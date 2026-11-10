@@ -61,7 +61,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    wyrd_testing::capacity::install_tracing();
+    if let Err(error) = wyrd_testing::capacity::install_tracing() {
+        eprintln!("capacity: cannot install the tracing registry: {error}");
+        return ExitCode::from(2);
+    }
     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     ExitCode::from(runtime.block_on(Box::pin(dispatch(&arguments, &root))))
 }
@@ -160,6 +163,10 @@ fn engine(name: &str) -> Option<Engine> {
 /// Plans `engine` at `level` from `arguments` and runs it, as its smoke
 /// under `--smoke`.
 async fn level(level: Level, engine: Engine, arguments: &[String], root: &Path) -> u8 {
+    if let Err(error) = start_benchmark() {
+        eprintln!("capacity l{} {}: {error}", u8::from(level), engine.name());
+        return 2;
+    }
     let context = Context {
         level,
         arguments,
@@ -182,6 +189,19 @@ async fn level(level: Level, engine: Engine, arguments: &[String], root: &Path) 
             2
         }
     }
+}
+
+/// Makes this driver process a benchmark recorder before it creates any
+/// client, as `WYRD_METRICS_BENCHMARK_SNAPSHOT=1` makes its child server one,
+/// so its own client, attempt, and fixture observations are kept; only
+/// `l1`/`l2` start it, never `report` or `results`.
+///
+/// # Errors
+///
+/// Returns the refusal when another `metrics` recorder is already installed.
+fn start_benchmark() -> Result<(), String> {
+    wyrd_benchmark::install()
+        .map_err(|error| format!("cannot start the benchmark recorder: {error}"))
 }
 
 /// The engine's plan at the context's level.
@@ -1673,6 +1693,140 @@ mod tests {
         ] {
             assert_eq!(dispatch(&line(usage), root.path()).await, 2, "{usage:?}");
         }
+    }
+
+    /// A transport over a local server answering every request `{}`.
+    async fn answered() -> wyrd_client::transport::HttpTransport {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = vec![0_u8; 8192];
+                let _ = socket.read(&mut request).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}")
+                    .await;
+            }
+        });
+        let config = wyrd_client::config::ClientConfig::default();
+        let auth = wyrd_client::auth::AuthMiddleware::new(
+            &config,
+            wyrd_client::transport::credential::ResolvedCredential::BearerToken(
+                "token".to_owned().into(),
+            ),
+        )
+        .expect("auth");
+        wyrd_client::transport::HttpTransport::new(
+            &wyrd_client::transport::config::HttpConfig {
+                base_url: format!("http://{address}"),
+                ..wyrd_client::transport::config::HttpConfig::default()
+            },
+            auth,
+        )
+        .expect("transport")
+    }
+
+    /// Driver startup installs the classification registry whether or not a
+    /// log filter is set, and the recorder, before any client exists: a span
+    /// labelled from benchmark metadata keeps its cohort, and a labelled
+    /// client call records its logical call and attempt in that cohort.
+    /// Starting again is not a second installation.
+    ///
+    /// # Panics
+    ///
+    /// Panics when startup fails, a label is lost, or the call is not
+    /// recorded in its cohort.
+    #[tokio::test]
+    async fn client_cohorts_record_without_log_environment() {
+        wyrd_testing::capacity::install_tracing().expect("the only subscriber");
+        super::start_benchmark().expect("the only recorder");
+        super::start_benchmark().expect("starting again changes nothing");
+        assert!(wyrd_benchmark::enabled());
+
+        let span = tracing::info_span!("fixture.request");
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            wyrd_benchmark::CASE_HEADER,
+            http::HeaderValue::from_static("direct-verify"),
+        );
+        headers.insert(
+            wyrd_benchmark::PHASE_HEADER,
+            http::HeaderValue::from_static("repetition-2"),
+        );
+        wyrd_benchmark::label_request(&span, &headers);
+        let cohort = wyrd_benchmark::Cohort::of_span(&span);
+        assert_eq!(
+            (cohort.case(), cohort.phase()),
+            ("direct-verify", "repetition-2"),
+            "the registry keeps span labels without a log layer"
+        );
+
+        let transport = answered().await;
+        let before = wyrd_benchmark::snapshot();
+        wyrd_client::transport::trace::with_benchmark_labels(
+            "direct-verify",
+            "repetition-1",
+            transport.request_json::<serde_json::Value, serde_json::Value>(
+                reqwest::Method::GET,
+                "/v1/probe",
+                None,
+            ),
+        )
+        .await
+        .expect("the call succeeds");
+        let interval = wyrd_benchmark::snapshot()
+            .since(&before)
+            .expect("one process");
+        for boundary in ["client.http", "client.http.attempt"] {
+            assert!(
+                interval
+                    .series
+                    .iter()
+                    .any(|series| series.boundary == boundary
+                        && series.outcome == wyrd_benchmark::SUCCESS
+                        && series.case == "direct-verify"
+                        && series.phase == "repetition-1"
+                        && series.count == 1),
+                "{boundary} keeps its cohort"
+            );
+        }
+        assert_eq!(interval.dropped, 0);
+    }
+
+    /// Building and calling an ordinary client installs neither a recorder
+    /// nor a subscriber and records nothing, so benchmark startup afterwards
+    /// still finds no other backend.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the client installs or records anything.
+    #[tokio::test]
+    async fn ordinary_clients_do_not_install_or_record_benchmarks() {
+        let before = wyrd_benchmark::snapshot();
+        let transport = answered().await;
+        let _clone = transport.clone();
+        let _: serde_json::Value = transport
+            .request_json(
+                reqwest::Method::GET,
+                "/v1/probe",
+                None::<&serde_json::Value>,
+            )
+            .await
+            .expect("the call succeeds");
+        assert!(!wyrd_benchmark::enabled());
+        assert!(
+            !tracing::dispatcher::has_been_set(),
+            "no subscriber installed"
+        );
+        let interval = wyrd_benchmark::snapshot()
+            .since(&before)
+            .expect("one process");
+        assert!(interval.series.is_empty() && interval.metrics.is_empty());
+        super::start_benchmark().expect("no other recorder was installed");
     }
 
     /// Every engine's L1 and L2 consumer reads its judged timings, scan

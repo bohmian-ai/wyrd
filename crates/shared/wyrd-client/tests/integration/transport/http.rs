@@ -446,6 +446,33 @@ mod transport_behavior {
         None
     }
 
+    /// The completed observations of `boundary` ending in `outcome` over
+    /// `interval`, every cohort included.
+    fn roots(interval: &wyrd_benchmark::BenchmarkInterval, boundary: &str, outcome: &str) -> u64 {
+        interval
+            .series
+            .iter()
+            .filter(|series| series.boundary == boundary && series.outcome == outcome)
+            .map(|series| series.count)
+            .sum()
+    }
+
+    /// The unlabelled logical calls over `interval` that reached `component`;
+    /// zero when none did.
+    fn reached(interval: &wyrd_benchmark::BenchmarkInterval, component: &str) -> u64 {
+        interval
+            .histogram(
+                wyrd_benchmark::COMPONENT_SECONDS,
+                &[
+                    ("boundary", "client.http"),
+                    ("component", component),
+                    ("case", wyrd_benchmark::UNLABELLED),
+                    ("phase", wyrd_benchmark::UNLABELLED),
+                ],
+            )
+            .map_or(0, |distribution| distribution.len())
+    }
+
     // ── tests ─────────────────────────────────────────────────────────────────
 
     /// A JSON body larger than one socket read is replayed byte for byte, with
@@ -457,6 +484,7 @@ mod transport_behavior {
     /// refused attempt, or it does not carry the renewed bearer.
     #[tokio::test]
     async fn json_body_and_request_identity_survive_auth_refresh() {
+        wyrd_benchmark::install().expect("the only recorder");
         let server = spawn_mock(vec![
             MockResponse::ok(&token_response("tok-A")),
             MockResponse::status(
@@ -468,6 +496,7 @@ mod transport_behavior {
         ])
         .await;
         let transport = make_api_key_transport(server.base_url.clone());
+        let before = wyrd_benchmark::snapshot();
         let body = serde_json::json!({"content": "x".repeat(64 * 1024), "escaped": "\"q\"\n"});
         let expected = serde_json::to_string(&body).expect("body serializes");
 
@@ -478,6 +507,30 @@ mod transport_behavior {
 
         assert_eq!(response["result"], "ok");
         assert_eq!(server.hits.load(Ordering::SeqCst), 4);
+        let interval = wyrd_benchmark::snapshot()
+            .since(&before)
+            .expect("one process");
+        assert_eq!(
+            (
+                roots(&interval, "client.http", wyrd_benchmark::SUCCESS),
+                roots(&interval, "client.http.attempt", wyrd_benchmark::ERROR),
+                roots(&interval, "client.http.attempt", wyrd_benchmark::SUCCESS),
+            ),
+            (1, 1, 1),
+            "one logical call of a refused and a replayed attempt"
+        );
+        for component in ["serialize", "auth", "send", "body", "decode"] {
+            assert_eq!(
+                reached(&interval, component),
+                1,
+                "{component} accumulates once"
+            );
+        }
+        assert_eq!(
+            reached(&interval, "backoff"),
+            0,
+            "a 401 replay waits no backoff"
+        );
         let captured = server.captured.lock().await;
         let (refused, replay) = (&captured[1], &captured[3]);
         assert_eq!(request_body(refused), expected);
@@ -503,6 +556,7 @@ mod transport_behavior {
     /// Panics when the request succeeds or the mock is hit more than once.
     #[tokio::test]
     async fn non_idempotent_json_is_not_replayed_after_ambiguous_failure() {
+        wyrd_benchmark::install().expect("the only recorder");
         let server = spawn_mock(vec![
             MockResponse::status(
                 503,
@@ -513,6 +567,7 @@ mod transport_behavior {
         .await;
         let transport = make_transport(server.base_url.clone());
         let body = serde_json::json!({"op": "run"});
+        let before = wyrd_benchmark::snapshot();
 
         transport
             .request_json::<_, serde_json::Value>(reqwest::Method::POST, "/v1/test", Some(&body))
@@ -520,8 +575,94 @@ mod transport_behavior {
             .expect_err("the ambiguous failure is reported");
 
         assert_eq!(server.hits.load(Ordering::SeqCst), 1);
+        let interval = wyrd_benchmark::snapshot()
+            .since(&before)
+            .expect("one process");
+        assert_eq!(
+            (
+                roots(&interval, "client.http", wyrd_benchmark::ERROR),
+                roots(&interval, "client.http.attempt", wyrd_benchmark::ERROR),
+                roots(&interval, "client.http.attempt", wyrd_benchmark::SUCCESS),
+            ),
+            (1, 1, 0),
+            "one failed call of one failed attempt"
+        );
+        assert_eq!(reached(&interval, "body"), 1, "the problem body was read");
+        assert_eq!(
+            reached(&interval, "decode"),
+            0,
+            "an unreached decode is absent"
+        );
         let captured = server.captured.lock().await;
         assert_eq!(request_body(&captured[0]), r#"{"op":"run"}"#);
+    }
+
+    /// A call whose answer does not decode is one failed logical call of a
+    /// successful attempt that reached decoding, and a call dropped while it
+    /// waits for headers records its logical call and attempt as cancelled.
+    /// Without the recorder the same calls record nothing.
+    ///
+    /// # Panics
+    /// Panics when a population, outcome, or reached component differs.
+    #[tokio::test]
+    async fn buffered_calls_keep_failed_decode_and_cancelled_populations() {
+        let server = spawn_mock(vec![MockResponse::ok("{}"), MockResponse::ok("not json")]).await;
+        let transport = make_transport(server.base_url.clone());
+        let decode = || {
+            transport.request_json::<serde_json::Value, serde_json::Value>(
+                reqwest::Method::GET,
+                "/v1/test",
+                None,
+            )
+        };
+        let ordinary = wyrd_benchmark::snapshot();
+        decode().await.expect("an ordinary call succeeds");
+        let interval = wyrd_benchmark::snapshot()
+            .since(&ordinary)
+            .expect("one process");
+        assert!(interval.series.is_empty() && interval.metrics.is_empty());
+
+        wyrd_benchmark::install().expect("the only recorder");
+        let before = wyrd_benchmark::snapshot();
+        decode().await.expect_err("prose is not JSON");
+        let silent = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = silent.local_addr().expect("address");
+        let unanswered = make_transport(format!("http://{address}"));
+        let mut pending = Box::pin(
+            unanswered.request_json::<serde_json::Value, serde_json::Value>(
+                reqwest::Method::GET,
+                "/v1/test",
+                None,
+            ),
+        );
+        let accepted = tokio::spawn(async move { silent.accept().await });
+        let _held = tokio::select! {
+            _ = &mut pending => panic!("an unanswered call never completes"),
+            accepted = accepted => accepted.expect("joins").expect("the call connects"),
+        };
+        drop(pending);
+
+        let interval = wyrd_benchmark::snapshot()
+            .since(&before)
+            .expect("one process");
+        assert_eq!(roots(&interval, "client.http", wyrd_benchmark::ERROR), 1);
+        assert_eq!(
+            roots(&interval, "client.http.attempt", wyrd_benchmark::SUCCESS),
+            1
+        );
+        assert_eq!(
+            reached(&interval, "decode"),
+            1,
+            "the failed decode was reached"
+        );
+        assert_eq!(
+            (
+                roots(&interval, "client.http", wyrd_benchmark::CANCELLED),
+                roots(&interval, "client.http.attempt", wyrd_benchmark::CANCELLED),
+            ),
+            (1, 1),
+            "a dropped call never disappears"
+        );
     }
 
     #[tokio::test]
@@ -720,6 +861,8 @@ mod transport_behavior {
         ])
         .await;
         let t = make_api_key_transport(server.base_url.clone());
+        wyrd_benchmark::install().expect("the only recorder");
+        let before = wyrd_benchmark::snapshot();
 
         let result: serde_json::Value = t
             .request_json(
@@ -731,6 +874,23 @@ mod transport_behavior {
             .expect("second attempt succeeds after re-exchange");
 
         assert_eq!(result["ok"], true);
+        let interval = wyrd_benchmark::snapshot()
+            .since(&before)
+            .expect("one process");
+        assert_eq!(
+            roots(&interval, "client.http", wyrd_benchmark::SUCCESS),
+            1,
+            "the re-exchanges are not logical calls of their own"
+        );
+        assert_eq!(
+            roots(&interval, "client.http.attempt", wyrd_benchmark::ERROR),
+            1
+        );
+        assert_eq!(
+            reached(&interval, "serialize"),
+            0,
+            "a GET serializes no body"
+        );
         assert_eq!(
             server.hits.load(Ordering::SeqCst),
             4,

@@ -59,7 +59,7 @@ unsafe impl GlobalAlloc for CountingMiMalloc {
             worker::refused(layout.size());
         }
         #[cfg(feature = "bench")]
-        wyrd_server::heap_profile::allocated(ptr, layout.size());
+        wyrd_benchmark::heap::allocated(ptr, layout.size());
         ptr
     }
 
@@ -67,7 +67,7 @@ unsafe impl GlobalAlloc for CountingMiMalloc {
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         worker::refund(layout.size());
         #[cfg(feature = "bench")]
-        wyrd_server::heap_profile::freed(ptr);
+        wyrd_benchmark::heap::freed(ptr);
         // SAFETY: `ptr` came from our `alloc`/`realloc` with this same `layout`.
         unsafe { MiMalloc.dealloc(ptr, layout) };
     }
@@ -81,7 +81,7 @@ unsafe impl GlobalAlloc for CountingMiMalloc {
             worker::refused(layout.size());
         }
         #[cfg(feature = "bench")]
-        wyrd_server::heap_profile::allocated(ptr, layout.size());
+        wyrd_benchmark::heap::allocated(ptr, layout.size());
         ptr
     }
 
@@ -93,7 +93,7 @@ unsafe impl GlobalAlloc for CountingMiMalloc {
             None => worker::refund(layout.size() - new_size),
         }
         #[cfg(feature = "bench")]
-        wyrd_server::heap_profile::freed(ptr);
+        wyrd_benchmark::heap::freed(ptr);
         // SAFETY: `ptr`/`layout` describe a live block from this allocator, and
         // `new_size` is the caller's — all forwarded unchanged.
         let new_ptr = unsafe { MiMalloc.realloc(ptr, layout, new_size) };
@@ -101,7 +101,7 @@ unsafe impl GlobalAlloc for CountingMiMalloc {
             worker::refused(new_size);
         }
         #[cfg(feature = "bench")]
-        wyrd_server::heap_profile::allocated(new_ptr, new_size);
+        wyrd_benchmark::heap::allocated(new_ptr, new_size);
         new_ptr
     }
 }

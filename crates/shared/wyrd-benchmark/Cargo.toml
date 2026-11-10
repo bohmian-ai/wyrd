@@ -9,11 +9,19 @@ authors = { workspace = true }
 publish = false
 description = "Opt-in high-resolution recording for benchmark-owned Wyrd servers."
 
+[features]
+# The allocation sampler and its pprof rendering (`heap`). Benchmark binaries
+# enable it; ordinary clients and SDKs never do.
+heap = ["dep:backtrace", "dep:flate2", "dep:prost"]
+
 [dependencies]
+backtrace = { workspace = true, optional = true }
+flate2 = { workspace = true, optional = true }
 hdrhistogram = { workspace = true }
 http = { workspace = true }
 metrics = { workspace = true }
 num-traits = { workspace = true }
+prost = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

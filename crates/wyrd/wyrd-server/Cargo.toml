@@ -10,7 +10,7 @@ authors = { workspace = true }
 [features]
 # Benchmark-only server surfaces: the Scribe stage/publish control and the
 # sampled heap profile. Only `bench:build` enables it.
-bench = ["dep:backtrace", "dep:prost"]
+bench = ["wyrd-benchmark/heap"]
 cloud = ["wyrd-storage/cloud", "vala-bifrost-redux/cloud"]
 storage-emulator = ["cloud", "wyrd-storage/emulator"]
 test-support = [
@@ -27,8 +27,6 @@ path = "src/main.rs"
 [dependencies]
 wyrd-benchmark = { workspace = true }
 mimalloc = { workspace = true }
-backtrace = { workspace = true, optional = true }
-prost = { workspace = true, optional = true }
 async-stream = { workspace = true }
 futures-util = { workspace = true }
 arc-swap = { workspace = true }

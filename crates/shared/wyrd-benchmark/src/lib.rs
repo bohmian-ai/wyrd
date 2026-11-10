@@ -41,6 +41,8 @@
 //! residual, or a missing component is counted, never clamped, and makes the
 //! interval's series report a problem.
 
+#[cfg(feature = "heap")]
+pub mod heap;
 mod recorder;
 
 use std::collections::BTreeMap;
@@ -110,6 +112,7 @@ pub const CASES: &[&str] = &[
     "otlp-spans-1k",
     "otlp-logs",
     "direct-verify",
+    "direct-verify-model",
     "queued-verify",
     "evidence-write",
     "buffered-1kib-capture-metadata",
@@ -246,6 +249,236 @@ fn labels_of(span: &tracing::Span) -> Labels {
     })
     .flatten()
     .unwrap_or(Labels::NONE)
+}
+
+/// The terminal outcome of an [`Observation`] that completed, whatever
+/// business result it carried.
+pub const SUCCESS: &str = "success";
+
+/// The terminal outcome of an [`Observation`] whose call failed.
+pub const ERROR: &str = "error";
+
+/// The terminal outcome of an [`Observation`] dropped before it finished.
+pub const CANCELLED: &str = "cancelled";
+
+/// The standard histogram an [`Observation`]'s components are recorded in,
+/// labelled by `boundary`, `component`, `case`, and `phase`; each series'
+/// count is the calls that reached that component.
+pub const COMPONENT_SECONDS: &str = "wyrd_benchmark_component_seconds";
+
+/// One closed benchmark classification: a case of [`CASES`] and a phase of
+/// [`PHASES`], either [`UNLABELLED`] or [`INVALID`]. It selects series only
+/// and carries no authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cohort(Labels);
+
+impl Cohort {
+    /// No classification.
+    pub const NONE: Self = Self(Labels::NONE);
+
+    /// The cohort `case` and `phase` name, as [`label_request`] reads them
+    /// from request metadata: an unknown value is [`INVALID`] and counted
+    /// once in `invalid_labels` while [`install`]ed.
+    #[must_use]
+    pub fn of(case: Option<&str>, phase: Option<&str>) -> Self {
+        let label = |value: Option<&str>, closed: &[&'static str]| {
+            value.map_or(UNLABELLED, |value| {
+                closed
+                    .iter()
+                    .find(|label| **label == value)
+                    .copied()
+                    .unwrap_or(INVALID)
+            })
+        };
+        let labels = Labels {
+            case: label(case, CASES),
+            phase: label(phase, PHASES),
+        };
+        if enabled() && (labels.case == INVALID || labels.phase == INVALID) {
+            REGISTRY.invalid_labels.fetch_add(1, Ordering::Relaxed);
+        }
+        Self(labels)
+    }
+
+    /// The cohort [`label_request`] put on `span` or its nearest labelled
+    /// ancestor, or [`Self::NONE`].
+    #[must_use]
+    pub fn of_span(span: &tracing::Span) -> Self {
+        Self(labels_of(span))
+    }
+
+    /// The closed case label.
+    #[must_use]
+    pub const fn case(self) -> &'static str {
+        self.0.case
+    }
+
+    /// The closed phase label.
+    #[must_use]
+    pub const fn phase(self) -> &'static str {
+        self.0.phase
+    }
+}
+
+/// One call's benchmark timing at a root `boundary`, with the components
+/// it reached, recorded once when it ends.
+///
+/// [`Self::start`] costs one relaxed load and nothing else unless the
+/// recorder is [`install`]ed: an inactive observation reads no clock,
+/// allocates nothing, and records nothing. An active one records its
+/// elapsed time since its start under its terminal outcome with
+/// [`Self::finish`]; dropped unfinished, it records [`CANCELLED`], so a
+/// cancelled call never disappears. Each component is recorded in
+/// [`COMPONENT_SECONDS`] under the root's boundary and cohort, without an
+/// outcome; one reached twice, such as authentication on a retry,
+/// accumulates into one observation. A component never reached is absent,
+/// not zero. The root and its components take only their own series'
+/// locks, so a snapshot taken while a call ends may hold its root without
+/// its components; a window differences snapshots taken once its cohort
+/// drained, which hold both.
+#[derive(Debug, Default)]
+pub struct Observation(Option<Active>);
+
+/// An [`install`]ed [`Observation`]'s state.
+#[derive(Debug)]
+struct Active {
+    /// The root timing boundary.
+    boundary: &'static str,
+    /// Its classification.
+    cohort: Cohort,
+    /// When the call started.
+    started: Instant,
+    /// The excluded waits, for a boundary that has them.
+    excluded: Option<Duration>,
+    /// Reached components and their accumulated durations, in first-reached
+    /// order.
+    components: Vec<(&'static str, Duration)>,
+    /// The terminal outcome, once finished.
+    outcome: Option<&'static str>,
+}
+
+impl Observation {
+    /// An observation of a call at `boundary` starting now in the cohort
+    /// `cohort` computes; inactive, and `cohort` never called, unless
+    /// [`install`]ed.
+    #[must_use]
+    pub fn start(boundary: &'static str, cohort: impl FnOnce() -> Cohort) -> Self {
+        if !enabled() {
+            return Self(None);
+        }
+        Self(Some(Active {
+            boundary,
+            cohort: cohort(),
+            started: Instant::now(),
+            excluded: None,
+            components: Vec::new(),
+            outcome: None,
+        }))
+    }
+
+    /// Whether this observation records.
+    #[must_use]
+    pub const fn active(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// An observation of a nested call at `boundary` starting now in this
+    /// one's cohort, such as one attempt of a retried call; inactive when
+    /// this one is.
+    #[must_use]
+    pub fn child(&self, boundary: &'static str) -> Self {
+        Self(self.0.as_ref().map(|active| Active {
+            boundary,
+            cohort: active.cohort,
+            started: Instant::now(),
+            excluded: None,
+            components: Vec::new(),
+            outcome: None,
+        }))
+    }
+
+    /// Now, when active: the start of a component to pass to [`Self::since`].
+    #[must_use]
+    pub fn now(&self) -> Option<Instant> {
+        self.0.as_ref().map(|_| Instant::now())
+    }
+
+    /// Adds `elapsed` to `component`.
+    pub fn component(&mut self, component: &'static str, elapsed: Duration) {
+        let Some(active) = &mut self.0 else {
+            return;
+        };
+        match active
+            .components
+            .iter_mut()
+            .find(|(name, _)| *name == component)
+        {
+            Some((_, total)) => *total += elapsed,
+            None => active.components.push((component, elapsed)),
+        }
+    }
+
+    /// Adds the time from `started`, a [`Self::now`] reading, until now to
+    /// `component`; nothing without a start.
+    pub fn since(&mut self, component: &'static str, started: Option<Instant>) {
+        if let Some(started) = started {
+            self.component(component, started.elapsed());
+        }
+    }
+
+    /// Adds `wait` to the root's excluded waits, so the root records a
+    /// residual.
+    pub fn exclude(&mut self, wait: Duration) {
+        if let Some(active) = &mut self.0 {
+            *active.excluded.get_or_insert(Duration::ZERO) += wait;
+        }
+    }
+
+    /// Records the call as ended now with `outcome`, [`SUCCESS`] or
+    /// [`ERROR`].
+    pub fn finish(mut self, outcome: &'static str) {
+        if let Some(active) = &mut self.0 {
+            active.outcome = Some(outcome);
+        }
+    }
+
+    /// Records the call as ended now with `result`'s outcome: [`SUCCESS`]
+    /// when it is `Ok`, whatever business result it carries, else
+    /// [`ERROR`].
+    pub fn settle<T, E>(self, result: &Result<T, E>) {
+        self.finish(if result.is_ok() { SUCCESS } else { ERROR });
+    }
+}
+
+impl Drop for Observation {
+    /// Records the root and its components, [`CANCELLED`] when unfinished.
+    fn drop(&mut self) {
+        let Some(active) = self.0.take() else {
+            return;
+        };
+        let elapsed = active.started.elapsed();
+        let Labels { case, phase } = active.cohort.0;
+        REGISTRY.record(
+            (
+                active.boundary,
+                active.outcome.unwrap_or(CANCELLED),
+                case,
+                phase,
+            ),
+            elapsed,
+            active.excluded,
+        );
+        for (component, duration) in active.components {
+            metrics::histogram!(
+                COMPONENT_SECONDS,
+                "boundary" => active.boundary,
+                "component" => component,
+                "case" => case,
+                "phase" => phase
+            )
+            .record(duration.as_secs_f64());
+        }
+    }
 }
 
 /// Records one request's server timing, and each of its `parts` as an
@@ -1770,5 +2003,133 @@ mod recording_tests {
         for boundary in ["bench.group", "bench.group.first", "bench.group.second"] {
             assert_eq!(count(&interval, boundary), THREADS * REQUESTS, "{boundary}");
         }
+    }
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use std::time::Duration;
+
+    use crate::{
+        self as timing, CANCELLED, COMPONENT_SECONDS, Cohort, ERROR, Observation, SUCCESS,
+    };
+
+    /// An observation records its root once under its terminal outcome,
+    /// success, error, or cancellation when dropped unfinished, with its
+    /// excluded wait and residual; each reached component accumulates into
+    /// one observation per call under the root's boundary and cohort, and an
+    /// unreached component stays absent rather than zero. An unknown label
+    /// is counted invalid.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a root, outcome, component count, or label is wrong.
+    #[test]
+    fn observations_keep_roots_outcomes_and_reached_components() {
+        timing::install().expect("the only recorder");
+        let before = timing::snapshot();
+        let cohort = || Cohort::of(Some("direct-verify"), Some("repetition-1"));
+        let mut completed = Observation::start("client.http", cohort);
+        completed.component("auth", Duration::from_micros(5));
+        completed.component("auth", Duration::from_micros(7));
+        completed.since("decode", completed.now());
+        completed.exclude(Duration::ZERO);
+        completed
+            .child("client.http.attempt")
+            .settle(&Err::<(), ()>(()));
+        completed
+            .child("client.http.attempt")
+            .settle(&Ok::<(), ()>(()));
+        completed.finish(SUCCESS);
+        let mut failed = Observation::start("client.http", cohort);
+        failed.component("auth", Duration::from_micros(1));
+        failed.finish(ERROR);
+        drop(Observation::start("client.http", cohort));
+        drop(Observation::start("client.http", || {
+            Cohort::of(Some("no-such-case"), None)
+        }));
+
+        let interval = timing::snapshot().since(&before).expect("one process");
+        let count = |outcome: &str, case: &str| {
+            interval
+                .series
+                .iter()
+                .filter(|s| s.boundary == "client.http" && s.outcome == outcome && s.case == case)
+                .map(|s| s.count)
+                .sum::<u64>()
+        };
+        assert_eq!(count(SUCCESS, "direct-verify"), 1);
+        assert_eq!(count(ERROR, "direct-verify"), 1);
+        assert_eq!(count(CANCELLED, "direct-verify"), 1);
+        assert_eq!(count(CANCELLED, timing::INVALID), 1);
+        assert_eq!(interval.invalid_labels, 1);
+        let attempts = |outcome: &str| {
+            interval
+                .series
+                .iter()
+                .filter(|s| {
+                    s.boundary == "client.http.attempt"
+                        && s.outcome == outcome
+                        && s.case == "direct-verify"
+                })
+                .map(|s| s.count)
+                .sum::<u64>()
+        };
+        assert_eq!(
+            (attempts(SUCCESS), attempts(ERROR)),
+            (1, 1),
+            "attempts keep their parent's cohort and their own outcomes"
+        );
+        let success = interval
+            .series
+            .iter()
+            .find(|s| s.boundary == "client.http" && s.outcome == SUCCESS)
+            .expect("the completed root");
+        assert!(success.residual.is_some() && success.problems().is_empty());
+        let component = |name: &str| {
+            interval.histogram(
+                COMPONENT_SECONDS,
+                &[
+                    ("boundary", "client.http"),
+                    ("component", name),
+                    ("case", "direct-verify"),
+                    ("phase", "repetition-1"),
+                ],
+            )
+        };
+        let auth = component("auth").expect("auth was reached");
+        assert_eq!(auth.len(), 2, "one accumulated observation per call");
+        assert!(
+            auth.maximum()
+                .is_some_and(|bucket| bucket.highest >= 12_000 && bucket.lowest <= 12_000),
+            "the retried call's auth accumulates"
+        );
+        assert_eq!(component("decode").expect("decode").len(), 1);
+        assert!(
+            component("send").is_err(),
+            "an unreached component is absent"
+        );
+    }
+
+    /// Without the recorder an observation computes no cohort, reads no
+    /// clock, and records nothing, finished or dropped.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an inactive observation does any of these.
+    #[test]
+    fn inactive_observations_read_no_clock_and_record_nothing() {
+        let before = timing::snapshot();
+        let mut observation = Observation::start("client.http", || {
+            panic!("an inactive observation computes no cohort")
+        });
+        assert!(!observation.active());
+        assert_eq!(observation.now(), None);
+        observation.component("auth", Duration::from_secs(1));
+        assert!(!observation.child("client.http.attempt").active());
+        observation.finish(SUCCESS);
+        drop(Observation::start("client.http", || Cohort::NONE));
+        let interval = timing::snapshot().since(&before).expect("one process");
+        assert!(interval.series.is_empty() && interval.metrics.is_empty());
     }
 }

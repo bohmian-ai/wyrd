@@ -34,16 +34,6 @@ tokio::task_local! {
     static BENCHMARK: (&'static str, &'static str);
 }
 
-/// Header carrying a benchmark driver's closed case, which a benchmark-mode
-/// server uses only to choose a timing series.
-#[cfg(feature = "test-support")]
-const BENCHMARK_CASE_HEADER: &str = "x-wyrd-benchmark-case";
-
-/// Header carrying a benchmark driver's closed phase: the repetition or
-/// admission phase the request was admitted in.
-#[cfg(feature = "test-support")]
-const BENCHMARK_PHASE_HEADER: &str = "x-wyrd-benchmark-phase";
-
 /// W3C header carrying the caller's trace and parent span.
 pub(crate) const TRACEPARENT: &str = "traceparent";
 /// W3C header carrying vendor trace state.
@@ -158,11 +148,24 @@ pub fn benchmark_headers() -> Vec<(&'static str, String)> {
     BENCHMARK
         .try_with(|(case, phase)| {
             vec![
-                (BENCHMARK_CASE_HEADER, (*case).to_owned()),
-                (BENCHMARK_PHASE_HEADER, (*phase).to_owned()),
+                (wyrd_benchmark::CASE_HEADER, (*case).to_owned()),
+                (wyrd_benchmark::PHASE_HEADER, (*phase).to_owned()),
             ]
         })
         .unwrap_or_default()
+}
+
+/// The benchmark cohort [`with_benchmark_labels`] scoped on this task, which
+/// classifies this process's own client observations; none outside a scope
+/// or without `test-support`.
+pub(crate) fn benchmark_cohort() -> wyrd_benchmark::Cohort {
+    #[cfg(feature = "test-support")]
+    if let Ok(cohort) =
+        BENCHMARK.try_with(|(case, phase)| wyrd_benchmark::Cohort::of(Some(case), Some(phase)))
+    {
+        return cohort;
+    }
+    wyrd_benchmark::Cohort::NONE
 }
 
 /// The current `tracing` span's valid OpenTelemetry span context as W3C

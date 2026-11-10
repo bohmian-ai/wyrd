@@ -429,7 +429,7 @@ pub const BENCHMARK_SNAPSHOT_PATH: &str = "/benchmark/snapshot";
 /// aggregate timings, counters, gauges, and histograms only, with no
 /// request identity, tenant, payload, query, or reset.
 ///
-/// A benchmark `bench` build also serves [`crate::heap_profile::PATH`]:
+/// A benchmark `bench` build also serves [`wyrd_benchmark::heap::PATH`]:
 /// `POST` starts heap sampling and `GET` returns the sampled allocations,
 /// allocated and still live, as a gzipped pprof profile of sizes and code
 /// locations only.
@@ -448,9 +448,9 @@ fn benchmark_router() -> Router {
     );
     #[cfg(feature = "bench")]
     let router = router.route(
-        crate::heap_profile::PATH,
+        wyrd_benchmark::heap::PATH,
         get(heap_profile).post(|| {
-            crate::heap_profile::start();
+            wyrd_benchmark::heap::start();
             ready(axum::http::StatusCode::NO_CONTENT)
         }),
     );
@@ -465,7 +465,7 @@ fn benchmark_router() -> Router {
 /// Answers 500 when rendering panicked.
 #[cfg(feature = "bench")]
 async fn heap_profile() -> Result<impl axum::response::IntoResponse, axum::http::StatusCode> {
-    let profile = tokio::task::spawn_blocking(crate::heap_profile::profile)
+    let profile = tokio::task::spawn_blocking(wyrd_benchmark::heap::profile)
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok((
@@ -975,7 +975,7 @@ mod tests {
         let call = |method: &str| {
             let request = Request::builder()
                 .method(method)
-                .uri(crate::heap_profile::PATH)
+                .uri(wyrd_benchmark::heap::PATH)
                 .body(Body::empty())
                 .expect("request builds");
             router.clone().oneshot(request)

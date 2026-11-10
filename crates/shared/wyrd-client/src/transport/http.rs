@@ -35,6 +35,7 @@ use reqwest::header::{HeaderName, HeaderValue};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
+use wyrd_benchmark::Observation;
 use wyrd_spec::auth::{SecretBearer, WORKLOAD_UID_HEADER};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::operator_connection::HttpsOrigin;
@@ -68,6 +69,30 @@ const QUERY_STREAM_CONTENT_TYPE: &str = "application/vnd.wyrd.bifrost-query-stre
 /// this header only; the application's own `Authorization` header is reserved
 /// for the embedding app and is never read or written by Wyrd.
 const HEADER_WYRD_ACCESS_TOKEN: &str = "x-wyrd-access-token";
+
+/// The benchmark root of one logical buffered call, from its body's
+/// serialization through its answer's decoding, across every attempt and
+/// credential refresh.
+const HTTP_ROOT: &str = "client.http";
+
+/// The benchmark root of one send attempt of a logical buffered call, from
+/// the send to its response headers or failure.
+const ATTEMPT_ROOT: &str = "client.http.attempt";
+
+/// The [`HTTP_ROOT`] components: serializing the body, producing the
+/// credential (refreshes included), sending to response headers, waiting
+/// out retry backoff, receiving the body, and decoding it.
+const SERIALIZE: &str = "serialize";
+/// See [`SERIALIZE`].
+const AUTH: &str = "auth";
+/// See [`SERIALIZE`].
+const SEND: &str = "send";
+/// See [`SERIALIZE`].
+const BACKOFF: &str = "backoff";
+/// See [`SERIALIZE`].
+const BODY: &str = "body";
+/// See [`SERIALIZE`].
+const DECODE: &str = "decode";
 
 /// [`HEADER_WYRD_ACCESS_TOKEN`] as a typed header name.
 ///
@@ -462,29 +487,38 @@ impl HttpTransport {
         S: Serialize,
         D: DeserializeOwned,
     {
-        let url = self.authenticated_url(path)?;
-        let request_id = self.auth.request_id(None);
-        let resp = self
-            .send_with_retry(Buffered {
-                method,
-                url: &url,
-                request_id: &request_id,
-                body: serialize_body(body)?,
-                idempotency_key: None,
-                extra_headers: headers,
-                timeout,
-            })
-            .await?;
+        let mut observation = Observation::start(HTTP_ROOT, trace::benchmark_cohort);
+        let result = async {
+            let url = self.authenticated_url(path)?;
+            let request_id = self.auth.request_id(None);
+            let started = body.and_then(|_| observation.now());
+            let body = serialize_body(body)?;
+            observation.since(SERIALIZE, started);
+            let resp = self
+                .send_with_retry(
+                    Buffered {
+                        method,
+                        url: &url,
+                        request_id: &request_id,
+                        body,
+                        idempotency_key: None,
+                        extra_headers: headers,
+                        timeout,
+                    },
+                    &mut observation,
+                )
+                .await?;
 
-        let bytes = resp.bytes().await.map_err(body_read_err)?;
-        // A `2xx` with an empty body (e.g. `204 No Content` from an admin
-        // DELETE) decodes as JSON `null`, so callers can request `D = ()` or
-        // `D = serde_json::Value` for no-content routes without a second helper.
-        let bytes: &[u8] = if bytes.is_empty() { b"null" } else { &bytes };
-        serde_json::from_slice(bytes).map_err(|err| WyrdError::Internal {
-            message: format!("response deserialization failed: {err}"),
-            details: serde_json::json!({}),
-        })
+            let bytes = received(resp, &mut observation).await?;
+            // A `2xx` with an empty body (e.g. `204 No Content` from an admin
+            // DELETE) decodes as JSON `null`, so callers can request `D = ()` or
+            // `D = serde_json::Value` for no-content routes without a second helper.
+            let bytes: &[u8] = if bytes.is_empty() { b"null" } else { &bytes };
+            decoded(bytes, &mut observation)
+        }
+        .await;
+        observation.settle(&result);
+        result
     }
 
     /// Send a request and return raw Arrow IPC bytes plus metadata headers.
@@ -513,29 +547,42 @@ impl HttpTransport {
     where
         S: Serialize,
     {
-        let url = self.authenticated_url(path)?;
-        let request_id = self.auth.request_id(None);
-        let resp = self
-            .send_with_retry(Buffered {
-                method,
-                url: &url,
-                request_id: &request_id,
-                body: serialize_body(body)?,
-                idempotency_key: None,
-                extra_headers: &[],
-                timeout: self.request_timeout,
+        let mut observation = Observation::start(HTTP_ROOT, trace::benchmark_cohort);
+        let result = async {
+            let url = self.authenticated_url(path)?;
+            let request_id = self.auth.request_id(None);
+            let started = body.and_then(|_| observation.now());
+            let body = serialize_body(body)?;
+            observation.since(SERIALIZE, started);
+            let resp = self
+                .send_with_retry(
+                    Buffered {
+                        method,
+                        url: &url,
+                        request_id: &request_id,
+                        body,
+                        idempotency_key: None,
+                        extra_headers: &[],
+                        timeout: self.request_timeout,
+                    },
+                    &mut observation,
+                )
+                .await?;
+
+            let schema_fingerprint =
+                header_str(&resp, HEADER_SCHEMA_FINGERPRINT).map(str::to_owned);
+            let row_count = header_str(&resp, HEADER_ROW_COUNT).and_then(|s| s.parse::<u64>().ok());
+
+            let frames = received(resp, &mut observation).await?.to_vec();
+            Ok(ArrowResponse {
+                frames,
+                schema_fingerprint,
+                row_count,
             })
-            .await?;
-
-        let schema_fingerprint = header_str(&resp, HEADER_SCHEMA_FINGERPRINT).map(str::to_owned);
-        let row_count = header_str(&resp, HEADER_ROW_COUNT).and_then(|s| s.parse::<u64>().ok());
-
-        let frames = resp.bytes().await.map_err(body_read_err)?.to_vec();
-        Ok(ArrowResponse {
-            frames,
-            schema_fingerprint,
-            row_count,
-        })
+        }
+        .await;
+        observation.settle(&result);
+        result
     }
 
     /// Send an authenticated request whose body is a one-shot stream.
@@ -884,38 +931,42 @@ impl HttpTransport {
         S: Serialize,
         D: DeserializeOwned,
     {
-        let url = self.authenticated_url(path)?;
-        let request_id = self.auth.request_id(None);
-        let generated_key;
-        let idempotency_key = if let Some(key) = key {
-            key
-        } else {
-            generated_key = Uuid::now_v7().to_string();
-            &generated_key
-        };
-        let body_bytes =
-            Bytes::from(serde_json::to_vec(body).map_err(|err| WyrdError::Internal {
-                message: format!("request serialization failed: {err}"),
-                details: serde_json::json!({}),
-            })?);
+        let mut observation = Observation::start(HTTP_ROOT, trace::benchmark_cohort);
+        let result = async {
+            let url = self.authenticated_url(path)?;
+            let request_id = self.auth.request_id(None);
+            let generated_key;
+            let idempotency_key = if let Some(key) = key {
+                key
+            } else {
+                generated_key = Uuid::now_v7().to_string();
+                &generated_key
+            };
+            let started = observation.now();
+            let body = serialize_body(Some(body))?;
+            observation.since(SERIALIZE, started);
 
-        let resp = self
-            .send_with_retry(Buffered {
-                method,
-                url: &url,
-                request_id: &request_id,
-                body: Some(body_bytes),
-                idempotency_key: Some(idempotency_key),
-                extra_headers: &[],
-                timeout: self.request_timeout,
-            })
-            .await?;
+            let resp = self
+                .send_with_retry(
+                    Buffered {
+                        method,
+                        url: &url,
+                        request_id: &request_id,
+                        body,
+                        idempotency_key: Some(idempotency_key),
+                        extra_headers: &[],
+                        timeout: self.request_timeout,
+                    },
+                    &mut observation,
+                )
+                .await?;
 
-        let bytes = resp.bytes().await.map_err(body_read_err)?;
-        serde_json::from_slice(&bytes).map_err(|err| WyrdError::Internal {
-            message: format!("response deserialization failed: {err}"),
-            details: serde_json::json!({}),
-        })
+            let bytes = received(resp, &mut observation).await?;
+            decoded(&bytes, &mut observation)
+        }
+        .await;
+        observation.settle(&result);
+        result
     }
 
     /// The credential that authenticates this transport's next request.
@@ -1080,7 +1131,21 @@ impl HttpTransport {
     /// time as [`WyrdClientError::TransportDown`] (503). The two live on
     /// different API surfaces (per-request send vs. one-time `connect`); the
     /// divergence is intentional and documented in both modules.
-    async fn send_with_retry(&self, request: Buffered<'_>) -> Result<reqwest::Response, WyrdError> {
+    ///
+    /// The logical call's `observation` gains each reached [`AUTH`],
+    /// [`SEND`], [`BACKOFF`], and refused-[`BODY`] interval, and every send
+    /// is observed as its own [`ATTEMPT_ROOT`]: successful when it answered
+    /// `2xx`, an error when it failed or answered otherwise, so a refreshed
+    /// `401` replay is two attempts of one call.
+    ///
+    /// # Errors
+    /// Returns the credential failure, the last transport failure, or the
+    /// server's mapped problem once the retry policy gives up.
+    async fn send_with_retry(
+        &self,
+        request: Buffered<'_>,
+        observation: &mut Observation,
+    ) -> Result<reqwest::Response, WyrdError> {
         // A request is replay-safe when re-sending it cannot double-apply a
         // server-side effect: idempotent HTTP methods, or any request carrying
         // a stable Idempotency-Key the server dedupes on.
@@ -1089,28 +1154,31 @@ impl HttpTransport {
         let mut auth_retried = false;
 
         loop {
+            let started = observation.now();
             let credential = self.request_credential().await?;
+            observation.since(AUTH, started);
             let req = self.attempt(&request, &credential);
 
+            let sent = observation.child(ATTEMPT_ROOT);
+            let started = observation.now();
             let result = req.send().await;
+            observation.since(SEND, started);
+            sent.finish(match &result {
+                Ok(resp) if resp.status().is_success() => wyrd_benchmark::SUCCESS,
+                _ => wyrd_benchmark::ERROR,
+            });
 
             match result {
                 // A connect error means the request never reached the server, so
                 // replaying it is always safe regardless of idempotency.
                 Err(err) if err.is_connect() && attempt < 2 => {
-                    tokio::time::sleep(Duration::from_millis(crate::transport::backoff_ms(
-                        attempt,
-                    )))
-                    .await;
+                    backoff(attempt, observation).await;
                     attempt += 1;
                 }
                 // A timeout is ambiguous: the server may have processed the
                 // request. Only retry when replay-safe.
                 Err(err) if err.is_timeout() && replay_safe && attempt < 2 => {
-                    tokio::time::sleep(Duration::from_millis(crate::transport::backoff_ms(
-                        attempt,
-                    )))
-                    .await;
+                    backoff(attempt, observation).await;
                     attempt += 1;
                 }
                 Err(err) => {
@@ -1124,7 +1192,9 @@ impl HttpTransport {
 
                     if status == 401 && !auth_retried {
                         auth_retried = true;
+                        let started = observation.now();
                         let _ = self.auth.force_refresh().await;
+                        observation.since(AUTH, started);
                         continue;
                     }
 
@@ -1132,19 +1202,18 @@ impl HttpTransport {
                         && attempt < 2
                         && replay_safe
                     {
-                        tokio::time::sleep(Duration::from_millis(crate::transport::backoff_ms(
-                            attempt,
-                        )))
-                        .await;
+                        backoff(attempt, observation).await;
                         attempt += 1;
                         continue;
                     }
 
                     if !resp.status().is_success() {
+                        let started = observation.now();
                         let body_val = resp
                             .json::<serde_json::Value>()
                             .await
                             .unwrap_or(serde_json::json!({}));
+                        observation.since(BODY, started);
                         return Err(from_problem_json(&body_val));
                     }
 
@@ -1192,6 +1261,47 @@ fn serialize_body<S: Serialize>(body: Option<&S>) -> Result<Option<Bytes>, WyrdE
             message: format!("request serialization failed: {err}"),
             details: serde_json::json!({}),
         })
+}
+
+/// Waits out retry `attempt`'s backoff, adding it to `observation`'s
+/// [`BACKOFF`].
+async fn backoff(attempt: u32, observation: &mut Observation) {
+    let started = observation.now();
+    tokio::time::sleep(Duration::from_millis(crate::transport::backoff_ms(attempt))).await;
+    observation.since(BACKOFF, started);
+}
+
+/// Receives `resp`'s whole body, adding the wait to `observation`'s
+/// [`BODY`] whether or not it completes.
+///
+/// # Errors
+/// Returns the body-read failure as [`WyrdError::Internal`].
+async fn received(
+    resp: reqwest::Response,
+    observation: &mut Observation,
+) -> Result<Bytes, WyrdError> {
+    let started = observation.now();
+    let bytes = resp.bytes().await.map_err(body_read_err);
+    observation.since(BODY, started);
+    bytes
+}
+
+/// Decodes a JSON answer from `bytes`, adding the work to `observation`'s
+/// [`DECODE`] whether or not it succeeds.
+///
+/// # Errors
+/// Returns the decoding failure as [`WyrdError::Internal`].
+fn decoded<D: DeserializeOwned>(
+    bytes: &[u8],
+    observation: &mut Observation,
+) -> Result<D, WyrdError> {
+    let started = observation.now();
+    let decoded = serde_json::from_slice(bytes).map_err(|err| WyrdError::Internal {
+        message: format!("response deserialization failed: {err}"),
+        details: serde_json::json!({}),
+    });
+    observation.since(DECODE, started);
+    decoded
 }
 
 /// Map a body-read error to [`WyrdError::Internal`].

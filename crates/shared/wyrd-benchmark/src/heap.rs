@@ -1,6 +1,8 @@
-//! Sampled heap profiles of a `bench` build, served as pprof.
+//! Sampled heap profiles of a benchmark process, rendered as pprof.
 //!
-//! The binary's allocator reports every allocation and free here. Until
+//! Compiled only with the `heap` feature, which benchmark binaries enable
+//! and ordinary clients never do. The binary's own allocator reports every
+//! allocation and free here; this crate installs no allocator. Until
 //! [`start`] runs, each report is one relaxed load. Afterwards about one
 //! allocation per [`SAMPLE_PERIOD`] allocated bytes is sampled with its call
 //! stack, the exponential sampling Go, tcmalloc and jemalloc use. Each sample
@@ -22,8 +24,8 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use prost::Message;
 
-/// Where the metrics listener serves the profile (`GET`) and starts
-/// sampling (`POST`).
+/// Where a benchmark server's metrics listener serves the profile (`GET`)
+/// and starts sampling (`POST`).
 pub const PATH: &str = "/benchmark/heap";
 
 /// Mean bytes allocated between samples, as in Go and tcmalloc.
@@ -40,7 +42,7 @@ const ALLOCATOR_ENTRIES: [&str; 4] = [
     "__rust_alloc",
     "__rust_realloc",
     "__rg_",
-    "wyrd_server::heap_profile::sample_allocation",
+    "wyrd_benchmark::heap::sample_allocation",
 ];
 
 /// Source paths of the Rust standard library, whose frames between the
@@ -649,10 +651,7 @@ mod tests {
         let library = "/rustc/0000/library/alloc/src/raw_vec/mod.rs";
         let stack = [
             frame("trace", "backtrace/src/backtrace/mod.rs"),
-            frame(
-                "wyrd_server::heap_profile::sample_allocation",
-                "src/heap_profile.rs",
-            ),
+            frame("wyrd_benchmark::heap::sample_allocation", "src/heap.rs"),
             frame("__rustc::__rust_alloc", ""),
             frame("grow_amortized", library),
             frame(

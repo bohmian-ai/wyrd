@@ -8,8 +8,6 @@ pub mod boot;
 pub mod components;
 pub mod config;
 pub mod grpc;
-#[cfg(feature = "bench")]
-pub mod heap_profile;
 pub mod http;
 pub mod mcp;
 pub mod oracle;

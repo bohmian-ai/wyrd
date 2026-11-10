@@ -10146,10 +10146,13 @@ dependencies = [
 name = "wyrd-benchmark"
 version = "0.4.1"
 dependencies = [
+ "backtrace",
+ "flate2",
  "hdrhistogram",
  "http",
  "metrics",
  "num-traits",
+ "prost",
  "serde",
  "tracing",
  "tracing-subscriber",
@@ -10276,6 +10279,7 @@ dependencies = [
  "vala-bifrost-redux",
  "wiremock",
  "workspace-hack",
+ "wyrd-benchmark",
  "wyrd-cards",
  "wyrd-loader",
  "wyrd-queue",
@@ -10613,7 +10617,6 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum",
- "backtrace",
  "base64 0.22.1",
  "blake3",
  "bytes",
@@ -10642,7 +10645,6 @@ dependencies = [
  "oauth2",
  "object_store",
  "opentelemetry",
- "prost",
  "rand 0.9.5",
  "regex",
  "reqwest 0.13.4",

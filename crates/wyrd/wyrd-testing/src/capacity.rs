@@ -861,19 +861,37 @@ pub fn binary_identity(binary: &Path) -> Result<Value, Error> {
     }))
 }
 
-/// Installs a stderr log subscriber when `WYRD_LOG`, else `RUST_LOG`, is set,
-/// so client-side failures read alongside the server logs. A subscriber
-/// already installed wins.
-pub fn install_tracing() {
-    let Ok(filter) = std::env::var("WYRD_LOG").or_else(|_| std::env::var("RUST_LOG")) else {
-        return;
-    };
-    let _ = tracing::subscriber::set_global_default(
-        tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
-            .with_writer(std::io::stderr)
-            .finish(),
-    );
+/// Installs the driver's process subscriber: a `tracing_subscriber`
+/// registry, where benchmark classifications live on spans, keeping every
+/// `INFO` span, with a stderr log layer only when `WYRD_LOG`, else
+/// `RUST_LOG`, is set, so client-side failures read alongside the server
+/// logs. The log filter applies to that layer alone, so a classified span
+/// exists in the registry whether or not it is logged.
+///
+/// # Errors
+///
+/// Returns the refusal when another global subscriber is already installed:
+/// it would hide the registry the benchmark classification needs.
+pub fn install_tracing() -> Result<(), tracing_subscriber::util::TryInitError> {
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+
+    let logs = std::env::var("WYRD_LOG")
+        .or_else(|_| std::env::var("RUST_LOG"))
+        .ok()
+        .map(|filter| {
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(tracing_subscriber::EnvFilter::new(filter))
+        });
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::layer::Identity::new()
+                .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+        )
+        .with(logs)
+        .try_init()
 }
 
 #[cfg(test)]

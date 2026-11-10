@@ -174,6 +174,19 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE` | 502 | Gateway upstream unavailable | Retry with backoff. If failures persist, a tenant administrator should check the deployment's provider, credential, and fallback configuration. |
 | `WYRD_GATEWAY_504_DEADLINE_EXCEEDED` | 504 | Gateway deadline exceeded | Retry with a longer deadline or a smaller request. |
 
+## WYRD_GITHUB
+
+| Code | Status | Title | Fix |
+| --- | ---: | --- | --- |
+| `WYRD_GITHUB_400_INVALID_REQUEST` | 400 | Invalid GitHub request | Send the documented query parameters or JSON body; details.field names the rejected part. |
+| `WYRD_GITHUB_401_WEBHOOK_REFUSED` | 401 | GitHub webhook refused | Configure the GitHub App's webhook secret to equal the deployment's WYRD_GITHUB_WEBHOOK_SECRET. |
+| `WYRD_GITHUB_403_CONNECTION_REFUSED` | 403 | GitHub connection refused | Begin a new connection with POST /v1/integrations/github/connect and finish it in a browser signed in to Wyrd as the same principal, authorizing a GitHub account that can access the installation; details.reason names the refused check. |
+| `WYRD_GITHUB_403_REPOSITORY_INACCESSIBLE` | 403 | GitHub repository not accessible | Select the repository in the tenant's GitHub installation and reconnect, or restore the installation; Wyrd uses a repository only while the installation can reach it and the tenant selected it. |
+| `WYRD_GITHUB_404_NOT_CONNECTED` | 404 | GitHub not connected | Connect the tenant with POST /v1/integrations/github/connect and complete the GitHub installation and authorization in a signed-in browser. |
+| `WYRD_GITHUB_409_CONNECTION_CONFLICT` | 409 | GitHub connection conflict | An installation belongs to at most one tenant and a tenant to one installation: disconnect the existing association first, or begin a new connection when details.reason is connection_changed. |
+| `WYRD_GITHUB_503_NOT_CONFIGURED` | 503 | GitHub integration not configured | Ask the deployment operator to configure the GitHub App (WYRD_GITHUB_* settings) and restart the server; every other Wyrd operation is unaffected. |
+| `WYRD_GITHUB_503_PROVIDER_UNAVAILABLE` | 503 | GitHub unavailable | Retry after the GitHub API recovers; when it persists, check the configured API URL, App credentials and network policy. |
+
 ## WYRD_LOADER
 
 | Code | Status | Title | Fix |

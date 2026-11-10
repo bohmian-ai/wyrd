@@ -43,6 +43,7 @@ Set up a local server, run one verification, then choose what to build, in this 
 - [Verification runtime](/wyrd/operate/configure-verification-runtime/): Choose which processes run Verifiers, size the worker pool, and diagnose startup refusals.
 - [Permissions](/wyrd/operate/grant-and-inspect-permissions/): See which roles a principal holds, grant or revoke a role, cut a principal off, and confirm the result in the audit log.
 - [Troubleshooting](/wyrd/operate/troubleshoot-a-deployment/): Find the cause of a Wyrd server that refuses to migrate or start, from the message it prints.
+- [Connect GitHub](/wyrd/operate/connect-github/): Register the deployment's GitHub App once, then connect a tenant to one GitHub installation and check which repositories it can reach.
 
 ## Understand
 

@@ -35,6 +35,7 @@ controls required to operate those boundaries.
 | `wyrd-server` replica to replica | Mutual TLS from one dedicated cluster CA with the fixed `wyrd-peer` identity; the receiver checks every operation's context against its own state |
 | Application to Postgres | Tenant traffic runs under RLS through `TenantConn` or the named single-statement owners; the operator pool is excluded from handlers by construction. Operators supply the logins; boot refuses superuser and `BYPASSRLS` logins. Production uses a separate tenant login that does not own Wyrd's objects, so RLS confines it even if compromised. One ordinary login (local and small self-hosted) keeps RLS per pool, but a process compromise could set the operator flag and reach every tenant |
 | Application to object storage | Workload identity or short-lived credentials; tenant-qualified prefixes; encryption in transit and at rest |
+| GitHub to `wyrd-server` | Webhooks are accepted only with a valid `X-Hub-Signature-256` HMAC over the raw body under the deployment's webhook secret, and name a tenant only through the one SECURITY DEFINER installation-to-tenant lookup; setup and callback parameters are hints that never confer tenant rights until GitHub confirms the installation and the authorizing user's access |
 
 ## Principal and credential lifecycle
 
@@ -491,6 +492,25 @@ credential.
   not exposed. Per-connection callback URLs would close the gap and are the
   upgrade path if it ever needs closing.
 
+### GitHub App association
+
+A tenant's GitHub connection is an association, not a principal or a
+credential. The deployment owns one GitHub App, configured from environment
+or files with its private key, OAuth client secret and webhook secret held as
+`SecretString`; none is ever accepted from TOML, a tenant, a Card or a
+request. `wyrd.github_installations` holds at most one installation per
+tenant and one tenant per installation and host, under forced RLS; it stores
+no key or token. A tenant principal holding `identity_connections:write`
+begins a one-use transaction in `auth_login_state` (`flow = 'github'`), bound
+to that principal and, at setup, to an HttpOnly browser binding cookie. Only
+the matching principal and browser can consume it, once, before it expires,
+and only against the slot revision it captured, so a stale callback cannot
+restore a released or replaced connection. The callback redeems the OAuth
+code with PKCE for a transient user token that is used for the
+installation-access check and dropped. Disconnect fences the tenant's GitHub
+work before it releases the installation. Every operation authorizes and
+audits through the ordinary permission path.
+
 ## Wyrd signing keys and JWKS
 
 Wyrd-issued JWTs use asymmetric signing with an explicit algorithm allowlist.
@@ -711,6 +731,14 @@ Multi-tenant Operator credentials never use process environment selectors.
 Secret values are redacted in diagnostics and are not persisted in Card specs
 or observations. Rotation changes the connection secret without changing the
 Card contract.
+
+GitHub repository access uses installation tokens the server mints on demand
+with an RS256 App JWT, narrowed to the one repository and the App's Contents
+read, Pull requests write and Checks write permissions. A token is minted
+only while the tenant's association is active, the repository is selected
+and GitHub still grants it; it is never persisted, returned, or derived from
+a user's personal token. The GitHub web and API origins are deployment
+configuration, reached through the screened HTTP client.
 
 Before fetching any user- or tenant-supplied URL, the server must:
 

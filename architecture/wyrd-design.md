@@ -928,6 +928,24 @@ storage, URLs, logs, telemetry, captures or cookies. Store failure is unavailabl
 not anonymous success. Prior credential-bearing UI cookies require re-login;
 no plaintext-cookie compatibility path is retained.
 
+#### GitHub App association
+
+A tenant connects to GitHub by associating one installation of the
+deployment's GitHub App with the tenant; it creates no principal, Card or
+binding. The association is the tenant's single
+`wyrd.github_installations` slot, served at `/v1/integrations/github`
+(read, connect, disconnect) with the browser `setup` and `callback`
+redirects and the unauthenticated, signature-verified `webhook`. Association
+happens only at the callback, after GitHub confirms the installation belongs
+to this App, is not suspended and is reachable by the authorizing user; the
+view returns the configured host and App, state, installation id and the
+selected repositories that user could reach. Installation events suspend,
+resume, narrow or release the slot. Work that needs a repository asks the
+server for an installation token at the moment of use; repository access is
+the conjunction of the association, the selection and GitHub's current
+answer. Security controls are in
+[GitHub App association](wyrd-security-posture.md#github-app-association).
+
 #### Cross-service delegation
 
 The API key is exchanged at `/auth/token`, or once at

@@ -2986,6 +2986,108 @@ When the server refuses its database, it exits and its last log line says why.
 | `exist but no sealing key is configured` at startup | Encrypted secrets are stored, and the server started without the key they were sealed under | Start with the same `WYRD_SEALING_KEY_FILE` as before |
 | A gateway call fails with an upstream-unavailable error after a key change | The provider key was sealed under a key the server no longer holds | List the old key in `WYRD_SEALING_RETAINED_KEYS_FILE` and restart, or put the credential again |
 
+# Connect GitHub
+
+Page: /wyrd/operate/connect-github/
+
+> Register the deployment's GitHub App once, then connect a tenant to one GitHub installation and check which repositories it can reach.
+
+Connect a tenant to GitHub so Wyrd can read its repositories and report on pull requests. The deployment operator registers one GitHub App and gives it to Wyrd. Each tenant administrator then connects their tenant to one installation of that App.
+
+Wyrd stores no GitHub key or token. It mints a short-lived installation token, narrowed to one repository, each time it needs one.
+
+## Before you start
+
+- A running Wyrd server reachable at a public HTTPS address, from [Deploy for a team](/wyrd/operate/deploy-wyrd-for-a-team/).
+- Permission to create a GitHub App for your organization, on github.com or your GitHub Enterprise Server.
+- A tenant administrator who can sign in to the Wyrd web app, and the `wyrd` CLI.
+
+## 1. Register the GitHub App
+
+In GitHub, open **Settings**, then **Developer settings**, then **GitHub Apps**, then **New GitHub App**. Replace `https://wyrd.example.com` with your server's public address.
+
+| Field | Value |
+| --- | --- |
+| Callback URL | `https://wyrd.example.com/v1/integrations/github/callback` |
+| Request user authorization (OAuth) during installation | Off |
+| Setup URL | `https://wyrd.example.com/v1/integrations/github/setup` |
+| Redirect on update | On |
+| Webhook URL | `https://wyrd.example.com/v1/integrations/github/webhook` |
+| Webhook secret | A long random string; keep it for step 2 |
+
+Under **Permissions**, set repository permissions to exactly these:
+
+| Permission | Access |
+| --- | --- |
+| Contents | Read-only |
+| Pull requests | Read and write |
+| Checks | Read and write |
+
+Under **Subscribe to events**, select **Pull request** and **Push**. GitHub always sends every App its **Installation** and **Installation repositories** events, which Wyrd uses to follow suspension and repository removal.
+
+Create the App. On its page, copy the **App ID**, the app's URL name (the slug in `https://github.com/apps/<slug>`) and the **Client ID**, generate a client secret, and generate and download a private key.
+
+## 2. Give the App to Wyrd
+
+Set these on every `wyrd-server` process and restart it. Secrets come only from the environment or a file, never from the server TOML file.
+
+```bash
+export WYRD_GITHUB_APP_ID=<App ID>
+export WYRD_GITHUB_APP_SLUG=<slug>
+export WYRD_GITHUB_PUBLIC_URL=https://wyrd.example.com
+export WYRD_GITHUB_OAUTH_CLIENT_ID=<Client ID>
+export WYRD_GITHUB_OAUTH_CLIENT_SECRET_FILE=/run/secrets/github-client-secret
+export WYRD_GITHUB_WEBHOOK_SECRET_FILE=/run/secrets/github-webhook-secret
+export WYRD_GITHUB_APP_PRIVATE_KEY_FILE=/run/secrets/github-app.pem
+```
+
+For GitHub Enterprise Server, also set `WYRD_GITHUB_WEB_ORIGIN=https://github.example.com` and `WYRD_GITHUB_API_ORIGIN=https://github.example.com/api/v3`. Without any `WYRD_GITHUB_*` setting the server starts with GitHub unavailable; with some but not all, it refuses to start and names the missing one.
+
+## 3. Connect the tenant
+
+As the tenant administrator, begin the connection:
+
+```bash
+export WYRD_SERVER_URL=https://wyrd.example.com
+export WYRD_API_KEY=<admin_credential>
+wyrd github connect
+```
+
+```text
+{"authorization_url":"https://github.com/apps/wyrd-reviews/installations/new?state=...","expires_at":"..."}
+```
+
+Within 5 minutes, open `authorization_url` in a browser where you are signed in to the Wyrd web app as the same account. GitHub asks you to choose the repositories to install the App on, then to authorize the App. The browser ends on the connection's JSON with `"state":"active"`.
+
+You can also start from GitHub: install the App from `https://github.com/apps/<slug>` while signed in to the Wyrd web app. Either way, Wyrd connects only after GitHub confirms the installation and that your GitHub account can reach it.
+
+## 4. Check the connection
+
+```bash
+wyrd github status
+```
+
+```text
+{"host":"github.com","app":{"id":4242,"slug":"wyrd-reviews"},"state":"active","installation_id":101,"repositories":[{"repository_id":"1","full_name":"acme/api"}],"connected_at":"...","updated_at":"..."}
+```
+
+`repositories` lists the repositories selected for the installation that your GitHub account could reach when you connected. `state` is `suspended` while the installation is suspended on GitHub. To change the selection, edit the installation on GitHub; Wyrd drops a removed repository as soon as GitHub reports it.
+
+To release the installation, run `wyrd github disconnect`. Wyrd stops starting GitHub work for the tenant before it releases the installation, which another tenant may then connect. The same operations are `GithubConnection` in the Rust, Python, and TypeScript SDKs and the [`github_connection` MCP tools](/wyrd/reference/mcp-tools/#github-connection).
+
+## If it fails
+
+| You see | Fix |
+| --- | --- |
+| `WYRD_GITHUB_503_NOT_CONFIGURED` | Set every variable in step 2 on every server process and restart |
+| `WYRD_GITHUB_403_CONNECTION_REFUSED` with `transaction_invalid` | Run `wyrd github connect` again and open the new URL within 5 minutes, signed in to Wyrd as the account that ran it |
+| `WYRD_GITHUB_403_CONNECTION_REFUSED` with `installation_inaccessible` | Authorize with a GitHub account that can see the installation, or install the App on that account's organization |
+| `WYRD_GITHUB_409_CONNECTION_CONFLICT` with `installation_claimed` | The installation belongs to another tenant; disconnect it there first |
+
+## Next
+
+- [Grant and inspect permissions](/wyrd/operate/grant-and-inspect-permissions/): connecting needs `identity_connections:write`, which `admin` holds.
+
 # Architecture
 
 Page: /wyrd/understand/architecture/
@@ -4011,6 +4113,18 @@ A token already minted from a revoked credential lapses within five minutes.
 | `operator_connections.update` | `operators:write` | `{connection_id, request}` → OperatorConnectionView | Patch a connection; provider and name are fixed |
 | `operator_connections.disable` | `operators:write` | `{connection_id}` → OperatorConnectionView | Disable a connection |
 
+## GitHub connection
+
+The read is listed for every caller; the writes are listed only for a caller
+holding `identity_connections:write`. GitHub's setup and OAuth callback are
+browser redirects, not tools.
+
+| Tool | Permission | Input → output | Purpose |
+| --- | --- | --- | --- |
+| `github_connection.get` | `identity_connections:write` | `{}` → GithubConnectionView | Read the tenant's redacted connection |
+| `github_connection.connect` | `identity_connections:write` | `{}` → GithubConnectResponse | Begin a connection; a signed-in human opens the returned install URL |
+| `github_connection.disconnect` | `identity_connections:write` | `{}` → GithubConnectionView | Fence GitHub work and release the installation |
+
 ## Gateway administration
 
 Gateway tools address resources by exact `name` and never call a model.
@@ -4220,6 +4334,19 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_GATEWAY_429_LIMIT_EXCEEDED` | 429 | Gateway limit exceeded | Retry after `details.retry_after_seconds`, reduce concurrency, or ask a tenant administrator to raise the limit. |
 | `WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE` | 502 | Gateway upstream unavailable | Retry with backoff. If failures persist, a tenant administrator should check the deployment's provider, credential, and fallback configuration. |
 | `WYRD_GATEWAY_504_DEADLINE_EXCEEDED` | 504 | Gateway deadline exceeded | Retry with a longer deadline or a smaller request. |
+
+## WYRD_GITHUB
+
+| Code | Status | Title | Fix |
+| --- | ---: | --- | --- |
+| `WYRD_GITHUB_400_INVALID_REQUEST` | 400 | Invalid GitHub request | Send the documented query parameters or JSON body; details.field names the rejected part. |
+| `WYRD_GITHUB_401_WEBHOOK_REFUSED` | 401 | GitHub webhook refused | Configure the GitHub App's webhook secret to equal the deployment's WYRD_GITHUB_WEBHOOK_SECRET. |
+| `WYRD_GITHUB_403_CONNECTION_REFUSED` | 403 | GitHub connection refused | Begin a new connection with POST /v1/integrations/github/connect and finish it in a browser signed in to Wyrd as the same principal, authorizing a GitHub account that can access the installation; details.reason names the refused check. |
+| `WYRD_GITHUB_403_REPOSITORY_INACCESSIBLE` | 403 | GitHub repository not accessible | Select the repository in the tenant's GitHub installation and reconnect, or restore the installation; Wyrd uses a repository only while the installation can reach it and the tenant selected it. |
+| `WYRD_GITHUB_404_NOT_CONNECTED` | 404 | GitHub not connected | Connect the tenant with POST /v1/integrations/github/connect and complete the GitHub installation and authorization in a signed-in browser. |
+| `WYRD_GITHUB_409_CONNECTION_CONFLICT` | 409 | GitHub connection conflict | An installation belongs to at most one tenant and a tenant to one installation: disconnect the existing association first, or begin a new connection when details.reason is connection_changed. |
+| `WYRD_GITHUB_503_NOT_CONFIGURED` | 503 | GitHub integration not configured | Ask the deployment operator to configure the GitHub App (WYRD_GITHUB_* settings) and restart the server; every other Wyrd operation is unaffected. |
+| `WYRD_GITHUB_503_PROVIDER_UNAVAILABLE` | 503 | GitHub unavailable | Retry after the GitHub API recovers; when it persists, check the configured API URL, App credentials and network policy. |
 
 ## WYRD_LOADER
 

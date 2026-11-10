@@ -163,3 +163,80 @@ PostgreSQL table; no UI.
 | O30 | "Update operator and tenant setup/diagnosis guides here, with no UI"; AC-011 | Guide commands match served CLI/SDK operations | docs:check + CLI journey runs guide commands |
 | O31 | Tier 2 "conditional association/revocation in SQL's integration target" | Association conditional on bound slot; uniqueness; release | `pg_github_installations` tests |
 | O32 | REQ-001 / INV-007 dedicated storage and unchanged OIDC trust | Only wyrd.github_installations is added; forced RLS and bidirectional uniqueness hold; flow-separated state refuses stale callbacks; OIDC trust shape/login behavior stay intact | Migration/source inspection; real Postgres races and isolation; callback negative journeys and existing OIDC regression coverage |
+
+## Evidence
+
+Abbreviations: **RJ** = `sdks/wyrd-sdk-rust/tests/integration/github_connection.rs`;
+**SQL** = `crates/wyrd/wyrd-sql/tests/integration/pg_github_installations.rs`;
+**SRV** = `crates/wyrd/wyrd-server/tests/integration/pg_github_connection.rs`;
+**OAS** = `crates/wyrd/wyrd-server/tests/integration/pg_openapi_contract.rs`;
+**CFG** = `crates/wyrd/wyrd-server/src/config.rs`; **CLI** =
+`crates/wyrd/wyrd-cli/tests/github_journey.rs`; **MCP** =
+`crates/wyrd/wyrd-mcp/tests/bifrost/mcp/github.rs`; **PY** =
+`sdks/wyrd-sdk-python/tests/integration/test_github_connection.py`; **TS** =
+`sdks/wyrd-sdk-ts/wyrd/tests/integration/github-connection.test.ts`; **DOC** =
+`docs/src/content/docs/operate/connect-github.md`.
+
+| Obligation | Implementation evidence | Assertion | Verification evidence | Result |
+|---|---|---|---|---|
+| O1 App config from config/secret providers, redacted | `GithubConfig` + `apply_env_overrides` in CFG | CFG:6819-6834 | `config::tests::github_app_config_parses_from_env_and_files_and_redacts` | PASS |
+| O2 missing config: only GitHub unavailable | `GithubConnections::app` → `not_configured()` | RJ:499 (begin/get/disconnect 503), RJ:511 (webhook 503), RJ:513 (Card list still served); PY:133; TS `github-connection-not-configured.test.ts`:18 | RJ `an_unconfigured_deployment_refuses_only_github`; PY/TS lanes | PASS |
+| O3 invalid present config: typed validation | `GithubConfig::resolve` | CFG:6930 (each missing field named), CFG:6957 (secrets refused from TOML) | `config::tests::github_app_config_is_optional_but_complete_once_present`, `github_secrets_never_come_from_toml` | PASS |
+| O4 configured GitHub host | `web_origin`/`api_origin` | CFG:6821 (GHE host), CFG:6873-6874 (defaults), RJ:182 (view host = mock host) | config tests; RJ | PASS |
+| O5 `/v1/integrations/github` connect/read/disconnect served and documented | `components/github/routes.rs` | OAS:318 (five operations, success status and security), OAS:325 (webhook clears bearer); SRV:213 (DELETE 200) | `pg_openapi_contract::github_connection_operations_publish_their_contract`; SRV | PASS |
+| O6 one-use, actor/tenant/browser-bound transaction, existing expiry | `GithubConnections::begin` (`TRANSACTION_TTL = LOGIN_STATE_TTL`), `bind_github_login_state` | SQL:607-608 (bound browser + hint), SQL:612-638 (no rebind/other browser/principal/tenant), SQL:683 (expired refused); CLI:94 (receipt expiry) | `pg_github_installations::github_transactions_are_flow_principal_and_browser_bound`; CLI | PASS |
+| O7 begun from Wyrd | connect → setup → authorize → callback | RJ:182-187 | RJ `connections_associate_only_after_github_confirms_them` | PASS |
+| O8 begun from GitHub | setup without state begins a browser-bound row | RJ:226-227 | RJ same test | PASS |
+| O9 setup only hints; only callback associates | `setup` never associates | RJ:163-166 (setup stopped at authorization → still not connected) | RJ | PASS |
+| O10 callback verifies code, installation, user access and user-accessible repos | `callback` | RJ:186 (hidden repo 3 excluded); mock refuses wrong PKCE/JWT; SRV:136 (App JWT accepted by mock) | RJ; SRV | PASS |
+| O11 spoofed installation IDs | hint used only if user can access it | RJ:287 (inaccessible hint and foreign App's installation refused) | RJ `spoofed_foreign_stale_and_conflicting_connections_are_refused` | PASS |
+| O12 consumed transaction | `consume_github_login_state` one-use | RJ:202; SQL:649-654 | RJ; SQL | PASS |
+| O13 foreign (other principal) transaction | actor + browser binding | RJ:305 (other principal); SQL:630; PY:118; TS:116 | RJ; SQL; PY; TS | PASS |
+| O14 foreign tenant | tenant RLS on login state | RJ:305 (tenant B browser); SQL:638 | RJ; SQL | PASS |
+| O15 bidirectional uniqueness; reconnect refreshes | conditional association | RJ:359 (installation_claimed), RJ:366 (tenant_connected); SQL:159-160 (refresh), SQL:231 | RJ; `pg_github_installations::installation_belongs_to_one_tenant_until_released` | PASS |
+| O15a concurrent claims both directions | unique indexes + slot revision | SQL:317-381 (one winner each direction) | `pg_github_installations::concurrent_claims_have_one_winner_in_both_directions` | PASS |
+| O15b cross-flow state | `flow` column separation | SQL:560, SQL:574, SQL:661; RJ:341 (OIDC callback refuses a GitHub state), RJ:350 (that state still completes GitHub) | SQL; RJ | PASS |
+| O15c stale callbacks after disconnect/reconnect | revision binding → `Stale` | SQL:183, SQL:195; RJ:382 | SQL; RJ | PASS |
+| O15d forced RLS | migration `FORCE ROW LEVEL SECURITY` | SQL:425 (enabled and forced), SQL:450 (B sees none), SQL:236 (B cannot release) | `pg_github_installations::slots_are_tenant_confined_and_track_removed_access` | PASS |
+| O15e unchanged OIDC login | migration does not reference `auth_human_connections` | `crates/wyrd/wyrd-server/src/auth/callback.rs`:373 (OIDC browser login completes and audits a session); `pg_migration.rs`:983-996 (OIDC table shape) | `auth::callback::pg_tests::` (28 passed with `auth::browser`), `pg_migration` | PASS |
+| O15f suspension retains ownership | `suspend_github_installation` | SQL:248, SQL:269; RJ:431 (view `suspended`, installation kept) | SQL; RJ `installation_events_synchronize_the_connection` | PASS |
+| O16 = O2/O3 | as O2/O3 | as O2/O3 | as O2/O3 | PASS |
+| O17 tokens/keys never in view, errors or Debug; nothing stored | `SecretString`; no token columns | RJ:229 (`assert_redacted` over every view/error/body); CFG:6834; CLI:131; MCP:35; PY:99; TS:96 | all journeys | PASS |
+| O18 exact redacted view | `GithubConnectionView` | RJ:182-188 | RJ | PASS |
+| O19 token only for associated, unsuspended, selected, accessible repo | `GithubConnections::installation_token` | SRV:112 (not connected), SRV:132 (minted), SRV:144 (unselected refused), SRV:167 (GitHub-deselected refused), SRV:174 (suspended refused) | `pg_github_connection::installation_tokens_follow_repository_access` | PASS |
+| O20 narrowed token request, no personal token | `GithubApp::installation_token` | SRV:133-143 (exact `repository_ids` + three permissions), SRV:248 (every request one repo) | SRV | PASS |
+| O21 installation events synchronize; bad signatures refused | `webhook` | RJ:420 (unsigned/missigned 401), RJ:431, RJ:465 (removed repo dropped), RJ:473 (deleted releases); `crates/shared/wyrd-crypt/src/lib.rs`:517-536 (HMAC vectors, truncated tags refused) | RJ; `wyrd-crypt` lib tests | PASS |
+| O22 access loss refuses only the affected repo | token facility reads the slot | SRV:161-163 (removed repo refused without GitHub call; repo 1 minted), SRV:167-168, SRV:174-178, SRV:233 (disconnect) | SRV | PASS |
+| O23 disconnect fences then releases; installation reusable | `fence_and_release` | SQL:280-286 (release then other tenant claims); RJ:476 (other tenant connects after deletion); SRV:233 | SQL; RJ; SRV | PASS |
+| O24 unrelated queued work survives | no queue mutation on access loss | SRV:237 (same single execution), SRV:245 (still `pending`) after removal/suspension/disconnect | SRV | PASS |
+| O25 no Cards/bindings created | connection writes only its slot | RJ:242-244 | RJ | PASS |
+| O26 permissions, events and served URLs documented | DOC | DOC:25-29 (served URLs), DOC:36-38 (permissions), DOC:40 (events) | `mise run docs:check` | PASS |
+| O27 architecture amendments | security posture + design | `architecture/wyrd-security-posture.md`:38 (Trust boundaries), :495 (Principal and credential lifecycle), :735 (Outbound credentials); `architecture/wyrd-design.md`:931 (Runtime identity) | review | PASS |
+| O28 existing permission/audit owners | `audit::authorize` with `identity_connections:write` | SRV:224 (setup/callback/disconnect audited allowed), SRV:230 (viewer read audited denied); RJ:274-276 | SRV; RJ | PASS |
+| O29 every surface | HTTP, `wyrd-client`, Rust/Python/TS SDK, CLI, MCP | SRV:213 (HTTP); RJ:182-214 (Rust); PY:70-96; TS:63-86; CLI:88-123; MCP:95 (writer tools listed for admin), MCP:166-169 (writer sees only the read), MCP:179 (refused) | per-surface journeys; MCP `discovery`/`connectivity` catalogs | PASS |
+| O30 guides match served operations, no UI | DOC | DOC:67, DOC:81, DOC:90 (`wyrd github connect/status/disconnect`) run by CLI:88-123 | `docs:check`; `github_journey::tenant_connects_github_through_the_cli` | PASS |
+| O31 conditional association/revocation in SQL target | `queries/github_installations.rs` | SQL:142-200 | `pg_github_installations::association_is_conditional_on_the_bound_slot_revision` | PASS |
+| O32 dedicated storage, unchanged OIDC trust | one new table only | `pg_migration.rs`:1013-1014 (table + RLS metadata); O15a–O15e rows | `pg_migration`, SQL, RJ, OIDC callback tests | PASS |
+
+### Commands
+
+- `scripts/postgres/with-test-postgres.sh -- mise exec -- cargo nextest run --locked -p wyrd-sql --test integration -E 'test(/^(pg_github_installations|pg_login_state|pg_migration|pg_platform_identity)::/)'` — 40 passed.
+- `mise run test:sql` — 217, 7, 88 and 3 passed.
+- `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner; cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E "test(/^github_connection::/)"'` — 4 passed.
+- `... cargo nextest run --locked -p wyrd-server --test integration -E 'test(/^(pg_github_connection|pg_openapi_contract)::/)'` — 1 and 24 passed.
+- `... cargo nextest run --locked -p wyrd-cli --test cli -E 'test(/^github_journey::/)'` — 1 passed.
+- `... cargo nextest run --locked -p wyrd-mcp --test mcp -P journey --run-ignored=all -E 'test(/^github::/) | test(/^discovery::/) | test(/^connectivity::/)'` — 7 passed.
+- `... cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^(callback|connections|platform_login|cli_logins)::/)'` — 8 passed; `-p wyrd-server --lib -E 'test(/^auth::(browser|callback)::/) | test(/^components::admin::identity::/)'` — 28 passed.
+- Python: `pytest -m "integration and not local_dev" tests/integration/test_github_connection.py` — 3 passed; TypeScript: `test:bifrost:journey:typescript:inner` — 205 passed.
+- `mise run fmt`, `mise run lints`, `mise run codegen:check`, `mise run docs:check`, `mise run check:tenant-isolation`, `mise run check:deps`, `mise run ts:napi:check`, `py:lints`, `py:typecheck` — pass.
+- Lanes: the GitHub server, CLI and Rust journeys run in `test:wyrdstate:journey:inner`; the MCP journey in `test:bifrost`; Python and TypeScript in their journey lanes.
+
+### Process exceptions and diagnoses
+
+- **No RED.** Production code was written before the SQL, config, journey and integration tests, so no scenario has a recorded missing-behavior failure. This is a process exception, not a pass of the RED step.
+- **Card baseline.** Symptom: RJ "a connection creates no Card" saw left 2, right 1. Evidence: `Deployment::key` bootstraps a Service with a root Card. Cause: the baseline was read before fixture setup. Fix site: the test's baseline is now taken after fixtures; the assertion is unchanged.
+- **Disconnect 401 in SRV.** Symptom: DELETE answered 401. Evidence: `oneshot_authenticated` sends `x-wyrd-access-token`. Cause: the test sent `Authorization`. Fix site: the test uses the server's access-token header.
+- **OpenAPI security.** Symptom: `pg_openapi_contract::unauthenticated_requests_match_each_operation_declared_security` failed for the webhook. Evidence: 503 without a token while the operation inherited document security. Cause: the HMAC-authenticated webhook did not clear the bearer requirement. Fix site: `security(())` on the webhook path in `components/github/routes.rs`.
+- **MCP catalogs.** Symptom: `discovery`/`connectivity` catalog mismatch. Evidence: five verification tools from 86597947d were missing from the expected lists. Cause: catalog drift from that earlier commit on this branch. Fix site: the expected catalogs in both test files.
+- **Mechanical deviations.** O24 was planned as a SQL integration test but is asserted in SRV, because a queued execution and the token facility meet only in the server. O15e uses the in-process OIDC callback tests; the Keycloak/Dex `identity_e2e` lane was not run.
+- **Non-goals.** No UI, no Card or binding writes, and no PR, check-run or source work. `auth_human_connections` is unchanged.

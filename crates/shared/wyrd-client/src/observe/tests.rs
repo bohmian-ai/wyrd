@@ -676,6 +676,47 @@ fn run_for_card_refuses_an_unknown_alias_without_network_io() {
     assert_eq!(error.code(), "WYRD_SDK_404_UNKNOWN_ALIAS");
 }
 
+/// A subject's bindings resolve in order: the root Service's own for the
+/// root, then each component occurrence naming the subject, then a standalone
+/// Agent's own. The first bound Verifier of the name wins, a Verifier bound
+/// elsewhere is unknown, and every result names the exact subject.
+///
+/// # Panics
+/// Panics if the fixture does not load, a binding resolves to the wrong
+/// Verifier or subject, or an unbound name resolves.
+#[test]
+fn verifier_resolution_preserves_subjects_and_binding_order() {
+    let (bundle, [judge, judge_next, solo]) = TestBundle::with_bound_verifiers();
+    let state = WyrdState::from_path(bundle.path()).expect("fixture bundle loads");
+    let root = state.root_ref().clone();
+    let model = state.card_ref("model").expect("model ref").clone();
+    let agent = state.card_ref("agent_triage").expect("agent ref").clone();
+    let quality = state
+        .card_ref("quality_check")
+        .expect("quality ref")
+        .clone();
+    let resolves = |subject: &wyrd_spec::reference::CardRef, name: &str| {
+        let bound = state
+            .bound_verifier(subject, name)
+            .unwrap_or_else(|error| panic!("{name} resolves for {subject}: {error}"));
+        (bound.verifier_card_uid, bound.card_uid)
+    };
+    let uid = |card: &wyrd_spec::reference::CardRef| card.uid.clone().expect("fixture UID");
+
+    assert_eq!(resolves(&root, "quality"), (uid(&quality), uid(&root)));
+    assert_eq!(resolves(&model, "judge"), (uid(&judge), uid(&model)));
+    assert_eq!(resolves(&model, "solo"), (uid(&solo), uid(&model)));
+    assert_eq!(resolves(&agent, "judge"), (uid(&judge_next), uid(&agent)));
+    assert_eq!(resolves(&agent, "solo"), (uid(&solo), uid(&agent)));
+    for (subject, name) in [(&root, "judge"), (&model, "quality"), (&agent, "quality")] {
+        let error = state
+            .bound_verifier(subject, name)
+            .err()
+            .unwrap_or_else(|| panic!("{name} is not bound to {subject}"));
+        assert_eq!(error.code(), "WYRD_SDK_404_UNKNOWN_VERIFIER");
+    }
+}
+
 // ── Scenario 2b: Verifier execution through named slots ────────────────────
 
 /// A client presenting a static bearer to `base_url` with `timeout_ms`, so no
@@ -1274,8 +1315,12 @@ async fn wait_deadline_bounds_slow_reads_and_starts_no_read_after_expiry() {
 /// A direct execution waits past a shorter configured `timeout_ms` so the
 /// server's own deadline answer reaches the caller, sent once.
 ///
+/// The longer execution deadline is the execute request's own: an ordinary
+/// request on the same client still times out at the configured deadline.
+///
 /// # Panics
-/// Panics when the delayed 504 is replaced by a client timeout or replayed.
+/// Panics when the delayed 504 is replaced by a client timeout or replayed,
+/// or the ordinary request outlives the configured deadline.
 #[tokio::test]
 async fn execute_outlives_the_configured_timeout() {
     use wiremock::matchers::{method, path};
@@ -1301,11 +1346,33 @@ async fn execute_outlives_the_configured_timeout() {
         crate::verify::Inputs::named([("answer", json!("yes"))]),
     );
 
+    Mock::given(method("POST"))
+        .and(path("/v1/ordinary"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(200))
+                .set_body_json(json!({})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = bearer_client(server.uri(), 20);
+
     let error = target(&spec)
-        .execute(&bearer_client(server.uri(), 20), run)
+        .execute(&client, run)
         .await
         .expect_err("the server's deadline answer is an error");
     assert_eq!(error.code(), "WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT");
+
+    let ordinary = client
+        .http
+        .request_json::<_, Value>(reqwest::Method::POST, "/v1/ordinary", Some(&json!({})))
+        .await
+        .expect_err("an ordinary request keeps the configured deadline");
+    assert!(
+        ordinary.to_string().contains("transport error"),
+        "{ordinary:?}"
+    );
 }
 
 // ── Scenario 3: the Drift projection ───────────────────────────────────────

@@ -207,9 +207,7 @@ mod transport_behavior {
 
                 tokio::spawn(async move {
                     hits_inner.fetch_add(1, Ordering::SeqCst);
-                    let mut buf = vec![0u8; 8192];
-                    let n = stream.read(&mut buf).await.unwrap_or(0);
-                    let raw = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let raw = read_request(&mut stream).await;
                     captured_inner.lock().await.push(raw);
 
                     let MockResponse {
@@ -254,6 +252,32 @@ mod transport_behavior {
             captured,
             _handle: handle,
         }
+    }
+
+    /// Reads one whole request, its head and the `content-length` body
+    /// after it, however many reads that takes.
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
+        let mut raw = Vec::new();
+        let mut buf = vec![0u8; 8192];
+        loop {
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            raw.extend_from_slice(&buf[..n]);
+            let text = String::from_utf8_lossy(&raw);
+            let complete = text.find("\r\n\r\n").is_some_and(|head| {
+                let length = extract_header(&text[..head], "content-length")
+                    .and_then(|length| length.parse::<usize>().ok())
+                    .unwrap_or(0);
+                raw.len() >= head + 4 + length
+            });
+            if n == 0 || complete {
+                return String::from_utf8_lossy(&raw).into_owned();
+            }
+        }
+    }
+
+    /// The body of one captured request.
+    fn request_body(raw: &str) -> &str {
+        raw.split_once("\r\n\r\n").map_or("", |(_, body)| body)
     }
 
     fn make_transport(base_url: String) -> HttpTransport {
@@ -423,6 +447,82 @@ mod transport_behavior {
     }
 
     // ── tests ─────────────────────────────────────────────────────────────────
+
+    /// A JSON body larger than one socket read is replayed byte for byte, with
+    /// the same request ID, after a `401` re-exchanges the credential; only the
+    /// bearer changes.
+    ///
+    /// # Panics
+    /// Panics when the replay's body, request ID, or method differs from the
+    /// refused attempt, or it does not carry the renewed bearer.
+    #[tokio::test]
+    async fn json_body_and_request_identity_survive_auth_refresh() {
+        let server = spawn_mock(vec![
+            MockResponse::ok(&token_response("tok-A")),
+            MockResponse::status(
+                401,
+                r#"{"code":"WYRD_AUTH_401_INVALID_TOKEN","detail":"unauthorized","details":{}}"#,
+            ),
+            MockResponse::ok(&token_response("tok-B")),
+            MockResponse::ok(r#"{"result":"ok"}"#),
+        ])
+        .await;
+        let transport = make_api_key_transport(server.base_url.clone());
+        let body = serde_json::json!({"content": "x".repeat(64 * 1024), "escaped": "\"q\"\n"});
+        let expected = serde_json::to_string(&body).expect("body serializes");
+
+        let response: serde_json::Value = transport
+            .request_json(reqwest::Method::POST, "/v1/test", Some(&body))
+            .await
+            .expect("the replay succeeds");
+
+        assert_eq!(response["result"], "ok");
+        assert_eq!(server.hits.load(Ordering::SeqCst), 4);
+        let captured = server.captured.lock().await;
+        let (refused, replay) = (&captured[1], &captured[3]);
+        assert_eq!(request_body(refused), expected);
+        assert_eq!(request_body(replay), expected);
+        assert!(refused.starts_with("POST /v1/test ") && replay.starts_with("POST /v1/test "));
+        let id = extract_header(refused, "wyrd-request-id").expect("request id");
+        assert_eq!(extract_header(replay, "wyrd-request-id"), Some(id));
+        assert_eq!(
+            extract_header(refused, "x-wyrd-access-token").as_deref(),
+            Some("Bearer tok-A")
+        );
+        assert_eq!(
+            extract_header(replay, "x-wyrd-access-token").as_deref(),
+            Some("Bearer tok-B")
+        );
+    }
+
+    /// A non-idempotent JSON request that the server may have applied, here
+    /// answered `503`, is reported, not replayed: shared body storage does
+    /// not make it replay-safe.
+    ///
+    /// # Panics
+    /// Panics when the request succeeds or the mock is hit more than once.
+    #[tokio::test]
+    async fn non_idempotent_json_is_not_replayed_after_ambiguous_failure() {
+        let server = spawn_mock(vec![
+            MockResponse::status(
+                503,
+                r#"{"code":"WYRD_SPEC_500_INTERNAL","detail":"overloaded","details":{}}"#,
+            ),
+            MockResponse::ok(r#"{"result":"ok"}"#),
+        ])
+        .await;
+        let transport = make_transport(server.base_url.clone());
+        let body = serde_json::json!({"op": "run"});
+
+        transport
+            .request_json::<_, serde_json::Value>(reqwest::Method::POST, "/v1/test", Some(&body))
+            .await
+            .expect_err("the ambiguous failure is reported");
+
+        assert_eq!(server.hits.load(Ordering::SeqCst), 1);
+        let captured = server.captured.lock().await;
+        assert_eq!(request_body(&captured[0]), r#"{"op":"run"}"#);
+    }
 
     #[tokio::test]
     async fn request_json_round_trips_json() {

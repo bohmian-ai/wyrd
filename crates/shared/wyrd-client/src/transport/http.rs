@@ -30,6 +30,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use reqwest::header::{HeaderName, HeaderValue};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -78,6 +79,25 @@ const HEADER_WYRD_ACCESS_TOKEN: &str = "x-wyrd-access-token";
 /// Never: the constant is a valid lowercase header name.
 fn access_token_header() -> HeaderName {
     HeaderName::from_static(HEADER_WYRD_ACCESS_TOKEN)
+}
+
+/// One buffered request that every attempt of
+/// [`HttpTransport::send_with_retry`] repeats unchanged.
+struct Buffered<'a> {
+    /// HTTP method; with the idempotency key, it decides replay safety.
+    method: Method,
+    /// Same-origin URL resolved by [`HttpTransport::authenticated_url`].
+    url: &'a str,
+    /// `wyrd-request-id` every attempt carries.
+    request_id: &'a str,
+    /// Serialized JSON body, owned once and shared by every attempt.
+    body: Option<Bytes>,
+    /// `Idempotency-Key` every attempt carries, when the request has one.
+    idempotency_key: Option<&'a str>,
+    /// Request-scoped headers applied verbatim on every attempt.
+    extra_headers: &'a [(&'a str, &'a str)],
+    /// Total deadline of each attempt.
+    timeout: Duration,
 }
 
 /// What authenticates one HTTP request: a Wyrd bearer, or a browser session
@@ -203,21 +223,6 @@ impl HttpTransport {
     #[must_use]
     pub(crate) const fn request_timeout(&self) -> Duration {
         self.request_timeout
-    }
-
-    /// Copy this transport with a per-attempt deadline of at least `floor`,
-    /// sharing its connection pool and auth path.
-    ///
-    /// Used by a request whose server-side deadline exceeds the configured
-    /// default, so the server's timeout answer reaches the caller.
-    #[must_use]
-    pub(crate) fn with_min_request_timeout(&self, floor: Duration) -> Self {
-        Self {
-            client: self.client.clone(),
-            request_timeout: self.request_timeout.max(floor),
-            auth: Arc::clone(&self.auth),
-            origin: self.origin.clone(),
-        }
     }
 
     /// Rebind this transport to another auth path, sharing its connection pool.
@@ -409,19 +414,66 @@ impl HttpTransport {
         S: Serialize,
         D: DeserializeOwned,
     {
+        self.request_json_within(method, path, body, headers, self.request_timeout)
+            .await
+    }
+
+    /// Send a JSON request like [`Self::request_json`] whose attempts each
+    /// wait at least `floor`.
+    ///
+    /// Used by a request whose server-side deadline exceeds the configured
+    /// default, so the server's timeout answer reaches the caller. Only this
+    /// request's deadline changes; the transport, its pool, and every other
+    /// request keep the configured one.
+    ///
+    /// # Errors
+    /// As [`Self::request_json`].
+    pub(crate) async fn request_json_with_min_timeout<S, D>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&S>,
+        floor: Duration,
+    ) -> Result<D, WyrdError>
+    where
+        S: Serialize,
+        D: DeserializeOwned,
+    {
+        self.request_json_within(method, path, body, &[], self.request_timeout.max(floor))
+            .await
+    }
+
+    /// The tail [`Self::request_json_with_headers`] and
+    /// [`Self::request_json_with_min_timeout`] share: send `body` with
+    /// `headers` on every attempt, each bounded by `timeout`, and decode the
+    /// answer.
+    ///
+    /// # Errors
+    /// As [`Self::request_json`].
+    async fn request_json_within<S, D>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&S>,
+        headers: &[(&str, &str)],
+        timeout: Duration,
+    ) -> Result<D, WyrdError>
+    where
+        S: Serialize,
+        D: DeserializeOwned,
+    {
         let url = self.authenticated_url(path)?;
         let request_id = self.auth.request_id(None);
-        let body_bytes = serialize_body(body)?;
-
         let resp = self
-            .send_with_retry(
-                &method,
-                &url,
-                &request_id,
-                body_bytes.as_deref(),
-                None,
-                headers,
-            )
+            .send_with_retry(Buffered {
+                method,
+                url: &url,
+                request_id: &request_id,
+                body: serialize_body(body)?,
+                idempotency_key: None,
+                extra_headers: headers,
+                timeout,
+            })
             .await?;
 
         let bytes = resp.bytes().await.map_err(body_read_err)?;
@@ -463,10 +515,16 @@ impl HttpTransport {
     {
         let url = self.authenticated_url(path)?;
         let request_id = self.auth.request_id(None);
-        let body_bytes = serialize_body(body)?;
-
         let resp = self
-            .send_with_retry(&method, &url, &request_id, body_bytes.as_deref(), None, &[])
+            .send_with_retry(Buffered {
+                method,
+                url: &url,
+                request_id: &request_id,
+                body: serialize_body(body)?,
+                idempotency_key: None,
+                extra_headers: &[],
+                timeout: self.request_timeout,
+            })
             .await?;
 
         let schema_fingerprint = header_str(&resp, HEADER_SCHEMA_FINGERPRINT).map(str::to_owned);
@@ -835,20 +893,22 @@ impl HttpTransport {
             generated_key = Uuid::now_v7().to_string();
             &generated_key
         };
-        let body_bytes = serde_json::to_vec(body).map_err(|err| WyrdError::Internal {
-            message: format!("request serialization failed: {err}"),
-            details: serde_json::json!({}),
-        })?;
+        let body_bytes =
+            Bytes::from(serde_json::to_vec(body).map_err(|err| WyrdError::Internal {
+                message: format!("request serialization failed: {err}"),
+                details: serde_json::json!({}),
+            })?);
 
         let resp = self
-            .send_with_retry(
-                &method,
-                &url,
-                &request_id,
-                Some(&body_bytes),
-                Some(idempotency_key),
-                &[],
-            )
+            .send_with_retry(Buffered {
+                method,
+                url: &url,
+                request_id: &request_id,
+                body: Some(body_bytes),
+                idempotency_key: Some(idempotency_key),
+                extra_headers: &[],
+                timeout: self.request_timeout,
+            })
             .await?;
 
         let bytes = resp.bytes().await.map_err(body_read_err)?;
@@ -954,14 +1014,50 @@ impl HttpTransport {
         }
     }
 
+    /// One attempt of `request`: [`Self::authenticated`] headers carrying
+    /// `credential`, the request's deadline, idempotency key and extra
+    /// headers, and its JSON body.
+    ///
+    /// Every attempt sends the same serialized body backing; only the
+    /// credential each attempt resolved differs.
+    fn attempt(
+        &self,
+        request: &Buffered<'_>,
+        credential: &RequestCredential,
+    ) -> reqwest::RequestBuilder {
+        let mut req = self
+            .authenticated(
+                request.method.clone(),
+                request.url,
+                credential,
+                request.request_id,
+            )
+            .timeout(request.timeout);
+        if let Some(key) = request.idempotency_key {
+            req = req.header(HEADER_IDEMPOTENCY_KEY, key);
+        }
+        // Re-applied on every attempt, like the bearer: a retry is a new
+        // request and must carry the same secondary credential.
+        for (name, value) in request.extra_headers {
+            req = req.header(*name, *value);
+        }
+        if let Some(bytes) = &request.body {
+            req = req
+                .header("content-type", "application/json")
+                .body(bytes.clone());
+        }
+        req
+    }
+
     /// Core send-with-retry loop shared by all three helpers.
     ///
-    /// Each attempt carries `HttpConfig::timeout_ms` as its total deadline,
+    /// Each attempt carries the request's deadline, `HttpConfig::timeout_ms`
+    /// unless a longer server-side deadline raised it, as its total deadline,
     /// covering connection, headers, and the caller's later body read, so JSON
     /// and control responses always finish or fail within a finite wait.
     ///
-    /// `extra_headers` are request-scoped headers applied verbatim on every
-    /// attempt, used for a secondary credential such as a per-run lease.
+    /// The request's extra headers are request-scoped headers applied verbatim
+    /// on every attempt, used for a secondary credential such as a per-run lease.
     ///
     /// Policy:
     /// - Fetches a fresh bearer before each attempt.
@@ -984,44 +1080,17 @@ impl HttpTransport {
     /// time as [`WyrdClientError::TransportDown`] (503). The two live on
     /// different API surfaces (per-request send vs. one-time `connect`); the
     /// divergence is intentional and documented in both modules.
-    async fn send_with_retry(
-        &self,
-        method: &reqwest::Method,
-        url: &str,
-        request_id: &str,
-        body: Option<&[u8]>,
-        idempotency_key: Option<&str>,
-        extra_headers: &[(&str, &str)],
-    ) -> Result<reqwest::Response, WyrdError> {
+    async fn send_with_retry(&self, request: Buffered<'_>) -> Result<reqwest::Response, WyrdError> {
         // A request is replay-safe when re-sending it cannot double-apply a
         // server-side effect: idempotent HTTP methods, or any request carrying
         // a stable Idempotency-Key the server dedupes on.
-        let replay_safe = method.is_idempotent() || idempotency_key.is_some();
+        let replay_safe = request.method.is_idempotent() || request.idempotency_key.is_some();
         let mut attempt = 0u32;
         let mut auth_retried = false;
 
         loop {
             let credential = self.request_credential().await?;
-
-            let mut req = self
-                .authenticated(method.clone(), url, &credential, request_id)
-                .timeout(self.request_timeout);
-
-            if let Some(key) = idempotency_key {
-                req = req.header(HEADER_IDEMPOTENCY_KEY, key);
-            }
-
-            // Re-applied on every attempt, like the bearer: a retry is a new
-            // request and must carry the same secondary credential.
-            for (name, value) in extra_headers {
-                req = req.header(*name, *value);
-            }
-
-            if let Some(bytes) = body {
-                req = req
-                    .header("content-type", "application/json")
-                    .body(bytes.to_vec());
-            }
+            let req = self.attempt(&request, &credential);
 
             let result = req.send().await;
 
@@ -1114,9 +1183,10 @@ fn build_http_client(config: &HttpConfig) -> Result<reqwest::Client, WyrdClientE
         })
 }
 
-/// Serialize an optional body to JSON bytes.
-fn serialize_body<S: Serialize>(body: Option<&S>) -> Result<Option<Vec<u8>>, WyrdError> {
-    body.map(serde_json::to_vec)
+/// Serialize an optional body to JSON bytes, owned once and shared by every
+/// attempt.
+fn serialize_body<S: Serialize>(body: Option<&S>) -> Result<Option<Bytes>, WyrdError> {
+    body.map(|body| serde_json::to_vec(body).map(Bytes::from))
         .transpose()
         .map_err(|err| WyrdError::Internal {
             message: format!("request serialization failed: {err}"),
@@ -1135,6 +1205,71 @@ fn body_read_err(err: reqwest::Error) -> WyrdError {
 /// Extract a response header value as a `&str`.
 fn header_str<'a>(resp: &'a reqwest::Response, name: &str) -> Option<&'a str> {
     resp.headers().get(name)?.to_str().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use reqwest::Method;
+    use wyrd_spec::auth::SecretBearer;
+
+    use super::{Buffered, HttpTransport, RequestCredential};
+    use crate::auth::AuthMiddleware;
+    use crate::config::ClientConfig;
+    use crate::transport::config::HttpConfig;
+    use crate::transport::credential::ResolvedCredential;
+
+    /// Every attempt of a buffered request sends the serialized body's own
+    /// allocation, spare capacity included, with the same bytes and length:
+    /// the initial attempt and each replay share it instead of copying it.
+    ///
+    /// # Panics
+    /// Panics when an attempt's body is not the serialized backing.
+    #[test]
+    fn serialized_body_backing_is_shared_across_attempts() {
+        let auth = AuthMiddleware::new(
+            &ClientConfig::default(),
+            ResolvedCredential::BearerToken("token".to_owned().into()),
+        )
+        .expect("auth builds");
+        let transport = HttpTransport::new(
+            &HttpConfig {
+                base_url: "http://127.0.0.1:9".to_owned(),
+                ..HttpConfig::default()
+            },
+            auth,
+        )
+        .expect("transport builds");
+        let mut serialized = Vec::with_capacity(64);
+        serialized.extend_from_slice(br#"{"key":"value"}"#);
+        let backing = (serialized.as_ptr(), serialized.len());
+        let request = Buffered {
+            method: Method::POST,
+            url: "http://127.0.0.1:9/v1/test",
+            request_id: "request",
+            body: Some(Bytes::from(serialized)),
+            idempotency_key: Some("key"),
+            extra_headers: &[],
+            timeout: Duration::from_secs(70),
+        };
+        let credential = RequestCredential::Bearer(SecretBearer::new("token".to_owned()));
+
+        for _ in 0..2 {
+            let request = transport
+                .attempt(&request, &credential)
+                .build()
+                .expect("attempt builds");
+            let sent = request
+                .body()
+                .and_then(reqwest::Body::as_bytes)
+                .expect("an in-memory body");
+            assert_eq!((sent.as_ptr(), sent.len()), backing);
+            assert_eq!(sent, br#"{"key":"value"}"#);
+            assert_eq!(request.timeout(), Some(&Duration::from_secs(70)));
+        }
+    }
 }
 
 #[cfg(test)]

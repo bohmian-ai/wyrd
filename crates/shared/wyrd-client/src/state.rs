@@ -23,7 +23,7 @@ use wyrd_cards::model::ModelCard;
 use wyrd_cards::prompt::PromptCard;
 use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::card::agent::AgentCard;
-use wyrd_spec::card::verifier::{VerificationBinding, VerifierSpec};
+use wyrd_spec::card::verifier::VerifierSpec;
 use wyrd_spec::envelope::{Card, CardKind, Relationships, Spec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
@@ -924,28 +924,36 @@ impl WyrdState {
         name: &str,
     ) -> Result<BoundVerifier<'_>, WyrdError> {
         let subject_key = subject.to_string();
-        let mut bindings: Vec<&VerificationBinding> = Vec::new();
-        if let Spec::Service(service) = &self.service().spec {
-            if subject_key == self.index.root_key {
-                bindings.extend(&service.verified_by);
-            }
-            for component in &service.components {
-                if component.card_ref.as_card_ref() == Some(subject) {
-                    bindings.extend(&component.verified_by);
-                }
-            }
-        }
-        if let Spec::Agent(agent) = &self.index.card_by_key(&subject_key)?.spec {
-            bindings.extend(&agent.verified_by);
-        }
+        let service = match &self.service().spec {
+            Spec::Service(service) => Some(service),
+            _ => None,
+        };
+        let root = service
+            .filter(|_| subject_key == self.index.root_key)
+            .map(|service| service.verified_by.as_slice())
+            .unwrap_or_default();
+        let components = service
+            .map(|service| service.components.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .filter(|component| component.card_ref.as_card_ref() == Some(subject))
+            .flat_map(|component| &component.verified_by);
+        let agent = match &self.index.card_by_key(&subject_key)?.spec {
+            Spec::Agent(agent) => agent.verified_by.as_slice(),
+            _ => &[],
+        };
+        let bindings = root.iter().chain(components).chain(agent);
         for binding in bindings {
-            let Some(verifier_ref) = binding.verifier.as_card_ref() else {
+            // The graph keys each Card by its own reference, so a bound Card's
+            // name is its reference's: only a matching binding is looked up.
+            let Some(verifier_ref) = binding
+                .verifier
+                .as_card_ref()
+                .filter(|verifier_ref| verifier_ref.name.as_str() == name)
+            else {
                 continue;
             };
             let card = self.index.card_by_key(&verifier_ref.to_string())?;
-            if card.metadata.name.as_str() != name {
-                continue;
-            }
             let Spec::Verifier(spec) = &card.spec else {
                 return Err(state_bundle_error(
                     "a verified_by binding names a Card that is not a Verifier",
@@ -2638,6 +2646,73 @@ pub(crate) mod tests {
             });
             bundle.write();
             bundle
+        }
+
+        /// Build [`Self::with_typed_cards`] with Verifiers bound at every
+        /// level: `judge` 1.0.0 on the `model` component, a second `model`
+        /// occurrence binding `judge` 2.0.0 then `solo`, `judge` 2.0.0 on the
+        /// `agent_triage` component, and `judge` 1.0.0 then `solo` on the
+        /// triage Agent itself. Returns the bundle and `judge` 1.0.0, `judge`
+        /// 2.0.0, and `solo`.
+        ///
+        /// # Panics
+        /// Panics if fixture construction or serialization fails.
+        pub(crate) fn with_bound_verifiers() -> (Self, [CardRef; 3]) {
+            let mut bundle = Self::with_typed_cards();
+            let judge = test_ref(CardKind::Verifier, "judge", 0x20);
+            let judge_next = CardRef {
+                version: VersionBlock::parse("2.0.0").expect("fixture version is valid"),
+                uid: test_ref(CardKind::Verifier, "judge", 0x21).uid,
+                ..judge.clone()
+            };
+            let solo = test_ref(CardKind::Verifier, "solo", 0x22);
+            for (alias, verifier) in [
+                ("judge", &judge),
+                ("judge_next", &judge_next),
+                ("solo", &solo),
+            ] {
+                bundle.add_card(
+                    alias,
+                    card(
+                        verifier,
+                        CardKind::Verifier,
+                        Spec::Verifier(assert_verifier()),
+                        Relationships::default(),
+                    ),
+                    &[],
+                );
+            }
+            let model_ref = test_ref(CardKind::Model, "model", 2);
+            let agent_ref = test_ref(CardKind::Agent, "triage", 6);
+            bundle.add_alias("model_again", &model_ref);
+            let bind = |refs: &[&CardRef]| -> Vec<VerificationBinding> {
+                refs.iter()
+                    .map(|verifier| verification_binding((*verifier).clone(), None))
+                    .collect()
+            };
+            bundle.rewrite_card(&test_ref(CardKind::Service, "service", 1), |card| {
+                let Spec::Service(spec) = &mut card.spec else {
+                    panic!("fixture root is a Service");
+                };
+                for component in &mut spec.components {
+                    match component.alias.as_str() {
+                        "model" => component.verified_by = bind(&[&judge]),
+                        "agent_triage" => component.verified_by = bind(&[&judge_next]),
+                        _ => {}
+                    }
+                }
+                let mut again = service_component("model_again", &model_ref);
+                again.verified_by = bind(&[&judge_next, &solo]);
+                spec.components.push(again);
+            });
+            bundle.rewrite_card(&agent_ref, |card| {
+                let Spec::Agent(spec) = &mut card.spec else {
+                    panic!("fixture triage Card is an Agent");
+                };
+                spec.verified_by = bind(&[&judge, &solo]);
+            });
+            bundle.write();
+            (bundle, [judge, judge_next, solo])
         }
 
         /// Add a Verifier, bound to the root Service, whose agent check runs

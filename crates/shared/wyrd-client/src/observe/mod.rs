@@ -362,8 +362,7 @@ impl Observe<'_> {
         inputs: impl Into<Inputs>,
     ) -> Result<VerificationResult, WyrdError> {
         let state = &self.run.state;
-        let bound = state.bound_verifier(&self.run.subject, verifier)?;
-        let target = self.target(&bound);
+        let target = self.target(state.bound_verifier(&self.run.subject, verifier)?);
         match target.project(inputs.into())? {
             Projected::Run(run) => target.execute(state.client()?, run).await,
             Projected::Window(_) => Err(WyrdError::VerificationInputUnsupported {
@@ -468,7 +467,7 @@ impl Observe<'_> {
         inputs: impl Into<Inputs>,
     ) -> Result<Option<StagedRun>, WyrdError> {
         let bound = self.run.state.bound_verifier(&self.run.subject, verifier)?;
-        match self.target(&bound).project(inputs.into())? {
+        match self.target(bound).project(inputs.into())? {
             Projected::Run(evidence) => Ok(Some(StagedRun {
                 verifier: verifier.to_owned(),
                 group_id: self.group_id.clone(),
@@ -503,18 +502,17 @@ impl Observe<'_> {
     /// As [`Observe::submit`].
     async fn enqueue_run(&self, staged: StagedRun) -> Result<Execution, WyrdError> {
         let state = &self.run.state;
-        let bound = state.bound_verifier(&self.run.subject, &staged.verifier)?;
-        let mut target = self.target(&bound);
+        let mut target = self.target(state.bound_verifier(&self.run.subject, &staged.verifier)?);
         target.group_id = staged.group_id;
         target.enqueue(state.client()?, staged.evidence).await
     }
 
-    /// The execution target of `bound` for this view's Run.
-    fn target<'a>(&self, bound: &BoundVerifier<'a>) -> Target<'a> {
+    /// The execution target of `bound` for this view's Run, taking its UIDs.
+    fn target<'a>(&self, bound: BoundVerifier<'a>) -> Target<'a> {
         Target {
             spec: bound.spec,
-            verifier_card_uid: bound.verifier_card_uid.clone(),
-            card_uid: bound.card_uid.clone(),
+            verifier_card_uid: bound.verifier_card_uid,
+            card_uid: bound.card_uid,
             run_id: self.run.run_id.clone(),
             group_id: self.group_id.clone(),
             deployment_environment: self.run.state.deployment_environment().map(str::to_owned),

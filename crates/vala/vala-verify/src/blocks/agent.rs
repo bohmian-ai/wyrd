@@ -9,6 +9,7 @@
 //! any number of distinct Agents, and no call can see another's media,
 //! tools, or workspace.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
@@ -205,16 +206,20 @@ impl AgentExecutor {
         self
     }
 
-    /// Resolve the Agent and its Prompt, keeping each Card identity.
+    /// Resolve the Agent and its Prompt, keeping each Card identity; an
+    /// inline Agent is borrowed from the call, not copied.
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for a loader-only path reference and
     /// the resolvers' errors.
-    async fn resolve(&self, agent: &InlineableRef<AgentSpec>) -> Result<Resolved, BlockError> {
+    async fn resolve<'a>(
+        &self,
+        agent: &'a InlineableRef<AgentSpec>,
+    ) -> Result<Resolved<'a>, BlockError> {
         let spec = match agent {
-            InlineableRef::Ref(card) => self.agents.resolve(card).await?,
+            InlineableRef::Ref(card) => Cow::Owned(self.agents.resolve(card).await?),
             InlineableRef::Sibling { sibling } => return Err(unbound_sibling("Agent", sibling)),
-            InlineableRef::Inline(spec) => (**spec).clone(),
+            InlineableRef::Inline(spec) => Cow::Borrowed(&**spec),
             InlineableRef::Path(path) => return Err(unresolved_path("Agent", path)),
         };
         let prompt = match &spec.prompt {
@@ -524,9 +529,9 @@ impl CheckExecutor for AgentExecutor {
 }
 
 /// An Agent and Prompt resolved for one call.
-struct Resolved {
-    /// The Agent body.
-    spec: AgentSpec,
+struct Resolved<'a> {
+    /// The Agent body, borrowed when the call declares it inline.
+    spec: Cow<'a, AgentSpec>,
     /// The Agent Card, when referenced.
     agent_ref: Option<CardRef>,
     /// The runtime Prompt.

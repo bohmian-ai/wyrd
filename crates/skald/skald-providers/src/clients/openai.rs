@@ -217,8 +217,8 @@ impl Debug for UploadFile {
 pub struct MediaAnswer {
     /// The provider's `content-type`, or `application/octet-stream`.
     pub content_type: String,
-    /// Answer bytes, unchanged.
-    pub bytes: Vec<u8>,
+    /// Answer bytes, unchanged; a single-chunk answer shares its chunk.
+    pub bytes: bytes::Bytes,
 }
 
 impl Debug for MediaAnswer {
@@ -870,7 +870,7 @@ impl ProviderClient for OpenAiClient {
                 let url = self.url(OpenAiRoute::ChatCompletions);
                 let body = serde_json::to_vec(&request)
                     .map_err(|error| ProviderError::decode("openai", error))?;
-                let text = super::send_bytes_with_retry(
+                let answer = super::send_bytes_with_retry(
                     &self.transport,
                     "openai",
                     reqwest::Method::POST,
@@ -880,14 +880,15 @@ impl ProviderClient for OpenAiClient {
                     &self.retry,
                 )
                 .await?;
-                let chunks = decode_sse_events("openai", text.as_bytes())?;
+                let chunks =
+                    decode_sse_events("openai", String::from_utf8_lossy(&answer).as_bytes())?;
                 Ok(ProviderStream::OpenAiChat(chunks))
             }
             ProviderRequest::OpenAiResponses(request) => {
                 let url = self.url(OpenAiRoute::Responses);
                 let body = serde_json::to_vec(&request)
                     .map_err(|error| ProviderError::decode("openai", error))?;
-                let text = super::send_bytes_with_retry(
+                let answer = super::send_bytes_with_retry(
                     &self.transport,
                     "openai",
                     reqwest::Method::POST,
@@ -897,7 +898,8 @@ impl ProviderClient for OpenAiClient {
                     &self.retry,
                 )
                 .await?;
-                let events = decode_sse_events("openai", text.as_bytes())?;
+                let events =
+                    decode_sse_events("openai", String::from_utf8_lossy(&answer).as_bytes())?;
                 Ok(ProviderStream::OpenAiResponses(events))
             }
             other => Err(ProviderError::variant_mismatch(
@@ -1114,7 +1116,7 @@ mod openai_media {
             )
             .await
             .expect("transcription succeeds");
-        assert_eq!(transcript.bytes, b"{\"text\":\"hi\"}");
+        assert_eq!(transcript.bytes, &b"{\"text\":\"hi\"}"[..]);
         let requests = server.received_requests().await.expect("recording");
         let sent = requests.last().expect("multipart request");
         let content_type = sent.headers["content-type"].to_str().expect("header");

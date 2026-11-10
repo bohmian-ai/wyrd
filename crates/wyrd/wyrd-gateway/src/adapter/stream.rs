@@ -198,7 +198,7 @@ impl MediaCapture {
         ResponseCapture::media(
             MediaAnswer {
                 content_type: self.content_type,
-                bytes: self.bytes,
+                bytes: self.bytes.into(),
             },
             self.secret.as_ref().map(ExposeSecret::expose_secret),
         )

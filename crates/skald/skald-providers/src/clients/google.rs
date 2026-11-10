@@ -169,7 +169,7 @@ impl ProviderClient for GoogleClient {
             ProviderRequest::GeminiGenerateContent(request) => {
                 let body = serde_json::to_vec(&request)
                     .map_err(|error| ProviderError::decode("google", error))?;
-                let text = super::send_bytes_with_retry(
+                let answer = super::send_bytes_with_retry(
                     &self.transport,
                     "google",
                     reqwest::Method::POST,
@@ -179,7 +179,8 @@ impl ProviderClient for GoogleClient {
                     &self.retry,
                 )
                 .await?;
-                let events = decode_jsonl_events("google", text.as_bytes())?;
+                let events =
+                    decode_jsonl_events("google", String::from_utf8_lossy(&answer).as_bytes())?;
                 Ok(ProviderStream::Google(events))
             }
             other => Err(ProviderError::variant_mismatch(

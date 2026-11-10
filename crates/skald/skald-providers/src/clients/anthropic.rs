@@ -156,7 +156,7 @@ impl ProviderClient for AnthropicClient {
                 let url = self.messages_url();
                 let body = serde_json::to_vec(&request)
                     .map_err(|error| ProviderError::decode("anthropic", error))?;
-                let text = super::send_bytes_with_retry(
+                let answer = super::send_bytes_with_retry(
                     &self.transport,
                     "anthropic",
                     reqwest::Method::POST,
@@ -166,7 +166,8 @@ impl ProviderClient for AnthropicClient {
                     &self.retry,
                 )
                 .await?;
-                let events = decode_sse_events("anthropic", text.as_bytes())?;
+                let events =
+                    decode_sse_events("anthropic", String::from_utf8_lossy(&answer).as_bytes())?;
                 Ok(ProviderStream::Anthropic(events))
             }
             other => Err(ProviderError::variant_mismatch(

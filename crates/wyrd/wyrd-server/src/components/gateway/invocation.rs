@@ -1031,9 +1031,9 @@ impl<'a> GatewayInvocation<'a> {
                 &execution.refusal,
             ) {
                 (Some(ResponseCapture::Json(content)), ..) => Ok(Some(content)),
-                (Some(ResponseCapture::Media(answer)), ..) => {
-                    Ok(Some(objects.reference(&answer.content_type, answer.bytes)))
-                }
+                (Some(ResponseCapture::Media(answer)), ..) => Ok(Some(
+                    objects.reference(&answer.content_type, answer.bytes.into()),
+                )),
                 (None, None, Some(refusal)) => Ok(Some(refusal.body.clone())),
                 (None, Some(ResponseBody::Json(_) | ResponseBody::Media(_)), _) => {
                     Err(CaptureDrop::Payload)

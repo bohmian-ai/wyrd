@@ -2161,7 +2161,7 @@ async fn media_routes_relay_json_binary_and_text_answers() {
     )
     .await;
     assert!(
-        matches!(&transcribed, AttemptResult::Completed { body: ResponseBody::Media(answer), .. } if answer.bytes == b"hello"),
+        matches!(&transcribed, AttemptResult::Completed { body: ResponseBody::Media(answer), .. } if answer.bytes == b"hello"[..]),
         "{transcribed:?}"
     );
     let requests = server.received_requests().await.expect("recording");
@@ -2261,7 +2261,7 @@ async fn selected_media_capture_copies_benign_bytes_and_drops_credentials() {
             &benign,
             Some(ResponseCapture::Media(MediaAnswer {
                 content_type: "audio/mpeg".to_owned(),
-                bytes: benign.clone(),
+                bytes: benign.clone().into(),
             })),
         ),
         ("benign", false, &benign, None),
@@ -2644,7 +2644,7 @@ async fn batch_actions_reach_their_routes_with_native_files() {
     else {
         panic!("file content expected: {content:?}");
     };
-    assert_eq!(answer.bytes, b"{\"custom_id\":\"a\"}\n");
+    assert_eq!(answer.bytes, &b"{\"custom_id\":\"a\"}\n"[..]);
 }
 
 /// A non-`OpenAI` adapter rejects Batches before dispatch.

@@ -10,8 +10,8 @@ use crate::transport::HttpTransport;
 /// Sends serialized JSON `body` bytes unchanged and returns the raw JSON response.
 ///
 /// The body's allocation, spare capacity included, moves into the request and
-/// backs every exchange, retries included; the answer text becomes the
-/// returned value.
+/// backs every exchange, retries included; the answer, as text whose invalid
+/// UTF-8 is replaced, becomes the returned value.
 ///
 /// # Errors
 ///
@@ -26,7 +26,7 @@ pub async fn send_raw(
     retry: &RetryPolicy,
 ) -> ProviderResult<Box<RawValue>> {
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    let text = super::clients::send_bytes_with_retry(
+    let answer = super::clients::send_bytes_with_retry(
         transport,
         provider,
         reqwest::Method::POST,
@@ -37,7 +37,8 @@ pub async fn send_raw(
     )
     .await?;
 
-    RawValue::from_string(text).map_err(|error| ProviderError::decode(provider, error))
+    RawValue::from_string(super::clients::answer_text(answer))
+        .map_err(|error| ProviderError::decode(provider, error))
 }
 
 #[cfg(test)]

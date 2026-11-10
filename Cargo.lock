@@ -10770,6 +10770,8 @@ version = "0.4.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "bytes",
+ "http",
  "httpdate",
  "insta",
  "jsonwebtoken",

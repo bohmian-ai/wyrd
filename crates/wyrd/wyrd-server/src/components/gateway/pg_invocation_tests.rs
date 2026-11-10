@@ -3692,7 +3692,7 @@ const PAYLOAD_OBJECT_BYTES: &[u8] = b"\x89PNG\r\n\x1a\ncaptured-object-bytes";
 fn media_completed(bytes: &[u8]) -> AttemptResult {
     let answer = MediaAnswer {
         content_type: "image/png".to_owned(),
-        bytes: bytes.to_vec(),
+        bytes: bytes.to_vec().into(),
     };
     AttemptResult::Completed {
         capture: Some(ResponseCapture::Media(answer.clone())),

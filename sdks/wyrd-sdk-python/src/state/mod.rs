@@ -167,7 +167,7 @@ impl PyWyrdState {
     /// ```
     ///
     /// # Arguments
-    /// * `card` - The root Service: its Card file, or an authored Card.
+    /// * `path` - The root Service: its Card file, or an authored Card.
     /// * `client` - The `WyrdClient` every call runs as, or `None` for the
     ///   ambient chain.
     /// * `bundle_dir` - A caller-owned directory to publish the bundle to,
@@ -182,18 +182,18 @@ impl PyWyrdState {
     /// documents, then `from_path`'s hydration errors. A failure after the
     /// registry accepted the declaration leaves it committed.
     #[staticmethod]
-    #[pyo3(signature = (card, client=None, *, bundle_dir=None, interfaces=None, load_kwargs=None, trusted_artifact_hashes=None))]
+    #[pyo3(signature = (path, client=None, *, bundle_dir=None, interfaces=None, load_kwargs=None, trusted_artifact_hashes=None))]
     fn declare(
         py: Python<'_>,
-        card: &Bound<'_, PyAny>,
+        path: &Bound<'_, PyAny>,
         client: Option<PyRef<'_, PyWyrdClient>>,
         bundle_dir: Option<PathBuf>,
         interfaces: Option<&Bound<'_, PyMapping>>,
         load_kwargs: Option<&Bound<'_, PyMapping>>,
         trusted_artifact_hashes: Option<&Bound<'_, PyMapping>>,
     ) -> CardPyResult<Self> {
-        let input = crate::authoring::declarable(card).ok_or_else(|| {
-            invalid_argument("card", "expected a Card file path or an authored Card")
+        let input = crate::authoring::declarable(path).ok_or_else(|| {
+            invalid_argument("path", "expected a Card file path or an authored Card")
         })?;
         let options = DeclareOptions {
             client: client.map(|client| client.inner().clone()),

@@ -138,7 +138,7 @@ class WyrdState:
 
     @staticmethod
     def declare(
-        card: str | Path | AnyCard,
+        path: str | Path | AnyCard,
         client: WyrdClient | None = None,
         *,
         bundle_dir: str | Path | None = None,
@@ -160,7 +160,7 @@ class WyrdState:
         ``bundle_dir``.
 
         Args:
-            card: The root Service: its Card file, or an authored Card from
+            path: The root Service: its Card file, or an authored Card from
                 ``wyrd.authoring``, copied as it is now.
             client: the ``WyrdClient`` every call runs as. Omitted, the
                 ambient client resolves once.

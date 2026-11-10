@@ -1,10 +1,10 @@
 ---
 id: SPEC-benchmark-latency-diagnosis
-revision: 4
+revision: 5
 status: approved
 ---
 
-# One benchmark recorder and verified Gateway latency improvements
+# Symmetric benchmark evidence and Gateway/Verification latency improvements
 
 ## Problem and proposed outcome
 
@@ -56,6 +56,14 @@ ownership, repeated native response validation, and provider body accumulation.
 Fresh allocation evidence and separately attributable production/fixture
 comparisons are required. All work stays in this task; it is not a research-only
 handoff, and the existing latency objectives do not become guaranteed outcomes.
+
+TASK-005 extends the same measurement contract to client processes and the full
+controlled Gateway and Verification paths. Client and server use the same
+benchmark recorder under explicit runtime activation and the same CPU/heap
+profiling workflow. It includes client/fixture timing, local work inside provider
+exchanges, request handoff/waits and model-backed Verification against a local
+provider. Complete the supported small optimizations identified by those profiles
+inside TASK-005; instrumentation and a proposal-only report do not complete it.
 
 ## Required behavior
 
@@ -185,6 +193,59 @@ handoff, and the existing latency objectives do not become guaranteed outcomes.
   all repetitions. Server profiles do not establish driver allocation. Historical
   baselines remain immutable and are not rebuilt; bounded fresh current-reference
   measurements for this task are distinct from rerunning historical baselines.
+- **REQ-017 — Client/server recorder parity.** In explicit benchmark mode, each
+  participating process installs the existing sole `wyrd-benchmark` backend before
+  metric registration. Benchmark client timing uses the same histogram precision,
+  snapshots and validity machinery as the server. Ordinary clients install no
+  recorder/subscriber, start no timers and accumulate no benchmark observations.
+  Installation belongs to process startup, never a client constructor. Reuse
+  `WYRD_METRICS_BENCHMARK_SNAPSHOT=1`; no new metrics feature or backend is selected.
+  Provide the required benchmark tracing registry even with ordinary log output off.
+- **REQ-018 — Full controlled-path evidence.** Measure logical client calls and
+  HTTP attempts, SDK preparation/auth/serialization/send-to-headers/body/decode,
+  direct Gateway caller and local-provider work, server ingress/governance/dispatch,
+  provider headers/body, answer resumption, Verification hosted setup and background
+  capture/draining. Record success/error/cancellation and late cohorts explicitly.
+  Provider exchange is an interval containing Wyrd-controlled work, not proof of
+  external provider compute. Preserve original total/residual/queue boundaries;
+  new actual-dispatch and handoff observations have distinct meanings. Driver and
+  server clocks/populations remain separate; nested phases are labelled and not summed.
+- **REQ-019 — Symmetric CPU and heap profiling.** The existing profiling command
+  profiles driver and server with explicit process roles and retained matching
+  binaries. Bare `--profile` keeps combined behavior; optional values `cpu`,
+  `heap`, and `both` select the collectors symmetrically. CPU-only starts no heap
+  sampler; heap-only starts no CPU sampler. Extract the existing heap sampler
+  into `wyrd-benchmark` behind one earned, default-off `heap` feature. It excludes
+  sampler/unwinding/pprof support from the ordinary client feature path, without
+  forbidding unrelated existing dependencies. The client adds only the plain
+  narrow recorder dependency; server's existing `bench` feature and tooling enable
+  heap support. Preserve binary-owned allocators and server memory charges; no
+  test-tooling crate enters production dependencies. Keep driver out of server
+  resource accounting. Preserve historical schema-3/server-only records accurately.
+- **REQ-020 — Cover both Verification paths.** Keep current assertion controls and
+  add separately declared `direct-verify-model-c1`/`direct-verify-model-c64`
+  diagnostics through the same WyrdState SDK and Card-bound runtime account.
+  One Agent check calls a deterministic local Gateway provider and returns a valid
+  cited verdict with usage; no external provider/credential is required. Reconcile
+  actual provider calls, accepted authority, result/citation counts and retained
+  evidence. Do not apply assertion-only latency judgments to new model diagnostics.
+- **REQ-021 — Deliver supported small optimizations.** Within TASK-005 implement
+  canonical borrowed-string comparison without redundant formatting and remove
+  unnecessary Vertex access-token HTTP client construction. Use full-path CPU,
+  phase and allocation evidence to select and implement safe owner-local reductions
+  in tracing bookkeeping, unused Verification hosted setup and capture-drain work.
+  A candidate lacking removable work must have concrete counterevidence; supported
+  changes are not deferred. Preserve all trace/tenant/authorization/capture/retry
+  semantics. New auth caches, schedulers, retry/capacity redesign or suppressed
+  required telemetry are outside this scope. Report measured benefits honestly.
+- **REQ-022 — Qualify instrumentation and improvements.** Retain current-reference,
+  measurement-complete and optimized milestones. Qualify added observation cost
+  before crediting optimizations. Use CPU-only profiles for CPU ranking and separate
+  per-process heap evidence for allocation. Keep exact case/window scope or explicit
+  clock uncertainty, process identities, binaries and all repetitions. Persist
+  client/server readings in the existing canonical reports; missing data is never
+  zero. Do not substitute residual for all Wyrd work, CPU shares for latency, or
+  a mean-throughput calculation for a median hardware limit.
 
 ## Invariants and boundaries
 
@@ -243,6 +304,12 @@ baselines are reused throughout.
 | **AC-010 — Native JSON/transport reductions** | REQ-015; INV-001–004 | Borrowing/ownership and compatibility tests establish the avoided request tree, consolidated Gateway-native response pass and single-chunk reuse through real consumers. Negative/edge and real-server cases preserve validation, canonical bounds, capture, provider errors and all fallback paths; standalone raw API behavior stays unchanged. |
 | **AC-011 — Fixture equivalence** | REQ-014; INV-001,003–004 | Differential predicate tests preserve old driver/stub validation and routing, including escapes/duplicates. Borrowing and scoped-header proofs show reduced ownership/setup without changing workload, pacing or the completion boundary. Method controls disclose fixture changes. |
 | **AC-012 — Current, reproducible attribution** | REQ-003,006–007,011,016; INV-004 | Fresh current-reference and production-candidate server heaps have declared populations and units. Unprofiled production and fixture comparisons retain distinct milestones and every repetition through the canonical renderer. Identical optimized server hashes isolate the final driver/stub comparison. Old allocation totals, missing samples, mean/median confusion, changed fixtures or sampled CPU are never used to invent current allocation, production gains or a hardware limit. |
+| **AC-013 — Recorder parity** | REQ-017–018; INV-001,003–004 | Disabled clients produce no benchmark state; enabled startup installs one backend/registry before calls. Driver/SDK/stub observations retain precision, terminal outcomes, retry/cohort counts and bounded classification. A conflicting recorder, dropped series, missing cancelled call or hidden ordinary-mode initialization fails. |
+| **AC-014 — Full path and distinct populations** | REQ-018; INV-001–004 | Focused/journey tests and saved reports identify driver versus server, SDK versus direct caller versus stub, provider headers/body and actual dispatch/handoff/hosted setup. Original boundaries/response ownership remain unchanged. No cross-process differencing, additive overlapping percentiles or exchange-as-external assumption occurs. |
+| **AC-015 — Symmetric profiling** | REQ-019; INV-001,003–004 | CPU/heap/both modes target and identify both processes, preserve each allocator and existing accounting, and retain named stacks/units/binary identities. CPU-only has no heap observer; heap-only has no CPU sampler. Shared sampler and ordinary SDK dependency closure pass focused tests and dependency checks. |
+| **AC-016 — Model-backed Verification coverage** | REQ-020; INV-001–004 | Local real-SDK diagnostics execute one model check with the original authority/deadline and valid citation/usage; upstream/result/evidence counts reconcile. Assertions retain old expectations/judgments and model cases remain separately identified diagnostics. |
+| **AC-017 — Improvements implemented** | REQ-021; INV-001–004 | Two source-proven reductions ship with equivalence tests. Profile-informed candidates have implemented supported reductions or source/profile counterevidence, never an unexplained deferral. Trace fidelity, unused-facility validation, caller isolation and capture/durable ownership remain intact. |
+| **AC-018 — Qualified, canonical results** | REQ-003,005–007,011,022; INV-004 | Reference→measurement-complete and measurement-complete→optimized comparisons distinguish observation cost from code gains. Both processes have valid case-scoped CPU/heap artifacts and per-repetition client/server/call-attempt evidence in regenerated canonical reports. No task completion from a profiling report alone or an unmeasured last fix. |
 
 ## Existing owners and evidence
 
@@ -291,6 +358,12 @@ and staged performance proof. Do not split either task's optimization work into
 future tasks or insert another general diagnosis gate. New experiments retain
 the explicit execution-authorization boundary above.
 
+[TASK-005](tasks/TASK-005-full-path-benchmark-parity-and-optimization.md) owns
+client/server metric and profiling parity, full controlled-path diagnostics,
+model-backed Verification, the supported small reductions and final qualification.
+Earlier task scopes/evidence remain intact; TASK-005 completes this additional
+work rather than reopening their finished implementation.
+
 ## Open material decisions
 
 Revision 2 was explicitly approved on 2026-11-09. Revision 3 records the
@@ -302,7 +375,18 @@ native JSON/transport work as one decision-complete TASK-004. It changes no
 security, durable protocol, public SDK/API or latency judgment. Additional
 benchmark execution remains separately controlled as described above.
 
+Revision 5 records the explicit client/server parity and full-path profiling
+instruction and the 2026-11-10 request to create TASK-005. Collector mode semantics,
+the narrow shared heap feature and the local model diagnostic close the material
+measurement decisions for that scope; product/security/durable behavior is unchanged.
+
 ## Authority and revision history
+
+- Revision 5 approved scope, 2026-11-10: explicit maintainer instruction to use
+  the same benchmark collection and profiling for client/server, profile the full
+  Gateway/Verification path, and create TASK-005 for that work and supported
+  improvements. Records this directed scope and bounded measurement decisions;
+  planning itself authorizes no implementation, builds or experiments.
 
 - Revision 4 approved scope, 2026-11-10: explicit maintainer request for one
   decision-complete TASK-004 encompassing the remaining SDK, fixture, native

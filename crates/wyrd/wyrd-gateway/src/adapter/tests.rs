@@ -1912,6 +1912,77 @@ fn provider_usage_is_typed_and_bounded() {
     }
 }
 
+/// A native answer decoded only for its usage, when capture is unselected,
+/// keeps its exact bytes and reads the same usage, or fails the same way, as
+/// the selected capture's whole decode: wire precedence, the last duplicate,
+/// escaped names, null, malformed, oversized, and overflowing usage,
+/// top-level arrays and scalars, and the nesting limit all agree, while only
+/// the usage member is ever decoded.
+///
+/// # Panics
+///
+/// Panics when the two decodes disagree, the bytes change, an unselected
+/// answer returns a decoded copy, or the usage read holds anything but the
+/// usage member.
+#[test]
+fn raw_metadata_usage_matches_selected_capture_without_materializing_content() {
+    let padding = "x".repeat(1 << 16);
+    let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
+    let cases = [
+        (super::Wire::OpenAi, json!({"choices": [{"message": {"content": padding}}], "usage": {"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8}}).to_string()),
+        (super::Wire::OpenAi, r#"{"usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}, "usage": {"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9}}"#.to_owned()),
+        (super::Wire::OpenAi, r#"{"usage": {"input_tokens": 2, "output_tokens": 4, "total_tokens": 6}}"#.to_owned()),
+        (super::Wire::OpenAi, r#"{"choices": {"usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}}"#.to_owned()),
+        (super::Wire::OpenAi, r#"{"usage": null}"#.to_owned()),
+        (super::Wire::OpenAi, r#"{"usage": "3 tokens"}"#.to_owned()),
+        (super::Wire::OpenAi, format!(r#"{{"usage": {{"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8, "padding": "{padding}"}}}}"#)),
+        (super::Wire::Anthropic, json!({"usage": {"input_tokens": u64::MAX, "output_tokens": 1, "cache_read_input_tokens": 1}}).to_string()),
+        (super::Wire::Google, r#"{"usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1}, "usage_metadata": {"promptTokenCount": 4, "candidatesTokenCount": 2}}"#.to_owned()),
+        (super::Wire::Google, r#"{"usage_metadata": null, "usageMetadata": {"promptTokenCount": 4, "candidatesTokenCount": 2}}"#.to_owned()),
+        (super::Wire::Jev, r#"[{"usage": {"input_tokens": 1, "output_tokens": 1}}]"#.to_owned()),
+        (super::Wire::Jev, "42".to_owned()),
+        (super::Wire::OpenAi, format!(r#"{{"usage": {{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}, "deep": {deep}}}"#)),
+        (super::Wire::OpenAi, format!(r#"{{"usage": {{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2, "deep": {deep}}}}}"#)),
+    ];
+    let mut known = 0;
+    for (wire, body) in cases {
+        let complete = |capture| {
+            let raw = serde_json::value::RawValue::from_string(body.clone()).expect("raw JSON");
+            super::complete(
+                skald_spec::ProviderResponse::RawV1(raw),
+                wire,
+                false,
+                capture,
+                "id",
+                "m",
+            )
+        };
+        let label = &body[..body.len().min(96)];
+        match (complete(false), complete(true)) {
+            (Ok((raw, usage, decoded)), Ok((selected_raw, selected, Some(whole)))) => {
+                assert_eq!(raw.get(), body, "{label}");
+                assert_eq!(selected_raw.get(), body, "{label}");
+                assert!(decoded.is_none(), "{label}");
+                assert_eq!(usage, selected, "{label}");
+                assert_eq!(usage, super::usage(wire, &whole), "{label}");
+                known += usize::from(usage.normalized.is_some());
+                let member = super::usage_member(wire, &body).expect("the answer decodes");
+                let names = super::usage_names(wire);
+                let expected = names.iter().find_map(|name| whole.get(name)).cloned();
+                assert_eq!(member, expected, "{label}");
+            }
+            (Err(usage), Err(selected)) => {
+                assert_eq!(usage, selected, "{label}");
+                assert!(super::usage_member(wire, &body).is_err(), "{label}");
+            }
+            (unselected, selected) => {
+                panic!("{label}: unselected {unselected:?} disagrees with selected {selected:?}")
+            }
+        }
+    }
+    assert_eq!(known, 5, "the cases that carry representable usage");
+}
+
 /// A provider refusal echoing the resolved credential, plainly or behind a
 /// JSON escape that decoding would restore, reaches the caller without it,
 /// native or translated, keeping the status and the rest of the message.

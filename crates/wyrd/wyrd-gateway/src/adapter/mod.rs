@@ -20,10 +20,13 @@ mod jev;
 mod media;
 mod stream;
 
+use std::borrow::Cow;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
-use serde::de::DeserializeOwned;
+use serde::de::{
+    self, DeserializeOwned, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor,
+};
 use serde::{Deserialize as _, Serialize};
 use serde_json::value::{RawValue, to_raw_value};
 use serde_json::{Map, Value, json};
@@ -348,9 +351,10 @@ pub(crate) fn prepare<'a>(
 /// Maps a successful provider answer to the ingress dialect and extracts its
 /// usage.
 ///
-/// A raw answer is a native passthrough whose bytes return unchanged; a parsed
-/// copy yields its usage, read as `wire`, and is returned for the capture
-/// projection when `capture` selects it, so a captured answer decodes once.
+/// A raw answer is a native passthrough whose bytes return unchanged. When
+/// `capture` selects it, its parsed copy yields its usage, read as `wire`,
+/// and is returned for the capture projection, so a captured answer decodes
+/// once; otherwise only its usage member is decoded, under the same rules.
 /// Every other answer returns no decoded copy. Typed Anthropic and Google
 /// answers translate to a chat completion, serialized once and named `id`
 /// when the provider supplies no usable identifier. A typed Jev answer
@@ -377,11 +381,16 @@ pub(crate) fn complete(
             .ok_or(usage)
     };
     match response {
-        ProviderResponse::RawV1(raw) => {
+        ProviderResponse::RawV1(raw) if capture => {
             let body: Value =
                 serde_json::from_str(raw.get()).map_err(|_| AttemptUsage::default())?;
             let usage = usage(wire, &body);
-            Ok((raw, usage, capture.then_some(body)))
+            Ok((raw, usage, Some(body)))
+        }
+        ProviderResponse::RawV1(raw) => {
+            let member = usage_member(wire, raw.get()).map_err(|_| AttemptUsage::default())?;
+            let usage = member.map_or_else(AttemptUsage::default, |member| counted(wire, &member));
+            Ok((raw, usage, None))
         }
         ProviderResponse::AnthropicMessage(native) => {
             let usage = usage(
@@ -1113,15 +1122,114 @@ fn now() -> u64 {
 /// object, one no typed usage decodes, or counts whose sum overflows leave
 /// usage unknown.
 fn usage(wire: Wire, body: &Value) -> AttemptUsage {
-    let object = match wire {
-        Wire::OpenAi | Wire::Anthropic | Wire::Jev => body.get("usage"),
-        Wire::Google => body
-            .get("usage_metadata")
-            .or_else(|| body.get("usageMetadata")),
-    };
-    let Some(object) = object else {
-        return AttemptUsage::default();
-    };
+    usage_names(wire)
+        .iter()
+        .find_map(|name| body.get(name))
+        .map_or_else(AttemptUsage::default, |object| counted(wire, object))
+}
+
+/// The top-level members a `wire` answer may carry its usage object in, in
+/// precedence order.
+const fn usage_names(wire: Wire) -> &'static [&'static str] {
+    match wire {
+        Wire::OpenAi | Wire::Anthropic | Wire::Jev => &["usage"],
+        Wire::Google => &["usage_metadata", "usageMetadata"],
+    }
+}
+
+/// Reads the usage member of a `wire` answer `body` without decoding the
+/// rest.
+///
+/// `body` is read as `serde_json::from_str::<Value>` reads it, with the same
+/// syntax, number, and nesting checks, top-level arrays and scalars included,
+/// and the last of duplicate members kept, so the member is the one [`usage`]
+/// finds in the whole decode. Only that member is decoded; every other value
+/// is checked and dropped, so a metadata-only answer never owns its content.
+///
+/// # Errors
+///
+/// Returns the JSON error when `body` is not one JSON value or exceeds the
+/// nesting limit.
+fn usage_member(wire: Wire, body: &str) -> serde_json::Result<Option<Value>> {
+    let mut deserializer = serde_json::Deserializer::from_str(body);
+    let member = UsageMember(usage_names(wire)).deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(member)
+}
+
+/// Decodes the first of `names`, at most two, that a JSON object holds, and
+/// checks every other value without keeping it.
+///
+/// Every value is read through `deserialize_any`, so `serde_json` applies the
+/// same nesting limit a [`Value`] decode does. With no names it only checks
+/// a value, which is how nested values are read.
+struct UsageMember(&'static [&'static str]);
+
+impl<'de> DeserializeSeed<'de> for UsageMember {
+    type Value = Option<Value>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for UsageMember {
+    type Value = Option<Value>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_i64<E: de::Error>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_u64<E: de::Error>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_str<E: de::Error>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        while seq.next_element_seed(Self(&[]))?.is_some() {}
+        Ok(None)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut found: [Option<Value>; 2] = [None, None];
+        while let Some(Name(name)) = map.next_key()? {
+            match self.0.iter().position(|wanted| *wanted == name) {
+                Some(slot) => found[slot] = Some(map.next_value()?),
+                None => {
+                    map.next_value_seed(Self(&[]))?;
+                }
+            }
+        }
+        Ok(found.into_iter().flatten().next())
+    }
+}
+
+/// An object member name, borrowed from the answer unless it holds escapes.
+#[derive(serde::Deserialize)]
+#[serde(transparent)]
+struct Name<'a>(#[serde(borrow)] Cow<'a, str>);
+
+/// Reads token usage of `wire` from its usage `object`.
+fn counted(wire: Wire, object: &Value) -> AttemptUsage {
     let counts = match wire {
         Wire::OpenAi => typed::<OpenAiUsage>(object)
             .map(|(usage, json)| (usage.prompt_tokens, Some(usage.completion_tokens), json))

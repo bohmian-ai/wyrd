@@ -44,7 +44,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::profile::{HeapProfiler, ProfileNote, Profiler};
+use crate::profile::{HeapProfiler, ProfileMode, ProfileNote, Profiler};
 use crate::release_server::{Host, HostLoad};
 
 /// The only record version this module writes and reads: a VALID or
@@ -1692,13 +1692,22 @@ pub trait Workload: Send {
     async fn finish(&mut self) -> Result<(), ExperimentError>;
 }
 
+/// What a `--profile` run collects and the CPU profiler it invokes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Profiling {
+    /// The collectors, for both process roles.
+    pub mode: ProfileMode,
+    /// The CPU profiler program, [`crate::profile::SAMPLY`] outside tests.
+    pub program: PathBuf,
+}
+
 /// Where a run keeps raw artifacts and whether it profiles.
 #[derive(Debug, Clone)]
 pub struct Options {
     /// Raw artifacts directory under `target/`.
     pub artifacts: PathBuf,
-    /// The profiler to run with `--profile`, or `None` without it.
-    pub profiler: Option<PathBuf>,
+    /// What `--profile` collects, or `None` without it.
+    pub profile: Option<Profiling>,
     /// Cancelled when the run is interrupted.
     pub interrupt: CancellationToken,
 }
@@ -1938,13 +1947,29 @@ where
             Err(reason) => stopped = Some(reason),
         }
         let profiles = options.artifacts.join("profiles");
-        let profiling = options.profiler.as_ref().filter(|_| stopped.is_none());
-        let profiler = match profiling {
-            Some(program) => Profiler::start(program, &workload.processes(), &profiles),
-            None => Profiler::disabled(),
+        let profiling = options.profile.as_ref().filter(|_| stopped.is_none());
+        let targets: Vec<(Role, u32)> = workload
+            .processes()
+            .into_iter()
+            .map(|pid| (Role::Server, pid))
+            .chain(std::iter::once((Role::Driver, std::process::id())))
+            .collect();
+        profile = ProfileNote {
+            requested: profiling.is_some(),
+            mode: profiling.map(|profiling| profiling.mode),
+            roles: if profiling.is_some() {
+                vec![Role::Server, Role::Driver]
+            } else {
+                Vec::new()
+            },
+            complete: profiling.is_some(),
+            ..ProfileNote::default()
         };
-        let heap_url = profiling.and_then(|_| workload.heap_profile_url());
-        let mut heap = HeapProfiler::start(heap_url, &profiles).await;
+        let cpu = profiling.filter(|profiling| profiling.mode.cpu());
+        let heap_mode = profiling.is_some_and(|profiling| profiling.mode.heap());
+        let heap_url = heap_mode.then(|| workload.heap_profile_url()).flatten();
+        let mut heap = HeapProfiler::start(heap_url, heap_mode, &profiles).await;
+        let mut saving = None;
         for step in &declaration.steps {
             if stopped.is_some()
                 || step.kind != StepKind::Measured
@@ -1952,6 +1977,12 @@ where
             {
                 continue;
             }
+            if let Some(previous) = saving.take() {
+                profile.absorb(saved(previous).await);
+            }
+            let profiler = cpu.map_or_else(Profiler::disabled, |cpu| {
+                Profiler::start(&cpu.program, &targets, &profiles.join(&step.id))
+            });
             let (repetitions, reasons) = measured.entry(step.id.clone()).or_default();
             let window = Duration::from_secs(declaration.step_timing(step).repetition_seconds);
             let warmup = Duration::from_secs(timing.warmup_seconds);
@@ -1999,8 +2030,8 @@ where
                 }
             }
             heap.capture(&step.id).await;
+            saving = Some(tokio::task::spawn_blocking(move || profiler.finish()));
         }
-        let saving = tokio::task::spawn_blocking(move || profiler.finish());
         match tokio::time::timeout(FINISH_GRACE, workload.finish()).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => validity.push(Reason::new(
@@ -2025,12 +2056,16 @@ where
             "after",
         ));
         worked = Some(clock.elapsed());
-        profile = saving.await.unwrap_or_else(|_| ProfileNote {
-            requested: true,
-            notes: vec!["the profiler thread panicked".to_owned()],
-            ..ProfileNote::default()
-        });
+        if let Some(last) = saving {
+            profile.absorb(saved(last).await);
+        }
         heap.finish(&mut profile);
+        if profile.requested && profile.captures.is_empty() && profile.notes.is_empty() {
+            profile.absorb(ProfileNote {
+                notes: vec!["no measured step was profiled".to_owned()],
+                ..ProfileNote::default()
+            });
+        }
     }
     let elapsed = worked.unwrap_or_else(|| clock.elapsed());
     if elapsed > Duration::from_secs(timing.budget_seconds) {
@@ -2115,6 +2150,15 @@ where
         },
         mode: declaration.mode,
     }
+}
+
+/// The note of a step's CPU captures once `saving` finished them; a
+/// panicked save is noted, never lost silently.
+async fn saved(saving: tokio::task::JoinHandle<ProfileNote>) -> ProfileNote {
+    saving.await.unwrap_or_else(|_| ProfileNote {
+        notes: vec!["the profiler thread panicked".to_owned()],
+        ..ProfileNote::default()
+    })
 }
 
 /// Awaits `work` until the budget `deadline` or an interrupt, whichever is
@@ -2933,9 +2977,13 @@ impl Record {
         }
         let profile = &self.artifacts.profile;
         if profile.requested {
+            let scope = profile.mode.map_or_else(String::new, |mode| {
+                let roles: Vec<&str> = profile.roles.iter().map(|role| role.name()).collect();
+                format!(" {} of {}", mode.name(), roles.join(" and "))
+            });
             let _ = writeln!(
                 out,
-                "\nprofile: {} ({} captures){}",
+                "\nprofile{scope}: {} ({} captures){}",
                 if profile.complete {
                     "complete"
                 } else {
@@ -3164,10 +3212,11 @@ mod tests {
 
     use super::{
         Arrivals, Criterion, Declaration, Derive, Direction, Engine, ExperimentError, HostRecord,
-        Invocation, Level, Metric, Mode, Op, Options, Outcome, Phase, REPORT_HEADER, Reading,
-        Record, Repetition, Source, Status, Step, Validity, Verdict, Workload, run,
+        Invocation, Level, Metric, Mode, Op, Options, Outcome, Phase, Profiling, REPORT_HEADER,
+        Reading, Record, Repetition, Role, Source, Status, Step, Validity, Verdict, Workload, run,
     };
     use crate::capacity::{Population, UNLABELLED};
+    use crate::profile::{ProfileMode, ProfileNote};
     use crate::release_server::Histogram;
     use crate::release_server::HostLoad;
 
@@ -3298,7 +3347,7 @@ mod tests {
         stall: Duration,
         /// Cancelled after this many calls, when set.
         interrupt: Option<(usize, CancellationToken)>,
-        /// Real time the first measurement blocks, so an external profiler
+        /// Real time each step's warmup blocks, so an external profiler
         /// started just before it is running when the paused clock races on.
         settle: Option<Duration>,
         /// Why preparation fails, when set.
@@ -3352,7 +3401,9 @@ mod tests {
             {
                 token.cancel();
             }
-            if let Some(settle) = self.settle.take() {
+            if phase == Phase::Warmup
+                && let Some(settle) = self.settle
+            {
                 std::thread::sleep(settle);
             }
             tokio::time::sleep(window + self.stall).await;
@@ -3374,7 +3425,7 @@ mod tests {
     fn options(directory: &Path) -> Options {
         Options {
             artifacts: directory.to_path_buf(),
-            profiler: None,
+            profile: None,
             interrupt: CancellationToken::new(),
         }
     }
@@ -5335,27 +5386,22 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn profiling_is_optional_diagnostic_evidence() {
         let root = tempfile::tempdir().expect("root");
-        let saving = root.path().join("saving-profiler");
-        std::fs::write(
-            &saving,
-            "#!/bin/sh\nout=''\nwhile [ $# -gt 0 ]; do [ \"$1\" = --output ] && out=\"$2\"; shift; done\n\
-             trap 'echo profile > \"$out\"; exit 0' INT\nwhile :; do sleep 0.02; done\n",
-        )
-        .expect("script");
+        let saving = saving_profiler(root.path());
         let silent = root.path().join("silent-profiler");
         std::fs::write(
             &silent,
             "#!/bin/sh\ntrap 'exit 0' INT\nwhile :; do sleep 0.02; done\n",
         )
         .expect("script");
-        for script in [&saving, &silent] {
-            let mut permissions = std::fs::metadata(script).expect("metadata").permissions();
-            std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-            std::fs::set_permissions(script, permissions).expect("chmod");
-        }
+        let mut permissions = std::fs::metadata(&silent).expect("metadata").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&silent, permissions).expect("chmod");
         let profiled = |program: Option<PathBuf>| Options {
             artifacts: root.path().join("target"),
-            profiler: program,
+            profile: program.map(|program| Profiling {
+                mode: ProfileMode::Cpu,
+                program,
+            }),
             interrupt: CancellationToken::new(),
         };
         let run_with = |options: Options, repetition: Repetition| async move {
@@ -5387,14 +5433,22 @@ mod tests {
             assert!(profile.requested);
             assert_eq!(profile.complete, complete, "{profile:?}");
             if complete {
-                assert_eq!(profile.captures.len(), 1);
-                assert!(record.render().contains("profile: complete (1 captures)"));
+                assert_eq!(profile.captures.len(), 2, "one per measured step");
+                assert!(
+                    record
+                        .render()
+                        .contains("profile cpu of server and driver: complete (2 captures)")
+                );
             } else {
                 assert!(
                     profile.notes.iter().any(|n| n.contains(note)),
                     "{note}: {profile:?}"
                 );
-                assert!(record.render().contains("profile: incomplete"));
+                assert!(
+                    record
+                        .render()
+                        .contains("profile cpu of server and driver: incomplete")
+                );
             }
         }
         let mut lost = good();
@@ -5430,8 +5484,9 @@ mod tests {
         let artifacts = root.path().join("target");
         let capture = artifacts
             .join("profiles")
-            .join(format!("profile-{}.json.gz", std::process::id()));
-        let run_with = |profiler: Option<PathBuf>, stall: Duration| {
+            .join("op-64")
+            .join(format!("cpu-server-{}.json.gz", std::process::id()));
+        let run_with = |program: Option<PathBuf>, stall: Duration| {
             let (artifacts, capture) = (artifacts.clone(), capture.clone());
             async move {
                 let mut workload = Scripted::always(&good());
@@ -5440,7 +5495,10 @@ mod tests {
                 workload.watch = Some(capture);
                 let options = Options {
                     artifacts,
-                    profiler,
+                    profile: program.map(|program| Profiling {
+                        mode: ProfileMode::Both,
+                        program,
+                    }),
                     interrupt: CancellationToken::new(),
                 };
                 let record = execute(
@@ -5474,5 +5532,154 @@ mod tests {
             );
             assert_eq!(overrun.verdict, Verdict::Invalid);
         }
+    }
+
+    /// Writes an executable stand-in profiler under `root` that saves a
+    /// capture to its `--output` when interrupted; returns its path.
+    fn saving_profiler(root: &Path) -> PathBuf {
+        let script = root.join("saving-profiler");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nout=''\nwhile [ $# -gt 0 ]; do [ \"$1\" = --output ] && out=\"$2\"; shift; done\n\
+             trap 'echo profile > \"$out\"; exit 0' INT\nwhile :; do sleep 0.02; done\n",
+        )
+        .expect("script");
+        let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&script, permissions).expect("chmod");
+        script
+    }
+
+    /// Runs the two-step declaration profiled in `mode`, or unprofiled,
+    /// writing artifacts under `artifacts`.
+    async fn profiled_run(artifacts: &Path, program: &Path, mode: Option<ProfileMode>) -> Record {
+        let mut workload = Scripted::always(&good());
+        workload.settle = Some(Duration::from_millis(500));
+        let options = Options {
+            artifacts: artifacts.to_path_buf(),
+            profile: mode.map(|mode| Profiling {
+                mode,
+                program: program.to_path_buf(),
+            }),
+            interrupt: CancellationToken::new(),
+        };
+        execute(
+            declaration(),
+            &mut workload,
+            [Some(quiet()), Some(quiet())],
+            &options,
+        )
+        .await
+    }
+
+    /// The files a run left under its `profiles/` directory, relative to it.
+    fn profile_files(artifacts: &Path) -> Vec<String> {
+        let profiles = artifacts.join("profiles");
+        let mut files = Vec::new();
+        let mut pending = vec![profiles.clone()];
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if let Ok(relative) = path.strip_prefix(&profiles) {
+                    files.push(relative.display().to_string());
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    /// Each mode starts only its collectors: no `--profile` starts neither,
+    /// `cpu` runs a CPU capture per measured step and no heap sampler,
+    /// `heap` starts no CPU profiler process and captures the driver's heap
+    /// after each step, and `both` does both; none changes the verdict.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a mode starts a collector it did not ask for or misses
+    /// one it did.
+    #[tokio::test(start_paused = true)]
+    async fn profile_modes_start_only_the_requested_collectors() {
+        let root = tempfile::tempdir().expect("root");
+        let program = saving_profiler(root.path());
+        let pid = std::process::id();
+        let cpu = [
+            format!("op-1/cpu-server-{pid}.json.gz"),
+            format!("op-1/samply-server-{pid}.log"),
+            format!("op-64/cpu-server-{pid}.json.gz"),
+            format!("op-64/samply-server-{pid}.log"),
+        ];
+        let heap = ["heap-driver-op-1.pb.gz", "heap-driver-op-64.pb.gz"].map(str::to_owned);
+        let unprofiled = profiled_run(&root.path().join("none"), &program, None).await;
+        assert!(!unprofiled.artifacts.profile.requested);
+        assert!(profile_files(&root.path().join("none")).is_empty());
+        for (mode, expected) in [
+            (ProfileMode::Cpu, cpu.to_vec()),
+            (ProfileMode::Heap, heap.to_vec()),
+            (ProfileMode::Both, [cpu.to_vec(), heap.to_vec()].concat()),
+        ] {
+            let artifacts = root.path().join(mode.name());
+            let record = profiled_run(&artifacts, &program, Some(mode)).await;
+            let files = profile_files(&artifacts);
+            let mut expected = expected.clone();
+            expected.sort();
+            assert_eq!(files, expected, "{mode:?}");
+            let note = &record.artifacts.profile;
+            assert!(note.complete, "{mode:?}: {note:?}");
+            assert_eq!(note.mode, Some(mode));
+            assert_eq!(record.verdict, unprofiled.verdict, "{mode:?}");
+        }
+    }
+
+    /// A profiled record keeps its mode, both process roles, each capture
+    /// under its measured step, and the declaration's executable identity;
+    /// a record that predates modes and roles reads back as the server-only
+    /// profile it was.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a manifest field is lost or an old record misreads.
+    #[tokio::test(start_paused = true)]
+    async fn profile_manifests_preserve_executable_and_window_identity() {
+        let root = tempfile::tempdir().expect("root");
+        let program = saving_profiler(root.path());
+        let record = profiled_run(root.path(), &program, Some(ProfileMode::Both)).await;
+        let read: Record =
+            serde_json::from_str(&serde_json::to_string(&record).expect("json")).expect("record");
+        let note = &read.artifacts.profile;
+        assert_eq!(note.mode, Some(ProfileMode::Both));
+        assert_eq!(note.roles, [Role::Server, Role::Driver]);
+        for step in ["op-1", "op-64"] {
+            assert!(
+                note.captures
+                    .iter()
+                    .any(|capture| capture.contains(&format!("/{step}/cpu-server-"))),
+                "{step}: {note:?}"
+            );
+            assert!(
+                note.captures
+                    .iter()
+                    .any(|capture| capture.ends_with(&format!("heap-driver-{step}.pb.gz"))),
+                "{step}: {note:?}"
+            );
+        }
+        assert_eq!(
+            read.build,
+            declaration().build,
+            "executable identity is kept"
+        );
+        let old: ProfileNote = serde_json::from_value(json!({
+            "requested": true,
+            "complete": true,
+            "captures": ["profiles/profile-1.json.gz"],
+            "notes": [],
+        }))
+        .expect("an old note");
+        assert_eq!((old.mode, old.roles.len()), (None, 0));
     }
 }

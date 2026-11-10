@@ -20,7 +20,8 @@
 //! or `--allow-dirty` run's under `target/benchmarks/`), and exit 0 (VALID)
 //! or 2 (INVALID);
 //! a missed performance target is reported and never changes the exit.
-//! `--profile` adds optional samply CPU captures and server heap profiles,
+//! `--profile [cpu|heap|both]` adds optional per-step CPU captures and heap
+//! profiles of both the server and this driver (bare `--profile` is `both`),
 //! `--allow-dirty` records a dirty source, `--steps` selects declared steps,
 //! and `--smoke` runs the same plan at smoke scale under
 //! `target/benchmarks/smoke/`. A full run never runs a smoke first;
@@ -33,12 +34,65 @@ mod levels;
 mod query;
 mod verification;
 
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use wyrd_testing::experiment::{DRIVER_CORES, Engine, Level};
 
 use crate::levels::{Context, Plan};
+
+/// The driver's allocator: the system allocator, reporting each allocation
+/// and free to the heap sampler, which ignores them until `--profile heap`
+/// or `both` starts it, so the driver's heap profiles follow the server's
+/// sampling contract.
+#[global_allocator]
+static GLOBAL: SampledSystem = SampledSystem;
+
+/// [`System`] plus the heap sampler's allocation and free hooks.
+struct SampledSystem;
+
+// SAFETY: every method forwards its arguments unchanged to `System` and
+// returns what `System` returned. No pointer is fabricated, aliased or freed
+// here, so this upholds exactly the invariants `System` upholds.
+#[expect(
+    unsafe_code,
+    reason = "a global allocator is unsafe; the sampling it adds is safe"
+)]
+unsafe impl GlobalAlloc for SampledSystem {
+    /// Allocates `layout` from the system and reports it.
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: `layout` comes from the caller and is forwarded unchanged.
+        let ptr = unsafe { System.alloc(layout) };
+        wyrd_benchmark::heap::allocated(ptr, layout.size());
+        ptr
+    }
+
+    /// Reports the free, then returns `ptr` to the system.
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        wyrd_benchmark::heap::freed(ptr);
+        // SAFETY: `ptr` came from our `alloc`/`realloc` with this same `layout`.
+        unsafe { System.dealloc(ptr, layout) };
+    }
+
+    /// Takes the system's pre-zeroed allocation and reports it.
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: `layout` comes from the caller and is forwarded unchanged.
+        let ptr = unsafe { System.alloc_zeroed(layout) };
+        wyrd_benchmark::heap::allocated(ptr, layout.size());
+        ptr
+    }
+
+    /// Reports the old block freed and the resized block allocated.
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        wyrd_benchmark::heap::freed(ptr);
+        // SAFETY: `ptr`/`layout` describe a live block from this allocator, and
+        // `new_size` is the caller's — all forwarded unchanged.
+        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
+        wyrd_benchmark::heap::allocated(new_ptr, new_size);
+        new_ptr
+    }
+}
 
 /// Where `results` writes the results page, under the repository root.
 const RESULTS: &str = "target/benchmarks/results.html";
@@ -95,7 +149,7 @@ async fn dispatch(arguments: &[String], root: &Path) -> u8 {
     match (command, engine, group) {
         (Some("l1"), Some(Engine::Bifrost), Some((skip, experiments))) => {
             let shared = rest(skip);
-            if let Err(message) = flags::known(&shared, &levels::VALUED[..0], &levels::SWITCHES) {
+            if let Err(message) = levels::known(&shared, &levels::VALUED[..0], &[]) {
                 eprintln!(
                     "capacity l1 bifrost: {message}; running several experiments takes only --profile, --allow-dirty and --smoke"
                 );
@@ -108,7 +162,7 @@ async fn dispatch(arguments: &[String], root: &Path) -> u8 {
         (Some("l2"), Some(engine), _) => Box::pin(level(Level::Two, engine, &rest(3), root)).await,
         (Some("l1"), None, _) if bare(2) => {
             let shared = rest(2);
-            if let Err(message) = flags::known(&shared, &levels::VALUED[..0], &levels::SWITCHES) {
+            if let Err(message) = levels::known(&shared, &levels::VALUED[..0], &[]) {
                 eprintln!(
                     "capacity l1: {message}; the aggregate takes only --profile, --allow-dirty and --smoke"
                 );
@@ -174,14 +228,13 @@ async fn level(level: Level, engine: Engine, arguments: &[String], root: &Path) 
     };
     let planned = plan(engine, &context).and_then(|mut plan| {
         levels::select(&mut plan.declaration, arguments)?;
-        Ok(plan)
+        Ok((plan, levels::profile(arguments)?))
     });
     match planned {
-        Ok(mut plan) => {
+        Ok((mut plan, profile)) => {
             if context.smoke() {
                 levels::smoke(&mut plan.declaration);
             }
-            let profile = arguments.iter().any(|argument| argument == "--profile");
             Box::pin(levels::execute(plan, root, profile)).await
         }
         Err(message) => {
@@ -230,6 +283,7 @@ mod tests {
         Options, Outcome, Over, Phase, Reading, Record, Repetition, Rule, Source, Status, Step,
         StepKind, Timing, Verdict, Workload, run,
     };
+    use wyrd_testing::profile::ProfileMode;
     use wyrd_testing::release_server::{HostLoad, PEAK_SAMPLE_INTERVAL_MS};
 
     use super::dispatch;
@@ -414,7 +468,7 @@ mod tests {
         let artifacts = tempfile::tempdir().expect("artifacts");
         let options = Options {
             artifacts: artifacts.path().to_path_buf(),
-            profiler: None,
+            profile: None,
             interrupt: CancellationToken::new(),
         };
         let quiet = |_| {
@@ -1590,6 +1644,34 @@ mod tests {
             seen,
             levels::ENGINES.map(|engine| (engine, vec!["--profile".to_owned()]))
         );
+        for (arguments, mode) in [
+            (&[][..], None),
+            (&["--profile"], Some(ProfileMode::Both)),
+            (&["--profile", "--smoke"], Some(ProfileMode::Both)),
+            (&["--profile", "cpu"], Some(ProfileMode::Cpu)),
+            (&["--profile", "heap", "--smoke"], Some(ProfileMode::Heap)),
+            (&["--profile", "both"], Some(ProfileMode::Both)),
+        ] {
+            let arguments = line(arguments);
+            assert_eq!(levels::profile(&arguments), Ok(mode), "{arguments:?}");
+            assert_eq!(levels::known(&arguments, &[], &[]), Ok(()), "{arguments:?}");
+            let mut seen = Vec::new();
+            levels::aggregate(&arguments, |_, forwarded| {
+                seen.push(forwarded.to_vec());
+                0
+            });
+            assert!(seen.iter().all(|forwarded| forwarded[..] == arguments[1..]));
+        }
+        for invalid in [
+            &["--profile", "memory"][..],
+            &["--profile", "--profile"],
+            &["--smoke", "cpu"],
+        ] {
+            assert!(
+                levels::known(&line(invalid), &[], &[]).is_err(),
+                "{invalid:?}"
+            );
+        }
         for (codes, expected) in [([0, 0, 0], 0), ([0, 1, 0], 2), ([2, 0, 1], 2)] {
             let mut next = codes.into_iter();
             assert_eq!(
@@ -1689,6 +1771,8 @@ mod tests {
             &["l1", "bifrost", "--clients", "4"],
             &["l1", "bifrost", "writes", "--steps", "native-write-c1"],
             &["smoke", "l1", "bifrost"],
+            &["l1", "--profile", "memory"],
+            &["l1", "bifrost", "--profile", "cpu", "cpu"],
             &[],
         ] {
             assert_eq!(dispatch(&line(usage), root.path()).await, 2, "{usage:?}");

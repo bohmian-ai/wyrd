@@ -1628,7 +1628,7 @@ mod tests {
             };
             let options = Options {
                 artifacts: directory.path().join("artifacts"),
-                profiler: None,
+                profile: None,
                 interrupt: CancellationToken::new(),
             };
             let mut workload = Calibration {

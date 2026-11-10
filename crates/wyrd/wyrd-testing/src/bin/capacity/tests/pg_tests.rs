@@ -313,7 +313,7 @@ async fn measured(
     let artifacts = directory.join(format!("{}-{}", engine.name(), declaration.experiment));
     let options = Options {
         artifacts: artifacts.clone(),
-        profiler: None,
+        profile: None,
         interrupt: CancellationToken::new(),
     };
     let record = run(

@@ -194,3 +194,56 @@ These rows supersede H1's "Python, workspace, memory unchanged" clause.
 | H7 | Revision 2 defaults | Workers `(4, 12)`, waiters `(16, 48)`, workspaces `(16, 48)`, pool 8192 MiB, one prewarmed worker per lane; combined totals `(16, 64, 64, 2)`; the defaults pass `worker_fits` and `lanes_fit` | `lanes_split_the_memory_ceilings`, with its overflow, pool-below-process and per-worker refusals retained against the new pool |
 | H8 | Revision 2 configuration | The pool budget resolves from `[verification] monty_pool_memory_mib` under `WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB`, alongside the Python and workspace file values from H2; a zero or overflowing pool value is refused, and file workers that exceed a file pool are refused | `verification_capacity_file_values_resolve_under_env` |
 | H9 | Revision 2 docs | Both pages show the new defaults and describe the pool as startup accounting, not a reservation or a measured guarantee | `docs:check`, plus the docs diff |
+
+## Evidence
+
+Exact selectors:
+
+- U: `mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=verification::hosted::tests::lanes_split_the_memory_ceilings) | test(=config::tests::verification_limits_env_applies_and_refuses) | test(=verification::tests::production_defaults_are_the_specified_ceilings) | test(=config::tests::verification_capacity_file_values_resolve_under_env)'`. 4/4 PASS.
+- G: `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --lib -E 'test(=components::gateway::pg_invocation_tests::lane_wait_spends_the_agent_call_budget) | test(=components::gateway::pg_invocation_tests::gateway_agent_calls_start_only_on_a_compatible_adapter)'"`. 2/2 PASS.
+- O: the remediation's orchestration pair selector. 2/2 PASS (recovery 11.9 s, disposition 14.2 s).
+- J, the relocated journey: `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-testing --test server -P journey --run-ignored=all -E 'test(=verification_runtime::isolated_capacity::direct_verification_runs_while_queued_capacity_is_held)'"`. PASS in 21.2 s.
+- `mise run fmt` 0, `mise run lints` 0, `mise run check:deps` 0, `mise run docs:check` 0, `git diff --check 395274d58 HEAD` 0.
+
+RED:
+
+- R1/R2: before the fix, both new cases panicked with `attempt to add with overflow` at `hosted/mod.rs:141`.
+- R4–R6: before the fix, the lane wait outlived a 300 ms budget, failing the test's 10 s bound on the wait (`pg_invocation_tests.rs`, the "lane wait ends within the call's budget" expect).
+- H2–H4, H8: the production change landed before its test, which is a process exception. RED was then taken by mutation: with `set_file` made to ignore its value, the new config test failed with `left: (256, 64, 300s)`, `right: (7, 9, 7200s)`.
+- H1/H7: the default changes landed with their assertions in the same edit, so no RED was taken. The assertions pin the approved values.
+- R8: the diagnosis comes from the validated FIND-001-3. COMPARE was never held, and the reply script answers it at once, so the comparison could decide before `extra` started or before its publication. The test now establishes the ordering; production code is unchanged.
+- R10: the code was moved, not changed. The journey's RED is still task 001's mutation RED.
+
+| Obligation | Implementation evidence | Assertion | Verification evidence | Result |
+|---|---|---|---|---|
+| R1: unrepresentable combined workers are refused without panic | `hosted/mod.rs:143-145`, `checked_add` before the conversion | `hosted/mod.rs:248-251` | U | PASS |
+| R2: the max-width env value gets the named config refusal | the shared `lanes_fit` refusal in `resolve_limits` | `config.rs:4730` case, expecting `WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS plus` | U | PASS |
+| R3: valid, default and memory cases still pass | unchanged checks | the retained assertions in both tests | U | PASS |
+| R4: a held lane times out within the call budget, with no dispatch | `caller.rs:135-158`, a `tokio::time::timeout(call.timeout, acquire_owned)` | `pg_invocation_tests.rs:6080-6089` (Timeout, `seen()` empty) | G | PASS |
+| R5: admission leaves only the remainder, and a provider past it times out | `caller.rs:155-158,180`, `timeout = call.timeout - elapsed` passed to GatewayInvocation | `pg_invocation_tests.rs:6103-6120` (`WYRD_GATEWAY_504_DEADLINE_EXCEEDED`; dispatched deadline at or before start + budget + 25%; the call ends before budget + 25%) | G | PASS |
+| R6: expiry and cancellation drop permit and wait state, and the next call proceeds | an owned permit dropped on return; the gateway still owns settlement | `pg_invocation_tests.rs:6090,6121,6137-6140` | G; J (cancelled direct wait, then a call that answers) | PASS |
+| R7: unbound callers, projection, refusal and response are unchanged | the `None` arm passes `call.timeout` unchanged | `gateway_agent_calls_start_only_on_a_compatible_adapter` | G | PASS |
+| R8: milestone ordering precedes the comparison | `verifier_orchestration.rs:2118-2156`: COMPARE held at a `HeldUpstream`; admit waits for `extra` to be Succeeded with no disposition; discard and block wait for `extra`'s turn-1 request, which carries its publish result, while `extra` is still Started | `verifier_orchestration.rs:2122-2133,2137-2153` | O | PASS |
+| R9: both tests pass with every assertion kept | only the setup changed; the takeover, content, attempt and retained-publication assertions are untouched | the existing assertions | O | PASS |
+| R10: the server target runs the full real-client journey | `crates/wyrd/wyrd-testing/tests/bifrost/server/verification_runtime/isolated_capacity.rs`, registered at `verification_runtime.rs:87-88`; the same YAML, client declare/pull/hydrate/verify/submit/status/wait and Bifrost reads; gateway setup through public `Gateway` plus `CredentialWriter` | every assertion of the former SDK story, carried over unchanged | J | PASS |
+| R11: the SDK story is removed, with no new SDK control or engine | `isolated_capacity.rs` removed from the SDK and its `mod` line dropped from `main.rs`; the fixtures README points at the server target | `git grep isolated_capacity` finds only the server module and the README | diff audit | PASS |
+| R12: the defaults test documents its panics | `verification/mod.rs:632` `# Panics` | — | U | PASS |
+| R13: format, lints, deps and diff check; no new API or dependency | no Cargo or manifest changes; the new config keys are those the approved revisions require | — | the lanes above | PASS |
+| H1: execution and model-call defaults are 256, queued slots stay 64 | `hosted/mod.rs` defaults | `hosted/mod.rs:237-243`; `verification/mod.rs` `(64, 5 min)` | U | PASS |
+| H2: the capacities and timeout are typed `[verification]` file settings on the normal loader | `config.rs` `VerificationConfig` file fields plus `VerificationLaneConfig`; `resolve_limits` called from `apply_env_overrides` inside `WyrdServerConfig::load` | `config.rs:4498-4534`: file values reach `limits` and `runtime`, and lease and verify timeout keep their defaults | U | PASS |
+| H3: env over file over defaults | file values folded first (`config.rs:1844-1904`), then the existing `set_scaled`/`set_millis` | `config.rs:4536-4556` | U | PASS |
+| H4: file values get the same validation | `set_file` refuses zero; the existing merged inconsistency checks run after both sources | `config.rs:4557-4620`: zero values, overflowing pool, pool overflow, unrepresentable workers, a min-workers conflict, a negative value | U | PASS |
+| H5: one owner, no new loader | `limits` and `runtime` remain the only projection into HostedBlocks and the runtime builder | — | diff audit; J | PASS |
+| H6: the docs describe the file keys and defaults, and the env-only claim is gone | `reference/verification-runtime-limits.md`, `operate/configure-verification-runtime.md`; `llms*.txt` regenerated with `docs:generate` | — | docs:check | PASS |
+| H7: revision 2 defaults | `hosted/mod.rs` defaults (4/12, 16/48, 16/48, 8192 MiB, prewarm 1) | `hosted/mod.rs:226-262`: totals `(16, 64, 64, 2)`, `worker_fits && lanes_fit`, and the extra-workers, pool-below-process and per-worker refusals | U | PASS |
+| H8: the pool budget is file-configurable under its env name | `config.rs:1890-1903`, with overflow refused | `config.rs:4498-4556,4575-4582,4591-4596` | U | PASS |
+| H9: revision 2 docs: startup accounting, no measured claim | the limits page's "sized for a 32 GiB server…" and pool paragraphs; the configure page's pool bullet | — | docs:check | PASS |
+
+Mechanical deviations:
+
+- `apply_limits_env` is renamed to `resolve_limits`, because it now resolves file values too. The env test keeps its name.
+- The relocated journey sits in a child module of `verification_runtime`, so its imports stay local.
+- R5's test sleeps for half its budget. Elapsed time is the quantity being measured, not a synchronization point.
+- The `isolated_capacity` fixture row now names the server target.
+
+Non-goals: no new API, dependency, queue, service, persistent format, scheduler, timeout option or platform enforcement. Lease and maintenance timings stay internal, production engine and admission semantics are unchanged, and no historical review report was edited.

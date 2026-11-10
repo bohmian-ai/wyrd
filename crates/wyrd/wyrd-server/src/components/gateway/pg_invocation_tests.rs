@@ -6039,8 +6039,8 @@ async fn gateway_agent_calls_start_only_on_a_compatible_adapter() {
 /// within its budget and nothing is dispatched. A call admitted after
 /// waiting out half its budget reaches the provider with only the remainder
 /// as its deadline, so a provider that never answers ends the call by the
-/// original deadline rather than a full budget after admission. Neither
-/// expiry keeps a permit, the gateway captures the hung call as timed out,
+/// original deadline rather than a full budget after admission. A cancelled
+/// wait ends at once. No expiry or cancellation keeps a permit, the gateway captures the hung call as timed out,
 /// and the next call is answered.
 ///
 /// # Panics
@@ -6096,6 +6096,31 @@ async fn lane_wait_spends_the_agent_call_budget() {
     );
     assert!(dispatch.seen().is_empty(), "nothing is dispatched");
     assert_eq!(permits.available_permits(), 0, "the wait took no permit");
+
+    // The lane is still held, so the call waits; its cancelled token ends the
+    // wait well inside its long budget.
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let waited = tokio::time::Instant::now();
+    let abandoned =
+        skald_agent::WyrdGatewayCaller::call(&agent, chat(Duration::from_secs(30)), &cancelled)
+            .await
+            .expect_err("a cancelled lane wait ends the call");
+    assert!(
+        matches!(abandoned, skald_providers::ProviderError::Timeout { .. })
+            && waited.elapsed() < Duration::from_secs(5),
+        "{abandoned:?} after {:?}",
+        waited.elapsed()
+    );
+    assert!(
+        dispatch.seen().is_empty(),
+        "a cancelled wait dispatches nothing"
+    );
+    assert_eq!(
+        permits.available_permits(),
+        0,
+        "the cancelled wait took no permit"
+    );
 
     let budget = Duration::from_secs(2);
     dispatch.push(Step::Hang);

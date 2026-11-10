@@ -652,3 +652,173 @@ decisions, not reasons to stop or defer one of the four optimizations.
 - [Capture reservation contract](../../../../architecture/wyrd-design.md#principal-model),
   [Scribe batching and identical-slice retries](../../../../architecture/bifrost-design.md),
   [audit integrity and privacy](../../../../architecture/wyrd-security-posture.md#audit-integrity-and-privacy).
+
+## Execution Evidence
+
+### Acceptance
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-001–004; INV-001–003; AC-001: one backend, independent progress, coherent groups | `wyrd-benchmark/src/lib.rs` per-series `Mutex` under a `RwLock` map, grouped timings under a shared `groups` gate that `snapshot` holds exclusively only while copying timings; `recorder.rs` `MetricSeries` with immutable key outside its lock (b557cf98c) | `recorder::tests::unrelated_series_record_while_one_series_is_held` (RED: 10 s deadlock guard under the global lock), `recording_tests::snapshots_preserve_complete_timing_groups_during_recording` (fails with the gate removed); `wyrd-benchmark --lib` 7/7 | PASS |
+| REQ-005–006,008; AC-003–004: persisted phase evidence with declared boundaries and overlap | `Repetition::diagnose`/`inapplicable`, `Metric::diagnostic` in `experiment.rs`; `Observed::diagnose` and `diagnostic_metrics()` in `capacity/gateway` (ef97098c6) | `gateway::run::tests::phase_diagnostics_preserve_window_populations_and_missing_evidence`; `--bin capacity -E 'test(/^gateway::/)'` 12/12 | PASS |
+| REQ-011; AC-007: one canonical fresh/saved report with every repetition | `Record::render_diagnostics` (b0033a70a); `benchmarks/README.md` "Records and reports" | `experiment::tests::reports_keep_repetition_diagnostics_after_artifacts_are_removed`; historical `20261109T153318Z-b1cf95f2e` renders "diagnostics: — unavailable" | PASS |
+| REQ-012; AC-008 scenario 5: drain without staged-row/Part copies | `Frame.parts: Arc<Vec<Part>>` built with `Arc::make_mut`; `Chunk { parts, range }`; `Part::dense` borrows rows; `StagedRow::project<R: Borrow<StagedRow>>` (535cf816f) | `scribe_outbox::tests::borrowed_projection_preserves_mixed_rows_and_retry_frames` (RED: chunks owned copied parts) and the 7 named drain proofs; `scribe_outbox::tests` 24/24; `staged_rows_project_into_one_dense_batch`; `wyrd-runtime outbox::tests` 20/20 | PASS |
+| REQ-012; AC-008 scenario 6: metadata usage without an owned response tree | `complete` RawV1 unselected arm, `usage_names`, `usage_member`, `UsageMember` visitor, `counted` in `adapter/mod.rs` (516771c44) | `adapter::tests::raw_metadata_usage_matches_selected_capture_without_materializing_content` (RED: no usage-only read) covering precedence, last duplicate, escaped names, null/malformed/oversized/overflowing usage, top-level array/scalar and the 128-level nesting limit; `adapter::tests` 46/46 | PASS |
+| REQ-012; AC-008 scenario 7: redaction without per-key and media-type copies | `secret_key` walks normalized bytes in place; media `data` member referenced before the member loop with the media type borrowed (3024f42f1) | `capture::tests::payload_materialization_preserves_redaction_and_variant_values` (behavior pinned on the old code first; `secret_key` table RED); `capture::tests` 12/12 | PASS |
+| REQ-012; AC-008 scenario 8: audit projection moves owned text | `stage_audit_event(event: AuditEvent, …)` moves trace, operation, resource, permission and `RequestId::into_inner` into cells; `ScribeWrite::from` and every caller closed (57e143636) | `tables::audit::projection::tests::owned_decision_preserves_canonical_row_and_attribution` (RED: by-value signature; buffer-pointer ownership proof) plus the two existing projection tests; `audit_decisions_frame_under_the_platform_audit_principal`, `a_slice_of_small_writes_travels_as_one_frame` | PASS |
+| Real-server seams and journeys | — | 5/5 `pg_invocation_tests`/`pg_administration_tests`; `scribe_persistence_path` 10/10 with Postgres; gateway journeys 7/7 (`-P journey --run-ignored=all`) | PASS |
+| Recovery envelope, corrected recorder (run A) | — | see [Qualification](#qualification-runs); two misses inside run-to-run swing, accepted by the maintainer (1–5% expected) | PASS (maintainer judgment) |
+| Final candidate keeps the envelope | — | see [Final comparison](#final-comparison): 13 of 15 met; 64 KiB metadata residual p50 +1.2% and payload client p50 +0.1%, payload residual p50 +6.5% over the envelope | **OPEN** for maintainer judgment; no supported regression found |
+
+Non-goals stayed excluded: no new dependency, feature, recorder, schema, cache,
+allocator, IPC path, reservation or audit-boundary change; historical baselines
+were not rerun. The temporary run-B variant was never committed.
+
+### Qualification runs
+
+All runs: host AMD Ryzen 9 9950X, 32 CPU / 91 GiB, Pop!_OS 24.04 x86_64;
+unprofiled; default 5 s warmup and 3 × 5 s repetitions; `--steps
+buffered-1kib-capture-metadata.c64,buffered-64kib-capture-metadata.c64,buffered-64kib-capture-payload.c64`;
+release `bench` build in `target/profiling`; fresh repository Postgres.
+
+| Run | Source | Binaries (sha256 prefix server / capacity) | Record | Verdict |
+|---|---|---|---|---|
+| A — corrected recorder, full phase instrumentation | b0033a70a clean | bbfc333b / cadefc6c | `target/benchmarks/gateway/overhead/20261110T114927Z-b0033a70a.json` | VALID |
+| B — A without phase and queue-delay histograms | b0033a70a + temporary diff 01b39e8b (`--allow-dirty`) | 6c3910f1 / 6d392abb | `…/20261110T115959Z-b0033a70a.json` | INVALID by design: its 11 diagnostics are missing |
+| Final — A plus scenarios 5–8 | 57e143636 clean | 16deac5d / 126ec2f2 | `…/20261110T123522Z-57e143636.json` | VALID |
+
+A first B attempt (`…/20261110T115905Z-b0033a70a.json`) refused a dirty tree
+before admitting work and holds no measurement. Every valid run had zero
+errors, lost, shed, unstaged and undrained captures, and staged one capture per
+arrival.
+
+Recovery envelope: the median repetition must not be worse than the worst
+repetition of `20261109T153318Z-b1cf95f2e`. Client and residual figures are in ms,
+CPU per request in µs, and throughput in requests/s.
+
+| Case | Client p50 | Residual p50 | Residual p99 | CPU/request | Throughput |
+|---|---|---|---|---|---|
+| 1 KiB metadata envelope | ≤ 1.046 | ≤ 0.178 | ≤ 0.481 | ≤ 353.67 | ≥ 57377 |
+| A | 0.990 | 0.175 | 0.455 | 335.4 | 60620 |
+| B | 1.067 | 0.170 | 0.505 | 326.4 | 55904 |
+| Final | 1.003 | 0.175 | 0.476 | 345.7 | 58593 |
+| 64 KiB metadata envelope | ≤ 2.374 | ≤ 0.409 | ≤ 1.499 | ≤ 803.60 | ≥ 25622 |
+| A | 2.361 | 0.409 | 1.484 | **805.0** | 25721 |
+| B | 2.557 | 0.420 | 1.578 | 843.7 | 23745 |
+| Final | 2.351 | **0.414** | 1.459 | 801.7 | 25836 |
+| 64 KiB payload envelope | ≤ 4.616 | ≤ 2.888 | ≤ 65.04 | ≤ 1710.01 | ≥ 8664 |
+| A | **4.671** | 2.840 | 53.79 | 1589.8 | 9299 |
+| B | 4.697 | 2.833 | 57.23 | 1637.8 | 8910 |
+| Final | **4.621** | **3.075** | 56.02 | 1636.3 | 9240 |
+
+Repetition spread, A → Final (min–max):
+- 1 KiB metadata client p50: 0.969–1.011 → 0.997–1.029.
+- 64 KiB metadata client p50: 2.359–2.389 → 2.340–2.380.
+- Payload client p50: 4.616–5.447 → 4.566–5.073.
+- Payload CPU per request: 1577–2158 → 1631–1959.
+
+In both runs, repetition 1 of the payload case is the outlier (39266 and 41089
+arrivals against about 46.5k).
+
+Observer cost (A against B): removing the phase and queue-delay histograms did
+not make the server faster. B was 1–8% slower on client p50, throughput and the
+64 KiB CPU per request, and 2.7% lower on 1 KiB CPU per request. The paired
+difference is inside run-to-run variation, so the added instrumentation has no
+cost this protocol can resolve. This is not a zero-overhead claim.
+
+### Final comparison
+
+Median per-phase wall time, A → Final (µs; overlapping rows never add):
+
+| Case | translate p50 | authorize p50 | capture p50 | parse p50 | admit p50 | outbox write p50 |
+|---|---|---|---|---|---|---|
+| 1 KiB metadata | 27.97 → 25.52 | 7.93 → 7.55 | 13.47 → 13.70 | 17.95 → 18.29 | 6.40 → 6.54 | 33915 → 35619 |
+| 64 KiB metadata | 95.94 → 91.01 | 13.13 → 12.36 | 27.36 → 27.18 | 67.65 → 78.46 | 9.17 → 9.23 | 64291 → 54329 |
+| 64 KiB payload | 116.22 → 125.31 | 13.59 → 13.05 | 159.74 → 160.26 | 76.74 → 86.02 | 2191 → 2390 | 110821 → 113312 |
+
+- **Scenario 6 (usage-only decode, `translate`, metadata only):** −9% (1 KiB)
+  and −5% (64 KiB), and p99 −12% and −11%. The payload case still decodes its
+  answer once and moved +8% the other way, which is about the resolution of
+  this protocol. Measured, with that limit.
+- **Scenario 8 (audit move, inside `authorize`):** −4% to −6% in all three cases,
+  near resolution. Ownership is proven by the buffer-pointer test.
+- **Scenario 7 (redaction, `capture`, payload only):** p50 unchanged, p99 −6%.
+  Below resolution. The removed work is one normalized `String` per object key
+  and one media-type copy per media object, proven by source and test.
+- **Scenario 5 (drain, background `outbox_write`):** a batch write, not
+  response latency. It moved −15%, +5% and +2% by case: below resolution.
+  The removed work is one `Part` clone per row per submission attempt and one
+  `StagedRow` clone per dense projection, proven by `Arc::ptr_eq`.
+
+**Envelope misses.**
+- The 64 KiB metadata residual p50 (+1.2%) and payload client p50 (+0.1%) are
+  inside the run-to-run swing the maintainer accepted for run A.
+- The payload residual p50 is 3.075 ms against ≤ 2.888 (+6.5%; A 2.840).
+  - The increase lies in `admit`, the capture-slot reservation wait (p50
+    2191 → 2390 µs; per repetition 2388 / 2437 / 2310 against A's
+    21 / 2189 / 2388).
+  - No changed code runs inside `admit` or `parse`: the ten changed files
+    touch neither `ingress.rs` nor admission.
+  - The work that frees capture slots did not grow: `capture` 160 → 160 µs,
+    outbox write p50 111 → 113 ms.
+  - The pre-task record itself spans 2.020–2.888 ms on this metric, and A
+    1.265–3.011 ms.
+  - So no regression attributable to scenarios 5–8 is supported. This needs
+    maintainer judgment and is not claimed as recovered.
+- `parse` (+12–16% at 64 KiB) is likewise unattributable: it covers the
+  request body read, which no change touches.
+
+Both p50 objectives, judged independently: client < 1 ms missed in all three
+cases (1 KiB 1.003 ms, marginally); Gateway-added < 500 µs met for both
+metadata cases (175 and 414 µs) and missed for payload (3.075 ms).
+
+### Failure diagnoses
+
+1. **Scenario 1, first GREEN.**
+   - **Symptom:** `recorder::tests::unrelated_series_record_while_one_series_is_held`
+     still hit its 10 s guard after per-series locks replaced the global lock.
+   - **Evidence:** `Metrics::register`'s first-sight scan locked each series'
+     mutex to compare its key, including the series the test held.
+   - **Cause:** the immutable key lived inside the mutable metric's lock.
+   - **Fix site:** `wyrd-benchmark/src/recorder.rs` `MetricSeries`. The name,
+     labels and kind moved outside the `Mutex`. `register` is the only key
+     comparison.
+2. **Scenario 3.**
+   - **Symptom:** `overhead_repetition_subtracts_waits_per_call_and_counts_capture`
+     reported 3 diagnostic reasons where the test expected more.
+   - **Evidence:** zero-call fixtures register empty phase histograms, which
+     difference to count 0 (present) rather than missing.
+     `server_elapsed`, `provider_excluded` and `residual` have no samples and
+     are the only missing diagnostics.
+   - **Cause:** the expectation conflated an empty population with an absent
+     series.
+   - **Fix site:** that test's expected reasons.
+   - No independent diagnostician was spawned for this assertion change.
+3. **Run B, first attempt.** It refused a dirty tree (`source.dirty`) before
+   admitting work. This is the declared protocol, not a defect. The rerun
+   declared `--allow-dirty` with the variant's diff hash.
+4. **Scenario 7 behavior pin.** The new test first expected `Ünïcode Sécret`
+   to be redacted. The pre-change code normalizes it to `ncodescret`, so the
+   expectation was wrong, not the code. It now pins the existing rule and adds
+   a redacted Unicode key (`Clé API-Key`).
+
+### Commands
+
+```bash
+mise run bench:l1:gateway -- --steps buffered-1kib-capture-metadata.c64,buffered-64kib-capture-metadata.c64,buffered-64kib-capture-payload.c64   # A and Final
+mise exec -- scripts/postgres/with-test-postgres.sh -- target/profiling/release/capacity l1 gateway --allow-dirty --steps <same>   # B, prebuilt variant binaries
+mise exec -- cargo nextest run --locked -p wyrd-server --lib --features test-support -E '<capture-drain proofs, as listed>'   # 8/8
+mise exec -- cargo nextest run --locked -p wyrd-server --lib --features test-support -E 'test(/^scribe_outbox::tests::/)'   # 24/24
+mise exec -- cargo nextest run --locked -p wyrd-server --lib --features test-support -E 'test(/^components::gateway::capture::tests::/)'   # 12/12
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(/^tables::audit::projection::tests::/) | test(=tables::staged::tests::staged_rows_project_into_one_dense_batch)'
+mise exec -- cargo nextest run --locked -p wyrd-runtime --lib -E 'test(/^outbox::tests::/)'   # 20/20
+mise exec -- cargo nextest run --locked -p wyrd-gateway --lib -E 'test(/^adapter::tests::/)'   # 46/46
+mise exec -- cargo nextest run --locked -p wyrd-benchmark --lib   # 7/7
+mise exec -- cargo nextest run --locked -p wyrd-testing --lib -E 'test(/^experiment::tests::/) | test(/^capacity::tests::/)'   # 21/21
+mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity -E 'test(/^gateway::/)'   # 12/12
+<real-server seams and journeys, exactly as listed above>   # 5/5, 10/10, 7/7
+mise run fmt:check && mise run check:deps && mise exec -- git diff --check
+mise exec -- cargo clippy --locked -p wyrd-spec -p wyrd-server -p vala-bifrost-redux -p wyrd-testing -p wyrd-gateway -p wyrd-benchmark --all-features --all-targets -- -D warnings
+```
+
+`wyrd-queue` Variant encoder: not applicable, unchanged.

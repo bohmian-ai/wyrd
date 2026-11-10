@@ -6,6 +6,12 @@ instrumentation ran for this report. Every number below comes from an
 existing record, timing snapshot or profile. Every mechanism comes from source
 read at the commit named next to it.
 
+[TASK-003](../tasks/TASK-003-recorder-overhead-and-standard-reporting.md)
+later ran three bounded experiments, answered M1, and implemented four
+reductions. Its results are in
+[Measurement qualification and implemented reductions](#measurement-qualification-and-implemented-reductions).
+The sections before it are unchanged.
+
 ## Summary
 
 | Case at c64 | Client p50 (reps) | Objective < 1 ms | Gateway-added p50 (reps) | Objective < 500 µs |
@@ -613,10 +619,75 @@ timestamps (`PacedUpstream` holds at most `bound` send times,
 that is instrumentation. It needs planning authority and is not proposed as a
 measurement here.
 
+## Measurement qualification and implemented reductions
+
+Source:
+[TASK-003 execution evidence](../tasks/TASK-003-recorder-overhead-and-standard-reporting.md#execution-evidence).
+Every figure there is pasted from the canonical report, `capacity report
+<record>`, which shows each repetition's diagnostics. `benchmarks/README.md`
+("Records and reports") makes that report the standard reference for this
+work.
+
+**Qualification.** Corrected recorder, full phase instrumentation:
+`target/benchmarks/gateway/overhead/20261110T114927Z-b0033a70a.json`.
+- It meets the pre-task recovery envelope (worst repetition of
+  `20261109T153318Z-b1cf95f2e`) on 13 of 15 figures. The two misses are
+  64 KiB metadata CPU per request (+0.2%) and payload client p50 (+1.2%). The
+  maintainer accepted both as run-to-run swing.
+- A paired run without the phase and queue-delay histograms
+  (`…/20261110T115959Z-b0033a70a.json`) was not faster: 1–8% slower on
+  client p50 and throughput. So the added instrumentation has no cost this
+  protocol resolves. This is not a zero-overhead claim.
+
+**M1 answered.** In every repetition of the payload case, the `admit` phase
+holds the residual tail:
+
+| | Repetition 1 | Repetition 2 | Repetition 3 |
+|---|---|---|---|
+| `admit` p99 | 67.6 ms | 53.1 ms | 51.3 ms |
+| residual p99 | 68.4 ms | 53.8 ms | 52.2 ms |
+| `capture` p99 | 1.17 ms | 0.74 ms | 0.70 ms |
+
+- The `admit` p95 (12–26 ms) also tracks the residual p95 (16–26 ms).
+- `queue_delay` overlaps `admit` by declaration and adds nothing separate.
+- **H2, the capture-slot wait, is supported.** H3, post-answer capture work
+  stalling workers, is contradicted as the tail's location.
+- The frequency of `admit` above 10 ms was not read separately.
+- The final run agrees.
+- C2's H2 branch, the Scribe outbox reserved share and delivery throughput,
+  is therefore the owner of the payload tail. Any change there still needs
+  its own approved scope (INV-002, INV-003).
+
+**Implemented reductions** (final record
+`…/20261110T123522Z-57e143636.json`, VALID):
+
+| Reduction | Work removed | Measured effect against the qualification run |
+|---|---|---|
+| Capture drain (`scribe_outbox.rs`, `staged.rs`) | one `Part` clone per row per submission attempt; one `StagedRow` clone per dense projection | background `outbox_write` −15% / +5% / +2% p50 by case: below resolution, not response latency |
+| Metadata usage (`adapter/mod.rs::complete`) | the owned `Value` tree of every metadata-only native answer | `translate` p50 −9% (1 KiB) and −5% (64 KiB); p99 −12% / −11% |
+| Payload redaction (`capture.rs::redact_object`) | one normalized `String` per object key; one media-type copy per media object | payload `capture` p50 unchanged, p99 −6%: below resolution |
+| Audit projection (`projection.rs::stage_audit_event`) | copies of trace, operation, resource, permission and request text | `authorize` p50 −4% to −6%: near resolution |
+
+**Final comparison.**
+- Client p50: 1.003 / 2.351 / 4.621 ms.
+- Gateway-added p50: 175 / 414 / 3075 µs.
+- CPU per request: 345.7 / 801.7 / 1636.3 µs.
+- Client < 1 ms is still missed in every case (1 KiB marginally).
+- Gateway-added < 500 µs is met for both metadata cases and missed for
+  payload.
+- **The payload residual p50 is 6.5% above the recovery envelope.** That
+  increase lies entirely in `admit` (p50 2.19 → 2.39 ms), which no change
+  touches. Capture work and outbox write time did not grow. On this metric
+  the pre-task record spans 2.02–2.89 ms and the qualification run
+  1.27–3.01 ms. No regression attributable to the reductions is supported.
+- None of the four reductions moves the payload tail, as C1 and C2 predicted.
+
 ## Limits
 
-- No improvement or target attainment is claimed. B, C and CR are
-  observations, not a controlled comparison.
+- No improvement or target attainment is claimed from B, C and CR: they are
+  observations, not a controlled comparison. TASK-003's effects are
+  same-host, same-protocol comparisons, with the resolution limits stated in
+  its section.
 - CP's `wyrd-server` CPU attribution is unavailable. Step intervals in the
   profile are inferred from its own CPU signal (±1 s) and include warmup.
 - Heap deltas include background and between-step work. Heap sampling is

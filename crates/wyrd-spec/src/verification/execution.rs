@@ -9,6 +9,7 @@
 //! verdict: a failed requirement is a normal result, never a transport error.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::LazyLock;
 
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
@@ -563,6 +564,34 @@ impl RequirementResult {
     }
 }
 
+/// The generated closed Verdict schema without `data`, the plain `verdict`
+/// format every expanded one extends. Generated once: it depends only on the
+/// Verdict type, and every compiled Prompt and decoded inline Agent check
+/// resolves it.
+///
+/// # Panics
+///
+/// Panics on first use if the generated schema is not an object declaring
+/// `properties`, an invariant of the derived schema.
+static PLAIN_VERDICT: LazyLock<Map<String, Value>> = LazyLock::new(|| {
+    let Ok(mut generated) = serde_json::to_value(crate::schema::schema_for::<Verdict>()) else {
+        unreachable!("a generated root schema serializes to a JSON object");
+    };
+    portable(&mut generated);
+    let Value::Object(mut schema) = generated else {
+        unreachable!("a generated root schema serializes to a JSON object");
+    };
+    if let Some(required) = schema.get_mut("required").and_then(Value::as_array_mut) {
+        required.retain(|name| name != "data");
+    }
+    schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .expect("the generated Verdict schema declares properties")
+        .remove("data");
+    schema
+});
+
 impl Verdict {
     /// Resolves a `verdict` response format to the schema its responses
     /// must satisfy.
@@ -602,25 +631,7 @@ impl Verdict {
                 ),
             ));
         }
-        let Ok(mut generated) = serde_json::to_value(crate::schema::schema_for::<Self>()) else {
-            unreachable!("a generated root schema serializes to a JSON object");
-        };
-        portable(&mut generated);
-        let Value::Object(mut schema) = generated else {
-            unreachable!("a generated root schema serializes to a JSON object");
-        };
-        let required = |schema: &mut Map<String, Value>| {
-            schema
-                .get_mut("required")
-                .and_then(Value::as_array_mut)
-                .map(|required| required.retain(|name| name != "data"))
-        };
-        required(&mut schema);
-        let properties = schema
-            .get_mut("properties")
-            .and_then(Value::as_object_mut)
-            .expect("the generated Verdict schema declares properties");
-        properties.remove("data");
+        let mut schema = PLAIN_VERDICT.clone();
         let Some(data) = format.data() else {
             return Ok(schema);
         };

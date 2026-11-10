@@ -17,7 +17,7 @@ use std::collections::BTreeSet;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use secrecy::ExposeSecret as _;
-use serde_json::Value;
+use serde_json::{Value, json};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::storage::ids::UploadId;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
@@ -290,6 +290,40 @@ async fn the_served_document_describes_the_composed_surface() {
     );
 
     server.shutdown().await.expect("server shuts down");
+}
+
+/// The GitHub connection surface is served: its five tenant operations take
+/// the Wyrd access token or the browser session and answer their documented
+/// success status, and the webhook clears that requirement because GitHub
+/// authenticates it by signature.
+#[tokio::test]
+async fn github_connection_operations_publish_their_contract() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    for (path, method, success) in [
+        ("/v1/integrations/github", "get", "200"),
+        ("/v1/integrations/github", "delete", "200"),
+        ("/v1/integrations/github/connect", "post", "201"),
+        ("/v1/integrations/github/setup", "get", "302"),
+        ("/v1/integrations/github/callback", "get", "200"),
+    ] {
+        let operation = &document["paths"][path][method];
+        assert!(
+            operation["responses"][success].is_object(),
+            "{method} {path}"
+        );
+        assert_eq!(
+            operation.get("security"),
+            Some(&token_or_browser_session()),
+            "{method} {path}"
+        );
+    }
+    let webhook = &document["paths"]["/v1/integrations/github/webhook"]["post"];
+    assert!(webhook["responses"]["202"].is_object(), "{webhook}");
+    assert_eq!(webhook["security"], json!([{}]));
+    server.shutdown().await.expect("test server shuts down");
 }
 
 /// The tenant human-connection administration surface is served with its typed

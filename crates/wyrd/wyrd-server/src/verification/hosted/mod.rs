@@ -135,11 +135,14 @@ impl HostedLimits {
     }
 
     /// Whether the live workers of both lanes, each counted at its process
-    /// ceiling, fit the pool ceiling together.
+    /// ceiling, fit the pool ceiling together; a combined count too large to
+    /// represent never fits.
     #[must_use]
     pub fn lanes_fit(&self) -> bool {
-        u64::try_from(self.direct.python_workers + self.queued.python_workers)
-            .ok()
+        self.direct
+            .python_workers
+            .checked_add(self.queued.python_workers)
+            .and_then(|workers| u64::try_from(workers).ok())
             .and_then(|workers| workers.checked_mul(self.monty_process_memory_bytes))
             .is_some_and(|total| total <= self.monty_pool_memory_bytes)
     }
@@ -212,8 +215,9 @@ mod tests {
 
     /// The default lanes split the former single pool: five 384 MiB workers
     /// in 2 GiB, 16 workspaces, and 16 waiters, with two prewarmed workers
-    /// in all. One more worker in either lane, a pool below the lanes, or a
-    /// process ceiling below the allocator ceiling refuses.
+    /// in all. One more worker in either lane, a combined worker count too
+    /// large to represent, a pool below the lanes, or a process ceiling below
+    /// the allocator ceiling refuses.
     ///
     /// # Panics
     /// Panics when a lane default or a memory ceiling is ignored.
@@ -233,6 +237,8 @@ mod tests {
         let mut wider = limits;
         wider.queued.python_workers += 1;
         assert!(!wider.lanes_fit(), "six workers exceed 2 GiB");
+        wider.queued.python_workers = usize::MAX;
+        assert!(!wider.lanes_fit(), "an unrepresentable worker count refuses");
         assert!(
             !HostedLimits {
                 monty_pool_memory_bytes: limits.monty_process_memory_bytes,

@@ -4433,6 +4433,13 @@ maintenance_interval_secs = 45
             ),
             (
                 [
+                    ("WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS", "2"),
+                    ("WYRD_VERIFICATION_QUEUED_PYTHON_WORKERS", "18446744073709551615"),
+                ],
+                "WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS plus",
+            ),
+            (
+                [
                     ("WYRD_VERIFICATION_MONTY_MEMORY_MIB", "384"),
                     ("WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB", "384"),
                 ],

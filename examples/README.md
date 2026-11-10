@@ -7,7 +7,7 @@ exactly what a reader builds: the Card YAML files and one program per language,
 | Example | Docs page | Journeys that run it |
 | --- | --- | --- |
 | `quickstart/` | `get-started/quickstart` | `sdks/wyrd-sdk-python/tests/integration/test_docsite_quickstart.py`, `examples/tests/quickstart.rs`, `sdks/wyrd-sdk-ts/wyrd/tests/integration/declare-and-pull.test.ts` |
-| `finance-release/` | — (Card authoring in Rust and Python; TypeScript follows) | `examples/tests/finance_release.rs`, `sdks/wyrd-sdk-python/tests/integration/cards/test_authoring_journey.py::test_finance_release_example` |
+| `finance-release/` | — (Card definitions through `verify` in Rust and Python; `service/` composes the Service from Python component modules) | `examples/tests/finance_release.rs`, `sdks/wyrd-sdk-python/tests/integration/cards/test_authoring_journey.py::test_finance_release_example`, `::test_multi_component_service_verifies_each_subject` (`service/`) |
 | `integrate-fastapi/` | `connect/integrate-asgi` | `sdks/wyrd-sdk-python/tests/integration/test_asgi_integration.py::test_fastapi_example` |
 
 Adding an example: create its directory, add one `[[bin]]` to `Cargo.toml` and

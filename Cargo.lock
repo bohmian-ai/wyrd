@@ -10917,6 +10917,7 @@ dependencies = [
  "http-body",
  "http-body-util",
  "iceberg",
+ "jsonwebtoken",
  "metrics",
  "metrics-exporter-prometheus",
  "num-traits",

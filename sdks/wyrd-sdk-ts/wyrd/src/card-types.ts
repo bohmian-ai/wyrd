@@ -2713,6 +2713,93 @@ export interface GatewayPriceRate {
 }
 
 /**
+ * The deployment's configured GitHub App.
+ */
+export interface GithubAppIdentity {
+  /**
+   * GitHub App id.
+   */
+  readonly id: number;
+  /**
+   * GitHub App slug, as in `https://github.com/apps/<slug>`.
+   */
+  readonly slug: string;
+}
+
+/**
+ * `POST /v1/integrations/github/connect` response: a durable, bounded
+ * connection transaction.
+ */
+export interface GithubConnectResponse {
+  /**
+   * GitHub's install page for the configured App. It carries the
+   * transaction's one-use state, which completes only in a browser signed
+   * in to Wyrd as the principal that began it.
+   */
+  readonly authorization_url: AbsoluteUrl;
+  /**
+   * Instant after which the transaction can no longer complete.
+   */
+  readonly expires_at: string;
+}
+
+/**
+ * Lifecycle state of a tenant's GitHub connection.
+ */
+export type GithubConnectionState = "not_connected" | "active" | "suspended";
+
+/**
+ * `GET /v1/integrations/github` response, and the result of a completed
+ * callback or a disconnect: the redacted connection and access view.
+ */
+export interface GithubConnectionView {
+  /**
+   * The deployment's configured App.
+   */
+  readonly app: GithubAppIdentity;
+  /**
+   * When the current association was verified; `None` when not connected.
+   */
+  readonly connected_at?: string | null;
+  /**
+   * Configured GitHub web host, such as `github.com`.
+   */
+  readonly host: string;
+  /**
+   * Verified installation id; `None` when not connected.
+   */
+  readonly installation_id?: number | null;
+  /**
+   * Selected repositories the installation can currently reach, by id.
+   */
+  readonly repositories: readonly GithubRepositoryAccess[];
+  /**
+   * Connection state.
+   */
+  readonly state: GithubConnectionState;
+  /**
+   * Last change to the association or its access; `None` when not
+   * connected.
+   */
+  readonly updated_at?: string | null;
+}
+
+/**
+ * A repository the tenant selected that its installation can currently
+ * reach.
+ */
+export interface GithubRepositoryAccess {
+  /**
+   * `owner/name` as GitHub last reported it; display only, not identity.
+   */
+  readonly full_name: string;
+  /**
+   * Stable provider repository id as a positive decimal string.
+   */
+  readonly repository_id: string;
+}
+
+/**
  * Caller-chosen opaque group identity, such as a conversation or order ID, scoped to the tenant and owner Service.
  */
 export type GroupId = string;

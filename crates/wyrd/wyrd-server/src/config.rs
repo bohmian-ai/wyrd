@@ -6751,4 +6751,208 @@ provider = "anthropic"
             );
         }
     }
+
+    /// A complete GitHub App section as the environment supplies it, with
+    /// the private key from a mounted file.
+    fn github_env(key_file: &Path) -> Vec<(&'static str, Option<String>)> {
+        vec![
+            ("WYRD_GITHUB_APP_ID", Some("4242".to_owned())),
+            ("WYRD_GITHUB_APP_SLUG", Some("wyrd-app".to_owned())),
+            (
+                "WYRD_GITHUB_WEB_ORIGIN",
+                Some("https://ghe.example.com:8443/".to_owned()),
+            ),
+            (
+                "WYRD_GITHUB_API_ORIGIN",
+                Some("https://ghe.example.com:8443/api/v3".to_owned()),
+            ),
+            (
+                "WYRD_GITHUB_PUBLIC_URL",
+                Some("https://wyrd.example.com/".to_owned()),
+            ),
+            ("WYRD_GITHUB_OAUTH_CLIENT_ID", Some("Iv1.client".to_owned())),
+            (
+                "WYRD_GITHUB_APP_PRIVATE_KEY_FILE",
+                Some(key_file.display().to_string()),
+            ),
+            (
+                "WYRD_GITHUB_WEBHOOK_SECRET",
+                Some("webhook-secret-value".to_owned()),
+            ),
+            (
+                "WYRD_GITHUB_OAUTH_CLIENT_SECRET",
+                Some("oauth-secret-value".to_owned()),
+            ),
+        ]
+    }
+
+    /// An owner-only file holding the test App key.
+    fn github_key_file(dir: &Path) -> PathBuf {
+        let path = dir.join("app.pem");
+        std::fs::write(&path, wyrd_testing::github::APP_PRIVATE_KEY_PEM).expect("key writes");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("key is owner-only");
+        path
+    }
+
+    /// Proves every GitHub App field parses from the environment and a
+    /// mounted key file, a GitHub Enterprise Server host keeps its port, and
+    /// neither Debug form prints a secret.
+    ///
+    /// # Panics
+    /// Panics when a field differs or a secret is printed.
+    #[test]
+    fn github_app_config_parses_from_env_and_files_and_redacts() {
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_file = github_key_file(dir.path());
+        temp_env::with_vars(github_env(&key_file), || {
+            let mut config = WyrdServerConfig::default();
+            config.apply_env_overrides().expect("the GitHub overrides apply");
+            let settings = config
+                .github
+                .resolve(true)
+                .expect("the section validates in production")
+                .expect("the section is present");
+            assert_eq!(settings.app_id, 4242);
+            assert_eq!(settings.slug, "wyrd-app");
+            assert_eq!(settings.host(), "ghe.example.com:8443");
+            assert_eq!(
+                settings.api_origin.as_str(),
+                "https://ghe.example.com:8443/api/v3"
+            );
+            assert_eq!(settings.public_url.as_str(), "https://wyrd.example.com/");
+            assert_eq!(settings.oauth_client_id, "Iv1.client");
+            assert_eq!(
+                settings.private_key.expose_secret().trim(),
+                wyrd_testing::github::APP_PRIVATE_KEY_PEM.trim()
+            );
+            for printed in [format!("{:?}", config.github), format!("{settings:?}")] {
+                for secret in ["webhook-secret-value", "oauth-secret-value", "PRIVATE KEY"] {
+                    assert!(!printed.contains(secret), "{printed}");
+                }
+            }
+        });
+    }
+
+    /// Proves an unset section configures no App, the default host is
+    /// `github.com`, and a partial or invalid section refuses startup naming
+    /// the field.
+    ///
+    /// # Panics
+    /// Panics when an unset section configures an App or an invalid one
+    /// validates.
+    #[test]
+    fn github_app_config_is_optional_but_complete_once_present() {
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        assert!(
+            WyrdServerConfig::default()
+                .github
+                .resolve(true)
+                .expect("an unset section is valid")
+                .is_none()
+        );
+        let complete = GithubConfig {
+            app_id: Some(1),
+            slug: Some("app".to_owned()),
+            public_url: Some("https://wyrd.example.com".to_owned()),
+            oauth_client_id: Some("Iv1.client".to_owned()),
+            private_key: Some(SecretString::from(
+                wyrd_testing::github::APP_PRIVATE_KEY_PEM,
+            )),
+            webhook_secret: Some(SecretString::from("webhook")),
+            oauth_client_secret: Some(SecretString::from("oauth")),
+            ..GithubConfig::default()
+        };
+        let settings = complete
+            .resolve(true)
+            .expect("a complete section validates")
+            .expect("present");
+        assert_eq!(settings.host(), "github.com");
+        assert_eq!(settings.api_origin.as_str(), "https://api.github.com/");
+
+        let cases: [(&str, GithubConfig); 7] = [
+            (
+                "public_url",
+                GithubConfig {
+                    public_url: None,
+                    ..complete.clone()
+                },
+            ),
+            (
+                "app_id",
+                GithubConfig {
+                    app_id: Some(0),
+                    ..complete.clone()
+                },
+            ),
+            (
+                "slug",
+                GithubConfig {
+                    slug: Some("Not A Slug".to_owned()),
+                    ..complete.clone()
+                },
+            ),
+            (
+                "web_origin",
+                GithubConfig {
+                    web_origin: Some("https://github.com/path".to_owned()),
+                    ..complete.clone()
+                },
+            ),
+            (
+                "api_origin",
+                GithubConfig {
+                    api_origin: Some("http://api.github.com".to_owned()),
+                    ..complete.clone()
+                },
+            ),
+            (
+                "webhook secret",
+                GithubConfig {
+                    webhook_secret: Some(SecretString::from("  ")),
+                    ..complete.clone()
+                },
+            ),
+            (
+                "private key",
+                GithubConfig {
+                    private_key: Some(SecretString::from("not a pem")),
+                    ..complete.clone()
+                },
+            ),
+        ];
+        for (field, config) in cases {
+            match config.resolve(true) {
+                Err(ConfigError::Invalid { message }) => {
+                    assert!(message.contains(field), "{field}: {message}");
+                }
+                other => panic!("{field}: expected a typed refusal, got {other:?}"),
+            }
+        }
+        assert!(
+            GithubConfig {
+                slug: Some("only-a-slug".to_owned()),
+                ..GithubConfig::default()
+            }
+            .resolve(false)
+            .is_err(),
+            "a partial section refuses startup"
+        );
+    }
+
+    /// Proves the TOML section carries no secret: a secret key there is an
+    /// unknown field.
+    ///
+    /// # Panics
+    /// Panics when a secret parses from TOML.
+    #[test]
+    fn github_secrets_never_come_from_toml() {
+        for field in ["private_key", "webhook_secret", "oauth_client_secret"] {
+            let parsed = from_toml_str_with_dev_oracle_opt_in(&format!(
+                "[github]\napp_id = 1\n{field} = \"value\"\n"
+            ));
+            assert!(parsed.is_err(), "{field} parsed from TOML");
+        }
+    }
 }

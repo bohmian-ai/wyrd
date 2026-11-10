@@ -89,6 +89,8 @@ WIRE_ROOTS = [
     "PublicationPage",
     "PublicationSelector",
     "OperatorConnectionView",
+    "GithubConnectResponse",
+    "GithubConnectionView",
     "UpdateOperatorConnectionRequest",
     "VerificationExecutionState",
     "VerificationResult",

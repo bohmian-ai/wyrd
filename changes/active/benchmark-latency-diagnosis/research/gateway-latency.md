@@ -10,7 +10,10 @@ read at the commit named next to it.
 later ran three bounded experiments, answered M1, and implemented four
 reductions. Its results are in
 [Measurement qualification and implemented reductions](#measurement-qualification-and-implemented-reductions).
-The sections before it are unchanged.
+[TASK-004](../tasks/TASK-004-client-and-json-hot-path.md) added fresh current
+allocation evidence and stage comparisons in
+[TASK-004 current allocation and stage comparisons](#task-004-current-allocation-and-stage-comparisons).
+The sections before them are unchanged.
 
 ## Summary
 
@@ -686,6 +689,45 @@ holds the residual tail:
   (+0.2%). The first final run's miss was run-to-run variation, not a
   regression.
 - None of the four reductions moves the payload tail, as C1 and C2 predicted.
+
+## TASK-004 current allocation and stage comparisons
+
+Source: [TASK-004 execution evidence](../tasks/TASK-004-client-and-json-hot-path.md#execution-evidence),
+which holds every repetition, record, executable hash and method.
+
+**Current server allocation** comes from fresh profiled runs of the
+post-TASK-003 server (A, `…/20261110T144306Z-d4ea94988.json`) and the
+production candidate (B, `…/20261110T162345Z-a31d121c4.json`). Figures are
+step deltas over the reconciled calls, warmup included. The 702 KiB above is
+historical record CP.
+
+| Step | A bytes/call | B bytes/call | A objects | B objects |
+|---|---|---|---|---|
+| 1 KiB meta c64 | 193.9 KiB | 193.4 KiB | 1117 | 1086 |
+| 64 KiB meta c64 | 646.7 KiB | 584.3 KiB | 1155 | 1081 |
+| payload c64 | 2065.7 KiB | 2037.8 KiB | 1591 | 1596 |
+
+- **64 KiB metadata:** B removes two payload-sized copies and adds one, in
+  `JsonAnswer::validated` (the reader buffer shrunk by `into_boxed_str`).
+  `3ae65fe4a` removes that one too, but no run measured it.
+- **Payload:** capture still decodes the request tree. The net −28 KiB is in
+  Arrow/Parquet capture encoding and is not attributed to this work.
+
+**A → B, production, original fixture.**
+- Client p50 is 1.04 / 2.28 / 4.65 ms.
+- `translate` falls from 92 to 64 µs at 64 KiB.
+- The only envelope miss is 64 KiB driver CPU (+1.5%), in an unchanged driver.
+- Verify SDK changes are below resolution.
+
+**B → C, fixture, identical server.**
+- Driver CPU falls 9–16%. Client p50 is 1.005 / 2.179 / 4.532 ms.
+- Residual p50 rises 0.6–9.9% with no server change. The faster closed-loop
+  driver keeps more calls in the server at once.
+
+**Objectives at C:**
+- Client < 1 ms is missed in every case; the 1 KiB case misses by 5 µs.
+- Gateway-added < 500 µs is met for both metadata cases (175, 362 µs) and
+  missed for payload (2.83 ms).
 
 ## Limits
 

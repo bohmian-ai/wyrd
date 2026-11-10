@@ -572,3 +572,185 @@ the implementor. They are not reasons to stop for another design exercise.
 - [Workflow](../../../spec-driven-development.md), [implementation execution](../../../implementation-execution.md), [testing](../../../../TESTING.md), [repository rules](../../../../AGENTS.md).
 - [Rust](../../../../agent_docs/rust.md), [maintainer style](../../../../agent_docs/maintainer-style.md), [agent surfaces](../../../../agent_docs/agent-surfaces.md).
 - [Capture/admission authority](../../../../architecture/wyrd-design.md#principal-model), [Bifrost](../../../../architecture/bifrost-design.md), [security boundaries](../../../../architecture/wyrd-security-posture.md).
+
+## Execution evidence
+
+Commits: `b211aab41` (scenarios 1–3), `03c0b1d99` (4), `9b7dccc94` (6),
+`a31d121c4` (5), `a5fed5839` (7–8), `3ae65fe4a` (post-B heap finding, below).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-013; AC-009; INV-001,003 — shared request backing, effective deadlines, unchanged selection/authority (scenarios 1–3) | `wyrd-client/src/transport/http.rs` (`serialize_body` → `Bytes` shared by every attempt; `request_json_within`, `request_json_with_min_timeout` per-request deadline, no client clone); `verify/mod.rs`, `state.rs`, `observe/mod.rs` (`target` borrows bound Verifiers) | `transport::http::tests::serialized_body_backing_is_shared_across_attempts`; integration `json_body_and_request_identity_survive_auth_refresh`, `non_idempotent_json_is_not_replayed_after_ambiguous_failure`, `execute_outlives_the_configured_timeout` (ordinary request keeps configured deadline); `observe::tests::verifier_resolution_preserves_subjects_and_binding_order`; `wyrd-client --lib` 271/271; wyrd-ai verify journeys 6/6 | PASS |
+| REQ-015; AC-010 — bounded collection keeps an eligible single chunk (scenario 4) | `skald-providers/src/clients/mod.rs` bounded reader returns the single chunk's `Bytes`; raw/typed callers in `openai.rs`, `anthropic.rs`, `google.rs`, `vertex.rs`, `raw.rs`; `3ae65fe4a` stops `JsonAnswer::validated` shrinking that buffer into a copy (`engine.rs`, `JsonAnswer(String)`) | `clients::tests::bounded_collection_reuses_single_chunks_and_coalesces_multiple_chunks` (pointer/backing, multi-chunk order, limits, empty and exact-limit); `adapter::tests::native_response_validation_preserves_usage_capture_and_answer_bytes` now also pins kept capacity (RED: 148 ≠ 212 before `3ae65fe4a`); `skald-providers --lib` 50/50 | PASS |
+| REQ-015; AC-010; INV-001–003 — native ingress without an owned tree (scenario 5) | `wyrd-gateway/src/request.rs::RequestJson` (kept compact text only when it equals the decoded value's compact serialization, else decoded); `routes.rs::JsonBody` with axum's own content-type probe; `adapter/http.rs::media_json`; Skald `send_media_json`/`stream_media_json` | `routes::usage_bound_tests::native_raw_ingress_matches_value_contract_and_bounds` (46 cases, tally kept/decoded/refused `[18, 20, 8]`; every native validator and bound; `to_json` against `RequestBody::Object`; content-type and refusal parity with `Json`; 64 KiB pointer and allocation checks); `adapter::tests` native body pointer check; server Gateway component tests with Postgres 66/66 | PASS |
+| REQ-015; AC-010 — one validation pass for native answers (scenario 6) | `adapter/mod.rs::native_answer` validates while reading usage, scans again only to classify a rejection; `JsonAnswer::validated`; `raw.rs` keeps Skald `send_raw` returning a validated public `RawValue` | `native_response_validation_preserves_usage_capture_and_answer_bytes` (differential with the former two-scan path, outcomes `[20, 8, 12]`, kept allocation); `wyrd-gateway --lib` 69/69 | PASS |
+| REQ-014; AC-011; INV-001,003–004 — driver and stub borrow only judged fields (scenario 7) | `wyrd-testing/src/gateway_capture.rs::pick` (`Step`, `Leaf`, decoded-value rules, duplicate last-wins); `capacity/gateway/workload.rs::buffered` | `gateway_capture::tests::paced_request_projection_preserves_validation_and_routing`; `gateway::workload::tests::buffered_validation_matches_the_existing_json_predicate` (answered 15), `buffered_validation_borrows_unescaped_content`; capacity bin 58/58 | PASS |
+| REQ-014; AC-011 — prepared caller keeps dynamic window labels (scenario 8) | `workload.rs::Caller`; `run.rs`, `capacity.rs` (`Driver::callers`); `mod.rs` control `fixture_method` | `gateway::workload::tests::prepared_requests_keep_dynamic_window_headers` (method, path, headers and body equal to the former request in two labelled windows and outside one) | PASS |
+| REQ-003,005–007,011,016; AC-012; INV-004 — A/B/C evidence | seven authorized invocations, each run once, all VALID; retained executables and hashes below | tables below; heap step deltas from `alloc_space`/`alloc_objects` | PASS |
+| REQ-013–016; AC-009–012 — every reduction implemented and attributed | scenarios 1–8 in the commits above | stage comparisons below; unresolved items named | PASS |
+| Owner and static closure | — | `mise run fmt:check`; clippy `-D warnings` on wyrd-client, wyrd-skald-providers, wyrd-gateway, wyrd-server, wyrd-testing; `cargo check --workspace --all-targets --all-features`; `mise run check:deps`; `git diff --check`; Gateway journeys 6/6 (after `a31d121c4`, `a5fed5839`, `3ae65fe4a`); profile regression `profile::tests::heap_captures_and_failures_become_profile_evidence` | PASS |
+
+### Experiment lineage
+
+Executables built with `mise run bench:build` (release, `-C force-frame-pointers=yes`,
+line tables, rustc 1.99.0) and retained as real copies:
+
+| Milestone | Source | `capacity` SHA-256 | `wyrd-server` SHA-256 | Fixture method |
+|---|---|---|---|---|
+| A `task004/a-current` | `d4ea94988` | `126ec2f2f707a5c4…` | `16deac5dc4b4cb79…` | original (no `fixture_method` control) |
+| B `task004/b-old-driver` | `a31d121c4` | `2cb5edd465796d8a…` | `b092b1aaf40b525a…` | original (no `fixture_method` control) |
+| C `task004/c-new-driver` | `a5fed5839` | `2d4ec1a45d230927…` | `b092b1aaf40b525a…` copied from B, matches | `prepared-borrowed` (declared control) |
+
+Full hashes: `target/benchmarks/task004/{b-old-driver,c-new-driver}/SHA256SUMS`.
+Logs: `target/benchmarks/task004/<milestone>/*.log`. Records (all VALID, exit 0):
+
+| Run | Record | SHA-256 prefix |
+|---|---|---|
+| A Gateway | `gateway/overhead/20261110T144132Z-d4ea94988.json` | `b579114b8ff054c4` |
+| A Gateway `--profile` | `gateway/overhead/20261110T144306Z-d4ea94988.json` | `2d810cb638b13eef` |
+| A Verification | `verification/direct-verify/20261110T144441Z-d4ea94988.json` | `cc7734014ea7a67c` |
+| B Gateway | `gateway/overhead/20261110T162206Z-a31d121c4.json` | `1280ecab42ca7abf` |
+| B Gateway `--profile` | `gateway/overhead/20261110T162345Z-a31d121c4.json` | `b68b6322ed9dcb11` |
+| B Verification | `verification/direct-verify/20261110T162531Z-a31d121c4.json` | `25155648c69059cf` |
+| C Gateway | `gateway/overhead/20261110T163901Z-a5fed5839.json` | `76a60d8c65282153` |
+
+Commands are the seven in the protocol above, run from the repository root.
+
+### A → B: production changes, original fixture
+
+Unprofiled Gateway, per repetition (A | B). Envelope: B median against A's worst.
+
+| Step | client p50 ms | residual p50 µs | residual p99 µs | server CPU µs/req | driver CPU µs/req | throughput /s |
+|---|---|---|---|---|---|---|
+| 1 KiB meta | 1.264 1.368 1.227 \| 1.002 1.040 1.052 | 181.1 176.1 175.4 \| 172.9 174.2 172.5 | 743 772 592 \| 469 512 516 | 345.2 349.8 340.4 \| 334.2 347.4 337.4 | 64.7 63.3 61.7 \| 60.4 61.2 60.7 | 46288 40887 47839 \| 59376 57472 56541 |
+| 64 KiB meta | 2.619 2.676 2.528 \| 2.333 2.284 2.204 | 391.4 390.9 387.3 \| 355.3 360.2 357.6 | 1712 1710 1552 \| 1431 1420 1358 | 752.8 751.5 745.8 \| 721.8 743.5 724.8 | 187.9 186.7 182.3 \| **190.8** 192.5 189.1 | 22831 22547 23961 \| 26078 26575 27264 |
+| 64 KiB payload | 4.849 4.645 4.442 \| 4.873 4.600 4.653 | 2474 2806 1706 \| 2572 1759 2486 | 64815 57180 64979 \| 60326 59736 43549 | 1810.6 1617.3 1643.9 \| 1825.7 1677.2 1589.6 | 293.6 272.3 275.0 \| 303.7 288.6 283.3 | 8263 8667 8798 \| 8239 8608 9168 |
+
+- Every figure meets the envelope except 64 KiB metadata driver CPU per request
+  (B median 190.8 against A worst 187.9 µs, +1.5%). The driver source is identical
+  between A and B (`git diff d4ea94988 a31d121c4 -- crates/wyrd/wyrd-testing/src/bin`
+  is empty). It still decodes each 64 KiB answer into a `Value`; B served 16% more
+  requests on the same shared host. The matched profiled pair meets the envelope
+  (Bp median 193.4 against Ap worst 198.9 µs), and C's driver work removes the
+  cost (173.9 µs, below). No production change is credited or blamed for it.
+- Phase means: `parse` 79 → 71 µs (64 KiB meta), `translate` 92 → 64 µs (64 KiB
+  meta) and 134–147 → 102–110 µs (payload). In the 1 KiB case: −1 µs and −2 µs.
+- Errors 0, every arrival staged, nothing undrained, in all repetitions.
+- Profiled pair (Ap | Bp) meets the envelope on every figure.
+
+Verification, the SDK changes (A | B):
+
+| Step | client p50 ms | server CPU µs/verification | driver CPU µs/verification | throughput /s |
+|---|---|---|---|---|
+| c1 | 0.079 0.080 0.081 \| 0.078 0.082 0.080 | 106.1 121.6 109.1 \| 104.6 126.9 108.7 | 25.2 25.6 26.9 \| 25.9 27.3 26.8 | 10233 10095 9955 \| 10344 9663 9988 |
+| c64 | 0.708 0.711 0.706 \| 0.705 0.728 0.703 | 216.8 225.1 217.1 \| 215.9 224.6 218.1 | 73.0 72.9 73.0 \| 71.4 72.1 71.0 | 83453 82522 84222 \| 83256 80144 83247 |
+
+The envelope holds. The SDK work (shared body, per-request deadline, borrowed
+binding) is below this protocol's resolution at c1; the c64 driver CPU −2% is
+near resolution. Gateway's timed caller does not use the SDK, so no Gateway
+figure is credited to scenarios 1–3.
+
+### B → C: driver and stub changes, identical server
+
+| Step | client p50 ms | residual p50 µs | residual p99 µs | server CPU µs/req | driver CPU µs/req | throughput /s |
+|---|---|---|---|---|---|---|
+| 1 KiB meta | 1.002 1.040 1.052 \| 0.983 1.007 1.005 | 172.9 174.2 172.5 \| **175.5** 175.7 173.4 | 469 512 516 \| 467 482 464 | 334.2 347.4 337.4 \| 328.0 341.7 339.7 | 60.4 61.2 60.7 \| 50.9 51.7 51.2 | 59376 57472 56541 \| 60935 59314 59850 |
+| 64 KiB meta | 2.333 2.284 2.204 \| 2.179 2.168 2.259 | 355.3 360.2 357.6 \| **362.5** 361.5 367.6 | 1431 1420 1358 \| 1300 1296 1317 | 721.8 743.5 724.8 \| 729.5 726.5 757.2 | 190.8 192.5 189.1 \| 173.9 171.8 176.5 | 26078 26575 27264 \| 27818 28040 27003 |
+| 64 KiB payload | 4.873 4.600 4.653 \| 4.656 4.440 4.532 | 2572 1759 2486 \| **2826** 2808 2873 | 60326 59736 43549 \| 56787 56263 55411 | 1825.7 1677.2 1589.6 \| 1751.0 1589.5 1604.9 | 303.7 288.6 283.3 \| 264.5 248.4 254.9 | 8239 8608 9168 \| 8537 9494 9274 |
+
+- Driver CPU per request drops 16% / 9% / 11%. Client p50 and throughput improve
+  in every case. These are fixture gains, not production gains.
+- **Residual p50 misses the envelope in all three cases** (+0.7%, +0.6%, +9.9%
+  against B's worst). The server executable is byte-identical, so no server
+  code moved. Residual means are unchanged (182.2–185.4 against 182.9–185.6 µs;
+  396–404 against 397–401 µs). Calls held inside the server rise (rate × mean
+  `server_elapsed`: 36.5 → 36.9, 36.7 → 37.0, 52.7 → 54.0), and `queue_delay`
+  p50 rises (32.8 → 33.4 µs, 52.2 → 53.5 µs, payload 0.80–1.93 → 2.24–2.28 ms).
+  The faster driver returns each client to the closed loop sooner, so each
+  server call shares the host with more concurrent work. The payload B
+  repetitions are bimodal (1.76 against 2.49–2.57 ms); C is not. This is a
+  shared-host effect of the fixture change. It cannot be fixed inside C,
+  whose server must stay identical to B, and it is retained here rather than
+  explained away.
+
+### Server allocation per call (profiled A and B)
+
+Source: `heap-<step>.pb.gz` under `20261110T144306Z/profiles/` (A) and
+`20261110T162345Z/profiles/` (B). Sample types `alloc_objects`/count,
+`alloc_space`/bytes, `inuse_objects`/count, `inuse_space`/bytes. Cumulative
+captures are differenced by stack identity (function names, else address)
+from the previous step. Every per-stack allocation delta is non-negative.
+Calls come from the step's reconciled `gateway.buffered` count, warmup plus three
+repetitions, in the last window's cumulative timing snapshot. These are A:
+1,006,371 / 443,997 / 154,018 and B: 1,078,644 / 476,463 / 164,796.
+
+| Step | A bytes/call | B bytes/call | A objects/call | B objects/call |
+|---|---|---|---|---|
+| 1 KiB meta c64 | 193.9 KiB | 193.4 KiB | 1117 | 1086 |
+| 64 KiB meta c64 | 646.7 KiB | 584.3 KiB | 1155 | 1081 |
+| 64 KiB payload c64 | 2065.7 KiB | 2037.8 KiB | 1591 | 1596 |
+
+- The 1 KiB figure includes startup and pre-step work, because its capture has no
+  earlier one. All figures include background and between-step work and are
+  statistical samples.
+- `inuse_*` are held memory, not allocation: B ends the steps at 279 / 446 /
+  1356 MB.
+- RSS peaks are in the records and are not allocation totals.
+- **64 KiB metadata, −62 KiB/call.** By the innermost non-allocator frame:
+  - Removed: the anonymous async-fn frame (65.4 → 1.0 KiB) and `visit_str`
+    (64.3 → 0.3 KiB). They match the ingress owned tree and the response
+    `RawValue` copy; the frames alone do not prove which is which.
+  - Added: `JsonAnswer::validated` (64.0 KiB), where `into_boxed_str` shrank the
+    reader's buffer into a fresh allocation.
+  - Net: one payload-sized copy removed per call. Smaller owners: borrowed views
+    replace `SeqRefDeserializer`/`MapRefDeserializer` visits.
+- **Payload, −27.9 KiB/call.** The same two copies are removed and the same
+  `validated` copy is added. Capture still needs the request tree, so a
+  `deserialize` frame decodes it (64.0 KiB). The net change is in Arrow and
+  Parquet capture encoding (`extend_from_dictionary` −22.1 KiB), which is
+  background capture work, not request ownership. It is not credited to this
+  task, and attribution is unresolved.
+- **1 KiB, −0.5 KiB/call:** below sampling resolution. Objects −31/call.
+- **Post-B finding, `3ae65fe4a`:** `JsonAnswer` now keeps the validated
+  `String`, so the 64 KiB `validated` copy is gone. The kept-capacity assertion
+  proves it. It postdates B and C, and no authorized run measured it.
+
+### Investigation objectives (c64 p50, C record medians)
+
+| Case | Client < 1 ms | Gateway-added < 500 µs |
+|---|---|---|
+| 1 KiB metadata | missed: 1.005 ms (one repetition 0.983) | met: 175 µs |
+| 64 KiB metadata | missed: 2.179 ms | met: 362 µs |
+| 64 KiB payload | missed: 4.532 ms | missed: 2.826 ms |
+
+The payload tail stays with `admit` (Scribe capture-slot wait), outside this
+task's scope.
+
+### Limits
+
+- Batch creation keeps the owned path for its JCS digest. Multipart media and
+  translated requests decode at ingress, as before.
+- `trace::headers()`/`benchmark_headers` still copy each window's labels; the
+  labels are dynamic per window.
+- `03c0b1d99` adds direct `bytes` and `http` edges to skald-providers. Both were
+  already locked workspace dependencies through `reqwest`, so no package or
+  feature was added. `check:deps` passes.
+- Individual SDK speedups are below resolution, and so are the 1 KiB heap and
+  phase changes. They are reported as unresolved, not claimed.
+- No median hardware limit is inferred from throughput, and A → C is not
+  credited to production.
+- Missing samply on a run would have been nonfatal; both profiled runs captured
+  CPU and heap evidence. CPU samples are not attributed to symbols.
+
+### Non-goals
+
+- No public SDK, wire or raw-API change.
+- No new durable contract, owner, parser, dependency or feature, and no
+  generated schema.
+- No change to retry, admission, security, capture or redaction policy.
+- No unsafe `RawValue` construction, and no weakened decoded-size, bound,
+  numeric, nesting, duplicate or escape rule.
+- No historical baseline rebuilt or rerun, and no profiler installed.
+- No benchmark repeated.
+- Files outside the task's owners: only callers updated in the same commits
+  (`pg_invocation_tests.rs` and the `wyrd-testing` Bifrost verification runtime).

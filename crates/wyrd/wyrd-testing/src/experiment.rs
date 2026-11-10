@@ -415,7 +415,34 @@ pub struct Metric {
     pub derive: Option<Derive>,
 }
 
+/// The id prefix of a diagnostic reading: `diagnostic.<observation>.<stat>`,
+/// one [`DIAGNOSTIC_STATS`] reading of one declared observation, such as one
+/// Gateway phase. No criterion judges one; the report shows each per
+/// repetition under [`Record::render`]'s `diagnostics` detail.
+pub const DIAGNOSTIC: &str = "diagnostic.";
+
+/// The readings of one diagnostic observation, by stat id and unit.
+pub const DIAGNOSTIC_STATS: [(&str, &str); 5] = [
+    ("count", "observations"),
+    ("p50_ms", "ms"),
+    ("p95_ms", "ms"),
+    ("p99_ms", "ms"),
+    ("mean_ms", "ms"),
+];
+
 impl Metric {
+    /// The [`DIAGNOSTIC_STATS`] readings of diagnostic `observation` over
+    /// `boundary`, which names its interval, population, and whether it
+    /// overlaps another observation.
+    #[must_use]
+    pub fn diagnostic(observation: &str, boundary: &str) -> Vec<Self> {
+        DIAGNOSTIC_STATS
+            .map(|(stat, unit)| {
+                Self::raw(&format!("{DIAGNOSTIC}{observation}.{stat}"), unit, boundary)
+            })
+            .to_vec()
+    }
+
     /// A raw metric the workload reads.
     #[must_use]
     pub fn raw(id: &str, unit: &str, boundary: &str) -> Self {
@@ -1390,6 +1417,61 @@ pub struct TimingEvidence {
 }
 
 impl Repetition {
+    /// Sets the [`DIAGNOSTIC_STATS`] readings of diagnostic `observation`
+    /// from its interval `distribution` of nanoseconds: its count, nearest-rank
+    /// bucket bounds, and the bounds of its mean. A refused distribution
+    /// leaves every reading missing with its reason; [`Self::invalid`] then
+    /// records it when the observation is `required`, since its absence
+    /// means the server did not record what it declares.
+    pub fn diagnose(
+        &mut self,
+        observation: &str,
+        distribution: Result<wyrd_benchmark::Distribution, String>,
+        required: bool,
+    ) {
+        let id = |stat: &str| format!("{DIAGNOSTIC}{observation}.{stat}");
+        let distribution = match distribution {
+            Ok(distribution) => distribution,
+            Err(reason) => {
+                for (stat, _) in DIAGNOSTIC_STATS {
+                    self.set(&id(stat), Reading::missing(reason.clone()));
+                }
+                if required {
+                    self.invalid
+                        .push(format!("diagnostic `{observation}` is missing: {reason}"));
+                }
+                return;
+            }
+        };
+        let per = crate::capacity::NANOS_PER_MS;
+        let samples = distribution.len();
+        self.set(&id("count"), Reading::count(samples));
+        for (stat, q) in [("p50_ms", 0.5), ("p95_ms", 0.95), ("p99_ms", 0.99)] {
+            self.set(&id(stat), Reading::quantile(&distribution, q, per));
+        }
+        let (low, high) = distribution.total_bounds();
+        self.set(
+            &id("mean_ms"),
+            if samples == 0 {
+                Reading::missing("no observation")
+            } else {
+                Reading::bounded(low as f64, high as f64, per * samples as f64)
+                    .with_samples(samples)
+            },
+        );
+    }
+
+    /// Sets every [`DIAGNOSTIC_STATS`] reading of `observation` missing as
+    /// inapplicable to this step, for `reason`.
+    pub fn inapplicable(&mut self, observation: &str, reason: &str) {
+        for (stat, _) in DIAGNOSTIC_STATS {
+            self.set(
+                &format!("{DIAGNOSTIC}{observation}.{stat}"),
+                Reading::missing(format!("inapplicable: {reason}")),
+            );
+        }
+    }
+
     /// Sets raw metric `id`.
     pub fn set(&mut self, id: &str, reading: Reading) {
         self.metrics.insert(id.to_owned(), reading);
@@ -2767,7 +2849,11 @@ impl Record {
                 step.status,
                 step.repetitions.len()
             );
-            for (id, summary) in &step.summary {
+            for (id, summary) in step
+                .summary
+                .iter()
+                .filter(|(id, _)| !id.starts_with(DIAGNOSTIC))
+            {
                 let range = summary
                     .min
                     .zip(summary.max)
@@ -2799,6 +2885,7 @@ impl Record {
                     let _ = writeln!(out, "  - repetition {} observed: {observation}", index + 1);
                 }
             }
+            self.render_diagnostics(&mut out, step);
         }
         if !self.reasons.is_empty() {
             out.push_str("\n## Reasons\n\n");
@@ -2836,6 +2923,54 @@ impl Record {
             self.exit_code()
         );
         out
+    }
+
+    /// Writes `step`'s diagnostic readings to `out`: each observation with
+    /// its declared boundary, then its readings in every repetition, so no
+    /// median conceals a slow repetition. Nothing for a step without any,
+    /// such as one from a record that predates them.
+    fn render_diagnostics(&self, out: &mut String, step: &StepRecord) {
+        let mut observations: Vec<&str> = step
+            .repetitions
+            .iter()
+            .flat_map(|repetition| repetition.metrics.keys())
+            .filter_map(|id| id.strip_prefix(DIAGNOSTIC)?.rsplit_once('.'))
+            .map(|(observation, _)| observation)
+            .collect();
+        observations.sort_unstable();
+        observations.dedup();
+        if observations.is_empty() {
+            return;
+        }
+        out.push_str(
+            "  - diagnostics (wall time; nearest-rank bucket bounds; rows overlap and never add or subtract):\n",
+        );
+        for observation in observations {
+            let id = |stat: &str| format!("{DIAGNOSTIC}{observation}.{stat}");
+            let boundary = self
+                .criteria
+                .metrics
+                .iter()
+                .find(|metric| metric.id == id("count"))
+                .map_or("undeclared", |metric| metric.boundary.as_str());
+            let _ = writeln!(out, "    - {observation}: {boundary}");
+            for (index, repetition) in step.repetitions.iter().enumerate() {
+                let count = repetition.reading(&id("count"));
+                let cells = if count.is_present() {
+                    DIAGNOSTIC_STATS
+                        .iter()
+                        .map(|(stat, unit)| {
+                            let label = stat.strip_suffix("_ms").unwrap_or(stat);
+                            format!("{label} {}", repetition.reading(&id(stat)).cell(unit))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                } else {
+                    count.cell("")
+                };
+                let _ = writeln!(out, "      - repetition {}: {cells}", index + 1);
+            }
+        }
     }
 
     /// The first eight common cells of a step row.

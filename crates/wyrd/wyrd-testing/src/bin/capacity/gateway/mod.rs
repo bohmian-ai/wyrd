@@ -453,6 +453,93 @@ fn overhead_metrics() -> Vec<Metric> {
         "server: handler entry until the answer handoff (`gateway.buffered`, or a stream's head at `gateway.stream.head`), successful calls; nearest-rank bucket bounds of the server's timing histograms",
     ));
     metrics.extend(efficiency_metrics());
+    metrics.extend(diagnostic_metrics());
+    metrics
+}
+
+/// The diagnostic readings every L1 repetition reports, none judged: each
+/// Gateway phase, the queue delay, the answer handoff's components, and
+/// the Scribe outbox's batch writes, each over its own population.
+fn diagnostic_metrics() -> Vec<Metric> {
+    const WINDOW: &str = "from the window open until its calls, captures, and outbox writes drained, so late calls count";
+    let phase = |name: &str, what: &str| {
+        Metric::diagnostic(
+            &format!("phase.{name}"),
+            &format!(
+                "server: `wyrd_gateway_phase_duration_seconds{{phase={name}}}`, {what}; every call {WINDOW}"
+            ),
+        )
+    };
+    let mut metrics = [
+        (
+            "authenticate",
+            "credential extraction and verification or API-key exchange",
+        ),
+        (
+            "parse",
+            "body read and decode, validation, and header parsing",
+        ),
+        ("snapshot", "the tenant gateway snapshot load"),
+        (
+            "authorize",
+            "the model's invoke decision and Card attribution",
+        ),
+        (
+            "route",
+            "candidate planning, fallback authorization, and representability",
+        ),
+        (
+            "admit",
+            "the admission transaction, including the capture-slot reservation",
+        ),
+        (
+            "credential",
+            "provider credential resolution, summed across attempts",
+        ),
+        (
+            "translate",
+            "adapter work outside provider exchanges, summed across attempts",
+        ),
+        (
+            "account",
+            "the settlement statement, before the answer handoff",
+        ),
+        (
+            "relay",
+            "relay decoding, translation, and framing of a stream's chunks; streams only",
+        ),
+        (
+            "capture",
+            "capture projection and staging after the answer handoff; never response latency",
+        ),
+    ]
+    .into_iter()
+    .flat_map(|(name, what)| phase(name, what))
+    .collect::<Vec<_>>();
+    for (observation, boundary) in [
+        (
+            "queue_delay",
+            format!("server: `wyrd_gateway_queue_delay_seconds`, receipt in `govern` until the call's execution task started; it includes admission, so it overlaps `phase.admit` and is not exclusive scheduler delay; every call {WINDOW}"),
+        ),
+        (
+            "server_elapsed",
+            "server: handler entry until the answer handoff (`gateway.buffered`, or a stream's head at `gateway.stream.head`), succeeded calls of the cohort".to_owned(),
+        ),
+        (
+            "provider_excluded",
+            "server: the union of a call's own provider waits until the answer handoff, excluded from its residual; succeeded calls of the cohort".to_owned(),
+        ),
+        (
+            "residual",
+            "server: per call, `server_elapsed` less `provider_excluded`, computed before aggregation; succeeded calls of the cohort".to_owned(),
+        ),
+        (
+            "outbox_write.scribe",
+            format!("server: `outbox_write_seconds{{outbox=scribe}}`, one observation per Scribe outbox batch write from dispatch to settlement, {WINDOW}; a batch write, not a request phase or response latency"),
+        ),
+    ] {
+        metrics.extend(Metric::diagnostic(observation, &boundary));
+    }
     metrics
 }
 

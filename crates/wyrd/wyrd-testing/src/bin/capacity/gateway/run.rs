@@ -25,6 +25,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
+use wyrd_benchmark::Distribution;
 use wyrd_client::transport::trace::with_benchmark_labels;
 use wyrd_testing::capacity::{Expected, NANOS_PER_MS, Population, Usage, Window, release_binary};
 use wyrd_testing::experiment::{ExperimentError, Phase, Reading, Repetition, Step, Workload};
@@ -59,6 +60,31 @@ pub const STREAM_END: &str = "gateway.stream.end";
 
 /// The outcome of every judged gateway timing.
 pub const SUCCEEDED: &str = "succeeded";
+
+/// The server's Gateway phase histogram.
+pub const PHASE_SECONDS: &str = "wyrd_gateway_phase_duration_seconds";
+
+/// The server's Gateway receipt-to-task-start histogram.
+pub const QUEUE_DELAY_SECONDS: &str = "wyrd_gateway_queue_delay_seconds";
+
+/// The server's outbox batch write histogram.
+pub const OUTBOX_WRITE_SECONDS: &str = "outbox_write_seconds";
+
+/// Every Gateway call phase in request order, each recorded once per call
+/// by a successful call without retries; `relay` only by a stream.
+pub const PHASES: [&str; 11] = [
+    "authenticate",
+    "parse",
+    "snapshot",
+    "authorize",
+    "route",
+    "admit",
+    "credential",
+    "translate",
+    "account",
+    "relay",
+    "capture",
+];
 
 /// The server timings each call records, its answer handoff first.
 #[must_use]
@@ -408,6 +434,7 @@ impl Observed {
                 Reading::exact(self.durable.bytes)
             },
         );
+        self.diagnose(&mut repetition);
         repetition.set("drain_s", Reading::exact(self.drain.seconds));
         repetition.set("undrained", Reading::exact(self.drain.remaining));
         if !samples.errors.is_empty() {
@@ -432,6 +459,50 @@ impl Observed {
             ));
         }
         repetition
+    }
+}
+
+impl Observed {
+    /// Sets the repetition's diagnostic readings from the window's server
+    /// histograms: each Gateway phase, the queue delay, the answer handoff's
+    /// elapsed, provider, and residual distributions, and the Scribe
+    /// outbox's batch writes. Each keeps its own population; an absent
+    /// required one is invalid evidence, never zero. In a window without
+    /// errors every call succeeded once, so each phase a call records once
+    /// must have one observation per answered call, late ones included.
+    fn diagnose(&self, repetition: &mut Repetition) {
+        let population = &self.population;
+        let answered = self.samples.completion_us.len() as u64;
+        let reconcile = self.samples.error_count() == 0;
+        for phase in PHASES {
+            let observation = format!("phase.{phase}");
+            if phase == "relay" && !self.stream {
+                repetition.inapplicable(&observation, "a buffered call relays no stream");
+                continue;
+            }
+            let distribution = population.histogram(PHASE_SECONDS, &[("phase", phase)]);
+            if let Ok(recorded) = distribution.as_ref().map(Distribution::len)
+                && reconcile
+                && recorded != answered
+            {
+                repetition.invalid.push(format!(
+                    "diagnostic `{observation}` recorded {recorded} observations for {answered} answered calls"
+                ));
+            }
+            repetition.diagnose(&observation, distribution, true);
+        }
+        let queue = population.histogram(QUEUE_DELAY_SECONDS, &[]);
+        repetition.diagnose("queue_delay", queue, true);
+        let answer = boundaries(self.stream)[0];
+        let missing = || format!("no `{answer}` timing observation has outcome `{SUCCEEDED}`");
+        let elapsed = population.elapsed(answer, SUCCEEDED).ok_or_else(missing);
+        repetition.diagnose("server_elapsed", elapsed, true);
+        let provider = population.excluded(answer, SUCCEEDED).ok_or_else(missing);
+        repetition.diagnose("provider_excluded", provider, true);
+        let residual = population.residuals(answer, SUCCEEDED);
+        repetition.diagnose("residual", residual, true);
+        let writes = population.histogram(OUTBOX_WRITE_SECONDS, &[("outbox", "scribe")]);
+        repetition.diagnose("outbox_write.scribe", writes, true);
     }
 }
 
@@ -789,11 +860,89 @@ async fn upstreams() -> std::io::Result<[PacedUpstream; 2]> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use wyrd_benchmark::{Distribution, IntervalSeries};
+    use wyrd_benchmark::{
+        BenchmarkSnapshot, Distribution, HistogramUnit, IntervalSeries, Method, MetricSnapshot,
+        MetricValue,
+    };
     use wyrd_testing::capacity::{Population, UNLABELLED, Usage};
     use wyrd_testing::experiment::Reading;
 
-    use super::{BUFFERED, Drain, Integrity, Observed, STREAM_END, STREAM_HEAD, Samples};
+    use super::{
+        BUFFERED, Drain, Integrity, OUTBOX_WRITE_SECONDS, Observed, PHASE_SECONDS, PHASES,
+        QUEUE_DELAY_SECONDS, STREAM_END, STREAM_HEAD, Samples,
+    };
+
+    /// A cumulative `_seconds` histogram series `name` with `labels` holding
+    /// `samples` nanoseconds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a sample is outside the duration range.
+    fn histogram(name: &str, labels: &[(&str, &str)], samples: &[u64]) -> MetricSnapshot {
+        MetricSnapshot {
+            name: name.to_owned(),
+            labels: labels
+                .iter()
+                .map(|(label, value)| ((*label).to_owned(), (*value).to_owned()))
+                .collect(),
+            rejected: 0,
+            value: MetricValue::Histogram {
+                unit: HistogramUnit::Nanoseconds,
+                count: samples.len() as u64,
+                buckets: Distribution::of_durations(samples)
+                    .expect("in-range samples")
+                    .buckets(),
+            },
+        }
+    }
+
+    /// The Gateway diagnostic histograms of `calls` calls, phase `i` taking
+    /// `(i + 1) × 10 µs + offset_ns` each, with `writes` Scribe batch writes.
+    fn diagnostics(
+        calls: usize,
+        offset_ns: u64,
+        writes: usize,
+        stream: bool,
+    ) -> Vec<MetricSnapshot> {
+        let mut metrics: Vec<MetricSnapshot> = PHASES
+            .iter()
+            .zip(1_u64..)
+            .filter(|(phase, _)| stream || **phase != "relay")
+            .map(|(phase, step)| {
+                histogram(
+                    PHASE_SECONDS,
+                    &[("operation", "chat"), ("phase", phase)],
+                    &vec![step * 10_000 + offset_ns; calls],
+                )
+            })
+            .collect();
+        metrics.push(histogram(
+            QUEUE_DELAY_SECONDS,
+            &[("operation", "chat")],
+            &vec![70_000 + offset_ns; calls],
+        ));
+        metrics.push(histogram(
+            OUTBOX_WRITE_SECONDS,
+            &[("outbox", "scribe")],
+            &vec![2_000_000 + offset_ns; writes],
+        ));
+        metrics
+    }
+
+    /// A cumulative snapshot of one process holding `metrics`.
+    fn snapshot(metrics: Vec<MetricSnapshot>) -> BenchmarkSnapshot {
+        BenchmarkSnapshot {
+            process: "server".to_owned(),
+            pid: 1,
+            taken_ns: metrics.len() as u64,
+            method: Method::current(),
+            series: Vec::new(),
+            scans: Vec::new(),
+            metrics,
+            dropped: 0,
+            invalid_labels: 0,
+        }
+    }
 
     /// The successful server timings at `boundary` of `calls`, each
     /// `(elapsed_ns, excluded_ns)` of provider wait.
@@ -870,6 +1019,10 @@ mod tests {
             },
             population: Population {
                 series,
+                metrics: snapshot(diagnostics(calls, 0, 3, stream))
+                    .since(&snapshot(Vec::new()))
+                    .expect("one process")
+                    .metrics,
                 ..Population::default()
             },
             integrity: Integrity {
@@ -972,14 +1125,23 @@ mod tests {
         let mut unwritten = observed(false, 1_000, 2_000_000, 5, 400_000);
         unwritten.integrity.written = 0.0;
         assert_eq!(unwritten.repetition().invalid.len(), 1);
+        let empty = observed(false, 0, 0, 0, 0).repetition().invalid;
+        let (diagnostics, judged): (Vec<&String>, Vec<&String>) = empty
+            .iter()
+            .partition(|reason| reason.starts_with("diagnostic `"));
         assert_eq!(
-            observed(false, 0, 0, 0, 0).repetition().invalid,
+            judged,
             [
                 "no `gateway.buffered` timing observation has outcome `succeeded`",
                 "no `gateway.buffered` timing observation has outcome `succeeded`",
                 "no call was sent in the window",
                 "no capture was staged in the window",
             ]
+        );
+        assert_eq!(
+            diagnostics.len(),
+            3,
+            "the answer handoff's components have no cohort, while registered empty histograms count zero: {diagnostics:?}"
         );
         let mut missing = observed(false, 1_000, 2_000_000, 5, 400_000);
         missing.population.series.clear();
@@ -990,5 +1152,143 @@ mod tests {
         let missing = missing.repetition();
         assert!(!missing.reading("overhead_p99_ms").is_present());
         assert!(missing.invalid[0].contains("recorded for 1000 requests"));
+    }
+
+    /// Each Gateway diagnostic keeps its own measured-to-drained population:
+    /// warmup observations before the window stay out, each phase keeps its
+    /// own distribution and mean, the batch writes keep their batch count,
+    /// and a buffered call's relay is inapplicable. An absent, refused, or
+    /// unreconciled required observation is invalid evidence, never zero;
+    /// with errors in the window, phase counts are not reconciled.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a diagnostic reading or its invalidity is wrong.
+    #[test]
+    fn phase_diagnostics_preserve_window_populations_and_missing_evidence() {
+        let warm = snapshot(diagnostics(50, 900_000, 7, false));
+        let mut later = diagnostics(50, 900_000, 7, false);
+        for (total, measured) in later.iter_mut().zip(diagnostics(1_000, 0, 3, false)) {
+            let (
+                MetricValue::Histogram { count, buckets, .. },
+                MetricValue::Histogram {
+                    count: added,
+                    buckets: more,
+                    ..
+                },
+            ) = (&mut total.value, measured.value)
+            else {
+                unreachable!("every diagnostic is a histogram");
+            };
+            *count += added;
+            buckets.0.extend(more.0);
+            buckets.0.sort_unstable();
+        }
+        let mut window = observed(false, 1_000, 2_000_000, 0, 0);
+        window.population.metrics = snapshot(later).since(&warm).expect("one process").metrics;
+        let repetition = window.repetition();
+        assert!(repetition.invalid.is_empty(), "{:?}", repetition.invalid);
+        let reading = |id: &str| repetition.reading(&format!("diagnostic.{id}"));
+        for (phase, step) in PHASES.iter().zip(1_u64..).filter(|(p, _)| **p != "relay") {
+            assert_eq!(
+                exact(&reading(&format!("phase.{phase}.count"))),
+                Some(1_000.0),
+                "{phase} keeps only the window's calls"
+            );
+            let ms = (step * 10_000) as f64 / 1e6;
+            for stat in ["p50_ms", "p99_ms", "mean_ms"] {
+                let value = reading(&format!("phase.{phase}.{stat}"));
+                assert!(holds(&value, ms), "{phase} {stat}: {value:?}");
+            }
+        }
+        let relay = reading("phase.relay.count");
+        assert!(
+            relay
+                .reason
+                .is_some_and(|reason| reason.starts_with("inapplicable"))
+        );
+        assert_eq!(exact(&reading("outbox_write.scribe.count")), Some(3.0));
+        assert!(holds(&reading("outbox_write.scribe.p50_ms"), 2.0));
+        assert!(holds(&reading("queue_delay.p95_ms"), 0.07));
+        assert_eq!(exact(&reading("server_elapsed.count")), Some(1_000.0));
+        assert!(holds(&reading("provider_excluded.p50_ms"), 2.0));
+        assert!(holds(&reading("residual.p50_ms"), 0.1));
+
+        let mut absent = window.clone();
+        absent.population.metrics.retain(|metric| {
+            metric
+                .labels
+                .get("phase")
+                .is_none_or(|phase| phase != "capture")
+        });
+        let absent = absent.repetition();
+        assert!(
+            !absent
+                .reading("diagnostic.phase.capture.count")
+                .is_present()
+        );
+        assert!(
+            absent
+                .invalid
+                .iter()
+                .any(|reason| reason.starts_with("diagnostic `phase.capture` is missing")),
+            "{:?}",
+            absent.invalid
+        );
+
+        let mut refused = window.clone();
+        for metric in &mut refused.population.metrics {
+            if metric
+                .labels
+                .get("phase")
+                .is_some_and(|phase| phase == "admit")
+            {
+                metric.rejected = 2;
+            }
+        }
+        let refused = refused.repetition();
+        assert!(
+            refused
+                .invalid
+                .iter()
+                .any(|reason| reason.contains("refused 2 unrepresentable")),
+            "{:?}",
+            refused.invalid
+        );
+
+        let mut short = observed(false, 1_000, 2_000_000, 0, 0);
+        short.population.metrics = snapshot(diagnostics(999, 0, 3, false))
+            .since(&snapshot(Vec::new()))
+            .expect("one process")
+            .metrics;
+        let unreconciled = short.clone().repetition();
+        assert_eq!(
+            unreconciled
+                .invalid
+                .iter()
+                .filter(
+                    |reason| reason.contains("recorded 999 observations for 1000 answered calls")
+                )
+                .count(),
+            PHASES.len() - 1,
+            "{:?}",
+            unreconciled.invalid
+        );
+        short.samples.errors.insert("timed_out".to_owned(), 1);
+        assert!(
+            short
+                .repetition()
+                .invalid
+                .iter()
+                .all(|reason| !reason.contains("answered calls")),
+            "a window with errors does not assume once-per-call phases"
+        );
+
+        let stream = observed(true, 1_000, 2_000_000, 0, 0).repetition();
+        assert!(stream.invalid.is_empty(), "{:?}", stream.invalid);
+        assert_eq!(
+            exact(&stream.reading("diagnostic.phase.relay.count")),
+            Some(1_000.0)
+        );
     }
 }

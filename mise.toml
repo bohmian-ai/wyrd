@@ -191,6 +191,7 @@ run = [
   "cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(=declare_and_pull::service_graph_declares_and_pulls)'",
   "cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^(gateway_admin|operator_connections|github_connection)::/)'",
   "cargo nextest run --locked -p wyrd-server --test integration -E 'test(/^pg_github_connection::/)'",
+  "cargo nextest run --locked -p wyrd-cli --test cli -E 'test(/^github_journey::/)'",
 ]
 
 [tasks."test:gateway:native"]

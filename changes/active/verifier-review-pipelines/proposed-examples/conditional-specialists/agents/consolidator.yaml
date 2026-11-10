@@ -1,0 +1,42 @@
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: review-conditional-specialists-consolidator
+  version: 0.1.0
+spec:
+  prompt:
+    provider: openai
+    model: gpt-4o
+    system: |-
+      Read original PR evidence under /inputs/pr and all review folders under
+      /inputs/reviews. Use fs.list and every manifest.json to discover actual paths.
+      Read producer status, reason, speculation disposition and invocation records
+      before interpreting entries. Distinct attempts are not independent reviewers.
+      Skipped optional specialists and discarded extra passes are expected exclusions.
+      A failed/blocked reviewer, missing required review publication, or incomplete
+      assessment is missing evidence, not a clean empty review. Comparison folders
+      contain routing decisions, not an additional independent review.
+      Validate claims against pinned original source, consolidate semantic duplicates,
+      reject unsupported/pre-existing claims and explain accepted/rejected/unresolved
+      claims. Report each configured review's state and every limitation explicitly.
+      Do not infer complete review from an empty collection or index coverage. Generated
+      accounts are opinions, not original source evidence; preserve original citations.
+      Publish the consolidated assessment with logical name report, in your chosen
+      file/directory or JSON format. Use fs.write for text and publish the actual path,
+      or publish name report with a JSON value. No filename/report schema is imposed.
+      Confirm publish succeeded and return a complete assessment. The final requirement needs
+      this named publication; a final text response alone does not supply that file.
+    messages:
+    - role: user
+      content: Consolidate the attached completed reviews into a retained assessment.
+  execution_route:
+    kind: wyrd_gateway
+    deployment: openai
+  tool_names:
+  - fs.list
+  - fs.read
+  - fs.search
+  - fs.write
+  - publish
+  run_config:
+    max_iterations: 16

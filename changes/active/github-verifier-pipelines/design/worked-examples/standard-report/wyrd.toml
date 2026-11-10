@@ -1,0 +1,3 @@
+[repository.verified_by]
+verifier = ["./verifier.yaml"]
+runs_on = { kind = "pull_request" }

@@ -1,0 +1,12 @@
+636c80ff029a65cfa86c41658cd44f30854db4404adc3100f41bfafebe963218  changes/active/verifier-review-pipelines/spec.md
+ed5779d5a3a84ea26f2c060b5b009d7c4353b8a0de7947b4f977581e2d9e4551  changes/active/verifier-review-pipelines/public-contracts.md
+08c4bf050e2f73cf5bb4eabcd91d412c3e73cf727b1a415165d504e9cb804d9f  changes/active/verifier-review-pipelines/execution-state-and-durability.md
+a02ceaf9c6f40f07e5995925161c64dc38fb7563471e993d3212810533b773e9  changes/active/verifier-review-pipelines/output-publication.md
+606b49eade3a0067006dc7cc3e20bcb3e0b705a35a7965f4b421f3ed15b263a6  changes/active/verifier-review-pipelines/tasks/TASK-003-generic-orchestration.md
+9ae0097fb6460be419c9efd5d051ad31681c7ca4a65b1872ffa38bd4422d85a7  changes/active/verifier-review-pipelines/tasks/verification.md
+ea2fcd9126f81981bbd7fcbf798a14691fa3ed3609225dafb1fa6de285984548  changes/active/verifier-review-pipelines/review/task-003-384a0def7/verdict.md
+8a9904f43336d44c0051a2a8d798612873cb78b8a29c426a9e76626f15c6d5fe  changes/active/verifier-review-pipelines/review/task-003-384a0def7/findings-validation.md
+51474fba43f57ddef8d25f9b57595200a499e671c696e320be71264773a70502  changes/active/verifier-review-pipelines/review/task-003-r1-f74a57634/verdict.md
+2d9df85efea43656a9ac6fc4f77050aa347ff7decba0a844638d8f443345a24f  changes/active/verifier-review-pipelines/review/task-003-r1-f74a57634/findings-validation.md
+2f701645b8d818f6448ea05917d151c5908608ccb256a4f8c942f24d6d8e4471  changes/active/verifier-review-pipelines/review/task-003-r1-f74a57634/followup-review.md
+44a21b83b946f3dc138ebb3dec1086495ae00eac8daf6fa1717b296107cddfb1  changes/active/verifier-review-pipelines/review/task-003-r1-f74a57634/TASK-003-R2-python-provider-hold-ownership.md

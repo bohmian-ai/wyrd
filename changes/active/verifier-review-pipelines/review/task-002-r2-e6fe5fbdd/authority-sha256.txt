@@ -1,0 +1,8 @@
+5af4975a59d8aaba3702e5c2fde40d34b074760456a293cf61f30cd907a5e683  changes/active/verifier-review-pipelines/spec.md
+ddeae71dba89e04fd418b7bf9fb189161ac20b16a0e78f416a7f62386059b68c  changes/active/verifier-review-pipelines/tasks/TASK-002-agent-tooling.md
+a02ceaf9c6f40f07e5995925161c64dc38fb7563471e993d3212810533b773e9  changes/active/verifier-review-pipelines/output-publication.md
+08c4bf050e2f73cf5bb4eabcd91d412c3e73cf727b1a415165d504e9cb804d9f  changes/active/verifier-review-pipelines/execution-state-and-durability.md
+9b12cec359fde7bb97158b264176e26dfc9b5d4998dc200e2a041db5d11c0c76  changes/active/verifier-review-pipelines/review/task-002-75c9bfa9e/TASK-002-R1-publication-integrity-and-proof.md
+5cf33aca8bf8156c5c08650de9b5311f7eb0496782dbdeb805b8b1298b9fdcf7  changes/active/verifier-review-pipelines/review/task-002-r1-28f07d99c/TASK-002-R2-lost-reply-proof-and-imports.md
+f40410b1ae0d0522683a6b2c40cb960003ac31232a797007f808f7e6a92e3993  .agents/skills/wyrd-task-review/SKILL.md
+4444c1609e672ca66f38aea272c4409637871fdc7a8f144dab7bfdd0e28e5780  .agents/skills/wyrd-implement/SKILL.md

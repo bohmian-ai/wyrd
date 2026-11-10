@@ -1,0 +1,74 @@
+# Proposed revision 16 contract; not runnable on today's engine.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: code-review-speculative-pass
+  version: 0.1.0
+spec:
+  steps:
+    - id: extract-pr
+      action:
+        kind: extract
+        extractor: pull_request
+
+    - id: review-a
+      action:
+        kind: agent
+        agent: ./agents/reviewer-a.yaml
+        workspace:
+          /inputs/pr: steps.extract-pr.publications.evidence
+
+    - id: review-b
+      action:
+        kind: agent
+        agent: ./agents/reviewer-b.yaml
+        workspace:
+          /inputs/pr: steps.extract-pr.publications.evidence
+
+    - id: agreement
+      action:
+        kind: agent
+        agent: ./agents/agreement.yaml
+        workspace:
+          /inputs/pr: steps.extract-pr.publications.evidence
+          /inputs/reviews/a: steps.review-a.publications
+          /inputs/reviews/b: steps.review-b.publications
+
+    # Start after either successful bootstrap; keep only on disagreement.
+    - id: additional-review
+      depends_on:
+        any_succeeded: [review-a, review-b]
+      when:
+        path: steps.agreement.output.agree
+        operator: equals
+        expected: false
+      speculative: true
+      action:
+        kind: agent
+        agent: ./agents/additional-reviewer.yaml
+        workspace:
+          /inputs/pr: steps.extract-pr.publications.evidence
+
+    - id: consolidate
+      action:
+        kind: agent
+        agent: ./agents/consolidator.yaml
+        workspace:
+          /inputs/pr: steps.extract-pr.publications.evidence
+          /inputs/reviews/a: steps.review-a.publications
+          /inputs/reviews/b: steps.review-b.publications
+          /inputs/reviews/agreement: steps.agreement.publications
+          /inputs/reviews/additional: steps.additional-review.publications
+
+  requirements:
+    - id: reviewed
+      statement: >-
+        The review completed with sufficient evidence and no substantiated
+        defects introduced by the pull request that require changes.
+      check:
+        kind: agent
+        agent: ./agents/final-judge.yaml
+        workspace:
+          /inputs/pr: steps.extract-pr.publications.evidence
+          /inputs/report: steps.consolidate.publications.report
+  decide: all

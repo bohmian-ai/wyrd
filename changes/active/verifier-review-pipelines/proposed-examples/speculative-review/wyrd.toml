@@ -1,0 +1,2 @@
+[[verification.pull_requests]]
+verifier = ["./verifier.yaml"]

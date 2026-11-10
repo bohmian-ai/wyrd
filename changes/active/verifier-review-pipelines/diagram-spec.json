@@ -1,0 +1,384 @@
+{
+  "title": "Three Verifier configurations for code review",
+  "status": "approved",
+  "spec": "SPEC-verifier-review-pipelines",
+  "revision": 18,
+  "canvas": {
+    "width": 1800,
+    "height": 2470
+  },
+  "nodes": [
+    {
+      "id": "admin",
+      "x": 50,
+      "y": 145,
+      "width": 500,
+      "height": 120,
+      "title": "Tenant administrator",
+      "lines": [
+        "Verify App; allow repositories and enable PR verification",
+        "Choose publishing/execution principals; constrain limits"
+      ]
+    },
+    {
+      "id": "team",
+      "x": 650,
+      "y": 145,
+      "width": 500,
+      "height": 120,
+      "title": "Team Verifier definitions",
+      "lines": [
+        "Publish independent exact versions through registry",
+        "Each application selects shared or local Verifiers"
+      ]
+    },
+    {
+      "id": "entry",
+      "x": 1250,
+      "y": 145,
+      "width": 500,
+      "height": 120,
+      "title": "PR webhook or manual request",
+      "lines": [
+        "Authenticate, authorize and persist accepted work",
+        "No client review scheduler or Service Card required"
+      ]
+    },
+    {
+      "id": "config",
+      "x": 350,
+      "y": 340,
+      "width": 1100,
+      "height": 125,
+      "title": "Trusted configuration and durable execution",
+      "lines": [
+        "Resolve target-tree root wyrd.toml; declare local Cards or resolve exact registered Verifiers",
+        "Pin repository binding, configuration, PR identity, authority, limits and retained evidence references",
+        "Each selected Verifier gets its own execution/check"
+      ]
+    },
+    {
+      "id": "extract",
+      "x": 350,
+      "y": 540,
+      "width": 1100,
+      "height": 130,
+      "title": "Extract pull_request using the public bohmian-code-review ReviewPipeline",
+      "lines": [
+        "Commit publications.evidence: pr.json, diff.patch, changes.json, changed/before and after, context.json",
+        "Reuse full library indexing/overlay/ranking/packing; extend its facade for complete pinned PR acquisition",
+        "Mount the same immutable directory at /inputs/pr for every reviewer; no injected Prompt inputs needed"
+      ]
+    },
+    {
+      "id": "sweeps",
+      "x": 50,
+      "y": 820,
+      "width": 500,
+      "height": 140,
+      "title": "1  Repeated sweeps",
+      "lines": [
+        "foreach: count 3",
+        "Same Agent, same PR mount, three private workspaces",
+        "Dispatch ready calls within existing server limits",
+        "Retain each invocation/attempt independently"
+      ]
+    },
+    {
+      "id": "conditional",
+      "x": 650,
+      "y": 820,
+      "width": 500,
+      "height": 140,
+      "title": "2  Conditional specialists",
+      "lines": [
+        "General reviewer and planning Agent can run together",
+        "Planner returns security_review / concurrency_review",
+        "Each specialist has its own Agent Prompt and tools",
+        "Conditions select work; no assignment-array indirection"
+      ]
+    },
+    {
+      "id": "bootstrap",
+      "x": 1250,
+      "y": 820,
+      "width": 500,
+      "height": 140,
+      "title": "3  Speculative review",
+      "lines": [
+        "Two independent bootstrap Agents run as capacity allows",
+        "Each reads the same pinned evidence and publishes work",
+        "Any bootstrap success makes the extra pass eligible",
+        "Comparison waits for both settled collections"
+      ]
+    },
+    {
+      "id": "sweeps_done",
+      "x": 50,
+      "y": 1080,
+      "width": 500,
+      "height": 140,
+      "title": "Collect three settled calls",
+      "lines": [
+        "Preserve ordered successful output array",
+        "Workspace collection also includes failed partial work",
+        "Manifest identifies status, attempt and actual paths",
+        "No failure becomes a clean empty review"
+      ]
+    },
+    {
+      "id": "specialists",
+      "x": 650,
+      "y": 1080,
+      "width": 500,
+      "height": 140,
+      "title": "Run selected security / concurrency Agents",
+      "lines": [
+        "Existing when: true runs; false intentionally skips",
+        "Decide before binding that branch workspace",
+        "Missing/wrong-type decision is an error, not false",
+        "Settled skipped collections remain mountable"
+      ]
+    },
+    {
+      "id": "speculate",
+      "x": 1250,
+      "y": 1080,
+      "width": 500,
+      "height": 175,
+      "title": "Run extra pass while condition is pending",
+      "lines": [
+        "any_succeeded + ordinary when + speculative: true",
+        "Known false: no call; later false: cancel/exclude",
+        "True: admit; invalid/unavailable decision: block",
+        "Action completion alone never releases withheld content",
+        "Execution readers see discarded bytes; consumers cannot"
+      ]
+    },
+    {
+      "id": "consolidate_sweeps",
+      "x": 50,
+      "y": 1380,
+      "width": 500,
+      "height": 130,
+      "title": "Consolidate attached review work",
+      "lines": [
+        "Wait for producers and decisions to settle",
+        "Read manifests and admitted reports in workspace",
+        "Distinguish success, intentional skip and failure",
+        "Validate source claims; publish logical name report"
+      ]
+    },
+    {
+      "id": "consolidate_conditional",
+      "x": 650,
+      "y": 1380,
+      "width": 500,
+      "height": 130,
+      "title": "Consolidate attached review work",
+      "lines": [
+        "Wait for producers and decisions to settle",
+        "Read manifests and admitted reports in workspace",
+        "Distinguish success, intentional skip and failure",
+        "Validate source claims; publish logical name report"
+      ]
+    },
+    {
+      "id": "consolidate_speculative",
+      "x": 1250,
+      "y": 1380,
+      "width": 500,
+      "height": 130,
+      "title": "Consolidate attached review work",
+      "lines": [
+        "Wait for producers and decisions to settle",
+        "Read manifests and admitted reports in workspace",
+        "Distinguish success, intentional skip and failure",
+        "Validate source claims; publish logical name report"
+      ]
+    },
+    {
+      "id": "judge",
+      "x": 350,
+      "y": 1635,
+      "width": 1100,
+      "height": 120,
+      "title": "Existing final Agent requirement and decide",
+      "lines": [
+        "Strictly mount successful consolidate.publications.report plus original PR evidence",
+        "Substantiated defect fails; insufficient evidence is inconclusive; complete supported clean review can pass",
+        "No platform finding schema, reviewer quorum or filename; named missing report remains missing evidence"
+      ]
+    },
+    {
+      "id": "delivery",
+      "x": 350,
+      "y": 1835,
+      "width": 1100,
+      "height": 120,
+      "title": "Committed result and exact-head GitHub Check Run",
+      "lines": [
+        "Persist result/report manifests before terminal completion; delivery retries independently",
+        "Reconcile ambiguous remote writes and never regress terminal state or rerun committed review",
+        "Reports remain private and authorized; configuration/import failure never becomes an empty successful suite"
+      ]
+    },
+    {
+      "id": "durability",
+      "x": 50,
+      "y": 2055,
+      "width": 825,
+      "height": 155,
+      "title": "Engine state / existing Bifrost shared writer",
+      "lines": [
+        "Memory drives execution; Bifrost WAL persists complete logical checkpoints",
+        "Keep exact File descriptors; preserve names, attempts, budgets and decisions",
+        "Takeover excludes stale writers; rejected WAL progress never resurrects",
+        "PostgreSQL owns queue claims and renewal, not duplicate execution state"
+      ]
+    },
+    {
+      "id": "history",
+      "x": 925,
+      "y": 2055,
+      "width": 825,
+      "height": 155,
+      "title": "Bifrost recovery / public APIs / UI",
+      "lines": [
+        "Load exact accepted state; unavailable means wait/retry, never fresh state",
+        "Keep selected result and execution_outputs; no terminal archive handoff",
+        "Inspect active/failed/discarded work under normal evidence permissions",
+        "Safe previews/downloads and stable pages through recovery/completion"
+      ]
+    },
+    {
+      "id": "maintenance",
+      "x": 50,
+      "y": 2280,
+      "width": 1700,
+      "height": 120,
+      "title": "Server-owned maintenance and boundaries",
+      "lines": [
+        "Default-branch pushes refresh library indexes; installation changes reconcile access and cancel revoked work",
+        "Library snapshot refresh and context cleanup use the public pipeline",
+        "No live finding-event successors, long-running streaming validator, automatic merge or extra orchestration service"
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "source": "admin",
+      "target": "config",
+      "label": "",
+      "kind": "flow"
+    },
+    {
+      "source": "team",
+      "target": "config",
+      "label": "",
+      "kind": "flow"
+    },
+    {
+      "source": "entry",
+      "target": "config",
+      "label": "",
+      "kind": "flow"
+    },
+    {
+      "source": "config",
+      "target": "extract",
+      "label": "",
+      "kind": "flow"
+    },
+    {
+      "source": "extract",
+      "target": "sweeps",
+      "label": "",
+      "kind": "flow"
+    },
+    {
+      "source": "extract",
+      "target": "conditional",
+      "label": "",
+      "kind": "flow"
+    },
+    {
+      "source": "extract",
+      "target": "bootstrap",
+      "label": "",
+      "kind": "flow"
+    },
+    {
+      "source": "sweeps",
+      "target": "sweeps_done",
+      "label": "",
+      "kind": "flow"
+    },
+    {
+      "source": "conditional",
+      "target": "specialists",
+      "label": "",
+      "kind": "flow"
+    },
+    {
+      "source": "bootstrap",
+      "target": "speculate",
+      "label": "",
+      "kind": "flow"
+    },
+    {
+      "source": "sweeps_done",
+      "target": "consolidate_sweeps",
+      "label": "",
+      "kind": "flow"
+    },
+    {
+      "source": "specialists",
+      "target": "consolidate_conditional",
+      "label": "",
+      "kind": "flow"
+    },
+    {
+      "source": "speculate",
+      "target": "consolidate_speculative",
+      "label": "",
+      "kind": "flow"
+    },
+    {
+      "source": "consolidate_sweeps",
+      "target": "judge",
+      "label": "",
+      "kind": "flow"
+    },
+    {
+      "source": "consolidate_conditional",
+      "target": "judge",
+      "label": "",
+      "kind": "flow"
+    },
+    {
+      "source": "consolidate_speculative",
+      "target": "judge",
+      "label": "",
+      "kind": "flow"
+    },
+    {
+      "source": "judge",
+      "target": "delivery",
+      "label": "",
+      "kind": "flow"
+    }
+  ],
+  "text_alternative": "diagram-notes.md",
+  "examples": [
+    "proposed-examples/repeated-sweeps/verifier.yaml",
+    "proposed-examples/conditional-specialists/verifier.yaml",
+    "proposed-examples/speculative-review/verifier.yaml"
+  ],
+  "contracts": [
+    "pull-request-extraction.md",
+    "output-publication.md",
+    "example-orchestration.md"
+  ],
+  "durability_contract": "execution-state-and-durability.md"
+}

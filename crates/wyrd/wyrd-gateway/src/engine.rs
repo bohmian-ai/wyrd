@@ -89,9 +89,10 @@ pub struct ProviderAttempt<'a> {
 ///
 /// It is either a [`RawValue`] or answer text the adapter validated in the
 /// same pass that read its usage, so every holder carries checked JSON and
-/// relays its text unchanged.
+/// relays its text unchanged. It keeps the reader's allocation, spare
+/// capacity included, rather than shrinking the answer into a copy.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JsonAnswer(Box<str>);
+pub struct JsonAnswer(String);
 
 impl JsonAnswer {
     /// Takes answer `text` that a full JSON decode of the adapter accepted,
@@ -99,7 +100,7 @@ impl JsonAnswer {
     pub(crate) fn validated(text: String) -> Self {
         let value = text.trim_matches([' ', '\t', '\n', '\r']);
         if value.len() == text.len() {
-            Self(text.into_boxed_str())
+            Self(text)
         } else {
             Self(value.into())
         }
@@ -114,13 +115,13 @@ impl JsonAnswer {
     /// Moves the JSON text out.
     #[must_use]
     pub fn into_string(self) -> String {
-        self.0.into_string()
+        self.0
     }
 }
 
 impl From<Box<RawValue>> for JsonAnswer {
     fn from(raw: Box<RawValue>) -> Self {
-        Self(raw.into())
+        Self(Box::<str>::from(raw).into_string())
     }
 }
 

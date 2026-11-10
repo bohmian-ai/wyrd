@@ -2078,12 +2078,25 @@ async fn native_response_validation_preserves_usage_capture_and_answer_bytes() {
                     })
                     .map_err(|_| false),
             };
-            let text = body.clone();
-            let backing = text.as_ptr();
+            // A reader's buffer usually has spare capacity, which a kept
+            // answer keeps rather than shrinking into a fresh allocation.
+            let mut text = String::with_capacity(body.len() + 64);
+            text.push_str(body);
+            let (backing, capacity) = (text.as_ptr(), text.capacity());
             let single = super::complete(Answer::Native(text), wire, false, capture, "id", "m");
             let kept = matches!(&single, Ok((answer, ..)) if answer.get().as_ptr() == backing);
             let single: Mapped = match single {
-                Ok((answer, usage, decoded)) => Ok((answer.into_string(), usage, decoded)),
+                Ok((answer, usage, decoded)) => {
+                    let answer = answer.into_string();
+                    if kept {
+                        assert_eq!(
+                            answer.capacity(),
+                            capacity,
+                            "{body:?}: a kept answer is not shrunk"
+                        );
+                    }
+                    Ok((answer, usage, decoded))
+                }
                 Err(Unmapped::Undecodable(_)) => Err(true),
                 Err(Unmapped::Unrepresentable(usage)) => {
                     assert_eq!(usage, AttemptUsage::default(), "{body:?}");

@@ -249,6 +249,16 @@ impl Canonical<'_> {
     fn written<E: de::Error, T: serde::Serialize + ?Sized>(&mut self, value: &T) -> Result<(), E> {
         serde_json::to_writer(&mut *self, value).map_err(|_| E::custom("not compact"))
     }
+
+    /// Matches a string `serde_json` borrowed from the text without
+    /// formatting it: it borrows only a string written without escapes, and
+    /// rejects raw control characters, so its compact serialization is the
+    /// string itself between quotes.
+    fn borrowed<E: de::Error>(&mut self, value: &str) -> Result<(), E> {
+        self.literal(b"\"")?;
+        self.literal(value.as_bytes())?;
+        self.literal(b"\"")
+    }
 }
 
 impl std::io::Write for Canonical<'_> {
@@ -309,6 +319,13 @@ impl<'de> Visitor<'de> for Part<'_, 'de> {
         self.scalar(value)
     }
 
+    fn visit_borrowed_str<E: de::Error>(self, value: &'de str) -> Result<(), E> {
+        if self.top {
+            return Err(E::custom("not an object"));
+        }
+        self.state.borrowed(value)
+    }
+
     fn visit_unit<E: de::Error>(self) -> Result<(), E> {
         self.scalar(&())
     }
@@ -345,7 +362,10 @@ impl<'de> Visitor<'de> for Part<'_, 'de> {
                 return Err(de::Error::custom("not unique"));
             }
             let start = self.state.at;
-            self.state.written(&*name)?;
+            match &name {
+                Cow::Borrowed(name) => self.state.borrowed(name)?,
+                Cow::Owned(name) => self.state.written(name)?,
+            }
             let named = start + 1..self.state.at - 1;
             self.state.names.push(name);
             self.state.literal(b":")?;
@@ -382,3 +402,80 @@ impl Part<'_, '_> {
 #[derive(Deserialize)]
 #[serde(transparent)]
 struct Name<'a>(#[serde(borrow)] Cow<'a, str>);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Text is kept exactly when it is its decode's compact serialization,
+    /// whether its strings borrow from the text or hold escapes, and the kept
+    /// members are the top-level names and values as written.
+    #[test]
+    fn canonical_borrowed_strings_match_compact_serialization() {
+        let deep = format!(r#"{{"a":{}1{}}}"#, "[".repeat(200), "]".repeat(200));
+        let members = |count: usize| {
+            let members: Vec<String> = (0..count).map(|i| format!(r#""m{i}":{i}"#)).collect();
+            format!("{{{}}}", members.join(","))
+        };
+        let cases = [
+            (
+                r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#,
+                true,
+            ),
+            ("{\"name\":\"café ☕ 𝄞\",\"del\":\"\u{7f}\"}", true),
+            (r#"{"name":"caf\u00e9"}"#, false),
+            (r#"{"q":"say \"hi\"\\ \n\t\r\b\f"}"#, true),
+            (r#"{"c":"\u0001"}"#, true),
+            (r#"{"c":"\u001F"}"#, false),
+            (r#"{"s":"a\/b"}"#, false),
+            ("{\"c\":\"\u{1}\"}", false),
+            (r#"{"say \"hi\"":1,"say":2}"#, true),
+            (
+                r#"{"n":1.5,"i":-7,"u":18446744073709551615,"f":0.1,"z":0}"#,
+                true,
+            ),
+            (r#"{"n":1.0}"#, true),
+            (r#"{"n":1.50}"#, false),
+            (r#"{"n":1e3}"#, false),
+            (r#"{"n":-0}"#, false),
+            (r#"{"a":1,"a":2}"#, false),
+            (r#"{"ab":1,"ab":2}"#, false),
+            (r#"{"a":{"b":1,"b":2}}"#, false),
+            (r#"{"a":{"b":1},"c":{"b":2}}"#, true),
+            (r#"{"a":[true,false,null,"x",{},[]]}"#, true),
+            (r#"{ "a":1}"#, false),
+            (r#"{"a":1} "#, false),
+            (r#"["a"]"#, false),
+            (r#""a""#, false),
+            (&deep, false),
+            (&members(MAX_CANONICAL_MEMBERS), true),
+            (&members(MAX_CANONICAL_MEMBERS + 1), false),
+        ];
+        for (text, kept) in cases {
+            assert_eq!(canonical(text.as_bytes()).is_some(), kept, "{text}");
+            if kept {
+                let compact =
+                    serde_json::to_vec(&serde_json::from_str::<Value>(text).expect("decodes"))
+                        .expect("serializes");
+                assert_eq!(compact.len(), text.len(), "{text}: compact bound");
+            }
+        }
+
+        let text = br#"{"say \"hi\"":"caf\u00e9x","model":"gpt-4o","n":[1,{"k":"v"}]}"#;
+        assert!(canonical(text).is_none(), "an escape compact writes raw");
+        let text = br#"{"say \"hi\"":"caf\"x","model":"gpt-4o","n":[1,{"k":"v"}]}"#;
+        let written: Vec<(&[u8], &[u8])> = canonical(text)
+            .expect("kept")
+            .into_iter()
+            .map(|member| (&text[member.name], &text[member.value]))
+            .collect();
+        assert_eq!(
+            written,
+            [
+                (&br#"say \"hi\""#[..], &br#""caf\"x""#[..]),
+                (b"model", br#""gpt-4o""#),
+                (b"n", br#"[1,{"k":"v"}]"#),
+            ]
+        );
+    }
+}

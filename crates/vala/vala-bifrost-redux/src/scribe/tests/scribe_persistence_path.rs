@@ -467,7 +467,7 @@ async fn assert_producer_rows_share_the_wal_path(scribe: &ScribeImpl, tenant: Da
             wyrd_spec::vala::api::AuditOutcome::Allowed,
         );
         event.detail = detail;
-        crate::tables::audit::projection::stage_audit_event(&event, decided_at)
+        crate::tables::audit::projection::stage_audit_event(event, decided_at)
             .expect("the decision stages")
     };
     let rows = crate::tables::staged::StagedRow::project(&[

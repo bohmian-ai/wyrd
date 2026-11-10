@@ -280,7 +280,7 @@ impl From<AuditEvent> for ScribeWrite {
     /// Stages one decision projected into its row, stamped with the instant
     /// it is staged, which is the instant the boundary decided.
     fn from(event: AuditEvent) -> Self {
-        Self::Audit(stage_audit_event(&event, Utc::now()).ok())
+        Self::Audit(stage_audit_event(event, Utc::now()).ok())
     }
 }
 

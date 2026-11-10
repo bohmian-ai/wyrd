@@ -424,10 +424,10 @@ pub const DIAGNOSTIC: &str = "diagnostic.";
 /// The readings of one diagnostic observation, by stat id and unit.
 pub const DIAGNOSTIC_STATS: [(&str, &str); 5] = [
     ("count", "observations"),
-    ("p50_ms", "ms"),
-    ("p95_ms", "ms"),
-    ("p99_ms", "ms"),
-    ("mean_ms", "ms"),
+    ("p50_us", "µs"),
+    ("p95_us", "µs"),
+    ("p99_us", "µs"),
+    ("mean_us", "µs"),
 ];
 
 impl Metric {
@@ -1418,8 +1418,9 @@ pub struct TimingEvidence {
 
 impl Repetition {
     /// Sets the [`DIAGNOSTIC_STATS`] readings of diagnostic `observation`
-    /// from its interval `distribution` of nanoseconds: its count, nearest-rank
-    /// bucket bounds, and the bounds of its mean. A refused distribution
+    /// from its interval `distribution` of nanoseconds: its count, and in
+    /// microseconds its nearest-rank bucket bounds and the bounds of its
+    /// mean. A refused distribution
     /// leaves every reading missing with its reason; [`Self::invalid`] then
     /// records it when the observation is `required`, since its absence
     /// means the server did not record what it declares.
@@ -1443,15 +1444,15 @@ impl Repetition {
                 return;
             }
         };
-        let per = crate::capacity::NANOS_PER_MS;
+        let per = 1e3;
         let samples = distribution.len();
         self.set(&id("count"), Reading::count(samples));
-        for (stat, q) in [("p50_ms", 0.5), ("p95_ms", 0.95), ("p99_ms", 0.99)] {
+        for (stat, q) in [("p50_us", 0.5), ("p95_us", 0.95), ("p99_us", 0.99)] {
             self.set(&id(stat), Reading::quantile(&distribution, q, per));
         }
         let (low, high) = distribution.total_bounds();
         self.set(
-            &id("mean_ms"),
+            &id("mean_us"),
             if samples == 0 {
                 Reading::missing("no observation")
             } else {
@@ -2925,21 +2926,29 @@ impl Record {
         out
     }
 
-    /// Writes `step`'s diagnostic readings to `out`: each observation with
-    /// its declared boundary, then its readings in every repetition, so no
-    /// median conceals a slow repetition. Nothing for a step without any,
-    /// such as one from a record that predates them.
+    /// Writes `step`'s diagnostic readings to `out`: each declared or read
+    /// observation with its declared boundary, then its reading in every
+    /// repetition, so no median conceals a slow repetition and a repetition
+    /// without one says why. A step of a record that declares and read
+    /// none, such as one that predates them, says they are unavailable.
     fn render_diagnostics(&self, out: &mut String, step: &StepRecord) {
-        let mut observations: Vec<&str> = step
-            .repetitions
+        let mut observations: Vec<&str> = self
+            .criteria
+            .metrics
             .iter()
-            .flat_map(|repetition| repetition.metrics.keys())
+            .map(|metric| metric.id.as_str())
+            .chain(
+                step.repetitions
+                    .iter()
+                    .flat_map(|repetition| repetition.metrics.keys().map(String::as_str)),
+            )
             .filter_map(|id| id.strip_prefix(DIAGNOSTIC)?.rsplit_once('.'))
             .map(|(observation, _)| observation)
             .collect();
         observations.sort_unstable();
         observations.dedup();
         if observations.is_empty() {
+            out.push_str("  - diagnostics: — unavailable: this record declares and read none\n");
             return;
         }
         out.push_str(
@@ -2957,12 +2966,11 @@ impl Record {
             for (index, repetition) in step.repetitions.iter().enumerate() {
                 let count = repetition.reading(&id("count"));
                 let cells = if count.is_present() {
-                    DIAGNOSTIC_STATS
-                        .iter()
-                        .map(|(stat, unit)| {
-                            let label = stat.strip_suffix("_ms").unwrap_or(stat);
+                    std::iter::once(format!("n {}", count.cell("")))
+                        .chain(DIAGNOSTIC_STATS[1..].iter().map(|(stat, unit)| {
+                            let label = stat.strip_suffix("_us").unwrap_or(stat);
                             format!("{label} {}", repetition.reading(&id(stat)).cell(unit))
-                        })
+                        }))
                         .collect::<Vec<_>>()
                         .join(", ")
                 } else {
@@ -5031,6 +5039,123 @@ mod tests {
                 Err(ExperimentError::Unsupported(found)) if found == version
             ));
         }
+    }
+
+    /// Every repetition's diagnostic readings survive publication: a
+    /// fresh and a re-read report agree once the raw artifacts are gone,
+    /// each observation shows its declared boundary and every repetition's
+    /// count, bucket bounds, and mean, a slow first repetition stays
+    /// visible beside the median, an inapplicable observation says why, a
+    /// repetition that read none says it was not read, and a record that
+    /// declares none says diagnostics are unavailable.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a diagnostic line is missing, collapsed, or differs
+    /// between the fresh and re-read report.
+    #[tokio::test(start_paused = true)]
+    async fn reports_keep_repetition_diagnostics_after_artifacts_are_removed() {
+        let root = tempfile::tempdir().expect("root");
+        let artifacts = root.path().join("target/run");
+        std::fs::create_dir_all(&artifacts).expect("artifacts");
+        std::fs::write(artifacts.join("timings.json"), "{}").expect("raw timings");
+        let mut declared = declaration();
+        declared.metrics.extend(Metric::diagnostic(
+            "phase.admit",
+            "server: the admission transaction, every call",
+        ));
+        declared.metrics.extend(Metric::diagnostic(
+            "phase.relay",
+            "server: stream relay; streams only",
+        ));
+        let diagnosed = |nanos: &[u64]| {
+            let mut repetition = good();
+            repetition.diagnose(
+                "phase.admit",
+                wyrd_benchmark::Distribution::of_durations(nanos),
+                true,
+            );
+            repetition.inapplicable("phase.relay", "a buffered call relays no stream");
+            repetition
+        };
+        let unread = good();
+        let mut workload = Scripted::always(&good());
+        workload.script = [
+            diagnosed(&[1]),
+            diagnosed(&[9_000_000; 4]),
+            diagnosed(&[20_000; 3]),
+            diagnosed(&[30_000, 50_000]),
+            diagnosed(&[1]),
+            diagnosed(&[40_000; 2]),
+            unread,
+            diagnosed(&[60_000]),
+        ]
+        .map(Ok)
+        .into_iter()
+        .collect();
+        let record = execute(
+            declared,
+            &mut workload,
+            [Some(quiet()), Some(quiet())],
+            &options(&artifacts),
+        )
+        .await;
+        let console = record.render();
+        let path = record.publish(root.path()).expect("publish");
+        std::fs::remove_dir_all(&artifacts).expect("raw artifacts removed");
+        let read = Record::read(&path).expect("read");
+        assert_eq!(
+            console,
+            read.render(),
+            "diagnostics regenerate from history alone"
+        );
+        let lines: Vec<&str> = console.lines().collect();
+        let admit: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|line| line.starts_with("      - repetition"))
+            .collect();
+        assert_eq!(
+            admit.len(),
+            12,
+            "both observations of both steps, every repetition: {admit:?}"
+        );
+        assert!(
+            admit[0].starts_with("      - repetition 1: n 4, p50 ("),
+            "{admit:?}"
+        );
+        assert!(admit[0].contains("mean ("), "{admit:?}");
+        assert!(admit[1].starts_with("      - repetition 2: n 3, p50 ("));
+        assert!(admit[2].starts_with("      - repetition 3: n 2, p50 ("));
+        assert!(admit[3].contains("— inapplicable: a buffered call relays no stream"));
+        assert!(
+            admit[7].contains("`diagnostic.phase.admit.count` was not read"),
+            "{admit:?}"
+        );
+        assert!(
+            console.contains("  - diagnostics (wall time; nearest-rank bucket bounds; rows overlap and never add or subtract):"),
+            "{console}"
+        );
+        assert!(
+            !console.contains("  - diagnostic.phase.admit.p50_us: median"),
+            "diagnostics are shown per repetition, not only as a median"
+        );
+
+        let mut workload = Scripted::always(&good());
+        let historical = execute(
+            declaration(),
+            &mut workload,
+            [Some(quiet()), Some(quiet())],
+            &options(&root.path().join("target/historical")),
+        )
+        .await;
+        assert_eq!(
+            historical
+                .render()
+                .matches("  - diagnostics: — unavailable: this record declares and read none")
+                .count(),
+            2
+        );
     }
 
     /// V8: a persisted multi-criterion record renders the exact common

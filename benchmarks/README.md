@@ -271,6 +271,26 @@ can be reproduced after `target/` is gone:
 target/profiling/release/capacity report benchmarks/history/bifrost/parquet/<record>.json
 ```
 
+A step's detail ends with its `diagnostics`: readings stored in each
+repetition as `diagnostic.<observation>.<stat>` (`count`, and `p50_us`,
+`p95_us`, `p99_us`, `mean_us`), judged by no criterion. Each observation is
+listed with its declared boundary and population, then one line per
+repetition with its count, nearest-rank bucket bounds, and mean bounds, so a
+slow repetition is never hidden behind a median. All are wall time, not CPU
+time; observations overlap (Gateway `queue_delay` includes `phase.admit`, and
+`server_elapsed` contains every request phase), so their values are never
+added, and percentiles are never subtracted. An inapplicable observation,
+such as Gateway `phase.relay` for a buffered call, says so; a missing
+required one makes the repetition INVALID; a record that predates
+diagnostics says they are unavailable. Gateway L1 records each phase of
+`wyrd_gateway_phase_duration_seconds`, `queue_delay`, the answer handoff's
+`server_elapsed`, `provider_excluded`, and `residual`, and the Scribe
+`outbox_write.scribe` batch writes, each over its own window population.
+
+When reporting a run, paste this report, fresh or regenerated with
+`capacity report <record>`, and append interpretation below it. Do not
+replace it with hand-built tables or extract results from raw snapshots.
+
 ## History
 
 History is the `benchmark-records` branch, which shares no commits with the

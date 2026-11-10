@@ -1195,10 +1195,10 @@ mod tests {
                 Some(1_000.0),
                 "{phase} keeps only the window's calls"
             );
-            let ms = (step * 10_000) as f64 / 1e6;
-            for stat in ["p50_ms", "p99_ms", "mean_ms"] {
+            let us = (step * 10_000) as f64 / 1e3;
+            for stat in ["p50_us", "p99_us", "mean_us"] {
                 let value = reading(&format!("phase.{phase}.{stat}"));
-                assert!(holds(&value, ms), "{phase} {stat}: {value:?}");
+                assert!(holds(&value, us), "{phase} {stat}: {value:?}");
             }
         }
         let relay = reading("phase.relay.count");
@@ -1208,11 +1208,11 @@ mod tests {
                 .is_some_and(|reason| reason.starts_with("inapplicable"))
         );
         assert_eq!(exact(&reading("outbox_write.scribe.count")), Some(3.0));
-        assert!(holds(&reading("outbox_write.scribe.p50_ms"), 2.0));
-        assert!(holds(&reading("queue_delay.p95_ms"), 0.07));
+        assert!(holds(&reading("outbox_write.scribe.p50_us"), 2_000.0));
+        assert!(holds(&reading("queue_delay.p95_us"), 70.0));
         assert_eq!(exact(&reading("server_elapsed.count")), Some(1_000.0));
-        assert!(holds(&reading("provider_excluded.p50_ms"), 2.0));
-        assert!(holds(&reading("residual.p50_ms"), 0.1));
+        assert!(holds(&reading("provider_excluded.p50_us"), 2_000.0));
+        assert!(holds(&reading("residual.p50_us"), 100.0));
 
         let mut absent = window.clone();
         absent.population.metrics.retain(|metric| {

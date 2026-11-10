@@ -67,7 +67,6 @@ impl Workspaces {
     /// # Panics
     /// Panics when admission is closed or taken concurrently.
     #[cfg(feature = "test-support")]
-    #[must_use]
     pub fn hold_for_test(&self) -> OwnedSemaphorePermit {
         super::hold_all(&self.permits)
     }

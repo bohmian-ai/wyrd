@@ -12,9 +12,9 @@ use monty_pool::{MountSpec, MountSpecMode};
 use serde_json::{Map, Value, json};
 use tokio::time::Instant;
 use vala_verify::blocks::BlockError;
-use wyrd_server::verification::hosted::{HostedLimits, LaneLimits};
 use wyrd_server::verification::hosted::sandbox::{CodeRun, Sandbox};
 use wyrd_server::verification::hosted::workspace::{Staged, Workspace};
+use wyrd_server::verification::hosted::{HostedLimits, LaneLimits};
 
 /// The worker binary: this package's `wyrd-server`, which serves as its own
 /// worker, launched once to completion before its path is first returned.
@@ -401,7 +401,11 @@ async fn sandbox_contains_runaway_code() {
             ..HostedLimits::default()
         },
     ] {
-        assert!(Sandbox::start(worker(), limits, limits.queued).await.is_err());
+        assert!(
+            Sandbox::start(worker(), limits, limits.queued)
+                .await
+                .is_err()
+        );
     }
 }
 

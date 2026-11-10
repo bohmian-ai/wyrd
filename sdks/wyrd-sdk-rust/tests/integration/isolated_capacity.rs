@@ -340,13 +340,25 @@ async fn direct_verification_runs_while_queued_capacity_is_held() {
         "two model and two two-turn writer runs: {subjects:?}"
     );
     assert!(
-        subjects.iter().all(|subject| subject.as_deref() == Some(&root)),
+        subjects
+            .iter()
+            .all(|subject| subject.as_deref() == Some(&root)),
         "every lane-admitted call is attributed to the verified Service: {subjects:?}"
     );
 
     for (admission, verifier, question, id) in [
-        (LaneAdmission::Workspaces, "scratch-check", "FULL-SCRATCH", "written"),
-        (LaneAdmission::Python, "python-check", "FULL-PYTHON", "measured"),
+        (
+            LaneAdmission::Workspaces,
+            "scratch-check",
+            "FULL-SCRATCH",
+            "written",
+        ),
+        (
+            LaneAdmission::Python,
+            "python-check",
+            "FULL-PYTHON",
+            "measured",
+        ),
     ] {
         let held = desk.hold(ExecutionMode::Direct, admission);
         let refused = desk

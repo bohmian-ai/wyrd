@@ -35,8 +35,8 @@ use wyrd_spec::card::verifier::{Action, Check, CodeCall, CodeSource};
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::verification::execution::CallProvenance;
 
-use super::{HostedLimits, LaneLimits};
 use super::evidence::TenantEvidence;
+use super::{HostedLimits, LaneLimits};
 
 /// The sandbox global holding the JSON-encoded entrypoint arguments.
 const INPUTS_GLOBAL: &str = "_wyrd_inputs";
@@ -111,7 +111,6 @@ impl Sandbox {
     /// # Panics
     /// Panics when admission is closed or taken concurrently.
     #[cfg(feature = "test-support")]
-    #[must_use]
     pub fn hold_for_test(&self) -> tokio::sync::OwnedSemaphorePermit {
         super::hold_all(&self.admission)
     }

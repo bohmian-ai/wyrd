@@ -34,13 +34,13 @@ use wyrd_spec::ids::{CardUid, SlotName};
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::InputDeclaration;
 
-use super::{HostedLimits, LaneLimits};
 use super::evidence::TenantEvidence;
 use super::registry::TenantRegistry;
 use super::sandbox::{CodeExecutor, Sandbox};
 use super::tools::HostedTools;
 use super::traces::CallerTraces;
 use super::workspace::Workspaces;
+use super::{HostedLimits, LaneLimits};
 use crate::components::auth::Caller;
 use crate::components::gateway::{GatewayCallContext, ServerWyrdGatewayCaller};
 use crate::state::AppState;
@@ -185,7 +185,6 @@ impl HostedBlocks {
     /// # Panics
     /// Panics when the admission is closed or taken concurrently.
     #[cfg(feature = "test-support")]
-    #[must_use]
     pub fn hold_for_test(
         &self,
         mode: ExecutionMode,
@@ -205,7 +204,6 @@ impl HostedBlocks {
     /// # Panics
     /// Panics when a permit is taken concurrently.
     #[cfg(feature = "test-support")]
-    #[must_use]
     pub fn hold_direct_executions_for_test(&self) -> OwnedSemaphorePermit {
         super::hold_all(&self.direct_executions)
     }

@@ -95,3 +95,47 @@ resource enforcement or completion-time SLA is part of this task.
 | O15 | "Amend wyrd-design.md … and relevant operator operations guidance" | Design and operator docs describe isolated admission, queued-only features, limits and the deadline ceiling for approvals | `mise run docs:check` |
 | O16 | "Run fmt, lints, check:deps, git diff --check" | All pass | command output |
 | O17 | "Preserve the one engine" | Both modes build their engine through `HostedBlocks::engine` | code citation + O1–O8 |
+
+## Evidence
+
+Journey selector: `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-ai -P journey --run-ignored=all -E 'test(=isolated_capacity::direct_verification_runs_while_queued_capacity_is_held)'"` (below: **J**). Unit selector: `mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=config::tests::verification_limits_env_applies_and_refuses) | test(=verification::hosted::tests::lanes_split_the_memory_ceilings) | test(=verification::tests::production_defaults_are_the_specified_ceilings)'` (below: **U**). `J` file: `sdks/wyrd-sdk-rust/tests/integration/isolated_capacity.rs`.
+
+| Obligation | Implementation evidence | Assertion | Verification evidence | Result |
+|---|---|---|---|---|
+| O1: direct completes with every queued execution slot held | `RuntimeLimits.execution_slots` configurable (`config.rs` `apply_limits_env`); direct ceiling `HostedBlocks::admit_direct` (`blocks.rs`), `service.rs:508` | `J:283` (queued model run, the only slot, is waiting) then `J:294` (direct `answer-check` passed) | J PASS | PASS |
+| O2: direct workspace Agent completes with queued workspaces held | per-lane `Workspaces` (`blocks.rs` `Lane`) | `J:319` hold, `J:324` | J PASS | PASS |
+| O3: direct code Verifier completes with queued Python held | per-lane `Sandbox` | `J:308` hold, `J:313` | J PASS | PASS |
+| O4: direct Agent completes with queued model calls held | `ServerWyrdGatewayCaller::admitted` (`caller.rs`), `blocks.rs:286` | `J:281` hold, `J:289` | J PASS | PASS |
+| O5: queued run waits for the queued execution slot, completes after release | runner execution slots | `J:295` (status `Pending` after two direct runs), `J:306` after release | J PASS | PASS |
+| O6: queued workspace run deferred while held, completes after release | `Workspaces::open` Busy → runner `Transition::Defer` | `J:326` deferral of that execution id, `J:328` | J PASS | PASS |
+| O7: queued code run deferred while held, completes after release | `Sandbox` Busy → `Transition::Defer` | `J:315`, `J:317` | J PASS | PASS |
+| O8: queued Agent waits for queued model admission, completes after release | lane wait in `caller.rs` | `J:283` (`MODEL_WAIT` with `queued`), `J:305` | J PASS | PASS |
+| O9: no borrowing, so a full direct lane refuses direct work while the queued lane is free | `blocks.rs` `lane()`; `service.rs:508` | `J:363`–`J:370` (direct workspace and Python held → `WYRD_SERVER_503_SERVICE_UNAVAILABLE`; the same queued work completes), `J:380`–`J:385` (direct execution ceiling held → 503) | J PASS | PASS |
+| O10: each call routes by accepted mode, including queued continuations | `Execution.mode` set `Direct` in `service.rs`, `Queued` for every runner claim and re-claim `runner.rs:821`; `HostedBlocks::engine` selects `lane(execution.mode)` | queued deferrals with the direct lane free (`J:315`, `J:326`), deferred runs resumed and completed (`J:317`, `J:328`); queued work completes with the direct lane held (`J:370`); direct runs complete with the queued lane held (O1–O4) | J PASS | PASS |
+| O11: lane limits, direct/queued ceilings and the deadline parse from env; bad or inconsistent values refuse | `config.rs` `apply_limits_env` | `config.rs:4339` test (`4387`–`4388` runtime, bad and inconsistent cases after) | U PASS | PASS |
+| O12: defaults keep the combined capacity and the 64-slot, five-minute queued ceiling | `HostedLimits::default`, `RuntimeLimits::default` | `hosted/mod.rs:221` test (totals 5/16/16/2), `verification/mod.rs:631` test (64, 5 min) | U PASS | PASS |
+| O13: a queued-only (Window) Verifier is refused by direct `verify` through one named check before any step | `service.rs:159` `direct_eligibility`, called in `resolve` `service.rs:962` before `run_direct` | `sdks/wyrd-sdk-rust/tests/integration/verify_in_real_time.rs:987` and `:993` (`WYRD_VERIFICATION_422_INPUT_UNSUPPORTED`; the same evidence submits as Recorded) | `verify_in_real_time::window_verifier_records_samples_and_refuses_verify` PASS | PASS |
+| O14: lane-admitted model calls stay on the ordinary gateway path, attributed to the subject | caller holds the lane permit, then calls `GatewayInvocation::run` unchanged | `J:337`–`J:342` (six `bifrost.gateway.calls` rows, each `subject_card_uid` = `capacity-desk`) | J PASS | PASS |
+| O15: design and operator docs updated | `architecture/wyrd-design.md` Agents, tools, and workspaces; `operate/configure-verification-runtime.md`; `reference/verification-runtime-limits.md`; regenerated `docs/public/llms*.txt` | `mise run docs:check` | see below | see below |
+| O16: fmt, lints, check:deps, `git diff --check` | — | command exit codes | `mise run fmt` clean, `mise run lints` 0, `mise run check:deps` 0, `git diff --check` 0 | PASS |
+| O17: one engine | both modes build through `HostedBlocks::engine` (`blocks.rs:241`); no second engine type | `J` direct and queued runs (O1–O8) | J PASS | PASS |
+
+**RED.** Production code was written before the journey, which is a process exception. RED was taken afterwards by mutation: `blocks.rs` `lane()` was made to return the queued lane for `Direct`. J then failed at `J:288`: `VerificationExecutionTimedOut … "deadline_seconds": 60`, because the direct Agent waited on the held queued model-call permit. Restoring the mapping turns J green.
+
+**Other lanes.** `wyrd-server` sandbox_worker, pg_hosted_artifacts, pg_durable_verifier_work, hosted workspace/tools pg_tests, `components::gateway`, `verification::hosted`, `config` ran 207 tests: 207 passed. Rust SDK `hosted_agent_tools`, `verifier_orchestration` and the window test ran 17: 16 passed. The failure is `verifier_orchestration::speculative_recovery_cannot_resurrect_content`. It failed twice, at different assertions (`verifier_orchestration.rs:2114`, `:2159`).
+
+Diagnosis, confirmed by a read-only diagnostician:
+- **Symptom:** the speculation disposition is either absent, or recorded with no `extra` invocation, before the takeover.
+- **Evidence:** the trace shows no lane wait, deferral or Busy. The test's server keeps default runtime limits and uses at most about 2 of its 48 queued model calls and 12 workspaces.
+- **Cause:** commit `f04384dbf` (an ancestor of this task's base) removed the `COMPARE:` reply delay for `LATE-DECISION` prompts. This test's ordering depended on that delay. `compare` now races `bootstrap`/`extra`. The engine correctly records a "known" decision, or cancels a not-yet-begun `extra`.
+- **Fix site:** that test. Order the race with `HeldUpstream` holds and invocation milestones, as its sibling `speculative_disposition_controls_consumer_admission` already does.
+
+This is independent of this diff and outside its write set, so it is left unchanged and reported.
+
+**Mechanical deviations.**
+- The AC-010 journey lives in the Rust SDK integration target (`isolated_capacity`), not in `wyrd-testing`'s `server` target. That target composes clusters through `wyrd_client` only and has no SDK Card bundle or `verify` harness. The task requires an SDK Verifier observed through the SDK.
+- No Python or TypeScript mirror was added: no new SDK surface ships.
+- The journey observes server events through the new `LogCapture::install_global`, because the in-process server runs on the shared runtime's threads.
+- The env names `WYRD_VERIFICATION_MAX_WORKSPACES`, `…_MONTY_MAX_WORKERS` and `…_MONTY_MAX_WAITERS` are replaced by per-lane `WYRD_VERIFICATION_{DIRECT,QUEUED}_{WORKSPACES,PYTHON_WORKERS,PYTHON_WAITERS,MODEL_CALLS}`. `MONTY_MIN_WORKERS` now prewarms each lane, with default 1 per lane (2 in total, as before).
+
+**Non-goals.** No separate engine, scheduler, process service, synthetic load, platform-specific enforcement, or queued-only action was added.

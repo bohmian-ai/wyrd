@@ -41,12 +41,12 @@ use wyrd_server::verification::hosted::tools::HostedTools;
 use wyrd_server::verification::hosted::workspace::{Workspace, Workspaces};
 use wyrd_server::verification::inputs::InputResolver;
 use wyrd_server::verification::leases::LeaseRenewal;
-use wyrd_server::verification::telemetry::ExecutionMode;
 use wyrd_server::verification::results::{ResultPayloadBuilder, ResultRun};
 use wyrd_server::verification::scheduler::GroupHandoff;
 use wyrd_server::verification::state::{
     Checkpoint, Decision, RunState, StateError, StateRow, revision_batch, stand_in_identity,
 };
+use wyrd_server::verification::telemetry::ExecutionMode;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Attribution;
 use wyrd_spec::card::verifier::{Action, VerifierSpec};
@@ -1553,7 +1553,11 @@ async fn retained_publications_keep_their_busy_attempt() {
     let leased = Leased::start().await;
     let limits = saturable();
     let caller = leased.publisher([Permission::tool_invoke_any()]);
-    let sandbox = Arc::new(Sandbox::start(worker(), limits, limits.queued).await.expect("pool starts"));
+    let sandbox = Arc::new(
+        Sandbox::start(worker(), limits, limits.queued)
+            .await
+            .expect("pool starts"),
+    );
     let none = serde_json::Map::new();
     let far = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
     // One admitted operation holds the only worker admission while pending.
@@ -1708,7 +1712,11 @@ async fn agent_publications_reach_a_recovered_consumer() {
     let leased = Leased::start().await;
     let limits = saturable();
     let caller = leased.publisher([Permission::tool_invoke_any()]);
-    let sandbox = Arc::new(Sandbox::start(worker(), limits, limits.queued).await.expect("pool starts"));
+    let sandbox = Arc::new(
+        Sandbox::start(worker(), limits, limits.queued)
+            .await
+            .expect("pool starts"),
+    );
     let none = serde_json::Map::new();
     let far = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
     // One admitted operation holds the only worker admission while pending.
@@ -2057,7 +2065,11 @@ async fn dropped_agent_work_makes_no_later_call() {
         .expect("the execution state claims");
     let limits = saturable();
     let caller = leased.publisher([Permission::tool_invoke_any()]);
-    let sandbox = Arc::new(Sandbox::start(worker(), limits, limits.queued).await.expect("pool starts"));
+    let sandbox = Arc::new(
+        Sandbox::start(worker(), limits, limits.queued)
+            .await
+            .expect("pool starts"),
+    );
     let model = Arc::new(MockProvider::new(ProviderName::OpenAi));
     for name in ["early", "after"] {
         model.push_response(answer(

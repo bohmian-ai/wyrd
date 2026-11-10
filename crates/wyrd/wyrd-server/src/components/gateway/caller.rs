@@ -127,9 +127,10 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
             answer,
         } = NativeCall::project(call.request, &call.model)?;
         let _permit = match &self.lane {
-            Some((lane, permits)) => Some(match Arc::clone(permits).try_acquire_owned() {
-                Ok(permit) => permit,
-                Err(_) => {
+            Some((lane, permits)) => Some(
+                if let Ok(permit) = Arc::clone(permits).try_acquire_owned() {
+                    permit
+                } else {
                     tracing::info!(lane, "the model call waits for its lane's admission");
                     tokio::select! {
                         permit = Arc::clone(permits).acquire_owned() => {
@@ -139,8 +140,8 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
                             return Err(ProviderError::timeout(PROVIDER));
                         }
                     }
-                }
-            }),
+                },
+            ),
             None => None,
         };
         let request = GatewayCallRequest {

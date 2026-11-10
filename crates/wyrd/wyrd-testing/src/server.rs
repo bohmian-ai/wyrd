@@ -576,8 +576,9 @@ pub struct WyrdTestServerBuilder {
     /// Hosted Verifier Deployment limits; `None` keeps the defaults with no
     /// prewarmed worker.
     verification_limits: Option<HostedLimits>,
-    /// Queued runtime bounds; `None` keeps the production defaults.
-    verification_runtime_limits: Option<RuntimeLimits>,
+    /// Queued runtime bounds; `None` keeps the production defaults. Boxed
+    /// so the builder a journey holds across awaits stays small.
+    verification_runtime_limits: Option<Box<RuntimeLimits>>,
     /// Hosted Verifier worker executable replacing the shipped same-profile
     /// `wyrd-server`, so a journey can prove a bad worker fails startup.
     verification_worker: Option<std::path::PathBuf>,
@@ -4583,8 +4584,8 @@ impl WyrdTestServerBuilder {
     /// defaults, through the same configuration production reads its queued
     /// execution slots and deadline from.
     #[must_use]
-    pub const fn with_verification_runtime_limits_for_test(mut self, limits: RuntimeLimits) -> Self {
-        self.verification_runtime_limits = Some(limits);
+    pub fn with_verification_runtime_limits_for_test(mut self, limits: RuntimeLimits) -> Self {
+        self.verification_runtime_limits = Some(Box::new(limits));
         self
     }
 
@@ -5313,8 +5314,8 @@ impl WyrdTestServerBuilder {
             monty_min_workers: 0,
             ..HostedLimits::default()
         });
-        if let Some(limits) = self.verification_runtime_limits {
-            config.verification.runtime = limits;
+        if let Some(limits) = self.verification_runtime_limits.take() {
+            config.verification.runtime = *limits;
         }
         let (operator_keys, operator_keys_dir) = match self.operator_keys.take() {
             Some(config) => (config, None),

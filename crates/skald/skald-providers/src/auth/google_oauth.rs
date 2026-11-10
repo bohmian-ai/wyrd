@@ -40,7 +40,9 @@ impl fmt::Debug for GoogleOAuthToken {
 /// Google OAuth ADC loader with a small in-memory token cache.
 pub struct GoogleOAuth {
     source: GoogleOAuthSource,
-    http: reqwest::Client,
+    /// Exchange client, absent for a caller-issued access token, which never
+    /// reaches the network.
+    http: Option<reqwest::Client>,
     // tokio::sync::Mutex held across the async fetch to prevent concurrent
     // token refreshes for the same instance.
     cache: tokio::sync::Mutex<Option<CachedToken>>,
@@ -89,7 +91,7 @@ impl GoogleOAuth {
     /// # Errors
     ///
     /// Returns [`ProviderError::Auth`] when another Rustls provider already
-    /// owns the process or the metadata HTTP client cannot be built.
+    /// owns the process.
     pub fn from_access_token(token: impl Into<String>) -> ProviderResult<Self> {
         Self::new(GoogleOAuthSource::AccessToken(super::secret(token)))
     }
@@ -167,7 +169,8 @@ impl GoogleOAuth {
         Self::from_metadata_server(base_url)
     }
 
-    /// Build a Google credential source with a provider-owned HTTP client.
+    /// Build a Google credential source, with a provider-owned HTTP client
+    /// for every source that exchanges or fetches its token.
     ///
     /// # Errors
     ///
@@ -178,9 +181,15 @@ impl GoogleOAuth {
             provider: "google".to_owned(),
             detail: error.to_string(),
         })?;
-        let http = reqwest::Client::builder()
-            .build()
-            .map_err(|error| ProviderError::decode("google", error))?;
+        let http = if matches!(source, GoogleOAuthSource::AccessToken(_)) {
+            None
+        } else {
+            Some(
+                reqwest::Client::builder()
+                    .build()
+                    .map_err(|error| ProviderError::decode("google", error))?,
+            )
+        };
         Ok(Self {
             source,
             http,
@@ -227,6 +236,18 @@ impl GoogleOAuth {
         Ok(token)
     }
 
+    /// The exchange client of a network-backed source.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called for an access-token source, which [`GoogleOAuth::token`]
+    /// answers without any exchange.
+    fn http(&self) -> &reqwest::Client {
+        self.http
+            .as_ref()
+            .expect("only an access-token source has no exchange client")
+    }
+
     async fn token_from_json(&self, json: &str) -> ProviderResult<GoogleOAuthToken> {
         let parsed: TokenJson =
             serde_json::from_str(json).map_err(|error| ProviderError::decode("google", error))?;
@@ -257,7 +278,7 @@ impl GoogleOAuth {
         };
         let assertion = sign_service_account_jwt(&client_email, &token_uri, &private_key)?;
         let response = self
-            .http
+            .http()
             .post(&token_uri)
             .form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
@@ -272,7 +293,7 @@ impl GoogleOAuth {
     async fn token_from_metadata(&self, base_url: &str) -> ProviderResult<GoogleOAuthToken> {
         let url = format!("{base_url}{METADATA_PATH}");
         let response = self
-            .http
+            .http()
             .get(url)
             .header("Metadata-Flavor", "Google")
             .send()
@@ -423,6 +444,25 @@ mod google_auth_oauth {
             secrecy::ExposeSecret::expose_secret(&second.access_token),
             secrecy::ExposeSecret::expose_secret(&first.access_token)
         );
+    }
+
+    /// A caller-issued access token builds no exchange client it would never
+    /// use, while every network-backed source keeps one.
+    #[test]
+    fn access_token_source_needs_no_network_client() {
+        assert!(
+            GoogleOAuth::from_access_token("issued")
+                .expect("oauth builds")
+                .http
+                .is_none()
+        );
+        for oauth in [
+            GoogleOAuth::from_account_json("{}"),
+            GoogleOAuth::from_credentials_file("adc.json"),
+            GoogleOAuth::from_metadata_server("http://127.0.0.1:1"),
+        ] {
+            assert!(oauth.expect("oauth builds").http.is_some());
+        }
     }
 
     /// A caller-issued access token is presented unchanged in a sensitive

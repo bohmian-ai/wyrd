@@ -13,21 +13,20 @@ use serde_json::Value;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::github::{GithubAppMock, GithubBrowser};
 
-use crate::principal_journey::run_cli_async_with_credential;
+use crate::principal_journey::run_cli_with_env;
 
-/// Run `wyrd github <verb> --server <base>` with `key` in `WYRD_API_KEY`.
+/// Run `wyrd github <verb>` as the guide does: the server from
+/// `WYRD_SERVER_URL` and `key` from `WYRD_API_KEY`.
 async fn github(verb: &str, base: &str, key: &str) -> Output {
-    run_cli_async_with_credential(
-        vec![
-            "github".to_owned(),
-            verb.to_owned(),
-            "--server".to_owned(),
-            base.to_owned(),
-        ],
-        "WYRD_API_KEY",
-        key.to_owned(),
-    )
+    let (verb, base, key) = (verb.to_owned(), base.to_owned(), key.to_owned());
+    tokio::task::spawn_blocking(move || {
+        run_cli_with_env(
+            &["github", &verb],
+            &[("WYRD_SERVER_URL", &base), ("WYRD_API_KEY", &key)],
+        )
+    })
     .await
+    .expect("CLI subprocess joins")
 }
 
 /// Bootstrap Service `name` holding `roles` in the fixture tenant and return

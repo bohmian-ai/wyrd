@@ -6975,7 +6975,9 @@ provider = "anthropic"
         let mut config = from_toml_str_with_dev_oracle_opt_in(
             "[github]\napp_id = 7\nslug = \"toml-app\"\n\
              public_url = \"https://wyrd.example.com\"\n\
-             oauth_client_id = \"Iv1.toml\"\n",
+             oauth_client_id = \"Iv1.toml\"\n\
+             web_origin = \"https://ghe.example.com\"\n\
+             api_origin = \"https://ghe.example.com/api/v3\"\n",
         )
         .expect("the section parses");
         let unset = github_env(&key_file)
@@ -7012,6 +7014,15 @@ provider = "anthropic"
             (7, "toml-app", "Iv1.toml")
         );
         assert_eq!(settings.public_url.as_str(), "https://wyrd.example.com/");
+        assert_eq!(settings.host(), "ghe.example.com");
+        assert_eq!(
+            settings.api_origin.as_str(),
+            "https://ghe.example.com/api/v3"
+        );
+        assert_eq!(
+            settings.private_key.expose_secret().trim(),
+            wyrd_testing::github::APP_PRIVATE_KEY_PEM.trim()
+        );
         assert_eq!(settings.webhook_secret.expose_secret(), "webhook-from-file");
         assert_eq!(
             settings.oauth_client_secret.expose_secret(),

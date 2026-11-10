@@ -386,12 +386,15 @@ mod pg_tests {
         );
     }
 
-    /// Forced RLS confines every slot read and write to its tenant, and an
-    /// access-removal webhook drops only the removed, selected repositories.
+    /// Forced RLS confines every slot read and write to its tenant, the
+    /// webhook routing lookup elevates only inside its pinned body and grants
+    /// the caller no read, and an access-removal webhook drops only the
+    /// removed, selected repositories.
     ///
     /// # Panics
-    /// Panics when a tenant sees or changes another tenant's slot, or the
-    /// removal keeps or drops the wrong repositories.
+    /// Panics when a tenant sees or changes another tenant's slot, the lookup
+    /// is not definer-owned with a pinned `search_path` or leaks its
+    /// elevation, or the removal keeps or drops the wrong repositories.
     #[tokio::test]
     async fn slots_are_tenant_confined_and_track_removed_access() {
         if database_url().is_none() {
@@ -423,8 +426,34 @@ mod pg_tests {
         .await
         .expect("catalog reads");
         assert!(enabled && forced, "RLS is enabled and forced");
+        let (definer, config): (bool, Vec<String>) = sqlx::query_as(
+            "SELECT prosecdef, proconfig FROM pg_proc
+              WHERE oid = 'wyrd.github_installation_tenant(text, bigint)'::regprocedure",
+        )
+        .fetch_one(fixture.app_pool())
+        .await
+        .expect("catalog reads");
+        assert!(definer, "the routing lookup is SECURITY DEFINER");
+        assert_eq!(config, vec!["search_path=pg_catalog, wyrd".to_owned()]);
 
         let mut conn = fixture.tenant_conn_for(tenant_b).await.expect("conn opens");
+        let operator = "SELECT coalesce(current_setting('app.operator', true), '')";
+        let before: String = sqlx::query_scalar(operator)
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("setting reads");
+        let routed: Option<Uuid> =
+            sqlx::query_scalar("SELECT wyrd.github_installation_tenant($1, 41)")
+                .bind(HOST)
+                .fetch_one(&mut **conn.transaction())
+                .await
+                .expect("lookup runs");
+        assert_eq!(routed, Some(tenant_a.as_uuid()), "B's session routes to A");
+        let after: String = sqlx::query_scalar(operator)
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("setting reads");
+        assert_eq!(after, before, "elevation ends with the lookup body");
         assert!(
             github_installation(&mut conn)
                 .await

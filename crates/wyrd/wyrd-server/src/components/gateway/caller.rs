@@ -79,7 +79,8 @@ impl ServerWyrdGatewayCaller {
     }
 
     /// Hold one of `permits`, the model-call capacity of verification lane
-    /// `lane`, for each call, waiting for one before the gateway is reached.
+    /// `lane`, for each call, waiting for one before the gateway is reached;
+    /// the wait spends the call's own timeout.
     pub(crate) fn admitted(mut self, lane: &'static str, permits: Arc<Semaphore>) -> Self {
         self.lane = Some((lane, permits));
         self
@@ -90,8 +91,10 @@ impl ServerWyrdGatewayCaller {
 impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
     /// Submit one governed model call to the in-process gateway.
     ///
-    /// A lane-bound caller first waits, until `cancellation`, for one of its
-    /// lane's model-call permits and holds it until the call returns. The
+    /// A lane-bound caller first waits, until `cancellation` or the call's
+    /// timeout, for one of its lane's model-call permits and holds it until
+    /// the call returns; the wait spends the call's timeout, and the gateway
+    /// is given only the remainder, so admission never restarts it. The
     /// request is projected before admission, so an unservable dialect
     /// reaches no gateway decision. The gateway evaluates and audits the captured caller's invoke permission
     /// for the requested model and every fallback candidate. Its cancellation
@@ -102,7 +105,8 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
     /// Returns [`ProviderError::BadRequest`] for a request dialect the gateway
     /// does not serve or a body that does not serialize;
     /// [`ProviderError::Timeout`] when the run is cancelled, including while
-    /// it waits for its lane;
+    /// it waits for its lane, or the call's timeout passes before it is
+    /// admitted to its lane;
     /// [`ProviderError::RemoteProblem`] for a gateway refusal or a provider's
     /// non-success answer; and [`ProviderError::Decode`] when a success is not
     /// the dialect's native response.
@@ -126,23 +130,35 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
             body,
             answer,
         } = NativeCall::project(call.request, &call.model)?;
-        let _permit = match &self.lane {
-            Some((lane, permits)) => Some(
-                if let Ok(permit) = Arc::clone(permits).try_acquire_owned() {
+        // A lane wait spends the call's own budget, so admission never
+        // restarts it and the gateway is given only what remains.
+        let (timeout, _permit) = match &self.lane {
+            Some((lane, permits)) => {
+                let started = tokio::time::Instant::now();
+                let permit = if let Ok(permit) = Arc::clone(permits).try_acquire_owned() {
                     permit
                 } else {
                     tracing::info!(lane, "the model call waits for its lane's admission");
                     tokio::select! {
-                        permit = Arc::clone(permits).acquire_owned() => {
-                            permit.map_err(|_| ProviderError::timeout(PROVIDER))?
-                        }
+                        permit = tokio::time::timeout(
+                            call.timeout,
+                            Arc::clone(permits).acquire_owned(),
+                        ) => match permit {
+                            Ok(Ok(permit)) => permit,
+                            _ => return Err(ProviderError::timeout(PROVIDER)),
+                        },
                         () = cancellation.cancelled() => {
                             return Err(ProviderError::timeout(PROVIDER));
                         }
                     }
-                },
-            ),
-            None => None,
+                };
+                let remaining = call.timeout.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err(ProviderError::timeout(PROVIDER));
+                }
+                (remaining, Some(permit))
+            }
+            None => (call.timeout, None),
         };
         let request = GatewayCallRequest {
             operation,
@@ -161,7 +177,7 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
             batch: None,
             deployment: None,
             stream: false,
-            timeout: call.timeout,
+            timeout,
             subject: self.subject.clone().map(GatewayCallAttribution::Resolved),
             prompt_provider: Some(call.provider),
         };

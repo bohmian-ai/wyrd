@@ -85,6 +85,8 @@ struct Scripted {
     script: Mutex<VecDeque<Step>>,
     /// Deployment names in dispatch order.
     seen: Mutex<Vec<String>>,
+    /// Caller deadlines of the dispatched attempts, in dispatch order.
+    deadlines: Mutex<Vec<tokio::time::Instant>>,
     /// Notified when a parked attempt starts.
     entered: Notify,
     /// Releases a parked attempt.
@@ -110,12 +112,16 @@ impl Scripted {
 
 #[async_trait]
 impl ProviderDispatch for Scripted {
-    /// Records the deployment and plays the next step.
+    /// Records the deployment and deadline and plays the next step.
     async fn dispatch(&self, attempt: ProviderAttempt<'_>) -> AttemptResult {
         self.seen
             .lock()
             .expect("seen")
             .push(attempt.deployment.name.as_str().to_owned());
+        self.deadlines
+            .lock()
+            .expect("deadlines")
+            .push(attempt.deadline);
         let step = self.script.lock().expect("script").pop_front();
         match step {
             Some(Step::Return(result)) => result,
@@ -6026,4 +6032,106 @@ async fn gateway_agent_calls_start_only_on_a_compatible_adapter() {
         .await
         .expect("a direct client call keeps protocol translation");
     assert_eq!(dispatch.seen(), ["dep-a", "claude", "claude"]);
+}
+
+/// A lane-bound Agent call spends one budget across its lane wait and its
+/// gateway call. With the lane's only permit held, a short call times out
+/// within its budget and nothing is dispatched. A call admitted after
+/// waiting out half its budget reaches the provider with only the remainder
+/// as its deadline, so a provider that never answers ends the call by the
+/// original deadline rather than a full budget after admission. Neither
+/// expiry keeps a permit, so the next call is answered.
+///
+/// # Panics
+/// Panics when a setup step fails, a wait outlives its budget, a call is
+/// dispatched while the lane is held, a dispatched deadline restarts the
+/// budget, or a permit is kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lane_wait_spends_the_agent_call_budget() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let dispatch = Scripted::shared();
+    let state = replica(&fixture, dispatch.clone()).await;
+    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
+    let permits = Arc::new(Semaphore::new(1));
+    let agent =
+        super::ServerWyrdGatewayCaller::new(state.clone(), invoker(tenant, 1, [open_access()]))
+            .admitted("queued", Arc::clone(&permits));
+    let chat = |timeout: Duration| skald_agent::WyrdGatewayCall {
+        request: skald_spec::ProviderRequest::OpenAiChatCompletion(
+            serde_json::from_value(json!({"model": "a", "max_tokens": 4,
+                    "messages": [{"role": "user", "content": "hi"}]}))
+            .expect("chat request"),
+        ),
+        model: model("dep-a/a"),
+        provider: skald_spec::ProviderName::OpenAi,
+        timeout,
+    };
+    let call = |timeout: Duration| {
+        let agent = agent.clone();
+        let call = chat(timeout);
+        async move {
+            skald_agent::WyrdGatewayCaller::call(&agent, call, &CancellationToken::new()).await
+        }
+    };
+
+    let held = Arc::clone(&permits)
+        .try_acquire_owned()
+        .expect("the lane's only permit");
+    let expired = tokio::time::timeout(Duration::from_secs(10), call(Duration::from_millis(300)))
+        .await
+        .expect("the lane wait ends within the call's budget")
+        .expect_err("a call whose lane stays held times out");
+    assert!(
+        matches!(expired, skald_providers::ProviderError::Timeout { .. }),
+        "{expired:?}"
+    );
+    assert!(dispatch.seen().is_empty(), "nothing is dispatched");
+    assert_eq!(permits.available_permits(), 0, "the wait took no permit");
+
+    let budget = Duration::from_secs(2);
+    dispatch.push(Step::Hang);
+    let started = tokio::time::Instant::now();
+    let waiting = tokio::spawn(call(budget));
+    // Elapsed time is the measured quantity: the call spends half its budget
+    // waiting for the lane before it is admitted.
+    tokio::time::sleep(budget / 2).await;
+    drop(held);
+    let expired = waiting
+        .await
+        .expect("the call joins")
+        .expect_err("a provider that never answers times out");
+    let ended = started.elapsed();
+    match expired {
+        skald_providers::ProviderError::RemoteProblem(problem) => {
+            assert_eq!(problem.code, "WYRD_GATEWAY_504_DEADLINE_EXCEEDED");
+        }
+        other => panic!("unexpected expiry: {other:?}"),
+    }
+    let deadlines = dispatch.deadlines.lock().expect("deadlines").clone();
+    assert_eq!(dispatch.seen(), ["dep-a"]);
+    assert!(
+        deadlines[0] <= started + budget + budget / 4,
+        "the provider's deadline is the original one, not a budget after admission"
+    );
+    assert!(ended < budget + budget / 4, "the call ended after {ended:?}");
+    assert_eq!(permits.available_permits(), 1, "the expiry kept no permit");
+
+    dispatch.push(Step::Return(AttemptResult::Completed {
+        body: ResponseBody::Json(
+            serde_json::value::to_raw_value(&json!({
+                "id": "chatcmpl-test", "object": "chat.completion", "created": 0, "model": "a",
+                "choices": [{"index": 0, "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "ok"}}]
+            }))
+            .expect("json"),
+        ),
+        usage: usage(1, 1),
+        capture: None,
+    }));
+    call(Duration::from_secs(10))
+        .await
+        .expect("the next call is admitted and answered");
+    assert_eq!(dispatch.seen(), ["dep-a", "dep-a"]);
+    assert_eq!(permits.available_permits(), 1);
 }

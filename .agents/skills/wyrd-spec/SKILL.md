@@ -1,14 +1,14 @@
 ---
 name: wyrd-spec
-description: Define or revise a human-approved Wyrd behavioral specification from agreed intent and applicable repository constraints, leaving implementation decisions open.
+description: Turn finalized Wyrd design notes and supplements into a concise human-approved behavioral contract, preserving settled decisions without adding requirements or redesigning the solution.
 ---
 
 # Wyrd Spec
 
-Preserve the agreement in a specification the maintainer can understand without
-reading code or the author conversation. Only explicit human approval makes a
-revision authoritative. Do not create tasks or edit implementation code; hand
-an approved specification to `$wyrd-plan`.
+Record the finalized design's agreement in a specification the maintainer can
+understand without reading code or the author conversation. Only explicit human
+approval makes a revision authoritative. Do not create tasks or edit
+implementation code; hand an approved specification to `$wyrd-plan`.
 
 ## Establish the agreement
 
@@ -18,9 +18,16 @@ change. Follow CodeGraph instructions before tracing repository behavior.
 Inspect existing owners, consumers and tests only far enough to distinguish
 current behavior from the agreed outcome and identify relevant constraints.
 
-When `changes/active/<slug>/design/notes.md` exists, read it and relevant
-supplements. Carry forward user decisions and distinguish them from agent
-assumptions and proposals. Design finalization is not spec approval. A proposed
+For a new change, consume finalized `changes/active/<slug>/design/notes.md` and
+its relevant supplements as the normal predecessor. If the solution has not
+been settled, return the missing material decision to `$wyrd-design` rather
+than designing it here. Existing approved packets remain authoritative; do not
+manufacture retroactive design notes.
+
+Carry forward the agreed approach and material decisions; distinguish them
+from illustrative sketches and agent proposals. Preserve explicitly settled
+implementation constraints without turning every private suggestion into a
+requirement. Design finalization is not spec approval. A proposed
 standards change is not enacted until the user resolves the conflict and the
 required authority update is made.
 
@@ -30,9 +37,10 @@ Explain necessary inferences where they arise; do not create a separate ledger.
 Keep optional improvements outside requirements until agreed.
 
 Resolve contradictions only when they prevent specifying this change correctly.
-Report unrelated documentation drift separately. Before proposing a new public
-surface or ownership boundary, identify the missing behavior and why the
-existing owner's workflow cannot provide it.
+Report unrelated documentation drift separately. If repository evidence shows
+the agreed solution needs a new material decision, return the specific question
+to design. Do not independently select a different public surface, ownership
+boundary or implementation approach while converting the design.
 
 ## Specify the outcome
 
@@ -43,6 +51,11 @@ ID, revision, and `draft | approved | superseded` status. Default to:
 - required behavior, scope and exclusions;
 - applicable constraints and material decisions; and
 - acceptance observations: the situation exercised and expected result.
+
+Link the finalized design and relevant supplements. Summarize the agreed
+implementation flow and why it delivers the outcome; keep supporting research
+in the design rather than duplicating it. Clarify wording without enlarging
+the agreement or inventing acceptance cases.
 
 Use stable local obligation IDs for task and review traceability. Describe each
 promise once; acceptance may reference it without repeating it. Link relevant
@@ -55,11 +68,10 @@ compatibility, concurrency and persistent formats only where the change affects
 them. Existing safeguards remain mandatory; touching an area does not authorize
 new guarantees for it.
 
-Resolve decisions that materially change the agreed outcome, public or
-persisted contract, required ownership, or safety boundary. Leave ordinary
-implementation decisions open, including private functions, modules, algorithms,
-available dependency APIs and test fixtures, unless the user or architecture
-explicitly makes a mechanism part of the contract.
+Material decisions belong in the design conversation before specification.
+Leave ordinary implementation decisions open, including private functions,
+modules, algorithms, available dependency APIs and test fixtures, unless the
+user or architecture explicitly makes a mechanism part of the contract.
 
 Stop elaborating when the agreed outcome, affected owner, material constraints
 and credible verification are clear. A conceivable failure mode alone does not

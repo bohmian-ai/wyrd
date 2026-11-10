@@ -1,13 +1,14 @@
 ---
 name: wyrd-plan
-description: Translate an approved Wyrd specification into the smallest cohesive task set without adding obligations or predicting private implementation details.
+description: Use an approved Wyrd spec and finalized design to write cohesive tasks that carry the agreed approach through real inputs, outputs, dependencies, and observable proof without adding scope.
 ---
 
 # Wyrd Plan
 
-Translate the approved contract into executable work. Planning may decompose
-obligations and identify necessary implementation work; it may not enlarge the
-agreement. Leave reversible technical decisions to `$wyrd-implement`.
+Translate the approved contract and agreed design into executable work. Carry
+the selected approach into tasks; decompose the flow without enlarging the
+agreement or designing a replacement solution. Leave unsettled reversible
+coding choices to `$wyrd-implement`.
 
 Do not use this skill for review remediation. Validated implementation findings
 go directly to `$wyrd-implement`; findings that change approved behavior go to
@@ -22,16 +23,20 @@ applicable directory guidance, [spec-driven development](../../../changes/spec-d
 the change. Follow CodeGraph instructions and inspect the owners, consumers,
 tests, manifests and `mise.toml` tasks needed to locate the work and its proof.
 
-Read relevant design notes when present. User decisions and approved semantics
-govern; proposed private mechanics remain guidance. Revalidate research only
-where it matters to the task.
+Read the finalized design notes and relevant supplements alongside the approved
+spec. Use the agreed implementation approach, flow and rationale to write the
+tasks. Explicitly settled constraints and approved semantics govern;
+illustrative private mechanics remain guidance. Revalidate research only where
+it matters to the task. Existing approved packets without design notes remain
+usable; do not invent a design or force retroactive artifacts.
 
 Do not add product guarantees, supported cases, interfaces, operational features
 or acceptance obligations. A newly discovered material need returns to
-`$wyrd-spec`; optional improvements stay outside the plan. Return
-`SPEC_REVISION_REQUIRED` when an unresolved decision materially changes the
-outcome, public or persisted contract, required ownership, or safety boundary.
-Ordinary implementation uncertainty is not a spec blocker.
+the design conversation, with `$wyrd-spec` revision and renewed approval when
+the approved contract must change; optional improvements stay outside the plan.
+Return `SPEC_REVISION_REQUIRED` when an unresolved decision materially changes
+the outcome, public or persisted contract, required ownership, or safety
+boundary. Ordinary implementation uncertainty is not a spec blocker.
 
 ## Decompose only as needed
 
@@ -54,21 +59,35 @@ ID, status, approved spec revision, mapped obligations and real dependencies.
 Use the smallest structure that conveys:
 
 - outcome and scope, including relevant exclusions;
-- the existing owner and missing behavior;
+- the existing owner, missing behavior and implementation approach carried
+  forward from the design;
+- inputs and their actual sources, outputs and their consumers;
 - acceptance observations mapped once to the approved obligations;
 - credible verification at the required test tier; and
 - any real dependency or material blocker.
 
-Add approach notes only where they resolve a real handoff ambiguity. Do not
-require a fixed step count or empty sections. Do not repeat the spec or invent
-extra cases to fill a template. Preserve the journeys, language surfaces and
-safeguards required by applicable repository authority.
+Name the design sections or supplements that explain the selected approach.
+Keep the task self-contained enough to execute without rediscovering the
+solution. Do not require a fixed step count or empty sections. Do not repeat
+the spec or invent extra cases to fill a template. Preserve the journeys,
+language surfaces and safeguards required by applicable repository authority.
+
+Each task implements an agreed part of the flow:
+input and source → agreed change → output and consumer → observable proof.
+An input comes from existing repository behavior or an identified predecessor
+task's output. State which output a dependency supplies; do not add placeholder
+tasks for capabilities that already exist or fabricate inputs to hide a gap.
 
 Describe verification as a concrete trigger and expected observation. Group
 equivalent cases where useful. TDD remains an execution discipline: do not
 script `RED`, `GREEN` or `REFACTOR` blocks or predict a refactoring. For static
 or already-correct behavior, name the appropriate proof without manufacturing
 tests or production changes.
+
+Proof must exercise the task's actual inputs and demonstrate its promised
+outputs. At connected boundaries, establish that the downstream consumer uses
+the predecessor's output through the agreed path. Preserve the end-to-end
+acceptance journey; disconnected fixtures alone do not prove the delivered flow.
 
 Identify the test owner, tier and existing runner. Include exact focused
 commands for existing tests named in the task. Do not invent names or selectors
@@ -82,10 +101,11 @@ fixtures and use of already-approved dependencies remain implementation-owned.
 
 ## Check and hand off
 
-Confirm coverage of approved obligations without adding new ones, respect
-exclusions, and check that dependencies are real. Stop elaborating when the
-outcome, affected owner, material constraints and credible verification are
-clear. A conceivable failure mode alone does not authorize another requirement.
+Confirm coverage of approved obligations and the agreed flow without adding
+new ones. Respect exclusions, check each input's source and dependency output,
+and ensure the combined proof connects the delivered flow. Stop elaborating
+when the outcome, affected owner, material constraints and credible verification
+are clear. A conceivable failure mode alone does not authorize another requirement.
 
 Complete the shared independent comprehension pass over the spec and tasks.
 Repair explanations without expanding approved semantics. Planning does not

@@ -6,6 +6,28 @@ tasks, task review, remediation, and final change verification. Execution
 discipline for one task is in
 [implementation execution](implementation-execution.md).
 
+## Design to observable proof
+
+The normal authoring flow is `$wyrd-design` → `$wyrd-spec` → `$wyrd-plan` →
+implementation and observable proof. Use the existing Markdown packet and
+approval process.
+
+| Skill | Predecessor | Responsibility and handoff |
+|---|---|---|
+| `wyrd-design` | User intent and repository evidence | Settle the solution, implementation flow, material decisions and observable success in finalized notes and useful supplements. |
+| `wyrd-spec` | Finalized design and supplements | Record the agreement as a concise behavioral contract for human approval. |
+| `wyrd-plan` | Approved spec and finalized design | Carry the agreed approach into cohesive tasks with real inputs, outputs, dependencies and proof. |
+
+Each stage preserves its predecessor's agreement and adds only the detail
+needed for its responsibility. Surface missing material decisions in the
+design conversation instead of silently supplying them. If the approved
+contract changes, revise the spec and obtain renewed approval before affected
+work proceeds. Ordinary private coding choices remain implementation-owned.
+
+Existing approved packets remain authoritative; do not manufacture retroactive
+design artifacts. Bounded direct instructions remain valid under
+[implementation execution](implementation-execution.md#change-contract).
+
 ## Authority
 
 Apply instructions in this order, for spec-driven changes and bounded direct
@@ -36,8 +58,9 @@ requirements until agreed.
 
 Planning may decompose approved obligations and identify their necessary work;
 it may not add guarantees, supported cases, interfaces, operational features or
-acceptance obligations. Newly discovered material needs return to specification
-and human approval. Existing repository safeguards remain mandatory. Reference
+acceptance obligations. Newly discovered material needs return to design, then
+specification and human approval when the approved contract must change.
+Existing repository safeguards remain mandatory. Reference
 their relevant consequences without restating policy as new change requirements.
 
 Resolve decisions that materially change the agreed outcome, public or
@@ -126,20 +149,25 @@ same author check; never claim independence for a self-review.
 
 ## Change artifact lifecycle
 
-An optional `$wyrd-design` conversation starts the packet at
+A `$wyrd-design` conversation normally starts the packet at
 `changes/active/<slug>/design/notes.md`, with supplemental files only as needed.
-It records the problem, desired outcome, implementation proposal, evidence,
-decisions, and open questions before a spec exists. Design status is
-`exploring` or `finalized`; the user decides when to finalize. Neither status
-grants spec approval or implementation readiness. Design may propose changes
+It records the problem, agreed solution, end-to-end implementation flow,
+evidence, material decisions and observable success before a spec exists.
+Design status is `exploring` or `finalized`. Finalize when the user agrees the
+proposal and no unresolved decision would materially change the solution.
+Stopping a conversation with such a decision open leaves it `exploring`;
+private coding choices need not be settled. Finalization makes the design ready
+for specification, not approved for implementation. Design may propose changes
 to repository standards, recording the exact conflict and the user's decision
 without silently changing authority. Required authority updates must be
 resolved before spec approval.
 
-`wyrd-spec` and `wyrd-plan` read this folder when present as reference material,
-revalidating its claims and distinguishing user constraints from proposed
-private mechanics. The approved spec remains the behavioral contract. No
-design folder is required for changes that start directly with specification.
+`wyrd-spec` consumes the finalized notes and relevant supplements to record the
+agreement without redesigning it. `wyrd-plan` reads both the approved spec and
+the design to decompose the selected approach into tasks. Distinguish explicit
+decisions from illustrative sketches and private suggestions. Revalidate claims
+only where they matter to the current handoff; missing material decisions
+return to design. The approved spec remains the behavioral contract.
 
 Use one tracked, repository-local change packet while work is active. Keep the
 packet with the implementation so ordinary branches, worktrees, pull requests,
@@ -160,7 +188,7 @@ Store the active packet under:
 
 ```text
 changes/active/<slug>/
-|-- design/                    optional pre-spec research and proposal
+|-- design/                    agreed solution, flow and supporting evidence
 |   `-- notes.md
 |-- spec.md
 `-- tasks/
@@ -215,9 +243,13 @@ than rewriting history to remove small text artifacts.
 
 ## Specification contract
 
-A specification fixes intent, constraints, invariants, externally observable
-behavior, and only those system boundaries that are themselves required. It
-leaves ordinary implementation mechanics open.
+A specification records the finalized design's intent, constraints, material
+decisions, externally observable behavior and required system boundaries.
+Preserve settled implementation constraints without promoting illustrative
+private suggestions into requirements. Link the design and relevant supplements
+and summarize the agreed flow; keep supporting research in the design. Missing
+material decisions return to design rather than being invented during conversion.
+Ordinary implementation mechanics remain open.
 
 Use stable local obligation IDs such as `REQ-001`, `INV-001`, and `AC-001`
 for traceability; do not require separate families for the same promise. Keep
@@ -254,7 +286,8 @@ defined in Scope discipline; it need not settle ordinary implementation choices.
 
 ## Task contract
 
-`wyrd-plan` derives implementation tasks from an approved spec revision.
+`wyrd-plan` derives implementation tasks from an approved spec revision and
+the finalized design, carrying forward the selected implementation approach.
 `wyrd-task-review` packages validated review findings into remediation tasks
 under that same spec. Default to one task; split only for real dependencies,
 distinct behavioral owners or independently deliverable outcomes. Include each
@@ -281,6 +314,8 @@ remediates: []
 - approved spec ID and revision;
 - mapped requirement, invariant, and acceptance IDs;
 - outcome, scope, existing owner and missing behavior;
+- the agreed approach and relevant design references;
+- inputs and their actual sources, outputs and their consumers;
 - acceptance observations mapped once to approved obligations;
 - credible verification at the required test tier, with the test owner and
   existing runner; exact commands for existing tests named in the task;
@@ -288,12 +323,23 @@ remediates: []
 - relevant exclusions and any real dependencies or material blockers; and
 - for remediation, the parent task and validated finding IDs.
 
-Use the smallest readable structure. Approach notes are needed only to resolve
-a real handoff ambiguity; no step count, empty sections or scripted
-Behavior/RED/GREEN/REFACTOR blocks are required. TDD remains an execution
-discipline. Describe the trigger and expected observation, leaving exact new
-test names, private mechanics and useful refactoring to implementation. Static
-or already-correct behavior needs appropriate proof, not manufactured tests.
+Each task implements an agreed part of the flow: input and source → agreed
+change → output and consumer → observable proof. Inputs come from existing
+repository behavior or an identified predecessor task's output. Explain which
+output a dependency supplies; do not add placeholder tasks for existing
+capabilities or fabricate inputs to hide a missing connection.
+
+Use the smallest readable structure and enough of the agreed approach to
+execute without rediscovering the solution. No step count, empty sections or
+scripted Behavior/RED/GREEN/REFACTOR blocks are required. TDD remains an
+execution discipline. Describe the trigger and expected observation, leaving
+exact new test names, private mechanics and useful refactoring to implementation.
+Static or already-correct behavior needs appropriate proof, not manufactured tests.
+
+Proof exercises actual inputs and demonstrates the promised outputs. At
+connected boundaries it establishes that the downstream consumer uses the
+predecessor's output through the agreed path. Preserve the end-to-end
+acceptance journey; disconnected fixtures alone do not prove the delivered flow.
 
 A task is ready when it covers its approved obligations and an implementer can
 proceed without a new material decision as defined in Scope discipline. It may

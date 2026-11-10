@@ -1129,3 +1129,52 @@ impl<'a> VerificationControl<'a> {
         ))
     }
 }
+
+/// The direct-eligibility rule, apart from any resolution or engine.
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use wyrd_spec::card::verifier::VerifierSpec;
+    use wyrd_spec::error::WyrdError;
+    use wyrd_spec::ids::CardUid;
+
+    use super::direct_eligibility;
+
+    /// A Verifier judging a scheduled window is refused as queued-only; an
+    /// ordinary assert-only Verifier is eligible.
+    ///
+    /// # Panics
+    /// Panics when a spec does not parse or the rule decides either wrongly.
+    #[test]
+    fn direct_eligibility_refuses_only_queued_only_verifiers() {
+        let verifier = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("a v7 UUID is a Card UID");
+        let spec = |inputs: serde_json::Value, check: serde_json::Value| -> VerifierSpec {
+            serde_json::from_value(json!({
+                "inputs": inputs,
+                "requirements": [{ "id": "r", "statement": "s", "check": check }],
+            }))
+            .expect("the spec parses")
+        };
+        let window = spec(
+            json!({ "latency": { "type": "samples", "features": ["latency"] } }),
+            json!({
+                "kind": "drift", "on": "inputs.latency", "method": "Psi",
+                "signal": { "kind": "Distribution", "features": ["latency"],
+                            "baseline_ref": { "kind": "Data", "name": "baseline", "version": "1.0.0" } },
+                "condition": { "kind": "Statistical" },
+                "profile": { "kind": "Psi", "binning_strategy": { "kind": "EqualWidth", "n_bins": 10 },
+                             "threshold": { "kind": "Fixed", "value": 0.25 } },
+            }),
+        );
+        let ordinary = spec(
+            json!({ "question": { "type": "json" } }),
+            json!({ "kind": "assert", "path": "inputs.question", "operator": "is_not_null" }),
+        );
+
+        assert!(matches!(
+            direct_eligibility(&verifier, &window),
+            Err(WyrdError::VerificationInputUnsupported { .. })
+        ));
+        assert!(direct_eligibility(&verifier, &ordinary).is_ok());
+    }
+}

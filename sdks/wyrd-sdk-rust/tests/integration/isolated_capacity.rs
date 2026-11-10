@@ -40,6 +40,9 @@ const UNAVAILABLE: &str = "WYRD_SERVER_503_SERVICE_UNAVAILABLE";
 /// The event a queued model call logs while its lane admits none.
 const MODEL_WAIT: &str = "the model call waits for its lane's admission";
 
+/// The stable code of a direct verification past its deadline.
+const TIMED_OUT: &str = "WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT";
+
 /// The event the runner logs when a queued execution meets a full admission.
 const DEFERRED: &str = "verification execution deferred by admission backpressure";
 
@@ -101,6 +104,7 @@ impl CapacityDesk {
                     direct_executions: 1,
                     direct: ONE,
                     queued: ONE,
+                    verify_timeout: Duration::from_secs(10),
                     ..HostedLimits::default()
                 })
                 .with_verification_runtime_limits_for_test(RuntimeLimits {
@@ -263,11 +267,14 @@ async fn settled(execution: &Execution) -> VerificationResult {
 /// queued run stays pending; both queued runs complete once the permit is
 /// released. With queued Python or the queued workspace held, the direct code
 /// or workspace Agent Verifier completes while its queued twin is deferred,
-/// then completes on release. Every model call, direct or queued, is
+/// then completes on release, its continuation staying on the queued lane
+/// while the direct one is held. Every model call, direct or queued, is
 /// recorded on the ordinary gateway path against the verified Service.
 /// Holding a direct admission refuses direct work with the stable
 /// unavailable code although the queued lane is free, and queued work of
-/// that resource still completes.
+/// that resource still completes; a direct model call waits for its own
+/// lane rather than taking the free queued one, and a wait past the direct
+/// deadline is cancelled without leaking a permit.
 ///
 /// # Panics
 /// Panics when the process already has a global subscriber, or a run, wait,
@@ -313,8 +320,10 @@ async fn direct_verification_runs_while_queued_capacity_is_held() {
     passed(&direct_python, "measured");
     let queued_python = desk.submit("python-check", "QUEUED-PYTHON").await;
     logged(&logs, &[DEFERRED, &queued_python.id().to_string()]).await;
+    let direct_python_held = desk.hold(ExecutionMode::Direct, LaneAdmission::Python);
     drop(python_held);
     passed(&settled(&queued_python).await, "measured");
+    drop(direct_python_held);
 
     let workspace_held = desk.hold(ExecutionMode::Queued, LaneAdmission::Workspaces);
     let direct_scratch = desk
@@ -324,8 +333,10 @@ async fn direct_verification_runs_while_queued_capacity_is_held() {
     passed(&direct_scratch, "written");
     let queued_scratch = desk.submit("scratch-check", "QUEUED-SCRATCH").await;
     logged(&logs, &[DEFERRED, &queued_scratch.id().to_string()]).await;
+    let direct_workspace_held = desk.hold(ExecutionMode::Direct, LaneAdmission::Workspaces);
     drop(workspace_held);
     passed(&settled(&queued_scratch).await, "written");
+    drop(direct_workspace_held);
 
     let subjects = desk.call_subjects().await;
     let root = desk
@@ -370,6 +381,30 @@ async fn direct_verification_runs_while_queued_capacity_is_held() {
         passed(&settled(&queued).await, id);
         drop(held);
     }
+    let held = desk.hold(ExecutionMode::Direct, LaneAdmission::ModelCalls);
+    let (waited, ()) = tokio::join!(desk.verify("model-check", "FULL-MODEL"), async {
+        logged(&logs, &[MODEL_WAIT, "direct"]).await;
+        drop(held);
+    });
+    passed(
+        &waited.expect("the direct call proceeds once its own lane frees"),
+        "answered",
+    );
+    let held = desk.hold(ExecutionMode::Direct, LaneAdmission::ModelCalls);
+    let refused = desk
+        .verify("model-check", "STUCK-MODEL")
+        .await
+        .expect_err("a direct call waiting past the deadline is cancelled");
+    assert_eq!(refused.code(), TIMED_OUT);
+    drop(held);
+    passed(
+        &desk
+            .verify("model-check", "AFTER-STUCK")
+            .await
+            .expect("the cancelled wait leaked no permit"),
+        "answered",
+    );
+
     let held = desk
         .deployment
         .server()

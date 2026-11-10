@@ -2975,28 +2975,7 @@ impl Record {
                 let _ = writeln!(out, "- {} {}: {}", reason.code, place, reason.message);
             }
         }
-        let profile = &self.artifacts.profile;
-        if profile.requested {
-            let scope = profile.mode.map_or_else(String::new, |mode| {
-                let roles: Vec<&str> = profile.roles.iter().map(|role| role.name()).collect();
-                format!(" {} of {}", mode.name(), roles.join(" and "))
-            });
-            let _ = writeln!(
-                out,
-                "\nprofile{scope}: {} ({} captures){}",
-                if profile.complete {
-                    "complete"
-                } else {
-                    "incomplete"
-                },
-                profile.captures.len(),
-                if profile.notes.is_empty() {
-                    String::new()
-                } else {
-                    format!("; {}", profile.notes.join("; "))
-                }
-            );
-        }
+        self.render_profile(&mut out);
         let _ = writeln!(
             out,
             "\nverdict: {} (exit {})",
@@ -3006,11 +2985,71 @@ impl Record {
         out
     }
 
+    /// Writes the profile evidence to `out`, when profiling was requested:
+    /// its mode and roles, whether it completed, its captures per role and
+    /// each capture's path, its notes, and the limits of its scope. A
+    /// record that predates profile modes and roles profiled the server
+    /// only, and says so.
+    fn render_profile(&self, out: &mut String) {
+        let profile = &self.artifacts.profile;
+        if !profile.requested {
+            return;
+        }
+        let scope = profile.mode.map_or_else(
+            || " of server (recorded before profile modes and roles)".to_owned(),
+            |mode| {
+                let roles: Vec<&str> = profile.roles.iter().map(|role| role.name()).collect();
+                format!(" {} of {}", mode.name(), roles.join(" and "))
+            },
+        );
+        let role = |capture: &str| {
+            if capture.contains("-driver-") {
+                Role::Driver
+            } else {
+                Role::Server
+            }
+        };
+        let per_role: Vec<String> = [Role::Server, Role::Driver]
+            .into_iter()
+            .map(|named| {
+                let count = profile
+                    .captures
+                    .iter()
+                    .filter(|capture| role(capture) == named)
+                    .count();
+                format!("{} {count}", named.name())
+            })
+            .collect();
+        let _ = writeln!(
+            out,
+            "\nprofile{scope}: {} ({} captures: {}){}",
+            if profile.complete {
+                "complete"
+            } else {
+                "incomplete"
+            },
+            profile.captures.len(),
+            per_role.join(", "),
+            if profile.notes.is_empty() {
+                String::new()
+            } else {
+                format!("; {}", profile.notes.join("; "))
+            }
+        );
+        out.push_str("- scope: a CPU capture spans one measured step from its warmup through its last repetition and settle; a heap capture holds the samples since sampling started, taken after each step; neither is aligned to a repetition window, and a profiled run is diagnostic, never a qualification\n");
+        for capture in &profile.captures {
+            let _ = writeln!(out, "- {} capture: {capture}", role(capture).name());
+        }
+    }
+
     /// Writes `step`'s diagnostic readings to `out`: each declared or read
-    /// observation with its declared boundary, then its reading in every
-    /// repetition, so no median conceals a slow repetition and a repetition
-    /// without one says why. A step of a record that declares and read
-    /// none, such as one that predates them, says they are unavailable.
+    /// observation under the process role that recorded it (`driver.`
+    /// observations are the driver's, every other one the server's) with its
+    /// declared boundary, then its reading in every repetition, so no median
+    /// conceals a slow repetition and a repetition without one says why. A
+    /// step of a record that declares and read none, such as one that
+    /// predates them, says they are unavailable, and one with no driver
+    /// observation says the driver's are, rather than reading as zero.
     fn render_diagnostics(&self, out: &mut String, step: &StepRecord) {
         let mut observations: Vec<&str> = self
             .criteria
@@ -3034,7 +3073,8 @@ impl Record {
         out.push_str(
             "  - diagnostics (wall time; nearest-rank bucket bounds; rows overlap and never add or subtract):\n",
         );
-        for observation in observations {
+        let driver = format!("{}.", Role::Driver.name());
+        for observation in &observations {
             let id = |stat: &str| format!("{DIAGNOSTIC}{observation}.{stat}");
             let boundary = self
                 .criteria
@@ -3042,7 +3082,10 @@ impl Record {
                 .iter()
                 .find(|metric| metric.id == id("count"))
                 .map_or("undeclared", |metric| metric.boundary.as_str());
-            let _ = writeln!(out, "    - {observation}: {boundary}");
+            let (role, name) = observation
+                .strip_prefix(&driver)
+                .map_or((Role::Server, *observation), |name| (Role::Driver, name));
+            let _ = writeln!(out, "    - {} {name}: {boundary}", role.name());
             for (index, repetition) in step.repetitions.iter().enumerate() {
                 let count = repetition.reading(&id("count"));
                 let cells = if count.is_present() {
@@ -3058,6 +3101,14 @@ impl Record {
                 };
                 let _ = writeln!(out, "      - repetition {}: {cells}", index + 1);
             }
+        }
+        if !observations
+            .iter()
+            .any(|observation| observation.starts_with(&driver))
+        {
+            out.push_str(
+                "    - driver: — unavailable: this record holds no driver observation for this step\n",
+            );
         }
     }
 
@@ -5239,6 +5290,157 @@ mod tests {
                 .count(),
             2
         );
+
+        let mut declared = declaration();
+        for (observation, boundary) in [
+            (
+                "phase.admit",
+                "server: the admission transaction, every call",
+            ),
+            (
+                "driver.client.http",
+                "driver: one logical request, every call",
+            ),
+            (
+                "driver.client.http.attempt",
+                "driver: one attempt, retries included",
+            ),
+        ] {
+            declared
+                .metrics
+                .extend(Metric::diagnostic(observation, boundary));
+        }
+        let observed = |server: &[u64], logical: &[u64], attempts: &[u64]| {
+            let mut repetition = good();
+            for (observation, nanos) in [
+                ("phase.admit", server),
+                ("driver.client.http", logical),
+                ("driver.client.http.attempt", attempts),
+            ] {
+                repetition.diagnose(
+                    observation,
+                    wyrd_benchmark::Distribution::of_durations(nanos),
+                    true,
+                );
+            }
+            repetition
+        };
+        let mut workload = Scripted::always(&good());
+        workload.script = [
+            observed(&[1], &[1], &[1]),
+            observed(&[10_000; 2], &[100_000; 3], &[40_000; 4]),
+            observed(&[20_000; 2], &[200_000; 5], &[90_000; 5]),
+            observed(&[30_000; 2], &[300_000; 7], &[70_000; 9]),
+            observed(&[1], &[1], &[1]),
+            observed(&[10_000], &[100_000], &[100_000]),
+            observed(&[10_000], &[100_000], &[100_000]),
+            observed(&[10_000], &[100_000], &[100_000]),
+        ]
+        .map(Ok)
+        .into_iter()
+        .collect();
+        let artifacts = root.path().join("target/roles");
+        let mut record = execute(
+            declared,
+            &mut workload,
+            [Some(quiet()), Some(quiet())],
+            &options(&artifacts),
+        )
+        .await;
+        record.artifacts.profile = ProfileNote {
+            requested: true,
+            complete: false,
+            captures: vec![
+                "profiles/op-1/cpu-server-7.json.gz".to_owned(),
+                "profiles/op-1/cpu-driver-8.json.gz".to_owned(),
+                "profiles/heap-driver-op-1.pb.gz".to_owned(),
+            ],
+            notes: vec!["the server heap profile was not served".to_owned()],
+            mode: Some(ProfileMode::Both),
+            roles: vec![Role::Server, Role::Driver],
+        };
+        let console = record.render();
+        let path = record.publish(root.path()).expect("publish");
+        std::fs::remove_dir_all(&artifacts).ok();
+        assert_eq!(
+            console,
+            Record::read(&path).expect("read").render(),
+            "roles and profile scope regenerate from history alone"
+        );
+        let block = |row: &str| -> Vec<String> {
+            let lines: Vec<&str> = console.lines().collect();
+            let start = lines
+                .iter()
+                .position(|line| line.starts_with(row))
+                .unwrap_or_else(|| panic!("{row} is reported: {console}"));
+            lines[start + 1..start + 4]
+                .iter()
+                .map(|line| line.trim().to_owned())
+                .collect()
+        };
+        let counts = |row: &str| -> Vec<String> {
+            block(row)
+                .iter()
+                .map(|line| line.split(',').next().unwrap_or_default().to_owned())
+                .collect()
+        };
+        assert_eq!(
+            counts("    - driver client.http: driver: one logical request"),
+            [
+                "- repetition 1: n 3",
+                "- repetition 2: n 5",
+                "- repetition 3: n 7"
+            ],
+            "every repetition's logical calls"
+        );
+        assert_eq!(
+            counts("    - driver client.http.attempt: driver: one attempt"),
+            [
+                "- repetition 1: n 4",
+                "- repetition 2: n 5",
+                "- repetition 3: n 9"
+            ],
+            "attempts are counted apart from logical calls"
+        );
+        assert_eq!(
+            counts("    - server phase.admit: server: the admission transaction"),
+            [
+                "- repetition 1: n 2",
+                "- repetition 2: n 2",
+                "- repetition 3: n 2"
+            ],
+            "the server's population is its own"
+        );
+        assert!(!console.contains("driver: — unavailable"), "{console}");
+        for line in [
+            "profile both of server and driver: incomplete (3 captures: server 1, driver 2); the server heap profile was not served",
+            "- driver capture: profiles/op-1/cpu-driver-8.json.gz",
+            "- server capture: profiles/op-1/cpu-server-7.json.gz",
+            "neither is aligned to a repetition window",
+        ] {
+            assert!(console.contains(line), "{line}: {console}");
+        }
+
+        let mut old = historical;
+        old.artifacts.profile = serde_json::from_value(json!({
+            "requested": true,
+            "complete": true,
+            "captures": ["profiles/profile-7.json.gz"],
+            "notes": [],
+        }))
+        .expect("an old profile note");
+        let report = old.render();
+        assert!(
+            report.contains("profile of server (recorded before profile modes and roles): complete (1 captures: server 1, driver 0)"),
+            "{report}"
+        );
+        assert_eq!(
+            report
+                .matches("    - driver: — unavailable: this record holds no driver observation for this step")
+                .count(),
+            0,
+            "a record with no diagnostics says so once, not per role"
+        );
     }
 
     /// V8: a persisted multi-criterion record renders the exact common
@@ -5434,11 +5636,9 @@ mod tests {
             assert_eq!(profile.complete, complete, "{profile:?}");
             if complete {
                 assert_eq!(profile.captures.len(), 2, "one per measured step");
-                assert!(
-                    record
-                        .render()
-                        .contains("profile cpu of server and driver: complete (2 captures)")
-                );
+                assert!(record.render().contains(
+                    "profile cpu of server and driver: complete (2 captures: server 2, driver 0)"
+                ));
             } else {
                 assert!(
                     profile.notes.iter().any(|n| n.contains(note)),

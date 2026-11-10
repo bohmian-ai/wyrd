@@ -21,12 +21,13 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use reqwest::{Client, RequestBuilder, Url};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::{Value, json};
+use wyrd_benchmark::Observation;
 use wyrd_client::bifrost::BifrostOptions;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::gateway_admin::{
     GatewayCaptureMode, GatewayCapturePolicyWrite, GatewayPayloadField,
 };
-use wyrd_client::transport::trace::benchmark_headers;
+use wyrd_client::transport::trace::{benchmark_cohort, benchmark_headers};
 use wyrd_client::{Bifrost, Gateway, GlobalConfig, Principals, WyrdClient};
 use wyrd_spec::auth::CreateServicePrincipalRequest;
 use wyrd_testing::gateway_capture::{GatewayCapture, Leaf, Step, pick};
@@ -308,9 +309,29 @@ pub struct Timed {
     pub outcome: Outcome,
 }
 
+/// The benchmark root of one raw Gateway call, from its send to its
+/// validated end, in the task's benchmark cohort.
+pub const CALL_ROOT: &str = "client.gateway";
+
+/// The benchmark root of a streamed call's head, from its send to its first
+/// data event carrying a choice.
+pub const HEAD_ROOT: &str = "client.gateway.head";
+
+/// The benchmark root of a call's one send attempt, from its send to its
+/// response headers or failure, as the SDK records its attempts.
+pub const ATTEMPT_ROOT: &str = "client.http.attempt";
+
 /// Sends one call of `shape` with `body` as `caller` and times it to its
 /// validated end.
+///
+/// In a benchmark process the call is one [`CALL_ROOT`] observation, a
+/// success only when answered, with its reached and disjoint `send`, `body`
+/// (receipt, a stream's consumption outside validation), and `decode`
+/// (answer validation) components, one [`ATTEMPT_ROOT`], and for a stream
+/// one [`HEAD_ROOT`]; a call dropped before its end records them cancelled.
 pub async fn call(caller: &Caller, shape: &Shape, body: Bytes) -> Timed {
+    let mut observation = Observation::start(CALL_ROOT, benchmark_cohort);
+    let mut head = shape.stream.then(|| observation.child(HEAD_ROOT));
     let sent = Instant::now();
     let mut timed = Timed {
         sent,
@@ -318,47 +339,104 @@ pub async fn call(caller: &Caller, shape: &Shape, body: Bytes) -> Timed {
         done: sent,
         outcome: Outcome::Answered,
     };
-    timed.outcome =
-        match tokio::time::timeout(CALL_TIMEOUT, exchange(caller, shape, body, &mut timed)).await {
-            Ok(outcome) => outcome,
-            Err(_) => Outcome::TimedOut,
-        };
+    let exchanged = exchange(caller, shape, body, &mut timed, &mut observation, &mut head);
+    timed.outcome = match tokio::time::timeout(CALL_TIMEOUT, exchanged).await {
+        Ok(outcome) => outcome,
+        Err(_) => Outcome::TimedOut,
+    };
     timed.done = Instant::now();
+    if let Some(head) = head {
+        head.finish(wyrd_benchmark::ERROR);
+    }
+    observation.finish(if timed.outcome.answered() {
+        wyrd_benchmark::SUCCESS
+    } else {
+        wyrd_benchmark::ERROR
+    });
     timed
 }
 
 /// Sends the request, with the benchmark labels scoped on this task, and
-/// reads its answer into `timed`, returning how it ended.
-async fn exchange(caller: &Caller, shape: &Shape, body: Bytes, timed: &mut Timed) -> Outcome {
-    let response = match caller.request(body).send().await {
+/// reads its answer into `timed`, returning how it ended; `observation` and
+/// the stream's `head` record what it reached, `head` finishing at the first
+/// choice event.
+async fn exchange(
+    caller: &Caller,
+    shape: &Shape,
+    body: Bytes,
+    timed: &mut Timed,
+    observation: &mut Observation,
+    head: &mut Option<Observation>,
+) -> Outcome {
+    let attempt = observation.child(ATTEMPT_ROOT);
+    let started = observation.now();
+    let sent = caller.request(body).send().await;
+    observation.since("send", started);
+    attempt.finish(match &sent {
+        Ok(response) if response.status().is_success() => wyrd_benchmark::SUCCESS,
+        _ => wyrd_benchmark::ERROR,
+    });
+    let response = match sent {
         Ok(response) => response,
         Err(error) if error.is_timeout() => return Outcome::TimedOut,
         Err(error) => return Outcome::Failed(format!("transport: {error}")),
     };
     let status = response.status();
+    let started = observation.now();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
+        observation.since("body", started);
         return refusal(status.as_u16(), &text);
     }
     if !shape.stream {
-        return match response.bytes().await {
-            Ok(bytes) => buffered(&bytes, shape.expected),
+        let bytes = response.bytes().await;
+        observation.since("body", started);
+        return match bytes {
+            Ok(bytes) => {
+                let started = observation.now();
+                let outcome = buffered(&bytes, shape.expected);
+                observation.since("decode", started);
+                outcome
+            }
             Err(error) => Outcome::Failed(format!("body: {error}")),
         };
     }
     let mut events = EventReader::default();
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            Ok(chunk) => {
-                if let Err(problem) = events.push(&chunk, &mut timed.events) {
-                    return Outcome::Failed(problem);
+    let mut decoding = std::time::Duration::ZERO;
+    let outcome = loop {
+        match stream.next().await {
+            Some(Ok(chunk)) => {
+                let started = observation.now();
+                let pushed = events.push(&chunk, &mut timed.events);
+                if let Some(started) = started {
+                    decoding += started.elapsed();
+                }
+                if !timed.events.is_empty()
+                    && let Some(head) = head.take()
+                {
+                    head.finish(wyrd_benchmark::SUCCESS);
+                }
+                if let Err(problem) = pushed {
+                    break Outcome::Failed(problem);
                 }
             }
-            Err(error) => return Outcome::Failed(format!("stream body: {error}")),
+            Some(Err(error)) => break Outcome::Failed(format!("stream body: {error}")),
+            None => {
+                let started = observation.now();
+                let outcome = events.finish(shape.expected);
+                if let Some(started) = started {
+                    decoding += started.elapsed();
+                }
+                break outcome;
+            }
         }
+    };
+    if let Some(started) = started {
+        observation.component("body", started.elapsed().saturating_sub(decoding));
+        observation.component("decode", decoding);
     }
-    events.finish(shape.expected)
+    outcome
 }
 
 /// The outcome of a non-2xx answer: a gateway refusal with its stable code

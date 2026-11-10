@@ -117,6 +117,19 @@ const BREAKDOWN: [(&str, &str); 9] = [
     ("wyrd_postgres_pool_acquire_seconds", "outcome"),
 ];
 
+/// The driver roots each direct `verify` records once, with their
+/// components: the SDK flow and its preparation, its one logical execution
+/// request, and that request's one attempt.
+const DRIVER_ROOTS: [(&str, bool, &[&str]); 3] = [
+    ("client.verify", false, &["prepare"]),
+    (
+        "client.http",
+        false,
+        &["serialize", "auth", "send", "body", "decode"],
+    ),
+    ("client.http.attempt", false, &[]),
+];
+
 /// The prefix of a direct execution's phase timing parts.
 const DIRECT_PARTS: &str = "verification.direct.";
 
@@ -298,6 +311,7 @@ impl Bench {
                 ))
             })?;
         let before = timings(server).await?;
+        let driver_before = wyrd_benchmark::snapshot();
         let first = scrape(server).await?;
         let (opened, _) = Window::open(server)
             .await
@@ -336,6 +350,22 @@ impl Bench {
         )
         .await;
         population.validate(&mut repetition, "measured");
+        let cohort = (DIRECT_CASE, phase.label());
+        let owed = DRIVER_ROOTS.map(|(boundary, _, _)| Expected {
+            boundary,
+            outcome: wyrd_benchmark::SUCCESS,
+            case: cohort.0,
+            phase: cohort.1,
+            count: acknowledged,
+        });
+        let driver = Population::collect_driver(&driver_before, &owed).await;
+        driver.validate(&mut repetition, "measured");
+        driver.diagnose_roots(
+            &mut repetition,
+            cohort,
+            &DRIVER_ROOTS,
+            measured.errors.is_empty().then_some(acknowledged),
+        );
         population.percentiles(
             &mut repetition,
             DIRECT_TIMING,

@@ -1383,10 +1383,38 @@ pub struct Repetition {
     pub timings: Vec<TimingEvidence>,
 }
 
-/// One server timing cohort's reconciliation: the observations a window
-/// owed at one boundary, outcome, case, and phase, and those it recorded.
+/// The process whose recorder produced timing evidence. Records written
+/// before the driver recorded its own observations hold only server
+/// evidence, so a missing role reads as [`Self::Server`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    /// The benchmark-owned `wyrd-server`.
+    #[default]
+    Server,
+    /// The capacity driver: its clients and its local provider fixture.
+    Driver,
+}
+
+impl Role {
+    /// The role's name in records and reports.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Server => "server",
+            Self::Driver => "driver",
+        }
+    }
+}
+
+/// One timing cohort's reconciliation: the observations a window owed at
+/// one boundary, outcome, case, and phase in one process, and those it
+/// recorded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reconciled {
+    /// The process that recorded them.
+    #[serde(default)]
+    pub role: Role,
     /// The server timing boundary.
     pub boundary: String,
     /// The outcome the observations were owed with.
@@ -1401,13 +1429,17 @@ pub struct Reconciled {
     pub recorded: u64,
 }
 
-/// The full server timing evidence of one window: the cumulative snapshots
-/// it differences, whose buckets rebuild every judged distribution, and
-/// its reconciliation.
+/// The full timing evidence of one window in one process: the cumulative
+/// snapshots it differences, whose buckets rebuild every judged
+/// distribution, and its reconciliation. A process's snapshots are never
+/// differenced against another's.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TimingEvidence {
     /// The window's name within its repetition, such as `measured`.
     pub window: String,
+    /// The process whose snapshots these are.
+    #[serde(default)]
+    pub role: Role,
     /// The snapshot at the window's open.
     pub before: wyrd_benchmark::BenchmarkSnapshot,
     /// The snapshot once the window's cohort drained.

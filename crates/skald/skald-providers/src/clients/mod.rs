@@ -23,7 +23,7 @@ use reqwest::Method;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER};
 
 use crate::error::{ProviderError, ProviderResult};
-use crate::exchange::ExchangeTimer;
+use crate::exchange::{ExchangeTimer, forward};
 use crate::retry::{RetryPolicy, parse_retry_after};
 use crate::transport::HttpTransport;
 
@@ -57,6 +57,7 @@ pub async fn send_bytes_with_retry(
     retry: &RetryPolicy,
 ) -> ProviderResult<Bytes> {
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    forward(&mut headers);
     let request = transport
         .client()
         .request(method, url)
@@ -157,6 +158,7 @@ pub async fn open_stream(
     body: Vec<u8>,
 ) -> ProviderResult<ProviderByteStream> {
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    forward(&mut headers);
     let mut exchange = ExchangeTimer::start();
     let response = transport
         .client()
@@ -406,6 +408,7 @@ impl HttpTransport {
             headers.insert(CONTENT_LENGTH, HeaderValue::from(payload.len));
             request = request.body(payload.body);
         }
+        forward(&mut headers);
         let mut exchange = ExchangeTimer::start();
         let response = request
             .headers(headers)

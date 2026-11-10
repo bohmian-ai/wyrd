@@ -14,13 +14,14 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use reqwest::Method;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use skald_spec::MediaFormat;
+use wyrd_benchmark::Observation;
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::card::verifier::{InputSlot as SlotSpec, VerifierSpec};
 use wyrd_spec::error::WyrdError;
@@ -420,6 +421,10 @@ impl Target<'_> {
     /// [`EXECUTE_RESPONSE_GRACE`] even when its configured timeout is
     /// shorter, so a slow execution ends in the server's 504.
     ///
+    /// The invocation's preparation, from `started` through evidence
+    /// pinning and request assembly, is added to `observation`'s `prepare`
+    /// component before the execution request.
+    ///
     /// # Errors
     /// Returns the local file and slot refusals of [`RunEvidence::pin`] and
     /// the server's refusal of the evidence plan, upload, or execution.
@@ -431,8 +436,11 @@ impl Target<'_> {
         self,
         client: &WyrdClient,
         run: RunEvidence,
+        observation: &mut Observation,
+        started: Option<Instant>,
     ) -> Result<VerificationResult, WyrdError> {
         let request = self.into_request(run.pin(client).await?);
+        observation.since("prepare", started);
         client
             .http
             .request_json_with_min_timeout(

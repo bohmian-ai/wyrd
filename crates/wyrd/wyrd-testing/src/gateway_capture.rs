@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -32,6 +33,7 @@ use serde_json::{Value, json};
 use url::Url;
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+use wyrd_benchmark::{Cohort, Observation};
 use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::GatewayAccess;
@@ -431,6 +433,12 @@ struct Paced {
 /// the marker; a handed frame is not proof of receipt. Nothing else is
 /// recorded, and at most `bound` calls' times are held until
 /// [`Self::take`] removes them. Dropping it stops serving.
+///
+/// In a benchmark process each answer is one [`FIXTURE_ROOT`] observation,
+/// classified by the benchmark metadata the Gateway forwarded, from the
+/// request's arrival to its answer's headers, with the paced delay excluded
+/// and its `parse` and `answer` components; a stream's paced body is not
+/// part of it.
 pub struct PacedUpstream {
     /// The bound address.
     address: SocketAddr,
@@ -537,10 +545,28 @@ const MARKER: &[Step] = &[Step::Key("messages"), Step::Index(0), Step::Key("cont
 /// Path of a chat request's `stream` member.
 const STREAM: &[Step] = &[Step::Key("stream")];
 
+/// The benchmark root of one [`PacedUpstream`] answer, apart from the
+/// driver's own client work although both run in the driver process.
+pub const FIXTURE_ROOT: &str = "fixture.upstream";
+
+/// Waits `delay` like [`pause`], excluding the wait from `observation`.
+async fn paused(delay: Duration, observation: &mut Observation) {
+    let started = observation.now();
+    pause(delay).await;
+    if let Some(started) = started {
+        observation.exclude(started.elapsed());
+    }
+}
+
 /// Answers one chat completion as [`PacedUpstream`] documents; a body that
 /// is not a JSON chat request is refused with `400`.
-async fn answer(State(paced): State<Paced>, body: Bytes) -> Response {
-    let Ok([marker, stream]) = pick(&body, [MARKER, STREAM]) else {
+async fn answer(State(paced): State<Paced>, headers: HeaderMap, body: Bytes) -> Response {
+    let mut observation = Observation::start(FIXTURE_ROOT, || Cohort::of_headers(&headers));
+    let started = observation.now();
+    let picked = pick(&body, [MARKER, STREAM]);
+    observation.since("parse", started);
+    let Ok([marker, stream]) = picked else {
+        observation.finish(wyrd_benchmark::ERROR);
         return (axum::http::StatusCode::BAD_REQUEST, "not json").into_response();
     };
     let marker = match marker {
@@ -549,12 +575,17 @@ async fn answer(State(paced): State<Paced>, body: Bytes) -> Response {
     };
     let pacing = paced.pacing;
     if stream != Some(Leaf::Bool(true)) {
-        pause(pacing.buffered_delay).await;
+        paused(pacing.buffered_delay, &mut observation).await;
+        let started = observation.now();
         paced.record(&marker);
-        return ([(CONTENT_TYPE, "application/json")], paced.buffered).into_response();
+        let answer = ([(CONTENT_TYPE, "application/json")], paced.buffered).into_response();
+        observation.since("answer", started);
+        observation.finish(wyrd_benchmark::SUCCESS);
+        return answer;
     }
     let marker = marker.into_owned();
-    pause(pacing.stream_delay).await;
+    paused(pacing.stream_delay, &mut observation).await;
+    let started = observation.now();
     let frames = GatewayCapture::chat_event_frames(&marker, pacing.chunks);
     let events = async_stream::stream! {
         for (index, frame) in frames.into_iter().enumerate() {
@@ -567,11 +598,14 @@ async fn answer(State(paced): State<Paced>, body: Bytes) -> Response {
             yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(frame));
         }
     };
-    (
+    let answer = (
         [(CONTENT_TYPE, "text/event-stream")],
         Body::from_stream(events),
     )
-        .into_response()
+        .into_response();
+    observation.since("answer", started);
+    observation.finish(wyrd_benchmark::SUCCESS);
+    answer
 }
 
 /// One step of a [`pick`] path: an object member or an array element.

@@ -33,6 +33,7 @@ use wyrd_spec::verification::execution::VerificationResult;
 
 use crate::bifrost::{Correlation, WriterTable};
 use crate::state::{BoundVerifier, WyrdState};
+use crate::transport::trace;
 use crate::verify::{Execution, Inputs, Projected, RunEvidence, Submission, Target};
 
 pub use lifecycle::DRIFT_OBSERVATIONS_TABLE;
@@ -356,22 +357,39 @@ impl Observe<'_> {
     ///
     /// # Cancellation
     /// Dropping the future abandons the request; it is never retried.
+    ///
+    /// In a benchmark process the whole flow is one `client.verify`
+    /// observation whose `prepare` component covers binding resolution,
+    /// projection, evidence pinning, and request assembly, before its
+    /// execution request's own logical call; a failed verdict is a successful
+    /// flow.
     pub async fn verify(
         &self,
         verifier: &str,
         inputs: impl Into<Inputs>,
     ) -> Result<VerificationResult, WyrdError> {
-        let state = &self.run.state;
-        let target = self.target(state.bound_verifier(&self.run.subject, verifier)?);
-        match target.project(inputs.into())? {
-            Projected::Run(run) => target.execute(state.client()?, run).await,
-            Projected::Window(_) => Err(WyrdError::VerificationInputUnsupported {
-                message:
-                    "a scheduled-window Verifier judges recorded samples; record them with submit"
+        let mut observation =
+            wyrd_benchmark::Observation::start("client.verify", trace::benchmark_cohort);
+        let started = observation.now();
+        let result = async {
+            let state = &self.run.state;
+            let target = self.target(state.bound_verifier(&self.run.subject, verifier)?);
+            match target.project(inputs.into())? {
+                Projected::Run(run) => {
+                    target
+                        .execute(state.client()?, run, &mut observation, started)
+                        .await
+                }
+                Projected::Window(_) => Err(WyrdError::VerificationInputUnsupported {
+                    message: "a scheduled-window Verifier judges recorded samples; record them with submit"
                         .to_owned(),
-                details: json!({ "verifier": verifier }),
-            }),
+                    details: json!({ "verifier": verifier }),
+                }),
+            }
         }
+        .await;
+        observation.settle(&result);
+        result
     }
 
     /// [`Observe::verify`], with every requirement's custom `data` decoded

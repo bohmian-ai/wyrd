@@ -157,8 +157,9 @@ pub fn benchmark_headers() -> Vec<(&'static str, String)> {
 
 /// The benchmark cohort [`with_benchmark_labels`] scoped on this task, which
 /// classifies this process's own client observations; none outside a scope
-/// or without `test-support`.
-pub(crate) fn benchmark_cohort() -> wyrd_benchmark::Cohort {
+/// or without `test-support`. A benchmark driver classifies its own
+/// observations of calls it sends outside a Wyrd client with it.
+pub fn benchmark_cohort() -> wyrd_benchmark::Cohort {
     #[cfg(feature = "test-support")]
     if let Ok(cohort) =
         BENCHMARK.try_with(|(case, phase)| wyrd_benchmark::Cohort::of(Some(case), Some(phase)))

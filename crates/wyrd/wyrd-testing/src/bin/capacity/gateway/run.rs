@@ -29,12 +29,13 @@ use wyrd_benchmark::Distribution;
 use wyrd_client::transport::trace::with_benchmark_labels;
 use wyrd_testing::capacity::{Expected, NANOS_PER_MS, Population, Usage, Window, release_binary};
 use wyrd_testing::experiment::{ExperimentError, Phase, Reading, Repetition, Step, Workload};
-use wyrd_testing::gateway_capture::{PacedUpstream, Pacing};
+use wyrd_testing::gateway_capture::{FIXTURE_ROOT, PacedUpstream, Pacing};
 use wyrd_testing::release_server::{LocalServer, Metrics};
 
 use crate::gateway::capacity::{MISS_AFTER, Schedule, open_loop};
 use crate::gateway::workload::{
-    Caller, CapturePolicy, Outcome, PREFIXES, Shape, Tenant, Timed, call, http,
+    ATTEMPT_ROOT, CALL_ROOT, Caller, CapturePolicy, HEAD_ROOT, Outcome, PREFIXES, Shape, Tenant,
+    Timed, call, http,
 };
 use crate::gateway::{
     CLIENTS, Case, LARGE_BYTES, PROCESS, Result, SMALL_BYTES, STREAM_CHUNKS, shutdown,
@@ -315,6 +316,11 @@ pub struct Observed {
     pub usage: Usage,
     /// The server timings of every call the window sent.
     pub population: Population,
+    /// The window's case and phase labels.
+    pub cohort: (&'static str, &'static str),
+    /// The driver's own observations of the window's calls and fixture
+    /// answers, once collected.
+    pub driver: Option<Population>,
     /// Integrity counters from the baseline to the post-drain scrape.
     pub integrity: Integrity,
     /// What the Scribe outbox wrote during the traffic window alone.
@@ -360,6 +366,9 @@ impl Observed {
         }
         let population = &self.population;
         population.validate(&mut repetition, "measured");
+        if let Some(driver) = &self.driver {
+            driver.validate(&mut repetition, "measured");
+        }
         let answer = boundaries(self.stream)[0];
         population.percentiles(
             &mut repetition,
@@ -503,6 +512,27 @@ impl Observed {
         repetition.diagnose("residual", residual, true);
         let writes = population.histogram(OUTBOX_WRITE_SECONDS, &[("outbox", "scribe")]);
         repetition.diagnose("outbox_write.scribe", writes, true);
+        if let Some(driver) = &self.driver {
+            let head: &[(&str, bool, &[&str])] = if self.stream {
+                &[(HEAD_ROOT, false, &[])]
+            } else {
+                &[]
+            };
+            let roots: Vec<(&str, bool, &[&str])> = [
+                (CALL_ROOT, false, &["send", "body", "decode"][..]),
+                (ATTEMPT_ROOT, false, &[][..]),
+                (FIXTURE_ROOT, true, &["parse", "answer"][..]),
+            ]
+            .into_iter()
+            .chain(head.iter().copied())
+            .collect();
+            driver.diagnose_roots(
+                repetition,
+                self.cohort,
+                &roots,
+                reconcile.then_some(answered),
+            );
+        }
     }
 }
 
@@ -601,6 +631,7 @@ impl Overhead {
             return Ok(Repetition::default());
         }
         let before = server.timings().await?;
+        let driver_before = wyrd_benchmark::snapshot();
         let (traffic, baseline) = Window::open(server).await?;
         let stop = Instant::now() + window;
         let (samples, usage, stopped) = traffic
@@ -625,8 +656,25 @@ impl Overhead {
             })
             .collect();
         let population = Population::collect(server, &before, &expected).await;
+        let answered = samples.completion_us.len() as u64;
+        let mut roots = vec![CALL_ROOT, ATTEMPT_ROOT];
+        roots.extend(shape.stream.then_some(HEAD_ROOT));
+        roots.extend((samples.error_count() == 0).then_some(FIXTURE_ROOT));
+        let owed: Vec<Expected<'_>> = roots
+            .into_iter()
+            .map(|boundary| Expected {
+                boundary,
+                outcome: wyrd_benchmark::SUCCESS,
+                case: labels.0,
+                phase: labels.1,
+                count: answered,
+            })
+            .collect();
+        let driver = Population::collect_driver(&driver_before, &owed).await;
         let observed = Observed {
             stream: shape.stream,
+            cohort: labels,
+            driver: Some(driver),
             samples,
             usage,
             population,

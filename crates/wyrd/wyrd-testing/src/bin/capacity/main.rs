@@ -1697,6 +1697,13 @@ mod tests {
 
     /// A transport over a local server answering every request `{}`.
     async fn answered() -> wyrd_client::transport::HttpTransport {
+        serving(|_| true).await
+    }
+
+    /// A transport over a local server answering a request `{}` when
+    /// `answers` accepts its request line, and a non-retryable 400 problem
+    /// otherwise.
+    async fn serving(answers: fn(&str) -> bool) -> wyrd_client::transport::HttpTransport {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1706,10 +1713,14 @@ mod tests {
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let mut request = vec![0_u8; 8192];
-                let _ = socket.read(&mut request).await;
-                let _ = socket
-                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}")
-                    .await;
+                let read = socket.read(&mut request).await.unwrap_or(0);
+                let line = String::from_utf8_lossy(&request[..read]);
+                let response: &[u8] = if answers(line.lines().next().unwrap_or_default()) {
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}"
+                } else {
+                    b"HTTP/1.1 400 Bad Request\r\ncontent-type: application/problem+json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}"
+                };
+                let _ = socket.write_all(response).await;
             }
         });
         let config = wyrd_client::config::ClientConfig::default();
@@ -1795,6 +1806,146 @@ mod tests {
             );
         }
         assert_eq!(interval.dropped, 0);
+    }
+
+    /// Calls `path` on `transport` as `case` admitted in `phase`, returning
+    /// whether it succeeded.
+    async fn labelled(
+        transport: &wyrd_client::transport::HttpTransport,
+        (case, phase): (&'static str, &'static str),
+        path: &str,
+    ) -> bool {
+        wyrd_client::transport::trace::with_benchmark_labels(
+            case,
+            phase,
+            transport.request_json::<serde_json::Value, serde_json::Value>(
+                reqwest::Method::GET,
+                path,
+                None,
+            ),
+        )
+        .await
+        .is_ok()
+    }
+
+    /// A driver population is read from the driver's own recorder and kept
+    /// as [`Role::Driver`] evidence beside the server's [`Role::Server`]
+    /// window, and a driver snapshot never differences against a server
+    /// snapshot, so neither process's observations pass for the other's.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a population loses its role, a cross-process difference
+    /// is accepted, or the driver call is not reconciled.
+    #[tokio::test]
+    async fn driver_and_server_snapshots_keep_distinct_process_populations() {
+        use wyrd_testing::capacity::{Expected, Population};
+        use wyrd_testing::experiment::Role;
+
+        wyrd_testing::capacity::install_tracing().expect("the only subscriber");
+        super::start_benchmark().expect("the only recorder");
+        let transport = answered().await;
+        let cohort = ("direct-verify", "repetition-1");
+        let before = wyrd_benchmark::snapshot();
+        assert!(labelled(&transport, cohort, "/v1/probe").await);
+        let owed = [Expected {
+            boundary: "client.http",
+            outcome: wyrd_benchmark::SUCCESS,
+            case: cohort.0,
+            phase: cohort.1,
+            count: 1,
+        }];
+        let driver = Population::collect_driver(&before, &owed).await;
+        assert!(driver.invalid.is_empty(), "{:?}", driver.invalid);
+        assert_eq!(driver.role, Role::Driver);
+        assert_eq!(driver.only(cohort.0, cohort.1).role, Role::Driver);
+
+        let mut server_before = before.clone();
+        server_before.process = format!("{}-server", before.process);
+        let mut server_after = server_before.clone();
+        server_after.taken_ns += 1;
+        assert!(
+            Population::between(&before, server_after.clone()).is_err(),
+            "a driver snapshot never differences against a server's"
+        );
+        let server = Population::between(&server_before, server_after).expect("one process");
+        assert_eq!(server.role, Role::Server);
+
+        let mut repetition = Repetition::default();
+        server.validate(&mut repetition, "window");
+        driver.validate(&mut repetition, "window");
+        let roles: Vec<_> = repetition
+            .timings
+            .iter()
+            .map(|timing| timing.role)
+            .collect();
+        assert_eq!(roles, [Role::Server, Role::Driver]);
+        assert!(
+            repetition
+                .reconciliation
+                .iter()
+                .all(|reconciled| reconciled.role == Role::Driver && reconciled.recorded == 1)
+        );
+        assert!(repetition.observations[0].starts_with("server timing"));
+        assert!(repetition.observations[1].starts_with("driver timing"));
+    }
+
+    /// A driver window owes each phase its own completed calls: failed calls
+    /// are counted beside the owed success count rather than inside it, and a
+    /// cohort owed more or fewer calls than recorded makes the population
+    /// invalid with its recorded count kept.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a phase's completions or failures are miscounted, or a
+    /// mismatched cohort is accepted.
+    #[tokio::test]
+    async fn driver_phase_counts_reconcile_completed_and_failed_calls() {
+        use wyrd_testing::capacity::{Expected, Population};
+
+        wyrd_testing::capacity::install_tracing().expect("the only subscriber");
+        super::start_benchmark().expect("the only recorder");
+        let transport = serving(|line| !line.contains("/v1/refused")).await;
+        let (case, first, second) = ("direct-verify", "repetition-1", "repetition-2");
+        let before = wyrd_benchmark::snapshot();
+        for (path, succeeds) in [
+            ("/v1/probe", true),
+            ("/v1/refused", false),
+            ("/v1/probe", true),
+        ] {
+            assert_eq!(labelled(&transport, (case, first), path).await, succeeds);
+        }
+        assert!(labelled(&transport, (case, second), "/v1/probe").await);
+        let owed = |phase, count| Expected {
+            boundary: "client.http",
+            outcome: wyrd_benchmark::SUCCESS,
+            case,
+            phase,
+            count,
+        };
+        let driver = Population::collect_driver(&before, &[owed(first, 2), owed(second, 1)]).await;
+        assert!(driver.invalid.is_empty(), "{:?}", driver.invalid);
+        for (phase, completed, failed) in [(first, 2, 1), (second, 1, 0)] {
+            let cohort = driver.only(case, phase);
+            assert_eq!(
+                cohort
+                    .elapsed("client.http", wyrd_benchmark::SUCCESS)
+                    .map(|d| d.len()),
+                Some(completed),
+                "{phase}"
+            );
+            assert_eq!(
+                cohort.others("client.http", wyrd_benchmark::SUCCESS),
+                failed,
+                "{phase}"
+            );
+        }
+
+        let (earlier, later) = driver.snapshots.clone().expect("the window's snapshots");
+        let mut overdue = Population::between(&earlier, later).expect("one process");
+        overdue.expect(&[owed(first, 3)]);
+        assert_eq!(overdue.invalid.len(), 1, "{:?}", overdue.invalid);
+        assert_eq!(overdue.reconciliation[0].recorded, 2);
     }
 
     /// Building and calling an ordinary client installs neither a recorder
@@ -2044,6 +2195,52 @@ mod tests {
     /// A streamed Gateway call's head and end handoffs.
     const STREAMED: Reach = &[("gateway.stream.head", CALL), ("gateway.stream.end", CALL)];
 
+    /// Every driver observation's terminal outcome (`wyrd_benchmark`).
+    const OBSERVED: &[&str] = &["success", "error", "cancelled"];
+
+    /// An SDK buffered call and its attempts (`wyrd-client` `transport/http.rs`).
+    const SDK: Reach = &[("client.http", OBSERVED), ("client.http.attempt", OBSERVED)];
+
+    /// An SDK `verify` flow (`wyrd-client` `observe/mod.rs`).
+    const VERIFY: Reach = &[("client.verify", OBSERVED)];
+
+    /// A raw Gateway call and its one attempt (`gateway/workload.rs`).
+    const GATEWAY_CALL: Reach = &[
+        ("client.gateway", OBSERVED),
+        ("client.http.attempt", OBSERVED),
+    ];
+
+    /// A raw streamed Gateway call's head (`gateway/workload.rs`).
+    const HEAD: Reach = &[("client.gateway.head", OBSERVED)];
+
+    /// A local provider fixture answer (`gateway_capture.rs`).
+    const FIXTURE: Reach = &[("fixture.upstream", OBSERVED)];
+
+    /// Driver roots and the components each reaches, recorded per cohort in
+    /// [`wyrd_benchmark::COMPONENT_SECONDS`].
+    type Parts = &'static [(&'static str, &'static [&'static str])];
+
+    /// An SDK buffered call's components.
+    const SDK_PARTS: Parts = &[(
+        "client.http",
+        &["serialize", "auth", "send", "backoff", "body", "decode"],
+    )];
+
+    /// An SDK `verify` flow's components, with its request's.
+    const VERIFY_PARTS: Parts = &[
+        ("client.verify", &["prepare"]),
+        (
+            "client.http",
+            &["serialize", "auth", "send", "backoff", "body", "decode"],
+        ),
+    ];
+
+    /// A raw Gateway call's components.
+    const GATEWAY_PARTS: Parts = &[("client.gateway", &["send", "body", "decode"])];
+
+    /// A fixture answer's components.
+    const FIXTURE_PARTS: Parts = &[("fixture.upstream", &["parse", "answer"])];
+
     /// The only Oracle outcome that records scan facts (`oracle/mod.rs`).
     const SCANNED: &[&str] = &["success"];
 
@@ -2090,6 +2287,10 @@ mod tests {
         unlabelled: Vec<Reach>,
         /// The cases whose queries record scan facts.
         scanned: &'static [&'static str],
+        /// Each group of cases and the root components they reach.
+        parts: Vec<(&'static [&'static str], Vec<Parts>)>,
+        /// Root components unlabelled work reaches.
+        unlabelled_parts: Vec<Parts>,
     }
 
     impl Lifetime {
@@ -2122,6 +2323,48 @@ mod tests {
                         series.extend(
                             keys.iter()
                                 .map(|(boundary, outcome)| (*boundary, *outcome, *case, *phase)),
+                        );
+                    }
+                }
+            }
+            series.sort_unstable();
+            series.dedup();
+            series
+        }
+
+        /// Every distinct component histogram key it can open: boundary,
+        /// component, case, and phase.
+        fn components(&self) -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
+            let keys = |parts: &[Parts]| -> Vec<(&'static str, &'static str)> {
+                parts
+                    .iter()
+                    .flat_map(|parts| parts.iter())
+                    .flat_map(|(boundary, components)| {
+                        components
+                            .iter()
+                            .map(move |component| (*boundary, *component))
+                    })
+                    .collect()
+            };
+            let mut series: Vec<_> = keys(&self.unlabelled_parts)
+                .into_iter()
+                .map(|(boundary, component)| {
+                    (
+                        boundary,
+                        component,
+                        wyrd_benchmark::UNLABELLED,
+                        wyrd_benchmark::UNLABELLED,
+                    )
+                })
+                .collect();
+            for (cases, parts) in &self.parts {
+                let keys = keys(parts);
+                for case in *cases {
+                    for phase in self.phases {
+                        series.extend(
+                            keys.iter().map(|(boundary, component)| {
+                                (*boundary, *component, *case, *phase)
+                            }),
                         );
                     }
                 }
@@ -2173,8 +2416,92 @@ mod tests {
             labelled,
             unlabelled,
             scanned,
+            parts: Vec::new(),
+            unlabelled_parts: Vec::new(),
         };
-        vec![
+        let driver = |name, phases, labelled, unlabelled, parts| Lifetime {
+            name,
+            phases,
+            labelled,
+            unlabelled,
+            scanned: &[],
+            parts,
+            unlabelled_parts: vec![SDK_PARTS, FIXTURE_PARTS],
+        };
+        let reads = |cases: &'static [&'static str]| vec![(cases, vec![SDK])];
+        let mut writes_reads: Vec<(&'static [&'static str], Vec<Reach>)> = vec![(
+            &["native-write", "otlp-spans", "otlp-spans-1k", "otlp-logs"][..],
+            vec![SDK],
+        )];
+        writes_reads.push((COMPETING_READS, vec![SDK]));
+        let verifications: &'static [&'static str] = &["direct-verify", "direct-verify-model"];
+        let gateway_cases: &'static [&'static str] = &[
+            "buffered-1kib-capture-metadata",
+            "buffered-64kib-capture-metadata",
+            "buffered-64kib-capture-payload",
+        ];
+        let streamed: &'static [&'static str] = &["streamed-1kib-capture-metadata"];
+        let gateway_driver = |name, phases, buffered: &'static [&'static str]| {
+            driver(
+                name,
+                phases,
+                vec![
+                    (buffered, vec![GATEWAY_CALL, FIXTURE]),
+                    (streamed, vec![GATEWAY_CALL, HEAD, FIXTURE]),
+                ],
+                vec![SDK, FIXTURE],
+                vec![
+                    (buffered, vec![GATEWAY_PARTS, FIXTURE_PARTS]),
+                    (streamed, vec![GATEWAY_PARTS, FIXTURE_PARTS]),
+                ],
+            )
+        };
+        let drivers = vec![
+            driver(
+                "l1 bifrost writes-parquet driver",
+                L1,
+                reads(&["native-write", "otlp-spans", "otlp-spans-1k", "otlp-logs"]),
+                vec![SDK],
+                vec![(
+                    &["native-write", "otlp-spans", "otlp-spans-1k", "otlp-logs"][..],
+                    vec![SDK_PARTS],
+                )],
+            ),
+            driver(
+                "l1 bifrost hot or parquet driver",
+                L1,
+                reads(READS),
+                vec![SDK],
+                vec![(READS, vec![SDK_PARTS])],
+            ),
+            driver(
+                "l2 bifrost driver",
+                L2,
+                writes_reads.clone(),
+                vec![SDK],
+                writes_reads
+                    .iter()
+                    .map(|(cases, _)| (*cases, vec![SDK_PARTS]))
+                    .collect(),
+            ),
+            driver(
+                "l1 verification driver",
+                L1,
+                vec![(verifications, vec![VERIFY, SDK, FIXTURE])],
+                vec![SDK, FIXTURE],
+                vec![(verifications, vec![VERIFY_PARTS, FIXTURE_PARTS])],
+            ),
+            driver(
+                "l2 verification driver",
+                L2,
+                vec![(verifications, vec![VERIFY, SDK, FIXTURE])],
+                vec![SDK, FIXTURE],
+                vec![(verifications, vec![VERIFY_PARTS, FIXTURE_PARTS])],
+            ),
+            gateway_driver("l1 gateway driver", L1, gateway_cases),
+            gateway_driver("l2 gateway driver", L2, &["buffered-1kib-capture-metadata"]),
+        ];
+        let mut lifetimes = vec![
             lifetime(
                 "l1 bifrost writes-parquet",
                 L1,
@@ -2200,15 +2527,21 @@ mod tests {
             lifetime(
                 "l1 verification",
                 L1,
-                vec![(&["direct-verify"][..], vec![DIRECT])],
-                vec![DIRECT, QUERY, SCRIBE],
+                vec![
+                    (&["direct-verify"][..], vec![DIRECT]),
+                    (&["direct-verify-model"][..], vec![DIRECT, BUFFERED]),
+                ],
+                vec![DIRECT, QUERY, SCRIBE, BUFFERED],
                 &[],
             ),
             lifetime(
                 "l2 verification",
                 L2,
-                vec![(&["direct-verify"][..], vec![DIRECT])],
-                vec![DIRECT, QUERY, SCRIBE],
+                vec![
+                    (&["direct-verify"][..], vec![DIRECT]),
+                    (&["direct-verify-model"][..], vec![DIRECT, BUFFERED]),
+                ],
+                vec![DIRECT, QUERY, SCRIBE, BUFFERED],
                 &[],
             ),
             lifetime(
@@ -2238,16 +2571,19 @@ mod tests {
                 vec![BUFFERED, STREAMED, QUERY, SCRIBE],
                 &[],
             ),
-        ]
+        ];
+        lifetimes.extend(drivers);
+        lifetimes
     }
 
-    /// Every declared engine and level's server process fits the timing
-    /// and scan series bounds: each lifetime's reachable cases, phases,
-    /// outcomes, and parts, setup and background work included, are at
-    /// most the bound, and the largest are all retained with nothing
-    /// dropped. Lifetimes are separate processes, so each is held against
-    /// the bounds alone; the largest timing and scan footprints are
-    /// recorded together, since they fill separate bounds.
+    /// Every declared engine and level's server and driver process fits the
+    /// timing, scan, and component series bounds: each lifetime's reachable
+    /// cases, phases, outcomes, parts, and root components, setup and
+    /// background work included, are at most the bound, and the largest are
+    /// all retained with nothing dropped. Lifetimes are separate processes,
+    /// so each is held against the bounds alone; the largest timing, scan,
+    /// and component footprints are recorded together, since they fill
+    /// separate bounds.
     ///
     /// # Panics
     ///
@@ -2258,10 +2594,16 @@ mod tests {
         wyrd_benchmark::install().expect("the benchmark recorder installs");
         let lifetimes = lifetimes();
         for lifetime in &lifetimes {
-            let (timings, scans) = (lifetime.timings().len(), lifetime.scans().len());
+            let (timings, scans, components) = (
+                lifetime.timings().len(),
+                lifetime.scans().len(),
+                lifetime.components().len(),
+            );
             assert!(
-                timings <= wyrd_benchmark::MAX_SERIES && scans <= wyrd_benchmark::MAX_SCAN_SERIES,
-                "{}: {timings} timing and {scans} scan series",
+                timings <= wyrd_benchmark::MAX_SERIES
+                    && scans <= wyrd_benchmark::MAX_SCAN_SERIES
+                    && components <= wyrd_benchmark::MAX_METRIC_SERIES,
+                "{}: {timings} timing, {scans} scan, and {components} component series",
                 lifetime.name
             );
         }
@@ -2273,6 +2615,7 @@ mod tests {
         };
         let timings = widest(|lifetime| lifetime.timings().len()).timings();
         let scans = widest(|lifetime| lifetime.scans().len()).scans();
+        let components = widest(|lifetime| lifetime.components().len()).components();
 
         let _registry = tracing::subscriber::set_default(tracing_subscriber::registry());
         let span = |case: &str, phase: &str| {
@@ -2306,5 +2649,29 @@ mod tests {
         assert_eq!(snapshot.invalid_labels, 0);
         assert_eq!(snapshot.series.len(), timings.len());
         assert_eq!(snapshot.scans.len(), scans.len());
+
+        // Components fill the standard metric bound, apart from the timing
+        // series their roots also open, which the lifetime's timings count.
+        for (boundary, component, case, phase) in components.iter().copied() {
+            metrics::histogram!(
+                wyrd_benchmark::COMPONENT_SECONDS,
+                "boundary" => boundary,
+                "component" => component,
+                "case" => case,
+                "phase" => phase
+            )
+            .record(1e-6);
+        }
+        let snapshot = wyrd_benchmark::snapshot();
+        assert_eq!(snapshot.dropped, 0, "every reachable component is kept");
+        assert_eq!(snapshot.invalid_labels, 0);
+        assert_eq!(
+            snapshot
+                .metrics
+                .iter()
+                .filter(|metric| metric.name == wyrd_benchmark::COMPONENT_SECONDS)
+                .count(),
+            components.len()
+        );
     }
 }

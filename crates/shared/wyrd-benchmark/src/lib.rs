@@ -220,13 +220,7 @@ pub fn label_request(span: &tracing::Span, headers: &http::HeaderMap) {
     if case.is_none() && phase.is_none() {
         return;
     }
-    let labels = Labels {
-        case: Labels::label(case, CASES),
-        phase: Labels::label(phase, PHASES),
-    };
-    if labels.case == INVALID || labels.phase == INVALID {
-        REGISTRY.invalid_labels.fetch_add(1, Ordering::Relaxed);
-    }
+    let Cohort(labels) = Cohort::of_headers(headers);
     span.with_subscriber(|(id, dispatch)| {
         if let Some(span) = dispatch
             .downcast_ref::<tracing_subscriber::Registry>()
@@ -300,11 +294,41 @@ impl Cohort {
         Self(labels)
     }
 
+    /// The cohort the benchmark metadata in `headers` declares, as
+    /// [`label_request`] reads it: [`UNLABELLED`] where absent, and
+    /// [`INVALID`], counted once in `invalid_labels` while [`install`]ed,
+    /// where unknown.
+    #[must_use]
+    pub fn of_headers(headers: &http::HeaderMap) -> Self {
+        let labels = Labels {
+            case: Labels::label(headers.get(CASE_HEADER), CASES),
+            phase: Labels::label(headers.get(PHASE_HEADER), PHASES),
+        };
+        if enabled() && (labels.case == INVALID || labels.phase == INVALID) {
+            REGISTRY.invalid_labels.fetch_add(1, Ordering::Relaxed);
+        }
+        Self(labels)
+    }
+
     /// The cohort [`label_request`] put on `span` or its nearest labelled
     /// ancestor, or [`Self::NONE`].
     #[must_use]
     pub fn of_span(span: &tracing::Span) -> Self {
         Self(labels_of(span))
+    }
+
+    /// The benchmark metadata that declares this cohort to another
+    /// process, as [`label_request`] reads it: an [`UNLABELLED`] or
+    /// [`INVALID`] label is not declared.
+    #[must_use]
+    pub fn headers(self) -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
+        for (name, label) in [(CASE_HEADER, self.case()), (PHASE_HEADER, self.phase())] {
+            if label != UNLABELLED && label != INVALID {
+                headers.insert(name, http::HeaderValue::from_static(label));
+            }
+        }
+        headers
     }
 
     /// The closed case label.
@@ -1675,6 +1699,25 @@ mod tests {
             super::INVALID
         );
         assert_eq!(Labels::label(None, super::PHASES), super::UNLABELLED);
+    }
+
+    /// A cohort's headers declare exactly its closed labels, which read back
+    /// as the same cohort; an unlabelled or invalid label is not declared.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a header is missing, extra, or reads back differently.
+    #[test]
+    fn cohort_headers_declare_only_closed_labels() {
+        let cohort = super::Cohort::of(Some("direct-verify-model"), Some("repetition-3"));
+        assert_eq!(super::Cohort::of_headers(&cohort.headers()), cohort);
+        let unknown = super::Cohort::of(Some("select 1"), None);
+        assert_eq!(
+            (unknown.case(), unknown.phase()),
+            (super::INVALID, super::UNLABELLED)
+        );
+        assert!(unknown.headers().is_empty());
+        assert!(super::Cohort::NONE.headers().is_empty());
     }
 
     /// A series opened beyond the bound is dropped and counted, never

@@ -639,9 +639,17 @@ impl GatewayEngine {
     ///
     /// Attempts run inside one [`exchange::scope`], so the returned
     /// [`ExecutionTiming`] separates credential, adapter, and provider time.
+    /// In a benchmark process every provider exchange forwards the closed
+    /// classification of the request that admitted the call, so a local
+    /// provider keeps a late call in its cohort; it carries no authority.
     pub async fn execute(&self, input: CallInput<'_>) -> CallExecution {
         let mut timing = ExecutionTiming::default();
-        let mut execution = exchange::scope(self.walk(&input, &mut timing)).await;
+        let forwarded = if wyrd_benchmark::enabled() {
+            wyrd_benchmark::Cohort::of_span(&tracing::Span::current()).headers()
+        } else {
+            reqwest::header::HeaderMap::new()
+        };
+        let mut execution = exchange::scope(forwarded, self.walk(&input, &mut timing)).await;
         execution.timing = timing;
         execution
     }

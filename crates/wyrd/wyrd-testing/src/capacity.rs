@@ -33,7 +33,7 @@ use wyrd_benchmark::{
     IntervalSeries,
 };
 
-use crate::experiment::{Reading, Reconciled, Repetition, TimingEvidence};
+use crate::experiment::{Reading, Reconciled, Repetition, Role, TimingEvidence};
 use crate::release_server::{LocalServer, Metrics, PeakSampler};
 
 /// Error type of the capacity helpers, matching the benchmark binaries.
@@ -387,11 +387,13 @@ pub struct Expected<'a> {
     pub count: u64,
 }
 
-/// One window's server timing observations: the series and scan facts
-/// recorded between two snapshots of one server process, and the
-/// snapshots and reconciliation they were read from.
+/// One window's timing observations in one process: the series and scan
+/// facts recorded between two snapshots of the server, or of the driver's
+/// own recorder, and the snapshots and reconciliation they were read from.
 #[derive(Debug, Clone, Default)]
 pub struct Population {
+    /// The process the snapshots are of.
+    pub role: Role,
     /// Every timing series with an observation in the window.
     pub series: Vec<IntervalSeries>,
     /// Every scan series with a query in the window.
@@ -416,27 +418,41 @@ impl Population {
         before: &BenchmarkSnapshot,
         expected: &[Expected<'_>],
     ) -> Self {
-        Self::wait(server, before, expected, COLLECTION_WAIT).await
+        let read = move || async move {
+            server
+                .timings()
+                .await
+                .map_err(|error| format!("the timing snapshot is unreadable: {error}"))
+        };
+        Self::wait(read, Role::Server, before, expected, COLLECTION_WAIT).await
     }
 
-    /// Polls `server`'s snapshot until the counts are reached or `wait`
-    /// expires, then validates the last interval.
-    async fn wait(
-        server: &LocalServer,
+    /// [`Self::collect`] over this driver process's own recorder, `before`
+    /// being its own snapshot: its clients' and local fixture's
+    /// observations, [`Role::Driver`] evidence never differenced against a
+    /// server snapshot.
+    pub async fn collect_driver(before: &BenchmarkSnapshot, expected: &[Expected<'_>]) -> Self {
+        let read = || std::future::ready(Ok(wyrd_benchmark::snapshot()));
+        Self::wait(read, Role::Driver, before, expected, COLLECTION_WAIT).await
+    }
+
+    /// Polls `read`'s snapshot of the `role` process until the counts are
+    /// reached or `wait` expires, then validates the last interval.
+    async fn wait<Read: Future<Output = Result<BenchmarkSnapshot, String>>>(
+        read: impl Fn() -> Read,
+        role: Role,
         before: &BenchmarkSnapshot,
         expected: &[Expected<'_>],
         wait: Duration,
     ) -> Self {
         let waiting = Instant::now();
         loop {
-            let mut population = match server.timings().await {
+            let mut population = match read().await {
                 Ok(after) => match Self::between(before, after) {
-                    Ok(population) => population,
-                    Err(reason) => return Self::refused(reason),
+                    Ok(population) => Self { role, ..population },
+                    Err(reason) => return Self::refused(role, reason),
                 },
-                Err(error) => {
-                    return Self::refused(format!("the timing snapshot is unreadable: {error}"));
-                }
+                Err(reason) => return Self::refused(role, reason),
             };
             let reached = expected
                 .iter()
@@ -473,6 +489,7 @@ impl Population {
                 ));
             }
             self.reconciliation.push(Reconciled {
+                role: self.role,
                 boundary: cohort.boundary.to_owned(),
                 outcome: cohort.outcome.to_owned(),
                 case: cohort.case.to_owned(),
@@ -544,9 +561,10 @@ impl Population {
         }
     }
 
-    /// A population with no observation, invalid for `reason`.
-    fn refused(reason: String) -> Self {
+    /// A `role` population with no observation, invalid for `reason`.
+    fn refused(role: Role, reason: String) -> Self {
         Self {
+            role,
             invalid: vec![reason],
             ..Self::default()
         }
@@ -571,6 +589,7 @@ impl Population {
                 .cloned()
                 .collect(),
             invalid: self.invalid.clone(),
+            role: self.role,
             ..Self::default()
         }
     }
@@ -643,6 +662,57 @@ impl Population {
         })
     }
 
+    /// Sets the diagnostics of each root of `roots`, a boundary, whether it
+    /// excludes waits, and its components, for the observations of `case`
+    /// admitted in `phase`: its successful elapsed distribution as
+    /// `<role>.<boundary>`, its residual as `<role>.<boundary>.residual`
+    /// when it excludes waits, and each component's reached-call
+    /// distribution as `<role>.<boundary>.<component>`. Every one is required
+    /// evidence. With `answered`, the successful calls of an error-free
+    /// window, a component recorded for another number of calls is invalid.
+    pub fn diagnose_roots(
+        &self,
+        repetition: &mut Repetition,
+        (case, phase): (&str, &str),
+        roots: &[(&str, bool, &[&str])],
+        answered: Option<u64>,
+    ) {
+        let cohort = self.only(case, phase);
+        let role = self.role.name();
+        for (boundary, excludes, components) in roots {
+            let name = format!("{role}.{boundary}");
+            let elapsed = cohort
+                .elapsed(boundary, wyrd_benchmark::SUCCESS)
+                .ok_or_else(|| format!("no successful `{boundary}` {role} observation"));
+            repetition.diagnose(&name, elapsed, true);
+            if *excludes {
+                let residual = cohort.residuals(boundary, wyrd_benchmark::SUCCESS);
+                repetition.diagnose(&format!("{name}.residual"), residual, true);
+            }
+            for component in *components {
+                let observation = format!("{name}.{component}");
+                let distribution = self.histogram(
+                    wyrd_benchmark::COMPONENT_SECONDS,
+                    &[
+                        ("boundary", boundary),
+                        ("component", component),
+                        ("case", case),
+                        ("phase", phase),
+                    ],
+                );
+                if let (Ok(recorded), Some(answered)) =
+                    (distribution.as_ref().map(Distribution::len), answered)
+                    && recorded != answered
+                {
+                    repetition.invalid.push(format!(
+                        "diagnostic `{observation}` recorded {recorded} observations for {answered} answered calls"
+                    ));
+                }
+                repetition.diagnose(&observation, distribution, true);
+            }
+        }
+    }
+
     /// Observations of `boundary` whose outcome is not `outcome`.
     #[must_use]
     pub fn others(&self, boundary: &str, outcome: &str) -> u64 {
@@ -657,7 +727,8 @@ impl Population {
     #[must_use]
     pub fn health(&self) -> String {
         format!(
-            "server timing: {} observations in {} series, {} scanned queries",
+            "{} timing: {} observations in {} series, {} scanned queries",
+            self.role.name(),
             self.series.iter().map(|series| series.count).sum::<u64>(),
             self.series.len(),
             self.scans.iter().map(|scan| scan.count).sum::<u64>(),
@@ -676,6 +747,7 @@ impl Population {
         if let Some((before, after)) = &self.snapshots {
             repetition.timings.push(TimingEvidence {
                 window: window.to_owned(),
+                role: self.role,
                 before: before.clone(),
                 after: after.clone(),
                 reconciliation: self.reconciliation.clone(),

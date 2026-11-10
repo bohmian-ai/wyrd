@@ -7,7 +7,9 @@
 //! arrived, and when its body was fully read or the exchange failed. A
 //! streamed answer whose body is read elsewhere is logged open, with no end.
 //! The caller drains the log with [`take`]. Outside a scope nothing is
-//! recorded, so ordinary callers pay only a failed task-local lookup.
+//! recorded, so ordinary callers pay only a failed task-local lookup. A
+//! scope may also name headers every exchange inside it forwards, such as a
+//! caller's request classification.
 //!
 //! The log is per task: an exchange sent by a task spawned inside the scope
 //! is not recorded. Timings are process-local monotonic instants, never
@@ -17,9 +19,19 @@ use std::cell::RefCell;
 use std::future::Future;
 use std::time::Instant;
 
+use reqwest::header::HeaderMap;
+
 tokio::task_local! {
-    /// Exchanges sent by the current task inside a [`scope`], in send order.
-    static EXCHANGES: RefCell<Vec<Exchange>>;
+    /// The current task's [`scope`].
+    static SCOPE: Scope;
+}
+
+/// One [`scope`]'s state.
+struct Scope {
+    /// Exchanges sent inside it, in send order.
+    exchanges: RefCell<Vec<Exchange>>,
+    /// Headers every exchange inside it forwards.
+    forwarded: HeaderMap,
 }
 
 /// One provider HTTP exchange's monotonic timing.
@@ -35,20 +47,37 @@ pub struct Exchange {
     pub ended: Option<Instant>,
 }
 
-/// Runs `future` with an empty exchange log for its task.
+/// Runs `future` with an empty exchange log for its task, every exchange it
+/// sends forwarding `forwarded` beside its own headers.
 ///
 /// Scopes nest: an inner scope shadows the outer one until it ends.
-pub async fn scope<F: Future>(future: F) -> F::Output {
-    EXCHANGES.scope(RefCell::new(Vec::new()), future).await
+pub async fn scope<F: Future>(forwarded: HeaderMap, future: F) -> F::Output {
+    let scope = Scope {
+        exchanges: RefCell::new(Vec::new()),
+        forwarded,
+    };
+    SCOPE.scope(scope, future).await
 }
 
 /// Drains the current scope's logged exchanges in send order; empty outside
 /// a scope.
 #[must_use]
 pub fn take() -> Vec<Exchange> {
-    EXCHANGES
-        .try_with(|log| std::mem::take(&mut *log.borrow_mut()))
+    SCOPE
+        .try_with(|scope| std::mem::take(&mut *scope.exchanges.borrow_mut()))
         .unwrap_or_default()
+}
+
+/// Adds the current [`scope`]'s forwarded headers to an exchange's
+/// `headers`; nothing outside a scope.
+pub(crate) fn forward(headers: &mut HeaderMap) {
+    SCOPE
+        .try_with(|scope| {
+            for (name, value) in &scope.forwarded {
+                headers.insert(name, value.clone());
+            }
+        })
+        .ok();
 }
 
 /// Times one exchange from its send and logs it when dropped.
@@ -95,15 +124,40 @@ impl Drop for ExchangeTimer {
             self.exchange.ended = Some(Instant::now());
         }
         let exchange = self.exchange;
-        EXCHANGES
-            .try_with(|log| log.borrow_mut().push(exchange))
+        SCOPE
+            .try_with(|scope| scope.exchanges.borrow_mut().push(exchange))
             .ok();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ExchangeTimer, scope, take};
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    use super::{ExchangeTimer, forward, scope, take};
+
+    /// An exchange forwards its scope's headers, and nothing outside a
+    /// scope; its own header of the same name is replaced.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a header is added outside a scope or missing inside one.
+    #[tokio::test]
+    async fn exchanges_forward_only_their_scope_headers() {
+        let mut forwarded = HeaderMap::new();
+        forwarded.insert("x-forwarded-case", HeaderValue::from_static("case"));
+        let mut outside = HeaderMap::new();
+        forward(&mut outside);
+        assert!(outside.is_empty(), "nothing is forwarded outside a scope");
+        let inside = scope(forwarded.clone(), async {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-forwarded-case", HeaderValue::from_static("own"));
+            forward(&mut headers);
+            headers
+        })
+        .await;
+        assert_eq!(inside, forwarded);
+    }
 
     /// Exchanges are logged in a scope, in send order, with an open stream
     /// left unended, and nothing is logged outside a scope.
@@ -115,7 +169,7 @@ mod tests {
     async fn exchanges_are_logged_only_inside_a_scope() {
         drop(ExchangeTimer::start());
         assert!(take().is_empty(), "nothing is logged outside a scope");
-        let logged = scope(async {
+        let logged = scope(HeaderMap::new(), async {
             let mut buffered = ExchangeTimer::start();
             buffered.headers();
             drop(buffered);

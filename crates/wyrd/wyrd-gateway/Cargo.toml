@@ -24,6 +24,7 @@ tokio = { workspace = true, features = ["fs", "io-util", "net", "sync", "time"] 
 tokio-util = { workspace = true }
 metrics = { workspace = true }
 tracing = { workspace = true }
+wyrd-benchmark = { workspace = true }
 reqwest = { workspace = true }
 skald-providers = { workspace = true }
 skald-spec = { workspace = true }

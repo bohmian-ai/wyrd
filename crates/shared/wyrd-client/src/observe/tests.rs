@@ -1001,7 +1001,12 @@ async fn execute_pins_files_and_completes_shared_uploads() {
     );
 
     let result = target(&spec)
-        .execute(&bearer_client(server.uri(), 5_000), run)
+        .execute(
+            &bearer_client(server.uri(), 5_000),
+            run,
+            &mut wyrd_benchmark::Observation::default(),
+            None,
+        )
         .await
         .expect("the execution succeeds");
     assert_eq!(result.execution_id, id);
@@ -1074,7 +1079,12 @@ async fn file_refusals_happen_locally_before_any_request() {
     ] {
         let run = run_evidence(&spec, crate::verify::Inputs::named([("policy", file)]));
         let error = target(&spec)
-            .execute(&client, run)
+            .execute(
+                &client,
+                run,
+                &mut wyrd_benchmark::Observation::default(),
+                None,
+            )
             .await
             .expect_err("the file is refused");
         assert_eq!(error.code(), code);
@@ -1084,7 +1094,12 @@ async fn file_refusals_happen_locally_before_any_request() {
         crate::verify::Inputs::named([("deck", crate::verify::File::bytes(vec![1]))]),
     );
     let error = target(&spec)
-        .execute(&client, run)
+        .execute(
+            &client,
+            run,
+            &mut wyrd_benchmark::Observation::default(),
+            None,
+        )
         .await
         .expect_err("a format must be declared when several are accepted");
     assert_eq!(error.code(), "WYRD_VERIFICATION_400_INPUT_INVALID");
@@ -1359,7 +1374,12 @@ async fn execute_outlives_the_configured_timeout() {
     let client = bearer_client(server.uri(), 20);
 
     let error = target(&spec)
-        .execute(&client, run)
+        .execute(
+            &client,
+            run,
+            &mut wyrd_benchmark::Observation::default(),
+            None,
+        )
         .await
         .expect_err("the server's deadline answer is an error");
     assert_eq!(error.code(), "WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT");

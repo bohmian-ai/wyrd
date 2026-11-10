@@ -547,7 +547,11 @@ mod tests {
 
     /// Lowercase hex of `bytes`.
     fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        use std::fmt::Write as _;
+        bytes.iter().fold(String::new(), |mut out, byte| {
+            write!(out, "{byte:02x}").expect("writing to a String cannot fail");
+            out
+        })
     }
 
     /// Seal `plaintext` in the unversioned `nonce ‖ ciphertext` form that

@@ -1,12 +1,14 @@
 //! The process-wide composition of every hosted Verifier block.
 //!
-//! [`HostedBlocks`] owns the capacity one server process shares — the Python
-//! sandbox pool, the workspace permits, and the Deployment limits — and
-//! builds one [`VerificationEngine`] per execution over them. Each engine's
-//! executors are bound to that execution's accepted caller and pinned
-//! evidence, so interleaved executions never share authority, evidence, or a
-//! workspace. Direct verification and the queued runner both build their
-//! engine here, which keeps one execution path for every caller.
+//! [`HostedBlocks`] owns the capacity of one server process — a direct and a
+//! queued lane, each with its own Python sandbox pool, workspace permits, and
+//! model-call permits, plus the direct execution permits and the Deployment
+//! limits — and builds one [`VerificationEngine`] per execution over the lane
+//! of its [`ExecutionMode`]. Neither lane borrows the other's free capacity.
+//! Each engine's executors are bound to that execution's accepted caller and
+//! pinned evidence, so interleaved executions never share authority,
+//! evidence, or a workspace. Direct verification and the queued runner both
+//! build their engine here, which keeps one execution path for every caller.
 //!
 //! The engine records every block's run interval on the execution's
 //! [`BlockClock`], so `wyrd_verification_verifier_seconds` holds the
@@ -19,6 +21,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use monty_pool::PoolError;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use vala_verify::blocks::{
     ActionExecutor, ActionOutput, AgentCardResolver, AgentExecutor, BlockCall, BlockClock,
     BlockError, CheckExecutor, CheckOutput, DriftChecks, EvidenceReader, PromptCardResolver,
@@ -31,7 +34,7 @@ use wyrd_spec::ids::{CardUid, SlotName};
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::InputDeclaration;
 
-use super::HostedLimits;
+use super::{HostedLimits, LaneLimits};
 use super::evidence::TenantEvidence;
 use super::registry::TenantRegistry;
 use super::sandbox::{CodeExecutor, Sandbox};
@@ -42,20 +45,64 @@ use crate::components::auth::Caller;
 use crate::components::gateway::{GatewayCallContext, ServerWyrdGatewayCaller};
 use crate::state::AppState;
 use crate::verification::state::RunState;
+use crate::verification::telemetry::ExecutionMode;
 
 /// Most steps or checks one execution runs at once.
 // ponytail: fixed per-execution fan-out; the sandbox and workspace pools
 // bound process capacity, so make this a Deployment limit only if needed.
 const STEP_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(4).expect("4 is non-zero");
 
-/// The hosted block capacity one server process shares.
+/// The hosted block capacity of one server process.
 pub struct HostedBlocks {
-    /// The process-wide Python sandbox pool.
-    sandbox: Arc<Sandbox>,
-    /// The process-wide workspace permits.
-    workspaces: Arc<Workspaces>,
+    /// Capacity reserved for direct `verify` executions.
+    direct: Lane,
+    /// Capacity reserved for queued executions and their continuations.
+    queued: Lane,
+    /// One permit per running direct execution.
+    direct_executions: Arc<Semaphore>,
     /// The Deployment limits every block enforces.
     limits: HostedLimits,
+}
+
+/// The block capacity one execution lane owns alone.
+struct Lane {
+    /// The lane's Python sandbox pool.
+    sandbox: Arc<Sandbox>,
+    /// The lane's workspace permits.
+    workspaces: Arc<Workspaces>,
+    /// The lane's model-call permits.
+    model_calls: Arc<Semaphore>,
+}
+
+impl Lane {
+    /// Start the lane sized by `lane` under `limits`.
+    ///
+    /// # Errors
+    /// Returns [`Sandbox::start`]'s [`PoolError`].
+    async fn start(
+        worker: PathBuf,
+        limits: HostedLimits,
+        lane: LaneLimits,
+    ) -> Result<Self, PoolError> {
+        Ok(Self {
+            sandbox: Arc::new(Sandbox::start(worker, limits, lane).await?),
+            workspaces: Arc::new(Workspaces::new(limits, lane.workspaces)),
+            model_calls: Arc::new(Semaphore::new(lane.model_calls)),
+        })
+    }
+}
+
+/// One lane admission a test can saturate with
+/// [`HostedBlocks::hold_for_test`].
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaneAdmission {
+    /// Workspace permits.
+    Workspaces,
+    /// Python sandbox admission.
+    Python,
+    /// Model-call permits.
+    ModelCalls,
 }
 
 /// The per-execution inputs an engine is bound to.
@@ -84,36 +131,91 @@ pub struct Execution<'a> {
     /// The execution state whose accepted publications workspaces mount;
     /// `None` for an engine bound to no execution.
     pub execution: Option<Arc<RunState>>,
+    /// The accepted execution mode, which selects the lane every Python
+    /// operation, workspace, and model call takes capacity from.
+    pub mode: ExecutionMode,
 }
 
 impl HostedBlocks {
-    /// Start the sandbox pool over the Monty worker at `worker` under
-    /// `limits`, prewarming `limits.monty_min_workers`.
+    /// Start both lanes' sandbox pools over the Monty worker at `worker`
+    /// under `limits`, prewarming `limits.monty_min_workers` in each.
     ///
     /// # Errors
-    /// Returns [`Sandbox::start`]'s [`PoolError`] when the limits hold no
-    /// worker or a prewarmed worker cannot start.
+    /// Returns [`Sandbox::start`]'s [`PoolError`] when the limits cannot hold
+    /// the lanes' workers or a prewarmed worker cannot start.
     pub async fn start(worker: PathBuf, limits: HostedLimits) -> Result<Self, PoolError> {
         Ok(Self {
-            sandbox: Arc::new(Sandbox::start(worker, limits).await?),
-            workspaces: Arc::new(Workspaces::new(limits)),
+            direct: Lane::start(worker.clone(), limits, limits.direct).await?,
+            queued: Lane::start(worker, limits, limits.queued).await?,
+            direct_executions: Arc::new(Semaphore::new(limits.direct_executions)),
             limits,
         })
     }
 
-    /// Settle the Python sandbox's admitted operations, refuse new ones,
-    /// and reap its workers by `deadline`; see [`Sandbox::shutdown`].
-    /// Returns whether everything settled.
+    /// Settle both lanes' admitted Python operations, refuse new ones, and
+    /// reap their workers by `deadline`; see [`Sandbox::shutdown`]. Returns
+    /// whether everything settled.
     pub async fn shutdown(&self, deadline: tokio::time::Instant) -> bool {
-        self.sandbox.shutdown(deadline).await
+        let (direct, queued) = tokio::join!(
+            self.direct.sandbox.shutdown(deadline),
+            self.queued.sandbox.shutdown(deadline)
+        );
+        direct && queued
     }
 
-    /// The process-wide Python sandbox pool, so a test can hold one of its
-    /// admissions while a queued execution runs.
+    /// One direct execution permit, held for the execution's lifetime, or
+    /// `None` when every direct execution permit is taken. Admission never
+    /// waits and never takes queued capacity.
+    #[must_use]
+    pub fn admit_direct(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.direct_executions).try_acquire_owned().ok()
+    }
+
+    /// The Python sandbox pool of `mode`'s lane, so a test can hold one of
+    /// its admissions while an execution runs.
     #[cfg(feature = "test-support")]
     #[must_use]
-    pub const fn sandbox(&self) -> &Arc<Sandbox> {
-        &self.sandbox
+    pub const fn sandbox(&self, mode: ExecutionMode) -> &Arc<Sandbox> {
+        &self.lane(mode).sandbox
+    }
+
+    /// Every free permit of `admission` in `mode`'s lane, held until the
+    /// returned permit drops, so a test can saturate one lane resource.
+    ///
+    /// # Panics
+    /// Panics when the admission is closed or taken concurrently.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn hold_for_test(
+        &self,
+        mode: ExecutionMode,
+        admission: LaneAdmission,
+    ) -> OwnedSemaphorePermit {
+        let lane = self.lane(mode);
+        match admission {
+            LaneAdmission::Workspaces => lane.workspaces.hold_for_test(),
+            LaneAdmission::Python => lane.sandbox.hold_for_test(),
+            LaneAdmission::ModelCalls => super::hold_all(&lane.model_calls),
+        }
+    }
+
+    /// Every free direct execution permit, held until the returned permit
+    /// drops.
+    ///
+    /// # Panics
+    /// Panics when a permit is taken concurrently.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn hold_direct_executions_for_test(&self) -> OwnedSemaphorePermit {
+        super::hold_all(&self.direct_executions)
+    }
+
+    /// The lane `mode` executes on.
+    const fn lane(&self, mode: ExecutionMode) -> &Lane {
+        match mode {
+            ExecutionMode::Direct => &self.direct,
+            ExecutionMode::Queued => &self.queued,
+        }
     }
 
     /// The Deployment limits in force.
@@ -122,7 +224,8 @@ impl HostedBlocks {
         &self.limits
     }
 
-    /// Build the engine of one execution over `state`.
+    /// Build the engine of one execution over `state`, on the lane of
+    /// `execution.mode`.
     ///
     /// The evidence reader, registry, code executor, built-in tools, and
     /// gateway caller are all bound to `execution.caller`; the evidence
@@ -130,8 +233,9 @@ impl HostedBlocks {
     /// every block's run interval is recorded on `execution.clock`; Agent and Prompt
     /// Cards resolve through the caller's audited `verifier:run` on
     /// `execution.verifier`, and every
-    /// model call goes through the in-process gateway as that caller,
-    /// attributed to `execution.subject`.
+    /// model call holds one of the lane's model-call permits while it goes
+    /// through the in-process gateway as that caller, attributed to
+    /// `execution.subject`.
     ///
     /// # Errors
     /// Returns the [`CallerTraces::new`] refusal when the caller cannot form
@@ -142,6 +246,7 @@ impl HostedBlocks {
         execution: Execution<'_>,
     ) -> Result<VerificationEngine, WyrdError> {
         let caller = execution.caller;
+        let lane = self.lane(execution.mode);
         let evidence = TenantEvidence::new(
             state.clone(),
             caller.clone(),
@@ -168,8 +273,8 @@ impl HostedBlocks {
                 state.clone(),
                 caller.clone(),
                 Arc::clone(&evidence),
-                Arc::clone(&self.workspaces),
-                Arc::clone(&self.sandbox),
+                Arc::clone(&lane.workspaces),
+                Arc::clone(&lane.sandbox),
                 self.limits,
             );
             match &execution.execution {
@@ -179,11 +284,12 @@ impl HostedBlocks {
         }))
         .with_wyrd_gateway(Arc::new(
             ServerWyrdGatewayCaller::new(state.clone(), caller.clone())
-                .attributed(Some(execution.subject)),
+                .attributed(Some(execution.subject))
+                .admitted(execution.mode.as_str(), Arc::clone(&lane.model_calls)),
         ))
         .with_route_overrides(execution.routes.clone());
         let blocks = Arc::new(Blocks {
-            code: CodeExecutor::new(Arc::clone(&self.sandbox), Arc::clone(&evidence)),
+            code: CodeExecutor::new(Arc::clone(&lane.sandbox), Arc::clone(&evidence)),
             evidence: Arc::clone(&evidence),
             agent,
         });

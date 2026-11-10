@@ -28,6 +28,7 @@ use wyrd_telemetry::TelemetryConfig;
 use wyrd_utils::secret::read_secret_file;
 
 use crate::boot::data_root::DEFAULT_BIFROST_DATA_DIR;
+use crate::verification::RuntimeLimits;
 use crate::verification::hosted::HostedLimits;
 
 /// Errors raised during configuration loading or validation.
@@ -1748,6 +1749,10 @@ pub struct VerificationConfig {
     /// The Deployment limits, read only from `WYRD_VERIFICATION_*` at startup.
     #[serde(skip)]
     pub limits: HostedLimits,
+    /// The runtime bounds; only the queued execution slots and the queued
+    /// execution deadline are read, from `WYRD_VERIFICATION_*` at startup.
+    #[serde(skip)]
+    pub runtime: RuntimeLimits,
 }
 
 /// Serde default for [`VerificationConfig::enabled`].
@@ -1762,13 +1767,15 @@ impl Default for VerificationConfig {
             enabled: default_verification_enabled(),
             operator_keys: OperatorKeysConfig::default(),
             limits: HostedLimits::default(),
+            runtime: RuntimeLimits::default(),
         }
     }
 }
 
 impl VerificationConfig {
-    /// Apply every `WYRD_VERIFICATION_*` Deployment limit and the Monty
-    /// worker path, then refuse inconsistent limits.
+    /// Apply every `WYRD_VERIFICATION_*` Deployment limit, each execution
+    /// lane's capacity, the queued execution slots and deadline, and the
+    /// Monty worker path, then refuse inconsistent limits.
     ///
     /// Each limit is a positive integer; `_MIB`/`_KIB` are binary units and
     /// `_MS` milliseconds. Unset variables keep the approved defaults.
@@ -1788,15 +1795,36 @@ impl VerificationConfig {
             1,
             &mut limits.monty_min_workers,
         )?;
+        for (lane, prefix) in [
+            (&mut limits.direct, "WYRD_VERIFICATION_DIRECT"),
+            (&mut limits.queued, "WYRD_VERIFICATION_QUEUED"),
+        ] {
+            set_scaled(&format!("{prefix}_WORKSPACES"), 1, &mut lane.workspaces)?;
+            set_scaled(
+                &format!("{prefix}_PYTHON_WORKERS"),
+                1,
+                &mut lane.python_workers,
+            )?;
+            set_scaled(
+                &format!("{prefix}_PYTHON_WAITERS"),
+                1,
+                &mut lane.python_waiters,
+            )?;
+            set_scaled(&format!("{prefix}_MODEL_CALLS"), 1, &mut lane.model_calls)?;
+        }
         set_scaled(
-            "WYRD_VERIFICATION_MONTY_MAX_WORKERS",
+            "WYRD_VERIFICATION_DIRECT_EXECUTIONS",
             1,
-            &mut limits.monty_max_workers,
+            &mut limits.direct_executions,
         )?;
         set_scaled(
-            "WYRD_VERIFICATION_MONTY_MAX_WAITERS",
+            "WYRD_VERIFICATION_QUEUED_EXECUTIONS",
             1,
-            &mut limits.monty_max_waiters,
+            &mut self.runtime.execution_slots,
+        )?;
+        set_millis(
+            "WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS",
+            &mut self.runtime.execution_timeout,
         )?;
         set_scaled(
             "WYRD_VERIFICATION_MONTY_MEMORY_MIB",
@@ -1876,16 +1904,17 @@ impl VerificationConfig {
             KIB,
             &mut limits.tool_result_max_bytes,
         )?;
-        set_scaled(
-            "WYRD_VERIFICATION_MAX_WORKSPACES",
-            1,
-            &mut limits.max_workspaces,
-        )?;
         set_millis("WYRD_VERIFICATION_TIMEOUT_MS", &mut limits.verify_timeout)?;
         let inconsistent = [
             (
-                limits.monty_min_workers > limits.monty_max_workers,
-                "WYRD_VERIFICATION_MONTY_MIN_WORKERS exceeds WYRD_VERIFICATION_MONTY_MAX_WORKERS",
+                limits.monty_min_workers > limits.direct.python_workers,
+                "WYRD_VERIFICATION_MONTY_MIN_WORKERS exceeds \
+                 WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS",
+            ),
+            (
+                limits.monty_min_workers > limits.queued.python_workers,
+                "WYRD_VERIFICATION_MONTY_MIN_WORKERS exceeds \
+                 WYRD_VERIFICATION_QUEUED_PYTHON_WORKERS",
             ),
             (
                 limits.monty_memory_bytes >= limits.monty_process_memory_bytes,
@@ -1898,9 +1927,16 @@ impl VerificationConfig {
                  WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB",
             ),
             (
-                limits.live_workers().is_none(),
+                !limits.worker_fits(),
                 "WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB cannot hold \
                  WYRD_VERIFICATION_MONTY_MEMORY_MIB plus Monty's allocator headroom",
+            ),
+            (
+                !limits.lanes_fit(),
+                "WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB cannot hold \
+                 WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS plus \
+                 WYRD_VERIFICATION_QUEUED_PYTHON_WORKERS at \
+                 WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB each",
             ),
             (
                 limits.file_max_bytes > limits.files_max_bytes,
@@ -3914,6 +3950,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::verification::hosted::LaneLimits;
     use vala_bifrost_redux::resources::{
         ORACLE_PARTITION_WORKING_MEMORY_BYTES, ResourcePlan, oracle_worker_slots,
     };
@@ -4304,11 +4341,23 @@ maintenance_interval_secs = 45
         let mut config = VerificationConfig::default();
         config.apply_limits_env().expect("defaults apply");
         assert_eq!(config.limits, HostedLimits::default());
+        assert_eq!(config.runtime, RuntimeLimits::default());
         temp_env::with_vars(
             [
                 ("WYRD_VERIFICATION_FILE_MAX_MIB", Some("5")),
                 ("WYRD_VERIFICATION_TOOL_RESULT_MAX_KIB", Some("8")),
                 ("WYRD_VERIFICATION_TIMEOUT_MS", Some("1500")),
+                ("WYRD_VERIFICATION_DIRECT_EXECUTIONS", Some("3")),
+                ("WYRD_VERIFICATION_DIRECT_WORKSPACES", Some("5")),
+                ("WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS", Some("1")),
+                ("WYRD_VERIFICATION_DIRECT_PYTHON_WAITERS", Some("7")),
+                ("WYRD_VERIFICATION_DIRECT_MODEL_CALLS", Some("9")),
+                ("WYRD_VERIFICATION_QUEUED_EXECUTIONS", Some("11")),
+                ("WYRD_VERIFICATION_QUEUED_WORKSPACES", Some("13")),
+                ("WYRD_VERIFICATION_QUEUED_PYTHON_WORKERS", Some("4")),
+                ("WYRD_VERIFICATION_QUEUED_PYTHON_WAITERS", Some("17")),
+                ("WYRD_VERIFICATION_QUEUED_MODEL_CALLS", Some("19")),
+                ("WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS", Some("7200000")),
             ],
             || {
                 let mut config = VerificationConfig::default();
@@ -4316,10 +4365,39 @@ maintenance_interval_secs = 45
                 assert_eq!(config.limits.file_max_bytes, 5 * 1024 * 1024);
                 assert_eq!(config.limits.tool_result_max_bytes, 8 * 1024);
                 assert_eq!(config.limits.verify_timeout, Duration::from_millis(1500));
+                assert_eq!(config.limits.direct_executions, 3);
+                assert_eq!(
+                    config.limits.direct,
+                    LaneLimits {
+                        workspaces: 5,
+                        python_workers: 1,
+                        python_waiters: 7,
+                        model_calls: 9,
+                    }
+                );
+                assert_eq!(
+                    config.limits.queued,
+                    LaneLimits {
+                        workspaces: 13,
+                        python_workers: 4,
+                        python_waiters: 17,
+                        model_calls: 19,
+                    }
+                );
+                assert_eq!(config.runtime.execution_slots, 11);
+                assert_eq!(config.runtime.execution_timeout, Duration::from_hours(2));
+                assert_eq!(
+                    config.runtime.lease,
+                    RuntimeLimits::default().lease,
+                    "only the queued slots and deadline are configurable"
+                );
             },
         );
         for (key, value) in [
-            ("WYRD_VERIFICATION_MAX_WORKSPACES", "0"),
+            ("WYRD_VERIFICATION_DIRECT_WORKSPACES", "0"),
+            ("WYRD_VERIFICATION_QUEUED_MODEL_CALLS", "-2"),
+            ("WYRD_VERIFICATION_QUEUED_EXECUTIONS", "many"),
+            ("WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS", "0"),
             ("WYRD_VERIFICATION_CODE_TIMEOUT_MS", "ten"),
             ("WYRD_VERIFICATION_SCRATCH_MAX_MIB", "-1"),
             ("WYRD_VERIFICATION_FILES_MAX_MIB", "18446744073709551615"),
@@ -4334,10 +4412,24 @@ maintenance_interval_secs = 45
         for (vars, named) in [
             (
                 [
-                    ("WYRD_VERIFICATION_MONTY_MIN_WORKERS", "9"),
-                    ("WYRD_VERIFICATION_MONTY_MAX_WORKERS", "8"),
+                    ("WYRD_VERIFICATION_MONTY_MIN_WORKERS", "3"),
+                    ("WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS", "2"),
                 ],
-                "WYRD_VERIFICATION_MONTY_MIN_WORKERS",
+                "WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS",
+            ),
+            (
+                [
+                    ("WYRD_VERIFICATION_MONTY_MIN_WORKERS", "2"),
+                    ("WYRD_VERIFICATION_QUEUED_PYTHON_WORKERS", "1"),
+                ],
+                "WYRD_VERIFICATION_QUEUED_PYTHON_WORKERS",
+            ),
+            (
+                [
+                    ("WYRD_VERIFICATION_QUEUED_PYTHON_WORKERS", "4"),
+                    ("WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB", "2048"),
+                ],
+                "WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS plus",
             ),
             (
                 [

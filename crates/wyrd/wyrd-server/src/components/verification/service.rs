@@ -19,7 +19,7 @@ use wyrd_runtime::outbox::{OutboxFull, Reservation};
 use wyrd_runtime::permission::{Action, Resource};
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_runtime::{AcceptedAuthority, CardAttribution, Permission};
-use wyrd_spec::card::verifier::CheckEvidence;
+use wyrd_spec::card::verifier::{CheckEvidence, VerifierSpec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, IdempotencyKey};
 use wyrd_spec::vala::api::AuditOutcome;
@@ -144,6 +144,37 @@ fn environment_tag(request: &VerificationRequest) -> Result<(), WyrdError> {
         });
     }
     Ok(())
+}
+
+/// Refuse a Verifier that only queued execution may run, before any step.
+///
+/// This is the single direct-eligibility rule `verify` applies once its
+/// target resolves and before the engine is built: a direct request is
+/// never converted to a queued one and never runs part of its graph. A
+/// Verifier judging a scheduled window is queued-only. Pure: no IO.
+///
+/// # Errors
+/// Returns [`WyrdError::VerificationInputUnsupported`] for a queued-only
+/// Verifier.
+fn direct_eligibility(verifier: &CardUid, spec: &VerifierSpec) -> Result<(), WyrdError> {
+    if spec
+        .all_requirements()
+        .any(|requirement| requirement.check.evidence() == CheckEvidence::Window)
+    {
+        return Err(window_refusal(verifier));
+    }
+    Ok(())
+}
+
+/// The refusal of a direct request for a Verifier that judges a scheduled
+/// window.
+fn window_refusal(verifier: &CardUid) -> WyrdError {
+    WyrdError::VerificationInputUnsupported {
+        message: "a drift Verifier judges a scheduled window; record samples and submit \
+                  them instead of verifying now"
+            .to_owned(),
+        details: serde_json::json!({ "verifier_card_uid": verifier }),
+    }
 }
 
 /// Owner of the Verification control plane for one request.
@@ -387,9 +418,9 @@ impl<'a> VerificationControl<'a> {
     /// combined input-file limit,
     /// [`WyrdError::VerificationExecutionTimedOut`] past the deadline,
     /// [`WyrdError::ServiceUnavailable`] when this process hosts no Verifier
-    /// blocks, a block is refused process capacity (a Python worker or a
-    /// workspace), or evidence metadata cannot be read now, a registry
-    /// unavailability error when a read fails, the Verifier's planning
+    /// blocks, every direct execution slot is in use, a block is refused its
+    /// direct lane's capacity (a Python worker or a workspace), or evidence
+    /// metadata cannot be read now, a registry unavailability error when a read fails, the Verifier's planning
     /// refusal, and [`WyrdError::VerificationStagingFull`] when the Scribe
     /// outbox cannot reserve the inputs and result slots, before anything
     /// is staged or the engine runs.
@@ -474,6 +505,15 @@ impl<'a> VerificationControl<'a> {
             Ok(target) => target,
             Err(error) => return ("refused", Err(error)),
         };
+        let Some(_admitted) = blocks.admit_direct() else {
+            return (
+                "unavailable",
+                Err(WyrdError::ServiceUnavailable {
+                    message: "every direct verification execution slot is in use".to_owned(),
+                    details: serde_json::json!({ "reason": "direct_executions" }),
+                }),
+            );
+        };
         if let Some(edge_timer) = edge_timer {
             edge_timer.hand_off();
         }
@@ -539,6 +579,7 @@ impl<'a> VerificationControl<'a> {
                     drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
                     clock: telemetry.clock(),
                     execution: Some(Arc::clone(&state)),
+                    mode: ExecutionMode::Direct,
                 },
             ) {
                 Ok(engine) => engine.with_checkpoints(
@@ -889,12 +930,6 @@ impl<'a> VerificationControl<'a> {
         caller: &Caller,
         request: &VerificationRequest,
     ) -> Result<Arc<Target>, WyrdError> {
-        let window = || WyrdError::VerificationInputUnsupported {
-            message: "a drift Verifier judges a scheduled window; record samples and submit \
-                      them instead of verifying now"
-                .to_owned(),
-            details: serde_json::json!({ "verifier_card_uid": request.verifier_card_uid }),
-        };
         let resolved = self
             .state
             .verification
@@ -910,7 +945,7 @@ impl<'a> VerificationControl<'a> {
         let target = match resolved {
             Ok(target) => target,
             Err(EnqueueRefusal::NotReady(VerifierReadiness::BaselineNotReady)) => {
-                return Err(window());
+                return Err(window_refusal(&request.verifier_card_uid));
             }
             Err(_) => {
                 return Err(WyrdError::VerificationTargetNotFound {
@@ -924,13 +959,7 @@ impl<'a> VerificationControl<'a> {
                 });
             }
         };
-        if target
-            .spec
-            .all_requirements()
-            .any(|requirement| requirement.check.evidence() == CheckEvidence::Window)
-        {
-            return Err(window());
-        }
+        direct_eligibility(&request.verifier_card_uid, &target.spec)?;
         Ok(target)
     }
 

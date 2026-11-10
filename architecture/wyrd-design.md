@@ -2015,12 +2015,27 @@ Agent declaration. Calls run under the execution's accepted authority; each
 decision is audited non-blocking; tool names, arguments, output digests, and
 byte counts are recorded.
 
-`code` and `code.run` run in one per-process pool of sandboxed Python worker
+`code` and `code.run` run in per-process pools of sandboxed Python worker
 processes with a separate unprivileged identity, empty credential
 environment, OS-enforced network denial, parent-serviced file access, no
 subprocesses or host packages, and a fresh interpreter session per operation.
 Pool, memory, file, archive, extraction, scratch, tool-result, and deadline
 limits are startup environment settings; slot limits only lower them.
+
+Direct `verify` and queued executions admit work from separate reserved
+capacity: each has its own execution slots, workspaces, Python pool, and
+model-call permits, sized by operator settings, with no borrowing between
+them. Direct admission refuses when its side is full; queued work waits, and
+a resumed or retried queued execution takes queued capacity again. A model
+call takes its side's permit before entering the ordinary gateway path, whose
+tenant and subject limits, budgets, and accounting still apply. Both sides
+run the one engine with the same authority, evidence, billing, cancellation,
+and platform behavior. The reservation covers these admissions only; CPU,
+Postgres, gateway, and provider capacity remain shared. A Verifier using a
+queued-only form (a scheduled-window check today) is refused by `verify`
+before any step runs, never converted to a queued request. The queued
+execution deadline is the original ceiling of everything a queued execution
+waits for, including approval periods; waiting never resets it.
 
 #### Drift checks
 A `drift` check flattens the existing `DriftSpec` next to `on:

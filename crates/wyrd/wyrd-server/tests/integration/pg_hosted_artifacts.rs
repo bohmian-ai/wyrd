@@ -42,13 +42,14 @@ use wyrd_runtime::{
 };
 use wyrd_server::components::auth::Caller;
 use wyrd_server::components::gateway::GatewayCallContext;
-use wyrd_server::verification::hosted::HostedLimits;
+use wyrd_server::verification::hosted::{HostedLimits, LaneLimits};
 use wyrd_server::verification::hosted::blocks::{Execution, HostedBlocks};
 use wyrd_server::verification::hosted::evidence::TenantEvidence;
 use wyrd_server::verification::hosted::registry::TenantRegistry;
 use wyrd_server::verification::hosted::sandbox::{CodeExecutor, Sandbox};
 use wyrd_server::verification::hosted::tools::HostedTools;
 use wyrd_server::verification::hosted::workspace::Workspaces;
+use wyrd_server::verification::telemetry::ExecutionMode;
 use wyrd_server::verification::{RuntimeLimits, VerificationRuntime};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, PrincipalId, Sha256Hex};
@@ -252,7 +253,7 @@ async fn artifact_evidence_and_code_reach_every_consumer() {
         vec![cited]
     );
 
-    let workspace = Workspaces::new(HostedLimits::default())
+    let workspace = Workspaces::new(HostedLimits::default(), HostedLimits::default().queued.workspaces)
         .open(
             &BTreeMap::from([(
                 "/inputs/notes.txt".to_owned(),
@@ -277,6 +278,7 @@ async fn artifact_evidence_and_code_reach_every_consumer() {
                 monty_min_workers: 0,
                 ..HostedLimits::default()
             },
+            HostedLimits::default().queued,
         )
         .await
         .expect("pool starts"),
@@ -494,7 +496,7 @@ async fn evidence_metadata_is_resolved_once() {
         value: CallValue::Evidence(value),
         sources: BTreeSet::from([slot.clone()]),
     };
-    let workspace = Workspaces::new(HostedLimits::default())
+    let workspace = Workspaces::new(HostedLimits::default(), HostedLimits::default().queued.workspaces)
         .open(
             &BTreeMap::from([
                 ("/inputs/doc.json".to_owned(), mounted(file.clone(), &doc)),
@@ -770,8 +772,8 @@ async fn recovered_authority_bounds_every_agent_tool() {
         state,
         caller,
         Arc::clone(&evidence),
-        Arc::new(Workspaces::new(limits)),
-        Arc::new(Sandbox::start(worker(), limits).await.expect("pool starts")),
+        Arc::new(Workspaces::new(limits, limits.queued.workspaces)),
+        Arc::new(Sandbox::start(worker(), limits, limits.queued).await.expect("pool starts")),
         limits,
     );
     let read = json!({"path": "/inputs/notes.txt", "start": 0});
@@ -1006,14 +1008,19 @@ async fn card_resolution_is_the_verifier_run() {
     );
 }
 
-/// Hosted limits of a one-worker pool with no waiters and one workspace, so
-/// a single held admission saturates each.
+/// Hosted limits whose lanes each hold a one-worker pool with no waiters and
+/// one workspace, so a single held admission saturates each.
 pub(crate) fn saturable() -> HostedLimits {
+    let lane = LaneLimits {
+        workspaces: 1,
+        python_workers: 1,
+        python_waiters: 0,
+        ..HostedLimits::default().queued
+    };
     HostedLimits {
         monty_min_workers: 0,
-        monty_max_workers: 1,
-        monty_max_waiters: 0,
-        max_workspaces: 1,
+        direct: lane,
+        queued: lane,
         code_timeout: Duration::from_secs(2),
         ..HostedLimits::default()
     }
@@ -1050,8 +1057,8 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
         BTreeMap::from([(notes(), registered.file("notes.txt"))]),
         limits,
     ));
-    let sandbox = Arc::new(Sandbox::start(worker(), limits).await.expect("pool starts"));
-    let workspaces = Arc::new(Workspaces::new(limits));
+    let sandbox = Arc::new(Sandbox::start(worker(), limits, limits.queued).await.expect("pool starts"));
+    let workspaces = Arc::new(Workspaces::new(limits, limits.queued.workspaces));
     let none = serde_json::Map::new();
     let far = Instant::now() + Duration::from_secs(30);
     // One admitted operation holds the only worker admission while pending.
@@ -1254,7 +1261,7 @@ async fn busy_queued_execution_is_deferred_until_capacity_frees() {
             .verification
             .blocks()
             .expect("blocks are hosted")
-            .sandbox(),
+            .sandbox(ExecutionMode::Queued),
     );
     // One admitted operation holds the only worker admission while pending.
     let mut held = Box::pin(sandbox.run("def f():\n    return 1", "f", &none, Vec::new(), far));
@@ -1399,6 +1406,7 @@ async fn artifact_evidence_is_admitted_against_its_slot_and_the_combined_limit()
                         drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
                         clock: BlockClock::default(),
                         execution: None,
+                        mode: ExecutionMode::Direct,
                     },
                 )
                 .expect("engine builds")

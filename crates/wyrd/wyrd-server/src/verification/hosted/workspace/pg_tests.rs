@@ -17,13 +17,10 @@ use crate::test_support::{test_caller, test_state};
 #[test]
 fn workspace_cleans_up_on_drop() {
     wyrd_runtime::runtime().block_on(async {
-        let limits = HostedLimits {
-            max_workspaces: 1,
-            ..HostedLimits::default()
-        };
+        let limits = HostedLimits::default();
         let evidence =
             TenantEvidence::new(test_state().await, test_caller([]), BTreeMap::new(), limits);
-        let workspaces = Workspaces::new(limits);
+        let workspaces = Workspaces::new(limits, 1);
         let files = BTreeMap::from([(
             "/inputs/a.json".to_owned(),
             CallInput {
@@ -53,13 +50,10 @@ fn workspace_cleans_up_on_drop() {
 #[test]
 fn cancelled_open_returns_its_admission() {
     wyrd_runtime::runtime().block_on(async {
-        let limits = HostedLimits {
-            max_workspaces: 1,
-            ..HostedLimits::default()
-        };
+        let limits = HostedLimits::default();
         let evidence =
             TenantEvidence::new(test_state().await, test_caller([]), BTreeMap::new(), limits);
-        let workspaces = Workspaces::new(limits);
+        let workspaces = Workspaces::new(limits, 1);
         let files = BTreeMap::from([(
             "/inputs/a.txt".to_owned(),
             CallInput {

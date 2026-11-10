@@ -7,7 +7,11 @@
 //! call does. Nothing about one call is stored on the caller, so concurrent
 //! calls cannot see each other's deadline. A caller built for a direct
 //! verification carries the Card, and optional Run, its agent-check calls
-//! are attributed to.
+//! are attributed to. A caller built for a verification lane first waits for
+//! one of that lane's model-call permits, so the lane's concurrency is bounded
+//! before the call reaches the gateway's own admission and accounting.
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::http::StatusCode;
@@ -17,6 +21,7 @@ use serde_json::Value;
 use skald_agent::{WyrdGatewayCall, WyrdGatewayCaller};
 use skald_providers::{ProviderError, RemoteProblem};
 use skald_spec::{ProviderRequest, ProviderResponse};
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use wyrd_gateway::{IngressDialect, ResponseBody};
 use wyrd_spec::error::WyrdError;
@@ -47,6 +52,9 @@ pub(crate) struct ServerWyrdGatewayCaller {
     /// Run and Card every call is attributed to, already resolved by the
     /// operation the calls serve; `None` leaves calls uncorrelated.
     subject: Option<GatewayCallContext>,
+    /// The verification lane label and its model-call permits each call
+    /// holds while it runs; `None` admits calls without a lane bound.
+    lane: Option<(&'static str, Arc<Semaphore>)>,
 }
 
 impl ServerWyrdGatewayCaller {
@@ -57,6 +65,7 @@ impl ServerWyrdGatewayCaller {
             state,
             caller,
             subject: None,
+            lane: None,
         }
     }
 
@@ -68,13 +77,22 @@ impl ServerWyrdGatewayCaller {
         self.subject = subject;
         self
     }
+
+    /// Hold one of `permits`, the model-call capacity of verification lane
+    /// `lane`, for each call, waiting for one before the gateway is reached.
+    pub(crate) fn admitted(mut self, lane: &'static str, permits: Arc<Semaphore>) -> Self {
+        self.lane = Some((lane, permits));
+        self
+    }
 }
 
 #[async_trait]
 impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
     /// Submit one governed model call to the in-process gateway.
     ///
-    /// The request is projected before admission, so an unservable dialect
+    /// A lane-bound caller first waits, until `cancellation`, for one of its
+    /// lane's model-call permits and holds it until the call returns. The
+    /// request is projected before admission, so an unservable dialect
     /// reaches no gateway decision. The gateway evaluates and audits the captured caller's invoke permission
     /// for the requested model and every fallback candidate. Its cancellation
     /// is a child of `cancellation`; the gateway owns any settlement that
@@ -83,7 +101,8 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
     /// # Errors
     /// Returns [`ProviderError::BadRequest`] for a request dialect the gateway
     /// does not serve or a body that does not serialize;
-    /// [`ProviderError::Timeout`] when the run is cancelled;
+    /// [`ProviderError::Timeout`] when the run is cancelled, including while
+    /// it waits for its lane;
     /// [`ProviderError::RemoteProblem`] for a gateway refusal or a provider's
     /// non-success answer; and [`ProviderError::Decode`] when a success is not
     /// the dialect's native response.
@@ -107,6 +126,23 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
             body,
             answer,
         } = NativeCall::project(call.request, &call.model)?;
+        let _permit = match &self.lane {
+            Some((lane, permits)) => Some(match Arc::clone(permits).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    tracing::info!(lane, "the model call waits for its lane's admission");
+                    tokio::select! {
+                        permit = Arc::clone(permits).acquire_owned() => {
+                            permit.map_err(|_| ProviderError::timeout(PROVIDER))?
+                        }
+                        () = cancellation.cancelled() => {
+                            return Err(ProviderError::timeout(PROVIDER));
+                        }
+                    }
+                }
+            }),
+            None => None,
+        };
         let request = GatewayCallRequest {
             operation,
             ingress,

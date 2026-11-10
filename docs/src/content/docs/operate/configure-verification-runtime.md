@@ -12,13 +12,19 @@ Decide which processes run Verifiers and how much Python each runs at once. Ever
 
 Every API-serving process runs Verifiers by default. To keep one out, set `WYRD_VERIFICATION_ENABLED=0`, or `enabled = false` under `[verification]` in the [server TOML file](/reference/verification-runtime-limits/#server-toml-file). Route verification traffic to the processes that keep it on.
 
-## Size the worker pool
+## Split direct and queued capacity
 
-The server starts its own Python workers; there is nothing to install. Each process has its own pool, and a process that runs Verifiers starts its first `WYRD_VERIFICATION_MONTY_MIN_WORKERS` workers before it reports ready.
+Each process reserves capacity for `verify` calls separately from queued executions: execution slots, workspaces, Python workers, and model calls. Neither side borrows the other's, so a full queue cannot block `verify`. Size each side for its own traffic with the `WYRD_VERIFICATION_DIRECT_*` and `WYRD_VERIFICATION_QUEUED_*` settings in [runtime limits](/reference/verification-runtime-limits/#direct-and-queued-capacity). CPU, Postgres, the gateway, and model providers stay shared.
 
-- To run more Python at once, raise `WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB` and `WYRD_VERIFICATION_MONTY_MAX_WORKERS` together.
+`WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS` bounds each queued execution from its first claim, waits and retries included. Raise it to fit the longest wait an execution is meant to survive, such as an intended human approval period.
+
+## Size the worker pools
+
+The server starts its own Python workers; there is nothing to install. Each process has a direct and a queued pool, and a process that runs Verifiers starts `WYRD_VERIFICATION_MONTY_MIN_WORKERS` workers in each before it reports ready.
+
+- To run more Python at once, raise `WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB` with `WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS` or `WYRD_VERIFICATION_QUEUED_PYTHON_WORKERS`; both pools' workers together must fit the pool memory.
 - To give each operation more memory, raise `WYRD_VERIFICATION_MONTY_MEMORY_MIB` with `WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB`, which must exceed it by at least 4 MiB.
-- Leave memory beyond the pool for the server, extraction, and model responses, and temporary-directory space for `WYRD_VERIFICATION_MAX_WORKSPACES` workspaces of up to `WYRD_VERIFICATION_SCRATCH_MAX_MIB` each.
+- Leave memory beyond the pools for the server, extraction, and model responses, and temporary-directory space for `WYRD_VERIFICATION_DIRECT_WORKSPACES` plus `WYRD_VERIFICATION_QUEUED_WORKSPACES` workspaces of up to `WYRD_VERIFICATION_SCRATCH_MAX_MIB` each.
 
 Settings are read at startup; restart to apply a change.
 

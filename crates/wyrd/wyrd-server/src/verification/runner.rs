@@ -818,6 +818,7 @@ impl VerifierRunner {
                 drift,
                 clock: telemetry.clock(),
                 execution: Some(Arc::clone(state)),
+                mode: ExecutionMode::Queued,
             },
         ) {
             Ok(engine) => engine,

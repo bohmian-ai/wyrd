@@ -825,9 +825,14 @@ fn yaml_and_code_share_diagnostics() {
             .and_then(wyrd_loader::build_declaration_input)
             .map_err(WyrdError::from)
             .expect_err("the YAML spec is not an object");
-        let from_code = CardDefinition::new(CardKind::Service, "shared", "1.0.0", raw)
-            .declaration()
-            .expect_err("the raw spec is not an object");
+        let from_code = CardDefinition(Card::with_spec(
+            CardKind::Service,
+            "shared",
+            "1.0.0",
+            Body::authored(raw),
+        ))
+        .declaration()
+        .expect_err("the raw spec is not an object");
         let file_label = file.display().to_string();
         let file_diagnostics: Vec<_> = diagnostics(&from_file)
             .into_iter()
@@ -843,9 +848,14 @@ fn yaml_and_code_share_diagnostics() {
             "raw {yaml} refuses alike"
         );
     }
-    CardDefinition::new(CardKind::Service, "shared", "1.0.0", json!({}))
-        .declaration()
-        .expect("an empty object is a valid Service spec");
+    CardDefinition(Card::with_spec(
+        CardKind::Service,
+        "shared",
+        "1.0.0",
+        Body::authored(json!({})),
+    ))
+    .declaration()
+    .expect("an empty object is a valid Service spec");
 }
 
 /// The `card_authoring` story's checked-in file at `relative`.

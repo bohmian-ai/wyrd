@@ -963,17 +963,6 @@ pub struct CardDefinition(
 );
 
 impl CardDefinition {
-    /// Define the `kind` Card `name` at `version` with the canonical `spec`
-    /// JSON, as its YAML `spec` would hold it.
-    pub fn new(
-        kind: CardKind,
-        name: impl Into<String>,
-        version: impl Into<String>,
-        spec: Value,
-    ) -> Self {
-        Self(Card::with_spec(kind, name, version, Body::authored(spec)))
-    }
-
     /// The exact reference this Card registers as.
     #[must_use]
     pub fn card_ref(&self) -> CardRef {

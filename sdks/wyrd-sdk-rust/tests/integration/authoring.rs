@@ -1504,23 +1504,6 @@ fn public_paths_author_every_native_family() {
         wyrd_ai::cards::Declarable::from(artifact),
         wyrd_ai::cards::Declarable::Card(_)
     ));
-    for (kind, spec) in [
-        (
-            CardKind::Policy,
-            json!({"description": "Sharing", "enforcement": "block"}),
-        ),
-        (
-            CardKind::Source,
-            json!({"source": {"kind": "object_store", "uri": "gs://archive/runs", "format": "parquet"}}),
-        ),
-    ] {
-        assert_authors(
-            CardDefinition::new(kind.clone(), "authored", "1.0.0", spec.clone()),
-            &kind,
-            spec,
-        );
-    }
-
     let mut verifier =
         Verifier::new("inventory", "1.0.0").inputs([("report", json!({"type": "object"}))]);
     verifier

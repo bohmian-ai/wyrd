@@ -92,3 +92,40 @@ conditional association/revocation in SQL's `integration` target via
 Use local provider mocks, real Postgres and WyrdTestServer; no live App keys.
 Record new focused commands once tests exist. Run applicable checks from README,
 including tenant isolation and OpenAPI; no new PostgreSQL table or UI.
+
+## Obligations
+
+| ID | Source (task line) | Observation | Planned assertion |
+|---|---|---|---|
+| O1 | "operator supplies App ID/slug, configured web/API origins, private key, webhook secret, OAuth client credentials and exact public URLs through existing server configuration/secret providers" | Every App field parses from server config/env; secrets only from env/file, redacted in Debug | `config` unit test parses and redacts the GitHub section |
+| O2 | "Missing optional App config makes only this integration unavailable" | Without App config the server boots, other `/v1` routes work and every GitHub operation refuses with a typed 503 | SDK journey: unconfigured server → typed unavailable error; ordinary read succeeds |
+| O3 | "invalid present config uses typed validation" | Partial/invalid App config refuses startup with `ConfigError::Invalid` naming the field | `config` unit test for partial, bad origin, bad key |
+| O4 | "Retain conventional configured GitHub host support" | Web and API origins are configurable (GitHub Enterprise Server shape); the view reports the configured host | config unit test + journey view `host` equals mock origin host |
+| O5 | "Implement the single `/v1/integrations/github` connect/read/disconnect flow" | `POST /connect`, `GET`, `DELETE` served with typed bodies and in OpenAPI | journey assertions per surface + OpenAPI path assertion |
+| O6 | "Start a one-use actor/tenant/browser-bound transaction with the existing transaction expiry behavior"; "connect transaction receipt follows durable transaction creation" | Connect returns the GitHub install URL and expiry only after the login-state row commits; the row binds actor and tenant, then the browser at setup, and expires with `LOGIN_STATE_TTL` | SQL integration: row bound/expiring; journey: receipt then setup works |
+| O7 | "Support installation begun from Wyrd" | connect → setup (state) → OAuth authorize → callback associates | journey (Wyrd-begun) |
+| O8 | "Support installation begun from ... GitHub" | setup without state, signed-in browser → transaction → OAuth → callback associates | journey (GitHub-begun) |
+| O9 | "Keep setup and OAuth callback separate: setup's installation ID is a hint" | setup never associates; only callback does, after verification | journey: after setup, view still not connected |
+| O10 | "callback verifies transaction and transient user authorization, revalidates installation and user repository access" | callback exchanges the code, checks the App installation, the user's installation access and user-accessible repositories before associating | journey with mock recording calls; selected repos = user-accessible repos |
+| O11 | AC-001 "spoofed installation IDs ... fail safely" | A hint the user cannot access, or another App's installation, is refused and nothing is associated | journey negative |
+| O12 | AC-001 "consumed ... transactions" | Replaying a consumed callback state is refused | journey negative |
+| O13 | AC-001 "foreign transactions" | A callback state presented by another principal's browser session is refused | journey negative |
+| O14 | AC-001 "foreign tenant" | A transaction of tenant A cannot be completed in tenant B's session | journey negative |
+| O15 | AC-001 "duplicate association"; "conditionally associates one installation with one tenant. Enforce the inverse uniqueness too" | An installation associated with tenant A is refused for tenant B; a tenant connected to installation X is refused for installation Y; reconnecting X refreshes selection | SQL integration + journey |
+| O16 | AC-001 "missing/invalid config fail safely" | = O2/O3 | as O2/O3 |
+| O17 | "OAuth tokens are transient/redacted"; AC-001 "keys/tokens never appear in view" | No user/installation token, key or secret in view, errors or Debug; nothing stored | journey: serialized views contain no mock token/key; unit Debug redaction |
+| O18 | "Return only the approved redacted connection/access view" | View = host, App id/slug, installation id when verified, state, selected accessible repositories (id, full name), safe timestamps | journey asserts exact view shape |
+| O19 | "Repository use requires both current installation access and tenant selection" | Installation token minted only for an associated, unsuspended, selected and still-accessible repository | server integration test of the token facility |
+| O20 | "Background work obtains installation tokens and narrowly authorized execution authority, never a saved personal token" | Token facility narrows `repository_ids` and permissions; no user token persisted | integration test inspects mock request body |
+| O21 | "Synchronize installation removal/suspension/access events" | Signed `installation` deleted/suspend/unsuspend and `installation_repositories` removed update the connection; bad signature refused | journey via signed webhook + unit HMAC test |
+| O22 | "Fence new source IO ... on access loss"; AC-001 "Remove one repository/suspend/disconnect" | After removal/suspension/disconnect the token facility refuses the affected repository; unrelated repositories keep working | integration test |
+| O23 | "disconnect fences work before releasing association"; AC-001 "association released in the right order" | Disconnect fences, then releases; afterwards the installation may associate with another tenant | SQL integration + journey |
+| O24 | AC-001 "observe only affected existing queued work fenced" | Unrelated queued executions remain unfinished after removal/suspend/disconnect | SQL integration: queued execution survives |
+| O25 | "Connection grants source access; it does not register a Card"; AC-001 "no Cards/bindings created" | Card list empty after connect | journey |
+| O26 | "Document Contents read, Pull requests write, Checks write and required PR/source/installation-access events and the actual served setup/callback URLs" | Operator guide lists exactly these and the served paths | `mise run docs:check` + doc citation |
+| O27 | "Amend wyrd-security-posture.md → Trust boundaries / Principal and credential lifecycle / Outbound credentials and wyrd-design.md → Runtime identity" | Sections describe association and credential ownership | doc citation |
+| O28 | "Reuse typed permission/audit owners without prescribing another permission category" | Read/connect/disconnect use existing `identity_connections` read/write; decisions audited | journey: unprivileged caller 403; audit unit |
+| O29 | "Ship typed HTTP, shared Rust client and thin Rust/Python/TypeScript SDK, CLI and MCP projections ... safe errors, discoverable reads and scoped writes" | Each surface reads/connects/disconnects; MCP read tool listed for readers, write tools only for writers | per-surface journeys |
+| O30 | "Update operator and tenant setup/diagnosis guides here, with no UI"; AC-011 | Guide commands match served CLI/SDK operations | docs:check + CLI journey runs guide commands |
+| O31 | Tier 2 "conditional association/revocation in SQL's integration target" | Association conditional on bound slot; uniqueness; release | `pg_github_connections` tests |
+| O32 | "Run applicable checks ... including tenant isolation and OpenAPI; no new PostgreSQL table or UI" | Checks pass; migration adds only columns | command output; migration has no `CREATE TABLE` |

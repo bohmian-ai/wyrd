@@ -2,10 +2,12 @@
 //!
 //! [`install`](crate::install) makes [`BenchmarkRecorder`] the process's only
 //! `metrics` recorder, so every existing `metrics::counter!`, `gauge!`, and
-//! `histogram!` observation lands in the same registry, under the same lock,
-//! as the explicit request timings. Series are keyed by kind, name, and
-//! sorted labels; there are at most [`MAX_METRIC_SERIES`], and a
-//! registration that would open another is counted in `dropped`.
+//! `histogram!` observation lands in the same registry as the explicit
+//! request timings. Series are keyed by kind, name, and sorted labels; there
+//! are at most [`MAX_METRIC_SERIES`], and a registration that would open
+//! another is counted in `dropped`. Each series has its own lock, and a
+//! repeated registration shares the series' existing handle, so an update
+//! waits for nothing but another update of the same series.
 //!
 //! Every histogram records fixed-point billionths of its observations
 //! ([`HistogramUnit::per_unit`]): a `_seconds` histogram's are nanoseconds
@@ -16,7 +18,9 @@
 //! cannot hold (negative, non-finite, or out of range) is counted
 //! `rejected`, never clamped.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use metrics::{
     Counter, CounterFn, Gauge, GaugeFn, Histogram, HistogramFn, Key, KeyName, Metadata, Recorder,
@@ -25,12 +29,12 @@ use metrics::{
 use num_traits::ToPrimitive as _;
 use serde::{Deserialize, Serialize};
 
-use crate::{Buckets, Registry, durations, lock, metric_values, record_into};
+use crate::{Buckets, REGISTRY, durations, locked, metric_values, read, record_into, write};
 
 /// The most standard metric series one process keeps.
 pub const MAX_METRIC_SERIES: usize = 1024;
 
-/// A standard metric's kind, which indexes [`Registry::metric_keys`] slots.
+/// A standard metric's kind, which indexes [`Metrics`] key slots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kind {
     /// A monotonic counter.
@@ -74,10 +78,6 @@ impl HistogramUnit {
 
 /// One standard metric series' cumulative state.
 pub(crate) struct Metric {
-    /// The metric family name.
-    name: String,
-    /// Its labels, sorted by name.
-    labels: BTreeMap<String, String>,
     /// Updates refused as unrepresentable.
     rejected: u64,
     /// The kind-specific value.
@@ -135,11 +135,11 @@ impl Metric {
         }
     }
 
-    /// This series in a snapshot.
-    fn snapshot(&self) -> MetricSnapshot {
+    /// This series in a snapshot, named `name` with `labels`.
+    fn snapshot(&self, name: &str, labels: &BTreeMap<String, String>) -> MetricSnapshot {
         MetricSnapshot {
-            name: self.name.clone(),
-            labels: self.labels.clone(),
+            name: name.to_owned(),
+            labels: labels.clone(),
             rejected: self.rejected,
             value: match &self.value {
                 Value::Counter(total) => MetricValue::Counter { total: *total },
@@ -157,16 +157,52 @@ impl Metric {
     }
 }
 
-impl Registry {
-    /// The index of `key`'s `kind` series, registering it on first sight;
-    /// `None`, counted dropped, once [`MAX_METRIC_SERIES`] are kept.
-    pub(crate) fn metric(&mut self, kind: Kind, key: &Key) -> Option<usize> {
-        if let Some(index) = self
-            .metric_keys
-            .get(key)
-            .and_then(|slots| slots[kind as usize])
-        {
-            return Some(index);
+/// One standard metric series, its state behind its own lock: the handle
+/// every registration of its key shares.
+pub(crate) struct MetricSeries {
+    /// The metric family name.
+    name: String,
+    /// Its labels, sorted by name.
+    labels: BTreeMap<String, String>,
+    /// Its kind.
+    kind: Kind,
+    /// Its cumulative state.
+    metric: Mutex<Metric>,
+}
+
+impl MetricSeries {
+    /// Applies `update` to this series under its own lock.
+    fn update(&self, update: impl FnOnce(&mut Metric)) {
+        update(&mut locked(&self.metric));
+    }
+}
+
+/// The process's standard metric series and each registered key's series.
+#[derive(Default)]
+pub(crate) struct Metrics {
+    /// Every series, in registration order.
+    series: Vec<Arc<MetricSeries>>,
+    /// Each registered key's series index, per [`Kind`].
+    keys: HashMap<Key, [Option<usize>; 3]>,
+}
+
+impl Metrics {
+    /// `key`'s registered `kind` series, if any.
+    fn find(&self, kind: Kind, key: &Key) -> Option<Arc<MetricSeries>> {
+        let index = self.keys.get(key)?[kind as usize]?;
+        self.series.get(index).cloned()
+    }
+
+    /// `key`'s `kind` series, registering it on first sight; `None`, counted
+    /// in `dropped`, once [`MAX_METRIC_SERIES`] are kept.
+    fn register(
+        &mut self,
+        kind: Kind,
+        key: &Key,
+        dropped: &AtomicU64,
+    ) -> Option<Arc<MetricSeries>> {
+        if let Some(series) = self.find(kind, key) {
+            return Some(series);
         }
         let name = key.name().to_owned();
         let labels: BTreeMap<String, String> = key
@@ -175,20 +211,13 @@ impl Registry {
             .collect();
         // ponytail: a linear scan on a key's first sight only; label-order
         // variants of one series then share its index.
-        let existing = self.metrics.iter().position(|metric| {
-            metric.name == name
-                && metric.labels == labels
-                && matches!(
-                    (&metric.value, kind),
-                    (Value::Counter(_), Kind::Counter)
-                        | (Value::Gauge { .. }, Kind::Gauge)
-                        | (Value::Histogram { .. }, Kind::Histogram)
-                )
+        let existing = self.series.iter().position(|series| {
+            series.kind == kind && series.name == name && series.labels == labels
         });
         let index = match existing {
             Some(index) => index,
-            None if self.metrics.len() >= MAX_METRIC_SERIES => {
-                self.dropped += 1;
+            None if self.series.len() >= MAX_METRIC_SERIES => {
+                dropped.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
             None => {
@@ -210,22 +239,27 @@ impl Registry {
                         }
                     }
                 };
-                self.metrics.push(Metric {
+                self.series.push(Arc::new(MetricSeries {
                     name,
                     labels,
-                    rejected: 0,
-                    value,
-                });
-                self.metrics.len() - 1
+                    kind,
+                    metric: Mutex::new(Metric { rejected: 0, value }),
+                }));
+                self.series.len() - 1
             }
         };
-        self.metric_keys.entry(key.clone()).or_default()[kind as usize] = Some(index);
-        Some(index)
+        self.keys.entry(key.clone()).or_default()[kind as usize] = Some(index);
+        self.series.get(index).cloned()
     }
 
-    /// Every standard metric series' cumulative snapshot.
-    pub(crate) fn metric_snapshots(&self) -> Vec<MetricSnapshot> {
-        self.metrics.iter().map(Metric::snapshot).collect()
+    /// Every standard metric series' cumulative snapshot, each read under
+    /// its own lock after `metrics` is released.
+    pub(crate) fn snapshots(metrics: &std::sync::RwLock<Self>) -> Vec<MetricSnapshot> {
+        let series = read(metrics).series.clone();
+        series
+            .iter()
+            .map(|series| locked(&series.metric).snapshot(&series.name, &series.labels))
+            .collect()
     }
 }
 
@@ -234,19 +268,7 @@ impl Registry {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BenchmarkRecorder;
 
-/// A registered series' handle: its index in the registry.
-struct Handle(usize);
-
-impl Handle {
-    /// Applies `update` to this series under the registry lock.
-    fn update(&self, update: impl FnOnce(&mut Metric)) {
-        if let Some(metric) = lock().metrics.get_mut(self.0) {
-            update(metric);
-        }
-    }
-}
-
-impl CounterFn for Handle {
+impl CounterFn for MetricSeries {
     /// Adds `value`, saturating.
     fn increment(&self, value: u64) {
         self.update(|metric| {
@@ -266,7 +288,7 @@ impl CounterFn for Handle {
     }
 }
 
-impl GaugeFn for Handle {
+impl GaugeFn for MetricSeries {
     /// Adds `value`.
     fn increment(&self, value: f64) {
         self.update(|metric| metric.gauge(|current| current + value));
@@ -283,7 +305,7 @@ impl GaugeFn for Handle {
     }
 }
 
-impl HistogramFn for Handle {
+impl HistogramFn for MetricSeries {
     /// Records `value` in the series' unit.
     fn record(&self, value: f64) {
         self.update(|metric| metric.observe(value));
@@ -291,11 +313,14 @@ impl HistogramFn for Handle {
 }
 
 impl BenchmarkRecorder {
-    /// The handle of `key`'s `kind` series, or `None` when the bound refused it.
-    fn handle(kind: Kind, key: &Key) -> Option<std::sync::Arc<Handle>> {
-        lock()
-            .metric(kind, key)
-            .map(|index| std::sync::Arc::new(Handle(index)))
+    /// The shared handle of `key`'s `kind` series, or `None` when the bound
+    /// refused it. A registered key needs only a shared read.
+    fn handle(kind: Kind, key: &Key) -> Option<Arc<MetricSeries>> {
+        let registry = &*REGISTRY;
+        if let Some(series) = read(&registry.metrics).find(kind, key) {
+            return Some(series);
+        }
+        write(&registry.metrics).register(kind, key, &registry.dropped)
     }
 }
 
@@ -571,5 +596,94 @@ impl crate::BenchmarkInterval {
         labels: &[(&str, &str)],
     ) -> Result<crate::Distribution, String> {
         IntervalMetric::histogram(&self.metrics, name, labels)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, mpsc};
+    use std::time::{Duration, Instant};
+
+    /// The registered counter series `name`.
+    fn registered(name: &'static str) -> Arc<super::MetricSeries> {
+        crate::read(&crate::REGISTRY.metrics)
+            .find(super::Kind::Counter, &metrics::Key::from_static_name(name))
+            .expect("a registered counter")
+    }
+
+    /// While one registered series is held mid-update, an unrelated series
+    /// still registers and records, and so does a grouped request timing,
+    /// even while a snapshot waits on the held series; the held update and
+    /// the snapshot then finish, and each total is exact.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an unrelated update waits for the held series or for the
+    /// snapshot, or a total is wrong.
+    #[test]
+    fn unrelated_series_record_while_one_series_is_held() {
+        crate::install().expect("the only recorder");
+        let before = crate::snapshot();
+        metrics::counter!("bench_held_total").increment(1);
+        let series = registered("bench_held_total");
+        let shared = Arc::strong_count(&series);
+        let held = crate::locked(&series.metric);
+        let (done, finished) = mpsc::channel();
+        // The timeouts only guard a deadlock; they are not latency bounds.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let progressed = std::thread::scope(|threads| {
+            let snapshot = threads.spawn(crate::snapshot);
+            // The snapshot has released the registry once it holds its own
+            // reference to every series, and then waits on the held one.
+            while Arc::strong_count(&series) == shared && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let reached = Arc::strong_count(&series) > shared;
+            threads.spawn(move || {
+                metrics::counter!("bench_free_total").increment(2);
+                metrics::histogram!("bench_free_seconds").record(0.001);
+                crate::record_timing_parts(
+                    &tracing::Span::none(),
+                    "bench.free",
+                    "success",
+                    Duration::from_micros(2),
+                    None,
+                    &[("bench.free.part", Duration::from_micros(1))],
+                );
+                let _ = done.send(());
+            });
+            let progressed = finished.recv_timeout(Duration::from_secs(10)).is_ok();
+            drop(held);
+            let snapshot = snapshot.join().expect("the snapshot finishes");
+            (reached, progressed, snapshot)
+        });
+        let (reached, progressed, during) = progressed;
+        assert!(reached, "the snapshot never reached the held series");
+        assert!(progressed, "an unrelated series waited for the held one");
+        assert!(
+            during.since(&before).is_ok(),
+            "the waiting snapshot is whole"
+        );
+        metrics::counter!("bench_held_total").increment(1);
+        let interval = crate::snapshot().since(&before).expect("one process");
+        assert_eq!(interval.counter("bench_held_total", &[]), Some(2));
+        assert_eq!(interval.counter("bench_free_total", &[]), Some(2));
+        assert_eq!(
+            interval
+                .histogram("bench_free_seconds", &[])
+                .map(|values| values.len()),
+            Ok(1)
+        );
+        for boundary in ["bench.free", "bench.free.part"] {
+            assert_eq!(
+                interval
+                    .series
+                    .iter()
+                    .find(|series| series.boundary == boundary)
+                    .map(|series| series.count),
+                Some(1),
+                "{boundary}"
+            );
+        }
     }
 }

@@ -31,9 +31,11 @@
 //! open another is counted in `dropped`, never merged into an existing
 //! series.
 //!
-//! [`snapshot`] reads every cumulative distribution, counter, and gauge
-//! under the same lock that records them, so a snapshot is consistent and no
-//! concurrent observation is lost or counted twice. There is no reset: an
+//! Every series has its own lock, so unrelated series never wait for each
+//! other. [`snapshot`] reads each series under its lock, so no concurrent
+//! observation is lost or counted twice, and holds a grouped request's
+//! timings out only while it copies the timing series, so a snapshot holds
+//! all of one request's timing parts or none. There is no reset: an
 //! interval is the difference of two snapshots of the same process
 //! ([`BenchmarkSnapshot::since`]). A value outside the range, a negative
 //! residual, or a missing component is counted, never clamped, and makes the
@@ -41,9 +43,11 @@
 
 mod recorder;
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, Mutex, PoisonError};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{
+    LazyLock, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
+};
 use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
@@ -141,8 +145,7 @@ pub const CLOCK: &str = "std::time::Instant: the OS monotonic clock";
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// The process's benchmark registry.
-// ponytail: one process-wide lock for timings and standard metrics; per-series locks if recording contention ever shows in server CPU.
-static REGISTRY: LazyLock<Mutex<Registry>> = LazyLock::new(|| Mutex::new(Registry::new()));
+static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
 
 /// Installs [`BenchmarkRecorder`] as this process's only standard `metrics`
 /// recorder and starts recording benchmark timings. A benchmark server calls
@@ -219,7 +222,7 @@ pub fn label_request(span: &tracing::Span, headers: &http::HeaderMap) {
         phase: Labels::label(phase, PHASES),
     };
     if labels.case == INVALID || labels.phase == INVALID {
-        lock().invalid_labels += 1;
+        REGISTRY.invalid_labels.fetch_add(1, Ordering::Relaxed);
     }
     span.with_subscriber(|(id, dispatch)| {
         if let Some(span) = dispatch
@@ -247,7 +250,7 @@ fn labels_of(span: &tracing::Span) -> Labels {
 
 /// Records one request's server timing, and each of its `parts` as an
 /// observation of the part's own boundary, under `parent`'s
-/// classification and one lock acquisition; see
+/// classification, as one group no snapshot divides; see
 /// [`record_timing_parts`]. Nothing is recorded unless [`install`]ed.
 pub(crate) fn record(
     parent: &tracing::Span,
@@ -261,12 +264,14 @@ pub(crate) fn record(
         return;
     }
     let labels = labels_of(parent);
-    let mut registry = lock();
-    registry.record(
-        (boundary, outcome, labels.case, labels.phase),
-        elapsed,
-        excluded,
-    );
+    let registry = &*REGISTRY;
+    let key = (boundary, outcome, labels.case, labels.phase);
+    if parts.is_empty() {
+        registry.record(key, elapsed, excluded);
+        return;
+    }
+    let _group = read(&registry.groups);
+    registry.record(key, elapsed, excluded);
     for (part, duration) in parts {
         registry.record((part, outcome, labels.case, labels.phase), *duration, None);
     }
@@ -286,13 +291,47 @@ pub fn record_scan(
         return;
     }
     let labels = labels_of(span);
-    lock().scan((outcome, labels.case, labels.phase), rows, bytes);
+    REGISTRY.scan((outcome, labels.case, labels.phase), rows, bytes);
 }
 
-/// The registry, whatever a panicking recorder left: every update is a
+/// `mutex`'s guard, whatever a panicking recorder left: every update is a
 /// whole increment, so a poisoned lock holds no half-written observation.
-fn lock() -> std::sync::MutexGuard<'static, Registry> {
-    REGISTRY.lock().unwrap_or_else(PoisonError::into_inner)
+fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// `lock`'s shared guard, whatever a panicking recorder left; see [`locked`].
+fn read<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// `lock`'s exclusive guard, whatever a panicking recorder left; see
+/// [`locked`].
+fn write<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Applies `update` to `key`'s series of `map` under that series' own lock,
+/// opening it with `open` on first sight unless `bound` series are kept;
+/// `false` when the bound refused it.
+fn update<K: Ord + Copy, V>(
+    map: &RwLock<BTreeMap<K, Mutex<V>>>,
+    key: K,
+    bound: usize,
+    open: impl FnOnce() -> V,
+    update: impl FnOnce(&mut V),
+) -> bool {
+    if let Some(series) = read(map).get(&key) {
+        update(&mut locked(series));
+        return true;
+    }
+    let mut map = write(map);
+    if !map.contains_key(&key) && map.len() >= bound {
+        return false;
+    }
+    let series = map.entry(key).or_insert_with(|| Mutex::new(open()));
+    update(series.get_mut().unwrap_or_else(PoisonError::into_inner));
+    true
 }
 
 /// A timing series' key: boundary, outcome, case, phase.
@@ -337,6 +376,7 @@ fn record_into(histogram: &mut Histogram<u64>, value: u64) -> bool {
 }
 
 /// One timing series' cumulative observations.
+#[derive(Clone)]
 struct Series {
     /// `record_timing` calls.
     count: u64,
@@ -371,24 +411,27 @@ struct Scan {
     out_of_range: u64,
 }
 
-/// The process's cumulative benchmark timings.
+/// The process's cumulative benchmark timings and standard metrics, each
+/// series under its own lock.
 struct Registry {
     /// When the registry started: the origin of snapshot times.
     started: Instant,
     /// This process's identity, fresh on every start.
     process: String,
+    /// Held shared while a request records its timing parts and exclusively
+    /// while a snapshot copies the timing series, so no snapshot divides a
+    /// request's group.
+    groups: RwLock<()>,
     /// Timing series.
-    series: BTreeMap<Key, Series>,
+    series: RwLock<BTreeMap<Key, Mutex<Series>>>,
     /// Scan series.
-    scans: BTreeMap<ScanKey, Scan>,
+    scans: RwLock<BTreeMap<ScanKey, Mutex<Scan>>>,
     /// Observations refused because their series would exceed a bound.
-    dropped: u64,
+    dropped: AtomicU64,
     /// Requests that declared an unknown case or phase.
-    invalid_labels: u64,
-    /// Standard metric series, indexed by their handles.
-    metrics: Vec<recorder::Metric>,
-    /// Each registered key's series index, per [`recorder::Kind`].
-    metric_keys: HashMap<metrics::Key, [Option<usize>; 3]>,
+    invalid_labels: AtomicU64,
+    /// Standard metric series.
+    metrics: RwLock<recorder::Metrics>,
 }
 
 impl Registry {
@@ -397,22 +440,18 @@ impl Registry {
         Self {
             started: Instant::now(),
             process: ulid::Ulid::new().to_string(),
-            series: BTreeMap::new(),
-            scans: BTreeMap::new(),
-            dropped: 0,
-            invalid_labels: 0,
-            metrics: Vec::new(),
-            metric_keys: HashMap::new(),
+            groups: RwLock::new(()),
+            series: RwLock::new(BTreeMap::new()),
+            scans: RwLock::new(BTreeMap::new()),
+            dropped: AtomicU64::new(0),
+            invalid_labels: AtomicU64::new(0),
+            metrics: RwLock::new(recorder::Metrics::default()),
         }
     }
 
     /// Records one observation into series `key`.
-    fn record(&mut self, key: Key, elapsed: Duration, excluded: Option<Duration>) {
-        if !self.series.contains_key(&key) && self.series.len() >= MAX_SERIES {
-            self.dropped += 1;
-            return;
-        }
-        let series = self.series.entry(key).or_insert_with(|| Series {
+    fn record(&self, key: Key, elapsed: Duration, excluded: Option<Duration>) {
+        let open = || Series {
             count: 0,
             elapsed: durations(),
             excluded: excluded.map(|_| durations()),
@@ -420,96 +459,67 @@ impl Registry {
             missing_excluded: 0,
             out_of_range: 0,
             negative_residual: 0,
-        });
-        series.count += 1;
-        let nanos = |duration: Duration| u64::try_from(duration.as_nanos()).ok();
-        let elapsed = nanos(elapsed);
-        match elapsed {
-            Some(value) if record_into(&mut series.elapsed, value) => {}
-            _ => series.out_of_range += 1,
-        }
-        match (excluded, &mut series.excluded, &mut series.residual) {
-            (None, None, None) => {}
-            (Some(excluded), Some(excluded_histogram), Some(residual_histogram)) => {
-                let excluded = nanos(excluded);
-                match excluded {
-                    Some(value) if record_into(excluded_histogram, value) => {}
-                    _ => series.out_of_range += 1,
-                }
-                match elapsed.zip(excluded).map(|(e, x)| e.checked_sub(x)) {
-                    Some(Some(residual)) => {
-                        if !record_into(residual_histogram, residual) {
-                            series.out_of_range += 1;
-                        }
-                    }
-                    Some(None) => series.negative_residual += 1,
-                    None => series.out_of_range += 1,
-                }
-            }
-            _ => series.missing_excluded += 1,
+        };
+        if !update(&self.series, key, MAX_SERIES, open, |series| {
+            series.observe(elapsed, excluded);
+        }) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     /// Records one query's scan facts into scan series `key`.
-    fn scan(&mut self, key: ScanKey, rows: Option<u64>, bytes: Option<u64>) {
-        if !self.scans.contains_key(&key) && self.scans.len() >= MAX_SCAN_SERIES {
-            self.dropped += 1;
-            return;
-        }
-        let scan = self.scans.entry(key).or_insert_with(|| Scan {
+    fn scan(&self, key: ScanKey, rows: Option<u64>, bytes: Option<u64>) {
+        let open = || Scan {
             count: 0,
             rows: facts(),
             bytes: facts(),
             missing_rows: 0,
             missing_bytes: 0,
             out_of_range: 0,
-        });
-        scan.count += 1;
-        for (fact, histogram, missing) in [
-            (rows, &mut scan.rows, &mut scan.missing_rows),
-            (bytes, &mut scan.bytes, &mut scan.missing_bytes),
-        ] {
-            match fact {
-                Some(value) => {
-                    if !record_into(histogram, value) {
-                        scan.out_of_range += 1;
-                    }
-                }
-                None => *missing += 1,
-            }
+        };
+        if !update(&self.scans, key, MAX_SCAN_SERIES, open, |scan| {
+            scan.observe(rows, bytes);
+        }) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     /// The cumulative snapshot of everything recorded so far.
+    ///
+    /// The timing series are copied while request groups are held out,
+    /// then converted with every producer free; each scan and standard
+    /// metric series is read under its own lock alone.
     fn snapshot(&self) -> BenchmarkSnapshot {
-        BenchmarkSnapshot {
-            process: self.process.clone(),
-            pid: std::process::id(),
-            taken_ns: u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-            method: Method::current(),
-            series: self
-                .series
+        let copied: Vec<(Key, Series)> = {
+            let _cut = write(&self.groups);
+            read(&self.series)
                 .iter()
-                .map(
-                    |((boundary, outcome, case, phase), series)| SeriesSnapshot {
-                        boundary: (*boundary).to_owned(),
-                        outcome: (*outcome).to_owned(),
-                        case: (*case).to_owned(),
-                        phase: (*phase).to_owned(),
-                        count: series.count,
-                        elapsed: Buckets::of(&series.elapsed),
-                        excluded: series.excluded.as_ref().map(Buckets::of),
-                        residual: series.residual.as_ref().map(Buckets::of),
-                        missing_excluded: series.missing_excluded,
-                        out_of_range: series.out_of_range,
-                        negative_residual: series.negative_residual,
-                    },
-                )
-                .collect(),
-            scans: self
-                .scans
-                .iter()
-                .map(|((outcome, case, phase), scan)| ScanSnapshot {
+                .map(|(key, series)| (*key, locked(series).clone()))
+                .collect()
+        };
+        let series = copied
+            .iter()
+            .map(
+                |((boundary, outcome, case, phase), series)| SeriesSnapshot {
+                    boundary: (*boundary).to_owned(),
+                    outcome: (*outcome).to_owned(),
+                    case: (*case).to_owned(),
+                    phase: (*phase).to_owned(),
+                    count: series.count,
+                    elapsed: Buckets::of(&series.elapsed),
+                    excluded: series.excluded.as_ref().map(Buckets::of),
+                    residual: series.residual.as_ref().map(Buckets::of),
+                    missing_excluded: series.missing_excluded,
+                    out_of_range: series.out_of_range,
+                    negative_residual: series.negative_residual,
+                },
+            )
+            .collect();
+        let scans = read(&self.scans)
+            .iter()
+            .map(|((outcome, case, phase), scan)| {
+                let scan = locked(scan);
+                ScanSnapshot {
                     outcome: (*outcome).to_owned(),
                     case: (*case).to_owned(),
                     phase: (*phase).to_owned(),
@@ -519,20 +529,83 @@ impl Registry {
                     missing_rows: scan.missing_rows,
                     missing_bytes: scan.missing_bytes,
                     out_of_range: scan.out_of_range,
-                })
-                .collect(),
-            metrics: self.metric_snapshots(),
-            dropped: self.dropped,
-            invalid_labels: self.invalid_labels,
+                }
+            })
+            .collect();
+        let metrics = recorder::Metrics::snapshots(&self.metrics);
+        BenchmarkSnapshot {
+            process: self.process.clone(),
+            pid: std::process::id(),
+            taken_ns: u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            method: Method::current(),
+            series,
+            scans,
+            metrics,
+            dropped: self.dropped.load(Ordering::Relaxed),
+            invalid_labels: self.invalid_labels.load(Ordering::Relaxed),
         }
     }
 }
 
-/// The cumulative snapshot of this process's benchmark timings, read
-/// consistently under the recording lock.
+impl Series {
+    /// Records one request's `elapsed` and `excluded` components.
+    fn observe(&mut self, elapsed: Duration, excluded: Option<Duration>) {
+        self.count += 1;
+        let nanos = |duration: Duration| u64::try_from(duration.as_nanos()).ok();
+        let elapsed = nanos(elapsed);
+        match elapsed {
+            Some(value) if record_into(&mut self.elapsed, value) => {}
+            _ => self.out_of_range += 1,
+        }
+        match (excluded, &mut self.excluded, &mut self.residual) {
+            (None, None, None) => {}
+            (Some(excluded), Some(excluded_histogram), Some(residual_histogram)) => {
+                let excluded = nanos(excluded);
+                match excluded {
+                    Some(value) if record_into(excluded_histogram, value) => {}
+                    _ => self.out_of_range += 1,
+                }
+                match elapsed.zip(excluded).map(|(e, x)| e.checked_sub(x)) {
+                    Some(Some(residual)) => {
+                        if !record_into(residual_histogram, residual) {
+                            self.out_of_range += 1;
+                        }
+                    }
+                    Some(None) => self.negative_residual += 1,
+                    None => self.out_of_range += 1,
+                }
+            }
+            _ => self.missing_excluded += 1,
+        }
+    }
+}
+
+impl Scan {
+    /// Records one query's scan facts.
+    fn observe(&mut self, rows: Option<u64>, bytes: Option<u64>) {
+        self.count += 1;
+        for (fact, histogram, missing) in [
+            (rows, &mut self.rows, &mut self.missing_rows),
+            (bytes, &mut self.bytes, &mut self.missing_bytes),
+        ] {
+            match fact {
+                Some(value) => {
+                    if !record_into(histogram, value) {
+                        self.out_of_range += 1;
+                    }
+                }
+                None => *missing += 1,
+            }
+        }
+    }
+}
+
+/// The cumulative snapshot of this process's benchmark timings and
+/// standard metrics, each series read under its own lock and no request's
+/// timing group divided.
 #[must_use]
 pub fn snapshot() -> BenchmarkSnapshot {
-    lock().snapshot()
+    REGISTRY.snapshot()
 }
 
 /// The histogram parameters every series of a snapshot shares.
@@ -1172,9 +1245,9 @@ pub fn record_timing(
 /// as one execution phase, recorded as an observation of its own boundary
 /// under the same outcome and classification.
 ///
-/// The request and its parts are recorded under one lock acquisition, so a
-/// snapshot holds either all of them or none, and a part costs no more
-/// lock traffic than the request already pays.
+/// The request and its parts are recorded as one group, so a snapshot
+/// holds either all of them or none; each still takes only its own series'
+/// lock, so unrelated requests never wait for each other.
 pub fn record_timing_parts(
     parent: &tracing::Span,
     boundary: &'static str,
@@ -1195,7 +1268,7 @@ mod tests {
     /// Records `elapsed`/`excluded` nanoseconds into `registry` under
     /// `case` and `phase` at `boundary`.
     fn observe(
-        registry: &mut Registry,
+        registry: &Registry,
         boundary: &'static str,
         case: &'static str,
         phase: &'static str,
@@ -1379,16 +1452,16 @@ mod tests {
     /// Panics when the extra series is kept or not counted dropped.
     #[test]
     fn series_beyond_the_bound_are_dropped() {
-        let mut registry = Registry::new();
+        let registry = Registry::new();
         for _ in 0..super::MAX_SERIES {
-            registry.series.insert(
+            super::write(&registry.series).insert(
                 (
                     "bifrost.query",
                     "success",
                     Box::leak(ulid::Ulid::new().to_string().into_boxed_str()),
                     "none",
                 ),
-                Series {
+                std::sync::Mutex::new(Series {
                     count: 0,
                     elapsed: durations(),
                     excluded: None,
@@ -1396,12 +1469,12 @@ mod tests {
                     missing_excluded: 0,
                     out_of_range: 0,
                     negative_residual: 0,
-                },
+                }),
             );
         }
-        observe(&mut registry, "bifrost.query", "full-scan", "none", 5, None);
-        assert_eq!(registry.dropped, 1);
-        assert_eq!(registry.series.len(), super::MAX_SERIES);
+        observe(&registry, "bifrost.query", "full-scan", "none", 5, None);
+        assert_eq!(registry.snapshot().dropped, 1);
+        assert_eq!(super::read(&registry.series).len(), super::MAX_SERIES);
     }
 
     /// A count above a threshold is exact away from it and widens by only
@@ -1632,5 +1705,70 @@ mod recording_tests {
         let mut reset = measured.clone();
         reset.series.retain(|series| series.case != "point-lookup");
         assert!(reset.since(&warm).is_err(), "a vanished series is a reset");
+    }
+
+    /// Snapshots taken while threads record grouped request timings each
+    /// hold every part of a group or none of it, and every component of a
+    /// request with its elapsed time; once recording stops the totals are
+    /// exact.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a snapshot divides a group or a request's components, or
+    /// a final count is wrong.
+    #[test]
+    fn snapshots_preserve_complete_timing_groups_during_recording() {
+        const THREADS: u64 = 4;
+        const REQUESTS: u64 = 2_000;
+        timing::install().expect("the only recorder");
+        let started = timing::snapshot();
+        let count = |interval: &timing::BenchmarkInterval, boundary: &str| {
+            interval
+                .series
+                .iter()
+                .filter(|series| series.boundary == boundary)
+                .map(|series| {
+                    assert!(series.problems().is_empty(), "{:?}", series.problems());
+                    series.count
+                })
+                .sum::<u64>()
+        };
+        let recording = std::sync::atomic::AtomicU64::new(THREADS);
+        let cuts = std::thread::scope(|threads| {
+            for thread in 0..THREADS {
+                let recording = &recording;
+                threads.spawn(move || {
+                    for i in 0..REQUESTS {
+                        let nanos = 1_000 + thread * REQUESTS + i;
+                        super::record_timing_parts(
+                            &tracing::Span::none(),
+                            "bench.group",
+                            "success",
+                            Duration::from_nanos(nanos * 3),
+                            Some(Duration::from_nanos(nanos)),
+                            &[
+                                ("bench.group.first", Duration::from_nanos(nanos)),
+                                ("bench.group.second", Duration::from_nanos(nanos)),
+                            ],
+                        );
+                    }
+                    recording.fetch_sub(1, std::sync::atomic::Ordering::Release);
+                });
+            }
+            let mut cuts = 0_u64;
+            while recording.load(std::sync::atomic::Ordering::Acquire) > 0 {
+                let interval = timing::snapshot().since(&started).expect("one process");
+                let parent = count(&interval, "bench.group");
+                assert_eq!(count(&interval, "bench.group.first"), parent);
+                assert_eq!(count(&interval, "bench.group.second"), parent);
+                cuts += 1;
+            }
+            cuts
+        });
+        assert!(cuts > 0, "at least one snapshot raced the recording");
+        let interval = timing::snapshot().since(&started).expect("one process");
+        for boundary in ["bench.group", "bench.group.first", "bench.group.second"] {
+            assert_eq!(count(&interval, boundary), THREADS * REQUESTS, "{boundary}");
+        }
     }
 }

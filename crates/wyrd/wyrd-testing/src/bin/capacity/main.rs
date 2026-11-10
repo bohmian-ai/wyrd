@@ -2612,21 +2612,15 @@ mod tests {
             lifetime(
                 "l1 verification",
                 L1,
-                vec![
-                    (&["direct-verify"][..], vec![DIRECT]),
-                    (&["direct-verify-model"][..], vec![DIRECT, BUFFERED]),
-                ],
-                vec![DIRECT, QUERY, SCRIBE, BUFFERED],
+                vec![(verifications, vec![DIRECT])],
+                vec![DIRECT, QUERY, SCRIBE],
                 &[],
             ),
             lifetime(
                 "l2 verification",
                 L2,
-                vec![
-                    (&["direct-verify"][..], vec![DIRECT]),
-                    (&["direct-verify-model"][..], vec![DIRECT, BUFFERED]),
-                ],
-                vec![DIRECT, QUERY, SCRIBE, BUFFERED],
+                vec![(verifications, vec![DIRECT])],
+                vec![DIRECT, QUERY, SCRIBE],
                 &[],
             ),
             lifetime(

@@ -88,6 +88,23 @@ impl GatewayCapture {
         completion
     }
 
+    /// A buffered Chat Completions answer whose message content is a passing
+    /// Verdict citing the whole of slot `slot`, with the fixed usage of
+    /// [`Self::completion`], for an Agent check that answers in the plain
+    /// `verdict` format.
+    pub fn verdict_completion(slot: &str) -> Value {
+        let mut completion = Self::completion();
+        completion["choices"][0]["message"]["content"] = json!(
+            json!({
+                "outcome": "passed",
+                "reason": "the fixture judges every answer acceptable",
+                "citations": [{"slot": slot, "locator": {"json_pointer": ""}}],
+            })
+            .to_string()
+        );
+        completion
+    }
+
     /// Exactly `bytes` bytes of ASCII English-like text, identical on every
     /// call, so sized messages compress like chat rather than like one
     /// repeated byte.
@@ -455,6 +472,20 @@ impl PacedUpstream {
     /// # Errors
     /// Returns the bind failure.
     pub async fn start(pacing: Pacing, bound: usize) -> std::io::Result<Self> {
+        let completion = GatewayCapture::sized_completion(pacing.buffered_bytes);
+        Self::answering(pacing, bound, &completion).await
+    }
+
+    /// [`Self::start`], answering every buffered call with `completion`
+    /// instead of a sized one; [`Pacing::buffered_bytes`] is unused.
+    ///
+    /// # Errors
+    /// Returns the bind failure.
+    pub async fn answering(
+        pacing: Pacing,
+        bound: usize,
+        completion: &Value,
+    ) -> std::io::Result<Self> {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
         let address = listener.local_addr()?;
         let sends: Sends = Arc::default();
@@ -462,9 +493,7 @@ impl PacedUpstream {
             .route("/{*path}", post(answer))
             .with_state(Paced {
                 pacing,
-                buffered: Bytes::from(
-                    GatewayCapture::sized_completion(pacing.buffered_bytes).to_string(),
-                ),
+                buffered: Bytes::from(completion.to_string()),
                 sends: Arc::clone(&sends),
                 bound,
             });

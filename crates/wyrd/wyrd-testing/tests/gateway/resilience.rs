@@ -32,7 +32,7 @@ use wyrd_testing::gateway_capture::{GatewayCapture, PacedUpstream, Pacing};
 use wyrd_testing::release_server::{Histogram, Metrics};
 
 use crate::harness::{
-    INVOKER_ROLE, Journey, api_key, openai_code, refusal, within_one_limit_window,
+    INVOKER_ROLE, Journey, api_key, openai_code, refusal, tokens, within_one_limit_window,
 };
 
 /// Address the failover call requests; its fallback is `acme-second/m`.
@@ -1277,4 +1277,237 @@ async fn gateway_capacity_paces_streams_isolates_tenants_and_recovers() {
             );
         }
     }
+}
+
+/// The judge Verifier of the Verification benchmark's model steps: one Agent
+/// check over slot `answer`, routed through deployment `bench-judge` for one
+/// iteration, answering a plain cited Verdict.
+const JUDGE: &str = "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: bench-judge\n  version: 1.0.0\nspec:\n  inputs:\n    answer: {type: json}\n  requirements:\n    - id: judged\n      statement: The answer is acceptable.\n      check:\n        kind: agent\n        inputs: {answer: inputs.answer}\n        agent:\n          execution_route: {kind: wyrd_gateway, deployment: bench-judge}\n          run_config: {max_iterations: 1}\n          prompt:\n            provider: openai\n            model: gpt-4o\n            messages:\n              - {role: user, content: \"Judge {{answer}}\"}\n            response_format: verdict\n";
+
+/// The Model the judge verifies.
+const JUDGED_MODEL: &str = "apiVersion: wyrd/v1\nkind: Model\nmetadata:\n  name: bench-model\n  version: 1.0.0\nspec:\n  interface:\n    kind: Custom\n    meta:\n      framework_version: 0.1.0\n      loader_module: fixture\n      loader_class: TinyModel\n      extra: {}\n  task_type: Other\n  signature:\n    inputs:\n      - name: f0\n        dtype: float64\n    outputs:\n      - name: score\n        dtype: float64\n  card_refs: []\n";
+
+/// The Service binding the judge to the Model.
+const JUDGED_SERVICE: &str = "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: bench-service-0\n  version: 1.0.0\nspec:\n  components:\n    - alias: model\n      ref: ./model.yaml\n      verified_by:\n        - verifier: ./judge.yaml\n";
+
+/// A public client of `journey`'s server presenting `credential`.
+///
+/// # Panics
+/// Panics when the client configuration is refused.
+fn sdk(journey: &Journey, credential: &SecretString) -> wyrd_client::WyrdClient {
+    wyrd_client::WyrdClient::with_config(wyrd_client::config::ClientConfig {
+        grpc: wyrd_client::transport::GrpcConfig {
+            endpoint: journey.server.grpc_url().expect("gRPC url"),
+            connect_retries: 0,
+            ..wyrd_client::transport::GrpcConfig::default()
+        },
+        http: wyrd_client::transport::HttpConfig {
+            base_url: journey.base.clone(),
+            ..wyrd_client::transport::HttpConfig::default()
+        },
+        credential: Some(credential.clone()),
+        ..wyrd_client::config::ClientConfig::default()
+    })
+    .expect("the client builds")
+}
+
+/// Proves the Verification benchmark's model path end to end: real SDK →
+/// Verify → Agent check → Gateway → local provider.
+///
+/// A benchmark-mode server, one deployment pointing at the instant local
+/// provider, and the benchmark's judge graph declared, pulled, and loaded
+/// under the Service family's own runtime key. Each labelled `verify` passes
+/// with a citation of slot `answer` and an Agent provenance on the declared
+/// route; the provider answers exactly once per verification; one snapshot
+/// interval holds every driver, server, and provider observation in the
+/// model case with a valid population, and the Gateway phases of both
+/// calls, which have no request arrival to time; each captured call settles the
+/// provider's fixed usage; and nothing is lost or left pending. A runtime key
+/// of another Service family cannot act as this Service root and is refused
+/// before any model call.
+///
+/// # Panics
+/// Panics when a verdict, count, observation, usage, or refusal expectation
+/// fails.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn model_verification_benchmark_records_the_complete_local_path() {
+    use wyrd_client::cards::{BundleMode, CardGraphPuller, CardSelector, Cards};
+    use wyrd_client::state::WyrdState;
+    use wyrd_client::transport::trace::with_benchmark_labels;
+    use wyrd_spec::auth::{
+        CreateServicePrincipalRequest, WorkloadFamily, WorkloadKind, WorkloadRestriction,
+    };
+    use wyrd_spec::verification::VerificationVerdict;
+    use wyrd_spec::verification::execution::CallProvenance;
+
+    const CASE: &str = "direct-verify-model";
+    wyrd_server::app::metrics::MetricsBackend::install(true)
+        .expect("the benchmark backend installs first");
+    let journey = Journey::start().await;
+    let instant = Pacing {
+        buffered_delay: Duration::ZERO,
+        buffered_bytes: 0,
+        stream_delay: Duration::ZERO,
+        chunks: 0,
+        chunk_interval: Duration::ZERO,
+    };
+    let provider =
+        PacedUpstream::answering(instant, 8, &GatewayCapture::verdict_completion("answer"))
+            .await
+            .expect("the local provider binds");
+    deploy_at(
+        &journey,
+        &journey.admin,
+        "bench-judge",
+        &format!("{}/v1", provider.uri()),
+    )
+    .await;
+    journey.capture_metadata().await;
+
+    let directory = tempfile::tempdir().expect("graph directory");
+    for (name, body) in [
+        ("judge.yaml", JUDGE),
+        ("model.yaml", JUDGED_MODEL),
+        ("service.yaml", JUDGED_SERVICE),
+    ] {
+        std::fs::write(directory.path().join(name), body).expect("card file");
+    }
+    let admin = sdk(
+        &journey,
+        &api_key(&journey.server, "judge_admin", &["admin"]).await,
+    );
+    let cards = Cards::connect_with(&admin).await.expect("cards connect");
+    let service = Box::pin(cards.declare_from_path(&directory.path().join("service.yaml")))
+        .await
+        .expect("the judge graph declares");
+    let principals = wyrd_client::Principals::connect_with(&admin)
+        .await
+        .expect("principals connect");
+    let runtime = |family: &wyrd_spec::ids::CardName| CreateServicePrincipalRequest {
+        name: format!("{family}-runtime"),
+        roles: vec!["workload".to_owned()],
+        description: None,
+        workload_restriction: Some(WorkloadRestriction::Family(WorkloadFamily {
+            kind: WorkloadKind::Service,
+            name: family.clone(),
+        })),
+    };
+    let owner = principals
+        .create_service_principal(&runtime(&service.root.name))
+        .await
+        .expect("the Service runtime account is created");
+    let stranger = principals
+        .create_service_principal(&runtime(&"another-service".parse().expect("a Card name")))
+        .await
+        .expect("another family's account is created");
+    let bundle = directory.path().join("bundle");
+    Box::pin(CardGraphPuller::new(cards.registry_context()).pull(
+        &CardSelector::exact(service.root.clone()),
+        &bundle,
+        BundleMode::Complete,
+    ))
+    .await
+    .expect("the bundle pulls");
+    let key = |issued: &wyrd_spec::auth::CreateServicePrincipalResponse| {
+        SecretString::from(issued.credential.expose().to_owned())
+    };
+    let state = WyrdState::from_path_with(&bundle, sdk(&journey, &key(&owner)))
+        .expect("the application loads its bundle");
+
+    let before = wyrd_benchmark::snapshot();
+    for sequence in 0..2 {
+        let run = state.run_for_card("model").expect("a Run for the model");
+        let judged = with_benchmark_labels(
+            CASE,
+            "steady",
+            run.observe()
+                .verify("bench-judge", json!({ "sequence": sequence })),
+        )
+        .await
+        .expect("the judge answers");
+        assert_eq!(judged.outcome.verdict, VerificationVerdict::Passed);
+        let [requirement] = judged.outcome.requirements.as_slice() else {
+            panic!("one requirement: {:?}", judged.outcome.requirements);
+        };
+        assert_eq!(
+            requirement
+                .citations
+                .iter()
+                .map(|citation| citation.slot.as_str())
+                .collect::<Vec<_>>(),
+            ["answer"]
+        );
+        assert!(
+            matches!(
+                &requirement.provenance,
+                Some(CallProvenance::Agent { route, .. })
+                    if *route == wyrd_spec::ExecutionRoute::WyrdGateway {
+                        deployment: "bench-judge".parse().expect("deployment name"),
+                    }
+            ),
+            "{:?}",
+            requirement.provenance
+        );
+    }
+    assert_eq!(provider.held(), 2, "one provider answer per verification");
+
+    let refused = WyrdState::from_path_with(&bundle, sdk(&journey, &key(&stranger)))
+        .expect("the bundle loads under any key")
+        .run_for_card("model")
+        .expect("a Run for the model")
+        .observe()
+        .verify("bench-judge", json!({ "sequence": 2 }))
+        .await
+        .expect_err("another family's key is refused");
+    assert_eq!(
+        refused.code(),
+        "WYRD_AUTH_401_WORKLOAD_UID_REFUSED",
+        "{refused:?}"
+    );
+    assert_eq!(provider.held(), 2, "a refusal reaches no model");
+
+    let usage = journey.settled_usage(2).await;
+    assert_eq!(usage, [tokens(11, 4), tokens(11, 4)], "fixed usage settles");
+    journey
+        .server
+        .await_audit_retained()
+        .await
+        .expect("the Scribe outbox settles");
+    let after = wyrd_benchmark::snapshot();
+    let interval = after.since(&before).expect("one process");
+    assert_eq!(interval.dropped, 0, "every series fits its bound");
+    let population = wyrd_testing::capacity::Population::from_interval(interval);
+    assert!(population.invalid.is_empty(), "{:?}", population.invalid);
+    let cohort = population.only(CASE, "steady");
+    for (boundary, outcome) in [
+        ("client.verify", wyrd_benchmark::SUCCESS),
+        ("client.http", wyrd_benchmark::SUCCESS),
+        ("verification.direct", "completed"),
+        ("fixture.upstream", wyrd_benchmark::SUCCESS),
+    ] {
+        let recorded: u64 = cohort
+            .series
+            .iter()
+            .filter(|series| series.boundary == boundary && series.outcome == outcome)
+            .map(|series| series.count)
+            .sum();
+        assert_eq!(recorded, 2, "{boundary} in the model case");
+    }
+    let (first, last) = (
+        Metrics::of_snapshot(&before).expect("a complete opening snapshot"),
+        Metrics::of_snapshot(&after).expect("a complete drained snapshot"),
+    );
+    assert_eq!(
+        delta(
+            &first,
+            &last,
+            "wyrd_gateway_phase_duration_seconds_count",
+            &["phase=\"account\""]
+        ),
+        2.0,
+        "the Gateway governs each model call, which records phases only"
+    );
+    assert_eq!(delta(&first, &last, "outbox_events_lost_total", &[]), 0.0);
+    assert_eq!(last.sum("outbox_pending", &["outbox=\"scribe\""]), 0.0);
 }

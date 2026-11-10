@@ -15,7 +15,11 @@
 //!   staged, less the Verifier's own blocks) p99 must be strictly under
 //!   0.5 ms at 64 clients, read from the server histogram's bucket, so an
 //!   unresolved tail cannot pass. Every repetition must answer with no
-//!   refusal and the expected verdict.
+//!   refusal and the expected verdict. Diagnostic `direct-verify-model-c1`
+//!   and `-c64`, declared only when `--steps` names one, verify a judge
+//!   Verifier whose one Agent check calls a local Gateway deployment backed
+//!   by a local provider; they share the correctness criteria and are never
+//!   judged by the overhead objective.
 //! - **L2, `competing`:** one stateful step whose every repetition runs open
 //!   loop capacity → overload → recovery ([`Schedule`]) with direct `verify`
 //!   and background `submit` together; every verification stages its result
@@ -40,6 +44,9 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 
 /// Closed-loop client counts of the L1 sweep, one step each.
 pub const CLIENTS: [u64; 2] = [1, 64];
+
+/// The prefix of the diagnostic model step ids, one per [`CLIENTS`] count.
+pub const MODEL_STEP: &str = "direct-verify-model-c";
 
 /// The client count the strict overhead objective applies at.
 pub const OBJECTIVE_CLIENTS: u64 = 64;
@@ -214,9 +221,13 @@ pub fn plan(context: &Context<'_>, base: Declaration) -> std::result::Result<Pla
     context.known(valued, &[])?;
     let declaration = declare(context.level, context.arguments, base)?;
     let logs = context.output(Engine::Verification, &declaration.experiment);
+    let model = declaration
+        .steps
+        .iter()
+        .any(|step| step.id.starts_with(MODEL_STEP));
     Ok(Plan {
         declaration,
-        workload: Box::new(run::Bench::new(context.level, logs)),
+        workload: Box::new(run::Bench::new(context.level, logs, model)),
     })
 }
 
@@ -232,7 +243,7 @@ pub fn declare(
     base: Declaration,
 ) -> std::result::Result<Declaration, String> {
     let mut declaration = match level {
-        Level::One => direct(base),
+        Level::One => direct(base, models(arguments)?),
         Level::Two => competing(base, arguments)?,
     };
     declaration.controls.insert(
@@ -323,8 +334,24 @@ fn latency_metrics(scope: &str) -> Vec<Metric> {
         .collect()
 }
 
-/// The L1 declaration: closed-loop direct `verify` at each of [`CLIENTS`].
-fn direct(mut base: Declaration) -> Declaration {
+/// Whether `--steps` names a [`MODEL_STEP`], so L1 declares the model steps.
+///
+/// # Errors
+///
+/// Returns the `--steps` value refusal.
+fn models(arguments: &[String]) -> std::result::Result<bool, String> {
+    Ok(
+        crate::flags::value(arguments, "--steps")?.is_some_and(|steps| {
+            steps
+                .split(',')
+                .any(|step| step.trim().starts_with(MODEL_STEP))
+        }),
+    )
+}
+
+/// The L1 declaration: closed-loop direct `verify` at each of [`CLIENTS`],
+/// and with `model` the diagnostic model steps at the same counts.
+fn direct(mut base: Declaration, model: bool) -> Declaration {
     let steps: Vec<String> = CLIENTS
         .iter()
         .map(|clients| format!("direct-verify-c{clients}"))
@@ -343,6 +370,21 @@ fn direct(mut base: Declaration) -> Declaration {
         .zip(&steps)
         .map(|(clients, id)| Step::measured(id, json!({ "clients": clients, "op": "verify" })))
         .collect();
+    let mut correct = steps.clone();
+    if model {
+        for clients in CLIENTS {
+            let id = format!("{MODEL_STEP}{clients}");
+            base.steps.push(Step::measured(
+                &id,
+                json!({ "clients": clients, "op": "verify", "check": "model" }),
+            ));
+            correct.push(id);
+        }
+        base.controls.insert(
+            "model".to_owned(),
+            json!(format!("diagnostic model steps: `{}` has one Agent check routed through local Gateway deployment `{}` for one iteration; the deployment calls a loopback plaintext HTTP/1.1 OpenAI-compatible provider in the driver process that answers every call at once with a passing Verdict citing slot `{}` and fixed usage (11 prompt, 4 completion tokens); unexercised: TLS, provider authentication, retries, fallbacks, streaming, tool calls, and remote provider latency, none of which is measured or zero", workload::JUDGE_VERIFIER, workload::JUDGE_DEPLOYMENT, workload::JUDGE_SLOT)),
+        );
+    }
     base.metrics = work_metrics();
     base.metrics
         .extend(latency_metrics("every acknowledged call"));
@@ -411,6 +453,10 @@ fn direct(mut base: Declaration) -> Declaration {
     }
     base.metrics
         .extend(Population::root_metrics(Role::Driver, &run::DRIVER_ROOTS));
+    if model {
+        base.metrics
+            .extend(Population::root_metrics(Role::Driver, &run::FIXTURE_ROOTS));
+    }
     let objective = format!("direct-verify-c{OBJECTIVE_CLIENTS}");
     base.criteria = vec![
         Criterion::limit(
@@ -421,9 +467,9 @@ fn direct(mut base: Declaration) -> Declaration {
             OVERHEAD_LIMIT_MS,
         )
         .percentile(99),
-        Criterion::every("no-errors", "errors", &steps, Op::Le, 0.0),
-        Criterion::every("correct-verdicts", "wrong", &steps, Op::Le, 0.0),
-        Criterion::every("no-lost-evidence", "lost_writes", &steps, Op::Le, 0.0),
+        Criterion::every("no-errors", "errors", &correct, Op::Le, 0.0),
+        Criterion::every("correct-verdicts", "wrong", &correct, Op::Le, 0.0),
+        Criterion::every("no-lost-evidence", "lost_writes", &correct, Op::Le, 0.0),
     ];
     base
 }
@@ -730,6 +776,98 @@ mod tests {
             assert!(declaration.metric(id).is_some(), "{id} is declared");
         }
         assert_eq!(declaration.refusals(), Vec::new());
+    }
+
+    /// The model steps exist only when `--steps` names one: the default L1
+    /// declaration is unchanged, and a model run adds both counts with the
+    /// `model` check over the same SDK `verify` flow, records the local
+    /// fixture and what it leaves unexercised, owes the provider's answers
+    /// as driver diagnostics, keeps the overhead objective on the assertion
+    /// step alone, and refuses an undeclared model step.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a model step leaks into the default run or is judged by
+    /// the overhead objective.
+    #[test]
+    fn model_steps_declare_the_existing_sdk_flow_and_local_fixture() {
+        let default =
+            declare(Level::One, &line(&[]), base(Level::One)).expect("L1 declares by default");
+        let selected = line(&["--steps", "direct-verify-c1,direct-verify-model-c64"]);
+        let mut model =
+            declare(Level::One, &selected, base(Level::One)).expect("L1 declares model steps");
+        let ids = |declaration: &Declaration| -> Vec<String> {
+            declaration
+                .steps
+                .iter()
+                .map(|step| step.id.clone())
+                .collect()
+        };
+        assert_eq!(ids(&default), ["direct-verify-c1", "direct-verify-c64"]);
+        assert!(!default.controls.contains_key("model"));
+        assert!(
+            !default
+                .metrics
+                .iter()
+                .any(|metric| metric.id.contains("fixture.upstream"))
+        );
+        assert_eq!(
+            ids(&model),
+            [
+                "direct-verify-c1",
+                "direct-verify-c64",
+                "direct-verify-model-c1",
+                "direct-verify-model-c64"
+            ]
+        );
+        for step in &model.steps[2..] {
+            assert_eq!(step.text("check"), Some("model"));
+            assert_eq!(step.text("op"), Some("verify"));
+        }
+        let fixture = model.controls["model"]
+            .as_str()
+            .expect("the fixture is recorded");
+        for named in [
+            super::workload::JUDGE_DEPLOYMENT,
+            "loopback plaintext HTTP/1.1",
+            "unexercised: TLS",
+        ] {
+            assert!(fixture.contains(named), "{named}: {fixture}");
+        }
+        assert!(
+            model
+                .metrics
+                .iter()
+                .any(|metric| metric.id.contains("driver.fixture.upstream")),
+            "the provider's answers are driver diagnostics"
+        );
+        let criterion = |id: &str| {
+            model
+                .criteria
+                .iter()
+                .find(|criterion| criterion.id == id)
+                .expect("declared")
+                .steps
+                .clone()
+        };
+        assert_eq!(criterion("overhead-p99"), ["direct-verify-c64"]);
+        for id in ["no-errors", "correct-verdicts", "no-lost-evidence"] {
+            assert_eq!(criterion(id).len(), 4, "{id} covers the model steps");
+        }
+        assert_eq!(model.refusals(), Vec::new());
+        crate::levels::select(&mut model, &selected).expect("declared steps select");
+        assert_eq!(
+            model.selection.as_deref(),
+            Some(
+                &[
+                    "direct-verify-c1".to_owned(),
+                    "direct-verify-model-c64".to_owned()
+                ][..]
+            )
+        );
+        let unknown = line(&["--steps", "direct-verify-model-c2"]);
+        let mut refused = declare(Level::One, &unknown, base(Level::One)).expect("declares");
+        assert!(crate::levels::select(&mut refused, &unknown).is_err());
     }
 
     /// L2 declares one stateful step with every phase's metrics, judges

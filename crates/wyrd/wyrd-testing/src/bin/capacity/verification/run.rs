@@ -40,9 +40,12 @@ use wyrd_testing::capacity::{
 use wyrd_testing::experiment::{
     ExperimentError, Level, Phase, Reading, Repetition, Step, Workload,
 };
+use wyrd_testing::gateway_capture::{FIXTURE_ROOT, GatewayCapture, PacedUpstream, Pacing};
 use wyrd_testing::release_server::{LocalServer, Metrics};
 
-use crate::verification::workload::{ASSERT_VERIFIER, Tenant, context, failing};
+use crate::verification::workload::{
+    ASSERT_VERIFIER, JUDGE_SLOT, JUDGE_VERIFIER, Tenant, context, failing,
+};
 use crate::verification::{
     ADMISSION_REFUSAL, APPLICATIONS, BACKLOG_LIMIT_SECONDS, CLIENTS, OVERHEAD_LIMIT_MS,
     OVERHEAD_TAILS, PHASE_TIMINGS, RECOVERY_LIMIT, STAGES, Schedule,
@@ -77,6 +80,10 @@ const COMPLETED: &str = "completed";
 
 /// The benchmark case of a direct `verify`.
 const DIRECT_CASE: &str = "direct-verify";
+
+/// The benchmark case of a direct `verify` of the judge Verifier, whose
+/// Agent check makes one local model call.
+pub(crate) const MODEL_CASE: &str = "direct-verify-model";
 
 /// The benchmark case of a queued `submit`.
 const QUEUED_CASE: &str = "queued-verify";
@@ -130,6 +137,10 @@ pub const DRIVER_ROOTS: [(&str, bool, &[&str]); 3] = [
     ("client.http.attempt", false, &[]),
 ];
 
+/// The driver root of the local provider's one answer per successful model
+/// verification, with its components; the provider runs in this process.
+pub const FIXTURE_ROOTS: [(&str, bool, &[&str]); 1] = [(FIXTURE_ROOT, false, &["parse", "answer"])];
+
 /// The prefix of a direct execution's phase timing parts.
 const DIRECT_PARTS: &str = "verification.direct.";
 
@@ -139,8 +150,12 @@ const COMPONENT_ROWS: usize = 15;
 /// Which public call an arrival makes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Op {
-    /// `observe.verify`: direct execution, judged before it answers.
+    /// `observe.verify` of the assertion Verifier: direct execution, judged
+    /// before it answers.
     Verify,
+    /// `observe.verify` of the judge Verifier: a direct execution whose one
+    /// Agent check calls the local model through the Gateway.
+    Judge,
     /// `observe.submit`: staged for one queued execution.
     Submit,
 }
@@ -150,7 +165,18 @@ impl Op {
     const fn case(self) -> &'static str {
         match self {
             Self::Verify => DIRECT_CASE,
+            Self::Judge => MODEL_CASE,
             Self::Submit => QUEUED_CASE,
+        }
+    }
+
+    /// The direct call `step` declares: [`Self::Judge`] for a `model` check,
+    /// else [`Self::Verify`].
+    fn direct(step: &Step) -> Self {
+        if step.text("check") == Some("model") {
+            Self::Judge
+        } else {
+            Self::Verify
         }
     }
 }
@@ -225,17 +251,25 @@ pub struct Bench {
     server: Option<LocalServer>,
     /// One application per client or rotation slot.
     states: Vec<WyrdState>,
+    /// Whether the run has model steps, so it binds the judge Verifier.
+    model: bool,
+    /// The local provider the judge's Gateway deployment calls, while a
+    /// model run is prepared.
+    provider: Option<PacedUpstream>,
 }
 
 impl Bench {
-    /// A workload at `level` keeping its files under `logs`; nothing starts
-    /// until [`Workload::prepare`].
-    pub const fn new(level: Level, logs: PathBuf) -> Self {
+    /// A workload at `level` keeping its files under `logs`, binding the
+    /// judge Verifier when `model`; nothing starts until
+    /// [`Workload::prepare`].
+    pub const fn new(level: Level, logs: PathBuf, model: bool) -> Self {
         Self {
             level,
             logs,
             server: None,
             states: Vec::new(),
+            model,
+            provider: None,
         }
     }
 
@@ -251,13 +285,31 @@ impl Bench {
     }
 
     /// Starts the release server through the guide and provisions the
-    /// tenant's applications for the level.
+    /// tenant's applications for the level; a model run first starts the
+    /// instant local provider answering a passing Verdict that cites
+    /// [`JUDGE_SLOT`].
     ///
     /// # Errors
     ///
-    /// Returns a workload error for a server or provisioning failure.
+    /// Returns a workload error for a provider, server, or provisioning
+    /// failure.
     async fn start(&mut self) -> Result<(), ExperimentError> {
         std::fs::create_dir_all(&self.logs).map_err(ExperimentError::workload)?;
+        if self.model {
+            let instant = Pacing {
+                buffered_delay: Duration::ZERO,
+                buffered_bytes: 0,
+                stream_delay: Duration::ZERO,
+                chunks: 0,
+                chunk_interval: Duration::ZERO,
+            };
+            let verdict = GatewayCapture::verdict_completion(JUDGE_SLOT);
+            self.provider = Some(
+                PacedUpstream::answering(instant, 0, &verdict)
+                    .await
+                    .map_err(ExperimentError::workload)?,
+            );
+        }
         let binary = release_binary().map_err(ExperimentError::workload)?;
         let server = LocalServer::start(&binary, &["bench"], &[])
             .await
@@ -274,6 +326,7 @@ impl Bench {
             setup,
             &self.logs.join("tenants"),
             applications,
+            self.provider.as_ref().map(PacedUpstream::uri).as_deref(),
         ))
         .await
         .map_err(ExperimentError::workload)?;
@@ -283,10 +336,12 @@ impl Bench {
     }
 
     /// One L1 repetition: `step`'s clients each run closed-loop direct
-    /// `verify` for `window`, labelled with `phase`, judged by each
-    /// acknowledged call's exact server timing. Work, seconds, and CPU stop
-    /// at the window's end; calls then in flight drain into the cohort and
-    /// count late.
+    /// `verify` of the Verifier its check names ([`Op::direct`]) for
+    /// `window`, labelled with `phase`, judged by each acknowledged call's
+    /// exact server timing. A model step also owes one local provider answer
+    /// per acknowledged call when none was refused. Work, seconds, and CPU
+    /// stop at the window's end; calls then in flight drain into the cohort
+    /// and count late.
     ///
     /// # Errors
     ///
@@ -317,11 +372,12 @@ impl Bench {
             .await
             .map_err(ExperimentError::workload)?;
         let stop = Instant::now() + window;
+        let op = Op::direct(step);
         let (measured, usage, _) = opened
             .measure(
                 server,
                 stop.into_std(),
-                drive(&self.states[..clients], stop, phase.label()),
+                drive(&self.states[..clients], op, stop, phase.label()),
             )
             .await
             .map_err(ExperimentError::workload)?;
@@ -343,27 +399,34 @@ impl Bench {
             &[Expected {
                 boundary: DIRECT_TIMING,
                 outcome: COMPLETED,
-                case: DIRECT_CASE,
+                case: op.case(),
                 phase: phase.label(),
                 count: acknowledged,
             }],
         )
         .await;
         population.validate(&mut repetition, "measured");
-        let cohort = (DIRECT_CASE, phase.label());
-        let owed = DRIVER_ROOTS.map(|(boundary, _, _)| Expected {
-            boundary,
-            outcome: wyrd_benchmark::SUCCESS,
-            case: cohort.0,
-            phase: cohort.1,
-            count: acknowledged,
-        });
+        let cohort = (op.case(), phase.label());
+        let mut roots = DRIVER_ROOTS.to_vec();
+        if op == Op::Judge && measured.errors.is_empty() {
+            roots.extend(FIXTURE_ROOTS);
+        }
+        let owed: Vec<Expected<'_>> = roots
+            .iter()
+            .map(|(boundary, _, _)| Expected {
+                boundary,
+                outcome: wyrd_benchmark::SUCCESS,
+                case: cohort.0,
+                phase: cohort.1,
+                count: acknowledged,
+            })
+            .collect();
         let driver = Population::collect_driver(&driver_before, &owed).await;
         driver.validate(&mut repetition, "measured");
         driver.diagnose_roots(
             &mut repetition,
             cohort,
-            &DRIVER_ROOTS,
+            &roots,
             measured.errors.is_empty().then_some(acknowledged),
         );
         population.percentiles(
@@ -705,6 +768,7 @@ impl Workload for Bench {
     /// copied. An unstarted workload finishes without error.
     async fn finish(&mut self) -> Result<(), ExperimentError> {
         self.states.clear();
+        self.provider = None;
         let Some(server) = self.server.take() else {
             return Ok(());
         };
@@ -896,7 +960,7 @@ where
     let [_, _, recovery] = schedule.stages();
     for (index, stage) in schedule.stages().into_iter().enumerate() {
         let rate = match op {
-            Op::Verify => stage.direct_rate,
+            Op::Verify | Op::Judge => stage.direct_rate,
             Op::Submit => stage.submit_rate,
         };
         for arrival in 0u32.. {
@@ -1015,10 +1079,11 @@ async fn scrape(server: &LocalServer) -> Result<Metrics, ExperimentError> {
     server.metrics().await.map_err(ExperimentError::workload)
 }
 
-/// Runs one closed-loop client per state making direct `verify` calls,
-/// labelled `phase`, admitted until `stop`, client `i` presenting
-/// application `i`'s key; a call answering at or after `stop` is late.
-async fn drive(states: &[WyrdState], stop: Instant, phase: &'static str) -> Measured {
+/// Runs one closed-loop client per state making direct `op` calls,
+/// labelled with `op`'s case and `phase`, admitted until `stop`, client `i`
+/// presenting application `i`'s key; a call answering at or after `stop` is
+/// late.
+async fn drive(states: &[WyrdState], op: Op, stop: Instant, phase: &'static str) -> Measured {
     let sequence = Arc::new(AtomicU64::new(0));
     let mut tasks = JoinSet::new();
     for state in states {
@@ -1028,8 +1093,7 @@ async fn drive(states: &[WyrdState], stop: Instant, phase: &'static str) -> Meas
             while Instant::now() < stop {
                 let next = sequence.fetch_add(1, Ordering::Relaxed);
                 let sent = Instant::now();
-                let outcome =
-                    with_benchmark_labels(DIRECT_CASE, phase, call(&state, Op::Verify, next)).await;
+                let outcome = with_benchmark_labels(op.case(), phase, call(&state, op, next)).await;
                 measured.record(micros(sent), outcome, Instant::now() >= stop);
             }
             measured
@@ -1051,7 +1115,8 @@ async fn drive(states: &[WyrdState], stop: Instant, phase: &'static str) -> Meas
 /// # Errors
 ///
 /// Returns the client's or server's refusal; a direct verdict other than the
-/// expected one is `Ok(false)`, not an error.
+/// expected one is `Ok(false)`, not an error. A judged call expects a pass
+/// whose requirement cites [`JUDGE_SLOT`].
 async fn call(state: &WyrdState, op: Op, sequence: u64) -> Result<bool, WyrdError> {
     let run = state.run_for_card("model")?;
     let observe = run.observe();
@@ -1068,6 +1133,16 @@ async fn call(state: &WyrdState, op: Op, sequence: u64) -> Result<bool, WyrdErro
                 VerificationVerdict::Passed
             };
             Ok(judged.outcome.verdict == expected)
+        }
+        Op::Judge => {
+            let judged = observe.verify(JUDGE_VERIFIER, context(sequence)).await?;
+            let cited = judged.outcome.requirements.iter().any(|requirement| {
+                requirement
+                    .citations
+                    .iter()
+                    .any(|citation| citation.slot.as_str() == JUDGE_SLOT)
+            });
+            Ok(judged.outcome.verdict == VerificationVerdict::Passed && cited)
         }
     }
 }
@@ -1331,6 +1406,79 @@ mod tests {
         );
     }
 
+    /// A model step drives the judge under its own case while assertion
+    /// steps keep theirs and their alternating expectations; the provider's
+    /// answer is a passing Verdict citing the judge's slot with fixed usage;
+    /// and a direct execution's Verifier block, which holds the model call,
+    /// stays out of its overhead residual.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a model step is driven as an assertion, the fixture's
+    /// answer is not a valid cited Verdict, or the provider time reaches the
+    /// residual.
+    #[test]
+    fn model_results_keep_provider_exclusion_and_expected_outcomes() {
+        use wyrd_testing::experiment::Step;
+
+        let model = Step::measured(
+            "direct-verify-model-c1",
+            serde_json::json!({ "clients": 1, "op": "verify", "check": "model" }),
+        );
+        let assertion = Step::measured(
+            "direct-verify-c1",
+            serde_json::json!({ "clients": 1, "op": "verify" }),
+        );
+        assert_eq!(Op::direct(&model), Op::Judge);
+        assert_eq!(Op::direct(&model).case(), super::MODEL_CASE);
+        assert_eq!(Op::direct(&assertion), Op::Verify);
+        assert_eq!(Op::direct(&assertion).case(), super::DIRECT_CASE);
+        let expected: Vec<bool> = (0..4).map(crate::verification::workload::failing).collect();
+        assert_eq!(expected, [false, true, false, true]);
+
+        let completion = wyrd_testing::gateway_capture::GatewayCapture::verdict_completion(
+            crate::verification::workload::JUDGE_SLOT,
+        );
+        let content = completion["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("the answer is text");
+        let verdict: wyrd_spec::verification::execution::Verdict =
+            serde_json::from_str(content).expect("the answer is a Verdict");
+        assert_eq!(
+            verdict.outcome,
+            wyrd_spec::verification::VerificationVerdict::Passed
+        );
+        assert_eq!(
+            verdict
+                .citations
+                .iter()
+                .map(|citation| citation.slot.as_str())
+                .collect::<Vec<_>>(),
+            [crate::verification::workload::JUDGE_SLOT]
+        );
+        assert_eq!(completion["usage"]["total_tokens"], 15);
+
+        wyrd_benchmark::install().expect("the benchmark recorder installs");
+        let before = wyrd_benchmark::snapshot();
+        wyrd_benchmark::record_timing_parts(
+            &tracing::Span::none(),
+            super::DIRECT_TIMING,
+            super::COMPLETED,
+            Duration::from_micros(1_000),
+            Some(Duration::from_micros(900)),
+            &[("verification.direct.engine", Duration::from_micros(950))],
+        );
+        let population =
+            wyrd_testing::capacity::Population::between(&before, wyrd_benchmark::snapshot())
+                .expect("one process");
+        let residual = super::mean_ms(population.residuals(super::DIRECT_TIMING, super::COMPLETED));
+        assert!(
+            residual.value.is_some_and(|high| high < 0.9),
+            "the provider's block is excluded: {residual:?}"
+        );
+        assert!(residual.above.is_some_and(|low| low < 0.1));
+    }
+
     /// Once a stalled call carries the clock past the window end, every
     /// remaining due arrival is missed rather than admitted after the
     /// measurement stopped, the planned count is kept, and the earlier
@@ -1496,7 +1644,7 @@ mod tests {
 
         use crate::tests::pg_tests::burn;
         use crate::verification::declare;
-        use crate::verification::run::{Bench, drive};
+        use crate::verification::run::{Bench, Op, drive};
         use crate::verification::tests::base;
 
         /// The step calibrated: one closed-loop client.
@@ -1632,7 +1780,7 @@ mod tests {
                 interrupt: CancellationToken::new(),
             };
             let mut workload = Calibration {
-                bench: Bench::new(Level::One, directory.path().join("logs")),
+                bench: Bench::new(Level::One, directory.path().join("logs"), false),
             };
             let record = run(
                 declaration.seal(),
@@ -1723,11 +1871,21 @@ mod tests {
                 "collection off serves no timing readout"
             );
             let states = &bench.states[..1];
-            drive(states, Instant::now() + Duration::from_secs(1), "warmup").await;
+            drive(
+                states,
+                Op::Verify,
+                Instant::now() + Duration::from_secs(1),
+                "warmup",
+            )
+            .await;
             let (opened, _) = Window::open(server).await.expect("open");
             let stop = Instant::now() + WINDOW;
             let (measured, usage, _) = opened
-                .measure(server, stop.into_std(), drive(states, stop, "repetition-1"))
+                .measure(
+                    server,
+                    stop.into_std(),
+                    drive(states, Op::Verify, stop, "repetition-1"),
+                )
                 .await
                 .expect("control window");
             assert!(measured.errors.is_empty(), "{:?}", measured.errors);

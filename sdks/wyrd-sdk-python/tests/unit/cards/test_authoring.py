@@ -20,7 +20,6 @@ from wyrd.authoring import (
     ArtifactFile,
     Audit,
     Binding,
-    CardDefinition,
     CardRef,
     Check,
     CodeSource,
@@ -340,15 +339,6 @@ def test_every_native_family_constructs_canonical_specs() -> None:
             .add_annotation("reviewed", "yes"),
             "Artifact",
         ),
-        (
-            CardDefinition(
-                CardKind.Policy,
-                "authored",
-                "1.0.0",
-                {"description": "Sharing", "enforcement": "block"},
-            ),
-            "Policy",
-        ),
         (judge(), "Agent"),
     ]
     for card, kind in singles:
@@ -540,3 +530,174 @@ def test_every_native_family_constructs_canonical_specs() -> None:
     with pytest.raises(WyrdError) as refused:
         pending.validate()
     assert "missing.py" in str(refused.value.details)
+
+
+def test_canonical_mappings_carry_native_values() -> None:
+    verifier = Verifier("checked", "1.0.0", inputs={"report": str}).add_step(checked("scan"))
+    canonical = judge("bound").verified_by([{"verifier": verifier}])
+    fluent = judge("bound").verified_by([Binding(verifier)])
+    assert canonical.spec() == fluent.spec()
+    assert canonical.spec()["verified_by"] == [
+        {"verifier": {"sibling": ref("Verifier", "checked")}}
+    ]
+    canonical.validate()
+    other = Verifier("checked", "1.0.0", inputs={"report": int}).add_step(checked("scan"))
+    conflicting = Component("other", judge("other").verified_by([Binding(other)]))
+
+    def probe(agent: Agent) -> Service:
+        return Service("probe", "1.0.0", components=[Component("bound", agent), conflicting])
+
+    with pytest.raises(WyrdError) as refused:
+        probe(canonical).validate()
+    assert refused.value.code == "WYRD_SPEC_400_DUPLICATE_SUBMISSION", (
+        "the mapping captured its Verifier as the fluent binding does"
+    )
+    # A plain sibling mapping captures nothing, so nothing conflicts.
+    probe(judge("bound").verified_by(fluent.spec()["verified_by"])).validate()
+
+    reviewer = judge()
+    service = Service("canonical", "1.0.0", components=[{"alias": "judge", "ref": reviewer}])
+    assert (
+        service.spec()
+        == Service("canonical", "1.0.0", components=[Component("judge", reviewer)]).spec()
+        == {"components": [{"alias": "judge", "ref": {"sibling": ref("Agent", "judge")}}]}
+    )
+    service.validate()
+    # A later edit to the child changes nothing already captured.
+    reviewer.tool_names(["fs.write"])
+    service.validate()
+    with pytest.raises(WyrdError) as refused:
+        service.add_component(Component("again", reviewer)).validate()
+    assert refused.value.code == "WYRD_SPEC_400_DUPLICATE_SUBMISSION"
+
+    replaced = Service(
+        "replaced",
+        "1.0.0",
+        components=[{"alias": "judge", "ref": judge()}],
+        verified_by=[{"verifier": verifier}],
+    )
+    # Replacing a field drops what its old value captured.
+    replaced.components([{"alias": "judge", "ref": reviewer}])
+    replaced.validate()
+    with pytest.raises(WyrdError) as refused:
+        replaced.add_component(conflicting).validate()
+    assert refused.value.code == "WYRD_SPEC_400_DUPLICATE_SUBMISSION", (
+        "another live field keeps its own capture"
+    )
+    with pytest.raises(WyrdError) as refused:
+        Service("twice", "1.0.0").add_component({"alias": "judge", "ref": judge()}).add_component(
+            {"alias": "judge", "ref": judge()}
+        ).validate()
+    assert "judge" in invalid(refused), "an incremental duplicate still refuses"
+
+    drift_spec = {
+        "method": "Spc",
+        "signal": {"kind": "Distribution", "features": ["latency"]},
+        "condition": {"kind": "Statistical"},
+        "profile": {"kind": "Spc", "sample_size": 5},
+    }
+    for baseline in [
+        CardRef.data("latency-baseline", "1.0.0"),
+        RegisteredRef(CardKind.Data, "latency-baseline", "1.0.0"),
+    ]:
+        drift = Verifier(
+            "latency-drift", "1.0.0", inputs={"latency": InputSlot.samples(["latency"])}
+        )
+        signal = {**drift_spec["signal"], "baseline_ref": baseline}
+        drift.add_requirement(
+            Requirement(
+                "stable", "Stable", Check.drift("inputs.latency", {**drift_spec, "signal": signal})
+            )
+        )
+        assert drift.spec()["requirements"][0]["check"]["signal"]["baseline_ref"] == ref(
+            "Data", "latency-baseline"
+        )
+        drift.validate()
+
+    local = Artifact.from_path("company-sharing-policy", "2.0.0", SHARING_POLICY)
+    source = CodeSource.file(POLICY / "missing.py")
+    nested = Step(
+        "summarize",
+        Action.code(CodeSource.inline("def f(**_):\n    return {}\n"), "f").add_workspace(
+            "/inputs/policy.json", local.file("extracted/policy.json")
+        ),
+    )
+    nested_verifier = Verifier("nested", "1.0.0", inputs={"report": str})
+    nested_verifier.steps([nested])
+    as_mapping = Verifier("nested", "1.0.0", inputs={"report": str})
+    as_mapping.steps(
+        [
+            {
+                "id": "summarize",
+                "action": {
+                    "kind": "code",
+                    "source": CodeSource.inline("def f(**_):\n    return {}\n"),
+                    "entrypoint": "f",
+                    "workspace": {"/inputs/policy.json": local.file("extracted/policy.json")},
+                },
+            }
+        ]
+    )
+    assert as_mapping.spec() == nested_verifier.spec()
+    pending = Verifier("pending", "1.0.0", inputs={"report": str}).add_requirement(
+        {
+            "id": "coded",
+            "statement": "Coded",
+            "check": {"kind": "code", "source": source, "entrypoint": "f"},
+        }
+    )
+    assert pending.spec()["requirements"][0]["check"]["source"] is None
+    with pytest.raises(WyrdError) as refused:
+        pending.validate()
+    assert "missing.py" in str(refused.value.details), "a nested code file is read at validation"
+
+    with pytest.raises(WyrdError) as refused:
+        Service("keyed", "1.0.0").add_component({"alias": "judge", "ref": judge(), 1: "x"})  # ty: ignore[invalid-argument-type]
+    assert refused.value.code == "WYRD_SPEC_400_VALIDATION"
+    with pytest.raises(WyrdError) as refused:
+        Service("keyed", "1.0.0").add_component({"alias": "judge", "config": {"x": float("nan")}})
+    assert refused.value.code == "WYRD_SPEC_400_VALIDATION"
+
+
+def test_canonical_mapping_callbacks_may_edit_their_receiver() -> None:
+    verifier = Verifier("reentrant", "1.0.0")
+
+    class Edits:
+        def model_dump_json(self) -> str:
+            verifier.description("set while converting")
+            return '"inputs.report"'
+
+    step = {"id": "read", "action": {"kind": "extract", "from": Edits()}}
+    assert verifier.steps([step]) is verifier  # ty: ignore[invalid-argument-type]
+    assert verifier.spec()["steps"] == [
+        {"id": "read", "action": {"kind": "extract", "from": "inputs.report"}}
+    ]
+
+
+def test_prompt_request_forms_take_canonical_nulls() -> None:
+    messages = [{"role": "user", "content": "Summarise {{report}}"}]
+    portable = Prompt(
+        "summary", "1.0.0", provider="openai", model="gpt-4o", messages=messages, body=None
+    )
+    assert portable.spec() == {
+        "provider": "openai",
+        "model": "gpt-4o",
+        "messages": messages,
+        "body": None,
+    }
+    portable.validate()
+    switched = Prompt("summary", "1.0.0", provider="openai", model="gpt-4o")
+    switched.body({"temperature": 0}).messages(messages).body(None)
+    assert switched.spec() == portable.spec()
+    switched.messages(None).add_body("temperature", 0)
+    assert switched.spec()["messages"] is None
+    assert switched.spec()["body"] == {"temperature": 0}
+    switched.body(None).add_message(messages[0])
+    assert switched.spec() == portable.spec(), "an addition after a null starts a new list"
+    with pytest.raises(WyrdError) as refused:
+        portable.messages(None).validate()
+    assert refused.value.code == "WYRD_LOADER_400_INVALID_ENVELOPE", (
+        "neither form is refused only at validation"
+    )
+    with pytest.raises(TypeError, match="takes a list"):
+        Prompt("summary", "1.0.0", messages="hi")

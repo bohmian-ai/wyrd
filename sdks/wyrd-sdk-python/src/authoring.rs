@@ -18,7 +18,9 @@ use std::path::PathBuf;
 
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBool, PyDict, PyFloat, PyInt, PyMapping, PyModule, PyString, PyType};
+use pyo3::types::{
+    PyAny, PyBool, PyDict, PyFloat, PyInt, PyList, PyMapping, PyModule, PyString, PyTuple, PyType,
+};
 use serde_json::{Value, json};
 use wyrd_cards::card_ref::CardRefPy;
 use wyrd_client::authoring::{
@@ -129,8 +131,7 @@ pub(crate) fn definition(value: &Bound<'_, PyAny>) -> Option<CardDefinition> {
         PyMcp,
         PyAudit,
         PyTrigger,
-        PyOperator,
-        PyCardDefinition
+        PyOperator
     );
     None
 }
@@ -147,10 +148,12 @@ pub(crate) fn declarable(value: &Bound<'_, PyAny>) -> Option<Declarable<'static>
 
 /// A value at any authoring position: a Card, which becomes a sibling
 /// reference; an authoring or `wyrd.cards` `CardRef`, which stays external;
-/// any other authoring value; or plain JSON, such as a reference string.
+/// any other authoring value; a `dict` or `list` composed entry by entry, so
+/// these may stand anywhere inside it; or plain JSON, such as a reference
+/// string.
 ///
 /// # Errors
-/// As [`json`].
+/// As [`json`], and as [`object`] for a mapping.
 fn field(field: &str, value: &Bound<'_, PyAny>) -> PyResult<FieldValue> {
     if let Some(card) = definition(value) {
         return Ok(card.into());
@@ -180,36 +183,75 @@ fn field(field: &str, value: &Bound<'_, PyAny>) -> PyResult<FieldValue> {
     if let Ok(card_ref) = value.cast::<CardRefPy>() {
         return Ok(card_ref.get().0.clone().into());
     }
+    if let Ok(mapping) = value.cast::<PyMapping>() {
+        return Ok(object(field, mapping)?.into_iter().collect());
+    }
+    if value.is_instance_of::<PyList>() || value.is_instance_of::<PyTuple>() {
+        return value
+            .try_iter()?
+            .map(|item| self::field(field, &item?))
+            .collect();
+    }
     json(field, value).map(FieldValue::from)
 }
 
-/// A verification binding: a `Binding`, or a Verifier, `CardRef` or YAML
-/// path bound with no trigger or Operators, or a canonical binding mapping.
+/// The entries of a canonical mapping, each value converted by [`field`].
 ///
 /// # Errors
-/// As [`json`].
+/// Raises `WYRD_SPEC_400_VALIDATION` naming `field` for a key that is not a
+/// `str`, as plain JSON refuses one, and each value's conversion error.
+fn object(field: &str, mapping: &Bound<'_, PyMapping>) -> PyResult<Vec<(String, FieldValue)>> {
+    mapping
+        .items()?
+        .iter()
+        .map(|entry| {
+            let (key, value): (Bound<'_, PyAny>, Bound<'_, PyAny>) = entry.extract()?;
+            let Ok(key) = key.cast::<PyString>() else {
+                let shown = key
+                    .repr()
+                    .map_or_else(|_| "<unrepresentable>".to_owned(), |repr| repr.to_string());
+                return Err(
+                    invalid_argument(field, format!("mapping key {shown} is not a str")).into(),
+                );
+            };
+            Ok((key.to_str()?.to_owned(), self::field(field, &value)?))
+        })
+        .collect()
+}
+
+/// A verification binding: a `Binding`, or a Verifier, `CardRef` or YAML
+/// path bound with no trigger or Operators, or a canonical binding mapping
+/// whose values convert as [`field`] converts them.
+///
+/// # Errors
+/// As [`field`].
 fn binding(field_name: &str, value: &Bound<'_, PyAny>) -> PyResult<Binding> {
     if let Ok(binding) = value.cast::<PyBinding>() {
         return Ok(binding.borrow().inner.clone());
     }
-    if value.cast::<PyMapping>().is_ok() {
-        return json(field_name, value).map(Binding::from);
+    if let Ok(mapping) = value.cast::<PyMapping>() {
+        return Ok(object(field_name, mapping)?.into_iter().collect());
     }
     field(field_name, value).map(Binding::new)
 }
 
 /// Generate the converter for a sub-value: its class, or its canonical
-/// mapping kept as authored.
+/// mapping kept as authored, with any authoring value inside it converted as
+/// [`field`] converts it.
 macro_rules! canonical {
     ($($name:ident: $class:ty => $native:ty),* $(,)?) => {
         $(
-            #[doc = concat!("A `", stringify!($native), "`, or its canonical mapping kept as authored.")]
+            #[doc = concat!("A `", stringify!($native), "`, or its canonical mapping kept as authored, whose values convert as [`field`] converts them.")]
             ///
             /// # Errors
-            /// As [`json`].
+            /// As [`field`]; any other value as [`json`], kept for validation
+            /// to refuse.
             fn $name(field: &str, value: &Bound<'_, PyAny>) -> PyResult<$native> {
                 if let Ok(value) = value.cast::<$class>() {
                     return Ok(value.borrow().inner.clone());
+                }
+                if let Ok(mapping) = value.cast::<PyMapping>() {
+                    return Ok(object(field, mapping)?.into_iter().collect());
                 }
                 json(field, value).map(<$native>::from)
             }
@@ -283,6 +325,7 @@ macro_rules! authoring_class {
             one { $($one:ident: $one_convert:ident),* $(,)? }
             list { $($list:ident, $list_add:ident: $list_convert:ident),* $(,)? }
             map { $($map:ident, $map_add:ident: $map_convert:ident),* $(,)? }
+            $(nullable { $($null:ident: $clear:ident),* $(,)? })?
         }
         $($methods:tt)*
     ) => {
@@ -295,13 +338,14 @@ macro_rules! authoring_class {
 
         impl $py {
             /// `inner` with the field `field` set from `value`, as its setter
-            /// sets it.
+            /// sets it; `None` at a nullable field sets it to `null`.
             ///
             /// # Errors
             /// Raises `TypeError` for a name that is no field, and the
             /// value's conversion error.
             fn set(inner: $native, field: &str, value: &Bound<'_, PyAny>) -> PyResult<$native> {
                 Ok(match field {
+                    $($(stringify!($null) if value.is_none() => inner.$clear(),)*)?
                     $(stringify!($one) => inner.$one($one_convert(field, value)?),)*
                     $(stringify!($list) => inner.$list(items(field, value, $list_convert)?),)*
                     $(stringify!($map) => inner.$map(entries(field, value, $map_convert)?),)*
@@ -421,6 +465,7 @@ macro_rules! card_class {
             one { $($one:tt)* }
             list { $($list:tt)* }
             map { $($map:tt)* }
+            $(nullable { $($null:tt)* })?
         }
         $($methods:tt)*
     ) => {
@@ -430,6 +475,7 @@ macro_rules! card_class {
                 one { $($one)* }
                 list { $($list)* }
                 map { labels, add_label: string, annotations, add_annotation: string, $($map)* }
+                $(nullable { $($null)* })?
             }
 
             /// An empty Card named `name` at `version`, with any spec fields
@@ -523,6 +569,7 @@ card_class! {
         }
         list { messages, add_message: json }
         map { body, add_body: json }
+        nullable { messages: clear_messages, body: clear_body }
     }
 }
 
@@ -668,63 +715,6 @@ card_class! {
         one { description: json, action: json, budget: json }
         list {}
         map {}
-    }
-}
-
-/// A Card of any registrable kind, authored as its kind and canonical spec
-/// mapping.
-#[pyclass(module = "wyrd.authoring", name = "CardDefinition")]
-pub(crate) struct PyCardDefinition {
-    /// The shared native definition.
-    inner: CardDefinition,
-}
-
-#[pymethods]
-impl PyCardDefinition {
-    /// Define the `kind` Card `name` at `version` with the canonical `spec`
-    /// mapping, as its YAML `spec` would hold it.
-    ///
-    /// # Errors
-    /// Raises `WYRD_SPEC_400_VALIDATION` for an unknown kind or a spec JSON
-    /// cannot represent.
-    #[new]
-    #[pyo3(signature = (kind, name, version, spec))]
-    fn __new__(
-        kind: &Bound<'_, PyAny>,
-        name: String,
-        version: String,
-        spec: &Bound<'_, PyAny>,
-    ) -> PyResult<Self> {
-        Ok(Self {
-            inner: CardDefinition::new(kind_arg(kind)?, name, version, json("spec", spec)?),
-        })
-    }
-
-    /// The exact reference this Card registers as.
-    fn card_ref(&self) -> PyCardRef {
-        PyCardRef {
-            inner: self.inner.card_ref(),
-        }
-    }
-
-    /// The spec as authored, before validation.
-    ///
-    /// # Errors
-    /// Raises a Python error when the spec cannot be converted.
-    fn spec(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        Ok(to_python(py, &self.inner.spec())?)
-    }
-
-    /// Validate the complete graph this Card roots exactly as its
-    /// declaration would, without registering or uploading anything.
-    ///
-    /// # Errors
-    /// Raises the shared validation's `WyrdError`.
-    fn validate(&self, py: Python<'_>) -> PyResult<()> {
-        let card = self.inner.clone();
-        Ok(py
-            .detach(|| card.declaration().map(drop))
-            .map_err(wyrd_utils::py::WyrdPyError::from)?)
     }
 }
 
@@ -1035,15 +1025,16 @@ authoring_class! {
     }
 
     /// Judge statistical drift over the samples slot `on` with the drift
-    /// fields `spec`: method, signal, condition, and profile.
+    /// fields `spec`: method, signal, condition, and profile; a Card or
+    /// `CardRef` may stand at `signal.baseline_ref`.
     ///
     /// # Errors
-    /// As [`json`].
+    /// As [`field`].
     #[staticmethod]
     #[pyo3(signature = (on, spec))]
     fn drift(on: String, spec: &Bound<'_, PyAny>) -> PyResult<Self> {
         Ok(Self {
-            inner: Check::drift(on, json("spec", spec)?),
+            inner: Check::drift(on, field("spec", spec)?),
         })
     }
 }
@@ -1200,7 +1191,6 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyAudit>()?;
     module.add_class::<PyTrigger>()?;
     module.add_class::<PyOperator>()?;
-    module.add_class::<PyCardDefinition>()?;
     module.add_class::<PyComponent>()?;
     module.add_class::<PyBinding>()?;
     module.add_class::<PyStep>()?;

@@ -60,3 +60,8 @@ def test_state_declares_and_lists_no_artifact_files() -> None:
     assert not hasattr(wyrd.WyrdState, "artifacts")
     assert not hasattr(importlib.import_module("wyrd.state"), "HydratedArtifact")
     assert not hasattr(wyrd, "HydratedArtifact")
+
+
+def test_authoring_exports_no_generic_card_constructor() -> None:
+    assert not hasattr(importlib.import_module("wyrd.authoring"), "CardDefinition")
+    assert not hasattr(importlib.import_module("wyrd._wyrd.authoring"), "CardDefinition")

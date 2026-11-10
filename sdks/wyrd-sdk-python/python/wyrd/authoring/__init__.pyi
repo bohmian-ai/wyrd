@@ -51,7 +51,6 @@ AnyCard: TypeAlias = (
     | Audit
     | Trigger
     | Operator
-    | CardDefinition
 )
 """Any authored Card; at a reference position it becomes a sibling in the same graph."""
 
@@ -68,12 +67,15 @@ FieldInput: TypeAlias = (
     | InputSlot
     | Action
     | Check
-    | JsonInput
+    | JsonScalar
+    | Sequence[FieldInput]
+    | Mapping[str, FieldInput]
 )
-"""A value at a reference position: a Card, an exact reference, an authoring value, or JSON."""
+"""A value at a reference position: a Card, an exact reference, an authoring value, or JSON,
+whose nested mappings and sequences may hold any of these."""
 
 BindingInput: TypeAlias = (
-    Binding | Verifier | CardRef | cards.CardRef | str | Mapping[str, JsonInput]
+    Binding | Verifier | CardRef | cards.CardRef | str | Mapping[str, FieldInput]
 )
 """A binding, or the Verifier, exact reference or YAML path it binds."""
 
@@ -258,7 +260,7 @@ class ServiceFields(TypedDict, total=False):
     annotations: Mapping[str, str]
     description: JsonInput
     service_type: JsonInput
-    components: Sequence[Component | Mapping[str, JsonInput]]
+    components: Sequence[Component | Mapping[str, FieldInput]]
     verified_by: Sequence[BindingInput]
     tables: Sequence[JsonInput]
     entry_point: JsonInput
@@ -356,7 +358,7 @@ class Service:
         """
         ...
 
-    def components(self, items: Iterable[Component | Mapping[str, JsonInput]]) -> Self:
+    def components(self, items: Iterable[Component | Mapping[str, FieldInput]]) -> Self:
         """Set the whole ``components`` list, replacing every earlier entry; returns this value.
 
         Args:
@@ -364,7 +366,7 @@ class Service:
         """
         ...
 
-    def add_component(self, item: Component | Mapping[str, JsonInput]) -> Self:
+    def add_component(self, item: Component | Mapping[str, FieldInput]) -> Self:
         """Append one entry to ``components``; returns this value.
 
         Args:
@@ -648,11 +650,11 @@ class PromptFields(TypedDict, total=False):
     provider: JsonInput
     model: JsonInput
     system: JsonInput
-    messages: Sequence[JsonInput]
+    messages: Sequence[JsonInput] | None
     settings: JsonInput
     response_format: JsonInput
     format: JsonInput
-    body: Mapping[str, JsonInput]
+    body: Mapping[str, JsonInput] | None
 
 class Prompt:
     """A Prompt Card: provider, model, and the authored prompt."""
@@ -748,11 +750,12 @@ class Prompt:
         """
         ...
 
-    def messages(self, items: Iterable[JsonInput]) -> Self:
+    def messages(self, items: Iterable[JsonInput] | None) -> Self:
         """Set the whole ``messages`` list, replacing every earlier entry; returns this value.
 
         Args:
-            items: The new ``messages`` entries.
+            items: The new ``messages`` entries, or ``None`` for a Prompt whose request
+                is its ``body``.
         """
         ...
 
@@ -788,11 +791,12 @@ class Prompt:
         """
         ...
 
-    def body(self, entries: Mapping[str, JsonInput]) -> Self:
+    def body(self, entries: Mapping[str, JsonInput] | None) -> Self:
         """Set the whole ``body`` map, replacing every earlier entry; returns this value.
 
         Args:
-            entries: The new ``body`` entries.
+            entries: The new ``body`` entries, or ``None`` for a Prompt whose request
+                is its ``messages``.
         """
         ...
 
@@ -812,8 +816,8 @@ class VerifierFields(TypedDict, total=False):
     annotations: Mapping[str, str]
     description: JsonInput
     inputs: Mapping[str, SlotInput]
-    steps: Sequence[Step | Mapping[str, JsonInput]]
-    requirements: Sequence[Requirement | Mapping[str, JsonInput]]
+    steps: Sequence[Step | Mapping[str, FieldInput]]
+    requirements: Sequence[Requirement | Mapping[str, FieldInput]]
     decide: JsonInput
     context_capture: JsonInput
     order_by: JsonInput
@@ -923,7 +927,7 @@ class Verifier:
         """
         ...
 
-    def steps(self, items: Iterable[Step | Mapping[str, JsonInput]]) -> Self:
+    def steps(self, items: Iterable[Step | Mapping[str, FieldInput]]) -> Self:
         """Set the whole ``steps`` list, replacing every earlier entry; returns this value.
 
         Args:
@@ -931,7 +935,7 @@ class Verifier:
         """
         ...
 
-    def add_step(self, item: Step | Mapping[str, JsonInput]) -> Self:
+    def add_step(self, item: Step | Mapping[str, FieldInput]) -> Self:
         """Append one entry to ``steps``; returns this value.
 
         Args:
@@ -939,7 +943,7 @@ class Verifier:
         """
         ...
 
-    def requirements(self, items: Iterable[Requirement | Mapping[str, JsonInput]]) -> Self:
+    def requirements(self, items: Iterable[Requirement | Mapping[str, FieldInput]]) -> Self:
         """Set the whole ``requirements`` list, replacing every earlier entry; returns this value.
 
         Args:
@@ -947,7 +951,7 @@ class Verifier:
         """
         ...
 
-    def add_requirement(self, item: Requirement | Mapping[str, JsonInput]) -> Self:
+    def add_requirement(self, item: Requirement | Mapping[str, FieldInput]) -> Self:
         """Append one entry to ``requirements``; returns this value.
 
         Args:
@@ -2241,7 +2245,7 @@ class StepFields(TypedDict, total=False):
 
     depends_on: Sequence[JsonInput]
     when: JsonInput
-    requirements: Sequence[Requirement | Mapping[str, JsonInput]]
+    requirements: Sequence[Requirement | Mapping[str, FieldInput]]
     timeout_seconds: JsonInput
     retries: JsonInput
 
@@ -2292,41 +2296,6 @@ class CodeSource:
 
         Args:
             path: The local source file.
-        """
-        ...
-
-class CardDefinition:
-    """A Card of any registrable kind, authored as its kind and canonical spec mapping."""
-
-    def __init__(
-        self, kind: CardKind | str, name: str, version: str, spec: Mapping[str, JsonInput]
-    ) -> None:
-        """Define a Card exactly as its YAML ``spec`` would hold it.
-
-        Args:
-            kind: The kind, as a ``CardKind`` or its wire name.
-            name: The Card name.
-            version: The exact Card version.
-            spec: The canonical spec mapping.
-
-        Raises:
-            WyrdError: ``WYRD_SPEC_400_VALIDATION`` for an unknown kind.
-        """
-        ...
-
-    def card_ref(self) -> CardRef:
-        """The exact reference this Card registers as."""
-        ...
-
-    def spec(self) -> dict[str, Any]:
-        """The spec as authored."""
-        ...
-
-    def validate(self) -> None:
-        """Validate the graph this Card roots exactly as its declaration would.
-
-        Raises:
-            WyrdError: The shared validation's refusal.
         """
         ...
 
@@ -2460,7 +2429,7 @@ class Step:
     """One data-producing Verifier step."""
 
     def __init__(
-        self, id: str, action: Action | Mapping[str, JsonInput], **fields: Unpack[StepFields]
+        self, id: str, action: Action | Mapping[str, FieldInput], **fields: Unpack[StepFields]
     ) -> None:
         """The step ``id`` running ``action``.
 
@@ -2495,7 +2464,7 @@ class Step:
         """
         ...
 
-    def requirements(self, items: Iterable[Requirement | Mapping[str, JsonInput]]) -> Self:
+    def requirements(self, items: Iterable[Requirement | Mapping[str, FieldInput]]) -> Self:
         """Set the whole ``requirements`` list, replacing every earlier entry; returns this value.
 
         Args:
@@ -2503,7 +2472,7 @@ class Step:
         """
         ...
 
-    def add_requirement(self, item: Requirement | Mapping[str, JsonInput]) -> Self:
+    def add_requirement(self, item: Requirement | Mapping[str, FieldInput]) -> Self:
         """Append one entry to ``requirements``; returns this value.
 
         Args:
@@ -2530,7 +2499,7 @@ class Step:
 class Requirement:
     """One requirement, producing exactly one verdict."""
 
-    def __init__(self, id: str, statement: str, check: Check | Mapping[str, JsonInput]) -> None:
+    def __init__(self, id: str, statement: str, check: Check | Mapping[str, FieldInput]) -> None:
         """The requirement ``id`` claiming ``statement``, judged by ``check``.
 
         Args:
@@ -2623,7 +2592,7 @@ class Action:
 
     @staticmethod
     def code(
-        source: CodeSource | ArtifactFile | Mapping[str, JsonInput],
+        source: CodeSource | ArtifactFile | Mapping[str, FieldInput],
         entrypoint: str,
         **fields: Unpack[ActionFields],
     ) -> Action:
@@ -2727,7 +2696,7 @@ class Check:
 
     @staticmethod
     def code(
-        source: CodeSource | ArtifactFile | Mapping[str, JsonInput],
+        source: CodeSource | ArtifactFile | Mapping[str, FieldInput],
         entrypoint: str,
         **fields: Unpack[CheckFields],
     ) -> Check:
@@ -2741,12 +2710,13 @@ class Check:
         ...
 
     @staticmethod
-    def drift(on: str, spec: Mapping[str, JsonInput]) -> Check:
+    def drift(on: str, spec: Mapping[str, FieldInput]) -> Check:
         """Judge statistical drift over the samples slot ``on``.
 
         Args:
             on: The samples slot reference.
-            spec: The drift fields: method, signal, condition, and profile.
+            spec: The drift fields: method, signal, condition, and profile; a Card or
+                ``CardRef`` may stand at ``signal.baseline_ref``.
         """
         ...
 
@@ -2807,7 +2777,6 @@ __all__ = [
     "ArtifactFile",
     "Audit",
     "Binding",
-    "CardDefinition",
     "CardRef",
     "Check",
     "CodeSource",

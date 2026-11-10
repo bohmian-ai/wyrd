@@ -323,8 +323,34 @@ async fn spoofed_foreign_stale_and_conflicting_connections_are_refused() {
         GithubConnectionState::NotConnected
     );
 
+    // The OIDC sign-in callback cannot consume a GitHub transaction.
+    let receipt = admin.sdk.begin().await.expect("connection begins");
+    let state = receipt
+        .authorization_url
+        .as_str()
+        .split_once("state=")
+        .map(|(_, state)| state.split('&').next().unwrap_or_default().to_owned())
+        .expect("the install URL carries the state");
+    let cross_flow = admin
+        .browser
+        .open(&format!("{base}/auth/callback?state={state}&code=forged"))
+        .await
+        .expect("browser navigates");
+    assert_eq!(
+        (cross_flow.status, cross_flow.problem_code()),
+        (400, Some("WYRD_AUTH_400_INVALID_STATE")),
+        "{:?}",
+        cross_flow.body
+    );
+
     // One installation per tenant and one tenant per installation.
-    let connected = associated(&admin.connect().await);
+    let connected = associated(
+        &admin
+            .browser
+            .open(receipt.authorization_url.as_str())
+            .await
+            .expect("browser navigates"),
+    );
     assert_eq!(connected.installation_id, Some(101));
     refused(
         &tenant_b.connect().await,

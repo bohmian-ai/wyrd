@@ -64,15 +64,13 @@ impl Prompt {
     /// Returns [`PromptBuilderError::Skald`] for an unknown name, an invalid
     /// `data` schema, or a request that already sets its own response format.
     pub(crate) fn with_named_response_format(
-        self,
+        mut self,
         named: skald_spec::NamedResponseFormat,
     ) -> PromptBuilderResult<Self> {
         let mut authored = self.inner.authored()?.into_owned();
         authored.response_format = Some(skald_spec::ResponseFormat::Named(named));
-        Ok(Self {
-            inner: wyrd_spec::card::prompt::compile_prompt(&authored)?,
-            ..self
-        })
+        self.inner = wyrd_spec::card::prompt::compile_prompt(&authored)?;
+        Ok(self)
     }
 
     /// Borrow the wrapped native prompt.

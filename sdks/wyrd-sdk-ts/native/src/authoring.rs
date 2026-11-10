@@ -93,19 +93,22 @@ enum Authored {
     /// A code source.
     CodeSource(CodeSource),
     /// An original Prompt, held inline at an Agent's `prompt`.
-    Prompt(Prompt),
+    Prompt(Box<Prompt>),
 }
 
 /// Generate [`Authored`]'s per-family dispatch: the family name, the field
-/// edits, the Card it is, and the value it contributes at a position.
+/// edits, the Card it is, and the value it contributes at a position. A
+/// `boxed` family is held in a `Box`, keeping a large value from sizing every
+/// other variant.
 macro_rules! families {
-    (cards { $($card:ident),* } values { $($value:ident),* }) => {
+    (cards { $($card:ident),* } values { $($value:ident),* } boxed { $($boxed:ident),* }) => {
         impl Authored {
             /// The family's public name, for argument errors.
             fn name(&self) -> &'static str {
                 match self {
                     $(Self::$card(_) => stringify!($card),)*
                     $(Self::$value(_) => stringify!($value),)*
+                    $(Self::$boxed(_) => stringify!($boxed),)*
                 }
             }
 
@@ -118,6 +121,7 @@ macro_rules! families {
                 Ok(match self {
                     $(Self::$card(inner) => Self::$card(inner.set(field, value)?),)*
                     $(Self::$value(inner) => Self::$value(inner.set(field, value)?),)*
+                    $(Self::$boxed(inner) => Self::$boxed(Box::new((*inner).set(field, value)?)),)*
                 })
             }
 
@@ -129,6 +133,7 @@ macro_rules! families {
                 match self {
                     $(Self::$card(inner) => inner.add(field, value),)*
                     $(Self::$value(inner) => inner.add(field, value),)*
+                    $(Self::$boxed(inner) => inner.add(field, value),)*
                 }
             }
 
@@ -141,6 +146,7 @@ macro_rules! families {
                 match self {
                     $(Self::$card(inner) => inner.insert(field, key, value),)*
                     $(Self::$value(inner) => inner.insert(field, key, value),)*
+                    $(Self::$boxed(inner) => inner.insert(field, key, value),)*
                 }
             }
 
@@ -149,6 +155,7 @@ macro_rules! families {
                 match self {
                     $(Self::$card(card) => Some(card.into()),)*
                     $(Self::$value(_) => None,)*
+                    $(Self::$boxed(_) => None,)*
                 }
             }
 
@@ -158,6 +165,7 @@ macro_rules! families {
                 match self {
                     $(Self::$card(inner) => inner.into(),)*
                     $(Self::$value(inner) => inner.into(),)*
+                    $(Self::$boxed(inner) => (*inner).into(),)*
                 }
             }
         }
@@ -168,8 +176,9 @@ families!(
     cards { Service, Agent, Verifier, Artifact, Model, Data, Experiment, Mcp, Audit, Trigger, Operator }
     values {
         Component, Binding, Step, Requirement, InputSlot, Action, Check, CardRef, ArtifactFile,
-        CodeSource, Prompt
+        CodeSource
     }
+    boxed { Prompt }
 );
 
 /// A host argument: canonical JSON plus the authoring values standing at
@@ -900,7 +909,7 @@ impl NativeAuthored {
             )
         });
         Ok(match built {
-            Ok(prompt) => Either::A(Self::of(Authored::Prompt(prompt))),
+            Ok(prompt) => Either::A(Self::of(Authored::Prompt(Box::new(prompt)))),
             Err(error) => Either::B(NativeWyrdError::from_wyrd(&WyrdError::from(error))),
         })
     }

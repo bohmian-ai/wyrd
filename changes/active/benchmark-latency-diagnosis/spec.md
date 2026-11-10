@@ -1,10 +1,10 @@
 ---
 id: SPEC-benchmark-latency-diagnosis
-revision: 2
+revision: 3
 status: approved
 ---
 
-# One benchmark recorder and a Gateway diagnosis
+# One benchmark recorder and verified Gateway latency improvements
 
 ## Problem and proposed outcome
 
@@ -37,8 +37,14 @@ cannot establish a cause, name the uncertainty and the smallest measurement
 that would distinguish the competing explanations. A slow background Scribe write
 is not, by itself, a slow Gateway response.
 
-This packet covers measurement consistency, diagnosis and an implementation
-proposal. It does not implement Gateway latency optimizations. The desired c64
+The maintainer extended this packet to implement the four identified hot-path
+optimizations in TASK-003, after repairing and qualifying the benchmark recorder.
+The task first restores the saved pre-task baseline with the corrected recorder
+and canonical diagnostic reporting, then improves capture draining, metadata
+response usage extraction, post-answer payload materialization and foreground audit
+construction. These are required parts of one task, not deferred proposals or a
+reason to repeat the general diagnosis. Preserve all existing product semantics.
+The desired c64
 p50s are client completion below 1 ms and Gateway-added latency below 500 us;
 these are investigation objectives, not new production SLOs or changes to the
 existing benchmark p99 judgments.
@@ -112,6 +118,31 @@ existing benchmark p99 judgments.
   Retain, rework or remove candidate changes according to the approved outcomes;
   preserve pre-existing work and record the disposition. Previously interrupted
   checks do not count as passes.
+- **REQ-010 — Qualify the measurement path.** Remove process-wide update
+  serialization and unnecessary registration work in the sole recorder while
+  preserving coherent timing groups and snapshots. Demonstrate performance
+  recovery against saved unprofiled pre-task evidence with full instrumentation,
+  and measure added instrumentation cost. Correct counts or a `VALID` verdict
+  alone do not establish acceptable recording overhead. Do not rerun historical
+  baselines or weaken observations to claim recovery.
+- **REQ-011 — Canonical diagnostic reporting.** Persist bounded phase diagnostics
+  and their populations in the existing experiment record. Fresh runs and saved
+  reports use the same terminal renderer, retain each repetition and expose
+  missing/invalid evidence and overlap. Regeneration works without raw artifact
+  directories. Existing supported records remain readable. Document the common
+  reporting rule for implementors rather than require custom extraction scripts.
+- **REQ-012 — Implement the four identified optimizations.** After recorder
+  recovery is confirmed, TASK-003 implements all four changes at their existing
+  owners: remove avoidable capture-drain copying/bookkeeping; avoid full owned
+  response JSON solely for metadata-mode usage extraction; reduce repeated
+  post-answer payload materialization; and reduce foreground audit construction
+  work. Preserve response/usage behavior, redaction, capture content and counts,
+  byte accounting, audit attribution, retries and acknowledgements. Authentication
+  caching, new execution policies and incremental retry/capacity redesign are not
+  selected. Verify correctness at the affected owners and through existing real
+  server journeys, then compare the optimized candidate against the corrected
+  recorder-only milestone with unchanged instrumentation and workload. The task
+  is not complete at recorder recovery and does not defer these optimizations.
 
 ## Invariants and boundaries
 
@@ -121,7 +152,7 @@ existing benchmark p99 judgments.
 - **INV-002:** capture reservation remains before charge/dispatch, bounded by the
   existing deadline, with the existing retryable refusal. Reserved captures are
   never shed. Projection failures never change an already answered call.
-- **INV-003:** measurement does not change cancellation, settlement, accepted-work
+- **INV-003:** recording and optimizations do not change cancellation, settlement, accepted-work
   ownership, retry, durable acknowledgement, or resource-admission semantics.
 - **INV-004:** historical records remain immutable and readable. Changed
   measurement settings are declared; results from different instrumentation or
@@ -148,7 +179,7 @@ only. It runs no benchmarks, starts no release builds and changes no implementat
 code. Specification approval permits task planning, not automatic execution.
 
 After task execution is explicitly requested, ordinary implementation checks may
-verify the recording change. Any proposed new benchmark experiment must first be
+verify recording, reporting and the four scoped optimizations. Any proposed new benchmark experiment must first be
 presented as a concrete, bounded measurement with its evidence gap, cases,
 profiling mode and interpretation, and receive explicit maintainer authorization.
 A full benchmark suite is not a default prerequisite for diagnosis. Existing
@@ -161,8 +192,11 @@ baselines are reused throughout.
 | **AC-001 — One recording workflow** | REQ-001–004; INV-001,003 | With benchmarking off, the production recorder remains installed and no benchmark observation accumulates. With it on, only the benchmark recorder is installed: counters increment, gauges update, and timing/diagnostic histograms retain their units and populations through benchmark-owned snapshots. Duplicate timing instrumentation does not double-count. Driver reconciliation, backlog and resource readings work without a Prometheus recorder, exporter or exposition parser. Cover all three engines and both benchmark levels through focused tests and consumer inspection; any live experiment requires the authorization above. |
 | **AC-002 — Reliable intervals** | REQ-003,004,007; INV-004 | Focused tests preserve per-request residuals, phase classification, warmup separation, late-cohort counts, distribution bounds and invalid-evidence detection. Existing records remain readable. Missing evidence is explicit, and maximum declared workload coverage fits bounded recording capacity. |
 | **AC-003 — Defensible c64 diagnosis** | REQ-005–007 | A report cites the existing records, applicable profile intervals and source mechanisms. It compares client and server p50s independently, distinguishes response latency from background work, and identifies where CPU profiles cannot explain waiting. Assertions of outbox saturation require outbox evidence; Scribe memory use alone is insufficient. |
-| **AC-004 — Actionable next work** | REQ-008; INV-001–003 | The report ranks supported costs and proposed remedies, identifies the smallest falsifiable measurement for each unresolved material cause, and states what evidence would select or reject each remedy. It makes no unsupported root-cause or target-attainment claim and does not implement an optimization. |
+| **AC-004 — Actionable diagnosis** | REQ-008; INV-001–003 | The TASK-002 research report ranks supported costs and proposed remedies, identifies the smallest falsifiable measurement for each unresolved material cause, and states what evidence would select or reject each remedy. It makes no unsupported root-cause or target-attainment claim. TASK-002 remains research-only; TASK-003 implements the four selected optimizations. |
 | **AC-005 — Candidate disposition** | REQ-009; INV-001–004 | A compact change inventory identifies what is reused, reworked or removed from the unfinished candidate and which checks remain. The recording outcome has focused regression tests, formatting, lint and dependency-boundary evidence; no interrupted run is claimed as complete. |
+| **AC-006 — Qualified recorder** | REQ-010; INV-001–004 | Independent-series progress and concurrent-snapshot tests preserve counts and complete timing groups. Valid, fully instrumented candidate evidence meets the task's declared recovery envelope against saved pre-task results and reports instrumentation costs and repetition spread. Recovery is a required intermediate milestone, not task completion. |
+| **AC-007 — Reproducible terminal diagnostics** | REQ-003–004,011; INV-004 | Each repetition's declared phase distributions, units, populations and missing evidence survive record publication. Fresh/saved rendering agrees after raw artifacts are removed; supported historical records remain readable. |
+| **AC-008 — Four optimizations delivered** | REQ-012; INV-001–004 | Each of the four paths has an implemented reduction in avoidable work, focused behavioral/allocation or ownership proof, and affected real-server regression evidence. The final unprofiled candidate uses the same corrected recorder/settings as the recovery milestone; report client/residual latency, phase evidence, CPU/work and throughput for every repetition. No optimization is deferred, and no response, redaction, audit, tenant, retry, byte-accounting or acknowledgement rule is weakened. Measured benefits and unresolved attribution are stated without claiming unsupported target attainment. |
 
 ## Existing owners and evidence
 
@@ -198,21 +232,32 @@ baselines are reused throughout.
 
 ## Task boundaries
 
-Two outcomes are sufficient: (1) finish and verify the single benchmark recording
-workflow, including the unfinished candidate's consumer closure; (2) deliver the
-Gateway diagnosis and evidence-backed optimization/measurement proposal using
-that measurement contract. Existing-artifact research can begin without new
-runs. Any future optimization implementation needs its own evidence-supported,
-approved scope. The implementation tasks are [sole benchmark recording](tasks/TASK-001-sole-benchmark-recorder.md) and [Gateway diagnosis and proposal](tasks/TASK-002-gateway-latency-diagnosis.md).
+The existing tasks are [sole benchmark recording](tasks/TASK-001-sole-benchmark-recorder.md)
+and [Gateway diagnosis and proposal](tasks/TASK-002-gateway-latency-diagnosis.md).
+They retain their original revision-2 scope. The maintainer explicitly added
+[recorder recovery, standard reporting and four hot-path optimizations](tasks/TASK-003-recorder-overhead-and-standard-reporting.md)
+as one required implementation task. Its ordering is recorder/reporting repair,
+measured baseline recovery, all four optimizations, and final correctness and
+performance verification. Do not split the optimization work into future tasks
+or insert another general diagnosis gate. New experiments retain the explicit
+execution-authorization boundary above.
 
 ## Open material decisions
 
-Revision 2 was explicitly approved by the maintainer on 2026-11-09. No new capture policy or
-optimization mechanism is awaiting selection inside this packet: those are
-outputs of the diagnosis, outside its implementation scope. Additional benchmark
-execution remains separately controlled as described above.
+Revision 2 was explicitly approved on 2026-11-09. Revision 3 records the
+maintainer's explicit scope correction on the same date: all four identified
+optimizations belong to TASK-003 after recorder recovery, with no deferral.
+No new capture policy, security semantics or retry protocol is selected.
+Additional benchmark execution remains separately controlled as described above.
 
 ## Authority and revision history
+
+- Revision 3 approved scope, 2026-11-09: explicit maintainer instruction that the
+  four identified hot-path optimizations are part of TASK-003 and must not be
+  deferred. Adds recorder qualification, canonical diagnostic reporting and
+  implementation/verification obligations for those four paths. This records
+  the directed scope, not permission to execute benchmarks or implementation
+  during planning. All existing product invariants remain in force.
 
 - [Wyrd workflow](../../spec-driven-development.md) and
   [bounded implementation execution](../../implementation-execution.md).

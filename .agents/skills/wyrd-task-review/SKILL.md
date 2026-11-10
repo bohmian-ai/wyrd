@@ -220,7 +220,10 @@ standard-required check from task drift: for OIDC ID tokens and JWT bearer
 assertions, compare the complete applicable OIDC Core, RFC 7523, and RFC 8725
 rules without duplicating signature/JWKS verification or inventing a profile.
 
-Build an explicit matrix:
+Build an explicit matrix. Seed it from the implementation's `## Obligations`
+ledger, then add any obligation the task requires that the ledger omits; an
+omitted obligation is `MISSING` unless the diff proves it. A test name alone is
+not verification evidence; cite the assertion.
 
 | Requirement, acceptance criterion, constraint, or non-goal | Implementation evidence | Verification evidence | Result |
 |---|---|---|---|

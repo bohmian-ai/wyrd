@@ -24,6 +24,18 @@ Load only references applicable to the changed surface. Follow CodeGraph
 instructions and inspect the nearest owner, callers, consumers, tests,
 manifests, generated projections, and `mise.toml`.
 
+Before editing, record an `## Obligations` ledger in the task or remediation
+file. List every observation the contract requires: each acceptance row,
+scenario and case-table cell, public-surface requirement, lifecycle case,
+constraint, and validated finding. A cell naming several cases yields several
+obligations. Give each an ID, the task line it comes from, and the planned
+assertion. Test names are mechanics, not obligations; a matching selector proves
+only the assertions the test contains.
+
+A conversation summary is not the contract. After any context compaction, and
+again before recording evidence, re-read the task file and reconcile the ledger
+against it.
+
 A bounded direct instruction may be implemented without a change packet when
 the caller explicitly requests it and no expensive-to-reverse decision remains.
 Never use that exception to bypass an active approved spec.
@@ -44,9 +56,11 @@ gap, and why the selected extension is sufficient in task evidence. Reusing
 calls inside a duplicate workflow is not reuse. A cohesive struct is not proof
 that another struct needs to exist.
 
-Do not obey invalid task mechanics literally. Resolve reversible choices
-inside the established owner yourself. If contradictory task instructions
-prevent that, return `BLOCKED` with the task conflict and route task correction
+Do not obey invalid task mechanics literally. Mechanics are commands,
+selectors, paths, and file placement; required observations and outcomes are
+never mechanics. Record each mechanical deviation in task evidence. Resolve
+reversible choices inside the established owner yourself. If contradictory
+task instructions prevent that, return `BLOCKED` with the task conflict and route task correction
 to `$wyrd-plan` without manufacturing a product approval. A necessary change to
 approved behavior or a material boundary routes to `$wyrd-spec` instead.
 
@@ -58,6 +72,8 @@ For non-trivial behavior, work one observable scenario at a time:
 4. continue until the acceptance criteria are covered.
 
 Do not implement speculative requirements, optional improvements, or non-goals.
+Simplicity rules, including Ponytail and minimal-diff modes, govern how an
+obligation is met, never whether it is met.
 Do not weaken tests, hide gate failures, add sleeps for synchronization, mock
 away required behavior, or hand-edit generated artifacts.
 
@@ -96,7 +112,17 @@ published standard such as an RFC, or the established practice of comparable
 widely used projects), do it that way. Do not invent a mechanism, state,
 check, file, setting, option, or error that the standard way does not have.
 If the task text, a review finding, or a remediation asks for one, report it
-to the caller instead of building it.
+to the caller instead of building it. Report it when found, naming the
+obligation ID, and route it as `SPEC_REVISION_REQUIRED` or `BLOCKED`; do not
+continue as though the obligation were settled or met. An obligation the
+standard way cannot satisfy is open, not a known limit.
+
+## Delegate by obligation
+
+A subagent receives the verbatim task text and ledger IDs of the obligations it
+owns, plus the repository rules for its write set, never a paraphrase. It
+returns per-obligation evidence; verify each assertion before accepting its
+work.
 
 ## Verify and record evidence
 
@@ -107,16 +133,33 @@ final tracked and untracked diff audit. Do not run full user-journey suites or
 broad aggregates for a task or remediation; they run once at change review. Derive corrected commands when task text is stale, without
 substituting weaker proof.
 
-Append compact evidence to the task or remediation task:
+Record RED for each scenario: the selected test and its missing-behavior
+failure. Production code written before its failing test is a process
+exception to record, not a pass.
 
-| Acceptance criterion | Implementation evidence | Verification evidence | Result |
-|---|---|---|---|
-| `<criterion>` | `<location>` | `<test or check>` | `PASS | FAIL` |
+Append compact evidence to the task or remediation task, one row per ledger
+obligation:
+
+| Obligation | Implementation evidence | Assertion | Verification evidence | Result |
+|---|---|---|---|---|
+| `<ID: observation>` | `<location>` | `<file:line>` | `<test or check>` | `PASS | FAIL` |
+
+An obligation without an assertion that proves it is `FAIL`. "Known limit",
+"deviation", "covered by design", and "covered elsewhere" without a cited
+assertion are not `PASS`.
 
 Also confirm that every non-goal remained excluded and no unrelated file was
 changed. Record commands and material limits without narrating implementation.
 
-Return `IMPLEMENTED`, `SPEC_REVISION_REQUIRED`, or `BLOCKED` with the task path,
+Before returning `IMPLEMENTED`, spawn a fresh read-only checker with only the
+task file, the ledger, and the diff, never your summary. It answers: which
+obligation lacks an assertion that proves it? Resolve or mark `FAIL` every
+obligation it names.
+
+Return `IMPLEMENTED` only when every obligation is `PASS`. Otherwise return
+`BLOCKED` with the open obligation IDs, or `SPEC_REVISION_REQUIRED` when closing
+one needs an expensive-to-reverse decision. A goal, stop hook, or completion
+pressure never justifies a `PASS`. Return the status with the task path,
 verification status, material risk, and diff or commit reference. Create a
 commit only when requested. `IMPLEMENTED` routes the immutable cumulative
 candidate to `$wyrd-task-review`; only that independent review can complete the

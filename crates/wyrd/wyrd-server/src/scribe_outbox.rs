@@ -50,6 +50,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
+use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -355,7 +356,7 @@ impl Part {
         let staged = parts
             .iter()
             .map(|part| match part {
-                Self::Row(row) => Some(row.clone()),
+                Self::Row(row) => Some(row),
                 Self::Batch(_) => None,
             })
             .collect::<Option<Vec<_>>>();
@@ -1205,8 +1206,9 @@ pub(crate) type Owner = (usize, Attribution);
 struct Frame {
     /// Destination table.
     table: ScribeTable,
-    /// The rows, all of one schema.
-    parts: Vec<Part>,
+    /// The rows, all of one schema, shared with every [`Chunk`] cut from
+    /// them so no attempt copies a part.
+    parts: Arc<Vec<Part>>,
     /// Owner of each row, in row order.
     owners: Vec<Owner>,
 }
@@ -1225,12 +1227,14 @@ impl Frame {
             .find(|frame| frame.shares(table, &part))
         {
             Some(frame) => {
-                frame.parts.push(part);
+                // The frame is still being assembled, so no chunk shares
+                // its parts and this never copies them.
+                Arc::make_mut(&mut frame.parts).push(part);
                 frame.owners.extend(owners);
             }
             None => frames.push(Self {
                 table,
-                parts: vec![part],
+                parts: Arc::new(vec![part]),
                 owners,
             }),
         }
@@ -1246,11 +1250,12 @@ impl Frame {
     }
 
     /// The [`Chunk`] of this frame's `rows` rows starting at row `first`,
-    /// held by `parts`.
-    fn chunk(&self, first: usize, rows: usize, parts: Vec<Part>) -> Chunk {
+    /// held by the frame's parts in `parts`.
+    fn chunk(&self, first: usize, rows: usize, parts: Range<usize>) -> Chunk {
         Chunk {
             table: self.table,
-            parts,
+            parts: Arc::clone(&self.parts),
+            range: parts,
             owners: self.owners[first..first + rows].to_vec(),
         }
     }
@@ -1359,23 +1364,22 @@ impl ScribeSink {
         let sample = &frame.parts[0];
         let row_bytes = sample.bytes().div_ceil(sample.num_rows().max(1)).max(1);
         let mut chunks = Vec::new();
-        let (mut first, mut rows, mut bytes, mut parts) = (0, 0, 0_usize, Vec::new());
-        for part in &frame.parts {
+        let (mut first, mut rows, mut bytes, mut start) = (0, 0, 0_usize, 0);
+        for (index, part) in frame.parts.iter().enumerate() {
             let part_bytes = match part {
                 Part::Row(_) => row_bytes,
                 Part::Batch(_) => part.bytes(),
             };
             if rows > 0 && bytes.saturating_add(part_bytes) > budget {
-                chunks.push(frame.chunk(first, rows, std::mem::take(&mut parts)));
+                chunks.push(frame.chunk(first, rows, start..index));
                 first += rows;
-                (rows, bytes) = (0, 0);
+                (rows, bytes, start) = (0, 0, index);
             }
             rows += part.num_rows();
             bytes = bytes.saturating_add(part_bytes);
-            parts.push(part.clone());
         }
         if rows > 0 {
-            chunks.push(frame.chunk(first, rows, parts));
+            chunks.push(frame.chunk(first, rows, start..frame.parts.len()));
         }
         chunks
     }
@@ -1388,9 +1392,11 @@ impl ScribeSink {
 struct Chunk {
     /// Destination table.
     table: ScribeTable,
-    /// The staged rows and projected batches holding the chunk's rows, in
-    /// row order.
-    parts: Vec<Part>,
+    /// Its frame's staged rows and projected batches, shared rather than
+    /// copied.
+    parts: Arc<Vec<Part>>,
+    /// The run of `parts` holding the chunk's rows, in row order.
+    range: Range<usize>,
     /// Owner of each row, in row order.
     owners: Vec<Owner>,
 }
@@ -1404,6 +1410,11 @@ type Origin = (Uuid, usize, usize);
 type Submitted = (Result<(), ScribeRefusal>, ScribeBatch, BTreeSet<usize>);
 
 impl Chunk {
+    /// The parts holding the chunk's rows, in row order.
+    fn rows(&self) -> &[Part] {
+        &self.parts[self.range.clone()]
+    }
+
     /// Builds the chunk's rows into one dense batch, appends each row's subject and actor
     /// unless they are audit decisions that carry their own, and cuts them
     /// into frames of at most `budget` sliced row bytes, each under the
@@ -1430,7 +1441,7 @@ impl Chunk {
         budget: usize,
         in_process: bool,
     ) -> Result<Vec<(ScribeBatch, BTreeSet<usize>)>, arrow::error::ArrowError> {
-        let rows = Part::dense(&self.parts)?;
+        let rows = Part::dense(self.rows())?;
         let rows = match self.table {
             ScribeTable::AuditLog => rows,
             _ => self.attributed(&rows)?,
@@ -1951,7 +1962,7 @@ mod tests {
     use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span};
 
     use super::{
-        ACT_PRINCIPAL_ID, EncodingHold, FRAMES_IN_FLIGHT, FramePayload, PEER_SUBMIT_TIMEOUT,
+        ACT_PRINCIPAL_ID, EncodingHold, FRAMES_IN_FLIGHT, FramePayload, PEER_SUBMIT_TIMEOUT, Part,
         SCRIBE_DELIVERIES, SCRIBE_LANES, SCRIBE_WRITERS, SUB_PRINCIPAL_ID, ScribeOutbox,
         ScribePeers, ScribeRefusal, ScribeRoute, ScribeSink, ScribeTable, ScribeWrite,
         ServerSpanSink, StagedRow, TENANT_SPAN_PERMITS, concat_batches, payload_ipc,
@@ -2344,6 +2355,61 @@ mod tests {
 
         let reason = 64 * 1024;
         assert!(ScribeSink::weight(&drift_result(&uid(), background(), 0, reason)) > reason);
+    }
+
+    /// Proves cutting a mixed slice's frames into chunks copies no part: every
+    /// chunk shares its frame's parts, the chunks' borrowed projections
+    /// concatenate to the frame's own dense batch, and cutting the same frame
+    /// again, as a retry does, yields the same rows, owners, and batches.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a chunk copies its frame's parts or a chunk's rows,
+    /// owners, or batch differ from the frame's or a retry's.
+    #[test]
+    fn borrowed_projection_preserves_mixed_rows_and_retry_frames() {
+        let tenant = DataTenantId::new_v7();
+        let slice = vec![
+            ScribeWrite::from(decision("cards.read")),
+            drift_result(&uid(), background(), 2, 3),
+            ScribeWrite::from(decision("cards.write \u{e9}")),
+            ScribeWrite::from(capture(tenant)),
+            ScribeWrite::from(decision("cards.delete")),
+        ];
+        let mut lost = BTreeSet::new();
+        let frames = ScribeSink::frames(&slice, usize::MAX, &mut lost);
+        assert!(lost.is_empty());
+        for frame in &frames {
+            let table = frame.table.fqn();
+            let whole = Part::dense(&frame.parts).expect("the frame projects");
+            let chunks = ScribeSink::chunks(frame, 1);
+            assert_eq!(chunks.len(), frame.parts.len(), "{table}");
+            for chunk in &chunks {
+                assert!(
+                    Arc::ptr_eq(&chunk.parts, &frame.parts),
+                    "{table}: a chunk shares its frame's parts"
+                );
+            }
+            let cut = chunks
+                .iter()
+                .map(|chunk| Part::dense(chunk.rows()).expect("the chunk projects"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                concat_batches(whole.schema_ref(), &cut).expect("chunks concatenate"),
+                whole,
+                "{table}"
+            );
+            let retry = ScribeSink::chunks(frame, 1);
+            for (first, again) in chunks.iter().zip(&retry) {
+                assert_eq!(first.range, again.range, "{table}");
+                assert_eq!(first.owners, again.owners, "{table}");
+                assert_eq!(
+                    Part::dense(first.rows()).expect("projects"),
+                    Part::dense(again.rows()).expect("projects"),
+                    "{table}"
+                );
+            }
+        }
     }
 
     /// Proves the frames of a mixed slice build every staged audit and

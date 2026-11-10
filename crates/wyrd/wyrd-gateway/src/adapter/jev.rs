@@ -13,7 +13,6 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use serde::Deserialize;
-use serde_json::Value;
 use skald_spec::wire::jev::{JevQuestion, JevRequest, JevRequestView, JevResponse};
 use skald_spec::wire::openai_chat::{
     OpenAiChatChoice, OpenAiChatMessage, OpenAiChatRequestView, OpenAiChatResponse,
@@ -21,6 +20,7 @@ use skald_spec::wire::openai_chat::{
 };
 
 use super::UnsupportedRequest;
+use crate::request::RequestJson;
 
 /// Jev request carried in a chat message's text: the typed request without
 /// its model, which the deployment selects.
@@ -46,8 +46,8 @@ fn not_jev(error: serde_json::Error) -> UnsupportedRequest {
 /// Returns [`UnsupportedRequest`] naming `body` when it is not a Jev request
 /// (unknown members or question forms included), or the member that breaks a
 /// documented Jev bound.
-pub(super) fn check(body: &Value, model: &str) -> Result<(), UnsupportedRequest> {
-    let mut request = JevRequestView::deserialize(body).map_err(not_jev)?;
+pub(super) fn check(body: &RequestJson, model: &str) -> Result<(), UnsupportedRequest> {
+    let mut request = body.view::<JevRequestView>().map_err(not_jev)?;
     request.model = model;
     request
         .validate()
@@ -60,8 +60,8 @@ pub(super) fn check(body: &Value, model: &str) -> Result<(), UnsupportedRequest>
 /// # Errors
 ///
 /// Returns [`UnsupportedRequest`] naming `body` when it does not decode.
-pub(super) fn request(body: &Value, model: &str) -> Result<JevRequest, UnsupportedRequest> {
-    let mut request = JevRequest::deserialize(body).map_err(not_jev)?;
+pub(super) fn request(body: &RequestJson, model: &str) -> Result<JevRequest, UnsupportedRequest> {
+    let mut request = body.view::<JevRequest>().map_err(not_jev)?;
     model.clone_into(&mut request.model);
     Ok(request)
 }

@@ -519,6 +519,32 @@ impl OpenAiClient {
         body: impl Into<RequestBody<'_>>,
         files: &[UploadFile],
     ) -> ProviderResult<MediaAnswer> {
+        let payload = media_payload(route, body.into(), files).await?;
+        self.send_media_payload(route, payload).await
+    }
+
+    /// Sends one Images or Audio request on a JSON `route` with `json`, the
+    /// request already encoded as JSON bytes, like [`Self::send_media`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::BadRequest`] for a multipart `route`, and the
+    /// auth and exchange errors of [`Self::send_media`].
+    pub async fn send_media_json(
+        &self,
+        route: OpenAiMediaRoute,
+        json: Vec<u8>,
+    ) -> ProviderResult<MediaAnswer> {
+        self.send_media_payload(route, json_media_payload(route, json)?)
+            .await
+    }
+
+    /// Sends `payload` on the media `route` once.
+    async fn send_media_payload(
+        &self,
+        route: OpenAiMediaRoute,
+        payload: Payload,
+    ) -> ProviderResult<MediaAnswer> {
         let (content_type, bytes) = self
             .transport
             .send_once(
@@ -526,7 +552,7 @@ impl OpenAiClient {
                 Method::POST,
                 &format!("{}{}", self.auth.base_url(), route.path()),
                 self.auth.headers()?,
-                Some(media_payload(route, body.into(), files).await?),
+                Some(payload),
             )
             .await?;
         Ok(MediaAnswer {
@@ -550,6 +576,32 @@ impl OpenAiClient {
         body: impl Into<RequestBody<'_>>,
         files: &[UploadFile],
     ) -> ProviderResult<ProviderByteStream> {
+        let payload = media_payload(route, body.into(), files).await?;
+        self.open_media_payload(route, payload).await
+    }
+
+    /// Opens one Images or Audio request on a JSON `route` with `json`, the
+    /// request already encoded as JSON bytes, like [`Self::stream_media`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::BadRequest`] for a multipart `route`, and the
+    /// auth, transport, and refusal errors of [`Self::stream_media`].
+    pub async fn stream_media_json(
+        &self,
+        route: OpenAiMediaRoute,
+        json: Vec<u8>,
+    ) -> ProviderResult<ProviderByteStream> {
+        self.open_media_payload(route, json_media_payload(route, json)?)
+            .await
+    }
+
+    /// Opens `payload` on the media `route` once for incremental reading.
+    async fn open_media_payload(
+        &self,
+        route: OpenAiMediaRoute,
+        payload: Payload,
+    ) -> ProviderResult<ProviderByteStream> {
         let response = self
             .transport
             .open_once(
@@ -557,7 +609,7 @@ impl OpenAiClient {
                 Method::POST,
                 &format!("{}{}", self.auth.base_url(), route.path()),
                 self.auth.headers()?,
-                Some(media_payload(route, body.into(), files).await?),
+                Some(payload),
             )
             .await?;
         Ok(ProviderByteStream {
@@ -865,9 +917,25 @@ async fn media_payload(
     let payload = body
         .to_json()
         .map_err(|error| ProviderError::decode("openai", error))?;
+    json_media_payload(route, payload)
+}
+
+/// The JSON payload of an Images or Audio request on `route`, already encoded
+/// as `json`.
+///
+/// # Errors
+///
+/// Returns [`ProviderError::BadRequest`] for a multipart `route`.
+fn json_media_payload(route: OpenAiMediaRoute, json: Vec<u8>) -> ProviderResult<Payload> {
+    if route.multipart() {
+        return Err(ProviderError::bad_request(
+            "openai",
+            "a multipart media route takes form fields",
+        ));
+    }
     Ok(Payload::bytes(
         HeaderValue::from_static("application/json"),
-        payload,
+        json,
     ))
 }
 

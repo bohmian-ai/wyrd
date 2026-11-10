@@ -18,7 +18,7 @@ use skald_agent::{WyrdGatewayCall, WyrdGatewayCaller};
 use skald_providers::{ProviderError, RemoteProblem};
 use skald_spec::{ProviderRequest, ProviderResponse};
 use tokio_util::sync::CancellationToken;
-use wyrd_gateway::{IngressDialect, ResponseBody};
+use wyrd_gateway::{IngressDialect, RequestJson, ResponseBody};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::{GatewayOperation, ModelRef};
 
@@ -107,6 +107,7 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
             body,
             answer,
         } = NativeCall::project(call.request, &call.model)?;
+        let body = RequestJson::from(body);
         let request = GatewayCallRequest {
             operation,
             ingress,

@@ -14,8 +14,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
+use serde_json::json;
 use serde_json::value::to_raw_value;
-use serde_json::{Value, json};
 use skald_spec::ProviderName;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
@@ -23,8 +23,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use wyrd_gateway::{
     AttemptUsage, BatchAction, CallExecution, CallInput, CallPlan, FailureClass,
-    GatewayTenantSnapshot, IngressDialect, MediaRequest, ResponseBody, ResponseCapture, StreamEnd,
-    UnsupportedRequest, outcome_error_code, outcome_name,
+    GatewayTenantSnapshot, IngressDialect, MediaRequest, RequestJson, ResponseBody,
+    ResponseCapture, StreamEnd, UnsupportedRequest, outcome_error_code, outcome_name,
 };
 use wyrd_runtime::outbox::Reservation;
 use wyrd_runtime::principal::CardAttribution;
@@ -85,7 +85,7 @@ pub struct GatewayCallRequest {
     /// Per-request fallback override replacing every tenant rule.
     pub fallback: Option<GatewayFallbackOverride>,
     /// Operation request body handed to the provider attempt.
-    pub body: Value,
+    pub body: RequestJson,
     /// Route and uploaded files of an Images or Audio call.
     pub media: Option<MediaRequest>,
     /// Lifecycle action of a Batches call.
@@ -237,7 +237,7 @@ struct AdmittedCall {
     /// Immutable admitted configuration, shared with the tenant snapshot cache.
     snapshot: Arc<GatewayTenantSnapshot>,
     /// Operation request body.
-    body: Value,
+    body: RequestJson,
     /// Route and uploaded files of an Images or Audio call.
     media: Option<MediaRequest>,
     /// Lifecycle action of a Batches call.
@@ -1086,13 +1086,18 @@ impl<'a> GatewayInvocation<'a> {
     /// waits and is never shed: it spends the slot admission reserved, and
     /// the outbox owns encoding and delivery. `body` is the call's request
     /// body, moved in so capture redacts and encodes it without a copy.
-    async fn capture(state: &AppState, call: &AdmittedCall, body: Value, facts: Option<CallFacts>) {
+    async fn capture(
+        state: &AppState,
+        call: &AdmittedCall,
+        body: RequestJson,
+        facts: Option<CallFacts>,
+    ) {
         let Some(mut facts) = facts else {
             return;
         };
         let work = async {
             if selects(&facts.policy, GatewayPayloadField::Request) {
-                request_content(body, call.media.as_ref(), &mut facts.objects)
+                request_content(body.into_tree(), call.media.as_ref(), &mut facts.objects)
                     .await
                     .map(|content| facts.request = Some(content))
                     .map_err(|_| CaptureDrop::Payload)?;

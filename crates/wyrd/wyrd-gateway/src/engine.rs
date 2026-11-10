@@ -45,6 +45,7 @@ use skald_providers::exchange::{self, Exchange};
 use crate::adapter::{BatchAction, IngressDialect, MediaRequest};
 use crate::credential::{CredentialResolver, ProviderSecret};
 use crate::health::DeploymentHealth;
+use crate::request::RequestJson;
 use crate::routing::{CallPlan, PlannedCandidate};
 use crate::snapshot::GatewayTenantSnapshot;
 
@@ -66,7 +67,7 @@ pub struct ProviderAttempt<'a> {
     /// Resolved credential, when the deployment authenticates.
     pub credential: Option<&'a ProviderSecret>,
     /// Operation request body.
-    pub body: &'a Value,
+    pub body: &'a RequestJson,
     /// Route and uploaded files of an Images or Audio call.
     pub media: Option<&'a MediaRequest>,
     /// Lifecycle action of a Batches call.
@@ -560,7 +561,7 @@ pub struct CallInput<'a> {
     /// Admitted candidates.
     pub plan: &'a CallPlan,
     /// Operation request body.
-    pub body: &'a Value,
+    pub body: &'a RequestJson,
     /// Dialect of `body`.
     pub ingress: IngressDialect,
     /// Route and uploaded files of an Images or Audio call.
@@ -1138,7 +1139,7 @@ mod tests {
                 tenant: DataTenantId::SYSTEM_OWNER,
                 snapshot: snap,
                 plan: &plan,
-                body: &json!({}),
+                body: &RequestJson::from(json!({})),
                 ingress: IngressDialect::OpenAi,
                 batch: None,
                 media: None,

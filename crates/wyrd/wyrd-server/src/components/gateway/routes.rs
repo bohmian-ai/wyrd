@@ -12,7 +12,6 @@ use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use skald_spec::wire::borrowed::Borrowed;
@@ -20,7 +19,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 use vala_bifrost_redux::catalog::{BifrostCatalogError, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use wyrd_gateway::{IngressDialect, MediaRequest, OpenAiMediaRoute, ResponseBody};
+use wyrd_gateway::{IngressDialect, MediaRequest, OpenAiMediaRoute, RequestJson, ResponseBody};
 use wyrd_runtime::{Action, Permission, Resource};
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::gateway::openai::{
@@ -918,7 +917,7 @@ pub(crate) async fn chat_completions(
     caller: Result<Caller, WyrdErrorResponse>,
     clock: Option<Extension<IngressClock>>,
     headers: HeaderMap,
-    request: Result<Json<Value>, JsonRejection>,
+    request: Result<JsonBody, WyrdErrorResponse>,
 ) -> Response {
     openai_call(
         &state,
@@ -973,7 +972,7 @@ pub(crate) async fn responses(
     caller: Result<Caller, WyrdErrorResponse>,
     clock: Option<Extension<IngressClock>>,
     headers: HeaderMap,
-    request: Result<Json<Value>, JsonRejection>,
+    request: Result<JsonBody, WyrdErrorResponse>,
 ) -> Response {
     openai_call(
         &state,
@@ -1019,7 +1018,7 @@ pub(crate) async fn embeddings(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
     clock: Option<Extension<IngressClock>>,
-    request: Result<Json<Value>, JsonRejection>,
+    request: Result<JsonBody, WyrdErrorResponse>,
 ) -> Response {
     openai_call(
         &state,
@@ -1065,7 +1064,7 @@ pub(crate) async fn image_generations(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
     clock: Option<Extension<IngressClock>>,
-    request: Result<Json<Value>, JsonRejection>,
+    request: Result<JsonBody, WyrdErrorResponse>,
 ) -> Response {
     json_media(
         &state,
@@ -1220,7 +1219,7 @@ pub(crate) async fn audio_speech(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
     clock: Option<Extension<IngressClock>>,
-    request: Result<Json<Value>, JsonRejection>,
+    request: Result<JsonBody, WyrdErrorResponse>,
 ) -> Response {
     json_media(
         &state,
@@ -1378,7 +1377,7 @@ async fn json_media(
     state: &AppState,
     caller: Result<Caller, WyrdErrorResponse>,
     clock: Option<IngressClock>,
-    request: Result<Json<Value>, JsonRejection>,
+    request: Result<JsonBody, WyrdErrorResponse>,
     route: OpenAiMediaRoute,
 ) -> Response {
     let (operation, body) = match route {
@@ -1472,7 +1471,7 @@ async fn openai_call(
     state: &AppState,
     caller: Result<Caller, WyrdErrorResponse>,
     clock: Option<IngressClock>,
-    request: Result<(Value, Option<MediaRequest>), WyrdError>,
+    request: Result<(RequestJson, Option<MediaRequest>), WyrdError>,
     operation: GatewayOperation,
     headers: Option<&HeaderMap>,
 ) -> Response {
@@ -1745,7 +1744,7 @@ pub(crate) async fn create_batch(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
     headers: HeaderMap,
-    request: Result<Json<Value>, JsonRejection>,
+    request: Result<JsonBody, WyrdErrorResponse>,
 ) -> Response {
     let answer = match (
         caller,
@@ -1757,7 +1756,7 @@ pub(crate) async fn create_batch(
         | (Ok(_), Ok(_), Err(error)) => Err(error),
         (Ok(caller), Ok(context), Ok(body)) => {
             GatewayBatches::new(&state, context)
-                .create(&caller, body)
+                .create(&caller, body.into_tree())
                 .await
         }
     };
@@ -1896,14 +1895,76 @@ fn batch_response(answer: Result<BatchAnswer, WyrdError>) -> Response {
     }
 }
 
-/// Decodes a public `OpenAI`-compatible JSON body.
+/// A public JSON request body, read as [`Json`] reads one: a JSON media type,
+/// the router's body limit, and one JSON value without trailing input.
+///
+/// The body is kept as [`RequestJson`], so compact text reaches validation
+/// and the provider without being decoded into an owned tree.
+pub(crate) struct JsonBody(RequestJson);
+
+impl<S: Send + Sync> axum::extract::FromRequest<S> for JsonBody {
+    type Rejection = WyrdErrorResponse;
+
+    /// Reads the request's JSON body.
+    ///
+    /// # Errors
+    /// Returns `GatewayInvalidRequest` for field `body` when the content type
+    /// is not JSON or the body cannot be read or is not JSON.
+    async fn from_request(
+        request: axum::extract::Request,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let refused = || {
+            WyrdErrorResponse(invalid_request(GatewayContractError::new(
+                "body",
+                "must be a JSON object",
+            )))
+        };
+        if !json_content_type(request.headers()).await {
+            return Err(refused());
+        }
+        let text = Bytes::from_request(request, state)
+            .await
+            .map_err(|_| refused())?;
+        RequestJson::parse(text).map(Self).map_err(|_| refused())
+    }
+}
+
+#[cfg(test)]
+impl From<Value> for JsonBody {
+    /// The body as it arrives as compact text, which an object keeps
+    /// undecoded.
+    fn from(body: Value) -> Self {
+        let text = serde_json::to_vec(&body).unwrap_or_default();
+        Self(RequestJson::parse(text.into()).unwrap_or_else(|_| RequestJson::from(body)))
+    }
+}
+
+/// Whether `headers` name a JSON media type, judged by [`Json`] itself from
+/// a probe carrying only the content type.
+async fn json_content_type(headers: &HeaderMap) -> bool {
+    let mut probe = axum::extract::Request::new(Body::empty());
+    if let Some(content_type) = headers.get(CONTENT_TYPE) {
+        probe
+            .headers_mut()
+            .insert(CONTENT_TYPE, content_type.clone());
+    }
+    !matches!(
+        <Json<serde::de::IgnoredAny> as axum::extract::FromRequest<()>>::from_request(probe, &())
+            .await,
+        Err(JsonRejection::MissingJsonContentType(_))
+    )
+}
+/// Takes a public `OpenAI`-compatible JSON body.
 ///
 /// # Errors
 /// Returns `GatewayInvalidRequest` for field `body` when the body is not JSON.
-pub(super) fn json_body(request: Result<Json<Value>, JsonRejection>) -> Result<Value, WyrdError> {
+pub(super) fn json_body(
+    request: Result<JsonBody, WyrdErrorResponse>,
+) -> Result<RequestJson, WyrdError> {
     request
-        .map(|Json(value)| value)
-        .map_err(|_| invalid_request(GatewayContractError::new("body", "must be a JSON object")))
+        .map(|JsonBody(body)| body)
+        .map_err(|WyrdErrorResponse(error)| error)
 }
 
 /// Validates a public JSON body against the shared operation request
@@ -1913,17 +1974,18 @@ pub(super) fn json_body(request: Result<Json<Value>, JsonRejection>) -> Result<V
 /// `T`'s rules while borrowing its text, so a missing or mistyped required
 /// member fails before authorization or dispatch without copying the payload;
 /// the checked body itself is forwarded, so every member `T` accepts,
-/// including flattened extensions, reaches the provider exactly as sent.
+/// including flattened extensions, reaches the provider exactly as sent. Kept
+/// compact text is read in place through [`RequestJson::view`].
 ///
 /// # Errors
 /// Returns the [`json_body`] error for a non-JSON body, and
 /// `GatewayInvalidRequest` naming the missing member, or `body`, when the
 /// body does not decode as `T`.
 pub(super) fn typed_body<T: for<'a> Borrowed<'a>>(
-    request: Result<Json<Value>, JsonRejection>,
-) -> Result<Value, WyrdError> {
+    request: Result<JsonBody, WyrdErrorResponse>,
+) -> Result<RequestJson, WyrdError> {
     let body = json_body(request)?;
-    <T as Borrowed<'_>>::View::deserialize(&body).map_err(|error| {
+    body.view::<<T as Borrowed<'_>>::View>().map_err(|error| {
         let message = error.to_string();
         let field = message
             .strip_prefix("missing field `")
@@ -1950,7 +2012,7 @@ async fn form_body(
     request: Result<Body, BytesRejection>,
     limit: usize,
     sink: FileSink,
-) -> Result<(Value, Option<MediaRequest>), WyrdError> {
+) -> Result<(RequestJson, Option<MediaRequest>), WyrdError> {
     let body = request
         .map_err(|_| invalid_request(GatewayContractError::new("body", "could not be read")))?;
     let content_type = headers
@@ -1959,7 +2021,7 @@ async fn form_body(
     let (body, files) = FormReader::new(body, limit)
         .decode(content_type, sink)
         .await?;
-    Ok((body, Some(MediaRequest { route, files })))
+    Ok((RequestJson::from(body), Some(MediaRequest { route, files })))
 }
 
 /// Validates a decoded public body and runs it as a governed `operation`
@@ -1980,13 +2042,14 @@ async fn invoke_openai(
     state: &AppState,
     caller: &Caller,
     clock: Option<IngressClock>,
-    request: Result<(Value, Option<MediaRequest>), WyrdError>,
+    request: Result<(RequestJson, Option<MediaRequest>), WyrdError>,
     operation: GatewayOperation,
     headers: Option<&HeaderMap>,
 ) -> Result<GatewayCallResponse, WyrdError> {
     let (body, media) = request?;
     let model = body
-        .get("model")
+        .member("model")
+        .as_deref()
         .and_then(Value::as_str)
         .ok_or_else(|| GatewayContractError::new("model", "must be <provider>/<model>"))
         .and_then(ModelRef::from_projection)
@@ -2009,7 +2072,7 @@ async fn invoke_openai(
                 ingress: IngressDialect::OpenAi,
                 model,
                 fallback,
-                stream: body.get("stream") == Some(&Value::Bool(true)),
+                stream: body.member("stream").as_deref() == Some(&Value::Bool(true)),
                 body,
                 media,
                 batch: None,
@@ -2049,9 +2112,9 @@ pub(super) fn openai_error(error: &WyrdError) -> Response {
 /// member bounds.
 pub(super) fn usage_bound(
     operation: GatewayOperation,
-    body: &Value,
+    body: &RequestJson,
 ) -> Option<Vec<GatewayUsageAmount>> {
-    let field = |name: &str| body.get(name).and_then(Value::as_u64);
+    let field = |name: &str| body.member(name).and_then(|member| member.as_u64());
     let output = match operation {
         GatewayOperation::ChatCompletions => Some(
             field("max_completion_tokens")
@@ -2074,13 +2137,22 @@ pub(super) fn usage_bound(
 /// tokens, or `None` when a quantity cannot be represented.
 ///
 /// Input tokens are bounded by the compact serialized body length, since no
-/// token is shorter than one byte; the length is counted as the body
+/// token is shorter than one byte. Kept compact text is that serialization,
+/// so its length is read directly; a decoded body's length is counted as it
 /// serializes, without keeping its text. `output` of `None` adds no output
 /// dimension.
-pub(super) fn token_bound(body: &Value, output: Option<u64>) -> Option<Vec<GatewayUsageAmount>> {
-    let mut length = SerializedLength(0);
-    serde_json::to_writer(&mut length, body).ok()?;
-    let input = u64::try_from(length.0).ok()?;
+pub(super) fn token_bound(
+    body: &RequestJson,
+    output: Option<u64>,
+) -> Option<Vec<GatewayUsageAmount>> {
+    let length = if let Some(text) = body.text() {
+        text.len()
+    } else {
+        let mut length = SerializedLength(0);
+        serde_json::to_writer(&mut length, body.tree()).ok()?;
+        length.0
+    };
+    let input = u64::try_from(length).ok()?;
     let amount = |dimension: &str, quantity: u64| {
         Some(GatewayUsageAmount {
             dimension: dimension.to_owned(),
@@ -2111,27 +2183,58 @@ impl std::io::Write for SerializedLength {
 
 #[cfg(test)]
 mod usage_bound_tests {
-    use axum::Json;
-    use axum::extract::rejection::JsonRejection;
     use serde::de::DeserializeOwned;
     use serde_json::{Value, json};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use wyrd_gateway::{
         AttemptResult, BatchAction, BatchInput, BuiltinEndpoints, CallPlan, GatewayTenantSnapshot,
         HttpProviderDispatch, IngressDialect, MediaRequest, OpenAiMediaRoute, ProviderAttempt,
-        ProviderDispatch, ProviderSecret, UploadContent, UploadFile,
+        ProviderDispatch, ProviderSecret, RequestJson, UploadContent, UploadFile,
     };
     use wyrd_spec::error::WyrdError;
+    use wyrd_spec::gateway::native::{
+        GatewayAnthropicMessagesRequest, GatewayGeminiGenerateContentRequest, GatewayJevRequest,
+    };
     use wyrd_spec::gateway::openai::{
         GatewayBatchCreateRequest, GatewayChatCompletionsRequest, GatewayEmbeddingsRequest,
         GatewayImageGenerationRequest, GatewayResponsesRequest, GatewaySpeechRequest,
     };
     use wyrd_spec::gateway::{
-        GatewayCallId, GatewayGovernancePolicy, GatewayOperation, ModelRef, ProviderDeployment,
+        GatewayCallId, GatewayGovernancePolicy, GatewayOperation, GatewayUsageAmount, ModelRef,
+        ProviderDeployment,
     };
 
-    use super::{typed_body, usage_bound};
+    use super::super::ingress::{anthropic_usage_bound, google_usage_bound};
+    use super::{Body, CONTENT_TYPE, HeaderValue, Json, JsonBody, typed_body, usage_bound};
+    use crate::http::error::WyrdErrorResponse;
     use crate::test_support::CountingAllocator;
+
+    /// `body` as it arrives: its compact text, which an object keeps
+    /// undecoded.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `body` does not serialize.
+    fn arrived(body: &Value) -> RequestJson {
+        RequestJson::parse(serde_json::to_vec(body).expect("json").into()).expect("decodes")
+    }
+
+    /// The usage bound of `body` as it arrives, asserting a decoded body is
+    /// bounded alike.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the two bounds differ.
+    fn bounded(operation: GatewayOperation, body: &Value) -> Option<Vec<GatewayUsageAmount>> {
+        let kept = usage_bound(operation, &arrived(body));
+        let decoded = usage_bound(operation, &RequestJson::from(body.clone()));
+        assert_eq!(
+            format!("{kept:?}"),
+            format!("{decoded:?}"),
+            "kept and decoded bounds of {body}"
+        );
+        kept
+    }
 
     /// Chat output is bounded by the maximum times the choice count, Responses
     /// output by `max_output_tokens`, and input by the body length; a chat or
@@ -2148,24 +2251,24 @@ mod usage_bound_tests {
     fn usage_bound_requires_an_output_maximum_where_output_exists() {
         let length = |body: &serde_json::Value| body.to_string().len().to_string();
         let chat = json!({"model": "acme/a", "max_tokens": 50, "n": 2});
-        let bound = usage_bound(GatewayOperation::ChatCompletions, &chat).expect("bounded");
+        let bound = bounded(GatewayOperation::ChatCompletions, &chat).expect("bounded");
         assert_eq!(bound[0].quantity.as_str(), length(&chat));
         assert_eq!(bound[1].quantity.as_str(), "100");
         let responses = json!({"model": "acme/a", "max_output_tokens": 7});
-        let bound = usage_bound(GatewayOperation::Responses, &responses).expect("bounded");
+        let bound = bounded(GatewayOperation::Responses, &responses).expect("bounded");
         assert_eq!(bound[1].quantity.as_str(), "7");
         let embeddings = json!({"model": "acme/a", "input": ["a", "b"]});
-        let bound = usage_bound(GatewayOperation::Embeddings, &embeddings).expect("bounded");
+        let bound = bounded(GatewayOperation::Embeddings, &embeddings).expect("bounded");
         assert_eq!(bound.len(), 1);
         assert_eq!(bound[0].quantity.as_str(), length(&embeddings));
         for operation in [
             GatewayOperation::ChatCompletions,
             GatewayOperation::Responses,
         ] {
-            assert!(usage_bound(operation, &json!({"model": "acme/a"})).is_none());
+            assert!(bounded(operation, &json!({"model": "acme/a"})).is_none());
         }
         let overflowing = json!({"model": "acme/a", "max_tokens": u64::MAX, "n": 2});
-        assert!(usage_bound(GatewayOperation::ChatCompletions, &overflowing).is_none());
+        assert!(bounded(GatewayOperation::ChatCompletions, &overflowing).is_none());
 
         for body in [
             json!({"input": "quote \" slash \\ tab \t nul \u{0} bell \u{7}"}),
@@ -2173,20 +2276,22 @@ mod usage_bound_tests {
             json!({"input": [[1, {"a": {"b": [true, false, null]}}], {}, []]}),
             json!({"input": [0, -1, u64::MAX, i64::MIN, 1.5, -0.0, 1e300, 2.5e-8]}),
         ] {
-            let bound = usage_bound(GatewayOperation::Embeddings, &body).expect("bounded");
+            let bound = bounded(GatewayOperation::Embeddings, &body).expect("bounded");
             assert_eq!(bound[0].quantity.as_str(), length(&body), "{body}");
         }
 
         let long = "x".repeat(1 << 20);
         let large = json!({"model": "acme/a", "messages": [{"content": long}], "max_tokens": 1});
-        let (bound, allocated) = CountingAllocator::measure(|| {
-            usage_bound(GatewayOperation::ChatCompletions, &large).expect("bounded")
-        });
-        assert_eq!(bound[0].quantity.as_str(), length(&large));
-        assert!(
-            allocated < 4096,
-            "counting serializes no request text: {allocated} bytes allocated"
-        );
+        for large in [arrived(&large), RequestJson::from(large.clone())] {
+            let (bound, allocated) = CountingAllocator::measure(|| {
+                usage_bound(GatewayOperation::ChatCompletions, &large).expect("bounded")
+            });
+            assert_eq!(bound[0].quantity.as_str(), length(large.tree()));
+            assert!(
+                allocated < 4096,
+                "counting serializes no request text: {allocated} bytes allocated"
+            );
+        }
     }
 
     /// The error projection of an owned decode of `body` as `T`: the missing
@@ -2203,21 +2308,36 @@ mod usage_bound_tests {
     }
 
     /// One operation's request validation, as the routes call it.
-    type Validate = fn(Result<Json<Value>, JsonRejection>) -> Result<Value, WyrdError>;
+    type Validate = fn(Result<JsonBody, WyrdErrorResponse>) -> Result<RequestJson, WyrdError>;
 
     /// One operation's owned reference decode.
     type Owned = fn(&Value) -> Result<(), String>;
 
-    /// Validates `body` with `validate`, asserting the checked body is
-    /// returned unchanged, and projects a refusal to its `field`.
+    /// One family's usage bound of a request body.
+    type Bound = fn(&RequestJson) -> Option<Vec<GatewayUsageAmount>>;
+
+    /// Validates `body` with `validate` as it arrives, asserting a decoded
+    /// body is judged alike and the checked body is returned unchanged, and
+    /// projects a refusal to its `field`.
     fn checked(validate: Validate, body: &Value) -> Result<(), String> {
-        match validate(Ok(Json(body.clone()))) {
+        let decoded = validate(Ok(JsonBody(RequestJson::from(body.clone()))));
+        match validate(Ok(JsonBody(arrived(body)))) {
             Ok(returned) => {
-                assert_eq!(&returned, body, "validation returns the body unchanged");
+                assert_eq!(
+                    returned.tree(),
+                    body,
+                    "validation returns the body unchanged"
+                );
+                assert_eq!(decoded.expect("decoded body valid").tree(), body);
                 Ok(())
             }
             Err(WyrdError::GatewayInvalidRequest { details, .. }) => {
-                Err(details["field"].as_str().expect("field").to_owned())
+                let field = details["field"].as_str().expect("field").to_owned();
+                assert!(
+                    matches!(decoded, Err(WyrdError::GatewayInvalidRequest { details, .. }) if details["field"] == field.as_str()),
+                    "decoded body refused alike: {body}"
+                );
+                Err(field)
             }
             Err(error) => panic!("unexpected refusal {error}"),
         }
@@ -2298,7 +2418,7 @@ mod usage_bound_tests {
         /// Gateway operation of the attempt.
         operation: GatewayOperation,
         /// The caller's body.
-        body: &'a Value,
+        body: &'a RequestJson,
         /// Media route and files of an Images or Audio attempt.
         media: Option<&'a MediaRequest>,
         /// Batches lifecycle action of a Batches attempt.
@@ -2586,9 +2706,13 @@ mod usage_bound_tests {
         for (operation, _, validate) in decoders {
             let allocated = |text: usize, extension: usize| {
                 let body = sized(operation, &kib(text), &kib(extension));
-                let input = Ok(Json(body.clone()));
+                let input = Ok(JsonBody(arrived(&body)));
                 let (checked, bytes) = CountingAllocator::measure(|| validate(input));
-                assert_eq!(checked.expect("valid"), body, "{operation} body unchanged");
+                assert_eq!(
+                    checked.expect("valid").tree(),
+                    &body,
+                    "{operation} body unchanged"
+                );
                 bytes
             };
             let base = allocated(1024, 1024);
@@ -2654,7 +2778,7 @@ mod usage_bound_tests {
                 &deployment,
                 &Native {
                     operation: GatewayOperation::Images,
-                    body: &body,
+                    body: &arrived(&body),
                     media: Some(&media),
                     batch: None,
                 },
@@ -2671,7 +2795,7 @@ mod usage_bound_tests {
                 &deployment,
                 &Native {
                     operation: GatewayOperation::Audio,
-                    body: &body,
+                    body: &RequestJson::from(body),
                     media: Some(&media),
                     batch: None,
                 },
@@ -2689,7 +2813,7 @@ mod usage_bound_tests {
                 &deployment,
                 &Native {
                     operation: GatewayOperation::Batches,
-                    body: &body,
+                    body: &RequestJson::from(body),
                     media: None,
                     batch: Some(&BatchAction::CreateBatch),
                 },
@@ -2711,7 +2835,7 @@ mod usage_bound_tests {
                 &deployment,
                 &Native {
                     operation: GatewayOperation::Batches,
-                    body: &json!({"purpose": "batch"}),
+                    body: &RequestJson::from(json!({"purpose": "batch"})),
                     media: None,
                     batch: Some(&action),
                 },
@@ -2768,6 +2892,9 @@ mod usage_bound_tests {
                     {"role": "tool", "tool_call_id": "c", "content": text},
                 ],
             });
+            // Translation reads the decoded body, which escaped arguments
+            // need, so it is measured as planning receives it.
+            let body = RequestJson::from(body);
             let mut plan = CallPlan::new(
                 &snapshot,
                 GatewayCallId::new_v7(),
@@ -2793,5 +2920,313 @@ mod usage_bound_tests {
                 "translated planning copies the request with more {label}: {base} then {grown} bytes"
             );
         }
+    }
+
+    /// One typed validation as an outcome: the checked body's decoded value,
+    /// or the refused field.
+    fn validated(validate: Validate, body: RequestJson) -> Result<Value, String> {
+        match validate(Ok(JsonBody(body))) {
+            Ok(checked) => Ok(checked.into_tree()),
+            Err(WyrdError::GatewayInvalidRequest { details, .. }) => {
+                Err(details["field"].as_str().unwrap_or("body").to_owned())
+            }
+            Err(error) => panic!("unexpected refusal {error}"),
+        }
+    }
+
+    /// Native JSON ingress keeps a body's arrived text only when it is the
+    /// compact serialization of its decoded value, and is then the decoded
+    /// body for every reader: the same decode refusals, decoded value,
+    /// members, typed validation of every native family, usage bounds of every
+    /// bounded family, and provider bytes with or without a model override.
+    /// Whitespace, escapes `serde_json` writes differently, duplicate names,
+    /// renormalized numbers, deep nesting, and non-object bodies take the
+    /// decoded path. Its JSON media types are exactly those [`Json`] accepts,
+    /// and a large unescaped body is kept in the very buffer that arrived and
+    /// is validated, bounded, and encoded without a decoded copy.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any reader of a kept body differs from the decoded one,
+    /// the kept decision differs from the expected one, a media type is judged
+    /// unlike [`Json`] judges it, or the large body is copied or decoded.
+    #[test]
+    fn native_raw_ingress_matches_value_contract_and_bounds() {
+        use axum::extract::FromRequest as _;
+        use bytes::Bytes;
+
+        let deep = |depth: usize| {
+            format!(
+                r#"{{"model":"acme/a","x":{}{}}}"#,
+                "[".repeat(depth),
+                "]".repeat(depth)
+            )
+        };
+        let members = |count: usize| {
+            let members: Vec<String> = (0..count)
+                .map(|index| format!(r#""m{index}":{index}"#))
+                .collect();
+            format!("{{{}}}", members.join(","))
+        };
+        // `Some(kept)` pins the representation; `None` pins only agreement.
+        let cases: Vec<(String, Option<bool>)> = [
+            (r#"{"model":"acme/a","messages":[{"role":"user","content":"hi"}],"max_tokens":5,"n":2}"#, Some(true)),
+            (r#"{"model":"acme/a","messages":[{"role":"user","content":"hi"}],"stream":true}"#, Some(true)),
+            (r#"{ "model": "acme/a", "messages": [] }"#, Some(false)),
+            ("{\"model\":\"acme/a\",\n\"input\":\"a\"}", Some(false)),
+            (r#"{"model":"acme/a","input":"q\"s\\n\nt\tc\u0001"}"#, Some(true)),
+            (r#"{"model":"acme/a","input":"\u00e9"}"#, Some(false)),
+            (r#"{"model":"acme/a","input":"a\/b"}"#, Some(false)),
+            (r#"{"model":"acme/a","input":"\u001F"}"#, Some(false)),
+            (r#"{"model":"acme/a","input":"é ☃ 🦀 \u2028"}"#, Some(false)),
+            ("{\"model\":\"acme/a\",\"input\":\"é ☃ 🦀 \u{2028}\"}", Some(true)),
+            (r#"{"q\"name":1,"ключ":["ü"]}"#, Some(true)),
+            (r#"{"model":"acme/a","model":"acme/b","input":"a"}"#, Some(false)),
+            (r#"{"model":"acme/a","x":{"a":1,"a":2}}"#, Some(false)),
+            (r#"{"model":"acme/a","x":[{"a":1},{"a":2}]}"#, Some(true)),
+            (r#"{"model":"acme/a","max_tokens":1.0,"t":1.5,"p":0.1,"z":-0.0}"#, Some(true)),
+            (r#"{"model":"acme/a","max_tokens":1e2}"#, Some(false)),
+            (r#"{"model":"acme/a","max_tokens":10E0}"#, Some(false)),
+            (r#"{"model":"acme/a","t":1.50}"#, Some(false)),
+            (r#"{"model":"acme/a","max_tokens":-0}"#, None),
+            (r#"{"model":"acme/a","max_tokens":18446744073709551615,"n":2}"#, Some(true)),
+            (r#"{"model":"acme/a","max_tokens":18446744073709551616}"#, Some(false)),
+            (r#"{"model":"acme/a","max_tokens":-9223372036854775808}"#, Some(true)),
+            (r#"{"model":"acme/a","t":1e400}"#, None),
+            (r#"{"model":"acme/a","t":1e-400}"#, None),
+            (r#"{"model":"acme/a","input":"\ud800"}"#, None),
+            (r#"{"model":"acme/a","input":"\ud83e\udd80"}"#, Some(false)),
+            (r#"{"model":"acme/a","input":"a"} "#, Some(false)),
+            (r#"{"model":"acme/a"}x"#, None),
+            (r#"{"model":"acme/a"}{}"#, None),
+            (r#"{"model":"acme/a""#, None),
+            ("", None),
+            (r#"{"model":"acme/a","input":null,"x":true,"y":false,"z":{},"w":[]}"#, Some(true)),
+            ("{}", Some(true)),
+            (r#"[{"model":"acme/a"}]"#, Some(false)),
+            (r#""acme/a""#, Some(false)),
+            ("null", Some(false)),
+            (r#"{"contents":[{"parts":[{"text":"hi"}]}],"generationConfig":{"maxOutputTokens":8,"candidateCount":2}}"#, Some(true)),
+            (r#"{"contents":[],"generation_config":{"max_output_tokens":8}}"#, Some(true)),
+            (r#"{"model":"claude/m","max_tokens":4,"messages":[{"role":"user","content":"hi"}]}"#, Some(true)),
+            (r#"{"model":"jev/m","input":{"text":"hi"}}"#, Some(true)),
+        ]
+        .into_iter()
+        .map(|(text, kept)| (text.to_owned(), kept))
+        .chain([
+            (deep(120), Some(true)),
+            (deep(126), None),
+            (deep(127), None),
+            (deep(400), None),
+            (members(64), Some(true)),
+            (members(65), Some(false)),
+        ])
+        .collect();
+
+        let validators: Vec<(&str, Validate)> = decoders()
+            .into_iter()
+            .map(|(name, _, validate)| (name, validate))
+            .chain([
+                (
+                    "anthropic",
+                    typed_body::<GatewayAnthropicMessagesRequest> as Validate,
+                ),
+                ("gemini", typed_body::<GatewayGeminiGenerateContentRequest>),
+                ("jev", typed_body::<GatewayJevRequest>),
+            ])
+            .collect();
+        let bounds: [(&str, Bound); 5] = [
+            ("chat", |body| {
+                usage_bound(GatewayOperation::ChatCompletions, body)
+            }),
+            ("responses", |body| {
+                usage_bound(GatewayOperation::Responses, body)
+            }),
+            ("embeddings", |body| {
+                usage_bound(GatewayOperation::Embeddings, body)
+            }),
+            ("anthropic", anthropic_usage_bound),
+            ("gemini", google_usage_bound),
+        ];
+        let mut tally = [0_usize; 3];
+        for (text, kept) in &cases {
+            let owned = serde_json::from_slice::<Value>(text.as_bytes());
+            let parsed = RequestJson::parse(Bytes::copy_from_slice(text.as_bytes()));
+            assert_eq!(parsed.is_ok(), owned.is_ok(), "decode agreement: {text}");
+            let (Ok(parsed), Ok(owned)) = (parsed, owned) else {
+                tally[2] += 1;
+                continue;
+            };
+            let decoded = RequestJson::from(owned.clone());
+            tally[usize::from(parsed.text().is_none())] += 1;
+            if let Some(kept) = kept {
+                assert_eq!(parsed.text().is_some(), *kept, "kept decision: {text}");
+            }
+            if let Some(kept) = parsed.text() {
+                assert_eq!(kept, text.as_bytes(), "kept text is the arrived text");
+                assert_eq!(
+                    kept,
+                    &serde_json::to_vec(&owned).expect("json")[..],
+                    "kept text is the compact serialization: {text}"
+                );
+            }
+            assert_eq!(parsed.tree(), &owned, "decoded value: {text}");
+            assert_eq!(parsed.is_object(), owned.is_object(), "{text}");
+            for name in ["model", "stream", "max_tokens", "input", "m63", "absent"] {
+                assert_eq!(
+                    parsed.member(name).as_deref(),
+                    owned.get(name),
+                    "member {name}: {text}"
+                );
+            }
+            for (family, validate) in &validators {
+                assert_eq!(
+                    validated(*validate, parsed.clone()),
+                    validated(*validate, decoded.clone()),
+                    "{family} validation: {text}"
+                );
+            }
+            for (family, bound) in &bounds {
+                assert_eq!(
+                    format!("{:?}", bound(&parsed)),
+                    format!("{:?}", bound(&decoded)),
+                    "{family} bound: {text}"
+                );
+            }
+            if let Value::Object(members) = &owned {
+                for model in [None, Some("native-m"), Some("q\"m")] {
+                    assert_eq!(
+                        parsed.to_json(model).expect("encodes"),
+                        skald_providers::RequestBody::Object { members, model }
+                            .to_json()
+                            .expect("encodes"),
+                        "provider bytes with model {model:?}: {text}"
+                    );
+                }
+            }
+        }
+        assert_eq!(tally, [18, 20, 8], "kept, decoded, and refused bodies");
+
+        // Media types and body refusals are exactly those of `Json`.
+        let runtime = wyrd_runtime::runtime();
+        let request = |content_type: Option<&[u8]>, body: &str| {
+            let mut request = axum::extract::Request::new(Body::from(body.to_owned()));
+            if let Some(content_type) = content_type {
+                request.headers_mut().insert(
+                    CONTENT_TYPE,
+                    HeaderValue::from_bytes(content_type).expect("header value"),
+                );
+            }
+            request
+        };
+        let judged = |content_type: Option<&[u8]>, body: &str| {
+            let axum = runtime
+                .block_on(Json::<Value>::from_request(
+                    request(content_type, body),
+                    &(),
+                ))
+                .is_ok();
+            let kept = runtime
+                .block_on(JsonBody::from_request(request(content_type, body), &()))
+                .is_ok();
+            (axum, kept)
+        };
+        let differing: Vec<_> = [
+            Some(&b"application/json"[..]),
+            Some(b"Application/JSON"),
+            Some(b"application/json; charset=utf-8"),
+            Some(b"application/json;charset=\"utf-8\""),
+            Some(b"application/vnd.api+json"),
+            Some(b"application/problem+JSON; v=1"),
+            Some(b"application/+json"),
+            Some(b"application/json+"),
+            Some(b"application/jsonx"),
+            Some(b"application/json "),
+            Some(b" application/json"),
+            Some(b"application/ json"),
+            Some(b"application /json"),
+            Some(b"application"),
+            Some(b"application/"),
+            Some(b"/json"),
+            Some(b"text/json"),
+            Some(b"text/plain"),
+            Some(b"multipart/form-data; boundary=x"),
+            Some(b"application/x-www-form-urlencoded"),
+            Some(b"application/json, text/plain"),
+            Some(b"application/ld+json;"),
+            Some(b"application/a+b+json"),
+            Some(b"application/a b+json"),
+            Some(b"application/a/b+json"),
+            Some(b"application/a@b+json"),
+            Some(b"application/json ;charset=utf-8"),
+            Some(b"application/json; charset"),
+            Some(b"application/json;"),
+            Some(b"application/json;;"),
+            Some(b"application/json; charset=utf-8; q"),
+            Some(b"application/json\t"),
+            Some(b"application/json\xff"),
+            Some(b""),
+            None,
+        ]
+        .into_iter()
+        .filter(|content_type| {
+            let (axum, kept) = judged(*content_type, "{}");
+            kept != axum
+        })
+        .map(|content_type| content_type.map(String::from_utf8_lossy))
+        .collect();
+        assert!(
+            differing.is_empty(),
+            "media types judged unlike Json: {differing:?}"
+        );
+        for (text, _) in &cases {
+            let (axum, kept) = judged(Some(b"application/json"), text);
+            assert_eq!(kept, axum, "body refusal: {text}");
+        }
+
+        // The 64 KiB unescaped body is kept in the buffer that arrived, and
+        // validation, bounding, and encoding copy none of its text.
+        let content = "x".repeat(64 << 10);
+        let body = json!({
+            "model": "acme/a",
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": 16,
+        });
+        let arrived_text = Bytes::from(serde_json::to_vec(&body).expect("json"));
+        let (parsed, allocated) =
+            CountingAllocator::measure(|| RequestJson::parse(arrived_text.clone()));
+        let parsed = parsed.expect("decodes");
+        assert!(allocated < 4096, "keeping copies text: {allocated} bytes");
+        assert!(
+            std::ptr::eq(parsed.text().expect("kept").as_ptr(), arrived_text.as_ptr()),
+            "the kept text is the arrived buffer"
+        );
+        let (checked, allocated) = CountingAllocator::measure(|| {
+            typed_body::<GatewayChatCompletionsRequest>(Ok(JsonBody(parsed)))
+        });
+        let checked = checked.expect("valid");
+        assert!(
+            allocated < 4096,
+            "validation copies text: {allocated} bytes"
+        );
+        assert!(std::ptr::eq(
+            checked.text().expect("still kept").as_ptr(),
+            arrived_text.as_ptr()
+        ));
+        let (bound, allocated) = CountingAllocator::measure(|| {
+            usage_bound(GatewayOperation::ChatCompletions, &checked).expect("bounded")
+        });
+        assert_eq!(bound[0].quantity.as_str(), arrived_text.len().to_string());
+        assert!(allocated < 4096, "bounding copies text: {allocated} bytes");
+        let (encoded, allocated) =
+            CountingAllocator::measure(|| checked.to_json(Some("native-m")).expect("encodes"));
+        assert!(
+            allocated < encoded.len() + 1024,
+            "encoding writes one buffer: {allocated} bytes for {}",
+            encoded.len()
+        );
+        let mut expected = body;
+        expected["model"] = json!("native-m");
+        assert_eq!(encoded, serde_json::to_vec(&expected).expect("json"));
     }
 }

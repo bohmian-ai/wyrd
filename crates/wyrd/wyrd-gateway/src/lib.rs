@@ -17,6 +17,7 @@ mod engine;
 mod health;
 mod managed;
 mod pricing;
+mod request;
 mod routing;
 mod snapshot;
 mod vault;
@@ -36,6 +37,7 @@ pub use engine::{
 pub use health::DeploymentHealth;
 pub use managed::ManagedSecretBinding;
 pub use pricing::{GatewayCost, PricedModel};
+pub use request::RequestJson;
 pub use routing::{CallPlan, PlannedCandidate};
 pub use skald_providers::{MediaAnswer, OpenAiMediaRoute, UploadContent, UploadFile};
 pub use snapshot::{

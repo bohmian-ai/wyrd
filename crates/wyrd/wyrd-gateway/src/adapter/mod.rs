@@ -24,10 +24,10 @@ use std::borrow::Cow;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
+use serde::Serialize;
 use serde::de::{
     self, DeserializeOwned, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor,
 };
-use serde::{Deserialize as _, Serialize};
 use serde_json::value::{RawValue, to_raw_value};
 use serde_json::{Map, Value, json};
 use skald_providers::RequestBody;
@@ -57,6 +57,7 @@ use wyrd_spec::ids::ModelId;
 
 use crate::credential::ProviderSecret;
 use crate::engine::{AttemptUsage, JsonAnswer};
+use crate::request::RequestJson;
 
 pub use batch::{BATCH_ENDPOINTS, BatchAction, BatchInput};
 pub use http::{BuiltinEndpoints, HttpProviderDispatch};
@@ -151,30 +152,34 @@ pub(crate) enum Prepared<'a> {
 /// exactly as submitted.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct NativeBody<'a> {
-    /// The caller's body, shared by every attempt of the call.
-    body: &'a Map<String, Value>,
+    /// The caller's object body, shared by every attempt of the call.
+    body: &'a RequestJson,
     /// The deployment's native model, when the dialect carries it in the body.
     model: Option<&'a str>,
 }
 
 impl NativeBody<'_> {
     /// Serializes the body with its model applied as compact JSON bytes,
-    /// through [`RequestBody::to_json`].
+    /// through [`RequestJson::to_json`].
     ///
     /// # Errors
     ///
     /// Returns the serialization error of a member serde cannot write.
     pub(crate) fn to_json(self) -> serde_json::Result<Vec<u8>> {
-        RequestBody::from(self).to_json()
+        self.body.to_json(self.model)
     }
 }
 
 impl<'a> From<NativeBody<'a>> for RequestBody<'a> {
-    /// The body as the provider encoders take it, its model still unapplied.
+    /// The decoded body as the provider encoders take it, its model still
+    /// unapplied.
     fn from(body: NativeBody<'a>) -> Self {
-        Self::Object {
-            members: body.body,
-            model: body.model,
+        match body.body.tree() {
+            Value::Object(members) => Self::Object {
+                members,
+                model: body.model,
+            },
+            other => Self::Json(other),
         }
     }
 }
@@ -227,7 +232,7 @@ pub(crate) fn check<'a>(
     ingress: IngressDialect,
     operation: GatewayOperation,
     stream: bool,
-    body: &'a Value,
+    body: &'a RequestJson,
     deployment: &ProviderDeployment,
     model: &'a ModelId,
     media: Option<&MediaRequest>,
@@ -245,7 +250,11 @@ pub(crate) fn check<'a>(
     if matches!(
         ingress,
         IngressDialect::OpenAi | IngressDialect::AnthropicMessages
-    ) && body.get("stream").and_then(Value::as_bool).unwrap_or(false) != stream
+    ) && body
+        .member("stream")
+        .and_then(|member| member.as_bool())
+        .unwrap_or(false)
+        != stream
     {
         return Err(UnsupportedRequest::new(
             "stream",
@@ -327,7 +336,7 @@ pub(crate) fn prepare<'a>(
     ingress: IngressDialect,
     operation: GatewayOperation,
     stream: bool,
-    body: &'a Value,
+    body: &'a RequestJson,
     deployment: &ProviderDeployment,
     model: &'a ModelId,
     media: Option<&MediaRequest>,
@@ -725,12 +734,12 @@ fn unsupported_operation(
 ///
 /// Returns [`UnsupportedRequest`] for a non-object body.
 fn native<'a>(
-    body: &'a Value,
+    body: &'a RequestJson,
     model: Option<&'a str>,
 ) -> Result<NativeBody<'a>, UnsupportedRequest> {
-    let Value::Object(body) = body else {
+    if !body.is_object() {
         return Err(UnsupportedRequest::new("body", "must be a JSON object"));
-    };
+    }
     Ok(NativeBody { body, model })
 }
 
@@ -752,13 +761,15 @@ const MAX_EMBEDDING_INPUTS: usize = 2048;
 /// request, `input` when it is empty, carries an empty item, or exceeds
 /// [`MAX_EMBEDDING_INPUTS`], `dimensions` when it is zero, and
 /// `encoding_format` for a format other than `float` or `base64`.
-fn embeddings(body: &Value) -> Result<(), UnsupportedRequest> {
-    let request = OpenAiEmbeddingsRequestView::deserialize(body).map_err(|error| {
-        UnsupportedRequest::new(
-            "body",
-            format!("is not a valid embeddings request: {error}"),
-        )
-    })?;
+fn embeddings(body: &RequestJson) -> Result<(), UnsupportedRequest> {
+    let request = body
+        .view::<OpenAiEmbeddingsRequestView>()
+        .map_err(|error| {
+            UnsupportedRequest::new(
+                "body",
+                format!("is not a valid embeddings request: {error}"),
+            )
+        })?;
     let (count, empty_item) = inputs(&request.input);
     if count == 0 || empty_item {
         return Err(UnsupportedRequest::new(
@@ -812,9 +823,9 @@ fn inputs(input: &OpenAiEmbeddingsInputView<'_>) -> (usize, bool) {
 /// every vector must have exactly that many values. A provider silently
 /// ignoring any of these would weaken the request, so the attempt fails
 /// instead of returning the answer.
-pub(crate) fn faithful_embeddings(request: &Value, answer: &str) -> bool {
+pub(crate) fn faithful_embeddings(request: &RequestJson, answer: &str) -> bool {
     let (Ok(request), Ok(answer)) = (
-        OpenAiEmbeddingsRequestView::deserialize(request),
+        request.view::<OpenAiEmbeddingsRequestView>(),
         serde_json::from_str::<Value>(answer),
     ) else {
         return false;
@@ -888,8 +899,8 @@ fn streamable(
 /// # Errors
 ///
 /// Returns [`UnsupportedRequest`] naming the decode failure.
-fn chat_view(body: &Value) -> Result<OpenAiChatRequestView<'_>, UnsupportedRequest> {
-    OpenAiChatRequestView::deserialize(body).map_err(not_chat)
+fn chat_view(body: &RequestJson) -> Result<OpenAiChatRequestView<'_>, UnsupportedRequest> {
+    body.view().map_err(not_chat)
 }
 
 /// Decodes a checked `OpenAI` Chat Completions body into its typed Skald
@@ -898,8 +909,8 @@ fn chat_view(body: &Value) -> Result<OpenAiChatRequestView<'_>, UnsupportedReque
 /// # Errors
 ///
 /// Returns [`UnsupportedRequest`] naming the decode failure.
-fn chat_request(body: &Value) -> Result<OpenAiChatRequest, UnsupportedRequest> {
-    OpenAiChatRequest::deserialize(body).map_err(not_chat)
+fn chat_request(body: &RequestJson) -> Result<OpenAiChatRequest, UnsupportedRequest> {
+    body.view().map_err(not_chat)
 }
 
 /// The rejection of a body that is not a chat completion request.

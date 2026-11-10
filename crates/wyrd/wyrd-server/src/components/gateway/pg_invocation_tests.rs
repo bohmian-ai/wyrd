@@ -10,7 +10,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use axum::Json;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -63,6 +62,7 @@ use super::ledger::{Accounted, GatewayLedger, LedgerCall};
 use super::pg_administration_tests::{
     admin, audit_decisions, await_lock_waiters, sealing_keyring, test_state,
 };
+use super::routes::JsonBody;
 use super::{GatewayAdministration, GatewayCallRequest, GatewayCallResponse, GatewayInvocation};
 use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
@@ -257,7 +257,7 @@ fn request(requested: &str, bound: Option<(u64, u64)>, timeout: Duration) -> Gat
         ingress: IngressDialect::OpenAi,
         model: model(requested),
         fallback: None,
-        body: json!({"model": requested, "messages": []}),
+        body: json!({"model": requested, "messages": []}).into(),
         media: None,
         batch: None,
         deployment: None,
@@ -849,7 +849,7 @@ async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
         Ok(invoker(tenant, 1, [])),
         None,
         HeaderMap::new(),
-        Ok(Json(
+        Ok(JsonBody::from(
             json!({"model": "dep-a/a", "max_tokens": 10, "messages": []}),
         )),
     )
@@ -922,7 +922,7 @@ async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
         Ok(broad),
         None,
         HeaderMap::new(),
-        Ok(Json(
+        Ok(JsonBody::from(
             json!({"model": "dep-a/a", "max_tokens": 10, "messages": []}),
         )),
     )
@@ -1603,7 +1603,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
     type Handler = fn(
         State<AppState>,
         Result<Caller, WyrdErrorResponse>,
-        Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+        Result<JsonBody, WyrdErrorResponse>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = axum::response::Response> + Send>,
     >;
@@ -1714,12 +1714,12 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
             .extend(extra.as_object().expect("object").clone());
         body
     };
-    let call = |operation, body| GatewayCallRequest {
+    let call = |operation, body: Value| GatewayCallRequest {
         operation,
         ingress: IngressDialect::OpenAi,
         model: model("deepseek/deepseek-chat"),
         fallback: None,
-        body,
+        body: body.into(),
         media: None,
         batch: None,
         deployment: None,
@@ -1769,7 +1769,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         Ok(caller.clone()),
         None,
         HeaderMap::new(),
-        Ok(Json(chat(json!({"stream": true})))),
+        Ok(JsonBody::from(chat(json!({"stream": true})))),
     )
     .await;
     assert_eq!(streaming.status(), StatusCode::OK);
@@ -1836,7 +1836,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         State(state.clone()),
         Ok(caller.clone()), None,
         HeaderMap::new(),
-        Ok(Json(json!({"model": "deepseek/deepseek-chat", "input": "hi", "max_output_tokens": 8, "stream": true}))),
+        Ok(JsonBody::from(json!({"model": "deepseek/deepseek-chat", "input": "hi", "max_output_tokens": 8, "stream": true}))),
     )
     .await;
     assert_eq!(streamed_responses.status(), StatusCode::OK);
@@ -1848,7 +1848,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         State(state.clone()),
         Ok(caller.clone()),
         None,
-        Ok(Json(
+        Ok(JsonBody::from(
             json!({"model": "deepseek/deepseek-chat", "input": ["b", "a"], "dimensions": 1}),
         )),
     )
@@ -1866,7 +1866,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         State(state.clone()),
         Ok(caller.clone()),
         None,
-        Ok(Json(
+        Ok(JsonBody::from(
             json!({"model": "deepseek/deepseek-chat", "input": "a", "dimensions": 0}),
         )),
     )
@@ -1889,7 +1889,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
             Ok(caller.clone()),
             None,
             HeaderMap::new(),
-            Ok(Json(sent.clone())),
+            Ok(JsonBody::from(sent.clone())),
         )
         .await;
         assert_eq!(answered.status(), StatusCode::OK, "{input}");
@@ -1968,7 +1968,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         let refused = handler(
             State(state.clone()),
             Ok(caller.clone()),
-            Ok(Json(body.clone())),
+            Ok(JsonBody::from(body.clone())),
         )
         .await;
         assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{body}");
@@ -2023,7 +2023,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         State(state.clone()),
         Ok(caller.clone()),
         None,
-        Ok(Json(
+        Ok(JsonBody::from(
             json!({"model": "deepseek/deepseek-chat", "prompt": "a cat"}),
         )),
     )
@@ -2039,7 +2039,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         State(state.clone()),
         Ok(caller.clone()),
         None,
-        Ok(Json(
+        Ok(JsonBody::from(
             json!({"model": "deepseek/deepseek-chat", "input": "hi", "voice": "alloy"}),
         )),
     )
@@ -2194,7 +2194,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         Ok(caller.clone()),
         None,
         HeaderMap::new(),
-        Ok(Json(chat(json!({"user": "limited"})))),
+        Ok(JsonBody::from(chat(json!({"user": "limited"})))),
     )
     .await;
     assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -2271,7 +2271,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
             Ok(invoker(tenant, 7, [open_access()])),
             None,
             HeaderMap::new(),
-            Ok(Json(json!({
+            Ok(JsonBody::from(json!({
                 "model": format!("{name}/{name}"),
                 "messages": [{"role": "user", "content": "hi"}],
                 "stream": true,
@@ -2635,7 +2635,7 @@ async fn gateway_batches_converge_replays_on_one_upstream_batch() {
             State(state.clone()),
             Ok(caller.clone()),
             HeaderMap::new(),
-            Ok(Json(json!({
+            Ok(JsonBody::from(json!({
                 "input_file_id": file_id,
                 "endpoint": "/v1/chat/completions",
                 "completion_window": window,
@@ -2951,7 +2951,7 @@ async fn gateway_batch_creations_release_claims_only_without_dispatch() {
             State(state.clone()),
             Ok(caller.clone()),
             HeaderMap::new(),
-            Ok(Json(json!({
+            Ok(JsonBody::from(json!({
                 "input_file_id": file_id, "endpoint": "/v1/chat/completions",
                 "completion_window": "24h", "metadata": {"n": n},
             }))),
@@ -3023,7 +3023,7 @@ async fn gateway_batch_creations_release_claims_only_without_dispatch() {
         State(c.clone()),
         Ok(invoker(tenant, 9, [])),
         HeaderMap::new(),
-        Ok(Json(json!({
+        Ok(JsonBody::from(json!({
             "input_file_id": file_id, "endpoint": "/v1/chat/completions",
             "completion_window": "24h", "metadata": {"n": "denied"},
         }))),
@@ -3193,7 +3193,7 @@ async fn gateway_batch_dispatch_reauthorizes_against_its_routing_snapshot() {
             State(state.clone()),
             Ok(caller.clone()),
             HeaderMap::new(),
-            Ok(Json(json!({
+            Ok(JsonBody::from(json!({
                 "input_file_id": file_id, "endpoint": "/v1/chat/completions",
                 "completion_window": "24h", "metadata": {"n": n},
             }))),
@@ -4059,7 +4059,7 @@ async fn gateway_selected_speech_persists_one_retrievable_object() {
                 State(state),
                 Ok(invoker(tenant, 1, [open_access()])),
                 None,
-                Ok(Json(
+                Ok(JsonBody::from(
                     json!({"model": "speech/speech", "input": "hi", "voice": voice}),
                 )),
             )
@@ -4603,7 +4603,8 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
             "model": "deepseek/deepseek-chat",
             "user": user,
             "messages": [{"role": "user", "content": "hi"}],
-        }),
+        })
+        .into(),
         media: None,
         batch: None,
         deployment: None,
@@ -4663,7 +4664,9 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
     let stream = |user: &str| {
         let mut request = call(user);
         request.stream = true;
-        request.body["stream"] = json!(true);
+        let mut body = std::mem::take(&mut request.body).into_tree();
+        body["stream"] = json!(true);
+        request.body = body.into();
         request
     };
     let mut streams = Vec::new();
@@ -4685,7 +4688,7 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
                 &caller,
                 GatewayCallRequest {
                     operation: GatewayOperation::Images,
-                    body: json!({"model": "deepseek/deepseek-chat", "prompt": prompt}),
+                    body: json!({"model": "deepseek/deepseek-chat", "prompt": prompt}).into(),
                     media: Some(wyrd_gateway::MediaRequest {
                         route: wyrd_gateway::OpenAiMediaRoute::ImageGenerations,
                         files: Vec::new(),
@@ -5190,7 +5193,9 @@ async fn gateway_terminal_spans_classify_every_call_and_attempt() {
     let call = |name: &str, stream: bool| {
         let mut request = request(&format!("{name}/{name}"), None, Duration::from_secs(2));
         request.stream = stream;
-        request.body["stream"] = json!(stream);
+        let mut body = std::mem::take(&mut request.body).into_tree();
+        body["stream"] = json!(stream);
+        request.body = body.into();
         request
     };
     let caller = |n: u128| invoker(tenant, n, [open_access()]);
@@ -5600,16 +5605,30 @@ impl FallbackIngress {
         match self {
             Self::ChatCompletions => {
                 let body = json!({"model": requested, "messages": messages});
-                super::routes::chat_completions(state, caller, None, headers, Ok(Json(body))).await
+                super::routes::chat_completions(
+                    state,
+                    caller,
+                    None,
+                    headers,
+                    Ok(JsonBody::from(body)),
+                )
+                .await
             }
             Self::Responses => {
                 let body = json!({"model": requested, "input": "hi"});
-                super::routes::responses(state, caller, None, headers, Ok(Json(body))).await
+                super::routes::responses(state, caller, None, headers, Ok(JsonBody::from(body)))
+                    .await
             }
             Self::AnthropicMessages => {
                 let body = json!({"model": requested, "max_tokens": 8, "messages": messages});
-                super::ingress::anthropic_messages(state, caller, None, headers, Ok(Json(body)))
-                    .await
+                super::ingress::anthropic_messages(
+                    state,
+                    caller,
+                    None,
+                    headers,
+                    Ok(JsonBody::from(body)),
+                )
+                .await
             }
             Self::GeminiGenerateContent => {
                 let body = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]});
@@ -5627,7 +5646,7 @@ impl FallbackIngress {
                     ),
                     axum::extract::RawQuery(None),
                     headers,
-                    Ok(Json(body)),
+                    Ok(JsonBody::from(body)),
                 )
                 .await
             }
@@ -6022,7 +6041,8 @@ async fn gateway_agent_calls_start_only_on_a_compatible_adapter() {
             &caller,
             GatewayCallRequest {
                 body: json!({"model": "claude/m", "max_tokens": 4,
-                    "messages": [{"role": "user", "content": "hi"}]}),
+                    "messages": [{"role": "user", "content": "hi"}]})
+                .into(),
                 ..request("claude/m", None, Duration::from_secs(10))
             },
         )

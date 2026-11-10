@@ -22,6 +22,7 @@ use super::{
     BuiltinEndpoints, HttpProviderDispatch, IngressDialect, MediaRequest, Prepared,
     UnsupportedRequest,
 };
+use crate::RequestJson;
 use crate::credential::ProviderSecret;
 use crate::engine::{
     AttemptResult, AttemptUsage, FailureClass, ProviderAttempt, ProviderDispatch, ResponseBody,
@@ -64,7 +65,21 @@ fn model_of(deployment: &ProviderDeployment) -> &ModelId {
     &deployment.models.as_ref().expect("fixture lists its model")[0]
 }
 
-/// Prepares `body` for the fixture model of `deployment`.
+/// `body` as it arrives at ingress as compact text, which an object body
+/// keeps undecoded.
+///
+/// # Panics
+///
+/// Panics when `body` does not serialize.
+fn request(body: &Value) -> RequestJson {
+    RequestJson::parse(serde_json::to_vec(body).expect("json").into()).expect("request decodes")
+}
+
+/// Prepares `body`, as it arrives at ingress, for the fixture model of
+/// `deployment`.
+///
+/// The arrived body is leaked so the prepared request may borrow it for the
+/// rest of the test.
 ///
 /// # Errors
 ///
@@ -73,7 +88,7 @@ fn prepare<'a>(
     ingress: IngressDialect,
     operation: GatewayOperation,
     stream: bool,
-    body: &'a Value,
+    body: &Value,
     deployment: &'a ProviderDeployment,
     media: Option<&MediaRequest>,
 ) -> Result<Prepared<'a>, UnsupportedRequest> {
@@ -81,7 +96,7 @@ fn prepare<'a>(
         ingress,
         operation,
         stream,
-        body,
+        Box::leak(Box::new(request(body))),
         deployment,
         model_of(deployment),
         media,
@@ -162,7 +177,7 @@ async fn attempt_mode(
             deployment,
             model: model_of(deployment),
             credential: secret.as_ref(),
-            body,
+            body: &request(body),
             media: None,
             batch: None,
             stream,
@@ -404,18 +419,23 @@ async fn compatible_passthrough_rewrites_model_and_uses_provider_credential() {
         serde_json::to_string(&expected).expect("serializes"),
         "only the model changes, escapes and extensions included"
     );
-    for model in [Some("deepseek-chat"), None] {
-        let native = super::NativeBody {
-            body: extended.as_object().expect("object body"),
-            model,
-        };
+    let decoded = RequestJson::from(extended.clone());
+    let arrived = request(&extended);
+    assert!(arrived.text().is_some(), "compact object text is kept");
+    for (model, body) in [Some("deepseek-chat"), None]
+        .into_iter()
+        .flat_map(|model| [(model, &decoded), (model, &arrived)])
+    {
+        let native = super::NativeBody { body, model };
         let json = native.to_json().expect("serializes");
         assert_eq!(json, serde_json::to_vec(&native).expect("serializes"));
-        assert_eq!(
-            json.capacity(),
-            skald_providers::RequestBody::from(native).len_hint(),
-            "the body serializes into its up-front buffer without growing"
-        );
+        if body.text().is_none() {
+            assert_eq!(
+                json.capacity(),
+                skald_providers::RequestBody::from(native).len_hint(),
+                "the body serializes into its up-front buffer without growing"
+            );
+        }
         assert!(
             json.capacity() <= json.len() + json.len() / 16,
             "{}",
@@ -460,14 +480,17 @@ async fn request_preparation_avoids_duplicate_body_materialization() {
     });
     let caller = body.clone();
     let object = body.as_object().expect("object body");
+    let arrived = request(&body);
+    assert!(arrived.text().is_some(), "compact object text is kept");
 
     for (deployment, native) in [(&first, "first-model"), (&second, "second-model")] {
-        let prepared = prepare(
+        let prepared = super::prepare(
             IngressDialect::OpenAi,
             GatewayOperation::ChatCompletions,
             false,
-            &body,
+            &arrived,
             deployment,
+            model_of(deployment),
             None,
         )
         .expect("a native body is representable");
@@ -475,7 +498,7 @@ async fn request_preparation_avoids_duplicate_body_materialization() {
             panic!("native request expected, got {prepared:?}");
         };
         assert!(
-            std::ptr::eq(native_body.body, object),
+            std::ptr::eq(native_body.body, std::ptr::from_ref(&arrived)),
             "preparation borrows the caller's body"
         );
         let mut expected = object.clone();
@@ -487,9 +510,9 @@ async fn request_preparation_avoids_duplicate_body_materialization() {
         );
     }
 
-    let modelless = json!({"input": "hi"});
+    let modelless = request(&json!({"input": "hi"}));
     let applied = super::NativeBody {
-        body: modelless.as_object().expect("object body"),
+        body: &modelless,
         model: Some("first-model"),
     };
     assert_eq!(
@@ -1228,7 +1251,7 @@ async fn embeddings_preserve_batches_and_reject_invalid_requests() {
             deployment: &target,
             model: model_of(&target),
             credential: Some(&secret),
-            body: &body,
+            body: &request(&body),
             media: None,
             batch: None,
             stream: false,
@@ -1467,7 +1490,7 @@ async fn open_stream(
             deployment: &deployment,
             model: model_of(&deployment),
             credential: Some(&secret),
-            body: &body,
+            body: &request(&body),
             media: None,
             batch: None,
             stream: true,
@@ -2249,7 +2272,7 @@ async fn media_attempt(
             deployment,
             model: model_of(deployment),
             credential: Some(&secret),
-            body,
+            body: &request(body),
             media: Some(media),
             batch: None,
             stream: false,
@@ -2397,7 +2420,7 @@ async fn media_capturing(
             deployment,
             model: model_of(deployment),
             credential: Some(&secret),
-            body,
+            body: &request(body),
             media: Some(&media),
             batch: None,
             stream: false,
@@ -2774,7 +2797,7 @@ async fn batch_actions_reach_their_routes_with_native_files() {
                     deployment: target,
                     model: model_of(target),
                     credential: Some(secret),
-                    body: &body,
+                    body: &request(&body),
                     media: None,
                     batch: Some(&action),
                     stream: false,
@@ -2987,7 +3010,7 @@ async fn embeddings_attempt(encoding: &str, answer: &Value) -> AttemptResult {
             deployment: &target,
             model: model_of(&target),
             credential: Some(&secret),
-            body: &body,
+            body: &request(&body),
             media: None,
             batch: None,
             stream: false,
@@ -3235,7 +3258,7 @@ async fn capturing(
             deployment,
             model: model_of(deployment),
             credential: Some(&secret),
-            body,
+            body: &request(body),
             media: None,
             batch: None,
             stream,
@@ -3391,7 +3414,7 @@ async fn image_capturing(
             deployment,
             model: model_of(deployment),
             credential: Some(&secret),
-            body: &json!({"model": "openai/gpt-4o", "prompt": prompt}),
+            body: &request(&json!({"model": "openai/gpt-4o", "prompt": prompt})),
             media: Some(&media),
             batch: None,
             stream: false,
@@ -3632,7 +3655,7 @@ async fn held_open_streams_settle_at_their_terminator() {
                 deployment: &target,
                 model: model_of(&target),
                 credential: Some(&secret),
-                body: &body,
+                body: &request(&body),
                 media: None,
                 batch: None,
                 stream: true,
@@ -3860,7 +3883,7 @@ async fn jev_attempt(
             deployment: &target,
             model: model_of(&target),
             credential: Some(&secret),
-            body,
+            body: &request(body),
             media: None,
             batch: None,
             stream: false,

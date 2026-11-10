@@ -7,11 +7,11 @@
 //! in the number it accepts. Provider-specific support is decided by
 //! [`super::prepare`].
 
-use serde_json::Value;
 use skald_providers::{OpenAiMediaRoute, UploadFile};
 use wyrd_spec::gateway::GatewayOperation;
 
 use super::UnsupportedRequest;
+use crate::request::RequestJson;
 
 /// Route and uploaded files of one Images or Audio call.
 #[derive(Debug, Clone)]
@@ -52,7 +52,7 @@ const fn family(route: OpenAiMediaRoute) -> GatewayOperation {
 pub(crate) fn validate(
     operation: GatewayOperation,
     media: Option<&MediaRequest>,
-    body: &Value,
+    body: &RequestJson,
 ) -> Result<(), UnsupportedRequest> {
     let media_operation = matches!(
         operation,
@@ -68,7 +68,7 @@ pub(crate) fn validate(
             ));
         }
     };
-    if body.get("stream").is_some() {
+    if body.member("stream").is_some() {
         return Err(UnsupportedRequest::new(
             "stream",
             "media operations do not stream through the gateway",

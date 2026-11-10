@@ -282,6 +282,9 @@ impl Client {
         prepared: Prepared<'_>,
     ) -> ProviderResult<MediaAnswer> {
         match (self, prepared) {
+            (Self::OpenAi(client), Prepared::Native(body)) if !media.route.multipart() => {
+                client.send_media_json(media.route, media_json(body)?).await
+            }
             (Self::OpenAi(client), Prepared::Native(body)) => {
                 client.send_media(media.route, body, &media.files).await
             }
@@ -304,6 +307,11 @@ impl Client {
         prepared: Prepared<'_>,
     ) -> ProviderResult<ProviderByteStream> {
         match (self, prepared) {
+            (Self::OpenAi(client), Prepared::Native(body)) if !media.route.multipart() => {
+                client
+                    .stream_media_json(media.route, media_json(body)?)
+                    .await
+            }
             (Self::OpenAi(client), Prepared::Native(body)) => {
                 client.stream_media(media.route, body, &media.files).await
             }
@@ -488,6 +496,17 @@ fn captured(attempt: &ProviderAttempt<'_>, raw: &str) -> Option<ResponseCapture>
     )
 }
 
+/// The JSON bytes of a native media `body`, spliced from kept request text
+/// when the call arrived as it.
+///
+/// # Errors
+///
+/// Returns [`ProviderError::Decode`] when the body cannot serialize.
+fn media_json(body: NativeBody<'_>) -> ProviderResult<Vec<u8>> {
+    body.to_json()
+        .map_err(|error| ProviderError::decode("openai", error))
+}
+
 /// Capture projection of a buffered raw media `answer`, only when `attempt`
 /// selected capture: a copy of its bytes, or `None` when they hold the
 /// attempt's exact credential, which binary content cannot be scrubbed of.
@@ -506,8 +525,12 @@ fn media_captured(attempt: &ProviderAttempt<'_>, answer: &MediaAnswer) -> Option
 /// and served `model` for a translated stream, or native passthrough.
 fn frames(attempt: &ProviderAttempt<'_>, translated: bool, id: String, model: &str) -> Frames {
     if translated {
-        let include_usage = attempt.body.pointer("/stream_options/include_usage")
-            == Some(&serde_json::Value::Bool(true));
+        let include_usage = attempt
+            .body
+            .member("stream_options")
+            .is_some_and(|options| {
+                options.get("include_usage") == Some(&serde_json::Value::Bool(true))
+            });
         Frames::Chat(ChatChunks::new(id, model, include_usage))
     } else {
         Frames::Native {

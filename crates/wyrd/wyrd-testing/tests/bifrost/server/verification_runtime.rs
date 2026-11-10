@@ -3751,7 +3751,8 @@ async fn reloaded_authority_cannot_widen_gateway_access() -> Result<(), ServerJo
             .expect("the model reference is valid"),
         fallback: None,
         body: json!({ "model": "openai/gpt-test",
-            "messages": [{ "role": "user", "content": "hi" }] }),
+            "messages": [{ "role": "user", "content": "hi" }] })
+        .into(),
         media: None,
         batch: None,
         deployment: None,
@@ -3790,7 +3791,7 @@ async fn reloaded_authority_cannot_widen_gateway_access() -> Result<(), ServerJo
             server.base_url().ok_or("missing HTTP URL")?
         ))
         .bearer_auth(b_token().await?)
-        .json(&call(None).body)
+        .json(call(None).body.tree())
         .send()
         .await?;
     if !fresh.status().is_success() {

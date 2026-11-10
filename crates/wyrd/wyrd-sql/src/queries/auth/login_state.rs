@@ -11,6 +11,13 @@
 //! is the only tenant selection; `data_tenant_id` is written as the row's
 //! owner and never repeated as a predicate. `PostgreSQL` owns every expiry:
 //! callers bind lifetimes, never instants.
+//!
+//! A GitHub App connection transaction is the same one-use row under a
+//! separate `flow`: [`insert_github_login_state`] when a tenant begins
+//! connecting, [`bind_github_login_state`] once GitHub's setup redirect
+//! reaches the beginning principal's browser, and
+//! [`consume_github_login_state`] at the GitHub OAuth callback. Neither
+//! callback consumes the other flow's rows.
 // raw-query grep allowlist: auth tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use std::time::Duration;
@@ -22,6 +29,7 @@ use wyrd_spec::auth::{
 };
 
 use crate::TenantConn;
+use crate::queries::github_installations::GithubSlotBinding;
 use crate::row_types::auth::HumanConnectionBinding;
 
 /// Drop this tenant's rows that can no longer be consumed.
@@ -50,7 +58,8 @@ const INSERT_LOGIN_STATE_SQL: &str = r"
 ///
 /// Only an unconsumed, unexpired row visible under forced RLS matches, and
 /// setting `consumed_at` makes every replay of the same state match nothing.
-/// A row retained from the retired OAuth client profile never matches.
+/// A row retained from the retired OAuth client profile never matches, and
+/// neither does a GitHub connection transaction.
 /// Returns the pinned connection, PKCE verifier, nonce, and initiation binding
 /// the callback needs to finish the exchange.
 const CONSUME_LOGIN_STATE_SQL: &str = r"
@@ -59,6 +68,7 @@ const CONSUME_LOGIN_STATE_SQL: &str = r"
      WHERE state_hash = $1
        AND consumed_at IS NULL
        AND oauth_client_id IS NULL
+       AND flow = 'oidc'
        AND expires_at > statement_timestamp()
     RETURNING connection_id, connection_revision, issuer, client_id, redirect_uri,
               code_verifier, nonce, browser_binding_hash, device_id,
@@ -250,6 +260,236 @@ pub async fn consume_login_state(
         })
     })
     .transpose()
+}
+
+/// Begin a GitHub connection transaction owned by the RLS tenant.
+///
+/// The OIDC-only columns stay empty; `flow = 'github'` keeps the OIDC
+/// callback from consuming the row. `ON CONFLICT DO NOTHING` never
+/// overwrites a reused state hash.
+const INSERT_GITHUB_LOGIN_STATE_SQL: &str = r"
+    INSERT INTO wyrd.auth_login_state (
+        state_hash, data_tenant_id, flow, connection_id, connection_revision, issuer,
+        client_id, redirect_uri, code_verifier, browser_binding_hash,
+        github_installation_id, tester_principal_id, tester_principal_kind, expires_at
+    ) VALUES ($1, $2, 'github', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+              statement_timestamp() + ($13 * interval '1 second'))
+    ON CONFLICT DO NOTHING
+";
+
+/// Every column a GitHub transaction read returns.
+macro_rules! github_login_columns {
+    () => {
+        "connection_id, connection_revision, issuer, client_id, redirect_uri, code_verifier, \
+         browser_binding_hash, github_installation_id, tester_principal_id, tester_principal_kind"
+    };
+}
+
+/// Bind an unbound, unconsumed, unexpired GitHub transaction to the browser
+/// that GitHub's setup redirect reached, signed in as the beginning
+/// principal, and record GitHub's installation hint.
+const BIND_GITHUB_LOGIN_STATE_SQL: &str = concat!(
+    "UPDATE wyrd.auth_login_state
+        SET browser_binding_hash = $3,
+            github_installation_id = COALESCE($4, github_installation_id)
+      WHERE state_hash = $1
+        AND flow = 'github'
+        AND tester_principal_id = $2
+        AND browser_binding_hash IS NULL
+        AND consumed_at IS NULL
+        AND expires_at > statement_timestamp()
+      RETURNING ",
+    github_login_columns!()
+);
+
+/// Consume a GitHub transaction exactly once at the GitHub callback, before
+/// provider IO, only from the bound browser signed in as the beginning
+/// principal. A mismatched browser or principal leaves the row untouched.
+const CONSUME_GITHUB_LOGIN_STATE_SQL: &str = concat!(
+    "UPDATE wyrd.auth_login_state
+        SET consumed_at = statement_timestamp()
+      WHERE state_hash = $1
+        AND flow = 'github'
+        AND tester_principal_id = $2
+        AND browser_binding_hash = $3
+        AND consumed_at IS NULL
+        AND expires_at > statement_timestamp()
+      RETURNING ",
+    github_login_columns!()
+);
+
+/// One GitHub App connection transaction.
+///
+/// `Debug` is safe to print: the PKCE verifier is a [`SecretString`].
+#[derive(Debug, Clone)]
+pub struct GithubLoginState {
+    /// The connection slot and revision the transaction began from.
+    pub slot: GithubSlotBinding,
+    /// Configured GitHub web origin.
+    pub issuer: String,
+    /// The App's OAuth client id.
+    pub client_id: String,
+    /// The deployment's GitHub OAuth callback.
+    pub redirect_uri: String,
+    /// Server-generated PKCE verifier for GitHub's token exchange.
+    pub code_verifier: SecretString,
+    /// The principal that began the transaction.
+    pub actor: ConnectionTester,
+    /// Digest of the bound browser's transaction secret, once bound.
+    pub browser_binding: Option<Sha256Hex>,
+    /// Installation id GitHub's setup redirect named; a hint, not proof.
+    pub installation_hint: Option<i64>,
+}
+
+/// Raw GitHub transaction row.
+#[derive(sqlx::FromRow)]
+struct GithubLoginRow {
+    /// Bound slot.
+    #[sqlx(flatten)]
+    slot: GithubSlotBinding,
+    /// Web origin.
+    issuer: String,
+    /// OAuth client id.
+    client_id: String,
+    /// Callback URI.
+    redirect_uri: String,
+    /// PKCE verifier; wrapped in a [`SecretString`] as soon as it is decoded.
+    code_verifier: String,
+    /// Browser binding digest, once bound.
+    browser_binding_hash: Option<Vec<u8>>,
+    /// Installation hint.
+    github_installation_id: Option<i64>,
+    /// Beginning principal id.
+    tester_principal_id: Uuid,
+    /// Beginning principal kind label.
+    tester_principal_kind: String,
+}
+
+impl TryFrom<GithubLoginRow> for GithubLoginState {
+    type Error = sqlx::Error;
+
+    /// Rebuild the transaction from its stored columns.
+    ///
+    /// # Errors
+    /// Returns [`sqlx::Error::Decode`] when the browser digest is not 32
+    /// bytes or the principal kind is not a principal kind label.
+    fn try_from(row: GithubLoginRow) -> Result<Self, Self::Error> {
+        let corrupt = || sqlx::Error::Decode("GitHub login state is corrupt".into());
+        let browser_binding = row
+            .browser_binding_hash
+            .map(|hash| <[u8; 32]>::try_from(hash.as_slice()).map(Sha256Hex::from))
+            .transpose()
+            .map_err(|_| corrupt())?;
+        let principal_kind =
+            serde_json::from_value::<PrincipalKindTag>(row.tester_principal_kind.into())
+                .map_err(|_| corrupt())?;
+        Ok(Self {
+            slot: row.slot,
+            issuer: row.issuer,
+            client_id: row.client_id,
+            redirect_uri: row.redirect_uri,
+            code_verifier: SecretString::from(row.code_verifier),
+            actor: ConnectionTester {
+                principal_id: PrincipalId::new(row.tester_principal_id),
+                principal_kind,
+            },
+            browser_binding,
+            installation_hint: row.github_installation_id,
+        })
+    }
+}
+
+/// Insert a GitHub connection transaction keyed by `state_hash` whose expiry
+/// `PostgreSQL` derives from `ttl`.
+///
+/// First purges this tenant's expired login rows, as [`insert_login_state`]
+/// does. Returns `false` without writing when the state hash is recorded.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the purge or the insert.
+pub async fn insert_github_login_state(
+    conn: &mut TenantConn<'_>,
+    state_hash: &Sha256Hex,
+    row: &GithubLoginState,
+    ttl: Duration,
+) -> Result<bool, sqlx::Error> {
+    let tenant = conn.data_tenant_id().as_uuid();
+    sqlx::query(PURGE_EXPIRED_LOGIN_STATE_SQL)
+        .execute(&mut **conn.transaction())
+        .await?;
+    let inserted = sqlx::query(INSERT_GITHUB_LOGIN_STATE_SQL)
+        .bind(state_hash.as_bytes().as_slice())
+        .bind(tenant)
+        .bind(row.slot.connection_id)
+        .bind(row.slot.connection_revision)
+        .bind(&row.issuer)
+        .bind(&row.client_id)
+        .bind(&row.redirect_uri)
+        .bind(row.code_verifier.expose_secret())
+        .bind(
+            row.browser_binding
+                .as_ref()
+                .map(|hash| hash.as_bytes().to_vec()),
+        )
+        .bind(row.installation_hint)
+        .bind(row.actor.principal_id.as_uuid())
+        .bind(row.actor.principal_kind.as_str())
+        .bind(ttl.as_secs_f64())
+        .execute(&mut **conn.transaction())
+        .await?;
+    Ok(inserted.rows_affected() == 1)
+}
+
+/// Bind an unbound GitHub transaction begun by `actor` to `browser_binding`
+/// and record GitHub's installation hint.
+///
+/// Returns the bound transaction, or `None` when the state is unknown,
+/// another flow's, another principal's, already bound, consumed or expired.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the update or the stored row is
+/// corrupt.
+pub async fn bind_github_login_state(
+    conn: &mut TenantConn<'_>,
+    state_hash: &Sha256Hex,
+    actor: PrincipalId,
+    browser_binding: &Sha256Hex,
+    installation_hint: Option<i64>,
+) -> Result<Option<GithubLoginState>, sqlx::Error> {
+    sqlx::query_as::<_, GithubLoginRow>(BIND_GITHUB_LOGIN_STATE_SQL)
+        .bind(state_hash.as_bytes().as_slice())
+        .bind(actor.as_uuid())
+        .bind(browser_binding.as_bytes().as_slice())
+        .bind(installation_hint)
+        .fetch_optional(&mut **conn.transaction())
+        .await?
+        .map(GithubLoginState::try_from)
+        .transpose()
+}
+
+/// Consume a bound GitHub transaction exactly once, before provider IO.
+///
+/// Matches only when `actor` began it and `browser_binding` is its bound
+/// browser. Returns `None` when the state is unknown, another flow's, another
+/// principal's or browser's, consumed or expired; nothing is consumed then.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the update or the stored row is
+/// corrupt.
+pub async fn consume_github_login_state(
+    conn: &mut TenantConn<'_>,
+    state_hash: &Sha256Hex,
+    actor: PrincipalId,
+    browser_binding: &Sha256Hex,
+) -> Result<Option<GithubLoginState>, sqlx::Error> {
+    sqlx::query_as::<_, GithubLoginRow>(CONSUME_GITHUB_LOGIN_STATE_SQL)
+        .bind(state_hash.as_bytes().as_slice())
+        .bind(actor.as_uuid())
+        .bind(browser_binding.as_bytes().as_slice())
+        .fetch_optional(&mut **conn.transaction())
+        .await?
+        .map(GithubLoginState::try_from)
+        .transpose()
 }
 
 #[cfg(test)]

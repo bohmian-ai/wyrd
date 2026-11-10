@@ -51,7 +51,10 @@ pub use local_passwords::{
     consume_password_reset, insert_invitation, insert_password_reset, record_attempt_failure,
     revoke_invitation,
 };
-pub use login_state::{LoginState, consume_login_state, insert_login_state};
+pub use login_state::{
+    GithubLoginState, LoginState, bind_github_login_state, consume_github_login_state,
+    consume_login_state, insert_github_login_state, insert_login_state,
+};
 pub use principal_directory::{
     AssignablePrincipalRow, PrincipalFilter, assignable_principal, list_assignable_principals,
 };

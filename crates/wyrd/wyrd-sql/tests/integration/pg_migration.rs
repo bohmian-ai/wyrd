@@ -1010,6 +1010,8 @@ mod pg_tests {
             ],
         )
         .await;
+        assert_regclass_exists(pool, "wyrd.github_installations", true).await;
+        assert_rls_metadata(pool, "github_%", &["github_installations"]).await;
         assert_rls_metadata(
             pool,
             "gateway_batch%",

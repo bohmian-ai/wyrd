@@ -1,10 +1,10 @@
 //! Direct and queued verification hold separate capacity, end to end:
 //! `capacity-desk` is verified by one Verifier per hosted admission (an
 //! execution slot, a workspace, a Python worker, a model call), so each can
-//! be saturated alone. With a queued admission held, a direct SDK `verify`
-//! that needs the same resource still completes, while queued work waits for
-//! its own lane and progresses once it is released; with a direct admission
-//! held, direct work is refused although the queued lane is free.
+//! be saturated alone. With a queued admission held, a direct client
+//! `verify` that needs the same resource still completes, while queued work
+//! waits for its own lane and progresses once it is released; with a direct
+//! admission held, direct work is refused although the queued lane is free.
 //!
 //! Every lane holds one of each admission and the runtime one queued
 //! execution slot. The local upstream answers each Agent by its prompt
@@ -12,27 +12,33 @@
 //! waiting for its lane, and an execution deferred by admission backpressure.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
+use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 use tokio::sync::OwnedSemaphorePermit;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
-use wyrd_ai::bifrost::BifrostOptions;
-use wyrd_ai::cards::CardRef;
-use wyrd_ai::gateway_admin::{GatewayCaptureMode, GatewayCapturePolicyWrite};
-use wyrd_ai::state::WyrdState;
-use wyrd_ai::verify::{Execution, Submission, VerificationExecutionStatus};
-use wyrd_ai::{Bifrost, Gateway, RequirementOutcome, VerificationResult};
-use wyrd_testing::logs::LogCapture;
-use wyrd_testing::server::{
-    ExecutionMode, HostedLimits, LaneAdmission, LaneLimits, RuntimeLimits, WyrdTestServer,
+use wyrd_client::bifrost::BifrostOptions;
+use wyrd_client::cards::{BundleMode, CardRef, CardSelector, Cards};
+use wyrd_client::gateway_admin::{
+    DeploymentAccess, GatewayCaptureMode, GatewayCapturePolicyWrite, GatewayOperation,
+    ProviderAdapter, ProviderAuth, ProviderCredentialName, ProviderCredentialWrite,
+    ProviderCredentialWriteSource, ProviderDeployment, ProviderDeploymentName, ProviderId,
 };
+use wyrd_client::gateway_credential::CredentialWriter;
+use wyrd_client::operator_connections::SecretBearer;
+use wyrd_client::state::WyrdState;
+use wyrd_client::verify::{Execution, Submission, VerificationExecutionStatus};
+use wyrd_client::{Bifrost, Gateway, WyrdClient};
+use wyrd_spec::error::WyrdError;
+use wyrd_spec::verification::execution::{RequirementOutcome, VerificationResult};
+use wyrd_testing::logs::LogCapture;
+use wyrd_testing::server::{ExecutionMode, HostedLimits, LaneAdmission, LaneLimits, RuntimeLimits};
+use wyrd_testing::{Bootstrap, WyrdTestServer};
 
-use crate::hosted_agent_tools::{calls, done, messages, text, turn};
-use crate::local_development::configure_gateway;
-use crate::support::{Deployment, declare, pull};
-use crate::verifier_building_blocks::{grants, requirement};
+use super::native_client;
 
 /// The stable code of a refusal for a full direct admission.
 const UNAVAILABLE: &str = "WYRD_SERVER_503_SERVICE_UNAVAILABLE";
@@ -54,18 +60,54 @@ const ONE: LaneLimits = LaneLimits {
     model_calls: 1,
 };
 
+/// A Chat Completions answer carrying the assistant `message`.
+fn completion(message: Value) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "id": "chatcmpl-capacity",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "gpt-4o",
+        "choices": [{ "index": 0, "finish_reason": "stop", "message": message }],
+        "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 },
+    }))
+}
+
 /// The scripted model: the writer writes one scratch file and then
 /// finishes; every other Agent finishes at once.
 fn reply(request: &Request) -> ResponseTemplate {
-    let messages = messages(request);
-    if text(&messages).contains("WRITE:") && turn(&messages) == 0 {
-        return calls(&[(
-            "w1",
-            "fs.write",
-            json!({ "path": "/work/answer.md", "content": "answer" }),
-        )]);
+    let body: Value = serde_json::from_slice(&request.body).unwrap_or_default();
+    let messages = body["messages"].as_array().cloned().unwrap_or_default();
+    let writes = messages
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .any(|content| content.contains("WRITE:"));
+    let answered = messages
+        .iter()
+        .any(|message| message["role"] == "assistant");
+    if writes && !answered {
+        let arguments = json!({ "path": "/work/answer.md", "content": "answer" });
+        return completion(json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "w1",
+                "type": "function",
+                "function": { "name": "fs_write", "arguments": arguments.to_string() },
+            }],
+        }));
     }
-    done()
+    completion(json!({ "role": "assistant", "content": r#"{"done":true}"# }))
+}
+
+/// The plaintext API key of a bootstrapped machine principal.
+///
+/// # Panics
+/// Panics when `bootstrap` is a user principal.
+fn api_key(bootstrap: Bootstrap) -> String {
+    match bootstrap {
+        Bootstrap::Machine { api_key, .. } => api_key.expose_secret().to_owned(),
+        Bootstrap::User { .. } => panic!("expected a machine principal"),
+    }
 }
 
 /// The capacity desk deployment: a server whose lanes each admit one of
@@ -73,10 +115,14 @@ fn reply(request: &Request) -> ResponseTemplate {
 /// metadata capture of every gateway call and `capacity-desk` registered
 /// and hydrated as a principal granted every tool.
 struct CapacityDesk {
-    /// The deployment.
-    deployment: Deployment,
-    /// The scripted model upstream; kept alive for the deployment.
+    /// The bound server.
+    server: WyrdTestServer,
+    /// The administrator's client.
+    admin: WyrdClient,
+    /// The scripted model upstream; kept alive for the server.
     _upstream: MockServer,
+    /// The hydrated bundle's directory; kept alive for `state`.
+    _bundle: tempfile::TempDir,
     /// The registered `capacity-desk` Service.
     root: CardRef,
     /// The hydrated Service, as a principal granted every tool.
@@ -85,8 +131,8 @@ struct CapacityDesk {
 
 impl CapacityDesk {
     /// Start the scripted upstream and the server, deploy `openai` on the
-    /// upstream, capture every gateway call's metadata, and declare, pull,
-    /// and load `capacity-desk`.
+    /// upstream through the public gateway administration, capture every
+    /// gateway call's metadata, and declare, pull, and load `capacity-desk`.
     ///
     /// # Panics
     /// Panics when a setup step fails.
@@ -97,7 +143,7 @@ impl CapacityDesk {
             .respond_with(reply)
             .mount(&upstream)
             .await;
-        let deployment = Deployment::start_with(
+        let server = Box::pin(
             WyrdTestServer::builder()
                 .with_verification_limits_for_test(HostedLimits {
                     monty_min_workers: 0,
@@ -115,32 +161,100 @@ impl CapacityDesk {
                 .with_verification_runtime_for_test()
                 .with_gateway_provider_root_for_test(
                     upstream.uri().parse().expect("upstream URL parses"),
-                ),
+                )
+                .start_bound(),
         )
-        .await;
-        configure_gateway(&deployment.admin()).await;
-        Gateway::connect_with(&deployment.admin())
+        .await
+        .expect("the server starts");
+        let admin = native_client(
+            &server,
+            &api_key(
+                server
+                    .bootstrap_service("capacity_admin", &["admin"])
+                    .await
+                    .expect("the administrator bootstraps"),
+            ),
+        )
+        .expect("the admin client builds");
+        CredentialWriter::new(admin.clone())
+            .put_credential(&ProviderCredentialWrite {
+                name: ProviderCredentialName::new("openai-key").expect("credential name"),
+                provider: ProviderId::new("openai").expect("provider"),
+                source: ProviderCredentialWriteSource::ManagedSecret {
+                    secret: SecretBearer::new("sk-local-upstream".to_owned()),
+                },
+            })
             .await
-            .expect("the gateway handle connects")
+            .expect("the credential puts");
+        let gateway = Gateway::connect_with(&admin)
+            .await
+            .expect("the gateway handle connects");
+        gateway
+            .put_deployment(&ProviderDeployment {
+                name: ProviderDeploymentName::new("openai").expect("deployment name"),
+                adapter: ProviderAdapter::OpenAi,
+                auth: ProviderAuth::Bearer {
+                    credential: ProviderCredentialName::new("openai-key").expect("credential"),
+                },
+                models: None,
+                capabilities: Some(BTreeSet::from([GatewayOperation::ChatCompletions])),
+                access: DeploymentAccess::Open,
+            })
+            .await
+            .expect("the deployment puts");
+        gateway
             .put_capture_policy(&GatewayCapturePolicyWrite {
                 mode: GatewayCaptureMode::Metadata,
                 payload_fields: BTreeSet::new(),
             })
             .await
             .expect("the capture policy puts");
-        let cards = deployment.cards().await;
-        let desk = declare(&cards, "cards/isolated_capacity/capacity-desk.yaml").await;
-        let bundle = pull(&cards, &desk.root).await;
-        let key = deployment
-            .granted_key("every_tool", &grants(json!("all")))
-            .await;
-        let state =
-            WyrdState::from_path_with(bundle.path().join("bundle"), deployment.client(&key))
-                .expect("bundle loads offline");
+        let cards = Cards::connect_with(&admin)
+            .await
+            .expect("the Cards handle connects");
+        let root = Box::pin(cards.declare_from_path(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../fixtures/cards/isolated_capacity/capacity-desk.yaml"
+        ))))
+        .await
+        .expect("capacity-desk declares")
+        .root;
+        let bundle = tempfile::tempdir().expect("the bundle directory creates");
+        Box::pin(cards.pull(
+            CardSelector::exact(root.clone()),
+            bundle.path().join("bundle"),
+            BundleMode::Complete,
+        ))
+        .await
+        .expect("the graph pulls");
+        let grants = [
+            json!({ "resource": "verifier", "action": "run", "scope": "all" }),
+            json!({ "resource": "gateway", "action": "invoke", "scope": "all" }),
+            json!({ "resource": "tool", "action": "invoke", "scope": "all" }),
+            json!({ "resource": "cards", "action": "read", "scope": "all" }),
+            json!({ "resource": "bifrost_query", "action": "read", "scope": "all" }),
+        ];
+        server
+            .seed_role("every_tool", &grants)
+            .await
+            .expect("the role seeds");
+        let key = api_key(
+            server
+                .bootstrap_service("every_tool", &["every_tool"])
+                .await
+                .expect("the principal bootstraps"),
+        );
+        let state = WyrdState::from_path_with(
+            bundle.path().join("bundle"),
+            native_client(&server, &key).expect("the client builds"),
+        )
+        .expect("the bundle loads offline");
         Self {
-            deployment,
+            server,
+            admin,
             _upstream: upstream,
-            root: desk.root,
+            _bundle: bundle,
+            root,
             state,
         }
     }
@@ -151,8 +265,7 @@ impl CapacityDesk {
     /// # Panics
     /// Panics when the server hosts no blocks or the admission is in use.
     fn hold(&self, mode: ExecutionMode, admission: LaneAdmission) -> OwnedSemaphorePermit {
-        self.deployment
-            .server()
+        self.server
             .state()
             .verification
             .blocks()
@@ -168,7 +281,7 @@ impl CapacityDesk {
         &self,
         verifier: &str,
         question: &str,
-    ) -> Result<VerificationResult, wyrd_ai::WyrdError> {
+    ) -> Result<VerificationResult, WyrdError> {
         self.state
             .run()
             .observe()
@@ -177,7 +290,7 @@ impl CapacityDesk {
     }
 
     /// Submit `question` to `verifier` and return its queued execution, read
-    /// as the deployment's admin.
+    /// as the administrator.
     ///
     /// # Panics
     /// Panics when the submission is refused or records instead of queuing.
@@ -192,7 +305,7 @@ impl CapacityDesk {
         else {
             panic!("Run evidence queues an execution");
         };
-        Execution::connect_with(*queued.id(), &self.deployment.admin())
+        Execution::connect_with(*queued.id(), &self.admin)
             .await
             .expect("the execution handle connects")
     }
@@ -203,31 +316,32 @@ impl CapacityDesk {
     /// # Panics
     /// Panics when the flush or the read fails.
     async fn call_subjects(&self) -> Vec<Option<String>> {
-        self.deployment
-            .server()
-            .flush_bifrost()
+        self.server.flush_bifrost().await.expect("rows publish");
+        let rows: Vec<Value> = Bifrost::connect_with(&self.admin, BifrostOptions::default())
             .await
-            .expect("rows publish");
-        let rows: Vec<Value> =
-            Bifrost::connect_with(&self.deployment.admin(), BifrostOptions::default())
-                .await
-                .expect("Bifrost connects")
-                .sql_as("SELECT subject_card_uid FROM bifrost.gateway.calls", &[])
-                .await
-                .expect("calls read back");
+            .expect("Bifrost connects")
+            .sql_as("SELECT subject_card_uid FROM bifrost.gateway.calls", &[])
+            .await
+            .expect("calls read back");
         rows.iter()
             .map(|row| row["subject_card_uid"].as_str().map(str::to_owned))
             .collect()
     }
 }
 
-/// `result`'s only requirement passed.
+/// `result`'s requirement `id` passed.
 ///
 /// # Panics
 /// Panics when the requirement is missing or did not pass.
 fn passed(result: &VerificationResult, id: &str) {
+    let requirement = result
+        .outcome
+        .requirements
+        .iter()
+        .find(|requirement| requirement.id.as_str() == id)
+        .unwrap_or_else(|| panic!("requirement {id}: {result:#?}"));
     assert_eq!(
-        requirement(result, id).outcome,
+        requirement.outcome,
         RequirementOutcome::Passed,
         "{result:?}"
     );
@@ -280,7 +394,7 @@ async fn settled(execution: &Execution) -> VerificationResult {
 /// Panics when the process already has a global subscriber, or a run, wait,
 /// refusal, or gateway attribution differs.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
 async fn direct_verification_runs_while_queued_capacity_is_held() {
     let logs = LogCapture::install_global().expect("the journey owns the process subscriber");
     let desk = CapacityDesk::start().await;
@@ -406,8 +520,7 @@ async fn direct_verification_runs_while_queued_capacity_is_held() {
     );
 
     let held = desk
-        .deployment
-        .server()
+        .server
         .state()
         .verification
         .blocks()
@@ -419,5 +532,5 @@ async fn direct_verification_runs_while_queued_capacity_is_held() {
         .expect_err("a full direct execution ceiling refuses");
     assert_eq!(refused.code(), UNAVAILABLE);
     drop(held);
-    desk.deployment.shutdown().await;
+    desk.server.shutdown().await.expect("the server stops");
 }

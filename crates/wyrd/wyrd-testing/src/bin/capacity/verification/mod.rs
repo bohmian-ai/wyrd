@@ -28,8 +28,9 @@ mod workload;
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use wyrd_testing::capacity::Population;
 use wyrd_testing::experiment::{
-    Criterion, Declaration, Derive, Direction, Engine, Level, Metric, Op, Reading, Step,
+    Criterion, Declaration, Derive, Direction, Engine, Level, Metric, Op, Reading, Role, Step,
 };
 
 use crate::levels::{Context, Plan};
@@ -50,9 +51,10 @@ pub const OVERHEAD_LIMIT_MS: f64 = 0.5;
 /// `verification.direct`, as the metric id segment it fills and its
 /// benchmark timing boundary. `outside` is the execution's time outside
 /// every phase: HTTP decode, middleware, and waits between phases.
-pub const PHASE_TIMINGS: [(&str, &str); 6] = [
+pub const PHASE_TIMINGS: [(&str, &str); 7] = [
     ("admit", "verification.direct.admit"),
     ("load", "verification.direct.load"),
+    ("setup", "verification.direct.setup"),
     ("prepare", "verification.direct.prepare"),
     ("engine", "verification.direct.engine"),
     ("stage", "verification.direct.stage"),
@@ -407,6 +409,8 @@ fn direct(mut base: Declaration) -> Declaration {
             ));
         }
     }
+    base.metrics
+        .extend(Population::root_metrics(Role::Driver, &run::DRIVER_ROOTS));
     let objective = format!("direct-verify-c{OBJECTIVE_CLIENTS}");
     base.criteria = vec![
         Criterion::limit(

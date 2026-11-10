@@ -2176,6 +2176,7 @@ mod tests {
             "verification.direct.input_read",
             &["completed", "cancelled"],
         ),
+        ("verification.direct.setup", &["completed", "cancelled"]),
         ("verification.direct.prepare", &["completed", "cancelled"]),
         ("verification.direct.engine", &["completed", "cancelled"]),
         ("verification.direct.stage", &["completed", "cancelled"]),

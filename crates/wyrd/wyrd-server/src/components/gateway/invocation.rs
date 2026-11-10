@@ -51,7 +51,7 @@ use super::capture::{
 };
 use super::ledger::{Accounted, Admission, GatewayLedger, LedgerCall};
 use super::service::{GatewayAdministration, unavailable};
-use super::telemetry::{CallTelemetry, IngressClock, Phase};
+use super::telemetry::{CallTelemetry, IngressClock, Phase, Wait};
 use crate::app::metrics::{
     GATEWAY_ATTEMPT_DURATION_SECONDS, GATEWAY_QUEUE_DELAY_SECONDS,
     GATEWAY_REQUEST_DURATION_SECONDS, GATEWAY_TIME_TO_FIRST_BYTE_SECONDS,
@@ -471,6 +471,7 @@ impl<'a> GatewayInvocation<'a> {
         let call_cancel = cancel.child_token();
         let cancel_on_drop = call_cancel.clone().drop_guard();
         let (head, answer) = oneshot::channel();
+        let spawned = Instant::now();
         let task = CallTask {
             state: self.state.clone(),
             call,
@@ -480,6 +481,7 @@ impl<'a> GatewayInvocation<'a> {
             stream,
             received,
             telemetry,
+            spawned,
             call_span: tracing::Span::current(),
             cancel: call_cancel,
         };
@@ -492,6 +494,7 @@ impl<'a> GatewayInvocation<'a> {
             dispatched,
             outcome,
             upstream,
+            sent,
         } = match answer.await {
             Ok(answer) => answer,
             Err(error) => {
@@ -504,6 +507,7 @@ impl<'a> GatewayInvocation<'a> {
                 });
             }
         };
+        telemetry.wait(Wait::Resume, sent.elapsed());
         telemetry.answered(outcome, upstream);
         // The answer reached the caller: a stream now ends on drain, deadline,
         // or its own drop rather than when this future returns.
@@ -1205,6 +1209,8 @@ struct Answer {
     outcome: GatewayCallOutcome,
     /// Provider exchange time the call waited on before this answer.
     upstream: Duration,
+    /// When the execution task sent this answer.
+    sent: Instant,
 }
 
 /// Execution of one admitted call on a tracked `gateway_tasks` task.
@@ -1228,6 +1234,8 @@ struct CallTask {
     received: Instant,
     /// The call's phase and handoff telemetry.
     telemetry: CallTelemetry,
+    /// When the caller's task spawned this task, after admission.
+    spawned: Instant,
     /// The caller's `gateway.call` span, which receives the settled outcome.
     call_span: tracing::Span,
     /// Call cancellation, fired if the caller drops before the answer.
@@ -1241,6 +1249,7 @@ impl CallTask {
     /// Latency: provider attempts are the dominant wait on the request path.
     /// One active-call gauge unit is held until settlement ends.
     async fn run(self, head: oneshot::Sender<Answer>) {
+        self.telemetry.wait(Wait::Dispatch, self.spawned.elapsed());
         let _active = ActiveCall::begin();
         metrics::histogram!(
             GATEWAY_QUEUE_DELAY_SECONDS,
@@ -1270,6 +1279,12 @@ impl CallTask {
                 .phase(Phase::Credential, execution.timing.credential);
             self.telemetry
                 .phase(Phase::Translate, execution.timing.translate);
+            let timing = execution.timing;
+            self.telemetry.wait(
+                Wait::ProviderHeaders,
+                timing.until_headers().saturating_sub(timing.body()),
+            );
+            self.telemetry.wait(Wait::ProviderBody, timing.body());
         }
         let end = match &mut execution.response {
             Some(ResponseBody::Events(events) | ResponseBody::MediaStream { events, .. }) => {
@@ -1351,6 +1366,7 @@ impl CallTask {
             dispatched,
             outcome,
             upstream,
+            sent: Instant::now(),
         })
         .ok();
         let started = std::time::Instant::now();
@@ -1391,6 +1407,7 @@ impl CallTask {
             dispatched,
             outcome: opened,
             upstream: timing.until_headers(),
+            sent: Instant::now(),
         })
         .ok();
         let end = end.await.unwrap_or_else(|_| StreamEnd {

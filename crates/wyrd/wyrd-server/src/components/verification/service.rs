@@ -541,26 +541,28 @@ impl<'a> VerificationControl<'a> {
         let executor = caller.clone().executed_by_system(system);
         let started_at = Utc::now();
         let timeout = blocks.limits().verify_timeout;
-        let engine = match blocks.engine(
-            self.state,
-            Execution {
-                caller: &executor,
-                routes: &request.execution_route_overrides,
-                subject: GatewayCallContext {
-                    workload_card_uid: wyrd_runtime::owning_root(
-                        &caller.principal,
-                        &caller.delegation_chain,
-                    )
-                    .cloned(),
-                    subject_card_uid: Some(request.card_uid.clone()),
-                    run_id: request.run_id.clone(),
-                    deployment_environment: request.deployment_environment.clone(),
+        let engine = match telemetry.time(Phase::Setup, || {
+            blocks.engine(
+                self.state,
+                Execution {
+                    caller: &executor,
+                    routes: &request.execution_route_overrides,
+                    subject: GatewayCallContext {
+                        workload_card_uid: wyrd_runtime::owning_root(
+                            &caller.principal,
+                            &caller.delegation_chain,
+                        )
+                        .cloned(),
+                        subject_card_uid: Some(request.card_uid.clone()),
+                        run_id: request.run_id.clone(),
+                        deployment_environment: request.deployment_environment.clone(),
+                    },
+                    defer_unlanded_traces: false,
+                    drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
+                    clock: telemetry.clock(),
                 },
-                defer_unlanded_traces: false,
-                drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
-                clock: telemetry.clock(),
-            },
-        ) {
+            )
+        }) {
             Ok(engine) => engine,
             Err(error) => return ("errored", Err(error)),
         };

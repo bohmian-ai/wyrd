@@ -53,7 +53,8 @@ impl ExecutionMode {
 
 /// The closed `phase` dimension of `wyrd_verification_phase_duration_seconds`.
 ///
-/// `Engine` is the inclusive parent of `Prepare`, and the blocks the
+/// `Engine` is the inclusive parent of `Prepare`, and of `Setup` in a queued
+/// execution, and the blocks the
 /// Verifier runs inside it are its own execution, not overhead; phases
 /// overlap and are never summed. A direct execution's time outside every
 /// phase is its HTTP decode and the request's middleware.
@@ -65,6 +66,8 @@ pub enum Phase {
     Load,
     /// Authorized queued evidence retrieval; direct execution has none.
     InputRead,
+    /// Construction of the execution's hosted block executors and engine.
+    Setup,
     /// Input normalization, spec/baseline decoding, and plan construction.
     Prepare,
     /// Inclusive engine dispatch through judgment.
@@ -77,10 +80,11 @@ pub enum Phase {
 
 impl Phase {
     /// Every phase, in emission order.
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::Admit,
         Self::Load,
         Self::InputRead,
+        Self::Setup,
         Self::Prepare,
         Self::Engine,
         Self::Stage,
@@ -94,6 +98,7 @@ impl Phase {
             Self::Admit => "admit",
             Self::Load => "load",
             Self::InputRead => "input_read",
+            Self::Setup => "setup",
             Self::Prepare => "prepare",
             Self::Engine => "engine",
             Self::Stage => "stage",
@@ -108,6 +113,7 @@ impl Phase {
             Self::Admit => "verification.direct.admit",
             Self::Load => "verification.direct.load",
             Self::InputRead => "verification.direct.input_read",
+            Self::Setup => "verification.direct.setup",
             Self::Prepare => "verification.direct.prepare",
             Self::Engine => "verification.direct.engine",
             Self::Stage => "verification.direct.stage",
@@ -121,7 +127,7 @@ impl Phase {
 const DIRECT_OUTSIDE_BOUNDARY: &str = "verification.direct.outside";
 
 /// Measured intervals per phase, indexed like [`Phase::ALL`].
-type Ledger = [Vec<Interval>; 7];
+type Ledger = [Vec<Interval>; 8];
 
 /// Owner of one verification execution's metrics lifetime.
 ///
@@ -433,5 +439,49 @@ mod tests {
             !text.contains(r#"mode="queued",outcome="cancelled""#),
             "{text}"
         );
+    }
+
+    /// A direct execution's hosted setup is its own part between load and
+    /// engine: it is counted once, never as time outside every phase, and
+    /// the execution's total is unchanged.
+    ///
+    /// # Panics
+    /// Panics when the setup part is missing or mismeasured, or the outside
+    /// part absorbs it.
+    #[test]
+    fn hosted_setup_is_a_direct_part_outside_the_engine() {
+        wyrd_benchmark::install().expect("the benchmark recorder installs");
+        let before = wyrd_benchmark::snapshot();
+        let start = Instant::now()
+            .checked_sub(Duration::from_millis(100))
+            .expect("invariant: the monotonic clock is past 100 ms");
+        let telemetry = ExecutionTelemetry::start(ExecutionMode::Direct, Some(start));
+        telemetry.record_phase(Phase::Load, at(start, 0), at(start, 10));
+        telemetry.record_phase(Phase::Setup, at(start, 10), at(start, 40));
+        telemetry.record_phase(Phase::Engine, at(start, 40), at(start, 90));
+        telemetry.finish("completed", false);
+        let interval = wyrd_benchmark::snapshot()
+            .since(&before)
+            .expect("one process");
+        let part = |boundary: &str| {
+            interval
+                .series
+                .iter()
+                .find(|series| series.boundary == boundary)
+                .unwrap_or_else(|| panic!("no {boundary}: {:?}", interval.series))
+        };
+        let within = |boundary: &str, low_ms: u64, high_ms: u64| {
+            let series = part(boundary);
+            assert_eq!(series.count, 1, "{boundary}");
+            series.elapsed.maximum().is_some_and(|bucket| {
+                bucket.highest >= low_ms * 1_000_000 && bucket.lowest <= high_ms * 1_000_000
+            })
+        };
+        assert!(within("verification.direct.setup", 30, 30));
+        assert!(
+            within("verification.direct.outside", 10, 20),
+            "outside excludes setup"
+        );
+        assert!(within("verification.direct", 100, 110));
     }
 }

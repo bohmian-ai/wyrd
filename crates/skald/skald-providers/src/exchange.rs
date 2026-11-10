@@ -17,7 +17,7 @@
 
 use std::cell::RefCell;
 use std::future::Future;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use reqwest::header::HeaderMap;
 
@@ -80,6 +80,77 @@ pub(crate) fn forward(headers: &mut HeaderMap) {
         .ok();
 }
 
+/// One attempt's provider wait, read from the exchanges it sent.
+///
+/// Retries and overlapping exchanges are each waited once: every total is
+/// the length of a union of intervals, never a sum.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Waits {
+    /// Send to end of every ended exchange.
+    pub ended: Duration,
+    /// The part of [`Self::ended`] some ended exchange spent between its
+    /// send and its headers, or its failure when none arrived; the rest of
+    /// [`Self::ended`] is body receipt.
+    pub headers: Duration,
+    /// Every ended exchange plus the open exchange's send to headers: the
+    /// whole provider wait inside the attempt.
+    pub waited: Duration,
+    /// Send and header instants of the exchange left open for a body read
+    /// elsewhere.
+    pub open: Option<(Instant, Instant)>,
+}
+
+impl Waits {
+    /// The waits of `exchanges`; one that failed before any response adds
+    /// only to [`Self::ended`], [`Self::headers`], and [`Self::waited`].
+    #[must_use]
+    pub fn of(exchanges: &[Exchange]) -> Self {
+        let mut ended = Vec::new();
+        let mut headers = Vec::new();
+        let mut waited = Vec::new();
+        let mut open = None;
+        for exchange in exchanges {
+            match (exchange.ended, exchange.headers) {
+                (Some(end), arrived) => {
+                    ended.push((exchange.sent, end));
+                    headers.push((exchange.sent, arrived.unwrap_or(end).min(end)));
+                    waited.push((exchange.sent, end));
+                }
+                (None, Some(arrived)) => {
+                    open = Some((exchange.sent, arrived));
+                    waited.push((exchange.sent, arrived));
+                }
+                (None, None) => {}
+            }
+        }
+        Self {
+            ended: union(&mut ended),
+            headers: union(&mut headers),
+            waited: union(&mut waited),
+            open,
+        }
+    }
+}
+
+/// Total length of the union of `intervals`, each `(start, end)`; an empty
+/// or inverted interval adds nothing.
+fn union(intervals: &mut [(Instant, Instant)]) -> Duration {
+    intervals.sort_unstable();
+    let mut total = Duration::ZERO;
+    let mut covered: Option<(Instant, Instant)> = None;
+    for &(start, end) in intervals.iter().filter(|(start, end)| end > start) {
+        covered = match covered {
+            Some((from, to)) if start <= to => Some((from, to.max(end))),
+            Some((from, to)) => {
+                total += to - from;
+                Some((start, end))
+            }
+            None => Some((start, end)),
+        };
+    }
+    total + covered.map_or(Duration::ZERO, |(from, to)| to - from)
+}
+
 /// Times one exchange from its send and logs it when dropped.
 ///
 /// Dropping it, including on an early error return or cancellation, logs the
@@ -134,7 +205,7 @@ impl Drop for ExchangeTimer {
 mod tests {
     use reqwest::header::{HeaderMap, HeaderValue};
 
-    use super::{ExchangeTimer, forward, scope, take};
+    use super::{Exchange, ExchangeTimer, Waits, forward, scope, take};
 
     /// An exchange forwards its scope's headers, and nothing outside a
     /// scope; its own header of the same name is replaced.
@@ -157,6 +228,49 @@ mod tests {
         })
         .await;
         assert_eq!(inside, forwarded);
+    }
+
+    /// Header waits and body receipt split each attempt's ended exchanges:
+    /// a failure before any response is header wait to its end, overlapping
+    /// retries are waited once, and an open stream adds only to the whole
+    /// wait.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an interval is attributed to the wrong part.
+    #[test]
+    fn header_and_body_intervals_preserve_failed_and_retried_exchanges() {
+        let base = std::time::Instant::now();
+        let at = |ms: u64| base + std::time::Duration::from_millis(ms);
+        let ms = std::time::Duration::from_millis;
+        let exchange = |sent, headers: Option<u64>, ended: Option<u64>| Exchange {
+            sent: at(sent),
+            headers: headers.map(at),
+            ended: ended.map(at),
+        };
+        let failed = Waits::of(&[exchange(0, None, Some(4))]);
+        assert_eq!(
+            (failed.ended, failed.headers, failed.waited, failed.open),
+            (ms(4), ms(4), ms(4), None)
+        );
+        let retried = Waits::of(&[
+            exchange(0, Some(10), Some(30)),
+            exchange(20, Some(25), Some(40)),
+            exchange(50, None, Some(52)),
+        ]);
+        assert_eq!(retried.ended, ms(40 + 2));
+        assert_eq!(
+            retried.headers,
+            ms(10 + 5 + 2),
+            "a retry's header wait overlapping another body is header wait"
+        );
+        let streamed = Waits::of(&[exchange(0, None, Some(3)), exchange(5, Some(9), None)]);
+        assert_eq!(
+            (streamed.ended, streamed.headers, streamed.waited),
+            (ms(3), ms(3), ms(3 + 4))
+        );
+        assert_eq!(streamed.open, Some((at(5), at(9))));
+        assert_eq!(Waits::of(&[]), Waits::default());
     }
 
     /// Exchanges are logged in a scope, in send order, with an open stream

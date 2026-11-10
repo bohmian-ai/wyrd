@@ -35,8 +35,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde_json::{Value, json};
+use wyrd_testing::capacity::Population;
 use wyrd_testing::experiment::{
-    Criterion, Declaration, Derive, Direction, Engine, Level, Metric, Op, Step,
+    Criterion, Declaration, Derive, Direction, Engine, Level, Metric, Op, Role, Step,
 };
 use wyrd_testing::release_server::LocalServer;
 
@@ -545,6 +546,30 @@ fn diagnostic_metrics() -> Vec<Metric> {
     ] {
         metrics.extend(Metric::diagnostic(observation, &boundary));
     }
+    for (wait, what) in [
+        (
+            "dispatch",
+            "the admitted call's execution task spawn until it started; admission excluded, unlike `queue_delay`",
+        ),
+        (
+            "provider_headers",
+            "ended provider exchanges' send to headers, or to failure, plus an opened stream's send to headers; includes local pool, connect, and runtime work, not remote compute alone",
+        ),
+        (
+            "provider_body",
+            "ended provider exchanges' body receipt outside every header wait",
+        ),
+        (
+            "resume",
+            "the execution task's answer send until the handler resumed on it",
+        ),
+    ] {
+        metrics.extend(Metric::diagnostic(
+            &format!("wait.{wait}"),
+            &format!("server: `wyrd_gateway_wait_seconds{{wait={wait}}}`, {what}; overlaps the phases and is never summed; every call {WINDOW}"),
+        ));
+    }
+    metrics.extend(Population::root_metrics(Role::Driver, &run::DRIVER_ROOTS));
     metrics
 }
 

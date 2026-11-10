@@ -120,7 +120,7 @@ const BREAKDOWN: [(&str, &str); 9] = [
 /// The driver roots each direct `verify` records once, with their
 /// components: the SDK flow and its preparation, its one logical execution
 /// request, and that request's one attempt.
-const DRIVER_ROOTS: [(&str, bool, &[&str]); 3] = [
+pub const DRIVER_ROOTS: [(&str, bool, &[&str]); 3] = [
     ("client.verify", false, &["prepare"]),
     (
         "client.http",

@@ -166,6 +166,10 @@ pub const GATEWAY_ATTEMPT_DURATION_SECONDS: &str = "wyrd_gateway_attempt_duratio
 pub const GATEWAY_TIME_TO_FIRST_BYTE_SECONDS: &str = "wyrd_gateway_time_to_first_byte_seconds";
 /// A governed call's receipt until its execution task started.
 pub const GATEWAY_QUEUE_DELAY_SECONDS: &str = "wyrd_gateway_queue_delay_seconds";
+/// One controlled wait of a governed call, recorded only while
+/// benchmarking: its execution task's dispatch, the caller's resumption on
+/// its answer, or its provider header wait and body receipt.
+pub const GATEWAY_WAIT_SECONDS: &str = "wyrd_gateway_wait_seconds";
 
 /// Gateway latency families sharing [`VERIFICATION_DURATION_BUCKETS`], so a
 /// sub-millisecond overhead p99 is resolvable.

@@ -33,7 +33,7 @@ use wyrd_benchmark::{
     IntervalSeries,
 };
 
-use crate::experiment::{Reading, Reconciled, Repetition, Role, TimingEvidence};
+use crate::experiment::{Metric, Reading, Reconciled, Repetition, Role, TimingEvidence};
 use crate::release_server::{LocalServer, Metrics, PeakSampler};
 
 /// Error type of the capacity helpers, matching the benchmark binaries.
@@ -711,6 +711,34 @@ impl Population {
                 repetition.diagnose(&observation, distribution, true);
             }
         }
+    }
+
+    /// The diagnostic metrics [`Self::diagnose_roots`] fills for `roots`
+    /// of a `role` process, so a report names each one's boundary.
+    #[must_use]
+    pub fn root_metrics(role: Role, roots: &[(&str, bool, &[&str])]) -> Vec<Metric> {
+        let role = role.name();
+        let mut metrics = Vec::new();
+        for (boundary, excludes, components) in roots {
+            let name = format!("{role}.{boundary}");
+            metrics.extend(Metric::diagnostic(
+                &name,
+                &format!("{role}: `{boundary}` start until its successful end, the cohort's calls"),
+            ));
+            if *excludes {
+                metrics.extend(Metric::diagnostic(
+                    &format!("{name}.residual"),
+                    &format!("{role}: per call, `{boundary}` elapsed less its excluded waits, computed before aggregation"),
+                ));
+            }
+            for component in *components {
+                metrics.extend(Metric::diagnostic(
+                    &format!("{name}.{component}"),
+                    &format!("{role}: `{boundary}` `{component}` work, accumulated per call across attempts, for every call that reached it; never added to the call's elapsed"),
+                ));
+            }
+        }
+        metrics
     }
 
     /// Observations of `boundary` whose outcome is not `outcome`.

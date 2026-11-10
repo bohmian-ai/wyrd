@@ -68,6 +68,22 @@ pub const PHASE_SECONDS: &str = "wyrd_gateway_phase_duration_seconds";
 /// The server's Gateway receipt-to-task-start histogram.
 pub const QUEUE_DELAY_SECONDS: &str = "wyrd_gateway_queue_delay_seconds";
 
+/// The server's benchmark-only Gateway controlled-wait histogram.
+pub const WAIT_SECONDS: &str = "wyrd_gateway_wait_seconds";
+
+/// Every controlled wait a governed call records once while benchmarking.
+pub const WAITS: [&str; 4] = ["dispatch", "provider_headers", "provider_body", "resume"];
+
+/// The driver roots a Gateway window diagnoses, each with whether it
+/// excludes waits and its components; the streamed head, last, only for a
+/// stream.
+pub const DRIVER_ROOTS: [(&str, bool, &[&str]); 4] = [
+    (CALL_ROOT, false, &["send", "body", "decode"]),
+    (ATTEMPT_ROOT, false, &[]),
+    (FIXTURE_ROOT, true, &["parse", "answer"]),
+    (HEAD_ROOT, false, &[]),
+];
+
 /// The server's outbox batch write histogram.
 pub const OUTBOX_WRITE_SECONDS: &str = "outbox_write_seconds";
 
@@ -512,24 +528,21 @@ impl Observed {
         repetition.diagnose("residual", residual, true);
         let writes = population.histogram(OUTBOX_WRITE_SECONDS, &[("outbox", "scribe")]);
         repetition.diagnose("outbox_write.scribe", writes, true);
+        for wait in WAITS {
+            let observation = format!("wait.{wait}");
+            let distribution = population.histogram(WAIT_SECONDS, &[("wait", wait)]);
+            repetition.diagnose(&observation, distribution, true);
+        }
         if let Some(driver) = &self.driver {
-            let head: &[(&str, bool, &[&str])] = if self.stream {
-                &[(HEAD_ROOT, false, &[])]
+            let roots = if self.stream {
+                &DRIVER_ROOTS[..]
             } else {
-                &[]
+                &DRIVER_ROOTS[..DRIVER_ROOTS.len() - 1]
             };
-            let roots: Vec<(&str, bool, &[&str])> = [
-                (CALL_ROOT, false, &["send", "body", "decode"][..]),
-                (ATTEMPT_ROOT, false, &[][..]),
-                (FIXTURE_ROOT, true, &["parse", "answer"][..]),
-            ]
-            .into_iter()
-            .chain(head.iter().copied())
-            .collect();
             driver.diagnose_roots(
                 repetition,
                 self.cohort,
-                &roots,
+                roots,
                 reconcile.then_some(answered),
             );
         }
@@ -916,7 +929,7 @@ mod tests {
 
     use super::{
         BUFFERED, Drain, Integrity, OUTBOX_WRITE_SECONDS, Observed, PHASE_SECONDS, PHASES,
-        QUEUE_DELAY_SECONDS, STREAM_END, STREAM_HEAD, Samples,
+        QUEUE_DELAY_SECONDS, STREAM_END, STREAM_HEAD, Samples, WAIT_SECONDS, WAITS,
     };
 
     /// A cumulative `_seconds` histogram series `name` with `labels` holding
@@ -973,6 +986,13 @@ mod tests {
             &[("outbox", "scribe")],
             &vec![2_000_000 + offset_ns; writes],
         ));
+        metrics.extend(WAITS.iter().zip(1_u64..).map(|(wait, step)| {
+            histogram(
+                WAIT_SECONDS,
+                &[("operation", "chat"), ("wait", wait)],
+                &vec![step * 1_000 + offset_ns; calls],
+            )
+        }));
         metrics
     }
 
@@ -1260,6 +1280,17 @@ mod tests {
         assert_eq!(exact(&reading("server_elapsed.count")), Some(1_000.0));
         assert!(holds(&reading("provider_excluded.p50_us"), 2_000.0));
         assert!(holds(&reading("residual.p50_us"), 100.0));
+        for (wait, step) in WAITS.iter().zip(1_u64..) {
+            assert_eq!(
+                exact(&reading(&format!("wait.{wait}.count"))),
+                Some(1_000.0)
+            );
+            let us = step as f64;
+            assert!(
+                holds(&reading(&format!("wait.{wait}.p50_us")), us),
+                "{wait}"
+            );
+        }
 
         let mut absent = window.clone();
         absent.population.metrics.retain(|metric| {

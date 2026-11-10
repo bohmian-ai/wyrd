@@ -15,6 +15,7 @@ use axum::http::Request;
 use secrecy::ExposeSecret as _;
 use serde_json::json;
 use wyrd_server::components::github::service::GithubConnections;
+use wyrd_spec::auth::PrincipalId;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::github::{GithubAppMock, GithubBrowser, INSTALLATION_TOKEN_PREFIX};
 use wyrd_testing::verification::VerificationFixture;
@@ -38,6 +39,41 @@ async fn minted(server: &WyrdTestServer, repository: u64) {
         token.expose_secret().starts_with(INSTALLATION_TOKEN_PREFIX),
         "repository {repository}"
     );
+}
+
+/// `principal`'s retained decisions for `operation` as (permission,
+/// outcome), once every decision staged so far is retained.
+///
+/// # Panics
+/// Panics when audit retention does not settle or the rows cannot be read.
+async fn decisions(
+    server: &WyrdTestServer,
+    principal: PrincipalId,
+    operation: &str,
+) -> Vec<(String, String)> {
+    server
+        .await_audit_retained()
+        .await
+        .expect("audit retention settles");
+    server
+        .retained_audit_records(
+            server.data_tenant_id(),
+            "permission, outcome",
+            &format!(
+                "operation = '{operation}' AND sub_principal_id = '{}'",
+                principal.as_uuid()
+            ),
+        )
+        .await
+        .expect("audit rows read")
+        .into_iter()
+        .map(|row| {
+            (
+                row[0].clone().unwrap_or_default(),
+                row[1].clone().unwrap_or_default(),
+            )
+        })
+        .collect()
 }
 
 /// Installation tokens are narrowed to one selected repository and the
@@ -155,6 +191,45 @@ async fn installation_tokens_follow_repository_access() {
         .await
         .expect("disconnect responds");
     assert_eq!(disconnected.status(), 200);
+    let viewer = server
+        .bootstrap_service_in_tenant(server.data_tenant_id(), "github_viewer", &["viewer"])
+        .await
+        .expect("viewer bootstraps");
+    let viewer_token = server
+        .exchange_api_key(viewer.api_key().expect("a machine principal"))
+        .await
+        .expect("api key exchanges");
+    let denied = server
+        .oneshot_authenticated(
+            &viewer_token,
+            Request::get("/v1/integrations/github")
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("read responds");
+    assert_eq!(denied.status(), 403);
+    let write = || {
+        (
+            "identity_connections:write".to_owned(),
+            "allowed".to_owned(),
+        )
+    };
+    for operation in [
+        "github_connection.setup",
+        "github_connection.callback",
+        "github_connection.disconnect",
+    ] {
+        assert_eq!(
+            decisions(&server, admin.id(), operation).await,
+            vec![write()],
+            "{operation}"
+        );
+    }
+    assert_eq!(
+        decisions(&server, viewer.id(), "github_connection.read").await,
+        vec![("identity_connections:write".to_owned(), "denied".to_owned())]
+    );
     refused(&server, 1, "WYRD_GITHUB_404_NOT_CONNECTED").await;
 
     assert_eq!(

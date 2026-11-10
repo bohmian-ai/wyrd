@@ -34,7 +34,7 @@ use wyrd_testing::release_server::{LocalServer, Metrics};
 
 use crate::gateway::capacity::{MISS_AFTER, Schedule, open_loop};
 use crate::gateway::workload::{
-    CapturePolicy, Outcome, PREFIXES, Shape, Tenant, Timed, call, http,
+    Caller, CapturePolicy, Outcome, PREFIXES, Shape, Tenant, Timed, call, http,
 };
 use crate::gateway::{
     CLIENTS, Case, LARGE_BYTES, PROCESS, Result, SMALL_BYTES, STREAM_CHUNKS, shutdown,
@@ -741,13 +741,12 @@ async fn drive(
     }
     let mut tasks = JoinSet::new();
     for key in tenant.keys.iter().take(clients) {
-        let (http, key, shape, body) = (http()?, key.clone(), shape.clone(), body.clone());
+        let (caller, shape, body) = (Caller::new(http()?, key)?, shape.clone(), body.clone());
         tasks.spawn(async move {
             let mut samples = Samples::default();
             while Instant::now() < stop {
                 let timed =
-                    with_benchmark_labels(case, phase, call(&http, &key, &shape, body.clone()))
-                        .await;
+                    with_benchmark_labels(case, phase, call(&caller, &shape, body.clone())).await;
                 samples.record(&timed, Some(stop));
             }
             samples
@@ -785,7 +784,7 @@ async fn paced(
         .keys
         .iter()
         .take(clients)
-        .map(|key| Ok((http()?, key.clone())))
+        .map(|key| Caller::new(http()?, key))
         .collect::<Result<Vec<_>>>()?;
     let lanes = Arc::new(Mutex::new(lanes));
     let samples = Arc::new(Mutex::new(Samples::default()));
@@ -810,10 +809,10 @@ async fn paced(
         async move {
             // A slot is held for every open call, so a lane is always free.
             let lane = lanes.lock().unwrap_or_else(PoisonError::into_inner).pop();
-            let Some((http, key)) = lane else {
+            let Some(caller) = lane else {
                 return;
             };
-            let timed = with_benchmark_labels(case, phase, call(&http, &key, &shape, body)).await;
+            let timed = with_benchmark_labels(case, phase, call(&caller, &shape, body)).await;
             samples
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -821,7 +820,7 @@ async fn paced(
             lanes
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .push((http, key));
+                .push(caller);
         }
     })
     .await;

@@ -247,6 +247,10 @@ fn positive_rate(arguments: &[String], flag: &str) -> std::result::Result<Option
         .transpose()
 }
 
+/// How the driver and its local upstream handle each call, declared so
+/// records of a different method are never compared as one.
+const FIXTURE_METHOD: &str = "prepared-borrowed: each caller's URL, credential, and content type built once, benchmark labels read per request; buffered answers and upstream requests read only by the members they judge or route by, under decoded-value rules, borrowing unescaped text";
+
 /// The L1 `overhead` declaration over `base`, offered open loop at `pace`
 /// requests/s when one is given.
 fn overhead(mut base: Declaration, pace: Option<f64>) -> Declaration {
@@ -259,6 +263,7 @@ fn overhead(mut base: Declaration, pace: Option<f64>) -> Declaration {
         ("clients".to_owned(), json!(CLIENTS)),
     ]);
     base.controls.extend([
+        ("fixture_method".to_owned(), json!(FIXTURE_METHOD)),
         (
             "fixture".to_owned(),
             json!(
@@ -638,6 +643,7 @@ fn capacity_declaration(mut base: Declaration, rate: Option<f64>, slo: Slo) -> D
         json!(["capacity", "overload", "recovery"]),
     )]);
     base.controls.extend([
+        ("fixture_method".to_owned(), json!(FIXTURE_METHOD)),
         (
             "fixture".to_owned(),
             json!({

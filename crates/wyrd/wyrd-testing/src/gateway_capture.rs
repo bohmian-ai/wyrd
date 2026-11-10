@@ -11,8 +11,10 @@
 //! frames [`PacedUpstream`] writes one at a time. `wiremock` returns one
 //! whole body after one delay, so it cannot pace a stream; [`PacedUpstream`]
 //! is the bounded local provider that does, recording when it sent each
-//! frame.
+//! frame. [`pick`] reads only the request and answer members a fixture
+//! judges or routes by, under a decoded value's rules.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -24,6 +26,8 @@ use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
+use serde::Deserialize;
+use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Value, json};
 use url::Url;
 use wiremock::matchers::{body_partial_json, method, path};
@@ -527,22 +531,29 @@ async fn pause(delay: Duration) {
     }
 }
 
+/// Path of a chat request's marker: its first message's content.
+const MARKER: &[Step] = &[Step::Key("messages"), Step::Index(0), Step::Key("content")];
+
+/// Path of a chat request's `stream` member.
+const STREAM: &[Step] = &[Step::Key("stream")];
+
 /// Answers one chat completion as [`PacedUpstream`] documents; a body that
 /// is not a JSON chat request is refused with `400`.
 async fn answer(State(paced): State<Paced>, body: Bytes) -> Response {
-    let Ok(request) = serde_json::from_slice::<Value>(&body) else {
+    let Ok([marker, stream]) = pick(&body, [MARKER, STREAM]) else {
         return (axum::http::StatusCode::BAD_REQUEST, "not json").into_response();
     };
-    let marker = request["messages"][0]["content"]
-        .as_str()
-        .unwrap_or_default()
-        .to_owned();
+    let marker = match marker {
+        Some(Leaf::Str(marker)) => marker,
+        _ => Cow::Borrowed(""),
+    };
     let pacing = paced.pacing;
-    if request["stream"] != Value::Bool(true) {
+    if stream != Some(Leaf::Bool(true)) {
         pause(pacing.buffered_delay).await;
         paced.record(&marker);
         return ([(CONTENT_TYPE, "application/json")], paced.buffered).into_response();
     }
+    let marker = marker.into_owned();
     pause(pacing.stream_delay).await;
     let frames = GatewayCapture::chat_event_frames(&marker, pacing.chunks);
     let events = async_stream::stream! {
@@ -561,4 +572,346 @@ async fn answer(State(paced): State<Paced>, body: Bytes) -> Response {
         Body::from_stream(events),
     )
         .into_response()
+}
+
+/// One step of a [`pick`] path: an object member or an array element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// The member of this name.
+    Key(&'static str),
+    /// The element at this position.
+    Index(usize),
+}
+
+/// The scalar [`pick`] found at a path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Leaf<'a> {
+    /// A string, borrowed from the document unless it holds escapes.
+    Str(Cow<'a, str>),
+    /// An integer a decoded [`Value`] holds as unsigned.
+    U64(u64),
+    /// A Boolean.
+    Bool(bool),
+}
+
+/// Reads `json` as a [`Value`] decode reads it, with the same syntax, number,
+/// string, nesting, and trailing-input rules and the last of duplicate
+/// members winning, but keeps only the scalar at each of `paths`, so no other
+/// member is materialized and an unescaped string is borrowed from `json`.
+///
+/// A path holds `None` where indexing the decoded value along it reaches no
+/// string, unsigned integer, or Boolean.
+///
+/// # Errors
+///
+/// Returns the JSON error of a document that does not decode as a [`Value`].
+///
+/// # Panics
+///
+/// Fails to compile for more than 64 paths.
+pub fn pick<'a, const N: usize>(
+    json: &'a [u8],
+    paths: [&[Step]; N],
+) -> serde_json::Result<[Option<Leaf<'a>>; N]> {
+    const { assert!(N <= 64, "pick reads at most 64 paths") };
+    let mut picked = std::array::from_fn(|_| None);
+    let mut deserializer = serde_json::Deserializer::from_slice(json);
+    Walk {
+        paths: &paths,
+        picked: &mut picked,
+        matching: (0..N).fold(0, |mask, path| mask | 1 << path),
+        depth: 0,
+    }
+    .deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(picked)
+}
+
+/// One value of [`pick`]'s document at `depth`, under which the paths of the
+/// `matching` mask continue.
+struct Walk<'s, 'de> {
+    /// Every requested path.
+    paths: &'s [&'s [Step]],
+    /// The scalar found for each path so far.
+    picked: &'s mut [Option<Leaf<'de>>],
+    /// Paths this value lies on, one bit per path.
+    matching: u64,
+    /// Steps from the document to this value.
+    depth: usize,
+}
+
+impl<'de> Walk<'_, 'de> {
+    /// The matching paths that `keep` accepts.
+    fn select(&self, keep: impl Fn(&[Step]) -> bool) -> u64 {
+        (0..self.paths.len())
+            .filter(|&index| self.matching & 1 << index != 0 && keep(self.paths[index]))
+            .fold(0, |mask, index| mask | 1 << index)
+    }
+
+    /// A walk of this value's child on the paths of `matching`.
+    fn child(&mut self, matching: u64) -> Walk<'_, 'de> {
+        Walk {
+            paths: self.paths,
+            picked: &mut *self.picked,
+            matching,
+            depth: self.depth + 1,
+        }
+    }
+
+    /// Stores the scalar `leaf` makes for every path ending at this value.
+    fn leaf(self, leaf: impl FnOnce() -> Option<Leaf<'de>>) {
+        let ending = self.select(|path| path.len() == self.depth);
+        if ending != 0 {
+            let leaf = leaf();
+            for (index, picked) in self.picked.iter_mut().enumerate() {
+                if ending & 1 << index != 0 {
+                    picked.clone_from(&leaf);
+                }
+            }
+        }
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for Walk<'_, 'de> {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Walk<'_, 'de> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<(), E> {
+        self.leaf(|| Some(Leaf::Bool(value)));
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<(), E> {
+        self.leaf(|| u64::try_from(value).ok().map(Leaf::U64));
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<(), E> {
+        self.leaf(|| Some(Leaf::U64(value)));
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<(), E> {
+        self.leaf(|| None);
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> Result<(), E> {
+        self.leaf(|| None);
+        Ok(())
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'de str) -> Result<(), E> {
+        self.leaf(|| Some(Leaf::Str(Cow::Borrowed(value))));
+        Ok(())
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<(), E> {
+        self.leaf(|| Some(Leaf::Str(Cow::Owned(value.to_owned()))));
+        Ok(())
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(mut self, mut seq: A) -> Result<(), A::Error> {
+        let mut index = 0;
+        loop {
+            let under = self.select(|path| path.get(self.depth) == Some(&Step::Index(index)));
+            if seq.next_element_seed(self.child(under))?.is_none() {
+                return Ok(());
+            }
+            index += 1;
+        }
+    }
+
+    fn visit_map<A: MapAccess<'de>>(mut self, mut map: A) -> Result<(), A::Error> {
+        while let Some(Name(name)) = map.next_key()? {
+            let under = self.select(
+                |path| matches!(path.get(self.depth), Some(Step::Key(key)) if *key == name),
+            );
+            // A later duplicate replaces the earlier value whole.
+            for (index, picked) in self.picked.iter_mut().enumerate() {
+                if under & 1 << index != 0 {
+                    *picked = None;
+                }
+            }
+            map.next_value_seed(self.child(under))?;
+        }
+        Ok(())
+    }
+}
+
+/// An object member name, borrowed from the document unless it holds escapes.
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct Name<'a>(#[serde(borrow)] Cow<'a, str>);
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+    use std::time::Duration;
+
+    use serde_json::Value;
+
+    use super::{GatewayCapture, Leaf, MARKER, PacedUpstream, Pacing, STREAM, pick};
+
+    /// The upstream's former projection of `body`: its marker and whether it
+    /// streams, from a decoded value.
+    fn decoded(body: &[u8]) -> Option<(String, bool)> {
+        let request = serde_json::from_slice::<Value>(body).ok()?;
+        let marker = request["messages"][0]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        Some((marker, request["stream"] == Value::Bool(true)))
+    }
+
+    /// The upstream's projection of `body` through [`pick`].
+    fn picked(body: &[u8]) -> Option<(Cow<'_, str>, bool)> {
+        let [marker, stream] = pick(body, [MARKER, STREAM]).ok()?;
+        let marker = match marker {
+            Some(Leaf::Str(marker)) => marker,
+            _ => Cow::Borrowed(""),
+        };
+        Some((marker, stream == Some(Leaf::Bool(true))))
+    }
+
+    /// The paced upstream reads a request's marker and stream flag exactly
+    /// as its decoded-value projection did, over escaped, duplicate,
+    /// mistyped, numeric, deep, and malformed bodies, borrowing an unescaped
+    /// marker from the body; served, a non-JSON body is refused, a buffered
+    /// call is answered and recorded under its marker, and only `stream:
+    /// true` streams.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a projection or an answer differs.
+    #[tokio::test]
+    async fn paced_request_projection_preserves_validation_and_routing() {
+        let deep = |depth: usize| {
+            format!(
+                r#"{{"messages":[{{"content":"m"}}],"x":{}{}}}"#,
+                "[".repeat(depth),
+                "]".repeat(depth)
+            )
+        };
+        let mut cases: Vec<String> = [
+            r#"{"model":"m","messages":[{"role":"system","content":"plain"},{"content":"x"}]}"#,
+            r#"{"messages":[{"content":"plain"}],"stream":true}"#,
+            r#"{"messages":[{"content":"plain"}],"stream":false}"#,
+            r#"{"messages":[{"content":"plain"}],"stream":"true"}"#,
+            r#"{"messages":[{"content":"plain"}],"stream":1}"#,
+            r#"{"messages":[{"content":"plain"}],"stream":null}"#,
+            r#"{"messages":[{"content":"q\"é\n"}]}"#,
+            r#"{"messages":[{"content":"a"}],"messages":[{"content":"b"}]}"#,
+            r#"{"messages":[{"content":"a"}],"messages":[]}"#,
+            r#"{"messages":[{"content":"a","content":7}]}"#,
+            r#"{"stream":true,"stream":false,"messages":[{"content":"a"}]}"#,
+            r#"{"stream":false,"stream":true,"messages":[{"content":"a"}]}"#,
+            r#"{"messages":[{"content":"escaped name"}],"stream":true}"#,
+            r#"{"messages":{"0":{"content":"object"}}}"#,
+            r#"{"messages":[["content"]]}"#,
+            r#"{"messages":[{"content":["a"]}]}"#,
+            r#"{"messages":[{"content":{"text":"a"}}]}"#,
+            r#"[{"messages":[{"content":"a"}]}]"#,
+            r#""messages""#,
+            "{}",
+            r#"{"messages":[{"content":"a"}],"n":1e400}"#,
+            r#"{"messages":[{"content":"a"}],"n":-0,"f":1.5,"i":-7}"#,
+            r#"{"messages":[{"content":"\ud800"}]}"#,
+            r#"{"messages":[{"content":"🦀"}]}"#,
+            r#"{"messages":[{"content":"a"}]} "#,
+            r#"{"messages":[{"content":"a"}]}x"#,
+            r#"{"messages":[{"content":"a"}"#,
+            "",
+        ]
+        .map(str::to_owned)
+        .into();
+        cases.extend([deep(100), deep(126), deep(127), deep(400)]);
+        let mut decodable = 0;
+        for case in &cases {
+            let expected = decoded(case.as_bytes());
+            let got = picked(case.as_bytes());
+            assert_eq!(
+                got.as_ref()
+                    .map(|(marker, stream)| (marker.as_ref(), *stream)),
+                expected
+                    .as_ref()
+                    .map(|(marker, stream)| (marker.as_str(), *stream)),
+                "{case}"
+            );
+            decodable += usize::from(expected.is_some());
+        }
+        assert_eq!(decodable, 25, "decodable bodies");
+
+        let body = format!(
+            r#"{{"messages":[{{"content":"marker-1"}},{{"content":"{}"}}]}}"#,
+            GatewayCapture::prose(65_536)
+        );
+        let (marker, _) = picked(body.as_bytes()).expect("decodes");
+        let Cow::Borrowed(marker) = marker else {
+            panic!("an unescaped marker is borrowed");
+        };
+        assert!(body.as_bytes().as_ptr_range().contains(&marker.as_ptr()));
+        assert!(matches!(
+            picked(br#"{"messages":[{"content":"a\nb"}]}"#),
+            Some((Cow::Owned(_), false))
+        ));
+
+        let upstream = PacedUpstream::start(
+            Pacing {
+                buffered_delay: Duration::ZERO,
+                buffered_bytes: 16,
+                stream_delay: Duration::ZERO,
+                chunks: 3,
+                chunk_interval: Duration::ZERO,
+            },
+            8,
+        )
+        .await
+        .expect("upstream starts");
+        let http = reqwest::Client::new();
+        let send = |body: String| {
+            http.post(format!("{}/chat/v1/chat/completions", upstream.uri()))
+                .header("content-type", "application/json")
+                .body(body)
+                .send()
+        };
+        let refused = send("not json".to_owned()).await.expect("answers");
+        assert_eq!(refused.status(), 400);
+        let buffered = send(body.clone()).await.expect("answers");
+        assert_eq!(buffered.status(), 200);
+        let answer: Value = buffered.json().await.expect("json answer");
+        assert_eq!(
+            answer,
+            GatewayCapture::sized_completion(16),
+            "the buffered answer"
+        );
+        assert_eq!(upstream.take("marker-1").len(), 1, "one buffered send");
+        let streamed = send(r#"{"messages":[{"content":"q\"m"}],"stream":true}"#.to_owned())
+            .await
+            .expect("answers")
+            .text()
+            .await
+            .expect("stream body");
+        assert_eq!(streamed, GatewayCapture::chat_events("q\"m", 3));
+        assert_eq!(upstream.take("q\"m").len(), 3, "one send per data event");
+        let unstreamed = send(r#"{"messages":[{"content":"s"}],"stream":"true"}"#.to_owned())
+            .await
+            .expect("answers");
+        assert_eq!(
+            unstreamed.headers()["content-type"],
+            "application/json",
+            "only a Boolean true streams"
+        );
+    }
 }

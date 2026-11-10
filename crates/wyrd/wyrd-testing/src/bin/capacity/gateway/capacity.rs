@@ -27,7 +27,6 @@ use wyrd_testing::release_server::PEAK_SAMPLE_INTERVAL_MS;
 use async_trait::async_trait;
 use num_traits::ToPrimitive;
 use reqwest::Client;
-use secrecy::SecretString;
 use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -46,7 +45,7 @@ use wyrd_testing::release_server::{LocalServer, Metrics};
 use crate::gateway::run::{
     BUFFERED, Drain, Durable, Integrity, STREAM_END, STREAM_HEAD, SUCCEEDED, outcome_key, settle,
 };
-use crate::gateway::workload::{CapturePolicy, Shape, Tenant, Timed, call, http};
+use crate::gateway::workload::{Caller, CapturePolicy, Shape, Tenant, Timed, call, http};
 use crate::gateway::{Case, PROCESS, Result, param, shutdown};
 
 /// The overload phase's rate over the declared rate.
@@ -781,10 +780,9 @@ impl Observed {
 /// The arrivals the driver launches, with everything a call needs.
 #[derive(Clone)]
 pub struct Driver {
-    /// The shared keep-alive client.
-    http: Client,
-    /// Each tenant's warmed keys.
-    keys: Arc<Vec<Vec<SecretString>>>,
+    /// Each tenant's warmed keys, prepared as callers over one shared
+    /// keep-alive client.
+    callers: Arc<Vec<Vec<Caller>>>,
     /// The paced upstream, for each call's send times.
     upstream: Arc<PacedUpstream>,
     /// The buffered and the streamed call shapes.
@@ -793,8 +791,11 @@ pub struct Driver {
 
 impl Driver {
     /// A driver of `tenants`' keys against `upstream` over `http`.
-    #[must_use]
-    pub fn new(http: Client, tenants: &[Tenant], upstream: Arc<PacedUpstream>) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns a caller preparation failure.
+    pub fn new(http: &Client, tenants: &[Tenant], upstream: Arc<PacedUpstream>) -> Result<Self> {
         let shape = |prefix: &str, stream: bool| Shape {
             model: format!("bench-{prefix}/gpt-4o"),
             stream,
@@ -805,12 +806,21 @@ impl Driver {
                 PACING.buffered_bytes
             },
         };
-        Self {
-            http,
-            keys: Arc::new(tenants.iter().map(|tenant| tenant.keys.clone()).collect()),
+        let callers = tenants
+            .iter()
+            .map(|tenant| {
+                tenant
+                    .keys
+                    .iter()
+                    .map(|key| Caller::new(http.clone(), key))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            callers: Arc::new(callers),
             upstream,
             shapes: Arc::new([shape("chat", false), shape("stream", true)]),
-        }
+        })
     }
 
     /// Launches the [`contention`] arrivals of `phases`' schedule at `rate`
@@ -831,21 +841,20 @@ impl Driver {
         let arrived = Arc::new(Mutex::new(Vec::new()));
         let launch = |planned: Planned| {
             let (tenant, stream) = contention(planned.index);
-            let keys = &self.keys[tenant];
-            let key = keys[usize::try_from(planned.index).unwrap_or(0) % keys.len()].clone();
+            let caller = usize::try_from(planned.index).unwrap_or(0) % self.callers[tenant].len();
             let marker = format!("{label}-{}", planned.index);
             let shape = self.shapes[usize::from(stream)].clone();
             let body = shape.body(&marker);
             let labels = (mode(stream).id(), phases.phase(planned.offset).label());
-            let (http, upstream, arrived) = (
-                self.http.clone(),
+            let (callers, upstream, arrived) = (
+                Arc::clone(&self.callers),
                 Arc::clone(&self.upstream),
                 Arc::clone(&arrived),
             );
             async move {
+                let caller = &callers[tenant][caller];
                 let timed =
-                    with_benchmark_labels(labels.0, labels.1, call(&http, &key, &shape, body))
-                        .await;
+                    with_benchmark_labels(labels.0, labels.1, call(caller, &shape, body)).await;
                 let sends = upstream.take(&marker);
                 arrived
                     .lock()
@@ -958,7 +967,7 @@ impl Capacity {
         if self.tenants.len() != TENANTS.len() {
             return Err(format!("setup provisioned {} tenants", self.tenants.len()).into());
         }
-        self.driver = Some(Driver::new(http()?, &self.tenants, Arc::clone(&upstream)));
+        self.driver = Some(Driver::new(&http()?, &self.tenants, Arc::clone(&upstream))?);
         self.upstream = Some(upstream);
         self.server = Some(server);
         Ok(())

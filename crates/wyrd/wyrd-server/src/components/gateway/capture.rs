@@ -909,37 +909,59 @@ fn redact_object(
     map: &mut Map<String, Value>,
     objects: &mut PayloadObjects,
 ) -> Result<(), CaptureDrop> {
-    let media_type = ["mime_type", "mimeType", "media_type", "format"]
+    // A `data` member beside a media type is referenced first, while the
+    // media type's original text can still be borrowed.
+    let media = ["mime_type", "mimeType", "media_type", "format"]
         .iter()
         .find_map(|key| map.get(*key).and_then(Value::as_str))
-        .map(str::to_owned);
+        .zip(map.get("data").and_then(Value::as_str))
+        .map(|(kind, encoded)| decode_base64(encoded).map(|bytes| objects.reference(kind, bytes)))
+        .transpose()?;
+    let referenced = media.is_some();
+    if let (Some(reference), Some(member)) = (media, map.get_mut("data")) {
+        *member = reference;
+    }
     for (key, member) in map.iter_mut() {
-        let normalized: String = key
-            .chars()
-            .filter(char::is_ascii_alphanumeric)
-            .map(|c| c.to_ascii_lowercase())
-            .collect();
-        if normalized == "token"
-            || SECRET_KEY_FRAGMENTS
-                .iter()
-                .any(|fragment| normalized.contains(fragment))
-        {
-            *member = Value::String(REDACTED.to_owned());
+        if referenced && key == "data" {
             continue;
         }
-        let inline = match (key.as_str(), member.as_str(), &media_type) {
-            ("b64_json", Some(encoded), _) => Some(("application/octet-stream", encoded)),
-            ("data", Some(encoded), Some(kind)) => Some((kind.as_str(), encoded)),
-            _ => None,
-        };
-        match inline {
-            Some((kind, encoded)) => {
-                *member = objects.reference(kind, decode_base64(encoded)?);
-            }
-            None => redact(member, objects)?,
+        if secret_key(key) {
+            *member = Value::String(REDACTED.to_owned());
+        } else if let ("b64_json", Some(encoded)) = (key.as_str(), member.as_str()) {
+            *member = objects.reference("application/octet-stream", decode_base64(encoded)?);
+        } else {
+            redact(member, objects)?;
         }
     }
     Ok(())
+}
+
+/// Whether `key` names a credential: lowercased and stripped to ASCII
+/// alphanumerics, it is exactly `token` or contains a
+/// [`SECRET_KEY_FRAGMENTS`] entry.
+///
+/// The normalized key is walked in place rather than collected, so checking
+/// every member of a payload allocates nothing.
+fn secret_key(key: &str) -> bool {
+    let mut rest = key
+        .bytes()
+        .filter(u8::is_ascii_alphanumeric)
+        .map(|byte| byte.to_ascii_lowercase());
+    if rest.clone().eq("token".bytes()) {
+        return true;
+    }
+    loop {
+        let starts = |fragment: &&str| {
+            let mut tail = rest.clone();
+            fragment.bytes().all(|byte| tail.next() == Some(byte))
+        };
+        if SECRET_KEY_FRAGMENTS.iter().any(starts) {
+            return true;
+        }
+        if rest.next().is_none() {
+            return false;
+        }
+    }
 }
 
 /// Reference for a `data:<type>;base64,<content>` URL, or `None` for any
@@ -1652,6 +1674,78 @@ pub(crate) mod tests {
             CallCapture::from_facts(facts).err(),
             Some(CaptureDrop::Payload)
         );
+    }
+
+    /// Proves redaction and Variant encoding keep the selected content
+    /// exactly: secret keys match after lowercasing and stripping to ASCII
+    /// alphanumerics, so case and separators never matter and a non-ASCII
+    /// letter splits a fragment, and `token` matches only whole; a media `data` member is referenced by the first
+    /// media-type member's original text even when that member is itself a
+    /// data URL; nested objects and arrays, Unicode keys, explicit nulls, and
+    /// exact numbers survive the encoding unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any member is redacted, referenced, or encoded differently
+    /// from the expected payload.
+    #[test]
+    fn payload_materialization_preserves_redaction_and_variant_values() {
+        let reference = |kind: &str| {
+            let mut objects = PayloadObjects::default();
+            let bytes = super::decode_base64(IMAGE_B64).expect("the image is base64");
+            objects.reference(kind, bytes)
+        };
+        let url = format!("data:text/plain;base64,{IMAGE_B64}");
+        let value = json!({
+            "X-Goog-Api-Key": CANARY,
+            "Clé API-Key": CANARY,
+            "Ünïcode Sécret": "visible",
+            "my_ACCESS-token": CANARY,
+            "To-Ken": CANARY,
+            "tokens": 12,
+            "tokenizer": "bpe",
+            "clé": null,
+            "nested": [{"Authorization": CANARY, "keep": [1, -2, 18_446_744_073_709_551_615_u64, 0.1]}],
+            "source": {"format": url, "mime_type": "image/png", "data": IMAGE_B64},
+            "audio": {"mimeType": "audio/wav", "format": "wav", "data": IMAGE_B64},
+            "plain": {"data": IMAGE_B64},
+        });
+        let expected = json!({
+            "X-Goog-Api-Key": REDACTED,
+            "Clé API-Key": REDACTED,
+            "Ünïcode Sécret": "visible",
+            "my_ACCESS-token": REDACTED,
+            "To-Ken": REDACTED,
+            "tokens": 12,
+            "tokenizer": "bpe",
+            "clé": null,
+            "nested": [{"Authorization": REDACTED, "keep": [1, -2, 18_446_744_073_709_551_615_u64, 0.1]}],
+            "source": {"format": reference("text/plain"), "mime_type": "image/png", "data": reference("image/png")},
+            "audio": {"mimeType": "audio/wav", "format": "wav", "data": reference("audio/wav")},
+            "plain": {"data": IMAGE_B64},
+        });
+        let mut objects = PayloadObjects::default();
+        let column = super::redacted_payload(value, &mut objects).expect("the payload encodes");
+        assert_eq!(
+            variant_cell_to_json(column.as_ref(), 0).expect("the payload renders"),
+            expected
+        );
+        assert_eq!(objects.refs().len(), 3, "one object per content type");
+        for (key, secret) in [
+            ("", false),
+            ("token", true),
+            ("TOK_EN", true),
+            ("tokens", false),
+            ("xtoken", false),
+            ("ppassword", true),
+            ("passwor", false),
+            ("user-secret", true),
+            ("sécret", false),
+            ("Set-Cookie", true),
+            ("id", false),
+        ] {
+            assert_eq!(super::secret_key(key), secret, "{key}");
+        }
     }
 
     /// Proves malformed inline base64 — a `b64_json` member, a media `data`

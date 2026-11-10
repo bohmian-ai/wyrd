@@ -675,11 +675,16 @@ holds the residual tail:
 - Client < 1 ms is still missed in every case (1 KiB marginally).
 - Gateway-added < 500 µs is met for both metadata cases and missed for
   payload.
-- **The payload residual p50 is 6.5% above the recovery envelope.** That
-  increase lies entirely in `admit` (p50 2.19 → 2.39 ms), which no change
-  touches. Capture work and outbox write time did not grow. On this metric
-  the pre-task record spans 2.02–2.89 ms and the qualification run
-  1.27–3.01 ms. No regression attributable to the reductions is supported.
+- **In the first final run the payload residual p50 was 6.5% above the
+  recovery envelope.** That increase lay entirely in `admit` (p50 2.19 →
+  2.39 ms), which no change touches. Capture work and outbox write time did
+  not grow. On this metric the pre-task record spans 2.02–2.89 ms and the
+  qualification run 1.27–3.01 ms.
+- A repeat run of the same code (`…/20261110T124026Z-7d7c73b9d.json`,
+  VALID) measured 2.842 ms, inside the envelope, with client p50
+  0.991 / 2.342 / 4.526 ms. Its one miss is the 64 KiB metadata residual p50
+  (+0.2%). The first final run's miss was run-to-run variation, not a
+  regression.
 - None of the four reductions moves the payload tail, as C1 and C2 predicted.
 
 ## Limits

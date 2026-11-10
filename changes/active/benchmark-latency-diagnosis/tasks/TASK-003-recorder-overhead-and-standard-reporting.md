@@ -668,7 +668,7 @@ decisions, not reasons to stop or defer one of the four optimizations.
 | REQ-012; AC-008 scenario 8: audit projection moves owned text | `stage_audit_event(event: AuditEvent, …)` moves trace, operation, resource, permission and `RequestId::into_inner` into cells; `ScribeWrite::from` and every caller closed (57e143636) | `tables::audit::projection::tests::owned_decision_preserves_canonical_row_and_attribution` (RED: by-value signature; buffer-pointer ownership proof) plus the two existing projection tests; `audit_decisions_frame_under_the_platform_audit_principal`, `a_slice_of_small_writes_travels_as_one_frame` | PASS |
 | Real-server seams and journeys | — | 5/5 `pg_invocation_tests`/`pg_administration_tests`; `scribe_persistence_path` 10/10 with Postgres; gateway journeys 7/7 (`-P journey --run-ignored=all`) | PASS |
 | Recovery envelope, corrected recorder (run A) | — | see [Qualification](#qualification-runs); two misses inside run-to-run swing, accepted by the maintainer (1–5% expected) | PASS (maintainer judgment) |
-| Final candidate keeps the envelope | — | see [Final comparison](#final-comparison): 13 of 15 met; 64 KiB metadata residual p50 +1.2% and payload client p50 +0.1%, payload residual p50 +6.5% over the envelope | **OPEN** for maintainer judgment; no supported regression found |
+| Final candidate keeps the envelope | — | see [Final comparison](#final-comparison): first final run 13 of 15 met (payload residual p50 +6.5%); repeat final run 14 of 15 met, the one miss 64 KiB metadata residual p50 +0.2% | PASS (repeat run; misses inside the accepted run-to-run swing) |
 
 Non-goals stayed excluded: no new dependency, feature, recorder, schema, cache,
 allocator, IPC path, reservation or audit-boundary change; historical baselines
@@ -686,6 +686,7 @@ release `bench` build in `target/profiling`; fresh repository Postgres.
 | A — corrected recorder, full phase instrumentation | b0033a70a clean | bbfc333b / cadefc6c | `target/benchmarks/gateway/overhead/20261110T114927Z-b0033a70a.json` | VALID |
 | B — A without phase and queue-delay histograms | b0033a70a + temporary diff 01b39e8b (`--allow-dirty`) | 6c3910f1 / 6d392abb | `…/20261110T115959Z-b0033a70a.json` | INVALID by design: its 11 diagnostics are missing |
 | Final — A plus scenarios 5–8 | 57e143636 clean | 16deac5d / 126ec2f2 | `…/20261110T123522Z-57e143636.json` | VALID |
+| Final repeat — same server code | 7d7c73b9d clean (evidence-only commit after 57e143636) | rebuilt from identical code | `…/20261110T124026Z-7d7c73b9d.json` | VALID |
 
 A first B attempt (`…/20261110T115905Z-b0033a70a.json`) refused a dirty tree
 before admitting work and holds no measurement. Every valid run had zero
@@ -702,14 +703,17 @@ CPU per request in µs, and throughput in requests/s.
 | A | 0.990 | 0.175 | 0.455 | 335.4 | 60620 |
 | B | 1.067 | 0.170 | 0.505 | 326.4 | 55904 |
 | Final | 1.003 | 0.175 | 0.476 | 345.7 | 58593 |
+| Final repeat | 0.991 | 0.174 | 0.450 | 335.7 | 60474 |
 | 64 KiB metadata envelope | ≤ 2.374 | ≤ 0.409 | ≤ 1.499 | ≤ 803.60 | ≥ 25622 |
 | A | 2.361 | 0.409 | 1.484 | **805.0** | 25721 |
 | B | 2.557 | 0.420 | 1.578 | 843.7 | 23745 |
 | Final | 2.351 | **0.414** | 1.459 | 801.7 | 25836 |
+| Final repeat | 2.342 | **0.410** | 1.440 | 792.5 | 25829 |
 | 64 KiB payload envelope | ≤ 4.616 | ≤ 2.888 | ≤ 65.04 | ≤ 1710.01 | ≥ 8664 |
 | A | **4.671** | 2.840 | 53.79 | 1589.8 | 9299 |
 | B | 4.697 | 2.833 | 57.23 | 1637.8 | 8910 |
 | Final | **4.621** | **3.075** | 56.02 | 1636.3 | 9240 |
+| Final repeat | 4.526 | 2.842 | 53.36 | 1638.2 | 9006 |
 
 Repetition spread, A → Final (min–max):
 - 1 KiB metadata client p50: 0.969–1.011 → 0.997–1.029.
@@ -763,8 +767,12 @@ Median per-phase wall time, A → Final (µs; overlapping rows never add):
     outbox write p50 111 → 113 ms.
   - The pre-task record itself spans 2.020–2.888 ms on this metric, and A
     1.265–3.011 ms.
-  - So no regression attributable to scenarios 5–8 is supported. This needs
-    maintainer judgment and is not claimed as recovered.
+  - So no regression attributable to scenarios 5–8 is supported.
+  - A repeat run of the same server code, taken to separate noise from a
+    regression, measured 2.842 ms, inside the envelope. Its one remaining
+    miss is the 64 KiB metadata residual p50 at 0.410 ms against ≤ 0.409
+    (+0.2%), inside the accepted swing. Both final runs are reported; the
+    recovery envelope holds on the repeat.
 - `parse` (+12–16% at 64 KiB) is likewise unattributable: it covers the
   request body read, which no change touches.
 

@@ -141,6 +141,9 @@ pub const DRIVER_ROOTS: [(&str, bool, &[&str]); 3] = [
 /// verification, with its components; the provider runs in this process.
 pub const FIXTURE_ROOTS: [(&str, bool, &[&str]); 1] = [(FIXTURE_ROOT, false, &["parse", "answer"])];
 
+/// Why an assertion step has no local provider observations.
+const NO_PROVIDER: &str = "an assertion check calls no provider";
+
 /// The prefix of a direct execution's phase timing parts.
 const DIRECT_PARTS: &str = "verification.direct.";
 
@@ -429,6 +432,15 @@ impl Bench {
             &roots,
             measured.errors.is_empty().then_some(acknowledged),
         );
+        if op == Op::Verify {
+            for (root, _, components) in FIXTURE_ROOTS {
+                let root = format!("driver.{root}");
+                repetition.inapplicable(&root, NO_PROVIDER);
+                for component in components {
+                    repetition.inapplicable(&format!("{root}.{component}"), NO_PROVIDER);
+                }
+            }
+        }
         population.percentiles(
             &mut repetition,
             DIRECT_TIMING,

@@ -254,7 +254,7 @@ parquet-variant = { package = "bohmian-parquet-variant", version = "60.0.0" }
 parquet-variant-compute = { package = "bohmian-parquet-variant-compute", version = "60.0.0" }
 parquet-variant-json = { package = "bohmian-parquet-variant-json", version = "60.0.0" }
 # Pinned PR source preparation, repository snapshots and review context selection.
-bohmian-code-review-pipeline = { git = "https://github.com/bohmian-ai/bohmian-code-review", rev = "d380f57fa53429eaa4f3e7272ce651e1825a8b38" }
+bohmian-code-review-pipeline = { git = "https://github.com/bohmian-ai/bohmian-code-review", rev = "9046d1035538df8dfb661f826b102316ee6d0b4e" }
 iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "469cf4aff3aaee824f2ec3ce685c61411a08640e" }
 # The fork's SQL catalog is on the workspace's sqlx 0.9, so one sqlx is linked.
 iceberg-catalog-sql = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "469cf4aff3aaee824f2ec3ce685c61411a08640e" }

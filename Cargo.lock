@@ -990,7 +990,7 @@ dependencies = [
 [[package]]
 name = "bohmian-code-review"
 version = "0.1.0"
-source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=d380f57fa53429eaa4f3e7272ce651e1825a8b38#d380f57fa53429eaa4f3e7272ce651e1825a8b38"
+source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=9046d1035538df8dfb661f826b102316ee6d0b4e#9046d1035538df8dfb661f826b102316ee6d0b4e"
 dependencies = [
  "bohmian-code-review-core",
  "bohmian-code-review-extract",
@@ -1003,7 +1003,7 @@ dependencies = [
 [[package]]
 name = "bohmian-code-review-core"
 version = "0.1.0"
-source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=d380f57fa53429eaa4f3e7272ce651e1825a8b38#d380f57fa53429eaa4f3e7272ce651e1825a8b38"
+source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=9046d1035538df8dfb661f826b102316ee6d0b4e#9046d1035538df8dfb661f826b102316ee6d0b4e"
 dependencies = [
  "serde",
  "serde_json",
@@ -1013,7 +1013,7 @@ dependencies = [
 [[package]]
 name = "bohmian-code-review-extract"
 version = "0.1.0"
-source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=d380f57fa53429eaa4f3e7272ce651e1825a8b38#d380f57fa53429eaa4f3e7272ce651e1825a8b38"
+source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=9046d1035538df8dfb661f826b102316ee6d0b4e#9046d1035538df8dfb661f826b102316ee6d0b4e"
 dependencies = [
  "bohmian-code-review-core",
  "cc",
@@ -1043,7 +1043,7 @@ dependencies = [
 [[package]]
 name = "bohmian-code-review-index"
 version = "0.1.0"
-source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=d380f57fa53429eaa4f3e7272ce651e1825a8b38#d380f57fa53429eaa4f3e7272ce651e1825a8b38"
+source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=9046d1035538df8dfb661f826b102316ee6d0b4e#9046d1035538df8dfb661f826b102316ee6d0b4e"
 dependencies = [
  "bohmian-code-review-core",
 ]
@@ -1051,7 +1051,7 @@ dependencies = [
 [[package]]
 name = "bohmian-code-review-pipeline"
 version = "0.1.0"
-source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=d380f57fa53429eaa4f3e7272ce651e1825a8b38#d380f57fa53429eaa4f3e7272ce651e1825a8b38"
+source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=9046d1035538df8dfb661f826b102316ee6d0b4e#9046d1035538df8dfb661f826b102316ee6d0b4e"
 dependencies = [
  "bohmian-code-review",
  "flate2",
@@ -1068,7 +1068,7 @@ dependencies = [
 [[package]]
 name = "bohmian-code-review-resolve"
 version = "0.1.0"
-source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=d380f57fa53429eaa4f3e7272ce651e1825a8b38#d380f57fa53429eaa4f3e7272ce651e1825a8b38"
+source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=9046d1035538df8dfb661f826b102316ee6d0b4e#9046d1035538df8dfb661f826b102316ee6d0b4e"
 dependencies = [
  "bohmian-code-review-core",
  "bohmian-code-review-index",
@@ -1077,7 +1077,7 @@ dependencies = [
 [[package]]
 name = "bohmian-code-review-select"
 version = "0.1.0"
-source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=d380f57fa53429eaa4f3e7272ce651e1825a8b38#d380f57fa53429eaa4f3e7272ce651e1825a8b38"
+source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=9046d1035538df8dfb661f826b102316ee6d0b4e#9046d1035538df8dfb661f826b102316ee6d0b4e"
 dependencies = [
  "bohmian-code-review-core",
  "bohmian-code-review-index",

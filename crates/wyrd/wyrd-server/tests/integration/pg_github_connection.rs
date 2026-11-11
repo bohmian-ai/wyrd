@@ -518,9 +518,9 @@ impl Connected {
 }
 
 /// A token GitHub mints while access changes is discarded: an unrelated
-/// removal, the repository's own removal, and a disconnect followed by a
-/// reconnect each refuse the old request, and a fresh request is decided on
-/// current access.
+/// removal, the repository's own removal, a suspension, a disconnect
+/// followed by a reconnect, and a disconnect each refuse the old request, and
+/// a fresh request is decided on current access.
 ///
 /// # Panics
 /// Panics when a discarded token is handed out or a fresh request answers
@@ -541,6 +541,21 @@ async fn tokens_minted_across_an_access_change_are_discarded() {
     let lost = connected.mint_while(2, connected.remove(2)).await;
     assert_eq!(lost.expect_err("the token is discarded").code(), conflict);
     refused(server, 2, "WYRD_GITHUB_403_REPOSITORY_INACCESSIBLE").await;
+
+    let suspended = connected
+        .mint_while(1, async {
+            connected.mock.set_suspended(101, true);
+            assert_eq!(connected.installation_event("suspend").await, 202);
+        })
+        .await;
+    assert_eq!(
+        suspended.expect_err("the token is discarded").code(),
+        conflict
+    );
+    refused(server, 1, "WYRD_GITHUB_403_REPOSITORY_INACCESSIBLE").await;
+    connected.mock.set_suspended(101, false);
+    assert_eq!(connected.installation_event("unsuspend").await, 202);
+    minted(server, 1).await;
 
     let install = format!(
         "{}apps/wyrd-test-app/installations/new",

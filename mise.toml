@@ -905,7 +905,7 @@ hide = true
 description = "Run the StorageHandle CRUD + server multipart e2e against real GCS (merge-to-main only; requires GCP credentials and WYRD_STORAGE_URL in env)"
 env = { WYRD_STORAGE_PART_SIZE_BYTES = "16777216", WYRD_STORAGE_MULTIPART_THRESHOLD_BYTES = "8388608" }
 run = """
-cargo nextest run -p wyrd-storage --features emulator --test integration -E 'test(=handle_crud::gcs_handle_crud) | test(/^integration_gcs::gcs_multipart_/)'
+cargo nextest run -p wyrd-storage --features emulator --test integration -E 'test(=handle_crud::gcs_handle_crud) | test(=handle_crud::gcs_create_only) | test(/^integration_gcs::gcs_multipart_/)'
 cargo nextest run -p wyrd-server --features storage-emulator --test integration --test-threads=1 -E 'test(=storage_e2e::gcs_multipart_e2e) | test(=storage_e2e::gcs_single_put_e2e)'
 """
 

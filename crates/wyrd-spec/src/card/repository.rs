@@ -94,9 +94,8 @@ impl RepositoryRemote {
         let host = authority.rsplit('@').next()?.to_ascii_lowercase();
         let host = match (scheme, host.split_once(':')) {
             ("https", Some((name, "443"))) | ("http", Some((name, "80"))) => name.to_owned(),
-            ("https" | "http", _) => host,
+            ("https" | "http", _) | (_, None) => host,
             (_, Some((name, _))) => name.to_owned(),
-            (_, None) => host,
         };
         let path = path.trim_matches('/');
         let path = path.strip_suffix(".git").unwrap_or(path);

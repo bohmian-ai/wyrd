@@ -7,6 +7,9 @@
 //! was written on its operation row, and [`settle_repository_selection`]
 //! decides it exactly once.
 
+// raw-query grep allowlist: Repository selection statements post-date the sqlx
+// offline cache; run `mise run sqlx:prepare` to promote them to macros.
+
 use sqlx::FromRow;
 use uuid::Uuid;
 use wyrd_semver::VersionBlock;

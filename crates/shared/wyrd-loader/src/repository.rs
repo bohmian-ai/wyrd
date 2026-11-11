@@ -10,7 +10,9 @@ use std::path::Path;
 
 use wyrd_config::RepositoryConfig;
 use wyrd_spec::api_version::ApiVersion;
-use wyrd_spec::card::repository::{RepositoryRemote, RepositorySpec, infer_card_name};
+use wyrd_spec::card::repository::{
+    RepositoryProvider, RepositoryRemote, RepositorySpec, infer_card_name,
+};
 use wyrd_spec::card::verifier::VerificationBinding;
 use wyrd_spec::envelope::{CardKind, Metadata, Spec};
 use wyrd_spec::error::WyrdError;
@@ -94,7 +96,7 @@ pub(crate) fn repository_root(
             origin: None,
         },
         spec: Spec::Repository(RepositorySpec {
-            provider: Default::default(),
+            provider: RepositoryProvider::default(),
             host: repository.spec.host.clone(),
             repository_id: repository.spec.repository_id.clone(),
             verified_by: bindings

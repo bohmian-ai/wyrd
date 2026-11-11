@@ -2605,7 +2605,9 @@ mod envelope_roundtrip_tests {
         };
         assert_eq!(spec.provider, RepositoryProvider::Github);
         assert_eq!(
-            spec.repository_id.as_ref().map(|id| id.as_str()),
+            spec.repository_id
+                .as_ref()
+                .map(crate::ids::RepositoryId::as_str),
             Some("42")
         );
         let Some(InlineableRef::Inline(trigger)) = &spec.verified_by[0].runs_on else {

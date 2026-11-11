@@ -583,7 +583,9 @@ mod tests {
         );
         let spec = repository_spec(&tree);
         assert_eq!(
-            spec.repository_id.as_ref().map(|id| id.as_str()),
+            spec.repository_id
+                .as_ref()
+                .map(wyrd_spec::ids::RepositoryId::as_str),
             Some("42")
         );
         assert!(spec.verified_by.is_empty());

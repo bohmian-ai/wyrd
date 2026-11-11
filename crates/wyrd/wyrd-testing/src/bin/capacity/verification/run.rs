@@ -1769,7 +1769,7 @@ mod tests {
         use async_trait::async_trait;
         use tokio::time::Instant;
         use tokio_util::sync::CancellationToken;
-        use wyrd_testing::capacity::{Window, release_binary};
+        use wyrd_testing::capacity::{ResourceWindow, release_binary};
         use wyrd_testing::experiment::{
             ExperimentError, Level, Options, Phase, Record, Repetition, Step, Timing, Verdict,
             Workload, run,
@@ -2011,20 +2011,34 @@ mod tests {
                 "warmup",
             )
             .await;
-            let (opened, _) = Window::open(server).await.expect("open");
-            let stop = Instant::now() + WINDOW;
-            let (measured, usage, _) = opened
-                .measure(
-                    server,
-                    stop.into_std(),
-                    drive(states, Op::Verify, stop, "repetition-1"),
-                )
-                .await
-                .expect("control window");
+            // A server without collection serves no snapshot to scrape, so
+            // the control window reads only its resources, frozen at the
+            // stop before in-flight calls drain, as `Window::measure` does.
+            let mut resources = ResourceWindow::open([server]);
+            let started = Instant::now();
+            let stop = started + WINDOW;
+            let (measured, seconds) = {
+                let mut work = std::pin::pin!(drive(states, Op::Verify, stop, "repetition-1"));
+                let early = tokio::select! {
+                    measured = &mut work => Some(measured),
+                    () = tokio::time::sleep_until(stop) => None,
+                };
+                resources.freeze([server]);
+                let seconds = started.elapsed().as_secs_f64();
+                match early {
+                    Some(measured) => (measured, seconds),
+                    None => (work.await, seconds),
+                }
+            };
+            let control_cpu = resources
+                .finish([server], seconds)
+                .first()
+                .and_then(|used| used.cpu_seconds)
+                .expect("control server CPU");
             assert!(measured.errors.is_empty(), "{:?}", measured.errors);
             let control = per_verification(
-                usage.seconds,
-                usage.server_cpu_seconds.expect("control server CPU"),
+                seconds,
+                control_cpu,
                 (measured.latencies_us.len() as u64 - measured.late) as f64,
             );
             let enabled = per_verification(

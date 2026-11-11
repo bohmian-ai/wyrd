@@ -28,6 +28,11 @@ function rehypeBaseLinks() {
     v !== BASE &&
     !v.startsWith(`${BASE}/`);
 
+  // SvelteKit's client router applies the page route's trailing-slash policy
+  // to same-origin anchors. Static resources must instead retain their exact
+  // filename when the browser requests them.
+  const isStaticResource = (v) => typeof v === 'string' && /\/[^/?#]+\.[^/?#]+(?:[?#].*)?$/.test(v);
+
   const fixSrcset = (value) =>
     value
       .split(',')
@@ -43,6 +48,7 @@ function rehypeBaseLinks() {
     if (node.type === 'element' && node.properties) {
       const p = node.properties;
       if (isInternal(p.href)) p.href = `${BASE}${p.href}`;
+      if (node.tagName === 'a' && isStaticResource(p.href)) p['data-sveltekit-reload'] = '';
       if (isInternal(p.src)) p.src = `${BASE}${p.src}`;
       if (typeof p.srcSet === 'string') p.srcSet = fixSrcset(p.srcSet);
     }

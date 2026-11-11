@@ -32,9 +32,10 @@ const publicFile = (path: string) =>
   statSync(new URL(`../../public${path}`, import.meta.url), { throwIfNoEntry: false })?.isFile() ?? false;
 const children = createRawSnippet(() => ({ render: () => '<p></p>' }));
 
+const rendered = (component: Component<any>, props = {}) => render(component, { props }).body;
+
 function internalLinks(component: Component<any>, props = {}): string[] {
-  const { body } = render(component, { props });
-  return [...body.matchAll(/href="\/wyrd(\/[^"#?]*)/g)].map((m) => m[1]);
+  return [...rendered(component, props).matchAll(/href="\/wyrd(\/[^"#?]*)/g)].map((m) => m[1]);
 }
 
 function deadLinks(links: string[]): string[] {
@@ -49,6 +50,11 @@ describe('landing and shell actions reach real destinations', () => {
   it('home shell header and footer link only to published pages', () => {
     app.page.route.id = '/';
     expect(deadLinks(internalLinks(Layout, { children }))).toEqual([]);
+  });
+
+  it('loads the footer machine-readable index without client-side route normalization', () => {
+    app.page.route.id = '/';
+    expect(rendered(Layout, { children })).toMatch(/<a href="\/wyrd\/llms\.txt" data-sveltekit-reload(?:="")?>llms\.txt<\/a>/);
   });
 
   it('doc shell header, sidebar, and footer link only to published pages', () => {
@@ -120,7 +126,11 @@ const page = (section: string, title: string, body: string, draft = false) =>
 describe('publication closure', () => {
   it('withdrawn pages leave every production discovery surface', () => {
     const build = buildFixtureSite({
-      'get-started/introduction.md': page('Get started', 'Fixture start', 'Published quokkafern text. [Kept](/understand/kept/)'),
+      'get-started/introduction.md': page(
+        'Get started',
+        'Fixture start',
+        'Published quokkafern text. [Kept](/understand/kept/) [Index](/llms.txt) [Full index](/llms-full.txt)'
+      ),
       'understand/kept.md': page('Understand', 'Kept concept', 'Retained concept.'),
       // A withdrawn page whose embed names an application file absent from the fixture.
       'get-started/withdrawn.md': page(
@@ -153,6 +163,11 @@ describe('publication closure', () => {
     expect(hrefs).toContain('/wyrd/understand/kept/');
     expect(hrefs.filter((href) => !served(href))).toEqual([]);
     expect(hrefs.filter((href) => /\/(operate|get-started\/withdrawn)\//.test(href))).toEqual([]);
+
+    const start = readFileSync(path.join(build, 'get-started/introduction/index.html'), 'utf8');
+    expect(start).toMatch(/<a href="\/wyrd\/llms\.txt" data-sveltekit-reload(?:="")?>Index<\/a>/);
+    expect(start).toMatch(/<a href="\/wyrd\/llms-full\.txt" data-sveltekit-reload(?:="")?>Full index<\/a>/);
+    expect(start).toMatch(/<a href="\/wyrd\/understand\/kept\/">Kept<\/a>/);
 
     for (const index of ['llms.txt', 'llms-full.txt']) {
       const body = readFileSync(path.join(build, index), 'utf8');

@@ -331,13 +331,14 @@ INVALID. `--allow-dirty` measures it anyway and records the SHA-256 of
 
 ## Profiling
 
-`--profile` runs `samply record` against each server process with the same
+`--profile [cpu|heap|both]` selects the captures; bare `--profile` is
+`both`. A CPU capture runs `samply record` against each server process with the same
 invocation on every platform, and saves the captures under the run's
 `target/benchmarks/` artifacts. A profile is diagnostic only. When samply is
 missing or a capture fails, the record carries a note instead, and the
 verdict is unchanged.
 
-`--profile` also takes heap profiles of the server. Once the fixtures are
+A heap capture (`heap` or `both`) profiles the server. Once the fixtures are
 loaded, the run asks the `bench` server build to start sampling its heap:
 about one allocation per 512 KiB allocated, recorded with its call stack,
 through the same mimalloc allocator the server always uses. After each

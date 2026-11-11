@@ -8,6 +8,7 @@ mod pg_tests {
     use std::path::Path;
 
     use wyrd_ai::cards::{CardKind, CardRef, CardSelector, Cards, DeclarationReceipt};
+    use wyrd_ai::cli;
     use wyrd_ai::github::{GithubConnection, GithubConnectionState};
     use wyrd_spec::envelope::RepositoryStatus;
     use wyrd_testing::WyrdTestServer;
@@ -98,14 +99,20 @@ mod pg_tests {
     ///
     /// # Errors
     /// Returns the declaration's refusal.
-    ///
-    /// # Panics
-    /// Panics when the policy cannot be copied.
     async fn declare_toml(
         cards: &Cards,
         checkout: &tempfile::TempDir,
         variant: &str,
     ) -> Result<DeclarationReceipt, wyrd_ai::WyrdError> {
+        cards.declare_from_path(policy(checkout, variant)).await
+    }
+
+    /// Make `policies/<variant>.toml` the checkout's `wyrd.toml` and return
+    /// its path.
+    ///
+    /// # Panics
+    /// Panics when the policy cannot be copied.
+    fn policy(checkout: &tempfile::TempDir, variant: &str) -> std::path::PathBuf {
         let toml = checkout.path().join("wyrd.toml");
         std::fs::copy(
             checkout
@@ -115,7 +122,7 @@ mod pg_tests {
             &toml,
         )
         .expect("policy copies");
-        cards.declare_from_path(toml).await
+        toml
     }
 
     /// The served Repository status and binding count of `card`.
@@ -299,6 +306,52 @@ mod pg_tests {
                 .full_name
                 .as_deref(),
             Some("acme/api-renamed")
+        );
+        deployment.shutdown().await;
+    }
+
+    /// `wyrd declare wyrd.toml` checks offline with the server checks
+    /// labelled deferred, refuses an invalid local Verifier before resolving
+    /// any credential, and declares the same selected Repository.
+    ///
+    /// # Panics
+    /// Panics when the CLI checks, refuses or declares differently.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the repository-managed Postgres journey lifecycle"]
+    async fn cli_checks_offline_and_declares_the_policy() {
+        let (mock, deployment, _connection, _key) = connected().await;
+        let checkout = checkout(&mock, "acme/api");
+
+        let report = cli::declare_check(policy(&checkout, "minimal")).expect("checks offline");
+        let names: Vec<_> = report.cards.iter().map(|card| card.name.as_str()).collect();
+        assert_eq!(names, ["code-review", "api"]);
+        assert_eq!(
+            report.deferred,
+            [
+                "repository_identity",
+                "registered_references",
+                "authorization",
+                "version_assignment"
+            ]
+        );
+        let broken = cli::declare(policy(&checkout, "broken"), None)
+            .await
+            .expect_err("a missing local Verifier is refused locally");
+        assert_eq!(
+            broken.code(),
+            "WYRD_LOADER_400_INVALID_ENVELOPE",
+            "{broken}"
+        );
+
+        let receipt = cli::declare(policy(&checkout, "minimal"), Some(deployment.admin()))
+            .await
+            .expect("wyrd declare wyrd.toml declares");
+        assert_eq!(receipt.root.kind, CardKind::Repository);
+        assert!(
+            repository(&deployment.cards().await, &receipt.root)
+                .await
+                .0
+                .selected
         );
         deployment.shutdown().await;
     }

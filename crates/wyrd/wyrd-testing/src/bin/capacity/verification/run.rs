@@ -1893,11 +1893,13 @@ mod tests {
         ///
         /// # Panics
         ///
-        /// Panics when a reading falls outside its reference, the observation
-        /// cost exceeds its allowance, or a check accepts a wrong reading.
+        /// Panics when another recorder is installed, a reading falls outside
+        /// its reference, the observation cost exceeds its allowance, or a
+        /// check accepts a wrong reading.
         #[tokio::test]
         #[ignore = "needs the release server from `mise run bench:build`, the Postgres wrapper and a quiet host"]
         async fn the_measurement_path_agrees_with_independent_references() {
+            wyrd_benchmark::install().expect("the benchmark recorder installs");
             let directory = tempfile::tempdir().expect("directory");
             let mut declaration = declare(Level::One, &[], base(Level::One)).expect("L1 declares");
             declaration.selection = Some(vec![STEP.to_owned()]);

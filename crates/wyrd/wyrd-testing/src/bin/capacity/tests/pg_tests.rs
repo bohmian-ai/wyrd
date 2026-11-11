@@ -264,18 +264,20 @@ async fn fresh_database() {
 /// Runs `engine`'s smoke-scale plan at `level` from `rest` through the
 /// shared runner with the wrapper's controls, three [`WINDOW`]s per L1 step,
 /// publishes the record, and reads it back. Each run starts from a
-/// [`fresh_database`].
+/// [`fresh_database`], with the driver's benchmark recorder started as
+/// `l1`/`l2` start it.
 ///
 /// # Panics
 ///
-/// Panics when the plan cannot be declared, the record does not read back
-/// unchanged, or the smoke is not VALID.
+/// Panics when another recorder is installed, the plan cannot be declared,
+/// the record does not read back unchanged, or the smoke is not VALID.
 async fn measured(
     engine: Engine,
     level: Level,
     rest: &[&str],
     directory: &std::path::Path,
 ) -> Measured {
+    crate::start_benchmark().expect("the only recorder");
     fresh_database().await;
     let root = repository();
     let mut arguments = line(rest);

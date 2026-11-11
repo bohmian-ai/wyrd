@@ -444,7 +444,10 @@ impl AuthoredPrompt {
             name: named.name().to_owned(),
             schema: resolved,
         });
-        prompt.authored = Some(Box::new(self.clone()));
+        prompt.authored = Some(Box::new(crate::prompt::Authored {
+            form: self.clone(),
+            request: crate::prompt::request_fingerprint(&prompt.request),
+        }));
         Ok(prompt)
     }
 

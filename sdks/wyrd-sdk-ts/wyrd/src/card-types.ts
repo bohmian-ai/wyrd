@@ -538,7 +538,7 @@ export interface CardDeclarationOutcome {
 /**
  * Wyrd Card kind.
  */
-export type CardKind = "Data" | "Model" | "Experiment" | "Prompt" | "Agent" | "Verifier" | "Service" | "Policy" | "Mcp" | "Audit" | "Artifact" | "Trigger" | "Operator" | "Source";
+export type CardKind = "Data" | "Model" | "Experiment" | "Prompt" | "Agent" | "Verifier" | "Service" | "Policy" | "Mcp" | "Audit" | "Artifact" | "Trigger" | "Operator" | "Source" | "Repository";
 
 /**
  * Server-managed lifecycle state for a Card.
@@ -5387,7 +5387,7 @@ export interface RegisteredAuditCard {
 /**
  * One registered Card envelope as `cards.get` returns it, discriminated by `kind`.
  */
-export type RegisteredCard = RegisteredDataCard | RegisteredModelCard | RegisteredArtifactCard | RegisteredPromptCard | RegisteredAgentCard | RegisteredVerifierCard | RegisteredServiceCard | RegisteredTriggerCard | RegisteredOperatorCard | RegisteredUntypedCard;
+export type RegisteredCard = RegisteredDataCard | RegisteredModelCard | RegisteredArtifactCard | RegisteredPromptCard | RegisteredAgentCard | RegisteredVerifierCard | RegisteredServiceCard | RegisteredTriggerCard | RegisteredOperatorCard | RegisteredRepositoryCard | RegisteredUntypedCard;
 
 /**
  * Registered `Data` Card envelope.
@@ -5600,6 +5600,36 @@ export interface RegisteredPromptCard {
 }
 
 /**
+ * Registered `Repository` Card envelope.
+ */
+export interface RegisteredRepositoryCard {
+  /**
+   * API version. Must be `wyrd/v1` for v1 Cards.
+   */
+  readonly apiVersion: ApiVersion;
+  /**
+   * Card kind discriminator.
+   */
+  readonly kind: "Repository";
+  /**
+   * Card metadata.
+   */
+  readonly metadata: Metadata;
+  /**
+   * Server-derived relationship summary.
+   */
+  readonly relationships?: Relationships;
+  /**
+   * Kind-specific spec payload.
+   */
+  readonly spec: RepositorySpec;
+  /**
+   * Optional server-derived status.
+   */
+  readonly status?: Status | null;
+}
+
+/**
  * Registered `Service` Card envelope.
  */
 export interface RegisteredServiceCard {
@@ -5767,6 +5797,72 @@ export interface Repeat {
    * The stop condition; it may read `iteration.output`.
    */
   readonly until: Condition;
+}
+
+/**
+ * Stable provider repository id: a positive decimal integer, as a string, that survives repository renames and transfers.
+ */
+export type RepositoryId = string;
+
+/**
+ * Source-hosting provider of a Repository.
+ */
+export type RepositoryProvider = "github";
+
+/**
+ * A connected provider repository and the Verifiers bound to it.
+ */
+export interface RepositorySpec {
+  /**
+   * Canonical configured provider web host, such as `github.com`.
+   *
+   * May be omitted when authoring; the server sets the configured host
+   * and refuses any other value.
+   */
+  readonly host?: string | null;
+  /**
+   * Source-hosting provider; `github` when omitted.
+   */
+  readonly provider?: RepositoryProvider;
+  /**
+   * Stable provider repository id, the Repository's durable identity.
+   *
+   * May be omitted when the declaration carries a repository hint, from
+   * which the server resolves it through the tenant's connection; a
+   * registered Repository always carries it.
+   */
+  readonly repository_id?: RepositoryId | null;
+  /**
+   * The complete desired list of Verifier bindings. Each binding's
+   * `runs_on`, when present, must be the `pull_request` activation.
+   */
+  readonly verified_by?: readonly VerificationBinding[];
+}
+
+/**
+ * Server-derived state of one Repository Card version.
+ *
+ * Exactly one version of a Repository family is selected once a
+ * declaration of it has completed: future pull request reviews use the
+ * selected version's bindings. Selection is separate from the Card's
+ * lifecycle `phase`: an Active version that a later declaration replaced
+ * stays readable and Active but is no longer selected.
+ */
+export interface RepositoryStatus {
+  /**
+   * `owner/name` as the provider last reported it, while the tenant's
+   * connection can reach the repository; `None` when it cannot.
+   */
+  readonly full_name?: string | null;
+  /**
+   * Whether this exact version is the family's selected policy.
+   */
+  readonly selected: boolean;
+  /**
+   * The family's selected version; `None` before any declaration of the
+   * family completed.
+   */
+  readonly selected_version?: VersionBlock | null;
 }
 
 /**
@@ -6646,6 +6742,11 @@ export interface Status {
    */
   readonly phase: string;
   /**
+   * Server-derived Repository policy selection and access, present only
+   * on a Repository Card. Read-side projection, like `verification`.
+   */
+  readonly repository?: RepositoryStatus | null;
+  /**
    * Last status update timestamp.
    */
   readonly updated_at?: string | null;
@@ -6926,7 +7027,7 @@ export type TriggerDuration = string;
 /**
  * Declarative activation for a bound Verifier.
  */
-export type TriggerSpec = TriggerSpecSchedule | TriggerSpecGroupEnd;
+export type TriggerSpec = TriggerSpecSchedule | TriggerSpecGroupEnd | TriggerSpecPullRequest;
 
 /**
  * Activate once per `group_id` group of source executions this long
@@ -6943,6 +7044,21 @@ export interface TriggerSpecGroupEnd {
    */
   readonly description?: string | null;
   readonly kind: "group_end";
+}
+
+/**
+ * Activate on each eligible pull request event of the owning
+ * Repository: opened, reopened, ready for review, or a new head or base.
+ *
+ * Valid only on a Repository's binding. It carries no event names: the
+ * eligible events are fixed, and an arbitrary event name is refused.
+ */
+export interface TriggerSpecPullRequest {
+  /**
+   * Optional human-readable purpose.
+   */
+  readonly description?: string | null;
+  readonly kind: "pull_request";
 }
 
 /**
@@ -6967,7 +7083,7 @@ export interface TriggerSpecSchedule {
 /**
  * Card kinds whose `spec` and `status` `cards.get` types.
  */
-export type TypedCardKind = "Data" | "Model" | "Artifact" | "Prompt" | "Agent" | "Verifier" | "Service" | "Trigger" | "Operator";
+export type TypedCardKind = "Data" | "Model" | "Artifact" | "Prompt" | "Agent" | "Verifier" | "Service" | "Trigger" | "Operator" | "Repository";
 
 /**
  * One named evidence slot. Slots are required unless `required: false`;

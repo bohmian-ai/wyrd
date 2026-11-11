@@ -31,12 +31,13 @@ use wyrd_spec::ids::{CardName, CardUid, DataTenantId};
 use wyrd_spec::reference::{CardRef, InlineableRef};
 use wyrd_spec::registry::{CardLifecycleStatus, DeclarationOutcomeKind};
 use wyrd_spec::storage::UploadId;
-use wyrd_sql::queries::cards::get_card_by_uid;
+use wyrd_sql::queries::cards::{get_card_by_uid, lock_version_line};
 use wyrd_sql::queries::verification::{InactivityTimeout, binding_activity};
 use wyrd_sql::queries::verifier_executions::{
     ScheduleOutcome, ScheduleSkip, VerifierExecutionQueue,
 };
 use wyrd_storage::settings::{BackendConfig, StorageSettings};
+use wyrd_testing::github::GithubAppMock;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 /// An assertion Verifier spec over one `json` slot.
@@ -5712,5 +5713,890 @@ async fn compensation_records_inventory_deletion() {
     assert!(objects.deleted);
     assert!(objects.files.is_empty());
 
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Storage settings for a bound server writing Card blobs under `root`.
+fn local_storage(root: &std::path::Path) -> StorageSettings {
+    StorageSettings {
+        backend: BackendConfig::Local {
+            root: root.to_path_buf(),
+        },
+        require_encryption: false,
+        presign_ttl: Duration::from_mins(10),
+        part_size_bytes: 16 * 1024 * 1024,
+        multipart_threshold_bytes: 100 * 1024 * 1024,
+    }
+}
+
+/// Associate the server's tenant with installation `101` on the mock's host,
+/// with repositories `4242` (`acme/policy`), `4343` and `4444` selected.
+///
+/// # Panics
+/// Panics when the slot cannot be written.
+async fn connect_policy_repository(server: &WyrdTestServer, mock: &GithubAppMock) {
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    sqlx::query(
+        "INSERT INTO wyrd.github_installations
+             (data_tenant_id, connection_id, revision, host, installation_id, repositories,
+              connected_at)
+         VALUES ($1, $2, 1, $3, 101,
+                 '[{\"repository_id\":\"4242\",\"full_name\":\"acme/policy\"},
+                   {\"repository_id\":\"4343\",\"full_name\":\"acme/other\"},
+                   {\"repository_id\":\"4444\",\"full_name\":\"acme/third\"}]'::jsonb,
+                 statement_timestamp())",
+    )
+    .bind(server.data_tenant_id().as_uuid())
+    .bind(Uuid::now_v7())
+    .bind(mock.host())
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("slot associates");
+    conn.commit().await.expect("slot commits");
+}
+
+/// Write `files` into `dir` and return the loader's declaration body for the
+/// Card at `dir/entry`.
+///
+/// # Panics
+/// Panics when a file cannot be written or the tree does not load.
+fn loaded_body(dir: &std::path::Path, files: &[(&str, &str)], entry: &str) -> Value {
+    for (name, contents) in files {
+        std::fs::write(dir.join(name), contents).expect("card file writes");
+    }
+    let input = build_declaration_input(load(&dir.join(entry)).expect("loader tree builds"))
+        .expect("declaration input builds");
+    serde_json::to_value(input.to_declare_card_request()).expect("request serializes")
+}
+
+/// Declare `body` under `key` and return the answered status and body.
+///
+/// # Panics
+/// Panics when the route does not respond.
+async fn declare_body(
+    server: &WyrdTestServer,
+    jwt: &str,
+    key: &str,
+    body: &Value,
+) -> (StatusCode, Value) {
+    let response = server
+        .oneshot_authenticated(jwt, request_with_body(key, body.clone()))
+        .await
+        .expect("declaration responds");
+    let status = response.status();
+    (status, response_json(response).await)
+}
+
+/// Run one tenant read in its own transaction.
+///
+/// # Panics
+/// Panics when the query fails.
+async fn tenant_row<T>(server: &WyrdTestServer, sql: &'static str, bind: &str) -> T
+where
+    T: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Send + Unpin,
+{
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let row = sqlx::query_as::<_, T>(sql)
+        .bind(bind)
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("tenant row reads");
+    conn.commit().await.expect("tenant read commits");
+    row
+}
+
+/// The selected version of Repository family `name`, if any.
+///
+/// # Panics
+/// Panics when the read fails.
+async fn selected_version(server: &WyrdTestServer, name: &str) -> Option<String> {
+    let (version,): (Option<String>,) = tenant_row(
+        server,
+        "SELECT max(version) FILTER (WHERE selected_at IS NOT NULL) FROM wyrd.cards \
+          WHERE kind = 'Repository' AND name = $1",
+        name,
+    )
+    .await;
+    version
+}
+
+/// A Card's UID and lifecycle status as read by name.
+#[derive(sqlx::FromRow)]
+struct CardStateRow {
+    /// The Card's UID.
+    card_uid: Uuid,
+    /// The Card's lifecycle status.
+    status: String,
+}
+
+/// The UID and lifecycle status of the only Card named `name`.
+///
+/// # Panics
+/// Panics when no single Card has that name or its UID is invalid.
+async fn card_state(server: &WyrdTestServer, name: &str) -> (CardUid, String) {
+    let CardStateRow { card_uid, status } = tenant_row(
+        server,
+        "SELECT card_uid, status FROM wyrd.cards WHERE name = $1",
+        name,
+    )
+    .await;
+    (
+        CardUid::from_uuid(card_uid).expect("stored UID is valid"),
+        status,
+    )
+}
+
+/// The UID and lifecycle status of `policy` version `version`.
+///
+/// # Panics
+/// Panics when that version is absent or its UID is invalid.
+async fn policy_state(server: &WyrdTestServer, version: &str) -> (CardUid, String) {
+    let CardStateRow { card_uid, status } = tenant_row(
+        server,
+        "SELECT card_uid, status FROM wyrd.cards \
+          WHERE kind = 'Repository' AND name = 'policy' AND version = $1",
+        version,
+    )
+    .await;
+    (
+        CardUid::from_uuid(card_uid).expect("stored UID is valid"),
+        status,
+    )
+}
+
+/// Push a pending reconciliation of `card_uid` an hour out, so only the test
+/// decides when the background reconciler next tries it.
+///
+/// # Panics
+/// Panics when the update fails.
+async fn hold_reconciliation(server: &WyrdTestServer, card_uid: &CardUid) {
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    sqlx::query(
+        "UPDATE wyrd.cards SET reconcile_next_attempt_at = now() + interval '1 hour' \
+         WHERE card_uid = $1 AND reconcile_status = 'pending'",
+    )
+    .bind(card_uid.as_uuid())
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("reconciliation holds");
+    conn.commit().await.expect("hold commits");
+}
+
+/// Wait until the Card named `name` reaches lifecycle `status`.
+///
+/// # Panics
+/// Panics when it does not within ten seconds.
+async fn wait_for_card_status(server: &WyrdTestServer, name: &str, status: &str) {
+    for _ in 0..100 {
+        if card_state(server, name).await.1 == status {
+            return;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    panic!(
+        "{name} did not become {status}; it is {}",
+        card_state(server, name).await.1
+    );
+}
+
+/// The old `policy` version: a Repository for `4242` with no Verifiers.
+const POLICY_V1: &str = "apiVersion: wyrd/v1\nkind: Repository\nmetadata:\n  name: policy\n  version: 1.0.0\nspec:\n  repository_id: \"4242\"\n  verified_by: []\n";
+/// The new `policy` version, binding the local `a-review` and `z-review`.
+const POLICY_V2: &str = "apiVersion: wyrd/v1\nkind: Repository\nmetadata:\n  name: policy\n  version: 2.0.0\nspec:\n  repository_id: \"4242\"\n  verified_by:\n    - verifier: ./a-review.yaml\n      runs_on: {kind: pull_request}\n    - verifier: ./z-review.yaml\n      runs_on: {kind: pull_request}\n";
+
+/// An exact metadata-only Verifier named `name`.
+fn review_verifier(name: &str) -> String {
+    format!(
+        "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: {name}\n  version: 1.0.0\nspec:\n  description: The answer is approve.\n  inputs:\n    answer: {{type: json}}\n  requirements:\n    - id: approves\n      statement: The answer is approve\n      check: {{kind: assert, path: inputs.answer, operator: equals, expected: approve}}\n"
+    )
+}
+
+/// A declaration reusing a Pending exact Verifier left by an earlier failed
+/// attempt selects only once that Verifier is Active, and the background
+/// reconciler makes that selection without a new declaration, in the same
+/// transaction as the activation.
+///
+/// Attempt A registers `z-review` while storage is broken, leaving it
+/// Pending. B reuses it beside a fresh `a-review` under a new `policy`
+/// version while only `z-review`'s blob path is blocked. Reconciliation then
+/// activates B's own Cards and a same-key replay revisits them, and the old
+/// version stays selected throughout. Once `z-review` can be written, an
+/// injected failure of its selection rolls back its activation too; without
+/// it the reconciler activates `z-review` and selects B, and B's replay
+/// answers success.
+///
+/// # Panics
+/// Panics when the old version is replaced before `z-review` is Active, a
+/// failed selection leaves `z-review` Active, or B is not selected by the
+/// reconciler.
+#[tokio::test(flavor = "current_thread")]
+async fn reused_pending_member_gates_selection_until_reconciled() {
+    let storage_root = tempfile::tempdir().expect("storage root creates");
+    let mock = GithubAppMock::start().expect("the GitHub mock starts");
+    let server = WyrdTestServer::builder()
+        .with_storage_settings(local_storage(storage_root.path()))
+        .with_github_app_for_test(&mock)
+        .start_bound()
+        .await
+        .expect("bound test server starts");
+    connect_policy_repository(&server, &mock).await;
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("repository-reused-member", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let checkout = tempfile::tempdir().expect("checkout creates");
+    let (z_review, a_review) = (review_verifier("z-review"), review_verifier("a-review"));
+
+    let old = loaded_body(checkout.path(), &[("v1.yaml", POLICY_V1)], "v1.yaml");
+    let (status, body) = declare_body(&server, &jwt, "reused-member-old", &old).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        selected_version(&server, "policy").await.as_deref(),
+        Some("1.0.0")
+    );
+
+    let moved_storage_root = storage_root.path().with_extension("moved");
+    std::fs::rename(storage_root.path(), &moved_storage_root).expect("storage root moves");
+    std::fs::write(storage_root.path(), b"not a directory").expect("broken storage root writes");
+    let attempt_a = loaded_body(
+        checkout.path(),
+        &[("z-review.yaml", &z_review)],
+        "z-review.yaml",
+    );
+    let (status, body) = declare_body(&server, &jwt, "reused-member-a", &attempt_a).await;
+    assert_ne!(status, StatusCode::CREATED, "{body}");
+    let (z_uid, z_status) = card_state(&server, "z-review").await;
+    assert_eq!(
+        z_status, "pending",
+        "A registered z-review before its blob failed"
+    );
+    hold_reconciliation(&server, &z_uid).await;
+    std::fs::remove_file(storage_root.path()).expect("broken storage root removes");
+    std::fs::rename(&moved_storage_root, storage_root.path()).expect("storage root restores");
+    let z_blocker = storage_root
+        .path()
+        .join(server.data_tenant_id().to_string())
+        .join("cards")
+        .join(z_uid.to_string());
+    std::fs::create_dir_all(z_blocker.parent().expect("cards directory")).expect("cards dir");
+    std::fs::write(&z_blocker, b"blocks only z-review").expect("z-review blob path blocks");
+
+    let attempt_b = loaded_body(
+        checkout.path(),
+        &[("a-review.yaml", &a_review), ("v2.yaml", POLICY_V2)],
+        "v2.yaml",
+    );
+    let (status, body) = declare_body(&server, &jwt, "reused-member-b", &attempt_b).await;
+    assert_ne!(status, StatusCode::CREATED, "{body}");
+    hold_reconciliation(&server, &z_uid).await;
+    let (root_uid, _) = policy_state(&server, "2.0.0").await;
+    let (a_uid, _) = card_state(&server, "a-review").await;
+    make_reconciliation_due(&server, &a_uid).await;
+    make_reconciliation_due(&server, &root_uid).await;
+    wait_for_card_status(&server, "a-review", "active").await;
+    for _ in 0..100 {
+        if policy_state(&server, "2.0.0").await.1 == "active" {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    let root_status = policy_state(&server, "2.0.0").await.1;
+    assert_eq!(root_status, "active", "B's own root recovers");
+    assert_eq!(card_state(&server, "z-review").await.1, "pending");
+    assert_eq!(
+        selected_version(&server, "policy").await.as_deref(),
+        Some("1.0.0"),
+        "B's recovered Cards cannot select while reused z-review is Pending"
+    );
+
+    let (status, body) = declare_body(&server, &jwt, "reused-member-b", &attempt_b).await;
+    assert_ne!(status, StatusCode::CREATED, "{body}");
+    hold_reconciliation(&server, &z_uid).await;
+    assert_eq!(
+        selected_version(&server, "policy").await.as_deref(),
+        Some("1.0.0"),
+        "B's replay cannot select while reused z-review is Pending"
+    );
+
+    std::fs::remove_file(&z_blocker).expect("z-review blob path unblocks");
+    let superuser = server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+    sqlx::query(
+        "CREATE FUNCTION wyrd.refuse_selection() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE EXCEPTION 'selection refused by test'; END $$",
+    )
+    .execute(&superuser)
+    .await
+    .expect("refusal function creates");
+    sqlx::query(
+        "CREATE TRIGGER refuse_selection BEFORE UPDATE OF selection \
+           ON wyrd.card_declaration_operations FOR EACH ROW \
+           WHEN (NEW.selection = 'selected') EXECUTE FUNCTION wyrd.refuse_selection()",
+    )
+    .execute(&superuser)
+    .await
+    .expect("refusal trigger creates");
+    let (_, attempts_before) = reconciliation_state(&server, &z_uid).await;
+    make_reconciliation_due(&server, &z_uid).await;
+    wait_for_reconciliation_state(&server, &z_uid, attempts_before + 1, "pending").await;
+    assert_eq!(
+        card_state(&server, "z-review").await.1,
+        "pending",
+        "a failed selection rolls back the activation that made it"
+    );
+    assert_eq!(
+        selected_version(&server, "policy").await.as_deref(),
+        Some("1.0.0")
+    );
+
+    sqlx::query("DROP TRIGGER refuse_selection ON wyrd.card_declaration_operations")
+        .execute(&superuser)
+        .await
+        .expect("refusal trigger drops");
+    sqlx::query("DROP FUNCTION wyrd.refuse_selection()")
+        .execute(&superuser)
+        .await
+        .expect("refusal function drops");
+    make_reconciliation_due(&server, &z_uid).await;
+    wait_for_card_status(&server, "z-review", "active").await;
+    assert_eq!(
+        selected_version(&server, "policy").await.as_deref(),
+        Some("2.0.0"),
+        "the reconciler selects B once its last member is Active"
+    );
+
+    let (status, body) = declare_body(&server, &jwt, "reused-member-b", &attempt_b).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// A rollback to an existing Active version selects in the declaration's own
+/// write commit, so no later step of the request is needed for it.
+///
+/// While the rollback is declared, a selection may be recorded only in the
+/// transaction that created its operation; one decided after that commit is
+/// refused.
+///
+/// # Panics
+/// Panics when the rollback is refused or the old version is not selected.
+#[tokio::test(flavor = "current_thread")]
+async fn rollback_selects_in_its_own_write_commit() {
+    let mock = GithubAppMock::start().expect("the GitHub mock starts");
+    let server = WyrdTestServer::builder()
+        .with_github_app_for_test(&mock)
+        .start_bound()
+        .await
+        .expect("bound test server starts");
+    connect_policy_repository(&server, &mock).await;
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("repository-rollback-commit", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let checkout = tempfile::tempdir().expect("checkout creates");
+    let old = loaded_body(checkout.path(), &[("v1.yaml", POLICY_V1)], "v1.yaml");
+    let new = loaded_body(
+        checkout.path(),
+        &[
+            ("a-review.yaml", &review_verifier("a-review")),
+            ("z-review.yaml", &review_verifier("z-review")),
+            ("v2.yaml", POLICY_V2),
+        ],
+        "v2.yaml",
+    );
+    for (key, body) in [("rollback-old", &old), ("rollback-new", &new)] {
+        let (status, answer) = declare_body(&server, &jwt, key, body).await;
+        assert_eq!(status, StatusCode::CREATED, "{answer}");
+    }
+    assert_eq!(
+        selected_version(&server, "policy").await.as_deref(),
+        Some("2.0.0")
+    );
+
+    let superuser = server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+    for statement in [
+        "CREATE FUNCTION wyrd.refuse_late_selection() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE EXCEPTION 'selection decided after its write'; END $$",
+        "CREATE TRIGGER refuse_late_selection BEFORE UPDATE OF selection \
+           ON wyrd.card_declaration_operations FOR EACH ROW \
+         WHEN (NEW.selection = 'selected' AND OLD.created_at <> now()) \
+         EXECUTE FUNCTION wyrd.refuse_late_selection()",
+    ] {
+        sqlx::query(statement)
+            .execute(&superuser)
+            .await
+            .expect("refusal installs");
+    }
+    let (status, answer) = declare_body(&server, &jwt, "rollback-again", &old).await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+    assert_eq!(
+        selected_version(&server, "policy").await.as_deref(),
+        Some("1.0.0"),
+        "the rollback selected in its write commit"
+    );
+    for statement in [
+        "DROP TRIGGER refuse_late_selection ON wyrd.card_declaration_operations",
+        "DROP FUNCTION wyrd.refuse_late_selection()",
+    ] {
+        sqlx::query(statement)
+            .execute(&superuser)
+            .await
+            .expect("refusal drops");
+    }
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// A Repository submission `name@version` for `repository_id` with no
+/// Verifiers.
+fn repository_body(name: &str, version: &str, repository_id: &str) -> Value {
+    json!({
+        "submissions": [{
+            "apiVersion": "wyrd/v1",
+            "kind": "Repository",
+            "metadata": { "name": name, "version": version },
+            "spec": { "provider": "github", "repository_id": repository_id, "verified_by": [] },
+            "artifacts": []
+        }]
+    })
+}
+
+/// The number of Repository versions named `name`.
+///
+/// # Panics
+/// Panics when the read fails.
+async fn repository_versions(server: &WyrdTestServer, name: &str) -> i64 {
+    let (versions,): (i64,) = tenant_row(
+        server,
+        "SELECT count(*) FROM wyrd.cards WHERE kind = 'Repository' AND name = $1",
+        name,
+    )
+    .await;
+    versions
+}
+
+/// Two concurrent first declarations admit exactly one Repository identity
+/// mapping: of one repository id under two names, or of two repository ids
+/// under one name, one answers the identity conflict and writes nothing. The
+/// same id and name keep versioning, and a released connection admits no
+/// Repository.
+///
+/// # Panics
+/// Panics when both declarations, or neither, are admitted, or a refusal
+/// has another code.
+#[tokio::test(flavor = "current_thread")]
+async fn concurrent_first_declarations_admit_one_repository_identity() {
+    let mock = GithubAppMock::start().expect("the GitHub mock starts");
+    let server = WyrdTestServer::builder()
+        .with_github_app_for_test(&mock)
+        .start_bound()
+        .await
+        .expect("bound test server starts");
+    connect_policy_repository(&server, &mock).await;
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("repository-identity-race", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+
+    let races = [
+        (("left", "4242"), ("right", "4242")),
+        (("shared", "4343"), ("shared", "4444")),
+    ];
+    let mut winners = Vec::new();
+    for (index, ((first_name, first_id), (second_name, second_id))) in races.into_iter().enumerate()
+    {
+        let first = repository_body(first_name, "1.0.0", first_id);
+        let second = repository_body(second_name, "1.1.0", second_id);
+        let (first_key, second_key) = (format!("race-{index}-a"), format!("race-{index}-b"));
+        let ((first_status, first_body), (second_status, second_body)) = tokio::join!(
+            declare_body(&server, &jwt, &first_key, &first),
+            declare_body(&server, &jwt, &second_key, &second),
+        );
+        let (winner, loser) = match (first_status, second_status) {
+            (StatusCode::CREATED, StatusCode::CREATED) => {
+                panic!("both identities were admitted: {first_body} {second_body}")
+            }
+            (StatusCode::CREATED, _) => (first_name, second_body),
+            (_, StatusCode::CREATED) => (second_name, first_body),
+            _ => panic!("neither identity was admitted: {first_body} {second_body}"),
+        };
+        assert_eq!(
+            loser["code"], "WYRD_REGISTRY_409_REPOSITORY_IDENTITY_CONFLICT",
+            "{loser}"
+        );
+        winners.push(winner);
+    }
+    let loser = if winners[0] == "left" {
+        "right"
+    } else {
+        "left"
+    };
+    assert_eq!(
+        repository_versions(&server, loser).await,
+        0,
+        "the loser wrote nothing"
+    );
+    assert_eq!(repository_versions(&server, winners[0]).await, 1);
+    assert_eq!(repository_versions(&server, "shared").await, 1);
+
+    let (status, body) = declare_body(
+        &server,
+        &jwt,
+        "identity-versions",
+        &repository_body(winners[0], "2.0.0", "4242"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "the same id and name version: {body}"
+    );
+
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    sqlx::query(
+        "UPDATE wyrd.github_installations
+            SET host = NULL, installation_id = NULL, connected_at = NULL,
+                repositories = '[]'::jsonb",
+    )
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("slot releases");
+    conn.commit().await.expect("release commits");
+    let (status, body) = declare_body(
+        &server,
+        &jwt,
+        "identity-released",
+        &repository_body(winners[0], "3.0.0", "4242"),
+    )
+    .await;
+    assert_ne!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["code"], "WYRD_GITHUB_404_NOT_CONNECTED", "{body}");
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// A declaration overtaken while its Cards recover records a selection
+/// conflict in the activation that completes it: the activation still
+/// commits, the newer selection stays, and the declaration's replay answers
+/// the conflict.
+///
+/// # Panics
+/// Panics when the activation is undone, the newer selection is replaced,
+/// or the replay answers otherwise.
+#[tokio::test(flavor = "current_thread")]
+async fn overtaken_declaration_records_its_conflict_on_activation() {
+    let storage_root = tempfile::tempdir().expect("storage root creates");
+    let mock = GithubAppMock::start().expect("the GitHub mock starts");
+    let server = WyrdTestServer::builder()
+        .with_storage_settings(local_storage(storage_root.path()))
+        .with_github_app_for_test(&mock)
+        .start_bound()
+        .await
+        .expect("bound test server starts");
+    connect_policy_repository(&server, &mock).await;
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("repository-overtaken", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let checkout = tempfile::tempdir().expect("checkout creates");
+    let old = loaded_body(checkout.path(), &[("v1.yaml", POLICY_V1)], "v1.yaml");
+    let (status, body) = declare_body(&server, &jwt, "overtaken-old", &old).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let moved_storage_root = storage_root.path().with_extension("moved");
+    std::fs::rename(storage_root.path(), &moved_storage_root).expect("storage root moves");
+    std::fs::write(storage_root.path(), b"not a directory").expect("broken storage root writes");
+    let recovering = loaded_body(
+        checkout.path(),
+        &[
+            ("a-review.yaml", &review_verifier("a-review")),
+            ("z-review.yaml", &review_verifier("z-review")),
+            ("v2.yaml", POLICY_V2),
+        ],
+        "v2.yaml",
+    );
+    let (status, body) = declare_body(&server, &jwt, "overtaken-b", &recovering).await;
+    assert_ne!(status, StatusCode::CREATED, "{body}");
+    let members = [
+        card_state(&server, "a-review").await.0,
+        card_state(&server, "z-review").await.0,
+        policy_state(&server, "2.0.0").await.0,
+    ];
+    for member in &members {
+        hold_reconciliation(&server, member).await;
+    }
+    std::fs::remove_file(storage_root.path()).expect("broken storage root removes");
+    std::fs::rename(&moved_storage_root, storage_root.path()).expect("storage root restores");
+
+    let newer = loaded_body(
+        checkout.path(),
+        &[("v3.yaml", &POLICY_V1.replace("1.0.0", "3.0.0"))],
+        "v3.yaml",
+    );
+    let (status, body) = declare_body(&server, &jwt, "overtaken-newer", &newer).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        selected_version(&server, "policy").await.as_deref(),
+        Some("3.0.0")
+    );
+
+    for member in &members {
+        make_reconciliation_due(&server, member).await;
+    }
+    wait_for_card_status(&server, "a-review", "active").await;
+    wait_for_card_status(&server, "z-review", "active").await;
+    for _ in 0..100 {
+        if policy_state(&server, "2.0.0").await.1 == "active" {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        policy_state(&server, "2.0.0").await.1,
+        "active",
+        "the activation commits"
+    );
+    assert_eq!(
+        selected_version(&server, "policy").await.as_deref(),
+        Some("3.0.0"),
+        "the newer selection stays"
+    );
+    let (status, body) = declare_body(&server, &jwt, "overtaken-b", &recovering).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body["code"],
+        "WYRD_REGISTRY_409_REPOSITORY_SELECTION_CONFLICT"
+    );
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// The lock waits in the test database, oldest backend first: the
+/// `wait_event` of every other backend blocked on a heavyweight lock.
+///
+/// # Panics
+/// Panics when the read fails.
+async fn lock_waits(superuser: &sqlx::PgPool) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT wait_event FROM pg_stat_activity \
+          WHERE datname = current_database() AND wait_event_type = 'Lock' \
+            AND pid <> pg_backend_pid() \
+          ORDER BY backend_start",
+    )
+    .fetch_all(superuser)
+    .await
+    .expect("lock waits read")
+}
+
+/// The number of backends blocked on a lock while holding a Card version
+/// line, such as a Repository family line.
+///
+/// # Panics
+/// Panics when the read fails.
+async fn line_holders_waiting(superuser: &sqlx::PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid \
+          WHERE l.locktype = 'advisory' AND l.granted \
+            AND a.datname = current_database() AND a.wait_event_type = 'Lock' \
+            AND a.pid <> pg_backend_pid()",
+    )
+    .fetch_one(superuser)
+    .await
+    .expect("line holders read")
+}
+
+/// Wait until `count` backends are blocked on locks and return their waits.
+///
+/// # Panics
+/// Panics when they are not within ten seconds.
+async fn wait_for_lock_waits(superuser: &sqlx::PgPool, count: usize) -> Vec<String> {
+    for _ in 0..200 {
+        let waits = lock_waits(superuser).await;
+        if waits.len() >= count {
+            return waits;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "{count} lock waits never formed: {:?}",
+        lock_waits(superuser).await
+    );
+}
+
+/// An exact retry of a Pending Repository root and that root's activation
+/// both finish, whichever reaches the root first.
+///
+/// Attempt A leaves `policy` Pending after its blob fails. A fresh key B
+/// then retries the identical exact version while A's same-key replay
+/// activates it, under a test lock that parks the first of them:
+///
+/// - writer first: B holds the root and waits on the family line, so
+///   the activation waits on B's hold rather than taking the line first;
+/// - activation first: A's activation holds the root and waits on its
+///   declaration, so B waits on the root without holding the family line.
+///
+/// Both answer success, the root is Active and selected, and B reuses it.
+///
+/// # Panics
+/// Panics when either request fails, the root is not Active and selected,
+/// B writes another version, a backend waits on a lock while holding the
+/// family line, or a writer-first activation waits on the family line.
+#[tokio::test(flavor = "current_thread")]
+async fn exact_pending_root_retry_and_activation_finish_in_either_order() {
+    let storage_root = tempfile::tempdir().expect("storage root creates");
+    let mock = GithubAppMock::start().expect("the GitHub mock starts");
+    let server = WyrdTestServer::builder()
+        .with_storage_settings(local_storage(storage_root.path()))
+        .with_github_app_for_test(&mock)
+        .start_bound()
+        .await
+        .expect("bound test server starts");
+    connect_policy_repository(&server, &mock).await;
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("repository-exact-root", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let superuser = server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+    let checkout = tempfile::tempdir().expect("checkout creates");
+    let old = loaded_body(checkout.path(), &[("v1.yaml", POLICY_V1)], "v1.yaml");
+    let (status, body) = declare_body(&server, &jwt, "exact-root-old", &old).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    for (version, writer_first) in [("2.0.0", true), ("3.0.0", false)] {
+        let file = format!("v{version}.yaml");
+        let exact = loaded_body(
+            checkout.path(),
+            &[(&file, &POLICY_V1.replace("1.0.0", version))],
+            &file,
+        );
+        let (key_a, key_b) = (
+            format!("exact-root-{version}-a"),
+            format!("exact-root-{version}-b"),
+        );
+        let moved_storage_root = storage_root.path().with_extension("moved");
+        std::fs::rename(storage_root.path(), &moved_storage_root).expect("storage root moves");
+        std::fs::write(storage_root.path(), b"not a directory")
+            .expect("broken storage root writes");
+        let (status, body) = declare_body(&server, &jwt, &key_a, &exact).await;
+        assert_ne!(status, StatusCode::CREATED, "{body}");
+        let (root_uid, root_status) = policy_state(&server, version).await;
+        assert_eq!(
+            root_status, "pending",
+            "A registered its root before the blob failed"
+        );
+        hold_reconciliation(&server, &root_uid).await;
+        std::fs::remove_file(storage_root.path()).expect("broken storage root removes");
+        std::fs::rename(&moved_storage_root, storage_root.path()).expect("storage root restores");
+        let versions = repository_versions(&server, "policy").await;
+
+        let mut gate = server
+            .tenant_conn_for(server.data_tenant_id())
+            .await
+            .expect("tenant connection opens");
+        if writer_first {
+            let family = CardName::new("policy").expect("family name is valid");
+            lock_version_line(&mut gate, CardKind::Repository, &family)
+                .await
+                .expect("family line locks");
+        } else {
+            sqlx::query(
+                "SELECT 1 FROM wyrd.card_declaration_operations \
+                  WHERE idempotency_key = $1 FOR UPDATE",
+            )
+            .bind(&key_a)
+            .execute(&mut **gate.transaction())
+            .await
+            .expect("A's declaration locks");
+        }
+        let retry = declare_body(&server, &jwt, &key_b, &exact);
+        let activation = declare_body(&server, &jwt, &key_a, &exact);
+        let (first, second) = if writer_first {
+            (retry, activation)
+        } else {
+            (activation, retry)
+        };
+        let ((first_status, first_body), (second_status, second_body), (waits, holders)) = tokio::join!(
+            first,
+            async {
+                wait_for_lock_waits(&superuser, 1).await;
+                second.await
+            },
+            async {
+                let waits = wait_for_lock_waits(&superuser, 2).await;
+                let holders = line_holders_waiting(&superuser).await;
+                gate.commit().await.expect("gate releases");
+                (waits, holders)
+            },
+        );
+        assert_eq!(
+            holders, 0,
+            "{version}: nothing waits on a lock while holding the family line"
+        );
+        let family_waits = waits.iter().filter(|wait| *wait == "advisory").count();
+        if writer_first {
+            assert_eq!(
+                family_waits, 1,
+                "only B waits on the family line; the activation waits on B's hold: {waits:?}"
+            );
+        } else {
+            assert_eq!(
+                family_waits, 0,
+                "B waits on the root, not the family: {waits:?}"
+            );
+        }
+        assert_eq!(first_status, StatusCode::CREATED, "{version}: {first_body}");
+        assert_eq!(
+            second_status,
+            StatusCode::CREATED,
+            "{version}: {second_body}"
+        );
+        let retried = if writer_first {
+            &first_body
+        } else {
+            &second_body
+        };
+        assert_eq!(
+            retried["root"]["uid"],
+            root_uid.to_string(),
+            "B reuses A's root"
+        );
+        assert_eq!(repository_versions(&server, "policy").await, versions);
+        assert_eq!(policy_state(&server, version).await.1, "active");
+        assert_eq!(
+            selected_version(&server, "policy").await.as_deref(),
+            Some(version)
+        );
+    }
     server.shutdown().await.expect("test server shuts down");
 }

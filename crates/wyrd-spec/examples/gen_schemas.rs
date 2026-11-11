@@ -39,6 +39,7 @@ use wyrd_spec::card::operator::{
 };
 use wyrd_spec::card::policy::{InvokeContext, InvokeOutcome, PolicyDecision, PolicySpec};
 use wyrd_spec::card::prompt::{ParameterName, PromptRef, PromptSpec};
+use wyrd_spec::card::repository::{RepositoryProvider, RepositorySpec};
 use wyrd_spec::card::service::{LockedComponent, ServiceLock};
 use wyrd_spec::card::service::{
     ServiceRuntime, ServiceRuntimeKind, ServiceRuntimeMode, ServiceRuntimePolicy, ServiceSpec,
@@ -177,6 +178,8 @@ fn contracts() -> Value {
         DriftSpec,
         TriggerSpec,
         TriggerActivation,
+        RepositorySpec,
+        RepositoryProvider,
         VerifierSpec,
         VerificationBinding,
         OperatorSpec,

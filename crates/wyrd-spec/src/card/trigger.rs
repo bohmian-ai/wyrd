@@ -2,7 +2,9 @@
 //!
 //! `schedule` runs a bound Verifier on cron boundaries; `group_end` runs a
 //! group Verifier once no new source evidence of a `group_id` group has been
-//! acknowledged for the Trigger's one [`TriggerDuration`], `after`.
+//! acknowledged for the Trigger's one [`TriggerDuration`], `after`;
+//! `pull_request` runs a Repository's bound Verifier for each eligible pull
+//! request event.
 //!
 //! A Trigger declares *when* a bound Verifier runs. It never names the
 //! Verifier, an Operator, or a verdict threshold: the verification binding
@@ -53,6 +55,12 @@ pub enum TriggerActivation {
         /// Quiet period after the latest acknowledged source input or result.
         after: TriggerDuration,
     },
+    /// Activate on each eligible pull request event of the owning
+    /// Repository: opened, reopened, ready for review, or a new head or base.
+    ///
+    /// Valid only on a Repository's binding. It carries no event names: the
+    /// eligible events are fixed, and an arbitrary event name is refused.
+    PullRequest {},
 }
 
 /// A positive whole duration authored as `<n><unit>`, such as `30m`, of at

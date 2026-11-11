@@ -1,0 +1,6 @@
+[repository.metadata]
+name = "api-other"
+
+[repository.verified_by]
+verifier = ["./code-review.yaml"]
+runs_on = { kind = "pull_request" }

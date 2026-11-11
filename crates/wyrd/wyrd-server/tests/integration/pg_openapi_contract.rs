@@ -1495,7 +1495,8 @@ async fn gateway_inference_ingress_publishes_the_fallback_header() {
 /// shapes.
 ///
 /// Also walks the served `Card -> Status -> verification -> binding_ids`
-/// chain, proving the read-side binding identities are a UUID array.
+/// chain, proving the read-side binding identities are a UUID array, and
+/// serves the Repository kind with its named selection status.
 ///
 /// # Panics
 /// Panics when the server fails to start or stop or any published shape
@@ -1537,8 +1538,16 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
             .as_array()
             .expect("typed spec alternatives")
             .len(),
-        14,
+        15,
         "one typed spec per registrable native Card kind"
+    );
+    assert!(
+        document["components"]["schemas"]["CardKind"]["enum"]
+            .as_array()
+            .expect("Card kinds")
+            .iter()
+            .any(|kind| kind == "Repository"),
+        "Repository is a native Card kind"
     );
 
     let status = resolve_schema(&document, &card["properties"]["status"]);
@@ -1546,6 +1555,11 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
     assert_eq!(
         verification, &document["components"]["schemas"]["VerificationStatus"],
         "Card status carries the named verification status"
+    );
+    let repository = resolve_schema(&document, &status["properties"]["repository"]);
+    assert_eq!(
+        repository, &document["components"]["schemas"]["RepositoryStatus"],
+        "Card status carries the named Repository selection"
     );
     let binding_ids = resolve_schema(&document, &verification["properties"]["binding_ids"]);
     assert_eq!(binding_ids["type"], "array", "binding IDs are an array");

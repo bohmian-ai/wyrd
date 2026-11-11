@@ -38,6 +38,7 @@ SUPPORTED_KINDS = [
     "Service",
     "Trigger",
     "Operator",
+    "Repository",
 ]
 
 # Bundle roots, by Rust type name, whose wire contracts the SDK exposes. Each

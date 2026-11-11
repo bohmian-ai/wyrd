@@ -86,7 +86,7 @@ A `group_end` Trigger judges every turn sharing a `group_id` once the conversati
 | Field | Required | Holds |
 | --- | --- | --- |
 | `verifier` | Yes | A path to the Verifier's file, or a declared Verifier |
-| `runs_on` | No | A `schedule` or `group_end` Trigger, as a path, a declared Trigger, or inline. Absent, only your code runs the Verifier |
+| `runs_on` | No | A `schedule` or `group_end` Trigger, or `pull_request` on a [Repository](/build-and-verify/declare/declare-a-repository/), as a path, a declared Trigger, or inline. Absent, only your code runs the Verifier |
 | `on_failure` | No | Operators to run after a `failed` verdict. Not allowed with `group_end` |
 | `on_verdict_change` | No | Operators to run when a `group_end` verdict changes |
 

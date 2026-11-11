@@ -370,7 +370,7 @@ and ingest clients or implement their own HTTP or gRPC transports.
 
 ## Kind catalog
 
-Wyrd registers 12 native Card kinds. `CardKind::External` is a non-registrable
+Wyrd registers 13 native Card kinds. `CardKind::External` is a non-registrable
 discriminator used when reading foreign or unknown kind metadata. The foreign
 payload remains opaque and source-specific; it is not a Wyrd Card. There is no
 `ExternalSpec` and no External Card declaration path.
@@ -383,6 +383,7 @@ payload remains opaque and source-specific; it is not a Wyrd Card. There is no
 | Governance    | Audit |
 | Observability | Verifier |
 | Reaction      | Trigger, Operator |
+| Source control| Repository |
 
 `Tool` (a Skald runtime registry name), `SubAgent` (an Agent-to-Agent
 relationship), `Skill`, and `Bifrost` (server state) are not Card kinds.
@@ -2179,7 +2180,7 @@ of bindings.
 ```yaml
 spec:
   description?: string
-  kind: schedule | group_end              # closed activation discriminator
+  kind: schedule | group_end | pull_request  # closed activation discriminator
   cron: string                            # schedule only
   tz?: string                             # schedule only — IANA tz name, default UTC
   after: duration                         # group_end only — elapsed since the newest acknowledged source evidence
@@ -2187,6 +2188,10 @@ spec:
 
 `group_end` binds only a Verifier with source inputs and judges each caller
 group once it ends (see Grouped verification under Verifier).
+
+`pull_request` carries no fields and is valid only on a Repository's
+`verified_by`; any other subject refuses it. It is the closed activation for a
+connected repository's pull requests, not an arbitrary provider event name.
 
 For `schedule`, each due occurrence creates one
 execution per active binding over that binding's subject window
@@ -2346,6 +2351,35 @@ channel: { kind: slack, connection: ops-slack, channel_id: C0123456789,
            text: "{{verifier_ref}} failed on {{subject_ref}}: {{summary}}" }
 ```
 
+### Repository
+A connected source repository and its complete review policy. Identity is the
+provider's stable repository ID on the deployment's configured host, verified
+against the tenant's GitHub connection; the owner/name is a hint, never
+authority.
+```yaml
+spec:
+  provider?: github                       # closed; github when omitted
+  host?: string                           # configured web host; set by the server, any other value refused
+  repository_id?: string                  # positive decimal provider ID; resolved from the hint when omitted
+  verified_by: [VerificationBinding]      # complete desired policy; runs_on, when present, is pull_request
+```
+
+`wyrd declare wyrd.toml` infers the Repository from the checkout's origin
+remote (or `--repository <url>`) and the `[repository]` table (see Workspace
+config). The server resolves the hint through the connection before
+registration, so a registered Repository always carries `host` and
+`repository_id`. A repository the connection does not currently cover is
+refused with `WYRD_GITHUB_403_REPOSITORY_INACCESSIBLE`. The first
+registration takes its Card name from the provider repository name; later
+declarations keep that family through a provider rename, and declaring the
+same `repository_id` under a second name is refused with
+`WYRD_REGISTRY_409_REPOSITORY_IDENTITY_CONFLICT`.
+
+`status.repository` projects the server-managed `full_name`, whether this
+version is `selected`, and the family's `selected_version`. Adding repository
+access never creates a Repository Card or bindings, and `verified_by: []`
+selects no automatic reviews without disconnecting access.
+
 ---
 
 ## Registry lifecycle
@@ -2396,6 +2430,22 @@ public error. Cycles surface as
 **Composite transaction.** Per-node inserts run in one Postgres
 transaction. Post-commit side effects (card blob write, presigned URL
 mint) are best-effort with reconcile — see below.
+
+### Repository selection
+
+A Repository family has at most one selected version. Selection is not Card
+`Active` state: an Active version may be unselected. A successful Repository
+declaration selects its exact root version only after the whole graph and
+every required artifact is ready, in the same commit that completes the
+declaration; the receipt follows that commit. The declaration attempt records
+its target and the selection it expected to replace, so a replay of the same
+target reuses it, a race between distinct targets conflicts, and a delayed
+completion never undoes a newer selection. A failed declaration, including an
+exact pin whose content changed (`WYRD_REGISTRY_409_SPEC_DRIFT`) or an
+unresolved registered reference (`WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY`),
+keeps the previous selection. Declaring an old exact version again is a new
+declaration and rolls the selection back to it. Unchanged content reuses the
+existing version and keeps it selected.
 
 ### Card blob state
 
@@ -2508,7 +2558,7 @@ is available only at `InlineableRef<T>` slots.
 | `Artifact`     | **Yes** (typically derived from heavy cards) | Pointer to durable bytes. |
 | `Prompt`       | Optional | Light. Inlineable as `InlineableRef<Prompt>` inside `Agent.prompt`; declaration materializes it as `<agent-name>-prompt`. |
 | `Agent`        | Optional | Light. Spec-only; `wyrd declare` declares it. Verifier `agent` actions and checks take `InlineableRef<AgentSpec>`. |
-| `Verifier`, `Trigger`, `Operator`, `Mcp`, `Audit`, `Service` | Optional | Light. Spec-only; `wyrd declare` declares each card as it's read. |
+| `Verifier`, `Trigger`, `Operator`, `Mcp`, `Audit`, `Service`, `Repository` | Optional | Light. Spec-only; `wyrd declare` declares each card as it's read. |
 
 A single YAML file may contain many `---`-separated card documents — `wyrd
 declare verification-suite.yaml` declares all of them in dependency order. The Agent
@@ -2570,7 +2620,7 @@ relationship tests all project from it:
 
 - `Service.components[].ref` (light and heavy targets)
 - `Service.components[].verified_by`, `Agent.verified_by`,
-  `Service.verified_by` — each binding's `verifier`, `runs_on`, and
+  `Service.verified_by`, `Repository.verified_by` — each binding's `verifier`, `runs_on`, and
   `on_failure[]`
 - `Agent.prompt`
 - Verifier refs: `agent` action and check `agent`, `code` Artifact `source`,
@@ -2665,6 +2715,39 @@ domain = "customer"
 "acme.com/owner" = "ml-platform"
 ```
 
+A checkout's `wyrd.toml` may also carry one `[repository]` table. Its
+presence makes `wyrd declare wyrd.toml` declare an inferred Repository root
+whose graph is only the listed Verifiers and their transitive references:
+
+```toml
+[repository.verified_by]
+verifier = ["./review/code-review.yaml",
+            { kind = "Verifier", name = "shared-check", version = "1.0.0" }]
+runs_on  = { kind = "pull_request" }
+
+# Overrides only; each is optional.
+[repository.metadata]
+name    = "web"          # Card name; inferred from the repository name
+version = "0.1.0"        # exact pin or scope; the server assigns one when absent
+
+[repository.spec]
+repository_id = "42"     # provider ID; still verified by the connection
+```
+
+- `verifier` entries are local Verifier paths (relative to `wyrd.toml`) or
+  exact registered references; each expands into one ordinary
+  `VerificationBinding` sharing `runs_on`. The list is complete desired
+  state, and `verifier = []` binds none.
+- `[repository.metadata]` accepts `name`, `version`, `bump`, `labels`, and
+  `annotations`; labels and annotations merge with `[defaults]` and
+  `[kind.Repository]` like any Card's.
+- `[repository.spec]` accepts `host` and `repository_id`. The origin remote
+  of the enclosing `.git/config`, or `--repository <url>` outside a checkout,
+  is a hint the server verifies; the loader never contacts the provider.
+- `wyrd declare --check wyrd.toml` validates locally and reports
+  `repository_identity`, `registered_references`, `authorization`, and
+  `version_assignment` as deferred server checks.
+
 - Defaultable fields: `labels`, `annotations`. `space` is not a field and
   is refused as an unknown key.
 - **`name` is never defaultable.** Every card's identity must be
@@ -2735,7 +2818,8 @@ foreign-card content pinning are not supported workflows.
 | Verifier| `agent` actions and checks, `code` Artifact sources, drift `signal.baseline_ref` | `*.verified_by[].verifier` |
 | Audit   | `subject_refs`, `query` (roots), `lineage` (nodes), `investigator` (Agent variant) | — |
 | Service | `components[].ref`, `components[].verified_by`, `verified_by` | — |
-| Trigger | `schedule` activation | `*.verified_by[].runs_on` |
+| Trigger | `schedule`, `group_end`, or `pull_request` activation | `*.verified_by[].runs_on` |
+| Repository | `verified_by` | — |
 | Operator| `action` (typed `channel` shape \| tenant connection) | `*.verified_by[].on_failure` |
 
 `Service.components` accepts: Agent, Prompt, Model, Mcp. No

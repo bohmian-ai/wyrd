@@ -18,7 +18,10 @@ mod merge;
 #[cfg(feature = "python")]
 mod py;
 
-pub use config::{Defaults, KindOverride, WyrdConfig};
+pub use config::{
+    Defaults, KindOverride, RepositoryBindings, RepositoryConfig, RepositoryIdentity,
+    RepositoryMetadata, WyrdConfig,
+};
 pub use error::WyrdConfigError;
 pub use merge::apply_defaults;
 

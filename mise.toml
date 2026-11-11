@@ -104,6 +104,7 @@ cargo test --locked -p wyrd-sql --test integration -- pg_cards_declare:: --nocap
 cargo nextest run --locked -p wyrd-server --test integration --test-threads=1 -E 'test(/^pg_card_declaration_route::/)'
 cargo nextest run --locked -p wyrd-server --test integration --test-threads=1 -E 'test(/^pg_verification_routes::/)'
 cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^declare_and_pull::/)'
+cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^repository_declaration::/)'
 """
 
 [tasks."test:principals:unit"]

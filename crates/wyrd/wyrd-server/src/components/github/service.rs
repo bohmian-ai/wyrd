@@ -24,11 +24,13 @@ use wyrd_auth::login::LOGIN_STATE_TTL;
 use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{AbsoluteUrl, ConnectionTester, Sha256Hex};
+use wyrd_spec::card::repository::RepositoryRemote;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::github_connection::{
     GithubAppIdentity, GithubCallbackQuery, GithubConnectResponse, GithubConnectionState,
-    GithubConnectionView, GithubSetupQuery,
+    GithubConnectionView, GithubRepositoryAccess, GithubSetupQuery,
 };
+use wyrd_spec::ids::RepositoryId;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
     GithubLoginState, bind_github_login_state, consume_github_login_state,
@@ -697,6 +699,102 @@ impl<'a> GithubConnections<'a> {
             "GitHub installation suspension synchronized"
         );
         Ok(())
+    }
+
+    /// Lock `conn`'s tenant connection slot for the rest of its transaction
+    /// and refuse unless it is associated on the configured host.
+    ///
+    /// A Card declaration holds this lock while it admits Repository
+    /// identities, so concurrent admissions serialize on the slot that
+    /// connect, release and access changes also lock.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::GithubNotConfigured`],
+    /// [`WyrdError::GithubNotConnected`] when nothing is associated on the
+    /// configured host, or a registry error.
+    pub(crate) async fn lock_association(
+        &self,
+        conn: &mut TenantConn<'_>,
+    ) -> Result<(), WyrdError> {
+        let app = self.app()?;
+        let slot = lock_github_installation(conn)
+            .await
+            .map_err(registry_db_error)?;
+        if Self::associated(app, slot.as_ref()).is_none() {
+            return Err(WyrdError::GithubNotConnected {
+                message: "this tenant has no GitHub installation associated".to_owned(),
+                details: serde_json::json!({}),
+            });
+        }
+        Ok(())
+    }
+
+    /// Verify a declared Repository's identity against `tenant`'s connection
+    /// and return the configured host and the connected repository.
+    ///
+    /// The connection must be associated on the configured host and not
+    /// suspended. An explicit `repository_id` wins and must be selected;
+    /// otherwise the `remote` hint's `owner/name` is matched, ignoring case,
+    /// against the selected repositories. A remote or explicit host other
+    /// than the configured one never matches. Declaration needs no
+    /// connection permission: nothing about the connection is returned
+    /// beyond the declared repository.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::GithubNotConfigured`],
+    /// [`WyrdError::GithubNotConnected`] when nothing is associated on the
+    /// configured host, [`WyrdError::RegistryRepositoryIdentityMissing`]
+    /// when neither an id nor a remote names the repository,
+    /// [`WyrdError::GithubRepositoryInaccessible`] when it is not selected
+    /// for an active installation, or a registry error.
+    pub(crate) async fn verify_repository(
+        &self,
+        tenant: DataTenantId,
+        host: Option<&str>,
+        repository_id: Option<&RepositoryId>,
+        remote: Option<&RepositoryRemote>,
+    ) -> Result<(String, GithubRepositoryAccess), WyrdError> {
+        let app = self.app()?;
+        let mut conn = self.conn(tenant).await?;
+        let slot = github_installation(&mut conn)
+            .await
+            .map_err(registry_db_error)?;
+        conn.commit().await.map_err(registry_db_error)?;
+        let Some(slot) = Self::associated(app, slot.as_ref()) else {
+            return Err(WyrdError::GithubNotConnected {
+                message: "this tenant has no GitHub installation associated".to_owned(),
+                details: serde_json::json!({}),
+            });
+        };
+        let configured = app.settings().host();
+        let found = match (repository_id, remote) {
+            (None, None) => {
+                return Err(WyrdError::RegistryRepositoryIdentityMissing {
+                    message: "the Repository names no repository_id and no remote".to_owned(),
+                    details: serde_json::json!({}),
+                });
+            }
+            (Some(id), _) => slot
+                .repositories
+                .0
+                .iter()
+                .find(|entry| entry.repository_id == id.as_str()),
+            (None, Some(remote)) => slot.repositories.0.iter().find(|entry| {
+                remote.host == configured && entry.full_name.eq_ignore_ascii_case(&remote.full_name)
+            }),
+        };
+        let found = found
+            .filter(|_| slot.suspended_at.is_none() && host.is_none_or(|host| host == configured));
+        let Some(found) = found else {
+            return Err(WyrdError::GithubRepositoryInaccessible {
+                message: "this repository is not selected for an active installation".to_owned(),
+                details: serde_json::json!({
+                    "repository_id": repository_id.map(RepositoryId::as_str),
+                    "remote": remote,
+                }),
+            });
+        };
+        Ok((configured, found.clone()))
     }
 
     /// A short-lived installation token for `tenant`'s repository

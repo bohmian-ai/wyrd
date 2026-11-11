@@ -41,6 +41,8 @@ pub enum Kind {
     Operator,
     /// Source Card.
     Source,
+    /// Repository Card.
+    Repository,
     /// Unknown/external card kind.
     External,
 }
@@ -62,6 +64,7 @@ impl Kind {
             Self::Trigger => "Trigger",
             Self::Operator => "Operator",
             Self::Source => "Source",
+            Self::Repository => "Repository",
             Self::External => "External",
         }
     }
@@ -82,6 +85,7 @@ impl Kind {
             Self::Trigger => CardKind::Trigger,
             Self::Operator => CardKind::Operator,
             Self::Source => CardKind::Source,
+            Self::Repository => CardKind::Repository,
             Self::External => CardKind::External,
         }
     }
@@ -102,6 +106,7 @@ impl Kind {
             CardKind::Trigger => Self::Trigger,
             CardKind::Operator => Self::Operator,
             CardKind::Source => Self::Source,
+            CardKind::Repository => Self::Repository,
             CardKind::External => Self::External,
         }
     }
@@ -144,7 +149,7 @@ impl CardRefPy {
     /// `kind` accepts the native wire name of a registered card kind
     /// (one of `Data`, `Model`, `Experiment`, `Prompt`, `Agent`,
     /// `Verifier`, `Service`, `Policy`, `Mcp`, `Audit`, `Artifact`,
-    /// `Trigger`, `Operator`, `Source`). External
+    /// `Trigger`, `Operator`, `Source`, `Repository`). External
     /// kinds are not constructable from Python in v1.
     /// Identity is `(kind, name, version)`; `uid` optionally pins one row.
     ///

@@ -13,6 +13,7 @@ mod manifest;
 mod order;
 mod parse;
 mod path;
+mod repository;
 mod resolve;
 mod upload;
 mod validate;
@@ -40,6 +41,8 @@ pub struct DeclarationInput {
     pub submissions: Vec<CardSubmission>,
     /// Local source files keyed by their validated manifest paths.
     pub artifact_sources: BTreeMap<RelativeArtifactPath, PathBuf>,
+    /// Identity hint for a `wyrd.toml` Repository root, verified server-side.
+    pub repository: Option<wyrd_spec::registry::RepositoryHint>,
 }
 
 impl DeclarationInput {
@@ -50,6 +53,7 @@ impl DeclarationInput {
     pub fn to_declare_card_request(&self) -> wyrd_spec::registry::DeclareCardRequest {
         wyrd_spec::registry::DeclareCardRequest {
             submissions: self.submissions.clone(),
+            repository: self.repository.clone(),
         }
     }
 }
@@ -62,6 +66,8 @@ pub struct LoadedTree {
     pub cards: Vec<LoadedCard>,
     /// All diagnostics collected during load (warnings and errors).
     pub diagnostics: Vec<Diagnostic>,
+    /// Identity hint for a `wyrd.toml` Repository root; `None` for YAML.
+    pub repository: Option<wyrd_spec::registry::RepositoryHint>,
     pub(crate) sandbox_root: PathBuf,
 }
 
@@ -76,14 +82,33 @@ pub struct LoadedCard {
 
 /// Load a card tree from the given path.
 ///
-/// This is the loader's single public surface. It performs the complete
-/// pipeline: parse → config → resolve → validate → order → diagnose.
+/// Equivalent to [`load_with_repository`] without an explicit remote.
 ///
 /// # Errors
 ///
 /// Returns `LoadError` containing every collected error-severity diagnostic.
 /// A successful tree contains warning diagnostics only.
 pub fn load(path: &Path) -> Result<LoadedTree, LoadError> {
+    load_with_repository(path, None)
+}
+
+/// Load a card tree from a YAML file, a directory, or a `wyrd.toml`.
+///
+/// Performs the complete pipeline: parse → config → resolve → validate →
+/// order → diagnose. A `wyrd.toml` entry declares the Repository root of its
+/// `[repository]` table, and only the Verifiers it lists plus their
+/// transitive graph; `repository` is an explicit Git remote URL that
+/// replaces the checkout's origin remote as the identity hint.
+///
+/// # Errors
+///
+/// Returns `LoadError` containing every collected error-severity diagnostic,
+/// including a missing Repository identity, or when `repository` is given
+/// for an entry other than `wyrd.toml`.
+pub fn load_with_repository(
+    path: &Path,
+    repository: Option<&str>,
+) -> Result<LoadedTree, LoadError> {
     let entry_path = path
         .canonicalize()
         .map_err(|error| LoadError::single(Diagnostic::io(path.to_path_buf(), &error)))?;
@@ -105,8 +130,26 @@ pub fn load(path: &Path) -> Result<LoadedTree, LoadError> {
         });
     let sandbox = path::PathSandbox::new(sandbox_root).map_err(LoadError::single)?;
 
-    // 3. Parse the entry file or directory.
-    let mut cards = parse::parse_path_with_sandbox(&entry_path, &sandbox)?;
+    // 3. Parse the entry file or directory, or build the `wyrd.toml` root.
+    let is_toml = entry_path.is_file() && entry_path.file_name() == Some("wyrd.toml".as_ref());
+    let (mut cards, hint) = if is_toml {
+        let table = config.repository.as_ref().ok_or_else(|| {
+            LoadError::single(Diagnostic::invalid_envelope(
+                entry_path.clone(),
+                "wyrd.toml has no [repository] table to declare".to_owned(),
+            ))
+        })?;
+        let (card, hint) = repository::repository_root(&entry_path, table, repository)
+            .map_err(LoadError::single)?;
+        (vec![card], Some(hint))
+    } else if repository.is_some() {
+        return Err(LoadError::single(Diagnostic::invalid_envelope(
+            entry_path,
+            "--repository applies only when declaring wyrd.toml".to_owned(),
+        )));
+    } else {
+        (parse::parse_path_with_sandbox(&entry_path, &sandbox)?, None)
+    };
 
     // 4. Apply config defaults.
     config::apply_defaults(&mut cards, &config);
@@ -146,6 +189,7 @@ pub fn load(path: &Path) -> Result<LoadedTree, LoadError> {
     Ok(LoadedTree {
         cards: loaded_cards,
         diagnostics,
+        repository: hint,
         sandbox_root: sandbox.root().to_path_buf(),
     })
 }
@@ -209,6 +253,7 @@ pub fn build_declaration_input(tree: LoadedTree) -> Result<DeclarationInput, Loa
     Ok(DeclarationInput {
         submissions,
         artifact_sources,
+        repository: tree.repository,
     })
 }
 
@@ -412,5 +457,249 @@ mod tests {
             panic!("path ref becomes a sibling projection");
         };
         assert!(external_ref.same_identity(sibling_ref));
+    }
+
+    /// A Verifier Card YAML named `name` with one assert requirement.
+    fn verifier(name: &str) -> String {
+        format!(
+            "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: {name}\n  version: \"1.0.0\"\nspec:\n  inputs:\n    pr:\n      type: json\n  requirements:\n    - id: ok\n      statement: The change is fine.\n      check:\n        kind: assert\n        path: inputs.pr.ok\n        operator: in\n        expected: [true]\n"
+        )
+    }
+
+    /// A checkout at `root` whose origin is `url`, with `wyrd.toml`.
+    ///
+    /// # Panics
+    /// Panics when the `.git` directory, its config or `wyrd.toml` cannot be
+    /// written.
+    fn checkout(root: &Path, url: Option<&str>, toml: &str) {
+        std::fs::create_dir_all(root.join(".git")).expect("git dir creates");
+        let config = url.map_or_else(String::new, |url| {
+            format!("[remote \"origin\"]\n\turl = {url}\n")
+        });
+        std::fs::write(root.join(".git/config"), config).expect("git config writes");
+        std::fs::write(root.join("wyrd.toml"), toml).expect("wyrd.toml writes");
+    }
+
+    /// The Repository root the TOML entry produced.
+    ///
+    /// # Panics
+    /// Panics when `tree` has no Repository Card or its spec does not decode
+    /// as a Repository.
+    fn repository_spec(tree: &super::LoadedTree) -> wyrd_spec::card::repository::RepositorySpec {
+        let root = tree
+            .cards
+            .iter()
+            .find(|card| card.submission.kind == wyrd_spec::envelope::CardKind::Repository)
+            .expect("repository root loads");
+        let Spec::Repository(spec) =
+            Spec::from_kind_and_value(&root.submission.kind, root.submission.spec.clone())
+                .expect("repository spec decodes")
+        else {
+            panic!("repository root keeps its spec");
+        };
+        spec
+    }
+
+    /// Minimal TOML declares the inferred Repository with one binding per
+    /// listed Verifier, local and registered, sharing `runs_on`; only the
+    /// listed local Verifier joins it, never unrelated YAML beside it.
+    ///
+    /// # Panics
+    /// Panics when the root, bindings, hint or selected graph differ.
+    #[test]
+    fn toml_declares_repository_root_with_only_selected_verifiers() {
+        let temp = TempDir::new().expect("temp directory creates");
+        std::fs::create_dir(temp.path().join("review")).expect("review dir creates");
+        std::fs::write(
+            temp.path().join("review/verifier.yaml"),
+            verifier("code-review"),
+        )
+        .expect("verifier writes");
+        std::fs::write(
+            temp.path().join("unrelated.yaml"),
+            prompt("unrelated", "1.0.0"),
+        )
+        .expect("unrelated writes");
+        checkout(
+            temp.path(),
+            Some("git@github.com:Acme/Widget.Service.git"),
+            "[repository.verified_by]\nverifier = [\"./review/verifier.yaml\", { kind = \"Verifier\", name = \"shared\", version = \"2.0.0\" }]\nruns_on = { kind = \"pull_request\" }\n",
+        );
+
+        let tree = load(&temp.path().join("wyrd.toml")).expect("wyrd.toml loads");
+        let names: Vec<_> = tree
+            .cards
+            .iter()
+            .map(|card| card.submission.metadata.name.as_str())
+            .collect();
+        assert_eq!(names, ["code-review", "widget-service"]);
+        let hint = tree.repository.clone().expect("toml carries a hint");
+        assert!(hint.infer_name);
+        assert_eq!(
+            hint.remote.map(|remote| (remote.host, remote.full_name)),
+            Some(("github.com".to_owned(), "Acme/Widget.Service".to_owned()))
+        );
+        let spec = repository_spec(&tree);
+        assert_eq!(spec.repository_id, None);
+        let [local, registered] = spec.verified_by.as_slice() else {
+            panic!("two verifiers expand into two bindings");
+        };
+        assert!(matches!(local.verifier, Ref::Sibling { .. }));
+        assert!(matches!(registered.verifier, Ref::Ref(_)));
+        assert_eq!(local.runs_on, registered.runs_on);
+        assert!(local.runs_on.is_some());
+        let request = build_declaration_input(tree)
+            .expect("input builds")
+            .to_declare_card_request();
+        assert!(request.repository.is_some());
+    }
+
+    /// Minimal TOML in a checkout whose origin uses Git's quoted value or an
+    /// uppercase variable name infers the Repository from that origin
+    /// instead of refusing it as unidentified.
+    ///
+    /// # Panics
+    /// Panics when either legal origin form does not reach the inferred root.
+    #[test]
+    fn toml_infers_repository_from_quoted_or_uppercase_origin() {
+        for line in [
+            "url = \"https://github.com/acme/widget.git\"",
+            "URL = https://github.com/acme/widget.git",
+        ] {
+            let temp = TempDir::new().expect("temp directory creates");
+            checkout(
+                temp.path(),
+                None,
+                "[repository.verified_by]\nverifier = []\n",
+            );
+            std::fs::write(
+                temp.path().join(".git/config"),
+                format!("[remote \"origin\"]\n\t{line}\n"),
+            )
+            .expect("git config writes");
+
+            let tree = load(&temp.path().join("wyrd.toml")).expect("legal origin loads");
+            assert_eq!(tree.cards[0].submission.metadata.name.as_str(), "widget");
+            assert_eq!(
+                tree.repository
+                    .and_then(|hint| hint.remote)
+                    .map(|remote| remote.full_name)
+                    .as_deref(),
+                Some("acme/widget"),
+                "{line}"
+            );
+        }
+    }
+
+    /// Overrides win and an explicit remote identifies a repository outside
+    /// any checkout; the hint then names no inferred name.
+    ///
+    /// # Panics
+    /// Panics when overrides or the explicit remote are not applied.
+    #[test]
+    fn toml_overrides_and_explicit_remote_work_outside_a_checkout() {
+        let temp = TempDir::new().expect("temp directory creates");
+        std::fs::write(
+            temp.path().join("wyrd.toml"),
+            "[repository.metadata]\nname = \"widget\"\nversion = \"1.2.0\"\n[repository.spec]\nrepository_id = \"42\"\n[repository.verified_by]\nverifier = []\n",
+        )
+        .expect("wyrd.toml writes");
+
+        let tree = super::load_with_repository(
+            &temp.path().join("wyrd.toml"),
+            Some("https://github.com/acme/widget"),
+        )
+        .expect("explicit identity loads");
+        let root = &tree.cards[0].submission;
+        assert_eq!(root.metadata.name.as_str(), "widget");
+        assert_eq!(
+            root.metadata
+                .version
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("1.2.0")
+        );
+        let hint = tree.repository.clone().expect("hint");
+        assert!(!hint.infer_name);
+        assert_eq!(
+            hint.remote.map(|remote| remote.full_name).as_deref(),
+            Some("acme/widget")
+        );
+        let spec = repository_spec(&tree);
+        assert_eq!(
+            spec.repository_id
+                .as_ref()
+                .map(wyrd_spec::ids::RepositoryId::as_str),
+            Some("42")
+        );
+        assert!(spec.verified_by.is_empty());
+
+        let tree = load(&temp.path().join("wyrd.toml")).expect("repository_id alone identifies");
+        assert!(tree.repository.expect("hint").remote.is_none());
+    }
+
+    /// Without a remote, an explicit remote or a repository id, declaring
+    /// the TOML is refused with the stable missing-identity code; a bad
+    /// explicit remote and `--repository` on YAML are refused too.
+    ///
+    /// # Panics
+    /// Panics when a missing or misplaced identity loads.
+    #[test]
+    fn toml_without_identity_is_refused() {
+        let temp = TempDir::new().expect("temp directory creates");
+        checkout(
+            temp.path(),
+            None,
+            "[repository.verified_by]\nverifier = []\n",
+        );
+        let toml = temp.path().join("wyrd.toml");
+        let error = load(&toml).expect_err("missing identity refuses");
+        assert_eq!(
+            error.diagnostics[0].code,
+            "WYRD_REGISTRY_400_REPOSITORY_IDENTITY_MISSING"
+        );
+        let error = super::load_with_repository(&toml, Some("/srv/git/widget"))
+            .expect_err("a remote that names no repository refuses");
+        assert_eq!(
+            error.diagnostics[0].code,
+            "WYRD_LOADER_400_INVALID_ENVELOPE"
+        );
+        std::fs::write(temp.path().join("prompt.yaml"), prompt("prompt", "1.0.0"))
+            .expect("prompt writes");
+        let error = super::load_with_repository(
+            &temp.path().join("prompt.yaml"),
+            Some("https://github.com/acme/widget"),
+        )
+        .expect_err("a remote without a wyrd.toml repository refuses");
+        assert_eq!(
+            error.diagnostics[0].code,
+            "WYRD_LOADER_400_INVALID_ENVELOPE"
+        );
+    }
+
+    /// An invalid listed Verifier fails local validation before anything
+    /// is submitted.
+    ///
+    /// # Panics
+    /// Panics when the invalid Verifier loads.
+    #[test]
+    fn toml_validates_listed_verifiers_locally() {
+        let temp = TempDir::new().expect("temp directory creates");
+        std::fs::write(
+            temp.path().join("verifier.yaml"),
+            "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: broken\nspec:\n  requirements: []\n  unknown: true\n",
+        )
+        .expect("verifier writes");
+        checkout(
+            temp.path(),
+            Some("https://github.com/acme/widget.git"),
+            "[repository.verified_by]\nverifier = [\"./verifier.yaml\"]\n",
+        );
+        let error = load(&temp.path().join("wyrd.toml")).expect_err("invalid Verifier refuses");
+        assert_eq!(
+            error.diagnostics[0].code,
+            "WYRD_LOADER_400_INVALID_ENVELOPE"
+        );
     }
 }

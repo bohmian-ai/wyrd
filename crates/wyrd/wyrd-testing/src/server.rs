@@ -4090,6 +4090,15 @@ impl WyrdTestServer {
             .map_err(|error| WyrdTestServerError::Io(error.to_string()))
     }
 
+    /// The local directory this server created for its Card storage, so a
+    /// test can make storage fail after registration and then restore it.
+    ///
+    /// `None` when the builder was given storage settings or a handle.
+    #[must_use]
+    pub fn local_storage_root(&self) -> Option<&std::path::Path> {
+        self.inner.storage_root.as_deref().map(TempDir::path)
+    }
+
     /// Return the Postgres fixture for direct SQL access in tests.
     #[must_use]
     pub fn pg_fixture(&self) -> &PgFixture {

@@ -71,6 +71,10 @@ class CheckReport:
     def diagnostics(self) -> list[CheckDiagnostic]:
         """Non-fatal loader diagnostics."""
         ...
+    @property
+    def deferred(self) -> list[str]:
+        """Checks only the server can make, which this local check skipped."""
+        ...
 
 class McpHostReport:
     """What ``mcp_install`` did to one host's configuration file."""

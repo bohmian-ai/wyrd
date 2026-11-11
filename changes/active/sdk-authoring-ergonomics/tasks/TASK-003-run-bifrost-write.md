@@ -291,8 +291,22 @@ and Shared pipeline regressions; `fmt`, `lints`, `py:format`, `py:lints`,
 `py:typecheck`, `ts:format`, `ts:lints`, `ts:typecheck`, `ts:napi:check`,
 `ts:pack:check`, `docs:check`, `git diff --check`.
 
-Remaining old-spelling hits outside `changes/`: `wyrd/bifrost/_client.py`
-names the separate telemetry `wyrd.observe.record` function, which is retained.
+Follow-up `0fd7faa07` (maintainer decision 2026-11-11: every
+`observe.record` goes): removed the fire-and-forget `wyrd.observe.record`
+(Python `_telemetry.py` and native pyfunction; TypeScript top-level `record`
+and `NativeBifrost.record`) and its Rust owner `wyrd_client::bifrost::observe`
+(`record`, `describe_and_record`), with the plumbing only it used:
+`Bifrost::admit_record`/`RecordAdmission`, the pending-record drain wait, and
+the `dropped` counter on `Bifrost` in all three SDKs. Its own tests went with
+it. Replacements already exist: `run.bifrost.write` for attributed rows and the
+direct client's `insert(row, correlation)`, which raises
+`WYRD_CLIENT_429_QUEUE_FULL` for the caller to handle. Verified: wyrd-client
+`observe::`/`bifrost::` 85 passed; Python surface + client-instantiation units
+88 passed; Python `test_bifrost_e2e.py` + observation surface 32 passed; TS
+units 88 passed; TS observation-surface, observe-a-run, bifrost-write 28
+passed; `lints`, `py:lints`, `py:typecheck`, `ts:lints`, `ts:typecheck`,
+`ts:napi:check`, `ts:pack:check`, `docs:check` exit 0. No `observe.record`
+spelling remains outside `changes/`.
 Other active packets' historical plans are untouched. Non-goals stayed
 excluded: no state-level writer, ambient Run selection, scoped query/table
 management, dependency, feature, or wire/persisted contract change; direct

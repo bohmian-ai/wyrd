@@ -159,7 +159,7 @@ library's `main`.
 ## Evidence
 
 Library: `bohmian-code-review` branch `wyrd-production` at
-`d380f57fa53429eaa4f3e7272ce651e1825a8b38`, PR #6 (open, not yet reviewed).
+`d380f57fa53429eaa4f3e7272ce651e1825a8b38`, merged to the library's `main` through PR #6 (`445a70bf`).
 Paths below are relative to `crates/bohmian-code-review-pipeline/` there (`J` =
 `tests/pipeline_journey.rs`). Wyrd: `S` =
 `crates/wyrd/wyrd-server/tests/integration/pg_code_review_cache.rs`, `Q` =
@@ -194,7 +194,7 @@ Paths below are relative to `crates/bohmian-code-review-pipeline/` there (`J` =
 | W9: actual pipeline over real adapters | `Custody` uses Postgres plus a local `StorageHandle` | cold/warm S:295, S:324, S:329-330; competing publication S:665-685; collection and retry through `Snapshots::collect` S:497-504; non-extending expiry through `pipeline.read` and `Contexts::collect_expired` S:608-629; rename S:337-347 | server `pg_code_review_cache` 5/5 | PASS |
 | N1: no Bifrost/Scribe metadata, no execution IDs, no coordination service | the metadata owner is `A` over `wyrd-sql` tables only; the migration has no execution ID column | `A:200-230`; migration source | diff review | PASS |
 | D1: design docs state custody, cache not canonical | `wyrd-design.md:2098`; `bifrost-design.md:654` | doc diff | `git diff --check` | PASS |
-| D2: revalidated branch; reviewed, committed, pushed library revision; Wyrd pins it | branch `wyrd-production` cut from the library's current `main`, no deleted App branch revived; `Cargo.toml:257` rev `d380f57f…`; `Cargo.lock` | lockfile source | `check:deps`; build | FAIL: library PR #6 is pushed but not yet reviewed or merged |
+| D2: revalidated branch; reviewed, committed, pushed library revision; Wyrd pins it | branch `wyrd-production` cut from the library's current `main`, no deleted App branch revived; `Cargo.toml:257` rev `d380f57f…`; `Cargo.lock` | lockfile source; `gh pr view 6`: merged 2026-11-11 as `445a70bf` with head `d380f57f`, approved by the user; `git merge-base --is-ancestor d380f57f origin/main` | `check:deps`; build | PASS |
 
 ### Commands
 

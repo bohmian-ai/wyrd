@@ -172,10 +172,12 @@ struct SelectionRow {
 /// Membership is the declaration's persisted outcome set (its replay seed),
 /// which includes reused Cards another declaration created, plus the
 /// operation that created the Card and any targeting it. A Card's activation
-/// takes these locks before it locks its Card row, and every settle of the
+/// takes these locks after it locks its Card row, and every settle of the
 /// same operation takes the operation lock first, so the activation that
 /// makes the last member Active observes every other member's committed
-/// state and settles in its own transaction.
+/// state and settles in its own transaction. A declaration still writing
+/// holds its reused Pending members (see [`hold_pending_member`]), so it has
+/// committed, and is found here, before their activation reads.
 ///
 /// # Errors
 /// Returns `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE` when the read fails.
@@ -205,6 +207,32 @@ pub async fn lock_card_repository_selections(
         .into_iter()
         .map(DeclarationOperationId::new)
         .collect())
+}
+
+/// Hold a reused Pending Card for the rest of a declaration's write
+/// transaction.
+///
+/// A declaration reads its members' states when it settles in its own write
+/// transaction, before its operation is visible to anyone else. Holding the
+/// reused Card `FOR SHARE` makes that Card's activation wait for the
+/// declaration to commit and then find it (see
+/// [`lock_card_repository_selections`]), so a member activated meanwhile is
+/// never missed by both sides. The caller takes it before any Repository
+/// family lock, so no lock holder waits on it in reverse. A Card that is no
+/// longer Pending holds nothing.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE` when the lock fails.
+pub async fn hold_pending_member(
+    conn: &mut TenantConn<'_>,
+    card_uid: &CardUid,
+) -> Result<(), WyrdError> {
+    sqlx::query("SELECT 1 FROM wyrd.cards WHERE card_uid = $1 AND status = 'pending' FOR SHARE")
+        .bind(card_uid.as_uuid())
+        .execute(&mut **conn.transaction())
+        .await
+        .map_err(registry_db_error)?;
+    Ok(())
 }
 
 /// Settle a declaration's Repository selection, at most once.

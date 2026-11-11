@@ -354,7 +354,7 @@ mod pg_tests {
 
     /// A declaration whose new root fails readiness after registration is
     /// refused with a typed error, the selected policy stays selected and the
-    /// Verifiers it registered stay readable.
+    /// registered Verifiers it binds stay readable.
     ///
     /// # Panics
     /// Panics when the failed declaration succeeds or changes the selection,
@@ -415,10 +415,12 @@ mod pg_tests {
         let (status, _) = repository(&cards, &first.root).await;
         assert!(status.selected, "the old policy stays selected");
         assert_eq!(status.selected_version.as_ref(), Some(&first.root.version));
-        cards
-            .get(CardSelector::exact(answer_check))
-            .await
-            .expect("the registered dependency stays readable");
+        for dependency in [answer_check, declared(&first, "code-review")] {
+            cards
+                .get(CardSelector::exact(dependency))
+                .await
+                .expect("a registered dependency stays readable");
+        }
         deployment.shutdown().await;
     }
 

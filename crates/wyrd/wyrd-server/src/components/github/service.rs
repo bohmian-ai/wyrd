@@ -701,6 +701,34 @@ impl<'a> GithubConnections<'a> {
         Ok(())
     }
 
+    /// Lock `conn`'s tenant connection slot for the rest of its transaction
+    /// and refuse unless it is associated on the configured host.
+    ///
+    /// A Card declaration holds this lock while it admits Repository
+    /// identities, so concurrent admissions serialize on the slot that
+    /// connect, release and access changes also lock.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::GithubNotConfigured`],
+    /// [`WyrdError::GithubNotConnected`] when nothing is associated on the
+    /// configured host, or a registry error.
+    pub(crate) async fn lock_association(
+        &self,
+        conn: &mut TenantConn<'_>,
+    ) -> Result<(), WyrdError> {
+        let app = self.app()?;
+        let slot = lock_github_installation(conn)
+            .await
+            .map_err(registry_db_error)?;
+        if Self::associated(app, slot.as_ref()).is_none() {
+            return Err(WyrdError::GithubNotConnected {
+                message: "this tenant has no GitHub installation associated".to_owned(),
+                details: serde_json::json!({}),
+            });
+        }
+        Ok(())
+    }
+
     /// Verify a declared Repository's identity against `tenant`'s connection
     /// and return the configured host and the connected repository.
     ///

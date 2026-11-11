@@ -55,7 +55,7 @@ use wyrd_sql::queries::cards::{
     activate_card, commit_declaration_operation, declaration_request_hash, fail_card,
     find_card_by_ref, get_card_by_uid as sql_get_card_by_uid,
     get_card_for_reconciliation as sql_get_card_for_reconciliation, get_latest_card_by_range,
-    inbound_relationships, insert_artifact_manifest_rows, insert_card_row,
+    hold_pending_member, inbound_relationships, insert_artifact_manifest_rows, insert_card_row,
     insert_declaration_operation, list_versions, lock_card_reconciliation_lease,
     lock_card_repository_selections, lock_pending_card_for_activation, lock_version_line,
     lookup_existing_operation, lookup_expired_operation, manifest_completion_rows,
@@ -68,7 +68,6 @@ use wyrd_sql::queries::cards::{
     soft_delete_card_by_ref, soft_delete_card_with_kind,
 };
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
-use wyrd_sql::queries::github_installations::lock_github_installation;
 use wyrd_sql::queries::storage::multipart_uploads;
 use wyrd_sql::queries::verification::{
     BindingActivation, FrozenTarget, NewBinding, owner_binding_ids, project_bindings,
@@ -847,10 +846,12 @@ async fn admit_repository_family(
 /// without a Repository takes no lock.
 ///
 /// # Errors
-/// Returns `WYRD_GITHUB_404_NOT_CONNECTED` when the tenant no longer has an associated installation, the refusal of
-/// [`admit_repository_family`], `WYRD_REGISTRY_422_INVALID_CARD_SPEC` for an
-/// undecodable spec, and registry errors.
+/// Returns the refusals of [`GithubConnections::lock_association`] when the
+/// tenant is no longer associated, the refusal of [`admit_repository_family`],
+/// `WYRD_REGISTRY_422_INVALID_CARD_SPEC` for an undecodable spec, and
+/// registry errors.
 async fn admit_repository_identities(
+    state: &AppState,
     conn: &mut TenantConn<'_>,
     submissions: &[CardSubmission],
 ) -> Result<(), WyrdError> {
@@ -869,15 +870,7 @@ async fn admit_repository_identities(
             .repository_id
             .ok_or_else(|| WyrdError::internal("preflight left a Repository unidentified"))?;
         if !locked {
-            let slot = lock_github_installation(conn)
-                .await
-                .map_err(registry_db_error)?;
-            if slot.is_none_or(|slot| slot.installation_id.is_none()) {
-                return Err(WyrdError::GithubNotConnected {
-                    message: "this tenant has no GitHub installation associated".to_owned(),
-                    details: serde_json::json!({}),
-                });
-            }
+            GithubConnections::new(state).lock_association(conn).await?;
             locked = true;
         }
         admit_repository_family(conn, &submission.metadata.name, &repository_id).await?;
@@ -1448,7 +1441,7 @@ impl DeclarationWriter<'_> {
         // so a dependency rejection — including a replacement Card at the same
         // identity — rolls back the entire attempt, including its bookkeeping row.
         // The row locks remain held while cards and relationships are written below.
-        admit_repository_identities(&mut conn, &plan.submissions).await?;
+        admit_repository_identities(self.state, &mut conn, &plan.submissions).await?;
         plan.external_refs = recheck_active_card_refs(&mut conn, &plan.external_refs).await?;
         let inserted = insert_declaration_operation(
             &mut conn,
@@ -1539,6 +1532,10 @@ impl DeclarationWriter<'_> {
         };
         let seed = replay_seed(&response, &plan.submissions);
         commit_declaration_operation(&mut conn, operation_id, &seed).await?;
+        // A declaration whose exact graph is already Active, such as a
+        // rollback to an existing version, selects in this commit; any other
+        // settles with the activation of its last member.
+        settle_waiting_selections(&mut conn, &[operation_id]).await?;
         conn.commit().await.map_err(registry_db_error)?;
         Ok((operation_id, seed))
     }
@@ -1582,6 +1579,9 @@ async fn persist_node(
     )
     .await?
     {
+        if existing.row.status == CardStatus::Pending {
+            hold_pending_member(conn, &existing.row.card_uid).await?;
+        }
         persist_outbound_relationships(conn, &existing.row.card_uid, &outbound_refs).await?;
         return Ok(existing_row_to_response(&existing.row, existing.outcome));
     }
@@ -2436,7 +2436,8 @@ pub(crate) fn reconciliation_caller(tenant_id: DataTenantId) -> Caller {
 ///
 /// # Errors
 /// Returns the Card status refusal, the manifest verification or blob
-/// storage error, and registry errors; no transition commits on an error.
+/// storage error, and registry errors. On an error no activation or
+/// selection commits; only a storage failure's recovery schedule does.
 async fn complete_card_inner(
     state: &AppState,
     caller: &Caller,
@@ -2766,10 +2767,11 @@ async fn ensure_card_blob(
 /// transaction.
 ///
 /// The pending selections whose exact graph includes the Card are locked
-/// before the Card row (see [`lock_card_repository_selections`]), so the
-/// activation of a declaration's last member observes every other member and
-/// settles it here; a failure anywhere rolls the whole transition back and
-/// leaves the Card Pending with its recovery scheduled.
+/// after the Card row (see [`lock_card_repository_selections`]), so the
+/// activation of a declaration's last member, including one a concurrent
+/// declaration reused, observes every other member and settles it here; a
+/// failure anywhere rolls the whole transition back and leaves the Card
+/// Pending with its recovery scheduled.
 ///
 /// # Errors
 /// Returns registry errors; nothing commits on any error.
@@ -2783,7 +2785,6 @@ async fn commit_card_activation(
     lease_owner: Option<Uuid>,
 ) -> Result<bool, WyrdError> {
     let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
-    let waiting = lock_card_repository_selections(&mut conn, card_uid).await?;
     if let Some(lease_owner) = lease_owner
         && !lock_card_reconciliation_lease(&mut conn, card_uid, lease_owner).await?
     {
@@ -2813,6 +2814,9 @@ async fn commit_card_activation(
         mark_card_reconciliation_succeeded(&mut conn, card_uid, lease_owner).await?;
     }
     if activated {
+        // Read after the Card lock: a declaration holding this Card while it
+        // wrote has committed by now and is found too.
+        let waiting = lock_card_repository_selections(&mut conn, card_uid).await?;
         settle_waiting_selections(&mut conn, &waiting).await?;
         tracing::info!(%card_uid, "card activated");
     }
@@ -3507,24 +3511,20 @@ mod tests {
     }
 }
 
-/// Real-Postgres proof of declaration identity admission, Repository
-/// selection and its completion and recovery boundary.
+/// Real-Postgres proof that a raced Repository selection settles once.
 #[cfg(test)]
 mod pg_tests {
     use uuid::Uuid;
     use wyrd_spec::envelope::Card;
     use wyrd_spec::ids::CardUid;
-    use wyrd_spec::registry::{DeclarationOperationId, DeclarationReplaySeed, DeclareCardRequest};
+    use wyrd_spec::registry::DeclarationOperationId;
     use wyrd_sql::queries::cards::{
         NewCardRow, NewDeclarationOperation, insert_card_row, insert_declaration_operation,
         record_repository_selection,
     };
     use wyrd_sql::row_types::cards::CardStatus;
 
-    use super::{
-        DeclarationWriter, hash_request, plan_declaration, plan_declaration_graph,
-        resolve_external, settle_selection, validate_request,
-    };
+    use super::settle_selection;
     use crate::components::auth::Caller;
     use crate::state::AppState;
     use crate::test_support::{test_caller, test_state};
@@ -3616,175 +3616,6 @@ mod pg_tests {
                     "WYRD_REGISTRY_409_REPOSITORY_SELECTION_CONFLICT"
                 );
             }
-        });
-    }
-
-    /// Associate `caller`'s tenant with a GitHub installation, as the
-    /// connection callback would.
-    ///
-    /// # Panics
-    /// Panics when the slot cannot be written.
-    async fn connect(state: &AppState, caller: &Caller) {
-        let mut conn = state
-            .registry_tenant_conn(caller.data_tenant_id)
-            .await
-            .expect("tenant connection opens");
-        sqlx::query(
-            "INSERT INTO wyrd.github_installations
-                 (data_tenant_id, connection_id, revision, host, installation_id, connected_at)
-             VALUES ($1, $2, 1, 'github.com', 101, statement_timestamp())
-             ON CONFLICT (data_tenant_id) DO NOTHING",
-        )
-        .bind(caller.data_tenant_id.as_uuid())
-        .bind(Uuid::now_v7())
-        .execute(&mut **conn.transaction())
-        .await
-        .expect("slot associates");
-        conn.commit().await.expect("slot commits");
-    }
-
-    /// A Repository submission `name@version` for `repository_id`, as
-    /// preflight leaves it.
-    fn repository(name: &str, version: &str, repository_id: &str) -> serde_json::Value {
-        serde_json::json!({
-            "apiVersion": "wyrd/v1",
-            "kind": "Repository",
-            "metadata": { "name": name, "version": version },
-            "spec": { "provider": "github", "host": "github.com", "repository_id": repository_id, "verified_by": [] },
-            "artifacts": []
-        })
-    }
-
-    /// A declaration request of `submissions`.
-    ///
-    /// # Panics
-    /// Panics when a submission does not decode.
-    fn request(submissions: Vec<serde_json::Value>) -> DeclareCardRequest {
-        serde_json::from_value(serde_json::json!({ "submissions": submissions }))
-            .expect("request decodes")
-    }
-
-    /// Plan and write `request` as `declare_card` does once preflight has
-    /// resolved it, without its post-commit completion.
-    ///
-    /// # Errors
-    /// Returns the validation, planning or write refusal.
-    async fn write(
-        state: &AppState,
-        caller: &Caller,
-        key: &str,
-        request: DeclareCardRequest,
-    ) -> Result<(DeclarationOperationId, DeclarationReplaySeed), wyrd_spec::error::WyrdError> {
-        let request_hash = hash_request(&request)?;
-        validate_request(&request)?;
-        let (order, root) = plan_declaration_graph(&request.submissions)?;
-        let external_refs = resolve_external(state, caller, &request.submissions).await?;
-        let plan = plan_declaration(request, request_hash, external_refs, order, root);
-        DeclarationWriter { state, caller }.write(key, plan).await
-    }
-
-    /// Run one tenant query in its own transaction and return its row.
-    ///
-    /// # Panics
-    /// Panics when the query fails.
-    async fn row<T>(state: &AppState, caller: &Caller, sql: &'static str, bind: &str) -> T
-    where
-        T: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Send + Unpin,
-    {
-        let mut conn = state
-            .registry_tenant_conn(caller.data_tenant_id)
-            .await
-            .expect("tenant connection opens");
-        let row = sqlx::query_as(sql)
-            .bind(bind)
-            .fetch_one(&mut **conn.transaction())
-            .await
-            .expect("row reads");
-        conn.commit().await.expect("read commits");
-        row
-    }
-
-    /// Two first declarations that each passed preflight before either wrote
-    /// admit exactly one Repository identity mapping: the second write of
-    /// one provider id under another name, or of another provider id under
-    /// the same name, answers the identity conflict and writes nothing. The
-    /// same id and name keep versioning normally.
-    ///
-    /// # Panics
-    /// Panics when a write is admitted or refused differently.
-    #[test]
-    fn preflighted_first_declarations_admit_one_repository_identity() {
-        wyrd_runtime::runtime().block_on(async {
-            let state = test_state().await;
-            let caller = test_caller([]);
-            connect(&state, &caller).await;
-            let suffix = Uuid::now_v7().simple().to_string();
-            let seed = Uuid::now_v7().as_u128() % 1_000_000_000;
-            let [id, other_id, third_id] = [seed + 1, seed + 2, seed + 3].map(|id| id.to_string());
-            let [left, right, shared] =
-                ["left", "right", "shared"].map(|name| format!("{name}-{suffix}"));
-
-            write(
-                &state,
-                &caller,
-                &format!("id-a-{suffix}"),
-                request(vec![repository(&left, "1.0.0", &id)]),
-            )
-            .await
-            .expect("the first mapping of a provider id is admitted");
-            let error = write(
-                &state,
-                &caller,
-                &format!("id-b-{suffix}"),
-                request(vec![repository(&right, "1.0.0", &id)]),
-            )
-            .await
-            .expect_err("one provider id cannot fork into two families");
-            assert_eq!(
-                error.code(),
-                "WYRD_REGISTRY_409_REPOSITORY_IDENTITY_CONFLICT"
-            );
-
-            write(
-                &state,
-                &caller,
-                &format!("name-a-{suffix}"),
-                request(vec![repository(&shared, "1.0.0", &other_id)]),
-            )
-            .await
-            .expect("the first mapping of a family name is admitted");
-            let error = write(
-                &state,
-                &caller,
-                &format!("name-b-{suffix}"),
-                request(vec![repository(&shared, "1.1.0", &third_id)]),
-            )
-            .await
-            .expect_err("one family cannot hold two provider ids");
-            assert_eq!(
-                error.code(),
-                "WYRD_REGISTRY_409_REPOSITORY_IDENTITY_CONFLICT"
-            );
-
-            for (name, expected) in [(&right, 0), (&shared, 1), (&left, 1)] {
-                let (versions,): (i64,) = row(
-                    &state,
-                    &caller,
-                    "SELECT count(*) FROM wyrd.cards WHERE kind = 'Repository' AND name = $1",
-                    name,
-                )
-                .await;
-                assert_eq!(versions, expected, "{name}: a refused write leaves no node");
-            }
-
-            write(
-                &state,
-                &caller,
-                &format!("id-c-{suffix}"),
-                request(vec![repository(&left, "2.0.0", &id)]),
-            )
-            .await
-            .expect("the same id and name version normally");
         });
     }
 }

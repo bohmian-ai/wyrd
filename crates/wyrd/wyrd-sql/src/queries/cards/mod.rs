@@ -53,7 +53,7 @@ pub use relationships::{
     inbound_relationships, persist_outbound_relationships, recheck_active_card_refs,
 };
 pub use repository::{
-    RepositorySelection, SelectedRepository, lock_card_repository_selections,
+    RepositorySelection, SelectedRepository, hold_pending_member, lock_card_repository_selections,
     record_repository_selection, repository_family_identity, repository_family_name,
     repository_status, selected_repository, settle_repository_selection,
 };

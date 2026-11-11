@@ -1,7 +1,8 @@
 //! Shared submission graph ordering for the loader.
 
+use wyrd_spec::envelope::Spec;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::graph::GraphError;
+use wyrd_spec::graph::{GraphError, spec_binding_errors};
 use wyrd_spec::registry::CardSubmission;
 
 use super::error::Diagnostic;
@@ -26,6 +27,10 @@ pub fn order_cards(cards: &[AuthoredCard]) -> Result<Vec<usize>, Vec<Diagnostic>
     // back to its local provenance IDs.
     let graph_submissions = wyrd_spec::graph::graph_ready_submissions(&submissions)
         .map_err(|error| vec![graph_diagnostic(&error, cards, &[])])?;
+    let binding_diagnostics = matched_binding_diagnostics(cards, &graph_submissions);
+    if !binding_diagnostics.is_empty() {
+        return Err(binding_diagnostics);
+    }
     let (nodes, edges) = wyrd_spec::graph::build(&graph_submissions)
         .map_err(|error| vec![graph_diagnostic(&error, cards, &[])])?;
     let card_refs = nodes
@@ -61,6 +66,41 @@ pub fn order_cards(cards: &[AuthoredCard]) -> Result<Vec<usize>, Vec<Diagnostic>
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|diagnostic| vec![diagnostic])
+}
+
+/// Binding refusals each card carries once its siblings name their matched
+/// targets.
+///
+/// Authored validation already ran [`spec_binding_errors`] on the authored
+/// spellings; an omitted and an explicit sibling naming one submitted
+/// Verifier or Operator only converge after matching, so the same owner runs
+/// again on the graph-ready specs.
+fn matched_binding_diagnostics(
+    cards: &[AuthoredCard],
+    graph_submissions: &[CardSubmission],
+) -> Vec<Diagnostic> {
+    cards
+        .iter()
+        .zip(graph_submissions)
+        .flat_map(|(card, graph)| {
+            match Spec::from_kind_and_value(&graph.kind, graph.spec.clone()) {
+                Ok(spec) => spec_binding_errors(&spec),
+                Err(error) => vec![WyrdError::LoaderInvalidEnvelope {
+                    message: error.to_string(),
+                    details: serde_json::json!({ "graph_error": error.to_string() }),
+                }],
+            }
+            .into_iter()
+            .map(|error| {
+                Diagnostic::from_wyrd_error(
+                    card.source_path.clone(),
+                    super::Severity::Error,
+                    None,
+                    &error,
+                )
+            })
+        })
+        .collect()
 }
 
 /// Project an authored envelope into the canonical client/server submission.
@@ -322,5 +362,63 @@ mod tests {
 
         assert_eq!(diagnostics[0].code, "WYRD_SPEC_400_UNBOUND_VERIFIER_PEER");
         assert_eq!(diagnostics[0].path, PathBuf::from("quality.yaml"));
+    }
+
+    /// An omitted and an explicit sibling naming one submitted Verifier, or
+    /// one submitted Operator, are one binding target and are refused as a
+    /// duplicate once matched.
+    #[test]
+    fn order_refuses_mixed_sibling_spellings_of_one_binding_target() {
+        let verifier = authored(
+            "quality",
+            &CardKind::Verifier,
+            serde_json::json!({
+                "inputs": { "answer": { "type": "json" } },
+                "requirements": [{
+                    "id": "answered",
+                    "statement": "The agent produced an answer.",
+                    "check": { "kind": "assert", "path": "inputs.answer", "operator": "is_not_null" }
+                }]
+            }),
+        );
+        let operator = authored(
+            "alert",
+            &CardKind::Operator,
+            serde_json::json!({ "kind": "http", "method": "post", "url": "https://hooks.example.com/alert" }),
+        );
+        let omitted = |kind: &str, name: &str| serde_json::json!({ "sibling": { "kind": kind, "name": name } });
+        let explicit = |kind: &str, name: &str| serde_json::json!({ "sibling": { "kind": kind, "name": name, "version": "1.0.0" } });
+        let cases = [
+            (
+                serde_json::json!([
+                    { "verifier": omitted("Verifier", "quality") },
+                    { "verifier": explicit("Verifier", "quality") },
+                ]),
+                "WYRD_SPEC_400_DUPLICATE_VERIFICATION_BINDING",
+            ),
+            (
+                serde_json::json!([{
+                    "verifier": omitted("Verifier", "quality"),
+                    "on_failure": [omitted("Operator", "alert"), explicit("Operator", "alert")],
+                }]),
+                "WYRD_SPEC_400_DUPLICATE_BINDING_OPERATOR",
+            ),
+        ];
+        for (verified_by, code) in cases {
+            let agent = authored(
+                "agent",
+                &CardKind::Agent,
+                serde_json::json!({
+                    "prompt": { "kind": "Prompt", "name": "prompt", "version": "1.0.0" },
+                    "execution_route": { "kind": "native" },
+                    "verified_by": verified_by,
+                }),
+            );
+            let diagnostics = order_cards(&[agent, verifier.clone(), operator.clone()])
+                .expect_err("mixed spellings name one target twice");
+
+            assert_eq!(diagnostics[0].code, code);
+            assert_eq!(diagnostics[0].path, PathBuf::from("agent.yaml"));
+        }
     }
 }

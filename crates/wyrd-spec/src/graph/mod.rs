@@ -6,7 +6,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 
-use crate::envelope::Spec;
+use crate::envelope::{CardKind, Spec};
+use crate::ids::CardName;
 use crate::reference::{CardRef, CardRefIdentity, SiblingRef};
 use crate::refs::ReferenceSlotVisitor;
 use crate::registry::CardSubmission;
@@ -88,17 +89,23 @@ pub struct RootPick {
 /// requests therefore receive a graph-only placeholder, and every sibling
 /// reference is rewritten to its target's graph identity using
 /// [`sibling_target`], so graph construction, composition, and declaration
-/// planning all match on exact identities. The authored submissions are
-/// cloned and never mutated; registration keeps their original version
-/// selection, and placeholders never become authored or persisted pins. A
-/// sibling with no submitted target is left unchanged for the registration
-/// boundary to refuse.
+/// planning all match on exact identities. Matching runs against the
+/// authored submissions, so the selected target is authoritative. A
+/// placeholder is the lowest `0.0.N` that no submission pin and no reference
+/// of that kind and name in the request spells, so it can never alias an
+/// authored pin: an explicit sibling that matches no submission stays
+/// unmatched, and an omitted and a pinned submission of one kind and name
+/// stay distinct nodes. The authored submissions are cloned and never
+/// mutated; registration keeps their original version selection, and
+/// placeholders never become authored or persisted pins. A sibling with no
+/// submitted target is left unchanged for the registration boundary to
+/// refuse.
 ///
 /// # Errors
 /// Returns [`GraphError::Empty`] when there are no submissions,
 /// [`GraphError::AmbiguousSibling`] when a versionless sibling names several
 /// submissions, and [`GraphError::InvalidSpec`] when a spec cannot be decoded
-/// or the fixed `0.0.0` placeholder cannot be built.
+/// or a placeholder cannot be built.
 pub fn graph_ready_submissions(
     submissions: &[CardSubmission],
 ) -> Result<Vec<CardSubmission>, GraphError> {
@@ -106,38 +113,83 @@ pub fn graph_ready_submissions(
         return Err(GraphError::Empty);
     }
 
-    let placeholder = VersionBlock::parse("0.0.0").map_err(|error| GraphError::InvalidSpec {
-        message: format!("invalid graph placeholder: {error}"),
-    })?;
+    let authored = authored_versions(submissions)?;
     let graph_refs = submissions
         .iter()
-        .map(|submission| CardRef {
-            kind: submission.kind.clone(),
-            name: submission.metadata.name.clone(),
-            version: submission
-                .metadata
-                .resolved_pin()
-                .cloned()
-                .unwrap_or_else(|| placeholder.clone()),
-            uid: submission.metadata.uid.clone(),
+        .map(|submission| {
+            let version = match submission.metadata.resolved_pin() {
+                Some(version) => version.clone(),
+                None => placeholder(&authored, &submission.kind, &submission.metadata.name)?,
+            };
+            Ok(CardRef {
+                kind: submission.kind.clone(),
+                name: submission.metadata.name.clone(),
+                version,
+                uid: submission.metadata.uid.clone(),
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, GraphError>>()?;
     submissions
         .iter()
         .cloned()
-        .map(|mut submission| {
-            if !submission
-                .metadata
-                .version
-                .as_ref()
-                .is_some_and(VersionSpec::is_pin)
-            {
-                submission.metadata.version = Some(VersionSpec::Pin(placeholder.clone()));
-            }
+        .zip(&graph_refs)
+        .map(|(mut submission, graph_ref)| {
+            submission.metadata.version = Some(VersionSpec::Pin(graph_ref.version.clone()));
             pin_siblings(&mut submission, submissions, &graph_refs)?;
             Ok(submission)
         })
         .collect()
+}
+
+/// Every version the request spells for each kind and name: submission pins
+/// and the versions of sibling and external references.
+///
+/// # Errors
+/// Returns [`GraphError::InvalidSpec`] when a spec cannot be decoded.
+fn authored_versions(
+    submissions: &[CardSubmission],
+) -> Result<BTreeSet<CardRefIdentity>, GraphError> {
+    let mut versions = submissions
+        .iter()
+        .filter_map(submission_card_ref)
+        .map(|card_ref| card_ref.identity_key())
+        .collect::<BTreeSet<_>>();
+    for submission in submissions {
+        let mut spec = Spec::from_kind_and_value(&submission.kind, submission.spec.clone())
+            .map_err(|error| GraphError::InvalidSpec {
+                message: error.to_string(),
+            })?;
+        ReferenceSlotVisitor::visit(&mut spec, |slot| {
+            versions.extend(slot.value.target().and_then(|target| target.identity_key()));
+        });
+    }
+    Ok(versions)
+}
+
+/// The lowest `0.0.N` graph-only version `authored` does not spell for
+/// `kind` and `name`.
+///
+/// # Errors
+/// Returns [`GraphError::InvalidSpec`] when the candidate does not parse,
+/// which a `0.0.N` version always does.
+fn placeholder(
+    authored: &BTreeSet<CardRefIdentity>,
+    kind: &CardKind,
+    name: &CardName,
+) -> Result<VersionBlock, GraphError> {
+    let free = (0_u64..)
+        .map(|patch| format!("0.0.{patch}"))
+        .find(|version| {
+            !authored.contains(&CardRefIdentity {
+                kind: kind.clone(),
+                name: name.clone(),
+                version: version.clone(),
+            })
+        })
+        .unwrap_or_default();
+    VersionBlock::parse(&free).map_err(|error| GraphError::InvalidSpec {
+        message: format!("invalid graph placeholder: {error}"),
+    })
 }
 
 /// Rewrite every sibling in one submission to its target's graph identity.
@@ -290,6 +342,8 @@ pub fn build(submissions: &[CardSubmission]) -> Result<(Vec<Node>, Vec<Edge>), G
     Ok((nodes, edges))
 }
 
+/// The UID-free `(kind, name, version)` key graph nodes, edges, and binding
+/// targets compare by.
 pub(crate) fn identity_key(card_ref: &CardRef) -> CardRefIdentity {
     card_ref.identity_key()
 }
@@ -519,6 +573,49 @@ mod tests {
             versions[1].clone(),
         ];
         let error = graph_ready_submissions(&omitted).expect_err("ambiguous link is refused");
+        assert!(matches!(error, super::GraphError::AmbiguousSibling { .. }));
+    }
+
+    /// Placeholders never alias an authored pin: an explicit `@0.0.0`
+    /// sibling finds no omitted submission, a real `0.0.0` pin is its exact
+    /// target beside an omitted submission of the same kind and name, and an
+    /// omitted sibling naming both is ambiguous.
+    ///
+    /// # Panics
+    /// Panics when a placeholder matches an authored version, the exact pin
+    /// is not selected, or the ambiguous link is accepted.
+    #[test]
+    fn placeholders_never_alias_authored_pins() {
+        let mut omitted = submission(&card_ref(CardKind::Prompt, "prompt"), prompt_spec());
+        omitted.metadata.version = None;
+        let explicit = json!({"kind": "Prompt", "name": "prompt", "version": "0.0.0"});
+
+        let missing = [sibling_service(explicit.clone()), omitted.clone()];
+        let ready = graph_ready_submissions(&missing).expect("graph projection");
+        let (_, edges) = build(&ready).expect("graph builds");
+        assert!(edges.is_empty(), "an unmatched explicit pin derives no edge");
+        assert_eq!(ready[0].spec["components"][0]["ref"]["sibling"], explicit);
+        assert_ne!(
+            ready[1].metadata.resolved_pin().map(ToString::to_string),
+            Some("0.0.0".to_owned())
+        );
+
+        let mut zero = card_ref(CardKind::Prompt, "prompt");
+        zero.version = VersionBlock::parse("0.0.0").expect("test version is valid");
+        let pinned = submission(&zero, prompt_spec());
+        let exact = [sibling_service(explicit), omitted.clone(), pinned.clone()];
+        let ready = graph_ready_submissions(&exact).expect("omitted and pinned stay distinct");
+        let (nodes, edges) = build(&ready).expect("graph builds");
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].to, zero);
+
+        let ambiguous = [
+            sibling_service(json!({"kind": "Prompt", "name": "prompt"})),
+            omitted,
+            pinned,
+        ];
+        let error = graph_ready_submissions(&ambiguous).expect_err("omitted link is ambiguous");
         assert!(matches!(error, super::GraphError::AmbiguousSibling { .. }));
     }
 

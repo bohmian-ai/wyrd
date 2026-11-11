@@ -79,7 +79,8 @@ use crate::components::cards::mapping::{
     existing_row_to_response, lifecycle_status, outcome_row_to_response,
 };
 use crate::components::cards::resolve::{
-    EffectiveSpecs, ResolvedRefs, bind_card_references, source_binding,
+    EffectiveSpecs, GroupSite, ResolvedRefs, ambiguous_source, bind_card_references,
+    sibling_identities, site_subjects, source_binding, validate_and_collect_refs,
 };
 use crate::components::storage::inventory::{
     ObjectFact, ObjectInventory, ObjectOrigin, ObjectState,
@@ -1124,14 +1125,30 @@ async fn resolve_external(
 ///
 /// Returns the order, the root, and the graph-ready submissions, whose
 /// siblings name their targets' graph identities for preflight and binding.
+/// A sibling no submission matched is refused here, before it can leave a
+/// disconnected graph. Binding validation runs again on the matched specs,
+/// because an omitted and an explicit sibling naming one submitted Verifier
+/// or Operator only converge once matched.
 ///
 /// # Errors
-/// Returns a stable Wyrd error when sibling matching, graph construction,
-/// root selection, or Service-root composition validation fails.
+/// Returns `WYRD_REGISTRY_*_UNRESOLVED_DEPENDENCY` for a sibling that names
+/// no submission, `WYRD_REGISTRY_*_UNRESOLVED_PATH_REF` for a loader-only
+/// path, and a stable Wyrd error when sibling matching, binding validation
+/// of the matched targets, graph construction, root selection, or
+/// Service-root composition validation fails.
 fn plan_declaration_graph(
     submissions: &[CardSubmission],
 ) -> Result<(TopoOrder, RootPick, Vec<CardSubmission>), WyrdError> {
     let graph_submissions = graph_ready_submissions(submissions).map_err(graph_error)?;
+    let siblings = sibling_identities(&graph_submissions);
+    for graph in &graph_submissions {
+        let spec = Spec::from_kind_and_value(&graph.kind, graph.spec.clone())
+            .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
+        validate_and_collect_refs(&spec, &siblings, &mut Vec::new())?;
+        if let Some(error) = spec_binding_errors(&spec).into_iter().next() {
+            return Err(error);
+        }
+    }
     let (nodes, edges) = build(&graph_submissions).map_err(graph_error)?;
     let order = topo_sort(&nodes, &edges).map_err(graph_error)?;
     let root = pick_root(&order).map_err(graph_error)?;
@@ -1162,8 +1179,11 @@ impl DeclarationWriter<'_> {
     ///
     /// # Errors
     /// Returns `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` when a preflight-validated UID is
-    /// no longer Active, and the idempotency, validation, or registry failure
-    /// otherwise; nothing commits on any error.
+    /// no longer Active, the binding refusal of `spec_binding_errors` when
+    /// selected versions make two binding targets one exact Card, the
+    /// grouped-source refusal of [`BindingProjector::freeze`] when they make
+    /// two sites' subjects one Card, and the idempotency, validation, or
+    /// registry failure otherwise; nothing commits on any error.
     #[tracing::instrument(skip(self, plan), fields(operation = "card.declaration.write"))]
     async fn write(
         &self,
@@ -1218,6 +1238,12 @@ impl DeclarationWriter<'_> {
             )
             .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
             bind_card_references(&mut spec, &plan.external_refs, &registered)?;
+            // A selected version can make a sibling and an external target
+            // the same exact Card, so bindings are validated again by the
+            // identities they now persist.
+            if let Some(error) = spec_binding_errors(&spec).into_iter().next() {
+                return Err(error);
+            }
             if let Spec::Agent(agent) = &mut spec
                 && let InlineableRef::Inline(prompt) = &agent.prompt
             {
@@ -1410,7 +1436,8 @@ impl<'a, 'c> BindingProjector<'a, 'c> {
     /// `verified_by` instead.
     ///
     /// # Errors
-    /// Returns `WYRD_INTERNAL` when a bound ref lacks its pinned UID or a
+    /// Returns the grouped-source refusal of [`Self::group_sources`],
+    /// `WYRD_INTERNAL` when a bound ref lacks its pinned UID or a
     /// referenced Trigger UID names another kind, the canonicalization error
     /// for an inline body that cannot be hashed, and the registry error from
     /// reading a referenced Trigger.
@@ -1429,9 +1456,15 @@ impl<'a, 'c> BindingProjector<'a, 'c> {
             }
             _ => {}
         }
+        let binding_sites: Vec<_> = spec
+            .binding_sites()
+            .into_iter()
+            .filter(|site| !site.nested)
+            .collect();
+        let subjects = site_subjects(spec);
         let mut bindings = Vec::new();
-        for (occurrence, subject, site) in sites {
-            for binding in site {
+        for (site_index, (occurrence, subject, site)) in sites.into_iter().enumerate() {
+            for (binding_index, binding) in site.iter().enumerate() {
                 let Some(runs_on) = &binding.runs_on else {
                     continue;
                 };
@@ -1456,8 +1489,14 @@ impl<'a, 'c> BindingProjector<'a, 'c> {
                         BindingActivation::Schedule { cron, tz }
                     }
                     TriggerActivation::GroupEnd { after } => {
+                        let group = GroupSite {
+                            sites: &binding_sites,
+                            subjects: &subjects,
+                            site: site_index,
+                        };
+                        let field = format!("{}[{binding_index}]", binding_sites[site_index].field);
                         let (sources, order_by) = self
-                            .group_sources(occurrence, &subject, site, &verifier_card_uid)
+                            .group_sources(occurrence, &subject, group, &field, &verifier_card_uid)
                             .await?;
                         BindingActivation::GroupEnd(GroupEndSettings {
                             after,
@@ -1496,21 +1535,29 @@ impl<'a, 'c> BindingProjector<'a, 'c> {
     /// source binding it reads, with the Verifier's declared `order_by`.
     ///
     /// The Verifier is read back by UID inside this transaction; each source
-    /// resolves within the same `site` through [`source_binding`], which
-    /// registration preflight already proved unique, so the pinned identity
-    /// is this site's occurrence and subject with the source's exact Verifier.
+    /// resolves within the binding's own site of `group` through
+    /// [`source_binding`], which registration preflight already proved
+    /// unique, so the pinned identity is this site's occurrence and subject
+    /// with the source's exact Verifier. `group` is built over the bound
+    /// spec, so [`GroupSite::ambiguous`] sees the selected exact subjects:
+    /// two aliases preflight saw as different Cards that version selection
+    /// made one are refused here, before the declaration commits.
     ///
     /// # Errors
-    /// Returns `WYRD_INTERNAL` when the Verifier UID names another kind, a
-    /// source no longer resolves to one binding, or a source ref is unpinned,
-    /// and the registry error from reading the Verifier.
+    /// Returns `WYRD_VALIDATION` with rule `source` at `field` when another
+    /// site binds the same subject Card and source Verifier, `WYRD_INTERNAL`
+    /// when the Verifier UID names another kind, a source no longer resolves
+    /// to one binding, or a source ref is unpinned, and the registry error
+    /// from reading the Verifier.
     async fn group_sources(
         &mut self,
         occurrence: &str,
         subject: &CardUid,
-        site: &[VerificationBinding],
+        group: GroupSite<'_, '_>,
+        field: &str,
         verifier: &CardUid,
     ) -> Result<(BTreeMap<SlotName, GroupSource>, Option<OrderBy>), WyrdError> {
+        let site = group.sites[group.site].bindings;
         let Spec::Verifier(verifier) = sql_get_card_by_uid(self.conn, verifier).await?.spec else {
             return Err(WyrdError::internal(
                 "bound Verifier UID is not a Verifier Card",
@@ -1527,6 +1574,9 @@ impl<'a, 'c> BindingProjector<'a, 'c> {
                 .verifier;
             let source = source_binding(site, &name)
                 .map_err(|_| WyrdError::internal("group source does not resolve to one binding"))?;
+            if group.ambiguous(source) {
+                return Err(ambiguous_source(field, &slot, &name));
+            }
             sources.insert(
                 slot,
                 GroupSource {

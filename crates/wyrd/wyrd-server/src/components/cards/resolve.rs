@@ -11,7 +11,7 @@ use wyrd_spec::card::verifier::{InputSlot, SourceField, VerificationBinding, Ver
 use wyrd_spec::envelope::Spec;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::graph::BindingSite;
-use wyrd_spec::ids::{CardName, CardUid};
+use wyrd_spec::ids::{CardName, CardUid, SlotName};
 use wyrd_spec::operator_connection::OperatorConnectionStatus;
 use wyrd_spec::reference::{CardRef, CardRefIdentity, InlineableRef, Ref, SiblingRef};
 use wyrd_spec::refs::{ReferenceSlotVisitor, SlotValue};
@@ -125,7 +125,7 @@ pub(super) fn source_binding<'a>(
 ///
 /// The owner-level site is `None`; a component site is its component's Card
 /// reference identity, or `None` for an inline component.
-fn site_subjects(spec: &Spec) -> Vec<Option<CardRefIdentity>> {
+pub(super) fn site_subjects(spec: &Spec) -> Vec<Option<CardRefIdentity>> {
     let mut subjects = vec![None];
     if let Spec::Service(service) = spec {
         subjects.extend(
@@ -139,20 +139,25 @@ fn site_subjects(spec: &Spec) -> Vec<Option<CardRefIdentity>> {
 }
 
 /// The owner's top-level binding sites seen from the one being validated.
+///
+/// Preflight builds it over the submitted spec and binding projection over
+/// the bound spec, whose subjects carry their selected exact versions, so
+/// two aliases that only become one Card after version selection are
+/// refused by the same rule.
 #[derive(Clone, Copy)]
-struct GroupSite<'s, 'a> {
+pub(super) struct GroupSite<'s, 'a> {
     /// Every top-level binding site of the owner spec.
-    sites: &'s [BindingSite<'a>],
+    pub(super) sites: &'s [BindingSite<'a>],
     /// Each site's subject identity, aligned with `sites`.
-    subjects: &'s [Option<CardRefIdentity>],
+    pub(super) subjects: &'s [Option<CardRefIdentity>],
     /// Index of the site holding the binding being validated.
-    site: usize,
+    pub(super) site: usize,
 }
 
 impl GroupSite<'_, '_> {
     /// Whether another site with the same subject Card also binds `source`'s
     /// exact Verifier, making their recorded rows indistinguishable.
-    fn ambiguous(&self, source: &VerificationBinding) -> bool {
+    pub(super) fn ambiguous(&self, source: &VerificationBinding) -> bool {
         let Some(subject) = &self.subjects[self.site] else {
             return false;
         };
@@ -456,10 +461,7 @@ impl EffectiveSpecs {
             let InputSlot::Source(text) = input else {
                 continue;
             };
-            let refuse = |reason: String| WyrdError::Validation {
-                message: format!("{field}: inputs.{slot} {reason}"),
-                details: json!({ "rule": "source", "path": format!("inputs.{slot}"), "field": field }),
-            };
+            let refuse = |reason: String| source_refusal(field, slot, &reason);
             let reference = text.parse().map_err(|error| refuse(error.to_string()))?;
             let source = source_binding(site, &reference.verifier).map_err(|count| {
                 refuse(format!(
@@ -490,10 +492,7 @@ impl EffectiveSpecs {
                 return Err(refuse("forms a source cycle".to_owned()));
             }
             if group.ambiguous(source) {
-                return Err(refuse(format!(
-                    "names Verifier {} whose subject and version are bound on another site too",
-                    reference.verifier
-                )));
+                return Err(ambiguous_source(field, slot, &reference.verifier));
             }
         }
         Ok(())
@@ -669,6 +668,26 @@ impl EffectiveSpecs {
     }
 }
 
+/// The `source` refusal of input `slot` on the binding at `field`.
+fn source_refusal(field: &str, slot: &SlotName, reason: &str) -> WyrdError {
+    WyrdError::Validation {
+        message: format!("{field}: inputs.{slot} {reason}"),
+        details: json!({ "rule": "source", "path": format!("inputs.{slot}"), "field": field }),
+    }
+}
+
+/// The refusal for a source whose subject and exact Verifier another site
+/// also binds, per [`GroupSite::ambiguous`].
+pub(super) fn ambiguous_source(field: &str, slot: &SlotName, verifier: &CardName) -> WyrdError {
+    source_refusal(
+        field,
+        slot,
+        &format!(
+            "names Verifier {verifier} whose subject and version are bound on another site too"
+        ),
+    )
+}
+
 /// Build the Drift validation refusal for an unusable baseline.
 fn baseline_error(message: impl Into<String>, details: serde_json::Value) -> WyrdError {
     WyrdError::DriftValidation {
@@ -711,7 +730,16 @@ fn collect_card_refs(spec: &Spec, output: &mut Vec<CardRef>) {
 }
 
 /// Reject loader-only paths, validate typed sibling targets, and collect external refs.
-fn validate_and_collect_refs(
+///
+/// Graph planning runs it on each graph-ready spec, so a sibling no
+/// submission matched is refused before the graph is ordered; preflight runs
+/// it again to collect the external references it resolves.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_*_UNRESOLVED_DEPENDENCY` for a sibling whose
+/// identity is not in `siblings` and `WYRD_REGISTRY_*_UNRESOLVED_PATH_REF`
+/// for a loader-only path.
+pub(super) fn validate_and_collect_refs(
     spec: &Spec,
     siblings: &BTreeSet<CardRefIdentity>,
     output: &mut Vec<CardRef>,
@@ -774,6 +802,10 @@ fn collect_inline_ref<T>(
 }
 
 /// Refuse a sibling that names no submission in this request.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_*_UNRESOLVED_DEPENDENCY` when the sibling has no
+/// version or its identity is not in `siblings`.
 fn validate_sibling(
     sibling: &SiblingRef,
     siblings: &BTreeSet<CardRefIdentity>,
@@ -920,7 +952,7 @@ fn require_uid(card_ref: &CardRef) -> Result<(), WyrdError> {
 /// Collect the graph identities of submissions eligible as sibling targets.
 ///
 /// Graph-ready submissions are all pinned, so every submission is eligible.
-fn sibling_identities(submissions: &[CardSubmission]) -> BTreeSet<CardRefIdentity> {
+pub(super) fn sibling_identities(submissions: &[CardSubmission]) -> BTreeSet<CardRefIdentity> {
     submissions.iter().filter_map(submission_identity).collect()
 }
 

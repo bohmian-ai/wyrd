@@ -89,19 +89,14 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
     /// non-success answer; and [`ProviderError::Decode`] when a success is not
     /// the dialect's native response.
     ///
-    /// The call's span and the gateway spans under it are routed to the
-    /// tenant under the captured caller's own pair, so an agent-check call SYSTEM
-    /// performs for the request's subject is not recorded as the request.
-    #[tracing::instrument(name = "agent.gateway.call", skip_all)]
+    /// The call opens no span of its own: it runs inside the Agent's
+    /// inference span, and [`GatewayInvocation::run`] routes its
+    /// `gateway.call` span to the captured caller's own pair.
     async fn call(
         &self,
         call: WyrdGatewayCall<'_>,
         cancellation: &CancellationToken,
     ) -> Result<ProviderResponse, ProviderError> {
-        wyrd_telemetry::bind_operation_route(wyrd_telemetry::TenantSpanRoute {
-            tenant: self.caller.data_tenant_id,
-            attribution: self.caller.attribution(),
-        });
         let NativeCall {
             operation,
             ingress,

@@ -79,7 +79,7 @@ impl SkaldRuntime {
     /// Returns the [`dispatch`] failure for an unregistered provider or a
     /// provider error.
     pub async fn send(&self, request: &ProviderRequest) -> SkaldRuntimeResult<ProviderResponse> {
-        dispatch(&self.providers, request.provider(), request).await
+        dispatch(&self.providers, request.provider(), request, None).await
     }
 
     /// Sends one native streaming request to its dialect's default provider
@@ -90,7 +90,7 @@ impl SkaldRuntime {
     /// Returns the [`dispatch_stream`] failure for an unregistered provider or
     /// a provider error.
     pub async fn stream(&self, request: &ProviderRequest) -> SkaldRuntimeResult<ProviderStream> {
-        dispatch_stream(&self.providers, request.provider(), request).await
+        dispatch_stream(&self.providers, request.provider(), request, None).await
     }
 
     /// Returns the runtime provider registry.

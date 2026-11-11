@@ -1760,7 +1760,7 @@ mod pg_tests {
     /// Spans the judged execution opens beneath its request span.
     const DESCENDANTS: [&str; 4] = [
         "verification.execute",
-        "agent.gateway.call",
+        "chat",
         "gateway.call",
         "gateway.execute",
     ];

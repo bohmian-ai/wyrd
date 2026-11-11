@@ -47,6 +47,7 @@ async fn unregistered_provider_returns_runtime_error() {
         &ProviderRegistry::new(),
         ProviderName::OpenAi,
         &openai_request("hello"),
+        None,
     )
     .await
     .expect_err("provider is missing");
@@ -66,6 +67,7 @@ async fn dispatch_stream_unregistered_provider_returns_runtime_error() {
         &ProviderRegistry::new(),
         ProviderName::OpenAi,
         &openai_request("hello"),
+        None,
     )
     .await
     .expect_err("provider is missing");

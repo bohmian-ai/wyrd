@@ -1066,9 +1066,11 @@ Server spans export twice from one tracer provider:
   caller's attempt, its catalog descendants, and its gateway calls' captured
   attempts read back from the enqueuing trace's timeline. The tenant copy carries only the
   behavior-span catalog — the request span, `verification.*`, the Agent
-  loop's `invoke_agent`, `chat`, and `execute_tool`, `dispatch`,
-  `agent.gateway.call`, `gateway.*` except `gateway.attempt`,
-  `bifrost.gate.*`, `bifrost.oracle.query`, and OTLP ingest — and only spans
+  loop's `invoke_agent` and `execute_tool`, one OpenTelemetry GenAI
+  inference span per model call named after its `gen_ai.operation.name`
+  (`chat`, `generate_content`, or `embeddings`), `gateway.*` except
+  `gateway.attempt`, `bifrost.gate.*`, `bifrost.oracle.query`, and OTLP
+  ingest — and only spans
   whose ancestors up to the span that opened the copy are all catalog
   spans. It keeps only safe
   attributes (`wyrd.*`, `gen_ai.*`, and HTTP, RPC, and error semantic

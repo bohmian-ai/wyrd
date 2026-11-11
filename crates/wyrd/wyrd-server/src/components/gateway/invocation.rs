@@ -382,6 +382,11 @@ impl<'a> GatewayInvocation<'a> {
     /// returned error, or by the execution task for a non-successful call the
     /// caller received as an answer.
     ///
+    /// The `gateway.call` span and its descendants are routed to the tenant
+    /// under `caller`'s own pair. For a public call that is its request's
+    /// pair; an agent-check call the tenant SYSTEM principal makes for a
+    /// request's subject is thereby not recorded as that request.
+    ///
     /// # Errors
     /// Returns every error of [`Self::invoke`] as a [`CallFailure`].
     #[tracing::instrument(
@@ -401,6 +406,10 @@ impl<'a> GatewayInvocation<'a> {
         request: GatewayCallRequest,
         cancel: &CancellationToken,
     ) -> Result<GatewayCallResponse, CallFailure> {
+        wyrd_telemetry::bind_operation_route(wyrd_telemetry::TenantSpanRoute {
+            tenant: caller.data_tenant_id,
+            attribution: caller.attribution(),
+        });
         let operation = operation_name(request.operation);
         let result = self.govern(caller, request, cancel).await;
         if let Err(failure) = &result {

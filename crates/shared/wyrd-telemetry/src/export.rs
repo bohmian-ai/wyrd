@@ -567,21 +567,22 @@ impl SpanProcessor for TenantExport {
 /// eligible for a tenant copy.
 ///
 /// The catalog is the request span, `verification.*`, the Agent loop's
-/// GenAI spans (`invoke_agent`, `chat`, `execute_tool`) that sit between a
-/// Verifier's Agent action and its gateway call, `dispatch`,
-/// `agent.gateway.call`, `gateway.*` except `gateway.attempt` (the gateway
-/// captures attempts as their own rows, so nothing below an attempt is
-/// copied either), `bifrost.gate.*`,
-/// `bifrost.oracle.query`, and the OTLP ingest spans.
+/// GenAI spans (`invoke_agent`, `execute_tool`, and the one inference span
+/// per model call, named after its operation: `chat`, `generate_content`,
+/// or `embeddings`) that sit between a Verifier's Agent action and its
+/// gateway call, `gateway.*` except `gateway.attempt` (the gateway captures
+/// attempts as their own rows, so nothing below an attempt is copied
+/// either), `bifrost.gate.*`, `bifrost.oracle.query`, and the OTLP ingest
+/// spans.
 pub(crate) fn in_catalog(name: &str) -> bool {
     matches!(
         name,
         "request"
-            | "dispatch"
-            | "agent.gateway.call"
             | "bifrost.oracle.query"
             | "invoke_agent"
             | "chat"
+            | "generate_content"
+            | "embeddings"
             | "execute_tool"
     ) || name.starts_with("verification.")
         || name.starts_with("bifrost.gate.")
@@ -1140,7 +1141,7 @@ mod tests {
             );
             let trace_id = write.span().span_context().trace_id();
             let write_id = write.span().span_context().span_id();
-            tracer.start_with_context("dispatch", &write).end();
+            tracer.start_with_context("gateway.call", &write).end();
             write.span().end();
             request.span().end();
             let copies = staged
@@ -1150,7 +1151,7 @@ mod tests {
                 .collect::<Vec<_>>();
             let expected = if sampled {
                 vec![
-                    ("dispatch".to_owned(), write_id.to_bytes().to_vec()),
+                    ("gateway.call".to_owned(), write_id.to_bytes().to_vec()),
                     (
                         "bifrost.gate.write".to_owned(),
                         request_id.to_bytes().to_vec(),
@@ -1247,7 +1248,7 @@ mod tests {
                 attribution: request_pair,
             },
         );
-        let judge = request.with_span(tracer.start_with_context("agent.gateway.call", &request));
+        let judge = request.with_span(tracer.start_with_context("gateway.call", &request));
         ROUTES.rebind(
             judge.span().span_context(),
             TenantSpanRoute {
@@ -1271,7 +1272,7 @@ mod tests {
             copies,
             vec![
                 ("gateway.invoke".to_owned(), judge_pair),
-                ("agent.gateway.call".to_owned(), judge_pair),
+                ("gateway.call".to_owned(), judge_pair),
                 ("verification.result".to_owned(), request_pair),
                 ("request".to_owned(), request_pair),
             ]
@@ -1333,11 +1334,11 @@ mod tests {
     fn catalog_names_only_behavior_spans() {
         for name in [
             "request",
-            "dispatch",
-            "agent.gateway.call",
             "verification.judge",
             "invoke_agent",
             "chat",
+            "generate_content",
+            "embeddings",
             "execute_tool",
             "gateway.call",
             "bifrost.gate.write",
@@ -1348,6 +1349,8 @@ mod tests {
         }
         for name in [
             "gateway.attempt",
+            "dispatch",
+            "agent.gateway.call",
             "bifrost.oracle.admission",
             "bifrost.scribe.wal.append",
             "storage.get",

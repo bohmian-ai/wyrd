@@ -2239,12 +2239,12 @@ pub struct GithubConfig {
     #[serde(default)]
     pub slug: Option<String>,
     /// GitHub web origin (`WYRD_GITHUB_WEB_ORIGIN`); `https://github.com`
-    /// when unset. A GitHub Enterprise Server deployment names its own.
+    /// when unset, and only that in production. Development and tests name a
+    /// local GitHub protocol mock.
     #[serde(default)]
     pub web_origin: Option<String>,
     /// GitHub REST API origin (`WYRD_GITHUB_API_ORIGIN`);
-    /// `https://api.github.com` when unset. GitHub Enterprise Server serves
-    /// it at `<web origin>/api/v3`.
+    /// `https://api.github.com` when unset, and only that in production.
     #[serde(default)]
     pub api_origin: Option<String>,
     /// This deployment's public base URL (`WYRD_GITHUB_PUBLIC_URL`). The App
@@ -2301,8 +2301,8 @@ pub struct GithubAppSettings {
     pub oauth_client_id: String,
     /// OAuth client secret.
     pub oauth_client_secret: SecretString,
-    /// RSA private key PEM the App JWT is signed with.
-    pub private_key: SecretString,
+    /// The App JWT's RS256 signing key, proven to sign at validation.
+    pub signing_key: jsonwebtoken::EncodingKey,
     /// Webhook HMAC secret.
     pub webhook_secret: SecretString,
 }
@@ -2355,8 +2355,10 @@ impl GithubConfig {
     /// Returns [`ConfigError::Invalid`] naming the first missing or invalid
     /// field: a zero App id, a slug that is not lowercase letters, digits and
     /// hyphens, an origin that is not a bare `http(s)` origin (`https` only
-    /// in production), a public URL with a query or fragment, an empty
-    /// client id or secret, or a private key that is not an RSA PEM.
+    /// in production), a production origin other than GitHub.com's
+    /// (`https://github.com`, `https://api.github.com`), a public URL with a
+    /// query or fragment, an empty client id or secret, or a private key that
+    /// cannot sign an RS256 App JWT.
     pub fn resolve(&self, production: bool) -> Result<Option<GithubAppSettings>, ConfigError> {
         if !self.is_present() {
             return Ok(None);
@@ -2417,6 +2419,15 @@ impl GithubConfig {
                 .unwrap_or("https://api.github.com"),
             false,
         )?;
+        if production
+            && (web_origin.as_str() != "https://github.com/"
+                || api_origin.as_str() != "https://api.github.com/")
+        {
+            return Err(invalid(
+                "web_origin and api_origin must be GitHub.com's \
+                 (https://github.com, https://api.github.com) in production",
+            ));
+        }
         let public_url = url(
             "public_url",
             self.public_url
@@ -2447,8 +2458,21 @@ impl GithubConfig {
             &self.private_key,
             "the App private key (WYRD_GITHUB_APP_PRIVATE_KEY_FILE)",
         )?;
-        jsonwebtoken::EncodingKey::from_rsa_pem(private_key.expose_secret().as_bytes())
-            .map_err(|_| invalid("the App private key is not an RSA private key PEM"))?;
+        let key_invalid = || {
+            invalid(
+                "the App private key (WYRD_GITHUB_APP_PRIVATE_KEY_FILE) is not an RSA \
+                 private key that signs RS256",
+            )
+        };
+        let signing_key =
+            jsonwebtoken::EncodingKey::from_rsa_pem(private_key.expose_secret().as_bytes())
+                .map_err(|_| key_invalid())?;
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
+            &serde_json::json!({}),
+            &signing_key,
+        )
+        .map_err(|_| key_invalid())?;
         Ok(Some(GithubAppSettings {
             app_id,
             slug,
@@ -2457,7 +2481,7 @@ impl GithubConfig {
             public_url,
             oauth_client_id,
             oauth_client_secret,
-            private_key,
+            signing_key,
             webhook_secret,
         }))
     }
@@ -6760,11 +6784,11 @@ provider = "anthropic"
             ("WYRD_GITHUB_APP_SLUG", Some("wyrd-app".to_owned())),
             (
                 "WYRD_GITHUB_WEB_ORIGIN",
-                Some("https://ghe.example.com:8443/".to_owned()),
+                Some("http://127.0.0.1:8443/".to_owned()),
             ),
             (
                 "WYRD_GITHUB_API_ORIGIN",
-                Some("https://ghe.example.com:8443/api/v3".to_owned()),
+                Some("http://127.0.0.1:8443/api/v3".to_owned()),
             ),
             (
                 "WYRD_GITHUB_PUBLIC_URL",
@@ -6786,7 +6810,33 @@ provider = "anthropic"
         ]
     }
 
+    /// Fail unless `settings` signs an RS256 App JWT that the test App's
+    /// public key verifies.
+    ///
+    /// # Panics
+    /// Panics when signing fails or the signature does not verify.
+    fn assert_signs_app_jwts(settings: &GithubAppSettings) {
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
+            &serde_json::json!({ "iss": "4242" }),
+            &settings.signing_key,
+        )
+        .expect("the validated key signs");
+        let key = jsonwebtoken::DecodingKey::from_rsa_pem(
+            wyrd_testing::github::APP_PUBLIC_KEY_PEM.as_bytes(),
+        )
+        .expect("the public half decodes");
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+        validation.set_required_spec_claims::<&str>(&[]);
+        validation.validate_exp = false;
+        jsonwebtoken::decode::<serde_json::Value>(&token, &key, &validation)
+            .expect("the public half verifies the App JWT");
+    }
+
     /// An owner-only file holding the test App key.
+    ///
+    /// # Panics
+    /// Panics when the key cannot be written or restricted.
     fn github_key_file(dir: &Path) -> PathBuf {
         let path = dir.join("app.pem");
         std::fs::write(&path, wyrd_testing::github::APP_PRIVATE_KEY_PEM).expect("key writes");
@@ -6796,8 +6846,9 @@ provider = "anthropic"
     }
 
     /// Proves every GitHub App field parses from the environment and a
-    /// mounted key file, a GitHub Enterprise Server host keeps its port, and
-    /// neither Debug form prints a secret.
+    /// mounted key file, a local development mock's host keeps its port, the
+    /// key signs App JWTs the public half verifies, and neither Debug form
+    /// prints a secret.
     ///
     /// # Panics
     /// Panics when a field differs or a secret is printed.
@@ -6813,22 +6864,16 @@ provider = "anthropic"
                 .expect("the GitHub overrides apply");
             let settings = config
                 .github
-                .resolve(true)
-                .expect("the section validates in production")
+                .resolve(false)
+                .expect("the section validates outside production")
                 .expect("the section is present");
             assert_eq!(settings.app_id, 4242);
             assert_eq!(settings.slug, "wyrd-app");
-            assert_eq!(settings.host(), "ghe.example.com:8443");
-            assert_eq!(
-                settings.api_origin.as_str(),
-                "https://ghe.example.com:8443/api/v3"
-            );
+            assert_eq!(settings.host(), "127.0.0.1:8443");
+            assert_eq!(settings.api_origin.as_str(), "http://127.0.0.1:8443/api/v3");
             assert_eq!(settings.public_url.as_str(), "https://wyrd.example.com/");
             assert_eq!(settings.oauth_client_id, "Iv1.client");
-            assert_eq!(
-                settings.private_key.expose_secret().trim(),
-                wyrd_testing::github::APP_PRIVATE_KEY_PEM.trim()
-            );
+            assert_signs_app_jwts(&settings);
             assert_eq!(
                 settings.webhook_secret.expose_secret(),
                 "webhook-secret-value"
@@ -6845,9 +6890,98 @@ provider = "anthropic"
         });
     }
 
+    /// Proves the "Connect GitHub" guide's embedded server settings,
+    /// `examples/connect-github/server.sh`, run as published, placeholders
+    /// included, and, with each `<...>` filled in and its secret files
+    /// mounted, configure a production server for GitHub.com.
+    ///
+    /// # Panics
+    /// Panics when the guide does not embed the script, `bash` cannot run
+    /// it, or the exported settings do not resolve to GitHub.com in
+    /// production.
+    #[test]
+    fn github_guide_settings_configure_a_production_server() {
+        const GUIDE: &str =
+            include_str!("../../../../docs/src/content/docs/operate/connect-github.md");
+        let block = include_str!("../../../../examples/connect-github/server.sh");
+        assert!(
+            GUIDE.contains(
+                r#"<CodeFromFile file="examples/connect-github/server.sh" lang="bash" />"#
+            )
+        );
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (name, value) in [
+            ("github-app.pem", wyrd_testing::github::APP_PRIVATE_KEY_PEM),
+            ("github-client-secret", "oauth-secret-value"),
+            ("github-webhook-secret", "webhook-secret-value"),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, value).expect("secret writes");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("secret is owner-only");
+        }
+        let published = std::process::Command::new("bash")
+            .args(["-euo", "pipefail", "-c", block])
+            .env_clear()
+            .output()
+            .expect("bash runs the settings");
+        assert!(published.status.success(), "{published:?}");
+        let block = block
+            .replace("<App ID>", "4242")
+            .replace("<slug>", "wyrd-app")
+            .replace("<Client ID>", "Iv1.client")
+            .replace("/run/secrets", &dir.path().display().to_string());
+        let printed = std::process::Command::new("bash")
+            .args(["-euo", "pipefail", "-c", &format!("{block}\nenv")])
+            .env_clear()
+            .output()
+            .expect("bash runs the filled-in settings");
+        assert!(printed.status.success(), "{printed:?}");
+        let exported: Vec<(String, Option<String>)> = String::from_utf8(printed.stdout)
+            .expect("the environment prints as UTF-8")
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .filter(|(name, _)| name.starts_with("WYRD_GITHUB_"))
+            .map(|(name, value)| (name.to_owned(), Some(value.to_owned())))
+            .collect();
+        let unset = github_env(Path::new("unused"))
+            .into_iter()
+            .map(|(name, _)| (name.to_owned(), None));
+        let vars: Vec<(String, Option<String>)> = unset.chain(exported).collect();
+        temp_env::with_vars(vars, || {
+            let mut config = WyrdServerConfig::default();
+            config
+                .apply_env_overrides()
+                .expect("the guide's settings apply");
+            let settings = config
+                .github
+                .resolve(true)
+                .expect("the guide's settings validate in production")
+                .expect("the guide configures the App");
+            assert_eq!(settings.app_id, 4242);
+            assert_eq!(settings.slug, "wyrd-app");
+            assert_eq!(settings.host(), "github.com");
+            assert_eq!(settings.web_origin.as_str(), "https://github.com/");
+            assert_eq!(settings.api_origin.as_str(), "https://api.github.com/");
+            assert_eq!(settings.public_url.as_str(), "https://wyrd.example.com/");
+            assert_eq!(settings.oauth_client_id, "Iv1.client");
+            assert_signs_app_jwts(&settings);
+            assert_eq!(
+                settings.webhook_secret.expose_secret(),
+                "webhook-secret-value"
+            );
+            assert_eq!(
+                settings.oauth_client_secret.expose_secret(),
+                "oauth-secret-value"
+            );
+        });
+    }
+
     /// Proves an unset section configures no App, the default host is
-    /// `github.com`, and a partial or invalid section refuses startup naming
-    /// the field.
+    /// `github.com`, production accepts only GitHub.com's origins, and a
+    /// partial or invalid section, including a public key in place of the
+    /// App's private key, refuses startup naming the field.
     ///
     /// # Panics
     /// Panics when an unset section configures an App or an invalid one
@@ -6880,8 +7014,9 @@ provider = "anthropic"
             .expect("present");
         assert_eq!(settings.host(), "github.com");
         assert_eq!(settings.api_origin.as_str(), "https://api.github.com/");
+        assert_signs_app_jwts(&settings);
 
-        let cases: [(&str, GithubConfig); 7] = [
+        let cases: [(&str, GithubConfig); 10] = [
             (
                 "public_url",
                 GithubConfig {
@@ -6931,6 +7066,27 @@ provider = "anthropic"
                     ..complete.clone()
                 },
             ),
+            (
+                "WYRD_GITHUB_APP_PRIVATE_KEY_FILE",
+                GithubConfig {
+                    private_key: Some(SecretString::from(wyrd_testing::github::APP_PUBLIC_KEY_PEM)),
+                    ..complete.clone()
+                },
+            ),
+            (
+                "web_origin",
+                GithubConfig {
+                    web_origin: Some("https://github.example.com".to_owned()),
+                    ..complete.clone()
+                },
+            ),
+            (
+                "api_origin",
+                GithubConfig {
+                    api_origin: Some("https://github.example.com/api/v3".to_owned()),
+                    ..complete.clone()
+                },
+            ),
         ];
         for (field, config) in cases {
             match config.resolve(true) {
@@ -6976,8 +7132,8 @@ provider = "anthropic"
             "[github]\napp_id = 7\nslug = \"toml-app\"\n\
              public_url = \"https://wyrd.example.com\"\n\
              oauth_client_id = \"Iv1.toml\"\n\
-             web_origin = \"https://ghe.example.com\"\n\
-             api_origin = \"https://ghe.example.com/api/v3\"\n",
+             web_origin = \"http://127.0.0.1:8443\"\n\
+             api_origin = \"http://127.0.0.1:8443/api/v3\"\n",
         )
         .expect("the section parses");
         let unset = github_env(&key_file)
@@ -7002,7 +7158,7 @@ provider = "anthropic"
         });
         let settings = config
             .github
-            .resolve(true)
+            .resolve(false)
             .expect("the section validates")
             .expect("present");
         assert_eq!(
@@ -7014,15 +7170,9 @@ provider = "anthropic"
             (7, "toml-app", "Iv1.toml")
         );
         assert_eq!(settings.public_url.as_str(), "https://wyrd.example.com/");
-        assert_eq!(settings.host(), "ghe.example.com");
-        assert_eq!(
-            settings.api_origin.as_str(),
-            "https://ghe.example.com/api/v3"
-        );
-        assert_eq!(
-            settings.private_key.expose_secret().trim(),
-            wyrd_testing::github::APP_PRIVATE_KEY_PEM.trim()
-        );
+        assert_eq!(settings.host(), "127.0.0.1:8443");
+        assert_eq!(settings.api_origin.as_str(), "http://127.0.0.1:8443/api/v3");
+        assert_signs_app_jwts(&settings);
         assert_eq!(settings.webhook_secret.expose_secret(), "webhook-from-file");
         assert_eq!(
             settings.oauth_client_secret.expose_secret(),

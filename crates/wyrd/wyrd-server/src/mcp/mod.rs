@@ -67,6 +67,7 @@ impl Mcp {
 pub(crate) mod bifrost;
 pub(crate) mod cards;
 mod gateway;
+/// Tenant GitHub connection over MCP.
 mod github;
 mod guide;
 mod operators;

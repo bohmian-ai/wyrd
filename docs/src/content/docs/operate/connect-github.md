@@ -13,7 +13,7 @@ Wyrd stores no GitHub key or token. It mints a short-lived installation token, n
 ## Before you start
 
 - A running Wyrd server reachable at a public HTTPS address, from [Deploy for a team](/operate/deploy-wyrd-for-a-team/).
-- Permission to create a GitHub App for your organization, on github.com or your GitHub Enterprise Server.
+- Permission to create a GitHub App for your organization on GitHub.com.
 - A tenant administrator who can sign in to the Wyrd web app, and the `wyrd` CLI.
 
 ## 1. Register the GitHub App
@@ -43,29 +43,17 @@ Create the App. On its page, copy the **App ID**, the app's URL name (the slug i
 
 ## 2. Give the App to Wyrd
 
-Set these on every `wyrd-server` process and restart it. Secrets come only from the environment or a file, never from the server TOML file.
+Set these on every `wyrd-server` process and restart it, replacing each `<...>` with the value from step 1. Secrets come only from the environment or a file, never from the server TOML file.
 
-```bash
-export WYRD_GITHUB_APP_ID=<App ID>
-export WYRD_GITHUB_APP_SLUG=<slug>
-export WYRD_GITHUB_PUBLIC_URL=https://wyrd.example.com
-export WYRD_GITHUB_OAUTH_CLIENT_ID=<Client ID>
-export WYRD_GITHUB_OAUTH_CLIENT_SECRET_FILE=/run/secrets/github-client-secret
-export WYRD_GITHUB_WEBHOOK_SECRET_FILE=/run/secrets/github-webhook-secret
-export WYRD_GITHUB_APP_PRIVATE_KEY_FILE=/run/secrets/github-app.pem
-```
+<CodeFromFile file="examples/connect-github/server.sh" lang="bash" />
 
-For GitHub Enterprise Server, also set `WYRD_GITHUB_WEB_ORIGIN=https://github.example.com` and `WYRD_GITHUB_API_ORIGIN=https://github.example.com/api/v3`. Without any `WYRD_GITHUB_*` setting the server starts with GitHub unavailable; with some but not all, it refuses to start and names the missing one.
+Wyrd reaches GitHub at `https://github.com` and `https://api.github.com`. Without any `WYRD_GITHUB_*` setting the server starts with GitHub unavailable; with some but not all, it refuses to start and names the missing one.
 
 ## 3. Connect the tenant
 
 As the tenant administrator, begin the connection:
 
-```bash
-export WYRD_SERVER_URL=https://wyrd.example.com
-export WYRD_API_KEY=<admin_credential>
-wyrd github connect
-```
+<CodeFromFile file="examples/connect-github/connect.sh" lang="bash" />
 
 ```text
 {"authorization_url":"https://github.com/apps/wyrd-reviews/installations/new?state=...","expires_at":"..."}
@@ -77,9 +65,7 @@ You can also start from GitHub: install the App from `https://github.com/apps/<s
 
 ## 4. Check the connection
 
-```bash
-wyrd github status
-```
+<CodeFromFile file="examples/connect-github/status.sh" lang="bash" />
 
 ```text
 {"host":"github.com","app":{"id":4242,"slug":"wyrd-reviews"},"state":"active","installation_id":101,"repositories":[{"repository_id":"1","full_name":"acme/api"}],"connected_at":"...","updated_at":"..."}

@@ -4,9 +4,10 @@
 //! App install page, OAuth authorization with PKCE, the token exchange, the
 //! App's installation reads and installation tokens, and the authorizing
 //! user's installation and repository reads — on one loopback origin, with
-//! the REST API under `/api/v3` the way GitHub Enterprise Server serves it.
-//! Tests script GitHub's side: installations, users, the browser's signed-in
-//! GitHub user, suspension and repository access. [`GithubBrowser`] is a
+//! the REST API under `/api/v3`. Tests script GitHub's side: installations,
+//! users, the browser's signed-in GitHub user, suspension and repository
+//! access, and can hold GitHub's next answer to interleave Wyrd work with
+//! it. [`GithubBrowser`] is a
 //! browser signed in to Wyrd that follows the redirect chain across Wyrd and
 //! the mock, keeping Wyrd's cookies. Webhooks are delivered signed with the
 //! configured secret, or deliberately missigned.
@@ -44,8 +45,8 @@ pub const WEBHOOK_SECRET: &str = "wyrd-test-webhook-secret";
 /// The mock App's RSA private key, PKCS#1 like the keys GitHub issues.
 pub const APP_PRIVATE_KEY_PEM: &str = include_str!("github_test_app_key.pem");
 /// The public half of [`APP_PRIVATE_KEY_PEM`], which the mock verifies App
-/// JWTs with.
-const APP_PUBLIC_KEY_PEM: &str = include_str!("github_test_app_key.pub.pem");
+/// JWTs with. It is not a signing key.
+pub const APP_PUBLIC_KEY_PEM: &str = include_str!("github_test_app_key.pub.pem");
 /// Prefix of every user token the mock issues.
 pub const USER_TOKEN_PREFIX: &str = "gho_wyrdmock_";
 /// Prefix of every installation token the mock issues.
@@ -69,6 +70,37 @@ struct User {
     installations: BTreeSet<u64>,
     /// Repositories the user cannot access, whatever the installation.
     hidden: BTreeSet<u64>,
+}
+
+/// GitHub's next answer to one route, held until the test releases it.
+///
+/// The mock computes the answer from GitHub's state when the request
+/// arrives, signals [`Self::arrived`], then waits for [`Self::release`], so
+/// the held answer reflects GitHub as it was when asked.
+#[derive(Debug, Clone, Default)]
+pub struct HeldAnswer {
+    /// Signalled once the held request has arrived and its answer is fixed.
+    arrived: Arc<tokio::sync::Notify>,
+    /// Signalled to let the held answer go.
+    released: Arc<tokio::sync::Notify>,
+}
+
+impl HeldAnswer {
+    /// Wait until the held request has arrived and its answer is fixed.
+    pub async fn arrived(&self) {
+        self.arrived.notified().await;
+    }
+
+    /// Let the held answer go.
+    pub fn release(&self) {
+        self.released.notify_one();
+    }
+
+    /// Signal arrival and wait for release; the route handler's side.
+    async fn hold(&self) {
+        self.arrived.notify_one();
+        self.released.notified().await;
+    }
 }
 
 /// An issued, unexchanged authorization code.
@@ -103,6 +135,12 @@ struct MockState {
     token_requests: Vec<Value>,
     /// Every code, token and secret the mock issued, for leak assertions.
     issued: Vec<String>,
+    /// Held next answer of the installation token route.
+    token_hold: Option<HeldAnswer>,
+    /// Held next answer of the App installation read.
+    installation_hold: Option<HeldAnswer>,
+    /// Token exchanges answered with a user token.
+    exchanges: usize,
     /// Counter for unique codes and tokens.
     serial: u64,
 }
@@ -296,6 +334,28 @@ impl GithubAppMock {
         if let Some(installation) = self.state().installations.get_mut(&id) {
             installation.repositories.remove(&repository_id);
         }
+    }
+
+    /// Hold GitHub's answer to the next installation token request.
+    #[must_use]
+    pub fn hold_next_token(&self) -> HeldAnswer {
+        let hold = HeldAnswer::default();
+        self.state().token_hold = Some(hold.clone());
+        hold
+    }
+
+    /// Hold GitHub's answer to the next App installation read.
+    #[must_use]
+    pub fn hold_next_installation_read(&self) -> HeldAnswer {
+        let hold = HeldAnswer::default();
+        self.state().installation_hold = Some(hold.clone());
+        hold
+    }
+
+    /// How many authorization codes GitHub exchanged for a user token.
+    #[must_use]
+    pub fn exchanges(&self) -> usize {
+        self.state().exchanges
     }
 
     /// Every installation token request body Wyrd sent, in order.
@@ -527,15 +587,44 @@ struct TokenForm {
 
 /// `POST /login/oauth/access_token`: a one-use code, the client secret and
 /// the PKCE verifier buy a user token. GitHub answers refusals with 200 and
-/// an `error` body.
-async fn access_token(State(weak): State<Weak>, Form(form): Form<TokenForm>) -> Response {
+/// an `error` body, and answers form-encoded unless the request accepts
+/// `application/json`.
+async fn access_token(
+    State(weak): State<Weak>,
+    headers: HeaderMap,
+    Form(form): Form<TokenForm>,
+) -> Response {
     let Some(mock) = weak.mock() else {
         return gone();
     };
+    let json_accepted = headers.get_all(header::ACCEPT).iter().any(|value| {
+        value
+            .to_str()
+            .is_ok_and(|accept| accept.contains("application/json"))
+    });
+    let answer = |body: &Value| -> Response {
+        if json_accepted {
+            return axum::Json(body.clone()).into_response();
+        }
+        let encoded = body.as_object().map_or_else(String::new, |fields| {
+            url::form_urlencoded::Serializer::new(String::new())
+                .extend_pairs(
+                    fields
+                        .iter()
+                        .map(|(name, value)| (name, value.as_str().unwrap_or_default())),
+                )
+                .finish()
+        });
+        (
+            [(header::CONTENT_TYPE, "application/x-www-form-urlencoded")],
+            encoded,
+        )
+            .into_response()
+    };
     let mut state = mock.state();
-    let refused = || axum::Json(json!({ "error": "bad_verification_code" })).into_response();
+    let refused = || answer(&json!({ "error": "bad_verification_code" }));
     if form.client_id != OAUTH_CLIENT_ID || form.client_secret != OAUTH_CLIENT_SECRET {
-        return axum::Json(json!({ "error": "incorrect_client_credentials" })).into_response();
+        return answer(&json!({ "error": "incorrect_client_credentials" }));
     }
     let Some(code) = state.codes.remove(&form.code) else {
         return refused();
@@ -551,8 +640,8 @@ async fn access_token(State(weak): State<Weak>, Form(form): Form<TokenForm>) -> 
     }
     let token = issue(&mut state, USER_TOKEN_PREFIX);
     state.tokens.insert(token.clone(), code.login);
-    axum::Json(json!({ "access_token": token, "token_type": "bearer", "scope": "" }))
-        .into_response()
+    state.exchanges += 1;
+    answer(&json!({ "access_token": token, "token_type": "bearer", "scope": "" }))
 }
 
 /// The bearer token of `headers`.
@@ -612,13 +701,20 @@ async fn app_installation(
     if !app_authenticated(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let state = mock.state();
-    match state.installations.get(&id) {
-        Some(installation) if installation.app_id == APP_ID => {
-            axum::Json(installation_json(id, installation)).into_response()
-        }
-        _ => StatusCode::NOT_FOUND.into_response(),
+    let (answer, hold) = {
+        let mut state = mock.state();
+        let answer = match state.installations.get(&id) {
+            Some(installation) if installation.app_id == APP_ID => {
+                axum::Json(installation_json(id, installation)).into_response()
+            }
+            _ => StatusCode::NOT_FOUND.into_response(),
+        };
+        (answer, state.installation_hold.take())
+    };
+    if let Some(hold) = hold {
+        hold.hold().await;
     }
+    answer
 }
 
 /// `GET /api/v3/user/installations`: installations the user can access,
@@ -698,7 +794,16 @@ async fn installation_token(
     if !app_authenticated(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let mut state = mock.state();
+    let (answer, hold) = mint(&mut mock.state(), id, body);
+    if let Some(hold) = hold {
+        hold.hold().await;
+    }
+    answer
+}
+
+/// GitHub's answer to one installation token request for installation
+/// `id`, and the hold on it, if any.
+fn mint(state: &mut MockState, id: u64, body: Value) -> (Response, Option<HeldAnswer>) {
     state.token_requests.push(body.clone());
     let Some(installation) = state
         .installations
@@ -706,27 +811,30 @@ async fn installation_token(
         .filter(|installation| installation.app_id == APP_ID)
         .cloned()
     else {
-        return StatusCode::NOT_FOUND.into_response();
+        return (StatusCode::NOT_FOUND.into_response(), None);
     };
     if installation.suspended {
-        return StatusCode::FORBIDDEN.into_response();
+        return (StatusCode::FORBIDDEN.into_response(), None);
     }
     let Ok(request) = serde_json::from_value::<TokenRequest>(body) else {
-        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+        return (StatusCode::UNPROCESSABLE_ENTITY.into_response(), None);
     };
     if request
         .repository_ids
         .iter()
         .any(|repository| !installation.repositories.contains_key(repository))
     {
-        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+        return (StatusCode::UNPROCESSABLE_ENTITY.into_response(), None);
     }
-    let token = issue(&mut state, INSTALLATION_TOKEN_PREFIX);
+    let token = issue(state, INSTALLATION_TOKEN_PREFIX);
     (
-        StatusCode::CREATED,
-        axum::Json(json!({ "token": token, "expires_at": "2099-01-01T00:00:00Z" })),
+        (
+            StatusCode::CREATED,
+            axum::Json(json!({ "token": token, "expires_at": "2099-01-01T00:00:00Z" })),
+        )
+            .into_response(),
+        state.token_hold.take(),
     )
-        .into_response()
 }
 
 /// The final answer of a browser navigation.

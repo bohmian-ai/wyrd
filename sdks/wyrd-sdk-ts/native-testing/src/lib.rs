@@ -21,6 +21,7 @@ use wyrd_testing::human_login::HumanSso;
 use wyrd_testing::server::{WyrdTestServer, WyrdTestServerError};
 
 pub mod cli;
+/// Test-tier napi projection of the loopback GitHub App and its browser.
 pub mod github;
 
 /// In-process server handle used only by TypeScript integration tests.

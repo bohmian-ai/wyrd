@@ -9,7 +9,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use jsonwebtoken::{Algorithm, Header};
 use reqwest::{Method, RequestBuilder, StatusCode};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
@@ -19,7 +19,7 @@ use wyrd_auth_oidc::{ScreenedHttp, read_bounded_body};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::github_connection::GithubRepositoryAccess;
 
-use crate::config::{ConfigError, GithubAppSettings};
+use crate::config::GithubAppSettings;
 
 /// GitHub REST API version every request pins.
 const API_VERSION: &str = "2022-11-28";
@@ -122,10 +122,8 @@ pub(crate) fn refused(reason: &str, message: &str) -> WyrdError {
 
 /// The deployment's configured GitHub App and its provider protocol.
 pub struct GithubApp {
-    /// Validated operator configuration.
+    /// Validated operator configuration, including the App JWT signing key.
     settings: GithubAppSettings,
-    /// App JWT signing key parsed from the configured PEM.
-    key: EncodingKey,
     /// Screened outbound HTTP for this deployment.
     http: ScreenedHttp,
 }
@@ -142,19 +140,9 @@ impl std::fmt::Debug for GithubApp {
 impl GithubApp {
     /// The App over validated `settings`, reaching GitHub through `http`.
     ///
-    /// # Errors
-    /// Returns [`ConfigError::Invalid`] when the private key is not an RSA
-    /// private key PEM.
-    pub fn new(settings: GithubAppSettings, http: ScreenedHttp) -> Result<Self, ConfigError> {
-        let key = EncodingKey::from_rsa_pem(settings.private_key.expose_secret().as_bytes())
-            .map_err(|_| ConfigError::Invalid {
-                message: "github: the App private key is not an RSA private key PEM".to_owned(),
-            })?;
-        Ok(Self {
-            settings,
-            key,
-            http,
-        })
+    /// Configuration resolution already proved the signing key signs RS256.
+    pub const fn new(settings: GithubAppSettings, http: ScreenedHttp) -> Self {
+        Self { settings, http }
     }
 
     /// The validated configuration.
@@ -214,6 +202,9 @@ impl GithubApp {
     /// Exchange the user authorization `code` with its PKCE `code_verifier`
     /// for a transient user access token.
     ///
+    /// GitHub's web token endpoint answers form-encoded unless asked for
+    /// JSON with `Accept: application/json`, which this request sends.
+    ///
     /// # Errors
     /// Returns [`WyrdError::GithubConnectionRefused`] (`authorization_refused`)
     /// when GitHub refuses the code and [`WyrdError::GithubUnavailable`] when
@@ -234,7 +225,10 @@ impl GithubApp {
             ("redirect_uri", &self.callback_uri()),
             ("code_verifier", code_verifier.expose_secret()),
         ];
-        let request = self.request(Method::POST, &url).await?.form(&form);
+        let request = self
+            .request_accepting(Method::POST, &url, "application/json")
+            .await?
+            .form(&form);
         let body: TokenBody = self.json(request, "the authorization exchange").await?;
         body.access_token
             .filter(|token| !token.is_empty())
@@ -430,12 +424,28 @@ impl GithubApp {
             .expect("invariant: a configured origin joined with a fixed path is a URL")
     }
 
-    /// A screened request to `url` with GitHub's JSON headers.
+    /// A screened request to `url` with the REST API's JSON headers.
     ///
     /// # Errors
     /// Returns [`WyrdError::GithubUnavailable`] when screening refuses the
     /// URL or the client cannot be built.
     async fn request(&self, method: Method, url: &Url) -> Result<RequestBuilder, WyrdError> {
+        self.request_accepting(method, url, "application/vnd.github+json")
+            .await
+    }
+
+    /// A screened request to `url` negotiating `accept`, with GitHub's
+    /// user agent and API version headers.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::GithubUnavailable`] when screening refuses the
+    /// URL or the client cannot be built.
+    async fn request_accepting(
+        &self,
+        method: Method,
+        url: &Url,
+        accept: &'static str,
+    ) -> Result<RequestBuilder, WyrdError> {
         let client = self
             .http
             .client_for(url)
@@ -443,7 +453,7 @@ impl GithubApp {
             .map_err(|_| unavailable("a screened request"))?;
         Ok(client
             .request(method, url.clone())
-            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .header(reqwest::header::ACCEPT, accept)
             .header(reqwest::header::USER_AGENT, "wyrd")
             .header("X-GitHub-Api-Version", API_VERSION))
     }
@@ -496,8 +506,12 @@ impl GithubApp {
             exp: now + 540,
             iss: self.settings.app_id.to_string(),
         };
-        jsonwebtoken::encode(&Header::new(Algorithm::RS256), &claims, &self.key)
-            .map(SecretString::from)
-            .map_err(|_| unavailable("App authentication"))
+        jsonwebtoken::encode(
+            &Header::new(Algorithm::RS256),
+            &claims,
+            &self.settings.signing_key,
+        )
+        .map(SecretString::from)
+        .map_err(|_| unavailable("App authentication"))
     }
 }

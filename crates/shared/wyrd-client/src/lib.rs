@@ -19,6 +19,7 @@ pub mod environment;
 pub mod error;
 pub mod gateway_admin;
 pub mod gateway_credential;
+/// Tenant GitHub connection: connect, read and disconnect the deployment's App.
 pub mod github;
 pub mod global_config;
 pub mod observe;

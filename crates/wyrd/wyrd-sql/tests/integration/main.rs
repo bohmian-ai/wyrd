@@ -7,6 +7,7 @@
 mod pg_admin_principals;
 mod pg_cards_declare;
 mod pg_drift_baselines;
+/// Tenant GitHub installation slots, revision fences and login state.
 mod pg_github_installations;
 mod pg_login_state;
 mod pg_migration;

@@ -22,6 +22,7 @@ use wyrd_spec::github_connection::{
 
 use super::service::{GithubConnections, TRANSACTION_TTL, not_configured};
 use crate::auth::browser::{cookie_header, cookie_pairs};
+use crate::auth::oauth::no_store;
 use crate::components::auth::Caller;
 use crate::http::error::{WyrdErrorResponse, body_rejection, query_rejection};
 use crate::state::AppState;
@@ -200,11 +201,10 @@ async fn setup(
         CALLBACK_PATH,
         TRANSACTION_TTL.as_secs(),
     );
-    Ok((
+    Ok(no_store(
         StatusCode::FOUND,
         [(header::LOCATION, location), (header::SET_COOKIE, cookie)],
-    )
-        .into_response())
+    ))
 }
 
 /// GitHub's OAuth callback: verify the authorization and installation and
@@ -277,7 +277,8 @@ async fn callback(
 ///
 /// # Errors
 /// Returns a stable Wyrd error for a missing or wrong signature, a body that
-/// is not an event, no configured App, or a failed write.
+/// is not an event, a suspension GitHub cannot report or that raced a
+/// connection change, no configured App, or a failed write.
 #[utoipa::path(
     post,
     path = "/integrations/github/webhook",
@@ -288,9 +289,11 @@ async fn callback(
           (WYRD_GITHUB_400_INVALID_REQUEST)", body = WyrdProblem),
         (status = 401, description = "The signature does not verify \
           (WYRD_GITHUB_401_WEBHOOK_REFUSED)", body = WyrdProblem),
-        (status = 503, description = "No GitHub App is configured, or the registry is \
-          unavailable (WYRD_GITHUB_503_NOT_CONFIGURED, \
-          WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE)", body = WyrdProblem)
+        (status = 409, description = "The connection changed while GitHub reported a \
+          suspension; redeliver (WYRD_GITHUB_409_CONNECTION_CONFLICT)", body = WyrdProblem),
+        (status = 503, description = "No GitHub App is configured, GitHub could not report \
+          a suspension, or the registry is unavailable (WYRD_GITHUB_503_NOT_CONFIGURED, \
+          WYRD_GITHUB_503_PROVIDER_UNAVAILABLE, WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE)", body = WyrdProblem)
     ),
     security(()),
     tag = "GitHub"

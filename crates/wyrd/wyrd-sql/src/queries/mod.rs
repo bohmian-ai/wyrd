@@ -13,6 +13,7 @@ pub mod cards;
 pub mod drift_baselines;
 pub mod gateway;
 pub mod gateway_admission;
+/// Tenant GitHub App installation associations in `wyrd.github_installations`.
 pub mod github_installations;
 pub mod operator_connections;
 pub mod operator_dispatches;

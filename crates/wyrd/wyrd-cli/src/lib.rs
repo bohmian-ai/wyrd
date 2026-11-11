@@ -16,6 +16,7 @@ pub mod declaration;
 pub mod error;
 mod execution;
 pub mod gateway;
+/// `wyrd github`: connect, check and release the tenant's GitHub App connection.
 mod github;
 /// `wyrd init`: local server bootstrap and its guided setup handoff.
 pub mod init;

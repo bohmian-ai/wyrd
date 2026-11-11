@@ -40,6 +40,16 @@ pub(crate) fn run_cli_with_credential(
 /// fails to spawn.
 pub(crate) fn run_cli_with_env(arguments: &[&str], sources: &[(&str, &str)]) -> Output {
     let mut command = Command::cargo_bin("wyrd").expect("wyrd binary builds");
+    command.args(arguments);
+    run_scrubbed(command, sources)
+}
+
+/// Run `command`, which reaches the shipped CLI, with the ambient environment
+/// scrubbed exactly as [`run_cli_with_env`] scrubs it and only `sources` set.
+///
+/// # Panics
+/// Panics when the process fails to spawn.
+pub(crate) fn run_scrubbed(mut command: Command, sources: &[(&str, &str)]) -> Output {
     command
         .env(
             "WYRD_CONFIG_HOME",
@@ -54,7 +64,7 @@ pub(crate) fn run_cli_with_env(arguments: &[&str], sources: &[(&str, &str)]) -> 
         .env_remove("WYRD_ISSUER_CLIENT_SECRET")
         .env_remove("RUST_LOG")
         .envs(sources.iter().copied());
-    command.args(arguments).output().expect("wyrd command runs")
+    command.output().expect("wyrd command runs")
 }
 
 /// Run the CLI off the async runtime, which a subprocess call would otherwise

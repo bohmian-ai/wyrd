@@ -296,6 +296,10 @@ async fn the_served_document_describes_the_composed_surface() {
 /// the Wyrd access token or the browser session and answer their documented
 /// success status, and the webhook clears that requirement because GitHub
 /// authenticates it by signature.
+///
+/// # Panics
+/// Panics when the server does not start or an operation's success
+/// status, security, schema or problem responses differ.
 #[tokio::test]
 async fn github_connection_operations_publish_their_contract() {
     let server = WyrdTestServer::start_in_process()

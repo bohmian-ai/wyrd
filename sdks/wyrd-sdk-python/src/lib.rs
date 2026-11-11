@@ -12,6 +12,7 @@ mod cli;
 mod client;
 #[cfg(feature = "python")]
 mod gateway_admin;
+/// `PyO3` boundary for the tenant GitHub connection handle.
 #[cfg(feature = "python")]
 mod github;
 #[cfg(feature = "python")]

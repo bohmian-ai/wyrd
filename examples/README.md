@@ -8,6 +8,7 @@ exactly what a reader builds: the Card YAML files and one program per language,
 | --- | --- | --- |
 | `quickstart/` | `get-started/quickstart` | `sdks/wyrd-sdk-python/tests/integration/test_docsite_quickstart.py`, `examples/tests/quickstart.rs`, `sdks/wyrd-sdk-ts/wyrd/tests/integration/declare-and-pull.test.ts` |
 | `integrate-fastapi/` | `connect/integrate-asgi` | `sdks/wyrd-sdk-python/tests/integration/test_asgi_integration.py::test_fastapi_example` |
+| `connect-github/` | `operate/connect-github` | `crates/wyrd/wyrd-cli/tests/github_journey.rs` (`connect.sh`, `status.sh`), `crates/wyrd/wyrd-server/src/config.rs::tests::github_guide_settings_configure_a_production_server` (`server.sh`) |
 
 Adding an example: create its directory, add one `[[bin]]` to `Cargo.toml` and
 one journey per SDK, and embed the files with `<CodeFromFile>`. The examples

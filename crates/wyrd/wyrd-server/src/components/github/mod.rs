@@ -7,8 +7,11 @@
 //! and OAuth callback redirects, webhooks and installation tokens; HTTP and
 //! MCP are thin projections of it.
 
+/// The deployment GitHub App's provider protocol.
 pub mod app;
+/// HTTP projection of the tenant GitHub connection.
 pub mod routes;
+/// The one owner of tenant GitHub connection state, shared by HTTP and MCP.
 pub mod service;
 
 pub use app::GithubApp;

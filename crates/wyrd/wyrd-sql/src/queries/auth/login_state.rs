@@ -369,6 +369,7 @@ struct GithubLoginRow {
 }
 
 impl TryFrom<GithubLoginRow> for GithubLoginState {
+    /// A stored column that no longer decodes, reported as a decode failure.
     type Error = sqlx::Error;
 
     /// Rebuild the transaction from its stored columns.

@@ -1321,13 +1321,11 @@ impl AppState {
                 .github
                 .resolve(config.deployment_profile.is_production())?
                 .map(|settings| {
-                    crate::components::github::GithubApp::new(
+                    Arc::new(crate::components::github::GithubApp::new(
                         settings,
                         config.deployment_profile.screened_http(),
-                    )
-                    .map(Arc::new)
-                })
-                .transpose()?;
+                    ))
+                });
             Ok::<_, ServerBootError>((gateway, verification, github))
         };
         let (gateway, verification, github) = match owners.await {

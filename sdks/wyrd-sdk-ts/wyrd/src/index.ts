@@ -1098,9 +1098,6 @@ export class QueryResult {
   }
 }
 
-/** Reads a {@link Bifrost}'s native handle for {@link record}. */
-let bifrostNative: (bifrost: Bifrost) => NativeBifrost;
-
 /**
  * The one Bifrost client: query any authorized table, write to the active one.
  *
@@ -1111,10 +1108,6 @@ let bifrostNative: (bifrost: Bifrost) => NativeBifrost;
  */
 export class Bifrost {
   readonly #native: NativeBifrost;
-
-  static {
-    bifrostNative = (bifrost) => bifrost.#native;
-  }
 
   private constructor(native: NativeBifrost) {
     this.#native = native;
@@ -1368,14 +1361,6 @@ export class Bifrost {
   }
 
   /**
-   * Rows dropped by the fire-and-forget observation path; always zero for
-   * {@link Bifrost.insert}, which refuses rather than drops.
-   */
-  get dropped(): number {
-    return this.#native.dropped;
-  }
-
-  /**
    * List active queries visible to the authenticated tenant.
    *
    * @returns Every active query.
@@ -1509,44 +1494,6 @@ export interface PullSummary {
 /** Card references cross the native boundary as text or serialized JSON. */
 function cardRefText(ref: CardRef | string): string {
   return typeof ref === "string" ? ref : JSON.stringify(ref);
-}
-
-/**
- * Record one telemetry observation, fire-and-forget.
- *
- * Telemetry names its own `table` and `schema` per call rather than using the
- * client's active binding, so an instrumented process writes its signals
- * alongside whatever the application writes. If the producer refuses the row,
- * for example because its queue is full, the row is dropped and counted on
- * {@link Bifrost.dropped} instead of throwing.
- *
- * @param bifrost - The client whose producers carry the row.
- * @param table - The destination table's `namespace.name`.
- * @param schema - The table's JSON Schema, or a schema that emits one, mapped
- * to the Arrow schema of the row.
- * @param row - One row object matching `schema`.
- * @param correlation - Optional `subjectCardUid` and `runId` stamped on the row;
- * omitted, the row is uncorrelated.
- * @throws {@link WyrdError} `WYRD_VALA_400_SCHEMA_PARSE` for a schema that
- * does not map to Arrow, or `WYRD_SPEC_400_VALIDATION` for unparsable schema
- * text or a malformed `subjectCardUid`.
- */
-export function record(
-  bifrost: Bifrost,
-  table: string,
-  schema: Readonly<Record<string, unknown>> | JsonSchemaSource,
-  row: Readonly<Record<string, unknown>>,
-  correlation: Correlation = {},
-): void {
-  lifecycleValue<null>(
-    bifrostNative(bifrost).record(
-      table,
-      jsonSchemaText(schema),
-      JSON.stringify(row),
-      correlation.subjectCardUid,
-      correlation.runId,
-    ),
-  );
 }
 
 /** Reads a {@link WyrdClient}'s native handle for the surfaces that call the server. */

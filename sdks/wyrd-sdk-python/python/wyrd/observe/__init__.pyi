@@ -5,7 +5,6 @@ from typing import Any, Literal
 from typing_extensions import TypeVar
 
 from ..verify import DataModel, Execution, Recorded, VerificationResult
-from ._telemetry import record
 
 _Model = TypeVar("_Model", bound=DataModel)
 
@@ -225,5 +224,4 @@ __all__ = [
     "Observe",
     "Run",
     "RunBifrost",
-    "record",
 ]

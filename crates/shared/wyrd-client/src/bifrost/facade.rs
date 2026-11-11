@@ -26,7 +26,6 @@ use arrow::json::writer::JsonArray;
 use arrow::record_batch::RecordBatch;
 use serde::de::DeserializeOwned;
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::watch;
 use wyrd_queue::QueueConfig;
 use wyrd_queue::variant::WyrdJsonEncoderFactory;
 use wyrd_queue::{BatchSink, ClientByteGuard, DurableBatchAck, SealedBatch, SinkError};
@@ -99,25 +98,6 @@ pub struct Bifrost {
     /// tables also queue behind each other; per-table gating only if distinct
     /// first uses ever contend on a hot path.
     describe_gate: AsyncMutex<()>,
-    /// Telemetry records still describing their destination; flush and
-    /// shutdown wait for zero so a record admitted before them is not lost.
-    pending_records: Arc<watch::Sender<usize>>,
-}
-
-/// One telemetry record admitted by [`Bifrost::admit_record`] and not yet
-/// enqueued or dropped; [`Bifrost::flush`] and [`Bifrost::shutdown`] wait for
-/// every admission to settle.
-#[derive(Debug)]
-pub struct RecordAdmission {
-    /// The client's pending-record count this admission holds one unit of.
-    pending: Arc<watch::Sender<usize>>,
-}
-
-impl Drop for RecordAdmission {
-    /// Settles this admission and wakes a drain waiting for zero.
-    fn drop(&mut self) {
-        self.pending.send_modify(|pending| *pending -= 1);
-    }
 }
 
 impl Bifrost {
@@ -257,7 +237,6 @@ impl Bifrost {
             active: Mutex::new(table),
             described: Mutex::new(HashMap::new()),
             describe_gate: AsyncMutex::new(()),
-            pending_records: Arc::new(watch::Sender::new(0)),
         }
     }
 
@@ -466,19 +445,6 @@ impl Bifrost {
                 .expect("described table lock poisoned")
                 .entry(Arc::from(table.fqn().as_str()))
                 .or_insert(destination);
-        }
-    }
-
-    /// Count one telemetry record that must describe its destination first.
-    ///
-    /// Taken synchronously before the describe is spawned, so a flush or
-    /// shutdown that follows waits for the record's enqueue instead of
-    /// closing the pool beneath it. Dropping the admission settles it.
-    #[must_use]
-    pub fn admit_record(&self) -> RecordAdmission {
-        self.pending_records.send_modify(|pending| *pending += 1);
-        RecordAdmission {
-            pending: Arc::clone(&self.pending_records),
         }
     }
 
@@ -874,12 +840,6 @@ impl Bifrost {
     ///
     /// Panics when the blocking drain task cannot be joined.
     async fn drain(&self, kind: Drain) -> Result<(), BifrostClientError> {
-        self.pending_records
-            .subscribe()
-            .wait_for(|pending| *pending == 0)
-            .await
-            .map(drop)
-            .expect("the client owns its pending-record sender");
         let writer = Arc::clone(&self.writer);
         tokio::task::spawn_blocking(move || match kind {
             Drain::Flush => writer.flush(),
@@ -1321,14 +1281,6 @@ impl Bifrost {
         self.writer.producer_count()
     }
 
-    /// Rows dropped by the fire-and-forget [`crate::bifrost::observe::record`] path.
-    ///
-    /// Always zero for [`Self::insert`], which refuses rather than drops.
-    #[must_use]
-    pub fn dropped(&self) -> u64 {
-        self.writer.dropped()
-    }
-
     /// Point-in-time bounded-ownership accounting for this client's producers.
     #[must_use]
     #[cfg(feature = "internal")]
@@ -1351,14 +1303,6 @@ impl Bifrost {
     #[cfg(feature = "internal")]
     pub fn observe_losses(&self, observer: impl Fn(u64) + Send + Sync + 'static) {
         self.writer.observe_losses(observer);
-    }
-
-    /// The producer pool this client writes through.
-    ///
-    /// Crate-private so [`crate::bifrost::observe::record`] can reach the drop-counting
-    /// path without the pool becoming a second public write door.
-    pub(crate) fn writer(&self) -> &WriterPool {
-        &self.writer
     }
 }
 

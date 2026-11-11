@@ -1097,9 +1097,7 @@ impl NativeBifrost {
         let client = self.client.clone();
         crate::trace::spawn(env, async move {
             match client.running().await {
-                Ok(queries) => NativeLifecycleResult::success(
-                    &queries,
-                ),
+                Ok(queries) => NativeLifecycleResult::success(&queries),
                 Err(error) => Ok(NativeLifecycleResult::failure(&error)),
             }
         })
@@ -1129,9 +1127,7 @@ impl NativeBifrost {
                 }
             };
             match client.status(&request_id).await {
-                Ok(summary) => NativeLifecycleResult::success(
-                    &summary,
-                ),
+                Ok(summary) => NativeLifecycleResult::success(&summary),
                 Err(error) => Ok(NativeLifecycleResult::failure(&error)),
             }
         })
@@ -1161,9 +1157,7 @@ impl NativeBifrost {
                 }
             };
             match client.cancel(&request_id).await {
-                Ok(response) => NativeLifecycleResult::success(
-                    &response,
-                ),
+                Ok(response) => NativeLifecycleResult::success(&response),
                 Err(error) => Ok(NativeLifecycleResult::failure(&error)),
             }
         })
@@ -1217,9 +1211,7 @@ impl NativeBifrost {
         let client = self.client.clone();
         crate::trace::spawn(env, async move {
             match client.list_tables().await {
-                Ok(entries) => NativeLifecycleResult::success(
-                    &entries,
-                ),
+                Ok(entries) => NativeLifecycleResult::success(&entries),
                 Err(error) => Ok(NativeLifecycleResult::failure(&error)),
             }
         })
@@ -1247,9 +1239,7 @@ impl NativeBifrost {
         let client = self.client.clone();
         crate::trace::spawn(env, async move {
             match client.describe_table(&namespace, &name).await {
-                Ok(description) => NativeLifecycleResult::success(
-                    &description,
-                ),
+                Ok(description) => NativeLifecycleResult::success(&description),
                 Err(error) => Ok(NativeLifecycleResult::failure(&error)),
             }
         })
@@ -1318,9 +1308,7 @@ impl NativeBifrost {
                 )),
             };
             match altered {
-                Ok(description) => NativeLifecycleResult::success(
-                    &description,
-                ),
+                Ok(description) => NativeLifecycleResult::success(&description),
                 Err(error) => Ok(NativeLifecycleResult::failure(&error)),
             }
         })

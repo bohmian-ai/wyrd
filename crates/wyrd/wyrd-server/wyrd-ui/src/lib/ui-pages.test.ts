@@ -479,3 +479,83 @@ test('every histogram series apart is labelled from the series index, plotted id
     ['{"service.name":"b"}', 1]
   ]);
 });
+
+import { fireEvent, render, waitFor, within } from '@testing-library/svelte';
+import { vi } from 'vitest';
+import { goto } from '$app/navigation';
+import { fixtureExecutor, SERVICE, stateExecutors, VERIFIER, verifiers } from '$lib/ui-fixtures';
+import { load as loadCardDetail } from '../routes/t/[tenantKey]/cards/detail/+page.server';
+import CardDetail from '../routes/t/[tenantKey]/cards/detail/+page.svelte';
+
+// The page's reads run through the fixture executor here; the real BFF path is the integration journey's.
+const host = vi.hoisted(() => ({ executor: undefined as Executor | undefined }));
+vi.mock('wyrd-ai-ui/node', () => ({ nodeExecutor: () => host.executor }));
+vi.mock('$app/navigation', () => ({ goto: vi.fn(async () => {}) }));
+
+test('an exact Verifier Card page shows its definition, versions and where it runs', async () => {
+  const requests: WireRequest[] = [];
+  const through = (executor: Executor): Executor => ({ run: (batch, signal) => (requests.push(...batch), executor.run(batch, signal)) });
+  const open = async (search: string, executor = fixtureExecutor) => {
+    host.executor = through(executor);
+    requests.length = 0;
+    const url = new URL(`http://ui.test/t/acme/cards/detail${search}`);
+    const data = await loadCardDetail({ locals: { browserSession: { client: () => ({}) } }, url, request: new Request(url) } as never);
+    return render(CardDetail, { data: { ...data, tenant: { key: 'acme', name: 'Acme' } } } as never);
+  };
+
+  // The exact version: header, Graph/Files/YAML tabs, description, graph, where it runs, relationships and metadata.
+  const page = await open('?kind=Verifier&name=ticket-policy&version=1.1.0');
+  await waitFor(() => expect(page.container.querySelector('[data-node="step:classify"]')).toBeInTheDocument());
+  expect(page.getByRole('heading', { level: 2, name: 'ticket-policy' })).toBeInTheDocument();
+  expect(page.container).toHaveTextContent('Verifier / ticket-policy@1.1.0');
+  const tabs = within(page.getByRole('navigation', { name: 'ticket-policy sections' }));
+  expect(tabs.getAllByRole('button').map((tab) => tab.textContent)).toEqual(['Graph', 'Files', 'YAML']);
+  expect(tabs.getByRole('button', { name: 'Graph' })).toHaveAttribute('aria-current', 'page');
+  expect(page.container).toHaveTextContent('A support ticket follows the refund policy.');
+  expect(page.container.querySelectorAll('[data-node]')).toHaveLength(9);
+  expect(page.getByRole('region', { name: 'Runs on' })).toHaveTextContent('component agent · schedule 0 * * * * Europe/Berlin');
+  expect(page.getByRole('region', { name: 'Relationships' })).toBeInTheDocument();
+  // The newest version carries no older-version note, and no Results link ships before the Verify list exists.
+  expect(page.queryByText(/You are viewing/)).toBeNull();
+  expect(page.container.textContent).not.toMatch(/Results in Verify/);
+  expect(page.container.querySelector('a[href*="verify"]')).toBeNull();
+  // Only exact Card reads: the header gates the rest, and nothing reads executions or telemetry.
+  expect(new Set(requests.map((request) => request.op))).toEqual(new Set(['cards.get_by_ref', 'cards.list']));
+  expect(requests.filter((request) => request.op === 'cards.get_by_ref').every((request) => 'version' in request.card_ref && /^\d/.test(request.card_ref.version))).toBe(true);
+
+  // Version navigation is exact and read-only: choosing a version navigates to that version's URL.
+  await fireEvent.change(page.getByRole('combobox'), { target: { value: '1.0.0' } });
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/cards/detail?kind=Verifier&name=ticket-policy&version=1.0.0', expect.anything());
+  await fireEvent.click(tabs.getByRole('button', { name: 'YAML' }));
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/cards/detail?kind=Verifier&name=ticket-policy&version=1.1.0&tab=yaml', expect.anything());
+  // Opening a binding owner follows its exact reference.
+  await fireEvent.click(within(page.getByRole('region', { name: 'Runs on' })).getByRole('button', { name: `${SERVICE.name}@${SERVICE.version}` }));
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/cards/detail?kind=Service&name=support-api&version=1.0.0', expect.anything());
+  page.unmount();
+
+  // An older version says that viewing changes nothing, draws its own graph, and has no binding.
+  const older = await open('?kind=Verifier&name=ticket-policy&version=1.0.0');
+  await waitFor(() => expect(older.container.querySelector('[data-node="req:has-answer"]')).toBeInTheDocument());
+  expect(older.getByText(/You are viewing/)).toHaveTextContent('You are viewing 1.0.0; the newest registered version is 1.1.0. Viewing a version changes nothing: each binding pins the exact version it runs.');
+  expect(older.container.querySelectorAll('[data-node]')).toHaveLength(2);
+  expect(older.getByRole('region', { name: 'Runs on' })).toHaveTextContent('No binding runs this exact version.');
+  older.unmount();
+
+  // The YAML tab shows the Card as returned and loads no graph.
+  const yaml = await open('?kind=Verifier&name=ticket-policy&version=1.1.0&tab=yaml');
+  expect(yaml.container.querySelector('pre')?.textContent).toContain('description: A support ticket follows the refund policy.');
+  expect(yaml.container.querySelector('pre')?.textContent).toContain(`name: ${verifiers['ticket-policy@1.1.0'].metadata.name}`);
+  expect(yaml.container.querySelector('[data-node]')).toBeNull();
+  yaml.unmount();
+
+  // A denied or missing Card shows only that outcome: no dependent read, no graph, no stale definition.
+  const denied = await open('?kind=Verifier&name=ticket-policy&version=1.1.0', stateExecutors.denied);
+  expect(denied.container).toHaveTextContent('WYRD_AUTH_403_FORBIDDEN');
+  expect(denied.container.querySelector('[data-node]')).toBeNull();
+  expect(requests).toEqual([{ op: 'cards.get_by_ref', card_ref: VERIFIER }]);
+  denied.unmount();
+  const missing = await open('?kind=Verifier&name=ticket-policy&version=9.9.9');
+  expect(missing.container).toHaveTextContent('WYRD_REGISTRY_404_CARD_NOT_FOUND');
+  expect(missing.container.querySelector('[data-node]')).toBeNull();
+  expect(requests).toHaveLength(1);
+});

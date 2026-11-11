@@ -2249,6 +2249,18 @@ test('verifier graph projects and lays out the declared topology', () => {
   // Declared repetition and gating are chips on the step that declares them.
   expect(graph.steps.map((step) => step.chips)).toEqual([[], ['↻ ≤ 2 retries'], ['when'], []]);
 
+  // A gate and an attached requirement each add the dependency they read, even when the action reads nothing.
+  const code = { kind: 'code', entrypoint: 'f', source: { inline: '' } };
+  const gated = definitionGraph({
+    inputs: { doc: { type: 'json' } },
+    steps: [
+      { id: 'a', action: code },
+      { id: 'b', action: code, when: { path: 'steps.a.status', operator: 'equals', expected: 'succeeded' }, retries: 1, requirements: [{ id: 'r', statement: 's', check: { kind: 'assert', path: 'inputs.doc.ok', operator: 'is_truthy' } }] }
+    ]
+  } as never);
+  expect(gated.edges).toEqual([{ source: 'step:a', target: 'step:b' }, { source: 'input:doc', target: 'step:b' }]);
+  expect(gated.steps[1].chips).toEqual(['when', '↻ ≤ 1 retry']);
+
   // Session-shaped: group sources are inputs feeding the judgment; drift-shaped: samples feed the drift check. No steps.
   const session = definitionGraph(specOf('session-quality@1.0.0'));
   expect(session.inputs).toEqual([

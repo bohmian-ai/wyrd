@@ -45,6 +45,9 @@ const REPO: u64 = 1_296_269;
 const PR: u64 = 7;
 
 /// Forty copies of `ch` as an object id.
+///
+/// # Panics
+/// Panics if `ch` is not a lowercase hex digit.
 fn sha(ch: char) -> ObjectSha {
     ObjectSha::new(&ch.to_string().repeat(40)).expect("sha")
 }
@@ -58,6 +61,10 @@ fn blob_sha(bytes: &[u8]) -> ObjectSha {
 }
 
 /// Gzipped tarball of `files` under GitHub's single top-level directory.
+///
+/// # Panics
+/// Panics if a path is not a valid archive entry name, or building the
+/// archive or compressing it fails.
 fn tarball(files: &[(&str, &[u8])]) -> Vec<u8> {
     let mut builder = tar::Builder::new(Vec::new());
     for (path, bytes) in files {
@@ -184,6 +191,9 @@ fn pins() -> PullRequestPins {
 
 /// The verified identity of the repository under `tenant`, labelled
 /// `owner/name`.
+///
+/// # Panics
+/// Panics if `owner` or `name` is not a valid repository label.
 fn identity(tenant: DataTenantId, owner: &str, name: &str) -> Identity {
     Identity {
         tenant: TenantId::new(&tenant.to_string()).expect("tenant"),
@@ -233,6 +243,9 @@ impl Custody {
     }
 
     /// Relative paths of every object in the local store.
+    ///
+    /// # Panics
+    /// Panics if a store directory or entry cannot be read.
     fn stored(&self) -> Vec<String> {
         let mut pending = vec![self.root.path().to_path_buf()];
         let mut paths = Vec::new();

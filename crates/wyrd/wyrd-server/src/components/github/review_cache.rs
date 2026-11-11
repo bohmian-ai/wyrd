@@ -85,6 +85,10 @@ fn object_backend(error: &StorageError) -> ObjectError {
 impl ObjectStorage for CodeReviewObjects {
     /// Create `key` only when it is free.
     ///
+    /// An interrupted create may have written; a repeat then returns
+    /// [`ObjectError::AlreadyExists`], which proves existence, not equal
+    /// bytes, as [`StorageHandle::create_object`] documents.
+    ///
     /// # Errors
     /// Returns [`ObjectError::AlreadyExists`] when `key` is taken, leaving it
     /// unchanged, and [`ObjectError::Backend`] for a refused key or a failed
@@ -116,7 +120,8 @@ impl ObjectStorage for CodeReviewObjects {
         }
     }
 
-    /// Delete `key`; an absent key succeeds.
+    /// Delete `key`; an absent key succeeds, so an interrupted delete that
+    /// already removed it repeats as success.
     ///
     /// # Errors
     /// Returns [`ObjectError::Backend`] for a refused key or a failed delete.
@@ -208,6 +213,15 @@ impl CodeReviewMetadata {
 
     /// Run one statement on `identity`'s tenant connection and commit it.
     ///
+    /// This is every metadata write's commit boundary, so each operation is
+    /// atomic: it lands whole or not at all.
+    ///
+    /// # Cancellation
+    /// A cancelled call or a lost commit reply can leave the statement
+    /// committed while the caller sees an error or nothing. The caller learns
+    /// the outcome only by reading or repeating; each operation documents what
+    /// a repeat after a committed attempt returns.
+    ///
     /// # Errors
     /// Returns [`PersistenceError::Backend`] when the tenant is not a Wyrd
     /// tenant, an id exceeds `BIGINT`, or Postgres fails.
@@ -269,6 +283,10 @@ impl SnapshotStore for CodeReviewMetadata {
 
     /// Publish `pointer` when the current pointer's tree is `expected`.
     ///
+    /// An interrupted publish may have moved the pointer; a repeat then finds
+    /// another tree than `expected` and returns `false`, so the caller reads
+    /// the pointer to learn which publication stands.
+    ///
     /// # Errors
     /// Returns [`PersistenceError::Backend`] on a refused identity or a
     /// Postgres failure.
@@ -297,6 +315,10 @@ impl SnapshotStore for CodeReviewMetadata {
 
     /// Insert or re-touch the record of `key`.
     ///
+    /// An interrupted call may have touched the record; a repeat touches it
+    /// again, or reports [`PersistenceError::Collecting`] if a collection
+    /// claimed it in between.
+    ///
     /// # Errors
     /// Returns [`PersistenceError::Collecting`] when a collection claimed it
     /// and [`PersistenceError::Backend`] on a refused identity or a Postgres
@@ -321,6 +343,9 @@ impl SnapshotStore for CodeReviewMetadata {
 
     /// Claim and return the unreferenced records untouched within `grace`.
     ///
+    /// An interrupted claim may have persisted; claimed records match again,
+    /// so a repeat returns them and the collection retries.
+    ///
     /// # Errors
     /// Returns [`PersistenceError::Backend`] on a refused identity, a
     /// Postgres failure or an invalid stored key.
@@ -339,7 +364,8 @@ impl SnapshotStore for CodeReviewMetadata {
         .collect()
     }
 
-    /// Delete the record of `key`; an absent record succeeds.
+    /// Delete the record of `key`; an absent record succeeds, so a repeat
+    /// after an interrupted delete succeeds.
     ///
     /// # Errors
     /// Returns [`PersistenceError::Backend`] on a refused identity or a
@@ -356,7 +382,8 @@ impl SnapshotStore for CodeReviewMetadata {
         .await
     }
 
-    /// Delete every pointer of `identity`.
+    /// Delete every pointer of `identity`; a repeat after an interrupted
+    /// delete succeeds.
     ///
     /// # Errors
     /// Returns [`PersistenceError::Backend`] on a refused identity or a
@@ -372,6 +399,9 @@ impl SnapshotStore for CodeReviewMetadata {
 
 impl ContextStore for CodeReviewMetadata {
     /// Record `record`, keeping an existing record's original stamps.
+    ///
+    /// A repeat after an interrupted call returns the original record's
+    /// stamps unchanged.
     ///
     /// # Errors
     /// Returns [`PersistenceError::Backend`] on a refused identity or a
@@ -455,7 +485,8 @@ impl ContextStore for CodeReviewMetadata {
             .collect()
     }
 
-    /// Delete `id`; an absent id succeeds.
+    /// Delete `id`; an absent id succeeds, so a repeat after an interrupted
+    /// delete succeeds.
     ///
     /// # Errors
     /// Returns [`PersistenceError::Backend`] on a refused identity or a
@@ -473,6 +504,10 @@ impl ContextStore for CodeReviewMetadata {
     }
 
     /// Delete every context of `identity`, returning their object keys.
+    ///
+    /// A repeat after an interrupted delete succeeds but returns only the
+    /// keys of contexts still recorded; keys removed by the interrupted call
+    /// are not returned again.
     ///
     /// # Errors
     /// Returns [`PersistenceError::Backend`] on a refused identity, a

@@ -397,6 +397,13 @@ impl StorageHandle {
     /// backend uses `object_store`'s conditional create, so a failed write
     /// never leaves a partial object readable.
     ///
+    /// # Cancellation
+    /// The backend may accept the bytes before the caller sees success, so a
+    /// cancelled call or a lost response leaves the object written or not.
+    /// A retry stays create-only: `false` then proves an object exists at
+    /// `path`, not that it holds these bytes. A caller that needs equality
+    /// reads the object and compares.
+    ///
     /// # Errors
     /// Returns [`StorageError::Backend`] when the backend write fails.
     #[tracing::instrument(skip(self, path, bytes), fields(backend = ?self.backend(), len = bytes.len()))]

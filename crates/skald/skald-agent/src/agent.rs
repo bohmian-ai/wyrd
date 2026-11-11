@@ -189,8 +189,15 @@ pub struct Agent {
     pub(crate) meta: CardMetadata,
     /// Preserved durable prompt reference: set when the Agent was built from
     /// one, otherwise derived on first read as the inline native form of
-    /// [`Self::prompt`], so constructing an Agent never copies its Prompt.
+    /// [`Self::authored_prompt`], so constructing an Agent never copies its
+    /// Prompt.
     pub(crate) prompt_ref: OnceLock<InlineableRef<PromptSpec>>,
+    /// Prompt the Agent was constructed with or explicitly retargeted to.
+    ///
+    /// An unset [`Self::prompt_ref`] derives from this shared handle rather
+    /// than the public [`Self::prompt`] field, so assigning that field never
+    /// changes the exported reference, whatever order reads happen in.
+    authored_prompt: Arc<Prompt>,
     /// Runtime-local tool names preserved for YAML round trips.
     pub(crate) tool_names: Vec<String>,
     /// Stable id used for tracing and diagnostics.
@@ -305,6 +312,7 @@ impl Agent {
     pub fn with_prompt(mut self, prompt: impl Into<Arc<Prompt>>) -> Self {
         self.prompt_ref = OnceLock::new();
         self.prompt = prompt.into();
+        self.authored_prompt = Arc::clone(&self.prompt);
         self
     }
 
@@ -318,6 +326,7 @@ impl Agent {
         resolver: &dyn PromptResolver,
     ) -> Result<Self, WyrdError> {
         self.prompt = Arc::new(resolve_prompt_ref(&prompt_ref, resolver)?);
+        self.authored_prompt = Arc::clone(&self.prompt);
         self.prompt_ref = OnceLock::from(prompt_ref);
         Ok(self)
     }
@@ -582,12 +591,16 @@ impl Agent {
     }
 
     /// Return the preserved prompt reference, or for an Agent built from a
-    /// resolved Prompt, the inline native form of [`Self::prompt`] as first
-    /// read.
+    /// resolved Prompt, the inline native form of the Prompt it was built
+    /// with or retargeted to through [`Self::with_prompt`].
+    ///
+    /// Reassigning the public [`Self::prompt`] field changes what runs, not
+    /// what this exports.
     #[must_use]
     pub fn prompt_ref(&self) -> &InlineableRef<PromptSpec> {
-        self.prompt_ref
-            .get_or_init(|| InlineableRef::from(self.prompt.as_ref().clone().into_native()))
+        self.prompt_ref.get_or_init(|| {
+            InlineableRef::from(self.authored_prompt.as_ref().clone().into_native())
+        })
     }
 
     /// Return preserved runtime-local tool names.
@@ -770,6 +783,9 @@ impl Agent {
         self.run_with(providers.as_ref(), None, input).await
     }
 
+    /// Builds an Agent with identity `id` that owns `prompt`; see
+    /// [`Self::from_resolved_arc_parts`] for the reference and default-field
+    /// contract.
     fn from_resolved_parts(
         id: String,
         prompt_ref: OnceLock<InlineableRef<PromptSpec>>,
@@ -792,6 +808,7 @@ impl Agent {
             prompt_ref,
             tool_names: Vec::new(),
             id,
+            authored_prompt: Arc::clone(&prompt),
             prompt,
             run_config: RunConfig::default(),
             authored_run_config: None,

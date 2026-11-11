@@ -19,17 +19,14 @@ export declare class NativeAuthored {
    */
   static artifactFromPath(name: string, version: string | undefined | null, path: string): NativeAuthored
   /**
-   * The original native OpenAI Chat Prompt for `model`, built by the
-   * shared Prompt builder, or the builder's stable refusal.
-   *
-   * # Errors
-   *
-   * Returns `InvalidArg` for `settings` that are not OpenAI Chat
-   * settings or a `response_format` that names no format; the builder's
-   * own refusal, such as `WYRD_PROMPT_400_EMPTY_MODEL`, is returned as
-   * the error value.
+   * The original native Prompt for `model` in `provider`'s request
+   * format (`openai_chat`, `openai_responses`, `anthropic`, `gemini`, or
+   * `vertex`), built by the shared Prompt builder from `options`, or the
+   * builder's stable refusal as the error value, such as
+   * `WYRD_PROMPT_400_EMPTY_MODEL` or `WYRD_PROMPT_400_INVALID` for
+   * malformed options or settings.
    */
-  static promptOpenaiChat(model: string, options: NativeOpenAiChatOptions): NativeAuthored | NativeWyrdError
+  static prompt(provider: string, model: string, options: any): NativeAuthored | NativeWyrdError
   /**
    * The component `alias` for `reference`: a Card, an exact `CardRef`,
    * or a reference path.
@@ -280,6 +277,54 @@ export declare class NativeAuthored {
    * validation's refusal is returned in the result.
    */
   plan(): NativeLifecycleResult
+  /**
+   * A copy of this Prompt with one `role` turn appended: `system`,
+   * `user`, or `assistant` text, or for `user` and `assistant` one native
+   * content part or a list of them in the request format's wire shape.
+   * The builder's refusal, such as `WYRD_PROMPT_400_INVALID` for content
+   * the format does not take, is returned as the error value.
+   *
+   * # Errors
+   * Returns `InvalidArg` when this value is not a Prompt.
+   */
+  promptMessage(role: string, content: any): NativeAuthored | NativeWyrdError
+  /**
+   * A copy of this Prompt with the result `content` of tool call
+   * `tool_use_id` appended, marked as a failure when `is_error`; the
+   * builder's refusal is returned as the error value.
+   *
+   * # Errors
+   * Returns `InvalidArg` when this value is not a Prompt.
+   */
+  promptToolResult(toolUseId: string, content: string, isError: boolean): NativeAuthored | NativeWyrdError
+  /**
+   * A copy of this Prompt with the text variables `vars` bound; the
+   * refusal of a malformed or undeclared variable is returned as the
+   * error value.
+   *
+   * # Errors
+   * Returns `InvalidArg` when this value is not a Prompt.
+   */
+  promptBind(vars: any): NativeAuthored | NativeWyrdError
+  /**
+   * A copy of this Prompt with the media placeholder `name` bound to
+   * the `media` reference (`{kind, source}`); the refusal of a malformed
+   * reference or an undeclared placeholder is returned as the error value.
+   *
+   * # Errors
+   * Returns `InvalidArg` when this value is not a Prompt.
+   */
+  promptBindMedia(name: string, media: any): NativeAuthored | NativeWyrdError
+  /**
+   * The native provider request this Prompt renders with the text
+   * variables `vars`, or the render's stable refusal, such as an unbound
+   * variable, in the result.
+   *
+   * # Errors
+   * Returns `InvalidArg` when this value is not a Prompt, and a napi
+   * error when the rendered request cannot be serialized.
+   */
+  promptRender(vars: any): NativeLifecycleResult
 }
 
 /**
@@ -1642,23 +1687,6 @@ export interface NativeLifecycleResult {
 }
 
 /**
- * The OpenAI Chat options `Prompt.openaiChat` takes, by their builder
- * names.
- */
-export interface NativeOpenAiChatOptions {
-  /** System message prepended to `messages`. */
-  system?: string
-  /** User message strings, each one native user message. */
-  messages?: Array<string>
-  /** The response format emitted into the native request. */
-  responseFormat?: NativeResponseFormat
-  /** OpenAI prompt cache key. */
-  promptCacheKey?: string
-  /** Native OpenAI Chat generation settings, by their wire names. */
-  settings?: any
-}
-
-/**
  * Closed result of connecting one Operator connection handle: the handle or a
  * catalog error.
  */
@@ -1735,22 +1763,6 @@ export interface NativeQueryStep {
   errorRemediation?: string
   /** Serialized JSON-safe structured details for a failed native step. */
   errorDetailsJson?: string
-}
-
-/**
- * One response format: `text`, `json_object`, `json_schema` with its
- * `name` and `schema`, or the canonical `verdict` with optional custom
- * `data` schema.
- */
-export interface NativeResponseFormat {
-  /** The format's name. */
-  type: string
-  /** A JSON Schema format's name. */
-  name?: string
-  /** A JSON Schema format's schema. */
-  schema?: any
-  /** A Verdict's custom data schema. */
-  data?: any
 }
 
 /**

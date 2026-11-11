@@ -2429,6 +2429,9 @@ export namespace verify {
   export type CodeCheckOptions = definitions.CodeCheckOptions;
   export type ResponseFormat = definitions.ResponseFormat;
   export type OpenAiChatOptions = definitions.OpenAiChatOptions;
+  export type PromptOptions = definitions.PromptOptions;
+  export type PromptContent = definitions.PromptContent;
+  export type MediaRef = definitions.MediaRef;
 
   /** How a {@link File} declares its format and display name. */
   export interface FileOptions {

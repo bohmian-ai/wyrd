@@ -192,6 +192,71 @@ impl Prompt {
         prompt.rederived()
     }
 
+    /// Return a copy with one turn of native content parts appended for
+    /// `role`: `value` is one provider content part or an ordered list of
+    /// them, in the request format's own wire shape, such as an `OpenAI`
+    /// Chat `image_url` part; `${media:name}` placeholders in it are
+    /// recognised for [`skald_spec::Prompt::bind_media`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PromptBuilderError::Validation`] when `value` does not
+    /// decode as the format's content parts,
+    /// [`PromptBuilderError::UnsupportedRole`] when the format has no
+    /// conversation turns, and [`PromptBuilderError::Skald`] when a
+    /// placeholder cannot be normalized.
+    pub fn with_content(&self, role: &str, value: serde_json::Value) -> PromptBuilderResult<Self> {
+        let mut out = self.clone();
+        match &mut out.inner.request {
+            ProviderRequest::OpenAiChatCompletion(request) => {
+                let parts = json_parts::<skald_spec::wire::openai_chat::OpenAiContentPart>(value)?;
+                request.messages.push(OpenAiChatMessage {
+                    role: role.to_owned(),
+                    content: Some(OpenAiMessageContent::Parts(parts)),
+                    ..Default::default()
+                });
+            }
+            ProviderRequest::OpenAiResponses(request) => {
+                let parts = json_parts::<OpenAiResponseContentPart>(value)?;
+                request.input.items_mut().push(OpenAiResponseItem::Message {
+                    role: role.to_owned(),
+                    content: parts,
+                });
+            }
+            ProviderRequest::AnthropicMessage(request) => {
+                let blocks = json_parts::<
+                    skald_spec::wire::anthropic_messages::AnthropicContentBlock,
+                >(value)?;
+                request.messages.push(AnthropicMessage {
+                    role: if role == "assistant" {
+                        "assistant".to_owned()
+                    } else {
+                        "user".to_owned()
+                    },
+                    content: blocks,
+                });
+            }
+            ProviderRequest::GeminiGenerateContent(request) => {
+                request.contents.push(GoogleContent {
+                    role: if role == "assistant" {
+                        "model".to_owned()
+                    } else {
+                        "user".to_owned()
+                    },
+                    parts: json_parts::<GooglePart>(value)?,
+                });
+            }
+            other => {
+                return Err(PromptBuilderError::UnsupportedRole {
+                    provider: other.provider().to_string(),
+                    role: role.to_owned(),
+                });
+            }
+        }
+        out.inner.normalize_media_placeholders_mut()?;
+        Ok(out)
+    }
+
     /// Rebuild after a request edit so the derived variables, media
     /// placeholders, and response type describe the edited request; the
     /// dispatch destination is kept.
@@ -340,6 +405,37 @@ pub(crate) fn wrong_variant(expected: &str, actual: &str) -> crate::error::Promp
     }
 }
 
+/// Decode authored native content as one part or an ordered list of parts.
+///
+/// Native content helpers accept either a single provider part object or an
+/// array of them; a single part becomes a one-element list.
+///
+/// # Errors
+/// Returns [`PromptBuilderError::Validation`] (the public
+/// `WYRD_PROMPT_400_INVALID`) when the value, or any element, is not a part
+/// of type `T`.
+fn json_parts<T>(value: serde_json::Value) -> PromptBuilderResult<Vec<T>>
+where
+    T: serde::de::DeserializeOwned,
+{
+    if value.is_array() {
+        serde_json::from_value(value).map_err(invalid_authored_json)
+    } else {
+        Ok(vec![
+            serde_json::from_value(value).map_err(invalid_authored_json)?,
+        ])
+    }
+}
+
+/// Refuse caller-authored Prompt JSON that does not decode.
+///
+/// The decode error names the refused field, so it surfaces as the public
+/// `WYRD_PROMPT_400_INVALID` rather than the boundary's internal JSON failure,
+/// which is reserved for Wyrd's own serialization.
+fn invalid_authored_json(error: serde_json::Error) -> PromptBuilderError {
+    PromptBuilderError::Validation(error.to_string())
+}
+
 #[cfg(feature = "python")]
 use crate::python;
 
@@ -359,7 +455,6 @@ use {
         prelude::*,
         types::{PyAny, PyDict, PyList, PyString, PyTuple},
     },
-    serde::de::DeserializeOwned,
     skald_spec::NamedResponseFormat,
     wyrd_utils::py::WyrdPyResult,
 };
@@ -1685,105 +1780,7 @@ fn append_py_content(
     }
 
     let value = wyrd_utils::py::pyobject_to_json(content)?;
-    append_native_json_content(prompt, role, value)
-}
-
-/// Appends one turn of native JSON content parts for `role`.
-///
-/// # Errors
-///
-/// Raises `WyrdError` when `value` does not decode as the format's content
-/// parts or the format has no conversation turns.
-#[cfg(feature = "python")]
-fn append_native_json_content(
-    prompt: &Prompt,
-    role: &str,
-    value: serde_json::Value,
-) -> WyrdPyResult<Prompt> {
-    let mut out = prompt.clone();
-    match &mut out.inner.request {
-        ProviderRequest::OpenAiChatCompletion(request) => {
-            let parts = json_parts::<skald_spec::wire::openai_chat::OpenAiContentPart>(value)?;
-            request.messages.push(OpenAiChatMessage {
-                role: role.to_owned(),
-                content: Some(OpenAiMessageContent::Parts(parts)),
-                ..Default::default()
-            });
-        }
-        ProviderRequest::OpenAiResponses(request) => {
-            let parts = json_parts::<OpenAiResponseContentPart>(value)?;
-            request.input.items_mut().push(OpenAiResponseItem::Message {
-                role: role.to_owned(),
-                content: parts,
-            });
-        }
-        ProviderRequest::AnthropicMessage(request) => {
-            let blocks =
-                json_parts::<skald_spec::wire::anthropic_messages::AnthropicContentBlock>(value)?;
-            request.messages.push(AnthropicMessage {
-                role: if role == "assistant" {
-                    "assistant".to_owned()
-                } else {
-                    "user".to_owned()
-                },
-                content: blocks,
-            });
-        }
-        ProviderRequest::GeminiGenerateContent(request) => {
-            request.contents.push(GoogleContent {
-                role: if role == "assistant" {
-                    "model".to_owned()
-                } else {
-                    "user".to_owned()
-                },
-                parts: json_parts::<GooglePart>(value)?,
-            });
-        }
-        other => {
-            return Err(PromptBuilderError::UnsupportedRole {
-                provider: other.provider().to_string(),
-                role: role.to_owned(),
-            }
-            .into());
-        }
-    }
-    out.inner
-        .normalize_media_placeholders_mut()
-        .map_err(PromptBuilderError::from)?;
-    Ok(out)
-}
-
-/// Decode authored native content as one part or an ordered list of parts.
-///
-/// Native content helpers accept either a single provider part object or an
-/// array of them; a single part becomes a one-element list.
-///
-/// # Errors
-/// Returns [`PromptBuilderError::Validation`] (the public
-/// `WYRD_PROMPT_400_INVALID`) when the value, or any element, is not a part
-/// of type `T`.
-#[cfg(feature = "python")]
-fn json_parts<T>(value: serde_json::Value) -> WyrdPyResult<Vec<T>>
-where
-    T: DeserializeOwned,
-{
-    if value.is_array() {
-        Ok(serde_json::from_value(value).map_err(invalid_authored_json)?)
-    } else {
-        Ok(vec![
-            serde_json::from_value(value).map_err(invalid_authored_json)?,
-        ])
-    }
-}
-
-/// Refuse caller-authored Prompt JSON that does not decode.
-///
-/// The decode error names the refused field, so it surfaces as the public
-/// `WYRD_PROMPT_400_INVALID` rather than the boundary's internal JSON failure,
-/// which is reserved for Wyrd's own serialization.
-#[cfg(feature = "python")]
-fn invalid_authored_json(error: serde_json::Error) -> PromptBuilderError {
-    PromptBuilderError::Validation(error.to_string())
+    Ok(prompt.with_content(role, value)?)
 }
 
 #[cfg(feature = "python")]

@@ -18,10 +18,11 @@ use napi::{Error, Result, Status};
 use napi_derive::napi;
 use serde_json::Value;
 use wyrd_client::verify::{
-    Action, Agent, Artifact, ArtifactFile, Audit, Binding, CardDefinition, CardRef, Check,
-    CodeSource, Component, Data, Experiment, FieldValue, InputSlot, Mcp, Model, OpenAiChatOptions,
-    Operator, Prompt, PromptBuilderError, Requirement, ResponseFormat, Service, Step, Trigger,
-    Verifier, openai_chat,
+    Action, Agent, AnthropicOptions, Artifact, ArtifactFile, Audit, Binding, CardDefinition,
+    CardRef, Check, CodeSource, Component, Data, Experiment, FieldValue, GeminiOptions, InputSlot,
+    Mcp, Model, OpenAiChatOptions, OpenAiResponsesOptions, Operator, Prompt, PromptBuilderError,
+    Requirement, ResponseFormat, Service, Step, Trigger, Verifier, anthropic, gemini, openai_chat,
+    openai_responses, vertex,
 };
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
@@ -727,65 +728,178 @@ fn kind_arg(kind: &str) -> Result<CardKind> {
     CardKind::from_wire_name(kind).ok_or_else(|| invalid(format!("unknown Card kind {kind:?}")))
 }
 
-/// The OpenAI Chat options `Prompt.openaiChat` takes, by their builder
-/// names.
-#[napi(object)]
-pub struct NativeOpenAiChatOptions {
-    /// System message prepended to `messages`.
-    pub system: Option<String>,
+/// The options every `Prompt` factory takes, by their builder names, as
+/// the TypeScript facade's JSON snapshot of them.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+struct PromptOptions {
+    /// System text: the system message, or OpenAI Responses `instructions`.
+    system: Option<String>,
     /// User message strings, each one native user message.
-    pub messages: Option<Vec<String>>,
+    messages: Vec<String>,
     /// The response format emitted into the native request.
-    pub response_format: Option<NativeResponseFormat>,
-    /// OpenAI prompt cache key.
-    pub prompt_cache_key: Option<String>,
-    /// Native OpenAI Chat generation settings, by their wire names.
-    pub settings: Option<Value>,
+    response_format: Option<PromptFormat>,
+    /// The structured-output format; wins over `response_format`.
+    output: Option<PromptFormat>,
+    /// OpenAI Chat prompt cache key.
+    prompt_cache_key: Option<String>,
+    /// The provider's native generation settings, by their wire names.
+    settings: Option<Value>,
 }
 
-/// One response format: `text`, `json_object`, `json_schema` with its
-/// `name` and `schema`, or the canonical `verdict` with optional custom
-/// `data` schema.
-#[napi(object)]
-pub struct NativeResponseFormat {
-    /// The format's name.
-    pub r#type: String,
-    /// A JSON Schema format's name.
-    pub name: Option<String>,
-    /// A JSON Schema format's schema.
-    pub schema: Option<Value>,
-    /// A Verdict's custom data schema.
-    pub data: Option<Value>,
+/// One response format, by its `type`: plain text, a JSON object, a named
+/// JSON Schema, or the canonical Verdict with an optional custom `data`
+/// schema.
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum PromptFormat {
+    /// Plain text.
+    Text,
+    /// Any JSON object.
+    JsonObject,
+    /// A JSON Schema format named `name`.
+    JsonSchema {
+        /// The format's name.
+        name: String,
+        /// The format's schema, checked by the builder.
+        schema: Value,
+    },
+    /// The canonical Verdict.
+    Verdict {
+        /// A custom `data` schema the builder expands.
+        #[serde(default)]
+        data: Option<serde_json::Map<String, Value>>,
+    },
 }
 
-impl NativeResponseFormat {
-    /// The shared format this names; a JSON Schema format's schema is
-    /// checked by the builder, so its refusal is the inner error.
+impl PromptFormat {
+    /// The shared format this names.
     ///
     /// # Errors
     ///
-    /// Returns `InvalidArg` for an unknown `type`, a JSON Schema format
-    /// without `name` or `schema`, or a Verdict `data` that is not an
-    /// object.
-    fn native(self) -> Result<std::result::Result<ResponseFormat, PromptBuilderError>> {
-        Ok(match self.r#type.as_str() {
-            "text" => Ok(ResponseFormat::text()),
-            "json_object" => Ok(ResponseFormat::json_object()),
-            "json_schema" => {
-                let (Some(name), Some(schema)) = (self.name, self.schema) else {
-                    return Err(invalid(
-                        "a json_schema response format takes name and schema",
-                    ));
-                };
-                ResponseFormat::json_schema(name, schema)
+    /// Returns the builder's refusal of a JSON Schema format whose schema
+    /// is not a JSON object.
+    fn native(self) -> std::result::Result<ResponseFormat, PromptBuilderError> {
+        match self {
+            Self::Text => Ok(ResponseFormat::text()),
+            Self::JsonObject => Ok(ResponseFormat::json_object()),
+            Self::JsonSchema { name, schema } => ResponseFormat::json_schema(name, schema),
+            Self::Verdict { data } => Ok(ResponseFormat::verdict(data)),
+        }
+    }
+}
+
+/// `value` decoded as caller-authored Prompt input `T`, refused as the
+/// public `WYRD_PROMPT_400_INVALID` naming `field`.
+///
+/// # Errors
+///
+/// Returns [`PromptBuilderError::Validation`] when `value` is not a `T`.
+fn authored<T: serde::de::DeserializeOwned>(
+    field: &str,
+    value: Value,
+) -> std::result::Result<T, PromptBuilderError> {
+    serde_json::from_value(value)
+        .map_err(|error| PromptBuilderError::Validation(format!("{field}: {error}")))
+}
+
+/// `provider`'s native Prompt for `model` from the shared builder.
+///
+/// # Errors
+///
+/// Returns [`PromptBuilderError::InvalidProvider`] for a provider with no
+/// builder, [`PromptBuilderError::Validation`] for malformed options or a
+/// cache key outside OpenAI Chat, and the builder's own refusal.
+fn build_prompt(
+    provider: &str,
+    model: String,
+    options: Value,
+) -> std::result::Result<Prompt, PromptBuilderError> {
+    let options: PromptOptions = authored("options", options)?;
+    let response_format = options
+        .response_format
+        .map(PromptFormat::native)
+        .transpose()?;
+    let output = options.output.map(PromptFormat::native).transpose()?;
+    let settings = options
+        .settings
+        .unwrap_or_else(|| Value::Object(serde_json::Map::default()));
+    if options.prompt_cache_key.is_some() && provider != "openai_chat" {
+        return Err(PromptBuilderError::Validation(format!(
+            "promptCacheKey is an OpenAI Chat option, not a {provider} one"
+        )));
+    }
+    let (system, messages) = (options.system, options.messages);
+    match provider {
+        "openai_chat" => openai_chat(
+            model,
+            OpenAiChatOptions {
+                system,
+                messages,
+                response_format,
+                output,
+                prompt_cache_key: options.prompt_cache_key,
+                settings: authored("settings", settings)?,
+            },
+        ),
+        "openai_responses" => openai_responses(
+            model,
+            OpenAiResponsesOptions {
+                instructions: system,
+                messages,
+                response_format,
+                output,
+                settings: authored("settings", settings)?,
+            },
+        ),
+        "anthropic" => anthropic(
+            model,
+            AnthropicOptions {
+                system,
+                messages,
+                response_format,
+                output,
+                settings: authored("settings", settings)?,
+            },
+        ),
+        "gemini" | "vertex" => {
+            let options = GeminiOptions {
+                system,
+                messages,
+                response_format,
+                output,
+                settings: authored("settings", settings)?,
+            };
+            if provider == "gemini" {
+                gemini(model, options)
+            } else {
+                vertex(model, options)
             }
-            "verdict" => Ok(ResponseFormat::verdict(match self.data {
-                None => None,
-                Some(Value::Object(data)) => Some(data),
-                Some(_) => return Err(invalid("a verdict's data takes a JSON Schema object")),
-            })),
-            other => return Err(invalid(format!("unknown response format {other:?}"))),
-        })
+        }
+        other => Err(PromptBuilderError::InvalidProvider(other.to_owned())),
+    }
+}
+
+/// The variable bindings `vars` names, in order, as the shared Prompt
+/// binds them.
+///
+/// # Errors
+///
+/// Returns [`PromptBuilderError::Validation`] when `vars` is not an object
+/// of strings.
+fn prompt_vars(vars: Value) -> std::result::Result<Vec<(String, String)>, PromptBuilderError> {
+    let vars: std::collections::BTreeMap<String, String> = authored("vars", vars)?;
+    Ok(vars.into_iter().collect())
+}
+
+/// The Node-facing result of a Prompt operation: the new Prompt, or the
+/// builder's stable refusal as the error value.
+fn prompt_result(
+    built: std::result::Result<Prompt, PromptBuilderError>,
+) -> Either<NativeAuthored, NativeWyrdError> {
+    match built {
+        Ok(prompt) => Either::A(NativeAuthored::of(Authored::Prompt(Box::new(prompt)))),
+        Err(error) => Either::B(NativeWyrdError::from_wyrd(&WyrdError::from(error))),
     }
 }
 
@@ -823,6 +937,17 @@ impl NativeAuthored {
     /// one, and arguments copy out of it rather than borrow it.
     fn of(inner: Authored) -> Self {
         Self { inner }
+    }
+
+    /// The Prompt this value holds.
+    ///
+    /// # Errors
+    /// Returns `InvalidArg` when this value is not a Prompt.
+    fn held_prompt(&self) -> Result<&Prompt> {
+        match &self.inner {
+            Authored::Prompt(prompt) => Ok(prompt),
+            other => Err(invalid(format!("a {} is not a Prompt", other.name()))),
+        }
     }
 }
 
@@ -871,47 +996,19 @@ impl NativeAuthored {
         )))
     }
 
-    /// The original native OpenAI Chat Prompt for `model`, built by the
-    /// shared Prompt builder, or the builder's stable refusal.
-    ///
-    /// # Errors
-    ///
-    /// Returns `InvalidArg` for `settings` that are not OpenAI Chat
-    /// settings or a `response_format` that names no format; the builder's
-    /// own refusal, such as `WYRD_PROMPT_400_EMPTY_MODEL`, is returned as
-    /// the error value.
+    /// The original native Prompt for `model` in `provider`'s request
+    /// format (`openai_chat`, `openai_responses`, `anthropic`, `gemini`, or
+    /// `vertex`), built by the shared Prompt builder from `options`, or the
+    /// builder's stable refusal as the error value, such as
+    /// `WYRD_PROMPT_400_EMPTY_MODEL` or `WYRD_PROMPT_400_INVALID` for
+    /// malformed options or settings.
     #[napi]
-    pub fn prompt_openai_chat(
+    pub fn prompt(
+        provider: String,
         model: String,
-        options: NativeOpenAiChatOptions,
-    ) -> Result<Either<NativeAuthored, NativeWyrdError>> {
-        let settings = options
-            .settings
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|error| invalid(format!("settings: {error}")))?
-            .unwrap_or_default();
-        let response_format = options
-            .response_format
-            .map(NativeResponseFormat::native)
-            .transpose()?;
-        let built = response_format.transpose().and_then(|response_format| {
-            openai_chat(
-                model,
-                OpenAiChatOptions {
-                    system: options.system,
-                    messages: options.messages.unwrap_or_default(),
-                    response_format,
-                    prompt_cache_key: options.prompt_cache_key,
-                    settings,
-                    ..OpenAiChatOptions::default()
-                },
-            )
-        });
-        Ok(match built {
-            Ok(prompt) => Either::A(Self::of(Authored::Prompt(Box::new(prompt)))),
-            Err(error) => Either::B(NativeWyrdError::from_wyrd(&WyrdError::from(error))),
-        })
+        options: Value,
+    ) -> Either<NativeAuthored, NativeWyrdError> {
+        prompt_result(build_prompt(&provider, model, options))
     }
 
     /// The component `alias` for `reference`: a Card, an exact `CardRef`,
@@ -1325,5 +1422,108 @@ impl NativeAuthored {
             Authored::Verifier(verifier) => NativeLifecycleResult::outcome(verifier.plan()),
             other => Err(invalid(format!("a {} has no plan", other.name()))),
         }
+    }
+
+    /// A copy of this Prompt with one `role` turn appended: `system`,
+    /// `user`, or `assistant` text, or for `user` and `assistant` one native
+    /// content part or a list of them in the request format's wire shape.
+    /// The builder's refusal, such as `WYRD_PROMPT_400_INVALID` for content
+    /// the format does not take, is returned as the error value.
+    ///
+    /// # Errors
+    /// Returns `InvalidArg` when this value is not a Prompt.
+    #[napi]
+    pub fn prompt_message(
+        &self,
+        role: String,
+        content: Value,
+    ) -> Result<Either<NativeAuthored, NativeWyrdError>> {
+        let prompt = self.held_prompt()?;
+        Ok(prompt_result(match (role.as_str(), content) {
+            ("system", Value::String(text)) => prompt.with_system(text),
+            ("user", Value::String(text)) => prompt.with_user(text),
+            ("assistant", Value::String(text)) => prompt.with_assistant(text),
+            ("user" | "assistant", content) => prompt.with_content(&role, content),
+            (role, _) => Err(PromptBuilderError::Validation(format!(
+                "a {role} turn takes no content here; system takes text, user and assistant take text or native parts"
+            ))),
+        }))
+    }
+
+    /// A copy of this Prompt with the result `content` of tool call
+    /// `tool_use_id` appended, marked as a failure when `is_error`; the
+    /// builder's refusal is returned as the error value.
+    ///
+    /// # Errors
+    /// Returns `InvalidArg` when this value is not a Prompt.
+    #[napi]
+    pub fn prompt_tool_result(
+        &self,
+        tool_use_id: String,
+        content: String,
+        is_error: bool,
+    ) -> Result<Either<NativeAuthored, NativeWyrdError>> {
+        Ok(prompt_result(self.held_prompt()?.with_tool_result(
+            tool_use_id,
+            content,
+            is_error,
+        )))
+    }
+
+    /// A copy of this Prompt with the text variables `vars` bound; the
+    /// refusal of a malformed or undeclared variable is returned as the
+    /// error value.
+    ///
+    /// # Errors
+    /// Returns `InvalidArg` when this value is not a Prompt.
+    #[napi]
+    pub fn prompt_bind(&self, vars: Value) -> Result<Either<NativeAuthored, NativeWyrdError>> {
+        let prompt = self.held_prompt()?;
+        Ok(prompt_result(prompt_vars(vars).and_then(|vars| {
+            let vars: Vec<(&str, &str)> =
+                vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            Ok(Prompt::from_native(prompt.native().bind(&vars)?))
+        })))
+    }
+
+    /// A copy of this Prompt with the media placeholder `name` bound to
+    /// the `media` reference (`{kind, source}`); the refusal of a malformed
+    /// reference or an undeclared placeholder is returned as the error value.
+    ///
+    /// # Errors
+    /// Returns `InvalidArg` when this value is not a Prompt.
+    #[napi]
+    pub fn prompt_bind_media(
+        &self,
+        name: String,
+        media: Value,
+    ) -> Result<Either<NativeAuthored, NativeWyrdError>> {
+        let prompt = self.held_prompt()?;
+        Ok(prompt_result(authored("media", media).and_then(|media| {
+            Ok(Prompt::from_native(
+                prompt.native().bind_media(&name, &media)?,
+            ))
+        })))
+    }
+
+    /// The native provider request this Prompt renders with the text
+    /// variables `vars`, or the render's stable refusal, such as an unbound
+    /// variable, in the result.
+    ///
+    /// # Errors
+    /// Returns `InvalidArg` when this value is not a Prompt, and a napi
+    /// error when the rendered request cannot be serialized.
+    #[napi]
+    pub fn prompt_render(&self, vars: Value) -> Result<NativeLifecycleResult> {
+        let prompt = self.held_prompt()?;
+        NativeLifecycleResult::outcome(
+            prompt_vars(vars)
+                .and_then(|vars| {
+                    let vars: Vec<(&str, &str)> =
+                        vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                    prompt.render_native(&vars)
+                })
+                .map_err(WyrdError::from),
+        )
     }
 }

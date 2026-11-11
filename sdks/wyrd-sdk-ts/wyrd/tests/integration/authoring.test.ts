@@ -719,17 +719,39 @@ function draftWriter(version: string | undefined, asks: string): Agent {
   });
 }
 
-/** `drafting`, without a version, as `omitted/drafting.yaml` declares it, with `judge` judging the writer's draft. */
-function drafting(judge: Agent): Service {
-  const checks = new Verifier("draft-checks", {
+/** `draft-checks`, without a version, as `omitted/draft-checks.yaml` declares it, with `judge` judging the draft. */
+function draftChecks(judge: Agent): Verifier {
+  return new Verifier("draft-checks", {
     inputs: { draft: { type: "object", required: ["text"], properties: { text: { type: "string" } } } },
     requirements: [
       new Requirement("has-text", "The draft has text.", Check.assert("inputs.draft.text", "is_non_empty", null)),
       new Requirement("judged", "A judge accepts the draft.", Check.agent(judge).inputs({ draft: "inputs.draft" })),
     ],
   });
+}
+
+/** `drafting`, without a version, as `omitted/drafting.yaml` declares it, with `judge` judging the writer's draft. */
+function drafting(judge: Agent): Service {
   return new Service("drafting", { service_type: "api" }).addComponent(
-    new Component("writer", draftWriter(undefined, "Draft release notes for {{change}}.")).verifiedBy([checks]),
+    new Component("writer", draftWriter(undefined, "Draft release notes for {{change}}.")).verifiedBy([
+      draftChecks(judge),
+    ]),
+  );
+}
+
+/** `drafting-mixed`, as `omitted/mixed.yaml` declares it: a writer pinned at 1.0.0 and a versionless Verifier and judge. */
+function draftingMixed(): Service {
+  const writer = new Agent("mixed-writer", {
+    version: "1.0.0",
+    execution_route: { kind: "wyrd_gateway", deployment: "openai" },
+    prompt: {
+      provider: "openai",
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "Draft a changelog entry for {{change}}." }],
+    },
+  });
+  return new Service("drafting-mixed", { service_type: "api" }).addComponent(
+    new Component("writer", writer).verifiedBy([draftChecks(draftJudge(undefined, "Judge the draft {{draft}}."))]),
   );
 }
 
@@ -771,15 +793,29 @@ test("omitted_versions_resolve_in_composed_definitions", async ({ cards }) => {
   expect(resolved(await cards.declare(authored)), "same identities and content").toEqual(resolved(files));
   expect(resolved(await cards.declare(authored)), "unchanged replay reuses them").toEqual(resolved(files));
 
-  const changed = await cards.declare(drafting(draftJudge("2.0.0", "Judge the draft {{draft}} strictly.")));
+  const mixedFiles = await cards.declare(omitted("mixed.yaml"));
+  const mixed = await cards.declare(draftingMixed());
+  expect(resolved(mixed), "same identities and content").toEqual(resolved(mixedFiles));
+  expect(declared(mixed, "mixed-writer").version).toBe("1.0.0");
+  const component = (await persisted(cards, mixed, "drafting-mixed")).components[0];
+  expect(component?.ref).toEqual(declared(mixed, "mixed-writer"));
+  expect(component?.verified_by[0]?.verifier, "the unchanged omitted Verifier is reused").toEqual(
+    declared(files, "draft-checks"),
+  );
+
+  const changed = await cards.declare(drafting(draftJudge(undefined, "Judge the draft {{draft}} strictly.")));
   await assertBound(cards, changed);
-  expect(declared(changed, "draft-judge").version).toBe("2.0.0");
-  expect(declared(changed, "draft-writer")).toEqual(declared(files, "draft-writer"));
-  for (const parent of ["draft-checks", "drafting"]) {
-    expect(declared(changed, parent).version, `the new judge reference gives ${parent} a new version`).not.toBe(
-      declared(files, parent).version,
-    );
+  const hash = (receipt: DeclarationReceipt, name: string): string | undefined =>
+    receipt.outcomes.find((each) => each.card_ref.name === name)?.spec_hash;
+  for (const name of ["draft-judge", "draft-checks", "drafting"]) {
+    const [old, next] = [declared(files, name), declared(changed, name)];
+    expect(next.version, `${name} gets a newly selected version`).not.toBe(old.version);
+    expect(next.uid, `${name} gets a new UID`).not.toBe(old.uid);
+    expect(hash(changed, name), `${name} gets a new hash`).not.toBe(hash(files, name));
   }
+  expect(declared(changed, "draft-writer"), "the unchanged writer keeps its reference").toEqual(
+    declared(files, "draft-writer"),
+  );
 
   const pair = (second: string | undefined): Service =>
     new Service("draft-pair")

@@ -167,7 +167,7 @@ fn authored_versions(
 }
 
 /// The lowest `0.0.N` graph-only version `authored` does not spell for
-/// `kind` and `name`.
+/// `kind` and `name`; among `authored.len() + 1` candidates one is free.
 ///
 /// # Errors
 /// Returns [`GraphError::InvalidSpec`] when the candidate does not parse,
@@ -177,7 +177,7 @@ fn placeholder(
     kind: &CardKind,
     name: &CardName,
 ) -> Result<VersionBlock, GraphError> {
-    let free = (0_u64..)
+    let free = (0..=authored.len())
         .map(|patch| format!("0.0.{patch}"))
         .find(|version| {
             !authored.contains(&CardRefIdentity {
@@ -593,7 +593,10 @@ mod tests {
         let missing = [sibling_service(explicit.clone()), omitted.clone()];
         let ready = graph_ready_submissions(&missing).expect("graph projection");
         let (_, edges) = build(&ready).expect("graph builds");
-        assert!(edges.is_empty(), "an unmatched explicit pin derives no edge");
+        assert!(
+            edges.is_empty(),
+            "an unmatched explicit pin derives no edge"
+        );
         assert_eq!(ready[0].spec["components"][0]["ref"]["sibling"], explicit);
         assert_ne!(
             ready[1].metadata.resolved_pin().map(ToString::to_string),

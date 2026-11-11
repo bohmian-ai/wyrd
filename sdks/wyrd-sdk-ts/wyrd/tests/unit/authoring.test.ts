@@ -436,6 +436,102 @@ test("every_native_family_constructs_canonical_specs", () => {
   expect(JSON.stringify(refusal(pending).details)).toContain("missing.py");
 });
 
+/** The `WyrdError` `build` throws. */
+function thrown(build: () => unknown): WyrdError {
+  try {
+    build();
+  } catch (error) {
+    expect(error).toBeInstanceOf(WyrdError);
+    return error as WyrdError;
+  }
+  throw new Error("expected a WyrdError");
+}
+
+test("prompts_project_every_native_builder_capability", () => {
+  const route = { kind: "wyrd_gateway", deployment: "anthropic" } as const;
+  const base = Prompt.anthropic("claude-sonnet-5", {
+    system: "Be brief",
+    messages: "Summarise {{report}}",
+    output: { type: "json_schema", name: "summary", schema: { type: "object" } },
+    settings: { max_tokens: 256 },
+  });
+  const prompt = base
+    .user([{ type: "image", source: { type: "url", url: "https://example.com/chart.png" } }])
+    .user(`Compare \${media:scan}`)
+    .assistant("Noted.")
+    .toolResult("call-1", "42");
+  expect(base.render({ report: "Q3" }), "an operation leaves its Prompt unchanged").toEqual({
+    provider: "anthropic_message",
+    body: {
+      model: "claude-sonnet-5",
+      system: "Be brief",
+      max_tokens: 256,
+      messages: [{ role: "user", content: [{ type: "text", text: "Summarise Q3" }] }],
+      output_config: { format: { type: "json_schema", schema: { type: "object" } } },
+    },
+  });
+  const writer = new Agent("writer", { prompt, execution_route: route });
+  expect(spec(writer).prompt).toMatchObject({
+    provider: "anthropic",
+    model: "claude-sonnet-5",
+    format: "messages",
+    body: {
+      system: "Be brief",
+      max_tokens: 256,
+      messages: [
+        { role: "user", content: [{ type: "text", text: "Summarise {{report}}" }] },
+        { role: "user", content: [{ type: "image", source: { type: "url", url: "https://example.com/chart.png" } }] },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Compare " },
+            { type: "text", text: `\${media:scan}` },
+          ],
+        },
+        { role: "assistant", content: [{ type: "text", text: "Noted." }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "call-1" }] },
+      ],
+    },
+  });
+  writer.validate();
+
+  const bound = prompt
+    .bind({ report: "Q3" })
+    .bindMedia("scan", { kind: "image", source: { type: "base64", mime_type: "image/png", data: "QUJD" } });
+  const rendered = bound.render() as { readonly body: { readonly messages: readonly unknown[] } };
+  expect(rendered.body.messages[0]).toEqual({ role: "user", content: [{ type: "text", text: "Summarise Q3" }] });
+  expect(JSON.stringify(rendered.body.messages[2]), "the media binds as a native image block").toContain("QUJD");
+  expect(Prompt.openaiResponses("gpt-4o", { system: "Plan", messages: "Go" }).render()).toMatchObject({
+    body: { instructions: "Plan" },
+  });
+  expect(Prompt.gemini("gemini-2.5-pro", { messages: "Go" }).render()).toMatchObject({
+    body: { contents: [{ role: "user", parts: [{ text: "Go" }] }] },
+  });
+  expect(
+    spec(new Agent("v", { prompt: Prompt.vertex("gemini-2.5-pro"), execution_route: route })).prompt,
+  ).toMatchObject({
+    provider: "vertex",
+  });
+
+  const cyclic: Record<string, unknown> = {};
+  cyclic.self = cyclic;
+  expect(thrown(() => Prompt.openaiChat("gpt-4o", { settings: cyclic as never })).code).toBe(
+    "WYRD_SPEC_400_VALIDATION",
+  );
+  expect(thrown(() => Prompt.openaiChat("gpt-4o", { settings: { temperature: "hot" } })).code).toBe(
+    "WYRD_PROMPT_400_INVALID",
+  );
+  expect(
+    thrown(() => Prompt.openaiChat("gpt-4o", { responseFormat: { type: "verdict", data: 1 as never } })).code,
+  ).toBe("WYRD_PROMPT_400_INVALID");
+  expect(thrown(() => Prompt.anthropic("claude-sonnet-5", { promptCacheKey: "k" } as never)).code).toBe(
+    "WYRD_PROMPT_400_INVALID",
+  );
+  expect(thrown(() => prompt.user({ type: "bogus" })).code).toBe("WYRD_PROMPT_400_INVALID");
+  expect(thrown(() => prompt.bind({ report: 1 as never })).code).toBe("WYRD_PROMPT_400_INVALID");
+  expect(thrown(() => base.render()).code).toMatch(/^WYRD_/);
+});
+
 test("versions_are_optional_and_prompts_are_native", () => {
   const unversioned = new Agent("writer");
   expect(unversioned.cardRef(), "registration assigns an omitted version").toBeUndefined();

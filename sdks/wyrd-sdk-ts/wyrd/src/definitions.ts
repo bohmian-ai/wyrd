@@ -31,7 +31,15 @@ import { createRequire } from "node:module";
 
 import type { NativeAuthored as NativeAuthoredHandle, NativeValue as NativeValueHandle } from "../index.cjs";
 import type * as Wire from "./card-types.js";
-import { authoredNative, authoredOf, holdAuthored, jsonSnapshot, lifecycleValue, projectedError } from "./native.js";
+import {
+  authoredNative,
+  authoredOf,
+  holdAuthored,
+  jsonSnapshot,
+  lifecycleValue,
+  type NativeErrorMetadata,
+  projectedError,
+} from "./native.js";
 
 const require = createRequire(import.meta.url);
 const { NativeAuthored, NativeValue } = require("../index.cjs") as typeof import("../index.cjs");
@@ -2270,9 +2278,9 @@ export class Check {
 }
 
 /**
- * One response format for {@link Prompt.openaiChat}: plain text, a JSON
- * object, a named JSON Schema, or the canonical Verdict with an optional
- * custom `data` schema, which the native builder expands.
+ * One response format for a {@link Prompt}: plain text, a JSON object, a
+ * named JSON Schema, or the canonical Verdict with an optional custom `data`
+ * schema, which the native builder expands.
  */
 export type ResponseFormat =
   | { readonly type: "text" }
@@ -2280,23 +2288,63 @@ export type ResponseFormat =
   | { readonly type: "json_schema"; readonly name: string; readonly schema: Readonly<Record<string, Wire.JsonValue>> }
   | { readonly type: "verdict"; readonly data?: Readonly<Record<string, Wire.JsonValue>> };
 
-/** {@link Prompt.openaiChat} options, by the native builder's names. */
-export type OpenAiChatOptions = {
-  /** System message prepended to `messages`. */
+/** The options every {@link Prompt} factory takes, by the native builder's names. */
+export type PromptOptions = {
+  /** System text: the system message, or OpenAI Responses `instructions`. */
   readonly system?: string;
   /** One user message, or several, in order. */
   readonly messages?: string | readonly string[];
   /** The response format emitted into the native request. */
   readonly responseFormat?: ResponseFormat;
-  /** OpenAI prompt cache key. */
-  readonly promptCacheKey?: string;
-  /** Native OpenAI Chat generation settings, by their wire names. */
+  /** The structured-output format; wins over `responseFormat`. */
+  readonly output?: ResponseFormat;
+  /** The provider's native generation settings, by their wire names. */
   readonly settings?: Readonly<Record<string, Wire.JsonValue>>;
 };
 
+/** {@link Prompt.openaiChat} options, by the native builder's names. */
+export type OpenAiChatOptions = PromptOptions & {
+  /** OpenAI prompt cache key. */
+  readonly promptCacheKey?: string;
+};
+
+/**
+ * One native content part, or several, in the Prompt's request format, such
+ * as an OpenAI Chat `{ type: "image_url", image_url: { url } }` part; a
+ * `${media:name}` placeholder in it is bound by {@link Prompt.bindMedia}.
+ */
+export type PromptContent =
+  | Readonly<Record<string, Wire.JsonValue>>
+  | readonly Readonly<Record<string, Wire.JsonValue>>[];
+
+/** A media reference {@link Prompt.bindMedia} binds to a `${media:name}` placeholder. */
+export type MediaRef = {
+  /** Image or document media. */
+  readonly kind: "image" | "document";
+  /** Where the provider reads it. */
+  readonly source:
+    | { readonly type: "url"; readonly url: string; readonly mime_type?: string }
+    | { readonly type: "base64"; readonly mime_type: string; readonly data: string }
+    | { readonly type: "file"; readonly uri: string; readonly mime_type?: string };
+};
+
+/** The Prompt `built` names, or its native refusal thrown as a {@link WyrdError}. */
+function builtPrompt(built: NativeAuthoredHandle | NativeErrorMetadata): Prompt {
+  if (!(built instanceof NativeAuthored)) {
+    throw projectedError(built) ?? new TypeError("the Prompt builder returned no Prompt");
+  }
+  return adopt(Prompt.prototype, built);
+}
+
+/** The JSON snapshot of `value`, refused as `field` when it is not plain JSON. */
+function snapshot(field: string, value: unknown): Wire.JsonValue {
+  return jsonSnapshot(field, value).value as Wire.JsonValue;
+}
+
 /**
  * The original native Prompt, built by the shared Rust Prompt builder and
- * held inline at an Agent's `prompt`; it registers with its Agent.
+ * held inline at an Agent's `prompt`; it registers with its Agent. Each
+ * operation returns a new Prompt and leaves this one unchanged.
  */
 export class Prompt {
   /** Type-only identity: no other value is a Prompt, whatever its shape. */
@@ -2304,27 +2352,157 @@ export class Prompt {
 
   private constructor() {}
 
+  /** The native `provider` Prompt for `model` from the snapshot of `options`. */
+  private static build(provider: string, model: string, options: OpenAiChatOptions): Prompt {
+    const { messages, ...rest } = options;
+    const named = { ...rest, messages: typeof messages === "string" ? [messages] : messages };
+    const value = snapshot(
+      "options",
+      Object.fromEntries(Object.entries(named).filter(([, option]) => option !== undefined)),
+    );
+    return builtPrompt(NativeAuthored.prompt(provider, model, value));
+  }
+
   /**
    * The native OpenAI Chat Prompt for `model`.
    *
    * @param model - The literal model name, such as `gpt-4o`.
-   * @param options - Messages, response format and settings.
+   * @param options - Messages, response format, output and settings.
    * @returns The Prompt.
    * @throws `WyrdError` from the native builder, such as
-   * `WYRD_PROMPT_400_EMPTY_MODEL` or `WYRD_PROMPT_400_INVALID_RESPONSE_SCHEMA`.
+   * `WYRD_PROMPT_400_EMPTY_MODEL`, or `WYRD_PROMPT_400_INVALID` and
+   * `WYRD_SPEC_400_VALIDATION` for malformed or non-JSON options.
    */
   static openaiChat(model: string, options: OpenAiChatOptions = {}): Prompt {
-    const { messages, responseFormat, promptCacheKey, ...rest } = options;
-    const built = NativeAuthored.promptOpenaiChat(model, {
-      ...rest,
-      messages: typeof messages === "string" ? [messages] : messages === undefined ? undefined : [...messages],
-      responseFormat,
-      promptCacheKey,
-    });
-    if (!(built instanceof NativeAuthored)) {
-      throw projectedError(built) ?? new TypeError("the Prompt builder returned no Prompt");
-    }
-    return adopt(Prompt.prototype, built);
+    return Prompt.build("openai_chat", model, options);
+  }
+
+  /**
+   * The native OpenAI Responses Prompt for `model`; `system` is its `instructions`.
+   *
+   * @param model - The literal model name.
+   * @param options - Messages, response format, output and settings.
+   * @returns The Prompt.
+   * @throws `WyrdError` from the native builder, as {@link Prompt.openaiChat} does.
+   */
+  static openaiResponses(model: string, options: PromptOptions = {}): Prompt {
+    return Prompt.build("openai_responses", model, options);
+  }
+
+  /**
+   * The native Anthropic Messages Prompt for `model`.
+   *
+   * @param model - The literal model name.
+   * @param options - Messages, response format, output and settings.
+   * @returns The Prompt.
+   * @throws `WyrdError` from the native builder, as {@link Prompt.openaiChat} does.
+   */
+  static anthropic(model: string, options: PromptOptions = {}): Prompt {
+    return Prompt.build("anthropic", model, options);
+  }
+
+  /**
+   * The native Gemini `GenerateContent` Prompt for `model`.
+   *
+   * @param model - The literal model name.
+   * @param options - Messages, response format, output and settings.
+   * @returns The Prompt.
+   * @throws `WyrdError` from the native builder, as {@link Prompt.openaiChat} does.
+   */
+  static gemini(model: string, options: PromptOptions = {}): Prompt {
+    return Prompt.build("gemini", model, options);
+  }
+
+  /**
+   * The native Vertex `GenerateContent` Prompt for `model`.
+   *
+   * @param model - The literal model name.
+   * @param options - Messages, response format, output and settings.
+   * @returns The Prompt.
+   * @throws `WyrdError` from the native builder, as {@link Prompt.openaiChat} does.
+   */
+  static vertex(model: string, options: PromptOptions = {}): Prompt {
+    return Prompt.build("vertex", model, options);
+  }
+
+  /**
+   * This Prompt with its system text set.
+   *
+   * @param text - The system text.
+   * @returns The new Prompt.
+   * @throws `WyrdError` when the request format has no system slot.
+   */
+  system(text: string): Prompt {
+    return builtPrompt(authoredOf(this).promptMessage("system", snapshot("text", text)));
+  }
+
+  /**
+   * This Prompt with one user turn appended.
+   *
+   * @param content - Text, or native content parts in the request format.
+   * @returns The new Prompt.
+   * @throws `WyrdError`, such as `WYRD_PROMPT_400_INVALID` for parts the format does not take.
+   */
+  user(content: string | PromptContent): Prompt {
+    return builtPrompt(authoredOf(this).promptMessage("user", snapshot("content", content)));
+  }
+
+  /**
+   * This Prompt with one assistant turn appended.
+   *
+   * @param content - Text, or native content parts in the request format.
+   * @returns The new Prompt.
+   * @throws `WyrdError`, as {@link Prompt.user} does.
+   */
+  assistant(content: string | PromptContent): Prompt {
+    return builtPrompt(authoredOf(this).promptMessage("assistant", snapshot("content", content)));
+  }
+
+  /**
+   * This Prompt with the result of tool call `toolUseId` appended.
+   *
+   * @param toolUseId - The tool call's id.
+   * @param content - The tool's result text.
+   * @param isError - Whether the call failed.
+   * @returns The new Prompt.
+   * @throws `WyrdError` when the request format has no tool results.
+   */
+  toolResult(toolUseId: string, content: string, isError = false): Prompt {
+    return builtPrompt(authoredOf(this).promptToolResult(toolUseId, content, isError));
+  }
+
+  /**
+   * This Prompt with text variables bound.
+   *
+   * @param vars - Each `{{name}}` variable's text.
+   * @returns The new Prompt.
+   * @throws `WyrdError` for an undeclared variable or a non-string value.
+   */
+  bind(vars: Readonly<Record<string, string>>): Prompt {
+    return builtPrompt(authoredOf(this).promptBind(snapshot("vars", vars)));
+  }
+
+  /**
+   * This Prompt with the media placeholder `name` bound.
+   *
+   * @param name - The `${media:name}` placeholder.
+   * @param media - The media reference.
+   * @returns The new Prompt.
+   * @throws `WyrdError` for an undeclared placeholder or a malformed reference.
+   */
+  bindMedia(name: string, media: MediaRef): Prompt {
+    return builtPrompt(authoredOf(this).promptBindMedia(name, snapshot("media", media)));
+  }
+
+  /**
+   * The native provider request this Prompt renders.
+   *
+   * @param vars - Each still-unbound `{{name}}` variable's text.
+   * @returns The provider request, in its wire shape.
+   * @throws `WyrdError` for an unbound or undeclared variable.
+   */
+  render(vars: Readonly<Record<string, string>> = {}): Wire.JsonValue {
+    return lifecycleValue<Wire.JsonValue>(authoredOf(this).promptRender(snapshot("vars", vars)));
   }
 }
 

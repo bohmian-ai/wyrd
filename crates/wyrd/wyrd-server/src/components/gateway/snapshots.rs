@@ -210,16 +210,15 @@ impl GatewaySnapshots {
         tracing::debug!(payload, "gateway snapshot invalidated");
         let mut entries = self.entries();
         entries.generation = entries.generation.wrapping_add(1);
-        match Uuid::parse_str(payload)
+        if let Some(tenant) = Uuid::parse_str(payload)
             .ok()
             .and_then(|tenant| DataTenantId::new(tenant).ok())
         {
-            Some(tenant) => entries.queue(tenant),
-            None => {
-                let cached: Vec<DataTenantId> = entries.snapshots.iter().map(|(t, _)| *t).collect();
-                for tenant in cached {
-                    entries.queue(tenant);
-                }
+            entries.queue(tenant);
+        } else {
+            let cached: Vec<DataTenantId> = entries.snapshots.iter().map(|(t, _)| *t).collect();
+            for tenant in cached {
+                entries.queue(tenant);
             }
         }
         drop(entries);

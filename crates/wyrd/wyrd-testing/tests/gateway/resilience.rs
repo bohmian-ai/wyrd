@@ -198,6 +198,130 @@ async fn a_retryable_refusal_fails_over_and_a_limit_refuses_before_dispatch() {
     );
 }
 
+/// Proves governed calls answer from the server's in-memory governance while
+/// their usage persists in the background, and that a restarted server
+/// enforces the committed usage.
+///
+/// Every quota usage table is held against writes while a call limited to
+/// two requests per minute answers; once released, background work persists
+/// the request. The second call answers and the third is refused with the
+/// stable limit code before dispatch. A restarted, cold server refuses its
+/// first call with the retryable `503` before dispatch, loads the tenant in
+/// the background, and then refuses with the limit from committed usage.
+///
+/// # Panics
+/// Panics when a status, refusal code, persisted count, or dispatch count
+/// expectation fails.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn gateway_cached_governance_answers_before_background_accounting() {
+    let journey = Journey::start().await;
+    Mock::given(method("POST"))
+        .and(path("/first/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(GatewayCapture::completion()))
+        .mount(&journey.upstream)
+        .await;
+    deploy_compatible(&journey, "acme-first", "/first").await;
+    journey
+        .put(
+            "governance-policy",
+            json!({
+                "limits": [{"subject": "tenant", "target": "all", "requests_per_minute": 2,
+                            "tokens_per_minute": null, "concurrent_calls": null}],
+                "budgets": [],
+                "pricing": [],
+                "unknown_cost": "allow_unpriced",
+            }),
+        )
+        .await;
+    let tenant = journey.server.data_tenant_id();
+    let bearer = vec![("authorization", format!("Bearer {}", journey.caller))];
+    let call = || chat("acme-first/m");
+    within_one_limit_window(Duration::from_secs(30)).await;
+
+    let mut held = journey
+        .server
+        .tenant_conn_for(tenant)
+        .await
+        .expect("tenant conn");
+    sqlx::query(
+        "LOCK TABLE wyrd.gateway_accounting_entries, wyrd.gateway_usage_windows, \
+         wyrd.gateway_usage_concurrency IN SHARE MODE",
+    )
+    .execute(&mut **held.transaction())
+    .await
+    .expect("usage tables lock");
+    let answered = journey.post("/v1/chat/completions", &bearer, &call()).await;
+    assert_eq!(
+        answered.status().as_u16(),
+        200,
+        "the call answers while its usage cannot persist"
+    );
+    held.commit().await.expect("usage tables release");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while persisted_requests(&journey, tenant).await != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("background work persists the request");
+
+    let answered = journey.post("/v1/chat/completions", &bearer, &call()).await;
+    assert_eq!(answered.status().as_u16(), 200);
+    refusal(
+        journey.post("/v1/chat/completions", &bearer, &call()).await,
+        429,
+        "WYRD_GATEWAY_429_LIMIT_EXCEEDED",
+        openai_code,
+    )
+    .await;
+    assert_eq!(journey.upstream_calls().await.len(), 2);
+
+    let journey = journey.restart().await;
+    let bearer = vec![("authorization", format!("Bearer {}", journey.caller))];
+    refusal(
+        journey
+            .post_once("/v1/chat/completions", &bearer, &call())
+            .await,
+        503,
+        "WYRD_SERVER_503_SERVICE_UNAVAILABLE",
+        openai_code,
+    )
+    .await;
+    refusal(
+        journey.post("/v1/chat/completions", &bearer, &call()).await,
+        429,
+        "WYRD_GATEWAY_429_LIMIT_EXCEEDED",
+        openai_code,
+    )
+    .await;
+    assert_eq!(
+        journey.upstream_calls().await.len(),
+        2,
+        "no refused call reaches the provider"
+    );
+}
+
+/// Requests every server has persisted against `tenant`'s limit windows.
+///
+/// # Panics
+/// Panics when the read fails.
+async fn persisted_requests(journey: &Journey, tenant: DataTenantId) -> i64 {
+    let mut conn = journey
+        .server
+        .tenant_conn_for(tenant)
+        .await
+        .expect("tenant conn");
+    let requests: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(requests), 0)::int8 FROM wyrd.gateway_usage_windows",
+    )
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("windows read");
+    conn.commit().await.expect("read commits");
+    requests
+}
+
 /// Proves that a caller who goes away mid-call leaves settled accounting.
 ///
 /// The provider holds the exchange open; once the upstream has recorded the

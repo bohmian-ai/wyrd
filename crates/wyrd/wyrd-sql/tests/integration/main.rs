@@ -6,6 +6,8 @@
 
 mod pg_admin_principals;
 mod pg_cards_declare;
+/// Code-review cache metadata: pointer publication, collection claims and context expiry.
+mod pg_code_review_cache;
 mod pg_drift_baselines;
 /// Tenant GitHub installation slots, revision fences and login state.
 mod pg_github_installations;

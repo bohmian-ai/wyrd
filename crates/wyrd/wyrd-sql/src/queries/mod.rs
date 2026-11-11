@@ -10,6 +10,8 @@
 
 pub mod auth;
 pub mod cards;
+/// Code-review pipeline cache metadata: snapshot pointers, snapshot records and contexts.
+pub mod code_review_cache;
 pub mod drift_baselines;
 pub mod gateway;
 pub mod gateway_admission;

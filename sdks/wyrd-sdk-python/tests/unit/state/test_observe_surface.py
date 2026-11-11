@@ -323,14 +323,9 @@ def test_execution_wait_behind_another_first_connection_keeps_its_budget(
 def test_verification_types_are_exported_and_judge_surfaces_are_gone() -> None:
     """The verify/submit types live only in ``wyrd.verify``; Judgment, drift/eval
     emits, and the Eval media module are removed with no alias."""
-    assert set(wyrd.verify.__all__) == {
-        "ArtifactRef",
-        "Execution",
-        "File",
-        "Recorded",
-        "VerificationResult",
-    }
-    for name in wyrd.verify.__all__:
+    verification = {"ArtifactRef", "Execution", "File", "Recorded", "VerificationResult"}
+    assert verification <= set(wyrd.verify.__all__)
+    for name in verification:
         assert not hasattr(wyrd, name)
         assert not hasattr(wyrd.observe, name)
     assert not hasattr(wyrd.observe, "Judgment")

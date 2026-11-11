@@ -39,6 +39,7 @@ use wyrd_spec::card::operator::{
 };
 use wyrd_spec::card::policy::{InvokeContext, InvokeOutcome, PolicyDecision, PolicySpec};
 use wyrd_spec::card::prompt::{ParameterName, PromptRef, PromptSpec};
+use wyrd_spec::card::repository::{RepositoryProvider, RepositorySpec};
 use wyrd_spec::card::service::{LockedComponent, ServiceLock};
 use wyrd_spec::card::service::{
     ServiceRuntime, ServiceRuntimeKind, ServiceRuntimeMode, ServiceRuntimePolicy, ServiceSpec,
@@ -47,7 +48,6 @@ use wyrd_spec::card::source::{
     LogConnection, MetricsConnection, SourceAuth, SourceKind, SourceSpec, SqlConnection,
     TraceConnection,
 };
-use wyrd_spec::card::repository::{RepositoryProvider, RepositorySpec};
 use wyrd_spec::card::trigger::{TriggerActivation, TriggerSpec};
 use wyrd_spec::card::verifier::{VerificationBinding, VerifierSpec};
 use wyrd_spec::envelope::{Card, CardKind};

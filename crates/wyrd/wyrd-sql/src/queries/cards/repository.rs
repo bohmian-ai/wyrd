@@ -228,8 +228,8 @@ pub async fn lock_card_repository_selections(
 /// declaration to commit and then find it (see
 /// [`lock_card_repository_selections`]), so a member activated meanwhile is
 /// never missed by both sides. The hold is taken before the declaration
-/// holds its Repository family line: its other Cards are persisted before
-/// its Repository root, and a reused exact Repository is held before that
+/// holds its Repository root's family line: its other Cards are persisted
+/// before that root, and a reused exact Repository is held before its
 /// line. The activation, which locks the Card row before the line, therefore
 /// never waits on the line while the declaration waits on the row. A hold
 /// that waits for an activation finds the Card no longer Pending and holds

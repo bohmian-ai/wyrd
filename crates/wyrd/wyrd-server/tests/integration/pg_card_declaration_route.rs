@@ -6413,6 +6413,23 @@ async fn lock_waits(superuser: &sqlx::PgPool) -> Vec<String> {
     .expect("lock waits read")
 }
 
+/// The number of backends blocked on a lock while holding a Card version
+/// line, such as a Repository family line.
+///
+/// # Panics
+/// Panics when the read fails.
+async fn line_holders_waiting(superuser: &sqlx::PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid \
+          WHERE l.locktype = 'advisory' AND l.granted \
+            AND a.datname = current_database() AND a.wait_event_type = 'Lock' \
+            AND a.pid <> pg_backend_pid()",
+    )
+    .fetch_one(superuser)
+    .await
+    .expect("line holders read")
+}
+
 /// Wait until `count` backends are blocked on locks and return their waits.
 ///
 /// # Panics
@@ -6447,8 +6464,8 @@ async fn wait_for_lock_waits(superuser: &sqlx::PgPool, count: usize) -> Vec<Stri
 ///
 /// # Panics
 /// Panics when either request fails, the root is not Active and selected,
-/// B writes another version, or a writer-first activation waits on the
-/// family line.
+/// B writes another version, a backend waits on a lock while holding the
+/// family line, or a writer-first activation waits on the family line.
 #[tokio::test(flavor = "current_thread")]
 async fn exact_pending_root_retry_and_activation_finish_in_either_order() {
     let storage_root = tempfile::tempdir().expect("storage root creates");
@@ -6529,7 +6546,7 @@ async fn exact_pending_root_retry_and_activation_finish_in_either_order() {
         } else {
             (activation, retry)
         };
-        let ((first_status, first_body), (second_status, second_body), waits) = tokio::join!(
+        let ((first_status, first_body), (second_status, second_body), (waits, holders)) = tokio::join!(
             first,
             async {
                 wait_for_lock_waits(&superuser, 1).await;
@@ -6537,10 +6554,27 @@ async fn exact_pending_root_retry_and_activation_finish_in_either_order() {
             },
             async {
                 let waits = wait_for_lock_waits(&superuser, 2).await;
+                let holders = line_holders_waiting(&superuser).await;
                 gate.commit().await.expect("gate releases");
-                waits
+                (waits, holders)
             },
         );
+        assert_eq!(
+            holders, 0,
+            "{version}: nothing waits on a lock while holding the family line"
+        );
+        let family_waits = waits.iter().filter(|wait| *wait == "advisory").count();
+        if writer_first {
+            assert_eq!(
+                family_waits, 1,
+                "only B waits on the family line; the activation waits on B's hold: {waits:?}"
+            );
+        } else {
+            assert_eq!(
+                family_waits, 0,
+                "B waits on the root, not the family: {waits:?}"
+            );
+        }
         assert_eq!(first_status, StatusCode::CREATED, "{version}: {first_body}");
         assert_eq!(
             second_status,
@@ -6563,18 +6597,6 @@ async fn exact_pending_root_retry_and_activation_finish_in_either_order() {
             selected_version(&server, "policy").await.as_deref(),
             Some(version)
         );
-        let family_waits = waits.iter().filter(|wait| *wait == "advisory").count();
-        if writer_first {
-            assert_eq!(
-                family_waits, 1,
-                "only B waits on the family line; the activation waits on B's hold: {waits:?}"
-            );
-        } else {
-            assert_eq!(
-                family_waits, 0,
-                "B waits on the root, not the family: {waits:?}"
-            );
-        }
     }
     server.shutdown().await.expect("test server shuts down");
 }

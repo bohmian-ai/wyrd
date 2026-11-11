@@ -1163,8 +1163,9 @@ async fn initialize_uploads(
 /// that makes its last exact member Active (see
 /// [`settle_waiting_selections`]); those record a conflict without failing
 /// the Card transition. This request-side call, in its own transaction,
-/// reads that stored decision and answers a conflict as the public refusal.
-/// One still pending, or without a Repository root, changes nothing. A
+/// answers that stored decision through the same settle, raising a conflict
+/// as the public refusal. One still pending, or without a Repository root,
+/// changes nothing. A
 /// settled operation answers its stored outcome again and never re-selects,
 /// so a delayed or replayed request cannot undo a newer selection.
 ///
@@ -1195,12 +1196,14 @@ fn selection_conflict(current: Option<&CardUid>) -> WyrdError {
 }
 
 /// Settle, in the caller's transaction, the pending Repository selections
-/// of the declarations `waiting`: those a Card's activation locked with
-/// [`lock_card_repository_selections`] after the Card row, or the
-/// declaration whose write commit this is.
+/// of the declarations `waiting`: those locked with
+/// [`lock_card_repository_selections`] by a Card's activation, after its Card
+/// row, or by an already-Active completion, or the declaration whose write
+/// commit this is.
 ///
-/// Each settle holds its operation row, then the Repository family line,
-/// until the caller commits or rolls back. Each declaration whose exact
+/// Each settle locks its operation row and, once that declaration is ready
+/// and still pending, the Repository family line; both stay held until the
+/// caller commits or rolls back. Each declaration whose exact
 /// graph is now Active selects or records its conflict in that commit, so
 /// no completion can leave a ready declaration unsettled. A conflict ends
 /// only that declaration's attempt; it is recorded, not raised, so the Card
@@ -1208,7 +1211,8 @@ fn selection_conflict(current: Option<&CardUid>) -> WyrdError {
 ///
 /// # Errors
 /// Returns registry errors; the caller's transaction then rolls back,
-/// including any Card transition in it.
+/// including any Card transition in it, and the Card's recovery or the
+/// declaration's replay settles it again.
 async fn settle_waiting_selections(
     conn: &mut TenantConn<'_>,
     waiting: &[DeclarationOperationId],

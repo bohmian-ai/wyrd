@@ -58,7 +58,7 @@ from wyrd.verify import (
 )
 
 from ..conftest import serving
-from ..support import FIXTURES, Receiver
+from ..support import FIXTURES, Receiver, details
 from ..test_local_development import configure_gateway
 
 pytestmark = pytest.mark.integration
@@ -464,8 +464,9 @@ def test_multi_component_service_verifies_each_subject(
         ):
             assert result.subject == state.card_ref(alias), result.subject
             assert result.verifier.name == verifier
-            assert {step["id"] for step in result.steps} == steps, result.steps
-            assert all(step["status"] == "succeeded" for step in result.steps), result.steps
+            executed = details(result.execution_id)["outcome"]["steps"]
+            assert {step["id"] for step in executed} == steps, executed
+            assert all(step["status"] == "succeeded" for step in executed), executed
         assert releases(report, access), (report.requirements, access.requirements)
         assert judge_calls(receiver) - asked == 2, "one policy read, then the verdict"
         [policy] = [
@@ -560,10 +561,11 @@ def test_multi_component_service_verifies_each_subject(
             (public, False, "failed"),
         ):
             access = judged(verify_both(summarized, request)[1])
-            ran = [step["id"] for step in access.steps]
+            executed = details(access.execution_id)["outcome"]["steps"]
+            ran = [step["id"] for step in executed]
             assert set(ran) == {"recipient", "destination", "summary"}, ran
             assert ran[-1] == "summary", "the summary runs after both prerequisites"
-            [summary] = [step for step in access.steps if step["id"] == "summary"]
+            [summary] = [step for step in executed if step["id"] == "summary"]
             assert summary["status"] == "succeeded", summary
             assert summary["output"] == {
                 "releasable": releasable,

@@ -40,7 +40,7 @@ def returned_records_are_typed(execution: Execution, result: VerificationResult)
     assert_type(described, VerificationDetails)
     assert_type(described["outcome"], OutcomeDetails)
     assert_type(described["outcome"]["requirements"], list[RequirementDetails])
-    assert_type(described["outcome"]["requirements"][0]["check"], Check)
+    assert_type(described["outcome"]["requirements"][0]["check"], CheckWire)
     assert_type(described["outcome"]["steps"], list[StepResult])
     assert_type(described["outcome"]["evidence"], dict[str, InputDeclaration])
     if "result" in state:

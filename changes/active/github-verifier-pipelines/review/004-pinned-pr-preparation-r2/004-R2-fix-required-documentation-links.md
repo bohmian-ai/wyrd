@@ -80,7 +80,7 @@ carrying forward FIND-004-1 closure and unaffected technical evidence.
 | ID | Promise (contract source) | Planned proof |
 |---|---|---|
 | R2-1 | The four `github_connection` module-doc links resolve to the existing public types, keeping labels and prose (Selected correction; FIND-004-2) | `mise run check:docs` exits 0 |
-| R2-2 | The diff changes only those link destinations; no wire, runtime, gate, test, SQL or pin change (Selected correction; Acceptance) | diff audit; `mise exec -- git diff --check` |
+| R2-2 | The diff only adds link definitions for those labels; no wire, runtime, gate, test, SQL or pin change (Selected correction; Acceptance) | diff audit; `mise exec -- git diff --check` |
 
 ## Evidence
 
@@ -88,5 +88,5 @@ Wyrd commit `fd5b7966e` (parent `b5c0db2e0`). No library change.
 
 | Obligation and required cases | Implementation evidence | Proof location | Verification evidence | Result |
 |---|---|---|---|---|
-| R2-1: four module links resolve | reference-style definitions under the existing module prose map each unchanged label to `crate::github_connection::<Type>` | `crates/wyrd-spec/src/github_connection.rs:11-14` | `mise run check:docs`: exit 0 (failed before with the four unresolved-link errors, as the review reproduced) | PASS |
-| R2-2: documentation destinations only | the diff adds one `//!` blank line and four `//!` link definitions; prose, wire types, runtime, gate scope, tests, SQL and the library pin are unchanged | `git show fd5b7966e` | `-U0` diff audit; `mise exec -- git diff --check`: clean; `cargo fmt --all -- --check`: clean | PASS |
+| R2-1: four module links resolve | reference-style definitions under the existing module prose map each unchanged label to `crate::github_connection::<Type>` | `crates/wyrd-spec/src/github_connection.rs:11-14` | `mise run check:docs`: exit 0. RED: with the file restored from `b5c0db2e0`, exit 101 with `unresolved link to` `GithubConnectResponse`, `GithubSetupQuery`, `GithubCallbackQuery`, `GithubConnectionView` | PASS |
+| R2-2: documentation destinations only | the diff adds one `//!` blank line and four `//!` link definitions; prose, wire types, runtime, gate scope, tests, SQL and the library pin are unchanged | `git show fd5b7966e` | `-U0` diff audit; `git diff --check b5c0db2e0..2cde86b7f`: clean; `cargo fmt --all -- --check`: clean | PASS |

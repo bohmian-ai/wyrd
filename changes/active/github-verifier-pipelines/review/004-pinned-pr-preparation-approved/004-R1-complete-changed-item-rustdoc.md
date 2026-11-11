@@ -1,7 +1,7 @@
 ---
 id: TASK-004-R1
 kind: remediation
-status: ready
+status: complete
 spec: SPEC-github-verifier-pipelines
 spec_revision: 6
 parent_task: TASK-004
@@ -155,3 +155,10 @@ the `stored` path check). All five were corrected in `9046d103` and `4d80bacc1`.
 `remove_repository` documents that a repeat after a lost reply omits keys the
 interrupted call removed. That is the existing behaviour, described accurately
 rather than changed.
+
+## Completion
+
+Complete following the [Task 004 PASS verdict](../004-pinned-pr-preparation-r3/verdict.md) for Wyrd candidate
+`dd2cb513ac8e4aee1316788335f33d2ca84f9393` and library revision
+`9046d1035538df8dfb661f826b102316ee6d0b4e`. FIND-004-1 and FIND-004-2
+are closed; no findings remain.

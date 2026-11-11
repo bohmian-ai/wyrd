@@ -5,10 +5,11 @@ by the user on 2026-11-10. They apply the current repository `wyrd-plan` skill.
 Revision 4 applies the approved installation storage amendment. Revision 5 uses
 GitHub.com’s documented App flow and removes the Enterprise Server compatibility
 decision. Task 002’s remediation packet carries that scope through configuration
-and proof. All task statuses
-are proposed. Task 004 now targets draft spec revision 6 for the user-directed
-storage amendment and remains proposed pending renewed approval; other tasks
-retain revision 5. This packet does not claim runtime proof.
+and proof. Task 004 targets approved spec revision 6 for the user-directed
+storage amendment and is complete following the
+[final PASS verdict](../review/004-pinned-pr-preparation-r3/verdict.md);
+FIND-004-1 and FIND-004-2 are closed. Other tasks retain their existing statuses
+and revision 5 basis. Verification evidence lives in the owning tasks and reviews.
 
 The selected path is existing connect/authorization→Card declaration saga→Scribe
 and SubmissionSink admission→fair verification queue→same engine and canonical
@@ -29,7 +30,7 @@ acquisition/comparison/index/context and remains standalone.
 | [001](001-isolate-queued-capacity.md) | Separate direct/queued execution/workspace/Python/model admission and original ceiling configuration; queued-only validation extended by 005/007/008 |
 | [002](002-github-app-connection.md) | Verified tenant installation/selected repository access, installation-token capability and revocation fence for 003/004/006/009 |
 | [003](003-repository-declaration.md) | Ready exact Repository receipt, selected policy/bindings and activation lifecycle for 006/007 |
-| [004](004-pinned-pr-preparation.md) | Reviewed pinned/baseline-aware ReviewPipeline revision, ObjectStorage adapter and PostgreSQL SnapshotStore/ContextStore metadata tables/adapters for 005 |
+| [004](004-pinned-pr-preparation.md) | **Complete.** Reviewed pinned/baseline-aware ReviewPipeline revision, ObjectStorage adapter and PostgreSQL SnapshotStore/ContextStore metadata tables/adapters for 005 |
 | [005](005-pull-request-extraction.md) | Accepted typed extraction and retained exact source/context for ordinary reviewers and 009 rendering |
 | [006](006-pr-admission-and-supersession.md) | Durable queued ExecutionIds with frozen policy/source/generation and cancellation fences for 005/007/008/009 |
 | [007](007-deferred-evidence-and-resumption.md) | Durable source-matched evidence, waiting inspection and same-execution park/continuation lifecycle for 008/009 |

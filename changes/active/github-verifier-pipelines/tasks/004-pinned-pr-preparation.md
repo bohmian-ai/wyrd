@@ -1,6 +1,6 @@
 ---
 id: TASK-004
-status: proposed
+status: complete
 spec_revision: 6
 requirements: [REQ-006, REQ-007]
 acceptance: [AC-004]
@@ -14,8 +14,8 @@ Implement the library/adapter portion of **approved-code-review-support.md →
 Library output and retained evidence / Successive commits and pipeline ownership**.
 This is source preparation for task 005, not a new Wyrd review orchestrator.
 The [Task 004 storage amendment](../design/approved-code-review-support.md#task-004-storage-amendment)
-corrects the earlier storage prohibition. Spec revision 6 is draft; this task
-remains proposed pending renewed spec approval.
+corrects the earlier storage prohibition. Revision 6 is approved, as explicitly
+confirmed by the user.
 
 ## Actual input and missing behavior
 
@@ -250,3 +250,10 @@ Non-goals stayed excluded: no metadata traits over Bifrost/Scribe, no
 execution IDs, no coordination service, no Task 005 execution evidence. The
 only change outside the task's write set is the stale storage journey fix
 above.
+
+## Completion
+
+Complete following the [Task 004 PASS verdict](../review/004-pinned-pr-preparation-r3/verdict.md) for Wyrd candidate
+`dd2cb513ac8e4aee1316788335f33d2ca84f9393` and library revision
+`9046d1035538df8dfb661f826b102316ee6d0b4e`. FIND-004-1 and FIND-004-2
+are closed; no findings remain.

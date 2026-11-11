@@ -1,7 +1,7 @@
 ---
 id: TASK-004-R2
 kind: remediation
-status: ready
+status: complete
 spec: SPEC-github-verifier-pipelines
 spec_revision: 6
 parent_task: TASK-004
@@ -90,3 +90,10 @@ Wyrd commit `fd5b7966e` (parent `b5c0db2e0`). No library change.
 |---|---|---|---|---|
 | R2-1: four module links resolve | reference-style definitions under the existing module prose map each unchanged label to `crate::github_connection::<Type>` | `crates/wyrd-spec/src/github_connection.rs:11-14` | `mise run check:docs`: exit 0. RED: with the file restored from `b5c0db2e0`, exit 101 with `unresolved link to` `GithubConnectResponse`, `GithubSetupQuery`, `GithubCallbackQuery`, `GithubConnectionView` | PASS |
 | R2-2: documentation destinations only | the diff adds one `//!` blank line and four `//!` link definitions; prose, wire types, runtime, gate scope, tests, SQL and the library pin are unchanged | `git show fd5b7966e` | `-U0` diff audit; `git diff --check b5c0db2e0..2cde86b7f`: clean; `cargo fmt --all -- --check`: clean | PASS |
+
+## Completion
+
+Complete following the [Task 004 PASS verdict](../004-pinned-pr-preparation-r3/verdict.md) for Wyrd candidate
+`dd2cb513ac8e4aee1316788335f33d2ca84f9393` and library revision
+`9046d1035538df8dfb661f826b102316ee6d0b4e`. FIND-004-1 and FIND-004-2
+are closed; no findings remain.

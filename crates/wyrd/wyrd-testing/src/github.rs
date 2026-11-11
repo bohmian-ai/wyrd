@@ -139,6 +139,8 @@ struct MockState {
     token_hold: Option<HeldAnswer>,
     /// Held next answer of the App installation read.
     installation_hold: Option<HeldAnswer>,
+    /// Whether the next App installation read fails with a server error.
+    installation_failure: bool,
     /// Token exchanges answered with a user token.
     exchanges: usize,
     /// Counter for unique codes and tokens.
@@ -350,6 +352,12 @@ impl GithubAppMock {
         let hold = HeldAnswer::default();
         self.state().installation_hold = Some(hold.clone());
         hold
+    }
+
+    /// Fail the next App installation read with `502 Bad Gateway`, as an
+    /// unavailable GitHub would.
+    pub fn fail_next_installation_read(&self) {
+        self.state().installation_failure = true;
     }
 
     /// How many authorization codes GitHub exchanged for a user token.
@@ -703,7 +711,9 @@ async fn app_installation(
     }
     let (answer, hold) = {
         let mut state = mock.state();
+        let failed = std::mem::take(&mut state.installation_failure);
         let answer = match state.installations.get(&id) {
+            _ if failed => StatusCode::BAD_GATEWAY.into_response(),
             Some(installation) if installation.app_id == APP_ID => {
                 axum::Json(installation_json(id, installation)).into_response()
             }

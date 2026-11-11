@@ -586,8 +586,9 @@ async fn tokens_minted_across_an_access_change_are_discarded() {
 /// Suspension follows GitHub's current state whatever order deliveries
 /// arrive in: an older delivery after a newer one changes nothing, and an
 /// observation GitHub answered before a newer applied one is refused for
-/// redelivery. The view and token decisions match GitHub each time, and an
-/// unchanged state keeps its public timestamp.
+/// redelivery. A delivery GitHub cannot answer for changes nothing and is
+/// refused for redelivery. The view and token decisions match GitHub each
+/// time, and an unchanged state keeps its public timestamp.
 ///
 /// # Panics
 /// Panics when the applied state or token decision differs from GitHub's.
@@ -620,12 +621,20 @@ async fn suspension_follows_github_whatever_the_delivery_order() {
     assert_eq!(older, 409, "the overtaken observation is refused");
     assert_eq!(connected.view().await["state"], "active");
     minted(server, 1).await;
+
+    mock.set_suspended(101, true);
+    mock.fail_next_installation_read();
+    let before = connected.view().await;
+    assert_eq!(connected.installation_event("suspend").await, 503);
+    assert_eq!(connected.view().await, before, "no observation, no change");
+    assert_eq!(connected.installation_event("suspend").await, 202);
+    assert_eq!(connected.view().await["state"], "suspended");
 }
 
 /// State saved under other App settings grants nothing: a slot saved for
 /// another host projects no active access and asks GitHub for no token yet
-/// still releases, a transaction begun under another OAuth client never
-/// redirects to GitHub, and one whose callback changed is refused before
+/// still releases, a transaction begun under another GitHub or OAuth client
+/// never redirects to GitHub, and one whose callback changed is refused before
 /// its code is exchanged. The served setup response is never cached, and a
 /// fresh connection then succeeds.
 ///
@@ -652,6 +661,28 @@ async fn state_saved_under_other_app_settings_grants_nothing() {
     connected
         .rewrite(
             "UPDATE wyrd.auth_login_state SET client_id = 'Iv1.replaced' WHERE flow = 'github'",
+        )
+        .await;
+    let answer = browser.open(&url).await.expect("browser navigates");
+    assert_eq!(
+        answer.problem_reason(),
+        Some("transaction_invalid"),
+        "{:?}",
+        answer.body
+    );
+    assert!(
+        !answer
+            .visited
+            .iter()
+            .any(|hop| hop.path() == "/login/oauth/authorize"),
+        "setup never redirected to GitHub: {:?}",
+        answer.visited
+    );
+
+    let url = connected.connect().await;
+    connected
+        .rewrite(
+            "UPDATE wyrd.auth_login_state SET issuer = 'https://github.old.example/' WHERE flow = 'github'",
         )
         .await;
     let answer = browser.open(&url).await.expect("browser navigates");

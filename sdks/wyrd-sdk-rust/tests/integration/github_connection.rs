@@ -280,8 +280,9 @@ mod pg_tests {
         deployment.shutdown().await;
     }
 
-    /// Spoofed and foreign installations, foreign principals and tenants,
-    /// stale transactions and both directions of uniqueness are refused, and
+    /// Spoofed and foreign installations, foreign principals and tenants, a
+    /// code GitHub issued another transaction, stale transactions and both
+    /// directions of uniqueness are refused, and
     /// none of them changes an association.
     ///
     /// # Panics
@@ -389,6 +390,63 @@ mod pg_tests {
             403,
             "WYRD_GITHUB_403_CONNECTION_REFUSED",
             "transaction_invalid",
+        );
+
+        // GitHub's code for one transaction, never exchanged, is refused on
+        // another: GitHub binds it to the first transaction's PKCE challenge.
+        mock.sign_out();
+        let first = admin.connect().await;
+        let first_authorize = first.visited.last().expect("authorization visited");
+        mock.sign_in("octo");
+        let exchanges = mock.exchanges();
+        let intercepted = other_principal
+            .browser
+            .open(first_authorize.as_str())
+            .await
+            .expect("browser navigates");
+        assert_eq!(
+            mock.exchanges(),
+            exchanges,
+            "the first code was never redeemed"
+        );
+        let code = intercepted
+            .callback_url()
+            .and_then(|callback| {
+                callback
+                    .query_pairs()
+                    .find(|(name, _)| name == "code")
+                    .map(|(_, code)| code.into_owned())
+            })
+            .expect("GitHub issued the first transaction a code");
+        mock.sign_out();
+        let second = admin.connect().await;
+        let substituted = second
+            .visited
+            .last()
+            .and_then(|authorize| {
+                authorize
+                    .query_pairs()
+                    .find(|(name, _)| name == "state")
+                    .map(|(_, state)| {
+                        format!("{base}/v1/integrations/github/callback?code={code}&state={state}")
+                    })
+            })
+            .expect("authorization carries the state");
+        mock.sign_in("octo");
+        refused(
+            &admin
+                .browser
+                .open(&substituted)
+                .await
+                .expect("browser navigates"),
+            403,
+            "WYRD_GITHUB_403_CONNECTION_REFUSED",
+            "authorization_refused",
+        );
+        assert_eq!(mock.exchanges(), exchanges, "GitHub issued no user token");
+        assert_eq!(
+            admin.sdk.get().await.expect("view reads").state,
+            GithubConnectionState::NotConnected
         );
 
         // The OIDC sign-in callback cannot consume a GitHub transaction.

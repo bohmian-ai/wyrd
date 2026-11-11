@@ -315,6 +315,7 @@ MOCK `crates/wyrd/wyrd-testing/src/github.rs`, CLI
 | R1-2a | FIND-002-2 mismatched saved slot → no active authority or token request | SRV host rewrite → `not_connected`, 404, GitHub not asked |
 | R1-2b | FIND-002-2 "preserving authorized release of stale associations" | SRV disconnect of the host-mismatched slot succeeds |
 | R1-2c | FIND-002-2 transaction under old client cannot redirect | SRV `client_id` rewrite → `transaction_invalid`, no authorize hop |
+| R1-2f | FIND-002-2 "Compare saved issuer …" | SRV `issuer` rewrite → `transaction_invalid`, no authorize hop |
 | R1-2d | FIND-002-2 transaction under old callback cannot exchange | SRV `redirect_uri` rewrite → `transaction_invalid`, exchange count unchanged |
 | R1-2e | FIND-002-2 "fresh legitimate connection must succeed" | SRV fresh connect → active, token minted |
 | R1-3a | FIND-002-3 public PEM → field-specific typed config error | CFG case naming `WYRD_GITHUB_APP_PRIVATE_KEY_FILE` |
@@ -324,6 +325,7 @@ MOCK `crates/wyrd/wyrd-testing/src/github.rs`, CLI
 | R1-5a | FIND-002-5 reverse deliveries end at GitHub's current state, view and token match | SRV unsuspend→suspend (GitHub active) and suspend→unsuspend (GitHub suspended) |
 | R1-5b | FIND-002-5 older paused observation overtaken → refused for redelivery | SRV held installation read → 409, state active, mint |
 | R1-5c | FIND-002-5 unchanged observation advances fence, keeps public timestamps | SQLT `again.revision`, timestamps equal; SRV `updated_at` equal |
+| R1-5d | FIND-002-5 "Provider failure supplies no observation" | SRV failed installation read → 503, view unchanged; redelivery applies |
 | R1-6a | FIND-002-6 removal of unselected B fences stale A+B callback; A retained | SQLT stale → `Stale`, selection `[A]` |
 | R1-6b | FIND-002-6 opposite order removes B normally | SQLT callback lands then removal → `[A]` |
 | R1-6c | FIND-002-6 nonempty removal advances revision, unchanged selection keeps timestamp | SQLT `fenced.revision`, `updated_at` equal; empty removal writes nothing |
@@ -338,6 +340,7 @@ MOCK `crates/wyrd/wyrd-testing/src/github.rs`, CLI
 | R1-13c | FIND-002-13 operator setup driven with mock credentials | CFG runs `server.sh`, resolves in production |
 | R1-13d | FIND-002-13 provider scope GitHub.com; docs verified through owners | guide text; `docs:generate`, `docs:check` |
 | R1-S | Scope: production GitHub.com only, local origins for mocks | CFG GHES-origin cases refuse in production; local origins resolve outside production |
+| R1-S2 | Scope: "refusal of a code substituted from another transaction" through the existing callback and mock | SDK code GitHub issued transaction A, never redeemed, presented with B's state → `authorization_refused`, no user token, not connected |
 | R1-14 | Historical diagnosis disposition | reference `findings-validation.md` FIND-002-14 |
 | R1-15 | FIND-002-15 exact selectors for named tests | exact-command block below |
 
@@ -345,26 +348,28 @@ MOCK `crates/wyrd/wyrd-testing/src/github.rs`, CLI
 
 | Obligation | Implementation evidence | Assertion | Verification evidence | Result |
 |---|---|---|---|---|
-| R1-1a | SVC `installation_token` re-reads the slot after minting; binding mismatch drops the token and returns `connection_changed` (SVC:755–765) | SRV:578–583, SRV:584 | `pg_github_connection::tokens_minted_across_an_access_change_are_discarded`; RED F1 (fence disabled) panicked SRV:530 "the token is discarded" | PASS |
+| R1-1a | SVC `installation_token` re-reads the slot after minting; binding mismatch drops the token and returns `connection_changed` (SVC:755–765) | SRV:578–583, SRV:584 | `pg_github_connection::tokens_minted_across_an_access_change_are_discarded`; RED F1 (post-IO check disabled) panicked SRV:536 "the token is discarded" (first held case) | PASS |
 | R1-1b | same; suspension and any removal advance revision | SRV:545–557 (suspension), SRV:541–543 (own removal), SRV:563–576 (disconnect+reclaim) | same test | PASS |
 | R1-1c | revision movement refuses only the held result; new request decides on current slot | SRV:534–539 | same test | PASS |
 | R1-1d | SVC module, `fence_and_release`, `installation_token` rustdoc describe the post-IO binding check | inspection | checker | PASS |
-| R1-2a | SVC `associated` filters on `row.host == settings.host()` (SVC:188–194) | SRV:640–648 | `…::state_saved_under_other_app_settings_grants_nothing`; RED F2 (host filter off) panicked SRV:623 `left: "active"` | PASS |
-| R1-2b | disconnect keeps the unfiltered slot read | SRV:649 (`disconnect` panics unless 200) | same test | PASS |
-| R1-2c | SVC `begun_here` (SVC:198) applied before setup redirect (SVC:410) | SRV:652–671 | same test; RED F2b (`begun_here` true) panicked SRV:637 (view active) | PASS |
-| R1-2d | `begun_here` before callback commit/exchange (SVC:481) | SRV:673–701 | same test (`mock.exchanges()` unchanged) | PASS |
-| R1-2e | — | SRV:737–741 | same test | PASS |
-| R1-3a | CFG `resolve` signs a probe JWT via `EncodingKey::from_rsa_pem` + `jsonwebtoken::encode` (CFG:2459–2475) | CFG:7072, CFG:7094 | `config::tests::github_app_config_is_optional_but_complete_once_present`; no RED captured (exception) | PASS |
+| R1-2a | SVC `associated` filters on `row.host == settings.host()` (SVC:188–194) | SRV:649–657 | `…::state_saved_under_other_app_settings_grants_nothing`; RED F2 (host filter off) panicked SRV:653 `left: "active"` | PASS |
+| R1-2b | disconnect keeps the unfiltered slot read | SRV:658 (`disconnect` panics unless 200) | same test | PASS |
+| R1-2c | SVC `begun_here` (SVC:198–202) applied before the setup redirect (SVC:410) | SRV:660–680 (`client_id` rewrite) | same test; RED F2b (`begun_here` always true) panicked SRV:667 at the `transaction_invalid` assertion | PASS |
+| R1-2f | `begun_here` compares `issuer` with `web_origin` | SRV:682–701 (`issuer` rewrite) | same test; RED F2c (issuer comparison dropped) panicked SRV:689 at the `transaction_invalid` assertion | PASS |
+| R1-2d | `begun_here` before callback commit/exchange (SVC:481) | SRV:703–732 | same test (`mock.exchanges()` unchanged) | PASS |
+| R1-2e | — | SRV:768–772 | same test | PASS |
+| R1-3a | CFG `resolve` signs a probe JWT via `EncodingKey::from_rsa_pem` + `jsonwebtoken::encode` (CFG:2459–2475) | CFG:7073, CFG:7099 | `config::tests::github_app_config_is_optional_but_complete_once_present`; no RED captured (exception) | PASS |
 | R1-3b | `GithubAppSettings.signing_key` | CFG:6876, CFG:6969, CFG:7017 | config github tests | PASS |
-| R1-3c | `GithubApp::new` infallible, `app_jwt` uses `settings.signing_key` (app.rs); refusal names the env var only | CFG:6771 (no key material in any refusal) | config github tests | PASS |
+| R1-3c | `GithubApp::new` is `const` and infallible, `app_jwt` uses `settings.signing_key` (app.rs); refusal names the env var only | CFG:7100–7103 (no GitHub refusal, the public-PEM case included, quotes `-----BEGIN` or the PEM body) | same test; existing behavior, no RED | PASS |
 | R1-4 | `exchange_code` → `request_accepting(POST, url, "application/json")` (app.rs:229); MOCK:591–619 answers form-urlencoded otherwise | SRV:136 callback 200; SDK/CLI/MCP/Python/TS callbacks | `pg_github_connection::installation_tokens_follow_repository_access`; RED F4 (vendor Accept) panicked at the callback assert with `WYRD_GITHUB_503_PROVIDER_UNAVAILABLE` | PASS |
-| R1-5a | SVC `observe_suspension` (SVC:667) reads `app.installation()` after commit, applies `set_github_installation_suspended(observed, current.suspended)` | SRV:600–605, SRV:607–611 | `…::suspension_follows_github_whatever_the_delivery_order`; RED F5 (applied action instead of observation) panicked SRV:589 | PASS |
-| R1-5b | SQL suspend conditional on `connection_id`+`revision`; None → `connection_changed` 409 | SRV:613–622 | same test | PASS |
+| R1-5a | SVC `observe_suspension` (SVC:667) reads `app.installation()` after commit, applies `set_github_installation_suspended(observed, current.suspended)` | SRV:601–605, SRV:607–612 | `…::suspension_follows_github_whatever_the_delivery_order`; RED F5 (applied the delivered action) panicked SRV:611 `left: "active"` | PASS |
+| R1-5b | SQL suspend conditional on `connection_id`+`revision`; None → `connection_changed` 409 | SRV:614–623 | same test | PASS |
 | R1-5c | `SUSPEND_SQL` always bumps revision, `updated_at`/`suspended_at` change only on state change | SQLT:240–256, SRV:604 | `pg_github_installations::pg_tests::installation_belongs_to_one_tenant_until_released` | PASS |
+| R1-5d | `app.installation(provider_id).await?` propagates GitHub failure as 503 before any write; MOCK `fail_next_installation_read` | SRV:625–631 | same test; RED F5b (failure swallowed) panicked SRV:628 `left: 202` | PASS |
 | R1-6a | `REMOVE_REPOSITORIES_SQL` matches any nonempty removal for host+installation | SQLT:529–538 | `pg_github_installations::pg_tests::removal_fences_a_callback_that_read_the_removed_repository`; RED under the old overlap guard panicked SQLT:521 "the removal applies" | PASS |
 | R1-6b | — | SQLT:540–549 | same test | PASS |
 | R1-6c | `updated_at` changes only on overlap | SQLT:472–488 | `…::slots_are_tenant_confined_and_track_removed_access` | PASS |
-| R1-8 | routes.rs:204 `no_store(StatusCode::FOUND, [LOCATION, SET_COOKIE])` | SRV:719–735 | `…::state_saved_under_other_app_settings_grants_nothing`; RED F8 (plain tuple) panicked SRV:707 (no `Cache-Control`) | PASS |
+| R1-8 | routes.rs:204 `no_store(StatusCode::FOUND, [LOCATION, SET_COOKIE])` | SRV:750–766 | `…::state_saved_under_other_app_settings_grants_nothing`; RED F8 (plain tuple) panicked SRV:759 `left: ""` | PASS |
 | R1-9 | `wyrd-crypt` `hmac_sha256`/`verify_hmac_sha256` via `hmac::Hmac::verify_slice` (lib.rs:450–470); Cargo.toml `hmac`, no `subtle` | lib.rs:507–545 (RFC 4231 short/long key, wrong at :536, truncated) | `wyrd-crypt tests::hmac_sha256_matches_rfc_4231`; refactor with unchanged vectors, no RED (no behavior change) | PASS |
 | R1-10 | `///` on every listed module and test registration, `TryFrom::Error`, SQLT `HOST` (SQLT:32), `# Panics` on all listed helpers (CLI, SRV `refused`/`minted`, CFG `github_key_file`, OpenAPI test, SDK helpers); SVC callback "spent state" and SQL `Associated` caller-owned commit docs | inspection | `mise run fmt`, `mise run lints` clean; checker | PASS |
 | R1-11a | SQLT `database_url()` guard deleted | SQLT selectors | 6 SQLT exact selectors pass on repository Postgres | PASS |
@@ -375,6 +380,7 @@ MOCK `crates/wyrd/wyrd-testing/src/github.rs`, CLI
 | R1-13c | `config::tests::github_guide_settings_configure_a_production_server` fills placeholders, mounts the secret files, exports via bash, resolves with `resolve(true)` | CFG:6959–6975 | that test | PASS |
 | R1-13d | guide prerequisite and step 2 name GitHub.com only; `docs/public/llms-full.txt` regenerated | `docs:check` | `mise run docs:generate`, `mise run docs:check` clean | PASS |
 | R1-S | CFG `resolve` refuses non-GitHub.com origins in production (CFG:2411–2428) | CFG:7079, CFG:7086 (refused in production); CFG:6872 (local mock origin outside production) | config github tests; no RED captured (exception) | PASS |
+| R1-S2 | existing callback sends the transaction's PKCE verifier; MOCK binds codes to their challenge | SDK:395–450 (first code never redeemed at :410; substitution refused `authorization_refused` at :444; no user token at :446; not connected) | `github_connection::pg_tests::spoofed_foreign_stale_and_conflicting_connections_are_refused`; RED with the mock's challenge comparison disabled: the substituted code associated, panicked SDK:106 `left: (200, None, None)` | PASS |
 | R1-14 | Historical diagnosis is satisfied by the independent tracing in `findings-validation.md` FIND-002-14 and the behavior and standards reports; the missing before-edit traces remain a historical limit | — | reference | PASS |
 | R1-15 | exact selectors below | — | all pass | PASS |
 
@@ -401,8 +407,9 @@ cargo nextest run --locked -p wyrd-mcp --test mcp -P journey --run-ignored=all -
 
 `mise run fmt`, `mise run lints`, `mise run check:tenant-isolation`,
 `mise run check:deps`, `mise run docs:check` and `git diff --check` are clean.
-RED runs temporarily mutated one production line each (F1, F2, F2b, F4, F5,
-F8), ran the exact selector, and restored the source.
+RED runs temporarily mutated one production line each (F1, F2, F2b, F2c, F4,
+F5, F5b, F8), ran the exact selector, and restored and touched the source so
+cargo rebuilt it. The line numbers above come from that final run.
 
 ### Process exceptions and deviations
 

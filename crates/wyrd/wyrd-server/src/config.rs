@@ -6981,11 +6981,12 @@ provider = "anthropic"
     /// Proves an unset section configures no App, the default host is
     /// `github.com`, production accepts only GitHub.com's origins, and a
     /// partial or invalid section, including a public key in place of the
-    /// App's private key, refuses startup naming the field.
+    /// App's private key, refuses startup naming the field without quoting
+    /// key material.
     ///
     /// # Panics
-    /// Panics when an unset section configures an App or an invalid one
-    /// validates.
+    /// Panics when an unset section configures an App, an invalid one
+    /// validates, or a refusal quotes key material.
     #[test]
     fn github_app_config_is_optional_but_complete_once_present() {
         let _guard = ENV_LOCK.lock().expect("environment test lock");
@@ -7088,10 +7089,18 @@ provider = "anthropic"
                 },
             ),
         ];
+        let key_body = wyrd_testing::github::APP_PUBLIC_KEY_PEM
+            .lines()
+            .nth(1)
+            .expect("the PEM has a body");
         for (field, config) in cases {
             match config.resolve(true) {
                 Err(ConfigError::Invalid { message }) => {
                     assert!(message.contains(field), "{field}: {message}");
+                    assert!(
+                        !message.contains("-----BEGIN") && !message.contains(key_body),
+                        "{field} refusal quotes key material: {message}"
+                    );
                 }
                 other => panic!("{field}: expected a typed refusal, got {other:?}"),
             }

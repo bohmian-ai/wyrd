@@ -760,7 +760,8 @@ test('observe boards match approved canvas', async ({ server, ui }) => {
       await capture('logs', mode, width);
 
       // Metrics: a 240px rail, then the chart card above the series card; no raw points until asked for.
-      await page.goto(`${observe}&signal=metrics&where=${encodeURIComponent(JSON.stringify([{ column: 'metric_name', value: 'ui.canvas' }]))}`);
+      // Every series apart, so both services' lines are drawn; the default merges them into one.
+      await page.goto(`${observe}&signal=metrics&apart=1&where=${encodeURIComponent(JSON.stringify([{ column: 'metric_name', value: 'ui.canvas' }]))}`);
       const series = page.locator('[data-panel="series"]');
       await expect.poll(() => series.locator('table.legend tbody tr').count(), { timeout: 30_000 }).toBe(2);
       if (desktop) expect((await page.locator('[data-panel="metrics"]').boundingBox())?.width).toBe(240);

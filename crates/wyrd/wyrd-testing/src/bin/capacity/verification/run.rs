@@ -1982,17 +1982,14 @@ mod tests {
                 .reading("verifications_after_window")
                 .value
                 .expect("late");
-            let recorded: u64 = plain
-                .reconciliation
-                .iter()
-                .map(|cohort| cohort.recorded)
-                .sum();
-            assert_eq!(
-                recorded as f64,
-                verifications + late,
-                "{:?}",
-                plain.reconciliation
-            );
+            assert!(!plain.reconciliation.is_empty(), "no cohort reconciled");
+            for cohort in &plain.reconciliation {
+                assert_eq!(
+                    cohort.recorded as f64,
+                    verifications + late,
+                    "each reconciled boundary records every call once: {cohort:?}"
+                );
+            }
 
             let bench = &mut workload.bench;
             let server = bench.server.as_mut().expect("the server still runs");

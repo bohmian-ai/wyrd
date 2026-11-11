@@ -585,7 +585,7 @@ async fn contexts_expire_without_extension_and_stay_in_their_tenant() {
             .await
             .expect("repeat after expiry")
             .expires_at,
-        review.context.lifetime.expires_at - Duration::from_secs(25 * 3600),
+        review.context.lifetime.expires_at - Duration::from_hours(25),
         "a repeat publication never extends an expired context"
     );
     assert!(matches!(

@@ -467,6 +467,10 @@ mod tests {
     }
 
     /// A checkout at `root` whose origin is `url`, with `wyrd.toml`.
+    ///
+    /// # Panics
+    /// Panics when the `.git` directory, its config or `wyrd.toml` cannot be
+    /// written.
     fn checkout(root: &Path, url: Option<&str>, toml: &str) {
         std::fs::create_dir_all(root.join(".git")).expect("git dir creates");
         let config = url.map_or_else(String::new, |url| {
@@ -477,6 +481,10 @@ mod tests {
     }
 
     /// The Repository root the TOML entry produced.
+    ///
+    /// # Panics
+    /// Panics when `tree` has no Repository Card or its spec does not decode
+    /// as a Repository.
     fn repository_spec(tree: &super::LoadedTree) -> wyrd_spec::card::repository::RepositorySpec {
         let root = tree
             .cards
@@ -544,6 +552,39 @@ mod tests {
             .expect("input builds")
             .to_declare_card_request();
         assert!(request.repository.is_some());
+    }
+
+    /// Minimal TOML in a checkout whose origin uses Git's quoted value or an
+    /// uppercase variable name infers the Repository from that origin
+    /// instead of refusing it as unidentified.
+    ///
+    /// # Panics
+    /// Panics when either legal origin form does not reach the inferred root.
+    #[test]
+    fn toml_infers_repository_from_quoted_or_uppercase_origin() {
+        for line in [
+            "url = \"https://github.com/acme/widget.git\"",
+            "URL = https://github.com/acme/widget.git",
+        ] {
+            let temp = TempDir::new().expect("temp directory creates");
+            checkout(temp.path(), None, "[repository.verified_by]\nverifier = []\n");
+            std::fs::write(
+                temp.path().join(".git/config"),
+                format!("[remote \"origin\"]\n\t{line}\n"),
+            )
+            .expect("git config writes");
+
+            let tree = load(&temp.path().join("wyrd.toml")).expect("legal origin loads");
+            assert_eq!(tree.cards[0].submission.metadata.name.as_str(), "widget");
+            assert_eq!(
+                tree.repository
+                    .and_then(|hint| hint.remote)
+                    .map(|remote| remote.full_name)
+                    .as_deref(),
+                Some("acme/widget"),
+                "{line}"
+            );
+        }
     }
 
     /// Overrides win and an explicit remote identifies a repository outside

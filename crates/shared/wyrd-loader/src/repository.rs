@@ -123,7 +123,8 @@ pub(crate) fn repository_root(
 ///
 /// Walks ancestors to the first `.git` directory or `gitdir:` file, follows
 /// a linked worktree's `commondir` to the shared config, and reads
-/// `[remote "origin"] url`. Returns `None` outside a checkout, without an
+/// `[remote "origin"] url`, whose variable name Git matches in any case and
+/// whose value may be double-quoted. Returns `None` outside a checkout, without an
 /// origin, or when the URL is not a repository remote.
 fn origin_remote(start: &Path) -> Option<RepositoryRemote> {
     let dot_git = start
@@ -149,9 +150,14 @@ fn origin_remote(start: &Path) -> Option<RepositoryRemote> {
             in_origin = line == r#"[remote "origin"]"#;
         } else if in_origin
             && let Some((key, value)) = line.split_once('=')
-            && key.trim() == "url"
+            && key.trim().eq_ignore_ascii_case("url")
         {
-            return RepositoryRemote::parse(value.trim());
+            let value = value.trim();
+            let value = value
+                .strip_prefix('"')
+                .and_then(|quoted| quoted.strip_suffix('"'))
+                .unwrap_or(value);
+            return RepositoryRemote::parse(value);
         }
     }
     None
@@ -199,5 +205,35 @@ mod tests {
         assert_eq!(origin_remote(&main), expected);
         assert_eq!(origin_remote(&worktree.join("nested")), expected);
         assert_eq!(origin_remote(&root.path().join("elsewhere")), None);
+    }
+
+    /// Git's quoted values and case-insensitive variable names in the
+    /// origin section yield the same remote as the plain form.
+    ///
+    /// # Panics
+    /// Panics when a legal origin form yields a different remote.
+    #[test]
+    fn origin_remote_decodes_quoted_values_and_any_key_case() {
+        for line in [
+            "url = \"https://github.com/acme/widget.git\"",
+            "URL = https://github.com/acme/widget.git",
+            "Url=\"https://github.com/acme/widget.git\" ",
+        ] {
+            let root = TempDir::new().unwrap();
+            fs::create_dir_all(root.path().join(".git")).unwrap();
+            fs::write(
+                root.path().join(".git/config"),
+                format!("[remote \"origin\"]\n\t{line}\n"),
+            )
+            .unwrap();
+            assert_eq!(
+                origin_remote(root.path()),
+                Some(RepositoryRemote {
+                    host: "github.com".to_owned(),
+                    full_name: "acme/widget".to_owned(),
+                }),
+                "{line}"
+            );
+        }
     }
 }

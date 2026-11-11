@@ -262,6 +262,22 @@ mod pg_tests {
             .await
             .expect_err("pull_request activates only a Repository binding");
         assert_eq!(off.code(), "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH");
+        let service = declare(&cards, "cards/verify_in_real_time/reviewed.yaml").await;
+        assert_eq!(
+            service.root.kind,
+            CardKind::Service,
+            "ordinary YAML still declares"
+        );
+        assert!(
+            cards
+                .get(CardSelector::exact(service.root.clone()))
+                .await
+                .expect("the Service reads back")
+                .status
+                .and_then(|status| status.repository)
+                .is_none(),
+            "a Service carries no Repository selection"
+        );
         deployment.shutdown().await;
     }
 

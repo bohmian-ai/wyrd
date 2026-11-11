@@ -143,8 +143,8 @@
     },
     {
       component: 'VerifierDefinition',
-      regions: [['Verification mock · Verifier page', 'description, Graph panel and declaration inspector']],
-      note: 'Definition only: no execution colour. Select a node, use the arrow keys, zoom and Fit.',
+      regions: [],
+      note: 'Reference: the approved verification mock, exact Verifier page (description, Graph panel, inspector). Definition only: no execution colour. Select a node, use the arrow keys, zoom and Fit.',
       cases: [
         { label: 'parallel steps, fan-in, gate, retries and both requirement positions', input: { cardRef: VERIFIER } },
         { label: 'requirements only: a compact panel', input: { cardRef: { ...VERIFIER, version: '1.0.0' } } },
@@ -156,7 +156,8 @@
     },
     {
       component: 'RunsOn',
-      regions: [['Verification mock · Verifier page', 'Runs on rail']],
+      regions: [],
+      note: 'Reference: the approved verification mock, exact Verifier page, Runs on rail.',
       cases: [{ label: 'a Service binding itself and one component', input: { cardRef: VERIFIER } }, ...states({ cardRef: VERIFIER })]
     },
     {

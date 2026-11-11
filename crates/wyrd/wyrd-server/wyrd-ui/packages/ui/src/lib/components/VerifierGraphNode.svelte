@@ -43,7 +43,7 @@
         <span class="id">{node.id}</span><span class="kind">{node.kind}</span>
       </span>
       {#if data.type === 'step'}
-        <span class="row needs">{data.needs}</span>
+        <span class="sub mono needs" title={data.needs}>{data.needs}</span>
         <span class="sub mono">{data.node.detail}</span>
         {#if data.node.chips.length}
           <span class="row">{#each data.node.chips as chip (chip)}<span class="chip">{chip}</span>{/each}</span>
@@ -138,11 +138,6 @@
     text-transform: uppercase;
     white-space: nowrap;
   }
-  .needs {
-    color: var(--muted);
-    font: 11px var(--font-mono);
-    white-space: nowrap;
-  }
   .sub {
     overflow: hidden;
     color: var(--muted);
@@ -152,6 +147,10 @@
   }
   .sub.mono {
     font: 11px var(--font-mono);
+  }
+  .needs {
+    flex: none;
+    line-height: 20px;
   }
   .chip {
     border: 1px dashed var(--border);

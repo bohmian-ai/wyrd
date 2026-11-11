@@ -182,7 +182,7 @@ Story fixtures: `fixtures/cards/repository_declaration/`.
 | O-35 tenant isolation + contract checks | raw-query justification in `queries/cards/repository.rs` | — | `check:tenant-isolation` rc=0, `codegen:check` rc=0 | PASS |
 | O-36 (unledgered, task ¶5) already accepted executions keep their policy | no Repository execution exists before task 006 admits one | — | — | OPEN: not observable in this task; route to task 006's admission proof |
 | O-37 (unledgered, Output ¶1) task 006 resolves selected registered bindings, not PR TOML | selected bindings served on `status.repository`/`status.verification` | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:180-183` | Rust journey | PASS for the producer side; consumer proof belongs to task 006 |
-| O-38 (unledgered, Proof AC-002) failed artifact upload in a Repository graph keeps the previous selection | an unverified upload leaves its Card pending, which `settle_repository_selection` never selects | `crates/wyrd/wyrd-sql/tests/integration/pg_cards_declare.rs:1503-1504` models the pending upload at the owner | SQL integration | OPEN: no journey uploads an artifact inside a Repository graph (no local Artifact fixture exists) |
+| O-38 (unledgered, Proof AC-002) failed artifact upload in a Repository graph keeps the previous selection | an unverified upload leaves its Card pending, which `settle_repository_selection` never selects | `crates/wyrd/wyrd-sql/tests/integration/pg_cards_declare.rs:1503-1504` models the pending upload at the owner | SQL integration | OPEN: a journey cannot fail an upload server-side. The client verifies each artifact's size and SHA-256 before submitting (`crates/shared/wyrd-client/src/cards/saga/hash_artifacts.rs:46`), and no storage-fault harness exists; adding one is a new test mechanism, routed to `$wyrd-plan` |
 
 Non-goals stayed excluded: no PR event producer (task 006), no deferred
 subscriptions (task 007), no new PostgreSQL tables, no provider IO in the loader.
@@ -245,3 +245,13 @@ Mechanical deviations:
 
 O-31 rests on two proofs: the journey's status read after the receipt, and the
 owner-tier proof that a pending graph never selects. O-36 and O-38 stay open.
+
+### Status
+
+`BLOCKED` on two items:
+
+- **O-36** needs Repository executions, which task 006 admits.
+- **O-38** needs a server-side upload-fault harness that does not exist.
+
+Route both to `$wyrd-plan` for task correction. Every other ledger row is
+`PASS`.

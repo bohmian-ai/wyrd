@@ -60,13 +60,6 @@ const MIB: f64 = 1_048_576.0;
 /// any table.
 const ROWS_INSERTED: &str = "bifrost_scribe_memtable_rows_inserted_total";
 
-/// The server's Gate request counter, by operation and outcome.
-const GATE_REQUESTS: &str = "bifrost_gate_requests_total";
-
-/// The Gate's write attempts refused after their permission decision, such
-/// as a busy refusal the native client retries without the driver seeing it.
-const REFUSED_WRITES: [&str; 2] = ["operation=\"write\"", "outcome=\"rejected\""];
-
 /// Items staged on the server's Scribe outbox and not yet written, such as
 /// the audit row each permission decision stages after its request answered.
 const OUTBOX_PENDING: &str = "outbox_pending";
@@ -143,9 +136,6 @@ struct Observed {
     /// Rows the server's memtables accepted from just before to just after
     /// the call, when both scrapes answered.
     rows_inserted: Option<f64>,
-    /// Write attempts the Gate refused over the same span, when both scrapes
-    /// answered.
-    refused_writes: Option<f64>,
     /// Seconds the scrape loop kept requests in flight, when it ran.
     scraping: Option<f64>,
 }
@@ -200,17 +190,9 @@ impl Workload for Controlled {
             None => None,
         };
         let after = settled_scrape().await;
-        let delta = |family: &str, labels: &[&str]| {
-            before
-                .as_ref()
-                .zip(after.as_ref())
-                .map(|(before, after)| after.sum(family, labels) - before.sum(family, labels))
-        };
-        let rows_inserted = delta(ROWS_INSERTED, &[]);
-        let refused_writes = delta(GATE_REQUESTS, &REFUSED_WRITES);
-        if let Some(refused) = refused_writes.filter(|refused| *refused > 0.0) {
-            println!("{} {phase:?}: {refused} write attempts refused", step.id);
-        }
+        let rows_inserted = before
+            .zip(after)
+            .map(|(before, after)| after.sum(ROWS_INSERTED, &[]) - before.sum(ROWS_INSERTED, &[]));
         self.observed
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -218,7 +200,6 @@ impl Workload for Controlled {
                 step: step.id.clone(),
                 phase,
                 rows_inserted,
-                refused_writes,
                 scraping,
             });
         repetition
@@ -435,23 +416,16 @@ fn population_reconciles(engine: Engine, repetition: &Repetition) -> Result<(), 
 }
 
 /// The rows an error-free write window acknowledged, in the window and
-/// after it, plus the one audit row each authorized attempt's permission
+/// after it, plus the one audit row each authorized request's permission
 /// decision stages, are the rows the server's memtables accepted around it
-/// once its outbox settled. Attempts are the acknowledged requests plus the
-/// `refused` ones the Gate turned away after authorizing them, which a
-/// client retry hides from the driver. A failed request still stages its
-/// audit row, so a window with errors has no exact reference.
-fn rows_match_the_server(
-    repetition: &Repetition,
-    inserted: f64,
-    refused: f64,
-) -> Result<(), String> {
+/// once its outbox settled. A failed request still stages its audit row, so
+/// a window with errors has no exact reference.
+fn rows_match_the_server(repetition: &Repetition, inserted: f64) -> Result<(), String> {
     within("write errors", value(repetition, "errors")?, 0.0, 0.0)?;
     let rows = value(repetition, "rows")?
         + value(repetition, "late_rows")?
         + value(repetition, "requests")?
-        + value(repetition, "late_requests")?
-        + refused;
+        + value(repetition, "late_requests")?;
     within("server rows inserted", inserted, rows, rows)
 }
 
@@ -545,14 +519,10 @@ fn step_holds(
         population_reconciles(engine, repetition).map_err(name)?;
         if repetition.reading("late_rows").is_present() {
             let phase = Phase::Repetition(u8::try_from(index).unwrap_or(u8::MAX));
-            let seen = at(phase);
-            let inserted = seen
+            let inserted = at(phase)
                 .and_then(|seen| seen.rows_inserted)
                 .ok_or_else(|| name("no settled row counter was read".to_owned()))?;
-            let refused = seen
-                .and_then(|seen| seen.refused_writes)
-                .ok_or_else(|| name("no settled Gate counter was read".to_owned()))?;
-            rows_match_the_server(repetition, inserted, refused).map_err(name)?;
+            rows_match_the_server(repetition, inserted).map_err(name)?;
             let wire = repetition.reading("wire_bytes");
             if step.id.starts_with("native") {
                 if wire.value.is_some() {

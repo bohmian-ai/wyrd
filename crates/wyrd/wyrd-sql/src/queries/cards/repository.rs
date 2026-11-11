@@ -62,6 +62,21 @@ pub async fn repository_family_identity(
     .map_err(registry_db_error)
 }
 
+/// The selected version of a Repository family and the selection change
+/// that selected it.
+///
+/// `occurrence` is private to the selection owner: it distinguishes two
+/// selections of one version (A, then B, then A again), which the version
+/// alone cannot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedRepository {
+    /// The selected Card version.
+    pub uid: CardUid,
+    /// The selection change that selected it: the selecting declaration's
+    /// operation id, or a unique backfilled value.
+    pub occurrence: Uuid,
+}
+
 /// The selected version of a Repository family, if one is selected.
 ///
 /// # Errors
@@ -69,22 +84,29 @@ pub async fn repository_family_identity(
 pub async fn selected_repository(
     conn: &mut TenantConn<'_>,
     name: &CardName,
-) -> Result<Option<CardUid>, WyrdError> {
-    let uid: Option<Uuid> = sqlx::query_scalar(
-        "SELECT card_uid FROM wyrd.cards
+) -> Result<Option<SelectedRepository>, WyrdError> {
+    let row: Option<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT card_uid, selection_occurrence FROM wyrd.cards
           WHERE kind = 'Repository' AND name = $1 AND selected_at IS NOT NULL",
     )
     .bind(name.as_str())
     .fetch_optional(&mut **conn.transaction())
     .await
     .map_err(registry_db_error)?;
-    uid.map(CardUid::from_uuid)
-        .transpose()
-        .map_err(WyrdError::from_card_uid_error)
+    row.map(|(uid, occurrence)| {
+        Ok(SelectedRepository {
+            uid: CardUid::from_uuid(uid).map_err(WyrdError::from_card_uid_error)?,
+            occurrence,
+        })
+    })
+    .transpose()
 }
 
-/// Record a declaration's target Repository version and the version that
-/// was selected when it was written, in the declaration transaction.
+/// Record a declaration's target Repository version and the selection that
+/// was current when it was written, in the declaration transaction.
+///
+/// The caller holds the family's version line, so `expected` is the
+/// selection no settle can change before this transaction commits.
 ///
 /// # Errors
 /// Returns `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE` when the write fails.
@@ -92,16 +114,18 @@ pub async fn record_repository_selection(
     conn: &mut TenantConn<'_>,
     operation_id: DeclarationOperationId,
     target: &CardUid,
-    expected: Option<&CardUid>,
+    expected: Option<&SelectedRepository>,
 ) -> Result<(), WyrdError> {
     sqlx::query(
         "UPDATE wyrd.card_declaration_operations
-            SET selection = 'pending', selection_target_uid = $2, selection_expected_uid = $3
+            SET selection = 'pending', selection_target_uid = $2, selection_expected_uid = $3,
+                selection_expected_occurrence = $4
           WHERE operation_id = $1",
     )
     .bind(operation_id.as_uuid())
     .bind(target.as_uuid())
-    .bind(expected.map(CardUid::as_uuid))
+    .bind(expected.map(|expected| expected.uid.as_uuid()))
+    .bind(expected.map(|expected| expected.occurrence))
     .execute(&mut **conn.transaction())
     .await
     .map_err(registry_db_error)?;
@@ -113,7 +137,7 @@ pub async fn record_repository_selection(
 pub enum RepositorySelection {
     /// The declaration has no Repository root.
     None,
-    /// A Card the declaration owns is not Active yet.
+    /// A member of the declaration's exact graph is not Active yet.
     Pending,
     /// The target is the family's selected version.
     Selected,
@@ -125,25 +149,77 @@ pub enum RepositorySelection {
     },
 }
 
+/// A declaration operation's selection state, read under its row lock.
 #[derive(FromRow)]
 struct SelectionRow {
+    /// `pending`, `selected` or `conflict`; `None` without a Repository root.
     selection: Option<String>,
+    /// The Repository version the declaration selects.
     selection_target_uid: Option<Uuid>,
+    /// The version selected when the declaration was written.
     selection_expected_uid: Option<Uuid>,
+    /// The selection change that selected `selection_expected_uid` then.
+    selection_expected_occurrence: Option<Uuid>,
+    /// The target's family name.
     name: Option<String>,
+    /// Whether the target and every member of the exact graph are Active.
     ready: bool,
+}
+
+/// Lock the pending Repository selections whose exact graph includes
+/// `card_uid`, in operation order, and return their operations.
+///
+/// Membership is the declaration's persisted outcome set (its replay seed),
+/// which includes reused Cards another declaration created, plus the
+/// operation that created the Card and any targeting it. A Card's activation
+/// takes these locks before it locks its Card row, and every settle of the
+/// same operation takes the operation lock first, so the activation that
+/// makes the last member Active observes every other member's committed
+/// state and settles in its own transaction.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE` when the read fails.
+pub async fn lock_card_repository_selections(
+    conn: &mut TenantConn<'_>,
+    card_uid: &CardUid,
+) -> Result<Vec<DeclarationOperationId>, WyrdError> {
+    // ponytail: scans the pending selections of the tenant, which are few;
+    // index the seed membership if pending declarations ever accumulate.
+    let operations: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT o.operation_id FROM wyrd.card_declaration_operations o
+          WHERE o.selection = 'pending'
+            AND (o.selection_target_uid = $1
+                 OR o.operation_id = (SELECT declaration_operation_id FROM wyrd.cards
+                                       WHERE card_uid = $1)
+                 OR o.stored_response->'outcomes'
+                    @> jsonb_build_array(jsonb_build_object(
+                           'card_ref', jsonb_build_object('uid', $1::text))))
+          ORDER BY o.operation_id
+            FOR UPDATE OF o",
+    )
+    .bind(card_uid.as_uuid())
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .map_err(registry_db_error)?;
+    Ok(operations
+        .into_iter()
+        .map(DeclarationOperationId::new)
+        .collect())
 }
 
 /// Settle a declaration's Repository selection, at most once.
 ///
 /// Locks the operation row. A settled operation returns its stored outcome
-/// and changes nothing. Otherwise, once every Card the operation owns and
-/// its target are Active, it locks the family line and compares the
-/// family's selected version with the target and the expected prior
-/// version: the target already selected is reused; the expected version
-/// still selected is replaced by the target; anything else is a conflict.
-/// The decision is stored on the operation and commits with the caller's
-/// transaction.
+/// and changes nothing. Otherwise, once its target and every member of its
+/// exact graph are Active — the Cards in its persisted outcome set, reused
+/// ones included, and the Cards it created — it locks the family line and
+/// compares the family's selection with the target and the selection the
+/// declaration was written from: the target already selected is reused
+/// unchanged; the expected version still selected by the same selection
+/// change is replaced by the target, whose occurrence becomes this
+/// operation; anything else, including a later reselection of the expected
+/// version, is a conflict. The decision is stored on the operation and
+/// commits with the caller's transaction.
 ///
 /// # Errors
 /// Returns `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE` when a read or write
@@ -153,11 +229,17 @@ pub async fn settle_repository_selection(
     operation_id: DeclarationOperationId,
 ) -> Result<RepositorySelection, WyrdError> {
     let row: Option<SelectionRow> = sqlx::query_as(
-        "SELECT o.selection, o.selection_target_uid, o.selection_expected_uid, t.name,
+        "SELECT o.selection, o.selection_target_uid, o.selection_expected_uid,
+                o.selection_expected_occurrence, t.name,
                 COALESCE(t.status = 'active' AND NOT EXISTS (
                     SELECT 1 FROM wyrd.cards c
-                     WHERE c.declaration_operation_id = o.operation_id
-                       AND c.status <> 'active'), false) AS ready
+                     WHERE c.status <> 'active'
+                       AND (c.declaration_operation_id = o.operation_id
+                            OR c.card_uid IN (
+                                SELECT (outcome->'card_ref'->>'uid')::uuid
+                                  FROM jsonb_array_elements(
+                                           COALESCE(o.stored_response->'outcomes', '[]'))
+                                       AS outcome))), false) AS ready
            FROM wyrd.card_declaration_operations o
            LEFT JOIN wyrd.cards t ON t.card_uid = o.selection_target_uid
           WHERE o.operation_id = $1
@@ -185,7 +267,9 @@ pub async fn settle_repository_selection(
         "selected" => return Ok(RepositorySelection::Selected),
         "conflict" => {
             return Ok(RepositorySelection::Conflict {
-                current: selected_repository(conn, &name).await?,
+                current: selected_repository(conn, &name)
+                    .await?
+                    .map(|current| current.uid),
             });
         }
         _ if !row.ready => return Ok(RepositorySelection::Pending),
@@ -193,12 +277,17 @@ pub async fn settle_repository_selection(
     }
     lock_version_line(conn, CardKind::Repository, &name).await?;
     let current = selected_repository(conn, &name).await?;
-    let current_uuid = current.as_ref().map(CardUid::as_uuid);
-    let outcome = if current_uuid == Some(target) {
+    let current_pair = current
+        .as_ref()
+        .map(|current| (current.uid.as_uuid(), current.occurrence));
+    let expected_pair = row
+        .selection_expected_uid
+        .zip(row.selection_expected_occurrence);
+    let outcome = if current_pair.is_some_and(|(uid, _)| uid == target) {
         RepositorySelection::Selected
-    } else if current_uuid == row.selection_expected_uid {
+    } else if current_pair == expected_pair {
         sqlx::query(
-            "UPDATE wyrd.cards SET selected_at = NULL
+            "UPDATE wyrd.cards SET selected_at = NULL, selection_occurrence = NULL
               WHERE kind = 'Repository' AND name = $1 AND selected_at IS NOT NULL",
         )
         .bind(name.as_str())
@@ -206,15 +295,19 @@ pub async fn settle_repository_selection(
         .await
         .map_err(registry_db_error)?;
         sqlx::query(
-            "UPDATE wyrd.cards SET selected_at = statement_timestamp() WHERE card_uid = $1",
+            "UPDATE wyrd.cards SET selected_at = statement_timestamp(), selection_occurrence = $2
+              WHERE card_uid = $1",
         )
         .bind(target)
+        .bind(operation_id.as_uuid())
         .execute(&mut **conn.transaction())
         .await
         .map_err(registry_db_error)?;
         RepositorySelection::Selected
     } else {
-        RepositorySelection::Conflict { current }
+        RepositorySelection::Conflict {
+            current: current.map(|current| current.uid),
+        }
     };
     let stored = if outcome == RepositorySelection::Selected {
         "selected"
@@ -232,10 +325,14 @@ pub async fn settle_repository_selection(
     Ok(outcome)
 }
 
+/// A Card's Repository selection view as read from its row.
 #[derive(FromRow)]
 struct RepositoryStatusRow {
+    /// Whether this version is its family's selected version.
     selected: bool,
+    /// The family's selected version, if any.
     selected_version: Option<String>,
+    /// The connected `owner/name` for the Repository's id, if reachable.
     full_name: Option<String>,
 }
 

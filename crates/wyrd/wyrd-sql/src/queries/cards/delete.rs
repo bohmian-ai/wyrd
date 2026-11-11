@@ -74,6 +74,11 @@ pub async fn soft_delete_card_with_kind(
     soft_delete_card_with_expected_kind(conn, uid, Some(expected_kind)).await
 }
 
+/// The shared soft delete behind every UID and exact-reference delete.
+///
+/// It clears the Card's Repository selection with its status, so a deleted
+/// version is never its family's selected version and no other version is
+/// selected in its place.
 async fn soft_delete_card_with_expected_kind(
     conn: &mut TenantConn<'_>,
     uid: &CardUid,
@@ -127,6 +132,8 @@ async fn soft_delete_card_with_expected_kind(
 
     sqlx::query(
         "UPDATE wyrd.cards SET status = 'deleted', \
+                selected_at = NULL, \
+                selection_occurrence = NULL, \
                 reconcile_kind = 'cleanup', \
                 reconcile_status = 'pending', \
                 reconcile_attempts = 0, \

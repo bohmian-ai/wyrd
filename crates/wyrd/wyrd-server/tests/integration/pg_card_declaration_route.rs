@@ -37,6 +37,7 @@ use wyrd_sql::queries::verifier_executions::{
     ScheduleOutcome, ScheduleSkip, VerifierExecutionQueue,
 };
 use wyrd_storage::settings::{BackendConfig, StorageSettings};
+use wyrd_testing::github::GithubAppMock;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 /// An assertion Verifier spec over one `json` slot.
@@ -5712,5 +5713,348 @@ async fn compensation_records_inventory_deletion() {
     assert!(objects.deleted);
     assert!(objects.files.is_empty());
 
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Storage settings for a bound server writing Card blobs under `root`.
+fn local_storage(root: &std::path::Path) -> StorageSettings {
+    StorageSettings {
+        backend: BackendConfig::Local {
+            root: root.to_path_buf(),
+        },
+        require_encryption: false,
+        presign_ttl: Duration::from_mins(10),
+        part_size_bytes: 16 * 1024 * 1024,
+        multipart_threshold_bytes: 100 * 1024 * 1024,
+    }
+}
+
+/// Associate the server's tenant with installation `101` on the mock's host,
+/// with repository `4242` (`acme/policy`) selected.
+///
+/// # Panics
+/// Panics when the slot cannot be written.
+async fn connect_policy_repository(server: &WyrdTestServer, mock: &GithubAppMock) {
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    sqlx::query(
+        "INSERT INTO wyrd.github_installations
+             (data_tenant_id, connection_id, revision, host, installation_id, repositories,
+              connected_at)
+         VALUES ($1, $2, 1, $3, 101,
+                 '[{\"repository_id\":\"4242\",\"full_name\":\"acme/policy\"}]'::jsonb,
+                 statement_timestamp())",
+    )
+    .bind(server.data_tenant_id().as_uuid())
+    .bind(Uuid::now_v7())
+    .bind(mock.host())
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("slot associates");
+    conn.commit().await.expect("slot commits");
+}
+
+/// Write `files` into `dir` and return the loader's declaration body for the
+/// Card at `dir/entry`.
+///
+/// # Panics
+/// Panics when a file cannot be written or the tree does not load.
+fn loaded_body(dir: &std::path::Path, files: &[(&str, &str)], entry: &str) -> Value {
+    for (name, contents) in files {
+        std::fs::write(dir.join(name), contents).expect("card file writes");
+    }
+    let input = build_declaration_input(load(&dir.join(entry)).expect("loader tree builds"))
+        .expect("declaration input builds");
+    serde_json::to_value(input.to_declare_card_request()).expect("request serializes")
+}
+
+/// Declare `body` under `key` and return the answered status and body.
+///
+/// # Panics
+/// Panics when the route does not respond.
+async fn declare_body(
+    server: &WyrdTestServer,
+    jwt: &str,
+    key: &str,
+    body: &Value,
+) -> (StatusCode, Value) {
+    let response = server
+        .oneshot_authenticated(jwt, request_with_body(key, body.clone()))
+        .await
+        .expect("declaration responds");
+    let status = response.status();
+    (status, response_json(response).await)
+}
+
+/// Run one tenant read in its own transaction.
+///
+/// # Panics
+/// Panics when the query fails.
+async fn tenant_row<T>(server: &WyrdTestServer, sql: &'static str, bind: &str) -> T
+where
+    T: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Send + Unpin,
+{
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let row = sqlx::query_as::<_, T>(sql)
+        .bind(bind)
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("tenant row reads");
+    conn.commit().await.expect("tenant read commits");
+    row
+}
+
+/// The selected version of Repository family `name`, if any.
+async fn selected_version(server: &WyrdTestServer, name: &str) -> Option<String> {
+    let (version,): (Option<String>,) = tenant_row(
+        server,
+        "SELECT max(version) FILTER (WHERE selected_at IS NOT NULL) FROM wyrd.cards \
+          WHERE kind = 'Repository' AND name = $1",
+        name,
+    )
+    .await;
+    version
+}
+
+/// The UID and lifecycle status of the only Card named `name`.
+async fn card_state(server: &WyrdTestServer, name: &str) -> (CardUid, String) {
+    let (uid, status): (Uuid, String) = tenant_row(
+        server,
+        "SELECT card_uid, status FROM wyrd.cards WHERE name = $1",
+        name,
+    )
+    .await;
+    (
+        CardUid::from_uuid(uid).expect("stored UID is valid"),
+        status,
+    )
+}
+
+/// The UID and lifecycle status of `policy` version `version`.
+async fn policy_state(server: &WyrdTestServer, version: &str) -> (CardUid, String) {
+    let (uid, status): (Uuid, String) = tenant_row(
+        server,
+        "SELECT card_uid, status FROM wyrd.cards \
+          WHERE kind = 'Repository' AND name = 'policy' AND version = $1",
+        version,
+    )
+    .await;
+    (
+        CardUid::from_uuid(uid).expect("stored UID is valid"),
+        status,
+    )
+}
+
+/// Push a pending reconciliation of `card_uid` an hour out, so only the test
+/// decides when the background reconciler next tries it.
+async fn hold_reconciliation(server: &WyrdTestServer, card_uid: &CardUid) {
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    sqlx::query(
+        "UPDATE wyrd.cards SET reconcile_next_attempt_at = now() + interval '1 hour' \
+         WHERE card_uid = $1 AND reconcile_status = 'pending'",
+    )
+    .bind(card_uid.as_uuid())
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("reconciliation holds");
+    conn.commit().await.expect("hold commits");
+}
+
+/// Wait until the Card named `name` reaches lifecycle `status`.
+///
+/// # Panics
+/// Panics when it does not within ten seconds.
+async fn wait_for_card_status(server: &WyrdTestServer, name: &str, status: &str) {
+    for _ in 0..100 {
+        if card_state(server, name).await.1 == status {
+            return;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    panic!(
+        "{name} did not become {status}; it is {}",
+        card_state(server, name).await.1
+    );
+}
+
+const POLICY_V1: &str = "apiVersion: wyrd/v1\nkind: Repository\nmetadata:\n  name: policy\n  version: 1.0.0\nspec:\n  repository_id: \"4242\"\n  verified_by: []\n";
+const POLICY_V2: &str = "apiVersion: wyrd/v1\nkind: Repository\nmetadata:\n  name: policy\n  version: 2.0.0\nspec:\n  repository_id: \"4242\"\n  verified_by:\n    - verifier: ./a-review.yaml\n      runs_on: {kind: pull_request}\n    - verifier: ./z-review.yaml\n      runs_on: {kind: pull_request}\n";
+
+/// An exact metadata-only Verifier named `name`.
+fn review_verifier(name: &str) -> String {
+    format!(
+        "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: {name}\n  version: 1.0.0\nspec:\n  description: The answer is approve.\n  inputs:\n    answer: {{type: json}}\n  requirements:\n    - id: approves\n      statement: The answer is approve\n      check: {{kind: assert, path: inputs.answer, operator: equals, expected: approve}}\n"
+    )
+}
+
+/// A declaration reusing a Pending exact Verifier left by an earlier failed
+/// attempt selects only once that Verifier is Active, and the background
+/// reconciler makes that selection without a new declaration, in the same
+/// transaction as the activation.
+///
+/// Attempt A registers `z-review` while storage is broken, leaving it
+/// Pending. B reuses it beside a fresh `a-review` under a new `policy`
+/// version while only `z-review`'s blob path is blocked. Reconciliation then
+/// activates B's own Cards and a same-key replay revisits them, and the old
+/// version stays selected throughout. Once `z-review` can be written, an
+/// injected failure of its selection rolls back its activation too; without
+/// it the reconciler activates `z-review` and selects B, and B's replay
+/// answers success.
+///
+/// # Panics
+/// Panics when the old version is replaced before `z-review` is Active, a
+/// failed selection leaves `z-review` Active, or B is not selected by the
+/// reconciler.
+#[tokio::test(flavor = "current_thread")]
+async fn reused_pending_member_gates_selection_until_reconciled() {
+    let storage_root = tempfile::tempdir().expect("storage root creates");
+    let mock = GithubAppMock::start().expect("the GitHub mock starts");
+    let server = WyrdTestServer::builder()
+        .with_storage_settings(local_storage(storage_root.path()))
+        .with_github_app_for_test(&mock)
+        .start_bound()
+        .await
+        .expect("bound test server starts");
+    connect_policy_repository(&server, &mock).await;
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("repository-reused-member", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let checkout = tempfile::tempdir().expect("checkout creates");
+    let (z_review, a_review) = (review_verifier("z-review"), review_verifier("a-review"));
+
+    let old = loaded_body(checkout.path(), &[("v1.yaml", POLICY_V1)], "v1.yaml");
+    let (status, body) = declare_body(&server, &jwt, "reused-member-old", &old).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        selected_version(&server, "policy").await.as_deref(),
+        Some("1.0.0")
+    );
+
+    let moved_storage_root = storage_root.path().with_extension("moved");
+    std::fs::rename(storage_root.path(), &moved_storage_root).expect("storage root moves");
+    std::fs::write(storage_root.path(), b"not a directory").expect("broken storage root writes");
+    let attempt_a = loaded_body(
+        checkout.path(),
+        &[("z-review.yaml", &z_review)],
+        "z-review.yaml",
+    );
+    let (status, body) = declare_body(&server, &jwt, "reused-member-a", &attempt_a).await;
+    assert_ne!(status, StatusCode::CREATED, "{body}");
+    let (z_uid, z_status) = card_state(&server, "z-review").await;
+    assert_eq!(
+        z_status, "pending",
+        "A registered z-review before its blob failed"
+    );
+    hold_reconciliation(&server, &z_uid).await;
+    std::fs::remove_file(storage_root.path()).expect("broken storage root removes");
+    std::fs::rename(&moved_storage_root, storage_root.path()).expect("storage root restores");
+    let z_blocker = storage_root
+        .path()
+        .join(server.data_tenant_id().to_string())
+        .join("cards")
+        .join(z_uid.to_string());
+    std::fs::create_dir_all(z_blocker.parent().expect("cards directory")).expect("cards dir");
+    std::fs::write(&z_blocker, b"blocks only z-review").expect("z-review blob path blocks");
+
+    let attempt_b = loaded_body(
+        checkout.path(),
+        &[("a-review.yaml", &a_review), ("v2.yaml", POLICY_V2)],
+        "v2.yaml",
+    );
+    let (status, body) = declare_body(&server, &jwt, "reused-member-b", &attempt_b).await;
+    assert_ne!(status, StatusCode::CREATED, "{body}");
+    hold_reconciliation(&server, &z_uid).await;
+    let (root_uid, _) = policy_state(&server, "2.0.0").await;
+    let (a_uid, _) = card_state(&server, "a-review").await;
+    make_reconciliation_due(&server, &a_uid).await;
+    make_reconciliation_due(&server, &root_uid).await;
+    wait_for_card_status(&server, "a-review", "active").await;
+    for _ in 0..100 {
+        if policy_state(&server, "2.0.0").await.1 == "active" {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    let root_status = policy_state(&server, "2.0.0").await.1;
+    assert_eq!(root_status, "active", "B's own root recovers");
+    assert_eq!(card_state(&server, "z-review").await.1, "pending");
+    assert_eq!(
+        selected_version(&server, "policy").await.as_deref(),
+        Some("1.0.0"),
+        "B's recovered Cards cannot select while reused z-review is Pending"
+    );
+
+    let (status, body) = declare_body(&server, &jwt, "reused-member-b", &attempt_b).await;
+    assert_ne!(status, StatusCode::CREATED, "{body}");
+    hold_reconciliation(&server, &z_uid).await;
+    assert_eq!(
+        selected_version(&server, "policy").await.as_deref(),
+        Some("1.0.0"),
+        "B's replay cannot select while reused z-review is Pending"
+    );
+
+    std::fs::remove_file(&z_blocker).expect("z-review blob path unblocks");
+    let superuser = server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+    sqlx::query(
+        "CREATE FUNCTION wyrd.refuse_selection() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE EXCEPTION 'selection refused by test'; END $$",
+    )
+    .execute(&superuser)
+    .await
+    .expect("refusal function creates");
+    sqlx::query(
+        "CREATE TRIGGER refuse_selection BEFORE UPDATE OF selection \
+           ON wyrd.card_declaration_operations FOR EACH ROW \
+           WHEN (NEW.selection = 'selected') EXECUTE FUNCTION wyrd.refuse_selection()",
+    )
+    .execute(&superuser)
+    .await
+    .expect("refusal trigger creates");
+    let (_, attempts_before) = reconciliation_state(&server, &z_uid).await;
+    make_reconciliation_due(&server, &z_uid).await;
+    wait_for_reconciliation_state(&server, &z_uid, attempts_before + 1, "pending").await;
+    assert_eq!(
+        card_state(&server, "z-review").await.1,
+        "pending",
+        "a failed selection rolls back the activation that made it"
+    );
+    assert_eq!(
+        selected_version(&server, "policy").await.as_deref(),
+        Some("1.0.0")
+    );
+
+    sqlx::query("DROP TRIGGER refuse_selection ON wyrd.card_declaration_operations")
+        .execute(&superuser)
+        .await
+        .expect("refusal trigger drops");
+    sqlx::query("DROP FUNCTION wyrd.refuse_selection()")
+        .execute(&superuser)
+        .await
+        .expect("refusal function drops");
+    make_reconciliation_due(&server, &z_uid).await;
+    wait_for_card_status(&server, "z-review", "active").await;
+    assert_eq!(
+        selected_version(&server, "policy").await.as_deref(),
+        Some("2.0.0"),
+        "the reconciler selects B once its last member is Active"
+    );
+
+    let (status, body) = declare_body(&server, &jwt, "reused-member-b", &attempt_b).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
     server.shutdown().await.expect("test server shuts down");
 }

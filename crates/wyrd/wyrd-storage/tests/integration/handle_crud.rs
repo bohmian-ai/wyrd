@@ -1,8 +1,8 @@
 //! Cross-backend `StorageHandle` data-plane CRUD suite.
 //!
 //! [`run_handle_crud`] is the single body exercised against every backend
-//! through the public [`StorageHandle`] surface (`put_object` / `get_object` /
-//! `get_object_bounded` / `list_objects` / `delete_object`). It is the server-side direct-CRUD path:
+//! through the public [`StorageHandle`] surface (`put_object` / `create_object` /
+//! `get_object` / `get_object_bounded` / `list_objects` / `delete_object`). It is the server-side direct-CRUD path:
 //! an agent request resolves a tenant from its JWT, a tenant-scoped
 //! [`ValidatedPath`] is built, and the handle reads/writes/lists/deletes the
 //! object itself (no client presign round-trip).
@@ -20,8 +20,9 @@ use wyrd_storage::error::StorageError;
 use wyrd_storage::settings;
 use wyrd_storage::{LocalSigner, StorageHandle, ValidatedPath, tenant_path};
 
-/// Write/read/list/delete round-trip plus a missing-key `NotFound`, all through
-/// the public [`StorageHandle`] data-plane API.
+/// Write/read/list/delete round-trip, a missing-key `NotFound`, and a
+/// create-only write that refuses an occupied path, all through the public
+/// [`StorageHandle`] data-plane API.
 ///
 /// Every object lives under a fresh tenant and Card prefix and is deleted before
 /// returning, so shared cloud buckets stay clean on success.
@@ -29,7 +30,8 @@ use wyrd_storage::{LocalSigner, StorageHandle, ValidatedPath, tenant_path};
 /// # Panics
 /// Panics when any put, get, bounded get, list, or delete fails, a bounded
 /// get holds more than one byte past its limit, the listing differs, or a
-/// deleted or missing key is not `ObjectNotFound`. A panic or cancellation
+/// deleted or missing key is not `ObjectNotFound`, or a create-only write
+/// overwrites an existing object. A panic or cancellation
 /// mid-run can leave up to three small objects under that unique prefix.
 async fn run_handle_crud(handle: &StorageHandle) {
     let tenant = DataTenantId::new_v7();
@@ -109,6 +111,33 @@ async fn run_handle_crud(handle: &StorageHandle) {
         matches!(err, StorageError::ObjectNotFound { .. }),
         "expected ObjectNotFound for missing key, got {err:?}"
     );
+
+    let cache = tenant_path::code_review(tenant, &format!("crud/{card}/snapshot"))
+        .expect("code-review path");
+    assert!(
+        handle
+            .create_object(&cache, b"first".to_vec())
+            .await
+            .expect("create"),
+        "a free path is created"
+    );
+    assert!(
+        !handle
+            .create_object(&cache, b"second".to_vec())
+            .await
+            .expect("create again"),
+        "an occupied path is refused"
+    );
+    assert_eq!(
+        handle.get_object(&cache).await.expect("get created"),
+        b"first",
+        "a refused create leaves the object unchanged"
+    );
+    handle.delete_object(&cache).await.expect("delete created");
+    handle
+        .delete_object(&cache)
+        .await
+        .expect("deleting an absent object succeeds");
 
     // Leave the bucket clean for cloud lanes.
     handle

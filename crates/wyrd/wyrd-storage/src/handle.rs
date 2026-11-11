@@ -390,6 +390,40 @@ impl StorageHandle {
         active.finish(result, len)
     }
 
+    /// Create an object only when its path is free.
+    ///
+    /// Returns `true` when this call wrote the object and `false` when an
+    /// object already exists at `path`, which is left unchanged. Every
+    /// backend uses `object_store`'s conditional create, so a failed write
+    /// never leaves a partial object readable.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Backend`] when the backend write fails.
+    #[tracing::instrument(skip(self, path, bytes), fields(backend = ?self.backend(), len = bytes.len()))]
+    pub async fn create_object(
+        &self,
+        path: &ValidatedPath,
+        bytes: Vec<u8>,
+    ) -> Result<bool, StorageError> {
+        let len = bytes.len() as u64;
+        let active = self.start(StorageOperation::Put);
+        let options = object_store::PutOptions {
+            mode: object_store::PutMode::Create,
+            ..object_store::PutOptions::default()
+        };
+        let result = match self
+            .objects
+            .put_opts(&path.location(), bytes.into(), options)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::AlreadyExists { .. }) => Ok(false),
+            Err(error) => Err(self.store_error(&error, "create_object", path)),
+        };
+        let written = if matches!(result, Ok(true)) { len } else { 0 };
+        active.finish(result, written)
+    }
+
     /// List object keys beneath a tenant-validated path.
     ///
     /// Returns the full backend keys of every object strictly under `path`

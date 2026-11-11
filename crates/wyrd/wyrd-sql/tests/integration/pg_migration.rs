@@ -941,8 +941,9 @@ mod pg_tests {
     ///
     /// Panics when the owner pool cannot connect, either migration run fails, a
     /// required relation is missing or a retired one exists, or the platform
-    /// resolver, `current_tenant` parallel safety, or `auth_%` and
-    /// `gateway_batch%` RLS metadata differ from the baseline.
+    /// resolver, `current_tenant` parallel safety, or `auth_%`, `github_%`,
+    /// `code_review_%`, and `gateway_batch%` RLS metadata differ from the
+    /// baseline.
     async fn migrations_apply_and_are_idempotent() {
         let Some(url) = database_url() else {
             return;
@@ -1012,6 +1013,16 @@ mod pg_tests {
         .await;
         assert_regclass_exists(pool, "wyrd.github_installations", true).await;
         assert_rls_metadata(pool, "github_%", &["github_installations"]).await;
+        assert_rls_metadata(
+            pool,
+            "code_review_%",
+            &[
+                "code_review_contexts",
+                "code_review_snapshot_pointers",
+                "code_review_snapshot_records",
+            ],
+        )
+        .await;
         assert_rls_metadata(
             pool,
             "gateway_batch%",

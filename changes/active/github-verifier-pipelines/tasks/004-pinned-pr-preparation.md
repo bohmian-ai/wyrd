@@ -158,8 +158,8 @@ library's `main`.
 ## Evidence
 
 Library: `bohmian-code-review` branch `wyrd-production` at
-`b8a4f37857d48a0b57669db5c4c6ed11aba59766`, PR #6 (open, unmerged). Paths
-below are relative to `crates/bohmian-code-review-pipeline/` there (`J` =
+`5a5fb1679638fec5a65e59fe95c345440b954b73`, PR #6 (open, not yet reviewed).
+Paths below are relative to `crates/bohmian-code-review-pipeline/` there (`J` =
 `tests/pipeline_journey.rs`). Wyrd: `S` =
 `crates/wyrd/wyrd-server/tests/integration/pg_code_review_cache.rs`, `Q` =
 `crates/wyrd/wyrd-sql/tests/integration/pg_code_review_cache.rs`, `A` =
@@ -167,42 +167,43 @@ below are relative to `crates/bohmian-code-review-pipeline/` there (`J` =
 
 | Obligation | Implementation evidence | Assertion | Verification evidence | Result |
 |---|---|---|---|---|
-| L1: facade takes PR number, base, head, head repository and optional baseline | `src/review.rs:147` `ReviewPipeline::pinned(client, identity, &PullRequestPins, Option<&ObjectSha>)` | J:948 calls it; J:965 head repository and merge base | library `mise run test:rust` | PASS |
-| L2: comparisons obey pins when the live PR moved | `src/comparison.rs` reads pins, never the live head | J:974 `(full.base, full.head) == (c, a)` with live head `f` (J:877) | `test:rust` | PASS |
-| L3: full is merge base → head | `Comparisons::pull_request` | J:974, J:1111, J:1113 | `test:rust` | PASS |
-| L4: active is baseline → head; none means full | `PinnedReview.active` | J:977 `active == full`; J:1106 `active.base == baseline` | `test:rust` | PASS |
-| L5: rewritten/unavailable baseline reported | `ComparisonError::BaselineUnusable` | J:1142 `Rewritten`, J:1143 `Unavailable`, J:1151 | `test:rust` | PASS |
-| L6: status, old path, hunks; renames and deletions | `ChangedFile` | J:986 renamed with old path; J:236 removed fixture asserted in the same file table; J:1050 hunks via spans; `src/comparison.rs:691` hunk split | `test:rust` | PASS |
-| L7: source text or explicit binary/unavailable/excluded | `Source` | J:1022 `Binary`; J:1031 `VendoredSegment`; J:1038 `Oversize`; `src/comparison.rs:721`, `:741` | `test:rust` | PASS |
-| L8: pinned metadata incl. fork head repository and merge base | `PullRequestMetadata` | J:965, J:970 (title, body, draft) | `test:rust` | PASS |
-| L9: unchanged `ReviewContext`, spans carry source | `PrContext::run` reused | J:1050 `assert_pinned_spans` | `test:rust` | PASS |
-| L10: truncation/pagination fails explicitly | `ComparisonError::Truncated`, `PatchUnavailable` | J:1181, J:1172; J:1161 fork mismatch | `test:rust` | PASS |
-| L11: omissions stay coverage data | context omissions | J:1196 | `test:rust` | PASS |
-| L12: empty active comparison valid | `ChangeSet` empty | J:1120 | `test:rust` | PASS |
-| L13: warm reuses snapshot, no rebuild | `ensure_snapshot` | J:958, J:1063 archive count 1; J:1064 no file refetch | `test:rust` | PASS |
+| L1: facade takes PR number, base, head, head repository and optional baseline | `src/review.rs:147` `ReviewPipeline::pinned(client, identity, &PullRequestPins, Option<&ObjectSha>)` | J:955 cold call, J:1061 warm call; J:966 fork head repository | library `mise run test:rust` | PASS |
+| L2: comparisons obey pins when the live PR moved | the comparison reads pins, never the live head | J:975 `(full.base, full.head) == (c, a)` with live head `f`; J:1071-1077 no request names `f` | `test:rust` | PASS |
+| L3: full is merge base → head | `src/review.rs` full uses `source.merge_base` | J:1275 base `5`, merge base `c`; J:1285 files equal the merge-base diff (`pinned_full_review_compares_from_the_merge_base`) | `test:rust`; a mutation comparing from `pins.base` fails it | PASS |
+| L4: active is baseline → head; none means full | `PinnedReview.active` | J:978 `active == full`; J:1107 `active.base == baseline` | `test:rust` | PASS |
+| L5: rewritten/unavailable baseline reported | `ComparisonError::BaselineUnusable` | J:1166 `Rewritten`, J:1167 `Unavailable` | `test:rust` | PASS |
+| L6: status, old path, hunks; renames and deletions | `ChangedFile` | J:988 deleted and kinds table; J:1007 renamed old path; J:1001, J:1004 hunks; `src/comparison.rs:691` hunk split | `test:rust` | PASS |
+| L7: exact before/after source or explicit binary/unavailable/excluded | `Source`, blobs read by verified tree id | J:997 before/after text; J:1023 `Binary`; J:1032 `VendoredSegment`; J:1039 `Oversize`; `src/comparison.rs:721`, `:741` | `test:rust` | PASS |
+| L8: pinned metadata: number, URL, title, body, state, draft, base, head, fork repository, merge base | `PullRequestSource` | J:962-978 number, base, head, fork, merge base, title, body, draft, URL; J:973 `state == Open` | `test:rust` | PASS |
+| L9: unchanged `ReviewContext` for the active comparison; spans carry source | `PrContext::run_files(active_files)` | J:1051 span text and blob; J:1136 incremental context names only the active file while the full one names others | `test:rust` | PASS |
+| L10: truncation verified; reconstruct or fail | `GitHubClient::tree` splits truncated listings; `Truncated`, `Unverified`, `PatchUnavailable` | J:1205 compare truncated; J:1242 unrebuildable tree truncated; J:1336 truncated head listing rebuilt equals the untruncated review; J:1228 `Unverified`; J:1196 patch unavailable | `test:rust`; a mutation disabling the rebuild fails J:1336 | PASS |
+| L11: omissions stay coverage data | context omissions | J:1220 | `test:rust` | PASS |
+| L12: empty active comparison valid | `ChangeSet` empty | J:1144 | `test:rust` | PASS |
+| L13: warm reuses snapshot, no rebuild | `ensure_snapshot` | J:958, J:1064 archive count stays 1 | `test:rust` | PASS |
 | L14: no policy/baseline/finding/verdict/tenant/delivery decision | signature takes caller pins and baseline only and returns evidence | `src/review.rs:147` | source review | PASS |
-| L15: existing workflows unchanged | no change to `context`/refresh/cache rules | all prior library suites | library `test:rust`: every binary `ok`, exit 0 | PASS |
-| W1: object adapter create-only, `AlreadyExists`, `NotFound`, idempotent delete, backend failure | `A:95-97`, `A:112-113`; `StorageHandle::create_object` | S:369 `AlreadyExists`; S:373 unchanged; S:376 `NotFound`; S:375 delete twice; S:386 refused key is `Backend`; `handle_crud.rs` `run_create_only` refused create and unchanged bytes | `pg_code_review_cache` (server); `test:storage:matrix` (local, RustFS, Azurite; GCS emulator runs CRUD only); `gcs_create_only` added to `test:storage:gcs:cloud` | PASS |
-| W2: three tables with forced tenant RLS | `migrations/20261111000000_code_review_cache.sql:63,71,79` | `pg_migration.rs` `assert_rls_metadata("code_review_%", …)`; Q:313 isolation | `pg_migration::pg_tests::migrations_apply_and_are_idempotent`; `mise run test:sql` | PASS |
-| W3: tree CAS and insert-if-absent under competition | `publish_code_review_snapshot_pointer` | Q:114 exactly one first publication; Q:118/122 swap on tree; S:428 one of two joined publishes wins; S:436 stale swap refused | `test:sql`; server `pg_code_review_cache` | PASS |
-| W4: claims vs upserts/publication, grace, interrupted retry | `claim_unreferenced_code_review_snapshots`; `A:318` | Q:160-196; S:454-461 grace; S:463 claim; S:471 `Collecting`; S:478 retried collect; S:485 object gone | same | PASS |
-| W5: context upsert keeps stamps; absent/expired/live; backend distinct | `upsert_code_review_context` no-op update | Q:256, Q:263-272; S:528 stamps; S:529 Live; S:547 Absent; S:559/567 Backend; S:573 Expired; S:581-589 no extension | same | PASS |
-| W6: scope by tenant/installation/numeric repo; isolation; rename continuity | PK columns; `A` `repository(identity)` uses numeric IDs | Q:337-360; S:316 tenant prefix; S:337-347 rename keeps snapshot and context; S:547 other tenant Absent | same | PASS |
-| W7: `TenantConn`, `OperatorPool` expiry, `statement_timestamp()`, no transaction across IO | `A:214-226` one conn per statement, committed before object IO; `A:441` operator pool; `A:450` tenant mismatch refused; SQL uses `statement_timestamp()` + `make_interval` | Q:287 sweep; S:600 `collect_expired` deletes record and object; S:610 object gone | `check:tenant-isolation`, `check:deps`, `test:sql` | PASS |
-| W8: no object bytes or payloads in Postgres | migration has keys, JSON metadata and stamps; no `BYTEA` | migration source review; S:310 objects in storage | schema review | PASS |
-| W9: actual pipeline over real adapters cold/warm | `Custody` uses Postgres plus a local `StorageHandle` | S:295/S:324 archive count 1 cold and warm; S:300 active == full; S:329-330 warm equals cold | `pinned_review_runs_cold_and_warm_over_wyrd_custody` | PASS |
+| L15: existing workflows unchanged | no change to `context`/refresh/cache rules | all prior library suites | `mise run test:rust`, `lints`, `fmt:check` exit 0 | PASS |
+| W1: object adapter create-only, `AlreadyExists`, `NotFound`, idempotent delete, backend failure | `A:95-97`, `A:112-113`; `StorageHandle::create_object` | S:371 `AlreadyExists`; S:378 `NotFound`; S:402, S:406 failing store is `Backend` on create and read; refused foreign key is `Backend`; `handle_crud.rs` `run_create_only` | server `pg_code_review_cache`; `test:storage:matrix` (local, RustFS, Azurite; GCS emulator runs CRUD only); `gcs_create_only` added to `test:storage:gcs:cloud` | PASS |
+| W2: three tables with forced tenant RLS | migration lines 63, 71, 79 | `pg_migration.rs` `assert_rls_metadata("code_review_%", …)` | `pg_migration::pg_tests::migrations_apply_and_are_idempotent`; `mise run test:sql` | PASS |
+| W3: tree CAS and insert-if-absent under competition | `publish_code_review_snapshot_pointer` | Q:114 exactly one first publication; Q:118-122 swap on tree; S:447 one of two joined publishes wins; S:455 stale swap refused | `test:sql`; server `pg_code_review_cache` | PASS |
+| W4: claims vs upserts and publication, grace, interrupted retry | one `UPDATE … RETURNING` claim; touch `WHERE NOT claimed` | Q:418 aged record touched or claimed, never both, over 24 joined rounds; Q:165 referenced record never claimed; Q:160 grace; S:480 grace; S:490 `Collecting`; S:497 retried collect deletes the object | `test:sql`; a mutation dropping the claim guard fails Q:418 | PASS |
+| W5: context upsert keeps stamps; absent/expired/live; backend distinct | no-op `DO UPDATE` | Q:256, Q:263-272; S:547 stamps; S:566 Absent; S:578 Backend; S:592 Expired; S:608 no extension | same | PASS |
+| W6: scope by tenant, installation and numeric repository; isolation; rename continuity | primary key columns; `A` `repository(identity)` uses numeric IDs | Q:475-489 sibling repository and installation see and claim nothing; Q:517 a sibling's pointer does not protect the record; Q:313 tenant isolation; S:337-347 rename keeps snapshot and context | same; a mutation dropping repository correlation fails Q:517 | PASS |
+| W7: `TenantConn`, `OperatorPool` expiry, `statement_timestamp()` deadlines, no transaction across IO | `A:214-226` one conn per statement, committed before object IO; `A:441` operator pool; `A:450` tenant mismatch refused; SQL binds durations into `statement_timestamp()` + `make_interval` | Q:229-232 stamps from the bound lifetime; Q:287 sweep; S:619 `collect_expired` deletes record and object | `check:tenant-isolation`, `check:deps`, `test:sql` | PASS |
+| W8: no object bytes or payloads in Postgres; expiry never touches retained evidence | migration holds keys, JSON metadata and stamps only (no `BYTEA`); objects live only under `<tenant>/code-review/` | `tenant_path.rs:294-301` code-review paths stay under their own prefix with no Card UID; S:316 every object under that prefix | schema review; storage unit test | PASS |
+| W9: actual pipeline over real adapters cold/warm | `Custody` uses Postgres plus a local `StorageHandle` | S:295, S:324 archive count 1 cold and warm; S:300 active == full; S:329-330 warm equals cold | `pinned_review_runs_cold_and_warm_over_wyrd_custody` | PASS |
 | D1: design docs state custody, cache not canonical | `wyrd-design.md:2098`; `bifrost-design.md:654` | doc diff | `git diff --check` | PASS |
-| D2: committed, pushed revision with PR; Wyrd pins it | `Cargo.toml:257` rev `b8a4f378…`; `Cargo.lock:1054` | lockfile source | `check:deps`; build | PASS |
+| D2: reviewed, committed, pushed library revision; Wyrd pins it | `Cargo.toml:257` rev `5a5fb167…`; `Cargo.lock` | lockfile source | `check:deps`; build | FAIL: library PR #6 is pushed but not yet reviewed or merged |
 
 ### Commands
 
-- Library: `mise run test:rust` (exit 0; every binary `test result: ok`).
+- Library: `mise run test:rust`, `mise run lints`, `mise run fmt:check` (exit 0).
   Deviation: the task text names `cargo nextest`, but the library pins no
-  nextest version (`mise ERROR No version is set for shim: cargo-nextest`).
-  `test:rust` is its managed aggregate and covers `pipeline_journey` with
-  `testing`.
+  nextest version. `test:rust` is its managed aggregate and runs
+  `pipeline_journey` with `testing`.
+- `scripts/postgres/with-test-postgres.sh -- mise exec -- cargo nextest run --locked -p wyrd-sql --test integration -E 'test(/^pg_code_review_cache::/)'`: 6/6.
 - `scripts/postgres/with-test-postgres.sh -- mise exec -- cargo nextest run --locked -p wyrd-server --test integration -E 'test(/^pg_code_review_cache::/)'`: 4/4.
-- `mise run test:sql`: 222, 7, 88 and 3 passed.
+- `mise run test:sql`: 222, 7, 88 and 3 passed (before the two new SQL cases,
+  which pass in the selector above).
 - `mise run test:storage:matrix`: every shard passed.
 - `mise run lints`, `mise run fmt`, `check:tenant-isolation`, `check:deps`,
   `git diff --check`: clean.
@@ -210,36 +211,40 @@ below are relative to `crates/bohmian-code-review-pipeline/` there (`J` =
 
 ### Process exceptions and diagnoses
 
-- RED: the library facade was written before its journey assertions. Mutation
-  checks reverted pin handling and baseline selection, and the journey failed
-  each time. Wyrd adapters were also written before their tests. Both are
-  recorded as process exceptions, not as RED passes.
+- RED: the library facade and the Wyrd adapters were written before their
+  assertions. This is a recorded process exception, not a RED pass. Mutation
+  checks stand in:
+  - comparing the full review from `pins.base`: fails J:1285;
+  - disabling the truncated-listing rebuild: fails J:1336;
+  - a touch that ignores claims: fails Q:418;
+  - pointer protection without repository correlation: fails Q:517;
+  - earlier, reverting pin handling and baseline selection failed the
+    journeys.
 - `collection_claims_race_touches_and_pointers_and_retries`.
   - Symptom: the retry claim returned `[]`.
-  - Cause: the test retried with a 3600s grace, unlike the original
-    collection. The library's reference `MemorySnapshotStore::unreferenced`
-    applies the grace to claimed records too, so the SQL is right.
+  - Cause: the retry used a 3600s grace, unlike the original collection. The
+    library's reference `MemorySnapshotStore::unreferenced` applies the grace
+    to claimed records too, so the SQL is right.
   - Fix site: the test now retries with the original grace.
 - `handle_crud::gcs_handle_crud`.
-  - Symptom: `handle_crud.rs:124` "an occupied path is refused" failed on
-    fake-gcs-server.
+  - Symptom: `handle_crud.rs:124` failed on fake-gcs-server.
   - Evidence: curl showed that `x-goog-if-generation-match: 0` returned 200
     twice and the object was overwritten.
   - Cause: the emulator ignores GCS preconditions. object_store 0.14
     `gcp/client.rs:406` sends the header and maps 412 to `AlreadyExists`.
   - Fix site: lane routing, following the `gcs_multipart_*` precedent.
-    Create-only checks moved to `run_create_only` (local, S3, Azure) and
-    `gcs_create_only` (real GCS only).
+    `run_create_only` runs on local, S3 and Azure; `gcs_create_only` runs on
+    real GCS only.
   - A fresh diagnostician agreed.
 - `storage_e2e::local_client_server_round_trip`.
-  - Symptom: HTTP 401 on `GET /v1/cards/download/local`, outside this task's
-    write set but inside its named lane.
+  - Symptom: HTTP 401 on `GET /v1/cards/download/local`.
   - Cause: the test replaced the server's root-relative plan with an absolute
     URL. Since `e36474189`, `authenticated()` sends credentials only for
     root-relative plans.
   - Fix site: the test now uses `download.plan`.
   - A fresh diagnostician agreed; no other caller hand-builds that URL.
 
-Non-goals stayed excluded: no Bifrost/Scribe metadata, no execution IDs, no
-coordination service, no Task 005 execution evidence. The only unrelated
-change is the stale storage journey fix above.
+Non-goals stayed excluded: no metadata traits over Bifrost/Scribe, no
+execution IDs, no coordination service, no Task 005 execution evidence. The
+only change outside the task's write set is the stale storage journey fix
+above.

@@ -360,8 +360,31 @@ Gateway (request assembly, answer parsing and structured-output handling);
 (about 1.3 ms of 1.9 ms), followed by the same Skald-side residual. Resolve,
 bind, verdict, and cite together are under 60 µs at c1.
 
-Status: BLOCKED. The remaining Agent time is localized to `run`, but the
-about 200 µs (c1) Skald-side residual is large and has no finer timing, so
-reducing it with attributable gains needs a CPU-only profile of
-`direct-verify-model-c1` and `direct-verify-model-c64`. That run needs
-maintainer authorization. Steps 1–4 and their proofs are complete.
+### Agent CPU profile (authorized, CPU-only)
+
+Run: `bench:l1:verification --profile cpu --allow-dirty --steps direct-verify-model-c1,direct-verify-model-c64`
+with the host-busy limit raised locally for this run only at the
+maintainer's direction (other sessions' builds held the host; reverted after
+the run, never committed). Latency from that run is not evidence; the
+profile is used only for where server CPU goes. Server capture
+`target/benchmarks/verification/direct-verify/20261111T152804Z/profiles/direct-verify-model-c1/cpu-server-2942193.json.gz`,
+symbolized with `addr2line` against `target/profiling/release/wyrd-server`.
+Inclusive share of sampled server CPU at c1, with the caller that owns it:
+
+| Share | Cost | Owner |
+|---|---|---|
+| 8.6% | `Prompt::authored` recompiles (and meta-validates) the authored form to detect field mutation | serializing a Verifier `Check`'s inline Prompt into evidence (`wyrd_queue::variant`) |
+| 6.6% | `Prompt` clones | `Prompt::render` 2.3%, `AgentExecutor::invoke` 1.6%, `Judged::report` 1.3% |
+| 5.2% | `Prompt::bind_mut` JSON round trip (`to_value`/`from_value`) | `Prompt::render` from `render_native` |
+
+Reduction 1 (`4a657ec1f`): a compiled Prompt keeps the request, model, and
+provider its authored form compiled to (shared by clones), so `authored`
+compares instead of recompiling. Proof: `wyrd-skald-spec` lib
+`authoring::tests::native_body_pairs_and_round_trip` (model and provider
+mutations still serialize natively); `wyrd-skald-spec`, `wyrd-skald-prompt`,
+`wyrd-skald-agent`, `vala-verify` 319/319; `wyrd-spec` Prompt tests 25/25.
+Attributable gain: NOT YET MEASURED; requires a valid unprofiled run.
+
+Status: BLOCKED. Reduction 1 needs a valid unprofiled `direct-verify-model-c1`/`-c64`
+run on an idle host to verify its gain; the `bind_mut` round trip and Prompt
+clones are the next localized candidates.

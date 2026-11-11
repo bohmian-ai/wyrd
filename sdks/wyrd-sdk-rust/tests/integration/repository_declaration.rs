@@ -265,9 +265,10 @@ mod pg_tests {
         deployment.shutdown().await;
     }
 
-    /// The remote is only a hint: an unselected repository is refused, an
-    /// explicit name cannot fork an established family, and a provider
-    /// rename keeps the family name.
+    /// The remote is only a hint: an unselected repository is refused,
+    /// verified name and repository_id overrides win, later inferred
+    /// declarations join that family, an explicit name cannot fork it, and a
+    /// provider rename keeps the family name.
     ///
     /// # Panics
     /// Panics when an identity is accepted or refused differently.
@@ -286,11 +287,25 @@ mod pg_tests {
             "{unselected}"
         );
 
-        let api = checkout(&mock, "acme/api");
-        let first = declare_toml(&cards, &api, "minimal")
+        let first = declare_toml(&cards, &checkout(&mock, "acme/web"), "named")
             .await
-            .expect("minimal wyrd.toml declares");
-        let named = declare_toml(&cards, &api, "named")
+            .expect("explicit name and repository_id declare");
+        assert_eq!(
+            first.root.name.as_str(),
+            "api-policy",
+            "the name override wins"
+        );
+        assert_eq!(
+            repository(&cards, &first.root).await.0.full_name.as_deref(),
+            Some("acme/api"),
+            "the verified repository_id override wins over the remote"
+        );
+        let api = checkout(&mock, "acme/api");
+        let inferred = declare_toml(&cards, &api, "minimal")
+            .await
+            .expect("an inferred declaration joins the established family");
+        assert_eq!(inferred.root.name, first.root.name);
+        let named = declare_toml(&cards, &api, "other-name")
             .await
             .expect_err("a second family name is refused");
         assert_eq!(
@@ -339,6 +354,15 @@ mod pg_tests {
                 "authorization",
                 "version_assignment"
             ]
+        );
+        let bare = tempfile::tempdir().expect("temp directory creates");
+        copy(&fixture("cards/repository_declaration"), bare.path());
+        let missing = cli::declare_check(policy(&bare, "minimal"))
+            .expect_err("no checkout and no override names no repository");
+        assert_eq!(missing.code(), "WYRD_LOADER_400_INVALID_ENVELOPE");
+        assert_eq!(
+            missing.problem().details["diagnostics"][0]["code"],
+            "WYRD_REGISTRY_400_REPOSITORY_IDENTITY_MISSING"
         );
         let broken = cli::declare(policy(&checkout, "broken"), None)
             .await

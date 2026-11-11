@@ -614,15 +614,22 @@ mod tests {
             error.diagnostics[0].code,
             "WYRD_REGISTRY_400_REPOSITORY_IDENTITY_MISSING"
         );
-        assert!(super::load_with_repository(&toml, Some("/srv/git/widget")).is_err());
+        let error = super::load_with_repository(&toml, Some("/srv/git/widget"))
+            .expect_err("a remote that names no repository refuses");
+        assert_eq!(
+            error.diagnostics[0].code,
+            "WYRD_LOADER_400_INVALID_ENVELOPE"
+        );
         std::fs::write(temp.path().join("prompt.yaml"), prompt("prompt", "1.0.0"))
             .expect("prompt writes");
-        assert!(
-            super::load_with_repository(
-                &temp.path().join("prompt.yaml"),
-                Some("https://github.com/acme/widget")
-            )
-            .is_err()
+        let error = super::load_with_repository(
+            &temp.path().join("prompt.yaml"),
+            Some("https://github.com/acme/widget"),
+        )
+        .expect_err("a remote without a wyrd.toml repository refuses");
+        assert_eq!(
+            error.diagnostics[0].code,
+            "WYRD_LOADER_400_INVALID_ENVELOPE"
         );
     }
 
@@ -644,6 +651,10 @@ mod tests {
             Some("https://github.com/acme/widget.git"),
             "[repository.verified_by]\nverifier = [\"./verifier.yaml\"]\n",
         );
-        assert!(load(&temp.path().join("wyrd.toml")).is_err());
+        let error = load(&temp.path().join("wyrd.toml")).expect_err("invalid Verifier refuses");
+        assert_eq!(
+            error.diagnostics[0].code,
+            "WYRD_LOADER_400_INVALID_ENVELOPE"
+        );
     }
 }

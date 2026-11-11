@@ -1334,8 +1334,9 @@ async fn selection(fixture: &PgFixture, card: &CardUid) -> (Option<CardUid>, Rep
     (selected, status)
 }
 
-/// A Repository selection waits for every owned Card to be Active, keeping
-/// the previous selection while one is not, then compares against the selection the declaration was written from: the
+/// A Repository selection waits for every owned Card of its graph, the root
+/// and each dependency, to be Active, keeping the previous selection while
+/// one is not, then compares against the selection the declaration was written from: the
 /// first distinct target wins, an identical target reuses it, a delayed
 /// completion of a raced declaration conflicts without undoing the newer
 /// selection and keeps answering that conflict, and a deliberate new
@@ -1465,4 +1466,59 @@ async fn repository_selection_settles_once_against_the_expected_prior() {
     assert_eq!(selected.as_ref(), Some(&old_uid));
     assert!(old_status.selected);
     assert!(!selection(&fixture, &new_uid).await.1.selected);
+
+    let (graph, graph_uid) = repository_declaration(
+        &fixture,
+        "graph",
+        Some((&repository_card("1.3.0"), CardStatus::Active)),
+        None,
+        Some(&old_uid),
+    )
+    .await;
+    let graph_uid = graph_uid.expect("owned");
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let dependency = insert_card_row(
+        &mut conn,
+        NewCardRow {
+            card: &prompt_card("graph-dependency"),
+            card_uid: CardUid::from_uuid(Uuid::now_v7()).expect("UUIDv7"),
+            attribution: Attribution::direct(PrincipalId::new(Uuid::from_u128(7))),
+            operation_id: graph,
+            status: CardStatus::Pending,
+            spec_hash: "graph-dependency",
+            artifact_hash: Some("graph-dependency"),
+            reconcile_delay: std::time::Duration::ZERO,
+        },
+    )
+    .await
+    .expect("dependency inserts")
+    .card_uid;
+    conn.commit().await.expect("dependency commits");
+    assert_eq!(
+        settle(&fixture, graph).await,
+        RepositorySelection::Pending,
+        "an Active root waits for its pending dependency"
+    );
+    assert_eq!(
+        selection(&fixture, &old_uid).await.0.as_ref(),
+        Some(&old_uid)
+    );
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    sqlx::query("UPDATE wyrd.cards SET status = 'active' WHERE card_uid = $1")
+        .bind(dependency.as_uuid())
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("dependency activates");
+    conn.commit().await.expect("activation commits");
+    assert_eq!(settle(&fixture, graph).await, RepositorySelection::Selected);
+    assert_eq!(
+        selection(&fixture, &old_uid).await.0.as_ref(),
+        Some(&graph_uid)
+    );
 }

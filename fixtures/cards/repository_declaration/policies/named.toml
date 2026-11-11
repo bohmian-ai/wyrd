@@ -1,6 +1,9 @@
 [repository.metadata]
 name = "api-policy"
 
+[repository.spec]
+repository_id = "1"
+
 [repository.verified_by]
 verifier = ["./code-review.yaml"]
 runs_on = { kind = "pull_request" }

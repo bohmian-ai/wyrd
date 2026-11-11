@@ -132,6 +132,14 @@ test("cli checks offline and declares the policy", async ({ server, cards, admin
     "authorization",
     "version_assignment",
   ]);
+  const bare = mkdtempSync(join(tmpdir(), "wyrd-ts-bare-"));
+  cpSync(fixture("cards/repository_declaration"), bare, { recursive: true });
+  expect(() => cli.declareCheck(policy(bare, "minimal"))).toThrow(
+    expect.objectContaining({
+      code: "WYRD_LOADER_400_INVALID_ENVELOPE",
+      details: { diagnostics: [expect.objectContaining({ code: "WYRD_REGISTRY_400_REPOSITORY_IDENTITY_MISSING" })] },
+    }),
+  );
   await expect(cli.declare(policy(root, "broken"))).rejects.toMatchObject({
     code: "WYRD_LOADER_400_INVALID_ENVELOPE",
   });

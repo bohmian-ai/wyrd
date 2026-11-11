@@ -159,6 +159,14 @@ def test_cli_checks_offline_and_declares_the_policy(
         "authorization",
         "version_assignment",
     ]
+    bare = tmp_path / "bare"
+    shutil.copytree(STORY, bare)
+    with pytest.raises(WyrdError) as missing:
+        cli.declare_check(policy(bare, "minimal"))
+    assert missing.value.code == "WYRD_LOADER_400_INVALID_ENVELOPE"
+    assert missing.value.details["diagnostics"][0]["code"] == (
+        "WYRD_REGISTRY_400_REPOSITORY_IDENTITY_MISSING"
+    )
     with pytest.raises(WyrdError) as broken:
         cli.declare(policy(root, "broken"))
     assert broken.value.code == "WYRD_LOADER_400_INVALID_ENVELOPE"

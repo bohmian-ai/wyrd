@@ -393,6 +393,9 @@ mod tests {
 
     /// A stand-in heap endpoint that starts on `POST` and serves `profile`
     /// on `GET`; returns its URL.
+    ///
+    /// # Panics
+    /// Panics when the local listener cannot bind or report its address.
     async fn heap_endpoint(profile: Vec<u8>) -> String {
         let router = axum::Router::new().route(
             "/benchmark/heap",
@@ -419,6 +422,10 @@ mod tests {
     /// Writes an executable stand-in profiler that saves `profile` to its
     /// `--output` when interrupted, and marks `<output>.ready` once it can
     /// be.
+    ///
+    /// # Panics
+    /// Panics when the script cannot be written or made executable in
+    /// `directory`.
     fn saving_profiler(directory: &Path) -> std::path::PathBuf {
         let script = directory.join("saving-profiler");
         std::fs::write(
@@ -435,6 +442,10 @@ mod tests {
 
     /// Waits until every capture of `outputs` under `step` is ready to be
     /// interrupted.
+    ///
+    /// # Panics
+    /// Panics when a capture's ready marker does not appear within ten
+    /// seconds.
     fn ready(step: &Path, outputs: &[String]) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         for output in outputs {

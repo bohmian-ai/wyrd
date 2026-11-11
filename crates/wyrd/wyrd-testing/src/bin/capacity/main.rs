@@ -1780,6 +1780,9 @@ mod tests {
     }
 
     /// A transport over a local server answering every request `{}`.
+    ///
+    /// # Panics
+    /// Panics under the conditions [`serving`] does.
     async fn answered() -> wyrd_client::transport::HttpTransport {
         serving(|_| true).await
     }
@@ -1787,6 +1790,10 @@ mod tests {
     /// A transport over a local server answering a request `{}` when
     /// `answers` accepts its request line, and a non-retryable 400 problem
     /// otherwise.
+    ///
+    /// # Panics
+    /// Panics when the local listener cannot bind or report its address, or
+    /// the client authentication or transport does not build.
     async fn serving(answers: fn(&str) -> bool) -> wyrd_client::transport::HttpTransport {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 

@@ -254,6 +254,10 @@ impl Canonical<'_> {
     /// formatting it: it borrows only a string written without escapes, and
     /// rejects raw control characters, so its compact serialization is the
     /// string itself between quotes.
+    ///
+    /// # Errors
+    /// Returns `not compact` when the text at the current position is not
+    /// `value` between quotes.
     fn borrowed<E: de::Error>(&mut self, value: &str) -> Result<(), E> {
         self.literal(b"\"")?;
         self.literal(value.as_bytes())?;
@@ -319,6 +323,13 @@ impl<'de> Visitor<'de> for Part<'_, 'de> {
         self.scalar(value)
     }
 
+    /// Matches a string `serde_json` borrowed from the text, as written,
+    /// without serializing it; see [`Canonical::borrowed`]. A string is
+    /// never the body itself, which must be an object.
+    ///
+    /// # Errors
+    /// Returns `not an object` for a body that is a string and `not compact`
+    /// when the text is not the string between quotes.
     fn visit_borrowed_str<E: de::Error>(self, value: &'de str) -> Result<(), E> {
         if self.top {
             return Err(E::custom("not an object"));
@@ -410,6 +421,11 @@ mod tests {
     /// Text is kept exactly when it is its decode's compact serialization,
     /// whether its strings borrow from the text or hold escapes, and the kept
     /// members are the top-level names and values as written.
+    ///
+    /// # Panics
+    /// Panics when a case is kept or refused contrary to its expectation, a
+    /// kept text's compact serialization differs in length, or the kept
+    /// members are not the names and values as written.
     #[test]
     fn canonical_borrowed_strings_match_compact_serialization() {
         let deep = format!(r#"{{"a":{}1{}}}"#, "[".repeat(200), "]".repeat(200));

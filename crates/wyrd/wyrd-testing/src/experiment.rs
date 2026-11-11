@@ -5736,6 +5736,10 @@ mod tests {
 
     /// Writes an executable stand-in profiler under `root` that saves a
     /// capture to its `--output` when interrupted; returns its path.
+    ///
+    /// # Panics
+    /// Panics when the script cannot be written or made executable under
+    /// `root`.
     fn saving_profiler(root: &Path) -> PathBuf {
         let script = root.join("saving-profiler");
         std::fs::write(

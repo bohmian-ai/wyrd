@@ -448,6 +448,10 @@ mod google_auth_oauth {
 
     /// A caller-issued access token builds no exchange client it would never
     /// use, while every network-backed source keeps one.
+    ///
+    /// # Panics
+    /// Panics when a source fails to build, the access-token source holds a
+    /// client, or a network-backed source holds none.
     #[test]
     fn access_token_source_needs_no_network_client() {
         assert!(

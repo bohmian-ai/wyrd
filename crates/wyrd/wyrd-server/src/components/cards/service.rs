@@ -3356,3 +3356,103 @@ mod tests {
         assert!(error.to_string().contains("artifact hash"));
     }
 }
+
+#[cfg(test)]
+mod pg_tests {
+    use uuid::Uuid;
+    use wyrd_spec::envelope::Card;
+    use wyrd_spec::ids::CardUid;
+    use wyrd_spec::registry::DeclarationOperationId;
+    use wyrd_sql::queries::cards::{
+        NewCardRow, NewDeclarationOperation, insert_card_row, insert_declaration_operation,
+        record_repository_selection,
+    };
+    use wyrd_sql::row_types::cards::CardStatus;
+
+    use super::settle_selection;
+    use crate::components::auth::Caller;
+    use crate::state::AppState;
+    use crate::test_support::{test_caller, test_state};
+
+    /// Write `caller`'s declaration under `key` owning an Active Repository
+    /// `name@version` that targets itself with no expected prior selection.
+    ///
+    /// # Panics
+    /// Panics when a write fails.
+    async fn declaration(state: &AppState, caller: &Caller, key: &str, name: &str, version: &str) {
+        let card: Card = serde_json::from_value(serde_json::json!({
+            "apiVersion": "wyrd/v1",
+            "kind": "Repository",
+            "metadata": { "name": name, "version": version },
+            "spec": { "provider": "github", "host": "github.com", "repository_id": "42", "verified_by": [] },
+            "relationships": { "outbound": [], "inbound": [] }
+        }))
+        .expect("repository fixture deserializes");
+        let operation_id = DeclarationOperationId::new(Uuid::now_v7());
+        let mut conn = state
+            .registry_tenant_conn(caller.data_tenant_id)
+            .await
+            .expect("tenant connection opens");
+        insert_declaration_operation(
+            &mut conn,
+            NewDeclarationOperation {
+                operation_id,
+                attribution: caller.attribution(),
+                idempotency_key: key,
+                request_hash: key,
+            },
+        )
+        .await
+        .expect("operation inserts");
+        let card_uid = insert_card_row(
+            &mut conn,
+            NewCardRow {
+                card: &card,
+                card_uid: CardUid::from_uuid(Uuid::now_v7()).expect("UUIDv7"),
+                attribution: caller.attribution(),
+                operation_id,
+                status: CardStatus::Active,
+                spec_hash: key,
+                artifact_hash: None,
+                reconcile_delay: std::time::Duration::ZERO,
+            },
+        )
+        .await
+        .expect("card inserts")
+        .card_uid;
+        record_repository_selection(&mut conn, operation_id, &card_uid, None)
+            .await
+            .expect("selection target records");
+        conn.commit().await.expect("declaration commits");
+    }
+
+    /// Two declarations of distinct versions written from the same prior
+    /// selection: the first to settle selects, and the other answers
+    /// `WYRD_REGISTRY_409_REPOSITORY_SELECTION_CONFLICT` on every retry.
+    ///
+    /// # Panics
+    /// Panics when a settle outcome differs.
+    #[test]
+    fn a_raced_repository_declaration_answers_a_selection_conflict() {
+        wyrd_runtime::runtime().block_on(async {
+            let state = test_state().await;
+            let caller = test_caller([]);
+            let name = format!("raced-{}", Uuid::now_v7().simple());
+            declaration(&state, &caller, "raced-a", &name, "1.0.0").await;
+            declaration(&state, &caller, "raced-b", &name, "1.1.0").await;
+
+            settle_selection(&state, &caller, "raced-a")
+                .await
+                .expect("the first distinct target selects");
+            for _ in 0..2 {
+                let error = settle_selection(&state, &caller, "raced-b")
+                    .await
+                    .expect_err("the raced target conflicts");
+                assert_eq!(
+                    error.code(),
+                    "WYRD_REGISTRY_409_REPOSITORY_SELECTION_CONFLICT"
+                );
+            }
+        });
+    }
+}

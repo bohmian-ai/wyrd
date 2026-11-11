@@ -1,6 +1,6 @@
 # GitHub Verifier pipelines
 
-Status: finalized
+Status: exploring (Task 004 storage amendment; prior decisions preserved)
 
 ## Problem
 
@@ -28,7 +28,9 @@ Wyrd owners, without a UI or a separate workflow system.
 ## Constraints and non-goals
 
 - No UI work here; it ships on another branch.
-- Only new PostgreSQL table: `wyrd.github_installations`; no second verification queue, general event bus,
+- New PostgreSQL tables are limited to `wyrd.github_installations` and Task 004's
+  required snapshot/context metadata; reuse the existing database deployment.
+  No second verification queue, general event bus,
   generic timer/external wait actions or replacement checkpoint store.
 - Reuse existing storage, Bifrost verification records, queue tables, Scribe
   outbox and SubmissionSink. Bifrost owns accepted execution state; PostgreSQL
@@ -141,7 +143,8 @@ Rejected or superseded directions:
 - Generic timer/external waits and GitHub Actions-specific CI acquisition:
   use deferred Wyrd inputs and separate human approval.
 - General new PostgreSQL tables or a separate workflow/outbox framework: extend
-  existing owners. Revision 4 permits only the dedicated installation table.
+  existing owners. Revision 4 permitted the installation table; the Task 004
+  amendment also permits the library's required snapshot/context metadata tables.
 
 [Original Repository proposal](repository-card-contract.md) and
 [superseded non-Card proposal](repository-declaration.md) retain research only
@@ -169,8 +172,10 @@ content-derived key; revalidate this mismatch at its owner before relying on it.
 The user approved and requested application of the dedicated-table amendment.
 The [runtime/GitHub storage decision](approved-runtime-and-github.md#approved-storage-amendment--revision-4)
 owns the agreed flow; [spec revision 4](../spec.md) and [task 002](../tasks/002-github-app-connection.md)
-carry it into implementation and proof. Only `wyrd.github_installations` may be
-added. Keep OIDC trust unchanged and reuse flow-separated `auth_login_state`.
+carry it into implementation and proof. That amendment authorized
+`wyrd.github_installations`; the later Task 004 amendment additionally permits
+library metadata tables. Keep OIDC trust unchanged and reuse flow-separated
+`auth_login_state`.
 
 Inspection confirmed that the abandoned shared-table SQL draft required nullable
 OIDC fields and provider-specific login indexes/queries. Dedicated storage removes
@@ -204,10 +209,12 @@ choices do not need another design decision. They belong to implementation.
 
 ## Handoff
 
-Design is finalized for approved specification revision 5 and its public
-contracts. Revision 4 selects dedicated installation storage. Revision 5 selects
-GitHub.com’s documented App flow. The [task packet](../tasks/README.md) references
-revision 5. Task 002 owns the dedicated table, flow-separated authorization state,
+Design was finalized for approved specification revision 5 and its public
+contracts. It is resumed for the user-directed Task 004 storage correction.
+[Spec revision 6](../spec.md) is draft; Task 004 targets it and remains proposed
+pending renewed spec approval. Other tasks retain their revision 5 basis.
+Revision 4 selects dedicated installation storage; revision 5 selects GitHub.com’s
+documented App flow. The [task packet](../tasks/README.md) records these bases. Task 002 owns the dedicated table, flow-separated authorization state,
 security/runtime authority updates and connected proof. Document approval does
 not claim runtime recovery or capacity proof.
 
@@ -223,3 +230,13 @@ an Enterprise Server protocol decision. Use GitHub.com and its documented
 installation and OAuth protections. This removes Enterprise Server support and
 capability negotiation from this change. The revision 4 implementation evidence
 and immutable review remain historical; the remediation packet applies revision 5.
+
+### Task 004 storage amendment
+
+The user directed implementation of `ObjectStorage` over Wyrd's current
+`object_store` backend and PostgreSQL-backed `SnapshotStore`/`ContextStore`.
+Task 004 owns the three adapters and required metadata tables/migrations in
+the existing deployment. See [storage flow and proof](approved-code-review-support.md#task-004-storage-amendment).
+Accepted execution evidence remains in Bifrost. Exact Wyrd table names and
+private module placement remain implementation-owned. No production change
+or runtime verification is claimed.

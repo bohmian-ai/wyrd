@@ -3,7 +3,8 @@
 Research snapshot: Wyrd f4ca61126; local bohmian-code-review d8c772d. Read-only
 source/authority inspection and primary GitHub documentation, not runtime or
 throughput proof. Existing uncommitted work was preserved. This file supports
-the revision 3 draft; requirements live in [spec.md](spec.md).
+the original revision 3 draft, with the Task 004 storage correction below;
+current requirements live in [spec.md](spec.md).
 
 ## Existing workflow and material gaps
 
@@ -29,7 +30,9 @@ scribe_state_heads is superseded by vala-sql migration
 
 These are inspected reuse boundaries and missing behavior, not a selected SQL
 schema or proof of implementation feasibility. The specification requires reuse
-of existing queue/storage owners and no new PostgreSQL tables. It does not
+of existing queue/storage owners. Task 002 permits installation association
+storage; Task 004 additionally permits the library's required PostgreSQL
+snapshot/context metadata tables in the existing deployment. It does not
 prescribe columns, indexes, control-row layouts or an additional writer.
 
 ### App, repository and declaration control
@@ -138,12 +141,16 @@ ranking metadata, omissions, budget and coverage. Its token budget excludes the
 diff/Prompt. The new public pinned/baseline facade must return complete and active
 comparisons while reusing selection, snapshot and overlay stages.
 
-Current SnapshotStore/ContextStore require conditional pointer publication,
-collection/expiry and tenant-safe identity. The Wyrd adapter must preserve those
-existing library contracts using the agreed storage owners. Do not turn these
-trait requirements into prescribed SQL columns, Card control metadata layouts or
-a second repository indexer. No additional cache-coordination subsystem is
-selected. Adapter storage feasibility still needs implementation validation.
+The library README explicitly requires `ObjectStorage` and one metadata owner
+implementing `SnapshotStore` plus `ContextStore`. The Task 004 correction uses
+Wyrd's configured `object_store` backend for immutable snapshot/context bytes and
+PostgreSQL for snapshot pointers, snapshot records and context lifecycle metadata.
+The README supplies three reference tables and SQL implementations; adapt those
+protocols to Wyrd's tenant/RLS/connection and database-clock rules, not raw pools.
+This is the bounded new-table exception; Bifrost/Scribe remains the accepted
+execution-evidence owner. See the [storage flow, source and proof](design/approved-code-review-support.md#task-004-storage-amendment).
+Exact Wyrd schema names and adapter placement remain implementation-owned;
+production concurrency and lifecycle behavior still need runtime proof.
 
 Generic App/check/webhook helpers existed at local historical 9fdf6dc. They do
 not imply the current detached library checkout includes all helpers or that a
@@ -189,7 +196,7 @@ its design records and the user's subsequent corrections. No production changes.
 | Separate manual confirm and disable/claim-management workflow | Conventional App connect/callback/access/disconnect flow |
 | Fixed five-minute App connection transaction lifetime | Reuse existing authorization-transaction expiry handling |
 | New evidence read/write and integration permission categories asserted as necessary | Reuse authorization owners; only the already agreed approval permission is explicit |
-| Specific tenant/Card/binding columns, indexes, cache metadata and table layouts | Remove schema prescriptions; retain existing-owner and no-new-Postgres-table constraints |
+| Specific tenant/Card/binding columns, indexes, cache metadata and table layouts | Remove private schema prescriptions; retain existing-owner constraints and the explicit Task 002/004 table exceptions |
 | Complete PR diff nested inside active changes, inflating the approved normal Prompt binding | Keep changes active-only; retain full comparison separately in review.full_pr in the same extraction JSON |
 | Agreed optional review helpers missing from the required behavior | Restore validation, aggregation/sorting, finding IDs and authored severity helper support without a new engine |
 | Ownership suggestions asserted as proven feasible implementations | Distinguish inspected owners, necessary behavior and untested implementation choices |

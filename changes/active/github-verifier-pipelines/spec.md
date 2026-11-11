@@ -1,7 +1,7 @@
 ---
 id: SPEC-github-verifier-pipelines
-revision: 5
-status: approved
+revision: 6
+status: draft
 ---
 
 # GitHub Verifier pipelines
@@ -40,8 +40,9 @@ no worker capacity. One optional standard report supplies GitHub findings and
 suggestions; authored requirements still determine the verification verdict.
 
 The cost is new Repository, PR extraction, deferred-input, approval and provider
-integration contracts at existing owners and one dedicated installation association
-table. There is no new execution engine, general event bus, generic wait framework
+integration contracts at existing owners, one dedicated installation association
+table and the independent library's required snapshot/context metadata tables.
+There is no new execution engine, general event bus, generic wait framework
 or UI workflow.
 
 ## Scope and fixed boundaries
@@ -53,7 +54,9 @@ or UI workflow.
   accepted execution state, storage adapters and GitHub delivery policy.
 - Existing Card registry, storage/upload, Bifrost/Scribe, verification queue,
   SubmissionSink, runner, checkpoints and engine remain the owners. No new
-  PostgreSQL tables except `wyrd.github_installations` for GitHub associations.
+  PostgreSQL tables except `wyrd.github_installations` for GitHub associations
+  and Task 004's required library snapshot/context metadata tables. Reuse the
+  existing PostgreSQL deployment.
 - This is the same implementation for SaaS, self-hosted and enterprise cloud.
   The provider is GitHub.com using its documented GitHub App installation
   and OAuth flow. Development uses local protocol mocks. Enterprise Server
@@ -145,6 +148,16 @@ pinned PRs and optional previous-reviewed head. Return the typed
 pr/review/changes/context output in [contracts](contracts.md#pull-request-extraction).
 Retain the actual library ReviewContext unchanged and enough source/diff evidence
 to verify findings and edits after recovery or library cache expiry.
+
+Implement the library's `ObjectStorage` over Wyrd's configured `object_store`
+backend and a PostgreSQL-backed metadata owner implementing both `SnapshotStore`
+and `ContextStore`, including required metadata tables/migrations. Preserve
+identity scoping, conditional publication and collection, context lifetime and
+cleanup contracts as detailed in the
+[Task 004 storage amendment](design/approved-code-review-support.md#task-004-storage-amendment).
+PostgreSQL stores pointers/records/lifecycle metadata; object bytes remain in
+object storage. Library cache publication is separate from accepted execution
+evidence in Bifrost, which survives cache expiry.
 
 The last completed usable review of the same PR and policy is the incremental
 baseline. Partial/cancelled work never advances it. P completed, A running, B
@@ -269,12 +282,12 @@ App setup, declaration, publication, approval and diagnosis without a UI.
 | ID | Must remain true | Failure prevented |
 |---|---|---|
 | INV-001 | Authenticated tenant and current permission constrain all operations; evidence matches stable repository/source identity while execution lineage retains exact Card/policy versions | Cross-tenant evidence or credentials becoming authority |
-| INV-002 | Bifrost owns evidence/decisions/checkpoints; existing Postgres rows coordinate claims, activation and owed delivery | Competing execution truth or a second payload store |
+| INV-002 | Bifrost owns accepted execution evidence/decisions/checkpoints; existing Postgres rows coordinate claims, activation and owed delivery; Task 004 metadata tables serve only the library snapshot/context protocols | Competing execution truth or a second payload store |
 | INV-003 | A positive consequential receipt follows durable acceptance; every accepted handoff can be rediscovered after restart | Lost acknowledged evidence, approval or queue work |
 | INV-004 | Recovery returns exact accepted state, authoritative absence or explicit unavailability | Replaying settled work or treating unavailable evidence as fresh state |
 | INV-005 | Existing source/policy, publication identity, budgets and deadline survive retry/resumption | A retry judging different code or silently replenishing authority/spend |
 | INV-006 | Stale/cancelled/superseded actors cannot release new work or publish as the current review | Late writes reviving an obsolete generation |
-| INV-007 | Only new Postgres table: wyrd.github_installations for tenant GitHub associations; no other new tables or generic broker/workflow engine; no secrets in Cards/TOML/results | Unnecessary infrastructure or credential disclosure |
+| INV-007 | New Postgres tables limited to wyrd.github_installations and Task 004 library snapshot/context metadata; no new database service or generic broker/workflow engine; no secrets in Cards/TOML/results | Unnecessary infrastructure or credential disclosure |
 
 Use existing upload completion/exact File custody, Scribe acknowledgement/batch
 fences and tenant queue transactions. There is no Bifrost/Postgres atomic
@@ -349,3 +362,9 @@ Design: [current index](design/notes.md), [declaration](design/approved-declarat
 [publication/approval](design/approved-deferred-inputs.md),
 [reports](design/approved-report-delivery.md),
 [App/runtime](design/approved-runtime-and-github.md).
+
+Revision 6 (draft) records the user-directed Task 004 storage correction:
+`ObjectStorage` over existing object storage, PostgreSQL `SnapshotStore` and
+`ContextStore`, and their required metadata-table exception. Revision 5 approval
+does not approve this amendment; renewed approval is required before affected
+implementation proceeds. Other behavior and completed review evidence are unchanged.

@@ -1,7 +1,7 @@
 ---
 id: TASK-004
 status: proposed
-approved_spec_revision: 5
+spec_revision: 6
 requirements: [REQ-006, REQ-007]
 acceptance: [AC-004]
 invariants: [INV-001, INV-002, INV-004, INV-005, INV-007]
@@ -13,6 +13,9 @@ depends_on: [TASK-002]
 Implement the library/adapter portion of **approved-code-review-support.md →
 Library output and retained evidence / Successive commits and pipeline ownership**.
 This is source preparation for task 005, not a new Wyrd review orchestrator.
+The [Task 004 storage amendment](../design/approved-code-review-support.md#task-004-storage-amendment)
+corrects the earlier storage prohibition. Spec revision 6 is draft; this task
+remains proposed pending renewed spec approval.
 
 ## Actual input and missing behavior
 
@@ -44,13 +47,33 @@ Verify pagination/truncation and reconstruct required absent source from verifie
 objects or fail; context-selection omissions remain honest coverage data. Empty
 active comparison is valid source evidence, not a verdict.
 
-Implement Wyrd's storage/persistence adapters over existing storage and canonical
-Bifrost/Scribe owners, preserving each actual trait's conditional publication,
-identity, cleanup/expiry and unavailable-versus-absent behavior. Task 002 provides
-verified connection and short-lived installation-token access. These adapters
-must not put payloads in PostgreSQL or invent fake execution IDs for cache data.
-No new PostgreSQL tables or cache-coordination service is authorized. Cache reuse
-is a library concern; accepted execution evidence custody is task 005's concern.
+Implement all three required library storage traits:
+
+- `ObjectStorage` over Wyrd's configured `object_store::ObjectStore` backend:
+  immutable snapshot/context bytes, scoped library keys, atomic create-only
+  writes, exact reads and idempotent deletion. Preserve `AlreadyExists` and
+  `NotFound` versus backend failures.
+- One PostgreSQL-backed metadata owner implementing `SnapshotStore` and
+  `ContextStore`. Task 004 owns the required snapshot-pointer, snapshot-record
+  and context metadata tables/migrations through `wyrd-sql`, equivalent to the
+  README's three-table schema. This is the explicit new-table exception alongside
+  Task 002's installation table; reuse the existing PostgreSQL deployment.
+- Preserve snapshot compatibility scope, tree-based conditional publication,
+  atomic collection claims against upserts/pointer publication, grace periods
+  and retryable cleanup. Context upserts keep original publication/expiry stamps;
+  lookup distinguishes absent, expired and live. Scope by tenant, installation
+  and numeric repository ID, never mutable owner/name labels.
+- Follow `wyrd-sql` ownership: `TenantConn`, forced tenant RLS and a narrow
+  `OperatorPool` capability for cross-tenant expiry. Use PostgreSQL
+  `statement_timestamp()` and duration-derived deadlines, with no transaction
+  spanning GitHub or object-store IO.
+
+Task 002 provides verified identity and short-lived installation-token access.
+PostgreSQL holds pointers/records/lifecycle metadata, never snapshot/context
+object bytes or execution payloads. Do not implement these metadata traits over
+Bifrost/Scribe, invent execution IDs for cache records or add a cache-coordination
+service. Library cache reuse is separate from Task 005's accepted Bifrost
+execution evidence; cache expiry must not remove that retained evidence.
 Amend the applicable **wyrd-design.md → Verifier** boundary and
 **bifrost-design.md → Table and row identity / Durability and visibility / Ingest**
 only as needed to state adapter custody without making library cache canonical.
@@ -78,10 +101,12 @@ full/incremental comparisons, moved live PR, rewritten/unavailable history,
 renames/deletions, binary/unavailable source, truncation and context omissions.
 Assert comparisons obey supplied pins, returned spans include source and warm
 reuse does not rebuild a parallel index. Assert limits/failures stay explicit.
-Test Wyrd adapters against real storage/Bifrost dependencies for conditional
-publication, tenant separation and cache expiry; an in-memory adapter alone
-cannot establish production custody. Task 005/006 supply the connected queued
-execution proof; no public Wyrd action is claimed shipped by this library task.
+Test the actual pipeline with real Wyrd object storage/PostgreSQL adapters for
+cold/warm reuse, competing pointer publication, collection versus upsert/
+publication, interrupted cleanup/retry, non-extending context expiry, absent/
+expired/backend-failure distinctions, identity isolation and rename continuity.
+An in-memory adapter alone cannot establish production custody. Task 005/006
+supply the connected queued execution proof; no public Wyrd action is claimed shipped by this library task.
 
 Library owner/tier: owning module tests and existing `pipeline_journey` integration
 target with its `testing` feature. Its manifest requires that feature; use the
@@ -89,6 +114,7 @@ library's actual managed task if present, otherwise `mise exec -- cargo nextest
 run --locked -p bohmian-code-review-pipeline --features testing --test
 pipeline_journey` in that repository. New named focused commands are recorded
 when tests exist. Wyrd adapter tier 2 belongs in its owner, using existing
-`mise run test:vala`/`mise run test:storage:matrix` only for the adapters actually
-touched, plus dependency/tenant checks and format/lints. No runtime proof is
-claimed by planning; external repo is not edited during this task authoring.
+`mise run test:sql` for migrations/RLS/metadata concurrency and
+`mise run test:storage:matrix` for object adapters, plus the owning pipeline
+integration runner, dependency/tenant checks and format/lints. No runtime proof
+is claimed by planning; external repo is not edited during this task authoring.

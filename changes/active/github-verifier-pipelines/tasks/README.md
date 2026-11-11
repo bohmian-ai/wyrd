@@ -6,13 +6,18 @@ Revision 4 applies the approved installation storage amendment. Revision 5 uses
 GitHub.com’s documented App flow and removes the Enterprise Server compatibility
 decision. Task 002’s remediation packet carries that scope through configuration
 and proof. All task statuses
-are proposed. This packet does not approve implementation or claim runtime proof.
+are proposed. Task 004 now targets draft spec revision 6 for the user-directed
+storage amendment and remains proposed pending renewed approval; other tasks
+retain revision 5. This packet does not claim runtime proof.
 
 The selected path is existing connect/authorization→Card declaration saga→Scribe
 and SubmissionSink admission→fair verification queue→same engine and canonical
 Bifrost checkpoints→independent provider delivery. Extend complete existing
-workflows. Only task 002 may add `wyrd.github_installations`; no other new
-PostgreSQL tables, queue, event bus, general wait framework,
+workflows. Task 002 may add `wyrd.github_installations`; Task 004 additionally
+owns the required library snapshot/context metadata tables and PostgreSQL
+`SnapshotStore`/`ContextStore` adapters, plus `ObjectStorage` over the configured
+object-store backend. No other new PostgreSQL tables or database service,
+queue, event bus, general wait framework,
 result mirror, UI, private enterprise path or source modification is authorized.
 Wyrd owns App keys/signing/callbacks/tenancy; the independent library owns generic
 acquisition/comparison/index/context and remains standalone.
@@ -24,7 +29,7 @@ acquisition/comparison/index/context and remains standalone.
 | [001](001-isolate-queued-capacity.md) | Separate direct/queued execution/workspace/Python/model admission and original ceiling configuration; queued-only validation extended by 005/007/008 |
 | [002](002-github-app-connection.md) | Verified tenant installation/selected repository access, installation-token capability and revocation fence for 003/004/006/009 |
 | [003](003-repository-declaration.md) | Ready exact Repository receipt, selected policy/bindings and activation lifecycle for 006/007 |
-| [004](004-pinned-pr-preparation.md) | Reviewed generic pinned/baseline-aware ReviewPipeline revision and Wyrd storage adapters for 005 |
+| [004](004-pinned-pr-preparation.md) | Reviewed pinned/baseline-aware ReviewPipeline revision, ObjectStorage adapter and PostgreSQL SnapshotStore/ContextStore metadata tables/adapters for 005 |
 | [005](005-pull-request-extraction.md) | Accepted typed extraction and retained exact source/context for ordinary reviewers and 009 rendering |
 | [006](006-pr-admission-and-supersession.md) | Durable queued ExecutionIds with frozen policy/source/generation and cancellation fences for 005/007/008/009 |
 | [007](007-deferred-evidence-and-resumption.md) | Durable source-matched evidence, waiting inspection and same-execution park/continuation lifecycle for 008/009 |

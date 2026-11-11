@@ -196,6 +196,59 @@ including suggested edits, in [runtime and GitHub decisions](approved-runtime-an
 Implement the required provider protocol/permissions; do not turn suggested
 edits into automatic source commits.
 
+## Task 004 storage amendment
+
+The user directed this correction on 2026-11-11. Task 004 implements the
+library's storage protocols over Wyrd's existing PostgreSQL and object-store
+deployment. Its required metadata tables are an explicit exception to the
+no-new-PostgreSQL-tables constraint, in addition to Task 002's installation table.
+No new database service or cache-coordination service is selected.
+
+The blob trait is `ObjectStorage`, distinct from `object_store::ObjectStore`.
+`ReviewPipeline::new` takes that adapter and one metadata owner implementing
+both `SnapshotStore` and `ContextStore`.
+
+| Implementation | Persistence and required behavior |
+|---|---|
+| `ObjectStorage` | Wrap Wyrd's configured `object_store` backend. Store immutable source-free snapshots and contexts containing selected source spans. Preserve library-scoped keys, atomic create-only writes (`AlreadyExists`), exact reads (`NotFound`), idempotent deletion and backend failures. |
+| `SnapshotStore` | PostgreSQL snapshot pointers and records. Preserve version/format/size scope, tree-based compare-and-swap, insert-if-absent cold publication, record touches, grace periods, atomic collection claims against upserts/pointer publication, and retryable idempotent cleanup. |
+| `ContextStore` | PostgreSQL context records and publication/expiry metadata. Repeated upsert preserves original timestamps. Lookup distinguishes absent, expired and live; bounded expiry enumeration and repository removal support object cleanup. |
+
+The README's three reference tables are `bcr_snapshot_pointers`,
+`bcr_snapshot_records` and `bcr_contexts`. Task 004 owns equivalent Wyrd metadata
+tables and migrations through `wyrd-sql`; exact Wyrd names and private adapter
+placement remain implementation-owned. PostgreSQL holds pointers, records and
+lifecycle metadata, never snapshot/context object bytes or execution payloads.
+
+Scope metadata by tenant, installation and stable numeric repository ID, with
+snapshot compatibility fields where required. Owner/name are labels; renames
+preserve metadata. Adapt the README's raw-pool examples to Wyrd's `TenantConn`
+and forced tenant RLS, with a narrow `OperatorPool` capability for cross-tenant
+expiry. Use PostgreSQL `statement_timestamp()` for lifecycle timestamps and
+bind durations for expiry/grace deadlines. Never hold a transaction across
+GitHub or object-store IO. Follow the [SQL owner rules](../../../../crates/wyrd/wyrd-sql/AGENTS.md).
+
+The flow is authorized identity and source pins → configured blob adapter plus
+PostgreSQL metadata adapter → public `ReviewPipeline` → returned source/context
+→ Task 005's accepted Bifrost evidence. Library metadata commits and blob
+publication satisfy library protocols, not Wyrd execution acceptance.
+Bifrost/Scribe still owns accepted execution evidence, decisions and checkpoints;
+cache expiry must not remove that evidence. Do not substitute Bifrost/Scribe for
+these PostgreSQL traits or fabricate execution IDs for library cache records.
+
+Proof uses the actual pipeline with real Wyrd storage/PostgreSQL adapters:
+cold publication and warm reuse, competing pointer publications, collection
+versus upsert/publication, interrupted cleanup/retry, non-extending context
+lifetimes, absent/expired/backend-failure distinctions, identity isolation and
+rename continuity. Task 005 proves retained execution evidence survives cache
+expiry. No runtime verification is claimed by this amendment.
+
+Evidence: [library README](/home/thorrester/Documents/GitHub/bohmian-code-review/README.md),
+“Implement ObjectStorage” and “Implement the metadata store (Postgres)”, plus
+[persistence traits](/home/thorrester/Documents/GitHub/bohmian-code-review/crates/bohmian-code-review-pipeline/src/persistence.rs),
+inspected at `d8c772de4248ce0130f79ec3b5fefda518b1431a`. This research revision is
+not an approved dependency pin.
+
 ## Sources inspected
 
 - bohmian-code-review-pipeline/src/context.rs::ReviewContext/SelectedSpan,

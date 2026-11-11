@@ -1551,6 +1551,15 @@ impl DeclarationWriter<'_> {
 /// client's presigned upload window has closed, so the reconciler recovers
 /// abandoned uploads without racing the client's own completion.
 ///
+/// A reused Pending Card is held (see [`hold_pending_member`]) so its
+/// activation finds this declaration. A Repository's version line is also its
+/// family's selection line, which an activation takes after locking the Card
+/// row, so a reused exact Repository is held before that line, then resolved
+/// again under it. Any other Card is held after its own line, which no
+/// activation takes. Every Repository declaration writes under the tenant's
+/// GitHub slot lock, so no other writer can create the pinned Repository
+/// between the hold and the line.
+///
 /// # Errors
 /// Returns a registry error when the submission cannot be canonicalized or
 /// version-resolved, a referenced binding target cannot be frozen, or any
@@ -1569,6 +1578,14 @@ async fn persist_node(
         .canonical_hash()
         .map_err(WyrdError::from_spec_canonicalization)?;
     let artifact_hash = canonical_artifact_manifest_hash(&submission.artifacts)?;
+    let repository = card.kind == CardKind::Repository;
+    if repository
+        && let Some(VersionSpec::Pin(version)) = &card.metadata.version
+        && let Some(pinned) =
+            find_card_by_ref(conn, card.kind.clone(), &card.metadata.name, version).await?
+    {
+        hold_pending_member(conn, &pinned.card_uid).await?;
+    }
     lock_version_line(conn, card.kind.clone(), &card.metadata.name).await?;
     if let Some(existing) = resolve_existing(
         conn,
@@ -1579,7 +1596,7 @@ async fn persist_node(
     )
     .await?
     {
-        if existing.row.status == CardStatus::Pending {
+        if !repository && existing.row.status == CardStatus::Pending {
             hold_pending_member(conn, &existing.row.card_uid).await?;
         }
         persist_outbound_relationships(conn, &existing.row.card_uid, &outbound_refs).await?;

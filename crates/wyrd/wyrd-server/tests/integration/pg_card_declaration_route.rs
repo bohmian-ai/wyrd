@@ -31,7 +31,7 @@ use wyrd_spec::ids::{CardName, CardUid, DataTenantId};
 use wyrd_spec::reference::{CardRef, InlineableRef};
 use wyrd_spec::registry::{CardLifecycleStatus, DeclarationOutcomeKind};
 use wyrd_spec::storage::UploadId;
-use wyrd_sql::queries::cards::get_card_by_uid;
+use wyrd_sql::queries::cards::{get_card_by_uid, lock_version_line};
 use wyrd_sql::queries::verification::{InactivityTimeout, binding_activity};
 use wyrd_sql::queries::verifier_executions::{
     ScheduleOutcome, ScheduleSkip, VerifierExecutionQueue,
@@ -6384,5 +6384,188 @@ async fn overtaken_declaration_records_its_conflict_on_activation() {
         body["code"],
         "WYRD_REGISTRY_409_REPOSITORY_SELECTION_CONFLICT"
     );
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// The lock waits in the test database, oldest backend first: the
+/// `wait_event` of every other backend blocked on a heavyweight lock.
+///
+/// # Panics
+/// Panics when the read fails.
+async fn lock_waits(superuser: &sqlx::PgPool) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT wait_event FROM pg_stat_activity \
+          WHERE datname = current_database() AND wait_event_type = 'Lock' \
+            AND pid <> pg_backend_pid() \
+          ORDER BY backend_start",
+    )
+    .fetch_all(superuser)
+    .await
+    .expect("lock waits read")
+}
+
+/// Wait until `count` backends are blocked on locks and return their waits.
+///
+/// # Panics
+/// Panics when they are not within ten seconds.
+async fn wait_for_lock_waits(superuser: &sqlx::PgPool, count: usize) -> Vec<String> {
+    for _ in 0..200 {
+        let waits = lock_waits(superuser).await;
+        if waits.len() >= count {
+            return waits;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "{count} lock waits never formed: {:?}",
+        lock_waits(superuser).await
+    );
+}
+
+/// An exact retry of a Pending Repository root and that root's activation
+/// both finish, whichever reaches the root first.
+///
+/// Attempt A leaves `policy` Pending after its blob fails. A fresh key B
+/// then retries the identical exact version while A's same-key replay
+/// activates it, under a test lock that parks the first of them:
+///
+/// - writer first: B holds the root and waits on the family line, so
+///   the activation waits on B's hold rather than taking the line first;
+/// - activation first: A's activation holds the root and waits on its
+///   declaration, so B waits on the root without holding the family line.
+///
+/// Both answer success, the root is Active and selected, and B reuses it.
+///
+/// # Panics
+/// Panics when either request fails, the root is not Active and selected,
+/// B writes another version, or a writer-first activation waits on the
+/// family line.
+#[tokio::test(flavor = "current_thread")]
+async fn exact_pending_root_retry_and_activation_finish_in_either_order() {
+    let storage_root = tempfile::tempdir().expect("storage root creates");
+    let mock = GithubAppMock::start().expect("the GitHub mock starts");
+    let server = WyrdTestServer::builder()
+        .with_storage_settings(local_storage(storage_root.path()))
+        .with_github_app_for_test(&mock)
+        .start_bound()
+        .await
+        .expect("bound test server starts");
+    connect_policy_repository(&server, &mock).await;
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("repository-exact-root", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let superuser = server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+    let checkout = tempfile::tempdir().expect("checkout creates");
+    let old = loaded_body(checkout.path(), &[("v1.yaml", POLICY_V1)], "v1.yaml");
+    let (status, body) = declare_body(&server, &jwt, "exact-root-old", &old).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    for (version, writer_first) in [("2.0.0", true), ("3.0.0", false)] {
+        let file = format!("v{version}.yaml");
+        let exact = loaded_body(
+            checkout.path(),
+            &[(&file, &POLICY_V1.replace("1.0.0", version))],
+            &file,
+        );
+        let (key_a, key_b) = (
+            format!("exact-root-{version}-a"),
+            format!("exact-root-{version}-b"),
+        );
+        let moved_storage_root = storage_root.path().with_extension("moved");
+        std::fs::rename(storage_root.path(), &moved_storage_root).expect("storage root moves");
+        std::fs::write(storage_root.path(), b"not a directory")
+            .expect("broken storage root writes");
+        let (status, body) = declare_body(&server, &jwt, &key_a, &exact).await;
+        assert_ne!(status, StatusCode::CREATED, "{body}");
+        let (root_uid, root_status) = policy_state(&server, version).await;
+        assert_eq!(
+            root_status, "pending",
+            "A registered its root before the blob failed"
+        );
+        hold_reconciliation(&server, &root_uid).await;
+        std::fs::remove_file(storage_root.path()).expect("broken storage root removes");
+        std::fs::rename(&moved_storage_root, storage_root.path()).expect("storage root restores");
+        let versions = repository_versions(&server, "policy").await;
+
+        let mut gate = server
+            .tenant_conn_for(server.data_tenant_id())
+            .await
+            .expect("tenant connection opens");
+        if writer_first {
+            let family = CardName::new("policy").expect("family name is valid");
+            lock_version_line(&mut gate, CardKind::Repository, &family)
+                .await
+                .expect("family line locks");
+        } else {
+            sqlx::query(
+                "SELECT 1 FROM wyrd.card_declaration_operations \
+                  WHERE idempotency_key = $1 FOR UPDATE",
+            )
+            .bind(&key_a)
+            .execute(&mut **gate.transaction())
+            .await
+            .expect("A's declaration locks");
+        }
+        let retry = declare_body(&server, &jwt, &key_b, &exact);
+        let activation = declare_body(&server, &jwt, &key_a, &exact);
+        let (first, second) = if writer_first {
+            (retry, activation)
+        } else {
+            (activation, retry)
+        };
+        let ((first_status, first_body), (second_status, second_body), waits) = tokio::join!(
+            first,
+            async {
+                wait_for_lock_waits(&superuser, 1).await;
+                second.await
+            },
+            async {
+                let waits = wait_for_lock_waits(&superuser, 2).await;
+                gate.commit().await.expect("gate releases");
+                waits
+            },
+        );
+        assert_eq!(first_status, StatusCode::CREATED, "{version}: {first_body}");
+        assert_eq!(
+            second_status,
+            StatusCode::CREATED,
+            "{version}: {second_body}"
+        );
+        let retried = if writer_first {
+            &first_body
+        } else {
+            &second_body
+        };
+        assert_eq!(
+            retried["root"]["uid"],
+            root_uid.to_string(),
+            "B reuses A's root"
+        );
+        assert_eq!(repository_versions(&server, "policy").await, versions);
+        assert_eq!(policy_state(&server, version).await.1, "active");
+        assert_eq!(
+            selected_version(&server, "policy").await.as_deref(),
+            Some(version)
+        );
+        let family_waits = waits.iter().filter(|wait| *wait == "advisory").count();
+        if writer_first {
+            assert_eq!(
+                family_waits, 1,
+                "only B waits on the family line; the activation waits on B's hold: {waits:?}"
+            );
+        } else {
+            assert_eq!(
+                family_waits, 0,
+                "B waits on the root, not the family: {waits:?}"
+            );
+        }
+    }
     server.shutdown().await.expect("test server shuts down");
 }

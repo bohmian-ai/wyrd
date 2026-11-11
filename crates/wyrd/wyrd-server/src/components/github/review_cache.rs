@@ -214,10 +214,7 @@ impl CodeReviewMetadata {
     async fn tenant<T>(
         &self,
         identity: &Identity,
-        statement: impl AsyncFnOnce(
-            &mut TenantConn<'_>,
-            CodeReviewRepository,
-        ) -> Result<T, SqlError>,
+        statement: impl AsyncFnOnce(&mut TenantConn<'_>, CodeReviewRepository) -> Result<T, SqlError>,
     ) -> Result<T, PersistenceError> {
         let repository = repository(identity)?;
         let mut conn = self
@@ -305,7 +302,11 @@ impl SnapshotStore for CodeReviewMetadata {
     /// and [`PersistenceError::Backend`] on a refused identity or a Postgres
     /// failure.
     #[tracing::instrument(skip_all)]
-    async fn upsert_record(&self, identity: &Identity, key: &ObjectKey) -> Result<(), PersistenceError> {
+    async fn upsert_record(
+        &self,
+        identity: &Identity,
+        key: &ObjectKey,
+    ) -> Result<(), PersistenceError> {
         let touched = self
             .tenant(identity, async |conn, repository| {
                 touch_code_review_snapshot_record(conn, repository, key.as_str()).await
@@ -344,7 +345,11 @@ impl SnapshotStore for CodeReviewMetadata {
     /// Returns [`PersistenceError::Backend`] on a refused identity or a
     /// Postgres failure.
     #[tracing::instrument(skip_all)]
-    async fn delete_record(&self, identity: &Identity, key: &ObjectKey) -> Result<(), PersistenceError> {
+    async fn delete_record(
+        &self,
+        identity: &Identity,
+        key: &ObjectKey,
+    ) -> Result<(), PersistenceError> {
         self.tenant(identity, async |conn, repository| {
             delete_code_review_snapshot_record(conn, repository, key.as_str()).await
         })
@@ -403,7 +408,11 @@ impl ContextStore for CodeReviewMetadata {
     /// Returns [`PersistenceError::Backend`] on a refused identity, a
     /// Postgres failure or an invalid stored record.
     #[tracing::instrument(skip_all)]
-    async fn context(&self, identity: &Identity, id: &ContextId) -> Result<ContextLookup, PersistenceError> {
+    async fn context(
+        &self,
+        identity: &Identity,
+        id: &ContextId,
+    ) -> Result<ContextLookup, PersistenceError> {
         let row = self
             .tenant(identity, async |conn, repository| {
                 code_review_context(conn, repository, id.as_str()).await
@@ -431,9 +440,10 @@ impl ContextStore for CodeReviewMetadata {
             .postgres
             .operator_pool()
             .ok_or_else(|| backend("code-review context expiry needs the operator pool"))?;
-        let rows = expired_code_review_contexts(&operator, i64::try_from(limit).unwrap_or(i64::MAX))
-            .await
-            .map_err(backend)?;
+        let rows =
+            expired_code_review_contexts(&operator, i64::try_from(limit).unwrap_or(i64::MAX))
+                .await
+                .map_err(backend)?;
         rows.into_iter()
             .map(|row| {
                 let identity: Identity = from_json(row.identity)?;
@@ -451,7 +461,11 @@ impl ContextStore for CodeReviewMetadata {
     /// Returns [`PersistenceError::Backend`] on a refused identity or a
     /// Postgres failure.
     #[tracing::instrument(skip_all)]
-    async fn delete_context(&self, identity: &Identity, id: &ContextId) -> Result<(), PersistenceError> {
+    async fn delete_context(
+        &self,
+        identity: &Identity,
+        id: &ContextId,
+    ) -> Result<(), PersistenceError> {
         self.tenant(identity, async |conn, repository| {
             delete_code_review_context(conn, repository, id.as_str()).await
         })
@@ -464,7 +478,10 @@ impl ContextStore for CodeReviewMetadata {
     /// Returns [`PersistenceError::Backend`] on a refused identity, a
     /// Postgres failure or an invalid stored key.
     #[tracing::instrument(skip_all)]
-    async fn remove_repository(&self, identity: &Identity) -> Result<Vec<ObjectKey>, PersistenceError> {
+    async fn remove_repository(
+        &self,
+        identity: &Identity,
+    ) -> Result<Vec<ObjectKey>, PersistenceError> {
         self.tenant(identity, async |conn, repository| {
             delete_code_review_contexts(conn, repository).await
         })

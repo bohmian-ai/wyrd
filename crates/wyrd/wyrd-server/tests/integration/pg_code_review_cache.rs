@@ -15,12 +15,11 @@ use std::time::Duration;
 use bohmian_code_review_pipeline::persistence::ContextLookup;
 use bohmian_code_review_pipeline::testing::RoutedTransport;
 use bohmian_code_review_pipeline::{
-    BoxFuture, ContextStore, Contexts, GitHubClient,
-    GitHubHost, HttpRequest, HttpResponse, HttpTransport, Identity, InstallationId,
-    InstallationToken, ObjectKey, ObjectSha, ObjectStorage, Operation, PersistenceError,
-    PipelineLimits, PullRequestPins, RepositoryIdentity, RequestLimits, ReviewPipeline,
-    SNAPSHOT_FORMAT_VERSION, SnapshotPointer, SnapshotScope, SnapshotStore, Snapshots,
-    StorageError, TenantId, TransportError,
+    BoxFuture, ContextStore, Contexts, GitHubClient, GitHubHost, HttpRequest, HttpResponse,
+    HttpTransport, Identity, InstallationId, InstallationToken, ObjectKey, ObjectSha,
+    ObjectStorage, Operation, PersistenceError, PipelineLimits, PullRequestPins,
+    RepositoryIdentity, RequestLimits, ReviewPipeline, SNAPSHOT_FORMAT_VERSION, SnapshotPointer,
+    SnapshotScope, SnapshotStore, Snapshots, StorageError, TenantId, TransportError,
 };
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -322,7 +321,11 @@ async fn pinned_review_runs_cold_and_warm_over_wyrd_custody() {
         .pinned(&client, &custody.identity(), &pins(), None)
         .await
         .expect("warm pinned review");
-    assert_eq!(client.calls().get(Operation::Archive), 1, "warm reuses the snapshot");
+    assert_eq!(
+        client.calls().get(Operation::Archive),
+        1,
+        "warm reuses the snapshot"
+    );
     assert_eq!(warm.full, cold.full);
     assert_eq!(warm.context.context.spans, cold.context.context.spans);
 
@@ -331,7 +334,11 @@ async fn pinned_review_runs_cold_and_warm_over_wyrd_custody() {
         .pinned(&client, &renamed, &pins(), None)
         .await
         .expect("pinned review after rename");
-    assert_eq!(client.calls().get(Operation::Archive), 1, "a rename keeps the snapshot");
+    assert_eq!(
+        client.calls().get(Operation::Archive),
+        1,
+        "a rename keeps the snapshot"
+    );
     assert_eq!(after_rename.full, cold.full);
     assert_eq!(
         pipeline
@@ -354,7 +361,11 @@ async fn objects_are_create_only_and_failures_stay_distinct() {
     let identity = custody.identity();
     let key = ObjectKey::snapshot(&identity, "v", 1, 1024, &sha('c'));
 
-    custody.objects.create(&key, b"first").await.expect("create");
+    custody
+        .objects
+        .create(&key, b"first")
+        .await
+        .expect("create");
     assert_eq!(
         custody.objects.create(&key, b"second").await,
         Err(StorageError::AlreadyExists { key: key.clone() })
@@ -407,8 +418,12 @@ async fn snapshot_metadata_survives_competition_and_interruption() {
     let (first, second) = (pointer('a'), pointer('b'));
 
     let (won_a, won_b) = tokio::join!(
-        custody.metadata.publish_snapshot_pointer(&scope, None, &first),
-        custody.metadata.publish_snapshot_pointer(&scope, None, &second),
+        custody
+            .metadata
+            .publish_snapshot_pointer(&scope, None, &first),
+        custody
+            .metadata
+            .publish_snapshot_pointer(&scope, None, &second),
     );
     assert!(won_a.expect("publish a") ^ won_b.expect("publish b"));
     let current = custody

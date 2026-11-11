@@ -73,7 +73,7 @@ Use the narrow applicable format/lint/boundary checks and `git diff --check` for
 | G9 | 22 | Completed permission decisions stay audited when a bound refuses the call | same test: the passed-bound phase's requested and fallback invoke decisions are staged |
 | G10 | 22 | The capture-slot wait reuses the deadline and its staging refusal | `capturing_call_waits_for_a_capture_slot_and_refuses_at_its_deadline`; the bound path passes the same `deadline` |
 | G11 | 24 | Settlement precedes the buffered answer, so a follow-on call does not meet its own hold | same test: under a concurrency limit of one, the call right after an expired admission is admitted |
-| G12 | 24 | Caller cancellation stays distinct from deadline expiry | same test: a lane-bound call dropped during a held snapshot is cancelled, dispatches nothing and keeps no permit; `gateway_terminal_spans_classify_every_call_and_attempt` (cancelled vs timed out) |
+| G12 | 24 | Caller cancellation stays distinct from deadline expiry | same test: a lane-bound call its caller cancels mid-attempt is accounted `cancelled` while the expired calls stay `timed_out`; a call dropped during a held snapshot dispatches nothing and keeps no permit |
 | G8 | 22, 26 | Unbound callers keep the relative timeout; the adapter and admission/settlement regressions stay green | `gateway_agent_calls_start_only_on_a_compatible_adapter`, `gateway_admission_holds_limits_and_budgets_across_replicas` |
 | C1 | 32, 38 | A valid env override wins over a zero file count (`queued_executions = 0`, `WYRD_VERIFICATION_QUEUED_EXECUTIONS=9`) | `verification_capacity_file_values_resolve_under_env` |
 | C2 | 32, 38 | A valid env pool wins over an overflowing file pool MiB `9223372036854775807` | same |
@@ -89,7 +89,7 @@ Use the narrow applicable format/lint/boundary checks and `git diff --check` for
 
 ## Implementation evidence
 
-Commits after the reviewed candidate `ea4460c3c`: 726536f82 (ledger), d050a6702 (deadline carried through admission), 509f56eb2 (config selection and representation), a8a6a0666, e5cd84932, 5b863220e, 6deeb6589 (gateway proofs), 3fc98df76 (evidence), 1e6abb69a (bound capture wait, dropped call, G1 lower bound). Production changes are `components/gateway/caller.rs`, which fixes one `Instant` before the lane wait and passes it to `GatewayInvocation::bounded`, and `components/gateway/invocation.rs`:
+Commits after the reviewed candidate `ea4460c3c`: 726536f82 (ledger), d050a6702 (deadline carried through admission), 509f56eb2 (config selection and representation), a8a6a0666, e5cd84932, 5b863220e, 6deeb6589 (gateway proofs), 3fc98df76 (evidence), 1e6abb69a (bound capture wait, dropped call, G1 lower bound), 844ba2e2b (cancelled bound call). Production changes are `components/gateway/caller.rs`, which fixes one `Instant` before the lane wait and passes it to `GatewayInvocation::bounded`, and `components/gateway/invocation.rs`:
 - the `bounded` handle (`:305`);
 - `timeout_at` around reversible preparation only (`:585–628`);
 - the admitted and capture deadline reused (`:632–634`);
@@ -99,10 +99,10 @@ The other production change is `config.rs`: `Selected` and `set_count` (`:2089�
 
 | Obligation | Implementation evidence | Assertion | Verification evidence | Result |
 |---|---|---|---|---|
-| G1: refuse a held cold snapshot past the original deadline | `invocation.rs:585–628` | lock waiter `:6185`; 504 code `:6194`; ends within `[budget, budget + 25%)` `:6198–6200`; barrier commits only after these `:6211` | G 5/5 | PASS |
+| G1: refuse a held cold snapshot past the original deadline | `invocation.rs:585–628` | 504 code `:6194` and end within `[budget, budget + 25%)` `:6198–6201`, both asserted after the lock waiter is observed (`:6185`) and before the barrier commits (`:6211`) | G 5/5 | PASS |
 | G2: no dispatch | same | `:6202–6204` | G | PASS |
 | G3: no permit kept | `caller.rs` permit drops with the call | `:6206–6209` | G | PASS |
-| G4: success after release | same | the hung-provider call is dispatched after release `:6267`; the next call is answered `:6304–6306` | G | PASS |
+| G4: success after release | same | the next call after release is admitted and answered `:6302–6306` | G | PASS |
 | G5: one instant for the lane wait and the engine deadline | `caller.rs:139–151`, `invocation.rs:632–634` | the dispatched deadline lies in `[started+budget, started+budget+budget/8]` after a delayed snapshot `:6268–6272` | G | PASS |
 | G6: expiry refused before the ledger write; a write already in progress hands off | `invocation.rs:663` | passed bound with the capture slot in hand: 504, unsettled, undispatched `:6413–6418`; uncaptured `:6421–6424`; write held past the deadline: 504 `:6343`, no attempt `:6347–6350`, `timed_out` capture `:6375–6378` | G | PASS |
 | G7: existing assertions kept | unchanged | held lane `[300ms,1s)` `:6134–6143`; cancellation `:6154–6168`; hung provider's problem `:6262`; `timed_out` capture `:6284–6287`; next call `:6304–6306` | G | PASS |
@@ -110,7 +110,7 @@ The other production change is `config.rs`: `Selected` and `set_count` (`:2089�
 | G9: completed decisions stay audited | audits are staged synchronously in `decide` | `:6427–6433` | G | PASS |
 | G10: capture wait and staging refusal | the bound path passes the same `deadline` to `capture_slot` | bound call with a 10 s relative timeout refused `GatewayCaptureStagingFull`, undispatched `:3493–3497`, at its 200 ms bound `:3498–3500` | G | PASS |
 | G11: settlement before the answer | existing `settle_buffered` order unchanged | the next call under `concurrent_calls = 1` is answered `:6367–6368` | G | PASS |
-| G12: cancellation distinct | drop guard `invocation.rs:490` unchanged | dropped call cancelled `:6223`, undispatched `:6224–6227`, no permit `:6228–6232`; `gateway_terminal_spans_classify_every_call_and_attempt` `:5168` | G | PASS |
+| G12: cancellation distinct | drop guard `invocation.rs:490` unchanged | cancelled mid-attempt: no permit kept `:6456–6460`, outcome `cancelled` `:6467–6471`, the two expiries still `timed_out` `:6472–6479`; dropped call undispatched `:6224–6227`, no permit `:6228–6232` | G | PASS |
 | C1–C3: valid env wins over stale file values | `Selected::of` checks a file value only when no variable is set | `(9, 8192 MiB, 2h)` over zero, overflowing and i64::MAX file values, `config.rs:4677–4690` | U 4/4 | PASS |
 | C4: file refusals by TOML name without overrides | `Selected::of`, `set_count`, `Selected::deadline` | `:4714`, `:4734`, `:4805–4816` | U | PASS |
 | C5: invalid env winners refused | `env_positive` and `Selected::refuse` | `:4692–4711`; env list `:4912–4928` | U | PASS |
@@ -132,9 +132,10 @@ The other production change is `config.rs`: `Selected` and `set_count` (`:2089�
 - C7, overflow: with waiters dropped from the sum, the test failed at `:4919`.
 - C8, timestamp: with the timestamp check disabled, the tests failed at `:4919` and `:4810`.
 - G10: giving the capture slot `Instant::now() + request.timeout` instead of the bound failed at `:3498` after 10.0065 s.
+- G12: making the engine report `TimedOut` on caller cancellation (`wyrd-gateway/src/engine.rs:642`) failed at `:6466` with outcome `timed_out`.
 - Every mutation was restored, and its diff is empty.
 
-**Characterization, not new behavior.** G7, G9, G11, G12 and C9 hold behavior that already existed. They have no RED. RED cites the line numbers at the time of the run.
+**Characterization, not new behavior.** G7, G9, G11 and C9 hold behavior that already existed. They have no RED. RED cites the line numbers at the time of the run.
 
 **G6 reachable form.** A capture slot that frees only after the bound cannot reach the pre-ledger check, because `reserve_until` already refuses at the same deadline (G10). The check before `admit` is therefore proved by a bound that has passed when the slot is granted at once.
 

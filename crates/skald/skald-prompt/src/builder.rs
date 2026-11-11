@@ -370,7 +370,13 @@ fn openai_response_user_item(content: String) -> OpenAiResponseItem {
     }
 }
 
-/// The native `OpenAI` Chat `response_format`; a named format sets none.
+/// The native `OpenAI` Chat `response_format`; a named format sets none and
+/// is applied after the request is built.
+///
+/// # Errors
+///
+/// Returns [`PromptBuilderError::InvalidResponseSchema`](crate::error::PromptBuilderError::InvalidResponseSchema)
+/// when a JSON Schema format's schema is not a JSON object.
 fn openai_chat_response_format(
     format: &ResponseFormat,
 ) -> PromptBuilderResult<Option<OpenAiResponseFormat>> {
@@ -389,7 +395,13 @@ fn openai_chat_response_format(
     }))
 }
 
-/// The native `OpenAI` Responses `text` setting; a named format sets none.
+/// The native `OpenAI` Responses `text` setting; a named format sets none
+/// and is applied after the request is built.
+///
+/// # Errors
+///
+/// Returns [`PromptBuilderError::InvalidResponseSchema`](crate::error::PromptBuilderError::InvalidResponseSchema)
+/// when a JSON Schema format's schema is not a JSON object.
 fn openai_responses_text(
     format: &ResponseFormat,
 ) -> PromptBuilderResult<Option<OpenAiResponsesText>> {

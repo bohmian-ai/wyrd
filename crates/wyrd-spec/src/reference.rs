@@ -111,6 +111,9 @@ impl SiblingRef {
 }
 
 impl From<&CardRef> for SiblingRef {
+    /// The sibling naming `card_ref`'s exact kind, name, and version, as a
+    /// graph rewrites a submitted target; the UID is dropped because a
+    /// sibling names a submission, not a registered Card.
     fn from(card_ref: &CardRef) -> Self {
         Self {
             kind: card_ref.kind.clone(),

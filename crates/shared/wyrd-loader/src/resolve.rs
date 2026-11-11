@@ -143,6 +143,10 @@ impl PathResolver<'_> {
     /// Resolution is bounded by the path-depth limit, uses the sandbox for
     /// filesystem containment, reuses cached card identities, and accepts only
     /// a single card from a referenced file.
+    ///
+    /// # Errors
+    /// Returns the [`Diagnostic`] of a path beyond the depth limit, outside
+    /// the sandbox, or naming a file that is not exactly one loadable card.
     fn resolve(
         &mut self,
         base_file: &Path,

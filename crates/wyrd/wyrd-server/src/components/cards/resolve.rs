@@ -210,7 +210,7 @@ impl EffectiveSpecs {
     /// but always before Card persistence.
     ///
     /// # Errors
-    /// Returns `WYRD_REGISTRY_*_UNRESOLVED_PATH_REF` or
+    /// Returns `WYRD_REGISTRY_400_UNRESOLVED_PATH_REF` or
     /// `WYRD_REGISTRY_*_UNRESOLVED_DEPENDENCY` when a reference is a loader-only
     /// path, names an unsubmitted sibling, or has no Card in this tenant; the
     /// binding refusals listed on [`validate_bindings`](Self::validate_bindings);
@@ -737,7 +737,7 @@ fn collect_card_refs(spec: &Spec, output: &mut Vec<CardRef>) {
 ///
 /// # Errors
 /// Returns `WYRD_REGISTRY_*_UNRESOLVED_DEPENDENCY` for a sibling whose
-/// identity is not in `siblings` and `WYRD_REGISTRY_*_UNRESOLVED_PATH_REF`
+/// identity is not in `siblings` and `WYRD_REGISTRY_400_UNRESOLVED_PATH_REF`
 /// for a loader-only path.
 pub(super) fn validate_and_collect_refs(
     spec: &Spec,
@@ -784,7 +784,7 @@ pub(super) fn validate_and_collect_refs(
 ///
 /// # Errors
 /// Returns `WYRD_REGISTRY_*_UNRESOLVED_DEPENDENCY` for an unsubmitted sibling
-/// and `WYRD_REGISTRY_*_UNRESOLVED_PATH_REF` for a loader-only path.
+/// and `WYRD_REGISTRY_400_UNRESOLVED_PATH_REF` for a loader-only path.
 fn collect_inline_ref<T>(
     reference: &InlineableRef<T>,
     siblings: &BTreeSet<CardRefIdentity>,
@@ -847,9 +847,9 @@ fn unresolved_path_error(path: &std::path::Path) -> WyrdError {
 /// child reference.
 ///
 /// # Errors
-/// Returns `WYRD_REGISTRY_*_UNRESOLVED_DEPENDENCY` for an external reference
+/// Returns `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` for an external reference
 /// without a resolved UID or a sibling whose target is not yet persisted, and
-/// `WYRD_REGISTRY_*_UNRESOLVED_PATH_REF` for a loader-only path.
+/// `WYRD_REGISTRY_400_UNRESOLVED_PATH_REF` for a loader-only path.
 pub fn bind_card_references(
     spec: &mut Spec,
     external: &ResolvedRefs,
@@ -877,6 +877,15 @@ pub fn bind_card_references(
     result
 }
 
+/// Bind one durable reference slot to its full registered reference: an
+/// external reference takes the UID preflight resolved, and a graph-ready
+/// sibling becomes the reference its submission persisted as in this
+/// declaration.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` for an external reference
+/// preflight did not resolve or a sibling not yet persisted, and
+/// `WYRD_REGISTRY_400_UNRESOLVED_PATH_REF` for a path the loader left in place.
 fn bind_ref(
     reference: &mut Ref,
     external: &ResolvedRefs,
@@ -895,6 +904,11 @@ fn bind_ref(
     }
 }
 
+/// Bind one inlineable reference slot as [`bind_ref`] does; an inline value
+/// stays in place.
+///
+/// # Errors
+/// As [`bind_ref`].
 fn bind_inline_ref<T>(
     reference: &mut InlineableRef<T>,
     external: &ResolvedRefs,

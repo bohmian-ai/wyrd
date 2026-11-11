@@ -1,6 +1,6 @@
 ---
 id: SPEC-benchmark-latency-diagnosis
-revision: 5
+revision: 7
 status: approved
 ---
 
@@ -65,7 +65,34 @@ exchanges, request handoff/waits and model-backed Verification against a local
 provider. Complete the supported small optimizations identified by those profiles
 inside TASK-005; instrumentation and a proposal-only report do not complete it.
 
+The model-check profile exposed a product cost: reading a result reconstructs
+the executable inline Agent and compiles its Prompt, although the caller needs
+the judgment. TASK-005 now also separates the compact decision from full retained
+execution evidence. For example, a caller receives the failed requirement,
+reason, citation and custom score immediately; it explicitly reads execution
+details to inspect the judge's Prompt or intermediate tool calls. The server
+continues recording those details. Neither result nor detail decoding compiles
+a Prompt. This is an intentional public contract change across all surfaces,
+not a fixture optimization or permission to discard retained evidence.
+
+Full details are not guaranteed durable when a verdict returns. Keep the useful
+decision self-contained and preserve asynchronous recording, existing retention
+and read authority. The costs are a deliberate SDK migration and an explicit
+network read for diagnostics; no automatic detail fetch or new durability wait
+is introduced.
+
 ## Required behavior
+
+Revision 7 adds TASK-006: local Gateway quota/usage reservations with asynchronous
+PostgreSQL persistence, plus lower Agent check latency through reused schema
+preparation and evidence-backed execution fixes. Global quota enforcement is
+approximate, including monetary budgets. Pending usage is memory-owned and may
+be lost on abrupt process death; no crash-safe local ledger is required. Cold,
+unhealthy or full usage state refuses until background recovery succeeds.
+These explicit trade-offs remove per-call database coordination without
+weakening authentication, permissions, tenant separation or model-answer
+validation. TASK-006 does not require TDD; it still requires focused regression,
+integration and honest performance evidence.
 
 - **REQ-001 — Sole benchmark recorder.** The benchmark backend is the only
   process metrics recorder in benchmark mode. All benchmark timing distributions,
@@ -247,16 +274,154 @@ inside TASK-005; instrumentation and a proposal-only report do not complete it.
   zero. Do not substitute residual for all Wyrd work, CPU shares for latency, or
   a mean-throughput calculation for a median hardware limit.
 
+- **REQ-023 — Compact decision contract.** `VerificationResult` keeps its existing
+  top-level `execution_id`, optional `run_id`, exact `verifier`, `subject`, optional
+  `deployment_environment`, and `outcome`. The outcome contains only `verdict` and
+  `requirements`. Each requirement retains `id`, optional `step`, `statement`,
+  `outcome`, `reason`, optional `actual`, `citations`, optional custom `data`, and
+  optional check-specific `detail` (including existing drift statistics). Full
+  `check` and execution `provenance`, outcome `steps`, and outcome `evidence` are
+  absent, not null placeholders. Direct execution, status, wait and typed reads
+  use this same compact contract; the meaning and validation of all retained
+  fields and custom data are unchanged. Citations still identify original slots
+  and locators; they do not promise that input bodies are echoed or fetchable.
+- **REQ-024 — Explicit descriptive details.** Add the read operation
+  `GET /v1/verification/executions/{execution_id}/details`, returning
+  `VerificationDetails` with the same execution/Run/Verifier/subject/environment
+  identity and full outcome: verdict, requirements including exact authored
+  checks and execution provenance, steps and pinned evidence declarations.
+  Expose it through the existing SDK `Execution` handle as `details` (and its
+  ordinary typed-data sibling), and MCP `verification.get_execution_details`.
+  The details preserve inline configuration even without standalone Agent or
+  Prompt Cards. They describe what ran; neither client decoding nor retained
+  server readback compiles, renders, hydrates or executes a Prompt. Structural
+  decoding and stored-data integrity checks remain; authoring/execution validation
+  and validation of model answers against their declared schema remain mandatory.
+  No wire-supplied trusted/validated flag or general schema cache is introduced.
+  REQ-032 permits narrowly owned immutable execution-preparation reuse; it does
+  not make descriptive reads compile or execute a Prompt.
+- **REQ-025 — Preserve evidence ownership.** Keep complete existing canonical
+  summary, output and input records, their shapes, selected result identity,
+  provenance, capture rules and retention. Compact response projection must not
+  remove check configuration, inputs or steps from storage. Read both projections
+  through the existing execution reader and authenticated Bifrost workflow;
+  introduce no duplicate store, ledger or execution orchestration. Previously
+  retained records remain readable as descriptive details without rejudgment.
+- **REQ-026 — Honest detail availability and authority.** Details require the
+  same tenant, Card/read and Bifrost authority as current full execution readback;
+  `verifier:run` does not confer read access. Reuse existing permission/audit and
+  non-disclosure rules. If no complete visible retained detail can be assembled,
+  including an unknown execution, not-yet-visible records or expired/lost records,
+  return `404 WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND` under the existing read
+  rules, never an empty successful detail or an invented pending/durable claim.
+  Do not turn permission or query failures into successful empty data. Known
+  queued status and its optional result retain their existing lifecycle behavior.
+  Direct calls never wait for durable detail publication; completed verdicts and
+  earlier responses are unchanged by failed detail reads. SDK properties and
+  default execution/status/wait perform no extra detail request. No new retention
+  promise, persistence acknowledgement or availability tracking service is added.
+- **REQ-027 — Coherent public migration and proof.** Update wire schemas, served
+  OpenAPI/MCP descriptions, Rust/Python/TypeScript SDKs, authored stubs, examples,
+  and affected journeys together. Configuration/step/input consumers explicitly
+  request details; ordinary outcome handling does not. There is one compact
+  default contract, no legacy alias, hidden full mode or compatibility fallback.
+  Measure final response bytes, client/server CPU, allocation, latency and
+  throughput with symmetric TASK-005 collection. Preserve earlier evidence and
+  disclose the changed response representation; no new performance claim is
+  established by old profiles or by changing the benchmark's validation boundary.
+
+- **REQ-028 — Local approximate quota admission.** TASK-006 extends the existing
+  process Gateway cache/lifecycle to hold tenant policy, refreshed shared usage
+  and local pending reservations. Request, token, concurrency and spending-budget
+  checks reserve atomically within a server before dispatch, accounting for the
+  existing applicable subject/target, window/period, retry/fallback exposure and
+  unknown-cost rules. Admission uses that local view and does not await PostgreSQL
+  reads, writes or cache fills. Accounting does not delay a buffered answer or
+  stream handoff. Explicit authentication/token-exchange and administrative
+  operations are outside this quota-path IO guarantee.
+- **REQ-029 — Approximate global enforcement.** Cached shared usage and local
+  reservations replace strict cross-replica serialization for all configured
+  Gateway quotas, including monetary budgets. Servers may exceed a configured
+  cluster total before their usage becomes mutually visible; a hard global
+  ceiling or numerical maximum overrun is not promised. Local admission still
+  enforces its current policy/view and cannot double-spend local headroom.
+  Existing applicable-limit/budget refusal codes remain when the usable local
+  view is exhausted. Approximate quotas are not authorization controls.
+- **REQ-030 — Background synchronization and refusal.** Cache loading, shared
+  usage refresh and persistence run through bounded Gateway-owned background
+  work. A missing usable policy/usage snapshot, loss of refresh health or a full
+  pending-accounting buffer refuses quota-covered work before dispatch with
+  `503 WYRD_SERVER_503_SERVICE_UNAVAILABLE`, preserving existing dialect mapping.
+  An unknown policy cannot be assumed to contain no quotas. Requests never
+  substitute a synchronous database query or silently admit unlimited work.
+  Recovery resumes admission only after a usable shared baseline is established.
+  Reuse notification/listener health and generation-fencing behavior; bound
+  background IO and stale-state detection, retaining the existing listener
+  liveness bound rather than claiming instantaneous notification/revocation.
+  Private batching, refresh scheduling and capacity sizes remain implementation
+  choices with observable boundedness and failure tests.
+- **REQ-031 — Memory-owned usage and replay-safe persistence.** Pending usage
+  and reservations may live only in memory. Abrupt process death or an expired
+  shutdown deadline may lose usage not yet committed to PostgreSQL; this is an
+  accepted additional source of undercount/overshoot, not a durable-accounting
+  promise. Do not add a local WAL, durable queue or separate coordination service.
+  During a live process, retain accepted usage until committed or the approved
+  shutdown boundary, refuse new work before its bounded pending capacity is
+  exceeded, and drain through the existing tracked lifecycle. Persist server
+  contributions without overwriting other servers' usage. A refresh must neither
+  erase pending reservations nor double-count committed local contributions.
+  Retried/uncertain commits must not repeat token deltas, costs or releases.
+  Cancelled/failed calls settle the applicable actual/bounded exposure; local
+  concurrency releases only when execution ends, including stream termination.
+  Restart loads committed shared usage in the background before admission; it
+  cannot recover usage already lost from another process's memory.
+  Extend existing PostgreSQL queries/migrations only as needed, preserving tenant
+  RLS, committed historical usage, domain identity and PostgreSQL-owned
+  coordination time. Use existing deployment migration/drain rules; no new
+  replica lease, distributed reservation, reconciliation service or rollout
+  protocol is selected. Do not reprice historical entries.
+- **REQ-032 — Reuse exact schema preparation.** Repeated warm Agent checks with
+  the same effective schema/validation settings reuse immutable meta-validation
+  and compiled validators through an existing owner whose lifetime spans calls.
+  Bounded eviction may require preparation again. Rendering, reachable-slot
+  narrowing and schema-changing hooks must select the matching preparation;
+  changed schemas/settings cannot reuse stale validation. Continue validating
+  model answers against the outgoing schema and the declared Verdict contract
+  where they differ, decoding typed Verdicts, enforcing custom-data bounds and
+  checking original-evidence citations. Code checks retain their validation.
+  Do not treat a wire/decoded output map as proof it was validated, introduce a
+  public trusted flag, or retain caller authority, evidence/media, mutable
+  conversations, tools or workspaces in reusable preparation. No general global
+  schema registry or new remote schema retrieval behavior is selected.
+- **REQ-033 — Complete Agent latency remediation.** Recover the saved Gateway
+  phase/wait distributions already present in Verification's raw snapshots and
+  persist them through the existing canonical reports. Distinguish provider
+  headers/body, task dispatch/resumption, local preparation/validation and
+  post-answer work. Remove repeated schema preparation and implement supported
+  owner-local reductions in the remaining Agent path, preserving retries,
+  deadlines, structured-output repair and retained evidence. Rejected candidates
+  require source/profile counterevidence; a research-only handoff is incomplete.
+  Neither PostgreSQL removal nor CPU shares explain the existing no-quota
+  fixture's whole elapsed Agent interval. Existing benchmark authorization and
+  comparable milestone/role/population requirements remain in force.
+
 ## Invariants and boundaries
 
 - **INV-001:** authentication, permissions, tenant separation, credential
-  scrubbing, audit behavior, governance, provider behavior, response contents,
-  stable errors and evidence attribution do not change.
+  scrubbing, audit behavior, governance, provider behavior, stable errors and
+  evidence attribution do not change. Response contents remain unchanged except
+  for the explicit compact/detail Verification contract in REQ-023–027. This
+  exception changes presentation and decoding, never judgment or stored evidence.
+  REQ-028–031 explicitly replace strict Gateway quota/settlement coordination
+  with approximate local enforcement and memory-owned asynchronous persistence;
+  permission decisions and tenant boundaries are unchanged.
 - **INV-002:** capture reservation remains before charge/dispatch, bounded by the
   existing deadline, with the existing retryable refusal. Reserved captures are
   never shed. Projection failures never change an already answered call.
 - **INV-003:** recording and optimizations do not change cancellation, settlement, accepted-work
-  ownership, retry, durable acknowledgement, or resource-admission semantics.
+  ownership, retry, durable acknowledgement, or resource-admission semantics,
+  except for the explicit Gateway quota/accounting changes in REQ-028–031.
+  Capture and Verification evidence acknowledgment/loss rules are unchanged.
 - **INV-004:** historical records remain immutable and readable. Changed
   measurement settings are declared; results from different instrumentation or
   workloads are not represented as a controlled performance improvement.
@@ -273,13 +438,22 @@ uncommitted candidate, not a mandated name.
 Recording overhead, synchronization, cardinality and profile overhead are costs
 to account for. New timing observations must not be assumed free or proposed as
 latency fixes. No new scheduler, cache, allocator, transport, memory-accounting
-framework, admission policy or public product workflow is selected here.
+framework or admission policy is selected here except the Gateway-local usage/
+reservation cache and narrow immutable execution preparation in REQ-028–032.
+The only new product read workflow
+is explicit execution-detail retrieval under REQ-024–027.
 
 ## Execution boundary
 
 Creating and reviewing this packet performs source and existing-artifact research
 only. It runs no benchmarks, starts no release builds and changes no implementation
 code. Specification approval permits task planning, not automatic execution.
+
+The maintainer explicitly waived TDD for TASK-006 on 2026-11-11. That task may
+implement fixes directly, followed by focused regression, integration, negative
+and performance/ownership evidence; no failing-first test or RED/GREEN/REFACTOR
+cycle is required. The waiver does not remove correctness coverage, relax
+assertions, authorize experiments or change other tasks' proof requirements.
 
 After task execution is explicitly requested, ordinary implementation checks may
 verify recording, reporting and the four scoped optimizations. Any proposed new benchmark experiment must first be
@@ -292,6 +466,10 @@ baselines are reused throughout.
 
 | Criterion | Obligations | Observable proof |
 |---|---|---|
+| **AC-023 — Local quota path** | REQ-028–030 | With usable local state, pause background PostgreSQL work and observe provider dispatch and the buffered answer before releasing it. Local concurrent admissions reserve atomically, tenant state stays isolated, and ordinary local quota exhaustion keeps its existing refusal. Multi-server tests establish approximate enforcement without pretending the configured total is a strict global ceiling. |
+| **AC-024 — Async usage lifecycle** | REQ-030–031 | Real PostgreSQL persistence/refresh/retry proofs retain pending contributions, aggregate servers without overwriting usage, and do not double-apply committed updates. Cold/unhealthy/full states return the existing retryable 503 before dispatch and recover through background work. Cancellation/streams release local concurrency at execution end. Restart reloads committed usage; loss of unflushed process-memory usage is accepted and not labelled durable recovery. |
+| **AC-025 — Prepared validation and Agent fixes** | REQ-032–033 | Warm repeated checks avoid repeated schema preparation; changed/bound/hook-replaced schemas validate correctly. Invalid answers, custom-data bounds, citations, repair and code checks retain behavior. Canonical Verification reports expose saved Gateway phase/wait evidence, and implemented Agent reductions have attributable correctness and performance evidence. |
+| **AC-026 — Small owner-native implementation** | REQ-028–033 | Reuse the existing Gateway cache/worker/task and Skald/Vala execution owners. No Redis, new coordination service, crash-safe local ledger or strict global-quota machinery is introduced. Focused regression/integration evidence is required; TASK-006 needs no TDD cycle. No new benchmark runs without the existing explicit authorization. |
 | **AC-001 — One recording workflow** | REQ-001–004; INV-001,003 | With benchmarking off, the production recorder remains installed and no benchmark observation accumulates. With it on, only the benchmark recorder is installed: counters increment, gauges update, and timing/diagnostic histograms retain their units and populations through benchmark-owned snapshots. Duplicate timing instrumentation does not double-count. Driver reconciliation, backlog and resource readings work without a Prometheus recorder, exporter or exposition parser. Cover all three engines and both benchmark levels through focused tests and consumer inspection; any live experiment requires the authorization above. |
 | **AC-002 — Reliable intervals** | REQ-003,004,007; INV-004 | Focused tests preserve per-request residuals, phase classification, warmup separation, late-cohort counts, distribution bounds and invalid-evidence detection. Existing records remain readable. Missing evidence is explicit, and maximum declared workload coverage fits bounded recording capacity. |
 | **AC-003 — Defensible c64 diagnosis** | REQ-005–007 | A report cites the existing records, applicable profile intervals and source mechanisms. It compares client and server p50s independently, distinguishes response latency from background work, and identifies where CPU profiles cannot explain waiting. Assertions of outbox saturation require outbox evidence; Scribe memory use alone is insufficient. |
@@ -310,6 +488,10 @@ baselines are reused throughout.
 | **AC-016 — Model-backed Verification coverage** | REQ-020; INV-001–004 | Local real-SDK diagnostics execute one model check with the original authority/deadline and valid citation/usage; upstream/result/evidence counts reconcile. Assertions retain old expectations/judgments and model cases remain separately identified diagnostics. |
 | **AC-017 — Improvements implemented** | REQ-021; INV-001–004 | Two source-proven reductions ship with equivalence tests. Profile-informed candidates have implemented supported reductions or source/profile counterevidence, never an unexplained deferral. Trace fidelity, unused-facility validation, caller isolation and capture/durable ownership remain intact. |
 | **AC-018 — Qualified, canonical results** | REQ-003,005–007,011,022; INV-004 | Reference→measurement-complete and measurement-complete→optimized comparisons distinguish observation cost from code gains. Both processes have valid case-scoped CPU/heap artifacts and per-repetition client/server/call-attempt evidence in regenerated canonical reports. No task completion from a profiling report alone or an unmeasured last fix. |
+| **AC-019 — Useful compact results** | REQ-023; INV-001 | Direct, queued status/wait and typed reads preserve passed/failed/inconclusive/not-applicable judgments, reasons, actuals, citations, custom data and drift findings. Compact wire/schema/SDK results omit configuration, provenance, steps and input echoes. Reading a result makes no detail call or Prompt compilation; typed-data refusal never reruns judgment. |
+| **AC-020 — Faithful descriptive details** | REQ-024–025; INV-001,003 | An inline Agent with no standalone Agent/Prompt Card retains its exact authored check, provenance, steps and evidence. Details and compact result agree on identity and judgments; repeated and historical retained reads do not compile or execute a Prompt. Existing storage facts/shapes remain intact. Invalid authored/model inputs are still refused at their existing execution boundaries. |
+| **AC-021 — Availability and access are explicit** | REQ-026; INV-001,003 | Real-server journeys cover visible detail, unknown/not-yet-visible/missing detail, read denial and cross-tenant access. Missing visible detail uses the existing not-found code without fabricated evidence or lifecycle changes. A completed direct verdict remains useful when recording fails; no read authority, hidden IO or durability barrier is introduced. |
+| **AC-022 — Migration and measured closure** | REQ-027,022; INV-004 | All first-class SDKs and HTTP/MCP expose compact results and explicit descriptive details with matching schemas/docs. Existing full-detail consumers migrate. Final canonical comparisons retain every repetition, both process profiles and response bytes, identify removed decode/compiler work, and state improvements/regressions/unresolved results separately. No old O result is relabelled as evidence for the new contract. |
 
 ## Existing owners and evidence
 
@@ -363,8 +545,26 @@ client/server metric and profiling parity, full controlled-path diagnostics,
 model-backed Verification, the supported small reductions and final qualification.
 Earlier task scopes/evidence remain intact; TASK-005 completes this additional
 work rather than reopening their finished implementation.
+Its appended revision-6 block also owns compact Verification responses, descriptive
+details, complete retained evidence, cross-surface migration and final measurement.
+Earlier TASK-005 execution evidence is historical proof of its revision-5 work,
+not completion of this extension.
 
 ## Open material decisions
+
+Revision 7 records the maintainer's 2026-11-11 approval and subsequent explicit
+choices: approximate enforcement is sufficient; unflushed usage may be lost on
+crash; cold/unhealthy/full cache state refuses until background recovery; and
+TASK-006 does not require TDD. No material decision remains open for this scope.
+Batch sizes, refresh cadence, bounded capacities and private preparation sharing
+remain implementation choices. Do not add strict global coordination, local
+durable storage or another service to solve a guarantee the user did not request.
+
+For Gateway usage/admission, revision 7 supersedes the gateway-capacity revision-4
+requirement that covered buffered calls settle before answering. That earlier
+packet remains historical evidence for its own scope. Other security, capture
+and evidence constraints remain unchanged. The owning Gateway quota section
+of `architecture/wyrd-design.md` records the revised contract.
 
 Revision 2 was explicitly approved on 2026-11-09. Revision 3 records the
 maintainer's explicit scope correction on the same date: all four identified
@@ -380,7 +580,34 @@ instruction and the 2026-11-10 request to create TASK-005. Collector mode semant
 the narrow shared heap feature and the local model diagnostic close the material
 measurement decisions for that scope; product/security/durable behavior is unchanged.
 
+Revision 6 was explicitly approved by the maintainer on 2026-11-10. The route,
+field split, missing-detail response, unchanged read authority and storage
+compatibility above close the material decisions. The owning Verification result and
+route sections of `architecture/wyrd-design.md` and the three-table assembly prose
+in `architecture/bifrost-design.md` must be updated in the same implementation
+change; their current full-default-result description is explicitly superseded
+when that cohesive update lands.
+
 ## Authority and revision history
+
+- Revision 7 approved scope, 2026-11-11: explicit instruction to approve the
+  TASK-006 spec revision; memory-owned per-server usage/reservations,
+  asynchronous PostgreSQL writes/refresh, approximate quotas including budgets,
+  accepted loss of unflushed usage after crash, and retryable refusal until
+  background recovery for missing/unhealthy/full cache state. Follow existing
+  owners and the simple cache-first/post-response-accounting pattern; no strict
+  cluster quota guarantee or new durable service. Remove repeated Agent schema
+  preparation and implement supported latency fixes. Explicitly waive TDD for
+  TASK-006 while retaining regression/integration/performance proof. Approval
+  authorizes planning; implementation, experiments and Git actions remain separate.
+  An independent read-only comprehension pass over revision 7 and TASK-006 found
+  no material explanation gaps or contradictions after these choices were recorded.
+
+- Revision 6 approved, 2026-11-10: compact default Verification results, explicit
+  descriptive execution details, no compile-on-read, preserved complete records
+  and asynchronous visibility, unchanged read authority, coordinated SDK/schema
+  migration and TASK-005 follow-on proof. Explicit approval of the written
+  contract authorizes planning; implementation and experiments remain separate.
 
 - Revision 5 approved scope, 2026-11-10: explicit maintainer instruction to use
   the same benchmark collection and profiling for client/server, profile the full

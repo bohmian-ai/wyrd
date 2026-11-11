@@ -219,6 +219,9 @@ pub struct GatewayInvocation<'a> {
     /// When the public request carrying the call reached the server; `None`
     /// for a server-internal call, which records phase telemetry only.
     arrival: Option<std::time::Instant>,
+    /// Deadline the caller fixed before waiting for its own admission; `None`
+    /// starts the call's relative timeout once it is routed.
+    bound: Option<Instant>,
 }
 
 /// Everything admission fixed for one call, owned so execution and accounting
@@ -286,7 +289,22 @@ impl<'a> GatewayInvocation<'a> {
         Self {
             state,
             arrival: None,
+            bound: None,
         }
+    }
+
+    /// Bounds the call this handle runs by `deadline`, an instant its caller
+    /// fixed before waiting for its own admission, such as a verification
+    /// lane's model-call permit. Snapshot, authorization, and routing that
+    /// outlive it refuse the call, as does a capture-slot wait that ends past
+    /// it, before the ledger is charged; an admitted call's provider deadline
+    /// is `deadline` itself. A ledger write already started when it passes
+    /// still hands off to settlement, and the engine then refuses to start an
+    /// attempt.
+    #[must_use]
+    pub(crate) fn bounded(mut self, deadline: Instant) -> Self {
+        self.bound = Some(deadline);
+        self
     }
 
     /// Times the call this handle runs from the arrival of the public
@@ -530,8 +548,10 @@ impl<'a> GatewayInvocation<'a> {
     /// Returns `ServiceUnavailable` while the server drains,
     /// `GatewayInvalidRequest` for an invalid fallback override or
     /// out-of-range timeout, the mapped permission denial of the requested
-    /// model, and every error of the snapshot load, [`Self::route`],
-    /// [`Self::capture_slot`], and [`Self::admit`]. Every one is undispatched.
+    /// model, `GatewayDeadlineExceeded` when a [bound](Self::bounded) passes
+    /// before [`Self::admit`] starts, and every error of the snapshot load,
+    /// [`Self::route`], [`Self::capture_slot`], and [`Self::admit`]. Every one
+    /// is undispatched.
     ///
     /// The snapshot, authorize, route, and admit phases are recorded on
     /// `telemetry` as each completes.
@@ -562,43 +582,56 @@ impl<'a> GatewayInvocation<'a> {
                 invalid_request(GatewayContractError::new("timeout", "is out of range"))
             })?;
         let tenant = caller.data_tenant_id;
-        let started = std::time::Instant::now();
-        let snapshot = GatewayAdministration::new(self.state)
-            .snapshot(tenant)
-            .await?;
-        telemetry.since(Phase::Snapshot, started);
-        let started = std::time::Instant::now();
-        self.decide(caller, OPERATION, &request.model, &snapshot)
-            .map_err(permission_deny_reason_to_wyrd)?;
-        // A caller's own call is owned by its verified workload root; a
-        // server-derived context already names its accepted owner.
-        let subject = Some(match request.subject.take() {
-            Some(GatewayCallAttribution::Resolved(context)) => context,
-            requested => GatewayCallContext {
-                workload_card_uid: wyrd_runtime::owning_root(
-                    &caller.principal,
-                    &caller.delegation_chain,
-                )
-                .cloned(),
-                ..match requested {
-                    Some(GatewayCallAttribution::Requested(context)) => {
-                        self.attribute(caller, context).await?
+        let prepared = async {
+            let started = std::time::Instant::now();
+            let snapshot = GatewayAdministration::new(self.state)
+                .snapshot(tenant)
+                .await?;
+            telemetry.since(Phase::Snapshot, started);
+            let started = std::time::Instant::now();
+            self.decide(caller, OPERATION, &request.model, &snapshot)
+                .map_err(permission_deny_reason_to_wyrd)?;
+            // A caller's own call is owned by its verified workload root; a
+            // server-derived context already names its accepted owner.
+            let subject = Some(match request.subject.take() {
+                Some(GatewayCallAttribution::Resolved(context)) => context,
+                requested => GatewayCallContext {
+                    workload_card_uid: wyrd_runtime::owning_root(
+                        &caller.principal,
+                        &caller.delegation_chain,
+                    )
+                    .cloned(),
+                    ..match requested {
+                        Some(GatewayCallAttribution::Requested(context)) => {
+                            self.attribute(caller, context).await?
+                        }
+                        _ => GatewayCallContext::default(),
                     }
-                    _ => GatewayCallContext::default(),
-                }
-            },
-        });
-        telemetry.since(Phase::Authorize, started);
-        // A call continuing a caller's trace parents its captured attempts on
-        // this `gateway.call` span; an untraced call keeps its own trace.
-        let trace = wyrd_telemetry::continued_context();
+                },
+            });
+            telemetry.since(Phase::Authorize, started);
+            // A call continuing a caller's trace parents its captured attempts on
+            // this `gateway.call` span; an untraced call keeps its own trace.
+            let trace = wyrd_telemetry::continued_context();
 
-        let started = std::time::Instant::now();
-        let mut plan = self.route(caller, &request, &snapshot, call_id).await?;
-        telemetry.since(Phase::Route, started);
+            let started = std::time::Instant::now();
+            let plan = self.route(caller, &request, &snapshot, call_id).await?;
+            telemetry.since(Phase::Route, started);
+            Ok::<_, CallFailure>((snapshot, subject, trace, plan))
+        };
+        // A bound caller's deadline covers this reversible preparation, which
+        // a refusal abandons before anything is charged.
+        let (snapshot, subject, trace, mut plan) = match self.bound {
+            Some(deadline) => tokio::time::timeout_at(deadline, prepared)
+                .await
+                .map_err(|_| expired(call_id))??,
+            None => prepared.await?,
+        };
 
         // Admission is the capture-slot wait and the ledger statement.
-        let deadline = Instant::now() + request.timeout;
+        let deadline = self
+            .bound
+            .unwrap_or_else(|| Instant::now() + request.timeout);
         let started = std::time::Instant::now();
         let capture_slot = if snapshot.capture.mode == GatewayCaptureMode::Disabled {
             None
@@ -626,6 +659,10 @@ impl<'a> GatewayInvocation<'a> {
             trace,
             capture_slot,
         };
+        // Only a bound caller's deadline can pass before the ledger is charged.
+        if self.bound.is_some_and(|bound| bound <= Instant::now()) {
+            return Err(expired(call_id).into());
+        }
         let admission = self.admit(&call, &mut plan).await?;
         telemetry.since(Phase::Admit, started);
         Ok((call, plan, admission))
@@ -1510,6 +1547,15 @@ pub(crate) fn invalid_request(error: GatewayContractError) -> WyrdError {
     WyrdError::GatewayInvalidRequest {
         message: error.to_string(),
         details: json!({ "field": error.field, "reason": error.reason }),
+    }
+}
+
+/// The `GatewayDeadlineExceeded` refusal of call `call_id`, whose bound
+/// passed before the ledger was charged; no provider saw it.
+fn expired(call_id: GatewayCallId) -> WyrdError {
+    WyrdError::GatewayDeadlineExceeded {
+        message: "the gateway call exceeded its deadline before admission".to_owned(),
+        details: json!({ "call_id": call_id }),
     }
 }
 

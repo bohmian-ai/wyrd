@@ -80,7 +80,7 @@ impl ServerWyrdGatewayCaller {
 
     /// Hold one of `permits`, the model-call capacity of verification lane
     /// `lane`, for each call, waiting for one before the gateway is reached;
-    /// the wait spends the call's own timeout.
+    /// the wait and the gateway's admission spend the call's own timeout.
     pub(crate) fn admitted(mut self, lane: &'static str, permits: Arc<Semaphore>) -> Self {
         self.lane = Some((lane, permits));
         self
@@ -93,8 +93,10 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
     ///
     /// A lane-bound caller first waits, until `cancellation` or the call's
     /// timeout, for one of its lane's model-call permits and holds it until
-    /// the call returns; the wait spends the call's timeout, and the gateway
-    /// is given only the remainder, so admission never restarts it. The
+    /// the call returns. Its deadline is fixed before the wait and bounds the
+    /// gateway's snapshot, authorization, routing, and capture-slot wait as
+    /// well, so no admission step restarts it and a call admitted to its lane
+    /// reaches the provider with that same deadline. The
     /// request is projected before admission, so an unservable dialect
     /// reaches no gateway decision. The gateway evaluates and audits the captured caller's invoke permission
     /// for the requested model and every fallback candidate. Its cancellation
@@ -103,7 +105,8 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
     ///
     /// # Errors
     /// Returns [`ProviderError::BadRequest`] for a request dialect the gateway
-    /// does not serve or a body that does not serialize;
+    /// does not serve, a body that does not serialize, or a lane-bound
+    /// timeout no deadline can represent;
     /// [`ProviderError::Timeout`] when the run is cancelled, including while
     /// it waits for its lane, or the call's timeout passes before it is
     /// admitted to its lane;
@@ -130,18 +133,22 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
             body,
             answer,
         } = NativeCall::project(call.request, &call.model)?;
-        // A lane wait spends the call's own budget, so admission never
-        // restarts it and the gateway is given only what remains.
-        let (timeout, _permit) = match &self.lane {
+        // A lane-bound call fixes its deadline before waiting, so the wait and
+        // the gateway's admission spend one budget and no step restarts it.
+        let (timeout, deadline, _permit) = match &self.lane {
             Some((lane, permits)) => {
-                let started = tokio::time::Instant::now();
+                let deadline = tokio::time::Instant::now()
+                    .checked_add(call.timeout)
+                    .ok_or_else(|| {
+                        ProviderError::bad_request(PROVIDER, "timeout is out of range")
+                    })?;
                 let permit = if let Ok(permit) = Arc::clone(permits).try_acquire_owned() {
                     permit
                 } else {
                     tracing::info!(lane, "the model call waits for its lane's admission");
                     tokio::select! {
-                        permit = tokio::time::timeout(
-                            call.timeout,
+                        permit = tokio::time::timeout_at(
+                            deadline,
                             Arc::clone(permits).acquire_owned(),
                         ) => match permit {
                             Ok(Ok(permit)) => permit,
@@ -152,13 +159,13 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
                         }
                     }
                 };
-                let remaining = call.timeout.saturating_sub(started.elapsed());
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
                     return Err(ProviderError::timeout(PROVIDER));
                 }
-                (remaining, Some(permit))
+                (remaining, Some(deadline), Some(permit))
             }
-            None => (call.timeout, None),
+            None => (call.timeout, None, None),
         };
         let request = GatewayCallRequest {
             operation,
@@ -181,9 +188,12 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
             subject: self.subject.clone().map(GatewayCallAttribution::Resolved),
             prompt_provider: Some(call.provider),
         };
-        let outcome = GatewayInvocation::new(&self.state)
-            .run(&self.caller, request, cancellation)
-            .await;
+        let invocation = GatewayInvocation::new(&self.state);
+        let invocation = match deadline {
+            Some(deadline) => invocation.bounded(deadline),
+            None => invocation,
+        };
+        let outcome = invocation.run(&self.caller, request, cancellation).await;
         if cancellation.is_cancelled() {
             return Err(ProviderError::timeout(PROVIDER));
         }

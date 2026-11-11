@@ -113,6 +113,10 @@ impl Scripted {
 #[async_trait]
 impl ProviderDispatch for Scripted {
     /// Records the deployment and deadline and plays the next step.
+    ///
+    /// # Panics
+    /// Panics when the seen, deadlines, or script lock is poisoned by a
+    /// panicking holder.
     async fn dispatch(&self, attempt: ProviderAttempt<'_>) -> AttemptResult {
         self.seen
             .lock()
@@ -6040,12 +6044,16 @@ async fn gateway_agent_calls_start_only_on_a_compatible_adapter() {
 /// waiting out half its budget reaches the provider with only the remainder
 /// as its deadline, so a provider that never answers ends the call by the
 /// original deadline rather than a full budget after admission. A cancelled
-/// wait ends at once. No expiry or cancellation keeps a permit, the gateway captures the hung call as timed out,
-/// and the next call is answered.
+/// wait ends at once. A call whose lane opens halfway through its budget but
+/// whose cold snapshot read is held past the original deadline is refused
+/// with the gateway deadline while that read is still blocked, undispatched.
+/// No expiry or cancellation keeps a permit, the gateway captures the hung
+/// call as timed out, and the next call is answered.
 ///
 /// # Panics
 /// Panics when a setup step fails, a wait outlives its budget, a call is
-/// dispatched while the lane is held, a dispatched deadline restarts the
+/// dispatched while the lane is held or past its deadline, a held snapshot
+/// read outlives the call's deadline, a dispatched deadline restarts the
 /// budget, a permit is kept, or the hung call is not captured.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lane_wait_spends_the_agent_call_budget() {
@@ -6121,6 +6129,52 @@ async fn lane_wait_spends_the_agent_call_budget() {
         0,
         "the cancelled wait took no permit"
     );
+
+    // The lane opens halfway through a short budget, then the call's cold
+    // snapshot read waits on a held pricing table past the original deadline;
+    // the call refuses by that deadline while the read is still blocked.
+    let budget = Duration::from_secs(1);
+    let superuser = fixture.superuser_pool().expect("superuser pool");
+    let mut barrier = superuser.begin().await.expect("barrier begins");
+    sqlx::query("LOCK TABLE wyrd.gateway_model_pricing IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *barrier)
+        .await
+        .expect("snapshot reads held");
+    let started = tokio::time::Instant::now();
+    let waiting = tokio::spawn(call(budget));
+    // Elapsed time is the measured quantity: half the budget goes to the lane.
+    tokio::time::sleep(budget / 2).await;
+    drop(held);
+    await_lock_waiters(&fixture, 1).await;
+    let expired = tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .expect("the call ends while its snapshot is held")
+        .expect("the call joins")
+        .expect_err("admission past the original deadline refuses");
+    let ended = started.elapsed();
+    match expired {
+        skald_providers::ProviderError::RemoteProblem(problem) => {
+            assert_eq!(problem.code, "WYRD_GATEWAY_504_DEADLINE_EXCEEDED");
+        }
+        other => panic!("unexpected expiry: {other:?}"),
+    }
+    assert!(
+        ended < budget + budget / 4,
+        "the held snapshot ended the call after {ended:?}"
+    );
+    assert!(
+        dispatch.seen().is_empty(),
+        "nothing is dispatched past the deadline"
+    );
+    assert_eq!(
+        permits.available_permits(),
+        1,
+        "the refused call kept no permit"
+    );
+    barrier.commit().await.expect("barrier releases");
+    let held = Arc::clone(&permits)
+        .try_acquire_owned()
+        .expect("the lane's only permit");
 
     let budget = Duration::from_secs(2);
     dispatch.push(Step::Hang);

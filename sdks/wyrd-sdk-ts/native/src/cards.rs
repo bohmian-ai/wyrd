@@ -1062,10 +1062,11 @@ impl NativeRun {
         })
     }
 
-    /// Emits one row into a registered `bifrost.datasets` table.
+    /// Buffers one row for a registered `bifrost.datasets` table.
     ///
     /// Asynchronous because the first call for a table describes it; later calls
-    /// reuse the cached schema and producer.
+    /// reuse the cached schema and producer. Resolving is buffered submission;
+    /// state shutdown drains it.
     ///
     /// # Errors
     ///
@@ -1073,7 +1074,7 @@ impl NativeRun {
     /// reserved, unknown, or unauthorized table and the lifecycle refusals are
     /// returned in [`NativeLifecycleResult`].
     #[napi]
-    pub fn record<'env>(
+    pub fn write<'env>(
         &self,
         env: &'env Env,
         table: String,
@@ -1082,7 +1083,7 @@ impl NativeRun {
         let run = self.run.clone();
         crate::trace::spawn(env, async move {
             NativeLifecycleResult::outcome(
-                Box::pin(run.observe().record_json(&table, &row_json)).await,
+                Box::pin(run.bifrost().write_json(&table, &row_json)).await,
             )
         })
     }

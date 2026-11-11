@@ -2567,7 +2567,43 @@ export namespace verify {
 }
 
 /**
- * The dataset emit and the Verifier execution available on one scoped {@link Run}.
+ * Caller-table writes attributed to one scoped {@link Run}.
+ *
+ * Every row carries the view's Card UID and the run's `runId`. Resolving a
+ * write is buffered submission, not a durable acknowledgement: a successful
+ * {@link WyrdState.shutdown} drains the queue.
+ */
+export class RunBifrost {
+  readonly #native: NativeRun;
+
+  private constructor(native: NativeRun) {
+    this.#native = native;
+  }
+
+  /** @internal Wrap the native run this surface writes through. */
+  static fromNative(native: NativeRun): RunBifrost {
+    return new RunBifrost(native);
+  }
+
+  /**
+   * Buffer one row for a registered `bifrost.datasets.<name>` table.
+   *
+   * The first call for a table describes it; later calls reuse the cached
+   * schema and producer, so only the first awaits a lookup. The row is durable
+   * only once {@link WyrdState.shutdown} succeeds.
+   *
+   * @param table - The table's `bifrost.datasets.<name>`.
+   * @param row - One JSON row matching the table's columns.
+   * @throws a {@link WyrdError} for a table outside `bifrost.datasets`, an unknown
+   * or unauthorized table, before startup, or after shutdown.
+   */
+  async write(table: string, row: unknown): Promise<void> {
+    lifecycleValue<null>(await this.#native.write(table, strictJson("row", row)));
+  }
+}
+
+/**
+ * The Verifier execution and submission available on one scoped {@link Run}.
  */
 export class Observe {
   readonly #native: NativeRun;
@@ -2579,21 +2615,6 @@ export class Observe {
   /** @internal Wrap the native run this surface emits through. */
   static fromNative(native: NativeRun): Observe {
     return new Observe(native);
-  }
-
-  /**
-   * Emit one row into a registered `bifrost.datasets.<name>` table.
-   *
-   * The first call for a table describes it; later calls reuse the cached
-   * schema and producer, so only the first awaits a lookup.
-   *
-   * @param table - The table's `bifrost.datasets.<name>`.
-   * @param row - One JSON row matching the table's columns.
-   * @throws a {@link WyrdError} for a table outside `bifrost.datasets`, an unknown
-   * or unauthorized table, before startup, or after shutdown.
-   */
-  async record(table: string, row: unknown): Promise<void> {
-    lifecycleValue<null>(await this.#native.record(table, strictJson("row", row)));
   }
 
   /**
@@ -2702,9 +2723,14 @@ export class Run {
     return this.#native.alias;
   }
 
-  /** The emit surface for this view. */
+  /** The verification and submission surface for this view. */
   get observe(): Observe {
     return Observe.fromNative(this.#native);
+  }
+
+  /** The caller-table write surface for this view. */
+  get bifrost(): RunBifrost {
+    return RunBifrost.fromNative(this.#native);
   }
 
   /**

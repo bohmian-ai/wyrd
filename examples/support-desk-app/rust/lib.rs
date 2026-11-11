@@ -208,8 +208,8 @@ impl SupportDesk {
             .as_str()
             .ok_or_else(|| ApiError::internal("the gateway reply carries no text"))?
             .to_owned();
-        run.observe()
-            .record(
+        run.bifrost()
+            .write(
                 "bifrost.datasets.tickets",
                 &json!({ "question": question, "answer": answer }),
             )

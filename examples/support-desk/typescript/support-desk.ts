@@ -183,14 +183,14 @@ export async function serve(desk: Desk): Promise<Served[]> {
       tracer.startActiveSpan("support-desk.request", async (span) => {
         try {
           const reply = await answer(client, state, run, asked);
-          const { observe } = run;
-          await observe.record("bifrost.datasets.tickets", {
+          // Buffered: state.shutdown() below drains the ticket rows.
+          await run.bifrost.write("bifrost.datasets.tickets", {
             ticket_id: `T-${index}`,
             question: asked,
             answer: reply,
             refund: asked.includes("refund"),
           });
-          const submitted = await observe.submit("policy-check", policyCheck(reply));
+          const submitted = await run.observe.submit("policy-check", policyCheck(reply));
           if (submitted.kind !== "queued") {
             throw new Error("policy-check judges Run evidence, not a window");
           }

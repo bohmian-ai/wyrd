@@ -1149,10 +1149,11 @@ export declare class NativeRun {
    */
   submit(verifier: string, inputs: Array<NativeVerifierInput>, groupId?: string | undefined | null): Promise<NativeSubmission>
   /**
-   * Emits one row into a registered `bifrost.datasets` table.
+   * Buffers one row for a registered `bifrost.datasets` table.
    *
    * Asynchronous because the first call for a table describes it; later calls
-   * reuse the cached schema and producer.
+   * reuse the cached schema and producer. Resolving is buffered submission;
+   * state shutdown drains it.
    *
    * # Errors
    *
@@ -1160,7 +1161,7 @@ export declare class NativeRun {
    * reserved, unknown, or unauthorized table and the lifecycle refusals are
    * returned in [`NativeLifecycleResult`].
    */
-  record(table: string, rowJson: string): Promise<NativeLifecycleResult>
+  write(table: string, rowJson: string): Promise<NativeLifecycleResult>
 }
 
 /**

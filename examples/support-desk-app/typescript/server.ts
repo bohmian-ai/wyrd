@@ -47,7 +47,7 @@ function answerInRun<T>(support: Support, question: string, check: (wyrdRun: Run
   // Spans started inside the scope carry the Run's ID.
   return wyrdRun.scope(async () => {
     const text = await answer(support.gateway, support.state, wyrdRun, question);
-    await wyrdRun.observe.record(TICKETS, { question, answer: text });
+    await wyrdRun.bifrost.write(TICKETS, { question, answer: text });
     return check(wyrdRun, text);
   });
   // ANCHOR_END: answer

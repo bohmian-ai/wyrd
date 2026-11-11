@@ -70,7 +70,7 @@ class Desk:
             agent = Agent(name="support-agent", model=model)
             result = await Runner.run(agent, self.template.replace("{{question}}", question))
             answer = str(result.final_output)
-            run.observe.record(TICKETS, {"question": question, "answer": answer})
+            run.bifrost.write(TICKETS, {"question": question, "answer": answer})
         # ANCHOR_END: answer
         return run, answer
 

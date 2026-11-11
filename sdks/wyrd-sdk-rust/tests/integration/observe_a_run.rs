@@ -1,13 +1,13 @@
-//! A Service's run submits samples for the Cards it composes; they read back
-//! by run id, stamped with the Card and run they belong to.
+//! A Service's run submits samples and writes caller-table rows for the Cards
+//! it composes; they read back by run id, stamped with the Card and run they
+//! belong to.
 
 use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::json;
 use tempfile::TempDir;
-use wyrd_ai::bifrost::BifrostOptions;
-use wyrd_ai::bifrost::QueryParam;
+use wyrd_ai::bifrost::{BifrostOptions, QueryParam, TableConfig};
 use wyrd_ai::state::{ConfigureOptions, WyrdState};
 use wyrd_ai::verify::Submission;
 use wyrd_ai::{Bifrost, QueueConfig, RequirementDetail, VerificationVerdict, WyrdClient};
@@ -30,6 +30,15 @@ struct DriftRow {
     subject_card_uid: String,
     /// The run every row of one invocation shares.
     run_id: String,
+}
+
+/// One caller-table row, as read back.
+#[derive(Debug, PartialEq, Deserialize)]
+struct WrittenRow {
+    /// The value the view wrote.
+    value: i64,
+    /// The Card of the view that wrote it.
+    subject_card_uid: String,
 }
 
 /// A deployment with the observed Service registered and hydrated, and the
@@ -131,6 +140,84 @@ async fn run_observations_read_back_by_run_id() {
             run_id,
         }]
     );
+    deployment.shutdown().await;
+}
+
+/// Rows written through two Card views of one run land in their registered
+/// tables under the view that wrote them, sharing the run's id.
+///
+/// # Panics
+/// Panics when a step fails or the rows differ.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn writes_land_under_the_view_that_wrote_them() {
+    const ANSWERS: &str = "bifrost.datasets.observed_answers";
+    const SCORES: &str = "bifrost.datasets.observed_scores";
+    let (deployment, dir) = observed().await;
+    let schema = json!({
+        "type": "object",
+        "properties": { "value": { "type": "integer" } },
+        "required": ["value"],
+    });
+    for table in [ANSWERS, SCORES] {
+        let registrar = Bifrost::connect_with(
+            &deployment.admin(),
+            BifrostOptions {
+                table: Some(TableConfig::from_json_schema(table, &schema).expect("table declares")),
+                ..BifrostOptions::default()
+            },
+        )
+        .await
+        .expect("Bifrost connects");
+        registrar.register().await.expect("table registers");
+        registrar.shutdown().await.expect("registrar drains");
+    }
+    let state = state_as(&dir, service_client(&deployment, &dir).await);
+    state.start_bifrost().await.expect("Bifrost starts");
+    let run = state.run();
+
+    for (alias, table, value) in [("agent", ANSWERS, 41), ("model", SCORES, 42)] {
+        run.for_card(alias)
+            .expect("view resolves")
+            .bifrost()
+            .write(table, &json!({ "value": value }))
+            .await
+            .expect("the row buffers");
+    }
+    state.shutdown().await.expect("rows drain");
+    deployment
+        .server()
+        .flush_bifrost()
+        .await
+        .expect("rows publish");
+
+    let reader = Bifrost::connect_with(&deployment.admin(), BifrostOptions::default())
+        .await
+        .expect("Bifrost connects");
+    for (alias, table, value) in [("agent", ANSWERS, 41), ("model", SCORES, 42)] {
+        let rows: Vec<WrittenRow> = reader
+            .sql_as(
+                &format!("SELECT value, subject_card_uid FROM {table} WHERE run_id = $1"),
+                &[QueryParam::String(run.run_id().to_string())],
+            )
+            .await
+            .expect("rows read back");
+        let subject = state
+            .card_ref(alias)
+            .expect("alias resolves")
+            .uid
+            .as_ref()
+            .expect("hydrated Card carries its UID")
+            .to_string();
+        assert_eq!(
+            rows,
+            [WrittenRow {
+                value,
+                subject_card_uid: subject,
+            }],
+            "{table}"
+        );
+    }
     deployment.shutdown().await;
 }
 

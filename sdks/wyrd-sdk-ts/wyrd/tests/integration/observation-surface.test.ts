@@ -1,5 +1,5 @@
 // TypeScript's own observation surface beyond the shared `observe_a_run`
-// story: generic records, local emit refusals, and a burst through the byte
+// story: caller-table writes, local emit refusals, and a burst through the byte
 // budget. Not mirrored.
 import { expect, vi } from "vitest";
 import { z } from "zod";
@@ -25,8 +25,8 @@ test("records land in their tables under the view that wrote them", async ({ ser
   await state.startBifrost();
   const run = state.run();
 
-  await run.forCard("agent").observe.record(ANSWERS, { value: 41 });
-  await run.forCard("model").observe.record(SCORES, { value: 42 });
+  await run.forCard("agent").bifrost.write(ANSWERS, { value: 41 });
+  await run.forCard("model").bifrost.write(SCORES, { value: 42 });
   await state.shutdown();
   server.flushBifrost();
 
@@ -46,13 +46,13 @@ test.for<Refusal>([
     "WYRD_SDK_400_BIFROST_NOT_STARTED",
   ],
   [
-    "record into a built-in table",
-    (state) => state.run("agent").observe.record("bifrost.drift.observations", { latency: 1 }),
+    "write into a built-in table",
+    (state) => state.run("agent").bifrost.write("bifrost.drift.observations", { latency: 1 }),
     "WYRD_SDK_400_INVALID_OBSERVATION",
   ],
   [
-    "record into an unregistered table",
-    (state) => state.run("agent").observe.record("bifrost.datasets.never_registered", { value: 1 }),
+    "write into an unregistered table",
+    (state) => state.run("agent").bifrost.write("bifrost.datasets.never_registered", { value: 1 }),
     "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
   ],
   ["view of an unknown alias", (state) => state.run().forCard("missing"), "WYRD_SDK_404_UNKNOWN_ALIAS"],

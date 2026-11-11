@@ -246,9 +246,8 @@ pub async fn serve(desk: &Desk) -> Result<Vec<Served>, Error> {
         let question = question(index);
         let request = async {
             let answer = answer(state, &run, &question).await?;
-            let observe = run.observe();
-            observe
-                .record(
+            run.bifrost()
+                .write(
                     "bifrost.datasets.tickets",
                     &TicketRow {
                         ticket_id: format!("T-{index}"),
@@ -258,7 +257,8 @@ pub async fn serve(desk: &Desk) -> Result<Vec<Served>, Error> {
                     },
                 )
                 .await?;
-            match observe
+            match run
+                .observe()
                 .submit("policy-check", policy_check(&answer))
                 .await?
             {

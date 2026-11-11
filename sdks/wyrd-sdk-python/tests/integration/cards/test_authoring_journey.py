@@ -932,7 +932,8 @@ def test_local_artifacts_and_declaration_parity(
     keeps that policy for reuse; changed bytes or content under a published
     version, an unreadable source, an unregistered reference, and a reader
     are refused with their stable codes; path and holder declaration still
-    work.
+    work; a local Artifact naming no version is linked by the reference its
+    publication selected.
     """
     configure_gateway(WyrdClient())
     authored = baseline(local_policy("1.0.0").file(POLICY_FILE))
@@ -1037,6 +1038,16 @@ def test_local_artifacts_and_declaration_parity(
     )
     assert CardKind.Artifact not in declared_kinds(recovered), recovered.outcomes
     assert mounted_policy(cards, "3.0.0") == "3.0.0"
+
+    unversioned = Artifact.from_path("unversioned-sharing-policy", POLICY).extract(True)
+    cards.declare(finance_release("5.0.0", unversioned.file(POLICY_FILE), release_access("5.0.0")))
+    spec = cards.get(RegisteredRef("Verifier", "report-policy", "5.0.0")).spec
+    link = spec["steps"][0]["requirements"][1]["check"]["workspace"]["/inputs/policy.json"]
+    publication = cards.get(cards.resolve_latest(CardKind.Artifact, "unversioned-sharing-policy"))
+    assert link["artifact"]["card"] == publication.card_ref.to_dict(), (
+        "the omitted-version policy is linked by its published reference"
+    )
+    assert publication.card_ref.version and publication.card_ref.uid, publication.card_ref
 
     root = cards.declare(local_policy("5.0.0"))
     assert root.root.name == "company-sharing-policy" and root.root.version == "5.0.0"

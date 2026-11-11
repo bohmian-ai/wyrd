@@ -1801,8 +1801,10 @@ mod edit_tests {
     /// One builder per editable request format, given optional system text
     /// and user messages, paired with that format's rich text part.
     type Build = fn(Option<&str>, &[&str]) -> Prompt;
+    /// A format's name, builder, and rich text part.
+    type Format = (&'static str, Build, fn(&str) -> Value);
 
-    fn formats() -> [(&'static str, Build, fn(&str) -> Value); 4] {
+    fn formats() -> [Format; 4] {
         fn texts(messages: &[&str]) -> Vec<String> {
             messages.iter().map(|text| (*text).to_owned()).collect()
         }

@@ -1334,8 +1334,8 @@ async fn selection(fixture: &PgFixture, card: &CardUid) -> (Option<CardUid>, Rep
     (selected, status)
 }
 
-/// A Repository selection waits for every owned Card to be Active, then
-/// compares against the selection the declaration was written from: the
+/// A Repository selection waits for every owned Card to be Active, keeping
+/// the previous selection while one is not, then compares against the selection the declaration was written from: the
 /// first distinct target wins, an identical target reuses it, a delayed
 /// completion of a raced declaration conflicts without undoing the newer
 /// selection and keeps answering that conflict, and a deliberate new
@@ -1406,6 +1406,23 @@ async fn repository_selection_settles_once_against_the_expected_prior() {
     assert_eq!(
         settle(&fixture, identical).await,
         RepositorySelection::Selected
+    );
+    let (unready, _) = repository_declaration(
+        &fixture,
+        "unready",
+        Some((&repository_card("1.2.0"), CardStatus::Pending)),
+        None,
+        Some(&new_uid),
+    )
+    .await;
+    assert_eq!(
+        settle(&fixture, unready).await,
+        RepositorySelection::Pending
+    );
+    assert_eq!(
+        selection(&fixture, &new_uid).await.0.as_ref(),
+        Some(&new_uid),
+        "an unready declaration keeps the previous selection"
     );
 
     let mut conn = fixture

@@ -1,0 +1,9 @@
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: off-repository
+  version: 1.0.0
+spec:
+  verified_by:
+    - verifier: ./code-review.yaml
+      runs_on: {kind: pull_request}

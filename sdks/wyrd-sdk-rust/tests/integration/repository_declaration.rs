@@ -240,7 +240,8 @@ mod pg_tests {
     }
 
     /// A YAML Repository declares and selects through the same lifecycle,
-    /// identified by its repository id.
+    /// identified by its repository id, and its `pull_request` activation is
+    /// refused on any other subject.
     ///
     /// # Panics
     /// Panics when the YAML Repository is not selected.
@@ -256,6 +257,11 @@ mod pg_tests {
         assert!(status.selected);
         assert_eq!(status.full_name.as_deref(), Some("acme/web"));
         assert_eq!(bindings, 1);
+        let off = cards
+            .declare_from_path(&fixture("cards/repository_declaration/off-repository.yaml"))
+            .await
+            .expect_err("pull_request activates only a Repository binding");
+        assert_eq!(off.code(), "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH");
         deployment.shutdown().await;
     }
 

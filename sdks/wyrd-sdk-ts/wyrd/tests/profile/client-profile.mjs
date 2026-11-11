@@ -81,13 +81,15 @@ const workloads = {
   "authoring chain8": () => chain(8).validate(),
   "authoring chain32": () => chain(32).validate(),
   "authoring shared": () => sharedChild().validate(),
-  "hydration": () => WyrdState.fromPath(operation),
+  hydration: () => WyrdState.fromPath(operation),
   "access typed": () => typed(WyrdState.fromPath(bundle)),
   "access agent": () => agentNavigation(WyrdState.fromPath(bundle)),
   "access run": () => runs(WyrdState.fromPath(bundle)),
 };
 const workload = workloads[family === "hydration" ? family : `${family} ${operation}`];
 if (workload === undefined) {
-  throw new Error("usage: client-profile authoring chain8|chain32|shared | hydration BUNDLE | access typed|agent|run BUNDLE");
+  throw new Error(
+    "usage: client-profile authoring chain8|chain32|shared | hydration BUNDLE | access typed|agent|run BUNDLE",
+  );
 }
 workload();

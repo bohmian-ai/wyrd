@@ -6050,7 +6050,9 @@ async fn gateway_agent_calls_start_only_on_a_compatible_adapter() {
 /// A call admitted after a lane wait and a delayed snapshot reaches the
 /// provider with the deadline fixed before its lane wait. A ledger write held
 /// past the deadline still hands off: no attempt starts, and its concurrency
-/// hold is settled before the answer, so the next call is admitted. No expiry
+/// hold is settled before the answer, so the next call is admitted. A bound
+/// that passes once preparation and a capture slot are in hand refuses the
+/// call before its ledger write, uncaptured. No expiry
 /// or cancellation keeps a permit, the gateway captures each expired call as
 /// timed out, and the next call is answered.
 ///
@@ -6323,4 +6325,52 @@ async fn lane_wait_spends_the_agent_call_budget() {
         Some(&json!("timed_out")),
         "the expired admission is accounted as timed out: {outcomes:?}"
     );
+
+    // With the snapshot cache listening, preparation and an open capture slot
+    // complete without waiting, so a bound that has already passed reaches
+    // the check before the ledger write: the call is refused there, never
+    // admitted, executed, or captured.
+    let shutdown = CancellationToken::new();
+    let (_, listener) = state
+        .gateway
+        .refresh_worker(fixture.wyrd_postgres(), shutdown.clone());
+    let listening = tokio::spawn(listener);
+    let administration = GatewayAdministration::new(&state);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while state.gateway.snapshots().cached(tenant).is_none() {
+            administration
+                .snapshot(tenant)
+                .await
+                .expect("snapshot loads");
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the snapshot is cached once the listener subscribes");
+    let captured = scribe.calls().len();
+    let failure = GatewayInvocation::new(&state)
+        .bounded(tokio::time::Instant::now())
+        .run(
+            &invoker(tenant, 1, [open_access()]),
+            request("dep-a/a", None, Duration::from_secs(10)),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("a call whose bound passed refuses");
+    assert!(
+        matches!(failure.error, WyrdError::GatewayDeadlineExceeded { .. })
+            && !failure.settled
+            && !failure.dispatched,
+        "the passed bound refuses before admission: {:?}",
+        failure.error
+    );
+    drain_gateway(&state).await;
+    assert_eq!(
+        scribe.calls().len(),
+        captured,
+        "a call refused before the ledger is never captured"
+    );
+    assert_eq!(dispatch.seen().len(), 3, "nor dispatched");
+    shutdown.cancel();
+    listening.await.expect("the listener stops");
 }

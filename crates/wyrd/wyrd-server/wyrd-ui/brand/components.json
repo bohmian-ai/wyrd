@@ -582,6 +582,108 @@
         "neutral geometry only: shape carries the trend beside a labeled value, never status or health"
       ]
     },
+    "VerifierDefinition": {
+      "status": "built",
+      "catalog": true,
+      "altitude": "quiet",
+      "consumers": [
+        "src/routes/t/[tenantKey]/cards/detail/+page.svelte",
+        "view documents (WyrdView)"
+      ],
+      "tokens": [
+        "--font-sans",
+        "--muted",
+        "--text"
+      ],
+      "props": {
+        "input": "VerifierInput (schemas.ts)",
+        "result": "loader result"
+      },
+      "variants": [],
+      "anatomy": [
+        "description",
+        "VerifierGraph",
+        "declaration of the selected node"
+      ],
+      "rules": [
+        "An exact Verifier as declared: its description, its graph, and the authored declaration of the selected node.",
+        "Definition only: no execution state, and nothing edits the Verifier.",
+        "States: populated, denied, error, loading."
+      ]
+    },
+    "RunsOn": {
+      "status": "built",
+      "catalog": true,
+      "altitude": "quiet",
+      "consumers": [
+        "src/routes/t/[tenantKey]/cards/detail/+page.svelte",
+        "view documents (WyrdView)"
+      ],
+      "tokens": [
+        "--border-soft",
+        "--declare-soft",
+        "--font-mono",
+        "--r",
+        "--selected-border"
+      ],
+      "props": {
+        "input": "VerifierInput (schemas.ts)",
+        "result": "loader result",
+        "actions?": "per-action state",
+        "onaction?": "(intent) => void"
+      },
+      "variants": [],
+      "anatomy": [
+        "owner row (opens the Card)",
+        "binding rows: subject and when it runs"
+      ],
+      "rules": [
+        "The Services and Agents whose bindings pin an exact Verifier version, each binding's subject and when it runs.",
+        "A refused owner read keeps its row.",
+        "States: populated, empty, denied, error, loading. An owner opens through card.open; without a host handler the row is not a control."
+      ]
+    },
+    "VerifierGraph": {
+      "status": "built",
+      "catalog": false,
+      "altitude": "quiet",
+      "consumers": [
+        "packages/ui/src/lib/components/VerifierDefinition.svelte"
+      ],
+      "tokens": [
+        "--bg",
+        "--border",
+        "--border-soft",
+        "--declare",
+        "--declare-soft",
+        "--font-mono",
+        "--font-sans",
+        "--muted",
+        "--r",
+        "--selected-border",
+        "--surface",
+        "--surface-hover",
+        "--text"
+      ],
+      "props": {
+        "graph": "DefinitionGraph (verifier.ts)",
+        "selected?": "string, bindable: the selected node key"
+      },
+      "variants": [],
+      "anatomy": [
+        "zoom tools",
+        "stage headings",
+        "input, step and requirement nodes",
+        "attached requirements inside their step",
+        "labelled dependency edges"
+      ],
+      "rules": [
+        "A read-only Svelte Flow drawing of declared inputs, steps, attached and whole-Verifier requirements under stage headings, with labelled dependency arrows.",
+        "Nothing drags, connects or deletes; no execution colour or state is drawn.",
+        "Laid out once from topology: selection, focus and zoom never move a node.",
+        "Selection and focus use --declare; arrow keys move between nodes."
+      ]
+    },
     "Shell": {
       "status": "built",
       "catalog": false,

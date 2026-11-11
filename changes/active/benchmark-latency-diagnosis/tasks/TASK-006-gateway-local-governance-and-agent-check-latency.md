@@ -327,15 +327,41 @@ touched.
 | Item | Implementation evidence | Verification evidence | Result |
 |---|---|---|---|
 | Agent phases `resolve`, `bind`, `run`, `verdict`, `cite`, bench-only | `vala-verify/src/blocks/agent.rs` `AGENT_PHASE_DURATION_SECONDS`, `phase_start`/`phase_end`; no clock read unless the recorder is installed | `vala-verify::integration blocks_agent::benchmark_check_agent_times_each_phase` PASS; `-p vala-verify --test integration` 14/14 | PASS |
-| Capacity report breaks down Agent phases and the Gateway call | `capacity/verification/run.rs` `BREAKDOWN` row for the phase family; `component_totals` adds the `gateway.buffered` timing (a bench server records the Gateway call there, not in `wyrd_gateway_duration_seconds`) | `verification::run::tests::diagnostics_use_benchmark_distributions`, `diagnostics_include_gateway_phases_and_waits` PASS | PASS |
+| Capacity report breaks down Agent phases | `capacity/verification/run.rs` `BREAKDOWN` row for the phase family. The in-process Gateway caller has no HTTP arrival and records no call total (`wyrd_gateway_duration_seconds` or `gateway.buffered`), so its existing `gateway.phase.*`/`gateway.wait.*` diagnostics remain the Gateway breakdown | `verification::run::tests::diagnostics_use_benchmark_distributions`, `diagnostics_include_gateway_phases_and_waits` PASS | PASS |
 | Benchmark-only timing exists only in `bench` builds | `wyrd-benchmark` `bench` feature gates `install` and `heap`; `enabled()` is `cfg!(feature = "bench") && …`; `wyrd-server` `bench = ["wyrd-benchmark/bench"]`; config and `MetricsBackend::install` refuse the snapshot without it | `cargo tree -p wyrd-server -e features -i wyrd-benchmark`: no `bench` in the default build; `cargo build -p wyrd-server --bin wyrd-server` clean; lib tests of wyrd-benchmark, vala-verify, wyrd-server, vala-bifrost-redux, wyrd-client 1866/1866 under test Postgres; `wyrd-client` transport integration 26/26; `mise run lints`, `check:deps`, `git diff --check` PASS | PASS |
 
 Commit: `31af28af7`.
 
-Status: BLOCKED on measurement authorization. The Agent internals are now
-instrumented, so one unprofiled run localizes the remaining Agent time;
-profiling is needed only if a phase is large and unclear. Requested
-experiment: `direct-verify-c1`, `direct-verify-c64`, `direct-verify-model-c1`,
-`direct-verify-model-c64`, all standard repetitions, unchanged fixture and
-recorder settings, no profiler and no heap capture. Steps 1–4 and their proofs
-are complete.
+### Agent phase measurement (authorized, unprofiled)
+
+Run: `mise run bench:l1:verification --steps direct-verify-c1,direct-verify-c64,direct-verify-model-c1,direct-verify-model-c64`,
+standard repetitions, no profiler or heap capture; VALID (exit 0); record
+`target/benchmarks/verification/direct-verify/20261111T150216Z-0626a7b2d.json`.
+Per-call means, three repetitions (µs):
+
+| Component | model-c1 | model-c64 |
+|---|---|---|
+| Agent block | 403–428 | 2061–2184 |
+| `resolve` | 20–23 | 49–51 |
+| `bind` | 20–21 | 37–38 |
+| `run` | 330–349 | 1841–1959 |
+| `verdict` | 10–11 | 29 |
+| `cite` | 6 | 11–12 |
+| Gateway phases (sum of 8) | 41–43 | 78–82 |
+| Gateway `provider_headers` wait | 69–70 | 1237–1333 |
+| Gateway `dispatch` + `resume` + `provider_body` waits | 29–30 | 63–67 |
+| `run` not attributed to the Gateway | about 190–205 | about 450–520 |
+
+Localization: `run` is 82–90% of the Agent block. At c1 the largest
+unattributed cost is about 190–205 µs inside the Skald loop outside the
+Gateway (request assembly, answer parsing and structured-output handling);
+`translate` (28 µs) is the largest Gateway phase. At c64 the
+`provider_headers` wait to the paced local upstream fixture dominates
+(about 1.3 ms of 1.9 ms), followed by the same Skald-side residual. Resolve,
+bind, verdict, and cite together are under 60 µs at c1.
+
+Status: BLOCKED. The remaining Agent time is localized to `run`, but the
+about 200 µs (c1) Skald-side residual is large and has no finer timing, so
+reducing it with attributable gains needs a CPU-only profile of
+`direct-verify-model-c1` and `direct-verify-model-c64`. That run needs
+maintainer authorization. Steps 1–4 and their proofs are complete.

@@ -181,12 +181,13 @@ pub struct NativeLifecycleResult {
 }
 
 impl NativeLifecycleResult {
-    /// Builds one successful JSON lifecycle projection.
+    /// Builds one successful JSON lifecycle projection, serializing `value`
+    /// straight to its JSON text.
     ///
     /// # Errors
     ///
     /// Returns a napi error when the canonical lifecycle value cannot be serialized.
-    fn success(value: &Value) -> Result<Self> {
+    fn success<T: Serialize + ?Sized>(value: &T) -> Result<Self> {
         Ok(Self {
             value_json: Some(serde_json::to_string(&value).map_err(napi_error)?),
             error_code: None,
@@ -205,7 +206,7 @@ impl NativeLifecycleResult {
     /// Returns a napi error when the successful value cannot be serialized.
     fn outcome<T: Serialize>(result: StdResult<T, WyrdError>) -> Result<Self> {
         match result {
-            Ok(value) => Self::success(&serde_json::to_value(value).map_err(napi_error)?),
+            Ok(value) => Self::success(&value),
             Err(error) => Ok(Self::from_wyrd(&error)),
         }
     }
@@ -1097,7 +1098,7 @@ impl NativeBifrost {
         crate::trace::spawn(env, async move {
             match client.running().await {
                 Ok(queries) => NativeLifecycleResult::success(
-                    &serde_json::to_value(queries).map_err(napi_error)?,
+                    &queries,
                 ),
                 Err(error) => Ok(NativeLifecycleResult::failure(&error)),
             }
@@ -1129,7 +1130,7 @@ impl NativeBifrost {
             };
             match client.status(&request_id).await {
                 Ok(summary) => NativeLifecycleResult::success(
-                    &serde_json::to_value(summary).map_err(napi_error)?,
+                    &summary,
                 ),
                 Err(error) => Ok(NativeLifecycleResult::failure(&error)),
             }
@@ -1161,7 +1162,7 @@ impl NativeBifrost {
             };
             match client.cancel(&request_id).await {
                 Ok(response) => NativeLifecycleResult::success(
-                    &serde_json::to_value(response).map_err(napi_error)?,
+                    &response,
                 ),
                 Err(error) => Ok(NativeLifecycleResult::failure(&error)),
             }
@@ -1217,7 +1218,7 @@ impl NativeBifrost {
         crate::trace::spawn(env, async move {
             match client.list_tables().await {
                 Ok(entries) => NativeLifecycleResult::success(
-                    &serde_json::to_value(entries).map_err(napi_error)?,
+                    &entries,
                 ),
                 Err(error) => Ok(NativeLifecycleResult::failure(&error)),
             }
@@ -1247,7 +1248,7 @@ impl NativeBifrost {
         crate::trace::spawn(env, async move {
             match client.describe_table(&namespace, &name).await {
                 Ok(description) => NativeLifecycleResult::success(
-                    &serde_json::to_value(description).map_err(napi_error)?,
+                    &description,
                 ),
                 Err(error) => Ok(NativeLifecycleResult::failure(&error)),
             }
@@ -1318,7 +1319,7 @@ impl NativeBifrost {
             };
             match altered {
                 Ok(description) => NativeLifecycleResult::success(
-                    &serde_json::to_value(description).map_err(napi_error)?,
+                    &description,
                 ),
                 Err(error) => Ok(NativeLifecycleResult::failure(&error)),
             }

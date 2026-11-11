@@ -44,7 +44,9 @@ use wyrd_loader::{DeclarationInput, Diagnostic, LoadError, Severity};
 use wyrd_spec::card::artifact::ArtifactSpec;
 use wyrd_spec::envelope::{CardKind, Metadata, Spec};
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::graph::sibling_target;
 use wyrd_spec::refs::ReferenceSlotVisitor;
+use wyrd_spec::registry::CardSubmission;
 
 pub use kinds::{
     Agent, Artifact, Audit, Binding, Component, Data, Experiment, Mcp, Model, Operator, Service,
@@ -1034,17 +1036,21 @@ impl CardDefinition {
     /// Every code file is read now and every Card, local Artifacts
     /// included, is decoded and validated as its YAML file would be. Each
     /// referenced definition joins the graph once; definitions that decode
-    /// to the same Card are one submission. A local Artifact is referenced
-    /// as a sibling until [`Declaration::bind_published`] replaces it with
-    /// the published reference, and no local path enters a submission.
+    /// to the same Card are one submission. Siblings are matched among the
+    /// whole capture, local Artifacts included, so an omitted sibling naming
+    /// a local and another Artifact of one name is refused before anything
+    /// publishes. A local Artifact is referenced as a sibling until
+    /// [`Declaration::bind_published`] replaces every sibling that matched it
+    /// with the published reference, and no local path enters a submission.
     ///
     /// # Errors
     /// Returns [`WyrdError::SpecDuplicateSubmission`] when two different
     /// definitions share one identity, a local Artifact and a Card without
     /// that source included, and `WYRD_LOADER_400_INVALID_ENVELOPE` carrying every diagnostic for
     /// an invalid graph: a malformed or incomplete field by its YAML path, a
-    /// repeated key, an unreadable code file, an invalid version, and each
-    /// shared tree validation refusal.
+    /// repeated key, an unreadable code file, an invalid version, an
+    /// ambiguous versionless sibling, and each shared tree validation
+    /// refusal.
     pub fn declaration(&self) -> Result<Declaration, WyrdError> {
         Graph::declaration(FieldValue::from(self.clone()).captures)
     }
@@ -1060,23 +1066,48 @@ pub struct Declaration {
     /// `None` when the root is itself a local Artifact, whose publication,
     /// last in `artifacts`, is the whole declaration.
     pub input: Option<DeclarationInput>,
+    /// Every authored Card, local Artifacts included, as the submissions
+    /// sibling matching selects among; siblings keep the targets they
+    /// matched here while their local Artifacts are published.
+    targets: Vec<CardSubmission>,
 }
 
 impl Declaration {
-    /// Replace every sibling naming `published`, a local Artifact just
-    /// published, with its exact registered reference, in the Artifacts
-    /// still to publish and in the graph.
+    /// Record that the first of `artifacts`, a local Artifact, was just
+    /// published as `published`: remove it and replace every sibling whose
+    /// authored target it is with that exact registered reference, in the
+    /// Artifacts still to publish and in the graph.
+    ///
+    /// A sibling is bound by the target shared sibling matching selected
+    /// among every authored Card, so a sibling naming another Card of the
+    /// same kind and name, or another version, keeps its own target. With
+    /// no Artifact left to publish, nothing changes.
     ///
     /// # Errors
     /// Returns [`WyrdError::internal`] when a validated submission no longer
-    /// decodes or serializes.
+    /// decodes or serializes, or the published Artifact is not one of the
+    /// authored targets.
     pub fn bind_published(
         &mut self,
         published: &wyrd_spec::reference::CardRef,
     ) -> Result<(), WyrdError> {
+        if self.artifacts.is_empty() {
+            return Ok(());
+        }
+        let artifact = self.artifacts.remove(0);
+        let target = self
+            .targets
+            .iter()
+            .position(|target| {
+                target.kind == CardKind::Artifact
+                    && target.metadata.name == artifact.metadata.name
+                    && target.metadata.version == artifact.metadata.version
+            })
+            .ok_or_else(|| WyrdError::internal("a published local Artifact is not authored"))?;
+        let targets = &self.targets;
         for artifact in &mut self.artifacts {
             let mut spec = Spec::Artifact(artifact.spec.clone());
-            bind_sibling(&mut spec, published);
+            bind_sibling(&mut spec, targets, target, published);
             if let Spec::Artifact(bound) = spec {
                 artifact.spec = bound;
             }
@@ -1089,7 +1120,7 @@ impl Declaration {
                 .map_err(|error| {
                     WyrdError::internal(format!("a validated submission does not decode: {error}"))
                 })?;
-            bind_sibling(&mut spec, published);
+            bind_sibling(&mut spec, targets, target, published);
             submission.spec = serde_json::to_value(&spec).map_err(|error| {
                 WyrdError::internal(format!(
                     "a validated submission does not serialize: {error}"
@@ -1100,13 +1131,19 @@ impl Declaration {
     }
 }
 
-/// Bind every sibling in `spec` that names `card_ref` to it.
-fn bind_sibling(spec: &mut Spec, card_ref: &wyrd_spec::reference::CardRef) {
+/// Bind every sibling in `spec` whose matched target among `targets` is
+/// `target` to `card_ref`.
+fn bind_sibling(
+    spec: &mut Spec,
+    targets: &[CardSubmission],
+    target: usize,
+    card_ref: &wyrd_spec::reference::CardRef,
+) {
     ReferenceSlotVisitor::visit(spec, |mut slot| {
         if slot
             .value
             .as_sibling()
-            .is_some_and(|sibling| sibling.matches(card_ref))
+            .is_some_and(|sibling| sibling_target(sibling, targets) == Ok(Some(target)))
         {
             slot.value.bind_sibling(card_ref.clone());
         }
@@ -1142,26 +1179,38 @@ impl Graph {
         let mut graph = Self::default();
         graph.absorb(captures)?;
         let mut diagnostics = Vec::new();
+        let mut every = Vec::new();
         let mut authored = Vec::new();
         let mut artifacts = Vec::new();
         for card in &graph.cards {
             let decoded = match &card.source {
-                Some(source) => card.local(source).map(|local| artifacts.push(local)),
-                None => card.decode().map(|card| authored.push(card)),
+                Some(source) => card.local(source).and_then(|local| {
+                    artifacts.push(local);
+                    card.decode()
+                }),
+                None => card.decode().inspect(|card| authored.push(card.clone())),
             };
-            if let Err(errors) = decoded {
-                diagnostics.extend(errors);
+            match decoded {
+                Ok(card) => every.push(card),
+                Err(errors) => diagnostics.extend(errors),
             }
         }
         if !diagnostics.is_empty() {
             return Err(LoadError::multiple(diagnostics).into());
         }
+        // The whole capture, local Artifacts included, is matched and
+        // validated as its YAML tree would be before anything publishes.
+        let targets = wyrd_loader::declaration_input_from_cards(&every)?.submissions;
         let input = if authored.is_empty() {
             None
         } else {
             Some(wyrd_loader::declaration_input_from_cards(&authored)?)
         };
-        Ok(Declaration { artifacts, input })
+        Ok(Declaration {
+            artifacts,
+            input,
+            targets,
+        })
     }
 
     /// Add every Card `captures` references, local Artifacts included, each

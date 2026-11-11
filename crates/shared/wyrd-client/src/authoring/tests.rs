@@ -1049,14 +1049,6 @@ fn declarations_match_file_authored_tree() {
     ))
     .declaration()
     .expect("valid graph");
-    authored
-        .bind_published(&published_ref("company-sharing-policy", "1.0.0"))
-        .expect("the published policy binds");
-    let files = wyrd_loader::build_declaration_input(
-        wyrd_loader::load(&story("finance-release.yaml")).expect("the story loads"),
-    )
-    .expect("the story builds");
-
     assert_eq!(
         authored.artifacts.len(),
         1,
@@ -1066,6 +1058,15 @@ fn declarations_match_file_authored_tree() {
         authored.artifacts[0].source,
         story("company-sharing-policy.pdf")
     );
+    authored
+        .bind_published(&published_ref("company-sharing-policy", "1.0.0"))
+        .expect("the published policy binds");
+    assert!(authored.artifacts.is_empty(), "the policy was published");
+    let files = wyrd_loader::build_declaration_input(
+        wyrd_loader::load(&story("finance-release.yaml")).expect("the story loads"),
+    )
+    .expect("the story builds");
+
     let identity = |submission: &wyrd_spec::registry::CardSubmission| {
         (
             format!("{:?}", submission.kind),
@@ -1291,8 +1292,12 @@ fn replacements_keep_only_current_dependencies() {
         "a nested local schema publishes first, once, and a replaced one not at all"
     );
     let schema_ref = |declaration: &Declaration| {
-        serde_json::to_value(&declaration.artifacts[1].spec).expect("serializes")["schema_ref"]
-            .clone()
+        let payload = declaration
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.metadata.name.as_str() == "payload")
+            .expect("the payload is still to publish");
+        serde_json::to_value(&payload.spec).expect("serializes")["schema_ref"].clone()
     };
     assert_eq!(
         schema_ref(&declaration),
@@ -1727,5 +1732,87 @@ fn unversioned_definitions_take_the_original_prompt_and_typed_values() {
     assert_eq!(
         verifier.spec["requirements"][0]["check"]["operator"],
         json!("not_contains")
+    );
+}
+
+/// Local Artifact siblings select among the whole capture: an omitted
+/// sibling naming a local Artifact and another Artifact of its name is
+/// refused before anything publishes, and each published Artifact binds only
+/// the siblings that matched it.
+///
+/// # Panics
+/// Panics when an ambiguous capture declares, a valid one does not, or a
+/// published reference binds a component that did not match it.
+#[test]
+fn local_artifact_siblings_match_the_whole_capture() {
+    let service = |components: [(&str, Artifact); 2]| {
+        let mut service = Service::new("artifact-service", "1.0.0");
+        for (alias, artifact) in components {
+            service.add_component(Component::new(alias, artifact));
+        }
+        CardDefinition::from(&service).declaration()
+    };
+    let local = |version| Artifact::from_path("policy", version, "policy.pdf");
+    for (shape, other) in [
+        ("local", local(None)),
+        (
+            "spec-only",
+            Artifact::new("policy", None).artifact_kind("code"),
+        ),
+    ] {
+        let error = service([("pinned", local(Some("1.0.0"))), ("omitted", other)])
+            .expect_err("an omitted sibling naming two Artifacts is ambiguous");
+        assert!(
+            diagnostics(&error)
+                .iter()
+                .any(|(code, _)| code == "WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY"),
+            "{shape}: {error:?}"
+        );
+    }
+
+    let component_ref = |declaration: &Declaration, index: usize| {
+        declaration
+            .input
+            .as_ref()
+            .expect("an ordinary graph")
+            .submissions[0]
+            .spec["components"][index]["ref"]
+            .clone()
+    };
+    let mut explicit = service([
+        ("first", local(Some("1.0.0"))),
+        ("second", local(Some("2.0.0"))),
+    ])
+    .expect("explicit versions of one Artifact are distinct targets");
+    explicit
+        .bind_published(&published_ref("policy", "1.0.0"))
+        .expect("the first Artifact binds");
+    assert_eq!(
+        component_ref(&explicit, 0),
+        json!({"kind": "Artifact", "name": "policy", "version": "1.0.0"})
+    );
+    assert_eq!(
+        component_ref(&explicit, 1),
+        json!({"sibling": {"kind": "Artifact", "name": "policy", "version": "2.0.0"}}),
+        "another version keeps its own target"
+    );
+
+    let mut omitted = Service::new("artifact-service", "1.0.0");
+    omitted.add_component(Component::new("policy", local(None)));
+    let mut omitted = CardDefinition::from(&omitted)
+        .declaration()
+        .expect("one omitted local Artifact is a unique target");
+    let selected: wyrd_spec::reference::CardRef = serde_json::from_value(json!({
+        "kind": "Artifact", "name": "policy", "version": "0.1.0",
+        "uid": "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b11"
+    }))
+    .expect("a registered reference decodes");
+    omitted
+        .bind_published(&selected)
+        .expect("the published Artifact binds");
+    assert_eq!(
+        component_ref(&omitted, 0),
+        serde_json::to_value(&selected).expect("serializes"),
+        "the omitted sibling binds the full registered version and UID"
     );
 }

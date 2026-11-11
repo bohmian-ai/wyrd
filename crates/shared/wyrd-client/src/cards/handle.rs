@@ -300,8 +300,7 @@ impl Cards {
             Declarable::Card(card) => {
                 let mut declaration = card.declaration()?;
                 let mut published = None;
-                while !declaration.artifacts.is_empty() {
-                    let artifact = declaration.artifacts.remove(0);
+                while let Some(artifact) = declaration.artifacts.first().cloned() {
                     let receipt = self
                         .publish_artifact(
                             artifact.source,

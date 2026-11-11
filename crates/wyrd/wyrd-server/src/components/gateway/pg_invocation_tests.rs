@@ -3423,9 +3423,10 @@ async fn gateway_capture_follows_policy_and_never_affects_the_call() {
 ///
 /// While every reservable slot is held, a call with a short deadline is
 /// refused with `WYRD_GATEWAY_429_CAPTURE_STAGING_FULL` after waiting out
-/// that deadline, before any provider sees it and with nothing captured. A
-/// call admitted while the slots are held waits, is admitted once they are
-/// released, answers, and its capture row is written.
+/// that deadline, before any provider sees it and with nothing captured; a
+/// call bound to an earlier instant than its relative timeout is refused the
+/// same way at that bound. A call admitted while the slots are held waits, is
+/// admitted once they are released, answers, and its capture row is written.
 ///
 /// # Panics
 /// Panics when the Postgres fixture, a seed or call, or an assertion fails.
@@ -3474,6 +3475,33 @@ async fn capturing_call_waits_for_a_capture_slot_and_refuses_at_its_deadline() {
     assert!(
         dispatch.seen().is_empty(),
         "a refused call reaches no provider"
+    );
+
+    // A bound call waits for its slot until its bound, not its far longer
+    // relative timeout, and is refused the same way.
+    let started = tokio::time::Instant::now();
+    let refused = GatewayInvocation::new(&state)
+        .bounded(started + Duration::from_millis(200))
+        .run(
+            &caller,
+            request("dep-a/a", Some((1000, 500)), Duration::from_secs(10)),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("no capture slot frees before the bound");
+    let waited = started.elapsed();
+    assert!(
+        matches!(refused.error, WyrdError::GatewayCaptureStagingFull { .. }) && !refused.dispatched,
+        "{:?}",
+        refused.error
+    );
+    assert!(
+        (Duration::from_millis(200)..Duration::from_secs(2)).contains(&waited),
+        "the bound ended the capture-slot wait after {waited:?}"
+    );
+    assert!(
+        dispatch.seen().is_empty(),
+        "a refused bound call reaches no provider"
     );
 
     let release = tokio::spawn(async move {
@@ -6046,7 +6074,8 @@ async fn gateway_agent_calls_start_only_on_a_compatible_adapter() {
 /// original deadline rather than a full budget after admission. A cancelled
 /// wait ends at once. A call whose lane opens halfway through its budget but
 /// whose cold snapshot read is held past the original deadline is refused
-/// with the gateway deadline while that read is still blocked, undispatched.
+/// with the gateway deadline at that deadline while that read is still
+/// blocked, undispatched, and a call dropped there keeps nothing.
 /// A call admitted after a lane wait and a delayed snapshot reaches the
 /// provider with the deadline fixed before its lane wait. A ledger write held
 /// past the deadline still hands off: no attempt starts, and its concurrency
@@ -6167,8 +6196,8 @@ async fn lane_wait_spends_the_agent_call_budget() {
         other => panic!("unexpected expiry: {other:?}"),
     }
     assert!(
-        ended < budget + budget / 4,
-        "the held snapshot ended the call after {ended:?}"
+        (budget..budget + budget / 4).contains(&ended),
+        "the held snapshot ended the call at its deadline, after {ended:?}"
     );
     assert!(
         dispatch.seen().is_empty(),
@@ -6178,6 +6207,28 @@ async fn lane_wait_spends_the_agent_call_budget() {
         permits.available_permits(),
         1,
         "the refused call kept no permit"
+    );
+    barrier.commit().await.expect("barrier releases");
+
+    // A call dropped while its held snapshot read is bounded is cancelled
+    // there: it dispatches nothing and keeps no permit.
+    let mut barrier = superuser.begin().await.expect("barrier begins");
+    sqlx::query("LOCK TABLE wyrd.gateway_model_pricing IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *barrier)
+        .await
+        .expect("snapshot reads held");
+    let dropped = tokio::spawn(call(Duration::from_secs(30)));
+    await_lock_waiters(&fixture, 1).await;
+    dropped.abort();
+    assert!(dropped.await.is_err_and(|error| error.is_cancelled()));
+    assert!(
+        dispatch.seen().is_empty(),
+        "a dropped call dispatches nothing"
+    );
+    assert_eq!(
+        permits.available_permits(),
+        1,
+        "a dropped call keeps no permit"
     );
     barrier.commit().await.expect("barrier releases");
     let held = Arc::clone(&permits)

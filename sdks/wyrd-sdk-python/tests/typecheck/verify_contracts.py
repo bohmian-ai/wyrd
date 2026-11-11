@@ -22,8 +22,11 @@ if TYPE_CHECKING:
         CheckWire,
         ExecutionState,
         InputDeclaration,
+        OutcomeDetails,
+        RequirementDetails,
         RequirementResult,
         StepResult,
+        VerificationDetails,
         VerificationResultWire,
         VerificationVerdict,
     )
@@ -33,8 +36,13 @@ def returned_records_are_typed(execution: Execution, result: VerificationResult)
     state = execution.status()
     assert_type(state, ExecutionState)
     assert_type(result.requirements, list[RequirementResult])
-    assert_type(result.steps, list[StepResult])
-    assert_type(result.evidence, dict[str, InputDeclaration])
+    described = execution.details()
+    assert_type(described, VerificationDetails)
+    assert_type(described["outcome"], OutcomeDetails)
+    assert_type(described["outcome"]["requirements"], list[RequirementDetails])
+    assert_type(described["outcome"]["requirements"][0]["check"], Check)
+    assert_type(described["outcome"]["steps"], list[StepResult])
+    assert_type(described["outcome"]["evidence"], dict[str, InputDeclaration])
     if "result" in state:
         assert_type(state["result"], VerificationResultWire)
         assert_type(state["result"]["outcome"]["verdict"], VerificationVerdict)
@@ -54,6 +62,9 @@ def typed_reads_carry_the_model(state: WyrdState, execution: Execution) -> None:
     typed = execution.status_typed(Judge)
     assert_type(typed["result"]["outcome"]["requirements"], list[RequirementResult[Judge]])
     assert_type(execution.wait(1.0).requirements[0]["data"], dict[str, JsonValue])
+    assert_type(
+        execution.details_typed(Judge)["outcome"]["requirements"], list[RequirementDetails[Judge]]
+    )
     execution.wait_typed(1.0, int)  # ty: ignore[invalid-argument-type]
 
 
@@ -78,32 +89,53 @@ def the_actual_status_shape_is_accepted() -> ExecutionState:
                             {"slot": "policy", "locator": {"page": 2}},
                             {"slot": "notes", "locator": {"lines": {"start": 1, "end": 3}}},
                         ],
-                        "check": {
-                            "kind": "agent",
-                            "agent": "./policy-judge.yaml",
-                            "inputs": {"claim": "requirement.statement"},
-                        },
                         "actual": {"any": [1, "json", None]},
-                        "provenance": {
-                            "kind": "agent",
-                            "route": {"kind": "wyrd_gateway", "deployment": "default"},
-                        },
                     }
                 ],
-                "steps": [
-                    {
-                        "id": "read",
-                        "status": "succeeded",
-                        "attempts": 1,
-                        "duration_ms": 12,
-                        "output": [1, {"free": "json"}],
-                        "tool_calls": [{"tool": "fs.read", "arguments": {}, "returned_bytes": 3}],
-                    }
-                ],
-                "evidence": {
-                    "policy": {"kind": "file", "sha256": "ab", "size_bytes": 3, "format": "pdf"},
-                    "answer": {"kind": "json", "value": "yes"},
-                },
+            },
+        },
+    }
+
+
+def the_actual_details_shape_is_accepted() -> VerificationDetails:
+    return {
+        "execution_id": "0190b2a4-0000-7000-8000-000000000000",
+        "verifier": {"kind": "Verifier", "name": "policy-review", "version": "1.0.0"},
+        "subject": {"kind": "Agent", "name": "desk", "version": "1.0.0"},
+        "outcome": {
+            "verdict": "passed",
+            "requirements": [
+                {
+                    "id": "follows-policy",
+                    "statement": "The answer follows the policy.",
+                    "outcome": "passed",
+                    "reason": "cited",
+                    "citations": [{"slot": "policy", "locator": {"page": 2}}],
+                    "check": {
+                        "kind": "agent",
+                        "agent": "./policy-judge.yaml",
+                        "inputs": {"claim": "requirement.statement"},
+                    },
+                    "actual": {"any": [1, "json", None]},
+                    "provenance": {
+                        "kind": "agent",
+                        "route": {"kind": "wyrd_gateway", "deployment": "default"},
+                    },
+                }
+            ],
+            "steps": [
+                {
+                    "id": "read",
+                    "status": "succeeded",
+                    "attempts": 1,
+                    "duration_ms": 12,
+                    "output": [1, {"free": "json"}],
+                    "tool_calls": [{"tool": "fs.read", "arguments": {}, "returned_bytes": 3}],
+                }
+            ],
+            "evidence": {
+                "policy": {"kind": "file", "sha256": "ab", "size_bytes": 3, "format": "pdf"},
+                "answer": {"kind": "json", "value": "yes"},
             },
         },
     }

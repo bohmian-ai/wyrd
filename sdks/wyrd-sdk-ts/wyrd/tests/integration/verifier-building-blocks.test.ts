@@ -45,8 +45,9 @@ import type { ReceivedRequest, Reply } from "../support/http-receiver.js";
 import { configureGateway } from "../support/local-development.js";
 import {
   type DeclaredRef,
-  fixture,
   declared,
+  details,
+  fixture,
   rooted,
   runtimeAccount,
   serverTest,
@@ -216,9 +217,9 @@ function requirement<T>(result: VerificationResult<T>, id: string): RequirementR
   return found;
 }
 
-/** The step `id` of `result`. */
-function step(result: VerificationResult, id: string): CardTypes.StepResult {
-  const found = result.outcome.steps.find((each) => each.id === id);
+/** The step `id` that `result`'s execution ran, read from its details. */
+async function step(result: VerificationResult, id: string): Promise<CardTypes.StepResult> {
+  const found = (await details(result.execution_id)).outcome.steps.find((each) => each.id === id);
   if (found === undefined) {
     throw new Error(`step ${id}: ${JSON.stringify(result)}`);
   }
@@ -330,13 +331,13 @@ function investigate(desk: PolicyDesk, client: WyrdClient, question: string): Pr
  * nothing. The model's tool turn shows the policy desk's Card only when the
  * Card read was allowed.
  */
-function assertTools(
+async function assertTools(
   provider: { received: readonly ReceivedRequest[] },
   result: VerificationResult,
   question: string,
   allowed: readonly string[],
-): void {
-  const investigated = step(result, "investigate");
+): Promise<void> {
+  const investigated = await step(result, "investigate");
   expect(investigated.status, question).toBe("succeeded");
   const calls = investigated.tool_calls ?? [];
   expect(
@@ -385,14 +386,14 @@ test("policy review runs every action and check kind", async ({ server, provider
 
   expect(result.outcome.verdict, JSON.stringify(result)).toBe("passed");
   expect(result.subject).toEqual(desk.root);
-  const text = step(result, "policy-text");
+  const text = await step(result, "policy-text");
   expect(text.status).toBe("succeeded");
   expect(text.output).toMatchObject({ format: "pdf" });
   expect(text.provenance?.kind).toBe("extract");
-  const rules = step(result, "refund-rules");
+  const rules = await step(result, "refund-rules");
   expect([rules.status, rules.output]).toEqual(["succeeded", { max_refund: 100 }]);
   expect(rules.tool_calls?.map((call) => call.tool)).toEqual(["fs.extract"]);
-  const facts = step(result, "answer-facts");
+  const facts = await step(result, "answer-facts");
   expect([facts.status, facts.output]).toEqual(["succeeded", { within_limit: true }]);
   expect(facts.provenance?.kind).toBe("code");
   for (const id of [
@@ -448,7 +449,7 @@ test("raising code check cannot pass", async ({ desk }) => {
 test("forbidden code access cannot pass dependent work", async ({ desk }) => {
   const result = await reviewNow(desk, review("read the host", 50));
 
-  expect(step(result, "answer-facts").status).toBe("failed");
+  expect((await step(result, "answer-facts")).status).toBe("failed");
   expect(requirement(result, "refund-within-limit").outcome).not.toBe("passed");
   expect(result.outcome.verdict).not.toBe("passed");
 });
@@ -476,7 +477,7 @@ test("malformed policy cannot pass", async ({ desk }) => {
     policy: verify.File.bytes(new TextEncoder().encode("not a pdf"), { format: "pdf" }),
   });
 
-  expect(step(result, "policy-text").status).toBe("failed");
+  expect((await step(result, "policy-text")).status).toBe("failed");
   expect(requirement(result, "policy-has-text").outcome).not.toBe("passed");
   expect(result.outcome.verdict).not.toBe("passed");
 });
@@ -598,7 +599,7 @@ test("every format extracts its locked output", async ({ desk }) => {
       document: verify.File.path(fixture(`cards/verifier_building_blocks/samples/${name}`)),
     });
 
-    expect(step(result, "read").output, name).toEqual(expected);
+    expect((await step(result, "read")).output, name).toEqual(expected);
     expect(requirement(result, "extracted").outcome, name).toBe("passed");
   }
 });
@@ -624,7 +625,7 @@ test("file inputs use shared uploads", async ({ server, desk }) => {
   ];
   for (const [document, rows] of files) {
     const result = await desk.state.run().observe.verify("document-formats", { document });
-    expect(step(result, "read").output).toEqual({ format: "csv", rows });
+    expect((await step(result, "read")).output).toEqual({ format: "csv", rows });
   }
 
   const token = await WyrdClient.connect().accessToken();
@@ -654,7 +655,7 @@ test("stored evidence readback uses canonical records", async ({ desk }) => {
   const status = await submitted.execution.status();
 
   expect(status.result).toEqual(result);
-  expect(result.outcome.evidence).toEqual({
+  expect((await submitted.execution.details()).outcome.evidence).toEqual({
     document: {
       kind: "file",
       sha256: createHash("sha256").update(content).digest("hex"),
@@ -669,7 +670,7 @@ test("document passed positionally fills the only slot", async ({ desk }) => {
     .run()
     .observe.verify("document-formats", verify.File.path(fixture("cards/verifier_building_blocks/samples/sample.md")));
 
-  expect(step(result, "read").output).toEqual({ format: "markdown", text: "# Title" });
+  expect((await step(result, "read")).output).toEqual({ format: "markdown", text: "# Title" });
   expect(requirement(result, "extracted").outcome).toBe("passed");
 });
 
@@ -686,10 +687,10 @@ test("failed reader leaves its dependents inconclusive", async ({ desk }) => {
   for (const [marker] of READER_FAILURES) {
     const result = await reviewNow(desk, review(`${marker}: refunds follow our policy.`, 50));
 
-    const rules = step(result, "refund-rules");
+    const rules = await step(result, "refund-rules");
     expect(rules.status, `${marker}: ${JSON.stringify(rules)}`).toBe("failed");
     expect(rules.reason, `${marker}: the failure says why`).toBeTruthy();
-    expect(step(result, "answer-facts").status, marker).toBe("skipped");
+    expect((await step(result, "answer-facts")).status, marker).toBe("skipped");
     for (const id of ["limit-found", "refund-within-limit", "follows-policy"]) {
       expect(requirement(result, id).outcome, `${marker} ${id}`).toBe("inconclusive");
     }
@@ -716,7 +717,7 @@ test("failed code step leaves its assertion inconclusive", async ({ desk }) => {
   for (const text of ["fail the facts", "spin the facts"]) {
     const result = await reviewNow(desk, review(text, 50));
 
-    const facts = step(result, "answer-facts");
+    const facts = await step(result, "answer-facts");
     expect(facts.status, `${text}: ${JSON.stringify(facts)}`).toBe("failed");
     expect(facts.reason, `${text}: the failure says why`).toBeTruthy();
     expect(requirement(result, "refund-within-limit").outcome, text).toBe("inconclusive");
@@ -779,11 +780,11 @@ test("hosted tools need the tool and domain grants", async ({ server, provider, 
 
     const result = await investigate(desk, WyrdClient.connect({ credential }), name);
 
-    assertTools(provider, result, name, allowed);
+    await assertTools(provider, result, name, allowed);
   }
   const credential = server.scopedApiKey("card_tool_only", grants({ tool: TOOLS[0] }));
   const result = await investigate(desk, WyrdClient.connect({ credential }), "card_tool_only");
-  assertTools(provider, result, "card_tool_only", [TOOLS[0]]);
+  await assertTools(provider, result, "card_tool_only", [TOOLS[0]]);
 });
 
 test("delegated tools keep the narrower authority", async ({ server, provider, desk }) => {
@@ -800,7 +801,7 @@ test("delegated tools keep the narrower authority", async ({ server, provider, d
 
   const result = await investigate(desk, delegated, "delegated");
 
-  assertTools(provider, result, "delegated", [TOOLS[0]]);
+  await assertTools(provider, result, "delegated", [TOOLS[0]]);
   server.flushBifrost();
   const attributed = await (await Bifrost.connect()).sql(
     "SELECT sub_principal_id, act_principal_id FROM bifrost.verification.results WHERE execution_id = $1",
@@ -871,7 +872,7 @@ test("custom_verdict_data_survives_readback", async ({ server, desk }) => {
     return JSON.parse(rows[0]?.output ?? "null").requirements;
   };
   expect(await retained(waited.execution_id), "the retained output keeps its data").toEqual(
-    waited.outcome.requirements,
+    (await execution.details()).outcome.requirements,
   );
 
   for (const [marker, data] of Object.entries(EXACT_DATA)) {
@@ -882,7 +883,9 @@ test("custom_verdict_data_survives_readback", async ({ server, desk }) => {
     const exact = await execution.wait({ timeoutMs: WAIT_MS });
     expect(requirement(exact, "well-formed").data, `${marker}: wait`).toEqual(data);
     expect((await execution.status()).result, `${marker}: status`).toEqual(exact);
-    expect(await retained(exact.execution_id), `${marker}: retained`).toEqual(exact.outcome.requirements);
+    expect(await retained(exact.execution_id), `${marker}: retained`).toEqual(
+      (await execution.details()).outcome.requirements,
+    );
   }
 });
 
@@ -967,6 +970,33 @@ test("custom_verdict_data_is_typed_on_return", async ({ desk }) => {
     throw new Error("a settled result");
   }
   expectTyped(status.result);
+});
+
+test("verification_decisions_and_details_are_separate_reads", async ({ provider, desk }) => {
+  const text = "Refunds follow our policy.";
+  const direct = await desk.state.run().observe.verifyTyped("scored-review", { text }, Scored, { positional: true });
+  for (const each of direct.outcome.requirements) {
+    expect(Object.keys(each), each.id).not.toContain("check");
+    expect(Object.keys(each), each.id).not.toContain("provenance");
+  }
+  expect(Object.keys(direct.outcome).sort()).toEqual(["requirements", "verdict"]);
+  const judged = provider.received.length;
+
+  const execution = await verify.Execution.connect(direct.execution_id);
+  expect((await execution.waitTyped({ timeoutMs: WAIT_MS }, Scored)).outcome).toEqual(direct.outcome);
+  const described = await execution.detailsTyped(Scored);
+
+  expect([described.execution_id, described.outcome.verdict]).toEqual([direct.execution_id, direct.outcome.verdict]);
+  expect(described.verifier).toEqual(direct.verifier);
+  expect(described.outcome.requirements.map(({ check: _check, provenance: _provenance, ...each }) => each)).toEqual(
+    direct.outcome.requirements,
+  );
+  const onTopic = described.outcome.requirements.find((each) => each.id === "on-topic");
+  expect(onTopic?.check).toMatchObject({ kind: "agent", agent: expect.any(Object) });
+  expect(onTopic?.provenance).toMatchObject({ kind: "agent" });
+  expect(described.outcome.steps.map((each) => [each.id, each.status])).toEqual([["tally", "succeeded"]]);
+  expect(described.outcome.evidence).toEqual({ answer: { kind: "json", value: { text } } });
+  expect(provider.received.length, "details judge nothing again").toBe(judged);
 });
 
 test("typed_verdict_data_mismatch_keeps_original_result", async ({ provider, desk }) => {

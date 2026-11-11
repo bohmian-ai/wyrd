@@ -29,7 +29,7 @@ mod pg_tests {
     /// caller that also holds tenant administration (`*`), `verifier:run`,
     /// `operators:write`, `gateway:write`, and `gateway:delete`: every read
     /// tool, then that caller's write tools.
-    const ADVERTISED_TOOLS: [&str; 39] = [
+    const ADVERTISED_TOOLS: [&str; 40] = [
         "bifrost.list_tables",
         "bifrost.describe_table",
         "bifrost.query",
@@ -40,6 +40,7 @@ mod pg_tests {
         "cards.list",
         "verification.get_binding",
         "verification.get_execution",
+        "verification.get_execution_details",
         "operator_connections.list",
         "operator_connections.get",
         "gateway.list_provider_credentials",

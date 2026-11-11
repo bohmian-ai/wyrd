@@ -439,7 +439,7 @@ mod pg_tests {
     use wyrd_spec::ids::SlotName;
     use wyrd_spec::verification::VerificationVerdict;
     use wyrd_spec::verification::execution::{
-        InputDeclaration, RequirementOutcome, VerificationOutcome,
+        ExecutedOutcome, InputDeclaration, RequirementOutcome,
     };
 
     use super::*;
@@ -535,9 +535,12 @@ mod pg_tests {
         let verifier = |spec: Value| -> Arc<VerifierSpec> {
             Arc::new(serde_json::from_value(spec).expect("Verifier"))
         };
-        let passed = |outcome: &VerificationOutcome| {
+        let passed = |outcome: &ExecutedOutcome| {
             assert_eq!(outcome.verdict, VerificationVerdict::Passed);
-            assert_eq!(outcome.requirements[0].outcome, RequirementOutcome::Passed);
+            assert_eq!(
+                outcome.requirements[0].result.outcome,
+                RequirementOutcome::Passed
+            );
         };
 
         let slot = SlotName::new("context").expect("slot");
@@ -576,7 +579,7 @@ mod pg_tests {
             assert_eq!(outcome.evidence, expected, "the original evidence returns");
             let digest = sha2::Sha256::digest(serde_json::to_vec(&context).expect("bytes"));
             assert_eq!(
-                outcome.requirements[0].actual,
+                outcome.requirements[0].result.actual,
                 Some(Value::String(format!("{digest:x}")))
             );
             allocated
@@ -610,7 +613,10 @@ mod pg_tests {
             let outcome = outcome.expect("outcome");
             passed(&outcome);
             assert_eq!(outcome.steps[0].output.as_ref(), Some(&output));
-            assert_eq!(outcome.requirements[0].actual.as_ref(), Some(&output));
+            assert_eq!(
+                outcome.requirements[0].result.actual.as_ref(),
+                Some(&output)
+            );
             allocated
         });
         assert!(

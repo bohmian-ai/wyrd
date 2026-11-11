@@ -17,7 +17,8 @@ use wyrd_spec::card::verifier::{PathSegment, Reference, ReferenceRoot, Requireme
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
-    InputDeclaration, RequirementOutcome, RequirementResult, StepResult, StepStatus,
+    ExecutedRequirement, InputDeclaration, RequirementOutcome, RequirementResult, StepResult,
+    StepStatus,
 };
 
 use super::{BoundJson, CallInput, CallValue};
@@ -119,7 +120,7 @@ pub(super) enum Done {
         state: Settled,
     },
     /// A judged requirement, as reported.
-    Requirement(Box<RequirementResult>),
+    Requirement(Box<ExecutedRequirement>),
 }
 
 /// The scope document of one stage: the original evidence plus every block
@@ -152,7 +153,7 @@ impl<'a> Scope<'a> {
     /// Returns a settled step requirement's verdict.
     fn verdict(&self, requirement: &TaskId) -> Option<&RequirementResult> {
         match self.ledger.get(requirement) {
-            Some(Done::Requirement(result)) => Some(result),
+            Some(Done::Requirement(requirement)) => Some(&requirement.result),
             _ => None,
         }
     }

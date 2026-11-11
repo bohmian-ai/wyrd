@@ -28,7 +28,9 @@ use wyrd_ai::operator_connections::{
 };
 use wyrd_ai::transport::{GrpcConfig, HttpConfig};
 use wyrd_ai::verify::Execution;
-use wyrd_ai::{Bifrost, ExecutionId, SpanRecord, TraceId, VerificationResult, WyrdClient};
+use wyrd_ai::{
+    Bifrost, ExecutionId, SpanRecord, TraceId, VerificationDetails, VerificationResult, WyrdClient,
+};
 use wyrd_spec::ids::BindingId;
 use wyrd_spec::verification::VerificationExecutionStatus;
 use wyrd_spec::verification::execution::VerificationExecutionState;
@@ -422,6 +424,26 @@ impl Deployment {
             );
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
+    }
+
+    /// The details of execution `id`, read as the administrator once its
+    /// result is visible: what it ran, with its steps and pinned evidence.
+    ///
+    /// # Panics
+    /// Panics when the handle cannot connect, no result is visible within a
+    /// minute, or the details do not read.
+    pub async fn details(&self, id: ExecutionId) -> VerificationDetails {
+        let execution = Execution::connect_with(id, &self.admin())
+            .await
+            .expect("the execution handle connects");
+        execution
+            .wait(Duration::from_secs(60))
+            .await
+            .expect("the result becomes visible");
+        execution
+            .details()
+            .await
+            .expect("the execution details read")
     }
 
     /// Start a local Operator hook and create the HTTP connection

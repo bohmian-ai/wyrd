@@ -87,7 +87,7 @@ use wyrd_spec::vala::api::{
 };
 use wyrd_spec::vala::trace::SpanRecord;
 use wyrd_spec::verification::execution::{
-    EnqueueVerificationResponse, EvidencePlanRequest, EvidencePlanResponse,
+    EnqueueVerificationResponse, EvidencePlanRequest, EvidencePlanResponse, VerificationDetails,
     VerificationExecutionState, VerificationRequest, VerificationResult,
 };
 use wyrd_spec::verification::{ExecutionPlan, VerificationBindingStatus};
@@ -315,6 +315,7 @@ fn contracts() -> Value {
         VerificationResult,
         VerificationExecutionState,
         ExecutionPlan,
+        VerificationDetails,
         CreateOperatorConnectionRequest,
         UpdateOperatorConnectionRequest,
         OperatorConnectionView,

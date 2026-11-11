@@ -3,8 +3,8 @@ id: TASK-005
 kind: implementation
 status: proposed
 spec: SPEC-benchmark-latency-diagnosis
-spec_revision: 5
-requirements: [REQ-003, REQ-005, REQ-006, REQ-007, REQ-011, REQ-017, REQ-018, REQ-019, REQ-020, REQ-021, REQ-022, INV-001, INV-002, INV-003, INV-004, AC-013, AC-014, AC-015, AC-016, AC-017, AC-018]
+spec_revision: 6
+requirements: [REQ-003, REQ-005, REQ-006, REQ-007, REQ-011, REQ-017, REQ-018, REQ-019, REQ-020, REQ-021, REQ-022, INV-001, INV-002, INV-003, INV-004, AC-013, AC-014, AC-015, AC-016, AC-017, AC-018, REQ-023, REQ-024, REQ-025, REQ-026, REQ-027, AC-019, AC-020, AC-021, AC-022]
 depends_on: [TASK-004]
 ---
 
@@ -1012,3 +1012,495 @@ Envelope: the later median must not be worse than the earlier worst repetition. 
 | driver_cpu_us_per_call | 409.5 / 401.1 / 388.9 | 314.1 / 319.3 / 318.4 | 318.4 (-20.6% vs 401.1) | ≤ 409.5 | within, improved |
 | rate | 8030 / 9141 / 1.033e+04 | 1.083e+04 / 1.023e+04 / 1.053e+04 | 1.053e+04 (+15.2% vs 9141) | ≥ 8030 | within, improved |
 
+
+
+## Revision 6 — Compact Verification results and descriptive execution details
+
+**Added 2026-11-10. Proposed under approved spec revision 6.**
+This block adds required implementation to TASK-005, not a future task. The
+preceding scenarios and execution evidence retain their revision-5 meaning. This
+block supersedes only the earlier prohibitions on public workflow/schema/SDK
+changes, full executable-check ownership in returned results, and candidate
+rejections based on those exclusions. Old U/M/O evidence and limitations remain
+historical; they neither measure nor complete this extension. Unaffected work
+retains its existing authority.
+
+### Outcome and contract
+
+Return a useful decision without rebuilding the judge. A failed model check still
+returns its requirement, explanation, citation and custom score. A user explicitly
+requests execution details to inspect the original Prompt, effective route, inputs
+or tools. Complete evidence remains recorded independently of compact responses.
+Neither client decoding nor retained server readback compiles a Prompt.
+
+Implement the exact field split and public operations in REQ-023–027. Default
+`VerificationResult` retains its attribution envelope and outcome verdict and
+requirements. Requirements keep statement, outcome, reason, actual, citations,
+custom data and drift findings; they omit check/provenance. Outcome steps and
+evidence are absent. `VerificationDetails` has the full previous field set with
+checks represented as typed authored data rather than executable runtime objects.
+Use `GET /v1/verification/executions/{execution_id}/details`, SDK `Execution.details`
+and the established typed-data sibling convention, and MCP
+`verification.get_execution_details`. The exact SDK spelling follows each
+language's existing method conventions, without changing the wire vocabulary.
+
+The new read reuses current tenant/Card/Bifrost authority and audits; execution
+permission grants no extra read authority. Missing complete visible details use
+`404 WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND`, subject to existing refusal and
+non-disclosure rules. A completed verdict does not promise durable/fetchable
+history. Keep current status lifecycle behavior, retention and async recording;
+no durability wait, new availability service, implicit detail request, general
+schema cache, trusted wire flag or legacy full-result alias is selected.
+
+Keep stored input/output/summary shapes intact. Ordinary authoring/execution still
+validates schemas, Prompts, model answers, citations and custom data. Descriptive
+reads retain structural/integrity checking without compiling/rendering/hydrating
+an Agent. Do not replace typed public configuration with an unstructured blob.
+
+### Approach
+
+1. Separate compact public decisions from complete descriptive stored outcomes.
+2. Preserve stored facts and read historical records through the existing reader.
+3. Extend the existing authenticated execution service with explicit details.
+4. Update SDKs/MCP, schemas, examples and all affected result consumers together.
+5. Update owning architecture prose, verify journeys, and measure final behavior.
+
+### Scenario 10 — Compact decisions preserve useful results
+
+**Behavior.** Direct execution, queued status/wait and typed reads return the same
+compact contract. Passed/failed/inconclusive/not-applicable outcomes preserve the
+specified judgment fields, custom data and drift findings. No check/provenance,
+steps or input echo remains in default wire/schema/SDK results. Typed-data refusal
+never rejudges. Default reads/properties perform no detail IO.
+
+**RED.** Add planned spec test
+`compact_results_preserve_judgments_without_configuration` ([R6-A](#focused-verification-and-evidence)). Assert exact
+retained/absent fields and typed-data behavior. Current full output fails.
+
+**GREEN.** Implement compact contracts and server projection independently of
+retained records. Rerun R6-A and existing typed-data regression R6-B.
+
+**REFACTOR.** Reuse existing attribution and typed-data conversion; remove obsolete
+full-result conversion instead of preserving aliases.
+
+### Scenario 11 — Details preserve authored evidence without compilation
+
+**Behavior.** An inline Agent/Prompt with no separate Cards retains its exact
+check, effective provenance, steps and pinned evidence. Compact and full views
+agree on execution identity and judgments. Historical stored shapes remain
+readable. Repeated server/client reads never compile a Prompt, rejudge, call the
+provider or substitute a current Card for historical configuration.
+
+**RED.** Add planned spec test
+`execution_details_preserve_authored_checks_without_compilation` ([R6-C](#focused-verification-and-evidence)) and server
+journey `details_preserve_retained_execution_evidence` ([R6-E](#focused-verification-and-evidence)). Exercise portable,
+named and native authored forms, existing stored shapes and inline configuration;
+assert provider counts and fidelity. The details contract/route is currently
+absent. Combine structural ownership proof with final CPU evidence: absence of
+sampled frames alone does not prove no compilation.
+
+**GREEN.** Keep complete stored facts separate from compact projection. Extend the
+existing retained reader to decode descriptive check configuration; rerun 10–11.
+
+**REFACTOR.** Reuse authored Prompt representations and the canonical reader;
+no second store, validator cache, Agent loader or execution orchestration.
+
+### Scenario 12 — Missing details and denied access preserve the decision
+
+**Behavior.** Full details return only when complete visible records can be read
+under current authority. Unknown, not-yet-visible and lost/expired details use the
+specified existing not-found behavior. Known queued completed states can lack a
+result as before. Never fabricate empty successful evidence, a durability claim
+or a permanent-loss diagnosis from a temporary miss. Permission/query errors are
+not successful empty data. Execute-only/foreign principals gain no read access.
+Recording failures and failed details reads never invalidate an answered verdict.
+
+**RED.** Add planned server journey
+`details_preserve_visibility_and_read_authority` ([R6-F](#focused-verification-and-evidence)), covering missing records,
+recording failure, execute-only and foreign callers with exact existing errors.
+Assert useful direct results survive recording failure without a publication wait.
+
+**GREEN.** Reuse current permission/audit/absence boundaries and async staging;
+rerun 10–12. Add no availability ledger or privileged reader.
+
+**REFACTOR.** Consolidate with existing tenant/Card/Bifrost gates without changing
+which decisions are audited or weakening non-disclosure.
+
+### Scenario 13 — SDK callers explicitly request full execution details
+
+**Behavior.** Rust/Python/TypeScript ordinary calls return compact decisions;
+`Execution.details` returns descriptive history. Typed compact/details reads keep
+custom data, including failed checks; type errors never rerun verification. Migrate
+consumers needing configuration, provenance, steps or inputs to explicit details.
+Do not hide IO in result decoding, properties, constructors, status or wait.
+
+**RED.** Add planned mirrored journey
+`verification_decisions_and_details_are_separate_reads` in each existing SDK
+verifier-building-blocks story ([R6-G/H/I](#focused-verification-and-evidence)). Assert useful compact output, explicit
+full retrieval, identity/data parity and no automatic detail request. Confirm
+actual collected selectors after adding the tests, before RED.
+
+**GREEN.** Extend shared `Execution`, thin bindings and public exports; update
+Python registration/stubs and TS declarations. Migrate existing building-block,
+drift and example consumers inside this task. Rerun focused affected regressions.
+
+**REFACTOR.** Keep transport/auth/retry/lifecycle/data decoding in `wyrd-client`;
+foreign bindings only project the shared contract.
+
+### Scenario 14 — HTTP, MCP and schemas expose one coherent contract
+
+**Behavior.** HTTP details and MCP `verification.get_execution_details` expose the
+same read under current authority. Execute/get-execution expose compact results.
+OpenAPI, MCP tool descriptions, generated TS types, Python stubs, Rust exports and
+examples agree. Generic CLI MCP access can use the new tool; no specialized CLI
+command is added.
+
+**RED.** Add planned MCP journey `execution_details_are_an_explicit_read` ([R6-J](#focused-verification-and-evidence)).
+Extend existing served Verification OpenAPI test R6-K for the new operation and
+both field sets. Missing route/tool and current full-default schemas fail.
+
+**GREEN.** Extend current route/MCP/contract owners and regenerate outputs. Update
+Verification routes/result prose in `architecture/wyrd-design.md` and the
+three-table projection prose in `architecture/bifrost-design.md` in the same
+cohesive implementation. Retained record shapes and async durability remain intact.
+
+**REFACTOR.** Keep one contract owner per projection. Remove obsolete full-default
+examples rather than publish a legacy alias or hidden full mode.
+
+### Scenario 15 — Final measurements establish the actual benefit
+
+**Behavior.** Default model-case result decode no longer reaches `compile_prompt`
+or output-schema meta-validation. Descriptive detail reads also avoid compilation,
+proved structurally and by journeys. Preserve the same timed completion boundary,
+judgment/citation/custom-data checks, fixture, provider counts and symmetric
+recorder/profilers. Details IO is outside the default timed loop. Retain actual
+response-body bytes and client/server CPU, allocations, latency and throughput.
+
+**RED.** Existing recorded CPU evidence establishes the unnecessary compiler work.
+If actual response-byte evidence is missing from canonical records, add planned
+`verification_reports_preserve_response_bytes` in existing experiment tests ([R6-D](#focused-verification-and-evidence)),
+asserting round-trip/regeneration with units/populations and explicit unavailable
+historical values. Do not manufacture RED for already-correct report behavior.
+
+**GREEN.** Complete correctness first, then run only the separately authorized
+protocol below. State measured gains, regressions and unresolved values; old CPU
+percentages are neither additive savings nor promised wall-time improvements.
+
+**REFACTOR.** Extend existing response-byte collection and `Record`/renderer;
+no new report format or timing registry.
+
+### Acceptance mapping
+
+| Obligations | Proof and failure condition |
+|---|---|
+| REQ-023; AC-019 | Scenarios 10/13 preserve decisions across direct/status/wait/typed reads. Extra detail IO, full configuration in default output or changed judgments fail. |
+| REQ-024–025; AC-020 | Scenario 11 preserves exact inline/history evidence and stored shapes. Compilation, Card substitution, rejudgment or lost retained fields fail. |
+| REQ-026; AC-021; INV-001,003 | Scenario 12 preserves current authority/audit, absence and async staging. Leakage, broader permissions, fabricated evidence or a new durability wait fails. |
+| REQ-027; AC-022 | Scenarios 13–15 close SDK/MCP/schema/docs migration and final measurement. A missing surface, old evidence or unmeasured final fix fails. |
+| REQ-003,007,011,022; INV-004 | Scenario 15 uses canonical reports with both processes, declared populations and all repetitions. CPU shares, response bytes and wall latency are never conflated. |
+
+### Source-backed reuse and consumer closure
+
+| Existing owner/workflow | Missing behavior and selected extension |
+|---|---|
+| `wyrd-spec/src/verification/execution.rs`: `VerificationResult`, `VerificationOutcome`, `RequirementResult`, `VerificationExecutionState`, `decode_data`; current round-trip/typed-data tests | Define compact and full descriptive projections at the wire owner. Reuse authored Prompt data and existing typed custom-data semantics; do not deserialize history into executable `Check`. |
+| Server `verification/results.rs`: `StoredOutput`, `ResultPayloadBuilder::build`; `verification/inputs.rs`: retained `result` reader | Storage shares full public requirement types today. Preserve serialized facts while separating compact projection and descriptive decoding; prove historical compatibility. |
+| `vala-verify/src/blocks/engine.rs`: `Judged::report`; server `components/verification/service.rs`: `direct_execution`, `get_execution`, `stage_direct` | Report clones executable checks today. Preserve full authored facts for retention without requiring runtime configuration in default responses; retain existing async staging. |
+| Server `components/verification/routes.rs`: `execute`, `get_execution`; `mcp/verification.rs`: descriptors/dispatch | Add explicit details under the current authenticated execution read workflow and existing stable absence error. No new privileged reader. |
+| `wyrd-client/src/verify/mod.rs`: `Target::execute`; `verify/execution.rs`: `Execution` status/wait/typed siblings | Add explicit details and typed-data read through the same transport. Default methods never fetch details. |
+| Python `src/verify.rs`, public exports/stubs; TS `native/src/verification.rs`, `NativeLifecycleResult`, `wyrd/src/index.ts`, generated `card-types.ts`; Rust SDK re-exports | Project both contracts; migrate building-block/drift/example consumers of check, evidence, provenance and step fields. Apply Python six-layer and TS generated-declaration rules. |
+| HTTP `pg_verification_routes`, OpenAPI `pg_openapi_contract`, MCP `tests/bifrost/mcp/verification.rs`, three SDK building-block/drift stories | Extend actual existing fixtures/targets for projection/details/absence/authority, without another server harness. |
+| Capacity Verification workload, `experiment::Record`/renderer, retained O artifacts | Preserve validation/completion predicates and both process populations. Add response-byte evidence where absent; old O remains historical. |
+
+Paths are guidance, not an implementation allowlist. Trace all callers before
+changing types. No new store, general cache, loader, transport or workflow owner
+is justified. Details use a typed authored schema, not an unstructured JSON escape.
+
+### Focused verification and evidence
+
+New selectors below are **planned**, except existing typed-data and OpenAPI tests.
+Confirm actual selectors after adding tests, before RED. Packages/targets/setup
+are taken from current owners. Cargo work runs sequentially. Existing task owner
+checks remain required for changed behavior; broad integrated suites run at change
+review rather than once per scenario.
+
+R6-A/B/C — compact contract, existing typed regression, descriptive details:
+
+```bash
+mise exec -- cargo nextest run --locked -p wyrd-spec --lib -E 'test(=verification::execution::tests::compact_results_preserve_judgments_without_configuration)'
+mise exec -- cargo nextest run --locked -p wyrd-spec --lib -E 'test(=verification::execution::tests::typed_data_decodes_whole_results)'
+mise exec -- cargo nextest run --locked -p wyrd-spec --lib -E 'test(=verification::execution::tests::execution_details_preserve_authored_checks_without_compilation)'
+```
+
+R6-D — response-byte report proof, only if behavior is missing:
+
+```bash
+mise exec -- cargo nextest run --locked -p wyrd-testing --lib -E 'test(=experiment::tests::verification_reports_preserve_response_bytes)'
+```
+
+Build current server once before Postgres-backed checks:
+
+```bash
+mise run build:server
+```
+
+R6-E/F — faithful retained details and permission/visibility failures:
+
+```bash
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --test integration --test-threads=1 -E "test(=pg_verification_routes::details_preserve_retained_execution_evidence)"'
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --test integration --test-threads=1 -E "test(=pg_verification_routes::details_preserve_visibility_and_read_authority)"'
+```
+
+R6-G — Rust SDK journey:
+
+```bash
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E "test(=verifier_building_blocks::verification_decisions_and_details_are_separate_reads)"'
+```
+
+R6-H — Python public journey, using the current extension:
+
+```bash
+mise run py:setup
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cd sdks/wyrd-sdk-python && mise exec -- uv run python -m pytest -q tests/integration/test_verifier_building_blocks.py::test_verification_decisions_and_details_are_separate_reads'
+```
+
+R6-I — TypeScript public journey, using current addon/test addon:
+
+```bash
+mise run ts:build
+mise run ts:build:testing
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cd sdks/wyrd-sdk-ts/wyrd && mise exec -- pnpm exec vitest run tests/integration/verifier-building-blocks.test.ts -t "^verification_decisions_and_details_are_separate_reads$"'
+```
+
+R6-J/K — MCP details journey and existing served OpenAPI contract. Update the
+OpenAPI test's operation-count assertion/name if necessary and record its final
+actual selector rather than retaining an inaccurate name:
+
+```bash
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-mcp --test mcp -P journey --run-ignored=all -E "test(=verification::pg_tests::execution_details_are_an_explicit_read)"'
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --test integration --test-threads=1 -E "test(=pg_openapi_contract::verification_contract_publishes_five_typed_operations_and_the_local_upload)"'
+```
+
+Migrate, then run focused existing custom-data, canonical-readback, drift and
+authority regressions at changed owners; record actual exact selected commands
+and results. Do not weaken their assertions: move check/input/step assertions to
+explicit details and keep decision assertions on compact results. Static/generated
+work needs no artificial RED: use `mise run codegen:regen`, `mise run codegen:check`,
+`mise run py:lints`, `mise run py:typecheck`, `mise run ts:typecheck`,
+`mise run ts:napi:check`, `mise run ts:format`, `mise run ts:lints` and the earlier
+scoped format/Clippy/dependency/tenant checks. Complete exports and authored stubs
+in the same change; never hand-edit generated output.
+
+### Bounded follow-on performance protocol
+
+This protocol needs the spec's separate explicit experiment authorization.
+Planning runs none of it. Preserve original U/M/O artifacts and unresolved limits.
+Use two current-source milestones: R0 before the result-contract change, R1 after
+all revision-6 changes and fixes. R0 is the current pre-extension candidate, not a
+rerun of historical baselines or U/M/O. If response-byte observations are new,
+include them identically in both milestones. Build each with `mise run bench:build`
+and retain real sibling binaries plus source/diff/hash/build-ID/settings manifests
+under `target/benchmarks/task005/{result-reference,result-compact}/bin/` following
+the existing retention workflow.
+
+Six invocations total: unprofiled, CPU-only and heap-only Verification at each
+milestone, assertion c1/c64 and model c1/c64, unchanged fixture/authority/provider,
+default warmup and three measured repetitions. No Gateway/L2 rerun, remote
+provider, new host load or OS change is implied. Run each invocation once:
+
+```bash
+mise exec -- scripts/postgres/with-test-postgres.sh -- "$PWD/target/benchmarks/task005/result-reference/bin/capacity" l1 verification --allow-dirty --steps direct-verify-c1,direct-verify-c64,direct-verify-model-c1,direct-verify-model-c64
+mise exec -- scripts/postgres/with-test-postgres.sh -- "$PWD/target/benchmarks/task005/result-reference/bin/capacity" l1 verification --allow-dirty --profile cpu --steps direct-verify-c1,direct-verify-c64,direct-verify-model-c1,direct-verify-model-c64
+mise exec -- scripts/postgres/with-test-postgres.sh -- "$PWD/target/benchmarks/task005/result-reference/bin/capacity" l1 verification --allow-dirty --profile heap --steps direct-verify-c1,direct-verify-c64,direct-verify-model-c1,direct-verify-model-c64
+mise exec -- scripts/postgres/with-test-postgres.sh -- "$PWD/target/benchmarks/task005/result-compact/bin/capacity" l1 verification --allow-dirty --steps direct-verify-c1,direct-verify-c64,direct-verify-model-c1,direct-verify-model-c64
+mise exec -- scripts/postgres/with-test-postgres.sh -- "$PWD/target/benchmarks/task005/result-compact/bin/capacity" l1 verification --allow-dirty --profile cpu --steps direct-verify-c1,direct-verify-c64,direct-verify-model-c1,direct-verify-model-c64
+mise exec -- scripts/postgres/with-test-postgres.sh -- "$PWD/target/benchmarks/task005/result-compact/bin/capacity" l1 verification --allow-dirty --profile heap --steps direct-verify-c1,direct-verify-c64,direct-verify-model-c1,direct-verify-model-c64
+```
+
+Apply existing validity, role/profile/population and nonregression-envelope rules
+to R0→R1; disclose every miss and representation/host difference. Keep all
+repetitions, exact completed/attempt/provider counts, both CPU profiles and
+whole-step allocation denominators. Do not reduce correctness predicates or count
+omitted detail reads as fewer required judgments. Default CPU stacks must establish
+removal of result-compiler work alongside structural/journey proof; details fidelity
+is established separately, without adding detail IO to the default timed loop.
+
+Persist actual response-body bytes per response, both processes' CPU/call and
+allocated bytes/objects, client/server p50/p99, residual and throughput in canonical
+reports with declared populations. State improved/regressed/unresolved plainly.
+Prior 52.6%/46.8%/15.6% shares motivate work but do not add up to guaranteed savings.
+No unmeasured final edit or old O result establishes extension completion.
+
+### Completion and material stop conditions
+
+Record scenarios 10–15, consumer/schema closure, historical stored-evidence
+compatibility and final authorized measurements in a new execution-evidence
+subsection below this block. Preserve earlier limitations. A need to broaden read
+authority, change stored record shapes, add durability guarantees, weaken judgment validation or replace
+the agreed public contract requires spec authority. Descriptive representations
+and private projection helpers remain implementation-owned. Missing measurement
+prerequisites require bounded repair or a separately authorized rerun, never
+invented evidence or silent deferral.
+
+### Revision 6 execution evidence — scenarios 10–15
+
+Scenarios 10–14 are implemented and verified. Scenario 15 ran once under
+explicit authorization, after R6-D; see the measurement subsection below. Task
+status stays `proposed`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-023; AC-019 — compact decisions on direct/status/wait/typed reads | `wyrd-spec/src/verification/execution.rs` (`VerificationOutcome` holds only verdict and requirements; `RequirementResult` has no check or provenance; `OutcomeDetails<_, Authored>`, `RequirementDetails`, `.compact()`); the server stores `ExecutedOutcome` and serves its compact projection | R6-A, R6-B; R6-G/H/I compact key sets and `details.compact() == direct`; R6-J compact key set | PASS |
+| REQ-024–025; AC-020 — details keep authored checks, steps, evidence and provenance without compiling | `Execution::details`/`details_typed` (`wyrd-client/src/verify/execution.rs`); `GET /v1/verification/executions/{execution_id}/details`; decoding uses the `Authored` Prompt form; stored record shapes unchanged | R6-C; R6-E `details_preserve_retained_execution_evidence`; `custom_verdict_data_survives_readback` (Python, TS) compares stored Bifrost rows with details | PASS |
+| REQ-026; AC-021; INV-001,003 — authority, audit, absence | Details reuse the status read's `cards:read` authority and audit (`verification.execution.details.read`); unknown or missing → `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND`; no cache, alias or durability wait | R6-F `details_preserve_visibility_and_read_authority` (unknown 404, viewer 200 audited allowed, outsider/run-only 403 equal to status and audited denied, foreign tenant 404); R6-J unknown 404 and run-only refusal | PASS |
+| REQ-027; AC-022 — SDK/MCP/schema/docs migration and final measurement | Rust SDK re-exports; Python `PyExecution.details`/`details_typed` with stubs; TS `Execution.details`/`detailsTyped` with generated types; MCP `verification.get_execution_details` and guide; OpenAPI `VerificationDetails`; architecture and docs pages; Scenario 15 R0→R1 below | R6-G/H/I/J/K; codegen:check; py:typecheck; ts:typecheck; R6-D; six authorized invocations | PASS |
+
+Commands run one at a time, each Postgres-backed one wrapped in
+`scripts/postgres/with-test-postgres.sh` after migrating:
+
+- `cargo nextest run -p wyrd-spec --lib` R6-A/B/C: 3/3 pass. vala-verify lib: 57/57. wyrd-server lib for verification, scribe_outbox and mcp (excluding `pg_tests`): 85/85.
+- `-p wyrd-server --test integration`: R6-E, R6-F, R6-K `pg_openapi_contract::verification_contract_publishes_six_typed_operations_and_the_local_upload` (renamed from `five`, since the details route is the sixth operation), plus `pg_verification_routes`, `pg_verification_groups` and `pg_operator_delivery`: 39/39. All of `pg_verification_runtime`: 54/54.
+- `-p wyrd-testing --test server -P journey --run-ignored=all` filter `verification_runtime::`: 31/31. `--test gateway` `resilience::model_verification_benchmark_records_the_complete_local_path`: 1/1. Provenance is read from details outside the measured loop.
+- `-p wyrd-mcp --test mcp -P journey --run-ignored=all`, filters `verification::`, `discovery`, `connectivity` and `query::investigation`, including R6-J `verification::pg_tests::execution_details_are_an_explicit_read`: 23/23.
+- `-p wyrd-ai --test integration -P journey --run-ignored=all`, filters `verifier_building_blocks`, `verify_in_real_time` and `scheduled_drift_alerts_operator`, including R6-G: 60/60.
+- Python pytest over `test_verifier_building_blocks.py`, `test_verify_in_real_time.py` and `test_scheduled_drift_alerts_operator.py`, including R6-H: 71/71, counting the rerun of the one migrated test.
+- TS vitest over `verifier-building-blocks`, `verify-in-real-time` and `scheduled-drift-alerts-operator`, including R6-I: 66/66, counting the rerun of the one migrated test.
+- Static checks: `fmt`, `lints`, `codegen:check`, `py:lints`, `py:typecheck`, `ts:typecheck`, `ts:format`, `ts:lints`, `docs:test`, `docs:check:commands`, `docs:linkcheck` and `git diff --check` are clean.
+
+Migrated assertions. These are consumers of the intended contract change, not defects. Decision assertions stay on compact results; check, step, evidence and provenance assertions moved to details:
+
+- MCP `grouped_frames_use_visible_outcomes` read `/result/outcome/evidence/outcomes`. It now reads `/outcome/evidence/outcomes` from `verification.get_execution_details`.
+- Python and TS `custom_verdict_data_survives_readback` compared stored Bifrost rows with the compact requirements. The stored rows keep the unchanged full shape, so they now compare with `details().outcome.requirements`. The compact equality checks of status against wait are unchanged.
+
+Limits:
+
+- `ts:napi:check` and `docs:check` diff generated files against git. They pass only once the regenerated `sdks/wyrd-sdk-ts/wyrd/index.d.ts` and `docs/public/llms-full.txt` are committed. The working-tree files are the generator's output.
+- R6-F does not separately exercise an audit-recording failure on the details read. It goes through the same Scribe outbox staging as the status read.
+- Non-goals stayed excluded: no cache, alias, compatibility route, durability wait, change to stored shapes, broader authority, or default-loop detail IO.
+
+#### Scenario 15 — R6-D and the authorized R0→R1 measurement
+
+R6-D. Canonical reports recorded no response-body bytes, so collection was
+added at the existing owners. `Observation::bytes` (`wyrd-benchmark`) records
+each read body into the `wyrd_benchmark_body_bytes` histogram under the
+observation's root boundary and cohort, and only when the recorder is
+installed. The client's `received` (`transport/http.rs`) records each 2xx body
+as `response`. `Population::response_bytes`/`response_byte_metrics`
+(`wyrd-testing/src/capacity.rs`) report `response_bytes_{count,p50,p99,max,mean}`
+per repetition: required evidence, invalid when sizes are recorded for a
+different number of answered calls. The Verification L1 step declares and
+fills them. Records from before this change read as "was not read".
+
+| Check | Result |
+|---|---|
+| `cargo nextest run -p wyrd-testing --lib -E 'test(=capacity::tests::verification_reports_preserve_response_bytes)'` (actual selector; the planned `experiment::tests` owner does not hold the reading logic) | PASS |
+| `-p wyrd-benchmark --lib` (extended `observations_keep_roots_outcomes_and_reached_components`; the inactive test covers `bytes`) | 10/10 PASS |
+| `-p wyrd-testing --lib --bin capacity`, excluding Postgres-backed tests | 124/125; the one failure is `server::teardown_tests::shutdown_aborts_and_joins_a_serve_task_that_outlives_its_drain`, which needs `WYRD_TEST_DATABASE_ADMIN_URL` outside the Postgres wrapper |
+| `fmt`, `lints` | clean |
+
+Milestones. Both were built with the `bench:build` flags into `target/profiling` and retained under
+`target/benchmarks/task005/{result-reference,result-compact}/` with `bin/`,
+`SHA256SUMS`, `SOURCE`, `build.log` and `exits`.
+
+- R0 `result-reference`: 7b66f9ea4 plus `response-bytes.patch` (sha256 4f04bc38), built in a detached worktree. The server binary has no details route.
+- R1 `result-compact`: the revision 6 working tree; `working-tree.diff` is retained.
+- The first R1 build failed because R0's workspace artifacts in the shared target directory were newer than the R1 sources. Touching the changed files rebuilt them. The binaries differ (server sha256 02c1c19b → 5d388e0b), and only R1 serves `/details`.
+
+The six invocations ran once each, sequentially, on an otherwise idle host. Records are in `benchmark-records` commit e4b41cd1b,
+under `verification/direct-verify/`:
+
+| Milestone | Unprofiled | CPU | Heap |
+|---|---|---|---|
+| R0 | 20261111T001023Z VALID | 20261111T001235Z INVALID: `driver.saturated`, 6.42 of 6.40 cores in one c64 repetition; all 8 captures complete | 20261111T001511Z VALID |
+| R1 | 20261111T001720Z VALID | 20261111T001926Z VALID | 20261111T002133Z VALID |
+
+Source-line limitation: every record names diff ae6c4007, because the recorder
+hashes the directory it runs from, and all runs started in the revision 6
+checkout. The R0 records' source line is therefore wrong. Their binaries are the
+reference build, as retained `SOURCE` and `SHA256SUMS` show.
+
+Standard reports, regenerated with `capacity report <record>`, are retained as
+`report.md` in each milestone directory. Medians of three repetitions follow,
+R0 → R1, from the unprofiled records (`result-compact/comparison.txt`).
+
+| Step | Response bytes (mean) | Server CPU/verification | Rate | Server p99 | Client p50 / p99 | Driver CPU/verification | Client decode mean |
+|---|---|---|---|---|---|---|---|
+| c1 | 3232 → 783 (−75.8%) | 142.2 → 103.6 µs (−27.2%) | +13.6% | 0.159 → 0.145 ms | −8.4% / −12.8% | −17.9% | 5.46 → 2.29 µs |
+| c64 | 3232 → 783 (−75.8%) | 216.5 → 222.0 µs (+2.5%) | +6.2% | 0.248 → 0.277 ms (+11.6%) | −9.7% / +13.3% | −12.2% | 16.4 → 6.2 µs |
+| model-c1 | 3058 → 568 (−81.4%) | 1042 → 953 µs (−8.5%) | +20.0% | 1.278 → 1.263 ms | −15.9% / −15.1% | −54.9% | 94.0 → 4.1 µs |
+| model-c64 | 3058 → 568 (−81.4%) | 2069 → 1955 µs (−5.5%) | +15.4% | 6.337 → 6.119 ms | −13.4% / −10.9% | −59.5% | 209.7 → 6.8 µs |
+
+CPU stacks: in the model-c64 driver capture, `wyrd_spec::card::prompt::spec::compile_prompt`
+is 37.24% inclusive at R0 and absent at R1. Driver `jsonschema` validation
+frames are also absent at R1. The server keeps its Verdict-output validation of
+the provider answer, which is required judgment work.
+
+Allocations per measured verification come from differencing cumulative heap
+captures (`result-compact/heap-comparison.txt`). Each step's capture includes
+its warmup, so these are upper-biased per-verification figures. Driver:
+
+- c1: −15.6% bytes, −19.8% objects
+- c64: −15.5% bytes, −20.5% objects
+- model-c1: −51.0% bytes, −78.0% objects
+- model-c64: −61.6% bytes, −84.4% objects
+
+Server: c1 −4.0% bytes; c64 −0.3% bytes and +2.6% objects; model-c1 +6.5%
+bytes and −10.7% objects; model-c64 −9.2% bytes and −8.4% objects.
+
+Results:
+
+- **Improved:** response bytes fell 76–81%, removing compile work from client
+  result decoding. Client CPU per verification fell 12–60%, and throughput rose
+  6–20% on every step. Server CPU per verification fell on c1 and both model steps.
+- **Regressed:** at c64 assertion, server p99 rose 0.248 → 0.277 ms and overhead
+  p99 rose 0.246 → 0.274 ms. Both stay under the 0.5 ms objective, which is met
+  in both. Client p99 rose 13.3% and server CPU per verification rose 2.5%. The
+  rate rose 6.2%, so the higher tail comes with more concurrent work per second
+  at the same 64 clients. One run per milestone cannot separate this from
+  run-to-run variance.
+- **Unresolved:** whether the c64 tail difference is real. That needs
+  repeated runs, which this protocol does not include.
+- **Not measured:** the gateway and L2.
+
+Old CPU shares were not used as savings.
+
+#### Full gate after scenario 15 — failures, diagnosis, remediation
+
+`mise run -c gate` (every lane, exit 100) reported four failures in three groups.
+
+1. **Uncommitted generated output** — `docs:check` and `ts:napi:check`.
+   - Both regenerate output and `git diff --exit-code` it against what is committed.
+   - Revision 6 regenerated `docs/public/llms-full.txt`, `docs/src/content/docs/reference/mcp-tools.md` and `sdks/wyrd-sdk-ts/wyrd/index.d.ts`.
+   - No code defect; both clear when they are committed with Revision 6.
+2. **`wyrd-cli::cli pg_tests::{guided_init_lifecycle_and_prompt, init_selected_mcp_host_reads, init_repeat_and_partial_failure_preserve_state}`** — deterministic.
+   - **Symptom:** the `wyrd` child panics with `failed printing to stdout: Resource temporarily unavailable (os error 11)` while printing the setup prompt, after the UI logs `Listening on`. The test reports `local startup failed` (`crates/wyrd/wyrd-cli/tests/pg_tests.rs:219`).
+   - **Evidence:**
+     - In text mode, `Diagnostics::attach` (`crates/wyrd/wyrd-cli/src/init.rs`) only redirected output for `Log`.
+     - So `ui_command`'s `node` child inherited the CLI's own stdout and stderr open file descriptions.
+     - `print_handoff` (`crates/wyrd/wyrd-cli/src/mcp/mod.rs`) then `println!`s the ~4.6 KB prompt once per selected host. Only the three tests that select an MCP host print it.
+   - **Cause:**
+     - Node (libuv) makes inherited stdio pipes non-blocking.
+     - The CLI shares that file description, so its own `println!` gets EAGAIN once the pipe is momentarily full, and `println!` panics on it.
+     - Real users piping `wyrd init` (`| tee`, CI logs) hit the same fault.
+   - **Independent diagnosis:** a fresh read-only diagnostician, given only the command, trace and diff, named the same cause and fix site. It found the diff not involved: the inheritance dates from 6d46eb9ca and 4188c05f3.
+   - **Fix site:** `Diagnostics::attach`, the one owner both serving spawns (server and UI) go through.
+     - Text mode now gives each child its own pipes, which the new `Diagnostics::relay` copies to the CLI's stdout and stderr.
+     - Log mode is unchanged.
+     - `wyrd-cli` gains tokio `io-std` and `io-util`. Their code is already built through workspace-hack's tokio `full`; `check:workspace-hack` passes.
+   - **Other callers checked:**
+     - the `node --version` probe uses `.output()`;
+     - the MCP host launch is a separate path and does not share the UI's descriptors.
+   - **Verification:**
+     - `mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-cli --test cli --run-ignored=all -E` with the full `test:local-dev:journey` filter set: 6 passed, including the three failures.
+     - `cargo clippy --locked -p wyrd-cli --all-targets -- -D warnings`, `mise run fmt:check`, `mise run check:workspace-hack` and `git diff --check` pass.
+3. **`wyrd-server::integration storage_e2e::azure_multipart_e2e`** — failed in the gate, passes alone (3.9 s, same lane environment).
+   - **Symptom:**
+     - Azurite answered the verification HEAD on upload complete with `HTTP 403 Forbidden`, logged as `head_for_verification_failed`, and the server returned a 500.
+     - The client's retry then got 409 `UploadNotPending`, which is what the test asserts on (`storage_e2e.rs:333`).
+   - **Leading hypothesis (independent diagnostician):**
+     - The Azure SAS signed for that HEAD carries `st = now`, rounded down to the second (`object_store` 0.14.2).
+     - Azurite runs in a colima QEMU VM with its own clock, so a VM clock behind the host by more than the sub-second offset rejects a just-signed SAS.
+     - Measured gap at rest: −0.011 to +0.017 s, within the measurement round trip. This is consistent with the hypothesis but does not confirm it.
+   - **Cause not confirmed, so no fix applied.** The deciding evidence is Azurite's `x-ms-error-code` and `Date` beside the signed `st` on the failing HEAD (`cloud.rs` `status_failed`), or Azurite `--debug`.
+   - The diff is not involved: no change touches `wyrd-storage` or the storage e2e test.
+   - The candidate fix site is `CloudSigner` in `crates/wyrd/wyrd-storage/src/cloud.rs`. Real Azure has the same exposure when the server's clock runs ahead.

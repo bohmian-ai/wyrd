@@ -774,6 +774,16 @@ export declare class NativeExecution {
    */
   status(): Promise<NativeLifecycleResult>
   /**
+   * Reads what the completed execution ran: each requirement's authored
+   * check and provenance, every step, and the pinned evidence.
+   *
+   * # Errors
+   * Returns a napi error only when the details cannot be projected; read
+   * failures, including `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND`, are
+   * returned in [`NativeLifecycleResult`].
+   */
+  details(): Promise<NativeLifecycleResult>
+  /**
    * Polls until a result, the execution's terminal error, or `timeout_ms`.
    *
    * # Errors

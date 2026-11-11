@@ -51,7 +51,7 @@ use wyrd_spec::card::operator::DriftCounts;
 use wyrd_spec::card::verifier::VerifierSpec;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{SlotName, VerificationResultId};
-use wyrd_spec::verification::execution::{InputDeclaration, VerificationOutcome};
+use wyrd_spec::verification::execution::{ExecutedOutcome, InputDeclaration};
 use wyrd_spec::verification::{TaskId, VerifierReadiness};
 use wyrd_spec::verification::{VerificationError, VerificationVerdict};
 use wyrd_sql::queries::verifier_executions::{
@@ -964,7 +964,7 @@ impl VerifierRunner {
 /// write.
 fn result(
     run: &ClaimedExecution,
-    outcome: &VerificationOutcome,
+    outcome: &ExecutedOutcome,
     system: PrincipalId,
     started_at: DateTime<Utc>,
 ) -> (Transition, Option<ScribeWrite>) {

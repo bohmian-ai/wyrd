@@ -1,10 +1,12 @@
-//! [`Execution`]: the handle of one queued Verifier execution.
+//! [`Execution`]: the handle of one Verifier execution.
 //!
 //! `submit` returns it for Run evidence, and any process can rebuild it
-//! from the execution ID with `connect`. It holds only the ID and one shared
-//! client; the queue, retries, and results stay server-owned. `wait` polls
-//! the status route with capped backoff and returns only a real result, the
-//! execution's terminal error, or a timeout.
+//! from an execution ID, queued or direct, with `connect`. It holds only the
+//! ID and one shared client; the queue, retries, and results stay
+//! server-owned. `wait` polls the status route with capped backoff and
+//! returns only a real compact result, the execution's terminal error, or a
+//! timeout. `details` alone reads what the execution ran; no other method
+//! requests it.
 
 use std::time::Duration;
 
@@ -15,7 +17,9 @@ use tokio::time::Instant;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::ExecutionId;
 use wyrd_spec::verification::VerificationExecutionStatus;
-use wyrd_spec::verification::execution::{VerificationExecutionState, VerificationResult};
+use wyrd_spec::verification::execution::{
+    VerificationDetails, VerificationExecutionState, VerificationResult,
+};
 
 use crate::client::WyrdClient;
 use crate::error::code_to_wyrd_error;
@@ -25,7 +29,7 @@ const FIRST_POLL: Duration = Duration::from_millis(100);
 /// Longest pause between status polls.
 const MAX_POLL: Duration = Duration::from_secs(2);
 
-/// One queued Verifier execution, addressed by its server-issued ID.
+/// One Verifier execution, addressed by its server-issued ID.
 #[derive(Debug, Clone)]
 pub struct Execution {
     /// The execution identity.
@@ -85,6 +89,43 @@ impl Execution {
                 None::<&()>,
             )
             .await
+    }
+
+    /// Read what the completed execution ran: each requirement's exact
+    /// authored check and provenance, every step, and the pinned evidence
+    /// declarations, beside the same judgments as its result.
+    ///
+    /// One read, never polled or retried as a wait: details become readable
+    /// after the execution's records are, and decoding keeps each Prompt as
+    /// authored, never compiling it.
+    ///
+    /// # Errors
+    /// Returns the server's `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND` when
+    /// no complete details are visible to the caller: an unknown execution,
+    /// one not yet recorded, or one no longer readable. Returns its
+    /// authorization or transport error otherwise.
+    pub async fn details(&self) -> Result<VerificationDetails, WyrdError> {
+        self.client
+            .http
+            .request_json(
+                Method::GET,
+                &format!("/v1/verification/executions/{}/details", self.id),
+                None::<&()>,
+            )
+            .await
+    }
+
+    /// [`Execution::details`], with each requirement's custom `data`
+    /// decoded as `T`.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Execution::details`], then
+    /// `WYRD_SDK_422_VERIFICATION_DATA_INVALID` when present data does not
+    /// decode as `T`.
+    pub async fn details_typed<T: DeserializeOwned>(
+        &self,
+    ) -> Result<VerificationDetails<T>, WyrdError> {
+        self.details().await?.decode_data()
     }
 
     /// Poll until the execution yields a result, fails, or `timeout` passes.

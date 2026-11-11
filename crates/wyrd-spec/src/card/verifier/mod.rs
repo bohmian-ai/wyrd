@@ -21,7 +21,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 use skald_spec::MediaFormat;
 
-use crate::card::agent::AgentSpec;
+use crate::card::agent::{AgentSpec, Compiled, PromptForm};
 use crate::card::drift::DriftSpec;
 use crate::card::operator::OperatorSpec;
 use crate::card::prompt::ParameterName;
@@ -384,12 +384,17 @@ pub enum Action {
 }
 
 /// One Agent invocation in a step or check position.
+///
+/// `F` is an inline Agent's Prompt form, as in [`AgentSpec`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(deny_unknown_fields)]
-pub struct AgentCall {
+#[cfg_attr(feature = "server", schema(bound = ""))]
+#[serde(deny_unknown_fields, bound = "")]
+#[schemars(rename = "AgentCall", bound = "F: PromptForm")]
+pub struct AgentCall<F: PromptForm = Compiled> {
     /// The Agent, inline, file-authored, or registered.
-    pub agent: InlineableRef<AgentSpec>,
+    #[cfg_attr(feature = "server", schema(value_type = InlineableRef<AgentSpec>))]
+    pub agent: InlineableRef<AgentSpec<F>>,
     /// Injected values keyed by the Prompt's text and media placeholders.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub inputs: BTreeMap<ParameterName, Reference>,
@@ -595,10 +600,19 @@ pub struct Requirement {
 }
 
 /// A verdict-producing requirement check.
+///
+/// `F` is an inline Agent's Prompt form, as in [`AgentSpec`]: compiled to
+/// execute, authored to describe retained evidence.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Check {
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    deny_unknown_fields,
+    bound = ""
+)]
+#[schemars(rename = "Check", bound = "F: PromptForm")]
+pub enum Check<F: PromptForm = Compiled> {
     /// Typed comparison over one value (`path`) or every wildcard match
     /// (`each`); exactly one is set.
     Assert {
@@ -617,7 +631,8 @@ pub enum Check {
     /// Trace assertion over a trace slot.
     Trace(TraceCheck),
     /// An Agent, with any tools it declares, returning the Verdict schema.
-    Agent(AgentCall),
+    #[cfg_attr(feature = "server", schema(value_type = AgentCall))]
+    Agent(AgentCall<F>),
     /// Sandboxed code returning the Verdict schema.
     Code(CodeCheck),
     /// Statistical drift over a samples slot.
@@ -633,7 +648,7 @@ pub enum CheckEvidence {
     Window,
 }
 
-impl Check {
+impl<F: PromptForm> Check<F> {
     /// Returns the evidence mode this check kind needs.
     #[must_use]
     pub fn evidence(&self) -> CheckEvidence {

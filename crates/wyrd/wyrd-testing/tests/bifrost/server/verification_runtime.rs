@@ -72,7 +72,8 @@ use wyrd_spec::vala::managed_columns::{
 use wyrd_spec::vala::{AuditDetail, BifrostError, audit_detail_canonical_json};
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
-    InputDeclaration, RequirementDetail, RequirementOutcome, RequirementResult, VerificationOutcome,
+    ExecutedOutcome, ExecutedRequirement, InputDeclaration, RequirementDetail, RequirementOutcome,
+    RequirementResult,
 };
 use wyrd_spec::verification::{DriftReport, DriftVerdict, DriftWindow, VerificationVerdict};
 use wyrd_testing::bifrost::{BifrostClusterSpec, RawIngest, WyrdTestCluster, canonical_signals};
@@ -115,7 +116,7 @@ fn two_feature_report() -> Result<DriftReport, ServerJourneyError> {
 ///
 /// # Errors
 /// Returns an error when the requirement id or check does not decode.
-fn drift_outcome(report: Option<DriftReport>) -> Result<VerificationOutcome, ServerJourneyError> {
+fn drift_outcome(report: Option<DriftReport>) -> Result<ExecutedOutcome, ServerJourneyError> {
     let (outcome, verdict) = match report.as_ref().map(|report| report.verdict) {
         Some(DriftVerdict::Drift) => (RequirementOutcome::Failed, VerificationVerdict::Failed),
         Some(DriftVerdict::NoDrift) => (RequirementOutcome::Passed, VerificationVerdict::Passed),
@@ -124,18 +125,20 @@ fn drift_outcome(report: Option<DriftReport>) -> Result<VerificationOutcome, Ser
             VerificationVerdict::Inconclusive,
         ),
     };
-    Ok(VerificationOutcome {
+    Ok(ExecutedOutcome {
         verdict,
-        requirements: vec![RequirementResult {
-            id: TaskId::new("drift")?,
-            step: None,
-            statement: "The window does not drift.".to_owned(),
-            outcome,
-            reason: "scored by the journey".to_owned(),
-            actual: None,
-            citations: Vec::new(),
-            data: None,
-            detail: report.map(RequirementDetail::Drift),
+        requirements: vec![ExecutedRequirement {
+            result: RequirementResult {
+                id: TaskId::new("drift")?,
+                step: None,
+                statement: "The window does not drift.".to_owned(),
+                outcome,
+                reason: "scored by the journey".to_owned(),
+                actual: None,
+                citations: Vec::new(),
+                data: None,
+                detail: report.map(RequirementDetail::Drift),
+            },
             check: serde_json::from_value::<Check>(json!({
                 "kind": "assert", "path": "inputs.x", "operator": "equals", "expected": true
             }))?,
@@ -2879,9 +2882,9 @@ fn expect_eq<T: PartialEq + Debug>(
 /// back as.
 struct PublishedResults {
     /// A Drift result whose requirement scored two features.
-    scored_drift: (VerificationResultId, VerificationOutcome),
+    scored_drift: (VerificationResultId, ExecutedOutcome),
     /// A Drift result whose window could not be scored.
-    unscored_drift: (VerificationResultId, VerificationOutcome),
+    unscored_drift: (VerificationResultId, ExecutedOutcome),
     /// The Service both results judge, which also owns their bindings.
     subject: CardUid,
     /// The tenant SYSTEM principal that wrote both results.

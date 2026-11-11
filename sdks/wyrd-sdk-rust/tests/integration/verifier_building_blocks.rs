@@ -235,15 +235,16 @@ pub(crate) fn requirement<'a>(result: &'a VerificationResult, id: &str) -> &'a R
         .unwrap_or_else(|| panic!("requirement {id}: {result:#?}"))
 }
 
-/// The step `id` of `result`.
+/// The step `id` of `result`, read from its explicitly requested details.
 ///
 /// # Panics
-/// Panics when the result has no such step.
-fn step<'a>(result: &'a VerificationResult, id: &str) -> &'a StepResult {
-    result
+/// Panics when the details do not read or have no such step.
+async fn step(deployment: &Deployment, result: &VerificationResult, id: &str) -> StepResult {
+    let details = deployment.details(result.execution_id).await;
+    details
         .outcome
         .steps
-        .iter()
+        .into_iter()
         .find(|step| step.id.as_str() == id)
         .unwrap_or_else(|| panic!("step {id}: {result:#?}"))
 }
@@ -478,7 +479,7 @@ impl PolicyDesk {
     /// # Panics
     /// Panics when the step, a call, or the model's tool turn differs.
     async fn assert_tools(&self, result: &VerificationResult, question: &str, allowed: &[&str]) {
-        let investigate = step(result, "investigate");
+        let investigate = step(&self.deployment, result, "investigate").await;
         assert_eq!(investigate.status, StepStatus::Succeeded, "{question}");
         let called: Vec<Value> = investigate
             .tool_calls
@@ -546,7 +547,7 @@ async fn policy_review_runs_every_action_and_check_kind() {
         "{result:#?}"
     );
     assert_eq!(result.subject, desk.root);
-    let text = step(&result, "policy-text");
+    let text = step(&desk.deployment, &result, "policy-text").await;
     assert_eq!(text.status, StepStatus::Succeeded);
     assert_eq!(
         text.output.as_ref().map(|output| &output["format"]),
@@ -556,7 +557,7 @@ async fn policy_review_runs_every_action_and_check_kind() {
         text.provenance,
         Some(CallProvenance::Extract { .. })
     ));
-    let rules = step(&result, "refund-rules");
+    let rules = step(&desk.deployment, &result, "refund-rules").await;
     assert_eq!(
         (rules.status, rules.output.as_ref()),
         (StepStatus::Succeeded, Some(&json!({ "max_refund": 100 })))
@@ -567,7 +568,7 @@ async fn policy_review_runs_every_action_and_check_kind() {
         .map(|call| serde_json::to_value(call.tool).expect("the tool serializes"))
         .collect();
     assert_eq!(tools, [json!("fs.extract")]);
-    let facts = step(&result, "answer-facts");
+    let facts = step(&desk.deployment, &result, "answer-facts").await;
     assert_eq!(
         (facts.status, facts.output.as_ref()),
         (
@@ -716,7 +717,10 @@ async fn forbidden_code_access_cannot_pass_dependent_work() {
 
     let result = desk.review(review("read the host", 50, None)).await;
 
-    assert_eq!(step(&result, "answer-facts").status, StepStatus::Failed);
+    assert_eq!(
+        step(&desk.deployment, &result, "answer-facts").await.status,
+        StepStatus::Failed
+    );
     assert_ne!(
         requirement(&result, "refund-within-limit").outcome,
         RequirementOutcome::Passed
@@ -801,7 +805,10 @@ async fn malformed_policy_cannot_pass() {
         ]))
         .await;
 
-    assert_eq!(step(&result, "policy-text").status, StepStatus::Failed);
+    assert_eq!(
+        step(&desk.deployment, &result, "policy-text").await.status,
+        StepStatus::Failed
+    );
     assert_ne!(
         requirement(&result, "policy-has-text").outcome,
         RequirementOutcome::Passed
@@ -924,7 +931,9 @@ async fn stored_evidence_readback_uses_canonical_records() {
     let status = execution.status().await.expect("the settled status reads");
 
     assert_eq!(status.result.as_ref(), Some(&result));
-    let evidence = serde_json::to_value(&result.outcome.evidence).expect("evidence encodes");
+    let details = execution.details().await.expect("the details read");
+    assert_eq!(details.clone().compact(), result);
+    let evidence = serde_json::to_value(&details.outcome.evidence).expect("evidence encodes");
     let declarations: Vec<&Value> = evidence
         .as_object()
         .expect("evidence is by slot")
@@ -1006,7 +1015,10 @@ async fn every_format_extracts_its_locked_output() {
             .await
             .unwrap_or_else(|error| panic!("{name} is read: {error}"));
         assert_eq!(
-            step(&result, "read").output.as_ref(),
+            step(&desk.deployment, &result, "read")
+                .await
+                .output
+                .as_ref(),
             Some(&expected),
             "{name}"
         );
@@ -1042,11 +1054,11 @@ async fn failed_reader_leaves_its_dependents_inconclusive() {
             ))
             .await;
 
-        let rules = step(&result, "refund-rules");
+        let rules = step(&desk.deployment, &result, "refund-rules").await;
         assert_eq!(rules.status, StepStatus::Failed, "{marker}: {rules:?}");
         assert!(rules.reason.is_some(), "{marker}: the failure says why");
         assert_eq!(
-            step(&result, "answer-facts").status,
+            step(&desk.deployment, &result, "answer-facts").await.status,
             StepStatus::Skipped,
             "{marker}"
         );
@@ -1080,7 +1092,7 @@ async fn failed_code_step_leaves_its_assertion_inconclusive() {
     for text in ["fail the facts", "spin the facts"] {
         let result = desk.review(review(text, 50, None)).await;
 
-        let facts = step(&result, "answer-facts");
+        let facts = step(&desk.deployment, &result, "answer-facts").await;
         assert_eq!(facts.status, StepStatus::Failed, "{text}: {facts:?}");
         assert!(facts.reason.is_some(), "{text}: the failure says why");
         assert_eq!(
@@ -1786,6 +1798,113 @@ async fn custom_verdict_data_is_typed_on_return() {
     desk.deployment.shutdown().await;
 }
 
+/// Ordinary reads carry only the decision; what the execution ran is the
+/// handle's explicit, typed details read.
+///
+/// The typed direct result keeps every judgment and its custom data but no
+/// check or provenance, and waiting on the same execution returns it
+/// unchanged. Its typed details return the same identity and judgments
+/// beside the authored checks, the inline `on-topic` Agent as written, the
+/// `tally` step, and the pinned answer, and reading them calls no model.
+///
+/// # Panics
+/// Panics when a compact or detailed field differs, or a read judges again.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn verification_decisions_and_details_are_separate_reads() {
+    let desk = PolicyDesk::start().await;
+    let text = "Refunds follow our policy.";
+    let direct = desk
+        .state
+        .run()
+        .observe()
+        .verify_typed::<Scored>("scored-review", json!({ "text": text }))
+        .await
+        .expect("the typed review runs");
+    let calls = || async {
+        desk.upstream
+            .received_requests()
+            .await
+            .expect("the upstream records requests")
+            .len()
+    };
+    let judged = calls().await;
+
+    let execution = Execution::connect_with(direct.execution_id, &desk.client)
+        .await
+        .expect("the handle connects");
+    assert_eq!(
+        execution
+            .wait_typed::<Scored>(WAIT)
+            .await
+            .expect("typed wait"),
+        direct
+    );
+    let compact = serde_json::to_value(
+        &execution
+            .status()
+            .await
+            .expect("the status reads")
+            .result
+            .expect("a settled result")
+            .outcome,
+    )
+    .expect("the outcome encodes");
+    assert_eq!(
+        compact.as_object().map(|outcome| outcome
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>()),
+        Some(std::collections::BTreeSet::from([
+            "requirements",
+            "verdict"
+        ])),
+        "{compact}"
+    );
+    for requirement in compact["requirements"].as_array().expect("requirements") {
+        assert!(
+            requirement.get("check").is_none() && requirement.get("provenance").is_none(),
+            "{requirement}"
+        );
+    }
+    let details = execution
+        .details_typed::<Scored>()
+        .await
+        .expect("typed details");
+    let steps: Vec<_> = details
+        .outcome
+        .steps
+        .iter()
+        .map(|step| {
+            (
+                step.id.as_str().to_owned(),
+                serde_json::to_value(step.status).expect("status encodes"),
+            )
+        })
+        .collect();
+    assert_eq!(steps, [("tally".to_owned(), json!("succeeded"))]);
+    let on_topic = details
+        .outcome
+        .requirements
+        .iter()
+        .find(|requirement| requirement.result.id.as_str() == "on-topic")
+        .expect("the on-topic requirement");
+    let check = serde_json::to_value(&on_topic.check).expect("the check encodes");
+    assert_eq!(check["kind"], "agent", "{check}");
+    assert!(
+        check["agent"].is_object(),
+        "the inline Agent is kept as written: {check}"
+    );
+    assert!(on_topic.provenance.is_some(), "{on_topic:?}");
+    assert_eq!(
+        serde_json::to_value(&details.outcome.evidence).expect("evidence encodes"),
+        json!({ "answer": { "kind": "json", "value": { "text": text } } })
+    );
+    assert_eq!(details.compact(), direct);
+    assert_eq!(calls().await, judged, "details judge nothing again");
+    desk.deployment.shutdown().await;
+}
+
 /// A caller type the data does not fit fails every typed read with
 /// `WYRD_SDK_422_VERIFICATION_DATA_INVALID` naming the requirement and
 /// the data root, never the payload or a returned key, while the ordinary read keeps the original
@@ -2053,7 +2172,10 @@ async fn file_inputs_use_shared_uploads() {
             .await
             .expect("the File is uploaded and read");
         assert_eq!(
-            step(&result, "read").output.as_ref(),
+            step(&desk.deployment, &result, "read")
+                .await
+                .output
+                .as_ref(),
             Some(&json!({"format": "csv", "rows": rows}))
         );
     }

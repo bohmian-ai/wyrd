@@ -94,6 +94,9 @@ const BODY: &str = "body";
 /// See [`SERIALIZE`].
 const DECODE: &str = "decode";
 
+/// The [`HTTP_ROOT`] body whose size a received answer records.
+const RESPONSE: &str = "response";
+
 /// [`HEADER_WYRD_ACCESS_TOKEN`] as a typed header name.
 ///
 /// The externally-framed path in [`HttpTransport::authenticated_replay`] hands
@@ -1272,7 +1275,8 @@ async fn backoff(attempt: u32, observation: &mut Observation) {
 }
 
 /// Receives `resp`'s whole body, adding the wait to `observation`'s
-/// [`BODY`] whether or not it completes.
+/// [`BODY`] whether or not it completes and recording the size of a body
+/// it read as the call's [`RESPONSE`] body.
 ///
 /// # Errors
 /// Returns the body-read failure as [`WyrdError::Internal`].
@@ -1283,6 +1287,9 @@ async fn received(
     let started = observation.now();
     let bytes = resp.bytes().await.map_err(body_read_err);
     observation.since(BODY, started);
+    if let Ok(bytes) = &bytes {
+        observation.bytes(RESPONSE, bytes.len());
+    }
     bytes
 }
 

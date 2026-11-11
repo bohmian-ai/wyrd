@@ -34,6 +34,15 @@ use wyrd_benchmark::{
 };
 
 use crate::experiment::{Metric, Reading, Reconciled, Repetition, Role, TimingEvidence};
+
+/// The readings [`Population::response_bytes`] sets, with their units.
+pub const RESPONSE_BYTE_STATS: [(&str, &str); 5] = [
+    ("response_bytes_count", "responses"),
+    ("response_bytes_p50", "bytes"),
+    ("response_bytes_p99", "bytes"),
+    ("response_bytes_max", "bytes"),
+    ("response_bytes_mean", "bytes"),
+];
 use crate::release_server::{LocalServer, Metrics, PeakSampler};
 
 /// Error type of the capacity helpers, matching the benchmark binaries.
@@ -713,6 +722,86 @@ impl Population {
         }
     }
 
+    /// Sets the response-body sizes, in bytes, of the successful
+    /// `boundary` calls of `case` admitted in `phase`: their count, p50, p99,
+    /// and maximum as histogram bucket bounds, and their mean from the
+    /// bucketed total's bounds, under [`RESPONSE_BYTE_STATS`]. Every one is
+    /// required evidence. With `answered`, the successful calls of an
+    /// error-free window, sizes recorded for another number of calls are
+    /// invalid.
+    pub fn response_bytes(
+        &self,
+        repetition: &mut Repetition,
+        boundary: &str,
+        (case, phase): (&str, &str),
+        answered: Option<u64>,
+    ) {
+        let sizes = self.histogram(
+            wyrd_benchmark::BODY_BYTES,
+            &[
+                ("boundary", boundary),
+                ("body", "response"),
+                ("case", case),
+                ("phase", phase),
+            ],
+        );
+        let sizes = match sizes {
+            Ok(sizes) => sizes,
+            Err(reason) => {
+                for (id, _) in RESPONSE_BYTE_STATS {
+                    repetition.set(id, Reading::missing(reason.clone()));
+                }
+                repetition
+                    .invalid
+                    .push(format!("`{boundary}` response sizes are missing: {reason}"));
+                return;
+            }
+        };
+        let samples = sizes.len();
+        if let Some(answered) = answered
+            && samples != answered
+        {
+            repetition.invalid.push(format!(
+                "`{boundary}` recorded {samples} response sizes for {answered} answered calls"
+            ));
+        }
+        let per = wyrd_benchmark::HistogramUnit::Billionths.per_unit() as f64;
+        let (low, high) = sizes.total_bounds();
+        repetition.set("response_bytes_count", Reading::count(samples));
+        for (id, q) in [
+            ("response_bytes_p50", 0.5),
+            ("response_bytes_p99", 0.99),
+            ("response_bytes_max", 1.0),
+        ] {
+            repetition.set(id, Reading::quantile(&sizes, q, per));
+        }
+        repetition.set(
+            "response_bytes_mean",
+            if samples == 0 {
+                Reading::missing("no observation")
+            } else {
+                Reading::bounded(low as f64, high as f64, per * samples as f64)
+                    .with_samples(samples)
+            },
+        );
+    }
+
+    /// The metrics [`Self::response_bytes`] fills for `boundary`'s calls
+    /// in a `role` process, so a report names what was read.
+    #[must_use]
+    pub fn response_byte_metrics(role: Role, boundary: &str) -> Vec<Metric> {
+        let role = role.name();
+        RESPONSE_BYTE_STATS
+            .map(|(id, unit)| {
+                Metric::raw(
+                    id,
+                    unit,
+                    &format!("{role}: response body bytes each successful `{boundary}` call read, the cohort's calls; histogram bucket bounds"),
+                )
+            })
+            .to_vec()
+    }
+
     /// The diagnostic metrics [`Self::diagnose_roots`] fills for `roots`
     /// of a `role` process, so a report names each one's boundary.
     #[must_use]
@@ -1002,6 +1091,95 @@ mod tests {
     };
     use crate::release_server::Metrics;
     use wyrd_benchmark::IntervalValue;
+
+    /// A repetition reports each successful call's response body bytes as
+    /// the recorder read them: count, p50, p99, maximum, and mean, each
+    /// interval holding the exact size, in declared units, surviving a
+    /// serialized round trip. Sizes recorded for another number of answered
+    /// calls are invalid; a cohort without sizes is missing with its reason
+    /// and invalid, and a record from before sizes were read holds none.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a reading, unit, reason, or invalid reason is wrong.
+    #[test]
+    fn verification_reports_preserve_response_bytes() {
+        use crate::experiment::{Reading, Repetition, Role};
+        use wyrd_benchmark::{Cohort, Observation, SUCCESS};
+
+        use super::RESPONSE_BYTE_STATS;
+
+        wyrd_benchmark::install().expect("the benchmark recorder installs");
+        let before = wyrd_benchmark::snapshot();
+        for size in [1_000, 1_000, 4_000] {
+            let observation = Observation::start("client.http", || {
+                Cohort::of(Some("direct-verify"), Some("repetition-1"))
+            });
+            observation.bytes("response", size);
+            observation.finish(SUCCESS);
+        }
+        let population =
+            Population::between(&before, wyrd_benchmark::snapshot()).expect("one process");
+        let cohort = ("direct-verify", "repetition-1");
+        let mut repetition = Repetition::default();
+        population.response_bytes(&mut repetition, "client.http", cohort, Some(3));
+        assert!(repetition.invalid.is_empty(), "{:?}", repetition.invalid);
+        let holds = |reading: &Reading, exact: f64| {
+            reading.value.is_some_and(|high| high >= exact)
+                && reading.above.is_none_or(|low| low < exact)
+        };
+        assert_eq!(repetition.reading("response_bytes_count").value, Some(3.0));
+        for (id, exact) in [
+            ("response_bytes_p50", 1_000.0),
+            ("response_bytes_p99", 4_000.0),
+            ("response_bytes_max", 4_000.0),
+            ("response_bytes_mean", 2_000.0),
+        ] {
+            let reading = repetition.reading(id);
+            assert!(holds(&reading, exact), "{id}: {reading:?}");
+            assert_eq!(reading.samples, Some(3), "{id}");
+        }
+        let back: Repetition = serde_json::from_str(
+            &serde_json::to_string(&repetition).expect("a repetition serializes"),
+        )
+        .expect("a repetition deserializes");
+        assert_eq!(back, repetition);
+        let declared: Vec<_> = Population::response_byte_metrics(Role::Driver, "client.http")
+            .into_iter()
+            .map(|metric| (metric.id, metric.unit))
+            .collect();
+        assert_eq!(
+            declared,
+            RESPONSE_BYTE_STATS.map(|(id, unit)| (id.to_owned(), unit.to_owned()))
+        );
+
+        let mut short = Repetition::default();
+        population.response_bytes(&mut short, "client.http", cohort, Some(4));
+        assert_eq!(
+            short.invalid,
+            ["`client.http` recorded 3 response sizes for 4 answered calls"]
+        );
+        let mut unread = Repetition::default();
+        population.response_bytes(
+            &mut unread,
+            "client.http",
+            ("direct-verify", "warmup"),
+            None,
+        );
+        for (id, _) in RESPONSE_BYTE_STATS {
+            let reading = unread.reading(id);
+            assert!(
+                reading.value.is_none() && reading.reason.is_some(),
+                "{id}: {reading:?}"
+            );
+        }
+        assert_eq!(unread.invalid.len(), 1, "{:?}", unread.invalid);
+        let historical = Repetition::default().reading("response_bytes_p50");
+        assert_eq!(
+            historical.reason.as_deref(),
+            Some("`response_bytes_p50` was not read")
+        );
+    }
 
     /// Controlled delays, waits, and CPU calibrate the shared measurement
     /// path against references measured independently of it. Each request

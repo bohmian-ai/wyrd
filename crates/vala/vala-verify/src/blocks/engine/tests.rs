@@ -14,7 +14,7 @@ use tokio::sync::{Barrier, Notify};
 use wyrd_spec::vala::ids::{SpanId, TraceId};
 use wyrd_spec::vala::trace::{InstrumentationScope, Resource, SpanKind, SpanRecord, SpanStatus};
 use wyrd_spec::verification::DriftWindow;
-use wyrd_spec::verification::execution::Verdict;
+use wyrd_spec::verification::execution::{ExecutedRequirement, Verdict};
 
 use super::*;
 use crate::InMemoryTraceSource;
@@ -258,7 +258,7 @@ async fn run(
     engine: &VerificationEngine,
     spec: &Arc<VerifierSpec>,
     inputs: Value,
-) -> Result<VerificationOutcome, EngineError> {
+) -> Result<ExecutedOutcome, EngineError> {
     let evidence = inputs
         .as_object()
         .expect("object")
@@ -282,11 +282,11 @@ async fn run(
 }
 
 /// Outcome and reason of each requirement by ID.
-fn outcomes(outcome: &VerificationOutcome) -> BTreeMap<&str, RequirementOutcome> {
+fn outcomes(outcome: &ExecutedOutcome) -> BTreeMap<&str, RequirementOutcome> {
     outcome
         .requirements
         .iter()
-        .map(|result| (result.id.as_str(), result.outcome))
+        .map(|requirement| (requirement.result.id.as_str(), requirement.result.outcome))
         .collect()
 }
 
@@ -294,11 +294,19 @@ fn outcomes(outcome: &VerificationOutcome) -> BTreeMap<&str, RequirementOutcome>
 ///
 /// # Panics
 /// Panics when `outcome` has no requirement `id`.
-fn requirement<'a>(outcome: &'a VerificationOutcome, id: &str) -> &'a RequirementResult {
+fn requirement<'a>(outcome: &'a ExecutedOutcome, id: &str) -> &'a RequirementResult {
+    &recorded(outcome, id).result
+}
+
+/// The recorded requirement, check and provenance included.
+///
+/// # Panics
+/// Panics when `outcome` has no requirement `id`.
+fn recorded<'a>(outcome: &'a ExecutedOutcome, id: &str) -> &'a ExecutedRequirement {
     outcome
         .requirements
         .iter()
-        .find(|result| result.id.as_str() == id)
+        .find(|requirement| requirement.result.id.as_str() == id)
         .expect("requirement result")
 }
 
@@ -306,7 +314,7 @@ fn requirement<'a>(outcome: &'a VerificationOutcome, id: &str) -> &'a Requiremen
 ///
 /// # Panics
 /// Panics when `outcome` has no step `id`.
-fn step<'a>(outcome: &'a VerificationOutcome, id: &str) -> &'a StepResult {
+fn step<'a>(outcome: &'a ExecutedOutcome, id: &str) -> &'a StepResult {
     outcome
         .steps
         .iter()
@@ -415,7 +423,10 @@ async fn no_step_verifier_judges_inputs_and_traces() {
     );
     let failed = requirement(&outcome, "no-guarantee");
     assert_eq!(failed.actual, Some(json!("A guaranteed refund applies.")));
-    assert_eq!(failed.check, spec.requirements[0].check);
+    assert_eq!(
+        recorded(&outcome, "no-guarantee").check,
+        spec.requirements[0].check
+    );
     assert!(requirement(&outcome, "lost").reason.contains("not found"));
     assert_eq!(outcome.verdict, VerificationVerdict::Failed);
     assert_eq!(outcome.evidence, evidence);
@@ -655,7 +666,12 @@ async fn dependents_wait_for_upstream_step_requirements() {
     let ids: Vec<_> = outcome
         .requirements
         .iter()
-        .map(|r| (r.id.as_str(), r.step.as_ref().map(TaskId::as_str)))
+        .map(|r| {
+            (
+                r.result.id.as_str(),
+                r.result.step.as_ref().map(TaskId::as_str),
+            )
+        })
         .collect();
     assert_eq!(
         ids,
@@ -2059,8 +2075,10 @@ async fn unlanded_traces_defer_only_a_deferring_engine() {
         judged
             .requirements
             .iter()
-            .all(|result| result.outcome == RequirementOutcome::Inconclusive
-                && result.reason.contains("not yet landed")),
+            .all(
+                |requirement| requirement.result.outcome == RequirementOutcome::Inconclusive
+                    && requirement.result.reason.contains("not yet landed")
+            ),
         "{judged:?}"
     );
     assert_eq!(judged.verdict, VerificationVerdict::Inconclusive);

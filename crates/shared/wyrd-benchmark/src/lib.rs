@@ -260,6 +260,11 @@ pub const CANCELLED: &str = "cancelled";
 /// count is the calls that reached that component.
 pub const COMPONENT_SECONDS: &str = "wyrd_benchmark_component_seconds";
 
+/// The standard histogram an [`Observation`]'s body sizes are recorded in,
+/// in bytes, labelled by `boundary`, `body`, `case`, and `phase`; each
+/// series' count is the calls that read that body.
+pub const BODY_BYTES: &str = "wyrd_benchmark_body_bytes";
+
 /// One closed benchmark classification: a case of [`CASES`] and a phase of
 /// [`PHASES`], either [`UNLABELLED`] or [`INVALID`]. It selects series only
 /// and carries no authority.
@@ -448,6 +453,24 @@ impl Observation {
         if let Some(started) = started {
             self.component(component, started.elapsed());
         }
+    }
+
+    /// Records `bytes` as the size of this call's `body`, such as the
+    /// response body it read, in [`BODY_BYTES`] under the root's boundary
+    /// and cohort; nothing when inactive.
+    pub fn bytes(&self, body: &'static str, bytes: usize) {
+        let Some(active) = &self.0 else {
+            return;
+        };
+        let Labels { case, phase } = active.cohort.0;
+        metrics::histogram!(
+            BODY_BYTES,
+            "boundary" => active.boundary,
+            "body" => body,
+            "case" => case,
+            "phase" => phase
+        )
+        .record(bytes as f64);
     }
 
     /// Adds `wait` to the root's excluded waits, so the root records a
@@ -2054,7 +2077,8 @@ mod observation_tests {
     use std::time::Duration;
 
     use crate::{
-        self as timing, CANCELLED, COMPONENT_SECONDS, Cohort, ERROR, Observation, SUCCESS,
+        self as timing, BODY_BYTES, CANCELLED, COMPONENT_SECONDS, Cohort, ERROR, HistogramUnit,
+        Observation, SUCCESS,
     };
 
     /// An observation records its root once under its terminal outcome,
@@ -2076,6 +2100,7 @@ mod observation_tests {
         completed.component("auth", Duration::from_micros(5));
         completed.component("auth", Duration::from_micros(7));
         completed.since("decode", completed.now());
+        completed.bytes("response", 1_234);
         completed.exclude(Duration::ZERO);
         completed
             .child("client.http.attempt")
@@ -2152,6 +2177,25 @@ mod observation_tests {
             component("send").is_err(),
             "an unreached component is absent"
         );
+        let response = interval
+            .histogram(
+                BODY_BYTES,
+                &[
+                    ("boundary", "client.http"),
+                    ("body", "response"),
+                    ("case", "direct-verify"),
+                    ("phase", "repetition-1"),
+                ],
+            )
+            .expect("the read response body");
+        let per = HistogramUnit::Billionths.per_unit();
+        assert_eq!(response.len(), 1, "one body size per call that read it");
+        assert!(
+            response.maximum().is_some_and(
+                |bucket| bucket.lowest <= 1_234 * per && bucket.highest >= 1_234 * per
+            ),
+            "the body size is recorded in bytes"
+        );
     }
 
     /// Without the recorder an observation computes no cohort, reads no
@@ -2169,6 +2213,7 @@ mod observation_tests {
         assert!(!observation.active());
         assert_eq!(observation.now(), None);
         observation.component("auth", Duration::from_secs(1));
+        observation.bytes("response", 9);
         assert!(!observation.child("client.http.attempt").active());
         observation.finish(SUCCESS);
         drop(Observation::start("client.http", || Cohort::NONE));

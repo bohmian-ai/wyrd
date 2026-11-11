@@ -414,11 +414,14 @@ typed columns:
     only writes a row again. Rows therefore repeat across replicas and
     restarts, and readers aggregate by `series_id`, never counting rows as
     series.
-- Three tables hold each verification fact once. A result read assembles the
-  public `VerificationResult` from them: the verdict from `results`,
-  `requirements` and `steps` from `execution_outputs` by `result_id`, and
-  `evidence` from `execution_inputs` by `execution_id`. Detail is never
-  copied between them, and no other table projects drift detail.
+- Three tables hold each verification fact once. One reader assembles both
+  public projections from them: the verdict from `results`, `requirements`
+  and `steps` from `execution_outputs` by `result_id`, and `evidence` from
+  `execution_inputs` by `execution_id`. The compact `VerificationResult`
+  keeps the verdict and each requirement's judgment; `VerificationDetails`
+  adds checks, provenance, steps, and evidence. Projection never changes
+  what is stored. Detail is never copied between them, and no other table
+  projects drift detail.
 - `bifrost.verification.results` is the payload-free summary of one result:
   result, execution, Run, Verifier, subject, binding, group, trigger, and
   window identity, execution status, the verdict, and timing. It carries no

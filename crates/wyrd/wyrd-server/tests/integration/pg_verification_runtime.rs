@@ -50,7 +50,7 @@ use wyrd_spec::vala::ids::TraceId;
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::InputDeclaration;
 use wyrd_spec::verification::execution::{
-    RequirementDetail, RequirementOutcome, RequirementResult, VerificationOutcome,
+    ExecutedOutcome, ExecutedRequirement, RequirementDetail, RequirementOutcome, RequirementResult,
 };
 use wyrd_spec::verification::{
     DriftReport, DriftVerdict, FeatureDriftReport, GroupEndSettings, GroupSource,
@@ -589,19 +589,21 @@ fn drift_outcome(
     verdict: VerificationVerdict,
     outcome: RequirementOutcome,
     report: DriftReport,
-) -> VerificationOutcome {
-    VerificationOutcome {
+) -> ExecutedOutcome {
+    ExecutedOutcome {
         verdict,
-        requirements: vec![RequirementResult {
-            id: drift_requirement(),
-            step: None,
-            statement: "The window does not drift.".to_owned(),
-            outcome,
-            reason: "scripted".to_owned(),
-            actual: None,
-            citations: Vec::new(),
-            data: None,
-            detail: Some(RequirementDetail::Drift(report)),
+        requirements: vec![ExecutedRequirement {
+            result: RequirementResult {
+                id: drift_requirement(),
+                step: None,
+                statement: "The window does not drift.".to_owned(),
+                outcome,
+                reason: "scripted".to_owned(),
+                actual: None,
+                citations: Vec::new(),
+                data: None,
+                detail: Some(RequirementDetail::Drift(report)),
+            },
             check: serde_json::from_value::<Check>(serde_json::json!({
                 "kind": "drift", "on": "inputs.samples", "method": "Custom",
                 "signal": { "kind": "Metric", "name": "latency_ms" },
@@ -619,7 +621,7 @@ fn drift_outcome(
 ///
 /// # Panics
 /// Panics when a static feature name is invalid.
-fn drifting_report() -> VerificationOutcome {
+fn drifting_report() -> ExecutedOutcome {
     let features = [
         ("latency", 3.0, DriftVerdict::Drift),
         ("tokens", 0.1, DriftVerdict::NoDrift),
@@ -654,7 +656,7 @@ fn drifting_report() -> VerificationOutcome {
 ///
 /// # Panics
 /// Panics when the static drift check is invalid.
-fn unscored_report() -> VerificationOutcome {
+fn unscored_report() -> ExecutedOutcome {
     drift_outcome(
         VerificationVerdict::Inconclusive,
         RequirementOutcome::Inconclusive,
@@ -1209,9 +1211,16 @@ async fn verification_records_have_one_payload_owner() {
             state["result"]["outcome"]["verdict"], verdict,
             "{id}: {state}"
         );
+        let (code, details) = call(
+            axum::http::Method::GET,
+            format!("/v1/verification/executions/{id}/details"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(code, axum::http::StatusCode::OK, "{id}: {details}");
         assert!(
-            state["result"]["outcome"]["requirements"][0]["check"].is_object(),
-            "the output reassembles its requirement detail: {id}: {state}"
+            details["outcome"]["requirements"][0]["check"].is_object(),
+            "the output reassembles its requirement detail: {id}: {details}"
         );
     }
 }

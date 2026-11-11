@@ -183,7 +183,7 @@ fn response(topic: GuideTopic) -> GuideResponse {
         GuideTopic::Verification => (
             vec![
                 "Read the owner Card's status.verification.binding_ids and call verification.get_binding for the exact owner, subject, Verifier, readiness, and last_execution_id.",
-                "Call verification.get_execution for execution status, its result, execution errors, and Operator dispatches. A failed judgment differs from an execution failure. Pending, errored, and timed-out executions do not establish a completed judgment. A just-enqueued execution may read as not found until the queue accepts it.",
+                "Call verification.get_execution for execution status, its result, execution errors, and Operator dispatches. A failed judgment differs from an execution failure. Pending, errored, and timed-out executions do not establish a completed judgment. A just-enqueued execution may read as not found until the queue accepts it. Its result is the compact decision: the verdict and each requirement's outcome, reason, actual, citations, data, and detail. Call verification.get_execution_details only to read what a completed execution ran: each requirement's authored check and provenance, its steps, and its pinned evidence.",
                 "Persisted judgment history lives in Bifrost SQL: query bifrost.verification.results by result_id, or by exact subject_card_uid or workload_card_uid within a suitable time window. The summary holds no payload: read requirement and step detail, including Drift feature scores, from bifrost.verification.execution_outputs by matching result_id, and the execution's inputs from bifrost.verification.execution_inputs by matching execution_id.",
                 "subject_card_uid identifies the Card verified, workload_card_uid the owner Service, and verifier_card_uid the Verifier; sub_principal_id and act_principal_id record who the work was for and who performed it. Verification details follow table query permission. Gateway request/response payload columns additionally require gateway_payload:read. Empty evidence is not proof of a passing judgment.",
                 "verification.execute and verification.enqueue require verifier:run on the Verifier and take the same inline inputs. verification.execute returns the judgment directly and dispatches no Operator. verification.enqueue accepts the work with 202 and an execution_id; poll verification.get_execution. File inputs are referenced by digest: verification.evidence returns an upload_id and plan for each file the tenant lacks; the SDK or HTTP client sends the bytes as the plan says and completes the upload with POST /v1/cards/upload/{upload_id}/complete; a local path is not server-readable. Drift Verifiers judge windows and run only on their binding schedule.",
@@ -197,6 +197,11 @@ fn response(topic: GuideTopic) -> GuideResponse {
                 example(
                     "verification.get_execution",
                     "Read an execution's status and result",
+                    json!({ "execution_id": "<execution_id>" }),
+                ),
+                example(
+                    "verification.get_execution_details",
+                    "Read what a completed execution ran",
                     json!({ "execution_id": "<execution_id>" }),
                 ),
                 sql_example(

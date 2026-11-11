@@ -21,7 +21,7 @@ from wyrd import WyrdError, verify
 from wyrd.bifrost import Bifrost
 from wyrd.cards import Cards
 
-from .support import FIXTURES, ON_CALL_TOKEN, Watch, client_of, scheduled_result
+from .support import FIXTURES, ON_CALL_TOKEN, Watch, client_of, details, scheduled_result
 
 pytestmark = pytest.mark.integration
 
@@ -70,11 +70,14 @@ def test_failed_schedule_alerts_its_operator_on_the_connection_origin(
     assert result.run_id is None, "a scheduled execution has no Run"
     [requirement] = result.requirements
     assert (requirement["id"], requirement["outcome"]) == ("latency-unshifted", "failed")
-    provenance = requirement.get("provenance")
+    [described] = details(result.execution_id, client_of(latency_watch.server))["outcome"][
+        "requirements"
+    ]
+    provenance = described.get("provenance")
     assert provenance is not None and provenance["kind"] == "drift", provenance
     window = provenance.get("window")
     assert window is not None and window["start"] < window["end"], window
-    check = requirement["check"]
+    check = described["check"]
     assert check["kind"] == "drift", check
     signal = cast("dict[str, Any]", check["signal"])
     assert signal["baseline_ref"]["name"] == "latency-baseline"
@@ -121,7 +124,10 @@ def test_ready_spc_baseline_charts_a_scheduled_window(latency_steady: Watch) -> 
     assert result.verifier.name == "latency-control"
     [requirement] = result.requirements
     assert (requirement["id"], requirement["outcome"]) == ("latency-in-control", "failed")
-    check = requirement["check"]
+    [described] = details(result.execution_id, client_of(latency_steady.server))["outcome"][
+        "requirements"
+    ]
+    check = described["check"]
     assert check["kind"] == "drift", check
     assert check["method"] == "Spc", check
     latency = requirement["detail"]["drift"]["features"]["latency"]
@@ -203,7 +209,8 @@ def test_scheduled_binding_scores_every_requirement(
     assert {
         requirement["id"]: requirement["outcome"] for requirement in result.requirements
     } == outcomes
-    for requirement in result.requirements:
+    described = details(result.execution_id, client_of(latency_budget.server))
+    for requirement in described["outcome"]["requirements"]:
         assert requirement["provenance"]["kind"] == "drift"
         window = requirement["provenance"]["window"]
         assert window["start"] < window["end"], window

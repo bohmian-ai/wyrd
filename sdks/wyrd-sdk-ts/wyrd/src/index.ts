@@ -96,7 +96,10 @@ import type {
   TokenAudience,
   UpdateOperatorConnectionRequest,
   NamedResponseFormatVariant2 as VerdictResponseFormat,
+  OutcomeDetails as WireOutcomeDetails,
+  RequirementDetails as WireRequirementDetails,
   RequirementResult as WireRequirementResult,
+  VerificationDetails as WireVerificationDetails,
   VerificationExecutionState as WireVerificationExecutionState,
   VerificationOutcome as WireVerificationOutcome,
   VerificationResult as WireVerificationResult,
@@ -281,7 +284,7 @@ export type VerdictData = NonNullable<WireRequirementResult["data"]>;
 /** The judgment of one requirement, its custom `data` typed `T`. */
 export type RequirementResult<T = VerdictData> = Omit<WireRequirementResult, "data"> & { readonly data?: T };
 
-/** Overall verdict with its requirement and step breakdown, custom `data` typed `T`. */
+/** Overall verdict with each requirement's judgment, custom `data` typed `T`. */
 export type VerificationOutcome<T = VerdictData> = Omit<WireVerificationOutcome, "requirements"> & {
   readonly requirements: readonly RequirementResult<T>[];
 };
@@ -289,6 +292,19 @@ export type VerificationOutcome<T = VerdictData> = Omit<WireVerificationOutcome,
 /** The attributable result of one Verifier execution, custom `data` typed `T`. */
 export type VerificationResult<T = VerdictData> = Omit<WireVerificationResult, "outcome"> & {
   readonly outcome: VerificationOutcome<T>;
+};
+
+/** One requirement's judgment with its authored check and provenance, custom `data` typed `T`. */
+export type RequirementDetails<T = VerdictData> = Omit<WireRequirementDetails, "data"> & { readonly data?: T };
+
+/** The verdict with everything the execution ran, custom `data` typed `T`. */
+export type OutcomeDetails<T = VerdictData> = Omit<WireOutcomeDetails, "requirements"> & {
+  readonly requirements: readonly RequirementDetails<T>[];
+};
+
+/** What one completed Verifier execution ran, custom `data` typed `T`. */
+export type VerificationDetails<T = VerdictData> = Omit<WireVerificationDetails, "outcome"> & {
+  readonly outcome: OutcomeDetails<T>;
 };
 
 /** A verification execution's status, its result's custom `data` typed `T`. */
@@ -306,7 +322,7 @@ export interface VerdictDataParser<T> {
 }
 
 /**
- * Decode every present requirement `data` of `result` with `parser`.
+ * Decode every present `data` of `requirements` with `parser`.
  *
  * Absent data stays absent; failed requirements decode too. Whatever the
  * parser throws, the first mismatch raises `WYRD_SDK_422_VERIFICATION_DATA_INVALID`
@@ -314,8 +330,11 @@ export interface VerdictDataParser<T> {
  * data root's empty `path`, never the data, the thrown value, or a deeper
  * path, which may hold a returned dictionary key.
  */
-function typedResult<T>(result: VerificationResult, parser: VerdictDataParser<T>): VerificationResult<T> {
-  const requirements = result.outcome.requirements.map((requirement): RequirementResult<T> => {
+function typedRequirements<R extends { readonly id: string; readonly data?: VerdictData | null }, T>(
+  requirements: readonly R[],
+  parser: VerdictDataParser<T>,
+): (Omit<R, "data"> & { readonly data?: T })[] {
+  return requirements.map((requirement) => {
     const { data, ...rest } = requirement;
     if (data === undefined) {
       return rest;
@@ -333,7 +352,14 @@ function typedResult<T>(result: VerificationResult, parser: VerdictDataParser<T>
       );
     }
   });
-  return { ...result, outcome: { ...result.outcome, requirements } };
+}
+
+/** {@link typedRequirements} over `result`'s requirements. */
+function typedResult<T>(result: VerificationResult, parser: VerdictDataParser<T>): VerificationResult<T> {
+  return {
+    ...result,
+    outcome: { ...result.outcome, requirements: typedRequirements(result.outcome.requirements, parser) },
+  };
 }
 
 /**
@@ -2562,6 +2588,36 @@ export namespace verify {
       parser: VerdictDataParser<T>,
     ): Promise<VerificationResult<T>> {
       return typedResult(await this.wait(options), parser);
+    }
+
+    /**
+     * Read what the completed execution ran: each requirement's authored
+     * check and provenance, every step, and the pinned evidence, beside the
+     * same judgments as its result. One read, never polled; no Prompt is
+     * compiled to decode it.
+     *
+     * @throws {@link WyrdError} `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND` when
+     * no complete details are visible to the caller, and the authorization or
+     * transport failure.
+     */
+    async details(): Promise<VerificationDetails> {
+      return lifecycleValue(await this.#native.details());
+    }
+
+    /**
+     * {@link Execution.details}, with each present custom `data` parsed by
+     * `parser`.
+     *
+     * @param parser - Parses each present `data`, such as a Zod schema.
+     * @throws {@link WyrdError} the errors of {@link Execution.details}, then
+     * `WYRD_SDK_422_VERIFICATION_DATA_INVALID` when present data does not parse.
+     */
+    async detailsTyped<T>(parser: VerdictDataParser<T>): Promise<VerificationDetails<T>> {
+      const details = await this.details();
+      return {
+        ...details,
+        outcome: { ...details.outcome, requirements: typedRequirements(details.outcome.requirements, parser) },
+      };
     }
   }
 }

@@ -36,8 +36,8 @@ use wyrd_spec::ids::SlotName;
 use wyrd_spec::verification::ContextCapture;
 use wyrd_spec::verification::VerificationVerdict;
 use wyrd_spec::verification::execution::{
-    CallProvenance, Citation, InputDeclaration, RequirementDetail, RequirementOutcome,
-    RequirementResult, StepResult, StepStatus, VerificationOutcome,
+    CallProvenance, Citation, ExecutedOutcome, InputDeclaration, RequirementDetail,
+    RequirementDetails, RequirementOutcome, RequirementResult, StepResult, StepStatus,
 };
 use wyrd_spec::verification::{ExecutionPlan, Stage, TaskId};
 
@@ -354,7 +354,7 @@ impl VerificationEngine {
         spec: Arc<VerifierSpec>,
         evidence: BTreeMap<SlotName, InputDeclaration>,
         deadline: Instant,
-    ) -> Result<VerificationOutcome, EngineError> {
+    ) -> Result<ExecutedOutcome, EngineError> {
         let expired = || Instant::now() >= deadline;
         if expired() {
             return Err(EngineError::DeadlineExceeded);
@@ -393,12 +393,14 @@ impl VerificationEngine {
         }
         let verdict = decide(
             spec.decide,
-            requirements.iter().map(|result| result.outcome),
+            requirements
+                .iter()
+                .map(|requirement| requirement.result.outcome),
         );
         if expired() {
             return Err(EngineError::DeadlineExceeded);
         }
-        Ok(VerificationOutcome {
+        Ok(ExecutedOutcome {
             verdict,
             requirements,
             steps,
@@ -1202,16 +1204,18 @@ impl Judged {
     /// Panics when `key` does not name a requirement of `spec`.
     fn report(self, spec: &VerifierSpec, key: Key) -> Done {
         let requirement = requirement_at(spec, key);
-        Done::Requirement(Box::new(RequirementResult {
-            id: requirement.id.clone(),
-            step: key.0.map(|index| spec.steps[index].id.clone()),
-            statement: requirement.statement.clone(),
-            outcome: self.outcome,
-            reason: self.reason,
-            actual: self.actual,
-            citations: self.citations,
-            data: self.data,
-            detail: self.detail,
+        Done::Requirement(Box::new(RequirementDetails {
+            result: RequirementResult {
+                id: requirement.id.clone(),
+                step: key.0.map(|index| spec.steps[index].id.clone()),
+                statement: requirement.statement.clone(),
+                outcome: self.outcome,
+                reason: self.reason,
+                actual: self.actual,
+                citations: self.citations,
+                data: self.data,
+                detail: self.detail,
+            },
             check: requirement.check.clone(),
             provenance: self.provenance,
         }))

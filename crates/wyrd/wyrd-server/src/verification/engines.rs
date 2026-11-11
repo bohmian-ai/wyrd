@@ -4,12 +4,10 @@
 //! execution through the one building-block engine and maps its result to an
 //! [`EngineOutcome`]; the runner turns every outcome into exactly one fenced
 //! lifecycle transition. The helpers here derive the bounded Operator failure
-//! context from a completed [`VerificationOutcome`].
+//! context from a completed [`ExecutedOutcome`].
 
 use wyrd_spec::card::operator::DriftCounts;
-use wyrd_spec::verification::execution::{
-    RequirementDetail, RequirementOutcome, VerificationOutcome,
-};
+use wyrd_spec::verification::execution::{ExecutedOutcome, RequirementDetail, RequirementOutcome};
 use wyrd_spec::verification::{DriftVerdict, VerificationError};
 use wyrd_sql::queries::verifier_executions::TerminalStatus;
 
@@ -23,7 +21,7 @@ use wyrd_sql::queries::verifier_executions::TerminalStatus;
 #[derive(Debug, Clone, PartialEq)]
 pub enum EngineOutcome {
     /// The engine produced a verdict and its breakdown.
-    Completed(VerificationOutcome),
+    Completed(ExecutedOutcome),
     /// A transient failure; the same execution and frozen input may be
     /// attempted again.
     Retry(VerificationError),
@@ -42,11 +40,11 @@ pub enum EngineOutcome {
 /// Only the verdict and requirement counts: never actual values, citations,
 /// or step output. Settlement clips it to the Operator summary bound.
 #[must_use]
-pub fn summary(outcome: &VerificationOutcome) -> String {
+pub fn summary(outcome: &ExecutedOutcome) -> String {
     let failed = outcome
         .requirements
         .iter()
-        .filter(|requirement| requirement.outcome == RequirementOutcome::Failed)
+        .filter(|requirement| requirement.result.outcome == RequirementOutcome::Failed)
         .count();
     format!(
         "Verdict {}: {failed} of {} requirements failed.",
@@ -61,9 +59,10 @@ pub fn summary(outcome: &VerificationOutcome) -> String {
 /// `None` unless exactly one requirement carries drift detail, since the
 /// `drift.*` template fields name a single check.
 #[must_use]
-pub fn drift_counts(outcome: &VerificationOutcome) -> Option<DriftCounts> {
+pub fn drift_counts(outcome: &ExecutedOutcome) -> Option<DriftCounts> {
     let mut reports = outcome.requirements.iter().filter_map(|requirement| {
         requirement
+            .result
             .detail
             .as_ref()
             .map(|RequirementDetail::Drift(report)| report)
@@ -94,7 +93,7 @@ mod tests {
     use wyrd_spec::card::drift::DriftMethod;
     use wyrd_spec::card::verifier::Check;
     use wyrd_spec::verification::TaskId;
-    use wyrd_spec::verification::execution::RequirementResult;
+    use wyrd_spec::verification::execution::{ExecutedRequirement, RequirementResult};
     use wyrd_spec::verification::{DriftReport, VerificationVerdict};
 
     use super::*;
@@ -104,17 +103,19 @@ mod tests {
     /// # Panics
     /// Panics when `id` is not a valid task id; every caller passes a static
     /// identifier literal.
-    fn requirement(id: &str, detail: Option<RequirementDetail>) -> RequirementResult {
-        RequirementResult {
-            id: TaskId::new(id).expect("valid task id"),
-            step: None,
-            statement: id.to_owned(),
-            outcome: RequirementOutcome::Failed,
-            reason: "failed".to_owned(),
-            actual: None,
-            citations: Vec::new(),
-            data: None,
-            detail,
+    fn requirement(id: &str, detail: Option<RequirementDetail>) -> ExecutedRequirement {
+        ExecutedRequirement {
+            result: RequirementResult {
+                id: TaskId::new(id).expect("valid task id"),
+                step: None,
+                statement: id.to_owned(),
+                outcome: RequirementOutcome::Failed,
+                reason: "failed".to_owned(),
+                actual: None,
+                citations: Vec::new(),
+                data: None,
+                detail,
+            },
             check: serde_json::from_value::<Check>(serde_json::json!({
                 "kind": "assert", "path": "inputs.x", "operator": "equals", "expected": true
             }))
@@ -139,7 +140,7 @@ mod tests {
     /// Panics when the derived context differs.
     #[test]
     fn failure_context_counts_requirements_and_the_one_drift_check() {
-        let mut outcome = VerificationOutcome {
+        let mut outcome = ExecutedOutcome {
             verdict: VerificationVerdict::Failed,
             requirements: vec![requirement("a", Some(drift())), requirement("b", None)],
             steps: Vec::new(),

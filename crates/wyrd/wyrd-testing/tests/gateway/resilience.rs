@@ -1416,6 +1416,7 @@ async fn model_verification_benchmark_records_the_complete_local_path() {
         .expect("the application loads its bundle");
 
     let before = wyrd_benchmark::snapshot();
+    let mut judgments = Vec::new();
     for sequence in 0..2 {
         let run = state.run_for_card("model").expect("a Run for the model");
         let judged = with_benchmark_labels(
@@ -1438,17 +1439,7 @@ async fn model_verification_benchmark_records_the_complete_local_path() {
                 .collect::<Vec<_>>(),
             ["answer"]
         );
-        assert!(
-            matches!(
-                &requirement.provenance,
-                Some(CallProvenance::Agent { route, .. })
-                    if *route == wyrd_spec::ExecutionRoute::WyrdGateway {
-                        deployment: "bench-judge".parse().expect("deployment name"),
-                    }
-            ),
-            "{:?}",
-            requirement.provenance
-        );
+        judgments.push(judged.execution_id);
     }
     assert_eq!(provider.held(), 2, "one provider answer per verification");
 
@@ -1510,4 +1501,28 @@ async fn model_verification_benchmark_records_the_complete_local_path() {
     );
     assert_eq!(delta(&first, &last, "outbox_events_lost_total", &[]), 0.0);
     assert_eq!(last.sum("outbox_pending", &["outbox=\"scribe\""]), 0.0);
+
+    // What each judgment ran is an explicit read, outside the measured interval.
+    for execution in judgments {
+        let details = wyrd_client::verify::Execution::connect_with(execution, &admin)
+            .await
+            .expect("the execution handle connects")
+            .details()
+            .await
+            .expect("the retained execution has details");
+        let [requirement] = details.outcome.requirements.as_slice() else {
+            panic!("one requirement: {:?}", details.outcome.requirements);
+        };
+        assert!(
+            matches!(
+                &requirement.provenance,
+                Some(CallProvenance::Agent { route, .. })
+                    if *route == wyrd_spec::ExecutionRoute::WyrdGateway {
+                        deployment: "bench-judge".parse().expect("deployment name"),
+                    }
+            ),
+            "{:?}",
+            requirement.provenance
+        );
+    }
 }

@@ -278,6 +278,7 @@ mod pg_tests {
                 "cards.list",
                 "verification.get_binding",
                 "verification.get_execution",
+                "verification.get_execution_details",
                 "operator_connections.list",
                 "operator_connections.get",
                 "gateway.list_provider_credentials",

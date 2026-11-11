@@ -124,13 +124,17 @@ const BREAKDOWN: [(&str, &str); 9] = [
     ("wyrd_postgres_pool_acquire_seconds", "outcome"),
 ];
 
+/// The driver root of a direct `verify`'s one logical execution request,
+/// whose response body sizes each repetition reports.
+pub const HTTP_ROOT: &str = "client.http";
+
 /// The driver roots each direct `verify` records once, with their
 /// components: the SDK flow and its preparation, its one logical execution
 /// request, and that request's one attempt.
 pub const DRIVER_ROOTS: [(&str, bool, &[&str]); 3] = [
     ("client.verify", false, &["prepare"]),
     (
-        "client.http",
+        HTTP_ROOT,
         false,
         &["serialize", "auth", "send", "body", "decode"],
     ),
@@ -430,6 +434,12 @@ impl Bench {
             &mut repetition,
             cohort,
             &roots,
+            measured.errors.is_empty().then_some(acknowledged),
+        );
+        driver.response_bytes(
+            &mut repetition,
+            HTTP_ROOT,
+            cohort,
             measured.errors.is_empty().then_some(acknowledged),
         );
         if op == Op::Verify {

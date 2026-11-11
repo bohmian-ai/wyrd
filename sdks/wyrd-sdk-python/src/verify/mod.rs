@@ -220,6 +220,44 @@ impl PyExecution {
         Ok(state)
     }
 
+    /// What the completed execution ran, as its wire mapping: each
+    /// requirement's authored check and provenance, every step, and the
+    /// pinned evidence declarations, beside the same judgments as its result.
+    ///
+    /// One read, never polled; no Prompt is compiled to decode it.
+    ///
+    /// # Errors
+    /// Raises the client's connection error on first use,
+    /// `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND` when no complete details
+    /// are visible to the caller, and its authorization or transport error.
+    fn details(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
+        let details = crate::trace::block_on(py, self.handle(py)?.details())?;
+        Ok(json_to_pyobject(py, &serde_json::to_value(details)?)?)
+    }
+
+    /// [`PyExecution::details`], with each present requirement `data`
+    /// converted by `data_type.model_validate`.
+    ///
+    /// # Errors
+    /// As [`PyExecution::details`], then
+    /// `WYRD_SDK_422_VERIFICATION_DATA_INVALID` for data `data_type`
+    /// refuses.
+    fn details_typed(
+        &self,
+        py: Python<'_>,
+        data_type: &Bound<'_, PyAny>,
+    ) -> WyrdPyResult<Py<PyAny>> {
+        let details = self.details(py)?;
+        decode_data(
+            &details
+                .bind(py)
+                .get_item("outcome")?
+                .get_item("requirements")?,
+            data_type,
+        )?;
+        Ok(details)
+    }
+
     /// Poll until a result, the execution's own error, or `timeout` seconds.
     ///
     /// One deadline starts at the call and bounds the whole wait: a first
@@ -410,30 +448,6 @@ impl PyVerificationResult {
         Ok(json_to_pyobject(
             py,
             &serde_json::to_value(&self.result.outcome.requirements)?,
-        )?)
-    }
-
-    /// Every step's result as its wire mapping, in plan order.
-    ///
-    /// # Errors
-    /// As [`PyVerificationResult::requirements`].
-    #[getter]
-    fn steps(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
-        Ok(json_to_pyobject(
-            py,
-            &serde_json::to_value(&self.result.outcome.steps)?,
-        )?)
-    }
-
-    /// The pinned original evidence by slot, as its wire mapping.
-    ///
-    /// # Errors
-    /// As [`PyVerificationResult::requirements`].
-    #[getter]
-    fn evidence(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
-        Ok(json_to_pyobject(
-            py,
-            &serde_json::to_value(&self.result.outcome.evidence)?,
         )?)
     }
 }

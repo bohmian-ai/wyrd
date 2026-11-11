@@ -1946,7 +1946,8 @@ mod tests {
     };
     use wyrd_spec::verification::TaskId;
     use wyrd_spec::verification::execution::{
-        RequirementDetail, RequirementOutcome, RequirementResult, VerificationOutcome,
+        ExecutedOutcome, ExecutedRequirement, RequirementDetail, RequirementOutcome,
+        RequirementResult,
     };
     use wyrd_spec::verification::{
         DriftReport, DriftVerdict, DriftWindow, FeatureDriftReport, VerificationVerdict,
@@ -2069,22 +2070,24 @@ mod tests {
                 (name, report)
             })
             .collect();
-        let outcome = VerificationOutcome {
+        let outcome = ExecutedOutcome {
             verdict: VerificationVerdict::Failed,
-            requirements: vec![RequirementResult {
-                id: TaskId::new("drift").expect("task id"),
-                step: None,
-                statement: "drift".to_owned(),
-                outcome: RequirementOutcome::Failed,
-                reason: "x".repeat(reason_bytes),
-                actual: None,
-                citations: Vec::new(),
-                data: None,
-                detail: Some(RequirementDetail::Drift(DriftReport {
-                    method: DriftMethod::Psi,
-                    features,
-                    verdict: DriftVerdict::Drift,
-                })),
+            requirements: vec![ExecutedRequirement {
+                result: RequirementResult {
+                    id: TaskId::new("drift").expect("task id"),
+                    step: None,
+                    statement: "drift".to_owned(),
+                    outcome: RequirementOutcome::Failed,
+                    reason: "x".repeat(reason_bytes),
+                    actual: None,
+                    citations: Vec::new(),
+                    data: None,
+                    detail: Some(RequirementDetail::Drift(DriftReport {
+                        method: DriftMethod::Psi,
+                        features,
+                        verdict: DriftVerdict::Drift,
+                    })),
+                },
                 check: serde_json::from_value::<Check>(serde_json::json!({
                     "kind": "assert", "path": "inputs.x", "operator": "equals", "expected": true
                 }))

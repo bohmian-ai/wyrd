@@ -340,9 +340,9 @@ class DataModel(Protocol):
 class RequirementResult(TypedDict, Generic[DataT]):
     """One requirement's judgment.
 
-    ``check`` is the Verifier Card's check declaration as authored; ``actual``
-    is the JSON value the check read; ``data`` is the custom data the check's
-    declared ``verdict`` format returned, absent when it declared none.
+    ``actual`` is the JSON value the check read; ``data`` is the custom data
+    the check's declared ``verdict`` format returned, absent when it declared
+    none. The check and provenance are read with ``Execution.details``.
     """
 
     id: str
@@ -354,6 +354,14 @@ class RequirementResult(TypedDict, Generic[DataT]):
     citations: NotRequired[list[Citation]]
     data: NotRequired[DataT]
     detail: NotRequired[RequirementDetail]
+
+class RequirementDetails(RequirementResult[DataT], Generic[DataT]):
+    """One requirement's judgment beside what produced it.
+
+    ``check`` is the Verifier Card's check declaration as authored, never
+    compiled; ``provenance`` is the call that judged it, when one did.
+    """
+
     check: CheckWire
     provenance: NotRequired[CallProvenance]
 
@@ -394,12 +402,28 @@ class StepResult(TypedDict):
 VerificationVerdict: TypeAlias = Literal["passed", "failed", "inconclusive"]
 
 class VerificationOutcome(TypedDict, Generic[DataT]):
-    """The decided verdict and its full breakdown."""
+    """The decided verdict and each requirement's judgment."""
 
     verdict: VerificationVerdict
     requirements: list[RequirementResult[DataT]]
+
+class OutcomeDetails(TypedDict, Generic[DataT]):
+    """The decided verdict and everything the execution ran."""
+
+    verdict: VerificationVerdict
+    requirements: list[RequirementDetails[DataT]]
     steps: list[StepResult]
     evidence: dict[str, InputDeclaration]
+
+class VerificationDetails(TypedDict, Generic[DataT]):
+    """What one completed execution ran, as ``Execution.details`` reads it."""
+
+    execution_id: str
+    run_id: NotRequired[str]
+    verifier: CardRefWire
+    subject: CardRefWire
+    outcome: OutcomeDetails[DataT]
+    deployment_environment: NotRequired[str]
 
 class VerificationResultWire(TypedDict, Generic[DataT]):
     """A result as ``Execution.status()`` carries it under ``result``."""
@@ -556,16 +580,6 @@ class VerificationResult(Generic[DataT]):
         """Every requirement's judgment as its wire mapping, in plan order."""
         ...
 
-    @property
-    def steps(self) -> list[StepResult]:
-        """Every step's result as its wire mapping, in plan order."""
-        ...
-
-    @property
-    def evidence(self) -> dict[str, InputDeclaration]:
-        """The pinned original evidence by slot, as wire declarations."""
-        ...
-
 class Execution:
     """One queued Verifier execution, addressed by its server-issued ID.
 
@@ -648,6 +662,38 @@ class Execution:
                 requirement ``data_type`` refuses, with the data root's
                 empty ``path``, never the data; ``WYRD_SPEC_400_VALIDATION`` when ``data_type`` has no
                 ``model_validate``.
+        """
+        ...
+
+    def details(self) -> VerificationDetails:
+        """Read what the completed execution ran.
+
+        One read, never polled: each requirement's authored check and
+        provenance, every step, and the pinned evidence declarations, beside
+        the same judgments as its result. No Prompt is compiled to decode it.
+
+        Returns:
+            The details' wire mapping.
+
+        Raises:
+            WyrdError: the client's connection error on first use,
+                ``WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND`` when no
+                complete details are visible to the caller, and its
+                authorization or transport error.
+        """
+        ...
+
+    def details_typed(self, data_type: type[_Model]) -> VerificationDetails[_Model]:
+        """``details``, with every present ``data`` validated as ``data_type``.
+
+        Args:
+            data_type: a model exposing ``model_validate``.
+
+        Returns:
+            The details' wire mapping, its ``data`` typed.
+
+        Raises:
+            WyrdError: As ``details``, then as ``status_typed`` for ``data``.
         """
         ...
 

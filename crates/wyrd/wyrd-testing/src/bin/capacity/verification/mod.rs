@@ -453,6 +453,10 @@ fn direct(mut base: Declaration, model: bool) -> Declaration {
     }
     base.metrics
         .extend(Population::root_metrics(Role::Driver, &run::DRIVER_ROOTS));
+    base.metrics.extend(Population::response_byte_metrics(
+        Role::Driver,
+        run::HTTP_ROOT,
+    ));
     if model {
         base.metrics
             .extend(Population::root_metrics(Role::Driver, &run::FIXTURE_ROOTS));

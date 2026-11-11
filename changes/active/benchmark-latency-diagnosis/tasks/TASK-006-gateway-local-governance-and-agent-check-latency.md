@@ -274,3 +274,49 @@ are missing, not zero. No hard latency improvement is promised by this plan.
   [security](../../../../architecture/wyrd-security-posture.md),
   [Bifrost cache/admission precedent](../../../../architecture/bifrost-design.md),
   [SQL directory rules](../../../../crates/wyrd/wyrd-sql/AGENTS.md).
+
+## Implementation Evidence
+
+Commits: `4a4c0b827` (diagnostics), `dc4c75e81` (prepared schema reuse),
+`59a428577` (in-memory governance, background usage), `b4db1d04f` (governed
+journey), and the commit recording this evidence (policy description,
+generated TypeScript type, evidence).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-003/005/007/011/018/022/033; AC-025; INV-004 | `wyrd-testing/src/bin/capacity/verification/run.rs` reports `gateway.phase.*`/`gateway.wait.*` with actual counts from server histograms; assertion steps mark them inapplicable | `verification::run::tests::diagnostics_include_gateway_phases_and_waits` | PASS |
+| REQ-020/021/024/032; AC-025 | `skald-agent/src/structured.rs` and `skald-spec/src/prompt.rs` reuse preparation keyed by the exact effective schema; `vala-verify/src/blocks.rs` keeps declared Verdict validation and data bounds | `structured::tests::prepared_schema_reuse_tracks_effective_schema`; `structured_output::{structured_output_validates_the_bound_schema, structured_output_validates_a_replaced_schema, structured_output_repairs_every_encoding}`; `blocks::tests::{prepared_verdict_keeps_validation_and_data_bounds, verdict_data_keeps_its_schema_resource}`; `verifier_building_blocks::{invalid_judge_verdicts_are_inconclusive, judge_repairs_an_invalid_verdict, custom_verdict_data_survives_readback}` | PASS |
+| REQ-028–030; AC-023 | `gateway/usage.rs::GatewayUsage::admit` (atomic under the tenant map lock), `ledger.rs::GatewayLedger::{admit,settle}` synchronous, `invocation.rs::admit_call` serves only the cached snapshot; limit refusal codes unchanged | `pg_invocation_tests::warm_governance_uses_local_reservations_without_database_waits` (all usage tables held `SHARE` until every admitted call answered 200); `usage::tests::local_admission_spends_headroom_once_per_tenant`; journey `resilience::gateway_cached_governance_answers_before_background_accounting` | PASS |
+| REQ-030–031; AC-024 | Migration `20261111000000_gateway_usage_contributions.sql` (absolute per-server window rows, leased concurrency rows); `wyrd-sql/src/queries/gateway_admission.rs::sync_gateway_usage` (one tenant transaction, fenced entries); `snapshots.rs` miss/listener-reset queue background reloads; 503 `WYRD_SERVER_503_SERVICE_UNAVAILABLE` with `{}` details on missing/stale/full state | `pg_invocation_tests::background_usage_reconciles_retries_and_remote_updates` (refused flush retried; uncertain replay adds nothing; servers' tokens accumulate 15→30; a deadline-ended call frees concurrency); `pg_invocation_tests::usage_cache_bounds_staleness_restarts_and_policy_changes` (cold 503 before dispatch then background recovery; restart sees committed concurrency; remote policy change applies after reload); `usage::tests::budget_reservations_count_once_across_refreshes`; `snapshots::tests::snapshots_serve_only_while_listening_and_reload_in_background` | PASS |
+| REQ-028–033; AC-026; INV-001–003 | Existing `Gateway` owner's `refresh_worker` runs reloads and `GatewayUsage::run` (bounded: 4096 tenants, 4096 pending entries, 8 concurrent syncs); `Gateway::drain` drains call tasks then flushes within the deadline; FORCE RLS on both new tables, no manual tenant predicate | Full `wyrd-server --lib` with Postgres: 593 passed; `mise run test:gateway:journey` exit 0 (Rust 17/17 Gateway journeys, Vault, CLI/MCP/SDK admin, Python 47, TypeScript 26); `check:tenant-isolation`, `check:deps` pass | PASS |
+| Format and boundary checks | — | `mise run fmt`, `mise run lints`, `mise run check:deps`, `mise run check:tenant-isolation`, `mise run codegen:regen` + `codegen:check`, `git diff --check` | PASS |
+
+Saved references recovered (no benchmark run): `direct-verify-model-c1`
+`provider_headers` wait about 63–68 µs mean and `direct-verify-model-c64`
+about 1354–1546 µs; `translate` phase about 26–44 µs. No benchmark,
+profiling or comparison was run for this task; the bounded measurement
+protocol still requires separate authorization.
+
+Strict-admission tests remapped to revision 7: replica-shared limit and
+budget tests now synchronize usage explicitly (`sync`/`warm`) to model the
+background refresh; the batch-abandonment scenario holds the claim on the
+batch table instead of the removed admission advisory lock; the
+settlement-failure test became the reconciliation test above. Replicas
+started after configuration warm before invoking, and two tests wait for the
+notified reload instead of expecting an immediate cross-replica change.
+The journey client (`tests/gateway/harness.rs::Journey::post`) retries the
+loading 503 like a client; `post_once` observes it.
+
+### Diagnoses
+
+- **Symptom:** after the change, seven `components::gateway::pg_*` tests failed with `ServiceUnavailable "gateway configuration is loading"`, one with `gateway.account` span missing, and the batch test created 4 batches instead of 3. **Evidence:** panics at `pg_invocation_tests.rs` sites invoking on replicas built after `configure`; `invocation.rs::admit_call` now returns 503 on `GatewaySnapshots::admitted` miss; the `#[tracing::instrument(name = "gateway.account")]` had been on the removed async settle; batch test waited on `pg_advisory_xact_lock('wyrd.gateway_admission:…')`, which admission no longer takes. **Cause:** tests encoded synchronous snapshot load and the strict SQL admission lock that revision 7 removes; the span was dropped with the async function. **Fix site:** tests warm late replicas (`warm` helper); span restored on `GatewayLedger::settle`; batch abandonment held at the claim's table lock. No production caller other than `admit_call` reads the snapshot on the call path.
+- **Symptom:** `gateway_managed_credentials_resolve_per_tenant_across_restart_and_rotation` refused nothing after a copied envelope (line 824). **Evidence:** the panic was reached at 1.4 s (timed checkpoints); the snapshot entry on `rewrapped` was still the pre-change `Arc`. **Cause:** `GatewaySnapshots::invalidate` now keeps the served snapshot until the background reload installs (approved), so another writer's change applies asynchronously. **Fix site:** the test waits for the reload (`reloaded` helper) before asserting; production behavior unchanged.
+- **Symptom:** Gateway journeys `compatible::managed_secret_rotation_survives_server_restart` and `native::gateway_api_key_exchange_is_scoped_cached_and_revocable` got 503 instead of 4xx for a never-loaded tenant. **Evidence:** body `code: WYRD_SERVER_503_SERVICE_UNAVAILABLE`, "gateway configuration is loading". **Cause:** first call of a tenant not yet cached is refused retryably by design (REQ-030). **Fix site:** the shared journey client `Journey::post` retries that refusal for up to 10 s; every journey routes through it.
+
+Non-goals stayed excluded: no Redis, crash-safe local ledger, replica leases,
+strict global quota, new service, dependency, Cargo feature, SDK API or wire
+change. The prior strict admission tables/functions remain (expand-and-
+contract). Unrelated untracked directories under `changes/active/` were not
+touched.
+
+Status: IMPLEMENTED — routes to `$wyrd-task-review`.

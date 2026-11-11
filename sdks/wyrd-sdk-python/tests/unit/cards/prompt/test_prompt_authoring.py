@@ -180,6 +180,20 @@ def test_role_helpers_cover_system_user_assistant_and_tool_result() -> None:
     ]
 
 
+@pytest.mark.parametrize("role", ["user", "assistant"])
+def test_terminal_rich_text_part_requires_its_variable(role: str) -> None:
+    base = Prompt.anthropic("claude-sonnet-4", messages="hello")
+    prompt = getattr(base, role)([{"type": "text", "text": "Hi {{who}}"}])
+
+    with pytest.raises(WyrdError) as error:
+        prompt.render()
+
+    assert error.value.code == "WYRD_PROMPT_422_MISSING_VARIABLE"
+    expected = {"role": role, "content": [{"type": "text", "text": "Hi Ada"}]}
+    assert prompt.render(who="Ada").messages[1] == expected
+    assert prompt.bind(who="Ada").render().messages[1] == expected
+
+
 def test_message_string_becomes_one_anthropic_text_block() -> None:
     prompt = Prompt.anthropic("claude-sonnet-4", messages="hello")
 

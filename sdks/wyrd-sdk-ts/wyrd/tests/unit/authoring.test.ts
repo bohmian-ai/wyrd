@@ -530,6 +530,22 @@ test("prompts_project_every_native_builder_capability", () => {
   expect(thrown(() => prompt.user({ type: "bogus" })).code).toBe("WYRD_PROMPT_400_INVALID");
   expect(thrown(() => prompt.bind({ report: 1 as never })).code).toBe("WYRD_PROMPT_400_INVALID");
   expect(thrown(() => base.render()).code).toMatch(/^WYRD_/);
+
+  for (const role of ["user", "assistant"] as const) {
+    const rich = Prompt.anthropic("claude-sonnet-5", { messages: "Hi", settings: { max_tokens: 64 } })[role]([
+      { type: "text", text: "Hi {{name}}" },
+    ]);
+    expect(thrown(() => rich.render()).code, `a ${role} text part requires its variable`).toBe(
+      "WYRD_PROMPT_422_MISSING_VARIABLE",
+    );
+    const expected = { role, content: [{ type: "text", text: "Hi Ada" }] };
+    const supplied = rich.render({ name: "Ada" }) as { readonly body: { readonly messages: readonly unknown[] } };
+    expect(supplied.body.messages[1]).toEqual(expected);
+    const boundRich = rich.bind({ name: "Ada" }).render() as {
+      readonly body: { readonly messages: readonly unknown[] };
+    };
+    expect(boundRich.body.messages[1]).toEqual(expected);
+  }
 });
 
 test("versions_are_optional_and_prompts_are_native", () => {

@@ -195,16 +195,17 @@ impl Prompt {
     /// Return a copy with one turn of native content parts appended for
     /// `role`: `value` is one provider content part or an ordered list of
     /// them, in the request format's own wire shape, such as an `OpenAI`
-    /// Chat `image_url` part; `${media:name}` placeholders in it are
-    /// recognised for [`skald_spec::Prompt::bind_media`].
+    /// Chat `image_url` part. The result is rebuilt like a text turn, so
+    /// `${name}` / `{{name}}` text in a part becomes a required variable and
+    /// `${media:name}` placeholders are recognised for
+    /// [`skald_spec::Prompt::bind_media`].
     ///
     /// # Errors
     ///
     /// Returns [`PromptBuilderError::Validation`] when `value` does not
     /// decode as the format's content parts,
     /// [`PromptBuilderError::UnsupportedRole`] when the format has no
-    /// conversation turns, and [`PromptBuilderError::Skald`] when a
-    /// placeholder cannot be normalized.
+    /// conversation turns, and the errors of [`Prompt::rederived`].
     pub fn with_content(&self, role: &str, value: serde_json::Value) -> PromptBuilderResult<Self> {
         let mut out = self.clone();
         match &mut out.inner.request {
@@ -253,8 +254,7 @@ impl Prompt {
                 });
             }
         }
-        out.inner.normalize_media_placeholders_mut()?;
-        Ok(out)
+        out.rederived()
     }
 
     /// Rebuild after a request edit so the derived variables, media

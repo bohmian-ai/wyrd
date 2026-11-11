@@ -43,6 +43,7 @@ use wyrd_testing::experiment::{
 use wyrd_testing::gateway_capture::{FIXTURE_ROOT, GatewayCapture, PacedUpstream, Pacing};
 use wyrd_testing::release_server::{LocalServer, Metrics};
 
+use crate::gateway::run::{PHASE_SECONDS, WAIT_SECONDS, WAITS};
 use crate::verification::workload::{
     ASSERT_VERIFIER, JUDGE_SLOT, JUDGE_VERIFIER, Tenant, context, failing,
 };
@@ -147,6 +148,20 @@ pub const FIXTURE_ROOTS: [(&str, bool, &[&str]); 1] = [(FIXTURE_ROOT, false, &["
 
 /// Why an assertion step has no local provider observations.
 const NO_PROVIDER: &str = "an assertion check calls no provider";
+
+/// The Gateway phases an in-process Agent check's model call records once
+/// each: the native caller authenticates and parses nothing, and a buffered
+/// call relays no stream.
+pub(crate) const GATEWAY_PHASES: [&str; 8] = [
+    "snapshot",
+    "authorize",
+    "route",
+    "admit",
+    "credential",
+    "translate",
+    "account",
+    "capture",
+];
 
 /// The prefix of a direct execution's phase timing parts.
 const DIRECT_PARTS: &str = "verification.direct.";
@@ -451,6 +466,7 @@ impl Bench {
                 }
             }
         }
+        set_gateway(&mut repetition, &population, op, measured.errors.is_empty());
         population.percentiles(
             &mut repetition,
             DIRECT_TIMING,
@@ -1217,6 +1233,38 @@ fn set_phases(repetition: &mut Repetition, population: &Population) {
     }
 }
 
+/// Sets the server's `gateway.phase.<phase>` and `gateway.wait.<wait>`
+/// diagnostics for each [`GATEWAY_PHASES`] phase and every controlled wait
+/// a judge's in-process model call records, each over its own histogram
+/// population, nested in the Verifier block and never summed. An assertion
+/// step calls no provider, so each is inapplicable; on a judge step without
+/// errors each is required.
+fn set_gateway(repetition: &mut Repetition, population: &Population, op: Op, clean: bool) {
+    let observations = GATEWAY_PHASES
+        .iter()
+        .map(|phase| {
+            (
+                format!("gateway.phase.{phase}"),
+                PHASE_SECONDS,
+                ("phase", *phase),
+            )
+        })
+        .chain(WAITS.iter().map(|wait| {
+            (
+                format!("gateway.wait.{wait}"),
+                WAIT_SECONDS,
+                ("wait", *wait),
+            )
+        }));
+    for (observation, family, label) in observations {
+        if op == Op::Verify {
+            repetition.inapplicable(&observation, NO_PROVIDER);
+        } else {
+            repetition.diagnose(&observation, population.histogram(family, &[label]), clean);
+        }
+    }
+}
+
 /// The mean, milliseconds, of a nanosecond `distribution` as the bounds of
 /// its bucketed total, or why there is none.
 pub(crate) fn mean_ms(distribution: Result<Distribution, String>) -> Reading {
@@ -1425,6 +1473,65 @@ mod tests {
         assert!(
             !super::observed_components(&wyrd_testing::capacity::Population::default()),
             "an empty window has no component"
+        );
+    }
+
+    /// A judge step reports each recorded Gateway phase and wait under its
+    /// own `gateway.phase.*` or `gateway.wait.*` label with its actual
+    /// observation count, from the server's histograms alone; an assertion
+    /// step marks every one inapplicable; and a judge window without a
+    /// recorded phase is invalid rather than zero.
+    ///
+    /// # Panics
+    /// Panics when a label, count, or inapplicable reason is wrong.
+    #[test]
+    fn diagnostics_include_gateway_phases_and_waits() {
+        use wyrd_testing::experiment::{DIAGNOSTIC, Repetition};
+        wyrd_benchmark::install().expect("the benchmark recorder installs");
+        let before = wyrd_benchmark::snapshot();
+        for (calls, phase) in (1_u32..).zip(super::GATEWAY_PHASES) {
+            for _ in 0..calls {
+                metrics::histogram!(super::PHASE_SECONDS, "operation" => "chat", "phase" => phase)
+                    .record(0.000_01);
+            }
+        }
+        for wait in super::WAITS {
+            metrics::histogram!(super::WAIT_SECONDS, "operation" => "chat", "wait" => wait)
+                .record(0.000_02);
+        }
+        let population =
+            wyrd_testing::capacity::Population::between(&before, wyrd_benchmark::snapshot())
+                .expect("one process");
+        let mut judge = Repetition::default();
+        super::set_gateway(&mut judge, &population, Op::Judge, true);
+        assert!(judge.invalid.is_empty(), "{:?}", judge.invalid);
+        for (calls, phase) in (1_u64..).zip(super::GATEWAY_PHASES) {
+            let count = judge.reading(&format!("{DIAGNOSTIC}gateway.phase.{phase}.count"));
+            assert_eq!(count.value, Some(calls as f64), "{phase}");
+        }
+        for wait in super::WAITS {
+            let mean = judge.reading(&format!("{DIAGNOSTIC}gateway.wait.{wait}.mean_us"));
+            assert!(
+                mean.value.is_some_and(|high| 20.0 <= high),
+                "{wait}: {mean:?}"
+            );
+            assert!(mean.above.is_some_and(|low| low < 20.0), "{wait}: {mean:?}");
+        }
+        let mut assertion = Repetition::default();
+        super::set_gateway(&mut assertion, &population, Op::Verify, true);
+        let reason = assertion
+            .reading(&format!("{DIAGNOSTIC}gateway.phase.admit.count"))
+            .reason;
+        assert_eq!(
+            reason.as_deref(),
+            Some("inapplicable: an assertion check calls no provider")
+        );
+        let mut empty = Repetition::default();
+        let none = wyrd_testing::capacity::Population::default();
+        super::set_gateway(&mut empty, &none, Op::Judge, true);
+        assert_eq!(
+            empty.invalid.len(),
+            super::GATEWAY_PHASES.len() + super::WAITS.len()
         );
     }
 

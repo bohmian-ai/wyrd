@@ -460,6 +460,18 @@ fn direct(mut base: Declaration, model: bool) -> Declaration {
     if model {
         base.metrics
             .extend(Population::root_metrics(Role::Driver, &run::FIXTURE_ROOTS));
+        for phase in run::GATEWAY_PHASES {
+            base.metrics.extend(Metric::diagnostic(
+                &format!("gateway.phase.{phase}"),
+                &format!("server: `wyrd_gateway_phase_duration_seconds{{phase={phase}}}` of a judge's in-process model call, measured window; nested in the Verifier block and never summed; inapplicable to an assertion step"),
+            ));
+        }
+        for wait in crate::gateway::run::WAITS {
+            base.metrics.extend(Metric::diagnostic(
+                &format!("gateway.wait.{wait}"),
+                &format!("server: `wyrd_gateway_wait_seconds{{wait={wait}}}` of a judge's in-process model call, measured window; overlaps the phases and is never summed; inapplicable to an assertion step"),
+            ));
+        }
     }
     let objective = format!("direct-verify-c{OBJECTIVE_CLIENTS}");
     base.criteria = vec![

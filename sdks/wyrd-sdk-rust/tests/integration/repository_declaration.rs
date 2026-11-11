@@ -7,7 +7,9 @@
 mod pg_tests {
     use std::path::Path;
 
-    use wyrd_ai::cards::{CardKind, CardRef, CardSelector, Cards, DeclarationReceipt};
+    use wyrd_ai::cards::{
+        CardKind, CardRef, CardSelector, Cards, DeclarationReceipt, ListCardsRequest,
+    };
     use wyrd_ai::cli;
     use wyrd_ai::github::{GithubConnection, GithubConnectionState};
     use wyrd_spec::envelope::RepositoryStatus;
@@ -344,6 +346,126 @@ mod pg_tests {
                 .as_deref(),
             Some("acme/api-renamed")
         );
+        deployment.shutdown().await;
+    }
+
+    /// A declaration whose new root fails readiness after registration is
+    /// refused with a typed error, the selected policy stays selected and the
+    /// Verifiers it registered stay readable.
+    ///
+    /// # Panics
+    /// Panics when the failed declaration succeeds or changes the selection,
+    /// or the storage root cannot be broken and restored.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the repository-managed Postgres journey lifecycle"]
+    async fn failed_readiness_keeps_the_selected_policy() {
+        let (mock, deployment, _connection, _key) = connected().await;
+        let cards = deployment.cards().await;
+        let answer_check = declared(
+            &declare(&cards, "cards/verify_in_real_time/answer-check.yaml").await,
+            "answer-check",
+        );
+        let checkout = checkout(&mock, "acme/api");
+        let first = declare_toml(&cards, &checkout, "minimal")
+            .await
+            .expect("minimal wyrd.toml declares");
+
+        let storage = deployment
+            .server()
+            .local_storage_root()
+            .expect("the deployment owns local storage");
+        let moved = storage.with_extension("moved");
+        std::fs::rename(storage, &moved).expect("storage moves away");
+        std::fs::write(storage, b"not a directory").expect("storage breaks");
+        let failed = declare_toml(&cards, &checkout, "changed")
+            .await
+            .expect_err("a root that cannot be stored is not declared");
+        assert_eq!(failed.code(), "WYRD_STORAGE_500_BACKEND", "{failed}");
+        let listed = cards
+            .list(ListCardsRequest {
+                kind: Some(CardKind::Repository),
+                name: Some(first.root.name.clone()),
+                version_range: None,
+                status: None,
+                filter: None,
+                include_prerelease: false,
+                limit: None,
+                cursor: None,
+            })
+            .await
+            .expect("Card summaries list without storage");
+        let registered = listed
+            .items
+            .iter()
+            .find(|summary| summary.version != first.root.version)
+            .expect("the refused root stays registered");
+
+        // Restore storage except the refused root's own blob, so every other
+        // Card reads while that root still cannot become ready.
+        let blocked = Path::new(&deployment.server().data_tenant_id().to_string())
+            .join("cards")
+            .join(registered.card_uid.to_string());
+        std::fs::write(moved.join(&blocked), b"blocks only the refused root")
+            .expect("root blob blocks");
+        std::fs::remove_file(storage).expect("broken storage removes");
+        std::fs::rename(&moved, storage).expect("storage restores");
+        let (status, _) = repository(&cards, &first.root).await;
+        assert!(status.selected, "the old policy stays selected");
+        assert_eq!(status.selected_version.as_ref(), Some(&first.root.version));
+        cards
+            .get(CardSelector::exact(answer_check))
+            .await
+            .expect("the registered dependency stays readable");
+        deployment.shutdown().await;
+    }
+
+    /// Deleting the selected root's exact version deletes it like any Card:
+    /// it is no longer served, no version of the family is selected in its
+    /// place, and the GitHub connection and its Verifiers are untouched.
+    ///
+    /// # Panics
+    /// Panics when the delete is refused or falls back to the old version.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the repository-managed Postgres journey lifecycle"]
+    async fn deleting_the_selected_root_selects_nothing() {
+        let (mock, deployment, connection, _key) = connected().await;
+        let cards = deployment.cards().await;
+        let answer_check = declared(
+            &declare(&cards, "cards/verify_in_real_time/answer-check.yaml").await,
+            "answer-check",
+        );
+        let checkout = checkout(&mock, "acme/api");
+        let first = declare_toml(&cards, &checkout, "minimal")
+            .await
+            .expect("minimal wyrd.toml declares");
+        let changed = declare_toml(&cards, &checkout, "changed")
+            .await
+            .expect("changed wyrd.toml declares");
+        assert!(repository(&cards, &changed.root).await.0.selected);
+
+        cards
+            .delete(CardSelector::exact(changed.root.clone()))
+            .await
+            .expect("the selected root deletes");
+        let gone = cards
+            .get(CardSelector::exact(changed.root.clone()))
+            .await
+            .expect_err("a deleted root is not served");
+        assert_eq!(gone.code(), "WYRD_REGISTRY_404_CARD_NOT_FOUND", "{gone}");
+        let (old, _) = repository(&cards, &first.root).await;
+        assert!(
+            !old.selected,
+            "the old version is not selected in its place"
+        );
+        assert_eq!(old.selected_version, None);
+        assert_eq!(
+            connection.get().await.expect("connection reads").state,
+            GithubConnectionState::Active
+        );
+        cards
+            .get(CardSelector::exact(answer_check))
+            .await
+            .expect("the registered Verifier stays readable");
         deployment.shutdown().await;
     }
 

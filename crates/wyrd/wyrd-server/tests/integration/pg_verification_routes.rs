@@ -2446,6 +2446,10 @@ fn tallied() -> Value {
 
 /// `details` without what only details carry: each requirement's check and
 /// provenance, and the outcome's steps and evidence.
+///
+/// # Panics
+/// Panics when `details` has no `outcome` object or its `requirements` is
+/// not a list of objects.
 fn compacted(details: &Value) -> Value {
     let mut compact = details.clone();
     let outcome = compact["outcome"]
@@ -2577,6 +2581,104 @@ async fn details_preserve_retained_execution_evidence() {
         compacted(&visible_details(&server, &jwt, &direct_id).await),
         direct,
         "the direct answer is the compact form of its details"
+    );
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Details report absence rather than empty evidence when what they read was
+/// never retained. A known queued execution that has not run keeps its
+/// pending status without a result while its details are not found; a
+/// completed execution whose retained result is unavailable keeps its
+/// completed status without a result while its details are not found; and a
+/// direct execution whose result recording is refused still answers its
+/// compact judgment at once, while its details are not found until the
+/// recording lands.
+///
+/// The queued execution stays queued because this server runs no Verifier
+/// runner. The unavailable result is a completed row naming a result no
+/// record holds. Recording is refused by the Scribe WAL disk-full breaker.
+///
+/// # Panics
+/// Panics when the server fails to start, a fixture write fails, a route
+/// fails to respond, or any status, code, or body differs.
+#[tokio::test(flavor = "current_thread")]
+async fn details_report_absence_when_retained_records_are_missing() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let fixture = Fixture::seed(&server).await;
+    let (_, jwt) = user(&server, "vr-absence-writer", &["editor"]).await;
+    let body = fixture.request(&fixture.assertion, json!(1));
+    let not_found = |execution: &str, (status, body): &(StatusCode, Value)| {
+        assert_eq!(
+            (*status, body["code"].as_str()),
+            (
+                StatusCode::NOT_FOUND,
+                Some("WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND")
+            ),
+            "{execution}: {body}"
+        );
+    };
+
+    let (status, accepted) = enqueue(&server, &jwt, &body, None).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    let queued = execution_id(&accepted);
+    let state = visible_execution(&server, &jwt, queued).await;
+    assert_eq!(state["status"], "pending", "{state}");
+    assert_eq!(state.get("result"), None, "{state}");
+    let details = format!("/v1/verification/executions/{queued}/details");
+    not_found("queued", &get(&server, &jwt, &details).await);
+
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let completed = sqlx::query(
+        "UPDATE wyrd.verifier_executions SET status = 'completed', \
+         result_id = $2, error = NULL, next_attempt_at = NULL, \
+         lease_token = NULL, lease_expires_at = NULL, settled_at = statement_timestamp() \
+         WHERE execution_id = $1",
+    )
+    .bind(queued.as_uuid())
+    .bind(Uuid::now_v7())
+    .execute(&pool)
+    .await
+    .expect("execution completes");
+    assert_eq!(completed.rows_affected(), 1);
+    let state = visible_execution(&server, &jwt, queued).await;
+    assert_eq!(state["status"], "completed", "{state}");
+    assert_eq!(state.get("result"), None, "{state}");
+    not_found("unretained", &get(&server, &jwt, &details).await);
+
+    server
+        .trip_bifrost_wal_disk_full_for_test()
+        .expect("the WAL breaker is reachable");
+    let (status, direct) = execute(&server, &jwt, body.to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{direct}");
+    assert_eq!(direct["outcome"]["verdict"], "passed", "{direct}");
+    assert_eq!(
+        direct["outcome"]
+            .as_object()
+            .map(|outcome| outcome.keys().map(String::as_str).collect::<BTreeSet<_>>()),
+        Some(BTreeSet::from(["requirements", "verdict"])),
+        "{direct}"
+    );
+    let direct_id = direct["execution_id"].as_str().expect("id").to_owned();
+    let uri = format!("/v1/verification/executions/{direct_id}");
+    not_found(
+        "unrecorded",
+        &get(&server, &jwt, &format!("{uri}/details")).await,
+    );
+    not_found("unrecorded status", &get(&server, &jwt, &uri).await);
+
+    server
+        .clear_bifrost_wal_disk_full_injection_for_test()
+        .expect("the WAL breaker is reachable");
+    server.flush_bifrost().await.expect("Scribe flushes");
+    assert_eq!(
+        compacted(&visible_details(&server, &jwt, &direct_id).await),
+        direct,
+        "the recording that lands is the judgment the caller received"
     );
     server.shutdown().await.expect("test server shuts down");
 }

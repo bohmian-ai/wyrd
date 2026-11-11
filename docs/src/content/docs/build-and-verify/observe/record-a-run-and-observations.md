@@ -53,8 +53,9 @@ def answer(question: str):
         reply = gateway.chat.completions.create(model="openai/gpt-4o", messages=messages)
         text = reply.choices[0].message.content
 
-        # A row in the Service's tickets table, tagged with this Run.
-        run.observe.record("bifrost.datasets.tickets", {"question": question, "answer": text})
+        # A row in the Service's tickets table, tagged with this Run. Buffered:
+        # state.shutdown() drains it.
+        run.bifrost.write("bifrost.datasets.tickets", {"question": question, "answer": text})
         return run, agent, text
 ```
 

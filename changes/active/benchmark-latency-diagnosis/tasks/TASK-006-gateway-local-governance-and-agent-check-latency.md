@@ -314,17 +314,28 @@ loading 503 like a client; `post_once` observes it.
 - **Symptom:** Gateway journeys `compatible::managed_secret_rotation_survives_server_restart` and `native::gateway_api_key_exchange_is_scoped_cached_and_revocable` got 503 instead of 4xx for a never-loaded tenant. **Evidence:** body `code: WYRD_SERVER_503_SERVICE_UNAVAILABLE`, "gateway configuration is loading". **Cause:** first call of a tenant not yet cached is refused retryably by design (REQ-030). **Fix site:** the shared journey client `Journey::post` retries that refusal for up to 10 s; every journey routes through it.
 
 Non-goals stayed excluded: no Redis, crash-safe local ledger, replica leases,
-strict global quota, new service, dependency, Cargo feature, SDK API or wire
-change. The prior strict admission tables/functions remain (expand-and-
+strict global quota, new service, SDK API or wire change. At the
+maintainer's direction, benchmark recording moved behind one feature:
+`wyrd-benchmark`'s `heap` feature became `bench` (no new feature), and
+`vala-verify` gained a dependency on the in-workspace `wyrd-benchmark` for
+the bench-only Agent phases. The prior strict admission tables/functions remain (expand-and-
 contract). Unrelated untracked directories under `changes/active/` were not
 touched.
 
-Status: BLOCKED. Approach step 5 is not complete. Localizing the remaining
-Agent cost after schema reuse, and verifying independently attributable gains
-for each reduction, both require a new profiled and unprofiled run of the
-`direct-verify` steps. Under the bounded measurement protocol that needs
-maintainer authorization first. Requested experiment: `direct-verify-c1`,
-`direct-verify-c64`, `direct-verify-model-c1`, `direct-verify-model-c64`, all
-standard repetitions, unchanged fixture and recorder settings, plus separate
-CPU-only and heap-only server captures of the model steps. Steps 1–4 and their
-proofs are complete.
+### Agent phase instrumentation (maintainer-directed)
+
+| Item | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Agent phases `resolve`, `bind`, `run`, `verdict`, `cite`, bench-only | `vala-verify/src/blocks/agent.rs` `AGENT_PHASE_DURATION_SECONDS`, `phase_start`/`phase_end`; no clock read unless the recorder is installed | `vala-verify::integration blocks_agent::benchmark_check_agent_times_each_phase` PASS; `-p vala-verify --test integration` 14/14 | PASS |
+| Capacity report breaks down Agent phases and the Gateway call | `capacity/verification/run.rs` `BREAKDOWN` row for the phase family; `component_totals` adds the `gateway.buffered` timing (a bench server records the Gateway call there, not in `wyrd_gateway_duration_seconds`) | `verification::run::tests::diagnostics_use_benchmark_distributions`, `diagnostics_include_gateway_phases_and_waits` PASS | PASS |
+| Benchmark-only timing exists only in `bench` builds | `wyrd-benchmark` `bench` feature gates `install` and `heap`; `enabled()` is `cfg!(feature = "bench") && …`; `wyrd-server` `bench = ["wyrd-benchmark/bench"]`; config and `MetricsBackend::install` refuse the snapshot without it | `cargo tree -p wyrd-server -e features -i wyrd-benchmark`: no `bench` in the default build; `cargo build -p wyrd-server --bin wyrd-server` clean; lib tests of wyrd-benchmark, vala-verify, wyrd-server, vala-bifrost-redux, wyrd-client 1866/1866 under test Postgres; `wyrd-client` transport integration 26/26; `mise run lints`, `check:deps`, `git diff --check` PASS | PASS |
+
+Commit: `31af28af7`.
+
+Status: BLOCKED on measurement authorization. The Agent internals are now
+instrumented, so one unprofiled run localizes the remaining Agent time;
+profiling is needed only if a phase is large and unclear. Requested
+experiment: `direct-verify-c1`, `direct-verify-c64`, `direct-verify-model-c1`,
+`direct-verify-model-c64`, all standard repetitions, unchanged fixture and
+recorder settings, no profiler and no heap capture. Steps 1–4 and their proofs
+are complete.

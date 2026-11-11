@@ -930,7 +930,11 @@ fn openai_chat(
     }
     messages.extend(turns.into_iter().map(|turn| {
         let content = if turn.plain {
-            OpenAiMessageContent::Text(turn.parts.concat())
+            // A plain turn lowers to one part, which moves rather than copies.
+            OpenAiMessageContent::Text(match <[String; 1]>::try_from(turn.parts) {
+                Ok([text]) => text,
+                Err(parts) => parts.concat(),
+            })
         } else {
             OpenAiMessageContent::Parts(
                 turn.parts

@@ -15,7 +15,7 @@ use serde_json::{Map, Value};
 use crate::error::{SkaldError, SkaldResult};
 use crate::media::{MediaKind, MediaRef, MediaSource};
 use crate::prompt::{
-    NamedFormat, Prompt, check_model, check_output_schema, media_placeholder_regex,
+    Compiled, NamedFormat, Prompt, check_model, check_output_schema, media_placeholder_regex,
 };
 use crate::request::{ProviderName, ProviderRequest};
 use crate::wire::anthropic_messages::{
@@ -444,7 +444,12 @@ impl AuthoredPrompt {
             name: named.name().to_owned(),
             schema: resolved,
         });
-        prompt.authored = Some(Box::new(self.clone()));
+        prompt.authored = Some(std::sync::Arc::new(Compiled {
+            authored: self.clone(),
+            request: prompt.request.clone(),
+            model: prompt.model.clone(),
+            provider: prompt.provider.clone(),
+        }));
         Ok(prompt)
     }
 
@@ -2249,6 +2254,14 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&prompt).expect("prompt json"),
             portable
+        );
+
+        let mut rerouted = prompt.clone();
+        rerouted.provider = None;
+        assert_eq!(
+            serde_json::to_value(&rerouted).expect("rerouted prompt json")["format"],
+            "messages",
+            "a Prompt whose provider changed serializes natively"
         );
 
         let mut edited = prompt;

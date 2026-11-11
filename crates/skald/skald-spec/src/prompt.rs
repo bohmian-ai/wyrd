@@ -49,10 +49,10 @@ pub struct Prompt {
     /// When absent, native dispatch uses the request dialect's default
     /// provider. Gateway routes select their own upstream and ignore it.
     pub provider: Option<ProviderName>,
-    /// The authored form this Prompt was compiled from, when it still
-    /// describes the request; absent after construction from a request or a
-    /// binding, when the native form is derived from the request instead.
-    pub(crate) authored: Option<Box<AuthoredPrompt>>,
+    /// The authored form this Prompt was compiled from and what that compile
+    /// produced; absent after construction from a request or a binding, when
+    /// the native form is derived from the request instead. Clones share it.
+    pub(crate) authored: Option<Arc<Compiled>>,
     /// Media kind each portable `${media:name}` binding requires, derived
     /// from its image or document block at compile time. Native placeholders
     /// carry no kind and are absent; the list survives text and media binds.
@@ -67,6 +67,21 @@ pub struct Prompt {
     /// The `variables` the rest of the request still declares, including
     /// `OpenAI` Chat system messages, which a system edit never replaces.
     pub(crate) body_variables: Vec<String>,
+}
+
+/// An authored Prompt beside the request, model, and dispatch provider its
+/// compile produced. Compiling is deterministic, so while a Prompt's public
+/// fields still equal these, the authored form describes it exactly.
+#[derive(Debug)]
+pub(crate) struct Compiled {
+    /// The authored form.
+    pub(crate) authored: AuthoredPrompt,
+    /// The compiled request.
+    pub(crate) request: ProviderRequest,
+    /// The compiled model.
+    pub(crate) model: String,
+    /// The compiled dispatch provider.
+    pub(crate) provider: Option<ProviderName>,
 }
 
 /// A named authored response format and the schema its host resolved.
@@ -624,23 +639,13 @@ impl Prompt {
     /// Returns [`SkaldError::PromptInvalid`] when the request kind is not a
     /// Prompt format, such as embeddings or a raw body.
     pub fn authored(&self) -> SkaldResult<std::borrow::Cow<'_, AuthoredPrompt>> {
-        // ponytail: recompiles to detect public-field mutation; make the
-        // fields private if Prompt serialization ever shows up in a profile.
         match self.authored.as_deref() {
-            Some(authored)
-                if authored
-                    .compile_resolved(
-                        self.named_format
-                            .as_ref()
-                            .and_then(|format| format.schema.clone()),
-                    )
-                    .is_ok_and(|compiled| {
-                        compiled.request == self.request
-                            && compiled.model == self.model
-                            && compiled.provider == self.provider
-                    }) =>
+            Some(compiled)
+                if compiled.request == self.request
+                    && compiled.model == self.model
+                    && compiled.provider == self.provider =>
             {
-                Ok(std::borrow::Cow::Borrowed(authored))
+                Ok(std::borrow::Cow::Borrowed(&compiled.authored))
             }
             _ => AuthoredPrompt::native(self.provider(), &self.model, &self.request)
                 .map(std::borrow::Cow::Owned),

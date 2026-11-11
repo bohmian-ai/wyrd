@@ -248,7 +248,8 @@ pub enum BlockError {
         reason: String,
     },
     /// The process refused the block a shared resource, such as a Python
-    /// worker or a workspace, at admission.
+    /// worker, a workspace, or a gateway call it cannot serve yet, at
+    /// admission.
     ///
     /// That is pressure on the host, not a failure of the block, so it spends
     /// no authored retry and is never judged: the engine stops the whole

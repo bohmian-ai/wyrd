@@ -604,6 +604,9 @@ struct Invoked {
     tool_calls: Vec<wyrd_spec::verification::execution::ToolCallRecord>,
 }
 
+/// The stable code of a server that cannot take the call now.
+const SERVER_UNAVAILABLE: &str = "WYRD_SERVER_503_SERVICE_UNAVAILABLE";
+
 /// Classify an Agent run failure.
 ///
 /// Provider answers follow the shared Agent classification and expose only a
@@ -612,9 +615,23 @@ struct Invoked {
 /// an unregistered provider, may clear on retry. Structured output still
 /// invalid when the Agent's iteration budget ran out carries its stable code
 /// and schema locations only. It is terminal, like every non-provider
-/// failure except an Agent timeout.
+/// failure except an Agent timeout. A gateway answering
+/// [`SERVER_UNAVAILABLE`] is the serving process draining, shedding load, or
+/// still loading the tenant's gateway configuration, so the block is
+/// [`BlockError::Busy`] and its execution runs again later instead of being
+/// judged.
 #[must_use]
 pub fn block_error(error: AgentError) -> BlockError {
+    if let AgentError::Provider(SkaldRuntimeError::Provider {
+        source: ProviderError::RemoteProblem(problem),
+        ..
+    }) = &error
+        && problem.code == SERVER_UNAVAILABLE
+    {
+        return BlockError::Busy {
+            reason: format!("{}: {}", problem.code, problem.message),
+        };
+    }
     let reason = match &error {
         AgentError::Provider(SkaldRuntimeError::Provider {
             source: ProviderError::RemoteProblem(problem),
@@ -674,5 +691,50 @@ pub(crate) fn render(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use skald_providers::RemoteProblem;
+    use skald_spec::ProviderName;
+
+    use super::*;
+
+    /// An Agent failure carrying the gateway problem `code`.
+    fn gateway_problem(code: &str, status: u16) -> AgentError {
+        AgentError::Provider(SkaldRuntimeError::from_provider(
+            ProviderName::OpenAi,
+            ProviderError::RemoteProblem(Box::new(RemoteProblem {
+                code: code.to_owned(),
+                status,
+                message: "gateway configuration is loading; retry shortly".to_owned(),
+                field: None,
+                remediation: String::new(),
+            })),
+        ))
+    }
+
+    /// A gateway that cannot serve the call yet makes the block busy, so the
+    /// execution runs again instead of judging it; a capacity refusal keeps
+    /// the shared retry classification.
+    #[test]
+    fn unavailable_gateway_is_busy_and_other_problems_are_classified() {
+        assert_eq!(
+            block_error(gateway_problem(SERVER_UNAVAILABLE, 503)),
+            BlockError::Busy {
+                reason: "WYRD_SERVER_503_SERVICE_UNAVAILABLE: \
+                         gateway configuration is loading; retry shortly"
+                    .to_owned()
+            }
+        );
+        assert!(matches!(
+            block_error(gateway_problem("WYRD_GATEWAY_429_LIMIT_EXCEEDED", 429)),
+            BlockError::Retryable { .. }
+        ));
+        assert!(matches!(
+            block_error(gateway_problem("WYRD_PERMISSION_403_DENIED_RBAC", 403)),
+            BlockError::Terminal { .. }
+        ));
     }
 }

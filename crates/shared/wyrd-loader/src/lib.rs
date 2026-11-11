@@ -567,7 +567,11 @@ mod tests {
             "URL = https://github.com/acme/widget.git",
         ] {
             let temp = TempDir::new().expect("temp directory creates");
-            checkout(temp.path(), None, "[repository.verified_by]\nverifier = []\n");
+            checkout(
+                temp.path(),
+                None,
+                "[repository.verified_by]\nverifier = []\n",
+            );
             std::fs::write(
                 temp.path().join(".git/config"),
                 format!("[remote \"origin\"]\n\t{line}\n"),

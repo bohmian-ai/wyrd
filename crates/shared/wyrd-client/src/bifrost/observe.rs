@@ -48,7 +48,7 @@ pub fn record(bifrost: &Bifrost, table: &WriterTable, json: Vec<u8>, correlation
 ///
 /// The cache-miss half of telemetry: a writer that has not yet described
 /// `fqn` must learn its table version before any batch can name it. Racing
-/// misses share one describe through [`Bifrost::writer_table`]'s gate, and a
+/// misses share one describe through the writer's described-table gate, and a
 /// failed describe drops and counts the row exactly as a full queue does.
 ///
 /// # Arguments

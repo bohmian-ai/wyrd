@@ -89,6 +89,8 @@ async function walkFiles(root) {
 
 const rootAllowed = new Set([
   "README.md",
+  "dist/authoring.d.ts",
+  "dist/authoring.js",
   "dist/card-types.d.ts",
   "dist/card-types.js",
   "dist/cli.d.ts",
@@ -97,6 +99,8 @@ const rootAllowed = new Set([
   "dist/error-codes.js",
   "dist/index.d.ts",
   "dist/index.js",
+  "dist/native.d.ts",
+  "dist/native.js",
   "dist/otel.d.ts",
   "dist/otel.js",
   "index.cjs",
@@ -147,6 +151,8 @@ try {
       import { Bifrost, TableConfig, WyrdAgentsTraceProcessor } from "wyrd-ai";
       if (typeof Bifrost.connect !== "function") throw new Error("Bifrost facade missing");
       if (typeof TableConfig !== "function") throw new Error("TableConfig missing");
+      const { Service } = await import("wyrd-ai/authoring");
+      if (new Service("app", "1.0.0").cardRef().version !== "1.0.0") throw new Error("authoring facade missing");
       // The clean project installs no optional peer, so this proves the Agents SDK is optional.
       await new WyrdAgentsTraceProcessor().onTraceStart({ traceId: "trace_1", name: "workflow" });
       const resolved = import.meta.resolve("wyrd-ai");
@@ -163,6 +169,8 @@ try {
     `import { Bifrost, TableConfig, WyrdAgentsTraceProcessor, WyrdClient, WyrdState } from "wyrd-ai";
 export const processor = new WyrdAgentsTraceProcessor();
 export type Root = [Bifrost, TableConfig, WyrdClient, WyrdState];
+import { Component, Service, Verifier } from "wyrd-ai/authoring";
+export const service: Service = new Service("app", "1.0.0").addComponent(new Component("judge", new Verifier("v", "1.0.0")));
 `,
   );
   const tsc = createRequire(join(sdkDir, "package.json")).resolve("typescript/bin/tsc");

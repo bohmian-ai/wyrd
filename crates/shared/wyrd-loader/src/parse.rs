@@ -246,6 +246,20 @@ fn parse_single_envelope(path: &Path, raw: serde_yaml::Value) -> Result<Authored
     })
 }
 
+/// Decode one Card envelope authored in memory exactly as one YAML document
+/// is decoded, so equal content yields equal Cards and diagnostics.
+///
+/// # Errors
+/// Returns [`parse_single_envelope`]'s diagnostics, labelled with `path`.
+pub(crate) fn parse_value(
+    path: &Path,
+    envelope: serde_json::Value,
+) -> Result<AuthoredCard, Diagnostic> {
+    let raw = serde_yaml::to_value(envelope)
+        .map_err(|error| Diagnostic::yaml_syntax(path.into(), &error))?;
+    parse_single_envelope(path, raw)
+}
+
 fn materialize_inline_files(
     value: &mut serde_yaml::Value,
     source_path: &Path,

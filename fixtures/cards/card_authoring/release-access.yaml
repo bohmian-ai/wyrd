@@ -1,0 +1,93 @@
+# The release-controls component's Verifier: independent recipient and
+# destination checks over synthetic records.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: release-access
+  version: 1.0.0
+spec:
+  description: The recipient and destination may receive the report.
+  inputs:
+    recipient:
+      type: json
+      schema:
+        type: object
+        additionalProperties: false
+        required: [email, authorized, permitted_purposes]
+        properties:
+          email: {type: string}
+          authorized: {type: boolean}
+          permitted_purposes: {type: array, items: {type: string}}
+    purpose: {type: json, schema: {type: string}}
+    destination:
+      type: json
+      schema:
+        type: object
+        additionalProperties: false
+        required: [url, encrypted, restricted_access, public_sharing]
+        properties:
+          url: {type: string}
+          encrypted: {type: boolean}
+          restricted_access: {type: boolean}
+          public_sharing: {type: boolean}
+    notes: {type: json, schema: {type: string}}
+  steps:
+    - id: recipient
+      action:
+        kind: code
+        entrypoint: recipient_facts
+        inputs: {recipient: inputs.recipient, purpose: inputs.purpose}
+        source:
+          inline: &checks |
+            """Release facts every card_authoring Verifier step computes."""
+
+
+            def recipient_facts(recipient: dict, purpose: str) -> dict:
+                return {
+                    "authorized": (
+                        recipient["authorized"] and purpose in recipient["permitted_purposes"]
+                    ),
+                }
+
+
+            def report_facts(report: dict) -> dict:
+                return {
+                    "contains_bank_identifier": "BANK-ACCOUNT-DEMO-001" in report["text"],
+                }
+
+
+            def destination_facts(destination: dict) -> dict:
+                return {
+                    "appropriate": (
+                        destination["encrypted"]
+                        and destination["restricted_access"]
+                        and not destination["public_sharing"]
+                    ),
+                }
+
+
+            def summarize_findings(recipient: dict, destination: dict) -> dict:
+                return {
+                    "releasable": recipient["authorized"] and destination["appropriate"],
+                    "recipient": recipient,
+                    "destination": destination,
+                }
+
+
+            def policy_context(report: dict, purpose: str) -> dict:
+                return {"has_report": bool(report["text"].strip()), "purpose": purpose}
+      requirements:
+        - id: recipient-authorized
+          statement: The recipient is authorized for this purpose.
+          check: {kind: assert, path: steps.recipient.output.authorized, operator: equals, expected: true}
+    - id: destination
+      action:
+        kind: code
+        entrypoint: destination_facts
+        inputs: {destination: inputs.destination}
+        source:
+          inline: *checks
+      requirements:
+        - id: destination-controls-satisfied
+          statement: The destination has appropriate access controls.
+          check: {kind: assert, path: steps.destination.output.appropriate, operator: equals, expected: true}

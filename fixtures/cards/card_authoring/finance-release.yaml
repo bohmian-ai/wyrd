@@ -1,0 +1,16 @@
+# Two distinct Agent components, each verified by its own two-step Verifier;
+# publish company-sharing-policy.pdf as Artifact company-sharing-policy 1.0.0 first.
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: finance-release
+  version: 1.0.0
+spec:
+  service_type: api
+  components:
+    - alias: report-reviewer
+      ref: ./report-reviewer.yaml
+      verified_by: [{verifier: ./report-policy.yaml}]
+    - alias: release-controls
+      ref: ./release-controls.yaml
+      verified_by: [{verifier: ./release-access.yaml}]

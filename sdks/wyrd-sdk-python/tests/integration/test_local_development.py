@@ -1013,7 +1013,7 @@ def interrupt_hidden_question(cli_path: str, home: Path, env: dict[str, str], se
         child.send_signal(sent)
         stdout, stderr = child.communicate(timeout=30)
         assert child.returncode == 130, stderr
-        assert termios.tcgetattr(slave)[3] & termios.ECHO, "echo left disabled"
+        assert termios.tcgetattr(master)[3] & termios.ECHO, "echo left disabled"
         assert b"typed-but-unsent" not in shown + stdout + stderr
         assert not (home / "wyrd/config.toml").exists()
         assert not (home / "wyrd/credentials.toml").exists()

@@ -1252,16 +1252,17 @@ fn tight_files() -> HostedLimits {
     }
 }
 
-/// A Verifier extracting media slots `a` and optional `b`, accepting
-/// `formats` up to `max_bytes`, whose one requirement holds when `a`
-/// extracts in two separate steps.
+/// A Verifier with media slots `a` and `b`, each accepting `formats` up to
+/// `max_bytes`, whose one requirement holds when `a` extracts in two
+/// separate steps; evidence omitted for `b` stays missing, and nothing reads
+/// it.
 ///
 /// # Panics
 /// Panics when the static spec is invalid.
 fn two_extracts(formats: &[&str], max_bytes: Option<u64>) -> Arc<VerifierSpec> {
-    let slot = |required: bool| json!({ "type": "media", "formats": formats, "max_bytes": max_bytes, "required": required });
+    let slot = json!({ "type": "media", "formats": formats, "max_bytes": max_bytes });
     let spec: VerifierSpec = serde_json::from_value(json!({
-        "inputs": { "a": slot(true), "b": slot(false) },
+        "inputs": { "a": slot.clone(), "b": slot },
         "steps": [
             { "id": "first", "action": { "kind": "extract", "from": "inputs.a" } },
             { "id": "again", "action": { "kind": "extract", "from": "inputs.a" } }
@@ -1438,8 +1439,8 @@ async fn nonconforming_queued_evidence_errors_without_a_verdict() {
             &json!({
                 "inputs": {
                     "x": { "type": "json", "schema": { "type": "integer" } },
-                    "a": { "type": "media", "formats": ["text"], "required": false },
-                    "b": { "type": "media", "formats": ["text"], "required": false }
+                    "a": { "type": "media", "formats": ["text"] },
+                    "b": { "type": "media", "formats": ["text"] }
                 },
                 "requirements": [{ "id": "x-present", "statement": "x is present.",
                     "check": { "kind": "assert", "path": "inputs.x", "operator": "is_not_null" } }]

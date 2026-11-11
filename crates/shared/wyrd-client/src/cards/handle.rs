@@ -235,7 +235,7 @@ impl Cards {
     /// Loads one Card document from disk and declares it through the authenticated registry.
     ///
     /// The loader resolves the document and its local source context before this method
-    /// delegates the durable write to [`Self::declare`].
+    /// delegates the durable write to the declaration saga.
     ///
     /// # Arguments
     /// * `path` - A Card file, or a bundle directory whose Card files and
@@ -253,23 +253,88 @@ impl Cards {
     ) -> Result<DeclarationReceipt, WyrdError> {
         let tree = wyrd_loader::load(path.as_ref())?;
         let input = wyrd_loader::build_declaration_input(tree)?;
-        self.declare(&input).await
+        self.submit(&input).await
     }
 
-    /// Declare a loader-produced composite input and drive its private
-    /// artifact transfer and server-owned completion lifecycle.
+    /// Declare a native input, the Card file or bundle at a path, or an
+    /// authored Card graph, and drive artifact transfer and server-owned
+    /// completion.
     ///
-    /// Native language card holders lower into this input at their language
-    /// adapter boundary. Local source paths are consumed only by the private
-    /// saga and never enter the request body.
+    /// A path is loaded as [`Self::declare_from_path`] loads it. An authored
+    /// Card is snapshotted and validated first
+    /// ([`crate::authoring::CardDefinition::declaration`]), so an invalid
+    /// graph publishes nothing; each local Artifact it references is then
+    /// published as its own sole submission through
+    /// [`Self::upload_artifact`], dependencies first, and the graph is
+    /// declared last. A local Artifact declared as the root is its own
+    /// publication, and its receipt is returned. A registered reference is used as is, with nothing
+    /// read or uploaded. Every submission follows the registry's version
+    /// rules, so an unchanged rerun declares nothing new. Local source paths
+    /// never enter a request body.
     ///
     /// # Arguments
-    /// * `input` - The loader-produced declaration input, including local artifact sources.
+    /// * `input` - A [`DeclarationInput`], a path, or an authored Card.
     ///
     /// # Errors
-    /// Returns a Wyrd error when validation, declaration, artifact upload, or
-    /// server-owned completion fails.
-    pub async fn declare(&self, input: &DeclarationInput) -> Result<DeclarationReceipt, WyrdError> {
+    /// Returns the loader's or the authored graph's local validation error
+    /// (`WYRD_LOADER_400_INVALID_ENVELOPE`, or
+    /// `WYRD_SPEC_400_DUPLICATE_SUBMISSION` for two definitions of one
+    /// identity), [`Self::upload_artifact`]'s errors for a local Artifact,
+    /// and the registry's error when validation, declaration, artifact
+    /// upload, or completion fails. A graph refused after an Artifact was
+    /// published keeps that Artifact version registered.
+    ///
+    /// # Cancellation
+    /// Nothing is rolled back. Every Artifact published before a failure or
+    /// a dropped future stays registered, and one interrupted mid-publication
+    /// is left as [`Self::upload_artifact`] describes. A graph interrupted
+    /// after its submission is left as the server holds it. A retry is a new
+    /// call under the registry's ordinary version rules, not a resumption.
+    pub async fn declare(
+        &self,
+        input: impl Into<Declarable<'_>>,
+    ) -> Result<DeclarationReceipt, WyrdError> {
+        match input.into() {
+            Declarable::Input(input) => self.submit(input).await,
+            Declarable::Path(path) => self.declare_from_path(path).await,
+            Declarable::Card(card) => {
+                let declaration = card.declaration()?;
+                let mut published = None;
+                for artifact in declaration.artifacts {
+                    published = Some(
+                        self.publish_artifact(
+                            artifact.source,
+                            artifact.metadata,
+                            artifact.spec,
+                            artifact.extract,
+                        )
+                        .await?,
+                    );
+                }
+                match (declaration.input, published) {
+                    (Some(input), _) => self.submit(&input).await,
+                    (None, Some(root)) => Ok(root),
+                    (None, None) => Err(WyrdError::internal(
+                        "an authored declaration held neither a graph nor an Artifact",
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Run the declaration saga for one native input.
+    ///
+    /// # Errors
+    /// Returns the saga's validation, declaration, upload, or completion
+    /// error.
+    ///
+    /// # Cancellation
+    /// As [`crate::cards::saga::declare`]: dropping the future after
+    /// submission leaves the server-owned declaration as it stands, possibly
+    /// pending with its files partially uploaded, and nothing is rolled
+    /// back. A retry is a fresh call under the registry's ordinary version
+    /// rules, not a resumption.
+    async fn submit(&self, input: &DeclarationInput) -> Result<DeclarationReceipt, WyrdError> {
         crate::cards::saga::declare(&self.engine, input, None)
             .await
             .map_err(Into::into)
@@ -312,13 +377,36 @@ impl Cards {
         spec: crate::cards::ArtifactSpec,
         extract: bool,
     ) -> Result<CardRef, WyrdError> {
-        let source = source.as_ref().to_path_buf();
+        let receipt = self
+            .publish_artifact(source.as_ref().to_path_buf(), metadata, spec, extract)
+            .await?;
+        Ok(receipt.root)
+    }
+
+    /// Prepare and declare one Artifact upload, returning the ordinary
+    /// declaration receipt; the work of [`Self::upload_artifact`].
+    ///
+    /// The prepared upload, and with it any extraction scratch directory,
+    /// lives until the declaration has transferred every file.
+    ///
+    /// # Errors
+    /// As [`Self::upload_artifact`].
+    ///
+    /// # Cancellation
+    /// As [`Self::upload_artifact`].
+    async fn publish_artifact(
+        &self,
+        source: std::path::PathBuf,
+        metadata: crate::cards::Metadata,
+        spec: crate::cards::ArtifactSpec,
+        extract: bool,
+    ) -> Result<DeclarationReceipt, WyrdError> {
         let upload = tokio::task::spawn_blocking(move || {
             wyrd_loader::ArtifactUpload::prepare(&source, metadata, spec, extract)
         })
         .await
         .map_err(|error| WyrdError::internal(format!("artifact preparation stopped: {error}")))??;
-        Ok(self.declare(&upload.input).await?.root)
+        self.submit(&upload.input).await
     }
 
     /// The server-authoritative file inventory of one Card: each file's
@@ -1058,5 +1146,73 @@ mod tests {
             CardSelector::uid(kind, uid),
             CardSelector::Uid { .. }
         ));
+    }
+}
+
+/// What [`Cards::declare`] accepts: a native input, the Card file or bundle
+/// directory at a path, or an authored Card graph.
+#[derive(Debug, Clone)]
+pub enum Declarable<'a> {
+    /// A loader-produced declaration input.
+    Input(&'a DeclarationInput),
+    /// A Card file, or a bundle directory declared together.
+    Path(std::path::PathBuf),
+    /// An authored Card and everything it references.
+    Card(Box<crate::authoring::CardDefinition>),
+}
+
+impl<'a> From<&'a DeclarationInput> for Declarable<'a> {
+    /// The native input as is.
+    fn from(input: &'a DeclarationInput) -> Self {
+        Self::Input(input)
+    }
+}
+
+impl From<std::path::PathBuf> for Declarable<'_> {
+    /// The Card file or bundle at `path`.
+    fn from(path: std::path::PathBuf) -> Self {
+        Self::Path(path)
+    }
+}
+
+impl From<&std::path::PathBuf> for Declarable<'_> {
+    /// The Card file or bundle at `path`.
+    fn from(path: &std::path::PathBuf) -> Self {
+        Self::Path(path.clone())
+    }
+}
+
+impl From<&Path> for Declarable<'_> {
+    /// The Card file or bundle at `path`.
+    fn from(path: &Path) -> Self {
+        Self::Path(path.to_path_buf())
+    }
+}
+
+impl From<&str> for Declarable<'_> {
+    /// The Card file or bundle at `path`.
+    fn from(path: &str) -> Self {
+        Self::Path(path.into())
+    }
+}
+
+impl From<String> for Declarable<'_> {
+    /// The Card file or bundle at `path`.
+    fn from(path: String) -> Self {
+        Self::Path(path.into())
+    }
+}
+
+impl From<crate::authoring::CardDefinition> for Declarable<'_> {
+    /// The authored Card and everything it references.
+    fn from(card: crate::authoring::CardDefinition) -> Self {
+        Self::Card(Box::new(card))
+    }
+}
+
+impl From<&crate::authoring::CardDefinition> for Declarable<'_> {
+    /// A copy of the authored Card as it is now.
+    fn from(card: &crate::authoring::CardDefinition) -> Self {
+        Self::Card(Box::new(card.clone()))
     }
 }

@@ -325,8 +325,7 @@ impl VerificationEngine {
     /// Before any block runs, every supplied declaration must conform to its
     /// declared slot (see [`conform`]) and the host's evidence reader, when
     /// set, must admit the whole set. A declared slot left unsupplied is not
-    /// refused here: a required one leaves its dependents without evidence
-    /// and an optional one reads as null.
+    /// refused here: it leaves the checks that need it inconclusive.
     ///
     /// # Errors
     /// Returns [`EngineError::InputInvalid`] or [`EngineError::InputTooLarge`]
@@ -527,7 +526,7 @@ impl VerificationEngine {
         walk(
             &stages,
             |ledger: &RunLedger<Done>, stage| {
-                let scope = Scope::new(spec, evidence, ledger);
+                let scope = Scope::new(evidence, ledger);
                 stage
                     .tasks
                     .iter()

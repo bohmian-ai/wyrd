@@ -1277,7 +1277,7 @@ fn standalone_card_request(kind: &str, name: &str, spec: Value, key: &str) -> Re
 ///
 /// Through the public HTTP route, with real declared targets behind every
 /// reference, this proves: the retired `kind: Drift` and `kind: Eval` Cards
-/// are refused; a `verifier`, `runs_on`, or `on_failure`
+/// and a slot-level `required`, true or false, are refused; a `verifier`, `runs_on`, or `on_failure`
 /// reference that resolves to a Card of the wrong kind is refused with its
 /// stable kind error; a repeated Verifier or Operator in one binding is
 /// refused as a duplicate; and an Operator carrying literal credential
@@ -1380,6 +1380,45 @@ async fn verifier_contract_refusals_leave_no_writes() {
             );
         }
     };
+
+    for (slot, name) in [
+        (
+            json!({ "type": "json", "required": false }),
+            "vc-optional-json",
+        ),
+        (
+            json!({ "type": "trace", "required": true }),
+            "vc-required-trace",
+        ),
+    ] {
+        let operation = format!("{name}-operation");
+        let response = server
+            .oneshot_authenticated(
+                &jwt,
+                standalone_card_request(
+                    "Verifier",
+                    name,
+                    json!({ "inputs": { "evidence": slot } }),
+                    &operation,
+                ),
+            )
+            .await
+            .expect("refused registration responds");
+        let status = response.status();
+        let problem = response_json(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{name}: {problem}");
+        assert_eq!(
+            problem["code"], "WYRD_REGISTRY_400_INVALID_CARD_SPEC",
+            "{name}: {problem}"
+        );
+        assert!(
+            problem["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("inputs.evidence: unknown field `required`")),
+            "{name}: {problem}"
+        );
+        assert_no_declaration_writes(&server, &operation, name).await;
+    }
 
     for kind in ["Drift", "Eval"] {
         let name = format!("vc-retired-{}", kind.to_lowercase());

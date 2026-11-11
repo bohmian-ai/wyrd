@@ -7,7 +7,7 @@ spec:
   description: One coding turn's prompt, tool, edit, test, or diff call left its tests passing.
   inputs:
     call: {type: json}
-    trace: {type: trace, required: false}
+    trace: {type: trace}
   requirements:
     - id: tests-pass
       statement: The call left the tests passing

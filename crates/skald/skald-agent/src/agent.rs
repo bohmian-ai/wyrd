@@ -187,8 +187,10 @@ pub struct AgentCallbacks {
 pub struct Agent {
     /// Local Card metadata used for envelope projection.
     pub(crate) meta: CardMetadata,
-    /// Preserved durable prompt reference.
-    pub(crate) prompt_ref: InlineableRef<PromptSpec>,
+    /// Preserved durable prompt reference: set when the Agent was built from
+    /// one, otherwise derived on first read as the inline native form of
+    /// [`Self::prompt`], so constructing an Agent never copies its Prompt.
+    pub(crate) prompt_ref: OnceLock<InlineableRef<PromptSpec>>,
     /// Runtime-local tool names preserved for YAML round trips.
     pub(crate) tool_names: Vec<String>,
     /// Stable id used for tracing and diagnostics.
@@ -260,8 +262,7 @@ impl Agent {
     /// run.
     #[must_use]
     pub fn new(prompt: Prompt) -> Self {
-        let prompt_ref = InlineableRef::from(prompt.clone().into_native());
-        Self::from_resolved_parts(generate_agent_id(), prompt_ref, prompt)
+        Self::from_resolved_parts(generate_agent_id(), OnceLock::new(), prompt)
     }
 
     /// Build an Agent from an already-shared resolved Prompt.
@@ -270,8 +271,7 @@ impl Agent {
     /// prompt handle.
     #[must_use]
     pub fn from_resolved(id: impl Into<String>, prompt: Arc<Prompt>) -> Self {
-        let prompt_ref = InlineableRef::from(prompt.as_ref().clone().into_native());
-        Self::from_resolved_arc_parts(id.into(), prompt_ref, prompt)
+        Self::from_resolved_arc_parts(id.into(), OnceLock::new(), prompt)
     }
 
     /// Build an Agent from a prompt reference and resolver.
@@ -288,7 +288,7 @@ impl Agent {
         let prompt = resolve_prompt_ref(&prompt_ref, resolver)?;
         Ok(Self::from_resolved_parts(
             generate_agent_id(),
-            prompt_ref,
+            OnceLock::from(prompt_ref),
             prompt,
         ))
     }
@@ -303,9 +303,8 @@ impl Agent {
     /// Return a copy retargeted to a resolved Prompt.
     #[must_use]
     pub fn with_prompt(mut self, prompt: impl Into<Arc<Prompt>>) -> Self {
-        let prompt = prompt.into();
-        self.prompt_ref = InlineableRef::from(prompt.as_ref().clone().into_native());
-        self.prompt = prompt;
+        self.prompt_ref = OnceLock::new();
+        self.prompt = prompt.into();
         self
     }
 
@@ -319,7 +318,7 @@ impl Agent {
         resolver: &dyn PromptResolver,
     ) -> Result<Self, WyrdError> {
         self.prompt = Arc::new(resolve_prompt_ref(&prompt_ref, resolver)?);
-        self.prompt_ref = prompt_ref;
+        self.prompt_ref = OnceLock::from(prompt_ref);
         Ok(self)
     }
 
@@ -582,10 +581,13 @@ impl Agent {
         self.meta.version.as_deref()
     }
 
-    /// Return the preserved prompt reference.
+    /// Return the preserved prompt reference, or for an Agent built from a
+    /// resolved Prompt, the inline native form of [`Self::prompt`] as first
+    /// read.
     #[must_use]
     pub fn prompt_ref(&self) -> &InlineableRef<PromptSpec> {
-        &self.prompt_ref
+        self.prompt_ref
+            .get_or_init(|| InlineableRef::from(self.prompt.as_ref().clone().into_native()))
     }
 
     /// Return preserved runtime-local tool names.
@@ -770,18 +772,19 @@ impl Agent {
 
     fn from_resolved_parts(
         id: String,
-        prompt_ref: InlineableRef<PromptSpec>,
+        prompt_ref: OnceLock<InlineableRef<PromptSpec>>,
         prompt: Prompt,
     ) -> Self {
         Self::from_resolved_arc_parts(id, prompt_ref, Arc::new(prompt))
     }
 
     /// Builds an Agent with identity `id` over an already resolved shared
-    /// Prompt and its authored reference; every other field takes its default,
+    /// Prompt and its authored reference (empty to derive it from the Prompt
+    /// on first read); every other field takes its default,
     /// including the native execution route and no gateway caller.
     fn from_resolved_arc_parts(
         id: String,
-        prompt_ref: InlineableRef<PromptSpec>,
+        prompt_ref: OnceLock<InlineableRef<PromptSpec>>,
         prompt: Arc<Prompt>,
     ) -> Self {
         Self {
@@ -812,7 +815,7 @@ impl Agent {
     #[must_use]
     pub fn to_spec(&self) -> AgentSpec {
         AgentSpec {
-            prompt: self.prompt_ref.clone(),
+            prompt: self.prompt_ref().clone(),
             execution_route: self.execution_route.clone(),
             tool_names: self.tool_names.clone(),
             run_config: self.run_config_spec(),

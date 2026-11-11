@@ -1700,7 +1700,7 @@ pub struct MetricsConfig {
     /// Prometheus recorder: its metrics listener then serves the read-only
     /// benchmark snapshot, `GET /benchmark/snapshot`, and no `/metrics`
     /// exposition. Defaults to false; only a benchmark-owned server enables
-    /// it, and it requires a loopback bind.
+    /// it, and it requires a loopback bind and a `bench` build.
     #[serde(default)]
     pub benchmark_snapshot: bool,
 }
@@ -3418,8 +3418,16 @@ impl WyrdServerConfig {
             }
         }
 
-        // 1c. The benchmark snapshot is served only on an enabled loopback
-        // metrics listener: it is an unauthenticated local readout.
+        // 1c. The benchmark snapshot exists only in a `bench` build and is
+        // served only on an enabled loopback metrics listener: it is an
+        // unauthenticated local readout.
+        if self.metrics.benchmark_snapshot && !cfg!(feature = "bench") {
+            return Err(ConfigError::Invalid {
+                message: "metrics.benchmark_snapshot requires a wyrd-server built with the \
+                          `bench` feature"
+                    .to_owned(),
+            });
+        }
         if self.metrics.benchmark_snapshot
             && (!self.metrics.enabled || self.metrics.is_public_bind(self.http.bind))
         {

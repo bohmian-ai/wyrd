@@ -10,9 +10,12 @@ publish = false
 description = "Opt-in high-resolution recording for benchmark-owned Wyrd servers."
 
 [features]
-# The allocation sampler and its pprof rendering (`heap`). Benchmark binaries
-# enable it; ordinary clients and SDKs never do.
-heap = ["dep:backtrace", "dep:flate2", "dep:prost"]
+# Benchmark recording: `install`, every timing and scan recorder, and the
+# allocation sampler with its pprof rendering. Only benchmark builds enable it;
+# without it `enabled` is a constant `false`, nothing can install the recorder,
+# every recorder call returns at once, and every site `enabled` guards compiles
+# away, so shipped binaries carry only operational metrics.
+bench = ["dep:backtrace", "dep:flate2", "dep:prost"]
 
 [dependencies]
 backtrace = { workspace = true, optional = true }
@@ -29,6 +32,8 @@ ulid = { workspace = true }
 
 [dev-dependencies]
 workspace-hack.workspace = true
+# The recorder's own tests install it.
+wyrd-benchmark = { path = ".", features = ["bench"] }
 
 [lints]
 workspace = true

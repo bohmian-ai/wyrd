@@ -60,8 +60,12 @@ configuration declares server limits.
   counters, gauges and diagnostic histograms all land in the snapshots it
   serves at `/benchmark/snapshot` on the loopback metrics port, and no
   Prometheus recorder or exporter runs. A duration that has both a timing
-  and a production histogram is recorded only as the timing. Ordinary
-  deployments install Prometheus and record nothing here. CPU and heap
+  and a production histogram is recorded only as the timing. The recorder,
+  every benchmark-only timing (such as an Agent check's
+  `wyrd_verification_agent_phase_duration_seconds{phase}`), and the heap
+  sampler exist only in a `wyrd-server` built with the `bench` feature, which
+  `bench:build` uses; a shipped build keeps only operational metrics, installs
+  Prometheus, and refuses `WYRD_METRICS_BENCHMARK_SNAPSHOT`. CPU and heap
   profiles and the OS's CPU and memory readings remain separate sources.
 - **Latency is server-side.** Each judged request is timed inside the server
   from handler entry until its result is ready, its write is acknowledged, or

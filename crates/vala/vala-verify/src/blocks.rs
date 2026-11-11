@@ -18,7 +18,8 @@ pub(crate) mod agent;
 mod tools;
 
 pub use agent::{
-    AgentCardResolver, AgentExecutor, EvidenceReader, PromptCardResolver, block_error,
+    AGENT_PHASE_DURATION_SECONDS, AgentCardResolver, AgentExecutor, EvidenceReader,
+    PromptCardResolver, block_error,
 };
 pub use tools::{AgentToolset, ToolSession, provider_tool_name};
 

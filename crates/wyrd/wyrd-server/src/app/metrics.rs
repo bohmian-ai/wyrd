@@ -231,6 +231,10 @@ pub enum MetricsError {
     /// Another recorder was installed before the benchmark recorder.
     #[error("failed to install the benchmark recorder")]
     Benchmark(#[source] metrics::SetRecorderError<wyrd_benchmark::BenchmarkRecorder>),
+    /// The benchmark recorder was requested from a build without the `bench`
+    /// feature, which has no recorder to install.
+    #[error("the benchmark recorder requires a wyrd-server built with the `bench` feature")]
+    BenchmarkUnavailable,
 }
 
 /// The process's one metrics backend, selected once at startup.
@@ -250,15 +254,21 @@ impl MetricsBackend {
     ///
     /// # Errors
     ///
-    /// Returns [`MetricsError`] when bucket setup fails or a recorder is
-    /// already installed; nothing falls back to the other backend.
+    /// Returns [`MetricsError`] when bucket setup fails, a recorder is
+    /// already installed, or `benchmark` is requested from a build without
+    /// the `bench` feature; nothing falls back to the other backend.
     pub fn install(benchmark: bool) -> Result<Self, MetricsError> {
         if !benchmark {
             return install_recorder().map(Self::Prometheus);
         }
-        wyrd_benchmark::install().map_err(MetricsError::Benchmark)?;
-        vala_bifrost_redux::gate::initialize_gate_metrics();
-        Ok(Self::Benchmark)
+        #[cfg(not(feature = "bench"))]
+        return Err(MetricsError::BenchmarkUnavailable);
+        #[cfg(feature = "bench")]
+        {
+            wyrd_benchmark::install().map_err(MetricsError::Benchmark)?;
+            vala_bifrost_redux::gate::initialize_gate_metrics();
+            Ok(Self::Benchmark)
+        }
     }
 
     /// The Prometheus render handle; `None` for the benchmark backend.

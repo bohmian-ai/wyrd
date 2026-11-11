@@ -39,6 +39,34 @@ use super::{
     CheckOutput, EngineError, Position, verdict_from,
 };
 
+/// Histogram of one Agent call's phases, seconds, labelled `phase`:
+/// `resolve` (the Agent, its Prompt, and the route), `bind` (inputs and
+/// citation slots into the Prompt), `run` (the Agent loop, its tools and model
+/// calls), and, for a check, `verdict` (the answer against the Verdict format)
+/// and `cite` (citations against reachable evidence). It is benchmark-only
+/// timing: recorded only once [`wyrd_benchmark::install`] has run, so a build
+/// without the `bench` feature never records or times it.
+pub const AGENT_PHASE_DURATION_SECONDS: &str = "wyrd_verification_agent_phase_duration_seconds";
+
+/// One benchmark-only Agent phase's start: `None` unless the benchmark
+/// recorder is installed, so an ordinary build reads no clock.
+fn phase_start() -> Option<std::time::Instant> {
+    wyrd_benchmark::enabled().then(std::time::Instant::now)
+}
+
+/// Records the Agent `phase` begun at `started` into
+/// [`AGENT_PHASE_DURATION_SECONDS`] and returns the next phase's start.
+fn phase_end(
+    phase: &'static str,
+    started: Option<std::time::Instant>,
+) -> Option<std::time::Instant> {
+    let started = started?;
+    let now = std::time::Instant::now();
+    metrics::histogram!(AGENT_PHASE_DURATION_SECONDS, "phase" => phase)
+        .record(now.duration_since(started).as_secs_f64());
+    Some(now)
+}
+
 /// Resolves a registered Agent Card into its pure Agent spec.
 #[async_trait]
 pub trait AgentCardResolver: Send + Sync {
@@ -367,9 +395,12 @@ impl AgentExecutor {
         slots: &BTreeSet<SlotName>,
         deadline: Instant,
     ) -> Result<Invoked, BlockError> {
+        let started = phase_start();
         let resolved = self.resolve(&call.agent).await?;
         let route = self.route(id, &resolved.spec.execution_route)?;
+        let started = phase_end("resolve", started);
         let (prompt, vars) = self.bind(resolved.prompt, inputs, slots).await?;
+        let started = phase_end("bind", started);
         let declared = resolved
             .spec
             .tool_names
@@ -431,6 +462,7 @@ impl AgentExecutor {
         let run = run
             .expect("the loop only stops early for a raised refusal")
             .map_err(block_error)?;
+        phase_end("run", started);
         Ok(Invoked {
             structured: run.structured_output,
             text: run.output,
@@ -522,11 +554,14 @@ impl CheckExecutor for AgentExecutor {
                 "the check Agent's Prompt declares no Verdict format",
             ));
         };
+        let started = phase_start();
         let mut verdict = verdict_from(&self.schemas, schema, Value::Object(answer))?;
+        let started = phase_end("verdict", started);
         let citations = std::mem::take(&mut verdict.citations);
         if let Some(reader) = &self.evidence {
             verdict.citations = reader.cited(&reachable, citations).await?;
         }
+        phase_end("cite", started);
         if verdict.outcome == VerificationVerdict::Passed && verdict.citations.is_empty() {
             verdict.outcome = VerificationVerdict::Inconclusive;
             verdict.reason = format!(

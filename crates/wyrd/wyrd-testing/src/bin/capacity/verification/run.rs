@@ -43,7 +43,7 @@ use wyrd_testing::experiment::{
 use wyrd_testing::gateway_capture::{FIXTURE_ROOT, GatewayCapture, PacedUpstream, Pacing};
 use wyrd_testing::release_server::{LocalServer, Metrics};
 
-use crate::gateway::run::{PHASE_SECONDS, WAIT_SECONDS, WAITS};
+use crate::gateway::run::{BUFFERED, PHASE_SECONDS, WAIT_SECONDS, WAITS};
 use crate::verification::workload::{
     ASSERT_VERIFIER, JUDGE_SLOT, JUDGE_VERIFIER, Tenant, context, failing,
 };
@@ -110,12 +110,14 @@ pub(crate) const STAGED: (&str, &str) = ("outcome", "staged");
 pub(crate) const SUBMITTED: (&str, &str) = ("origin", "manual");
 
 /// The verification runtime's component histograms, each with the label that
-/// names its components: queued execution phases, Verifier blocks, queue SQL,
-/// each outbox's write, and the Scribe queue, WAL, and lane times. A direct
-/// execution's phases are its `verification.direct.*` timing parts.
-const BREAKDOWN: [(&str, &str); 9] = [
+/// names its components: queued execution phases, Verifier blocks, Agent call
+/// phases, queue SQL, each outbox's write, and the Scribe queue, WAL, and lane
+/// times. A direct execution's phases are its `verification.direct.*` timing
+/// parts, and an Agent check's Gateway call is its [`BUFFERED`] timing.
+const BREAKDOWN: [(&str, &str); 10] = [
     ("wyrd_verification_phase_duration_seconds", "phase"),
     ("wyrd_verification_block_duration_seconds", "kind"),
+    ("wyrd_verification_agent_phase_duration_seconds", "phase"),
     ("wyrd_verification_store_duration_seconds", "op"),
     ("outbox_write_seconds", "outbox"),
     ("bifrost_scribe_queue_wait_seconds", ""),
@@ -1303,9 +1305,10 @@ pub(crate) fn acknowledgements(population: &Population) -> Result<Distribution, 
 }
 
 /// The runtime's component times over a window, largest total first: each
-/// [`BREAKDOWN`] histogram series and each direct execution phase part,
-/// keyed `family{label=value}` with the `wyrd_verification_` prefix and the
-/// `_seconds` unit dropped, or by part boundary.
+/// [`BREAKDOWN`] histogram series, each direct execution phase part, and the
+/// Gateway's [`BUFFERED`] call timing, keyed `family{label=value}` with the
+/// `wyrd_verification_` prefix and the `_seconds` unit dropped, or by
+/// boundary.
 ///
 /// # Panics
 ///
@@ -1343,7 +1346,7 @@ fn component_totals(population: &Population) -> BTreeMap<String, Distribution> {
         }
     }
     for series in &population.series {
-        if series.boundary.starts_with(DIRECT_PARTS) {
+        if series.boundary.starts_with(DIRECT_PARTS) || series.boundary == BUFFERED {
             add(series.boundary.clone(), &series.elapsed);
         }
     }
@@ -1411,8 +1414,8 @@ mod tests {
     /// Diagnostic means, acknowledgements, and components come from the
     /// benchmark recorder's snapshots: the production submission, queue-wait,
     /// and component histograms through the standard `metrics` interface,
-    /// and the timed Scribe appends and direct phases through their timing
-    /// parts, each observation counted once.
+    /// and the timed Scribe appends, direct phases, and Gateway calls through
+    /// their timings, each observation counted once.
     ///
     /// # Panics
     /// Panics when a benchmark observation is missing, counted twice, or its
@@ -1426,7 +1429,16 @@ mod tests {
         metrics::histogram!(super::QUEUE_WAIT, "origin" => "manual").record(0.000_3);
         metrics::histogram!(super::SCRIBE_ACK).record(0.000_4);
         metrics::histogram!("outbox_write_seconds", "outbox" => "scribe").record(0.000_05);
+        metrics::histogram!("wyrd_verification_agent_phase_duration_seconds", "phase" => "run")
+            .record(0.000_3);
         let span = tracing::Span::none();
+        wyrd_benchmark::record_timing(
+            &span,
+            super::BUFFERED,
+            "succeeded",
+            Duration::from_micros(200),
+            Some(Duration::from_micros(10)),
+        );
         wyrd_benchmark::record_timing(
             &span,
             super::SCRIBE_WRITE,
@@ -1467,9 +1479,11 @@ mod tests {
         }
         assert!(super::observed_components(&population));
         let components = super::components(&population, 1);
-        assert_eq!(components.len(), 2, "{components:?}");
-        assert!(components[0].starts_with("component verification.direct.engine:"));
-        assert!(components[1].starts_with("component outbox_write{outbox=scribe}:"));
+        assert_eq!(components.len(), 4, "{components:?}");
+        assert!(components[0].starts_with("component agent_phase_duration{phase=run}:"));
+        assert!(components[1].starts_with("component gateway.buffered:"));
+        assert!(components[2].starts_with("component verification.direct.engine:"));
+        assert!(components[3].starts_with("component outbox_write{outbox=scribe}:"));
         assert!(
             !super::observed_components(&wyrd_testing::capacity::Population::default()),
             "an empty window has no component"

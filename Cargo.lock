@@ -9305,6 +9305,7 @@ dependencies = [
  "uuid",
  "vala-drift",
  "workspace-hack",
+ "wyrd-benchmark",
  "wyrd-skald-agent",
  "wyrd-skald-prompt",
  "wyrd-skald-providers",
@@ -10156,6 +10157,7 @@ dependencies = [
  "tracing-subscriber",
  "ulid",
  "workspace-hack",
+ "wyrd-benchmark",
 ]
 
 [[package]]
@@ -10693,6 +10695,7 @@ dependencies = [
  "wyrd-queue",
  "wyrd-runtime",
  "wyrd-semver",
+ "wyrd-server",
  "wyrd-skald-agent",
  "wyrd-skald-prompt",
  "wyrd-skald-providers",

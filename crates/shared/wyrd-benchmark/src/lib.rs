@@ -41,7 +41,7 @@
 //! residual, or a missing component is counted, never clamped, and makes the
 //! interval's series report a problem.
 
-#[cfg(feature = "heap")]
+#[cfg(feature = "bench")]
 pub mod heap;
 mod recorder;
 
@@ -153,12 +153,14 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
 /// Installs [`BenchmarkRecorder`] as this process's only standard `metrics`
 /// recorder and starts recording benchmark timings. A benchmark server calls
 /// it once at startup, before registering any metric; it cannot be turned
-/// off, and a repeated call after it succeeded does nothing.
+/// off, and a repeated call after it succeeded does nothing. It exists only
+/// with the `bench` feature, so a build without it cannot record.
 ///
 /// # Errors
 ///
 /// Returns the refusal when another `metrics` recorder is already installed:
 /// a process never mixes the benchmark recorder with another backend.
+#[cfg(feature = "bench")]
 pub fn install() -> Result<(), metrics::SetRecorderError<BenchmarkRecorder>> {
     if enabled() {
         return Ok(());
@@ -169,10 +171,13 @@ pub fn install() -> Result<(), metrics::SetRecorderError<BenchmarkRecorder>> {
     Ok(())
 }
 
-/// Whether [`install`] made this process a benchmark recorder.
+/// Whether [`install`] made this process a benchmark recorder. Without the
+/// `bench` feature it is a constant `false`, so every site it guards compiles
+/// away.
 #[must_use]
+#[inline]
 pub fn enabled() -> bool {
-    ENABLED.load(Ordering::Acquire)
+    cfg!(feature = "bench") && ENABLED.load(Ordering::Acquire)
 }
 
 /// One request's benchmark classification, kept in its span's extensions.

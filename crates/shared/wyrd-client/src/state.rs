@@ -84,6 +84,7 @@ impl fmt::Debug for TypedCards {
         formatter
             .debug_struct("TypedCards")
             .field("agents", &self.agents.keys().collect::<Vec<_>>())
+            .field("agent_prompts", &self.agent_prompts)
             .field("prompts", &self.prompts.keys().collect::<Vec<_>>())
             .field("models", &self.models.keys().collect::<Vec<_>>())
             .field("data", &self.data.keys().collect::<Vec<_>>())

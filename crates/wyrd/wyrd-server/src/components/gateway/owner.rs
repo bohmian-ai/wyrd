@@ -20,6 +20,10 @@ use crate::boot::ServerBootError;
 use crate::config::{DeploymentProfile, GatewayConfig};
 use crate::state::EngineWorker;
 
+/// Wait before retrying reloads after a pass in which a snapshot load failed,
+/// so failing storage is retried steadily rather than in a tight loop.
+const RELOAD_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// One server's governed gateway; see the module docs.
 pub struct Gateway {
     /// Operator-declared credential bindings and secret backends, shared with
@@ -140,8 +144,12 @@ impl Gateway {
             Box::pin(async move {
                 let reloads = async {
                     loop {
+                        let mut failed = false;
                         for tenant in snapshots.reloads().await {
-                            snapshots.reload(&postgres, &config, tenant).await;
+                            failed |= snapshots.reload(&postgres, &config, tenant).await.is_err();
+                        }
+                        if failed {
+                            tokio::time::sleep(RELOAD_RETRY).await;
                         }
                     }
                 };

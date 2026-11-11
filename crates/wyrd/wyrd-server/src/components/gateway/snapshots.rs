@@ -16,7 +16,9 @@
 //! forgets everything and queues every forgotten tenant for reload. A call
 //! finding no snapshot never loads one itself: it queues its tenant and is
 //! refused with the retryable 503, because an unknown policy cannot be
-//! assumed to carry no quotas. A notification is delivered after its commit,
+//! assumed to carry no quotas. A reload that does not install stays queued
+//! until one does, and a failed one forgets the tenant's snapshot meanwhile;
+//! see [`GatewaySnapshots::install`]. A notification is delivered after its commit,
 //! so a call racing an administrative write can still route on the previous
 //! snapshot for that delivery and reload latency, as a call admitted just
 //! before the write would.
@@ -35,6 +37,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use wyrd_gateway::GatewayTenantSnapshot;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::error::WyrdError;
 
 use super::service::load_snapshot;
 use crate::config::GatewayConfig;
@@ -147,28 +150,77 @@ impl GatewaySnapshots {
     }
 
     /// Loads `tenant`'s snapshot from `postgres` with `config`'s bindings and
-    /// caches it, returning whether it was cached: not while the node is not
-    /// listening, when the load fails (logged), or when an invalidation
-    /// raced it, which queued another reload itself.
+    /// installs it; see [`Self::install`] for what a load that does not
+    /// install leaves behind.
+    ///
+    /// Returns whether the snapshot was cached.
+    ///
+    /// # Errors
+    /// Returns the load's error after logging it.
     pub(crate) async fn reload(
         &self,
         postgres: &wyrd_sql::WyrdPostgres,
         config: &GatewayConfig,
         tenant: DataTenantId,
-    ) -> bool {
+    ) -> Result<bool, WyrdError> {
         let Some(generation) = self.fill_generation() else {
-            return false;
+            return Ok(false);
         };
-        match load_snapshot(postgres, config, tenant).await {
-            Ok(snapshot) => self.insert(tenant, Some(generation), snapshot).1,
+        let loaded = load_snapshot(postgres, config, tenant).await;
+        self.install(tenant, generation, loaded)
+    }
+
+    /// Installs one reload of `tenant` that started under `generation`,
+    /// keeping the reload owed until a current load installs.
+    ///
+    /// A load raced by any invalidation is not cached and queues `tenant`
+    /// again, since the invalidation may have named another tenant. A failed
+    /// load also forgets `tenant`'s snapshot, which a reload only replaces
+    /// once it may be stale, so calls are refused through the cache-miss 503
+    /// rather than served an obsolete policy while storage fails; other
+    /// tenants keep serving. Returns whether the snapshot was cached.
+    ///
+    /// # Errors
+    /// Returns the failed load's error after logging it.
+    fn install(
+        &self,
+        tenant: DataTenantId,
+        generation: u64,
+        loaded: Result<GatewayTenantSnapshot, WyrdError>,
+    ) -> Result<bool, WyrdError> {
+        match loaded {
+            Ok(snapshot) => {
+                let cached = self.insert(tenant, Some(generation), snapshot).1;
+                if !cached {
+                    self.requeue(tenant);
+                }
+                Ok(cached)
+            }
             Err(error) => {
                 tracing::warn!(tenant = %tenant.as_uuid(), error = %error, "gateway snapshot reload failed");
-                false
+                self.entries().snapshots.pop(&tenant);
+                self.requeue(tenant);
+                Err(error)
             }
         }
     }
 
+    /// Queues `tenant` for reload again while listening; a node that is not
+    /// listening queues every tenant it forgot once it listens again.
+    fn requeue(&self, tenant: DataTenantId) {
+        let mut entries = self.entries();
+        if entries.live {
+            entries.queue(tenant);
+            drop(entries);
+            self.wake.notify_one();
+        }
+    }
+
     /// Waits until the listener is live.
+    ///
+    /// # Panics
+    /// Panics if the cache's own watch sender is gone, which cannot happen
+    /// while `self` is borrowed.
     #[cfg(test)]
     pub(crate) async fn listening(&self) {
         self.live
@@ -272,9 +324,11 @@ impl GatewaySnapshots {
 mod tests {
     use std::collections::BTreeSet;
     use std::num::NonZeroU64;
+    use std::sync::Arc;
 
     use wyrd_gateway::GatewayTenantSnapshot;
     use wyrd_spec::DataTenantId;
+    use wyrd_spec::error::WyrdError;
     use wyrd_spec::gateway::{GatewayCaptureMode, GatewayCapturePolicy};
 
     use super::{CACHE_TENANTS, GatewaySnapshots};
@@ -336,6 +390,58 @@ mod tests {
         cache.reset(true);
         assert!(cache.cached(tenant).is_none(), "a lost listener forgets");
         assert_eq!(cache.reloads().await.len(), 2, "forgotten tenants reload");
+    }
+
+    /// A reload fenced by another tenant's invalidation stays queued and
+    /// installs on its next attempt without another edit, and a failed load
+    /// forgets only that tenant's snapshot and stays queued until a load
+    /// installs.
+    ///
+    /// # Panics
+    /// Panics when a fenced or failed reload is dropped, a fenced load is
+    /// cached, a failed tenant keeps serving, or another tenant stops serving.
+    #[tokio::test]
+    async fn reloads_that_do_not_install_stay_owed() {
+        let cache = GatewaySnapshots::default();
+        cache.reset(true);
+        let (a, b) = (DataTenantId::new_v7(), DataTenantId::new_v7());
+        cache.insert(a, cache.fill_generation(), snapshot());
+        cache.insert(b, cache.fill_generation(), snapshot());
+        let obsolete = cache.cached(a).expect("a serves");
+
+        cache.invalidate(&a.as_uuid().to_string());
+        assert_eq!(cache.reloads().await, vec![a]);
+        let started = cache.fill_generation().expect("listening");
+        cache.invalidate(&b.as_uuid().to_string());
+        assert_eq!(
+            cache.install(a, started, Ok(snapshot())).ok(),
+            Some(false),
+            "a fenced load is not cached"
+        );
+        let mut owed = cache.reloads().await;
+        owed.sort();
+        let mut both = vec![a, b];
+        both.sort();
+        assert_eq!(owed, both, "the fenced reload stays queued beside b");
+        let retry = cache.fill_generation().expect("listening");
+        assert_eq!(cache.install(a, retry, Ok(snapshot())).ok(), Some(true));
+        assert!(
+            !Arc::ptr_eq(&cache.cached(a).expect("a serves"), &obsolete),
+            "the retry replaces the obsolete snapshot"
+        );
+
+        let failing = cache.fill_generation().expect("listening");
+        let failure = WyrdError::ServiceUnavailable {
+            message: "storage is down".to_owned(),
+            details: serde_json::json!({}),
+        };
+        assert!(cache.install(a, failing, Err(failure)).is_err());
+        assert!(cache.cached(a).is_none(), "a failed reload stops serving");
+        assert!(cache.cached(b).is_some(), "other tenants keep serving");
+        assert_eq!(cache.reloads().await, vec![a], "the failed reload is owed");
+        let recovered = cache.fill_generation().expect("listening");
+        assert_eq!(cache.install(a, recovered, Ok(snapshot())).ok(), Some(true));
+        assert!(cache.cached(a).is_some(), "recovery serves again");
     }
 
     /// The cache retains at most [`CACHE_TENANTS`] tenants, evicting the

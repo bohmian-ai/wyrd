@@ -646,10 +646,12 @@ impl<'a> GatewayAdministration<'a> {
     pub(crate) async fn warm(&self, tenant: DataTenantId) {
         let snapshots = self.state.gateway.snapshots();
         for _ in 0..3 {
-            if snapshots
-                .reload(self.postgres.wyrd(), self.config, tenant)
-                .await
-            {
+            if matches!(
+                snapshots
+                    .reload(self.postgres.wyrd(), self.config, tenant)
+                    .await,
+                Ok(true)
+            ) {
                 break;
             }
         }

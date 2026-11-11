@@ -1222,6 +1222,83 @@ async fn usage_cache_bounds_staleness_restarts_and_policy_changes() {
     drain_gateway(&restarted).await;
 }
 
+/// A snapshot reload that fails on storage stops serving the stale policy
+/// with the retryable 503 before any dispatch, and background retry installs
+/// the committed configuration once storage recovers, with no further edit.
+///
+/// The failure is the pricing table disappearing from the snapshot query
+/// while another server's change notification arrives; renaming it back
+/// sends no notification.
+///
+/// # Panics
+/// Panics when the fixture or a call fails, the stale policy keeps serving,
+/// a refused call dispatches, or the snapshot does not recover.
+#[tokio::test]
+async fn snapshot_reload_recovers_from_a_transient_load_failure() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let dispatch = Scripted::shared();
+    let state = replica(&fixture, dispatch.clone()).await;
+    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
+    let caller = invoker(tenant, 1, [open_access()]);
+    let call = || request("dep-a/a", None, Duration::from_secs(30));
+    let snapshots = state.gateway.snapshots();
+    assert!(
+        snapshots.cached(tenant).is_some(),
+        "configured tenant serves"
+    );
+
+    let admin = fixture.superuser_pool().expect("superuser pool");
+    let rename = |sql: &'static str| {
+        let admin = admin.clone();
+        async move {
+            sqlx::query(sql)
+                .execute(&admin)
+                .await
+                .expect("pricing table renames");
+        }
+    };
+    rename("ALTER TABLE wyrd.gateway_model_pricing RENAME TO gateway_model_pricing_hidden").await;
+    sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(super::snapshots::SNAPSHOT_CHANNEL)
+        .bind(tenant.as_uuid().to_string())
+        .execute(&admin)
+        .await
+        .expect("change notifies");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while snapshots.cached(tenant).is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a failed reload stops serving the stale snapshot");
+    let refused = GatewayInvocation::new(&state)
+        .invoke(&caller, call())
+        .await
+        .expect_err("a tenant without a usable snapshot is refused");
+    assert_eq!(refused.code(), "WYRD_SERVER_503_SERVICE_UNAVAILABLE");
+    assert!(
+        dispatch.seen().is_empty(),
+        "a refused call never dispatches"
+    );
+
+    rename("ALTER TABLE wyrd.gateway_model_pricing_hidden RENAME TO gateway_model_pricing").await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while snapshots.cached(tenant).is_none() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("background retry reloads once storage recovers");
+    dispatch.push(Step::Return(completed(10, 5)));
+    GatewayInvocation::new(&state)
+        .invoke(&caller, call())
+        .await
+        .expect("the recovered snapshot admits");
+    assert_eq!(dispatch.seen(), ["dep-a"]);
+    drain_gateway(&state).await;
+}
+
 /// The ledger fences replayed reservations, an abandoned expired reservation
 /// is never settled and so keeps counting at its full reserved cost, and a
 /// deadline-exceeded call captures unknown usage and cost and settles at the

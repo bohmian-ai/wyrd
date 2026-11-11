@@ -990,7 +990,7 @@ dependencies = [
 [[package]]
 name = "bohmian-code-review"
 version = "0.1.0"
-source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=b8a4f37857d48a0b57669db5c4c6ed11aba59766#b8a4f37857d48a0b57669db5c4c6ed11aba59766"
+source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=5a5fb1679638fec5a65e59fe95c345440b954b73#5a5fb1679638fec5a65e59fe95c345440b954b73"
 dependencies = [
  "bohmian-code-review-core",
  "bohmian-code-review-extract",
@@ -1003,7 +1003,7 @@ dependencies = [
 [[package]]
 name = "bohmian-code-review-core"
 version = "0.1.0"
-source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=b8a4f37857d48a0b57669db5c4c6ed11aba59766#b8a4f37857d48a0b57669db5c4c6ed11aba59766"
+source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=5a5fb1679638fec5a65e59fe95c345440b954b73#5a5fb1679638fec5a65e59fe95c345440b954b73"
 dependencies = [
  "serde",
  "serde_json",
@@ -1013,7 +1013,7 @@ dependencies = [
 [[package]]
 name = "bohmian-code-review-extract"
 version = "0.1.0"
-source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=b8a4f37857d48a0b57669db5c4c6ed11aba59766#b8a4f37857d48a0b57669db5c4c6ed11aba59766"
+source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=5a5fb1679638fec5a65e59fe95c345440b954b73#5a5fb1679638fec5a65e59fe95c345440b954b73"
 dependencies = [
  "bohmian-code-review-core",
  "cc",
@@ -1043,7 +1043,7 @@ dependencies = [
 [[package]]
 name = "bohmian-code-review-index"
 version = "0.1.0"
-source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=b8a4f37857d48a0b57669db5c4c6ed11aba59766#b8a4f37857d48a0b57669db5c4c6ed11aba59766"
+source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=5a5fb1679638fec5a65e59fe95c345440b954b73#5a5fb1679638fec5a65e59fe95c345440b954b73"
 dependencies = [
  "bohmian-code-review-core",
 ]
@@ -1051,7 +1051,7 @@ dependencies = [
 [[package]]
 name = "bohmian-code-review-pipeline"
 version = "0.1.0"
-source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=b8a4f37857d48a0b57669db5c4c6ed11aba59766#b8a4f37857d48a0b57669db5c4c6ed11aba59766"
+source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=5a5fb1679638fec5a65e59fe95c345440b954b73#5a5fb1679638fec5a65e59fe95c345440b954b73"
 dependencies = [
  "bohmian-code-review",
  "flate2",
@@ -1068,7 +1068,7 @@ dependencies = [
 [[package]]
 name = "bohmian-code-review-resolve"
 version = "0.1.0"
-source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=b8a4f37857d48a0b57669db5c4c6ed11aba59766#b8a4f37857d48a0b57669db5c4c6ed11aba59766"
+source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=5a5fb1679638fec5a65e59fe95c345440b954b73#5a5fb1679638fec5a65e59fe95c345440b954b73"
 dependencies = [
  "bohmian-code-review-core",
  "bohmian-code-review-index",
@@ -1077,7 +1077,7 @@ dependencies = [
 [[package]]
 name = "bohmian-code-review-select"
 version = "0.1.0"
-source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=b8a4f37857d48a0b57669db5c4c6ed11aba59766#b8a4f37857d48a0b57669db5c4c6ed11aba59766"
+source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=5a5fb1679638fec5a65e59fe95c345440b954b73#5a5fb1679638fec5a65e59fe95c345440b954b73"
 dependencies = [
  "bohmian-code-review-core",
  "bohmian-code-review-index",
@@ -8385,7 +8385,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

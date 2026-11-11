@@ -66,6 +66,9 @@ struct HydratedArtifact {
 struct TypedCards {
     /// Agent Card holders keyed by exact `CardRef`.
     agents: BTreeMap<String, AgentCard>,
+    /// The exact `CardRef` key of each Agent's pinned Prompt, keyed like
+    /// `agents`, so navigation formats no key.
+    agent_prompts: BTreeMap<String, String>,
     /// Prompt Card holders keyed by exact `CardRef`.
     prompts: BTreeMap<String, PromptCard>,
     /// Model Card holders keyed by exact `CardRef`.
@@ -108,12 +111,16 @@ impl TypedCards {
                 json!({ "card_ref_key": key }),
             )
         })?;
-        let prompt = self.prompts.get(&prompt_ref.to_string()).ok_or_else(|| {
-            state_bundle_error(
-                "Agent prompt target is missing or is not a Prompt Card",
-                json!({ "card_ref_key": key, "card_ref": prompt_ref }),
-            )
-        })?;
+        let prompt = self
+            .agent_prompts
+            .get(key)
+            .and_then(|prompt_key| self.prompts.get(prompt_key))
+            .ok_or_else(|| {
+                state_bundle_error(
+                    "Agent prompt target is missing or is not a Prompt Card",
+                    json!({ "card_ref_key": key, "card_ref": prompt_ref }),
+                )
+            })?;
         Ok(HydratedAgent {
             card,
             prompt_ref,
@@ -188,7 +195,8 @@ struct HydratedStateIndex {
     /// Exact root reference emitted by the hydration producer.
     root_ref: CardRef,
     /// Complete Card envelopes indexed by canonical exact-reference key.
-    cards_by_ref: BTreeMap<String, Card>,
+    /// Shared so adapter projections retain the same envelope.
+    cards_by_ref: BTreeMap<String, Arc<Card>>,
     /// Exact Card references indexed by their canonical key.
     refs_by_key: BTreeMap<String, CardRef>,
     /// Persisted aliases mapped to canonical exact-reference keys.
@@ -235,7 +243,7 @@ impl HydratedStateIndex {
         for item in loaded {
             let key = item.key;
             refs_by_key.insert(key.clone(), item.card_ref);
-            cards_by_ref.insert(key.clone(), item.card);
+            cards_by_ref.insert(key.clone(), Arc::new(item.card));
             #[cfg(feature = "internal")]
             {
                 let mut item_aliases = item.aliases;
@@ -295,7 +303,7 @@ impl HydratedStateIndex {
     /// Returns an invalid-state-bundle error when the key is absent from the
     /// validated Card map.
     fn card_by_key(&self, key: &str) -> Result<&Card, WyrdError> {
-        self.cards_by_ref.get(key).ok_or_else(|| {
+        self.cards_by_ref.get(key).map(Arc::as_ref).ok_or_else(|| {
             state_bundle_error(
                 "validated CardRef key points to a missing Card",
                 json!({ "card_ref_key": key }),
@@ -942,10 +950,10 @@ impl WyrdState {
             let Some(verifier_ref) = binding.verifier.as_card_ref() else {
                 continue;
             };
-            let card = self.index.card_by_key(&verifier_ref.to_string())?;
-            if card.metadata.name.as_str() != name {
+            if verifier_ref.name.as_str() != name {
                 continue;
             }
+            let card = self.index.card_by_key(&verifier_ref.to_string())?;
             let Spec::Verifier(spec) = &card.spec else {
                 return Err(state_bundle_error(
                     "a verified_by binding names a Card that is not a Verifier",
@@ -1331,8 +1339,11 @@ impl WyrdState {
     }
 
     /// Iterate over every loaded Card keyed by its canonical exact `CardRef`.
+    ///
+    /// Each Card is the state's shared envelope, so an adapter projection
+    /// can retain it without copying.
     #[cfg(feature = "internal")]
-    pub fn cards(&self) -> impl Iterator<Item = (&str, &Card)> {
+    pub fn cards(&self) -> impl Iterator<Item = (&str, &Arc<Card>)> {
         self.index
             .cards_by_ref
             .iter()
@@ -1344,7 +1355,7 @@ impl WyrdState {
     /// # Arguments
     /// * `kind` - The Card kind to keep.
     #[cfg(feature = "internal")]
-    pub fn cards_of_kind(&self, kind: CardKind) -> impl Iterator<Item = (&str, &Card)> {
+    pub fn cards_of_kind(&self, kind: CardKind) -> impl Iterator<Item = (&str, &Arc<Card>)> {
         self.index
             .cards_by_ref
             .iter()
@@ -1787,33 +1798,40 @@ fn state_bundle_error(message: impl Into<String>, details: Value) -> WyrdError {
 /// # Errors
 /// Returns `WYRD_SDK_400_INVALID_STATE_BUNDLE` when a validated envelope cannot
 /// be converted to its required native typed holder.
-fn hydrate_typed_cards(cards: &BTreeMap<String, Card>) -> Result<TypedCards, WyrdError> {
+fn hydrate_typed_cards(cards: &BTreeMap<String, Arc<Card>>) -> Result<TypedCards, WyrdError> {
     let mut typed = TypedCards::default();
     for (key, envelope) in cards {
         match envelope.kind {
             CardKind::Agent => {
-                let holder = AgentCard::from_envelope(envelope.clone())
+                let holder = AgentCard::from_envelope(Card::clone(envelope))
                     .map_err(|error| typed_hydration_error(envelope, &error))?;
                 typed.agents.insert(key.clone(), holder);
             }
             CardKind::Prompt => {
-                let holder = PromptCard::from_card(envelope.clone())
+                let holder = PromptCard::from_card(Card::clone(envelope))
                     .map_err(|error| typed_hydration_error(envelope, &error))?;
                 typed.prompts.insert(key.clone(), holder);
             }
             CardKind::Model => {
-                let holder = ModelCard::from_card(envelope.clone())
+                let holder = ModelCard::from_card(Card::clone(envelope))
                     .map_err(|error| typed_hydration_error(envelope, &error))?;
                 typed.models.insert(key.clone(), holder);
             }
             CardKind::Data => {
-                let holder = DataCard::from_card(envelope.clone())
+                let holder = DataCard::from_card(Card::clone(envelope))
                     .map_err(|error| typed_hydration_error(envelope, &error))?;
                 typed.data.insert(key.clone(), holder);
             }
             _ => {}
         }
     }
+    typed.agent_prompts = typed
+        .agents
+        .iter()
+        .filter_map(|(key, agent)| {
+            Some((key.clone(), agent.spec.prompt.as_card_ref()?.to_string()))
+        })
+        .collect();
     for key in typed.agents.keys() {
         typed.agent(key)?;
     }

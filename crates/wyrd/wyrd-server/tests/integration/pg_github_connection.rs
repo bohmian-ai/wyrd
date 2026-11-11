@@ -498,6 +498,18 @@ impl Connected {
 
     /// Mint a token for `repository` while `during` runs against GitHub's
     /// held answer, and return the minting result.
+    ///
+    /// The mint must reach GitHub's token request; one refused before it never
+    /// releases the hold, and the call waits until the test times out.
+    ///
+    /// # Errors
+    /// Returns the error of [`GithubConnections::installation_token`]
+    /// unchanged: `WYRD_GITHUB_409_CONNECTION_CONFLICT` when `during` changed
+    /// the slot while GitHub minted, a not-connected, inaccessible-repository
+    /// or unavailable refusal, or a registry error.
+    ///
+    /// # Panics
+    /// Panics when `during` panics, such as on a failed assertion inside it.
     async fn mint_while<F: std::future::Future<Output = ()>>(
         &self,
         repository: u64,

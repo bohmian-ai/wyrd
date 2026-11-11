@@ -633,3 +633,55 @@ async fn contexts_expire_without_extension_and_stay_in_their_tenant() {
         })
     );
 }
+
+/// Two cold pinned reviews of one repository racing over Wyrd custody
+/// both succeed with the same comparison, converge on one snapshot, and a
+/// later review reuses it without another archive.
+///
+/// # Panics
+/// Panics when either racing review fails, they disagree, more than one
+/// snapshot object is kept, or the later review rebuilds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn competing_cold_reviews_converge_on_one_snapshot() {
+    let custody = Custody::start().await;
+    let github = FakeGitHub::pinned();
+    let pipeline = ReviewPipeline::new(
+        &custody.objects,
+        &custody.metadata,
+        PipelineLimits::default(),
+    );
+    let identity = custody.identity();
+    let (first_client, second_client) = (github.client(), github.client());
+    let pins = pins();
+
+    let (first, second) = tokio::join!(
+        pipeline.pinned(&first_client, &identity, &pins, None),
+        pipeline.pinned(&second_client, &identity, &pins, None),
+    );
+    let (first, second) = (
+        first.expect("first racing review"),
+        second.expect("second racing review"),
+    );
+    assert_eq!(first.full, second.full);
+    assert_eq!(
+        custody
+            .stored()
+            .iter()
+            .filter(|path| path.contains("/snapshots/"))
+            .count(),
+        1,
+        "{:?}",
+        custody.stored()
+    );
+
+    let later = github.client();
+    pipeline
+        .pinned(&later, &identity, &pins, None)
+        .await
+        .expect("later review");
+    assert_eq!(
+        later.calls().get(Operation::Archive),
+        0,
+        "the later review reuses the converged snapshot"
+    );
+}

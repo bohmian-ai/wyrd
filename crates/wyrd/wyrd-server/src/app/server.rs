@@ -797,7 +797,11 @@ impl BoundServer {
         // work returns immediately even when the supervised drain consumed
         // the whole budget; work still running at the deadline is a lifecycle
         // failure rather than a clean drain.
-        let gateway_drained = self.state.gateway.drain(deadline).await;
+        let gateway_drained = self
+            .state
+            .gateway
+            .drain(self.state.postgres.wyrd(), deadline)
+            .await;
         let mcp_drained = self.state.mcp.drain(deadline).await;
         let hosted_closed = self.state.verification.close_hosted(deadline).await;
         let terminal = match terminal {

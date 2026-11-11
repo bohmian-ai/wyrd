@@ -4,7 +4,7 @@
 //! [`GatewayInvocation::invoke`] is the single pipeline: validate the request,
 //! authorize and audit the exact requested model, load one immutable tenant
 //! snapshot, plan candidates, authorize and audit every fallback candidate,
-//! admit against limits and budgets in tenant Postgres, execute through the
+//! admit against limits and budgets in process memory, execute through the
 //! shared [`GatewayEngine`], and account every attempt. Identity comes only
 //! from the verified [`Caller`]; the gateway engine never sees a database
 //! handle.
@@ -522,19 +522,20 @@ impl<'a> GatewayInvocation<'a> {
     /// Checks, authorizes, routes, and reserves one call before any provider
     /// sees it.
     ///
-    /// Latency: on the request path. The tenant snapshot is served from the
-    /// process cache, and [`Self::admit`] costs one Postgres statement only
-    /// when a limit or budget covers the call. A capturing call first waits
+    /// Latency: on the request path, with no Postgres wait. The tenant
+    /// snapshot is served from the process cache, and [`Self::admit`]
+    /// charges process memory. A capturing call first waits
     /// for a Scribe outbox capture slot ([`Self::capture_slot`]), which is
     /// immediate unless the outbox is full. Every invoke-decision audit, here and per fallback
     /// model in [`Self::route`], is staged on the process audit outbox and is
     /// not a request-path round trip.
     ///
     /// # Errors
-    /// Returns `ServiceUnavailable` while the server drains,
+    /// Returns `ServiceUnavailable` while the server drains or before the
+    /// tenant's snapshot is cached (queueing its background load),
     /// `GatewayInvalidRequest` for an invalid fallback override or
     /// out-of-range timeout, the mapped permission denial of the requested
-    /// model, and every error of the snapshot load, [`Self::route`],
+    /// model, and every error of [`Self::route`],
     /// [`Self::capture_slot`], and [`Self::admit`]. Every one is undispatched.
     ///
     /// The snapshot, authorize, route, and admit phases are recorded on
@@ -567,9 +568,15 @@ impl<'a> GatewayInvocation<'a> {
             })?;
         let tenant = caller.data_tenant_id;
         let started = std::time::Instant::now();
-        let snapshot = GatewayAdministration::new(self.state)
-            .snapshot(tenant)
-            .await?;
+        let snapshot = self
+            .state
+            .gateway
+            .snapshots()
+            .admitted(tenant)
+            .ok_or_else(|| WyrdError::ServiceUnavailable {
+                message: "gateway configuration is loading; retry shortly".to_owned(),
+                details: json!({}),
+            })?;
         telemetry.since(Phase::Snapshot, started);
         let started = std::time::Instant::now();
         self.decide(caller, OPERATION, &request.model, &snapshot)
@@ -630,7 +637,7 @@ impl<'a> GatewayInvocation<'a> {
             trace,
             capture_slot,
         };
-        let admission = self.admit(&call, &mut plan).await?;
+        let admission = self.admit(&call, &mut plan)?;
         telemetry.since(Phase::Admit, started);
         Ok((call, plan, admission))
     }
@@ -968,36 +975,14 @@ impl<'a> GatewayInvocation<'a> {
 
     /// Admits `call` against its limits and budgets.
     ///
-    /// A call nothing covers is admitted with no IO; a covered call costs one
-    /// admission statement.
+    /// Admits `call` against this server's quota usage, with no IO.
     ///
     /// # Errors
-    /// Returns the admission rejections of [`GatewayLedger::admit`] and
-    /// `ServiceUnavailable` when storage fails; a rejection charges nothing.
+    /// Returns the admission rejections of [`GatewayLedger::admit`]; a
+    /// rejection charges nothing.
     #[tracing::instrument(name = "gateway.admit", skip_all)]
-    async fn admit(
-        &self,
-        call: &AdmittedCall,
-        plan: &mut CallPlan,
-    ) -> Result<Admission, WyrdError> {
-        GatewayLedger::new(self.state.postgres.wyrd())
-            .admit(&call.ledger(), plan)
-            .await
-    }
-
-    /// Settles what admission charged `call`, in one statement, after the
-    /// caller has its answer.
-    ///
-    /// A failure is logged and never changes the call: leases lapse at their
-    /// expiry and each reservation keeps counting at its reserved cost.
-    #[tracing::instrument(name = "gateway.account", skip_all)]
-    async fn settle(state: &AppState, call: &AdmittedCall, accounted: &Accounted) {
-        if let Err(error) = GatewayLedger::new(state.postgres.wyrd())
-            .settle(call.tenant, accounted)
-            .await
-        {
-            tracing::error!(call_id = %call.call_id.as_uuid(), error = %error, "gateway call settlement failed");
-        }
+    fn admit(&self, call: &AdmittedCall, plan: &mut CallPlan) -> Result<Admission, WyrdError> {
+        GatewayLedger::new(self.state.gateway.usage()).admit(&call.ledger(), plan)
     }
 
     /// Terminal facts of `execution` when the admitted policy captures `call`.
@@ -1305,12 +1290,10 @@ impl CallTask {
     /// Prices and settles a buffered call, answers the caller, then captures
     /// it.
     ///
-    /// Latency: pricing is in memory. A call that charged a limit or budget
-    /// settles in one statement before the answer is sent, so a caller that
-    /// calls again on its answer never meets its own lease, hold, or
-    /// reservation; a call that charged nothing waits for no Postgres work.
-    /// A failed settlement is only logged, leaving its leases to lapse and
-    /// its reservations counting at their reserved cost. Entries that violate
+    /// Latency: pricing and settlement are in memory, before the answer is
+    /// sent, so a caller that calls again on its answer never meets its own
+    /// concurrency on this server; background work persists the usage, and
+    /// no Postgres work delays the answer. Entries that violate
     /// the ledger contract fail the call as `Failed` with that error code,
     /// while attempt and routing evidence keep the provider's outcome.
     /// Capture runs after the answer is sent and never delays it.
@@ -1351,9 +1334,9 @@ impl CallTask {
         GatewayInvocation::observe(operation, self.received, outcome, &execution, entries);
         record_first_byte(operation, self.received);
         let answer = match accounted {
-            Ok(accounted) => {
+            Ok(mut accounted) => {
                 let started = std::time::Instant::now();
-                GatewayInvocation::settle(&self.state, &self.call, &accounted).await;
+                GatewayLedger::settle(&mut self.admission, &mut accounted);
                 self.telemetry.since(Phase::Account, started);
                 GatewayInvocation::respond(&self.call, execution)
             }
@@ -1447,11 +1430,11 @@ impl CallTask {
             attempt_span,
             timing,
         };
-        let priced = Accounted::new(&self.call.ledger(), &self.admission, &accounted);
-        match &priced {
+        let mut priced = Accounted::new(&self.call.ledger(), &self.admission, &accounted);
+        match &mut priced {
             Ok(priced) => {
                 let started = std::time::Instant::now();
-                GatewayInvocation::settle(&self.state, &self.call, priced).await;
+                GatewayLedger::settle(&mut self.admission, priced);
                 self.telemetry.since(Phase::Account, started);
             }
             Err(error) => {

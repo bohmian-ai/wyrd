@@ -7,6 +7,12 @@
 //! indexes, so a retried or uncertain write never adds a charge twice and no
 //! server overwrites another's usage. FORCE RLS is the tenant boundary, so
 //! statements carry no tenant-only predicate.
+//!
+//! During a rolling deployment the previous release still charges its
+//! shared counters and leases (`gateway_limit_windows`,
+//! `gateway_call_leases`); the shared view counts them beside other
+//! servers' rows, and that release's admission counts this one's rows
+//! (migration `20261111000001`), so each side sees the other's usage once.
 // raw-query grep allowlist: the usage tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use chrono::{DateTime, Utc};
@@ -142,20 +148,37 @@ const INSERT_ENTRIES_SQL: &str = r"
     ON CONFLICT DO NOTHING
 ";
 
-/// Other servers' window totals.
+/// Other servers' window totals: every other current server's rows plus the
+/// previous release's shared counters, which carry no server identity and
+/// are never this server's.
 const WINDOWS_SQL: &str = r"
     SELECT limit_key, window_start,
            SUM(requests)::int8 AS requests, SUM(tokens)::int8 AS tokens
-      FROM wyrd.gateway_usage_windows
-     WHERE server_id <> $1 AND window_start >= $2
+      FROM (
+          SELECT limit_key, window_start, requests, tokens
+            FROM wyrd.gateway_usage_windows
+           WHERE server_id <> $1 AND window_start >= $2
+          UNION ALL
+          SELECT limit_key, window_start, requests, tokens
+            FROM wyrd.gateway_limit_windows
+           WHERE window_start >= $2
+      ) AS w
      GROUP BY limit_key, window_start
 ";
 
-/// Other servers' unexpired running calls.
+/// Other servers' unexpired running calls: every other current server's
+/// counts plus one per unexpired lease of the previous release.
 const CONCURRENCY_SQL: &str = r"
     SELECT limit_key, SUM(active)::int8 AS active
-      FROM wyrd.gateway_usage_concurrency
-     WHERE server_id <> $1 AND expires_at > statement_timestamp()
+      FROM (
+          SELECT limit_key, active
+            FROM wyrd.gateway_usage_concurrency
+           WHERE server_id <> $1 AND expires_at > statement_timestamp()
+          UNION ALL
+          SELECT limit_key, 1
+            FROM wyrd.gateway_call_leases
+           WHERE expires_at > statement_timestamp()
+      ) AS c
      GROUP BY limit_key
 ";
 

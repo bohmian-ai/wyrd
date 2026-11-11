@@ -2775,7 +2775,7 @@ mod kind_tests {
     use proptest::prelude::*;
     use serde_json::json;
 
-    /// Lock 15 native kinds (14 registrable plus `External`), with `Verifier`
+    /// Lock 16 native kinds (15 registrable plus `External`), with `Verifier`
     /// replacing both `Drift` and `Eval` and no `Workflow`.
     ///
     /// # Panics

@@ -2205,6 +2205,21 @@ struct CardCompletionState {
 /// therefore safe to retry without holding a database connection across
 /// backend calls. The route validates and forwards the caller's idempotency
 /// key so transport retries retain the declaration saga key.
+///
+/// The final transaction is the one [`complete_card_inner`] commits: it
+/// activates the Card and settles, in that same commit, every pending
+/// Repository selection whose exact graph the activation completes. This
+/// call then answers the stored selection of the operation `idempotency_key`
+/// names; it never decides a selection itself. Cancelling before that commit
+/// leaves the Card Pending with its recovery scheduled, and cancelling after
+/// it loses only the answer: a retry with the same key, or the Card
+/// reconciler, repeats the idempotent transition and the settled operation
+/// answers the same outcome.
+///
+/// # Errors
+/// Returns the completion errors of [`complete_card_inner`],
+/// `WYRD_REGISTRY_409_REPOSITORY_SELECTION_CONFLICT` when the operation's
+/// selection settled as a conflict, and registry errors.
 #[tracing::instrument(
     skip(state, caller, idempotency_key),
     fields(
@@ -2408,6 +2423,20 @@ pub(crate) fn reconciliation_caller(tenant_id: DataTenantId) -> Caller {
     }
 }
 
+/// Verify, store and activate one Card, settling the Repository selections
+/// its activation completes.
+///
+/// An already-Active Card still settles the pending selections waiting on it
+/// and, for a request or a reconciler claim, records its reconciliation
+/// success, in one transaction. Otherwise manifests are verified and the
+/// blob written before [`commit_card_activation`] commits the activation and
+/// those selections together. A storage failure with `schedule_failures`
+/// schedules the Card's recovery and leaves it Pending; nothing selects.
+/// `lease_owner` fences a reconciler claim.
+///
+/// # Errors
+/// Returns the Card status refusal, the manifest verification or blob
+/// storage error, and registry errors; no transition commits on an error.
 async fn complete_card_inner(
     state: &AppState,
     caller: &Caller,

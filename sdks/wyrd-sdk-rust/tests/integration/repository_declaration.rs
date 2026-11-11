@@ -101,6 +101,9 @@ mod pg_tests {
     ///
     /// # Errors
     /// Returns the declaration's refusal.
+    ///
+    /// # Panics
+    /// Panics when the policy file cannot be copied into the checkout.
     async fn declare_toml(
         cards: &Cards,
         checkout: &tempfile::TempDir,

@@ -465,6 +465,14 @@ mod tests {
         );
     }
 
+    /// A component authored as an external reference stays one, a path
+    /// component becomes a sibling, and that sibling matches the external
+    /// reference to the same Card without becoming it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the tree does not load or either component keeps the
+    /// wrong reference form.
     #[test]
     fn path_and_external_refs_keep_distinct_wire_projections() {
         let temp = TempDir::new().expect("temp directory creates");

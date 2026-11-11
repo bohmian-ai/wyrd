@@ -1258,7 +1258,13 @@ fn seeded_agent_spec(verified_by: Value) -> Value {
     })
 }
 
-/// Post `submissions` under `key` and return the status and JSON body.
+/// Post `submissions` to the declaration route under idempotency `key` as
+/// `jwt` and return the status and JSON body, so a journey can assert a
+/// refusal's code as readily as a receipt.
+///
+/// # Panics
+///
+/// Panics when the server does not respond or the body is not JSON.
 async fn declare_json(
     server: &WyrdTestServer,
     jwt: &str,

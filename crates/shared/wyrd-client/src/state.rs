@@ -3177,6 +3177,11 @@ pub(crate) mod tests {
     }
 
     /// Assert the stable error shape used when durable state contains a sibling.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `result` succeeds or its error lacks the invalid-bundle
+    /// code, the owner, or the sibling projection of `expected_ref`.
     fn assert_sibling_error(result: Result<WyrdState, WyrdError>, expected_ref: &CardRef) {
         let error = result.expect_err("sibling reference must be rejected");
         assert_eq!(error.code(), "WYRD_SDK_400_INVALID_STATE_BUNDLE");

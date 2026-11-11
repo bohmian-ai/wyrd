@@ -1162,6 +1162,14 @@ mod tests {
         assert_eq!(refs[0].uid, Some(uid));
     }
 
+    /// An external reference and a sibling naming one identity each bind
+    /// the UID of their own source: the registered Card and the submitted
+    /// sibling.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture does not build or either reference binds the
+    /// other source's UID.
     #[test]
     fn external_and_sibling_same_identity_bind_from_separate_sources() {
         let expected = prompt_ref("shared");

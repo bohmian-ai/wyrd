@@ -1766,6 +1766,15 @@ fn cache_prompt_key(value: Option<&Bound<'_, PyAny>>) -> WyrdPyResult<Option<Str
     Ok(Some(value.str()?.extract::<String>()?))
 }
 
+/// Append one Python `content` turn for `role`: a string is a plain text
+/// turn and anything else is the format's native content parts, both
+/// through the shared Prompt operations.
+///
+/// # Errors
+///
+/// Returns the conversion error for content that is not JSON-compatible and
+/// the errors of [`Prompt::with_user`], [`Prompt::with_assistant`], and
+/// [`Prompt::with_content`].
 #[cfg(feature = "python")]
 fn append_py_content(
     prompt: &Prompt,

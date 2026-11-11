@@ -124,6 +124,12 @@ impl From<&CardRef> for SiblingRef {
 }
 
 impl fmt::Display for SiblingRef {
+    /// Writes `Kind/name`, with `@version` only when the sibling names one,
+    /// so diagnostics show an omitted version as omitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns the formatter's error when writing fails.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}", self.kind.wire_name(), self.name)?;
         if let Some(version) = &self.version {
@@ -845,6 +851,12 @@ mod tests {
         assert_eq!(card_ref, parsed);
     }
 
+    /// A sibling serializes under its explicit `sibling` wrapper and parses
+    /// back to the same reference.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the sibling does not round-trip through that wire shape.
     #[test]
     fn sibling_ref_uses_explicit_wire_wrapper() {
         let reference = Ref::Sibling {

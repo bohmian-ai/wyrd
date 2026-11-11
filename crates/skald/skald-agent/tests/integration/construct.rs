@@ -146,6 +146,13 @@ fn agent_try_from_ref_card_succeeds_with_test_resolver() {
     assert_eq!(agent.cascade_children(), vec![card_ref]);
 }
 
+/// An exact sibling Prompt resolves through the local registry like the
+/// external reference it names.
+///
+/// # Panics
+///
+/// Panics when the Prompt does not register or the sibling does not
+/// resolve to it.
 #[test]
 fn agent_try_from_sibling_resolves_against_test_resolver() {
     let _guard = registry_lock();

@@ -500,6 +500,7 @@ mod tests {
         );
     }
 
+    /// A minimal OpenAI Chat Prompt spec for submissions that need one.
     fn prompt_spec() -> serde_json::Value {
         json!({"provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]})
     }

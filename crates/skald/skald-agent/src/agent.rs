@@ -51,6 +51,16 @@ impl<T: PromptResolver + ?Sized> PromptResolver for &T {
 pub struct LocalPromptResolver;
 
 impl PromptResolver for LocalPromptResolver {
+    /// Resolve an inline Prompt as authored and an exact external or sibling
+    /// reference from the process-local registry. A versionless sibling has
+    /// no version to look up here; declaration selects it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdError::RegistryUnresolvedDependency`] for a versionless
+    /// sibling, a validation error when the registry lock is poisoned,
+    /// [`AgentCardError::PromptCardNotFound`] for an unregistered reference,
+    /// and the unresolved-path error for a `Path` the loader did not rewrite.
     fn resolve(&self, prompt_ref: &InlineableRef<PromptSpec>) -> Result<Prompt, WyrdError> {
         match prompt_ref {
             InlineableRef::Inline(prompt) => Ok(Prompt::from_native((**prompt).clone())),

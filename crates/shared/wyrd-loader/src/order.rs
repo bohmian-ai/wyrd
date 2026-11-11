@@ -8,7 +8,22 @@ use wyrd_spec::registry::CardSubmission;
 use super::error::Diagnostic;
 use super::parse::AuthoredCard;
 
-/// Order authored cards with the canonical graph implementation.
+/// Order authored cards dependencies first through the canonical graph.
+///
+/// The loader and the registration service share graph construction and
+/// sorting, so a tree the loader orders is the tree registration accepts.
+/// Each card is projected to its submission, sibling targets are matched
+/// against the whole tree, and binding uniqueness is checked on those
+/// matched targets before the graph is built. The returned indices point
+/// into `cards`, dependencies first and the single root last.
+///
+/// # Errors
+///
+/// Returns every [`Diagnostic`] found, each at the authored path it came
+/// from: an invalid envelope for an empty tree or a card that does not
+/// project to a submission, the binding diagnostics of the matched targets,
+/// and the graph diagnostic for an unresolved, ambiguous, or cyclic
+/// reference, a tree without exactly one root, or an invalid composition.
 pub fn order_cards(cards: &[AuthoredCard]) -> Result<Vec<usize>, Vec<Diagnostic>> {
     if cards.is_empty() {
         return Err(vec![Diagnostic::invalid_envelope(
@@ -241,6 +256,10 @@ mod tests {
     }
 
     /// Build a Service fixture with an optional Service dependency.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `dependency` is not a valid Card name.
     fn service(name: &str, dependency: Option<&str>) -> AuthoredCard {
         let components = dependency
             .map(|dependency| {
@@ -301,6 +320,11 @@ mod tests {
     }
 
     /// Surface the stable peer-component diagnostic when a Verifier is a Service component.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the tree orders or its diagnostic carries another code or
+    /// path.
     #[test]
     fn order_rejects_verifier_service_component_with_stable_code() {
         let mut service = service("app", None);
@@ -367,6 +391,11 @@ mod tests {
     /// An omitted and an explicit sibling naming one submitted Verifier, or
     /// one submitted Operator, are one binding target and are refused as a
     /// duplicate once matched.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a mixed-spelling binding orders, or its diagnostic carries
+    /// another code or path.
     #[test]
     fn order_refuses_mixed_sibling_spellings_of_one_binding_target() {
         let verifier = authored(

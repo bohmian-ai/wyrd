@@ -422,6 +422,13 @@ fn openai_responses_text(
     }))
 }
 
+/// Projects a JSON Schema response format onto Anthropic's native
+/// `output_config`; text, JSON object, and named formats set no field.
+///
+/// # Errors
+///
+/// Returns [`PromptBuilderError::InvalidResponseSchema`](crate::error::PromptBuilderError::InvalidResponseSchema)
+/// when the schema is not a JSON object.
 fn anthropic_output_config(
     format: &ResponseFormat,
 ) -> PromptBuilderResult<Option<skald_spec::wire::anthropic_messages::AnthropicOutputConfig>> {
@@ -502,6 +509,11 @@ mod builder_tests {
     /// `ResponseFormat::verdict` authors the named `verdict` format, plain
     /// or with custom data, and resolves it through the native Verdict
     /// schema builder; an invalid data schema is refused there.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a valid format does not build or resolve to the Verdict
+    /// schema, or an invalid one is accepted.
     #[test]
     fn verdict_format_resolves_through_the_native_builder() {
         let chat = |format| {

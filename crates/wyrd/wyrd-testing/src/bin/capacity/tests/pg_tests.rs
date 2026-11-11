@@ -9,6 +9,7 @@
 //! Needs `mise run bench:build`, the repository Postgres wrapper, and a quiet
 //! host; see each test for its command.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -60,12 +61,11 @@ const MIB: f64 = 1_048_576.0;
 /// any table.
 const ROWS_INSERTED: &str = "bifrost_scribe_memtable_rows_inserted_total";
 
-/// The server's Gate request counter, by operation and outcome.
+/// The server's Gate request counter, by operation and terminal outcome.
 const GATE_REQUESTS: &str = "bifrost_gate_requests_total";
 
-/// The Gate's write attempts refused after their permission decision, such
-/// as a busy refusal the native client retries without the driver seeing it.
-const REFUSED_WRITES: [&str; 2] = ["operation=\"write\"", "outcome=\"rejected\""];
+/// Every terminal outcome the Gate counts a request under.
+const GATE_OUTCOMES: [&str; 4] = ["success", "rejected", "failed", "cancelled"];
 
 /// Items staged on the server's Scribe outbox and not yet written, such as
 /// the audit row each permission decision stages after its request answered.
@@ -143,9 +143,9 @@ struct Observed {
     /// Rows the server's memtables accepted from just before to just after
     /// the call, when both scrapes answered.
     rows_inserted: Option<f64>,
-    /// Write attempts the Gate refused over the same span, when both scrapes
-    /// answered.
-    refused_writes: Option<f64>,
+    /// Write attempts the Gate ended over the same span, by terminal
+    /// outcome, when both scrapes answered.
+    write_attempts: Option<BTreeMap<String, f64>>,
     /// Seconds the scrape loop kept requests in flight, when it ran.
     scraping: Option<f64>,
 }
@@ -200,17 +200,24 @@ impl Workload for Controlled {
             None => None,
         };
         let after = settled_scrape().await;
-        let delta = |family: &str, labels: &[&str]| {
-            before
-                .as_ref()
-                .zip(after.as_ref())
-                .map(|(before, after)| after.sum(family, labels) - before.sum(family, labels))
-        };
-        let rows_inserted = delta(ROWS_INSERTED, &[]);
-        let refused_writes = delta(GATE_REQUESTS, &REFUSED_WRITES);
-        if let Some(refused) = refused_writes.filter(|refused| *refused > 0.0) {
-            println!("{} {phase:?}: {refused} write attempts refused", step.id);
-        }
+        let settled = before.as_ref().zip(after.as_ref());
+        let rows_inserted = settled
+            .map(|(before, after)| after.sum(ROWS_INSERTED, &[]) - before.sum(ROWS_INSERTED, &[]));
+        let write_attempts = settled.map(|(before, after)| {
+            GATE_OUTCOMES
+                .iter()
+                .map(|outcome| {
+                    let labels = [
+                        "operation=\"write\"".to_owned(),
+                        format!("outcome=\"{outcome}\""),
+                    ];
+                    let labels = [labels[0].as_str(), labels[1].as_str()];
+                    let ended =
+                        after.sum(GATE_REQUESTS, &labels) - before.sum(GATE_REQUESTS, &labels);
+                    ((*outcome).to_owned(), ended)
+                })
+                .collect()
+        });
         self.observed
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -218,7 +225,7 @@ impl Workload for Controlled {
                 step: step.id.clone(),
                 phase,
                 rows_inserted,
-                refused_writes,
+                write_attempts,
                 scraping,
             });
         repetition
@@ -435,23 +442,25 @@ fn population_reconciles(engine: Engine, repetition: &Repetition) -> Result<(), 
 }
 
 /// The rows an error-free write window acknowledged, in the window and
-/// after it, plus the one audit row each authorized attempt's permission
+/// after it, plus the one audit row each Gate write attempt's permission
 /// decision stages, are the rows the server's memtables accepted around it
-/// once its outbox settled. Attempts are the acknowledged requests plus the
-/// `refused` ones the Gate turned away after authorizing them, which a
-/// client retry hides from the driver. A failed request still stages its
-/// audit row, so a window with errors has no exact reference.
+/// once its outbox settled. The Gate's `attempts` by outcome, not the
+/// driver's acknowledged requests, count the audit rows: the native client
+/// retries a busy or uncertain attempt without the driver seeing it. A
+/// failed request still stages its audit row, so a window with errors has
+/// no exact reference.
 fn rows_match_the_server(
     repetition: &Repetition,
     inserted: f64,
-    refused: f64,
+    attempts: &BTreeMap<String, f64>,
 ) -> Result<(), String> {
     within("write errors", value(repetition, "errors")?, 0.0, 0.0)?;
-    let rows = value(repetition, "rows")?
-        + value(repetition, "late_rows")?
-        + value(repetition, "requests")?
-        + value(repetition, "late_requests")?
-        + refused;
+    let requests = value(repetition, "requests")? + value(repetition, "late_requests")?;
+    let audited: f64 = attempts.values().sum();
+    if (audited - requests).abs() >= 0.5 {
+        println!("{requests} acknowledged requests, Gate write attempts {attempts:?}");
+    }
+    let rows = value(repetition, "rows")? + value(repetition, "late_rows")? + audited;
     within("server rows inserted", inserted, rows, rows)
 }
 
@@ -549,10 +558,10 @@ fn step_holds(
             let inserted = seen
                 .and_then(|seen| seen.rows_inserted)
                 .ok_or_else(|| name("no settled row counter was read".to_owned()))?;
-            let refused = seen
-                .and_then(|seen| seen.refused_writes)
+            let attempts = seen
+                .and_then(|seen| seen.write_attempts.as_ref())
                 .ok_or_else(|| name("no settled Gate counter was read".to_owned()))?;
-            rows_match_the_server(repetition, inserted, refused).map_err(name)?;
+            rows_match_the_server(repetition, inserted, attempts).map_err(name)?;
             let wire = repetition.reading("wire_bytes");
             if step.id.starts_with("native") {
                 if wire.value.is_some() {

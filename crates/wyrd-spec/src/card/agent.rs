@@ -184,7 +184,10 @@ fn inline_prompt<'de, D: serde::Deserializer<'de>>(
 
 /// An inline Agent Prompt compiled once, straight from its authored form,
 /// through [`compile_prompt`](crate::card::prompt::compile_prompt).
-struct CompiledPrompt(skald_spec::Prompt);
+struct CompiledPrompt(
+    /// The native Prompt compiled canonically from the authored form.
+    skald_spec::Prompt,
+);
 
 impl<'de> Deserialize<'de> for CompiledPrompt {
     /// Decodes the authored Prompt form and compiles it.

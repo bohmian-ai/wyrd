@@ -1846,6 +1846,11 @@ fn service_chain(length: usize) -> Service {
 /// A copied definition shares every captured descendant instead of copying
 /// it, and a graph's snapshot borrows each descendant from its root rather
 /// than retaining a flattened copy beside the nested capture.
+///
+/// # Panics
+/// Panics when the chain does not capture eight descendants, a copy does not
+/// share them, the graph refuses the definition or holds other than nine
+/// Cards, or a graph Card is not borrowed from the root.
 #[test]
 fn captures_share_descendants_and_graphs_borrow_them() {
     let root = CardDefinition::from(service_chain(8));
@@ -1878,6 +1883,10 @@ fn captures_share_descendants_and_graphs_borrow_them() {
 /// Definitions equal in content but copied separately, such as one child
 /// passed to many parents, still join the graph once, and the snapshot
 /// keeps no full spec for sibling matching when nothing publishes first.
+///
+/// # Panics
+/// Panics when the fixture does not declare, a shared child joins the graph
+/// more than once, or the snapshot retains sibling-matching targets.
 #[test]
 fn shared_children_join_once_and_plain_graphs_keep_no_targets() {
     let child = Service::new("child", "1.0.0").components([Component::new("agent", reviewer())]);

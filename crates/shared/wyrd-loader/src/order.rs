@@ -293,6 +293,11 @@ mod tests {
         order.iter().map(|(index, _)| *index).collect()
     }
 
+    /// Ordering a Service and the Model it references places the Model
+    /// first.
+    ///
+    /// # Panics
+    /// Panics when the pair does not order or the Model is not first.
     #[test]
     fn order_reuses_shared_graph_and_places_dependencies_first() {
         let cards = vec![service("service", Some("model")), service("model", None)];
@@ -309,6 +314,12 @@ mod tests {
         assert_eq!(diagnostics[0].code, "WYRD_REGISTRY_400_DEPENDENCY_CYCLE");
     }
 
+    /// Two versions of one Card name are distinct graph nodes, the
+    /// referenced version ordered first.
+    ///
+    /// # Panics
+    /// Panics when the fixture version does not parse, the versions do not
+    /// order as one graph, or the referenced version is not first.
     #[test]
     fn order_keeps_same_named_versions_as_distinct_nodes() {
         let v1 = service("service", None);

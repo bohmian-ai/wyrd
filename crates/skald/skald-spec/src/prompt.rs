@@ -87,12 +87,23 @@ pub(crate) struct Authored {
 pub(crate) fn request_fingerprint(request: &ProviderRequest) -> u64 {
     use std::hash::Hasher;
     /// Feeds written bytes to the hasher.
-    struct Sink(std::hash::DefaultHasher);
+    struct Sink(
+        /// The hasher the serialized request streams into.
+        std::hash::DefaultHasher,
+    );
     impl std::io::Write for Sink {
+        /// Feeds `bytes` to the hasher and accepts all of them.
+        ///
+        /// # Errors
+        /// Never fails; hashing does no IO.
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             self.0.write(bytes);
             Ok(bytes.len())
         }
+        /// Does nothing; the hasher buffers nothing to flush.
+        ///
+        /// # Errors
+        /// Never fails.
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
@@ -970,12 +981,23 @@ impl ResponseType {
 /// Returns a serialization error when `value` does not serialize.
 fn json_text(value: &(impl Serialize + ?Sized)) -> SkaldResult<String> {
     /// Counts written bytes.
-    struct Count(usize);
+    struct Count(
+        /// The number of serialized bytes written so far.
+        usize,
+    );
     impl std::io::Write for Count {
+        /// Adds `bytes`' length to the count and accepts all of them.
+        ///
+        /// # Errors
+        /// Never fails; counting does no IO.
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             self.0 += bytes.len();
             Ok(bytes.len())
         }
+        /// Does nothing; the count buffers nothing to flush.
+        ///
+        /// # Errors
+        /// Never fails.
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
@@ -1024,6 +1046,14 @@ fn slot_variables(
     request: &mut ProviderRequest,
     variables: &[String],
 ) -> SkaldResult<(Vec<String>, Vec<String>)> {
+    /// The text variables of `body`'s system slot and of the rest of it.
+    ///
+    /// The slot is taken out while the rest is scanned and put back before
+    /// either result is returned, so `body` is unchanged on every path.
+    ///
+    /// # Errors
+    /// Returns a serialization error when the slot or the rest does not
+    /// serialize.
     fn scan<B: Serialize, T: Serialize>(
         body: &mut B,
         slot: fn(&mut B) -> &mut Option<T>,

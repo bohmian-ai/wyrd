@@ -167,6 +167,10 @@ mod tests {
 
     /// Reject two `verified_by` bindings to the same Verifier version on one
     /// Service component occurrence before anything is submitted.
+    ///
+    /// # Panics
+    /// Panics when a fixture name or version is invalid or the duplicate
+    /// binding is not rejected with its diagnostic.
     #[test]
     fn validate_rejects_duplicate_component_publication_targets() {
         let verifier_ref = CardRef {

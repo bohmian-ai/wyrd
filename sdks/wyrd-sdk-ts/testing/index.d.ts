@@ -38,6 +38,8 @@ export interface CheckReport {
     readonly version: string | null;
   }[];
   readonly diagnostics: readonly CheckDiagnostic[];
+  /** Checks only the server can make, which this local check skipped. */
+  readonly deferred: readonly string[];
 }
 
 /** Card selector: a `uid` with `kind`, or `kind` and `name`; `version` narrows either. */

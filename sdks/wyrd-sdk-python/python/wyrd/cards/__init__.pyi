@@ -157,6 +157,7 @@ class CardKind:
     Trigger: CardKind
     Operator: CardKind
     Source: CardKind
+    Repository: CardKind
     External: CardKind
 
     @property

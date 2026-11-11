@@ -162,12 +162,20 @@ declared graph and where it runs`.
 - `brand/components.json` holds the `VerifierDefinition`, `RunsOn` and
   `VerifierGraph` contracts only in the working tree: the file already carried
   an uncommitted rewrite that these entries cannot be separated from.
-- The task's full integration command was not green. `development environment
-  lifecycle` stalled in its refused-setup phase (the server exited with
-  `WYRD_AUTH_401_UNAUTHENTICATED` before it was ready) and was stopped; `observe
-  boards match approved canvas` fails on the Metrics legend (1 row, expected 2),
-  alone as well as in the file. Neither exercises code this task changed, and
-  neither was diagnosed further. The other 12 tests in the two files passed.
+- Every test the task's integration command selects has passed, but not in one
+  invocation. `observe boards match approved canvas` failed on the Metrics
+  legend because the Metrics default now merges series; `d8bfff7c2` asks the
+  board for every series and it passes. In the full command 13 of 14 tests
+  pass and `development environment lifecycle` fails in its refused-setup
+  phase: `wyrd-server setup` is refused with `WYRD_AUTH_401_UNAUTHENTICATED`.
+  The same test passes when run alone with
+  `vitest run src/lib/ui-pages.integration.test.ts -t "development environment lifecycle"`,
+  and `scripts/postgres/dev-server.sh` sets up cleanly with the same bad
+  ambient `WYRD_API_KEY`. The launcher's ports are fixed, and a `wyrd-server`
+  from another checkout on this machine was found listening on
+  `127.0.0.1:8080` after the failing run; that contention is the suspected
+  cause and was not proven for the failing moment. The full command needs a
+  rerun on a machine where nothing else uses ports 8080, 3000, 8000 and 1080.
 - The `dev:full` screenshots predate the arrow-label change in `f677bd329`
   and the narrower nodes in `64769eeac`.
 - An independent read-only check of the diff against this ledger found, and

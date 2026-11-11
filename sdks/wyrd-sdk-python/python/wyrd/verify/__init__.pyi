@@ -45,6 +45,7 @@ from typing import (
     TypeAlias,
     TypedDict,
     Unpack,
+    overload,
 )
 
 from typing_extensions import TypeVar
@@ -150,6 +151,17 @@ class _GatewayRoute(TypedDict):
     kind: Literal["wyrd_gateway"]
     deployment: str
 
+ExecutionRouteWire: TypeAlias = _NativeRoute | _GatewayRoute
+"""The canonical wire form of an ``ExecutionRoute``."""
+
+class AgentRunConfigWire(TypedDict, total=False):
+    """The canonical wire form of an ``AgentRunConfig``; an omitted field keeps the runtime's default."""
+
+    max_iterations: int
+    tool_concurrency_cap: int
+    session_recent_limit: int
+    timeout_ms: int
+
 class AgentProvenance(TypedDict):
     """An Agent call; ``agent`` and ``prompt`` are absent when declared inline."""
 
@@ -209,10 +221,17 @@ class RequirementDetail(TypedDict):
 
     drift: DriftReport
 
+class SiblingTargetWire(TypedDict):
+    """The Card a sibling reference names; an omitted version names the submission's only one."""
+
+    kind: str
+    name: str
+    version: NotRequired[str]
+
 class SiblingRefWire(TypedDict):
     """A loader-projected reference to another Card in the same submission."""
 
-    sibling: CardRefWire
+    sibling: SiblingTargetWire
 
 CardRefTarget: TypeAlias = CardRefWire | SiblingRefWire | str
 """A declared, sibling, or authored-path (``str``) Card reference."""
@@ -1155,9 +1174,9 @@ class AgentFields(TypedDict, total=False):
     labels: Mapping[str, str]
     annotations: Mapping[str, str]
     prompt: Prompt | FieldInput
-    execution_route: ExecutionRoute | JsonInput
+    execution_route: ExecutionRoute | ExecutionRouteWire
     tool_names: Sequence[str]
-    run_config: AgentRunConfig | JsonInput
+    run_config: AgentRunConfig | AgentRunConfigWire
     verified_by: Sequence[BindingInput]
 
 class Agent:
@@ -1241,7 +1260,7 @@ class Agent:
         """
         ...
 
-    def execution_route(self, value: ExecutionRoute | JsonInput) -> Self:
+    def execution_route(self, value: ExecutionRoute | ExecutionRouteWire) -> Self:
         """Set ``execution_route``, replacing its earlier value; returns this value.
 
         Args:
@@ -1265,7 +1284,7 @@ class Agent:
         """
         ...
 
-    def run_config(self, value: AgentRunConfig | JsonInput) -> Self:
+    def run_config(self, value: AgentRunConfig | AgentRunConfigWire) -> Self:
         """Set ``run_config``, replacing its earlier value; returns this value.
 
         Args:
@@ -1523,19 +1542,30 @@ class Artifact:
         """
         ...
 
+    @overload
+    @staticmethod
+    def from_path(name: str, path: PathLike, /, **fields: Unpack[ArtifactFields]) -> Artifact: ...
+    @overload
+    @staticmethod
+    def from_path(name: str, *, path: PathLike, **fields: Unpack[ArtifactFields]) -> Artifact: ...
+    @overload
     @staticmethod
     def from_path(
         name: str, version: str | None, path: PathLike, **fields: Unpack[ArtifactFields]
     ) -> Artifact:
         """The ``file`` Artifact published from ``path`` before its graph.
 
-        Nothing is read until it is published.
+        Nothing is read until it is published. ``from_path(name, path)`` and
+        ``from_path(name, path=path)`` let registration assign the version.
 
         Args:
             name: The Artifact name.
             version: The exact Artifact version; ``None`` lets registration assign it.
             path: The local file or directory to publish.
             **fields: Further ``Artifact`` spec fields.
+
+        Raises:
+            TypeError: When no path is given.
         """
         ...
 

@@ -1948,7 +1948,7 @@ impl PyCards {
     /// Declare an authored Card graph, a Card file or bundle directory, or a
     /// caller-owned `DataCard`, `ModelCard`, or `PromptCard`.
     ///
-    /// An authored Card from `wyrd.authoring` is copied as it is now,
+    /// An authored Card from `wyrd.verify` is copied as it is now,
     /// validated, and declared through the shared Rust declaration: each
     /// local Artifact it references is published first as its own
     /// submission, then the graph; a later graph failure leaves those

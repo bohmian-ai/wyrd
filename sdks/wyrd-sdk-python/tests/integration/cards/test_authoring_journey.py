@@ -685,9 +685,9 @@ def draft_writer(version: str | None, asks: str) -> Agent:
     )
 
 
-def drafting(judge: Agent) -> Service:
-    """``drafting`` without a version, as ``omitted/drafting.yaml`` declares it, judged by ``judge``."""
-    checks = Verifier(
+def draft_checks(judge: Agent) -> Verifier:
+    """``draft-checks`` without a version, as ``omitted/draft-checks.yaml`` declares it, judged by ``judge``."""
+    return Verifier(
         "draft-checks",
         inputs={
             "draft": {
@@ -709,9 +709,33 @@ def drafting(judge: Agent) -> Service:
             ),
         ],
     )
+
+
+def drafting(judge: Agent) -> Service:
+    """``drafting`` without a version, as ``omitted/drafting.yaml`` declares it, judged by ``judge``."""
     writer = draft_writer(None, "Draft release notes for {{change}}.")
     return Service(
         "drafting",
+        service_type="api",
+        components=[Component("writer", writer, verified_by=[draft_checks(judge)])],
+    )
+
+
+def drafting_mixed() -> Service:
+    """``drafting-mixed`` as ``omitted/mixed.yaml`` declares it: a pinned writer, versionless checks."""
+    writer = Agent(
+        "mixed-writer",
+        "1.0.0",
+        execution_route=ExecutionRoute.wyrd_gateway(deployment="openai"),
+        prompt={
+            "provider": "openai",
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "Draft a changelog entry for {{change}}."}],
+        },
+    )
+    checks = draft_checks(draft_judge(None, "Judge the draft {{draft}}."))
+    return Service(
+        "drafting-mixed",
         service_type="api",
         components=[Component("writer", writer, verified_by=[checks])],
     )
@@ -746,9 +770,12 @@ def test_omitted_versions_resolve_in_composed_definitions(cards: Cards) -> None:
 
     The server selects every version and binds each component, bound
     Verifier, and transitive judge to its full registered reference; a rerun
-    reuses them. A judge changed under an explicit version beside omitted
-    parents gives them new versions; two explicit versions of one Agent are
-    distinct targets; an omitted link naming two submissions is refused.
+    reuses them. A mixed graph keeps its pinned writer and selects the rest,
+    alike from YAML and definitions. A judge whose content changes without a
+    version gets a newly selected version that gives its parents new
+    versions while the writer keeps its reference; two explicit versions of
+    one Agent are distinct targets; an omitted link naming two submissions
+    is refused.
     """
     files = cards.declare_from_path(OMITTED / "drafting.yaml")
     assert_bound(cards, files)
@@ -756,12 +783,21 @@ def test_omitted_versions_resolve_in_composed_definitions(cards: Cards) -> None:
     assert resolved(cards.declare(authored)) == resolved(files), "same identities and content"
     assert resolved(cards.declare(authored)) == resolved(files), "a rerun reuses them"
 
-    changed = cards.declare(drafting(draft_judge("2.0.0", "Judge the draft {{draft}} strictly.")))
+    mixed_files = cards.declare_from_path(OMITTED / "mixed.yaml")
+    mixed = cards.declare(drafting_mixed())
+    assert resolved(mixed) == resolved(mixed_files), "same identities and content"
+    assert declared(mixed, "mixed-writer")["version"] == "1.0.0"
+    component = persisted(cards, mixed, "drafting-mixed")["components"][0]
+    assert component["ref"] == declared(mixed, "mixed-writer")
+    assert component["verified_by"][0]["verifier"] == declared(files, "draft-checks")
+
+    changed = cards.declare(drafting(draft_judge(None, "Judge the draft {{draft}} strictly.")))
     assert_bound(cards, changed)
-    assert declared(changed, "draft-judge")["version"] == "2.0.0"
+    for name in ("draft-judge", "draft-checks", "drafting"):
+        old, new = declared(files, name), declared(changed, name)
+        assert old["version"] != new["version"] and old["uid"] != new["uid"], (old, new)
+        assert resolved(files)[name][1] != resolved(changed)[name][1], name
     assert declared(changed, "draft-writer") == declared(files, "draft-writer")
-    for parent in ("draft-checks", "drafting"):
-        assert declared(changed, parent)["version"] != declared(files, parent)["version"], parent
 
     def pair(second: str | None) -> Service:
         return Service(

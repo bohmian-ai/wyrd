@@ -359,7 +359,8 @@ fn entries<T>(
 /// model with `release: Release`, the same slots as
 /// `{"release": Release}`. A property that references one of the class's
 /// `$defs` becomes that definition, carrying the definitions it reaches, so
-/// nested models and references still resolve.
+/// nested models and references still resolve. A recursive model's schema
+/// is a root `$ref` to its own definition, whose properties are the slots.
 ///
 /// # Errors
 /// As [`entries`] with [`slot`] for a mapping, and as [`class_schema`] for a
@@ -369,7 +370,18 @@ fn verifier_inputs(field: &str, value: &Bound<'_, PyAny>) -> PyResult<Vec<(Strin
         return entries(field, value, slot);
     };
     let schema = class_schema(field, class)?;
-    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+    let empty = serde_json::Map::new();
+    let defs = schema
+        .get("$defs")
+        .and_then(Value::as_object)
+        .unwrap_or(&empty);
+    let root = schema
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(local_def)
+        .and_then(|name| defs.get(name))
+        .unwrap_or(&schema);
+    let Some(properties) = root.get("properties").and_then(Value::as_object) else {
         return Err(invalid_argument(
             field,
             format!(
@@ -379,11 +391,6 @@ fn verifier_inputs(field: &str, value: &Bound<'_, PyAny>) -> PyResult<Vec<(Strin
         )
         .into());
     };
-    let empty = serde_json::Map::new();
-    let defs = schema
-        .get("$defs")
-        .and_then(Value::as_object)
-        .unwrap_or(&empty);
     Ok(properties
         .iter()
         .map(|(name, property)| (name.clone(), InputSlot::from(standalone(property, defs))))
@@ -738,20 +745,31 @@ card_class! {
         map { metadata, add_metadata: json }
     }
 
-    /// The `file` Artifact named `name`, at `version` unless it is `None`,
-    /// published from the file or directory at `path` before its graph;
-    /// nothing is read until it is published.
+    /// The `file` Artifact named `name`, at `version` unless it is omitted
+    /// or `None`, published from the file or directory at `path` before its
+    /// graph: `from_path(name, path)`, `from_path(name, path=path)`, or
+    /// `from_path(name, version, path)`; nothing is read until it is
+    /// published.
     ///
     /// # Errors
-    /// As the constructor.
+    /// Raises `TypeError` when no path is given or an argument has the wrong
+    /// type, and otherwise as the constructor.
     #[staticmethod]
-    #[pyo3(signature = (name, version, path, **fields))]
+    #[pyo3(signature = (name, version = None, path = None, **fields))]
     fn from_path(
         name: String,
-        version: Option<String>,
-        path: PathBuf,
+        version: Option<&Bound<'_, PyAny>>,
+        path: Option<PathBuf>,
         fields: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
+        let (version, path) = match (version, path) {
+            (None, Some(path)) => (None, path),
+            (Some(version), Some(path)) => (version.extract::<Option<String>>()?, path),
+            (Some(path), None) => (None, path.extract::<PathBuf>()?),
+            (None, None) => {
+                return Err(PyTypeError::new_err("Artifact.from_path takes a path"));
+            }
+        };
         Ok(Self {
             inner: Self::with_fields(
                 Artifact::from_path(name, version.as_deref(), path),
@@ -1509,23 +1527,36 @@ pub(crate) struct PyAgentRunConfig {
 
 #[pymethods]
 impl PyAgentRunConfig {
-    /// The configuration with only the given fields set.
+    /// The configuration with only the given fields set, each converted as
+    /// the canonical `run_config` mapping is.
+    ///
+    /// # Errors
+    /// Raises `WYRD_SPEC_400_VALIDATION` naming `run_config` for a value
+    /// that is not a non-negative integer in its field's range.
     #[new]
     #[pyo3(signature = (*, max_iterations = None, tool_concurrency_cap = None, session_recent_limit = None, timeout_ms = None))]
     fn __new__(
-        max_iterations: Option<u32>,
-        tool_concurrency_cap: Option<usize>,
-        session_recent_limit: Option<usize>,
-        timeout_ms: Option<u64>,
-    ) -> Self {
-        Self {
-            inner: AgentRunConfigSpec {
-                max_iterations,
-                tool_concurrency_cap,
-                session_recent_limit,
-                timeout_ms,
-            },
+        py: Python<'_>,
+        max_iterations: Option<&Bound<'_, PyAny>>,
+        tool_concurrency_cap: Option<&Bound<'_, PyAny>>,
+        session_recent_limit: Option<&Bound<'_, PyAny>>,
+        timeout_ms: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let mut fields = serde_json::Map::new();
+        for (name, value) in [
+            ("max_iterations", max_iterations),
+            ("tool_concurrency_cap", tool_concurrency_cap),
+            ("session_recent_limit", session_recent_limit),
+            ("timeout_ms", timeout_ms),
+        ] {
+            if let Some(value) = value {
+                fields.insert(name.to_owned(), json_value(py, name, value)?);
+            }
         }
+        Ok(Self {
+            inner: serde_json::from_value(Value::Object(fields))
+                .map_err(|error| invalid_argument("run_config", error))?,
+        })
     }
 
     /// The canonical wire form, as `repr`.

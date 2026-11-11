@@ -265,3 +265,35 @@ def test_openai_responses_text_input_reads_as_one_user_message(fixtures_dir: Pat
 
     (item,) = prompt.request.openai_responses().input
     assert (item.kind, item.as_message_role()) == ("message", "user")
+
+
+def test_response_format_verdict_shares_the_class_and_inspects_expanded() -> None:
+    import wyrd.verify
+    from pydantic import BaseModel
+
+    class Score(BaseModel):
+        value: float
+
+    class Judged(BaseModel):
+        score: Score
+
+    plain = ResponseFormat.verdict()
+    assert type(plain) is ResponseFormat is wyrd.verify.ResponseFormat
+    assert plain.to_dict() == {"kind": "verdict"}
+    assert ResponseFormat.verdict(None).to_dict() == plain.to_dict()
+    schema = {**Judged.model_json_schema(), "additionalProperties": False}
+    custom = ResponseFormat.verdict(Judged)
+    assert custom.to_dict() == ResponseFormat.verdict(schema).to_dict(), (
+        "a model is its closed schema"
+    )
+    assert custom.to_dict()["kind"] == "verdict"
+    assert custom.to_dict()["data"]["properties"]["score"] == {"$ref": "#/$defs/Score"}
+    assert "Score" in custom.to_dict()["data"]["$defs"]
+    dict_only = ResponseFormat.verdict({"type": "object", "properties": {"n": {"type": "integer"}}})
+    assert dict_only.to_dict()["data"]["properties"] == {"n": {"type": "integer"}}
+
+    prompt = Prompt.openai_chat("gpt-4o", messages="Judge", response_format=plain)
+    assert json.loads(str(prompt))["response_format"] == "verdict", "Prompts keep the named form"
+    for refused in (1, "verdict", ["not", "a", "schema"]):
+        with pytest.raises(WyrdError):
+            ResponseFormat.verdict(refused)  # ty: ignore[invalid-argument-type]

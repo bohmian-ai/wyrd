@@ -1206,7 +1206,8 @@ class ResponseFormat:
         ...
 
     def to_dict(self) -> JsonDict:
-        """Return ``{"type": ...}`` plus ``name`` and ``schema`` for JSON Schema."""
+        """Return ``{"type": ...}`` plus ``name`` and ``schema`` for JSON Schema; a Verdict is
+        ``{"kind": "verdict"}`` plus its ``data`` schema when it has one."""
         ...
 
     def __str__(self) -> str:

@@ -201,6 +201,10 @@ def test_plain_schemas_do_not_require_pydantic() -> None:
         assert inputs["report"]["schema"]["properties"]["text"] == {"type": "string"}
         assert inputs["notes"] == {"type": "json", "schema": {"type": ["string", "null"]}}
         assert inputs["canonical"] == {"type": "json", "schema": {"type": "string"}}
+        from wyrd.prompt import ResponseFormat
+
+        verdict = ResponseFormat.verdict({"type": "object", "properties": {"n": {"type": "integer"}}})
+        assert verdict.to_dict()["data"]["properties"] == {"n": {"type": "integer"}}
         assert "pydantic" not in [name for name, module in sys.modules.items() if module is not None]
         try:
             Verifier("model", "1.0.0", inputs={"bad": object})
@@ -804,3 +808,52 @@ def test_unversioned_definitions_take_the_original_prompt_and_canonical_values()
     Service(
         "finance-release", components=[Component("judge", judge, verified_by=[verifier])]
     ).validate()
+
+
+class Tree(BaseModel):
+    label: str
+    children: list["Tree"] = []
+
+
+def test_recursive_models_supply_slots_through_their_root_reference() -> None:
+    schema = Tree.model_json_schema()
+    assert "properties" not in schema, "a recursive model's schema is a root $ref"
+    tree = schema["$defs"]["Tree"]
+    mapping = {
+        "label": tree["properties"]["label"],
+        "children": {**tree["properties"]["children"], "$defs": schema["$defs"]},
+    }
+    labelled = Requirement(
+        "labelled", "Labelled", Check.assert_("inputs.label", "is_non_empty", None)
+    )
+    verifier = Verifier("tree-checks", inputs=Tree, requirements=[labelled])
+    assert (
+        verifier.spec() == Verifier("tree-checks", inputs=mapping, requirements=[labelled]).spec()
+    )
+    assert verifier.spec()["inputs"]["children"]["schema"]["items"] == {"$ref": "#/$defs/Tree"}
+    verifier.validate()
+
+
+def test_run_config_integers_convert_as_the_canonical_mapping_does() -> None:
+    assert Agent("a", run_config=AgentRunConfig(max_iterations=0)).spec()["run_config"] == {
+        "max_iterations": 0
+    }
+    for invalid in (-1, 2**64, True, "3"):
+        with pytest.raises(WyrdError) as refused:
+            AgentRunConfig(timeout_ms=invalid)  # ty: ignore[invalid-argument-type]
+        assert refused.value.code == "WYRD_SPEC_400_VALIDATION", invalid
+        assert refused.value.details["field"] == "run_config", refused.value.details
+
+
+def test_local_artifacts_take_an_omitted_version() -> None:
+    for omitted in (
+        Artifact.from_path("company-sharing-policy", SHARING_POLICY),
+        Artifact.from_path("company-sharing-policy", path=SHARING_POLICY),
+        Artifact.from_path("company-sharing-policy", None, SHARING_POLICY),
+    ):
+        assert omitted.card_ref() is None
+        assert omitted.spec() == Artifact.from_path("company-sharing-policy", SHARING_POLICY).spec()
+    pinned = Artifact.from_path("company-sharing-policy", "2.0.0", SHARING_POLICY)
+    assert pinned.card_ref() == CardRef.artifact("company-sharing-policy", "2.0.0")
+    with pytest.raises(TypeError):
+        Artifact.from_path("company-sharing-policy")  # ty: ignore[no-matching-overload]

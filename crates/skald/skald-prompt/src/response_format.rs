@@ -132,30 +132,12 @@ impl ResponseFormat {
         Ok(Self::json_schema(name, value)?)
     }
 
-    /// Python constructor for the canonical Verdict format, optionally
-    /// requiring custom `data` described by a Pydantic model class or a JSON
-    /// Schema.
+    /// Return a JSON-serializable dict for inspection; a named format is
+    /// its expanded `{"kind": ..., "data"?: ...}` mapping.
     ///
     /// # Errors
     ///
-    /// Raises `WyrdError` when `data` is neither a model class nor a JSON
-    /// Schema object.
-    #[staticmethod]
-    #[pyo3(name = "verdict", signature = (data = None))]
-    pub fn verdict_py(
-        data: Option<&pyo3::Bound<'_, pyo3::types::PyAny>>,
-    ) -> wyrd_utils::py::WyrdPyResult<Self> {
-        let Some(data) = data.filter(|data| !pyo3::types::PyAnyMethods::is_none(*data)) else {
-            return Ok(Self::verdict(None));
-        };
-        let schema = crate::prompt::output_schema_from_py(data)?;
-        let serde_json::Value::Object(schema) = schema else {
-            return Err(crate::error::PromptBuilderError::InvalidResponseSchema.into());
-        };
-        Ok(Self::verdict(Some(schema)))
-    }
-
-    /// Return a JSON-serializable dict for inspection.
+    /// Raises `WyrdError` when the value cannot be converted to Python.
     pub fn to_dict(
         &self,
         py: pyo3::Python<'_>,
@@ -166,7 +148,10 @@ impl ResponseFormat {
             ResponseFormatKind::JsonSchema { name, schema } => {
                 serde_json::json!({ "type": "json_schema", "name": name, "schema": schema })
             }
-            ResponseFormatKind::Named(named) => serde_json::json!(named),
+            ResponseFormatKind::Named(named) => serde_json::json!(NamedResponseFormat::Expanded {
+                kind: named.name().to_owned(),
+                data: named.data().cloned(),
+            }),
         };
         Ok(wyrd_utils::py::json_to_pyobject(py, &value)?)
     }

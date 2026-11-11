@@ -1523,7 +1523,7 @@ fn response_format_from_py(value: Option<&Bound<'_, PyAny>>) -> WyrdPyResult<For
 ///
 /// Raises `WyrdError` for a value that is neither.
 #[cfg(feature = "python")]
-pub(crate) fn output_schema_from_py(value: &Bound<'_, PyAny>) -> WyrdPyResult<serde_json::Value> {
+pub fn output_schema_from_py(value: &Bound<'_, PyAny>) -> WyrdPyResult<serde_json::Value> {
     let mut schema = crate::coerce::schema_from_py(value)?;
     if is_pydantic_model(value.py(), value) {
         normalize_output_schema(&mut schema);

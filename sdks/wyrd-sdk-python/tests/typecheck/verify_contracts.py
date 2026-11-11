@@ -13,11 +13,12 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel
 from typing_extensions import assert_type
 from wyrd.state import WyrdState
-from wyrd.verify import Execution, VerificationResult
+from wyrd.verify import Agent, AgentRunConfig, Execution, ExecutionRoute, VerificationResult
 
 if TYPE_CHECKING:
     from wyrd.cards import JsonValue
     from wyrd.verify import (
+        CardRefTarget,
         CheckWire,
         ExecutionState,
         InputDeclaration,
@@ -216,3 +217,26 @@ def unknown_fixed_keys_and_values_are_rejected() -> tuple[object, ...]:
         "operator": "equals",
     }
     return status, misspelled, step, unknown_kind, foreign_key, wrong_type
+
+
+def agent_routes_and_run_configs_are_closed() -> tuple[object, ...]:
+    native = Agent("a", execution_route={"kind": "native"}, run_config={"max_iterations": 0})
+    gateway = Agent("b").execution_route({"kind": "wyrd_gateway", "deployment": "openai"})
+    typed = Agent(
+        "c", execution_route=ExecutionRoute.Native, run_config=AgentRunConfig(timeout_ms=5)
+    )
+    unknown_route = Agent("d").execution_route({"kind": "proxy"})  # ty: ignore[invalid-argument-type]
+    no_deployment = Agent("e", execution_route={"kind": "wyrd_gateway"})  # ty: ignore[invalid-argument-type]
+    misspelled = Agent("f").run_config({"max_iteration": 1})  # ty: ignore[invalid-key, invalid-argument-type]
+    wrong_type = Agent("g", run_config={"timeout_ms": "5"})  # ty: ignore[invalid-argument-type]
+    return native, gateway, typed, unknown_route, no_deployment, misspelled, wrong_type
+
+
+def sibling_targets_omit_versions_and_carry_no_uid() -> tuple[CardRefTarget, ...]:
+    pinned: CardRefTarget = {"sibling": {"kind": "Agent", "name": "j", "version": "1.0.0"}}
+    omitted: CardRefTarget = {"sibling": {"kind": "Agent", "name": "j"}}
+    exact: CardRefTarget = {"kind": "Agent", "name": "j", "version": "1.0.0", "uid": "u"}
+    with_uid: CardRefTarget = {  # ty: ignore[invalid-assignment]
+        "sibling": {"kind": "Agent", "name": "j", "uid": "u"},
+    }
+    return pinned, omitted, exact, with_uid

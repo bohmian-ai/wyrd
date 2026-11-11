@@ -132,6 +132,26 @@ exact Verifier definition and where it runs load through every authorized
 host`; `ui-pages.integration.test.ts` — `an exact Verifier Card page draws its
 declared graph and where it runs`.
 
+Exact invocations, each from the repository root. The unit selectors need no
+services:
+
+```bash
+pnpm --dir crates/wyrd/wyrd-server/wyrd-ui package
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/ui-library.test.ts -t "verifier graph projects and lays out the declared topology"
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/ui-library.test.ts -t "verifier graph is read-only, selectable and keyboard and zoom operable"
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/ui-library.test.ts -t "verifier definition and bindings stay truthful across hosts and states"
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/ui-pages.test.ts -t "an exact Verifier Card page shows its definition, versions and where it runs"
+```
+
+The live selectors need Docker for the managed Postgres and, first, the SDK,
+its testing addon and the server built from this tree:
+
+```bash
+mise run ts:build && mise run ts:build:testing && mise run build:server
+mise exec -- scripts/postgres/with-test-postgres.sh -- env WYRD_UI_INTEGRATION=1 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/ui-library.integration.test.ts -t "an exact Verifier definition and where it runs load through every authorized host"
+mise exec -- scripts/postgres/with-test-postgres.sh -- env WYRD_UI_INTEGRATION=1 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/ui-pages.integration.test.ts -t "an exact Verifier Card page draws its declared graph and where it runs"
+```
+
 | Obligation and required cases | Implementation evidence | Proof location | Verification evidence | Result |
 |---|---|---|---|---|
 | REQ-004.topology — ordinary, session-shaped, drift-shaped, parallel, repeated declared topology; fan-in/out | `packages/ui/src/lib/verifier.ts` `definitionGraph` derives inputs, steps, attached and whole-Verifier requirements and edges from the spec's references, `when.path` and `depends_on`; `verifier-layout.ts` `layoutDefinition` lays out stages, parallel branches and routed edges; `VerifierGraph*.svelte` draw stage headings, arrowheads and labels | `ui-library.test.ts` `verifier graph projects and lays out the declared topology`; integration test on the registered `policy-review` (3 inputs, 3 chained steps, 2 attached and 6 whole requirements, 13 edges) and `investigation-drift` | `pnpm test` 60 passed; both integration selectors passed against a real server. Removing the gate-only dependency fails the unit test. Declared repetition is the `retries` chip and the gate the `when` chip: `VerifierSpec` has no fan-out or repeat field, so no repeated node is drawn | PASS |
@@ -159,9 +179,13 @@ declared graph and where it runs`.
 - The gallery checkpoints name the mock as their reference in a note and carry
   no board regions, because the gallery's region links point at canvas boards
   this mock does not have.
-- `brand/components.json` holds the `VerifierDefinition`, `RunsOn` and
-  `VerifierGraph` contracts only in the working tree: the file already carried
-  an uncommitted rewrite that these entries cannot be separated from.
+- `859b55fb8` adds the `VerifierDefinition`, `RunsOn` and `VerifierGraph` contracts
+  to the committed `brand/components.json`, in that file's committed entry
+  format and as 102 added lines only. The uncommitted rewrite of that file in
+  the working tree is not part of the commit. Checked at that commit: each
+  entry is `built`, its props match the component's, its tokens match the
+  ones the component uses, and `catalog` is true exactly for the two entries
+  in the generated catalog.
 - Every test the task's integration command selects has passed, but not in one
   invocation. `observe boards match approved canvas` failed on the Metrics
   legend because the Metrics default now merges series; `d8bfff7c2` asks the

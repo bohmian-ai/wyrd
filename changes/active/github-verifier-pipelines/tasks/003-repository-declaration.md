@@ -146,29 +146,29 @@ Story fixtures: `fixtures/cards/repository_declaration/`.
 | Obligation | Implementation evidence | Assertion | Verification evidence | Result |
 |---|---|---|---|---|
 | O-01 minimal TOML declares inferred Repository root | `wyrd-config/src/config.rs::RepositoryConfig`, `wyrd-loader/src/repository.rs`, `wyrd-cli/src/card.rs::declare_tree` | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:171`, `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:355` | Rust journey `toml_policy_is_selected_only_once_declared`, `cli_checks_offline_and_declares_the_policy` | PASS |
-| O-02 YAML Repository same lifecycle | `Spec::Repository` through `cards/saga` and `components/cards/service.rs` | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:254-258` | `yaml_repository_declares_through_the_same_lifecycle` (Rust/Python/TS) | PASS |
-| O-03 ordinary YAML declaration unchanged | `wyrd-sql/src/queries/cards/repository.rs` `COALESCE(ready)` for non-Repository roots | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:162` (plain Verifier YAML declares), `crates/wyrd/wyrd-sql/tests/integration/pg_cards_declare.rs:1374` (no Repository root settles nothing) | `declare_and_pull::*` 15/15 and `pg_cards_declare` in `mise run test:cards:integration` | PASS |
+| O-02 YAML Repository same lifecycle | `Spec::Repository` through `cards/saga` and `components/cards/service.rs` | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:254-259` | `yaml_repository_declares_through_the_same_lifecycle` (Rust/Python/TS) | PASS |
+| O-03 ordinary YAML declaration unchanged | `wyrd-sql/src/queries/cards/repository.rs` `COALESCE(ready)` for non-Repository roots | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:269-280` (YAML Service declares, carries no Repository status), `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:162`, `crates/wyrd/wyrd-sql/tests/integration/pg_cards_declare.rs:1374` | Rust journey; `declare_and_pull::*` 15/15 in `mise run test:cards:integration` | PASS |
 | O-04 remote is a hint; unselected repo refused | `components/cards/service.rs::resolve_repositories` via `GithubConnections::verify_repository` | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:285` | `repository_identity_is_verified_by_the_connection` (Rust/Python/TS) | PASS |
-| O-05 metadata/spec overrides win, still verified | `RepositoryMetadata`/`RepositoryIdentity` in loader | `crates/shared/wyrd-loader/src/lib.rs:555`; `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:258` (explicit `repository_id` verified to `acme/web`); `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:298` (name override verified against family) | loader lib; journeys | PASS |
+| O-05 metadata/spec overrides win, still verified | `RepositoryMetadata`/`RepositoryIdentity`; `resolve_repositories` prefers `repository_id` over the remote | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:312` (name override wins), `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:317` (`repository_id = "1"` from an `acme/web` checkout verifies to `acme/api`), `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:323` (later inferred declare joins the family), `crates/shared/wyrd-loader/src/lib.rs:555` | Rust journey; wyrd-loader lib | PASS |
 | O-06 explicit identity outside a checkout | `--repository` → `load_with_repository` | `crates/shared/wyrd-loader/src/lib.rs:555` | `cargo nextest run -p wyrd-loader --lib` | PASS |
-| O-07 missing identity refuses | `WYRD_REGISTRY_400_REPOSITORY_IDENTITY_MISSING` | `crates/shared/wyrd-loader/src/lib.rs:604` | wyrd-loader lib | PASS |
+| O-07 missing/ambiguous identity refuses clearly | loader diagnostics | `crates/shared/wyrd-loader/src/lib.rs:615` (missing → `REPOSITORY_IDENTITY_MISSING`), `:621` (remote naming no repository), `:632` (`--repository` without a `[repository]` table); `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:378-381`, Python `test_repository_declaration.py:168`, TS `repository-declaration.test.ts:140` (CLI surfaces carry the diagnostic) | wyrd-loader lib 56/56; Rust/Python/TS journeys | PASS |
 | O-08 only selected Verifiers; unrelated YAML absent | loader builds root from `[repository.verified_by]` only | `crates/shared/wyrd-loader/src/lib.rs:502`, `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:178` | loader lib; Rust journey | PASS |
 | O-09 local and registered refs | `RepositoryBindings::verifier: Vec<Ref>` | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:193` (`changed.toml` = path + registered answer-check → 2 bindings, `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:196`) | Rust/Python/TS journeys | PASS |
 | O-10 local validation before registration | loader validates listed Verifiers before `Cards::declare` | `crates/shared/wyrd-loader/src/lib.rs:635`, `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:348` (no client resolved) | loader lib; CLI journey | PASS |
 | O-11 first registration infers name | `wyrd-spec/src/card/repository.rs::infer_card_name` | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:172` | Rust journey | PASS |
 | O-12 rename preserves family | `repository_family_name` lookup in `resolve_repositories` | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:307` | Rust journey (rename observed through reconnect) | PASS |
 | O-13 explicit conflicting name refused | `WYRD_REGISTRY_409_REPOSITORY_IDENTITY_CONFLICT` | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:298` | Rust/Python/TS journeys | PASS |
-| O-14 no provider IO in loader | `wyrd-loader/src/repository.rs:128` reads only `.git/config` | `crates/shared/wyrd-loader/src/repository.rs:175` | `mise run check:deps` rc=0; wyrd-loader lib | PASS |
+| O-14 no provider IO in loader | `wyrd-loader/src/repository.rs:128` reads only `.git/config` | `crates/shared/wyrd-loader/src/repository.rs:175`; dependency proof: `cargo tree --locked -p wyrd-loader -e normal` lists 247 crates, none matching `reqwest`, `hyper`, `tokio`, `http`, `octocrab` or `ureq` | wyrd-loader lib; cargo tree | PASS |
 | O-15 `--check` local, deferred labels | `wyrd-cli/src/card.rs::check_tree` | `crates/wyrd/wyrd-cli/src/card.rs:1154`, `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:335` | wyrd-cli lib; CLI journey (Rust/Python/TS) | PASS |
 | O-16 Repository ordinary kind, closed shape | `wyrd-spec/src/card/repository.rs`, `envelope.rs` | `crates/wyrd-spec/src/card/mod.rs:2591`, `crates/wyrd-spec/src/card/repository.rs:221` | wyrd-spec lib | PASS |
 | O-17 verifier array → singular bindings | loader expansion | `crates/shared/wyrd-loader/src/lib.rs:502`, `crates/wyrd/wyrd-config/src/config.rs:305` | loader/config lib | PASS |
 | O-18 projections accept Repository | `gen_schemas.rs`, `gen_ts_types.py`, Python `Kind::Repository`, TS exports | Python `first.root.kind == CardKind.Repository`; TS `toMatchObject({kind:"Repository"})`; `pg_openapi_contract.rs:1537-1549` | `codegen:check` rc=0; py/ts journeys; openapi 24/24 | PASS |
 | O-19 reuse / auto-version / pin conflict | normal saga hashing; `seed_version` | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:188`, `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:193`, `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:210` | Rust/Python/TS journeys | PASS |
-| O-20 select only after graph ready | `settle_repository_selection` waits for every owned Card Active | `crates/wyrd/wyrd-sql/tests/integration/pg_cards_declare.rs:1388` | `pg_cards_declare::repository_selection_settles_once_against_the_expected_prior` | PASS |
-| O-21 failed declaration keeps selection; deps survive | settle not reached / `Pending` | `crates/wyrd/wyrd-sql/tests/integration/pg_cards_declare.rs:1420-1425` (unready keeps previous), `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:214-219` | SQL integration; Rust journey | PASS |
-| O-22 distinct race: one selects, other conflicts | CAS on expected prior | `crates/wyrd/wyrd-sql/tests/integration/pg_cards_declare.rs:1441` | SQL integration | PASS |
+| O-20 select only after graph ready | `settle_repository_selection` waits for every owned Card Active | `crates/wyrd/wyrd-sql/tests/integration/pg_cards_declare.rs:1388` (pending root), `crates/wyrd/wyrd-sql/tests/integration/pg_cards_declare.rs:1503` (Active root waits for a pending dependency with an artifact hash), `crates/wyrd/wyrd-sql/tests/integration/pg_cards_declare.rs:1522` (selects once it activates) | `pg_cards_declare::repository_selection_settles_once_against_the_expected_prior` | PASS |
+| O-21 failed declaration keeps selection; deps survive | settle not reached / `Pending` | `crates/wyrd/wyrd-sql/tests/integration/pg_cards_declare.rs:1426` and `crates/wyrd/wyrd-sql/tests/integration/pg_cards_declare.rs:1503-1504` (unready graph keeps previous selection), `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:210-219` (refused declarations keep selection; registered dependency readable) | SQL integration; Rust/Python/TS journeys | PASS |
+| O-22 distinct race: one selects, other conflicts | CAS on expected prior; `settle_selection` maps `Conflict` | `crates/wyrd/wyrd-sql/tests/integration/pg_cards_declare.rs:1441`; `crates/wyrd/wyrd-server/src/components/cards/service.rs:3453` (`WYRD_REGISTRY_409_REPOSITORY_SELECTION_CONFLICT`, on every retry) | SQL integration; `wyrd-server` `components::cards::service::pg_tests::a_raced_repository_declaration_answers_a_selection_conflict` | PASS |
 | O-23 identical target reuses | target equality | `crates/wyrd/wyrd-sql/tests/integration/pg_cards_declare.rs:1407` | SQL integration | PASS |
-| O-24 delayed completion cannot undo newer | settled outcome kept | `crates/wyrd/wyrd-sql/tests/integration/pg_cards_declare.rs:1441-1445` | SQL integration | PASS |
+| O-24 delayed completion cannot undo newer | settled outcome kept | `crates/wyrd/wyrd-sql/tests/integration/pg_cards_declare.rs:1441-1448` | SQL integration | PASS |
 | O-25 rollback by old exact version | new operation with old target | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:224-226`, `crates/wyrd/wyrd-sql/tests/integration/pg_cards_declare.rs:1461` | Rust journey; SQL integration | PASS |
 | O-26 Active ≠ selected; no new tables | `selected_at` column + partial unique index | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:200`, `crates/wyrd/wyrd-sql/tests/integration/pg_cards_declare.rs:1449`; migration has 0 `CREATE TABLE` | journey; `grep -ci "create table"` = 0 | PASS |
 | O-27 empty list, connection stays active | complete desired state | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:234-237` | Rust/Python/TS journeys | PASS |
@@ -176,10 +176,13 @@ Story fixtures: `fixtures/cards/repository_declaration/`.
 | O-29 design + root catalog amended | `architecture/wyrd-design.md` (Kind catalog, Repository per-kind, Trigger, Repository selection, Pre-declaration, Reference slots, Workspace config, Reference-direction); `AGENTS.md` 13 kinds | docs diff | `mise run docs:check` rc=0 | PASS |
 | O-30 receipt root/outcomes + status | `RepositoryStatus` on `status.repository`; `status.verification` | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:171-183` | journeys | PASS |
 | O-31 receipt follows committed selection | settle at end of `initialize_uploads`/`complete_card` | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:180` (status read right after receipt is selected) | journeys | PASS |
-| O-32 projections on every surface | Rust/Python/TS/CLI/MCP/HTTP | per-surface journeys; MCP `github.rs:253` | `mise run test:cards:integration`, `py:test` selector, `ts` selector, MCP selector | PASS |
+| O-32 projections on every surface | Rust client/SDK, CLI, Python, TS, HTTP route (`POST /v1/cards` driven by every SDK journey), MCP read tools (`cards.get`/`cards.list`; MCP has no declare tool) | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:171`; Python `test_repository_declaration.py:87`; TS `repository-declaration.test.ts:70`; `crates/wyrd/wyrd-mcp/tests/bifrost/mcp/github.rs:253`; `pg_openapi_contract.rs:1537-1549` | journeys per surface; `codegen:check` | PASS |
 | O-33 authoring guide | `docs/src/content/docs/build-and-verify/declare/declare-a-repository.md` embeds the journey fixtures | docs page | `mise run docs:check` rc=0 | PASS |
-| O-34 same receipts/errors/served schemas | identical codes asserted in three SDK journeys; served OpenAPI | `pg_openapi_contract.rs:1537-1549`; journeys | openapi 24/24; journeys | PASS |
+| O-34 same receipts/errors/served schemas | identical codes asserted in the three SDK journeys | Rust/Python/TS each assert `403_REPOSITORY_INACCESSIBLE`, `409_REPOSITORY_IDENTITY_CONFLICT`, `409_SPEC_DRIFT`, `422_UNRESOLVED_DEPENDENCY`, `400_INVALID_ENVELOPE` with `REPOSITORY_IDENTITY_MISSING`; served `Spec`/`CardKind` at `pg_openapi_contract.rs:1537-1549`; error catalog page regenerated by `docs:generate` | journeys; openapi 24/24; `docs:check` | PASS |
 | O-35 tenant isolation + contract checks | raw-query justification in `queries/cards/repository.rs` | — | `check:tenant-isolation` rc=0, `codegen:check` rc=0 | PASS |
+| O-36 (unledgered, task ¶5) already accepted executions keep their policy | no Repository execution exists before task 006 admits one | — | — | OPEN: not observable in this task; route to task 006's admission proof |
+| O-37 (unledgered, Output ¶1) task 006 resolves selected registered bindings, not PR TOML | selected bindings served on `status.repository`/`status.verification` | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:180-183` | Rust journey | PASS for the producer side; consumer proof belongs to task 006 |
+| O-38 (unledgered, Proof AC-002) failed artifact upload in a Repository graph keeps the previous selection | an unverified upload leaves its Card pending, which `settle_repository_selection` never selects | `crates/wyrd/wyrd-sql/tests/integration/pg_cards_declare.rs:1503-1504` models the pending upload at the owner | SQL integration | OPEN: no journey uploads an artifact inside a Repository graph (no local Artifact fixture exists) |
 
 Non-goals stayed excluded: no PR event producer (task 006), no deferred
 subscriptions (task 007), no new PostgreSQL tables, no provider IO in the loader.
@@ -219,3 +222,26 @@ subscriptions (task 007), no new PostgreSQL tables, no provider IO in the loader
 - `mise run test:cards:integration` (includes `pg_cards_declare`, `declare_and_pull`, `repository_declaration::`): rc=0.
 - Python `test_repository_declaration.py` 4 passed; TS `repository-declaration.test.ts` 4 passed; MCP `an_agent_reads_the_selected_repository_policy` passed; `pg_openapi_contract` 24 passed.
 - `git diff --check`: clean.
+
+### Checker round 1
+
+A fresh read-only checker named O-05, O-07, O-14, O-20, O-21, O-22, O-31, O-32,
+O-34 and three unledgered requirements. These are closed by:
+
+- the override, CLI-surface identity diagnostic and YAML Service regression
+  assertions in `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs`;
+- the pending-dependency graph case in `crates/wyrd/wyrd-sql/tests/integration/pg_cards_declare.rs`;
+- the server-owner selection-conflict test in `crates/wyrd/wyrd-server/src/components/cards/service.rs::pg_tests`;
+- the loader dependency proof.
+
+All of these passed on first run against existing behavior, which is a process
+exception.
+
+Mechanical deviations:
+
+- The tier-2 "server declaration route" proof runs through the `POST /v1/cards`
+  call in every SDK journey.
+- MCP exposes Cards read tools only, so MCP proves the read projection.
+
+O-31 rests on two proofs: the journey's status read after the receipt, and the
+owner-tier proof that a pending graph never selects. O-36 and O-38 stay open.

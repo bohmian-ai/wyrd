@@ -204,13 +204,22 @@ choices do not need another design decision. They belong to implementation.
 
 ## Handoff
 
-Design is finalized for approved specification revision 4 and its public
-contracts. Revision 4 changes only GitHub installation storage; other approved
-behavior remains intact. The [task packet](../tasks/README.md) references revision
-4. Task 002 owns the dedicated table, flow-separated authorization state,
+Design is finalized for approved specification revision 5 and its public
+contracts. Revision 4 selects dedicated installation storage. Revision 5 selects
+GitHub.com’s documented App flow. The [task packet](../tasks/README.md) references
+revision 5. Task 002 owns the dedicated table, flow-separated authorization state,
 security/runtime authority updates and connected proof. Document approval does
 not claim runtime recovery or capacity proof.
 
-Resume task 002 through `$wyrd-implement` using the storage decision above. Do
+Resume task 002 through `$wyrd-implement` using its
+[remediation packet](../review/002-github-app-connection-r1/002-R1-conventional-github-app.md). Do
 not restore the shared OIDC/GitHub table approach or rewrite applied migrations.
 Do not stage or commit without instruction.
+
+### GitHub App simplification — approved revision 5
+
+The user directed the conventional GitHub App flow after the task review raised
+an Enterprise Server protocol decision. Use GitHub.com and its documented
+installation and OAuth protections. This removes Enterprise Server support and
+capability negotiation from this change. The revision 4 implementation evidence
+and immutable review remain historical; the remediation packet applies revision 5.

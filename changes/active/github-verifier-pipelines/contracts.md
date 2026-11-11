@@ -1,9 +1,10 @@
-# Public contracts — approved revision 4
+# Public contracts — approved revision 5
 
 These shapes make [spec.md](spec.md) reviewable. Existing CardRef, File,
 execution, receipt, typed permission and problem+json contracts remain canonical.
 The user approved these shapes with specification revision 3 on 2026-11-10.
-Revision 4 changes installation storage only; these public shapes are unchanged.
+Revision 4 changes installation storage. Revision 5 selects the documented
+GitHub.com App flow. These public shapes are unchanged.
 JSON objects are closed unless an existing referenced type says otherwise.
 
 ## Repository and declaration
@@ -31,6 +32,11 @@ metadata defaults/labels/annotations retain their normal merge semantics.
 accept arbitrary event names. Referenced Trigger Cards use the same activation.
 
 ## GitHub connection
+
+Use GitHub.com’s documented GitHub App installation and OAuth flow with standard
+state, PKCE and installation confirmation. Production provider endpoints are
+`https://github.com` and `https://api.github.com`; development may use local
+protocol mocks.
 
 Operator configuration supplies App ID, slug, web/API origins, private key,
 webhook secret, OAuth client ID/secret and exact public URLs through existing

@@ -1,7 +1,7 @@
 ---
 id: TASK-002
 status: proposed
-approved_spec_revision: 4
+approved_spec_revision: 5
 requirements: [REQ-001, REQ-016]
 acceptance: [AC-001, AC-011]
 invariants: [INV-001, INV-003, INV-006, INV-007]
@@ -65,7 +65,9 @@ authorized execution authority, never a saved personal token.
 App key signing, webhook verification, connection callbacks and tenant policy
 belong in Wyrd. The independent library supplies generic provider requests only;
 deleted historical App branches/commits supply neither code nor an approved pin.
-Retain conventional configured GitHub host support. Missing optional App config
+Use GitHub.com’s documented App installation and OAuth flow with its standard
+state, PKCE and installation confirmation. Production uses GitHub.com’s web and
+API endpoints; development may use local protocol mocks. Missing optional App config
 makes only this integration unavailable; invalid present config uses typed
 validation. Document Contents read, Pull requests write, Checks write and required
 PR/source/installation-access events and the actual served setup/callback URLs.
@@ -128,7 +130,7 @@ PostgreSQL table; no UI.
 | O1 | "operator supplies App ID/slug, configured web/API origins, private key, webhook secret, OAuth client credentials and exact public URLs through existing server configuration/secret providers" | Every App field parses from server config/env; secrets only from env/file, redacted in Debug | `config` unit test parses and redacts the GitHub section |
 | O2 | "Missing optional App config makes only this integration unavailable" | Without App config the server boots, other `/v1` routes work and every GitHub operation refuses with a typed 503 | SDK journey: unconfigured server → typed unavailable error; ordinary read succeeds |
 | O3 | "invalid present config uses typed validation" | Partial/invalid App config refuses startup with `ConfigError::Invalid` naming the field | `config` unit test for partial, bad origin, bad key |
-| O4 | "Retain conventional configured GitHub host support" | Web and API origins are configurable (GitHub Enterprise Server shape); the view reports the configured host | config unit test + journey view `host` equals mock origin host |
+| O4 | "Use GitHub.com’s documented App installation and OAuth flow" | Production uses GitHub.com web/API endpoints, development supports local mocks, and the view reports the provider identity | config validation and existing callback journey |
 | O5 | "Implement the single `/v1/integrations/github` connect/read/disconnect flow" | `POST /connect`, `GET`, `DELETE` served with typed bodies and in OpenAPI | journey assertions per surface + OpenAPI path assertion |
 | O6 | "Start a one-use actor/tenant/browser-bound transaction with the existing transaction expiry behavior"; "connect transaction receipt follows durable transaction creation" | Connect returns the GitHub install URL and expiry only after the login-state row commits; the row binds actor and tenant, then the browser at setup, and expires with `LOGIN_STATE_TTL` | SQL integration: row bound/expiring; journey: receipt then setup works |
 | O7 | "Support installation begun from Wyrd" | connect → setup (state) → OAuth authorize → callback associates | journey (Wyrd-begun) |
@@ -168,6 +170,10 @@ PostgreSQL table; no UI.
 | O35 | L65-67 "App key signing, webhook verification, connection callbacks and tenant policy belong in Wyrd; the independent library supplies generic provider requests only" | All four live in `wyrd-server`; no GitHub library dependency is added | inspection |
 
 ## Evidence
+
+The following evidence describes revision 4 at `3dd1555a0`. Revision 5 is the
+current approved scope. See [the remediation packet](../review/002-github-app-connection-r1/002-R1-conventional-github-app.md)
+for required corrections and current finding dispositions.
 
 Abbreviations: **RJ** = `sdks/wyrd-sdk-rust/tests/integration/github_connection.rs`;
 **SQL** = `crates/wyrd/wyrd-sql/tests/integration/pg_github_installations.rs`;

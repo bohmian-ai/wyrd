@@ -495,7 +495,8 @@ credential.
 ### GitHub App association
 
 A tenant's GitHub connection is an association, not a principal or a
-credential. The deployment owns one GitHub App, configured from environment
+credential. The deployment owns one GitHub.com App, using GitHub.com’s documented
+installation and OAuth flow, configured from environment
 or files with its private key, OAuth client secret and webhook secret held as
 `SecretString`; none is ever accepted from TOML, a tenant, a Card or a
 request. `wyrd.github_installations` holds at most one installation per
@@ -737,8 +738,9 @@ with an RS256 App JWT, narrowed to the one repository and the App's Contents
 read, Pull requests write and Checks write permissions. A token is minted
 only while the tenant's association is active, the repository is selected
 and GitHub still grants it; it is never persisted, returned, or derived from
-a user's personal token. The GitHub web and API origins are deployment
-configuration, reached through the screened HTTP client.
+a user's personal token. Production uses `https://github.com` and
+`https://api.github.com` through the screened HTTP client. Development and tests
+may configure local protocol mocks.
 
 Before fetching any user- or tenant-supplied URL, the server must:
 

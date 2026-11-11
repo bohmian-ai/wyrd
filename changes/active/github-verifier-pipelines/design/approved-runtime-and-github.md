@@ -96,10 +96,11 @@ The old App permissions must be updated for the newly approved review-comment
 surface: Contents read, Pull requests write and Checks write (Metadata read is
 implicit). Publishing suggestions does not authorize source commits.
 
-App deployment is settled: use the conventional operator-configured App and
-verified tenant installation flow above. Do not reopen it or add host-management
-requirements. The assistant's later GitHub.com-only/GitHub Enterprise deferral
-suggestion is not an approved scope restriction.
+The user approved revision 5 to use GitHub.com’s conventional App installation
+and OAuth flow. Use its documented state, PKCE and installation confirmation.
+Enterprise Server compatibility and provider capability negotiation are outside
+this change. Production uses GitHub.com’s web and API endpoints; local protocol
+mocks serve development and tests.
 
 ## Webhook ingress
 

@@ -1,9 +1,11 @@
 # GitHub Verifier pipeline tasks
 
-These nine tasks derive from **approved spec revision 4 and contracts**, approved
+These nine tasks derive from **approved spec revision 5 and contracts**, approved
 by the user on 2026-11-10. They apply the current repository `wyrd-plan` skill.
-Revision 4 applies the approved installation storage amendment; other task
-behavior is unchanged. All task statuses
+Revision 4 applies the approved installation storage amendment. Revision 5 uses
+GitHub.com’s documented App flow and removes the Enterprise Server compatibility
+decision. Task 002’s remediation packet carries that scope through configuration
+and proof. All task statuses
 are proposed. This packet does not approve implementation or claim runtime proof.
 
 The selected path is existing connect/authorization→Card declaration saga→Scribe
@@ -139,3 +141,10 @@ both gaps resolved, including CLI alongside SDK/MCP proof. This is comprehension
 evidence only; runtime feasibility,
 external library availability and implementation correctness remain unverified.
 No separate review artifact or readiness gate was created.
+
+Revision 5 and TASK-002-R1 received a bounded independent comprehension check.
+The reader traced the original finding dispositions and correction/proof
+boundaries; subsequent [Ponytail calibration](../review/002-github-app-connection-r1/scope-resolution.md)
+reduces retry and historical-evidence work. Its requested clarifications to revision references, packet
+requirements and the substituted-code negative proof are incorporated. This
+checks the authoring handoff; implementation closure remains pending.

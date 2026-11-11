@@ -1,6 +1,6 @@
 ---
 id: SPEC-github-verifier-pipelines
-revision: 4
+revision: 5
 status: approved
 ---
 
@@ -55,8 +55,9 @@ or UI workflow.
   SubmissionSink, runner, checkpoints and engine remain the owners. No new
   PostgreSQL tables except `wyrd.github_installations` for GitHub associations.
 - This is the same implementation for SaaS, self-hosted and enterprise cloud.
-  Conventional configured GitHub host/App support is retained; no new host or
-  installation-management product is introduced.
+  The provider is GitHub.com using its documented GitHub App installation
+  and OAuth flow. Development uses local protocol mocks. Enterprise Server
+  support and provider capability negotiation are outside this change.
 - No source commits/autofix, merge approval, automatic thread resolution,
   general signal buffer, timer wait action or CI-provider-specific integration.
 
@@ -69,8 +70,9 @@ through existing configuration and secret providers. A tenant completes verified
 installation association and repository selection. Enforce one connected
 installation per tenant and one tenant per installation. Disconnect stops
 connection use and affected unfinished work before releasing its association.
-GitHub's setup URL is not its OAuth callback, and an installation_id is not
-association proof.
+Use GitHub.com's documented setup and OAuth callback flow, including its
+standard state and PKCE protections and installation confirmation. The tenant
+completes this ordinary flow once to connect the App.
 
 `wyrd-sql` owns one dedicated `wyrd.github_installations` table for tenant identity
 (`data_tenant_id`), configured host, verified installation ID, selected accessible
@@ -306,7 +308,10 @@ without production GitHub credentials.
 
 The user explicitly approved revision 3 and [contracts](contracts.md) for planning
 on 2026-11-10, then approved and requested the dedicated installation storage
-amendment as revision 4. Public shapes are unchanged. Contracts define those shapes;
+amendment as revision 4. The user then directed removal of the Enterprise
+Server compatibility decision and use of the conventional GitHub App flow as
+revision 5. GitHub.com is the provider for this change. Public shapes are
+unchanged. Contracts define those shapes;
 [research](research.md) records inspected owners, necessary extensions and
 verification limits. The [standard-report example](design/worked-examples/standard-report/README.md)
 illustrates the declaration-to-delivery flow; its future contracts have not been
@@ -315,6 +320,8 @@ executed against the server.
 Specification approval covers the behavior and public contracts in this packet.
 It does not claim implementation readiness. Revision 4 selects the installation
 table; private column layout and query mechanics remain implementation-owned.
+Revision 5 uses GitHub.com’s documented installation and authorization flow.
+The user’s direction to simplify this scope authorizes this revision.
 
 Owning architecture still needs the approved amendments for Repository/Card
 roots, closed PR activation, TOML roots, deferred publication/approval, scoped
@@ -331,6 +338,7 @@ readiness. Implementation tasks derive from this approved revision.
 | 2 | draft | User correction: approval uses normal authorization only; remove authentication-age and interactive-proof requirements |
 | 3 | approved 2026-11-10 | Apply approved source-based evidence matching; remove publication Card-version overrides, public reactivation rules, extra App management workflow and prescribed permission/layout additions; audit supporting contracts. User explicitly approved this revision and its contracts for planning. |
 | 4 | approved 2026-11-10 | User approved and requested the storage amendment: allow only wyrd.github_installations, preserve OIDC trust, reuse flow-separated login state and revise task 002 proof. Public contracts and other task behavior are unchanged. |
+| 5 | approved 2026-11-10 | User directed the conventional GitHub App flow and removal of the Enterprise Server compatibility decision. Scope the provider to GitHub.com with its documented installation and OAuth protections. |
 
 Authority: [Wyrd doctrine/Verifier](../../../architecture/wyrd-design.md),
 [Bifrost](../../../architecture/bifrost-design.md),

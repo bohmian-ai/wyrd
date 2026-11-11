@@ -930,8 +930,8 @@ no plaintext-cookie compatibility path is retained.
 
 #### GitHub App association
 
-A tenant connects to GitHub by associating one installation of the
-deployment's GitHub App with the tenant; it creates no principal, Card or
+A tenant connects to GitHub.com through its documented App installation and
+OAuth flow, associating one installation of the deployment's GitHub App with the tenant; it creates no principal, Card or
 binding. The association is the tenant's single
 `wyrd.github_installations` slot, served at `/v1/integrations/github`
 (read, connect, disconnect) with the browser `setup` and `callback`

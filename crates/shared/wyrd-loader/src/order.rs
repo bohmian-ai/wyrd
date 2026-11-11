@@ -1,8 +1,7 @@
 //! Shared submission graph ordering for the loader.
 
-use wyrd_spec::envelope::Spec;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::graph::{GraphError, spec_binding_errors};
+use wyrd_spec::graph::{GraphError, GraphSubmission, spec_binding_errors};
 use wyrd_spec::registry::CardSubmission;
 
 use super::error::Diagnostic;
@@ -14,8 +13,9 @@ use super::parse::AuthoredCard;
 /// sorting, so a tree the loader orders is the tree registration accepts.
 /// Each card is projected to its submission, sibling targets are matched
 /// against the whole tree, and binding uniqueness is checked on those
-/// matched targets before the graph is built. The returned indices point
-/// into `cards`, dependencies first and the single root last.
+/// matched targets before the graph is built. Each returned index points
+/// into `cards` beside that card's submission, dependencies first and the
+/// single root last.
 ///
 /// # Errors
 ///
@@ -24,7 +24,9 @@ use super::parse::AuthoredCard;
 /// project to a submission, the binding diagnostics of the matched targets,
 /// and the graph diagnostic for an unresolved, ambiguous, or cyclic
 /// reference, a tree without exactly one root, or an invalid composition.
-pub fn order_cards(cards: &[AuthoredCard]) -> Result<Vec<usize>, Vec<Diagnostic>> {
+pub fn order_cards(
+    cards: &[AuthoredCard],
+) -> Result<Vec<(usize, CardSubmission)>, Vec<Diagnostic>> {
     if cards.is_empty() {
         return Err(vec![Diagnostic::invalid_envelope(
             "<loader>".into(),
@@ -62,6 +64,7 @@ pub fn order_cards(cards: &[AuthoredCard]) -> Result<Vec<usize>, Vec<Diagnostic>
     let order = wyrd_spec::graph::root_last(order)
         .map_err(|error| vec![graph_diagnostic(&error, cards, &card_refs)])?;
 
+    let mut submissions = submissions.into_iter().map(Some).collect::<Vec<_>>();
     order
         .nodes
         .iter()
@@ -69,6 +72,7 @@ pub fn order_cards(cards: &[AuthoredCard]) -> Result<Vec<usize>, Vec<Diagnostic>
             card_refs
                 .iter()
                 .position(|card_ref| card_ref.same_identity(&node.card_ref))
+                .and_then(|index| Some((index, submissions[index].take()?)))
                 .ok_or_else(|| {
                     Diagnostic::invalid_envelope(
                         "<loader>".into(),
@@ -92,21 +96,13 @@ pub fn order_cards(cards: &[AuthoredCard]) -> Result<Vec<usize>, Vec<Diagnostic>
 /// again on the graph-ready specs.
 fn matched_binding_diagnostics(
     cards: &[AuthoredCard],
-    graph_submissions: &[CardSubmission],
+    graph_submissions: &[GraphSubmission],
 ) -> Vec<Diagnostic> {
     cards
         .iter()
         .zip(graph_submissions)
         .flat_map(|(card, graph)| {
-            match Spec::from_kind_and_value(&graph.kind, graph.spec.clone()) {
-                Ok(spec) => spec_binding_errors(&spec),
-                Err(error) => vec![WyrdError::LoaderInvalidEnvelope {
-                    message: error.to_string(),
-                    details: serde_json::json!({ "graph_error": error.to_string() }),
-                }],
-            }
-            .into_iter()
-            .map(|error| {
+            spec_binding_errors(&graph.spec).into_iter().map(|error| {
                 Diagnostic::from_wyrd_error(
                     card.source_path.clone(),
                     super::Severity::Error,
@@ -292,12 +288,17 @@ mod tests {
         }
     }
 
+    /// The card indices of an order.
+    fn indices(order: &[(usize, CardSubmission)]) -> Vec<usize> {
+        order.iter().map(|(index, _)| *index).collect()
+    }
+
     #[test]
     fn order_reuses_shared_graph_and_places_dependencies_first() {
         let cards = vec![service("service", Some("model")), service("model", None)];
         let order = order_cards(&cards).unwrap();
 
-        assert_eq!(order, vec![1, 0]);
+        assert_eq!(indices(&order), vec![1, 0]);
     }
 
     #[test]
@@ -316,7 +317,7 @@ mod tests {
 
         let order = order_cards(&[v2, v1]).expect("different versions form one graph");
 
-        assert_eq!(order, vec![1, 0]);
+        assert_eq!(indices(&order), vec![1, 0]);
     }
 
     /// Surface the stable peer-component diagnostic when a Verifier is a Service component.

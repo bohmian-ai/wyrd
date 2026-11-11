@@ -83,6 +83,53 @@ pub struct RootPick {
     pub root: CardRef,
 }
 
+/// A graph-ready submission and its spec, decoded once for every graph
+/// operation that reads it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphSubmission {
+    /// The submission, its version pinned and its siblings naming their
+    /// targets' graph identities.
+    pub submission: CardSubmission,
+    /// The decoded `submission.spec`.
+    pub spec: Spec,
+    /// The identities `spec`'s sibling references name, in visit order.
+    siblings: Vec<CardRefIdentity>,
+}
+
+impl GraphSubmission {
+    /// Decode a submission whose versions and siblings are already exact.
+    ///
+    /// [`graph_ready_submissions`] produces these from authored submissions;
+    /// this takes one as it is.
+    ///
+    /// # Errors
+    /// Returns [`GraphError::InvalidSpec`] when the spec cannot be decoded.
+    pub fn decode(submission: CardSubmission) -> Result<Self, GraphError> {
+        let mut spec = decode_spec(&submission)?;
+        let mut siblings = Vec::new();
+        ReferenceSlotVisitor::visit(&mut spec, |slot| {
+            siblings.extend(slot.value.as_sibling().and_then(SiblingRef::identity_key));
+        });
+        Ok(Self {
+            submission,
+            spec,
+            siblings,
+        })
+    }
+}
+
+/// Decode one submission's spec.
+///
+/// # Errors
+/// Returns [`GraphError::InvalidSpec`] when the spec cannot be decoded.
+fn decode_spec(submission: &CardSubmission) -> Result<Spec, GraphError> {
+    Spec::from_kind_and_value(&submission.kind, submission.spec.clone()).map_err(|error| {
+        GraphError::InvalidSpec {
+            message: error.to_string(),
+        }
+    })
+}
+
 /// Prepare submissions for the pure graph operations.
 ///
 /// Graph identity is `(kind, name, version)`. Auto and range version
@@ -108,12 +155,16 @@ pub struct RootPick {
 /// or a placeholder cannot be built.
 pub fn graph_ready_submissions(
     submissions: &[CardSubmission],
-) -> Result<Vec<CardSubmission>, GraphError> {
+) -> Result<Vec<GraphSubmission>, GraphError> {
     if submissions.is_empty() {
         return Err(GraphError::Empty);
     }
 
-    let authored = authored_versions(submissions)?;
+    let mut specs = submissions
+        .iter()
+        .map(decode_spec)
+        .collect::<Result<Vec<_>, _>>()?;
+    let authored = authored_versions(submissions, &mut specs);
     let graph_refs = submissions
         .iter()
         .map(|submission| {
@@ -132,38 +183,38 @@ pub fn graph_ready_submissions(
     submissions
         .iter()
         .cloned()
+        .zip(specs)
         .zip(&graph_refs)
-        .map(|(mut submission, graph_ref)| {
+        .map(|((mut submission, mut spec), graph_ref)| {
             submission.metadata.version = Some(VersionSpec::Pin(graph_ref.version.clone()));
-            pin_siblings(&mut submission, submissions, &graph_refs)?;
-            Ok(submission)
+            let siblings = pin_siblings(&mut submission, &mut spec, submissions, &graph_refs)?;
+            Ok(GraphSubmission {
+                submission,
+                spec,
+                siblings,
+            })
         })
         .collect()
 }
 
 /// Every version the request spells for each kind and name: submission pins
-/// and the versions of sibling and external references.
-///
-/// # Errors
-/// Returns [`GraphError::InvalidSpec`] when a spec cannot be decoded.
+/// and the versions of sibling and external references in the decoded
+/// `specs`.
 fn authored_versions(
     submissions: &[CardSubmission],
-) -> Result<BTreeSet<CardRefIdentity>, GraphError> {
+    specs: &mut [Spec],
+) -> BTreeSet<CardRefIdentity> {
     let mut versions = submissions
         .iter()
         .filter_map(submission_card_ref)
         .map(|card_ref| card_ref.identity_key())
         .collect::<BTreeSet<_>>();
-    for submission in submissions {
-        let mut spec = Spec::from_kind_and_value(&submission.kind, submission.spec.clone())
-            .map_err(|error| GraphError::InvalidSpec {
-                message: error.to_string(),
-            })?;
-        ReferenceSlotVisitor::visit(&mut spec, |slot| {
+    for spec in specs {
+        ReferenceSlotVisitor::visit(spec, |slot| {
             versions.extend(slot.value.target().and_then(|target| target.identity_key()));
         });
     }
-    Ok(versions)
+    versions
 }
 
 /// The lowest `0.0.N` graph-only version `authored` does not spell for
@@ -192,23 +243,21 @@ fn placeholder(
     })
 }
 
-/// Rewrite every sibling in one submission to its target's graph identity.
+/// Rewrite every sibling in one submission and its decoded spec to its
+/// target's graph identity, returning the identities its siblings then name.
 ///
 /// # Errors
-/// Returns the decode and ambiguity errors of [`graph_ready_submissions`].
+/// Returns the serialization and ambiguity errors of
+/// [`graph_ready_submissions`].
 fn pin_siblings(
     submission: &mut CardSubmission,
+    spec: &mut Spec,
     submissions: &[CardSubmission],
     graph_refs: &[CardRef],
-) -> Result<(), GraphError> {
-    let mut spec =
-        Spec::from_kind_and_value(&submission.kind, submission.spec.clone()).map_err(|error| {
-            GraphError::InvalidSpec {
-                message: error.to_string(),
-            }
-        })?;
+) -> Result<Vec<CardRefIdentity>, GraphError> {
     let mut result = Ok(false);
-    ReferenceSlotVisitor::visit(&mut spec, |mut slot| {
+    let mut siblings = Vec::new();
+    ReferenceSlotVisitor::visit(spec, |mut slot| {
         let Ok(changed) = &mut result else {
             return;
         };
@@ -223,13 +272,15 @@ fn pin_siblings(
             Ok(None) => {}
             Err(error) => result = Err(error),
         }
+        siblings.extend(slot.value.as_sibling().and_then(SiblingRef::identity_key));
     });
     if result? {
-        submission.spec = serde_json::to_value(&spec).map_err(|error| GraphError::InvalidSpec {
-            message: error.to_string(),
-        })?;
+        submission.spec =
+            serde_json::to_value(&*spec).map_err(|error| GraphError::InvalidSpec {
+                message: error.to_string(),
+            })?;
     }
-    Ok(())
+    Ok(siblings)
 }
 
 /// Find the submission a sibling reference names.
@@ -289,14 +340,14 @@ pub fn sibling_target(
 /// # Errors
 /// Returns [`GraphError::Empty`] when the request is empty or contains a
 /// submission whose identity has not been resolved.
-pub fn build(submissions: &[CardSubmission]) -> Result<(Vec<Node>, Vec<Edge>), GraphError> {
+pub fn build(submissions: &[GraphSubmission]) -> Result<(Vec<Node>, Vec<Edge>), GraphError> {
     if submissions.is_empty() {
         return Err(GraphError::Empty);
     }
 
     let submission_refs = submissions
         .iter()
-        .map(submission_card_ref)
+        .map(|graph| submission_card_ref(&graph.submission))
         .collect::<Option<Vec<_>>>()
         .ok_or(GraphError::Empty)?;
 
@@ -314,19 +365,9 @@ pub fn build(submissions: &[CardSubmission]) -> Result<(Vec<Node>, Vec<Edge>), G
 
     let mut edges = Vec::new();
     let mut seen = BTreeSet::new();
-    for (submission, parent) in submissions.iter().zip(nodes.iter()) {
-        let spec = Spec::from_kind_and_value(&submission.kind, submission.spec.clone()).map_err(
-            |error| GraphError::InvalidSpec {
-                message: error.to_string(),
-            },
-        )?;
-        let mut spec = spec;
-        let mut references = Vec::new();
-        ReferenceSlotVisitor::visit(&mut spec, |slot| {
-            references.extend(slot.value.as_sibling().and_then(SiblingRef::identity_key));
-        });
-        for child in references {
-            let Some(target) = siblings.get(&child) else {
+    for (graph, parent) in submissions.iter().zip(nodes.iter()) {
+        for child in &graph.siblings {
+            let Some(target) = siblings.get(child) else {
                 continue;
             };
             let edge_key = (identity_key(&parent.card_ref), identity_key(target));
@@ -364,7 +405,7 @@ pub(super) fn submission_card_ref(submission: &CardSubmission) -> Option<CardRef
 
 #[cfg(test)]
 mod tests {
-    use super::{Edge, build, graph_ready_submissions, identity_key};
+    use super::{Edge, GraphSubmission, build, graph_ready_submissions, identity_key};
     use crate::api_version::ApiVersion;
     use crate::envelope::{CardKind, Metadata};
     use crate::reference::CardRef;
@@ -402,6 +443,17 @@ mod tests {
         }
     }
 
+    /// Decode submissions whose versions and siblings are already exact.
+    ///
+    /// # Panics
+    /// Panics when a spec does not decode.
+    fn graph<const N: usize>(submissions: [CardSubmission; N]) -> Vec<GraphSubmission> {
+        submissions
+            .into_iter()
+            .map(|submission| GraphSubmission::decode(submission).expect("test spec decodes"))
+            .collect()
+    }
+
     /// A durable reference to a Card outside the submission set derives no
     /// edge, though both Cards remain nodes.
     ///
@@ -411,7 +463,7 @@ mod tests {
     fn build_ignores_external_refs() {
         let parent = card_ref(CardKind::Service, "service");
         let external = card_ref(CardKind::Prompt, "external");
-        let (nodes, edges) = build(&[
+        let (nodes, edges) = build(&graph([
             submission(
                 &parent,
                 json!({"components": [{"alias": "external", "ref": serde_json::to_value(external.clone()).expect("ref serializes")}] }),
@@ -420,7 +472,7 @@ mod tests {
                 &external,
                 json!({"provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]}),
             ),
-        ])
+        ]))
         .expect("resolved submission builds");
 
         assert_eq!(nodes.len(), 2);
@@ -439,7 +491,7 @@ mod tests {
         let child_value = json!({
             "sibling": serde_json::to_value(&child).expect("ref serializes")
         });
-        let (nodes, edges) = build(&[
+        let (nodes, edges) = build(&graph([
             submission(
                 &parent,
                 json!({"components": [{"alias": "prompt", "ref": child_value}]}),
@@ -448,7 +500,7 @@ mod tests {
                 &child,
                 json!({"provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]}),
             ),
-        ])
+        ]))
         .expect("resolved submissions build");
 
         assert_eq!(nodes.len(), 2);
@@ -495,7 +547,11 @@ mod tests {
 
         assert!(authored.metadata.version.is_none());
         assert_eq!(
-            ready[0].metadata.resolved_pin().map(ToString::to_string),
+            ready[0]
+                .submission
+                .metadata
+                .resolved_pin()
+                .map(ToString::to_string),
             Some("0.0.0".to_owned())
         );
     }
@@ -537,7 +593,7 @@ mod tests {
         assert_eq!(edges[0].to.name.as_str(), "prompt");
         assert!(authored.iter().all(|card| card.metadata.version.is_none()));
         assert_eq!(
-            ready[0].spec["components"][0]["ref"]["sibling"]["version"],
+            ready[0].submission.spec["components"][0]["ref"]["sibling"]["version"],
             json!("0.0.0")
         );
     }
@@ -598,9 +654,16 @@ mod tests {
             edges.is_empty(),
             "an unmatched explicit pin derives no edge"
         );
-        assert_eq!(ready[0].spec["components"][0]["ref"]["sibling"], explicit);
+        assert_eq!(
+            ready[0].submission.spec["components"][0]["ref"]["sibling"],
+            explicit
+        );
         assert_ne!(
-            ready[1].metadata.resolved_pin().map(ToString::to_string),
+            ready[1]
+                .submission
+                .metadata
+                .resolved_pin()
+                .map(ToString::to_string),
             Some("0.0.0".to_owned())
         );
 
@@ -630,7 +693,7 @@ mod tests {
     #[test]
     fn duplicate_submission_identity_is_rejected() {
         let first = card_ref(CardKind::Prompt, "duplicate");
-        let error = build(&[
+        let error = build(&graph([
             submission(
                 &first,
                 json!({"provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]}),
@@ -639,7 +702,7 @@ mod tests {
                 &first,
                 json!({"provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]}),
             ),
-        ])
+        ]))
         .expect_err("duplicate identities must be rejected");
 
         assert!(matches!(error, super::GraphError::DuplicateIdentity { .. }));

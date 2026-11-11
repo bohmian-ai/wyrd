@@ -12,11 +12,14 @@ use super::error::{Diagnostic, Severity};
 use super::parse::AuthoredCard;
 
 /// Validate the loaded tree and return every diagnostic found.
+///
+/// The cards are borrowed mutably only because the reference visitor yields
+/// mutable slots; validation never changes them.
 #[must_use]
-pub fn validate_tree(cards: &[AuthoredCard]) -> Vec<Diagnostic> {
+pub fn validate_tree(cards: &mut [AuthoredCard]) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     check_duplicate_identities(cards, &mut diagnostics);
-    for card in cards {
+    for card in cards.iter_mut() {
         validate_card(card, &mut diagnostics);
         check_resolved_references(card, &mut diagnostics);
     }
@@ -66,23 +69,26 @@ fn validate_card(card: &AuthoredCard, diagnostics: &mut Vec<Diagnostic>) {
 
 /// Confirm that every reference is fully resolved and obeys authored-reference
 /// rules before the submission reaches the registration boundary.
-fn check_resolved_references(card: &AuthoredCard, diagnostics: &mut Vec<Diagnostic>) {
-    let mut spec = card.spec.clone();
-    ReferenceSlotVisitor::visit(&mut spec, |slot| {
-        let diagnostic = if slot.value.as_path().is_some() {
-            Some(unresolved_path_diagnostic(card, &slot.path))
-        } else if let Some(reference) = slot.value.as_card_ref() {
-            reference
-                .uid
-                .is_some()
-                .then(|| authored_uid_diagnostic(card, &slot.path))
-        } else {
-            None
-        };
-        if let Some(diagnostic) = diagnostic {
-            diagnostics.push(diagnostic);
+fn check_resolved_references(card: &mut AuthoredCard, diagnostics: &mut Vec<Diagnostic>) {
+    let mut unresolved = Vec::new();
+    ReferenceSlotVisitor::visit(&mut card.spec, |slot| {
+        if slot.value.as_path().is_some() {
+            unresolved.push((true, slot.path));
+        } else if slot
+            .value
+            .as_card_ref()
+            .is_some_and(|reference| reference.uid.is_some())
+        {
+            unresolved.push((false, slot.path));
         }
     });
+    diagnostics.extend(unresolved.into_iter().map(|(path, field)| {
+        if path {
+            unresolved_path_diagnostic(card, &field)
+        } else {
+            authored_uid_diagnostic(card, &field)
+        }
+    }));
 }
 
 /// Build the diagnostic emitted when a path reference survived resolution.
@@ -207,7 +213,7 @@ mod tests {
             artifacts: Vec::new(),
         };
 
-        let diagnostics = validate_tree(&[card]);
+        let diagnostics = validate_tree(&mut [card]);
         assert!(diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "WYRD_SPEC_400_DUPLICATE_VERIFICATION_BINDING"
                 && diagnostic

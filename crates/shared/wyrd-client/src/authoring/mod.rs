@@ -883,8 +883,8 @@ impl Card {
     /// # Panics
     /// Never: only an Artifact Card has a local source.
     fn local(&self, source: &Path) -> Result<LocalArtifact, Vec<Diagnostic>> {
-        let card = self.decode()?;
-        wyrd_loader::declaration_input_from_cards(std::slice::from_ref(&card))
+        let mut card = self.decode()?;
+        wyrd_loader::declaration_input_from_cards(std::slice::from_mut(&mut card))
             .map_err(|error| error.diagnostics)?;
         let Spec::Artifact(spec) = card.spec else {
             unreachable!("only an Artifact Card has a local source");
@@ -1249,7 +1249,7 @@ impl<'a> Graph<'a> {
         }
         // The whole capture, local Artifacts included, is matched and
         // validated as its YAML tree would be before anything publishes.
-        let whole = wyrd_loader::declaration_input_from_cards(&every)?;
+        let whole = wyrd_loader::declaration_input_from_cards(&mut every)?;
         if !has_local {
             return Ok(Declaration {
                 artifacts,
@@ -1270,7 +1270,7 @@ impl<'a> Graph<'a> {
         let input = if authored.is_empty() {
             None
         } else {
-            Some(wyrd_loader::declaration_input_from_cards(&authored)?)
+            Some(wyrd_loader::declaration_input_from_cards(&mut authored)?)
         };
         Ok(Declaration {
             artifacts,

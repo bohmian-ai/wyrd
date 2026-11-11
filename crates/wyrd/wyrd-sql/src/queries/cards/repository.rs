@@ -73,8 +73,17 @@ pub struct SelectedRepository {
     /// The selected Card version.
     pub uid: CardUid,
     /// The selection change that selected it: the selecting declaration's
-    /// operation id, or a unique backfilled value.
+    /// operation id.
     pub occurrence: Uuid,
+}
+
+/// The selected Repository row as read, before its UID is validated.
+#[derive(FromRow)]
+struct SelectedRepositoryRow {
+    /// The selected Card's UID.
+    card_uid: Uuid,
+    /// The selection change that selected it.
+    selection_occurrence: Uuid,
 }
 
 /// The selected version of a Repository family, if one is selected.
@@ -85,7 +94,7 @@ pub async fn selected_repository(
     conn: &mut TenantConn<'_>,
     name: &CardName,
 ) -> Result<Option<SelectedRepository>, WyrdError> {
-    let row: Option<(Uuid, Uuid)> = sqlx::query_as(
+    let row: Option<SelectedRepositoryRow> = sqlx::query_as(
         "SELECT card_uid, selection_occurrence FROM wyrd.cards
           WHERE kind = 'Repository' AND name = $1 AND selected_at IS NOT NULL",
     )
@@ -93,10 +102,10 @@ pub async fn selected_repository(
     .fetch_optional(&mut **conn.transaction())
     .await
     .map_err(registry_db_error)?;
-    row.map(|(uid, occurrence)| {
+    row.map(|row| {
         Ok(SelectedRepository {
-            uid: CardUid::from_uuid(uid).map_err(WyrdError::from_card_uid_error)?,
-            occurrence,
+            uid: CardUid::from_uuid(row.card_uid).map_err(WyrdError::from_card_uid_error)?,
+            occurrence: row.selection_occurrence,
         })
     })
     .transpose()
@@ -175,9 +184,10 @@ struct SelectionRow {
 /// takes these locks after it locks its Card row, and every settle of the
 /// same operation takes the operation lock first, so the activation that
 /// makes the last member Active observes every other member's committed
-/// state and settles in its own transaction. A declaration still writing
-/// holds its reused Pending members (see [`hold_pending_member`]), so it has
-/// committed, and is found here, before their activation reads.
+/// state and settles in its own transaction; each settle then takes the
+/// family line. A declaration still writing holds its reused Pending members
+/// (see [`hold_pending_member`]), so it has committed, and is found here,
+/// before their activation reads.
 ///
 /// # Errors
 /// Returns `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE` when the read fails.
@@ -217,9 +227,13 @@ pub async fn lock_card_repository_selections(
 /// reused Card `FOR SHARE` makes that Card's activation wait for the
 /// declaration to commit and then find it (see
 /// [`lock_card_repository_selections`]), so a member activated meanwhile is
-/// never missed by both sides. The caller takes it before any Repository
-/// family lock, so no lock holder waits on it in reverse. A Card that is no
-/// longer Pending holds nothing.
+/// never missed by both sides. The hold is taken before the declaration
+/// holds its Repository family line: its other Cards are persisted before
+/// its Repository root, and a reused exact Repository is held before that
+/// line. The activation, which locks the Card row before the line, therefore
+/// never waits on the line while the declaration waits on the row. A hold
+/// that waits for an activation finds the Card no longer Pending and holds
+/// nothing, so the declaration then reads it Active.
 ///
 /// # Errors
 /// Returns `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE` when the lock fails.

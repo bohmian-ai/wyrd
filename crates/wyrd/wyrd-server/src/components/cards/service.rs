@@ -1155,17 +1155,18 @@ async fn initialize_uploads(
     Ok(response)
 }
 
-/// Settle and report the Repository selection of declaration `operation_id`.
+/// Report the Repository selection of declaration `operation_id` to its
+/// request.
 ///
-/// The decision itself belongs to the Card lifecycle transaction that makes
-/// the declaration's last exact member Active (see
-/// [`settle_waiting_selections`]). This request-side call answers the stored
-/// decision and settles an operation every member of which was already
-/// Active when it was written, such as a rollback to an existing exact
-/// version; one still pending, or without a Repository root, changes
-/// nothing. A settled operation answers its stored outcome again and never
-/// re-selects, so a delayed or replayed request cannot undo a newer
-/// selection.
+/// The decision is made by the declaration's write commit when its exact
+/// graph is already Active, and otherwise by the Card lifecycle transaction
+/// that makes its last exact member Active (see
+/// [`settle_waiting_selections`]); those record a conflict without failing
+/// the Card transition. This request-side call, in its own transaction,
+/// reads that stored decision and answers a conflict as the public refusal.
+/// One still pending, or without a Repository root, changes nothing. A
+/// settled operation answers its stored outcome again and never re-selects,
+/// so a delayed or replayed request cannot undo a newer selection.
 ///
 /// # Errors
 /// Returns `WYRD_REGISTRY_409_REPOSITORY_SELECTION_CONFLICT` when another
@@ -1193,19 +1194,21 @@ fn selection_conflict(current: Option<&CardUid>) -> WyrdError {
     }
 }
 
-/// Settle, in a Card's lifecycle transaction, every pending Repository
-/// selection `waiting` on it, as locked by [`lock_card_repository_selections`]
-/// before the Card row.
+/// Settle, in the caller's transaction, the pending Repository selections
+/// of the declarations `waiting`: those a Card's activation locked with
+/// [`lock_card_repository_selections`] after the Card row, or the
+/// declaration whose write commit this is.
 ///
-/// Each declaration whose exact graph is now Active selects or records its
-/// conflict, committing with the Card's transition, so no completion can
-/// leave a ready declaration unsettled. A conflict ends only that
-/// declaration's attempt; it is recorded, not raised, so the Card transition
-/// and its other declarations still commit.
+/// Each settle holds its operation row, then the Repository family line,
+/// until the caller commits or rolls back. Each declaration whose exact
+/// graph is now Active selects or records its conflict in that commit, so
+/// no completion can leave a ready declaration unsettled. A conflict ends
+/// only that declaration's attempt; it is recorded, not raised, so the Card
+/// transition and the other declarations still commit.
 ///
 /// # Errors
-/// Returns registry errors; the caller's transaction then rolls back with
-/// the Card's transition.
+/// Returns registry errors; the caller's transaction then rolls back,
+/// including any Card transition in it.
 async fn settle_waiting_selections(
     conn: &mut TenantConn<'_>,
     waiting: &[DeclarationOperationId],
@@ -2783,8 +2786,10 @@ async fn ensure_card_blob(
 /// success and the Repository selections the activation completes, in one
 /// transaction.
 ///
-/// The pending selections whose exact graph includes the Card are locked
-/// after the Card row (see [`lock_card_repository_selections`]), so the
+/// Locks are taken in one order: the Card row (through its lease when
+/// `lease_owner` is set), then the pending selections whose exact graph
+/// includes the Card (see [`lock_card_repository_selections`]), then each
+/// selection's Repository family line. So the
 /// activation of a declaration's last member, including one a concurrent
 /// declaration reused, observes every other member and settles it here; a
 /// failure anywhere rolls the whole transition back and leaves the Card

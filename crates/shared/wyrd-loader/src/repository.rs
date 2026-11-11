@@ -210,22 +210,24 @@ mod tests {
     /// Git's quoted values and case-insensitive variable names in the
     /// origin section yield the same remote as the plain form.
     ///
+    /// # Errors
+    /// Returns the IO error when the temporary checkout cannot be written.
+    ///
     /// # Panics
     /// Panics when a legal origin form yields a different remote.
     #[test]
-    fn origin_remote_decodes_quoted_values_and_any_key_case() {
+    fn origin_remote_decodes_quoted_values_and_any_key_case() -> std::io::Result<()> {
         for line in [
             "url = \"https://github.com/acme/widget.git\"",
             "URL = https://github.com/acme/widget.git",
             "Url=\"https://github.com/acme/widget.git\" ",
         ] {
-            let root = TempDir::new().unwrap();
-            fs::create_dir_all(root.path().join(".git")).unwrap();
+            let root = TempDir::new()?;
+            fs::create_dir_all(root.path().join(".git"))?;
             fs::write(
                 root.path().join(".git/config"),
                 format!("[remote \"origin\"]\n\t{line}\n"),
-            )
-            .unwrap();
+            )?;
             assert_eq!(
                 origin_remote(root.path()),
                 Some(RepositoryRemote {
@@ -235,5 +237,6 @@ mod tests {
                 "{line}"
             );
         }
+        Ok(())
     }
 }

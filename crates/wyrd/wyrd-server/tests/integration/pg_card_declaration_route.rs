@@ -5826,19 +5826,28 @@ async fn selected_version(server: &WyrdTestServer, name: &str) -> Option<String>
     version
 }
 
+/// A Card's UID and lifecycle status as read by name.
+#[derive(sqlx::FromRow)]
+struct CardStateRow {
+    /// The Card's UID.
+    card_uid: Uuid,
+    /// The Card's lifecycle status.
+    status: String,
+}
+
 /// The UID and lifecycle status of the only Card named `name`.
 ///
 /// # Panics
 /// Panics when no single Card has that name or its UID is invalid.
 async fn card_state(server: &WyrdTestServer, name: &str) -> (CardUid, String) {
-    let (uid, status): (Uuid, String) = tenant_row(
+    let CardStateRow { card_uid, status } = tenant_row(
         server,
         "SELECT card_uid, status FROM wyrd.cards WHERE name = $1",
         name,
     )
     .await;
     (
-        CardUid::from_uuid(uid).expect("stored UID is valid"),
+        CardUid::from_uuid(card_uid).expect("stored UID is valid"),
         status,
     )
 }
@@ -5848,7 +5857,7 @@ async fn card_state(server: &WyrdTestServer, name: &str) -> (CardUid, String) {
 /// # Panics
 /// Panics when that version is absent or its UID is invalid.
 async fn policy_state(server: &WyrdTestServer, version: &str) -> (CardUid, String) {
-    let (uid, status): (Uuid, String) = tenant_row(
+    let CardStateRow { card_uid, status } = tenant_row(
         server,
         "SELECT card_uid, status FROM wyrd.cards \
           WHERE kind = 'Repository' AND name = 'policy' AND version = $1",
@@ -5856,7 +5865,7 @@ async fn policy_state(server: &WyrdTestServer, version: &str) -> (CardUid, Strin
     )
     .await;
     (
-        CardUid::from_uuid(uid).expect("stored UID is valid"),
+        CardUid::from_uuid(card_uid).expect("stored UID is valid"),
         status,
     )
 }

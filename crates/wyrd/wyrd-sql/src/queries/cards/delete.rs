@@ -79,6 +79,13 @@ pub async fn soft_delete_card_with_kind(
 /// It clears the Card's Repository selection with its status, so a deleted
 /// version is never its family's selected version and no other version is
 /// selected in its place.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_404_CARD_NOT_FOUND` when the uid is absent or its
+/// kind is not `expected_kind`, a conflict when the Card is neither Active
+/// nor deleted or another visible Card still references it, the invalid
+/// Card spec error when the stored row does not parse, and
+/// `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE` when a query fails.
 async fn soft_delete_card_with_expected_kind(
     conn: &mut TenantConn<'_>,
     uid: &CardUid,

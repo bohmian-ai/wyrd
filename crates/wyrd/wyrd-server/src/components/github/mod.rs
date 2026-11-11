@@ -5,10 +5,13 @@
 //! [`app::GithubApp`] owns the App's credentials and every GitHub call;
 //! [`service::GithubConnections`] owns connect, read, disconnect, the setup
 //! and OAuth callback redirects, webhooks and installation tokens; HTTP and
-//! MCP are thin projections of it.
+//! MCP are thin projections of it. [`review_cache`] keeps the code-review
+//! pipeline's cache in Wyrd's object store and PostgreSQL.
 
 /// The deployment GitHub App's provider protocol.
 pub mod app;
+/// Wyrd custody of the code-review pipeline's object and metadata cache.
+pub mod review_cache;
 /// HTTP projection of the tenant GitHub connection.
 pub mod routes;
 /// The one owner of tenant GitHub connection state, shared by HTTP and MCP.

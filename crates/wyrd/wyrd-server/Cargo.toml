@@ -24,6 +24,7 @@ name = "wyrd-server"
 path = "src/main.rs"
 
 [dependencies]
+bohmian-code-review-pipeline = { workspace = true }
 mimalloc = { workspace = true }
 async-stream = { workspace = true }
 futures-util = { workspace = true }
@@ -123,6 +124,8 @@ utoipa-axum = { workspace = true }
 zip = { workspace = true }
 
 [dev-dependencies]
+bohmian-code-review-pipeline = { workspace = true, features = ["testing"] }
+sha1 = { workspace = true }
 object_store = { workspace = true }
 workspace-hack.workspace = true
 tracing-subscriber = { workspace = true }

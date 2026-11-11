@@ -650,6 +650,12 @@ An append acknowledgement means the WAL append and batch fence are durable and
 the exact rows and their recorded table version are authoritative in Scribe.
 It does not wait for local Parquet, object publication, Iceberg promotion, or compaction.
 
+Bifrost durability is the only evidence durability. The
+[code-review source cache](wyrd-design.md#code-review-source-cache) is Wyrd
+cache custody outside Bifrost: Scribe never ingests it, its objects and
+metadata are not table rows, and its collection or expiry never touches
+accepted Bifrost evidence.
+
 Every query pins one published cut: an Iceberg snapshot and committed Scribe
 hot objects not represented by that snapshot, with the table versions needed
 to resolve its schema and sources. Definition pins protect native definition

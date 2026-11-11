@@ -2095,6 +2095,21 @@ requirement ID. Existing threshold, minimum-sample, baseline-readiness, and
 insufficient-data rules apply; per-feature statistics, thresholds, counts,
 flags, and window identity are in the requirement `detail`.
 
+#### Code-review source cache
+
+Code-review source preparation runs the independent `bohmian-code-review`
+pipeline over Wyrd custody. Its immutable snapshot and context objects live in
+the configured object store under `<tenant>/code-review/`, created only when
+absent; its snapshot pointers, snapshot records and context records live in
+`wyrd.code_review_snapshot_pointers`, `wyrd.code_review_snapshot_records` and
+`wyrd.code_review_contexts`, scoped by tenant RLS, installation and numeric
+repository id, with PostgreSQL-stamped lifetimes. No object bytes are stored in
+PostgreSQL. The cache is a reusable acceleration, never evidence: a review's
+accepted source, findings and verdict are retained by Bifrost, and cache
+collection or expiry never removes them. Context expiry is enumerated across
+tenants on the operator pool; each deletion runs on the owning tenant's
+connection.
+
 ### Bifrost
 
 Bifrost is Wyrd's public OLAP warehouse surface and the analytical substrate

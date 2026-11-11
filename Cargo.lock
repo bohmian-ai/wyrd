@@ -988,6 +988,104 @@ dependencies = [
 ]
 
 [[package]]
+name = "bohmian-code-review"
+version = "0.1.0"
+source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=b8a4f37857d48a0b57669db5c4c6ed11aba59766#b8a4f37857d48a0b57669db5c4c6ed11aba59766"
+dependencies = [
+ "bohmian-code-review-core",
+ "bohmian-code-review-extract",
+ "bohmian-code-review-index",
+ "bohmian-code-review-resolve",
+ "bohmian-code-review-select",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "bohmian-code-review-core"
+version = "0.1.0"
+source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=b8a4f37857d48a0b57669db5c4c6ed11aba59766#b8a4f37857d48a0b57669db5c4c6ed11aba59766"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "bohmian-code-review-extract"
+version = "0.1.0"
+source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=b8a4f37857d48a0b57669db5c4c6ed11aba59766#b8a4f37857d48a0b57669db5c4c6ed11aba59766"
+dependencies = [
+ "bohmian-code-review-core",
+ "cc",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
+ "tree-sitter",
+ "tree-sitter-c",
+ "tree-sitter-c-sharp",
+ "tree-sitter-cpp",
+ "tree-sitter-go",
+ "tree-sitter-java",
+ "tree-sitter-javascript",
+ "tree-sitter-language",
+ "tree-sitter-luau",
+ "tree-sitter-php",
+ "tree-sitter-python",
+ "tree-sitter-r",
+ "tree-sitter-ruby",
+ "tree-sitter-rust",
+ "tree-sitter-swift",
+ "tree-sitter-typescript",
+]
+
+[[package]]
+name = "bohmian-code-review-index"
+version = "0.1.0"
+source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=b8a4f37857d48a0b57669db5c4c6ed11aba59766#b8a4f37857d48a0b57669db5c4c6ed11aba59766"
+dependencies = [
+ "bohmian-code-review-core",
+]
+
+[[package]]
+name = "bohmian-code-review-pipeline"
+version = "0.1.0"
+source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=b8a4f37857d48a0b57669db5c4c6ed11aba59766#b8a4f37857d48a0b57669db5c4c6ed11aba59766"
+dependencies = [
+ "bohmian-code-review",
+ "flate2",
+ "getrandom 0.4.3",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "sha1 0.10.7",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "bohmian-code-review-resolve"
+version = "0.1.0"
+source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=b8a4f37857d48a0b57669db5c4c6ed11aba59766#b8a4f37857d48a0b57669db5c4c6ed11aba59766"
+dependencies = [
+ "bohmian-code-review-core",
+ "bohmian-code-review-index",
+]
+
+[[package]]
+name = "bohmian-code-review-select"
+version = "0.1.0"
+source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=b8a4f37857d48a0b57669db5c4c6ed11aba59766#b8a4f37857d48a0b57669db5c4c6ed11aba59766"
+dependencies = [
+ "bohmian-code-review-core",
+ "bohmian-code-review-index",
+ "bohmian-code-review-resolve",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "bohmian-parquet-variant"
 version = "60.0.0"
 source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
@@ -8137,6 +8235,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "streaming-iterator"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b2231b7c3057d5e4ad0156fb3dc807d900806020c5ffa3ee6ff2c8c76fb8520"
+
+[[package]]
 name = "stringprep"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8782,6 +8886,166 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "tree-sitter"
+version = "0.25.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78f873475d258561b06f1c595d93308a7ed124d9977cb26b148c2084a4a3cc87"
+dependencies = [
+ "cc",
+ "regex",
+ "regex-syntax",
+ "serde_json",
+ "streaming-iterator",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-c"
+version = "0.24.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9b2eb57a55fed6b00812912e730b7a275cf4fe98bfd6a5d76263d4438371728"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-c-sharp"
+version = "0.23.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1aac67f1ad71de1d6d39708d34811081c26dfa495658de6c14c34200849357c"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-cpp"
+version = "0.23.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df2196ea9d47b4ab4a31b9297eaa5a5d19a0b121dceb9f118f6790ad0ab94743"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-go"
+version = "0.23.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b13d476345220dbe600147dd444165c5791bf85ef53e28acbedd46112ee18431"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-java"
+version = "0.23.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0aa6cbcdc8c679b214e616fd3300da67da0e492e066df01bcf5a5921a71e90d6"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-javascript"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68204f2abc0627a90bdf06e605f5c470aa26fdcb2081ea553a04bdad756693f5"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-language"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
+
+[[package]]
+name = "tree-sitter-luau"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "871abeb427d719788bb38094facd7ff082908ef2b93c1d3d6a5f6025330120f4"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-php"
+version = "0.24.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d8c17c3ab69052c5eeaa7ff5cd972dd1bc25d1b97ee779fec391ad3b5df5592"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-python"
+version = "0.23.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d065aaa27f3aaceaf60c1f0e0ac09e1cb9eb8ed28e7bcdaa52129cffc7f4b04"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-r"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "429133cbda9f8a46e03ef3aae6abb6c3d22875f8585cad472138101bfd517255"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-ruby"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be0484ea4ef6bb9c575b4fdabde7e31340a8d2dbc7d52b321ac83da703249f95"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-rust"
+version = "0.24.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "439e577dbe07423ec2582ac62c7531120dbfccfa6e5f92406f93dd271a120e45"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-swift"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe36052155b9dd69ca82b3b8f1b4ccfb2d867125ac1a4db1dd7331829242668c"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-typescript"
+version = "0.23.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c5f76ed8d947a75cc446d5fccd8b602ebf0cde64ccf2ffa434d873d7a575eff"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
 ]
 
 [[package]]
@@ -10545,6 +10809,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "blake3",
+ "bohmian-code-review-pipeline",
  "bytes",
  "chrono",
  "clap",
@@ -10581,6 +10846,7 @@ dependencies = [
  "serde",
  "serde_jcs",
  "serde_json",
+ "sha1 0.10.7",
  "sha2 0.10.9",
  "shellexpand",
  "sqlx",

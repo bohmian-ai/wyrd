@@ -154,6 +154,8 @@ zip = { version = "8.6", default-features = false, features = ["deflate-flate2"]
 zstd = "0.13"
 walkdir = "2.*"
 sha2 = "0.10"
+# Git blob ids in code-review pipeline fixtures.
+sha1 = "0.10"
 uuid = { version = "1", default-features = false, features = ["serde"] }
 crc32c = "0.6"
 rustix = { version = "1.1.4", features = ["fs"] }
@@ -251,6 +253,8 @@ parquet = "60.0"
 parquet-variant = { package = "bohmian-parquet-variant", version = "60.0.0" }
 parquet-variant-compute = { package = "bohmian-parquet-variant-compute", version = "60.0.0" }
 parquet-variant-json = { package = "bohmian-parquet-variant-json", version = "60.0.0" }
+# Pinned PR source preparation, repository snapshots and review context selection.
+bohmian-code-review-pipeline = { git = "https://github.com/bohmian-ai/bohmian-code-review", rev = "b8a4f37857d48a0b57669db5c4c6ed11aba59766" }
 iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "469cf4aff3aaee824f2ec3ce685c61411a08640e" }
 # The fork's SQL catalog is on the workspace's sqlx 0.9, so one sqlx is linked.
 iceberg-catalog-sql = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "469cf4aff3aaee824f2ec3ce685c61411a08640e" }

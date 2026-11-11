@@ -6091,7 +6091,8 @@ async fn gateway_agent_calls_start_only_on_a_compatible_adapter() {
 /// dispatched while the lane is held or past its deadline, a held snapshot
 /// read outlives the call's deadline, a dispatched deadline is not the one
 /// fixed before the lane wait, an expired admission dispatches or keeps its
-/// hold, a permit is kept, or an expired call is not captured.
+/// hold, a permit is kept, an expired call is not captured, or a cancelled
+/// call is not accounted as cancelled.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lane_wait_spends_the_agent_call_budget() {
     let fixture = PgFixture::start().await.expect("fixture starts");
@@ -6431,6 +6432,50 @@ async fn lane_wait_spends_the_agent_call_budget() {
             ("gateway.invoke".to_owned(), "allowed".to_owned()),
         ],
         "its completed requested and fallback invoke decisions stay audited"
+    );
+
+    // A lane-bound call its caller cancels mid-attempt is accounted as
+    // cancelled, not as the timeout its bound would have produced.
+    dispatch.push(Step::Park(completed(1, 1)));
+    let token = CancellationToken::new();
+    let cancelling = {
+        let agent = agent.clone();
+        let call = chat(Duration::from_secs(30));
+        let token = token.clone();
+        tokio::spawn(
+            async move { skald_agent::WyrdGatewayCaller::call(&agent, call, &token).await },
+        )
+    };
+    dispatch.entered.notified().await;
+    token.cancel();
+    cancelling
+        .await
+        .expect("the call joins")
+        .expect_err("a cancelled call fails");
+    dispatch.release.notify_one();
+    assert_eq!(
+        permits.available_permits(),
+        1,
+        "the cancelled call kept no permit"
+    );
+    drain_gateway(&state).await;
+    let outcomes: Vec<Value> = scribe
+        .calls()
+        .into_iter()
+        .map(|row| row["outcome"].clone())
+        .collect();
+    assert_eq!(
+        outcomes.last(),
+        Some(&json!("cancelled")),
+        "caller cancellation stays distinct from expiry: {outcomes:?}"
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| *outcome == "timed_out")
+            .count(),
+        2,
+        "the expired calls stay timed out: {outcomes:?}"
     );
     shutdown.cancel();
     listening.await.expect("the listener stops");

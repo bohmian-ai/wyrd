@@ -36,7 +36,7 @@ macro_rules! card_kind {
         impl From<$ty> for CardDefinition {
             /// The same Card, keeping what it references.
             fn from(card: $ty) -> Self {
-                Self(card.card)
+                Self(std::sync::Arc::new(card.card))
             }
         }
 

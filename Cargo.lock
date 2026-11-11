@@ -10246,8 +10246,8 @@ version = "0.4.1"
 dependencies = [
  "aes-gcm",
  "argon2",
+ "hmac 0.12.1",
  "sha2 0.10.9",
- "subtle",
  "thiserror 2.0.21",
  "workspace-hack",
  "zeroize",

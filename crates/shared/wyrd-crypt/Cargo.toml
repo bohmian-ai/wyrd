@@ -9,8 +9,8 @@ authors = { workspace = true }
 [dependencies]
 aes-gcm = { workspace = true }
 argon2 = { workspace = true }
+hmac = { workspace = true }
 sha2 = { workspace = true }
-subtle = { workspace = true }
 thiserror = { workspace = true }
 zeroize = { workspace = true }
 

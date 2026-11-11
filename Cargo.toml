@@ -172,6 +172,7 @@ password-hash = { version = "0.5", features = ["getrandom"] }
 unicode-normalization = "0.1"
 unicase = "2.9"
 secrecy = "0.10"
+hmac = "0.12"
 subtle = "2.6"
 zeroize = "1"
 rand = "0.9"

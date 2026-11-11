@@ -6,6 +6,7 @@ use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::aead::{Aead, KeyInit, OsRng, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use argon2::Argon2;
+use hmac::Mac as _;
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -443,41 +444,30 @@ fn canonical_aad(domain: &str, context: &[&str]) -> Vec<u8> {
 /// HMAC-SHA256 (RFC 2104) of `message` under `key`.
 ///
 /// Authenticates provider deliveries signed with a shared secret, such as a
-/// GitHub webhook's `X-Hub-Signature-256`. A key longer than the 64-byte
-/// SHA-256 block is hashed first, exactly as the RFC requires.
+/// GitHub webhook's `X-Hub-Signature-256`. Any key length is accepted, as
+/// the RFC allows.
 #[must_use]
 pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    const BLOCK: usize = 64;
-    let mut block = Zeroizing::new([0_u8; BLOCK]);
-    if key.len() > BLOCK {
-        block[..32].copy_from_slice(&Sha256::digest(key));
-    } else {
-        block[..key.len()].copy_from_slice(key);
-    }
-    let pad = |byte: u8| -> Zeroizing<[u8; BLOCK]> {
-        let mut padded = Zeroizing::new([0_u8; BLOCK]);
-        for (out, key_byte) in padded.iter_mut().zip(block.iter()) {
-            *out = key_byte ^ byte;
-        }
-        padded
-    };
-    let inner = Sha256::new()
-        .chain_update(pad(0x36).as_slice())
-        .chain_update(message)
-        .finalize();
-    Sha256::new()
-        .chain_update(pad(0x5c).as_slice())
-        .chain_update(inner)
-        .finalize()
-        .into()
+    hmac_of(key, message).finalize().into_bytes().into()
 }
 
-/// Whether `tag` is the HMAC-SHA256 of `message` under `key`, compared in
-/// constant time so a forger learns nothing from how long refusal takes.
+/// Whether `tag` is the full HMAC-SHA256 of `message` under `key`, compared
+/// in constant time so a forger learns nothing from how long refusal takes.
+/// A truncated tag is refused.
 #[must_use]
 pub fn verify_hmac_sha256(key: &[u8], message: &[u8], tag: &[u8]) -> bool {
-    use subtle::ConstantTimeEq as _;
-    hmac_sha256(key, message).ct_eq(tag).into()
+    hmac_of(key, message).verify_slice(tag).is_ok()
+}
+
+/// The keyed HMAC-SHA256 state after absorbing `message`.
+///
+/// # Panics
+/// Never: HMAC accepts a key of any length.
+fn hmac_of(key: &[u8], message: &[u8]) -> hmac::Hmac<Sha256> {
+    let mut mac = <hmac::Hmac<Sha256> as hmac::Mac>::new_from_slice(key)
+        .expect("invariant: HMAC accepts a key of any length");
+    mac.update(message);
+    mac
 }
 
 /// Cryptography helper errors.
@@ -542,6 +532,13 @@ mod tests {
             b"Jefe",
             b"what do ya want for nothing?",
             &short[..31]
+        ));
+        let mut wrong = short;
+        wrong[0] ^= 1;
+        assert!(!verify_hmac_sha256(
+            b"Jefe",
+            b"what do ya want for nothing?",
+            &wrong
         ));
     }
 

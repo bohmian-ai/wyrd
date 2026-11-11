@@ -377,7 +377,7 @@ Inclusive share of sampled server CPU at c1, with the caller that owns it:
 | 6.6% | `Prompt` clones | `Prompt::render` 2.3%, `AgentExecutor::invoke` 1.6%, `Judged::report` 1.3% |
 | 5.2% | `Prompt::bind_mut` JSON round trip (`to_value`/`from_value`) | `Prompt::render` from `render_native` |
 
-Reduction 1 (`4a657ec1f`): a compiled Prompt keeps the request, model, and
+Reduction 1 (`60ff31cac`, rebased onto `card-authoring-r1`): a compiled Prompt keeps the request, model, and
 provider its authored form compiled to (shared by clones), so `authored`
 compares instead of recompiling. Proof: `wyrd-skald-spec` lib
 `authoring::tests::native_body_pairs_and_round_trip` (model and provider
@@ -385,6 +385,43 @@ mutations still serialize natively); `wyrd-skald-spec`, `wyrd-skald-prompt`,
 `wyrd-skald-agent`, `vala-verify` 319/319; `wyrd-spec` Prompt tests 25/25.
 Attributable gain: NOT YET MEASURED; requires a valid unprofiled run.
 
-Status: BLOCKED. Reduction 1 needs a valid unprofiled `direct-verify-model-c1`/`-c64`
-run on an idle host to verify its gain; the `bind_mut` round trip and Prompt
-clones are the next localized candidates.
+Reduction 2 (`74dabadf9`): `Prompt::render` substitutes from the borrowed
+request instead of cloning the Prompt (the 2.3% render clone), and
+`render`/`bind_mut` share one substitution that builds each placeholder
+pattern once per call and skips string leaves holding neither `$` nor `{{`
+(part of the 5.2% round trip). The `to_value`/`from_value` round trip
+itself remains. After the rebase, r1 moved media normalization out of
+render. Proof: `prompt::placeholder_syntax_tests::render_matches_bind_mut`
+(chained value, lone `$`) and the existing render tests.
+
+Reduction 3 (`ebdc695d2`): `Agent::from_resolved` no longer copies the
+Prompt into its inline prompt reference. The reference is a `OnceLock`
+derived on first read by `prompt_ref()` or `to_spec()`, so the per-check
+Agent in `vala-verify/src/blocks/agent.rs` never copies it. Proof:
+`wyrd-skald-agent` 128/128 (accessor `construct.rs`, Card projection
+`agent_fields.rs`); `vala-verify`, `wyrd-skald-prompt`, `wyrd-skald-spec`
+198/198; `mise run fmt`, `mise run lints` PASS.
+
+Deferred: the inline Check/Prompt copy that `Judged::report` stores in
+evidence (1.3%). Removing it changes what the evidence carries and needs a
+spec decision.
+
+c64 `provider_headers` wait (from reading the code, no run): the timer
+(`wyrd-gateway/src/clients/mod.rs` `ExchangeTimer::start` → `headers()`)
+covers pool checkout, connect, the request write, the whole upstream
+turnaround and the header read (`engine.rs:483`). The model steps use zero
+pacing (`capacity/verification/run.rs:323-332`). `PacedUpstream`
+(`gateway_capture.rs:489-504`) is a plain `axum::serve` with no limiter,
+and it runs on the driver's runtime, which also runs the 64 closed-loop
+clients: `worker_threads(DRIVER_CORES)` (`capacity/main.rs:108`),
+`DRIVER_CORES = 8` (`experiment.rs:253`). The Gateway shares one outbound
+client with an unbounded idle pool (`endpoint.rs`, `transport.rs`) and
+has no semaphore or rate limiter on dispatch. Most likely cause: the
+fixture's scheduling delay on the saturated 8-worker driver runtime and
+the shared host. This is a fixture artifact, not a production-path cost, so
+no Gateway change is proposed. Check: compare the fixture's own
+`fixture.upstream` observation with `provider_headers` at c64.
+
+Status: BLOCKED. Reductions 1–3 need a valid, authorized, unprofiled
+`direct-verify-model-c1`/`-c64` run on an idle host to verify attributable
+gains against `20261111T150216Z-0626a7b2d` (Agent block 403–428 µs at c1).

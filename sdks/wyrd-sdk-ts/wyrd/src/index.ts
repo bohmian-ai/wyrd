@@ -77,6 +77,7 @@ import type {
   RegisteredDataCard,
   RegisteredModelCard,
   RegisteredPromptCard,
+  RegisteredRepositoryCard,
   RegisteredServiceCard,
   RegisteredVerifierCard,
   DeclarationReceipt,
@@ -275,6 +276,8 @@ export type {
   RegisteredUntypedCard,
   RegisteredVerifierCard,
   Relationships as CardRelationships,
+  RepositorySpec,
+  RepositoryStatus,
   ServiceSpec,
   SpanRecord,
   Status as CardStatus,
@@ -1978,8 +1981,10 @@ export class Cards {
    * Fetch one declared Card envelope by exact reference, without artifacts.
    *
    * The envelope is discriminated by `kind`: `spec` and `status` are typed for
-   * Data, Model, Prompt, Agent, Verifier, Service, Trigger, and Operator Cards,
-   * including a Drift Verifier's `status.verification.baseline` state. Other
+   * Data, Model, Prompt, Agent, Verifier, Service, Trigger, Operator, and
+   * Repository Cards, including a Drift Verifier's
+   * `status.verification.baseline` state and a Repository's `status.repository`
+   * selection. Other
    * kinds return {@link RegisteredUntypedCard}, whose `spec` is a plain record.
    *
    * @param ref - A Card reference, or its `Kind/name@version[#uid]` text.

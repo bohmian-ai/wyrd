@@ -47,6 +47,7 @@ use wyrd_spec::card::source::{
     LogConnection, MetricsConnection, SourceAuth, SourceKind, SourceSpec, SqlConnection,
     TraceConnection,
 };
+use wyrd_spec::card::repository::{RepositoryProvider, RepositorySpec};
 use wyrd_spec::card::trigger::{TriggerActivation, TriggerSpec};
 use wyrd_spec::card::verifier::{VerificationBinding, VerifierSpec};
 use wyrd_spec::envelope::{Card, CardKind};
@@ -177,6 +178,8 @@ fn contracts() -> Value {
         DriftSpec,
         TriggerSpec,
         TriggerActivation,
+        RepositorySpec,
+        RepositoryProvider,
         VerifierSpec,
         VerificationBinding,
         OperatorSpec,

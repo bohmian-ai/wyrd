@@ -138,7 +138,7 @@ export const verifiers: Record<string, RegisteredCard> = {
         { id: 'score', action: { kind: 'code', entrypoint: 'score', inputs: { ticket: 'inputs.ticket' }, source: { inline: 'def score(ticket): ...' } }, retries: 2, timeout_seconds: 30 },
         {
           id: 'classify',
-          action: { kind: 'agent', agent: AGENT, inputs: { ticket: 'inputs.ticket', text: 'steps.read-photo.output.text' } },
+          action: { kind: 'agent', agent: AGENT, inputs: { ticket: 'inputs.ticket', photo_text: 'steps.read-photo.output.text' } },
           when: { path: 'steps.read-photo.status', operator: 'equals', expected: 'succeeded' },
           requirements: [{ id: 'classified', statement: 'The ticket has exactly one label', check: { kind: 'assert', path: 'steps.classify.output.label', operator: 'is_non_empty' } }]
         },

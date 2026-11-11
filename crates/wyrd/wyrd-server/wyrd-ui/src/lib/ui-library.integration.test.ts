@@ -722,7 +722,8 @@ test('an exact Verifier definition and where it runs load through every authoriz
           { source: 'input:policy', target: 'step:policy-text' },
           { source: 'step:answer-facts', target: 'req:refund-within-limit', label: 'within_limit' },
           { source: 'input:trace', target: 'req:policy-looked-up' },
-          { source: 'step:refund-rules', target: 'req:follows-policy' }
+          { source: 'step:policy-text', target: 'step:refund-rules', label: 'outline' },
+          { source: 'step:refund-rules', target: 'req:follows-policy', label: 'rules' }
         ])
       );
       // Drift-shaped: one samples input judged by one whole-Verifier requirement.

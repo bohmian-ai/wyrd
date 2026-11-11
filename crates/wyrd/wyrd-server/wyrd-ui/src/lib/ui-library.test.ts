@@ -2233,12 +2233,12 @@ test('verifier graph projects and lays out the declared topology', () => {
   ]);
   expect(graph.steps[2].requirements).toEqual([{ key: 'req:classified', id: 'classified', kind: 'assert', statement: 'The ticket has exactly one label', step: 'classify' }]);
   expect(graph.requirements.map((each) => [each.id, each.kind, each.step])).toEqual([['policy-followed', 'agent', undefined], ['has-answer', 'assert', undefined]]);
-  // Dependencies come from references, the gate and depends_on; an output read labels its edge; a step never depends on itself.
+  // Dependencies come from references, the gate and depends_on; a step output's edge is labelled by the argument it is passed as, else the field read; a step never depends on itself.
   expect(graph.edges).toEqual([
     { source: 'input:photo', target: 'step:read-photo' },
     { source: 'input:ticket', target: 'step:score' },
     { source: 'input:ticket', target: 'step:classify' },
-    { source: 'step:read-photo', target: 'step:classify', label: 'text' },
+    { source: 'step:read-photo', target: 'step:classify', label: 'photo_text' },
     { source: 'step:classify', target: 'step:summarise', label: 'label' },
     { source: 'step:score', target: 'step:summarise', label: 'units' },
     { source: 'step:read-photo', target: 'step:summarise' },
@@ -2294,7 +2294,7 @@ test('verifier graph projects and lays out the declared topology', () => {
     edge.points.slice(1).forEach((point, index) => expect(point[0] === edge.points[index][0] || point[1] === edge.points[index][1], edge.id).toBe(true));
   }
   // A fan-in shares one final run, so its target has one port per producer lane, and each label is drawn once.
-  expect(laid.edges.filter((edge) => edge.labelAt).map((edge) => edge.label).sort()).toEqual(['label', 'summary', 'text', 'units']);
+  expect(laid.edges.filter((edge) => edge.labelAt).map((edge) => edge.label).sort()).toEqual(['label', 'photo_text', 'summary', 'units']);
   expect(laid.stages.map((stage) => stage.text)).toEqual(['Inputs', 'Steps', 'After all steps']);
   // A simple graph stays compact, and a Verifier without steps names its last stage Requirements.
   const simple = layoutDefinition(drift);
@@ -2330,7 +2330,7 @@ test('verifier graph is read-only, selectable and keyboard and zoom operable', a
     [...graph.inputs, ...graph.steps, ...graph.steps.flatMap((step) => step.requirements), ...graph.requirements].map((each) => each.key).sort()
   );
   expect(shown.container.querySelectorAll('[data-edge] path.arrow')).toHaveLength(graph.edges.length);
-  expect([...shown.container.querySelectorAll('[data-edge] text')].map((label) => label.textContent).sort()).toEqual(['label', 'summary', 'text', 'units']);
+  expect([...shown.container.querySelectorAll('[data-edge] text')].map((label) => label.textContent).sort()).toEqual(['label', 'photo_text', 'summary', 'units']);
   expect(node('step:classify')).toHaveTextContent('classifyagent needs read-photo support@1.0.0 when');
   expect(node('step:score')).toHaveTextContent('↻ ≤ 2 retries');
   expect(node('req:has-answer')).toHaveTextContent('The ticket carries an answer');

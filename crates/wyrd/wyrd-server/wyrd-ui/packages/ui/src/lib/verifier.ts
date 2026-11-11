@@ -46,7 +46,7 @@ export interface DefinitionStep {
   readonly requirements: readonly DefinitionRequirement[];
 }
 
-/** One declared dependency between node keys; `label` is the output field read. */
+/** One declared dependency between node keys; `label` names a step output: the argument it is passed as, else the field read. */
 export interface DefinitionEdge {
   readonly source: string;
   readonly target: string;
@@ -65,20 +65,23 @@ export interface DefinitionGraph {
 /** `inputs.<slot>` or `steps.<id>`, with the output field when one is read. */
 const REFERENCE = /^(inputs|steps)\.([^.[]+)(?:\.output\.([^.[]+))?/;
 
-/** Every reference string a step action or requirement check reads. */
-function reads(block: CardTypes.Action | CardTypes.Check): string[] {
+/** One reference a block reads, and the argument name it is passed as when it has one. */
+type Reference = readonly [reference: string, argument?: string];
+
+/** Every reference a step action or requirement check reads. */
+function reads(block: CardTypes.Action | CardTypes.Check): Reference[] {
   switch (block.kind) {
     case 'extract':
-      return [block.from];
+      return [[block.from]];
     case 'trace':
     case 'drift':
-      return [block.on];
+      return [[block.on]];
     case 'assert':
-      return [block.path, block.each].filter((each) => typeof each === 'string');
+      return [block.path, block.each].filter((each) => typeof each === 'string').map((each) => [each]);
     case 'agent':
     case 'code': {
       const workspace = 'workspace' in block ? Object.values(block.workspace ?? {}) : [];
-      return [...Object.values(block.inputs ?? {}), ...workspace.filter((each) => typeof each === 'string')];
+      return [...Object.entries(block.inputs ?? {}).map(([argument, reference]): Reference => [reference, argument]), ...workspace.filter((each) => typeof each === 'string').map((each): Reference => [each])];
     }
   }
 }
@@ -128,15 +131,17 @@ export function definitionGraph(spec: VerifierSpec): DefinitionGraph {
     const label_ = edges.get(id)?.label ?? label;
     edges.set(id, { source, target, ...(label_ === undefined ? {} : { label: label_ }) });
   };
-  const follow = (references: readonly string[], target: string) => {
-    for (const reference of references) {
+  const follow = (references: readonly Reference[], target: string) => {
+    for (const [reference, argument] of references) {
       const match = REFERENCE.exec(reference);
-      if (match) link(`${match[1] === 'inputs' ? 'input' : 'step'}:${match[2]}`, target, match[3]);
+      if (!match) continue;
+      if (match[1] === 'inputs') link(`input:${match[2]}`, target);
+      else link(`step:${match[2]}`, target, argument ?? match[3]);
     }
   };
   for (const step of steps) {
     const key = `step:${step.id}`;
-    follow([...reads(step.action), ...(step.when ? [step.when.path] : []), ...(step.requirements ?? []).flatMap((each) => reads(each.check))], key);
+    follow([...reads(step.action), ...(step.when ? [[step.when.path] as const] : []), ...(step.requirements ?? []).flatMap((each) => reads(each.check))], key);
     for (const id of step.depends_on ?? []) link(`step:${id}`, key);
   }
   for (const each of spec.requirements ?? []) follow(reads(each.check), `req:${each.id}`);

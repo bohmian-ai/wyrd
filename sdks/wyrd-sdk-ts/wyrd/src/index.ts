@@ -3178,14 +3178,14 @@ export class WyrdState {
    * @throws {@link WyrdError} `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias.
    */
   get(alias: string): HydratedCard {
-    const card = this.card(alias);
-    if (card.kind === "Agent") {
+    const { kind } = this.cardRef(alias);
+    if (kind === "Agent") {
       return this.agent(alias);
     }
-    if (card.kind === "Prompt") {
+    if (kind === "Prompt") {
       return this.prompt(alias);
     }
-    return card;
+    return lifecycleValue<HydratedCard>(this.#native.card(alias));
   }
 
   /**

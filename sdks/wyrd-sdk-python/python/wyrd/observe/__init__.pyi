@@ -33,7 +33,12 @@ class Run:
 
     @property
     def observe(self) -> Observe:
-        """The emit surface for this view."""
+        """The verification and submission surface for this view."""
+        ...
+
+    @property
+    def bifrost(self) -> RunBifrost:
+        """The caller-table write surface for this view."""
         ...
 
     def for_card(self, alias: str) -> Run:
@@ -79,10 +84,10 @@ class Run:
         ...
 
 class Observe:
-    """Verification and caller-table records on one scoped run.
+    """Verification and submission on one scoped run.
 
-    Returning from ``record`` is queue admission, not a durable
-    acknowledgement. ``WyrdState.shutdown()`` is the durability barrier.
+    Recording window samples through ``submit`` is queue admission, not a
+    durable acknowledgement. ``WyrdState.shutdown()`` is the durability barrier.
     """
 
     def verify(
@@ -184,12 +189,21 @@ class Observe:
         """
         ...
 
-    def record(self, table: str, row: Mapping[str, Any] | Any) -> None:
-        """Emit one row into a registered ``bifrost.datasets.<name>`` table.
+class RunBifrost:
+    """Caller-table writes attributed to one scoped run.
+
+    Every row carries this view's Card UID and the run's ``run_id``.
+    Returning from ``write`` is buffered submission, not a durable
+    acknowledgement: a successful ``WyrdState.shutdown()`` drains the queue.
+    """
+
+    def write(self, table: str, row: Mapping[str, Any] | Any) -> None:
+        """Buffer one row for a registered ``bifrost.datasets.<name>`` table.
 
         The first call for a table blocks to describe it; later calls reuse
         the cached schema and producer. Row values are checked against that
-        schema when the queue seals a batch, not here.
+        schema when the queue seals a batch, not here, and the row is durable
+        only once ``WyrdState.shutdown()`` succeeds.
 
         Args:
             table: the registered ``"bifrost.datasets.<name>"`` table.
@@ -210,5 +224,6 @@ class Observe:
 __all__ = [
     "Observe",
     "Run",
+    "RunBifrost",
     "record",
 ]

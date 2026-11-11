@@ -27,7 +27,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from wyrd.client import WyrdClient
-from wyrd.observe import Observe, Run
+from wyrd.observe import Observe, Run, RunBifrost
 from wyrd.otel import install_run_correlation
 from wyrd.state import WyrdState
 from wyrd.verify import ArtifactRef, Execution, File
@@ -40,6 +40,19 @@ def test_run_targets_the_root_service_with_a_uuidv7_identity(state: WyrdState) -
     assert UUID(run.run_id).version == 7
     assert run.alias == "root"
     assert isinstance(run.observe, Observe)
+
+
+def test_run_exposes_bifrost_write_and_observe_verification(state: WyrdState) -> None:
+    """Caller-table rows go through ``run.bifrost.write``; Observe keeps verification."""
+    run = state.run()
+    assert isinstance(run.bifrost, RunBifrost)
+    assert callable(run.bifrost.write)
+    assert not hasattr(run.observe, "record")
+    assert callable(run.observe.verify)
+    assert callable(run.observe.submit)
+    with pytest.raises(wyrd.WyrdError) as raised:
+        run.for_card("model").bifrost.write("bifrost.datasets.latency", {"latency_ms": 1.0})
+    assert raised.value.code == "WYRD_SDK_400_BIFROST_NOT_STARTED"
 
 
 def test_scoped_views_share_one_invocation_and_keep_their_subjects(state: WyrdState) -> None:
@@ -63,10 +76,10 @@ def test_unknown_alias_is_refused(state: WyrdState) -> None:
     assert raised.value.code == "WYRD_SDK_404_UNKNOWN_ALIAS"
 
 
-def test_record_refuses_a_table_outside_vala_datasets(state: WyrdState) -> None:
-    """``record`` writes registered caller-owned tables only."""
+def test_write_refuses_a_table_outside_bifrost_datasets(state: WyrdState) -> None:
+    """``write`` targets registered caller-owned tables only."""
     with pytest.raises(wyrd.WyrdError) as raised:
-        state.run().observe.record("bifrost.drift.observations", {"value": 1})
+        state.run().bifrost.write("bifrost.drift.observations", {"value": 1})
     assert raised.value.code == "WYRD_SDK_400_INVALID_OBSERVATION"
 
 
@@ -84,10 +97,10 @@ def test_shutdown_without_startup_succeeds(state: WyrdState) -> None:
 
 
 @pytest.mark.parametrize("key", [1, 1.5, True, None])
-def test_record_refuses_a_non_string_mapping_key(state: WyrdState, key: object) -> None:
+def test_write_refuses_a_non_string_mapping_key(state: WyrdState, key: object) -> None:
     """``json.dumps`` would stringify the key, so it is refused before the writer."""
     with pytest.raises(wyrd.WyrdError) as raised:
-        state.run().observe.record("bifrost.datasets.latency", {key: 1.0})
+        state.run().bifrost.write("bifrost.datasets.latency", {key: 1.0})
     assert raised.value.code == "WYRD_SPEC_400_VALIDATION"
 
 
@@ -608,10 +621,10 @@ def test_otel_imports_without_the_agents_sdk() -> None:
     importlib.reload(wyrd.otel)
 
 
-def _record_reaches_the_ordinary_boundary(run: Run) -> None:
-    """Record one explicit row and assert its ordinary offline error."""
+def _write_reaches_the_ordinary_boundary(run: Run) -> None:
+    """Write one explicit row and assert its ordinary offline error."""
     with pytest.raises(wyrd.WyrdError) as raised:
-        run.observe.record("bifrost.datasets.latency", {"latency_ms": 1.0})
+        run.bifrost.write("bifrost.datasets.latency", {"latency_ms": 1.0})
     assert raised.value.code == "WYRD_SDK_400_BIFROST_NOT_STARTED"
 
 
@@ -628,13 +641,13 @@ def test_registration_and_attach_failures_never_block_observations(
     for provider in (object(), _Unmarkable(), _Raising()):
         monkeypatch.setattr(trace, "get_tracer_provider", lambda provider=provider: provider)
         with run as entered:
-            _record_reaches_the_ordinary_boundary(entered)
+            _write_reaches_the_ordinary_boundary(entered)
         with pytest.raises(ValueError, match="app"), run:
             raise ValueError("app")
 
     monkeypatch.setattr(otel_context, "attach", _broken)
     with run as entered:
-        _record_reaches_the_ordinary_boundary(entered)
+        _write_reaches_the_ordinary_boundary(entered)
 
 
 def test_failing_enrichment_never_blocks_spans_or_observations(
@@ -647,7 +660,7 @@ def test_failing_enrichment_never_blocks_spans_or_observations(
     with state.run() as entered, monkeypatch.context() as patch:
         patch.setattr(otel_context, "get_value", _broken)
         provider.get_tracer("framework").start_span("unenriched").end()
-        _record_reaches_the_ordinary_boundary(entered)
+        _write_reaches_the_ordinary_boundary(entered)
     assert _correlation(exporter) == {"unenriched": None}
 
 
@@ -672,10 +685,10 @@ def test_exit_context_update_failure_never_blocks_observations(
     with monkeypatch.context() as patch:
         with model_run:
             patch.setattr(otel_context, "attach", _broken)
-        _record_reaches_the_ordinary_boundary(model_run)
+        _write_reaches_the_ordinary_boundary(model_run)
         with pytest.raises(ValueError, match="app"), model_run:
             raise ValueError("app")
-        _record_reaches_the_ordinary_boundary(model_run)
+        _write_reaches_the_ordinary_boundary(model_run)
 
 
 def test_mismatched_exit_changes_nothing(

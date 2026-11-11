@@ -91,8 +91,8 @@ def test_records_land_under_the_view_that_wrote_them(
 ) -> None:
     run = observed_with_bifrost.run()
 
-    run.for_card("agent").observe.record(dataset, {"value": 41})
-    run.for_card("model").observe.record(dataset, {"value": 42})
+    run.for_card("agent").bifrost.write(dataset, {"value": 41})
+    run.for_card("model").bifrost.write(dataset, {"value": 42})
     observed_with_bifrost.flush()
     wyrd_server.flush_bifrost()
 
@@ -114,11 +114,11 @@ def test_records_land_under_the_view_that_wrote_them(
         ("bifrost.datasets.never_registered", "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND"),
     ],
 )
-def test_record_into_a_managed_or_unregistered_table_is_refused(
+def test_write_into_a_managed_or_unregistered_table_is_refused(
     observed_with_bifrost: WyrdState, table: str, code: str
 ) -> None:
     with pytest.raises(WyrdError) as refused:
-        observed_with_bifrost.run("agent").observe.record(table, {"value": 1})
+        observed_with_bifrost.run("agent").bifrost.write(table, {"value": 1})
     assert refused.value.code == code
 
 

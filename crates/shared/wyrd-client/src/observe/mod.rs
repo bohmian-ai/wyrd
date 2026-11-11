@@ -7,7 +7,8 @@
 //! [`Run::for_card`] returns an immutable sibling view over the same invocation,
 //! so concurrent views never disturb each other's subject.
 //!
-//! [`Observe::verify`] executes a bound Verifier now and [`Observe::submit`]
+//! [`RunBifrost::write`] buffers caller-table rows through the state's one
+//! Bifrost writer. [`Observe::verify`] executes a bound Verifier now and [`Observe::submit`]
 //! queues one execution or records scheduled-window samples. Slot projection,
 //! evidence upload, and execution polling live here rather than in
 //! [`crate::bifrost`]: the facade, the producer pool, and `wyrd-queue` stay
@@ -37,7 +38,7 @@ use crate::verify::{Execution, Inputs, Projected, RunEvidence, Submission, Targe
 
 pub use lifecycle::DRIFT_OBSERVATIONS_TABLE;
 
-/// The only namespace `observe.record` may write.
+/// The only namespace `run.bifrost.write` may write.
 ///
 /// `bifrost.datasets` is the caller-owned registration namespace; every other
 /// Bifrost namespace is reserved for server-managed tables. Refusing the rest
@@ -160,13 +161,20 @@ impl Run {
         })
     }
 
-    /// The emit surface for this view.
+    /// The verification and submission surface for this view.
     #[must_use]
     pub fn observe(&self) -> Observe<'_> {
         Observe {
             run: self,
             group_id: None,
         }
+    }
+
+    /// The caller-table write surface for this view, over the state's one
+    /// Bifrost writer.
+    #[must_use]
+    pub fn bifrost(&self) -> RunBifrost<'_> {
+        RunBifrost { run: self }
     }
 
     /// This view's row correlation: the subject Card's UID plus invocation.
@@ -192,10 +200,10 @@ impl Run {
     }
 }
 
-/// The observation and verification surface of one scoped run.
+/// The verification and submission surface of one scoped run.
 ///
-/// Recording is not a durability acknowledgement — the queue publishes in the
-/// background and `WyrdState::shutdown` is the barrier.
+/// Recording a window sample is not a durability acknowledgement — the queue
+/// publishes in the background and `WyrdState::shutdown` is the barrier.
 #[derive(Debug)]
 pub struct Observe<'a> {
     /// The view whose subject and invocation every emit correlates to.
@@ -232,69 +240,6 @@ impl Observe<'_> {
         Ok(())
     }
 
-    /// Emit one row into a registered caller-owned table.
-    ///
-    /// Async because the first call for a table describes it; later calls reuse
-    /// the writer's cached schema and producer with no schema lookup. Returning
-    /// is neither a durability nor a whole-row-validation acknowledgement: the
-    /// queue checks row values against the described schema when it seals a
-    /// batch.
-    ///
-    /// # Arguments
-    /// * `table` - A registered `bifrost.datasets.<name>` table.
-    /// * `row` - The row, serialized to the table's columns.
-    ///
-    /// # Errors
-    /// Returns `WYRD_SDK_400_INVALID_OBSERVATION` for a table outside
-    /// `bifrost.datasets`, which is where reserved and system-managed tables are
-    /// refused before admission; the server's not-found, authorization, or
-    /// availability error for an unknown, unauthorized, or unavailable table;
-    /// `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup,
-    /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, and
-    /// `WYRD_CLIENT_429_QUEUE_FULL` when the producer is saturated.
-    pub async fn record<T: Serialize>(&self, table: &str, row: &T) -> Result<(), WyrdError> {
-        self.record_value(table, &to_value(row, "record row")?)
-            .await
-    }
-
-    /// Emit one row into a registered table from a foreign runtime's JSON text.
-    ///
-    /// # Arguments
-    /// * `table` - A registered `bifrost.datasets.<name>` table.
-    /// * `json` - The row as one JSON object.
-    ///
-    /// # Errors
-    /// As [`Observe::record`], plus an invalid-observation error when `json` is
-    /// not valid JSON.
-    #[cfg(feature = "internal")]
-    pub async fn record_json(&self, table: &str, json: &str) -> Result<(), WyrdError> {
-        self.record_value(table, &parse_json(json, "record row")?)
-            .await
-    }
-
-    /// Describe on first use, then enqueue one caller row.
-    ///
-    /// # Errors
-    /// As [`Observe::record`].
-    async fn record_value(&self, table: &str, row: &Value) -> Result<(), WyrdError> {
-        if !table.starts_with(DATASETS_PREFIX) || table[DATASETS_PREFIX.len()..].contains('.') {
-            return Err(invalid_observation(
-                "observe.record writes only registered `bifrost.datasets.<name>` tables",
-                json!({ "table": table }),
-            ));
-        }
-        let started = self.run.state.started_bifrost()?;
-        let destination = started.bifrost.resolve_writer_table(table).await?;
-        started.bifrost.insert_observation(
-            &destination,
-            vec![row_bytes(row)?],
-            self.run.correlation(),
-        )?;
-        Ok(())
-    }
-}
-
-impl Observe<'_> {
     /// Carry `group_id` on every execution `verify` and `submit` start from
     /// this surface.
     ///
@@ -519,6 +464,80 @@ impl Observe<'_> {
             group_id: self.group_id.clone(),
             deployment_environment: self.run.state.deployment_environment().map(str::to_owned),
         }
+    }
+}
+
+/// Caller-table writes attributed to one scoped run.
+///
+/// Every row carries this view's subject Card UID and the invocation's
+/// `run_id`. Writing is buffered submission, not a durability
+/// acknowledgement: the state's queue publishes in the background and a
+/// successful `WyrdState::shutdown` is the drain barrier.
+#[derive(Debug)]
+pub struct RunBifrost<'a> {
+    /// The view whose subject and invocation every row correlates to.
+    run: &'a Run,
+}
+
+impl RunBifrost<'_> {
+    /// Buffer one row for a registered caller-owned table.
+    ///
+    /// Async because the first call for a table describes it; later calls reuse
+    /// the writer's cached schema and producer with no schema lookup. Returning
+    /// is neither a durability nor a whole-row-validation acknowledgement: the
+    /// queue checks row values against the described schema when it seals a
+    /// batch, and `WyrdState::shutdown` drains it.
+    ///
+    /// # Arguments
+    /// * `table` - A registered `bifrost.datasets.<name>` table.
+    /// * `row` - The row, serialized to the table's columns.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_400_INVALID_OBSERVATION` for a table outside
+    /// `bifrost.datasets`, which is where reserved and system-managed tables are
+    /// refused before admission; the server's not-found, authorization, or
+    /// availability error for an unknown, unauthorized, or unavailable table;
+    /// `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup,
+    /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, and
+    /// `WYRD_CLIENT_429_QUEUE_FULL` when the producer is saturated.
+    pub async fn write<T: Serialize>(&self, table: &str, row: &T) -> Result<(), WyrdError> {
+        self.write_value(table, &to_value(row, "write row")?).await
+    }
+
+    /// Buffer one row for a registered table from a foreign runtime's JSON text.
+    ///
+    /// # Arguments
+    /// * `table` - A registered `bifrost.datasets.<name>` table.
+    /// * `json` - The row as one JSON object.
+    ///
+    /// # Errors
+    /// As [`RunBifrost::write`], plus an invalid-observation error when `json`
+    /// is not valid JSON.
+    #[cfg(feature = "internal")]
+    pub async fn write_json(&self, table: &str, json: &str) -> Result<(), WyrdError> {
+        self.write_value(table, &parse_json(json, "write row")?)
+            .await
+    }
+
+    /// Describe on first use, then enqueue one caller row.
+    ///
+    /// # Errors
+    /// As [`RunBifrost::write`].
+    async fn write_value(&self, table: &str, row: &Value) -> Result<(), WyrdError> {
+        if !table.starts_with(DATASETS_PREFIX) || table[DATASETS_PREFIX.len()..].contains('.') {
+            return Err(invalid_observation(
+                "run.bifrost.write writes only registered `bifrost.datasets.<name>` tables",
+                json!({ "table": table }),
+            ));
+        }
+        let started = self.run.state.started_bifrost()?;
+        let destination = started.bifrost.resolve_writer_table(table).await?;
+        started.bifrost.insert_observation(
+            &destination,
+            vec![row_bytes(row)?],
+            self.run.correlation(),
+        )?;
+        Ok(())
     }
 }
 

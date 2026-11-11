@@ -93,13 +93,14 @@ model_calls = 256
 
 ## Startup rules
 
-The server refuses to start, naming the variable, when a value is empty, not a positive integer, or overflows once scaled to bytes, or when `WYRD_VERIFICATION_ENABLED` is not `1` or `0`. A TOML value of zero is refused naming its key, and a negative one fails to parse. The combinations below are checked after file and environment values are merged, whichever source set them, and are refused naming both variables (prefix `WYRD_VERIFICATION_` omitted):
+The server refuses to start, naming the variable, when a value is empty, not a positive integer, or overflows once scaled to bytes, or when `WYRD_VERIFICATION_ENABLED` is not `1` or `0`. A TOML value is checked only when no environment variable overrides it, so a valid variable replaces a stale file value; a winning TOML value that is zero or overflows is refused naming its key, and a negative one fails to parse. Whichever source wins is also refused, naming it, when an execution, workspace, or model-call count exceeds 2305843009213693951, the most permits the runtime can hold, or when the queued execution timeout would end after the latest timestamp the queue can represent, about the year 262000. The combinations below are checked after file and environment values are merged, whichever source set them, and are refused naming both variables (prefix `WYRD_VERIFICATION_` omitted):
 
 - `MONTY_MIN_WORKERS` above `DIRECT_PYTHON_WORKERS` or `QUEUED_PYTHON_WORKERS`
 - `MONTY_MEMORY_MIB` at or above `MONTY_PROCESS_MEMORY_MIB`
 - `MONTY_POOL_MEMORY_MIB` below `MONTY_PROCESS_MEMORY_MIB`
 - `MONTY_PROCESS_MEMORY_MIB` below `MONTY_MEMORY_MIB` + 4 MiB allocator headroom
 - `DIRECT_PYTHON_WORKERS` + `QUEUED_PYTHON_WORKERS`, times `MONTY_PROCESS_MEMORY_MIB`, above `MONTY_POOL_MEMORY_MIB`
+- `DIRECT_PYTHON_WORKERS` + `DIRECT_PYTHON_WAITERS`, or `QUEUED_PYTHON_WORKERS` + `QUEUED_PYTHON_WAITERS`, above 2305843009213693951
 - `FILE_MAX_MIB` above `FILES_MAX_MIB`
 - `WORK_WRITE_MAX_MIB` above `SCRATCH_MAX_MIB`
 

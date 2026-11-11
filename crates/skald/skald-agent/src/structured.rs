@@ -1,10 +1,12 @@
 //! Validation and repair feedback for structured-output Agent answers.
 
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use jsonschema::error::ValidationErrorKind;
 use jsonschema::{ValidationError, Validator};
 use serde_json::{Map, Value};
+use skald_spec::PreparedSchemas;
 
 use crate::error::{AgentError, AgentResult};
 
@@ -29,8 +31,9 @@ const CORRECTION_OPENING: &str = "Your previous reply was not accepted because i
 pub(crate) struct StructuredOutput {
     /// The schema sent with the run's requests.
     schema: Value,
-    /// Its compiled validator.
-    validator: Validator,
+    /// Its compiled validator, possibly shared with other runs sending the
+    /// same schema.
+    validator: Arc<Validator>,
 }
 
 /// Why a proposed final answer was refused.
@@ -44,17 +47,20 @@ pub(crate) struct Rejection {
 }
 
 impl StructuredOutput {
-    /// Compiles `schema`, the response schema an outgoing request sends.
+    /// The validator of `schema`, the response schema an outgoing request
+    /// sends, compiled unless `schemas` already prepared that exact schema.
     ///
     /// # Errors
     ///
     /// Returns [`AgentError::Prompt`] when `schema` does not compile, which a
     /// binding or `before_model` hook can cause.
-    pub(crate) fn new(agent: &str, schema: &Value) -> AgentResult<Self> {
-        let validator = jsonschema::validator_for(schema).map_err(|_| AgentError::Prompt {
-            agent: agent.to_owned(),
-            detail: "the response schema does not compile".to_owned(),
-        })?;
+    pub(crate) fn new(agent: &str, schemas: &PreparedSchemas, schema: &Value) -> AgentResult<Self> {
+        let validator = schemas
+            .validator(schema)
+            .ok_or_else(|| AgentError::Prompt {
+                agent: agent.to_owned(),
+                detail: "the response schema does not compile".to_owned(),
+            })?;
         Ok(Self {
             schema: schema.clone(),
             validator,
@@ -209,7 +215,8 @@ mod tests {
     #[test]
     fn check_refuses_with_safe_violations() {
         let schema = json!({"type": "object", "properties": {"a": {"enum": ["x"]}}, "additionalProperties": false});
-        let output = StructuredOutput::new("a", &schema).expect("compiles");
+        let output =
+            StructuredOutput::new("a", &PreparedSchemas::default(), &schema).expect("compiles");
         assert_eq!(
             output.check(r#"{"a": "x"}"#).ok(),
             Some(json!({"a": "x"}).as_object().cloned().expect("object"))
@@ -224,6 +231,53 @@ mod tests {
             assert_eq!(rejection.violations, vec![violation.to_owned()], "{reply}");
             assert!(rejection.correction.starts_with(CORRECTION_OPENING));
         }
+    }
+
+    /// A warm unchanged schema reuses its prepared validator and check, a
+    /// changed schema is prepared again and validates by its own rules, a
+    /// schema that does not compile is refused every time, and reaching the
+    /// bound forgets entries so a schema is prepared again.
+    ///
+    /// # Panics
+    /// Panics when a warm schema is prepared again, a changed schema reuses
+    /// a stale validator, or an answer is judged on the wrong side.
+    #[test]
+    fn prepared_schema_reuse_tracks_effective_schema() {
+        let schemas = PreparedSchemas::default();
+        let sent =
+            json!({"type": "object", "properties": {"a": {"enum": ["x"]}}, "required": ["a"]});
+        let first = StructuredOutput::new("a", &schemas, &sent).expect("compiles");
+        let warm = StructuredOutput::new("a", &schemas, &sent).expect("compiles");
+        assert!(
+            Arc::ptr_eq(&first.validator, &warm.validator),
+            "warm schema prepared again"
+        );
+        assert!(warm.check(r#"{"a": "y"}"#).is_err());
+        let narrowed =
+            json!({"type": "object", "properties": {"a": {"enum": ["y"]}}, "required": ["a"]});
+        let changed = StructuredOutput::new("a", &schemas, &narrowed).expect("compiles");
+        assert!(!Arc::ptr_eq(&first.validator, &changed.validator));
+        assert!(changed.check(r#"{"a": "y"}"#).is_ok());
+        assert!(changed.check(r#"{"a": "x"}"#).is_err());
+        for _ in 0..2 {
+            assert!(StructuredOutput::new("a", &schemas, &json!({"type": 5})).is_err());
+        }
+        schemas.check(&sent, "schema", true).expect("valid");
+        schemas.check(&sent, "schema", true).expect("still valid");
+        assert!(
+            schemas
+                .check(&json!({"type": "string"}), "schema", true)
+                .is_err()
+        );
+        for bound in 0..256 {
+            let _ = schemas.validator(&json!({"maxLength": bound}));
+        }
+        let evicted = StructuredOutput::new("a", &schemas, &sent).expect("compiles");
+        assert!(
+            !Arc::ptr_eq(&first.validator, &evicted.validator),
+            "the bound kept everything"
+        );
+        assert!(evicted.check(r#"{"a": "x"}"#).is_ok());
     }
 
     /// A clip respects the budget and character boundaries.

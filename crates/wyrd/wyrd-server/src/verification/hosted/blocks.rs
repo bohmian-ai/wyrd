@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use monty_pool::PoolError;
+use skald_spec::PreparedSchemas;
 use vala_verify::blocks::{
     ActionExecutor, ActionOutput, AgentCardResolver, AgentExecutor, BlockCall, BlockClock,
     BlockError, CheckExecutor, CheckOutput, DriftChecks, EvidenceReader, PromptCardResolver,
@@ -53,6 +54,9 @@ pub struct HostedBlocks {
     workspaces: Arc<Workspaces>,
     /// The Deployment limits every block enforces.
     limits: HostedLimits,
+    /// Agent response and Verdict schema preparation every execution reuses;
+    /// it holds schemas only, never a caller's evidence or authority.
+    schemas: Arc<PreparedSchemas>,
 }
 
 /// The per-execution inputs an engine is bound to.
@@ -87,6 +91,7 @@ impl HostedBlocks {
             sandbox: Arc::new(Sandbox::start(worker, limits).await?),
             workspaces: Arc::new(Workspaces::new(limits)),
             limits,
+            schemas: Arc::default(),
         })
     }
 
@@ -155,7 +160,8 @@ impl HostedBlocks {
             ServerWyrdGatewayCaller::new(state.clone(), caller.clone())
                 .attributed(Some(execution.subject)),
         ))
-        .with_route_overrides(execution.routes.clone());
+        .with_route_overrides(execution.routes.clone())
+        .with_prepared_schemas(Arc::clone(&self.schemas));
         let blocks = Arc::new(Blocks {
             code: CodeExecutor::new(Arc::clone(&self.sandbox), Arc::clone(&evidence)),
             evidence: Arc::clone(&evidence),

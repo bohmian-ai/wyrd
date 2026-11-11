@@ -1,5 +1,5 @@
-use std::collections::HashSet;
-use std::sync::OnceLock;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -276,6 +276,83 @@ pub fn check_output_schema(schema: &Value, field: &str, object_root: bool) -> Sk
         ));
     }
     Ok(())
+}
+
+/// Most distinct schemas one [`PreparedSchemas`] keeps before it forgets
+/// them all.
+const PREPARED_SCHEMAS: usize = 256;
+
+/// Immutable preparation of exact JSON Schemas reused across calls: the
+/// compiled validator of each schema text and which schemas already passed
+/// [`check_output_schema`] for an object-root or any-root destination.
+///
+/// A host whose lifetime spans many calls owns one and lends it to each call
+/// that sends or checks a schema, so repeated calls with an unchanged schema
+/// skip meta-validation and compilation. Entries are keyed by the schema's
+/// exact serialized text: a changed, narrowed, or hook-replaced schema is a
+/// different key and is prepared again, never validated by a stale entry.
+/// It holds only schemas and their validators, never request contents,
+/// media, tools, or caller authority. It is bounded at [`PREPARED_SCHEMAS`]
+/// entries per map; reaching the bound forgets every entry, after which
+/// schemas are prepared again.
+#[derive(Debug, Default)]
+pub struct PreparedSchemas {
+    /// Compiled validators keyed by schema text.
+    validators: Mutex<HashMap<String, Arc<jsonschema::Validator>>>,
+    /// Schema texts, each with whether its destination required an object
+    /// root, that passed [`check_output_schema`].
+    checked: Mutex<HashSet<(bool, String)>>,
+}
+
+impl PreparedSchemas {
+    /// The compiled validator of `schema`, compiled now unless an equal
+    /// schema text was compiled before; `None` when it does not compile,
+    /// which is never kept.
+    ///
+    /// # Panics
+    /// Never panics: a poisoned lock is recovered, since every entry is
+    /// complete once inserted.
+    #[must_use]
+    pub fn validator(&self, schema: &Value) -> Option<Arc<jsonschema::Validator>> {
+        let key = schema.to_string();
+        let lock = || {
+            self.validators
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+        };
+        if let Some(validator) = lock().get(&key) {
+            return Some(Arc::clone(validator));
+        }
+        // Compiled unlocked: concurrent first calls may each compile once.
+        let validator = Arc::new(jsonschema::validator_for(schema).ok()?);
+        let mut validators = lock();
+        // ponytail: forget-all eviction; an LRU if many distinct live schemas thrash it.
+        if validators.len() >= PREPARED_SCHEMAS {
+            validators.clear();
+        }
+        validators.insert(key, Arc::clone(&validator));
+        Some(validator)
+    }
+
+    /// [`check_output_schema`] of `schema`, skipped when an equal schema text
+    /// already passed it with the same `object_root`; only a pass is kept.
+    ///
+    /// # Errors
+    /// Returns [`check_output_schema`]'s refusal at `field`.
+    pub fn check(&self, schema: &Value, field: &str, object_root: bool) -> SkaldResult<()> {
+        let key = (object_root, schema.to_string());
+        let lock = || self.checked.lock().unwrap_or_else(PoisonError::into_inner);
+        if lock().contains(&key) {
+            return Ok(());
+        }
+        check_output_schema(schema, field, object_root)?;
+        let mut checked = lock();
+        if checked.len() >= PREPARED_SCHEMAS {
+            checked.clear();
+        }
+        checked.insert(key);
+        Ok(())
+    }
 }
 
 /// Native body path of a request's output schema, and whether its
@@ -780,8 +857,13 @@ impl Prompt {
     ///
     /// Returns [`SkaldError::PromptInvalid`] at the schema's native body path
     /// when the edited schema is invalid for its destination (see
-    /// [`check_output_schema`]).
-    pub fn edit_response_schema_mut(&mut self, edit: impl FnOnce(&mut Value)) -> SkaldResult<()> {
+    /// [`check_output_schema`]); `schemas` skips that check for an edited
+    /// schema it already passed.
+    pub fn edit_response_schema_mut(
+        &mut self,
+        schemas: &PreparedSchemas,
+        edit: impl FnOnce(&mut Value),
+    ) -> SkaldResult<()> {
         use crate::wire::anthropic_messages::AnthropicOutputFormat;
         use crate::wire::openai_chat::OpenAiResponseFormat;
         use crate::wire::openai_responses::OpenAiTextResponseFormat;
@@ -835,7 +917,7 @@ impl Prompt {
         self.response_type = ResponseType::of(&self.request);
         if let ResponseType::JsonSchema { schema, .. } = &self.response_type {
             let (field, object_root) = output_schema_field(&self.request);
-            check_output_schema(schema, field, object_root)?;
+            schemas.check(schema, field, object_root)?;
         }
         Ok(())
     }
@@ -2429,8 +2511,9 @@ mod response_schema_edit {
         let model = request.model.clone();
         let mut prompt =
             Prompt::new(ProviderRequest::OpenAiChatCompletion(request), &model).expect("builds");
+        let schemas = crate::prompt::PreparedSchemas::default();
         prompt
-            .edit_response_schema_mut(|schema| {
+            .edit_response_schema_mut(&schemas, |schema| {
                 schema["properties"]["slot"]["enum"] = json!(["order"]);
             })
             .expect("narrowed schema is valid");
@@ -2446,7 +2529,7 @@ mod response_schema_edit {
 
         assert!(
             prompt
-                .edit_response_schema_mut(|schema| *schema = json!({"type": 5}))
+                .edit_response_schema_mut(&schemas, |schema| *schema = json!({"type": 5}))
                 .is_err()
         );
     }

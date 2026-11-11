@@ -28,6 +28,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use skald_spec::PreparedSchemas;
 use thiserror::Error;
 use tokio::time::Instant;
 
@@ -296,16 +297,23 @@ pub trait CheckExecutor: Send + Sync {
 /// [`Verdict`], and keep its custom `data` within the fixed bounds. Agent
 /// and code checks share this rule; a refusal names the failing schema
 /// location or limit, never the response contents or a path into them,
-/// since returned dictionary keys are response contents.
+/// since returned dictionary keys are response contents. `schemas` reuses
+/// the schema's compiled validator when an equal schema was prepared before;
+/// the response is validated either way.
 ///
 /// # Errors
 /// Returns [`BlockError::Terminal`], which makes the requirement
 /// inconclusive, for an invalid schema, a response the schema refuses, a
 /// response that is not a Verdict, or data beyond its bounds.
-pub fn verdict_from(schema: &Value, response: Value) -> Result<Verdict, BlockError> {
+pub fn verdict_from(
+    schemas: &PreparedSchemas,
+    schema: &Value,
+    response: Value,
+) -> Result<Verdict, BlockError> {
     let terminal = |reason: String| BlockError::Terminal { reason };
-    let validator = jsonschema::validator_for(schema)
-        .map_err(|_| terminal("the declared Verdict format is not a valid schema".to_owned()))?;
+    let validator = schemas
+        .validator(schema)
+        .ok_or_else(|| terminal("the declared Verdict format is not a valid schema".to_owned()))?;
     if let Some(error) = validator.iter_errors(&response).next() {
         return Err(terminal(format!(
             "the check response violates its declared Verdict format at schema `{}`",
@@ -470,19 +478,68 @@ mod tests {
             let format: skald_spec::NamedResponseFormat =
                 serde_json::from_value(json!({"kind": "verdict", "data": data})).expect("format");
             let schema = Value::Object(Verdict::response_format(&format).expect("resolves"));
-            let verdict = verdict_from(&schema, response(good.clone()))
-                .unwrap_or_else(|error| panic!("{good}: {error}"));
+            let verdict =
+                verdict_from(&PreparedSchemas::default(), &schema, response(good.clone()))
+                    .unwrap_or_else(|error| panic!("{good}: {error}"));
             assert_eq!(serde_json::to_value(verdict.data).expect("data"), good);
             for bad in bad {
                 assert!(
                     matches!(
-                        verdict_from(&schema, response(bad.clone())),
+                        verdict_from(&PreparedSchemas::default(), &schema, response(bad.clone())),
                         Err(BlockError::Terminal { .. })
                     ),
                     "{bad}"
                 );
             }
         }
+    }
+
+    /// A warm prepared Verdict format still refuses a response its schema
+    /// refuses, a non-Verdict, and custom data beyond the depth bound, and a
+    /// changed format is judged by its own schema rather than a stale one.
+    ///
+    /// # Panics
+    /// Panics when a warm format accepts what it refuses cold, or a changed
+    /// format reuses the previous validator.
+    #[test]
+    fn prepared_verdict_keeps_validation_and_data_bounds() {
+        let schemas = PreparedSchemas::default();
+        let format = |data: Value| {
+            let format: skald_spec::NamedResponseFormat =
+                serde_json::from_value(json!({"kind": "verdict", "data": data})).expect("format");
+            Value::Object(Verdict::response_format(&format).expect("resolves"))
+        };
+        let integers = format(json!({"type": "object", "additionalProperties": true}));
+        let response = |data: Value| json!({"outcome": "passed", "reason": "judged", "citations": [], "data": data});
+        let mut deep = json!(1);
+        for _ in 0..=wyrd_spec::verification::execution::MAX_VERDICT_DATA_DEPTH {
+            deep = json!({"n": deep});
+        }
+        for _ in 0..2 {
+            let verdict =
+                verdict_from(&schemas, &integers, response(json!({"n": 1}))).expect("valid");
+            assert_eq!(
+                verdict.outcome,
+                wyrd_spec::verification::VerificationVerdict::Passed
+            );
+            for refused in [
+                json!({"outcome": "passed", "reason": "judged", "citations": [], "data": 1}),
+                json!({"outcome": "maybe", "reason": "judged", "citations": []}),
+                response(deep.clone()),
+            ] {
+                assert!(
+                    matches!(
+                        verdict_from(&schemas, &integers, refused.clone()),
+                        Err(BlockError::Terminal { .. })
+                    ),
+                    "{refused}"
+                );
+            }
+        }
+        let strings = format(json!({"type": "object", "additionalProperties": {"type": "string"}}));
+        assert!(verdict_from(&schemas, &strings, response(json!({"n": 1}))).is_err());
+        assert!(verdict_from(&schemas, &strings, response(json!({"n": "1"}))).is_ok());
+        assert!(verdict_from(&schemas, &integers, response(json!({"n": 1}))).is_ok());
     }
 
     /// A refusal names where the declared schema failed, never where the
@@ -502,7 +559,7 @@ mod tests {
         let secret = "customer-secret@example.test";
         let response = json!({"outcome": "passed", "reason": "judged", "citations": [],
             "data": {"nested": 1, secret: "wrong"}});
-        match verdict_from(&schema, response) {
+        match verdict_from(&PreparedSchemas::default(), &schema, response) {
             Err(BlockError::Terminal { reason }) => {
                 assert!(!reason.contains("customer-secret"), "{reason}");
             }

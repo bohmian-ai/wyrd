@@ -22,7 +22,7 @@ use skald_agent::{
 use skald_prompt::Prompt;
 use skald_providers::ProviderError;
 use skald_runtime::{ProviderRegistry, SkaldRuntimeError};
-use skald_spec::{MediaRef, ResponseType};
+use skald_spec::{MediaRef, PreparedSchemas, ResponseType};
 use tokio::time::Instant;
 use wyrd_spec::card::agent::{AgentSpec, BuiltinTool, ExecutionRoute};
 use wyrd_spec::card::verifier::{Action, AgentCall, Check, InputSlot};
@@ -155,6 +155,9 @@ pub struct AgentExecutor {
     toolset: Option<Arc<dyn AgentToolset>>,
     /// Whole-route replacements keyed by step or requirement ID.
     routes: BTreeMap<TaskId, ExecutionRoute>,
+    /// Response and Verdict schema preparation, shared with the host's other
+    /// executions when it lends one.
+    schemas: Arc<PreparedSchemas>,
 }
 
 impl AgentExecutor {
@@ -174,7 +177,17 @@ impl AgentExecutor {
             gateway: None,
             toolset: None,
             routes: BTreeMap::new(),
+            schemas: Arc::default(),
         }
+    }
+
+    /// Reuse `schemas` to prepare each call's narrowed response schema and
+    /// declared Verdict format, so executions with unchanged schemas skip
+    /// meta-validation and compilation. Every answer is still validated.
+    #[must_use]
+    pub fn with_prepared_schemas(mut self, schemas: Arc<PreparedSchemas>) -> Self {
+        self.schemas = schemas;
+        self
     }
 
     /// Read native media placeholders' evidence through `reader`.
@@ -256,7 +269,7 @@ impl AgentExecutor {
         }
     }
 
-    /// Bind `inputs` to the Prompt placeholders on a per-call Prompt copy.
+    /// Bind `inputs` to the placeholders of `prompt`, the call's own copy.
     ///
     /// Input keys must equal the Prompt's text and media placeholders. JSON
     /// strings render raw and other JSON as JSON text; evidence binds as
@@ -271,24 +284,23 @@ impl AgentExecutor {
     /// provider rejects, plus the reader's errors.
     async fn bind(
         &self,
-        prompt: &Prompt,
+        prompt: Prompt,
         inputs: &BTreeMap<String, CallInput>,
         slots: &BTreeSet<SlotName>,
     ) -> Result<(Prompt, Vec<(String, String)>), BlockError> {
-        let native = prompt.native();
-        let placeholders: BTreeSet<&str> = native
+        let mut bound = prompt.into_native();
+        let placeholders: BTreeSet<&str> = bound
             .variables
             .iter()
-            .chain(&native.media_variables)
+            .chain(&bound.media_variables)
             .map(String::as_str)
             .collect();
         if placeholders != inputs.keys().map(String::as_str).collect() {
             return Err(terminal("Agent inputs must match the Prompt placeholders"));
         }
-        let mut bound = native.clone();
         let mut vars = Vec::new();
         for (name, input) in inputs {
-            let is_media = native.media_variables.contains(name);
+            let is_media = bound.media_variables.contains(name);
             match (&input.value, is_media) {
                 (CallValue::Json(value), false) => vars.push((name.clone(), render(value))),
                 (CallValue::Evidence(evidence), true) => {
@@ -317,7 +329,9 @@ impl AgentExecutor {
         }
         if !slots.is_empty() {
             bound
-                .edit_response_schema_mut(|schema| Verdict::restrict_slots(schema, slots))
+                .edit_response_schema_mut(&self.schemas, |schema| {
+                    Verdict::restrict_slots(schema, slots);
+                })
                 .map_err(|error| BlockError::Terminal {
                     reason: format!("the Verdict citation slots cannot be narrowed: {error}"),
                 })?;
@@ -355,7 +369,7 @@ impl AgentExecutor {
     ) -> Result<Invoked, BlockError> {
         let resolved = self.resolve(&call.agent).await?;
         let route = self.route(id, &resolved.spec.execution_route)?;
-        let (prompt, vars) = self.bind(&resolved.prompt, inputs, slots).await?;
+        let (prompt, vars) = self.bind(resolved.prompt, inputs, slots).await?;
         let declared = resolved
             .spec
             .tool_names
@@ -383,8 +397,9 @@ impl AgentExecutor {
             Some(session) => session.resolve(&declared, &records)?,
             None => Vec::new(),
         };
-        let mut agent = Agent::new(prompt.clone())
-            .with_id(id.as_str())
+        let prompt = Arc::new(prompt);
+        let mut agent = Agent::from_resolved(id.as_str(), Arc::clone(&prompt))
+            .with_prepared_schemas(Arc::clone(&self.schemas))
             .with_tools(tools)
             .with_run_config(run_config_from_agent_run_config_spec(
                 &resolved.spec.run_config,
@@ -507,7 +522,7 @@ impl CheckExecutor for AgentExecutor {
                 "the check Agent's Prompt declares no Verdict format",
             ));
         };
-        let mut verdict = verdict_from(schema, Value::Object(answer))?;
+        let mut verdict = verdict_from(&self.schemas, schema, Value::Object(answer))?;
         let citations = std::mem::take(&mut verdict.citations);
         if let Some(reader) = &self.evidence {
             verdict.citations = reader.cited(&reachable, citations).await?;
@@ -547,7 +562,7 @@ struct Invoked {
     /// The final text answer.
     text: String,
     /// The bound Prompt that ran.
-    prompt: Prompt,
+    prompt: Arc<Prompt>,
     /// Agent, Prompt, and effective route.
     provenance: CallProvenance,
     /// Tool calls in call order.

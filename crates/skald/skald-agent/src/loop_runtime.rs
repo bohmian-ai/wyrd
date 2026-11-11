@@ -427,7 +427,7 @@ impl Agent {
                 ResponseType::Text => None,
                 ResponseType::JsonSchema { schema, .. } => match structured.take() {
                     Some(current) if current.schema() == &schema => Some(current),
-                    _ => Some(StructuredOutput::new(&self.id, &schema)?),
+                    _ => Some(StructuredOutput::new(&self.id, &self.schemas, &schema)?),
                 },
             };
             self.append_model_journal_call(iteration, &request).await?;

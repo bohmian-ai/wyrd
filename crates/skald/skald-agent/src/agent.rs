@@ -7,7 +7,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use skald_prompt::Prompt;
-use skald_spec::Prompt as PromptSpec;
+use skald_spec::{PreparedSchemas, Prompt as PromptSpec};
 use skald_tool::{AgentTool, ToolError, ToolResolver};
 use wyrd_spec::{
     AgentCard, AgentRunConfigSpec, AgentSpec, CardMetadata, ExecutionRoute,
@@ -226,6 +226,10 @@ pub struct Agent {
     /// Host-supplied gateway seam a `wyrd_gateway` route dispatches through.
     /// Runtime state only, never serialized.
     pub(crate) gateway_caller: Option<Arc<dyn WyrdGatewayCaller>>,
+    /// Response-schema preparation reused across this Agent's runs, or
+    /// across a host's calls when it lends one with
+    /// [`Self::with_prepared_schemas`]. Runtime state only, never serialized.
+    pub(crate) schemas: Arc<PreparedSchemas>,
 }
 
 impl fmt::Debug for Agent {
@@ -361,6 +365,16 @@ impl Agent {
     #[must_use]
     pub fn with_gateway_caller(mut self, caller: Arc<dyn WyrdGatewayCaller>) -> Self {
         self.gateway_caller = Some(caller);
+        self
+    }
+
+    /// Reuse `schemas` to prepare each outgoing response schema, so a host
+    /// running many Agents with unchanged schemas compiles each once.
+    /// The answer is still validated against the exact schema each request
+    /// sends.
+    #[must_use]
+    pub fn with_prepared_schemas(mut self, schemas: Arc<PreparedSchemas>) -> Self {
+        self.schemas = schemas;
         self
     }
 
@@ -786,6 +800,7 @@ impl Agent {
             provider_override: None,
             execution_route: ExecutionRoute::Native {},
             gateway_caller: None,
+            schemas: Arc::default(),
         }
     }
 

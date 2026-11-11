@@ -350,11 +350,11 @@ async fn pinned_review_runs_cold_and_warm_over_wyrd_custody() {
 }
 
 /// The object adapter refuses an occupied key, distinguishes an absent key
-/// from a backend failure, and deletes idempotently.
+/// and a taken key from a failing store, and deletes idempotently.
 ///
 /// # Panics
 /// Panics when a create overwrites, an absent read is not `NotFound`, or a
-/// foreign key is not refused as a backend failure.
+/// foreign key or a failing store is not reported as a backend failure.
 #[tokio::test]
 async fn objects_are_create_only_and_failures_stay_distinct() {
     let custody = Custody::start().await;
@@ -387,6 +387,25 @@ async fn objects_are_create_only_and_failures_stay_distinct() {
         custody.objects.read(&foreign_key).await,
         Err(StorageError::Backend { .. })
     ));
+
+    let broken = tempfile::tempdir().expect("tempdir");
+    let objects = CodeReviewObjects::new(Arc::new(StorageHandle::new(
+        LocalSigner::new(broken.path().to_path_buf()).expect("local signer"),
+    )));
+    std::fs::remove_dir(broken.path()).expect("remove the store root");
+    std::fs::write(broken.path(), b"not a directory").expect("replace it with a file");
+    assert!(
+        matches!(
+            objects.create(&key, b"bytes").await,
+            Err(StorageError::Backend { .. })
+        ),
+        "a failing store is a backend failure, not a taken key"
+    );
+    assert!(
+        matches!(objects.read(&key).await, Err(StorageError::Backend { .. })),
+        "a failing store is a backend failure, not an absent key"
+    );
+    std::fs::remove_file(broken.path()).expect("clean up");
 }
 
 /// The metadata owner keeps the snapshot protocol: one of two competing

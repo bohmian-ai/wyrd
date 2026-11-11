@@ -464,10 +464,10 @@ impl Provider for RecordingProvider {
     /// # Errors
     ///
     /// Returns [`ProviderError::BadRequest`] once the script is exhausted.
-    async fn send(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+    async fn send(&self, request: &ProviderRequest) -> Result<ProviderResponse, ProviderError> {
         match self.requests.lock() {
-            Ok(mut guard) => guard.push(request),
-            Err(poisoned) => poisoned.into_inner().push(request),
+            Ok(mut guard) => guard.push(request.clone()),
+            Err(poisoned) => poisoned.into_inner().push(request.clone()),
         }
         self.responses()
             .pop_front()
@@ -479,7 +479,7 @@ impl Provider for RecordingProvider {
     /// # Errors
     ///
     /// Always returns [`ProviderError::BadRequest`].
-    async fn stream(&self, _request: ProviderRequest) -> Result<ProviderStream, ProviderError> {
+    async fn stream(&self, _request: &ProviderRequest) -> Result<ProviderStream, ProviderError> {
         Err(ProviderError::bad_request(
             "recording",
             "recording provider does not stream",

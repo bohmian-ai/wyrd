@@ -174,32 +174,91 @@ impl RequestJson {
             };
             return RequestBody::Object { members, model }.to_json();
         };
-        let mut json = Vec::with_capacity(text.len() + model.map_or(0, |model| model.len() + 11));
-        let mut replaced = false;
-        json.push(b'{');
-        for member in members {
-            if json.len() > 1 {
-                json.push(b',');
-            }
-            json.extend_from_slice(&text[member.name.start - 1..member.value.start]);
-            match model {
-                Some(model) if &text[member.name.clone()] == b"model" => {
-                    replaced = true;
-                    serde_json::to_writer(&mut json, model)?;
-                }
-                _ => json.extend_from_slice(&text[member.value.clone()]),
-            }
-        }
-        if let Some(model) = model.filter(|_| !replaced) {
-            if json.len() > 1 {
-                json.push(b',');
-            }
-            json.extend_from_slice(br#""model":"#);
-            serde_json::to_writer(&mut json, model)?;
-        }
-        json.push(b'}');
-        Ok(json)
+        write_members(text, members, model, None)
     }
+
+    /// This object body with its top-level `model` member set to `model`,
+    /// placed as [`Self::to_json`] places it.
+    ///
+    /// Kept text stays kept: the members are copied once with the new
+    /// `model`, and nothing is decoded or scanned again.
+    ///
+    /// # Errors
+    ///
+    /// Returns the serialization error of a decoded body that is not an
+    /// object.
+    pub fn with_model(mut self, model: &str) -> serde_json::Result<Self> {
+        if let Some((text, members)) = &self.text {
+            let mut kept = Vec::with_capacity(members.len() + 1);
+            let json = write_members(text, members, Some(model), Some(&mut kept))?;
+            return Ok(Self {
+                text: Some((Bytes::from(json), kept)),
+                tree: OnceLock::new(),
+            });
+        }
+        let Some(Value::Object(members)) = self.tree.get_mut() else {
+            return Err(de::Error::custom("request body is not a JSON object"));
+        };
+        members.insert("model".to_owned(), Value::String(model.to_owned()));
+        Ok(self)
+    }
+}
+
+/// Compact JSON bytes of the kept object `text` with `model` applied: a
+/// present `model` member keeps its position with the new value and an
+/// absent one follows the others. When `kept` is given, it receives the
+/// members of the written bytes.
+///
+/// # Errors
+///
+/// Returns the serialization error of `model`.
+fn write_members(
+    text: &[u8],
+    members: &[Member],
+    model: Option<&str>,
+    mut kept: Option<&mut Vec<Member>>,
+) -> serde_json::Result<Vec<u8>> {
+    let mut json = Vec::with_capacity(text.len() + model.map_or(0, |model| model.len() + 11));
+    let mut replaced = false;
+    json.push(b'{');
+    for member in members {
+        if json.len() > 1 {
+            json.push(b',');
+        }
+        let name = json.len() + 1..json.len() + 1 + member.name.len();
+        json.extend_from_slice(&text[member.name.start - 1..member.value.start]);
+        let value = json.len();
+        match model {
+            Some(model) if &text[member.name.clone()] == b"model" => {
+                replaced = true;
+                serde_json::to_writer(&mut json, model)?;
+            }
+            _ => json.extend_from_slice(&text[member.value.clone()]),
+        }
+        if let Some(kept) = kept.as_deref_mut() {
+            kept.push(Member {
+                name,
+                value: value..json.len(),
+            });
+        }
+    }
+    if let Some(model) = model.filter(|_| !replaced) {
+        if json.len() > 1 {
+            json.push(b',');
+        }
+        let name = json.len() + 1..json.len() + 6;
+        json.extend_from_slice(br#""model":"#);
+        let value = json.len();
+        serde_json::to_writer(&mut json, model)?;
+        if let Some(kept) = kept {
+            kept.push(Member {
+                name,
+                value: value..json.len(),
+            });
+        }
+    }
+    json.push(b'}');
+    Ok(json)
 }
 
 /// The top-level members of `text` when it is a JSON object written exactly
@@ -493,5 +552,49 @@ mod tests {
                 (b"n", br#"[1,{"k":"v"}]"#),
             ]
         );
+    }
+
+    /// `with_model` replaces a present `model` in place and appends an
+    /// absent one, keeping text kept with members that match a fresh scan,
+    /// and sets the member of a decoded body.
+    ///
+    /// # Panics
+    /// Panics when a body is not rewritten as described or its members
+    /// differ from a scan of the written text.
+    #[test]
+    fn with_model_rewrites_kept_text_without_decoding() {
+        let cases = [
+            (
+                r#"{"say \"hi\"":1,"model":"gpt-4o","n":[1]}"#,
+                r#"{"say \"hi\"":1,"model":"dep/gpt-4o","n":[1]}"#,
+            ),
+            (
+                r#"{"contents":[]}"#,
+                r#"{"contents":[],"model":"dep/gpt-4o"}"#,
+            ),
+        ];
+        for (text, written) in cases {
+            let body = RequestJson::parse(Bytes::from(text))
+                .expect("parses")
+                .with_model("dep/gpt-4o")
+                .expect("rewrites");
+            assert_eq!(body.text(), Some(written.as_bytes()), "{text}");
+            assert!(body.tree.get().is_none(), "{text}: never decoded");
+            let (kept, members) = body.text.as_ref().expect("kept");
+            let scanned = canonical(kept).expect("written text is canonical");
+            let ranges = |members: &[Member]| {
+                members
+                    .iter()
+                    .map(|member| (member.name.clone(), member.value.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(ranges(members), ranges(&scanned), "{text}");
+        }
+
+        let decoded = RequestJson::from(serde_json::json!({"model": "a", "n": 1}))
+            .with_model("dep/a")
+            .expect("rewrites");
+        assert_eq!(decoded.tree()["model"], "dep/a");
+        assert!(RequestJson::from(Value::Null).with_model("dep/a").is_err());
     }
 }

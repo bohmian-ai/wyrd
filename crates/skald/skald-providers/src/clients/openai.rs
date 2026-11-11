@@ -673,7 +673,7 @@ impl OpenAiClient {
     }
 
     /// Sends a native OpenAI request.
-    pub async fn send_native(&self, request: ProviderRequest) -> ProviderResult<ProviderResponse> {
+    pub async fn send_native(&self, request: &ProviderRequest) -> ProviderResult<ProviderResponse> {
         match request {
             ProviderRequest::OpenAiChatCompletion(request) => {
                 let url = self.url(OpenAiRoute::ChatCompletions);
@@ -731,7 +731,7 @@ impl OpenAiClient {
             }
             other => Err(ProviderError::variant_mismatch(
                 "openai",
-                super::request_variant_label(&other),
+                super::request_variant_label(other),
             )),
         }
     }
@@ -941,11 +941,11 @@ fn json_media_payload(route: OpenAiMediaRoute, json: Vec<u8>) -> ProviderResult<
 
 #[async_trait]
 impl ProviderClient for OpenAiClient {
-    async fn send(&self, request: ProviderRequest) -> ProviderResult<ProviderResponse> {
+    async fn send(&self, request: &ProviderRequest) -> ProviderResult<ProviderResponse> {
         self.send_native(request).await
     }
 
-    async fn stream(&self, request: ProviderRequest) -> ProviderResult<ProviderStream> {
+    async fn stream(&self, request: &ProviderRequest) -> ProviderResult<ProviderStream> {
         match request {
             ProviderRequest::OpenAiChatCompletion(request) => {
                 let url = self.url(OpenAiRoute::ChatCompletions);
@@ -985,7 +985,7 @@ impl ProviderClient for OpenAiClient {
             }
             other => Err(ProviderError::variant_mismatch(
                 "openai",
-                super::request_variant_label(&other),
+                super::request_variant_label(other),
             )),
         }
     }
@@ -1013,7 +1013,7 @@ mod openai_chat {
         let request: OpenAiChatRequest =
             serde_json::from_str(&request_body).expect("fixture parses");
         let response = common::openai_client(&server.uri())
-            .send(ProviderRequest::OpenAiChatCompletion(request))
+            .send(&ProviderRequest::OpenAiChatCompletion(request))
             .await
             .expect("request succeeds");
 
@@ -1038,7 +1038,7 @@ mod openai_chat {
         let request: OpenAiChatRequest =
             serde_json::from_str(&request_body).expect("fixture parses");
         let response = common::openai_client(&server.uri())
-            .send(ProviderRequest::OpenAiChatCompletion(request))
+            .send(&ProviderRequest::OpenAiChatCompletion(request))
             .await
             .expect("request succeeds");
 
@@ -1065,7 +1065,7 @@ mod openai_chat {
         let request: OpenAiChatRequest =
             serde_json::from_str(&request_body).expect("fixture parses");
         let response = common::openai_client(&server.uri())
-            .send(ProviderRequest::OpenAiChatCompletion(request))
+            .send(&ProviderRequest::OpenAiChatCompletion(request))
             .await
             .expect("retry succeeds");
 
@@ -1468,7 +1468,7 @@ mod openai_embed {
         let request: OpenAiEmbeddingsRequest =
             serde_json::from_str(&request_body).expect("fixture parses");
         let response = common::openai_client(&server.uri())
-            .send(ProviderRequest::OpenAiEmbeddings(request))
+            .send(&ProviderRequest::OpenAiEmbeddings(request))
             .await
             .expect("request succeeds");
 
@@ -1499,7 +1499,7 @@ mod openai_responses {
         let request: OpenAiResponsesRequest =
             serde_json::from_str(&request_body).expect("fixture parses");
         let response = common::openai_client(&server.uri())
-            .send(ProviderRequest::OpenAiResponses(request))
+            .send(&ProviderRequest::OpenAiResponses(request))
             .await
             .expect("request succeeds");
 
@@ -1521,7 +1521,7 @@ mod variant_mismatch {
             serde_json::from_str(&request_body).expect("fixture parses");
 
         let error = common::openai_client("http://localhost")
-            .send(ProviderRequest::AnthropicMessage(request))
+            .send(&ProviderRequest::AnthropicMessage(request))
             .await
             .expect_err("variant mismatch");
 

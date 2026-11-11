@@ -24,10 +24,10 @@ static DEFAULT_REGISTRY: OnceLock<RwLock<Arc<ProviderRegistry>>> = OnceLock::new
 #[async_trait]
 pub trait Provider: Send + Sync + 'static {
     /// Sends one native provider request.
-    async fn send(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError>;
+    async fn send(&self, request: &ProviderRequest) -> Result<ProviderResponse, ProviderError>;
 
     /// Sends one streaming native provider request.
-    async fn stream(&self, request: ProviderRequest) -> Result<ProviderStream, ProviderError>;
+    async fn stream(&self, request: &ProviderRequest) -> Result<ProviderStream, ProviderError>;
 
     /// Returns the provider this client handles.
     fn name(&self) -> ProviderName;
@@ -39,14 +39,14 @@ macro_rules! provider_client_impl {
         impl Provider for $client {
             async fn send(
                 &self,
-                request: ProviderRequest,
+                request: &ProviderRequest,
             ) -> Result<ProviderResponse, ProviderError> {
                 ProviderClient::send(self, request).await
             }
 
             async fn stream(
                 &self,
-                request: ProviderRequest,
+                request: &ProviderRequest,
             ) -> Result<ProviderStream, ProviderError> {
                 ProviderClient::stream(self, request).await
             }

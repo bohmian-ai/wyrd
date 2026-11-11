@@ -531,7 +531,7 @@ mod bounded_answers {
         );
 
         let oversized = client
-            .send(ProviderRequest::OpenAiChatCompletion(request.clone()))
+            .send(&ProviderRequest::OpenAiChatCompletion(request.clone()))
             .await
             .expect_err("oversized answer fails");
         assert!(
@@ -540,7 +540,7 @@ mod bounded_answers {
         );
 
         let refused = client
-            .send(ProviderRequest::OpenAiChatCompletion(request))
+            .send(&ProviderRequest::OpenAiChatCompletion(request))
             .await
             .expect_err("refusal fails");
         assert_eq!(

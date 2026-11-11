@@ -893,7 +893,7 @@ impl Provider for Recording {
     ///
     /// # Panics
     /// Panics when the request log's lock is poisoned.
-    async fn send(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+    async fn send(&self, request: &ProviderRequest) -> Result<ProviderResponse, ProviderError> {
         self.requests
             .lock()
             .expect("unpoisoned")
@@ -905,7 +905,7 @@ impl Provider for Recording {
     ///
     /// # Errors
     /// Always the mock's empty-stream error.
-    async fn stream(&self, request: ProviderRequest) -> Result<ProviderStream, ProviderError> {
+    async fn stream(&self, request: &ProviderRequest) -> Result<ProviderStream, ProviderError> {
         self.mock.stream(request).await
     }
 

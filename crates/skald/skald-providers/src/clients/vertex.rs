@@ -117,7 +117,7 @@ impl VertexClient {
 
     /// Sends a native Vertex request: a Google GenerateContent body to the
     /// project/location `generateContent` endpoint, or a Predict body.
-    pub async fn send_native(&self, request: ProviderRequest) -> ProviderResult<ProviderResponse> {
+    pub async fn send_native(&self, request: &ProviderRequest) -> ProviderResult<ProviderResponse> {
         match request {
             ProviderRequest::GeminiGenerateContent(request) => {
                 let url = self.auth.model_url(&self.model, "generateContent");
@@ -162,7 +162,7 @@ impl VertexClient {
             }
             other => Err(ProviderError::variant_mismatch(
                 "vertex",
-                super::request_variant_label(&other),
+                super::request_variant_label(other),
             )),
         }
     }
@@ -170,11 +170,11 @@ impl VertexClient {
 
 #[async_trait]
 impl ProviderClient for VertexClient {
-    async fn send(&self, request: ProviderRequest) -> ProviderResult<ProviderResponse> {
+    async fn send(&self, request: &ProviderRequest) -> ProviderResult<ProviderResponse> {
         self.send_native(request).await
     }
 
-    async fn stream(&self, request: ProviderRequest) -> ProviderResult<ProviderStream> {
+    async fn stream(&self, request: &ProviderRequest) -> ProviderResult<ProviderStream> {
         match request {
             ProviderRequest::GeminiGenerateContent(request) => {
                 let url = self.auth.model_url(&self.model, "streamGenerateContent");
@@ -196,7 +196,7 @@ impl ProviderClient for VertexClient {
             }
             other => Err(ProviderError::variant_mismatch(
                 "vertex",
-                super::request_variant_label(&other),
+                super::request_variant_label(other),
             )),
         }
     }
@@ -224,7 +224,7 @@ mod vertex_embed {
         let request: VertexPredictRequest =
             serde_json::from_str(&request_body).expect("fixture parses");
         let response = common::vertex_client(&server.uri(), "text-embedding-004")
-            .send(ProviderRequest::VertexPredict(request))
+            .send(&ProviderRequest::VertexPredict(request))
             .await
             .expect("request succeeds");
 
@@ -255,7 +255,7 @@ mod vertex_generate {
         let request: GoogleGenerateContentRequest =
             serde_json::from_str(&request_body).expect("fixture parses");
         let response = common::vertex_client(&server.uri(), "gemini-2.5-flash")
-            .send(ProviderRequest::GeminiGenerateContent(request))
+            .send(&ProviderRequest::GeminiGenerateContent(request))
             .await
             .expect("request succeeds");
 

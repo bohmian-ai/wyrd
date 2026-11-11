@@ -304,7 +304,7 @@ impl Agent {
         self.append_model_journal_call(0, &request).await?;
         let provider = self.prompt.native().provider();
         let chat = chat_span(&provider, &request, model);
-        let response = dispatch(providers, provider, request)
+        let response = dispatch(providers, provider, &request)
             .instrument(chat.clone())
             .await;
         let finish_reason = match &response {
@@ -333,6 +333,27 @@ impl Agent {
             errors: Vec::new(),
             structured_output: None,
         })
+    }
+
+    /// Returns the structured-output check for the response schema `request`
+    /// sends, reusing `current` when it already checks that schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`StructuredOutput::new`] failure for a schema that does
+    /// not compile.
+    fn structured_output(
+        &self,
+        request: &ProviderRequest,
+        current: Option<StructuredOutput>,
+    ) -> AgentResult<Option<StructuredOutput>> {
+        match ResponseType::of(request) {
+            ResponseType::Text => Ok(None),
+            ResponseType::JsonSchema { schema, .. } => match current {
+                Some(current) if current.schema() == &schema => Ok(Some(current)),
+                _ => StructuredOutput::new(&self.id, &self.schemas, Arc::new(schema)).map(Some),
+            },
+        }
     }
 
     /// Runs the bounded model/tool loop inside the caller's `invoke_agent` span.
@@ -374,14 +395,19 @@ impl Agent {
 
         let concurrency_cap = self.run_config.tool_concurrency_cap.unwrap_or(8).max(1);
         let max_iterations = self.run_config.max_iterations;
-        let mut structured: Option<StructuredOutput> = None;
-        // The schema is taken once and a copy put back per request, so the
-        // per-iteration template copy skips it; without `before_model` hooks
-        // every request sends this schema, so its validator is looked up once.
-        let schema = template
-            .take_response_schema()
-            .map(|(schema, field)| (Arc::new(schema), field));
+        // The run owns one request: each iteration replaces only its
+        // messages, so tools and the response schema are never copied.
+        if !self.tools.is_empty() {
+            template = template.with_tools(tool_descriptors(&self.tools));
+        }
         let hooked = !self.callbacks.before_model.is_empty();
+        // Without `before_model` hooks every request sends the template's
+        // schema, so its validator is looked up once per run.
+        let mut structured = if hooked {
+            None
+        } else {
+            self.structured_output(&template, None)?
+        };
 
         for iteration in 0..max_iterations {
             self.journal
@@ -390,31 +416,21 @@ impl Agent {
                 .map_err(|source| AgentError::JournalAppendFailed { source })?;
 
             let ctx = self.agent_context_with_session(session_id, iteration, &conversation);
-            let mut request = request_from_conversation(
-                &self.id,
-                template.clone(),
-                &seed_messages,
-                &conversation,
-            )?;
-            if let Some((schema, field)) = &schema {
-                request.set_response_schema(field, serde_json::Value::clone(schema));
-            }
-            if !self.tools.is_empty() {
-                request = request.with_tools(tool_descriptors(&self.tools));
-            }
+            request_from_conversation(&self.id, &mut template, &seed_messages, &conversation)?;
 
-            // Without hooks the request is unchanged, so it is not copied.
-            if hooked {
-                request = match apply_chain_with_panic_catch(
+            // A hook may replace the request, so only a hooked run copies it.
+            let replaced;
+            let request = if hooked {
+                replaced = match apply_chain_with_panic_catch(
                     &self.callbacks.before_model,
                     &ctx,
-                    request.clone(),
+                    template.clone(),
                     "before_model",
                 )? {
                     ChainResult::Abort(error, _) => {
                         self.append_model_journal_call_result(ModelJournalCallRecord {
                             iteration,
-                            request: &request,
+                            request: &template,
                             finish_reason: "callback_aborted".to_owned(),
                             synthetic: true,
                         })
@@ -432,36 +448,16 @@ impl Agent {
                     }
                     ChainResult::Replaced(replacement) => replacement,
                 };
-            }
-
-            // The outgoing request, after rendering and hooks, owns the
-            // schema its answer must satisfy.
-            structured = if hooked {
-                match ResponseType::of(&request) {
-                    ResponseType::Text => None,
-                    ResponseType::JsonSchema { schema, .. } => match structured.take() {
-                        Some(current) if current.schema() == &schema => Some(current),
-                        _ => Some(StructuredOutput::new(
-                            &self.id,
-                            &self.schemas,
-                            Arc::new(schema),
-                        )?),
-                    },
-                }
+                // The outgoing request, after hooks, owns the schema its
+                // answer must satisfy.
+                structured = self.structured_output(&replaced, structured.take())?;
+                &replaced
             } else {
-                match (structured.take(), &schema) {
-                    (Some(current), _) => Some(current),
-                    (None, Some((schema, _))) => Some(StructuredOutput::new(
-                        &self.id,
-                        &self.schemas,
-                        Arc::clone(schema),
-                    )?),
-                    (None, None) => None,
-                }
+                &template
             };
-            self.append_model_journal_call(iteration, &request).await?;
+            self.append_model_journal_call(iteration, request).await?;
             let provider = self.prompt.native().provider();
-            let chat = chat_span(&provider, &request, model);
+            let chat = chat_span(&provider, request, model);
             let response = dispatch(providers, provider, request)
                 .instrument(chat.clone())
                 .await;

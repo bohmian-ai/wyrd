@@ -24,9 +24,9 @@ static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 pub async fn dispatch(
     providers: &ProviderRegistry,
     provider: ProviderName,
-    request: ProviderRequest,
+    request: &ProviderRequest,
 ) -> SkaldRuntimeResult<ProviderResponse> {
-    let span = dispatch_span(&provider, &request);
+    let span = dispatch_span(&provider, request);
     async move {
         let client = providers
             .get(&provider)
@@ -55,9 +55,9 @@ pub async fn dispatch(
 pub async fn dispatch_stream(
     providers: &ProviderRegistry,
     provider: ProviderName,
-    request: ProviderRequest,
+    request: &ProviderRequest,
 ) -> SkaldRuntimeResult<ProviderStream> {
-    let span = dispatch_span(&provider, &request);
+    let span = dispatch_span(&provider, request);
     async move {
         let client = providers
             .get(&provider)

@@ -1027,11 +1027,10 @@ impl ProviderRequest {
     /// with its native body path (see [`output_schema_field`]) and leaving
     /// the field absent; `None` when the request declares no schema.
     ///
-    /// A caller that sends the request with the same schema several times,
-    /// such as an Agent loop, takes it once and puts a copy back per send
-    /// with [`set_response_schema`](Self::set_response_schema), so the rest
-    /// of the request copies without it.
-    pub fn take_response_schema(&mut self) -> Option<(Value, &'static str)> {
+    /// Rendering takes it before the rest of the request round-trips and
+    /// puts it back with [`set_response_schema`](Self::set_response_schema),
+    /// so the schema is never copied.
+    fn take_response_schema(&mut self) -> Option<(Value, &'static str)> {
         use crate::wire::anthropic_messages::AnthropicOutputFormat;
         use crate::wire::openai_chat::OpenAiResponseFormat;
         use crate::wire::openai_responses::OpenAiTextResponseFormat;
@@ -1076,7 +1075,7 @@ impl ProviderRequest {
     /// [`take_response_schema`](Self::take_response_schema) returned for a
     /// request of this kind and format; any other path, or a non-object
     /// schema for an object-typed field, leaves the request unchanged.
-    pub fn set_response_schema(&mut self, field: &str, schema: Value) {
+    fn set_response_schema(&mut self, field: &str, schema: Value) {
         use crate::wire::anthropic_messages::AnthropicOutputFormat;
         use crate::wire::openai_chat::OpenAiResponseFormat;
         use crate::wire::openai_responses::OpenAiTextResponseFormat;

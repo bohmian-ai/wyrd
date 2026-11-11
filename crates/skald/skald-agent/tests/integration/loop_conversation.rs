@@ -282,14 +282,14 @@ impl RecordingProvider {
 
 #[async_trait]
 impl Provider for RecordingProvider {
-    async fn send(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
-        self.requests_lock().push(request);
+    async fn send(&self, request: &ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        self.requests_lock().push(request.clone());
         self.responses_lock()
             .pop_front()
             .ok_or_else(|| ProviderError::bad_request("recording", "response queue is empty"))
     }
 
-    async fn stream(&self, _request: ProviderRequest) -> Result<ProviderStream, ProviderError> {
+    async fn stream(&self, _request: &ProviderRequest) -> Result<ProviderStream, ProviderError> {
         Err(ProviderError::bad_request(
             "recording",
             "recording provider does not stream",

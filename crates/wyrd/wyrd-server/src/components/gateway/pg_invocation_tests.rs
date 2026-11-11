@@ -6483,12 +6483,13 @@ async fn gateway_agent_calls_start_only_on_a_compatible_adapter() {
         .expect("fallback stores");
     let caller = invoker(tenant, 1, [open_access()]);
     let agent = super::ServerWyrdGatewayCaller::new(state.clone(), caller.clone());
+    let native = skald_spec::ProviderRequest::OpenAiChatCompletion(
+        serde_json::from_value(json!({"model": "m", "max_tokens": 4,
+                "messages": [{"role": "user", "content": "hi"}]}))
+        .expect("chat request"),
+    );
     let chat = |requested: &str| skald_agent::WyrdGatewayCall {
-        request: skald_spec::ProviderRequest::OpenAiChatCompletion(
-            serde_json::from_value(json!({"model": "m", "max_tokens": 4,
-                    "messages": [{"role": "user", "content": "hi"}]}))
-            .expect("chat request"),
-        ),
+        request: &native,
         model: model(requested),
         provider: skald_spec::ProviderName::OpenAi,
         timeout: Duration::from_secs(10),

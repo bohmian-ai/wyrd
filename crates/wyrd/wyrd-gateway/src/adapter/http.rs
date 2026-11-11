@@ -377,22 +377,22 @@ impl Client {
             }
             (Self::Anthropic(client), Prepared::Anthropic(request)) => Answer::Typed(Box::new(
                 client
-                    .send_native(ProviderRequest::AnthropicMessage(*request))
+                    .send_native(&ProviderRequest::AnthropicMessage(*request))
                     .await?,
             )),
             (Self::Google(client), Prepared::Google(request)) => Answer::Typed(Box::new(
                 client
-                    .send_native(ProviderRequest::GeminiGenerateContent(*request))
+                    .send_native(&ProviderRequest::GeminiGenerateContent(*request))
                     .await?,
             )),
             (Self::Vertex(client), Prepared::Google(request)) => Answer::Typed(Box::new(
                 client
-                    .send_native(ProviderRequest::GeminiGenerateContent(*request))
+                    .send_native(&ProviderRequest::GeminiGenerateContent(*request))
                     .await?,
             )),
             (Self::Jev(client), Prepared::Jev(request)) => Answer::Typed(Box::new(
                 client
-                    .send_native(ProviderRequest::JevSystemOne(*request))
+                    .send_native(&ProviderRequest::JevSystemOne(*request))
                     .await?,
             )),
             (_, _) => return Err(mismatch()),

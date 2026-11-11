@@ -12,11 +12,11 @@ async fn mock_queues_responses_in_order() {
     mock.push_response(openai_response("second"));
 
     let first = mock
-        .send(openai_request("one"))
+        .send(&openai_request("one"))
         .await
         .expect("first response");
     let second = mock
-        .send(openai_request("two"))
+        .send(&openai_request("two"))
         .await
         .expect("second response");
 
@@ -33,7 +33,7 @@ async fn mock_unexpected_request_returns_provider_error() {
         .expect_request(expected)
         .respond_with(openai_response("unused"));
 
-    let err = mock.send(actual).await.expect_err("mismatch fails");
+    let err = mock.send(&actual).await.expect_err("mismatch fails");
 
     assert_eq!(err.code(), "SKALD_PROVIDERS_400_BAD_REQUEST");
     assert!(err.to_string().contains("mock request mismatch"));
@@ -47,7 +47,7 @@ async fn mock_supports_stream_chunks() {
     ]));
 
     let stream = mock
-        .stream(anthropic_request("stream"))
+        .stream(&anthropic_request("stream"))
         .await
         .expect("stream response");
 

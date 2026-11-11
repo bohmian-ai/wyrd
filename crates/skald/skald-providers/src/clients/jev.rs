@@ -92,11 +92,11 @@ impl JevClient {
     /// Jev response or the credential is not a valid header, and
     /// [`ProviderError::Connect`], [`ProviderError::Timeout`], or
     /// [`ProviderError::Upstream`] when the exchange fails.
-    pub async fn send_native(&self, request: ProviderRequest) -> ProviderResult<ProviderResponse> {
+    pub async fn send_native(&self, request: &ProviderRequest) -> ProviderResult<ProviderResponse> {
         let ProviderRequest::JevSystemOne(request) = request else {
             return Err(ProviderError::variant_mismatch(
                 PROVIDER,
-                super::request_variant_label(&request),
+                super::request_variant_label(request),
             ));
         };
         let response = super::send_json_with_retry(
@@ -126,7 +126,7 @@ impl ProviderClient for JevClient {
     /// credential header, and [`ProviderError::Connect`],
     /// [`ProviderError::Timeout`], or [`ProviderError::Upstream`] when the
     /// exchange fails.
-    async fn send(&self, request: ProviderRequest) -> ProviderResult<ProviderResponse> {
+    async fn send(&self, request: &ProviderRequest) -> ProviderResult<ProviderResponse> {
         self.send_native(request).await
     }
 
@@ -135,7 +135,7 @@ impl ProviderClient for JevClient {
     /// # Errors
     ///
     /// Always returns [`ProviderError::BadRequest`].
-    async fn stream(&self, _request: ProviderRequest) -> ProviderResult<ProviderStream> {
+    async fn stream(&self, _request: &ProviderRequest) -> ProviderResult<ProviderStream> {
         Err(ProviderError::bad_request(PROVIDER, "jev does not stream"))
     }
 }
@@ -185,7 +185,7 @@ mod tests {
             .await;
 
         let response = client(&server)
-            .send(ProviderRequest::JevSystemOne(request()))
+            .send(&ProviderRequest::JevSystemOne(request()))
             .await
             .expect("answers");
         let ProviderResponse::JevSystemOne(answer) = response else {
@@ -209,12 +209,12 @@ mod tests {
             .await;
 
         let error = client(&server)
-            .send(ProviderRequest::JevSystemOne(request()))
+            .send(&ProviderRequest::JevSystemOne(request()))
             .await
             .expect_err("refused");
         assert!(matches!(error, ProviderError::Status { status: 400, .. }));
         let error = client(&server)
-            .send(ProviderRequest::RawV1 {
+            .send(&ProviderRequest::RawV1 {
                 provider: skald_spec::ProviderName::Jev,
                 body: json!({}),
             })

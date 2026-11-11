@@ -91,7 +91,7 @@ mod raw_passthrough {
         let body = serde_json::from_str(&request_body).expect("raw request parses");
 
         let response = common::openai_client(&server.uri())
-            .send(ProviderRequest::RawV1 {
+            .send(&ProviderRequest::RawV1 {
                 provider: ProviderName::OpenAi,
                 body,
             })

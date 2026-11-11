@@ -119,7 +119,7 @@ impl AnthropicClient {
     }
 
     /// Sends a native Anthropic request.
-    pub async fn send_native(&self, request: ProviderRequest) -> ProviderResult<ProviderResponse> {
+    pub async fn send_native(&self, request: &ProviderRequest) -> ProviderResult<ProviderResponse> {
         match request {
             ProviderRequest::AnthropicMessage(request) => {
                 let url = self.messages_url();
@@ -151,7 +151,7 @@ impl AnthropicClient {
             }
             other => Err(ProviderError::variant_mismatch(
                 "anthropic",
-                super::request_variant_label(&other),
+                super::request_variant_label(other),
             )),
         }
     }
@@ -159,11 +159,11 @@ impl AnthropicClient {
 
 #[async_trait]
 impl ProviderClient for AnthropicClient {
-    async fn send(&self, request: ProviderRequest) -> ProviderResult<ProviderResponse> {
+    async fn send(&self, request: &ProviderRequest) -> ProviderResult<ProviderResponse> {
         self.send_native(request).await
     }
 
-    async fn stream(&self, request: ProviderRequest) -> ProviderResult<ProviderStream> {
+    async fn stream(&self, request: &ProviderRequest) -> ProviderResult<ProviderStream> {
         match request {
             ProviderRequest::AnthropicMessage(request) => {
                 let url = self.messages_url();
@@ -185,7 +185,7 @@ impl ProviderClient for AnthropicClient {
             }
             other => Err(ProviderError::variant_mismatch(
                 "anthropic",
-                super::request_variant_label(&other),
+                super::request_variant_label(other),
             )),
         }
     }
@@ -213,7 +213,7 @@ mod anthropic_messages {
         let request: AnthropicMessagesRequest =
             serde_json::from_str(&request_body).expect("fixture parses");
         let response = common::anthropic_client(&server.uri())
-            .send(ProviderRequest::AnthropicMessage(request))
+            .send(&ProviderRequest::AnthropicMessage(request))
             .await
             .expect("request succeeds");
 
@@ -236,7 +236,7 @@ mod anthropic_messages {
         let request: AnthropicMessagesRequest =
             serde_json::from_str(&request_body).expect("fixture parses");
         common::anthropic_client(&server.uri())
-            .send(ProviderRequest::AnthropicMessage(request))
+            .send(&ProviderRequest::AnthropicMessage(request))
             .await
             .expect("request succeeds");
         common::assert_received_body(&server, &request_body).await;

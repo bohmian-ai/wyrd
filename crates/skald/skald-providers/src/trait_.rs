@@ -25,8 +25,8 @@ pub enum ProviderStream {
 #[async_trait]
 pub trait ProviderClient: Send + Sync {
     /// Sends one native provider request and returns the native response.
-    async fn send(&self, request: ProviderRequest) -> ProviderResult<ProviderResponse>;
+    async fn send(&self, request: &ProviderRequest) -> ProviderResult<ProviderResponse>;
 
     /// Sends one streaming request and decodes provider-native stream chunks.
-    async fn stream(&self, request: ProviderRequest) -> ProviderResult<ProviderStream>;
+    async fn stream(&self, request: &ProviderRequest) -> ProviderResult<ProviderStream>;
 }

@@ -123,7 +123,7 @@ impl GoogleClient {
     }
 
     /// Sends a native Google request.
-    pub async fn send_native(&self, request: ProviderRequest) -> ProviderResult<ProviderResponse> {
+    pub async fn send_native(&self, request: &ProviderRequest) -> ProviderResult<ProviderResponse> {
         match request {
             ProviderRequest::GeminiGenerateContent(request) => {
                 let response = super::send_json_with_retry(
@@ -165,7 +165,7 @@ impl GoogleClient {
             }
             other => Err(ProviderError::variant_mismatch(
                 "google",
-                super::request_variant_label(&other),
+                super::request_variant_label(other),
             )),
         }
     }
@@ -173,11 +173,11 @@ impl GoogleClient {
 
 #[async_trait]
 impl ProviderClient for GoogleClient {
-    async fn send(&self, request: ProviderRequest) -> ProviderResult<ProviderResponse> {
+    async fn send(&self, request: &ProviderRequest) -> ProviderResult<ProviderResponse> {
         self.send_native(request).await
     }
 
-    async fn stream(&self, request: ProviderRequest) -> ProviderResult<ProviderStream> {
+    async fn stream(&self, request: &ProviderRequest) -> ProviderResult<ProviderStream> {
         match request {
             ProviderRequest::GeminiGenerateContent(request) => {
                 let body = serde_json::to_vec(&request)
@@ -198,7 +198,7 @@ impl ProviderClient for GoogleClient {
             }
             other => Err(ProviderError::variant_mismatch(
                 "google",
-                super::request_variant_label(&other),
+                super::request_variant_label(other),
             )),
         }
     }
@@ -227,7 +227,7 @@ mod google_embed {
         let request: GoogleBatchEmbedRequest =
             serde_json::from_str(&request_body).expect("fixture parses");
         let response = common::google_client(&server.uri(), "text-embedding-004")
-            .send(ProviderRequest::GoogleBatchEmbed(request))
+            .send(&ProviderRequest::GoogleBatchEmbed(request))
             .await
             .expect("request succeeds");
 
@@ -261,7 +261,7 @@ mod google_generate {
         let request: GoogleGenerateContentRequest =
             serde_json::from_str(&request_body).expect("fixture parses");
         let response = common::google_client(&server.uri(), "gemini-2.5-flash")
-            .send(ProviderRequest::GeminiGenerateContent(request))
+            .send(&ProviderRequest::GeminiGenerateContent(request))
             .await
             .expect("request succeeds");
 

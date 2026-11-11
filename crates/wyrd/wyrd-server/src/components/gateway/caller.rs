@@ -11,6 +11,7 @@
 
 use async_trait::async_trait;
 use axum::http::StatusCode;
+use bytes::Bytes;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -94,7 +95,7 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
     #[tracing::instrument(name = "agent.gateway.call", skip_all)]
     async fn call(
         &self,
-        call: WyrdGatewayCall,
+        call: WyrdGatewayCall<'_>,
         cancellation: &CancellationToken,
     ) -> Result<ProviderResponse, ProviderError> {
         wyrd_telemetry::bind_operation_route(wyrd_telemetry::TenantSpanRoute {
@@ -107,7 +108,6 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
             body,
             answer,
         } = NativeCall::project(call.request, &call.model)?;
-        let body = RequestJson::from(body);
         let request = GatewayCallRequest {
             operation,
             ingress,
@@ -192,8 +192,9 @@ struct NativeCall {
     operation: GatewayOperation,
     /// Dialect of `body`.
     ingress: IngressDialect,
-    /// Provider-bound request body.
-    body: Value,
+    /// Provider-bound request body, kept as the compact text it was
+    /// serialized to.
+    body: RequestJson,
     /// Shape the successful answer decodes as.
     answer: Answer,
 }
@@ -210,59 +211,59 @@ impl NativeCall {
     /// enters as Vertex when `model` names the `vertex` provider, which the
     /// Agent derives from a Prompt whose provider is Vertex.
     ///
+    /// The borrowed request is serialized once and its text kept, so the
+    /// gateway reads and forwards it without decoding or copying it again.
+    ///
     /// # Errors
     /// Returns [`ProviderError::BadRequest`] for a request dialect the
     /// gateway does not serve or a body that does not serialize.
-    fn project(request: ProviderRequest, model: &ModelRef) -> Result<Self, ProviderError> {
-        let (operation, ingress, answer, body) = match request {
-            ProviderRequest::OpenAiChatCompletion(mut body) => {
-                body.model = model.to_string();
-                (
-                    GatewayOperation::ChatCompletions,
-                    IngressDialect::OpenAi,
-                    Answer::OpenAiChat,
-                    encode(&body)?,
-                )
-            }
-            ProviderRequest::OpenAiResponses(mut body) => {
-                body.model = model.to_string();
-                (
-                    GatewayOperation::Responses,
-                    IngressDialect::OpenAi,
-                    Answer::OpenAiResponses,
-                    encode(&body)?,
-                )
-            }
-            ProviderRequest::AnthropicMessage(mut body) => {
-                body.model = model.model.to_string();
-                (
-                    GatewayOperation::ChatCompletions,
-                    IngressDialect::AnthropicMessages,
-                    Answer::AnthropicMessages,
-                    encode(&body)?,
-                )
-            }
+    fn project(request: &ProviderRequest, model: &ModelRef) -> Result<Self, ProviderError> {
+        let (operation, ingress, answer, body, model) = match request {
+            ProviderRequest::OpenAiChatCompletion(body) => (
+                GatewayOperation::ChatCompletions,
+                IngressDialect::OpenAi,
+                Answer::OpenAiChat,
+                encode(body)?,
+                Some(model.to_string()),
+            ),
+            ProviderRequest::OpenAiResponses(body) => (
+                GatewayOperation::Responses,
+                IngressDialect::OpenAi,
+                Answer::OpenAiResponses,
+                encode(body)?,
+                Some(model.to_string()),
+            ),
+            ProviderRequest::AnthropicMessage(body) => (
+                GatewayOperation::ChatCompletions,
+                IngressDialect::AnthropicMessages,
+                Answer::AnthropicMessages,
+                encode(body)?,
+                Some(model.model.to_string()),
+            ),
             ProviderRequest::GeminiGenerateContent(body) => (
                 GatewayOperation::ChatCompletions,
                 IngressDialect::GeminiGenerateContent,
                 Answer::GeminiGenerateContent,
-                encode(&body)?,
+                encode(body)?,
+                None,
             ),
-            ProviderRequest::JevSystemOne(mut body) => {
-                body.model = model.model.to_string();
-                (
-                    GatewayOperation::SystemOne,
-                    IngressDialect::Jev,
-                    Answer::Jev,
-                    encode(&body)?,
-                )
-            }
+            ProviderRequest::JevSystemOne(body) => (
+                GatewayOperation::SystemOne,
+                IngressDialect::Jev,
+                Answer::Jev,
+                encode(body)?,
+                Some(model.model.to_string()),
+            ),
             _ => {
                 return Err(ProviderError::bad_request(
                     PROVIDER,
                     "the Wyrd gateway does not serve this request dialect",
                 ));
             }
+        };
+        let body = match model {
+            Some(model) => body.with_model(&model).map_err(|_| unserializable())?,
+            None => body,
         };
         Ok(Self {
             operation,
@@ -273,13 +274,18 @@ impl NativeCall {
     }
 }
 
-/// Serialize a native request body.
+/// Serialize a native request body to compact text the gateway keeps.
 ///
 /// # Errors
 /// Returns [`ProviderError::BadRequest`] when the body does not serialize.
-fn encode(body: &impl Serialize) -> Result<Value, ProviderError> {
-    serde_json::to_value(body)
-        .map_err(|_| ProviderError::bad_request(PROVIDER, "request does not serialize"))
+fn encode(body: &impl Serialize) -> Result<RequestJson, ProviderError> {
+    let text = serde_json::to_vec(body).map_err(|_| unserializable())?;
+    RequestJson::parse(Bytes::from(text)).map_err(|_| unserializable())
+}
+
+/// The refusal of a request body that does not serialize.
+fn unserializable() -> ProviderError {
+    ProviderError::bad_request(PROVIDER, "request does not serialize")
 }
 
 /// Decode a native response body.

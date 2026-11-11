@@ -15,7 +15,7 @@ async fn routes_typed_request_by_provider_name() {
     let runtime = runtime_with(&mock);
 
     assert_eq!(
-        runtime.send(request).await.expect("dispatch succeeds"),
+        runtime.send(&request).await.expect("dispatch succeeds"),
         response
     );
     assert_eq!(mock.remaining(), 0);
@@ -36,7 +36,7 @@ async fn raw_v1_uses_embedded_provider_for_dispatch() {
     let runtime = runtime_with(&mock);
 
     assert_eq!(
-        runtime.send(request).await.expect("raw dispatch succeeds"),
+        runtime.send(&request).await.expect("raw dispatch succeeds"),
         response
     );
 }
@@ -46,7 +46,7 @@ async fn unregistered_provider_returns_runtime_error() {
     let err = dispatch(
         &ProviderRegistry::new(),
         ProviderName::OpenAi,
-        openai_request("hello"),
+        &openai_request("hello"),
     )
     .await
     .expect_err("provider is missing");
@@ -65,7 +65,7 @@ async fn dispatch_stream_unregistered_provider_returns_runtime_error() {
     let err = dispatch_stream(
         &ProviderRegistry::new(),
         ProviderName::OpenAi,
-        openai_request("hello"),
+        &openai_request("hello"),
     )
     .await
     .expect_err("provider is missing");

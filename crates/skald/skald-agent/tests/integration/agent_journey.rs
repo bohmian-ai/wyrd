@@ -438,7 +438,7 @@ impl WyrdGatewayCaller for ScriptedGateway {
     /// Panics when a lock is poisoned or the script has no reply left.
     async fn call(
         &self,
-        call: WyrdGatewayCall,
+        call: WyrdGatewayCall<'_>,
         _cancellation: &CancellationToken,
     ) -> Result<ProviderResponse, ProviderError> {
         self.targets.lock().expect("targets lock").push(call.model);

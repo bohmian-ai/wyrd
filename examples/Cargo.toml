@@ -27,6 +27,10 @@ name = "client_request"
 path = "rust/client_request.rs"
 
 [[bin]]
+name = "client_profile"
+path = "rust/client_profile.rs"
+
+[[bin]]
 name = "quickstart"
 path = "quickstart/quickstart.rs"
 

@@ -118,3 +118,39 @@ when tests exist. Wyrd adapter tier 2 belongs in its owner, using existing
 `mise run test:storage:matrix` for object adapters, plus the owning pipeline
 integration runner, dependency/tenant checks and format/lints. No runtime proof
 is claimed by planning; external repo is not edited during this task authoring.
+
+## Obligations
+
+Implementation proceeds under the user's 2026-11-11 direction to implement this
+revised task while spec revision 6 awaits formal approval. The library branch is
+the user-directed new branch `wyrd-production`, delivered through a PR into the
+library's `main`.
+
+| ID | Source | Observation | Planned assertion |
+|---|---|---|---|
+| L1 | Missing behavior ¶2 | Public `ReviewPipeline` accepts frozen PR number, base, head, head repository ID and optional baseline | journey calls the public facade with pins |
+| L2 | ¶2, Proof | Comparisons obey supplied pins when the live PR moved | moved-live-PR journey: output base/head equal pins, not live head |
+| L3 | ¶2 | Full comparison is PR merge base → head | `full.base == merge_base` and files equal merge-base diff |
+| L4 | ¶2 | Active comparison is baseline → head; none means full | incremental journey `active.base == baseline`; first review `active == full` |
+| L5 | ¶2 | Rewritten or unavailable baseline is reported, never silently replaced | journey asserts `BaselineUnusable` reasons |
+| L6 | ¶3 | Changed files carry status, old path, hunks; renames and deletions | rename/delete file assertions |
+| L7 | ¶3 | Before/after source text or explicit binary/unavailable/excluded identity | binary, oversize and excluded assertions |
+| L8 | ¶3 | Pinned metadata: number, URL, title, body, state, draft, base, head with fork repository, merge base | fork journey metadata assertion |
+| L9 | ¶3 | Unchanged `ReviewContext` selected for the active comparison, spans carry source | context spans text and active-change anchoring |
+| L10 | ¶3 | Truncation/pagination verified; reconstruct or fail explicitly | truncated comparison fails with typed error |
+| L11 | ¶3 | Context-selection omissions stay coverage data | omission journey succeeds with omissions |
+| L12 | ¶3 | Empty active comparison is valid | identical baseline yields empty active files |
+| L13 | Proof | Cold then warm; warm reuses snapshot without rebuilding an index | warm call archive count 0 |
+| L14 | ¶2 | Library takes no policy/baseline/finding/verdict/tenant/delivery decision | source review of facade signature |
+| L15 | ¶2 | Existing context/refresh workflows and cache rules unchanged | existing library suites green |
+| W1 | Storage bullet 1 | `ObjectStorage` over object_store: create-only `AlreadyExists`, `NotFound`, idempotent delete, backend failure | adapter tests on local and emulator backends |
+| W2 | bullet 2 | Three metadata tables in `wyrd-sql` with forced tenant RLS | migration/RLS test |
+| W3 | bullet 3 | Tree compare-and-swap and insert-if-absent pointer publication under competition | competing publication test |
+| W4 | bullet 3 | Collection claims against upserts/publication, grace, interrupted cleanup retry | claim/upsert/retry tests |
+| W5 | bullet 3 | Context upsert keeps stamps; absent/expired/live; backend failure distinct | expiry and lookup tests |
+| W6 | bullet 3 | Scoped by tenant/installation/numeric repo ID; isolation; rename continuity | isolation and rename tests |
+| W7 | bullet 4 | `TenantConn`, `OperatorPool` cross-tenant expiry, `statement_timestamp()`, no transaction across IO | source + expiry sweep test |
+| W8 | Task 002 ¶ | PostgreSQL holds no object bytes or execution payloads | schema review |
+| W9 | Proof | Actual pipeline over real Wyrd adapters cold/warm | Wyrd pg pipeline test |
+| D1 | ¶ last | Design docs state adapter custody without making the cache canonical | doc diff |
+| D2 | Dependency delivery | Committed, pushed library revision with PR; Wyrd pins that normal git revision | Cargo.toml/Cargo.lock rev |

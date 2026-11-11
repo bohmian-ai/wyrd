@@ -102,3 +102,24 @@ conditional fanout/generation/crash handoffs via `mise run test:sql` and affecte
 focused commands for new tests after creation. Use existing deterministic crash
 and execution controls where applicable; no synthetic host-load benchmark or
 arbitrary completion-time target. Run README boundary/contract checks.
+
+## Obligations
+
+| ID | Source | Observation | Planned assertion |
+|---|---|---|---|
+| A1 | REQ-004; INV-001; ¶Actual sources 1 | A signature-verified `pull_request` delivery for a connected, selected repository resolves to the selected Repository Card and its `pull_request` bindings; unsigned/mis-signed, unconnected and unselected deliveries admit nothing; policy never comes from the PR head | unit signature/eligibility branches; journey admits one execution per binding; unselected repository admits none |
+| A2 | REQ-004; INV-005; ¶Actual sources 3 | Repository, Verifier, Trigger, authority and PR base/head/head-repository identity are frozen on each execution before handoff; a later policy selection affects only later admissions and sweeps no open PR | inspection shows pins and frozen Verifier/Trigger; re-declare then redeliver keeps the first policy; new event after re-declare uses the new one |
+| A3 | REQ-004; ¶Lifecycle 1 | opened/reopened/ready_for_review/synchronize and base change admit non-draft PRs; draft PRs and metadata-only `edited` do not | eligibility unit branches; journey draft-open admits none, metadata edit admits none |
+| A4 | REQ-004; INV-001 | Execution authority is the selecting declaration's tenant principal, constrained by current permission; missing `verifier:run` settles durably as a refusal, never through saved OAuth or provider metadata | SQL/server test: revoked principal → durable refusal, 2xx, no runnable work |
+| A5 | INV-003; ¶Actual sources 3 | 2xx follows only committed admissions or durable obsolete/refusal settlement; failure before commit answers non-2xx and stays retryable | crash before queue commit → non-2xx; 2xx body lists committed execution IDs |
+| A6 | INV-003; INV-004; AC-003 | Duplicate delivery and redelivery after a restart that interrupted fanout at canonical ACK or queue commit reuse the first batch's frozen policy and execution IDs and settle each binding exactly once | journey with `CapabilityCrash` at both boundaries + restart + redeliver: same IDs, one execution per binding |
+| A7 | INV-003; ¶Actual sources 4 | Failed deliveries are recovered through the GitHub App owner: bounded listing of App hook deliveries and redelivery of those without a successful attempt, rediscovering the original handoff identities, with no inbox table or broker | mock records redelivery request; recovered delivery admits same IDs as original |
+| A8 | REQ-005; INV-006; AC-003 | A new head/base coalesces queued older generations, fences running and parked older work, keeps their pins and history; P completed, A running, B pushed cancels A and leaves P completed | journey: queued B replaced by C (B cancelled superseded), running A cancelled with fence, P untouched |
+| A9 | REQ-005; INV-006; ¶Lifecycle 2 | Delayed old events cannot restore an obsolete generation: current provider PR state is confirmed before a source becomes current | journey: delayed A event after B admits nothing and B stays current |
+| A10 | REQ-004; INV-006; ¶Lifecycle 1 | Draft conversion, close, repository removal, suspension and disconnect cancel affected unfinished work with a stable reason while preserving history | journeys for draft, close, repositories_removed, suspend, disconnect |
+| A11 | REQ-015; AC-003 | 41 eligible PRs under bounded ingress commit recoverable executions that progress through the existing fair queue with typed status | 41-PR journey: 41 executions committed, all reach terminal completed |
+| A12 | ¶Lifecycle 3; INV-006 | Stale-generation checks live at the existing queue owner so later wait/delivery extensions inherit them | source inspection: one queue-owned supersession/fence path |
+| A13 | REQ-016; AC-011 | Execution inspection projects PR activation (repository, number, base, head, head repository, delivery) and cancellation reasons on HTTP/MCP, Rust, Python and TypeScript SDKs and CLI | journeys on each surface read pins and cancellation reason |
+| A14 | AC-011 | Docs explain eligibility, accepted pins, cancellation and diagnosis without a UI | docs content review; `mise run docs:check` |
+| A15 | ¶Lifecycle 4 | `wyrd-design.md → Trigger / Verifier queued activation` authorizes closed `pull_request` activation and removes the external-push exclusion only for it; ACK and failed-delivery recovery documented at execution and operations owners | content review |
+| A16 | INV-002; INV-007 | No new tables, queue, engine, inbox or broker; Bifrost owns evidence; no secrets in Cards/results | migration review; `check:deps`, `check:tenant-isolation` |

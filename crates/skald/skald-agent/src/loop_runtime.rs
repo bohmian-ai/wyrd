@@ -393,33 +393,36 @@ impl Agent {
                 request = request.with_tools(tool_descriptors(&self.tools));
             }
 
-            request = match apply_chain_with_panic_catch(
-                &self.callbacks.before_model,
-                &ctx,
-                request.clone(),
-                "before_model",
-            )? {
-                ChainResult::Abort(error, _) => {
-                    self.append_model_journal_call_result(ModelJournalCallRecord {
-                        iteration,
-                        request: &request,
-                        finish_reason: "callback_aborted".to_owned(),
-                        synthetic: true,
-                    })
-                    .await?;
-                    return Ok(AgentRun {
-                        output: String::new(),
-                        final_response: None,
-                        iterations: iteration + 1,
-                        finish_reason: FinishReason::CallbackAborted,
-                        conversation,
-                        error: Some(error),
-                        errors: Vec::new(),
-                        structured_output: None,
-                    });
-                }
-                ChainResult::Replaced(replacement) => replacement,
-            };
+            // Without hooks the request is unchanged, so it is not copied.
+            if !self.callbacks.before_model.is_empty() {
+                request = match apply_chain_with_panic_catch(
+                    &self.callbacks.before_model,
+                    &ctx,
+                    request.clone(),
+                    "before_model",
+                )? {
+                    ChainResult::Abort(error, _) => {
+                        self.append_model_journal_call_result(ModelJournalCallRecord {
+                            iteration,
+                            request: &request,
+                            finish_reason: "callback_aborted".to_owned(),
+                            synthetic: true,
+                        })
+                        .await?;
+                        return Ok(AgentRun {
+                            output: String::new(),
+                            final_response: None,
+                            iterations: iteration + 1,
+                            finish_reason: FinishReason::CallbackAborted,
+                            conversation,
+                            error: Some(error),
+                            errors: Vec::new(),
+                            structured_output: None,
+                        });
+                    }
+                    ChainResult::Replaced(replacement) => replacement,
+                };
+            }
 
             // The outgoing request, after rendering and hooks, owns the
             // schema its answer must satisfy.
@@ -427,7 +430,7 @@ impl Agent {
                 ResponseType::Text => None,
                 ResponseType::JsonSchema { schema, .. } => match structured.take() {
                     Some(current) if current.schema() == &schema => Some(current),
-                    _ => Some(StructuredOutput::new(&self.id, &self.schemas, &schema)?),
+                    _ => Some(StructuredOutput::new(&self.id, &self.schemas, schema)?),
                 },
             };
             self.append_model_journal_call(iteration, &request).await?;

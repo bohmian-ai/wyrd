@@ -1,4 +1,6 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use regex::Regex;
@@ -303,25 +305,59 @@ const PREPARED_SCHEMAS: usize = 256;
 ///
 /// A host whose lifetime spans many calls owns one and lends it to each call
 /// that sends or checks a schema, so repeated calls with an unchanged schema
-/// skip meta-validation and compilation. Entries are keyed by the schema's
-/// exact serialized text: a changed, narrowed, or hook-replaced schema is a
-/// different key and is prepared again, never validated by a stale entry.
+/// skip meta-validation and compilation. Entries are found by a structural
+/// hash and matched by exact equality, so a lookup never serializes the
+/// schema: a changed, narrowed, or hook-replaced schema is a different entry
+/// and is prepared again, never validated by a stale entry.
 /// It holds only schemas and their validators, never request contents,
 /// media, tools, or caller authority. It is bounded at [`PREPARED_SCHEMAS`]
 /// entries per map; reaching the bound forgets every entry, after which
 /// schemas are prepared again.
 #[derive(Debug, Default)]
 pub struct PreparedSchemas {
-    /// Compiled validators keyed by schema text.
-    validators: Mutex<HashMap<String, Arc<jsonschema::Validator>>>,
-    /// Schema texts, each with whether its destination required an object
-    /// root, that passed [`check_output_schema`].
-    checked: Mutex<HashSet<(bool, String)>>,
+    /// Schemas with their compiled validators, by [`schema_hash`].
+    validators: Mutex<HashMap<u64, Vec<PreparedValidator>>>,
+    /// Schemas that passed [`check_output_schema`], by whether their
+    /// destination required an object root and [`schema_hash`].
+    checked: Mutex<HashMap<(bool, u64), Vec<Value>>>,
+}
+
+/// One schema and its compiled validator.
+type PreparedValidator = (Value, Arc<jsonschema::Validator>);
+
+/// Structural hash of `schema`, computed without serializing it; equal
+/// schemas with the same key order hash equally.
+fn schema_hash(schema: &Value) -> u64 {
+    /// Feeds `value` to `state`, tagging each node so shapes cannot collide.
+    fn feed(value: &Value, state: &mut impl Hasher) {
+        match value {
+            Value::Null => 0u8.hash(state),
+            Value::Bool(flag) => (1u8, flag).hash(state),
+            Value::Number(number) => (2u8, number).hash(state),
+            Value::String(text) => (3u8, text).hash(state),
+            Value::Array(values) => {
+                (4u8, values.len()).hash(state);
+                for value in values {
+                    feed(value, state);
+                }
+            }
+            Value::Object(fields) => {
+                (5u8, fields.len()).hash(state);
+                for (key, value) in fields {
+                    key.hash(state);
+                    feed(value, state);
+                }
+            }
+        }
+    }
+    let mut state = DefaultHasher::new();
+    feed(schema, &mut state);
+    state.finish()
 }
 
 impl PreparedSchemas {
     /// The compiled validator of `schema`, compiled now unless an equal
-    /// schema text was compiled before; `None` when it does not compile,
+    /// schema was compiled before; `None` when it does not compile,
     /// which is never kept.
     ///
     /// # Panics
@@ -329,13 +365,16 @@ impl PreparedSchemas {
     /// complete once inserted.
     #[must_use]
     pub fn validator(&self, schema: &Value) -> Option<Arc<jsonschema::Validator>> {
-        let key = schema.to_string();
+        let key = schema_hash(schema);
         let lock = || {
             self.validators
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
         };
-        if let Some(validator) = lock().get(&key) {
+        if let Some((_, validator)) = lock()
+            .get(&key)
+            .and_then(|entries| entries.iter().find(|(known, _)| known == schema))
+        {
             return Some(Arc::clone(validator));
         }
         // Compiled unlocked: concurrent first calls may each compile once.
@@ -345,19 +384,22 @@ impl PreparedSchemas {
         if validators.len() >= PREPARED_SCHEMAS {
             validators.clear();
         }
-        validators.insert(key, Arc::clone(&validator));
+        validators
+            .entry(key)
+            .or_default()
+            .push((schema.clone(), Arc::clone(&validator)));
         Some(validator)
     }
 
-    /// [`check_output_schema`] of `schema`, skipped when an equal schema text
+    /// [`check_output_schema`] of `schema`, skipped when an equal schema
     /// already passed it with the same `object_root`; only a pass is kept.
     ///
     /// # Errors
     /// Returns [`check_output_schema`]'s refusal at `field`.
     pub fn check(&self, schema: &Value, field: &str, object_root: bool) -> SkaldResult<()> {
-        let key = (object_root, schema.to_string());
+        let key = (object_root, schema_hash(schema));
         let lock = || self.checked.lock().unwrap_or_else(PoisonError::into_inner);
-        if lock().contains(&key) {
+        if lock().get(&key).is_some_and(|known| known.contains(schema)) {
             return Ok(());
         }
         check_output_schema(schema, field, object_root)?;
@@ -365,7 +407,7 @@ impl PreparedSchemas {
         if checked.len() >= PREPARED_SCHEMAS {
             checked.clear();
         }
-        checked.insert(key);
+        checked.entry(key).or_default().push(schema.clone());
         Ok(())
     }
 }
@@ -930,6 +972,9 @@ impl Prompt {
 ///
 /// Each pattern is built once per call rather than once per leaf, and a leaf
 /// holding neither `$` nor `{{` is left untouched without a scan per name.
+/// The substituted response schema is detached before the request decodes
+/// and moved back afterwards, so the largest subtree is never decoded
+/// through the format's tagged-enum buffering.
 ///
 /// # Errors
 ///
@@ -943,7 +988,69 @@ fn substitute(request: &ProviderRequest, vars: &[(&str, &str)]) -> SkaldResult<P
         .collect();
     let mut value = serde_json::to_value(request).map_err(SkaldError::serialize)?;
     replace_string_leaves(&mut value, &patterns);
-    serde_json::from_value(value).map_err(SkaldError::deserialize)
+    let (field, _) = output_schema_field(request);
+    let schema = matches!(
+        request,
+        ProviderRequest::OpenAiChatCompletion(_)
+            | ProviderRequest::OpenAiResponses(_)
+            | ProviderRequest::AnthropicMessage(_)
+            | ProviderRequest::GeminiGenerateContent(_)
+    )
+    .then(|| value.pointer_mut(&format!("/{}", field.replace('.', "/"))))
+    .flatten()
+    .filter(|schema| !schema.is_null())
+    .map(Value::take);
+    let mut substituted = serde_json::from_value(value).map_err(SkaldError::deserialize)?;
+    if let Some(schema) = schema {
+        restore_response_schema(&mut substituted, field, schema);
+    }
+    Ok(substituted)
+}
+
+/// Moves `schema`, detached by [`substitute`] from the serialized request
+/// at the native body path `field`, back into that field of `request`.
+///
+/// The field decoded as absent, so the slot is set rather than edited; a
+/// schema that left an object-typed field serialized as an object.
+fn restore_response_schema(request: &mut ProviderRequest, field: &str, schema: Value) {
+    use crate::wire::anthropic_messages::AnthropicOutputFormat;
+    use crate::wire::openai_chat::OpenAiResponseFormat;
+    use crate::wire::openai_responses::OpenAiTextResponseFormat;
+
+    match request {
+        ProviderRequest::OpenAiChatCompletion(request) => {
+            if let Some(OpenAiResponseFormat::JsonSchema { json_schema }) =
+                &mut request.response_format
+                && let Value::Object(schema) = schema
+            {
+                json_schema.schema = Some(schema);
+            }
+        }
+        ProviderRequest::OpenAiResponses(request) => {
+            if let Some(OpenAiTextResponseFormat::JsonSchema { schema: slot, .. }) =
+                request.text.as_mut().and_then(|text| text.format.as_mut())
+                && let Value::Object(schema) = schema
+            {
+                *slot = Some(schema);
+            }
+        }
+        ProviderRequest::AnthropicMessage(request) => {
+            if let Some(config) = &mut request.output_config {
+                let AnthropicOutputFormat::JsonSchema { schema: slot } = &mut config.format;
+                *slot = schema;
+            }
+        }
+        ProviderRequest::GeminiGenerateContent(request) => {
+            if let Some(config) = &mut request.settings.generation_config {
+                if field.ends_with("response_json_schema") {
+                    config.response_json_schema = Some(schema);
+                } else {
+                    config.response_schema = Some(schema);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Replaces each `(dollar, mustache, value)` pattern pair inside the string
@@ -2539,6 +2646,43 @@ mod response_schema_edit {
 
     use crate::wire::openai_chat::{OpenAiJsonSchema, OpenAiResponseFormat};
     use crate::{Prompt, ProviderRequest, ResponseType, common};
+
+    /// Rendering still substitutes inside every structured kind's response
+    /// schema, and the schema detached for decoding returns to its field.
+    ///
+    /// # Panics
+    /// Panics when a rendered request differs from the same request written
+    /// with the value in place, such as a lost or unsubstituted schema.
+    #[test]
+    fn render_substitutes_and_keeps_every_response_schema() {
+        let schema = json!({"type": "object", "description": "for {{name}}"});
+        for body in [
+            json!({"provider": "open_ai_chat_completion", "body": {
+                "model": "m", "messages": [{"role": "user", "content": "hi {{name}}"}],
+                "response_format": {"type": "json_schema",
+                    "json_schema": {"name": "answer", "schema": schema}}}}),
+            json!({"provider": "open_ai_responses", "body": {
+                "model": "m", "input": "hi {{name}}",
+                "text": {"format": {"type": "json_schema", "name": "answer", "schema": schema}}}}),
+            json!({"provider": "anthropic_message", "body": {
+                "model": "m", "max_tokens": 16,
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "hi {{name}}"}]}],
+                "output_config": {"format": {"type": "json_schema", "schema": schema}}}}),
+            json!({"provider": "gemini_generate_content", "body": {
+                "contents": [{"role": "user", "parts": [{"text": "hi {{name}}"}]}],
+                "generation_config": {"response_json_schema": schema}}}),
+            json!({"provider": "gemini_generate_content", "body": {
+                "contents": [{"role": "user", "parts": [{"text": "hi {{name}}"}]}],
+                "generation_config": {"response_schema": schema}}}),
+        ] {
+            let expected: ProviderRequest = common::typed(
+                serde_json::from_str(&body.to_string().replace("{{name}}", "Ada")).expect("json"),
+            );
+            let rendered =
+                super::substitute(&common::typed(body), &[("name", "Ada")]).expect("renders");
+            assert_eq!(rendered, expected);
+        }
+    }
 
     /// An edit reaches both the sent request and the derived response type,
     /// and an edit the destination rejects fails construction-time checks.

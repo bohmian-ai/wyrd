@@ -1786,6 +1786,10 @@ where
     )?)
 }
 
+/// Proves the content editors' state transitions on every editable request
+/// format: bound data stays data, newly authored placeholders become
+/// required, system replacement drops only its own declarations, and compiled
+/// media kinds and named formats survive an edit.
 #[cfg(test)]
 mod edit_tests {
     use serde_json::{Value, json};

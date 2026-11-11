@@ -1080,6 +1080,13 @@ fn scan_text_for_system_media(text: &str) -> SkaldResult<()> {
     Ok(())
 }
 
+/// Splits every `${media:name}` token in `request`'s non-system text into
+/// its own provider-native text part, in place, and returns the placeholder
+/// names in order of appearance, with repeats.
+///
+/// [`Prompt::new`] refuses system media before calling this and
+/// deduplicates the names. Formats without conversation text, such as
+/// embeddings or raw bodies, are left unchanged and yield no names.
 fn split_request_text_parts(request: &mut ProviderRequest) -> Vec<String> {
     let mut names = Vec::new();
     match request {

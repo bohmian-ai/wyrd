@@ -735,9 +735,7 @@ impl Prompt {
     /// and a deserialization error when the substituted request no longer
     /// decodes as its provider variant.
     pub fn bind_mut(&mut self, vars: &[(&str, &str)]) -> SkaldResult<()> {
-        let mut request = serde_json::to_value(&self.request).map_err(SkaldError::serialize)?;
-        replace_string_leaves(&mut request, vars);
-        self.request = serde_json::from_value(request).map_err(SkaldError::deserialize)?;
+        self.request = substitute(&self.request, vars)?;
         self.authored = None;
         let unbound = |name: &String| !vars.iter().any(|(key, _)| key == name);
         self.variables.retain(unbound);
@@ -845,9 +843,7 @@ impl Prompt {
                 .find(|(key, _)| key == name)
                 .ok_or_else(|| SkaldError::missing_variable(name))?;
         }
-        let mut prompt = self.clone();
-        prompt.bind_mut(vars)?;
-        Ok(prompt.request)
+        substitute(&self.request, vars)
     }
 
     /// Applies `edit` to the response schema inside the native request and
@@ -928,22 +924,52 @@ impl Prompt {
     }
 }
 
-fn replace_string_leaves(value: &mut Value, vars: &[(&str, &str)]) {
+/// Returns `request` with each `${name}` and `{{name}}` in `vars` replaced
+/// inside its JSON string leaves, in `vars` order: the one substitution
+/// behind [`Prompt::bind_mut`] and [`Prompt::render`].
+///
+/// Each pattern is built once per call rather than once per leaf, and a leaf
+/// holding neither `$` nor `{{` is left untouched without a scan per name.
+///
+/// # Errors
+///
+/// Returns a serialization error when `request` cannot be serialized and a
+/// deserialization error when the substituted request no longer decodes as
+/// its provider variant.
+fn substitute(request: &ProviderRequest, vars: &[(&str, &str)]) -> SkaldResult<ProviderRequest> {
+    let patterns: Vec<_> = vars
+        .iter()
+        .map(|(name, value)| (format!("${{{name}}}"), format!("{{{{{name}}}}}"), *value))
+        .collect();
+    let mut value = serde_json::to_value(request).map_err(SkaldError::serialize)?;
+    replace_string_leaves(&mut value, &patterns);
+    serde_json::from_value(value).map_err(SkaldError::deserialize)
+}
+
+/// Replaces each `(dollar, mustache, value)` pattern pair inside the string
+/// leaves of `value`, in order; see [`substitute`].
+fn replace_string_leaves(value: &mut Value, patterns: &[(String, String, &str)]) {
     match value {
         Value::String(text) => {
-            for (name, replacement) in vars {
-                *text = text.replace(&format!("${{{name}}}"), replacement);
-                *text = text.replace(&format!("{{{{{name}}}}}"), replacement);
+            if !text.contains('$') && !text.contains("{{") {
+                return;
+            }
+            for (dollar, mustache, replacement) in patterns {
+                for pattern in [dollar, mustache] {
+                    if text.contains(pattern.as_str()) {
+                        *text = text.replace(pattern.as_str(), replacement);
+                    }
+                }
             }
         }
         Value::Array(values) => {
             for value in values {
-                replace_string_leaves(value, vars);
+                replace_string_leaves(value, patterns);
             }
         }
         Value::Object(values) => {
             for value in values.values_mut() {
-                replace_string_leaves(value, vars);
+                replace_string_leaves(value, patterns);
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
@@ -1930,6 +1956,25 @@ mod placeholder_syntax_tests {
         let request = openai_request_with_user("hello {name}");
         let vars = extract_text_variables(&request).expect("extracts");
         assert!(vars.is_empty());
+    }
+
+    /// Proves `render` substitutes exactly as `bind_mut` does, including a
+    /// bound value that names a later variable and a lone `$` that names none.
+    ///
+    /// # Panics
+    /// Panics when the Prompt does not build, render, or bind, or the two
+    /// requests differ.
+    #[test]
+    fn render_matches_bind_mut() {
+        let prompt = Prompt::new(
+            openai_request_with_user("${a} costs $5 and {{b}}"),
+            "gpt-test",
+        )
+        .expect("prompt builds");
+        let vars = [("a", "${b}"), ("b", "two")];
+        let mut bound = prompt.clone();
+        bound.bind_mut(&vars).expect("binds");
+        assert_eq!(prompt.render(&vars).expect("renders"), bound.request);
     }
 
     /// Proves `${name}` placeholders render.

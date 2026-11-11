@@ -6288,3 +6288,101 @@ async fn concurrent_first_declarations_admit_one_repository_identity() {
     assert_eq!(body["code"], "WYRD_GITHUB_404_NOT_CONNECTED", "{body}");
     server.shutdown().await.expect("test server shuts down");
 }
+
+/// A declaration overtaken while its Cards recover records a selection
+/// conflict in the activation that completes it: the activation still
+/// commits, the newer selection stays, and the declaration's replay answers
+/// the conflict.
+///
+/// # Panics
+/// Panics when the activation is undone, the newer selection is replaced,
+/// or the replay answers otherwise.
+#[tokio::test(flavor = "current_thread")]
+async fn overtaken_declaration_records_its_conflict_on_activation() {
+    let storage_root = tempfile::tempdir().expect("storage root creates");
+    let mock = GithubAppMock::start().expect("the GitHub mock starts");
+    let server = WyrdTestServer::builder()
+        .with_storage_settings(local_storage(storage_root.path()))
+        .with_github_app_for_test(&mock)
+        .start_bound()
+        .await
+        .expect("bound test server starts");
+    connect_policy_repository(&server, &mock).await;
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("repository-overtaken", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let checkout = tempfile::tempdir().expect("checkout creates");
+    let old = loaded_body(checkout.path(), &[("v1.yaml", POLICY_V1)], "v1.yaml");
+    let (status, body) = declare_body(&server, &jwt, "overtaken-old", &old).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let moved_storage_root = storage_root.path().with_extension("moved");
+    std::fs::rename(storage_root.path(), &moved_storage_root).expect("storage root moves");
+    std::fs::write(storage_root.path(), b"not a directory").expect("broken storage root writes");
+    let recovering = loaded_body(
+        checkout.path(),
+        &[
+            ("a-review.yaml", &review_verifier("a-review")),
+            ("z-review.yaml", &review_verifier("z-review")),
+            ("v2.yaml", POLICY_V2),
+        ],
+        "v2.yaml",
+    );
+    let (status, body) = declare_body(&server, &jwt, "overtaken-b", &recovering).await;
+    assert_ne!(status, StatusCode::CREATED, "{body}");
+    let members = [
+        card_state(&server, "a-review").await.0,
+        card_state(&server, "z-review").await.0,
+        policy_state(&server, "2.0.0").await.0,
+    ];
+    for member in &members {
+        hold_reconciliation(&server, member).await;
+    }
+    std::fs::remove_file(storage_root.path()).expect("broken storage root removes");
+    std::fs::rename(&moved_storage_root, storage_root.path()).expect("storage root restores");
+
+    let newer = loaded_body(
+        checkout.path(),
+        &[("v3.yaml", &POLICY_V1.replace("1.0.0", "3.0.0"))],
+        "v3.yaml",
+    );
+    let (status, body) = declare_body(&server, &jwt, "overtaken-newer", &newer).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        selected_version(&server, "policy").await.as_deref(),
+        Some("3.0.0")
+    );
+
+    for member in &members {
+        make_reconciliation_due(&server, member).await;
+    }
+    wait_for_card_status(&server, "a-review", "active").await;
+    wait_for_card_status(&server, "z-review", "active").await;
+    for _ in 0..100 {
+        if policy_state(&server, "2.0.0").await.1 == "active" {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        policy_state(&server, "2.0.0").await.1,
+        "active",
+        "the activation commits"
+    );
+    assert_eq!(
+        selected_version(&server, "policy").await.as_deref(),
+        Some("3.0.0"),
+        "the newer selection stays"
+    );
+    let (status, body) = declare_body(&server, &jwt, "overtaken-b", &recovering).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body["code"],
+        "WYRD_REGISTRY_409_REPOSITORY_SELECTION_CONFLICT"
+    );
+    server.shutdown().await.expect("test server shuts down");
+}

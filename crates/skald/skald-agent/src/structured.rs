@@ -29,8 +29,9 @@ const CORRECTION_OPENING: &str = "Your previous reply was not accepted because i
 /// The exact response schema an outgoing request sent, compiled once and
 /// checked against every proposed final answer while that schema is sent.
 pub(crate) struct StructuredOutput {
-    /// The schema sent with the run's requests.
-    schema: Value,
+    /// The schema sent with the run's requests, shared with the loop that
+    /// sends it.
+    schema: Arc<Value>,
     /// Its compiled validator, possibly shared with other runs sending the
     /// same schema.
     validator: Arc<Validator>,
@@ -49,13 +50,17 @@ pub(crate) struct Rejection {
 impl StructuredOutput {
     /// The validator of `schema`, the response schema an outgoing request
     /// sends, compiled unless `schemas` already prepared that exact schema.
-    /// It owns `schema`, which the caller derived from that request.
+    /// It shares `schema`, which the caller derived from that request.
     ///
     /// # Errors
     ///
     /// Returns [`AgentError::Prompt`] when `schema` does not compile, which a
     /// binding or `before_model` hook can cause.
-    pub(crate) fn new(agent: &str, schemas: &PreparedSchemas, schema: Value) -> AgentResult<Self> {
+    pub(crate) fn new(
+        agent: &str,
+        schemas: &PreparedSchemas,
+        schema: Arc<Value>,
+    ) -> AgentResult<Self> {
         let validator = schemas
             .validator(&schema)
             .ok_or_else(|| AgentError::Prompt {
@@ -66,7 +71,7 @@ impl StructuredOutput {
     }
 
     /// The schema this validator was compiled from.
-    pub(crate) const fn schema(&self) -> &Value {
+    pub(crate) fn schema(&self) -> &Value {
         &self.schema
     }
 
@@ -213,8 +218,8 @@ mod tests {
     #[test]
     fn check_refuses_with_safe_violations() {
         let schema = json!({"type": "object", "properties": {"a": {"enum": ["x"]}}, "additionalProperties": false});
-        let output =
-            StructuredOutput::new("a", &PreparedSchemas::default(), schema).expect("compiles");
+        let output = StructuredOutput::new("a", &PreparedSchemas::default(), Arc::new(schema))
+            .expect("compiles");
         assert_eq!(
             output.check(r#"{"a": "x"}"#).ok(),
             Some(json!({"a": "x"}).as_object().cloned().expect("object"))
@@ -244,8 +249,8 @@ mod tests {
         let schemas = PreparedSchemas::default();
         let sent =
             json!({"type": "object", "properties": {"a": {"enum": ["x"]}}, "required": ["a"]});
-        let first = StructuredOutput::new("a", &schemas, sent.clone()).expect("compiles");
-        let warm = StructuredOutput::new("a", &schemas, sent.clone()).expect("compiles");
+        let first = StructuredOutput::new("a", &schemas, Arc::new(sent.clone())).expect("compiles");
+        let warm = StructuredOutput::new("a", &schemas, Arc::new(sent.clone())).expect("compiles");
         assert!(
             Arc::ptr_eq(&first.validator, &warm.validator),
             "warm schema prepared again"
@@ -253,12 +258,12 @@ mod tests {
         assert!(warm.check(r#"{"a": "y"}"#).is_err());
         let narrowed =
             json!({"type": "object", "properties": {"a": {"enum": ["y"]}}, "required": ["a"]});
-        let changed = StructuredOutput::new("a", &schemas, narrowed).expect("compiles");
+        let changed = StructuredOutput::new("a", &schemas, Arc::new(narrowed)).expect("compiles");
         assert!(!Arc::ptr_eq(&first.validator, &changed.validator));
         assert!(changed.check(r#"{"a": "y"}"#).is_ok());
         assert!(changed.check(r#"{"a": "x"}"#).is_err());
         for _ in 0..2 {
-            assert!(StructuredOutput::new("a", &schemas, json!({"type": 5})).is_err());
+            assert!(StructuredOutput::new("a", &schemas, Arc::new(json!({"type": 5}))).is_err());
         }
         schemas.check(&sent, "schema", true).expect("valid");
         schemas.check(&sent, "schema", true).expect("still valid");
@@ -270,7 +275,8 @@ mod tests {
         for bound in 0..256 {
             let _ = schemas.validator(&json!({"maxLength": bound}));
         }
-        let evicted = StructuredOutput::new("a", &schemas, sent.clone()).expect("compiles");
+        let evicted =
+            StructuredOutput::new("a", &schemas, Arc::new(sent.clone())).expect("compiles");
         assert!(
             !Arc::ptr_eq(&first.validator, &evicted.validator),
             "the bound kept everything"

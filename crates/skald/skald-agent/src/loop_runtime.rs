@@ -359,7 +359,7 @@ impl Agent {
         inputs: RunLoopInputs<'_>,
     ) -> AgentResult<AgentRun> {
         let RunLoopInputs {
-            template,
+            mut template,
             seed_messages,
             mut conversation,
             session_id,
@@ -375,6 +375,13 @@ impl Agent {
         let concurrency_cap = self.run_config.tool_concurrency_cap.unwrap_or(8).max(1);
         let max_iterations = self.run_config.max_iterations;
         let mut structured: Option<StructuredOutput> = None;
+        // The schema is taken once and a copy put back per request, so the
+        // per-iteration template copy skips it; without `before_model` hooks
+        // every request sends this schema, so its validator is looked up once.
+        let schema = template
+            .take_response_schema()
+            .map(|(schema, field)| (Arc::new(schema), field));
+        let hooked = !self.callbacks.before_model.is_empty();
 
         for iteration in 0..max_iterations {
             self.journal
@@ -389,12 +396,15 @@ impl Agent {
                 &seed_messages,
                 &conversation,
             )?;
+            if let Some((schema, field)) = &schema {
+                request.set_response_schema(field, serde_json::Value::clone(schema));
+            }
             if !self.tools.is_empty() {
                 request = request.with_tools(tool_descriptors(&self.tools));
             }
 
             // Without hooks the request is unchanged, so it is not copied.
-            if !self.callbacks.before_model.is_empty() {
+            if hooked {
                 request = match apply_chain_with_panic_catch(
                     &self.callbacks.before_model,
                     &ctx,
@@ -426,12 +436,28 @@ impl Agent {
 
             // The outgoing request, after rendering and hooks, owns the
             // schema its answer must satisfy.
-            structured = match ResponseType::of(&request) {
-                ResponseType::Text => None,
-                ResponseType::JsonSchema { schema, .. } => match structured.take() {
-                    Some(current) if current.schema() == &schema => Some(current),
-                    _ => Some(StructuredOutput::new(&self.id, &self.schemas, schema)?),
-                },
+            structured = if hooked {
+                match ResponseType::of(&request) {
+                    ResponseType::Text => None,
+                    ResponseType::JsonSchema { schema, .. } => match structured.take() {
+                        Some(current) if current.schema() == &schema => Some(current),
+                        _ => Some(StructuredOutput::new(
+                            &self.id,
+                            &self.schemas,
+                            Arc::new(schema),
+                        )?),
+                    },
+                }
+            } else {
+                match (structured.take(), &schema) {
+                    (Some(current), _) => Some(current),
+                    (None, Some((schema, _))) => Some(StructuredOutput::new(
+                        &self.id,
+                        &self.schemas,
+                        Arc::clone(schema),
+                    )?),
+                    (None, None) => None,
+                }
             };
             self.append_model_journal_call(iteration, &request).await?;
             let provider = self.prompt.native().provider();

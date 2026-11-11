@@ -412,6 +412,17 @@ impl PreparedSchemas {
     }
 }
 
+/// Native body path of the OpenAI Chat response schema.
+const CHAT_SCHEMA_FIELD: &str = "body.response_format.json_schema.schema";
+/// Native body path of the OpenAI Responses response schema.
+const RESPONSES_SCHEMA_FIELD: &str = "body.text.format.schema";
+/// Native body path of the Anthropic output schema.
+const ANTHROPIC_SCHEMA_FIELD: &str = "body.output_config.format.schema";
+/// Native body path of the GenerateContent JSON Schema.
+const GEMINI_JSON_SCHEMA_FIELD: &str = "body.generation_config.response_json_schema";
+/// Native body path of the GenerateContent OpenAPI-subset schema.
+const GEMINI_SCHEMA_FIELD: &str = "body.generation_config.response_schema";
+
 /// Native body path of a request's output schema, and whether its
 /// destination requires an object root (OpenAI with `strict: true`).
 ///
@@ -422,11 +433,11 @@ fn output_schema_field(request: &ProviderRequest) -> (&'static str, bool) {
 
     match request {
         ProviderRequest::OpenAiChatCompletion(request) => (
-            "body.response_format.json_schema.schema",
+            CHAT_SCHEMA_FIELD,
             matches!(&request.response_format, Some(OpenAiResponseFormat::JsonSchema { json_schema }) if json_schema.strict == Some(true)),
         ),
         ProviderRequest::OpenAiResponses(request) => (
-            "body.text.format.schema",
+            RESPONSES_SCHEMA_FIELD,
             matches!(
                 request.text.as_ref().and_then(|text| text.format.as_ref()),
                 Some(OpenAiTextResponseFormat::JsonSchema {
@@ -435,7 +446,7 @@ fn output_schema_field(request: &ProviderRequest) -> (&'static str, bool) {
                 })
             ),
         ),
-        ProviderRequest::AnthropicMessage(_) => ("body.output_config.format.schema", false),
+        ProviderRequest::AnthropicMessage(_) => (ANTHROPIC_SCHEMA_FIELD, false),
         ProviderRequest::GeminiGenerateContent(request)
             if request
                 .settings
@@ -443,9 +454,9 @@ fn output_schema_field(request: &ProviderRequest) -> (&'static str, bool) {
                 .as_ref()
                 .is_some_and(|config| config.response_json_schema.is_some()) =>
         {
-            ("body.generation_config.response_json_schema", false)
+            (GEMINI_JSON_SCHEMA_FIELD, false)
         }
-        _ => ("body.generation_config.response_schema", false),
+        _ => (GEMINI_SCHEMA_FIELD, false),
     }
 }
 
@@ -777,7 +788,7 @@ impl Prompt {
     /// and a deserialization error when the substituted request no longer
     /// decodes as its provider variant.
     pub fn bind_mut(&mut self, vars: &[(&str, &str)]) -> SkaldResult<()> {
-        self.request = substitute(&self.request, vars)?;
+        substitute(&mut self.request, vars)?;
         self.authored = None;
         let unbound = |name: &String| !vars.iter().any(|(key, _)| key == name);
         self.variables.retain(unbound);
@@ -885,7 +896,9 @@ impl Prompt {
                 .find(|(key, _)| key == name)
                 .ok_or_else(|| SkaldError::missing_variable(name))?;
         }
-        substitute(&self.request, vars)
+        let mut request = self.request.clone();
+        substitute(&mut request, vars)?;
+        Ok(request)
     }
 
     /// Applies `edit` to the response schema inside the native request and
@@ -966,90 +979,142 @@ impl Prompt {
     }
 }
 
-/// Returns `request` with each `${name}` and `{{name}}` in `vars` replaced
-/// inside its JSON string leaves, in `vars` order: the one substitution
-/// behind [`Prompt::bind_mut`] and [`Prompt::render`].
+/// Replaces each `${name}` and `{{name}}` in `vars` inside the JSON string
+/// leaves of `request`, in `vars` order: the one substitution behind
+/// [`Prompt::bind_mut`] and [`Prompt::render`].
 ///
 /// Each pattern is built once per call rather than once per leaf, and a leaf
 /// holding neither `$` nor `{{` is left untouched without a scan per name.
-/// The substituted response schema is detached before the request decodes
-/// and moved back afterwards, so the largest subtree is never decoded
-/// through the format's tagged-enum buffering.
+/// The response schema, the largest subtree, is taken out first and
+/// substituted in place, so only the rest of the request makes the JSON
+/// round trip; with no `vars` nothing changes and nothing is serialized.
 ///
 /// # Errors
 ///
 /// Returns a serialization error when `request` cannot be serialized and a
 /// deserialization error when the substituted request no longer decodes as
-/// its provider variant.
-fn substitute(request: &ProviderRequest, vars: &[(&str, &str)]) -> SkaldResult<ProviderRequest> {
+/// its provider variant; `request` is then unchanged.
+fn substitute(request: &mut ProviderRequest, vars: &[(&str, &str)]) -> SkaldResult<()> {
+    if vars.is_empty() {
+        return Ok(());
+    }
     let patterns: Vec<_> = vars
         .iter()
         .map(|(name, value)| (format!("${{{name}}}"), format!("{{{{{name}}}}}"), *value))
         .collect();
-    let mut value = serde_json::to_value(request).map_err(SkaldError::serialize)?;
-    replace_string_leaves(&mut value, &patterns);
-    let (field, _) = output_schema_field(request);
-    let schema = matches!(
-        request,
-        ProviderRequest::OpenAiChatCompletion(_)
-            | ProviderRequest::OpenAiResponses(_)
-            | ProviderRequest::AnthropicMessage(_)
-            | ProviderRequest::GeminiGenerateContent(_)
-    )
-    .then(|| value.pointer_mut(&format!("/{}", field.replace('.', "/"))))
-    .flatten()
-    .filter(|schema| !schema.is_null())
-    .map(Value::take);
-    let mut substituted = serde_json::from_value(value).map_err(SkaldError::deserialize)?;
-    if let Some(schema) = schema {
-        restore_response_schema(&mut substituted, field, schema);
+    let schema = request.take_response_schema();
+    let substituted = serde_json::to_value(&*request)
+        .map_err(SkaldError::serialize)
+        .and_then(|mut value| {
+            replace_string_leaves(&mut value, &patterns);
+            serde_json::from_value::<ProviderRequest>(value).map_err(SkaldError::deserialize)
+        });
+    let schema = schema.map(|(mut schema, field)| {
+        if substituted.is_ok() {
+            replace_string_leaves(&mut schema, &patterns);
+        }
+        (schema, field)
+    });
+    let result = substituted.map(|substituted| *request = substituted);
+    if let Some((schema, field)) = schema {
+        request.set_response_schema(field, schema);
     }
-    Ok(substituted)
+    result
 }
 
-/// Moves `schema`, detached by [`substitute`] from the serialized request
-/// at the native body path `field`, back into that field of `request`.
-///
-/// The field decoded as absent, so the slot is set rather than edited; a
-/// schema that left an object-typed field serialized as an object.
-fn restore_response_schema(request: &mut ProviderRequest, field: &str, schema: Value) {
-    use crate::wire::anthropic_messages::AnthropicOutputFormat;
-    use crate::wire::openai_chat::OpenAiResponseFormat;
-    use crate::wire::openai_responses::OpenAiTextResponseFormat;
+impl ProviderRequest {
+    /// Moves the structured-output schema out of this request, returning it
+    /// with its native body path (see [`output_schema_field`]) and leaving
+    /// the field absent; `None` when the request declares no schema.
+    ///
+    /// A caller that sends the request with the same schema several times,
+    /// such as an Agent loop, takes it once and puts a copy back per send
+    /// with [`set_response_schema`](Self::set_response_schema), so the rest
+    /// of the request copies without it.
+    pub fn take_response_schema(&mut self) -> Option<(Value, &'static str)> {
+        use crate::wire::anthropic_messages::AnthropicOutputFormat;
+        use crate::wire::openai_chat::OpenAiResponseFormat;
+        use crate::wire::openai_responses::OpenAiTextResponseFormat;
 
-    match request {
-        ProviderRequest::OpenAiChatCompletion(request) => {
-            if let Some(OpenAiResponseFormat::JsonSchema { json_schema }) =
-                &mut request.response_format
-                && let Value::Object(schema) = schema
-            {
-                json_schema.schema = Some(schema);
-            }
-        }
-        ProviderRequest::OpenAiResponses(request) => {
-            if let Some(OpenAiTextResponseFormat::JsonSchema { schema: slot, .. }) =
-                request.text.as_mut().and_then(|text| text.format.as_mut())
-                && let Value::Object(schema) = schema
-            {
-                *slot = Some(schema);
-            }
-        }
-        ProviderRequest::AnthropicMessage(request) => {
-            if let Some(config) = &mut request.output_config {
-                let AnthropicOutputFormat::JsonSchema { schema: slot } = &mut config.format;
-                *slot = schema;
-            }
-        }
-        ProviderRequest::GeminiGenerateContent(request) => {
-            if let Some(config) = &mut request.settings.generation_config {
-                if field.ends_with("response_json_schema") {
-                    config.response_json_schema = Some(schema);
-                } else {
-                    config.response_schema = Some(schema);
+        match self {
+            ProviderRequest::OpenAiChatCompletion(request) => match &mut request.response_format {
+                Some(OpenAiResponseFormat::JsonSchema { json_schema }) => json_schema
+                    .schema
+                    .take()
+                    .map(|schema| (Value::Object(schema), CHAT_SCHEMA_FIELD)),
+                _ => None,
+            },
+            ProviderRequest::OpenAiResponses(request) => {
+                match request.text.as_mut().and_then(|text| text.format.as_mut()) {
+                    Some(OpenAiTextResponseFormat::JsonSchema { schema, .. }) => schema
+                        .take()
+                        .map(|schema| (Value::Object(schema), RESPONSES_SCHEMA_FIELD)),
+                    _ => None,
                 }
             }
+            ProviderRequest::AnthropicMessage(request) => {
+                request.output_config.as_mut().map(|config| {
+                    let AnthropicOutputFormat::JsonSchema { schema } = &mut config.format;
+                    (schema.take(), ANTHROPIC_SCHEMA_FIELD)
+                })
+            }
+            ProviderRequest::GeminiGenerateContent(request) => {
+                let config = request.settings.generation_config.as_mut()?;
+                match config.response_json_schema.take() {
+                    Some(schema) => Some((schema, GEMINI_JSON_SCHEMA_FIELD)),
+                    None => config
+                        .response_schema
+                        .take()
+                        .map(|schema| (schema, GEMINI_SCHEMA_FIELD)),
+                }
+            }
+            _ => None,
         }
-        _ => {}
+    }
+
+    /// Puts `schema` back at `field`, a native body path
+    /// [`take_response_schema`](Self::take_response_schema) returned for a
+    /// request of this kind and format; any other path, or a non-object
+    /// schema for an object-typed field, leaves the request unchanged.
+    pub fn set_response_schema(&mut self, field: &str, schema: Value) {
+        use crate::wire::anthropic_messages::AnthropicOutputFormat;
+        use crate::wire::openai_chat::OpenAiResponseFormat;
+        use crate::wire::openai_responses::OpenAiTextResponseFormat;
+
+        match self {
+            ProviderRequest::OpenAiChatCompletion(request) if field == CHAT_SCHEMA_FIELD => {
+                if let Some(OpenAiResponseFormat::JsonSchema { json_schema }) =
+                    &mut request.response_format
+                    && let Value::Object(schema) = schema
+                {
+                    json_schema.schema = Some(schema);
+                }
+            }
+            ProviderRequest::OpenAiResponses(request) if field == RESPONSES_SCHEMA_FIELD => {
+                if let Some(OpenAiTextResponseFormat::JsonSchema { schema: slot, .. }) =
+                    request.text.as_mut().and_then(|text| text.format.as_mut())
+                    && let Value::Object(schema) = schema
+                {
+                    *slot = Some(schema);
+                }
+            }
+            ProviderRequest::AnthropicMessage(request) if field == ANTHROPIC_SCHEMA_FIELD => {
+                if let Some(config) = &mut request.output_config {
+                    let AnthropicOutputFormat::JsonSchema { schema: slot } = &mut config.format;
+                    *slot = schema;
+                }
+            }
+            ProviderRequest::GeminiGenerateContent(request) => {
+                if let Some(config) = &mut request.settings.generation_config {
+                    if field == GEMINI_JSON_SCHEMA_FIELD {
+                        config.response_json_schema = Some(schema);
+                    } else if field == GEMINI_SCHEMA_FIELD {
+                        config.response_schema = Some(schema);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -2678,8 +2743,8 @@ mod response_schema_edit {
             let expected: ProviderRequest = common::typed(
                 serde_json::from_str(&body.to_string().replace("{{name}}", "Ada")).expect("json"),
             );
-            let rendered =
-                super::substitute(&common::typed(body), &[("name", "Ada")]).expect("renders");
+            let mut rendered: ProviderRequest = common::typed(body);
+            super::substitute(&mut rendered, &[("name", "Ada")]).expect("renders");
             assert_eq!(rendered, expected);
         }
     }

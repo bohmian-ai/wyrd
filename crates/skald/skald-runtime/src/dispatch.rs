@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use skald_providers::ProviderStream;
 use skald_spec::{ProviderName, ProviderRequest, ProviderResponse};
-use tracing::{Span, instrument};
+use tracing::{Instrument as _, Span, info_span};
 
 use crate::error::{SkaldRuntimeError, SkaldRuntimeResult};
 use crate::provider::ProviderRegistry;
@@ -21,36 +21,29 @@ static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 ///
 /// Returns [`SkaldRuntimeError::ProviderNotRegistered`] when no client is
 /// registered under `provider`, or the client's provider failure.
-#[instrument(skip_all, fields(
-    provider = tracing::field::Empty,
-    model = tracing::field::Empty,
-    request_id = tracing::field::Empty,
-    usage_input_tokens = tracing::field::Empty,
-    usage_output_tokens = tracing::field::Empty,
-))]
 pub async fn dispatch(
     providers: &ProviderRegistry,
     provider: ProviderName,
     request: ProviderRequest,
 ) -> SkaldRuntimeResult<ProviderResponse> {
-    let request_id = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-    Span::current().record("provider", tracing::field::debug(&provider));
-    if let Some(model) = request_model(&request) {
-        Span::current().record("model", tracing::field::display(model));
+    let span = dispatch_span(&provider, &request);
+    async move {
+        let client = providers
+            .get(&provider)
+            .ok_or_else(|| SkaldRuntimeError::provider_not_registered(provider.clone()))?;
+        let response = client
+            .send(request)
+            .await
+            .map_err(|source| SkaldRuntimeError::from_provider(provider, source))?;
+        if let Some(usage) = response.adapter().usage() {
+            let span = Span::current();
+            span.record("usage_input_tokens", usage.usage.input_tokens);
+            span.record("usage_output_tokens", usage.usage.output_tokens);
+        }
+        Ok(response)
     }
-    Span::current().record("request_id", request_id);
-    let client = providers
-        .get(&provider)
-        .ok_or_else(|| SkaldRuntimeError::provider_not_registered(provider.clone()))?;
-    let response = client
-        .send(request)
-        .await
-        .map_err(|source| SkaldRuntimeError::from_provider(provider, source))?;
-    if let Some(usage) = response.adapter().usage() {
-        Span::current().record("usage_input_tokens", usage.usage.input_tokens);
-        Span::current().record("usage_output_tokens", usage.usage.output_tokens);
-    }
-    Ok(response)
+    .instrument(span)
+    .await
 }
 
 /// Routes a native streaming request to the client registered under `provider`.
@@ -59,29 +52,38 @@ pub async fn dispatch(
 ///
 /// Returns [`SkaldRuntimeError::ProviderNotRegistered`] when no client is
 /// registered under `provider`, or the client's provider failure.
-#[instrument(skip_all, fields(
-    provider = tracing::field::Empty,
-    model = tracing::field::Empty,
-    request_id = tracing::field::Empty,
-))]
 pub async fn dispatch_stream(
     providers: &ProviderRegistry,
     provider: ProviderName,
     request: ProviderRequest,
 ) -> SkaldRuntimeResult<ProviderStream> {
-    let request_id = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-    Span::current().record("provider", tracing::field::debug(&provider));
-    if let Some(model) = request_model(&request) {
-        Span::current().record("model", tracing::field::display(model));
+    let span = dispatch_span(&provider, &request);
+    async move {
+        let client = providers
+            .get(&provider)
+            .ok_or_else(|| SkaldRuntimeError::provider_not_registered(provider.clone()))?;
+        client
+            .stream(request)
+            .await
+            .map_err(|source| SkaldRuntimeError::from_provider(provider, source))
     }
-    Span::current().record("request_id", request_id);
-    let client = providers
-        .get(&provider)
-        .ok_or_else(|| SkaldRuntimeError::provider_not_registered(provider.clone()))?;
-    client
-        .stream(request)
-        .await
-        .map_err(|source| SkaldRuntimeError::from_provider(provider, source))
+    .instrument(span)
+    .await
+}
+
+/// Opens the `dispatch` span of one send of `request` to `provider`, with
+/// the provider, model, and a process-unique request id set at creation so
+/// no field is recorded later; usage tokens stay empty until a response
+/// reports them.
+fn dispatch_span(provider: &ProviderName, request: &ProviderRequest) -> Span {
+    info_span!(
+        "dispatch",
+        provider = ?provider,
+        model = request_model(request),
+        request_id = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed),
+        usage_input_tokens = tracing::field::Empty,
+        usage_output_tokens = tracing::field::Empty,
+    )
 }
 
 fn request_model(request: &ProviderRequest) -> Option<&str> {

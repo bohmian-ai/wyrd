@@ -5,7 +5,8 @@ mod pg_tests {
     //! the operator pool for the cross-tenant expiry sweep: pointer
     //! publication under competition, collection claims against touches and
     //! pointers with retry, context stamps that never extend, database-clock
-    //! expiry, and tenant isolation. Without a database they fail at fixture
+    //! expiry, a touch racing a claim, and tenant, installation and repository
+    //! isolation. Without a database they fail at fixture
     //! start rather than pass.
 
     use std::time::Duration;
@@ -378,6 +379,142 @@ mod pg_tests {
                 .await
                 .expect("read")
                 .is_some()
+        );
+    }
+
+    /// A touch racing a collection over a record older than the grace ends
+    /// with exactly one winner: either the touch refreshes it and the claim
+    /// skips it, or the claim takes it and the touch is refused.
+    ///
+    /// # Panics
+    /// Panics when a round both refreshes and claims the record, or neither.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_aged_record_is_either_touched_or_claimed_never_both() {
+        let fixture = PgFixture::start().await.expect("fixture");
+        let tenant = fixture.data_tenant_id();
+        let superuser = fixture.superuser_pool().expect("superuser pool");
+        let grace = Duration::from_hours(1);
+
+        for round in 0..24 {
+            let key = format!("race-{round}");
+            assert!(touch(&fixture, tenant, &key).await);
+            sqlx::query(
+                "UPDATE wyrd.code_review_snapshot_records
+                    SET touched_at = touched_at - interval '2 hours'
+                  WHERE object_key = $1",
+            )
+            .bind(&key)
+            .execute(&superuser)
+            .await
+            .expect("age the record");
+
+            let (claimed, touched) = tokio::join!(
+                claim(&fixture, tenant, grace),
+                touch(&fixture, tenant, &key)
+            );
+            assert_ne!(
+                claimed.contains(&key),
+                touched,
+                "round {round}: exactly one of the touch and the claim wins"
+            );
+            let mut conn = fixture.tenant_conn_for(tenant).await.expect("conn opens");
+            delete_code_review_snapshot_record(&mut conn, REPO, &key)
+                .await
+                .expect("delete");
+            conn.commit().await.expect("commit");
+        }
+    }
+
+    /// Rows of one repository are invisible to another repository and to
+    /// the same repository ID under another installation of one tenant, and
+    /// another repository's pointer never protects this repository's record.
+    ///
+    /// # Panics
+    /// Panics when any row crosses a repository or installation boundary.
+    #[tokio::test]
+    async fn cache_rows_stay_inside_their_repository_and_installation() {
+        let fixture = PgFixture::start().await.expect("fixture");
+        let tenant = fixture.data_tenant_id();
+
+        assert!(touch(&fixture, tenant, "key-a").await);
+        assert!(publish(&fixture, tenant, None, "tree-a", "key-b").await);
+        let mut conn = fixture.tenant_conn_for(tenant).await.expect("conn opens");
+        upsert_code_review_context(
+            &mut conn,
+            REPO,
+            "ctx",
+            &json!({}),
+            &json!({"key": "k"}),
+            Duration::from_secs(3600),
+        )
+        .await
+        .expect("upsert");
+        conn.commit().await.expect("commit");
+
+        let siblings = [
+            CodeReviewRepository {
+                repository_id: 8,
+                ..REPO
+            },
+            CodeReviewRepository {
+                installation_id: 12,
+                ..REPO
+            },
+        ];
+        for sibling in siblings {
+            let mut conn = fixture.tenant_conn_for(tenant).await.expect("conn opens");
+            let sibling_scope = CodeReviewSnapshotScope {
+                repository: sibling,
+                ..scope()
+            };
+            assert_eq!(
+                code_review_snapshot_pointer(&mut conn, sibling_scope)
+                    .await
+                    .expect("read"),
+                None,
+                "{sibling:?} sees no pointer"
+            );
+            assert_eq!(
+                code_review_context(&mut conn, sibling, "ctx")
+                    .await
+                    .expect("read"),
+                None,
+                "{sibling:?} sees no context"
+            );
+            assert_eq!(
+                claim_unreferenced_code_review_snapshots(&mut conn, sibling, Duration::ZERO)
+                    .await
+                    .expect("claim"),
+                Vec::<String>::new(),
+                "{sibling:?} claims nothing"
+            );
+            assert!(
+                publish_code_review_snapshot_pointer(
+                    &mut conn,
+                    sibling_scope,
+                    None,
+                    &pointer("tree-s", "key-a"),
+                    "tree-s",
+                )
+                .await
+                .expect("publish"),
+                "{sibling:?} publishes its own first pointer"
+            );
+            conn.commit().await.expect("commit");
+        }
+
+        let mut conn = fixture.tenant_conn_for(tenant).await.expect("conn opens");
+        assert_eq!(
+            code_review_snapshot_pointer(&mut conn, scope())
+                .await
+                .expect("read"),
+            Some(pointer("tree-a", "key-b"))
+        );
+        conn.commit().await.expect("commit");
+        assert_eq!(
+            claim(&fixture, tenant, Duration::ZERO).await,
+            vec!["key-a".to_owned()],
+            "a sibling's pointer naming the same key does not protect this record"
         );
     }
 }

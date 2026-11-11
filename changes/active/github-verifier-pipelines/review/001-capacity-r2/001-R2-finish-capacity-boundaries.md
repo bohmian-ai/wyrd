@@ -99,18 +99,18 @@ The other production change is `config.rs`: `Selected` and `set_count` (`:2089�
 
 | Obligation | Implementation evidence | Assertion | Verification evidence | Result |
 |---|---|---|---|---|
-| G1: refuse a held cold snapshot past the original deadline | `invocation.rs:585–628` | 504 code `:6194` and end within `[budget, budget + 25%)` `:6198–6201`, both asserted after the lock waiter is observed (`:6185`) and before the barrier commits (`:6211`) | G 5/5 | PASS |
-| G2: no dispatch | same | `:6202–6204` | G | PASS |
-| G3: no permit kept | `caller.rs` permit drops with the call | `:6206–6209` | G | PASS |
-| G4: success after release | same | the next call after release is admitted and answered `:6302–6306` | G | PASS |
-| G5: one instant for the lane wait and the engine deadline | `caller.rs:139–151`, `invocation.rs:632–634` | the dispatched deadline lies in `[started+budget, started+budget+budget/8]` after a delayed snapshot `:6268–6272` | G | PASS |
-| G6: expiry refused before the ledger write; a write already in progress hands off | `invocation.rs:663` | passed bound with the capture slot in hand: 504, unsettled, undispatched `:6413–6418`; uncaptured `:6421–6424`; write held past the deadline: 504 `:6343`, no attempt `:6347–6350`, `timed_out` capture `:6375–6378` | G | PASS |
-| G7: existing assertions kept | unchanged | held lane `[300ms,1s)` `:6134–6143`; cancellation `:6154–6168`; hung provider's problem `:6262`; `timed_out` capture `:6284–6287`; next call `:6304–6306` | G | PASS |
+| G1: refuse a held cold snapshot past the original deadline | `invocation.rs:585–628` | 504 code `:6195` and end within `[budget, budget + 25%)` `:6199–6202`, both asserted after the lock waiter is observed (`:6186`) and before the barrier commits (`:6212`) | G 5/5 | PASS |
+| G2: no dispatch | same | `:6203–6205` | G | PASS |
+| G3: no permit kept | `caller.rs` permit drops with the call | `:6207–6210` | G | PASS |
+| G4: success after release | same | the next call after release is admitted and answered `:6303–6307` | G | PASS |
+| G5: one instant for the lane wait and the engine deadline | `caller.rs:139–151`, `invocation.rs:632–634` | the dispatched deadline lies in `[started+budget, started+budget+budget/8]` after a delayed snapshot `:6269–6273` | G | PASS |
+| G6: expiry refused before the ledger write; a write already in progress hands off | `invocation.rs:663` | passed bound with the capture slot in hand: 504, unsettled, undispatched `:6414–6419`; uncaptured `:6422–6425`; write held past the deadline: 504 `:6344`, no attempt `:6348–6351`, `timed_out` capture `:6376–6379` | G | PASS |
+| G7: existing assertions kept | unchanged | held lane `[300ms,1s)` `:6135–6144`; cancellation `:6155–6169`; hung provider's problem `:6263`; `timed_out` capture `:6285–6288`; next call `:6305–6307` | G | PASS |
 | G8: unbound path and regressions | `caller.rs:168` passes no bound; `invocation.rs:634` keeps the relative timeout | `gateway_agent_calls_start_only_on_a_compatible_adapter`, `gateway_admission_holds_limits_and_budgets_across_replicas` | G | PASS |
-| G9: completed decisions stay audited | audits are staged synchronously in `decide` | `:6427–6433` | G | PASS |
+| G9: completed decisions stay audited | audits are staged synchronously in `decide` | `:6428–6434` | G | PASS |
 | G10: capture wait and staging refusal | the bound path passes the same `deadline` to `capture_slot` | bound call with a 10 s relative timeout refused `GatewayCaptureStagingFull`, undispatched `:3493–3497`, at its 200 ms bound `:3498–3500` | G | PASS |
-| G11: settlement before the answer | existing `settle_buffered` order unchanged | the next call under `concurrent_calls = 1` is answered `:6367–6368` | G | PASS |
-| G12: cancellation distinct | drop guard `invocation.rs:490` unchanged | cancelled mid-attempt: no permit kept `:6456–6460`, outcome `cancelled` `:6467–6471`, the two expiries still `timed_out` `:6472–6479`; dropped call undispatched `:6224–6227`, no permit `:6228–6232` | G | PASS |
+| G11: settlement before the answer | existing `settle_buffered` order unchanged | the next call under `concurrent_calls = 1` is answered `:6368–6369` | G | PASS |
+| G12: cancellation distinct | drop guard `invocation.rs:490` unchanged | cancelled mid-attempt: no permit kept `:6456–6460`, outcome `cancelled` `:6467–6471`, the two expiries still `timed_out` `:6472–6479`; dropped call undispatched `:6225–6228`, no permit `:6229–6233` | G | PASS |
 | C1–C3: valid env wins over stale file values | `Selected::of` checks a file value only when no variable is set | `(9, 8192 MiB, 2h)` over zero, overflowing and i64::MAX file values, `config.rs:4677–4690` | U 4/4 | PASS |
 | C4: file refusals by TOML name without overrides | `Selected::of`, `set_count`, `Selected::deadline` | `:4714`, `:4734`, `:4805–4816` | U | PASS |
 | C5: invalid env winners refused | `env_positive` and `Selected::refuse` | `:4692–4711`; env list `:4912–4928` | U | PASS |

@@ -31,13 +31,14 @@ export function writeInventory(input: CardInventoryInput): string {
   return search ? `?${search}` : '';
 }
 
-/** Detail tabs every Card has, and the Prompt's added Versions tab. */
+/** Detail tabs every Card has, the Prompt's added Versions tab, and the Verifier's Graph in place of Overview. */
 export const CARD_TABS = [
   { id: 'overview', label: 'Overview' },
   { id: 'files', label: 'Files' },
   { id: 'yaml', label: 'YAML' }
 ] as const;
 export const PROMPT_TABS = [CARD_TABS[0], { id: 'versions', label: 'Versions' }, CARD_TABS[1], CARD_TABS[2]] as const;
+export const VERIFIER_TABS = [{ id: 'overview', label: 'Graph' }, CARD_TABS[1], CARD_TABS[2]] as const;
 
 /** The detail URL search for one exact Card, each value encoded on its own. */
 export function writeDetail(ref: CardRef, extra: { tab?: string; compare?: string } = {}): string {

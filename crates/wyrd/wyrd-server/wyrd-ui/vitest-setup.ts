@@ -21,3 +21,6 @@ globalThis.ResizeObserver ??= class {
     this.targets.clear();
   }
 };
+
+// jsdom has no media queries; Svelte Flow asks for the colour scheme when it mounts.
+globalThis.matchMedia ??= ((media: string) => ({ media, matches: false, addEventListener() {}, removeEventListener() {} })) as never;

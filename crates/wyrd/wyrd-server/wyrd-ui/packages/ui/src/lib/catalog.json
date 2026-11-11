@@ -1489,6 +1489,178 @@
         }
       ]
     },
+    "VerifierDefinition": {
+      "description": "An exact Verifier as declared: its description, the read-only graph of its inputs, steps, attached and whole-Verifier requirements with their declared dependencies, and the authored declaration of the selected node. No execution state.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "cardRef": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "Verifier"
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "version": {
+                "type": "string",
+                "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+              },
+              "uid": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "name",
+              "version"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "cardRef"
+        ],
+        "additionalProperties": false
+      },
+      "states": [
+        "populated",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": []
+    },
+    "RunsOn": {
+      "description": "The Services and Agents whose bindings pin an exact Verifier version, from its server-derived inbound relationships, with each binding's subject and when it runs.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "cardRef": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "Verifier"
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "version": {
+                "type": "string",
+                "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+              },
+              "uid": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "name",
+              "version"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "cardRef"
+        ],
+        "additionalProperties": false
+      },
+      "states": [
+        "populated",
+        "empty",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": [
+        {
+          "name": "card.open",
+          "description": "Open this exact Card version.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "card_ref": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "Data",
+                      "Model",
+                      "Artifact",
+                      "Experiment",
+                      "Prompt",
+                      "Agent",
+                      "Mcp",
+                      "Service",
+                      "Audit",
+                      "Verifier",
+                      "Trigger",
+                      "Operator"
+                    ]
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "version": {
+                    "type": "string",
+                    "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+                  },
+                  "uid": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "name",
+                  "version"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "card_ref"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        }
+      ]
+    },
     "StatStrip": {
       "description": "One to five recorded numbers with a sparkline each, from built-in reads of bifrost.traces.spans, bifrost.logs.records and bifrost.gateway.calls, optionally scoped to one workload_card_uid or subject_card_uid.",
       "input": {

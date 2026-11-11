@@ -48,6 +48,7 @@ import {
   type UsedByProps,
   type VersionDiffProps
 } from './cards.js';
+import { loadRunsOn, loadVerifierDefinition, type RunsOnProps, type VerifierDefinitionProps } from './verifier.js';
 import {
   components,
   type AbsoluteRange,
@@ -61,6 +62,7 @@ export * from './contract.js';
 export * from './schemas.js';
 export * from './observe.js';
 export * from './cards.js';
+export * from './verifier.js';
 
 /** What every loader receives from its host. */
 export interface LoadContext {
@@ -97,6 +99,8 @@ export interface ComponentProps {
   PromptVariables: PromptVariablesProps;
   UsedBy: UsedByProps;
   VersionDiff: VersionDiffProps;
+  VerifierDefinition: VerifierDefinitionProps;
+  RunsOn: RunsOnProps;
   StatStrip: StatStripProps;
   FacetRail: FacetRailProps;
   RecordTable: RecordTableProps;
@@ -245,6 +249,8 @@ const LOADERS: {
   PromptVariables: loadPromptVariables,
   UsedBy: loadUsedBy,
   VersionDiff: loadVersionDiff,
+  VerifierDefinition: loadVerifierDefinition,
+  RunsOn: loadRunsOn,
   StatStrip: loadStatStrip,
   FacetRail: loadFacetRail,
   RecordTable: loadRecordTable,

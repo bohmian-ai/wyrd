@@ -14,6 +14,9 @@ export { default as PromptMessages } from './components/PromptMessages.svelte';
 export { default as PromptVariables } from './components/PromptVariables.svelte';
 export { default as UsedBy } from './components/UsedBy.svelte';
 export { default as VersionDiff } from './components/VersionDiff.svelte';
+export { default as VerifierDefinition } from './components/VerifierDefinition.svelte';
+export { default as RunsOn } from './components/RunsOn.svelte';
+export { default as VerifierGraph } from './components/VerifierGraph.svelte';
 export { default as Panel } from './components/Panel.svelte';
 export { default as StatStrip } from './components/StatStrip.svelte';
 export { default as FacetRail } from './components/FacetRail.svelte';
@@ -44,6 +47,16 @@ export type {
   PromptVariablesProps,
   RelationshipListProps,
   UsedByProps,
+  DefinitionEdge,
+  DefinitionGraph,
+  DefinitionInput,
+  DefinitionRequirement,
+  DefinitionStep,
+  RunsOnProps,
+  VerifierBinding,
+  VerifierDefinitionData,
+  VerifierDefinitionProps,
+  VerifierOwner,
   VersionDiffData,
   VersionDiffProps,
   ChartProps,

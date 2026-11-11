@@ -28,6 +28,7 @@
     card,
     day,
     denied,
+    DRIFT_VERIFIER,
     fixtureExecutor,
     liveExecutor,
     LOG,
@@ -36,11 +37,13 @@
     RANGE,
     registered,
     series,
+    SESSION_VERIFIER,
     stateExecutors,
     summary,
     terminal,
     timeseries,
-    TRACE
+    TRACE,
+    VERIFIER
   } from '$lib/ui-fixtures';
 
   let drawer = $state(false);
@@ -137,6 +140,24 @@
       component: 'VersionDiff',
       regions: [['Prompt', 'Changes from the previous version']],
       cases: [{ label: '1.0.0 → 1.1.0', input: { cardRef: PROMPT } }, { label: 'only one version', input: { cardRef: PROMPT }, state: 'empty' }, ...STATES.filter((state) => state !== 'empty').map((state) => ({ label: state, input: { cardRef: PROMPT }, state }))]
+    },
+    {
+      component: 'VerifierDefinition',
+      regions: [['Verification mock · Verifier page', 'description, Graph panel and declaration inspector']],
+      note: 'Definition only: no execution colour. Select a node, use the arrow keys, zoom and Fit.',
+      cases: [
+        { label: 'parallel steps, fan-in, gate, retries and both requirement positions', input: { cardRef: VERIFIER } },
+        { label: 'requirements only: a compact panel', input: { cardRef: { ...VERIFIER, version: '1.0.0' } } },
+        { label: 'session judgment over group sources', input: { cardRef: SESSION_VERIFIER } },
+        { label: 'drift check over samples', input: { cardRef: DRIFT_VERIFIER } },
+        ...STATES.filter((state) => state !== 'empty').map((state) => ({ label: state, input: { cardRef: VERIFIER }, state })),
+        { label: 'narrow: the graph pans', input: { cardRef: VERIFIER }, narrow: true }
+      ]
+    },
+    {
+      component: 'RunsOn',
+      regions: [['Verification mock · Verifier page', 'Runs on rail']],
+      cases: [{ label: 'a Service binding itself and one component', input: { cardRef: VERIFIER } }, ...states({ cardRef: VERIFIER })]
     },
     {
       component: 'FacetRail',

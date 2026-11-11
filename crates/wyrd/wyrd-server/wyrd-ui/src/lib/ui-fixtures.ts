@@ -109,6 +109,71 @@ export const agent = {
   relationships: { outbound_refs: [{ ref: PROMPT }], inbound_refs: [{ ref: SERVICE }] },
   status: { phase: 'active' }
 } as unknown as RegisteredCard;
+/**
+ * Verifiers as registered: an ordinary one with parallel steps, a fan-in, a gated and retried step and both
+ * requirement positions, in two versions; a session judgment over group sources; and a drift check.
+ */
+export const VERIFIER = { kind: 'Verifier', name: 'ticket-policy', version: '1.1.0' } as const satisfies CardRef;
+export const SESSION_VERIFIER = { kind: 'Verifier', name: 'session-quality', version: '1.0.0' } as const satisfies CardRef;
+export const DRIFT_VERIFIER = { kind: 'Verifier', name: 'latency-drift', version: '1.0.0' } as const satisfies CardRef;
+const verifierCard = (ref: CardRef, spec: object, inbound: CardRef[] = []) =>
+  ({
+    apiVersion: 'wyrd/v1',
+    kind: 'Verifier',
+    metadata: { name: ref.name, version: ref.version, uid: `card_verifier_${ref.name}_${ref.version}` },
+    spec,
+    relationships: { inbound_refs: inbound.map((each) => ({ ref: each })), outbound_refs: [] },
+    status: { phase: 'active' }
+  }) as unknown as RegisteredCard;
+const hasAnswer = { id: 'has-answer', statement: 'The ticket carries an answer', check: { kind: 'assert', path: 'inputs.ticket.answer', operator: 'is_non_empty' } };
+export const verifiers: Record<string, RegisteredCard> = {
+  'ticket-policy@1.0.0': verifierCard({ ...VERIFIER, version: '1.0.0' }, { description: 'A support ticket carries an answer.', inputs: { ticket: { type: 'json' } }, requirements: [hasAnswer] }),
+  'ticket-policy@1.1.0': verifierCard(
+    VERIFIER,
+    {
+      description: 'A support ticket follows the refund policy.',
+      inputs: { ticket: { type: 'json', schema: { type: 'object' } }, photo: { type: 'media', formats: ['png', 'jpeg'] } },
+      steps: [
+        { id: 'read-photo', action: { kind: 'extract', from: 'inputs.photo' } },
+        { id: 'score', action: { kind: 'code', entrypoint: 'score', inputs: { ticket: 'inputs.ticket' }, source: { inline: 'def score(ticket): ...' } }, retries: 2, timeout_seconds: 30 },
+        {
+          id: 'classify',
+          action: { kind: 'agent', agent: AGENT, inputs: { ticket: 'inputs.ticket', text: 'steps.read-photo.output.text' } },
+          when: { path: 'steps.read-photo.status', operator: 'equals', expected: 'succeeded' },
+          requirements: [{ id: 'classified', statement: 'The ticket has exactly one label', check: { kind: 'assert', path: 'steps.classify.output.label', operator: 'is_non_empty' } }]
+        },
+        { id: 'summarise', action: { kind: 'code', entrypoint: 'summarise', inputs: { label: 'steps.classify.output.label', units: 'steps.score.output.units' }, source: { inline: 'def summarise(label, units): ...' } }, depends_on: ['read-photo'] }
+      ],
+      requirements: [
+        { id: 'policy-followed', statement: 'The reply follows the refund policy for its label', check: { kind: 'agent', agent: AGENT, inputs: { summary: 'steps.summarise.output.summary' } } },
+        hasAnswer
+      ]
+    },
+    [SERVICE]
+  ),
+  'session-quality@1.0.0': verifierCard(SESSION_VERIFIER, {
+    description: 'Every reply in a session passed its refund check.',
+    inputs: { outcomes: 'verifiers.ticket-policy.requirements.policy-followed.outcome', tickets: 'verifiers.ticket-policy.inputs.ticket' },
+    requirements: [{ id: 'all-passed', statement: 'No reply in the session failed', check: { kind: 'assert', each: 'inputs.outcomes[*]', operator: 'equals', expected: 'passed' } }]
+  }),
+  'latency-drift@1.0.0': verifierCard(DRIFT_VERIFIER, {
+    inputs: { latency: { type: 'samples', features: ['latency_ms'] } },
+    requirements: [{ id: 'latency-stable', statement: 'Latency stays within its fitted baseline', check: { kind: 'drift', on: 'inputs.latency', method: 'Psi', signal: { kind: 'feature', name: 'latency_ms' }, condition: { kind: 'window', size: 100 } } }]
+  })
+};
+/** The Service binding the newer ticket-policy version: once on itself, explicitly, and once on a component, on a schedule. */
+export const service = {
+  apiVersion: 'wyrd/v1',
+  kind: 'Service',
+  metadata: { name: SERVICE.name, version: SERVICE.version, uid: 'card_service' },
+  spec: {
+    service_type: 'agent',
+    verified_by: [{ verifier: VERIFIER }, { verifier: { ...VERIFIER, version: '1.0.0' }, runs_on: { kind: 'group_end', after: '10m' } }],
+    components: [{ alias: 'agent', ref: AGENT, verified_by: [{ verifier: VERIFIER, runs_on: { kind: 'schedule', cron: '0 * * * *', tz: 'Europe/Berlin' } }] }]
+  },
+  relationships: { outbound_refs: [{ ref: AGENT, alias: 'agent' }, { ref: VERIFIER }], inbound_refs: [] },
+  status: { phase: 'active' }
+} as unknown as RegisteredCard;
 /** The files registration recorded for the Model. */
 export const artifacts = {
   artifacts: [
@@ -334,6 +399,8 @@ export const fixtureExecutor: Executor = {
           case 'cards.get_by_ref': {
             const ref = request.card_ref;
             if (ref.kind === 'Agent') return { ok: true, value: agent };
+            if (ref.kind === 'Verifier') return verifiers[`${ref.name}@${ref.version}`] ? { ok: true, value: verifiers[`${ref.name}@${ref.version}`] } : { ok: false, problem: notFound };
+            if (ref.kind === 'Service') return { ok: true, value: service };
             if (ref.name === NATIVE.name) return { ok: true, value: nativePrompt };
             if (ref.kind === 'Prompt') return prompts[ref.version] ? { ok: true, value: prompts[ref.version] } : { ok: false, problem: notFound };
             return { ok: true, value: registered };
@@ -341,6 +408,9 @@ export const fixtureExecutor: Executor = {
           case 'cards.list':
             if (request.kind === 'Prompt' && request.name === PROMPT.name)
               return { ok: true, value: { items: [summary('1.0.0', 'active', 'Prompt', PROMPT.name), summary('1.1.0', 'active', 'Prompt', PROMPT.name)], next_cursor: null } };
+            if (request.kind === 'Verifier' && request.name === VERIFIER.name)
+              return { ok: true, value: { items: [summary('1.0.0', 'active', 'Verifier', VERIFIER.name), summary('1.1.0', 'active', 'Verifier', VERIFIER.name)], next_cursor: null } };
+            if (request.kind === 'Verifier' && typeof request.name === 'string') return { ok: true, value: { items: [summary('1.0.0', 'active', 'Verifier', request.name)], next_cursor: null } };
             if (request.name === NATIVE.name) return { ok: true, value: { items: [summary('1.0.0', 'active', 'Prompt', NATIVE.name)], next_cursor: null } };
             if (request.name !== undefined) return { ok: true, value: { items: [summary('1.4.2'), summary('1.4.1', 'deprecated')], next_cursor: null } };
             return { ok: true, value: { items: request.cursor ? inventory.slice(3) : inventory.slice(0, 3), next_cursor: request.cursor ? null : 'page-2' } };

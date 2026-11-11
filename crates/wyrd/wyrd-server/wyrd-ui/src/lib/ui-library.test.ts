@@ -57,6 +57,9 @@ import {
   RelationshipList,
   UsedBy,
   VersionDiff,
+  RunsOn,
+  VerifierDefinition,
+  VerifierGraph,
   fmtYaml,
   Chart,
   Drawer,
@@ -91,6 +94,9 @@ import {
   loadRelationshipList,
   loadUsedBy,
   loadVersionDiff,
+  definitionGraph,
+  loadRunsOn,
+  loadVerifierDefinition,
   loadChart,
   loadRecordDetail,
   loadRecordTable,
@@ -113,6 +119,7 @@ import { nodeExecutor } from 'wyrd-ai-ui/node';
 import { Bifrost, WyrdError, type WyrdClient } from 'wyrd-ai';
 import catalog from 'wyrd-ai-ui/catalog.json';
 import { place as placeAll, rowsHeight } from '../../packages/ui/src/lib/layout';
+import { layoutDefinition } from '../../packages/ui/src/lib/verifier-layout';
 import { CARD_TABS, PROMPT_TABS, readInventory, writeDetail, writeInventory } from '$lib/cards-host';
 import { load as loadCardDetail } from '../routes/t/[tenantKey]/cards/detail/+page.server';
 import {
@@ -132,6 +139,7 @@ import {
   card,
   costs,
   denied,
+  DRIFT_VERIFIER,
   facet,
   fixtureExecutor,
   LOG,
@@ -141,6 +149,8 @@ import {
   RANGE,
   registered,
   series,
+  service,
+  SESSION_VERIFIER,
   spanRow,
   spans,
   stateExecutors,
@@ -151,7 +161,9 @@ import {
   trace,
   TRACE,
   traceCounts,
-  traces
+  traces,
+  VERIFIER,
+  verifiers
 } from '$lib/ui-fixtures';
 import { reactive } from '$lib/ui-fixtures.svelte';
 
@@ -1214,6 +1226,8 @@ test('TASK-004: Canonical signal interactions', async () => {
     'PromptVariables',
     'UsedBy',
     'VersionDiff',
+    'VerifierDefinition',
+    'RunsOn',
     'StatStrip',
     'FacetRail',
     'RecordTable',
@@ -2200,4 +2214,306 @@ test('prompt definitions and comparisons preserve authored forms', async () => {
   expect([...reads.calls, ...users.calls, ...compared.calls].map((call) => call.request.op)).not.toContain('bifrost.query');
   for (const name of ['PromptMessages', 'PromptVariables', 'UsedBy', 'VersionDiff'] as const)
     expect(validateView({ version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels: [{ id: 'p', component: name, input: { cardRef: PROMPT } }] })).toMatchObject({ panels: [{ component: name }] });
+});
+
+const specOf = (key: string) => verifiers[key].spec as Parameters<typeof definitionGraph>[0];
+
+test('verifier graph projects and lays out the declared topology', () => {
+  // Ordinary: every declared input, step, attached and whole-Verifier requirement, with exact ids.
+  const graph = definitionGraph(specOf('ticket-policy@1.1.0'));
+  expect(graph.inputs).toEqual([
+    { key: 'input:ticket', id: 'ticket', kind: 'json', detail: 'JSON matching its schema' },
+    { key: 'input:photo', id: 'photo', kind: 'media', detail: 'png, jpeg' }
+  ]);
+  expect(graph.steps.map((step) => [step.id, step.kind, step.detail])).toEqual([
+    ['read-photo', 'extract', 'from inputs.photo'],
+    ['score', 'code', 'score()'],
+    ['classify', 'agent', 'support@1.0.0'],
+    ['summarise', 'code', 'summarise()']
+  ]);
+  expect(graph.steps[2].requirements).toEqual([{ key: 'req:classified', id: 'classified', kind: 'assert', statement: 'The ticket has exactly one label', step: 'classify' }]);
+  expect(graph.requirements.map((each) => [each.id, each.kind, each.step])).toEqual([['policy-followed', 'agent', undefined], ['has-answer', 'assert', undefined]]);
+  // Dependencies come from references, the gate and depends_on; an output read labels its edge; a step never depends on itself.
+  expect(graph.edges).toEqual([
+    { source: 'input:photo', target: 'step:read-photo' },
+    { source: 'input:ticket', target: 'step:score' },
+    { source: 'input:ticket', target: 'step:classify' },
+    { source: 'step:read-photo', target: 'step:classify', label: 'text' },
+    { source: 'step:classify', target: 'step:summarise', label: 'label' },
+    { source: 'step:score', target: 'step:summarise', label: 'units' },
+    { source: 'step:read-photo', target: 'step:summarise' },
+    { source: 'step:summarise', target: 'req:policy-followed', label: 'summary' },
+    { source: 'input:ticket', target: 'req:has-answer' }
+  ]);
+  expect(graph.steps.map((step) => step.needs)).toEqual([[], [], ['read-photo'], ['classify', 'score', 'read-photo']]);
+  // Declared repetition and gating are chips on the step that declares them.
+  expect(graph.steps.map((step) => step.chips)).toEqual([[], ['↻ ≤ 2 retries'], ['when'], []]);
+
+  // Session-shaped: group sources are inputs feeding the judgment; drift-shaped: samples feed the drift check. No steps.
+  const session = definitionGraph(specOf('session-quality@1.0.0'));
+  expect(session.inputs).toEqual([
+    { key: 'input:outcomes', id: 'outcomes', kind: 'source', detail: 'verifiers.ticket-policy.requirements.policy-followed.outcome' },
+    { key: 'input:tickets', id: 'tickets', kind: 'source', detail: 'verifiers.ticket-policy.inputs.ticket' }
+  ]);
+  expect(session.edges).toEqual([{ source: 'input:outcomes', target: 'req:all-passed' }]);
+  const drift = definitionGraph(specOf('latency-drift@1.0.0'));
+  expect(drift.inputs).toEqual([{ key: 'input:latency', id: 'latency', kind: 'samples', detail: 'latency_ms' }]);
+  expect(drift.requirements).toEqual([{ key: 'req:latency-stable', id: 'latency-stable', kind: 'drift', statement: 'Latency stays within its fitted baseline' }]);
+  expect(drift.edges).toEqual([{ source: 'input:latency', target: 'req:latency-stable' }]);
+
+  // Layout: columns follow dependency rank, parallel steps share a column, and no two nodes overlap.
+  const laid = layoutDefinition(graph);
+  const at = (key: string) => laid.nodes.find((node) => node.key === key)!;
+  expect(at('step:score').x).toBe(at('step:classify').x);
+  expect(at('input:ticket').x).toBeLessThan(at('step:read-photo').x);
+  expect(at('step:read-photo').x).toBeLessThan(at('step:classify').x);
+  expect(at('step:classify').x).toBeLessThan(at('step:summarise').x);
+  expect(at('step:summarise').x).toBeLessThan(at('req:policy-followed').x);
+  for (const a of laid.nodes)
+    for (const b of laid.nodes)
+      if (a.key < b.key) expect(a.x + a.width <= b.x || b.x + b.width <= a.x || a.y + a.height <= b.y || b.y + b.height <= a.y, `${a.key} overlaps ${b.key}`).toBe(true);
+  // Every edge leaves its source's right side and ends on its target's left boundary, in orthogonal segments.
+  for (const edge of laid.edges) {
+    const [first, last] = [edge.points[0], edge.points.at(-1)!];
+    const [source, target] = [at(edge.source), at(edge.target)];
+    expect(first[0], edge.id).toBe(source.x + source.width);
+    expect(last[0], edge.id).toBe(target.x);
+    expect(last[1] > target.y && last[1] < target.y + target.height, edge.id).toBe(true);
+    edge.points.slice(1).forEach((point, index) => expect(point[0] === edge.points[index][0] || point[1] === edge.points[index][1], edge.id).toBe(true));
+  }
+  // A fan-in shares one final run, so its target has one port per producer lane, and each label is drawn once.
+  expect(laid.edges.filter((edge) => edge.labelAt).map((edge) => edge.label).sort()).toEqual(['label', 'summary', 'text', 'units']);
+  expect(laid.stages.map((stage) => stage.text)).toEqual(['Inputs', 'Steps', 'After all steps']);
+  // A simple graph stays compact, and a Verifier without steps names its last stage Requirements.
+  const simple = layoutDefinition(drift);
+  expect(simple.stages.map((stage) => stage.text)).toEqual(['Inputs', 'Requirements']);
+  expect(simple.height).toBeLessThan(100);
+  expect(simple.width).toBeLessThan(laid.width / 2);
+  // A single chain of steps stacks vertically in one column.
+  const chained = layoutDefinition(
+    definitionGraph({ inputs: { doc: { type: 'json' } }, steps: ['a', 'b', 'c'].map((id, index, ids) => ({ id, action: { kind: 'code', entrypoint: id, inputs: { from: index ? `steps.${ids[index - 1]}.output` : 'inputs.doc' }, source: { inline: '' } } })) } as never)
+  );
+  const [a, b, c] = ['step:a', 'step:b', 'step:c'].map((key) => chained.nodes.find((node) => node.key === key)!);
+  expect([b.x, c.x]).toEqual([a.x, a.x]);
+  expect(a.y + a.height).toBeLessThan(b.y);
+  expect(b.y + b.height).toBeLessThan(c.y);
+  // Long text never widens a node past its cap, and an undeclared reference draws no edge.
+  const long = definitionGraph({ inputs: { ['x'.repeat(200)]: { type: 'json' } }, requirements: [{ id: 'r', statement: 'y'.repeat(500), check: { kind: 'assert', path: 'inputs.missing', operator: 'is_null' } }] } as never);
+  expect(long.edges).toEqual([]);
+  expect(Math.max(...layoutDefinition(long).nodes.map((node) => node.width))).toBeLessThanOrEqual(340);
+});
+
+test('verifier graph is read-only, selectable and keyboard and zoom operable', async () => {
+  const graph = definitionGraph(specOf('ticket-policy@1.1.0'));
+  const shown = render(VerifierGraph, { graph });
+  const flow = () => shown.container.querySelector('.svelte-flow__viewport') as HTMLElement;
+  await waitFor(() => expect(flow()).toBeInTheDocument());
+  const node = (key: string) => shown.container.querySelector(`[data-node="${key}"]`) as HTMLButtonElement;
+  const positions = () => [...shown.container.querySelectorAll<HTMLElement>('.svelte-flow__node')].map((each) => each.style.transform);
+  const placed = positions();
+
+  // Stage headings, every node, an arrowhead per dependency and each output label.
+  expect([...shown.container.querySelectorAll('[data-stage]')].map((stage) => stage.textContent)).toEqual(['Inputs', 'Steps', 'After all steps']);
+  expect([...shown.container.querySelectorAll('[data-node]')].map((each) => each.getAttribute('data-node')).sort()).toEqual(
+    [...graph.inputs, ...graph.steps, ...graph.steps.flatMap((step) => step.requirements), ...graph.requirements].map((each) => each.key).sort()
+  );
+  expect(shown.container.querySelectorAll('[data-edge] path.arrow')).toHaveLength(graph.edges.length);
+  expect([...shown.container.querySelectorAll('[data-edge] text')].map((label) => label.textContent).sort()).toEqual(['label', 'summary', 'text', 'units']);
+  expect(node('step:classify')).toHaveTextContent('classifyagent needs read-photo support@1.0.0 when');
+  expect(node('step:score')).toHaveTextContent('↻ ≤ 2 retries');
+  expect(node('req:has-answer')).toHaveTextContent('The ticket carries an answer');
+
+  // Definition only: no execution word, outcome glyph or state attribute anywhere in the drawing.
+  expect(shown.container.textContent).not.toMatch(/passed|failed|running|waiting|skipped|inconclusive|not judged|✓|✕/);
+  expect(shown.container.querySelector('[data-outcome], [data-status], .failed, .dim, .bad')).toBeNull();
+  expect(shown.container).toHaveTextContent('No execution state is shown.');
+
+  // No authoring gesture: nothing is draggable, connectable or selectable for Svelte Flow, and Delete removes nothing.
+  expect(shown.container.querySelector('.svelte-flow__node.draggable, .svelte-flow__node.selectable, .svelte-flow__node.connectable, .svelte-flow__handle.connectable, .svelte-flow__edge.selectable')).toBeNull();
+  await fireEvent.click(node('step:classify'));
+  for (const key of ['Delete', 'Backspace']) await fireEvent.keyDown(node('step:classify'), { key });
+  expect(shown.container.querySelectorAll('[data-node]')).toHaveLength(9);
+  expect(shown.container.querySelectorAll('[data-edge]')).toHaveLength(graph.edges.length);
+  expect(positions()).toEqual(placed);
+
+  // Clicking selects one node and marks its own dependencies; layout does not move.
+  expect(node('step:classify')).toHaveAttribute('aria-pressed', 'true');
+  expect(shown.container.querySelectorAll('[aria-pressed="true"]')).toHaveLength(1);
+  const hot = () => [...shown.container.querySelectorAll('[data-edge].hot')].map((edge) => edge.getAttribute('data-edge'));
+  expect(hot()).toEqual(['input:ticket->step:classify', 'step:read-photo->step:classify', 'step:classify->step:summarise']);
+  await fireEvent.click(node('req:classified'));
+  expect(node('req:classified')).toHaveAttribute('aria-pressed', 'true');
+  expect(node('step:classify')).toHaveAttribute('aria-pressed', 'false');
+  expect(positions()).toEqual(placed);
+
+  // Arrow keys move by layout position; the moved-to node is selected and focused.
+  node('input:ticket').focus();
+  await fireEvent.keyDown(node('input:ticket'), { key: 'ArrowRight' });
+  expect(node('step:read-photo')).toHaveAttribute('aria-pressed', 'true');
+  expect(document.activeElement).toBe(node('step:read-photo'));
+  await fireEvent.keyDown(node('step:read-photo'), { key: 'ArrowRight' });
+  expect(document.activeElement).toBe(node('step:classify'));
+  await fireEvent.keyDown(node('step:classify'), { key: 'ArrowDown' });
+  expect(document.activeElement).toBe(node('req:classified'));
+  await fireEvent.keyDown(node('req:classified'), { key: 'ArrowUp' });
+  expect(document.activeElement).toBe(node('step:classify'));
+  await fireEvent.keyDown(node('step:classify'), { key: 'ArrowLeft' });
+  expect(document.activeElement).toBe(node('step:read-photo'));
+  // Clicking the empty canvas clears the selection.
+  await fireEvent.click(shown.container.querySelector('.svelte-flow__pane') as Element);
+  expect(shown.container.querySelector('[aria-pressed="true"]')).toBeNull();
+
+  // Zoom in, out, to 100% and to fit, within 60%–160%; zoom never moves a node.
+  const zoom = within(shown.container).getByRole('group', { name: 'Zoom' });
+  const percent = () => zoom.querySelector('[data-zoom]')?.textContent;
+  expect(percent()).toBe('100%');
+  await fireEvent.click(within(zoom).getByRole('button', { name: 'Zoom in' }));
+  expect(percent()).toBe('120%');
+  await waitFor(() => expect(flow().style.transform).toContain('scale(1.2)'));
+  for (let presses = 0; presses < 3; presses += 1) await fireEvent.click(within(zoom).getByRole('button', { name: 'Zoom in' }));
+  expect(percent()).toBe('160%');
+  expect(within(zoom).getByRole('button', { name: 'Zoom in' })).toBeDisabled();
+  for (let presses = 0; presses < 8; presses += 1) await fireEvent.click(within(zoom).getByRole('button', { name: 'Zoom out' }));
+  expect(percent()).toBe('60%');
+  expect(within(zoom).getByRole('button', { name: 'Zoom out' })).toBeDisabled();
+  await fireEvent.click(within(zoom).getByRole('button', { name: '100%' }));
+  expect(percent()).toBe('100%');
+  await fireEvent.click(within(zoom).getByRole('button', { name: 'Fit' }));
+  await waitFor(() => expect(flow().style.transform).toBe('translate(16px, 12px) scale(1)'));
+  expect(positions()).toEqual(placed);
+  shown.unmount();
+
+  // A narrow screen fits no lower than 60% and pans: moving to an off-screen node brings it into view.
+  const width = vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(360);
+  const narrow = render(VerifierGraph, { graph });
+  await waitFor(() => expect(narrow.container.querySelector('.svelte-flow__viewport')).toBeInTheDocument());
+  const view = narrow.container.querySelector('.svelte-flow__viewport') as HTMLElement;
+  expect(narrow.container.querySelector('[data-zoom]')).toHaveTextContent('60%');
+  expect(view.style.transform).toBe('translate(16px, 12px) scale(0.6)');
+  const far = narrow.container.querySelector('[data-node="step:summarise"]') as HTMLButtonElement;
+  const from = narrow.container.querySelector('[data-node="step:classify"]') as HTMLButtonElement;
+  from.focus();
+  await fireEvent.keyDown(from, { key: 'ArrowRight' });
+  expect(document.activeElement).toBe(far);
+  const panned = Number(/translate\((-?[\d.]+)px/.exec(view.style.transform)?.[1]);
+  const centre = layoutDefinition(graph).targets.find((target) => target.key === 'step:summarise')!.x * 0.6 + panned;
+  expect(centre).toBeGreaterThan(0);
+  expect(centre).toBeLessThan(360);
+  width.mockRestore();
+});
+
+test('verifier definition and bindings stay truthful across hosts and states', async () => {
+  // One exact Card read yields the authored spec and its graph; no other read is planned.
+  const reads = fixtureRecording();
+  const definition = await loadVerifierDefinition({ cardRef: VERIFIER }, { executor: reads.executor });
+  expect(reads.calls.map((call) => call.request)).toEqual([{ op: 'cards.get_by_ref', card_ref: VERIFIER }]);
+  expect(definition.result).toEqual({ state: 'populated', data: { spec: verifiers['ticket-policy@1.1.0'].spec, graph: definitionGraph(specOf('ticket-policy@1.1.0')) } });
+
+  // The page region: description, graph, and the authored declaration of the selected node.
+  const shown = render(VerifierDefinition, definition);
+  await waitFor(() => expect(shown.container.querySelector('[data-node="step:score"]')).toBeInTheDocument());
+  expect(shown.container).toHaveTextContent('A support ticket follows the refund policy.');
+  const declaration = () => within(shown.container).getByRole('region', { name: /Declaration|Input|Step|Requirement/ });
+  expect(declaration()).toHaveTextContent('Select an input, step or requirement in the graph to read its declaration.');
+  const steps = specOf('ticket-policy@1.1.0').steps!;
+  await fireEvent.click(shown.container.querySelector('[data-node="step:score"]') as Element);
+  expect(within(shown.container).getByRole('region', { name: 'Step score' }).querySelector('pre')?.textContent).toBe(fmtYaml(steps[1]));
+  expect(declaration()).toHaveTextContent('retries: 2');
+  await fireEvent.click(shown.container.querySelector('[data-node="req:classified"]') as Element);
+  const attached = within(shown.container).getByRole('region', { name: 'Requirement classified' });
+  expect(attached).toHaveTextContent('judged after step classify');
+  expect(attached.querySelector('pre')?.textContent).toBe(fmtYaml(steps[2].requirements![0]));
+  await fireEvent.click(shown.container.querySelector('[data-node="req:has-answer"]') as Element);
+  expect(within(shown.container).getByRole('region', { name: 'Requirement has-answer' })).toHaveTextContent('judged after every step');
+  await fireEvent.click(shown.container.querySelector('[data-node="input:photo"]') as Element);
+  expect(within(shown.container).getByRole('region', { name: 'Input photo' }).querySelector('pre')?.textContent).toBe(fmtYaml({ photo: { type: 'media', formats: ['png', 'jpeg'] } }));
+  // Nothing on a definition links to results or edits the Verifier.
+  expect(shown.container.querySelector('a, input, textarea, select, [contenteditable]')).toBeNull();
+  expect(shown.container.textContent).not.toMatch(/Results in Verify/);
+
+  // Denied, missing, failed and loading reads say so; another kind of Card is refused, never drawn.
+  for (const state of ['denied', 'error'] as const) {
+    const refused = await loadVerifierDefinition({ cardRef: VERIFIER }, { executor: stateExecutors[state] });
+    expect(refused.result.state).toBe(state);
+    const empty = render(VerifierDefinition, refused);
+    expect(empty.container.querySelector('[data-node]')).toBeNull();
+    expect(empty.container).toHaveTextContent((refused.result as { problem: { code: string } }).problem.code);
+  }
+  expect((await loadVerifierDefinition({ cardRef: { ...VERIFIER, version: '9.9.9' } }, { executor: fixtureExecutor })).result).toEqual({ state: 'error', problem: notFound });
+  expect(render(VerifierDefinition, { input: { cardRef: VERIFIER }, result: { state: 'loading' } }).container).toHaveTextContent('Loading the definition of ticket-policy@1.1.0');
+  const wrongKind = await loadVerifierDefinition({ cardRef: VERIFIER }, { executor: recording(() => ({ ok: true, value: agent })).executor });
+  expect(wrongKind.result).toMatchObject({ state: 'error', problem: { code: 'WYRD_SPEC_400_VALIDATION', detail: 'ticket-policy@1.1.0 is a Agent Card, not a Verifier' } });
+  for (const name of ['VerifierDefinition', 'RunsOn'] as const) {
+    expect(validatePanel(name, { cardRef: PROMPT })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+    expect(validatePanel(name, { cardRef: { ...VERIFIER, version: 'latest' } })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  }
+
+  // Runs on: inbound owners, each read for the bindings that pin exactly this version.
+  const owners = fixtureRecording();
+  const runsOn = await loadRunsOn({ cardRef: VERIFIER }, { executor: owners.executor });
+  expect(owners.calls.map((call) => call.request)).toEqual([{ op: 'cards.get_by_ref', card_ref: VERIFIER }, { op: 'cards.get_by_ref', card_ref: SERVICE }]);
+  expect(runsOn.result).toEqual({
+    state: 'populated',
+    data: [{ ref: SERVICE, bindings: { state: 'populated', data: [{ when: 'explicit invocation only' }, { subject: 'agent', when: 'schedule 0 * * * * Europe/Berlin' }] } }]
+  });
+  const onaction = vi.fn();
+  const rail = render(RunsOn, { ...runsOn, onaction });
+  expect(rail.container).toHaveTextContent('the whole Card · explicit invocation only');
+  expect(rail.container).toHaveTextContent('component agent · schedule 0 * * * * Europe/Berlin');
+  // The Service's binding of the older version is not this version's.
+  expect(rail.container).not.toHaveTextContent('group end');
+  await fireEvent.click(within(rail.container).getByRole('button', { name: `${SERVICE.name}@${SERVICE.version}` }));
+  expect(onaction).toHaveBeenLastCalledWith({ name: 'card.open', input: { card_ref: SERVICE } });
+  expect(validateIntent('RunsOn', onaction.mock.lastCall?.[0])).toEqual(onaction.mock.lastCall?.[0]);
+  // The older version is bound at group end; a version nothing binds says so.
+  const older = await loadRunsOn({ cardRef: { ...VERIFIER, version: '1.0.0' } }, { executor: fixtureRecording((request) => (request.op === 'cards.get_by_ref' && request.card_ref.version === '1.0.0' && request.card_ref.kind === 'Verifier' ? { ok: true, value: { ...verifiers['ticket-policy@1.0.0'], relationships: { inbound_refs: [{ ref: SERVICE }] } } as never } : undefined)).executor });
+  expect(older.result).toMatchObject({ data: [{ bindings: { data: [{ when: 'group end after 10m' }] } }] });
+  const unbound = await loadRunsOn({ cardRef: SESSION_VERIFIER }, { executor: fixtureExecutor });
+  expect(unbound.result).toEqual({ state: 'empty', data: [], reason: 'No binding runs this exact version.' });
+  expect(render(RunsOn, unbound).container).toHaveTextContent('No binding runs this exact version.');
+  // A refused owner keeps its row; a refused Verifier issues no owner read.
+  const refusedOwner = await loadRunsOn({ cardRef: VERIFIER }, { executor: fixtureRecording((request) => (request.op === 'cards.get_by_ref' && request.card_ref.kind === 'Service' ? { ok: false, problem: denied } : undefined)).executor });
+  expect(refusedOwner.result).toEqual({ state: 'populated', data: [{ ref: SERVICE, bindings: { state: 'denied', problem: denied } }] });
+  expect(render(RunsOn, refusedOwner).container).toHaveTextContent(denied.code);
+  const refusedVerifier = recording(() => ({ ok: false, problem: denied }));
+  expect((await loadRunsOn({ cardRef: VERIFIER }, { executor: refusedVerifier.executor })).result.state).toBe('denied');
+  expect(ops(refusedVerifier.calls)).toEqual(['cards.get_by_ref']);
+  expect(service.spec).toMatchObject({ verified_by: [{}, {}] });
+
+  // The same loader serves an MCP host through the existing cards.get tool, with the same graph.
+  const app = { callServerTool: vi.fn(async () => ({ content: [], structuredContent: { card: verifiers['latency-drift@1.0.0'] } })) };
+  const viaMcp = await loadVerifierDefinition({ cardRef: DRIFT_VERIFIER }, { executor: mcpExecutor(app as never) });
+  expect(app.callServerTool).toHaveBeenCalledWith({ name: 'cards.get', arguments: { card_ref: DRIFT_VERIFIER } }, { signal: undefined });
+  expect(viaMcp.result).toMatchObject({ state: 'populated', data: { graph: definitionGraph(specOf('latency-drift@1.0.0')) } });
+
+  // Both components are placeable in a view document, and the shared renderer draws them from it.
+  const doc = (version: string) => ({
+    version: 'wyrd.view/v1',
+    catalogId: 'wyrd.ui/v1',
+    range: RANGE,
+    panels: [{ id: 'definition', component: 'VerifierDefinition', input: { cardRef: { ...VERIFIER, version } } }, { id: 'runs-on', component: 'RunsOn', input: { cardRef: { ...VERIFIER, version } } }]
+  });
+  expect(validateView(doc('1.1.0'))).toMatchObject({ panels: [{ component: 'VerifierDefinition' }, { component: 'RunsOn' }] });
+  expect(catalog.components.VerifierDefinition.states).toEqual(['populated', 'denied', 'error', 'loading']);
+  expect(catalog.components.RunsOn.emits.map((action) => action.name)).toEqual(['card.open']);
+  const placed = render(WyrdView, { doc: doc('1.1.0'), executor: fixtureExecutor });
+  await waitFor(() => expect(placed.container.querySelector('[data-node="step:summarise"]')).toBeInTheDocument());
+  expect(placed.container).toHaveTextContent('component agent · schedule 0 * * * * Europe/Berlin');
+  placed.unmount();
+
+  // A replaced version supersedes its in-flight read; the late old definition never renders.
+  const pending: ((result: WireResult) => void)[] = [];
+  const held = recording(() => new Promise<WireResult>((resolve) => pending.push(resolve)));
+  const one = (version: string) => ({ ...doc(version), panels: [doc(version).panels[0]] });
+  const view = render(WyrdView, { doc: one('1.0.0'), executor: held.executor });
+  await waitFor(() => expect(held.calls).toHaveLength(1));
+  await view.rerender({ doc: one('1.1.0'), executor: held.executor });
+  await waitFor(() => expect(held.calls).toHaveLength(2));
+  expect(held.calls[0].signal?.aborted).toBe(true);
+  pending[1]({ ok: true, value: verifiers['ticket-policy@1.1.0'] });
+  await waitFor(() => expect(view.container).toHaveTextContent('A support ticket follows the refund policy.'));
+  pending[0]({ ok: true, value: verifiers['ticket-policy@1.0.0'] });
+  await tick();
+  expect(view.container).not.toHaveTextContent('A support ticket carries an answer.');
+  expect(view.container.querySelector('[data-node="step:summarise"]')).toBeInTheDocument();
 });

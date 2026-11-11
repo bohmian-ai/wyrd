@@ -134,6 +134,9 @@ const promptRef = CardRefSchema.extend({ kind: z.literal('Prompt') });
 /** The input of a Prompt component. */
 export const PromptInputSchema = z.object({ cardRef: promptRef }).strict();
 
+/** The input of a Verifier component: one exact Verifier Card. */
+export const VerifierInputSchema = z.object({ cardRef: CardRefSchema.extend({ kind: z.literal('Verifier') }) }).strict();
+
 /** The input of `VersionDiff`: one exact Prompt and another registered version; absent, the version before it. */
 export const VersionDiffInputSchema = z
   .object({ cardRef: promptRef, otherVersion: exactVersion.optional() })
@@ -514,6 +517,20 @@ export const components = {
         completion: 'host-navigation'
       }
     }
+  },
+  VerifierDefinition: {
+    description:
+      'An exact Verifier as declared: its description, the read-only graph of its inputs, steps, attached and whole-Verifier requirements with their declared dependencies, and the authored declaration of the selected node. No execution state.',
+    input: VerifierInputSchema,
+    states: ['populated', 'denied', 'error', 'loading'],
+    emits: {}
+  },
+  RunsOn: {
+    description:
+      "The Services and Agents whose bindings pin an exact Verifier version, from its server-derived inbound relationships, with each binding's subject and when it runs.",
+    input: VerifierInputSchema,
+    states: ['populated', 'empty', 'denied', 'error', 'loading'],
+    emits: { 'card.open': openCard }
   },
   StatStrip: {
     description:

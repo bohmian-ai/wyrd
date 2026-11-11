@@ -10,12 +10,14 @@ import {
   type PromptMessagesProps,
   type PromptVariablesProps,
   type RelationshipListProps,
+  type RunsOnProps,
   type UsedByProps,
+  type VerifierDefinitionProps,
   type VersionDiffProps
 } from 'wyrd-ai-ui/loaders';
 import { nodeExecutor } from 'wyrd-ai-ui/node';
 import { reject } from '$lib/server/auth/session';
-import { CARD_TABS, PROMPT_TABS } from '$lib/cards-host';
+import { CARD_TABS, PROMPT_TABS, VERIFIER_TABS } from '$lib/cards-host';
 import type { PageServerLoad } from './$types';
 
 /**
@@ -33,7 +35,7 @@ export const load: PageServerLoad = async ({ locals, url, request }) => {
     return { problem: wyrdProblem('validation', `The Card URL ${issue.path.join('.') || 'reference'}: ${issue.message}`) };
   }
   const cardRef = parsed.data;
-  const tabs = cardRef.kind === 'Prompt' ? PROMPT_TABS : CARD_TABS;
+  const tabs = cardRef.kind === 'Prompt' ? PROMPT_TABS : cardRef.kind === 'Verifier' ? VERIFIER_TABS : CARD_TABS;
   const tab = tabs.find((each) => each.id === url.searchParams.get('tab'))?.id ?? 'overview';
   const compare = url.searchParams.get('compare') ?? undefined;
   const session = locals.browserSession ?? reject('unauthenticated');
@@ -48,6 +50,10 @@ export const load: PageServerLoad = async ({ locals, url, request }) => {
   if (tab === 'versions')
     return { cardRef, tab, compare, header, diff: (await panel('VersionDiff', compare ? { cardRef, otherVersion: compare } : one)) as VersionDiffProps | Problem };
   const [facts, relationships] = (await Promise.all([panel('CardFacts', one), panel('RelationshipList', one)])) as [CardFactsProps, RelationshipListProps];
+  if (cardRef.kind === 'Verifier') {
+    const [definition, runsOn] = (await Promise.all([panel('VerifierDefinition', one), panel('RunsOn', one)])) as [VerifierDefinitionProps, RunsOnProps];
+    return { cardRef, tab, compare, header, facts, relationships, verifier: { definition, runsOn } };
+  }
   if (cardRef.kind !== 'Prompt') return { cardRef, tab, compare, header, facts, relationships };
   const [messages, variables, usedBy, diff] = (await Promise.all([
     panel('PromptMessages', one),

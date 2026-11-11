@@ -1,7 +1,8 @@
 <!--
   One exact Card version: breadcrumb, header, then the selected tab. Every Card has
   Overview (facts and relationships), Files and YAML; a Prompt adds its
-  authored definition, variables, using Agents and version comparison. The
+  authored definition, variables, using Agents and version comparison; a
+  Verifier's overview is its declared graph and where that version runs. The
   URL holds the exact reference, tab and comparison, so every navigation
   keeps the selected version until the reader picks another.
 -->
@@ -17,7 +18,9 @@
     PromptMessages,
     PromptVariables,
     RelationshipList,
+    RunsOn,
     UsedBy,
+    VerifierDefinition,
     VersionDiff,
     type ActionIntent,
     type ActionState,
@@ -32,6 +35,13 @@
   let actions = $state<Record<string, ActionState>>({});
   /** A Prompt records no telemetry; its primary action opens the first Agent that uses it. */
   const agent = $derived(data.prompt?.usedBy.result.state === 'populated' ? data.prompt.usedBy.result.data[0]?.ref : undefined);
+
+  /** The newest listed version of a Verifier, when the reader is viewing an older one. */
+  const newer = $derived.by(() => {
+    const versions = data.verifier && data.header?.result.state === 'populated' ? data.header.result.data.versions : undefined;
+    const newest = versions?.state === 'populated' ? versions.data.items[0]?.version : undefined;
+    return newest !== undefined && newest !== data.cardRef?.version ? newest : undefined;
+  });
 
   /** Navigating to another version clears this version's content until the new one loads. */
   const switching = $derived.by(() => {
@@ -98,7 +108,12 @@
   {:else if data.facts && data.relationships}
     <div class="content columns">
       <div class="main">
-        {#if data.prompt}
+        {#if data.verifier}
+          {#if newer}
+            <p class="note" role="note">You are viewing {data.cardRef?.version}; the newest registered version is {newer}. Viewing a version changes nothing: each binding pins the exact version it runs.</p>
+          {/if}
+          <VerifierDefinition {...data.verifier.definition} />
+        {:else if data.prompt}
           <PromptMessages {...data.prompt.messages} />
           <PromptVariables {...data.prompt.variables} />
           <UsedBy {...data.prompt.usedBy} {actions} onaction={onaction('UsedBy')} />
@@ -108,8 +123,9 @@
         {/if}
       </div>
       <aside>
+        {#if data.verifier}<RunsOn {...data.verifier.runsOn} {actions} onaction={onaction('RunsOn')} />{/if}
         <RelationshipList {...data.relationships} {actions} onaction={onaction('RelationshipList')} />
-        {#if data.prompt}<CardFacts {...data.facts} />{/if}
+        {#if data.prompt || data.verifier}<CardFacts {...data.facts} />{/if}
       </aside>
     </div>
   {/if}
@@ -171,6 +187,16 @@
   }
   aside {
     gap: 16px;
+  }
+  .note {
+    margin: 0;
+    border: 1px solid var(--border);
+    border-left: 2px solid var(--declare);
+    border-radius: var(--r);
+    padding: 8px 12px;
+    background: var(--surface);
+    color: var(--text);
+    font: 13px/1.5 var(--font-sans);
   }
   @media (max-width: 1023px) {
     .columns {

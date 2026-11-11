@@ -284,7 +284,7 @@ generated TypeScript type, evidence).
 
 | Acceptance criterion | Implementation evidence | Verification evidence | Result |
 |---|---|---|---|
-| REQ-003/005/007/011/018/022/033; AC-025; INV-004 | `wyrd-testing/src/bin/capacity/verification/run.rs` reports `gateway.phase.*`/`gateway.wait.*` with actual counts from server histograms; assertion steps mark them inapplicable | `verification::run::tests::diagnostics_include_gateway_phases_and_waits` | PASS |
+| REQ-003/005/007/011/018/022/033; AC-025; INV-004 | Diagnostics: `wyrd-testing/src/bin/capacity/verification/run.rs` reports `gateway.phase.*`/`gateway.wait.*` with actual counts; assertion steps mark them inapplicable. Agent fixes: only the costs the saved CPU capture localized (`validator_for` 12.81%/15.67%, `check_output_schema` 4.49%/6.43% of sampled server CPU) were reduced (`dc4c75e81`). The remaining research candidates (`gateway/caller.rs::NativeCall::project` typed→`Value` encode, typed answer decode, Prompt clone in `blocks/agent.rs::bind`) were inspected: one encode and one decode each, no redundant copy found, and none is localized by saved evidence | `verification::run::tests::diagnostics_include_gateway_phases_and_waits` PASS. Attributable gains: NOT VERIFIED; requires the authorized bounded measurement | INCOMPLETE |
 | REQ-020/021/024/032; AC-025 | `skald-agent/src/structured.rs` and `skald-spec/src/prompt.rs` reuse preparation keyed by the exact effective schema; `vala-verify/src/blocks.rs` keeps declared Verdict validation and data bounds | `structured::tests::prepared_schema_reuse_tracks_effective_schema`; `structured_output::{structured_output_validates_the_bound_schema, structured_output_validates_a_replaced_schema, structured_output_repairs_every_encoding}`; `blocks::tests::{prepared_verdict_keeps_validation_and_data_bounds, verdict_data_keeps_its_schema_resource}`; `verifier_building_blocks::{invalid_judge_verdicts_are_inconclusive, judge_repairs_an_invalid_verdict, custom_verdict_data_survives_readback}` | PASS |
 | REQ-028–030; AC-023 | `gateway/usage.rs::GatewayUsage::admit` (atomic under the tenant map lock), `ledger.rs::GatewayLedger::{admit,settle}` synchronous, `invocation.rs::admit_call` serves only the cached snapshot; limit refusal codes unchanged | `pg_invocation_tests::warm_governance_uses_local_reservations_without_database_waits` (all usage tables held `SHARE` until every admitted call answered 200); `usage::tests::local_admission_spends_headroom_once_per_tenant`; journey `resilience::gateway_cached_governance_answers_before_background_accounting` | PASS |
 | REQ-030–031; AC-024 | Migration `20261111000000_gateway_usage_contributions.sql` (absolute per-server window rows, leased concurrency rows); `wyrd-sql/src/queries/gateway_admission.rs::sync_gateway_usage` (one tenant transaction, fenced entries); `snapshots.rs` miss/listener-reset queue background reloads; 503 `WYRD_SERVER_503_SERVICE_UNAVAILABLE` with `{}` details on missing/stale/full state | `pg_invocation_tests::background_usage_reconciles_retries_and_remote_updates` (refused flush retried; uncertain replay adds nothing; servers' tokens accumulate 15→30; a deadline-ended call frees concurrency); `pg_invocation_tests::usage_cache_bounds_staleness_restarts_and_policy_changes` (cold 503 before dispatch then background recovery; restart sees committed concurrency; remote policy change applies after reload); `usage::tests::budget_reservations_count_once_across_refreshes`; `snapshots::tests::snapshots_serve_only_while_listening_and_reload_in_background` | PASS |
@@ -319,4 +319,12 @@ change. The prior strict admission tables/functions remain (expand-and-
 contract). Unrelated untracked directories under `changes/active/` were not
 touched.
 
-Status: IMPLEMENTED — routes to `$wyrd-task-review`.
+Status: BLOCKED. Approach step 5 is not complete. Localizing the remaining
+Agent cost after schema reuse, and verifying independently attributable gains
+for each reduction, both require a new profiled and unprofiled run of the
+`direct-verify` steps. Under the bounded measurement protocol that needs
+maintainer authorization first. Requested experiment: `direct-verify-c1`,
+`direct-verify-c64`, `direct-verify-model-c1`, `direct-verify-model-c64`, all
+standard repetitions, unchanged fixture and recorder settings, plus separate
+CPU-only and heap-only server captures of the model steps. Steps 1–4 and their
+proofs are complete.

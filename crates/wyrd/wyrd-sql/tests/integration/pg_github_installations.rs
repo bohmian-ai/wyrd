@@ -4,10 +4,9 @@ mod pg_tests {
     //! Every case runs on real Postgres through tenant RLS connections: the
     //! conditional association, both uniqueness directions under concurrent
     //! claims, stale-transaction refusal, suspension, release and webhook
-    //! routing, and the GitHub/OIDC separation of shared login state.
-    //!
-    //! Skipped automatically when the database environment is unset so the
-    //! default suite stays credential-free.
+    //! routing, and the GitHub/OIDC separation of shared login state. The
+    //! `pg_` placement keeps them out of the credential-free lanes; without a
+    //! database they fail at fixture start rather than pass.
 
     use std::time::Duration;
 
@@ -30,12 +29,8 @@ mod pg_tests {
     };
     use wyrd_sql::row_types::auth::HumanConnectionBinding;
 
-    const HOST: &str = "github.example.com";
-
-    /// Skip when no database is configured, matching the sibling suites.
-    fn database_url() -> Option<String> {
-        std::env::var("WYRD_DATABASE_URL").ok()
-    }
+    /// The configured GitHub host every association in these cases uses.
+    const HOST: &str = "github.com";
 
     /// A repository selection entry.
     fn repo(id: u64) -> GithubRepositoryAccess {
@@ -126,9 +121,6 @@ mod pg_tests {
     /// Panics when any transition answers differently.
     #[tokio::test]
     async fn association_is_conditional_on_the_bound_slot_revision() {
-        if database_url().is_none() {
-            return;
-        }
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
 
@@ -210,9 +202,6 @@ mod pg_tests {
     /// Panics when another tenant takes or sees the installation.
     #[tokio::test]
     async fn installation_belongs_to_one_tenant_until_released() {
-        if database_url().is_none() {
-            return;
-        }
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant_a = fixture.data_tenant_id();
         let tenant_b = fixture
@@ -236,8 +225,9 @@ mod pg_tests {
             "B cannot release A's association"
         );
 
+        let observed = begin(&fixture, tenant_a).await;
         let mut conn = fixture.tenant_conn_for(tenant_a).await.expect("conn opens");
-        let suspended = set_github_installation_suspended(&mut conn, HOST, 21, true)
+        let suspended = set_github_installation_suspended(&mut conn, observed, true)
             .await
             .expect("suspend runs")
             .expect("the associated installation suspends");
@@ -248,18 +238,21 @@ mod pg_tests {
             "suspension keeps ownership"
         );
         assert!(
-            set_github_installation_suspended(&mut conn, HOST, 21, true)
+            set_github_installation_suspended(&mut conn, observed, false)
                 .await
-                .expect("suspend runs")
+                .expect("unsuspend runs")
                 .is_none(),
-            "an unchanged suspension writes nothing"
+            "an observation older than the applied one is refused"
         );
-        assert!(
-            set_github_installation_suspended(&mut conn, HOST, 99, true)
-                .await
-                .expect("suspend runs")
-                .is_none(),
-            "another installation is not suspended"
+        let again = set_github_installation_suspended(&mut conn, suspended.binding(), true)
+            .await
+            .expect("suspend runs")
+            .expect("an unchanged observation still advances the fence");
+        assert_eq!(again.revision, suspended.revision + 1);
+        assert_eq!(
+            (again.suspended_at, again.updated_at),
+            (suspended.suspended_at, suspended.updated_at),
+            "an unchanged state keeps its public timestamps"
         );
         conn.commit().await.expect("suspension commits");
         assert_eq!(route(21).await.expect("route resolves"), Some(tenant_a));
@@ -269,8 +262,9 @@ mod pg_tests {
             "a suspended installation stays claimed"
         );
 
+        let observed = begin(&fixture, tenant_a).await;
         let mut conn = fixture.tenant_conn_for(tenant_a).await.expect("conn opens");
-        let unsuspended = set_github_installation_suspended(&mut conn, HOST, 21, false)
+        let unsuspended = set_github_installation_suspended(&mut conn, observed, false)
             .await
             .expect("unsuspend runs")
             .expect("the installation unsuspends");
@@ -295,9 +289,6 @@ mod pg_tests {
     /// Panics when both or neither claim wins.
     #[tokio::test]
     async fn concurrent_claims_have_one_winner_in_both_directions() {
-        if database_url().is_none() {
-            return;
-        }
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant_a = fixture.data_tenant_id();
         let tenant_b = fixture
@@ -397,9 +388,6 @@ mod pg_tests {
     /// elevation, or the removal keeps or drops the wrong repositories.
     #[tokio::test]
     async fn slots_are_tenant_confined_and_track_removed_access() {
-        if database_url().is_none() {
-            return;
-        }
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant_a = fixture.data_tenant_id();
         let tenant_b = fixture
@@ -436,6 +424,7 @@ mod pg_tests {
         assert!(definer, "the routing lookup is SECURITY DEFINER");
         assert_eq!(config, vec!["search_path=pg_catalog, wyrd".to_owned()]);
 
+        let a_slot = begin(&fixture, tenant_a).await;
         let mut conn = fixture.tenant_conn_for(tenant_b).await.expect("conn opens");
         let operator = "SELECT coalesce(current_setting('app.operator', true), '')";
         let before: String = sqlx::query_scalar(operator)
@@ -467,7 +456,7 @@ mod pg_tests {
                 .is_none()
         );
         assert!(
-            set_github_installation_suspended(&mut conn, HOST, 41, true)
+            set_github_installation_suspended(&mut conn, a_slot, true)
                 .await
                 .expect("suspend runs")
                 .is_none()
@@ -479,13 +468,24 @@ mod pg_tests {
         assert_eq!(count, 0, "B sees no slot");
         conn.commit().await.expect("B commits");
 
+        let before = slot(&fixture, tenant_a).await.expect("A's slot");
         let mut conn = fixture.tenant_conn_for(tenant_a).await.expect("conn opens");
         assert!(
-            remove_github_repositories(&mut conn, HOST, 41, &["9".to_owned()])
+            remove_github_repositories(&mut conn, HOST, 41, &[])
                 .await
                 .expect("removal runs")
                 .is_none(),
-            "removing an unselected repository writes nothing"
+            "an empty removal writes nothing"
+        );
+        let fenced = remove_github_repositories(&mut conn, HOST, 41, &["9".to_owned()])
+            .await
+            .expect("removal runs")
+            .expect("an unselected removal still advances the fence");
+        assert_eq!(fenced.revision, before.revision + 1);
+        assert_eq!(
+            (fenced.repositories.0.clone(), fenced.updated_at),
+            (before.repositories.0.clone(), before.updated_at),
+            "an unchanged selection keeps its public timestamp"
         );
         let removed =
             remove_github_repositories(&mut conn, HOST, 41, &["1".to_owned(), "3".to_owned()])
@@ -498,6 +498,54 @@ mod pg_tests {
         assert_eq!(
             slot(&fixture, tenant_a).await.map(|row| row.repositories.0),
             Some(vec![repo(2)])
+        );
+    }
+
+    /// A signed removal of B fences a callback that read A+B before it,
+    /// though only A was selected: the stale callback is refused and A is
+    /// kept. Committed in the opposite order, the callback lands and the
+    /// removal then drops B.
+    ///
+    /// # Panics
+    /// Panics when the stale callback restores B or either order keeps the
+    /// wrong selection.
+    #[tokio::test]
+    async fn removal_fences_a_callback_that_read_the_removed_repository() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let remove_b = || async {
+            let mut conn = fixture.tenant_conn_for(tenant).await.expect("conn opens");
+            remove_github_repositories(&mut conn, HOST, 51, &["2".to_owned()])
+                .await
+                .expect("removal runs")
+                .expect("the removal applies");
+            conn.commit().await.expect("removal commits");
+        };
+        assert!(matches!(
+            associate(&fixture, tenant, fresh(), 51, &[repo(1)]).await,
+            GithubAssociationOutcome::Associated(_)
+        ));
+
+        let stale = begin(&fixture, tenant).await;
+        remove_b().await;
+        assert_eq!(
+            associate(&fixture, tenant, stale, 51, &[repo(1), repo(2)]).await,
+            GithubAssociationOutcome::Stale
+        );
+        assert_eq!(
+            slot(&fixture, tenant).await.map(|row| row.repositories.0),
+            Some(vec![repo(1)])
+        );
+
+        let current = begin(&fixture, tenant).await;
+        assert!(matches!(
+            associate(&fixture, tenant, current, 51, &[repo(1), repo(2)]).await,
+            GithubAssociationOutcome::Associated(_)
+        ));
+        remove_b().await;
+        assert_eq!(
+            slot(&fixture, tenant).await.map(|row| row.repositories.0),
+            Some(vec![repo(1)])
         );
     }
 
@@ -533,9 +581,6 @@ mod pg_tests {
     /// a valid one fails.
     #[tokio::test]
     async fn github_transactions_are_flow_principal_and_browser_bound() {
-        if database_url().is_none() {
-            return;
-        }
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant_a = fixture.data_tenant_id();
         let tenant_b = fixture

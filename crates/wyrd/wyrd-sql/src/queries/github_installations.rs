@@ -6,7 +6,8 @@
 //! a disconnect, reconnect or replacement can never restore the old
 //! association. The webhook writers ([`set_github_installation_suspended`],
 //! [`remove_github_repositories`]) and [`release_github_installation`] change
-//! only an associated slot and advance its revision. Every function runs on
+//! only an associated slot and advance its revision, which fences any
+//! callback or token result read at the previous one. Every function runs on
 //! the caller's RLS [`TenantConn`] and never commits, so a caller composes the
 //! write with its fence. The primary key and the
 //! `github_installations_one_tenant` unique index enforce one installation per
@@ -66,20 +67,24 @@ const ASSOCIATE_SQL: &str = concat!(
     columns!()
 );
 
-/// Record GitHub's suspension or unsuspension of the associated installation;
-/// an unchanged state writes nothing.
+/// Apply GitHub's observed suspension state to the associated slot at the
+/// observed revision, advancing the revision even when the state is
+/// unchanged; public timestamps change only with the state.
 const SUSPEND_SQL: &str = concat!(
     "UPDATE wyrd.github_installations
         SET revision = revision + 1,
-            suspended_at = CASE WHEN $3 THEN statement_timestamp() END,
-            updated_at = statement_timestamp()
-      WHERE host = $1 AND installation_id = $2 AND (suspended_at IS NULL) = $3
+            suspended_at = CASE WHEN $3 THEN COALESCE(suspended_at, statement_timestamp()) END,
+            updated_at = CASE WHEN (suspended_at IS NOT NULL) = $3 THEN updated_at
+                              ELSE statement_timestamp() END
+      WHERE connection_id = $1 AND revision = $2 AND installation_id IS NOT NULL
       RETURNING ",
     columns!()
 );
 
-/// Drop repositories GitHub removed from the associated installation; a
-/// removal touching no selected repository writes nothing.
+/// Drop repositories GitHub removed from the associated installation. Any
+/// nonempty removal advances the revision, so a callback that read a
+/// selection including them cannot restore one; `updated_at` changes only
+/// when the selection does.
 const REMOVE_REPOSITORIES_SQL: &str = concat!(
     "UPDATE wyrd.github_installations
         SET revision = revision + 1,
@@ -88,10 +93,11 @@ const REMOVE_REPOSITORIES_SQL: &str = concat!(
                   FROM jsonb_array_elements(repositories) WITH ORDINALITY AS kept(entry, ordinality)
                  WHERE NOT (entry->>'repository_id' = ANY($3))
             ), '[]'::jsonb),
-            updated_at = statement_timestamp()
-      WHERE host = $1 AND installation_id = $2
-        AND EXISTS (SELECT 1 FROM jsonb_array_elements(repositories) AS held(entry)
+            updated_at = CASE WHEN EXISTS (
+                    SELECT 1 FROM jsonb_array_elements(repositories) AS held(entry)
                      WHERE entry->>'repository_id' = ANY($3))
+                THEN statement_timestamp() ELSE updated_at END
+      WHERE host = $1 AND installation_id = $2 AND cardinality($3::text[]) > 0
       RETURNING ",
     columns!()
 );
@@ -167,7 +173,8 @@ pub struct GithubAssociation<'a> {
 /// Result of [`associate_github_installation`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GithubAssociationOutcome {
-    /// Associated or refreshed; the committed slot.
+    /// Associated or refreshed; the written slot, durable once the caller
+    /// commits.
     Associated(GithubInstallationRow),
     /// The slot changed since the transaction began.
     Stale,
@@ -266,24 +273,26 @@ pub async fn associate_github_installation(
     }
 }
 
-/// Record that GitHub suspended (`true`) or unsuspended (`false`) the
-/// tenant's associated installation `(host, installation_id)`.
+/// Apply GitHub's current suspension state (`true` suspended), read from
+/// GitHub after the slot was `observed`, to the tenant's associated slot.
 ///
-/// Suspension keeps the association, so the installation stays claimed.
-/// Returns the changed slot, or `None` when the slot is not associated with
-/// that installation or is already in that state.
+/// The write applies only while the slot is still at `observed`, and always
+/// advances the revision, so an older observation still in flight can never
+/// overwrite a newer one. Suspension keeps the association, so the
+/// installation stays claimed. Returns the written slot, or `None` when the
+/// slot changed since `observed` or is no longer associated; the caller
+/// discards that observation.
 ///
 /// # Errors
 /// Returns [`SqlError`] when Postgres rejects the update.
 pub async fn set_github_installation_suspended(
     conn: &mut TenantConn<'_>,
-    host: &str,
-    installation_id: i64,
+    observed: GithubSlotBinding,
     suspended: bool,
 ) -> Result<Option<GithubInstallationRow>, SqlError> {
     Ok(sqlx::query_as::<_, GithubInstallationRow>(SUSPEND_SQL)
-        .bind(host)
-        .bind(installation_id)
+        .bind(observed.connection_id)
+        .bind(observed.connection_revision)
         .bind(suspended)
         .fetch_optional(&mut **conn.transaction())
         .await?)
@@ -292,8 +301,10 @@ pub async fn set_github_installation_suspended(
 /// Drop `repository_ids` from the tenant's selection for the associated
 /// installation `(host, installation_id)`.
 ///
-/// Returns the changed slot, or `None` when the slot is not associated with
-/// that installation or selects none of those repositories.
+/// A nonempty removal advances the revision even when the selection holds
+/// none of those repositories, fencing a callback that read them. Returns
+/// the written slot, or `None` when the slot is not associated with that
+/// installation or `repository_ids` is empty.
 ///
 /// # Errors
 /// Returns [`SqlError`] when Postgres rejects the update.

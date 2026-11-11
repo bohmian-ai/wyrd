@@ -7,6 +7,11 @@
 //! [`GithubConnectionView`] is the only read shape. No request carries a
 //! tenant id, App key or provider host, and no view carries a code, token,
 //! secret or signing material.
+//!
+//! [`GithubConnectResponse`]: crate::github_connection::GithubConnectResponse
+//! [`GithubSetupQuery`]: crate::github_connection::GithubSetupQuery
+//! [`GithubCallbackQuery`]: crate::github_connection::GithubCallbackQuery
+//! [`GithubConnectionView`]: crate::github_connection::GithubConnectionView
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

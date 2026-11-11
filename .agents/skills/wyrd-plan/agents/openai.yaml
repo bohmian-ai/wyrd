@@ -1,4 +1,4 @@
 interface:
   display_name: "Wyrd Plan"
-  short_description: "Create small tasks from an approved spec"
-  default_prompt: "Use $wyrd-plan to turn this approved Wyrd spec into the minimum set of outcome-complete implementation tasks."
+  short_description: "Carry the agreed Wyrd flow into tasks and proof"
+  default_prompt: "Use $wyrd-plan with the approved spec and finalized design to write cohesive tasks carrying the agreed approach through real inputs, outputs, dependencies, and observable proof."

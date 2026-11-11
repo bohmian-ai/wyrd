@@ -1,5 +1,49 @@
 # Verification owners for the UI task packet
 
+## Revision 28 — current consolidated task ownership
+
+The active assignments are [Tasks 005–012](../plan.md), replacing the old
+component-family/page split. Their exact behavior-named selectors and current
+source-backed setup are authoritative for new work. Older task numbers below
+refer to their historical revision; they are not extra active assignments.
+
+The inspected current UI `package.json::test` builds `wyrd-ai-ui` and its App
+artifact, then runs Vitest. `ui-pages.integration.test.ts::startBff` launches
+actual `node build`; `humanSignIn` and the extended `serverTest` fixture drive
+Chromium through ordinary human auth with two tenants and a limited principal.
+The existing `development environment lifecycle` selector exercises `devFull`
+and owns actual launcher cleanup/failure proof. Extend those owners rather than
+introducing a second test server/browser/development environment.
+
+Before managed live component/page proofs, build SDK, testing addon and server
+through `mise run ts:build`, `mise run ts:build:testing`, and
+`mise run build:server` sequentially; install current workspace dependencies and
+Playwright Chromium through existing package/setup owners. Build the production
+UI with its package's `build` command; the actual BFF journey consumes `build/`.
+Task-local commands supply repository Postgres/migrations and existing
+`WYRD_UI_INTEGRATION=1`; the launcher lifecycle owns its own database instead.
+No app/test environment or selector API is added.
+
+Each new component keeps T1–T5, catalog/custom-app/MCP/action closure and individual
+gallery acceptance. Its first page adds T6 and normal `mise run dev:full`
+representative data/route acceptance in the same delivery task. Development
+startup and batch success alone do not prove the new feature's populated state.
+New012 owns production MCP/connected-agent acceptance; earlier T4 artifact tests
+remain required. The opt-in paid agent lane stays separate from default CI.
+
+Query History semantics, safe requirement-detail
+projection, Service charts, Change/repository contracts and shared MCP histogram
+projection are explicit prerequisites, not approved by consolidation. See task
+activation/stop conditions. Task005 has no separate artifact or derived-Prompt
+SDK/hydration gate: its Files tab reads registered files and its Prompt UI
+displays existing derived variables through the established UI host boundaries. Fixtures, disabled controls and skips cannot close
+those gates. Existing completed implementation/evidence remains unchanged.
+
+## Historical verification records
+
+The remainder preserves earlier inspected setups and revision decisions. Use
+the current task and source owner when an older command/status is superseded.
+
 This is a planning reference, not another test/build framework. Original source is committed main `8651b96fd`; revision-11 browser/agent ownership was inspected at `cbd4e97c8`. Commands were inspected, not executed in planning.
 
 ## Revision-10 remediation proof

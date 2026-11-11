@@ -1,10 +1,92 @@
 ---
 id: SPEC-wyrd-ui-main-integration
-revision: 27
+revision: 28
 status: approved
 ---
 
 # Migrate the Wyrd UI onto current main
+
+## Revision 28 — Components and their working UI ship together
+
+**Approved by the caller on 2026-11-06.** The caller approved replacing the
+remaining component-family/page split with eight consolidated delivery tasks.
+The component library and gallery remain the primary deliverable. Each new
+component is built with its first conventional UI consumer so the maintainer
+can validate the actual feature after running `mise run dev:full`.
+
+- **REQ-062 — Paired component and conventional delivery.** Each remaining
+  delivery slice owns its reusable typed components, portable loaders, catalog
+  and view rendering, Node/MCP executor and action-consumer closure, gallery
+  states, authenticated conventional routes and navigation, and representative
+  development data through the existing setup. A component stays in the shared
+  package; a page owns layout and host state only. Move a component to its first
+  real consumer rather than building a gallery-only remainder for a later page.
+  Reuse completed shell, Observe, view layout and browser-test owners.
+- **Completion.** `mise run dev:full` must expose the new feature at the task's
+  documented route, with enough real seeded data to exercise its populated
+  workflow. Seed through existing public registration/verification flows;
+  never write protected result tables or add a fixture fallback to production.
+  Preserve the existing workload and lifetime. A seed failure remains visible
+  and cannot count as populated acceptance. Gallery states remain fixtures.
+  This is a development validation promise, not persistence across launches.
+- **Exact visual authority.** Every remaining task directly links its exact
+  approved `.dc.html` canvases. A directory link or board name alone is
+  insufficient. Implementers follow those designs and stop for maintainer
+  clarification when a required visual detail is absent or contradictory; they
+  must not guess layouts or invent replacements.
+- **Proof and acceptance.** Each slice retains applicable T1–T5 component and
+  host proof, adds T6 for each assembled page, and records individual gallery
+  and page checkpoints on desktop/mobile in light/dark. Combining assignments
+  never combines distinct visual acceptance into one undifferentiated pass.
+  Human inspection is required before the next dependent slice. Correctness
+  tests precede acceptance; no separate whole-library completion gate prevents
+  assembling a page in the same task as its components.
+- **Cross-host delivery.** Custom-app and MCP portability are checked in every
+  consuming slice, including the actual built AppBridge artifact and applicable
+  supported actions. The final MCP task owns production resource/tool delivery
+  and the connected live-agent/browser journey over the complete library; it
+  is no longer a prerequisite for ordinary page implementation. Incremental
+  production MCP wiring does not establish complete-library shipment. Ask,
+  saved views and runtime A2UI remain deferred. Revision 21's deferred MCP
+  histogram projection remains a specific final-MCP prerequisite, not implied
+  to be implemented by the conventional Metrics page.
+- **Existing prerequisite limits remain.** This approval changes task
+  boundaries and sequencing. It does not approve Query History source/lifetime,
+  a non-sensitive outcome projection, Service chart persistence, or Change
+  Request/repository wire contracts. Conditional work
+  retains its outcome and owner but cannot execute the affected scenario or
+  claim completion until its separately approved prerequisite is available.
+  Missing prerequisites block affected completion and whole-library shipment,
+  not unrelated paired slices. No fixture or unavailable control closes them.
+
+**Caller clarification, 2026-11-06.** Task 005 delivers a Files tab on every
+Card page, listing that exact registered Card's already-recorded files through
+the existing authorized read. It also displays the Prompt variables the existing
+compiler already derives during decoding/registration. The added artifact and
+derived-Prompt SDK/hydration prerequisites were not approved and are removed;
+UI/shared-host wiring belongs to Task 005. Policy and Source are removed, with
+no separate approval or reconciliation project. This corrects the consolidation
+text; it does not expand registration, storage or variable-extraction behavior.
+
+The [current plan](plan.md) owns the eight tasks, exact transfer of the old
+assignments, component ownership and dependency edges. Completed Tasks 001–004
+and 027 and their immutable evidence retain their original meaning. The caller
+reports Task 004 complete; this planning revision does not rerun or manufacture
+implementation or human-acceptance evidence.
+
+Current-source reconciliation is required by INV-001: the authoritative Card
+catalog has twelve registrable kinds. Detailed requirements, steps and drift
+features belong to the sensitive `bifrost.verification.execution_outputs.output`,
+joined by exact result identity; `bifrost.verification.results` is payload-free.
+There is no `bifrost.drift.result_features` read. Earlier source inventories are
+historical, not permission to recreate retired tables or weaken payload access.
+Use viewer-authorized current reads and explicit denied states; non-sensitive
+facets/detail still wait for their named platform projection. Correct source
+and generator drift at its owner, never by hand-editing a generated projection.
+
+| ID | Observable acceptance | Credible evidence |
+|---|---|---|
+| AC-041 | Each new component is reusable through the catalog/gallery and mounted in its first working conventional UI consumer; normal `dev:full` exposes the documented feature with representative real data | Per-component T1–T5, per-page production-browser T6, setup/readback evidence, and separate human gallery/page acceptance; explicit prerequisite gates remain unsatisfied until delivered |
 
 ## Revision 27 — Series rows become durable before their points
 
@@ -839,8 +921,8 @@ amendment, 2026-11-02). Its model responses are scripted; its HTTP requests, too
 and retained telemetry use the real application and server. MockServer adds
 one local container dependency and no paid inference requirement. The existing
 ephemeral environment retains evidence during a running session, not across
-restart. Full-library and later MCP shipping obligations remain unchanged;
-only this Observe slice has the existing early-live ordering exception.
+restart. Revision 28 extends paired component/page delivery beyond Observe;
+full-library and final MCP shipping proof remain required.
 
 ## Objective and authority
 
@@ -1143,7 +1225,8 @@ implementor never sees two versions of anything.
   kinds, exact identity, metadata labels/annotations, and server-owned status.
 - **REQ-009 — Exact Card detail.** Card detail built from `CardHeader`,
   `CardFacts`, `RelationshipList` (REQ-030): version selection,
-  relationships, artifacts, and raw spec (YAML tab), using current
+  relationships, a Files tab listing associated artifacts already recorded at
+  registration, and raw spec (YAML tab), using current
   Card/registry/storage contracts.
   Display the exact selected version; links cannot silently switch subject or
   version. Do not create another lineage or hydration owner.
@@ -1203,9 +1286,9 @@ implementor never sees two versions of anything.
   interaction, long content, and narrow-container overflow where applicable.
   Pause before beginning the next dependent slice until the human has inspected
   the current slice. Every in-scope inventory component must be fully implemented, tested,
-  and visually accepted on desktop and mobile before the library ships or
-  conventional pages begin, except the early live slice in REQ-039.
-  Fixture-only progress cannot satisfy that gate.
+  and visually accepted on desktop and mobile before the library ships. Under REQ-062, components and their first pages are
+  built in the same task with separate gallery/page checkpoints. Fixture-only
+  progress cannot satisfy live completion.
 
 ### UI design decisions — canvas revision (caller, 2026-10-19)
 
@@ -1228,7 +1311,7 @@ not protocol authority.
   workload, subject or application Run. The UI never decides pass, fail, or
   drift: it renders
   recorded results (`bifrost.verification.results.verdict`, requirement outcomes,
-  `bifrost.drift.result_features.verdict`); aggregates such as failure rate only
+  viewer-authorized recorded drift requirement outcomes); aggregates such as failure rate only
   count recorded results, not pending executions or presumed missing observations.
 - **REQ-023 — Workload, subject and account correlation (platform prerequisite).**
   Consume the approved service packet's shared managed envelope on system and
@@ -1274,8 +1357,8 @@ not protocol authority.
   - Model: interface, signature, artifacts; spans/metrics attributed to the
     Card grouped by name, shown only when present; drift from bound Verifiers.
   - Data: schema, `stats`, `splits`, `target_columns`, `sql`; per-feature drift
-    from `bifrost.drift.result_features` where a drift check names it as
-    `baseline_ref`.
+    from the selected result's viewer-authorized requirement detail where a drift
+    check names it as `baseline_ref`; the non-sensitive detail prerequisite remains.
   - Service: Overview (signals by `workload_card_uid`, broken down by component),
     Charts, Versions, YAML.
   - Verifier: the Verifier graph (REQ-027); results live in Verify (REQ-026).
@@ -1768,10 +1851,10 @@ not protocol authority.
   | `AttentionList` | Home, Service | `{scope, range}` | failed `bifrost.verification.results` by `workload_card_uid` | CR rows: REQ-029 |
   | `SignalBreakdownTable` | Home, Service | `{groupBy: workload_card_uid \| subject_card_uid, scope, range}` | root spans + `bifrost.gateway.calls` | REQ-023 |
   | `CardInventory` (list, filters, kinds) and `CardInventorySummary` | Cards, Home | `{filters, page}` / `{}` | `cards.list` | — |
-  | `VerifierGraph` (plain or coloured by one result) | Verifier, Verify, VerifySession, VerifyDrift | `{cardRef}` or `{resultId}` | `VerifierSpec`; `outcome` of `bifrost.verification.results` | — |
-  | `VerificationResult` (drawer body: header, `VerifierGraph`, `RequirementDetail`, Inputs) | Verify, VerifySession, VerifyDrift | `{resultId}` | `bifrost.verification.results`; drift adds `bifrost.drift.result_features`; existing execution readback supplies pinned group membership | main already supplies `group_id`/`group_end`; non-sensitive requirement outcomes remain a prerequisite |
+  | `VerifierGraph` (plain or coloured by one result) | Verifier, Verify, VerifySession, VerifyDrift | `{cardRef}` or `{resultId}` | `VerifierSpec`; viewer-authorized `VerificationResult.requirements`/`steps` from execution readback | — |
+  | `VerificationResult` (drawer body: header, `VerifierGraph`, `RequirementDetail`, Inputs) | Verify, VerifySession, VerifyDrift | `{resultId}` | `bifrost.verification.results` summary; existing execution readback assembles authorized detail from `execution_outputs`; exact input readback supplies pinned group membership | main already supplies `group_id`/`group_end`; non-sensitive requirement outcomes remain a prerequisite |
   | `RequirementDetail` | Verify*, ChangeVerification | `{resultId, requirementId}` | requirement outcome in `outcome` | — |
-  | `DriftFeatureTable` | VerifyDrift, Data | `{resultId}` or `{cardRef}` | `bifrost.drift.result_features` | — |
+  | `DriftFeatureTable` | VerifyDrift, Data | `{resultId}` or `{cardRef}` | exact result requirement detail in sensitive `execution_outputs.output` via authorized readback | non-sensitive detail where required |
   | `QueryEditor`, `TableCatalog`, `QueryDetails` | Query, QueryChart | `{sql, range, limit}` / `{}` | existing Bifrost list/describe/query contracts; resolved schema, layout and revisions | schema/description cutover |
   | `ChartEditor` | ServiceCharts | `{cardRef, chartId?}` | `ServiceSpec.charts` | REQ-025 |
   | `ChangeRequestList`, `ChangeHeader`, `SubjectsTable`, `RevisionList`, `ActivityFeed`, `ChangeVerifierList`, `RequestVerificationForm`, `ReviewSubmission`, `Participants` | Changes, ChangeDetail, ChangeVerification | `{crId, revision?}` | none on main | REQ-029 |
@@ -1793,7 +1876,7 @@ not protocol authority.
   tabs are Traces, Logs, Metrics only; every chart link reads "Open in
   Query".
 
-  **Tests.** Every component, before any page uses it:
+  **Tests.** Every component, within the same delivery task as its first page:
   - T1 states: rendered with Vitest and Testing Library from fixture props in
     every state it lists, in light and dark, at desktop and mobile widths.
   - T2 loader: assert actual requests and dependent stages from recorded
@@ -1828,45 +1911,35 @@ not protocol authority.
   `WyrdView` from the fixture view documents, each labeled with the canvas
   board it must match. The human inspects every component against
   `references/canvas/png/` on desktop and mobile, in light and dark, before
-  pages are built, except REQ-039's early live slice. Record component-level acceptance with the task evidence;
+  its delivery slice is accepted, alongside the first conventional consumer (REQ-062). Record component-level acceptance with the task evidence;
   accepting a family does not waive inspection of its individual components.
   Automated checks supplement human visual inspection rather than replace it.
 
-  **Build order (caller, 2026-10-19; early live exception in revision 15).**
-  REQ-037–040 and TASK-004-REV-02 may run after the existing foundation and Observe
-  implementation, before the remaining families and step 4. The slice's actual
-  browser workflow supplies its contextual visual checkpoint; existing required
-  trace-component implementation is a prerequisite, but unrelated family or
-  StatStrip gallery acceptance is not. Required correctness/review still applies.
-  The gallery remains supporting state/visual evidence. This exception does not waive the
-  full-library shipping gate, remaining family proof or final MCP App journey.
-  1. REQ-032 deletes the old UI. TASK-001 (packaging, install, launch, login)
-     runs in parallel and is independent of the component library.
-  2. Foundation: `wyrd-ai-ui` package and workspace, generated prop types,
-     view-document schema and validator, `WyrdView`, catalog generator and
-     `codegen:check` drift check, Node executor, MCP executor, BFF load
-     endpoint, `/_gallery`, and the T1–T5 harness, proven end to end with
-     `Chart` and `CardHeader`.
-  3. The full component library, every component in the inventory with its
-     loader, catalog entry, fixtures, T1–T5, and gallery entries, in groups
-     with a human gallery checkpoint after each: primitives; Observe
-     (`Chart`, `StatStrip`, `FacetRail`, `RecordTable`, `TraceWaterfall`,
-     `RecordDetail`); Card (`CardHeader`, `RelationshipList`, `CardFacts`,
-     `CompositionGraph`, Prompt, Model, `CardInventory`); Query; Verify
-     (`VerifierGraph`, `VerificationResult`, `RequirementDetail`,
-     `DriftFeatureTable`, `VerificationBindings`, `AttentionList`); Service
-     (`SignalBreakdownTable`, `ChartEditor`); Changes and Repos. AskPanel
-     and saved-view controls are deferred and excluded from this shipping gate.
-  4. MCP App: resources capability, `ui://wyrd/view`, `ui.show_view`,
-     `ui.catalog`, and the complete REQ-035 agent investigation journey.
-  5. Only then the conventional pages (REQ-007 to REQ-019, REQ-021,
-     REQ-024 to REQ-029), each assembled from finished components with its
-     real-browser T6 journey (REQ-034). A page whose prerequisite has not
-     shipped waits for it. Other platform prerequisites remain blocking; only
-     Ask/saved views are removed from this delivery gate.
+  **Build order (revision 28, approved 2026-11-06).** Completed deletion,
+  distribution/login, shared foundation, Observe/shell and view-layout work are
+  retained. The remaining work is delivered as paired component/gallery and
+  conventional-page outcomes under REQ-062:
+  1. Cards and Prompt definitions.
+  2. Query workbench.
+  3. Verification.
+  4. Agent, Model and Data workspaces, each with its own checkpoint.
+  5. Changes and Repositories, each with its own checkpoint.
+  6. Service workspace and charts.
+  7. Home dashboard.
+  8. Production MCP App completion and connected-agent/browser proof.
+
+  The plan and task metadata define real dependency edges; this list is a
+  recommended delivery order, not a dependency between unrelated tasks.
+  Components retain their package owners and applicable T1–T5 in each slice;
+  pages add T6 in the same slice. A missing external contract blocks its
+  affected scenario and completion, never licenses invented data or a dropped
+  outcome. The final MCP task waits for the complete in-scope library and
+  actions. Other pages do not wait for final MCP acceptance. Deferred Ask and
+  saved views remain excluded. Every component and every distinct page still
+  needs individual human acceptance.
 
   The complete self-contained browser artifact needed for T4 is built during
-  foundation/library verification against the fixture host. Step 4 registers
+  foundation/library verification against the fixture host. The final MCP task registers
   and proves the production MCP resource/tools; it does not first create the
   artifact that earlier component proofs require. Before task handoff, use
   `$plan-readiness-reviewer` on the proposed task packet in place of the former
@@ -1885,8 +1958,10 @@ not protocol authority.
     resource labels.
   - Data per-column drift: the loader reads the Verifier specs whose drift
     check's `baseline_ref` names this Data Card, collecting each Verifier and
-    requirement id, then queries `bifrost.drift.result_features` filtered by
-    that Verifier and requirement id. No schema change.
+    requirement id, then resolves exact recorded results and their viewer-authorized
+    requirement detail. Current Bifrost stores that detail only in
+    `verification.execution_outputs.output`; no separate drift detail table is
+    introduced. Non-sensitive detail waits for its approved platform projection.
 
 - **REQ-036 — View layout: placed, resizable panels.** A view document
   lays its panels out on a grid the way a dashboard does, and a reader can
@@ -1954,8 +2029,8 @@ not protocol authority.
   Browser navigation, JavaScript, focus/keyboard and applicable mobile behavior
   must execute in a real engine, which may run headlessly. HTTP-client cookie
   simulation, jsdom, imported handlers and screenshots alone are supporting
-  proof, not completion. Preserve per-page human inspection. TASK-013–026 own
-  page-specific closure; TASK-012 does not manufacture pages to test them early.
+  proof, not completion. Preserve per-page human inspection. The consolidated tasks own
+  page-specific closure through the revision-28 delivery owners; no fixture substitutes for their browser proof.
 
 - **REQ-035 — Primary agent-harness MCP App investigation journey.** A user
   completes an unsaved investigation in an MCP App-capable agent harness with
@@ -1976,7 +2051,7 @@ not protocol authority.
      force these failures; natural-language discovery/follow-up remain live-agent
      proof. Do not require a model to reproduce every injected negative case.
 
-  TASK-011 owns this outcome. Reuse the existing coding-agent readiness owner
+  TASK-012 owns this outcome under revision 28. Reuse the existing coding-agent readiness owner
   for local configuration, checkout docs, owned `wyrd server dev`, agent process
   deadlines/cancellation, credential isolation and sanitized reports. Extend it
   for actual conversation turns and connect its actual MCP results to a real
@@ -2121,7 +2196,7 @@ not protocol authority.
 ## Invariants, constraints, and non-goals
 
 - **INV-001 — Current contracts.** Current `wyrd-spec` and architecture own
-  vocabulary and behavior. Fourteen registrable native Card kinds; no Workflow,
+  vocabulary and behavior. Twelve registrable native Card kinds; no Workflow,
   Eval, Tool, Skill, SubAgent, Bifrost, or External registration. Verifier is the
   generic verification Card; drift belongs within its check model. No legacy routes,
   compatibility aliases, per-kind verification models, or replacement contracts.
@@ -2180,8 +2255,9 @@ not protocol authority.
   fixtures, manifests, and setup. Add behavioral scenarios through TDD; use
   static/regression proof for unchanged/static obligations. No fake RED, weakened
   assertions, test-only production configuration, or invented test selector.
-  Agent, Prompt, Model, traces, logs, metrics, and distinct summary pages cannot
-  be combined into a large visual slice. Lower-level tests supplement real
+  Agent, Prompt, Model, Data, traces, logs, metrics, and distinct summary pages
+  retain individual visual checkpoints even when their delivery tasks combine
+  component and page work. Lower-level tests supplement real
   deployed journeys.
 
 ## Decisions and ownership
@@ -2227,10 +2303,10 @@ not protocol authority.
 | AC-008 | Query, traces, logs, and metrics each read current canonical data, respect authorization/time bounds, and do not present failed/partial reads as success | Existing Bifrost/identity fixtures and narrow UI consumer journeys, terminal/cancellation regressions, separate page inspections |
 | AC-009 | Verification screens show generic requirements/verdicts/evidence and correct subject/Verifier/execution identities; summaries agree with those retained facts | Real generic verification-to-UI journey and focused projection tests; separate verification and summary checkpoints |
 | AC-010 | All original draft/reference bytes remain available with provenance; every task is self-contained, source-backed, narrowly verified, and visually inspectable; independent task readiness findings are resolved or surfaced | Preservation hashes, evidence inventory, obligation/task map and independent plan-readiness-reviewer findings/dispositions |
-| AC-011 | Every in-scope inventory component (excluding deferred Ask/saved views) is fully implemented, tested, and individually accepted on desktop/mobile in light/dark before library shipment; REQ-039 permits one early live slice with contextual individual inspection before other conventional page work; unmet platform prerequisites block completion rather than disappear behind fixtures | Per-component interaction/accessibility/state evidence, applicable live authorization journeys, gallery evidence and the early slice's individual live-page acceptance |
+| AC-011 | Every in-scope inventory component (excluding deferred Ask/saved views) is fully implemented, tested, and individually accepted on desktop/mobile in light/dark before library shipment; REQ-062 pairs each new component with its first conventional consumer and individual gallery/page inspection; unmet platform prerequisites block completion rather than disappear behind fixtures | Per-component interaction/accessibility/state evidence, applicable live authorization journeys, gallery evidence and the early slice's individual live-page acceptance |
 | AC-012 | Rust-owned opaque sessions support SSO and recovery, reject tampering/expiry/revocation/tenant mismatch and CSRF, preserve safe metadata/settings/chooser/logout, continue across two replicas/restarts, and require no additional deploy secret/env/service; old credential cookies require re-login | Real two-replica native and nginx browser journey, SQL/session negative tests, served cookie-auth contract, source/config audit and unchanged bearer/device/platform regressions |
 | AC-013 | Conventional UI users complete each page's real workflow in a browser against deployed BFF/server, with truthful range/identity, failure and tenant behavior | REQ-034; TASK-004-REV-02 browser foundation/Observe journeys and remaining page journeys, plus per-page human acceptance |
-| AC-014 | A real agent conversation produces an MCP App view, refines it on follow-up, and supports in-app range reloads under the viewer's permissions without opening Wyrd UI or building an app | REQ-035; TASK-011 gated live agent plus real-browser host evidence and deterministic deployed-host negatives; missing credentials/host are BLOCKED |
+| AC-014 | A real agent conversation produces an MCP App view, refines it on follow-up, and supports in-app range reloads under the viewer's permissions without opening Wyrd UI or building an app | REQ-035; TASK-012 gated live agent plus real-browser host evidence and deterministic deployed-host negatives; missing credentials/host are BLOCKED |
 | AC-015 | A view document places panels on the 12-column grid; with a host layout handler a reader resizes and moves panels by pointer and keyboard with grid snapping and no overlap, the handler receives the whole updated document, charts fill their resized panels, narrow views stack, and a document without `layout` renders as before; out-of-range layouts fail validation | REQ-036; unit tests for schema bounds, collision resolution and handler output; real-browser gallery and AppBridge artifact evidence at desktop and mobile in light and dark; recorded human gallery acceptance |
 | AC-016 | After the upstream cutover, discovery, descriptions, built-in SQL and shipped examples/fixtures agree on the `bifrost` catalog and canonical fields in each in-scope host; obsolete authored SQL fails visibly without rewriting or fallback | REQ-014/030; focused SDK/MCP/BFF query and description journeys, example smoke and affected foundation proof, including denied and obsolete-reference cases |
 | AC-017 | Two releases sharing a component and stable account remain distinct by workload; component and account queries select their own dimensions; rootless/subjectless rows keep truthful nulls and correlations grant no read access | REQ-023/024/028; real accepted telemetry/results with different workload, subject and account identities, exact-release queries, null cases and existing tenant/table-denial proof |
@@ -2248,12 +2324,11 @@ combined proof and cross-task seams; task gates remain bounded to their owners.
 
 ## Open material decisions and approval
 
-Revision19 is draft. The caller has approved the requested outcomes but has
-not yet approved the concrete workspace-provisioning/enrollment, security,
-persisted-key/session and light-palette proposals above. Task03 is proposed,
-not ready. Existing revision18/earlier approval records below remain historical
-and do not approve revision19. Approve the proposed admission/security/visual contract as a complete
-revision before implementation; no user/admin role may be inferred at signup.
+Current authority is approved revision 28. The former revision-19 draft notice
+is superseded by its explicit 2026-11-02 approval recorded above. Earlier review
+subjects and verdicts remain historical; they are not retroactive implementation
+acceptance. Revision 28 approves consolidation and sequencing only. The external
+contracts identified in its prerequisite limits still require their own authority.
 
 The caller's 2026-11-02 instruction approves revision 18's replacement local
 MockServer and complete live Observe outcomes. New implementation tasks remain
@@ -2328,6 +2403,10 @@ review verdicts are not rewritten. A host lacking supported integration is a
 reported live-proof blocker, never an assumed capability or silent pass.
 
 ## Revision history and authorities
+
+- Revision 28 approved (2026-11-06): eight remaining delivery tasks pair shared
+  components/gallery and live conventional consumers, add REQ-062/AC-041, and
+  preserve conditional platform gates and final complete-library/MCP proof.
 
 - Revision 27 reconciled under the caller's deviation authorization (2026-11-04, TASK-004-R1): a series has one index row per hour and accepted context, because native runs and Gate-stamped Service and environment vary independently of a series' attributes.
 - Revision 27 approved (2026-11-04): series rows are admitted and durable before their points, in two ordered admissions, because Bifrost has no cross-table admission; a batch of already-written series admits no series batch.

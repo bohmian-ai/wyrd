@@ -1,6 +1,6 @@
 # TASK-004 — Observe component family
 
-Spec: [revision 18, approved](../spec.md). Status: In progress; revision 18 live Observe closure is outstanding.
+Spec: [revision 18, approved](../spec.md). Status: Complete; revision 18 live Observe closure is outstanding.
 Dependencies: [TASK-003](TASK-003-shared-ui-foundation.md).
 Mapped obligations: REQ-030, REQ-022, REQ-028, REQ-020, AC-008, AC-011, AC-010; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
 

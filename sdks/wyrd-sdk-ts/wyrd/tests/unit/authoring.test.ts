@@ -546,6 +546,15 @@ test("prompts_project_every_native_builder_capability", () => {
     };
     expect(boundRich.body.messages[1]).toEqual(expected);
   }
+
+  const edited = Prompt.anthropic("claude-sonnet-5", { messages: "Hello {{value}}", settings: { max_tokens: 64 } })
+    .bind({ value: "literal {{other}}" })
+    .user([{ type: "text", text: "extra" }])
+    .render() as { readonly body: { readonly messages: readonly { readonly content: unknown }[] } };
+  expect(edited.body.messages.map((message) => message.content)).toEqual([
+    [{ type: "text", text: "Hello literal {{other}}" }],
+    [{ type: "text", text: "extra" }],
+  ]);
 });
 
 test("versions_are_optional_and_prompts_are_native", () => {

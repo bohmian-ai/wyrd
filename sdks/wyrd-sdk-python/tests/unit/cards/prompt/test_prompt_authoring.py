@@ -194,6 +194,16 @@ def test_terminal_rich_text_part_requires_its_variable(role: str) -> None:
     assert prompt.bind(who="Ada").render().messages[1] == expected
 
 
+def test_bound_template_text_stays_data_after_appending_rich_content() -> None:
+    prompt = Prompt.anthropic("claude-sonnet-5", messages="Hello {{value}}")
+    prompt = prompt.bind("value", "literal {{other}}").user([{"type": "text", "text": "extra"}])
+
+    rendered = prompt.render()
+
+    assert rendered.messages[0]["content"] == [{"type": "text", "text": "Hello literal {{other}}"}]
+    assert rendered.messages[1]["content"] == [{"type": "text", "text": "extra"}]
+
+
 def test_message_string_becomes_one_anthropic_text_block() -> None:
     prompt = Prompt.anthropic("claude-sonnet-4", messages="hello")
 

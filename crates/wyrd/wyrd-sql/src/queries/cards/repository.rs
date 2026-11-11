@@ -9,7 +9,8 @@
 
 use sqlx::FromRow;
 use uuid::Uuid;
-use wyrd_spec::envelope::CardKind;
+use wyrd_semver::VersionBlock;
+use wyrd_spec::envelope::{CardKind, RepositoryStatus};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, CardUid};
 use wyrd_spec::registry::DeclarationOperationId;
@@ -228,26 +229,28 @@ pub async fn settle_repository_selection(
     Ok(outcome)
 }
 
-/// Server-managed selection view of one Repository Card version.
-#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
-pub struct RepositoryStatusRow {
-    /// Whether this version is the family's selected version.
-    pub selected: bool,
-    /// The family's selected version, if any.
-    pub selected_version: Option<String>,
-    /// `owner/name` the tenant's connection last reported for its id.
-    pub full_name: Option<String>,
+#[derive(FromRow)]
+struct RepositoryStatusRow {
+    selected: bool,
+    selected_version: Option<String>,
+    full_name: Option<String>,
 }
 
-/// Read the selection view of a Repository Card version.
+/// Read the server-managed selection view of a Card version; `None` for a
+/// Card that is not a Repository.
+///
+/// `full_name` is what the tenant's connection last reported for the
+/// Repository's id, and `None` once the connection no longer reaches it.
 ///
 /// # Errors
-/// Returns `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE` when the read fails.
+/// Returns `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE` when the read fails, and
+/// `WYRD_REGISTRY_400_INVALID_VERSION_BLOCK` for a stored version that no
+/// longer parses.
 pub async fn repository_status(
     conn: &mut TenantConn<'_>,
     card_uid: &CardUid,
-) -> Result<Option<RepositoryStatusRow>, WyrdError> {
-    sqlx::query_as(
+) -> Result<Option<RepositoryStatus>, WyrdError> {
+    let row: Option<RepositoryStatusRow> = sqlx::query_as(
         "SELECT c.selected_at IS NOT NULL AS selected, s.version AS selected_version,
                 (SELECT r->>'full_name'
                    FROM wyrd.github_installations g,
@@ -262,5 +265,17 @@ pub async fn repository_status(
     .bind(card_uid.as_uuid())
     .fetch_optional(&mut **conn.transaction())
     .await
-    .map_err(registry_db_error)
+    .map_err(registry_db_error)?;
+    row.map(|row| {
+        Ok(RepositoryStatus {
+            selected: row.selected,
+            selected_version: row
+                .selected_version
+                .map(VersionBlock::parse)
+                .transpose()
+                .map_err(|e| WyrdError::registry_invalid_version_block(e.to_string()))?,
+            full_name: row.full_name,
+        })
+    })
+    .transpose()
 }

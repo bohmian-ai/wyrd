@@ -6,17 +6,18 @@ use wyrd_runtime::PermissionSet;
 use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};
 use wyrd_semver::VersionBlock;
 use wyrd_spec::auth::Attribution;
-use wyrd_spec::envelope::Card;
+use wyrd_spec::envelope::{Card, RepositoryStatus};
 use wyrd_spec::ids::{CardName, CardUid};
 use wyrd_spec::reference::{CardRef, scope_child_card_refs};
 use wyrd_spec::registry::{ArtifactManifestEntry, DeclarationOperationId};
 use wyrd_sql::queries::auth::insert_service_account;
 use wyrd_sql::queries::cards::{
-    NewCardRow, NewDeclarationOperation, RECONCILE_KIND_DECLARATION, claim_card_reconciliation,
-    insert_artifact_manifest_rows, insert_card_row, insert_declaration_operation,
-    lookup_existing_operation, manifest_completion_rows, persist_outbound_relationships,
-    recheck_active_card_refs, record_card_reconciliation_failure, soft_delete_card_by_ref,
-    soft_delete_card_with_state,
+    NewCardRow, NewDeclarationOperation, RECONCILE_KIND_DECLARATION, RepositorySelection,
+    claim_card_reconciliation, insert_artifact_manifest_rows, insert_card_row,
+    insert_declaration_operation, lookup_existing_operation, manifest_completion_rows,
+    persist_outbound_relationships, recheck_active_card_refs, record_card_reconciliation_failure,
+    record_repository_selection, repository_status, selected_repository,
+    settle_repository_selection, soft_delete_card_by_ref, soft_delete_card_with_state,
 };
 use wyrd_sql::row_types::cards::CardStatus;
 
@@ -1220,4 +1221,207 @@ async fn flat_registry_identity_is_tenant_and_kind_scoped() {
         assert_eq!(&row.card_uid, uid);
     }
     conn.commit().await.expect("read transaction commits");
+}
+
+/// Build one resolved Repository Card fixture at `version`.
+///
+/// # Panics
+/// Panics when the static Card fixture does not deserialize.
+fn repository_card(version: &str) -> Card {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "wyrd/v1",
+        "kind": "Repository",
+        "metadata": { "name": "widget", "version": version },
+        "spec": { "provider": "github", "host": "github.com", "repository_id": "42", "verified_by": [] },
+        "relationships": { "outbound": [], "inbound": [] }
+    }))
+    .expect("repository fixture must deserialize")
+}
+
+/// Write a declaration operation owning `card` at `status`, targeting
+/// `target` (that Card when `None`) with the `expected` prior selection,
+/// and return the operation and the owned Card.
+///
+/// # Panics
+/// Panics when a write fails.
+async fn repository_declaration(
+    fixture: &PgFixture,
+    key: &str,
+    card: Option<(&Card, CardStatus)>,
+    target: Option<&CardUid>,
+    expected: Option<&CardUid>,
+) -> (DeclarationOperationId, Option<CardUid>) {
+    let principal = Attribution::direct(PrincipalId::new(Uuid::from_u128(7)));
+    let operation_id = DeclarationOperationId::new(Uuid::now_v7());
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    insert_declaration_operation(
+        &mut conn,
+        NewDeclarationOperation {
+            operation_id,
+            attribution: principal,
+            idempotency_key: key,
+            request_hash: key,
+        },
+    )
+    .await
+    .expect("operation inserts");
+    let owned = match card {
+        Some((card, status)) => Some(
+            insert_card_row(
+                &mut conn,
+                NewCardRow {
+                    card,
+                    card_uid: CardUid::from_uuid(Uuid::now_v7()).expect("UUIDv7"),
+                    attribution: principal,
+                    operation_id,
+                    status,
+                    spec_hash: key,
+                    artifact_hash: None,
+                    reconcile_delay: std::time::Duration::ZERO,
+                },
+            )
+            .await
+            .expect("card inserts")
+            .card_uid,
+        ),
+        None => None,
+    };
+    let target = target.or(owned.as_ref()).expect("a target");
+    record_repository_selection(&mut conn, operation_id, target, expected)
+        .await
+        .expect("selection target records");
+    conn.commit().await.expect("declaration commits");
+    (operation_id, owned)
+}
+
+/// Settle `operation` in its own transaction.
+///
+/// # Panics
+/// Panics when settling fails.
+async fn settle(fixture: &PgFixture, operation: DeclarationOperationId) -> RepositorySelection {
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let outcome = settle_repository_selection(&mut conn, operation)
+        .await
+        .expect("selection settles");
+    conn.commit().await.expect("settle commits");
+    outcome
+}
+
+/// The family's selected version and `card`'s own selection view.
+///
+/// # Panics
+/// Panics when a read fails.
+async fn selection(fixture: &PgFixture, card: &CardUid) -> (Option<CardUid>, RepositoryStatus) {
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let name = CardName::new("widget").expect("name");
+    let selected = selected_repository(&mut conn, &name)
+        .await
+        .expect("selected reads");
+    let status = repository_status(&mut conn, card)
+        .await
+        .expect("status reads")
+        .expect("a Repository");
+    conn.commit().await.expect("read commits");
+    (selected, status)
+}
+
+/// A Repository selection waits for every owned Card to be Active, then
+/// compares against the selection the declaration was written from: the
+/// first distinct target wins, an identical target reuses it, a delayed
+/// completion of a raced declaration conflicts without undoing the newer
+/// selection and keeps answering that conflict, and a deliberate new
+/// declaration of the older exact version rolls the family back. An Active
+/// version is not thereby selected.
+///
+/// # Panics
+/// Panics when a settle outcome or the stored selection differs.
+#[tokio::test]
+async fn repository_selection_settles_once_against_the_expected_prior() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let old = repository_card("1.0.0");
+    let new = repository_card("1.1.0");
+
+    let (delayed, old_uid) = repository_declaration(
+        &fixture,
+        "delayed",
+        Some((&old, CardStatus::Pending)),
+        None,
+        None,
+    )
+    .await;
+    let old_uid = old_uid.expect("owned");
+    assert_eq!(
+        settle(&fixture, delayed).await,
+        RepositorySelection::Pending
+    );
+
+    let (winner, new_uid) = repository_declaration(
+        &fixture,
+        "winner",
+        Some((&new, CardStatus::Active)),
+        None,
+        None,
+    )
+    .await;
+    let new_uid = new_uid.expect("owned");
+    assert_eq!(
+        settle(&fixture, winner).await,
+        RepositorySelection::Selected
+    );
+    let (identical, _) =
+        repository_declaration(&fixture, "identical", None, Some(&new_uid), None).await;
+    assert_eq!(
+        settle(&fixture, identical).await,
+        RepositorySelection::Selected
+    );
+
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    sqlx::query("UPDATE wyrd.cards SET status = 'active' WHERE card_uid = $1")
+        .bind(old_uid.as_uuid())
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("delayed card activates");
+    conn.commit().await.expect("activation commits");
+    let conflict = RepositorySelection::Conflict {
+        current: Some(new_uid.clone()),
+    };
+    assert_eq!(settle(&fixture, delayed).await, conflict);
+    assert_eq!(settle(&fixture, delayed).await, conflict);
+    assert_eq!(
+        settle(&fixture, winner).await,
+        RepositorySelection::Selected
+    );
+    let (selected, old_status) = selection(&fixture, &old_uid).await;
+    assert_eq!(selected.as_ref(), Some(&new_uid));
+    assert!(!old_status.selected, "an Active version is not selected");
+    assert_eq!(
+        old_status
+            .selected_version
+            .map(|version| version.to_string())
+            .as_deref(),
+        Some("1.1.0")
+    );
+
+    let (rollback, _) =
+        repository_declaration(&fixture, "rollback", None, Some(&old_uid), Some(&new_uid)).await;
+    assert_eq!(
+        settle(&fixture, rollback).await,
+        RepositorySelection::Selected
+    );
+    let (selected, old_status) = selection(&fixture, &old_uid).await;
+    assert_eq!(selected.as_ref(), Some(&old_uid));
+    assert!(old_status.selected);
+    assert!(!selection(&fixture, &new_uid).await.1.selected);
 }

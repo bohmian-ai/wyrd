@@ -188,8 +188,9 @@ mod pg_tests {
         assert!(
             receipt.expires_at - sent_at > chrono::TimeDelta::minutes(4)
                 && receipt.expires_at - answered_at <= chrono::TimeDelta::minutes(5),
-            "the transaction expires with the login-state lifetime: {} after the request",
-            receipt.expires_at - sent_at
+            "the transaction expires with the login-state lifetime: {} after sending, {} after the answer",
+            receipt.expires_at - sent_at,
+            receipt.expires_at - answered_at
         );
         let stopped = admin
             .browser

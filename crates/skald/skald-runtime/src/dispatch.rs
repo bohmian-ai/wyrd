@@ -42,9 +42,18 @@ pub async fn dispatch(
     .instrument(span.clone())
     .await
     .inspect(|response| {
+        // OpenTelemetry has no unsigned integer: a `u64` would export as a
+        // string, which Bifrost rejects for these integer GenAI attributes.
         if let Some(usage) = response.adapter().usage() {
-            span.record("gen_ai.usage.input_tokens", usage.usage.input_tokens);
-            span.record("gen_ai.usage.output_tokens", usage.usage.output_tokens);
+            let tokens = |count: u64| i64::try_from(count).unwrap_or(i64::MAX);
+            span.record(
+                "gen_ai.usage.input_tokens",
+                tokens(usage.usage.input_tokens),
+            );
+            span.record(
+                "gen_ai.usage.output_tokens",
+                tokens(usage.usage.output_tokens),
+            );
         }
     })
     .inspect_err(|error| record_error(&span, error.code()))

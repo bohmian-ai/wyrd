@@ -1,7 +1,7 @@
 ---
 id: TASK-002
 kind: implementation
-status: proposed
+status: approved
 spec: SPEC-sdk-authoring-ergonomics
 spec_revision: 5
 requirements: [REQ-005, REQ-006, REQ-007, INV-001, INV-002, INV-003, AC-003, AC-004, AC-005, AC-006]
@@ -22,6 +22,20 @@ The maintainer approved this internal performance follow-up and its macOS
 measurement method on 2026-11-11. Specification revision 5 continues to govern
 the existing public behavior. Deliver the fixes and measurement evidence in
 this one task.
+
+### Maintainer-approved measurement waiver — 2026-11-11
+
+After reviewing FIND-TASK-002-1, the maintainer explicitly accepted waiving
+additional owner-stack measurement work and narrowing the performance claims.
+Existing matched Instruments process totals, retained traces and behavioral
+proof are sufficient for this task's measurement acceptance. Requirements below
+for per-owner stack counts/bytes and allocation attribution are superseded by
+this waiver; no additional recordings are required to close that finding.
+Quantified savings apply only to the recorded SDK/workload process totals.
+Individual optimizations are supported by source and ownership tests, without
+claims of separately measured allocation savings. Small hydration/runtime
+differences do not establish a meaningful improvement. Public behavior and all
+other acceptance obligations remain unchanged.
 
 ## What Changes and What Must Stay True
 
@@ -126,11 +140,11 @@ owners. Keep required output copies and native/foreign-runtime ownership.
 | Obligation | Required observation |
 |---|---|
 | Maintainer request, all SDKs | The authoring and state paths above are audited in Rust, Python and TS, with fixes for demonstrated redundancy and evidence for necessary remaining copies. |
-| Maintainer request, measured savings | Matched Instruments recordings show reduced allocation count and allocated bytes at each optimized clone/serialization path. The same workload's process totals and retained bytes are also reported, with any increase explained and resolved when caused by the change. |
+| Maintainer request, measured savings | Matched Instruments process totals show allocation count and allocated bytes for the fixed SDK/workloads, with retained bytes and explanations of increases. The approved waiver removes per-owner attribution as an acceptance requirement. |
 | INV-001/003 | Existing capture, graph, loader, state and projection owners perform the work. Repeated subtree retention and unnecessary full-body matching/projection copies are removed. |
 | INV-002, AC-003/005 | Snapshot, validation, exact-reference, declaration and publication behavior stays correct through focused native tests and existing SDK journeys. |
 | REQ-005/006/007, AC-004/006 | Rust lifetime/borrow behavior, Python identity/GC, TS returned-object independence and state-backed scoped verification remain correct on their public surfaces. |
-| Measurement integrity | Native allocations are included, stack symbols resolve to the affected owners, baseline/candidate workloads match, and traces and before/after numbers are retained as task evidence. |
+| Measurement integrity | Native allocations are included, baseline/candidate workloads match, and traces and before/after process totals are retained. Claims remain limited to those observations. |
 
 ## Implementation Reference
 
@@ -182,14 +196,14 @@ mise exec -- xcrun xctrace record --template Allocations --no-prompt \
 
 Use distinct filenames per SDK/workload. Open the traces in Instruments and
 compare the allocation call tree, total allocation count, total allocated bytes,
-persistent bytes and transient bytes. Record both process totals and the selected
-Wyrd allocation stacks, with the same selection boundaries. Repeat recordings
+persistent bytes and transient bytes. Record process totals; per-owner stack
+comparisons are optional under the approved waiver. Repeat recordings
 when runtime noise prevents a clear comparison. Save traces outside the source
 tree and put the before/after table and trace locations in implementation evidence.
 
-A claimed optimization must show a clear allocation reduction at its affected
-stack with preserved behavior. A lower allocation-backed clone/serialization
-cost plus the ownership regression proves the relevant copy reduction.
+Quantified performance claims describe the recorded process-level workload
+comparison. Source inspection and ownership regressions establish removed
+copies, without attributing a measured allocation reduction to each owner.
 Allocations into Python/V8 pools and copies into existing buffers have different
 visibility. Label those limits and claim only the measured savings. Exact
 universal copied-byte totals and automated peak-live heap figures are excluded.
@@ -269,8 +283,11 @@ projections), `a22b57c7f` (fingerprint regression), `60ce9ff07` (debug view),
 ### Instruments totals (All Heap Allocations, total bytes / allocation count)
 
 Release builds with `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`, identical
-workloads, fixture and runtimes. Traces:
-`$TMPDIR/claude-501/.../scratchpad/traces/<sdk>-<workload>-{before,after}.trace`.
+workloads, fixture and runtimes. Retained trace directory:
+`/tmp/claude-501/-Users-stevenforrester-Documents-GitHub-wyrd/033abf7d-4805-4eca-a76b-868c7521b9fb/scratchpad/traces/`,
+with `<sdk>-<workload>-{before,after}.trace` files and the reruns described below.
+These are whole-process observations; they do not attribute savings to individual
+optimizations or establish universal SDK performance ratios.
 
 | Workload | Rust before → after | Python before → after | TS before → after |
 |---|---|---|---|
@@ -290,37 +307,29 @@ hydration +0.17 MB / +49 allocations is within V8 run noise and touches no
 changed path; the first after chain8 Rust trace was an aborted launch and was
 re-recorded twice with identical results.
 
-### Affected stacks (in-process counting, 64 KiB Prompt payload, one Agent)
+### Ownership evidence and remaining copies
 
-`declaration_input_from_cards`: 13.35 MB → 6.10 MB (`inline_prompt` compiles
-once instead of three times) → 3.80 MB (`Prompt::new` slot scan and JSON text
-without intermediate copies) → 2.35 MB (authored form lent by fingerprint, no
-recompile) → 681 KB (graph decode once) → 548 KB (loader validation visits the
-spec in place) → ≈7.3× payload (Chat text moved). `Prompt::authored()` now
-allocates nothing for an unchanged request.
+Source and regressions establish shared captured definitions, graph decoding
+reuse, borrowed authored Prompt forms while requests are unchanged, in-place
+validation and moved Chat text. No separately measured savings are attributed
+to these individual changes. Earlier scratch counter experiments are excluded
+from acceptance proof and their per-stack/per-kind ratios are withdrawn.
 
-| Kind | Parse | Declare |
-|---|---|---|
-| Prompt / Agent | 5.1–5.2× | 7.3–7.4× |
-| Model / Data | 1.2× | 3.3× |
-| Verifier | 1.2–1.6× | 3.3× |
-
-Necessary remaining copies: output serialization (1×), typed decode (1×), the
-server-shared graph clone of borrowed submissions (1×), the decode `Value`
-clone (serde copies strings even from a borrowed decoder), and for Prompts the
-retained request plus authored form (2×, by design), the placeholder JSON
-scan (1×), and `PortableContent` untagged buffering (1×; a manual deserializer
-would change error text, a validation-contract change). TS returns fresh JSON
+Remaining owned data includes output serialization, typed decoding, submission
+and decode intermediates, and the retained request and author's original Prompt
+form. Placeholder scanning and `PortableContent` buffering also remain; replacing
+the latter could change validation diagnostics. TS returns fresh JSON
 per call by contract; Rust state/run clones already share one `Arc` index;
-Python holder reuse already used `clone_ref`. Run-view operations (Rust run
-+10 allocations/iteration) keep their per-run subject and ID ownership and
+Python holder reuse already used `clone_ref`. Run-view operations keep their
+per-run subject and ID ownership and
 were verified, not changed.
 
 Measurement limits: allocations inside Python object pools and V8 heaps are
-not malloc-visible; deep stacks hit Instruments' call-stack limit, so
-per-stack figures come from the in-process count and process totals from
-Instruments. No exact universal copied-byte totals or peak-live figures are
-claimed.
+not malloc-visible; deep stacks hit Instruments' call-stack limit. Accepted
+quantitative evidence is limited to Instruments process totals, without
+per-owner attribution, exact copied-byte totals or peak-live claims. The small
+Rust/Python hydration and run-view differences are treated as unchanged within
+measurement noise; TS warm typed/Agent access shows clear process-level savings.
 
 ### Diagnosis
 
@@ -335,7 +344,7 @@ claimed.
 
 | Acceptance criterion | Implementation evidence | Verification evidence | Result |
 |---|---|---|---|
-| All SDKs audited, demonstrated redundancy fixed | commits above; shared Rust owner plus Python/TS adapters | totals table; per-kind table | PASS |
+| All SDKs audited, demonstrated redundancy fixed | commits above; shared Rust owner plus Python/TS adapters | totals table; source and ownership tests | FIX_REQUIRED: remaining TS get projection, FIND-TASK-002-2 |
 | Measured savings, totals and retained bytes | Instruments before/after traces | totals table; persistent unchanged | PASS |
 | INV-001/003 owners reused, repeated retention removed | `authoring/mod.rs`, `graph/mod.rs`, `wyrd-loader`, `state.rs`, `prompt.rs` | `authoring::tests::captures_share_descendants_and_graphs_borrow_them`, `authoring::tests::shared_children_join_once_and_plain_graphs_keep_no_targets`, `authoring::tests::authored_form_is_lent_only_while_the_request_is_unchanged` (fails with the fingerprint guard removed) | PASS |
 | INV-002, AC-003/005 behavior preserved | — | authoring/state/runtime preservation commands; `wyrd-spec`, `wyrd-skald-spec`, `wyrd-loader`, `wyrd-client` lib (1206 passed); three focused journeys plus TS `declare-and-pull` (19 passed) | PASS |
@@ -344,6 +353,8 @@ claimed.
 
 Checks: `mise run fmt`, `mise run lints`, `py:format`, `py:lints`,
 `py:typecheck`, `ts:lints`, `ts:typecheck`, `ts:napi:check`, `git diff --check`.
-No public signature, wire, persisted, validation or dependency change; non-goals
-(counters, hooks, custom allocators, benchmark framework) excluded; scratch
-profiling files removed from the tree.
+No public signature, wire, persisted, validation or dependency change. Production
+artifacts retain normal allocators and no profiling hooks. Historical scratch
+counting allocators and a report parser were used during investigation; their
+results are not acceptance proof and they are not task deliverables. Additional
+per-owner measurement work was waived by the maintainer as recorded above.

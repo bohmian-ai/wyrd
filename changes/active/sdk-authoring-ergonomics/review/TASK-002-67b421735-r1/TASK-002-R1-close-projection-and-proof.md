@@ -1,7 +1,7 @@
 ---
 id: TASK-002-R1
 kind: remediation
-status: ready
+status: approved
 spec: SPEC-sdk-authoring-ergonomics
 spec_revision: 5
 requirements: [INV-001, INV-002, INV-003, AC-003, AC-005]

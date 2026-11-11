@@ -4,8 +4,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use wyrd_semver::{VersionBump, VersionSpec};
+use wyrd_spec::card::trigger::TriggerSpec;
 use wyrd_spec::envelope::CardKind;
+use wyrd_spec::ids::{CardName, RepositoryId};
 use wyrd_spec::metadata::{Annotations, Labels};
+use wyrd_spec::reference::{InlineableRef, Ref};
 
 use crate::error::WyrdConfigError;
 
@@ -21,6 +25,12 @@ pub struct WyrdConfig {
     /// **excluding `External`** (rejected post-deserialize).
     #[serde(default, rename = "kind")]
     pub kind_overrides: BTreeMap<CardKind, KindOverride>,
+
+    /// `[repository]` table: the checkout's inferred Repository Card, the
+    /// root `wyrd declare wyrd.toml` declares. Absent when this file only
+    /// supplies defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<RepositoryConfig>,
 
     /// Resolved absolute path of the discovered `wyrd.toml`.
     /// `None` when the config was synthesized via `empty()`.
@@ -54,6 +64,71 @@ pub struct KindOverride {
     /// Per-kind annotations merged per-key into `metadata.annotations`.
     #[serde(default)]
     pub annotations: Annotations,
+}
+
+/// `[repository]` table: an inferred Repository Card and its review policy.
+///
+/// Identity comes from the checkout's origin remote unless `spec`
+/// overrides it; the server verifies either against the tenant's GitHub
+/// connection. `metadata` and `spec` hold overrides only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryConfig {
+    /// `[repository.metadata]` overrides of the inferred Card metadata.
+    #[serde(default)]
+    pub metadata: RepositoryMetadata,
+    /// `[repository.spec]` overrides of the inferred provider identity.
+    #[serde(default)]
+    pub spec: RepositoryIdentity,
+    /// `[repository.verified_by]`: the complete desired review policy.
+    pub verified_by: RepositoryBindings,
+}
+
+/// `[repository.metadata]`: explicit Card metadata that wins over inference.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryMetadata {
+    /// Card name; inferred from the repository name when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<CardName>,
+    /// Version scope or exact pin; the server assigns one when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<VersionSpec>,
+    /// Bump level for the automatic version paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bump: Option<VersionBump>,
+    /// Labels, merged with workspace defaults like any Card's.
+    #[serde(default)]
+    pub labels: Labels,
+    /// Annotations, merged with workspace defaults like any Card's.
+    #[serde(default)]
+    pub annotations: Annotations,
+}
+
+/// `[repository.spec]`: explicit provider identity, still verified.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryIdentity {
+    /// Provider web host; the configured host when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// Stable provider repository id; resolved from the remote when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_id: Option<RepositoryId>,
+}
+
+/// `[repository.verified_by]`: Verifiers bound to the Repository.
+///
+/// Each `verifier` entry expands into one ordinary verification binding
+/// sharing `runs_on`. The list is complete: `verifier = []` binds none.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryBindings {
+    /// Local Verifier paths or exact registered Verifier references.
+    pub verifier: Vec<Ref>,
+    /// Activation shared by every binding, such as `{ kind = "pull_request" }`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runs_on: Option<InlineableRef<TriggerSpec>>,
 }
 
 impl WyrdConfig {
@@ -219,6 +294,63 @@ mod parse {
         .unwrap();
         assert_eq!(cfg.defaults.labels.len(), 1);
         assert_eq!(cfg.kind_overrides[&CardKind::Model].annotations.len(), 1);
+    }
+
+    /// The minimal `[repository.verified_by]` table parses, with a local
+    /// path and an exact registered reference, and the shared activation.
+    ///
+    /// # Panics
+    /// Panics when the minimal table or its overrides do not parse.
+    #[test]
+    fn repository_table_parses_minimal_policy_and_overrides() {
+        use wyrd_spec::reference::{InlineableRef, Ref};
+
+        let cfg = parse(
+            r#"
+[repository.metadata]
+name = "widget"
+version = "1.2.0"
+
+[repository.spec]
+repository_id = "42"
+
+[repository.verified_by]
+verifier = ["./review/code-review.yaml", { kind = "Verifier", name = "shared", version = "1.0.0" }]
+runs_on = { kind = "pull_request" }
+"#,
+        )
+        .unwrap();
+        let repository = cfg.repository.unwrap();
+        assert_eq!(repository.metadata.name.unwrap().as_str(), "widget");
+        assert_eq!(repository.spec.repository_id.unwrap().as_str(), "42");
+        assert!(matches!(repository.verified_by.verifier[0], Ref::Path(_)));
+        assert!(matches!(repository.verified_by.verifier[1], Ref::Ref(_)));
+        assert!(matches!(
+            repository.verified_by.runs_on,
+            Some(InlineableRef::Inline(_))
+        ));
+        let empty = parse("[repository.verified_by]\nverifier = []\n").unwrap();
+        assert!(empty.repository.unwrap().verified_by.verifier.is_empty());
+    }
+
+    /// The binding list is required and every table is closed.
+    ///
+    /// # Panics
+    /// Panics when an incomplete or unknown repository table parses.
+    #[test]
+    fn repository_table_requires_the_policy_and_refuses_unknown_fields() {
+        for toml in [
+            "[repository.metadata]\nname = \"widget\"\n",
+            "[repository.verified_by]\nverifier = []\nevents = [\"push\"]\n",
+            "[repository.spec]\nfull_name = \"acme/widget\"\n[repository.verified_by]\nverifier = []\n",
+            "[repository.verified_by]\nverifier = []\nruns_on = { kind = \"push\" }\n",
+        ] {
+            let err = parse(toml).unwrap_err();
+            assert!(
+                matches!(err, WyrdConfigError::Schema { .. }),
+                "{toml}: {err:?}"
+            );
+        }
     }
 
     #[test]

@@ -296,6 +296,13 @@ impl Spec {
                     nested: false,
                 });
             }
+            Self::Repository(repository) => {
+                sites.push(BindingSite {
+                    field: "spec.verified_by".to_owned(),
+                    bindings: &repository.verified_by,
+                    nested: false,
+                });
+            }
             Self::Service(service) => {
                 sites.push(BindingSite {
                     field: "spec.verified_by".to_owned(),

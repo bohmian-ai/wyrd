@@ -134,6 +134,11 @@ id_type!(
     validate_group_id
 );
 id_type!(SplitName, "DataCard split label.", validate_card_token);
+id_type!(
+    RepositoryId,
+    "Stable provider repository id: a positive decimal integer, as a string, that survives repository renames and transfers.",
+    validate_positive_decimal
+);
 id_type!(QueryName, "DataCard SQL query key.", validate_card_token);
 id_type!(
     TenantSlug,
@@ -424,6 +429,23 @@ fn validate_token_with_min(value: &str, min_len: usize) -> Result<(), IdError> {
     }
 }
 
+/// Accepts a positive decimal integer of at most 20 digits without a sign or
+/// leading zero.
+///
+/// # Errors
+///
+/// Returns [`IdError::InvalidPositiveDecimal`] for any other value.
+fn validate_positive_decimal(value: &str) -> Result<(), IdError> {
+    if (1..=20).contains(&value.len())
+        && !value.starts_with('0')
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        Ok(())
+    } else {
+        Err(IdError::InvalidPositiveDecimal)
+    }
+}
+
 /// Accepts an identifier matching `[a-zA-Z_][a-zA-Z0-9_]{0,63}`.
 ///
 /// # Errors
@@ -530,6 +552,9 @@ pub enum IdError {
     /// a control character.
     #[error("group_id must be 1..=256 UTF-8 bytes without whitespace or control characters")]
     InvalidGroupId,
+    /// Provider repository id was not a positive decimal integer.
+    #[error("repository_id must be a positive decimal integer string without a leading zero")]
+    InvalidPositiveDecimal,
 }
 
 #[cfg(test)]

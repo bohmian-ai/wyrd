@@ -13,6 +13,7 @@ pub mod model;
 pub mod operator;
 pub mod policy;
 pub mod prompt;
+pub mod repository;
 pub mod service;
 pub mod source;
 pub mod trigger;
@@ -2580,6 +2581,40 @@ mod envelope_roundtrip_tests {
         assert_eq!(decoded.kind, CardKind::Operator);
         assert!(matches!(decoded.spec, Spec::Operator(_)));
     }
+
+    /// A Repository Card decodes with its closed spec, binding list, and the
+    /// closed `pull_request` activation; an arbitrary event name is refused.
+    ///
+    /// # Panics
+    /// Panics when the Repository envelope or the activation shape changes.
+    #[test]
+    fn repository_card_uses_native_kind_and_closed_pull_request_activation() {
+        use crate::card::repository::RepositoryProvider;
+        use crate::card::trigger::TriggerActivation;
+        use crate::reference::InlineableRef;
+
+        let yaml = |runs_on: &str| {
+            format!(
+                "apiVersion: wyrd/v1\nkind: Repository\nmetadata:\n  name: widget\nspec:\n  host: github.com\n  repository_id: \"42\"\n  verified_by:\n    - verifier: ./review.yaml\n      runs_on: {runs_on}\n"
+            )
+        };
+        let decoded: Card = format::yaml::from_str(&yaml("{kind: pull_request}")).unwrap();
+        assert_eq!(decoded.kind, CardKind::Repository);
+        let Spec::Repository(spec) = &decoded.spec else {
+            panic!("expected Repository spec");
+        };
+        assert_eq!(spec.provider, RepositoryProvider::Github);
+        assert_eq!(
+            spec.repository_id.as_ref().map(|id| id.as_str()),
+            Some("42")
+        );
+        let Some(InlineableRef::Inline(trigger)) = &spec.verified_by[0].runs_on else {
+            panic!("expected inline Trigger");
+        };
+        assert_eq!(trigger.activation, TriggerActivation::PullRequest {});
+        assert!(format::yaml::from_str(&yaml("{kind: push}")).is_err());
+        assert!(format::yaml::from_str(&yaml("{kind: pull_request, events: [opened]}")).is_err());
+    }
 }
 
 #[cfg(test)]
@@ -2746,9 +2781,10 @@ mod kind_tests {
     #[test]
     fn native_card_kind_count_is_locked() {
         assert_eq!(CardKind::native().len(), CardKind::NATIVE_COUNT);
-        assert_eq!(CardKind::NATIVE_COUNT, 15);
+        assert_eq!(CardKind::NATIVE_COUNT, 16);
         assert_eq!(CardKind::registrable().len(), CardKind::REGISTRABLE_COUNT);
-        assert_eq!(CardKind::REGISTRABLE_COUNT, 14);
+        assert_eq!(CardKind::REGISTRABLE_COUNT, 15);
+        assert!(CardKind::registrable().contains(&CardKind::Repository));
         assert!(CardKind::registrable().contains(&CardKind::Verifier));
         assert!(!CardKind::registrable().contains(&CardKind::External));
         assert!(
@@ -2787,7 +2823,7 @@ mod kind_tests {
         assert_eq!(decoded, CardKind::External);
     }
 
-    /// Publish exactly the 14 registrable kinds in the CardKind schema, with
+    /// Publish exactly the 15 registrable kinds in the CardKind schema, with
     /// no `External` or retired kind.
     ///
     /// # Panics
@@ -2802,6 +2838,7 @@ mod kind_tests {
         assert!(enum_values.contains(&json!("Trigger")));
         assert!(enum_values.contains(&json!("Operator")));
         assert!(enum_values.contains(&json!("Source")));
+        assert!(enum_values.contains(&json!("Repository")));
         assert!(
             !enum_values.contains(&json!("External")),
             "External must not appear in the registrable schema"
@@ -2813,7 +2850,7 @@ mod kind_tests {
         assert!(!enum_values.contains(&json!("Drift")));
         assert!(!enum_values.contains(&json!("Eval")));
         assert!(!enum_values.contains(&json!("Workflow")));
-        assert_eq!(enum_values.len(), 14);
+        assert_eq!(enum_values.len(), 15);
     }
 
     proptest! {

@@ -17,6 +17,7 @@ mod lifecycle;
 mod list;
 
 pub mod relationships;
+mod repository;
 mod version_query;
 mod version_resolve;
 mod version_sql;
@@ -50,6 +51,11 @@ pub use list::{
 };
 pub use relationships::{
     inbound_relationships, persist_outbound_relationships, recheck_active_card_refs,
+};
+pub use repository::{
+    RepositorySelection, RepositoryStatusRow, record_repository_selection,
+    repository_family_identity, repository_family_name, repository_status, selected_repository,
+    settle_repository_selection,
 };
 pub use version_query::{get_latest_card_by_range, list_versions};
 pub use version_resolve::{Resolution, SubmittedCardIdentity, resolve_version};

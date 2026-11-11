@@ -333,6 +333,7 @@ async fn readyz_returns_ok_when_all_probes_pass() {
             forge_coordinator: None,
             forge_worker: None,
             verification: None,
+            repository: None,
             scribe_fault_is_role_local: false,
         }));
 

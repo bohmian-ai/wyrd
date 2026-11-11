@@ -150,6 +150,9 @@ impl ReferenceSlotVisitor {
             Spec::Agent(agent) => agent.visit(&mut f),
             Spec::Verifier(verifier) => verifier.visit(&mut f),
             Spec::Service(service) => service.visit(&mut f),
+            Spec::Repository(repository) => {
+                visit_verified_by(&mut repository.verified_by, "spec.verified_by", &mut f);
+            }
             Spec::Mcp(mcp) => mcp.visit(&mut f),
             Spec::Audit(audit) => audit.visit(&mut f),
             Spec::Artifact(artifact) => artifact.visit(&mut f),

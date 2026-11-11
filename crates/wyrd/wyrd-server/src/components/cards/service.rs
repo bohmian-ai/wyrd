@@ -442,6 +442,7 @@ async fn hydrate_card(
         message: None,
         updated_at: Some(row.updated_at),
         verification,
+        repository: None,
     });
     Ok(GetCardResponse {
         card,
@@ -1330,7 +1331,10 @@ async fn persist_node(
     .await?;
     persist_outbound_relationships(conn, &row.card_uid, &outbound_refs).await?;
     insert_artifact_manifest_rows(conn, &row.card_uid, &submission.artifacts).await?;
-    if matches!(card.kind, CardKind::Service | CardKind::Agent) {
+    if matches!(
+        card.kind,
+        CardKind::Service | CardKind::Agent | CardKind::Repository
+    ) {
         BindingProjector::new(conn)
             .project(&row.card_uid, &card.kind, &card.spec)
             .await?;
@@ -1392,10 +1396,11 @@ impl<'a, 'c> BindingProjector<'a, 'c> {
         Ok(())
     }
 
-    /// Freeze a bound Service or Agent spec's effective verification bindings.
+    /// Freeze a bound Service, Agent or Repository spec's effective
+    /// verification bindings.
     ///
-    /// Walks the three legal owner locations — Service level and standalone
-    /// Agent (keyed by [`OWNER_OCCURRENCE_KEY`]) and each Service component
+    /// Walks the legal owner locations — Service level, standalone Agent and
+    /// Repository (keyed by [`OWNER_OCCURRENCE_KEY`]) and each Service component
     /// occurrence (keyed by its alias) — of a spec whose refs resolution
     /// already pinned to exact UIDs. A referenced Trigger is read back by UID
     /// inside this transaction (a sibling Trigger was persisted earlier in it)
@@ -1415,6 +1420,9 @@ impl<'a, 'c> BindingProjector<'a, 'c> {
         match spec {
             Spec::Agent(agent) => {
                 sites.push((OWNER_OCCURRENCE_KEY, owner.clone(), &agent.verified_by));
+            }
+            Spec::Repository(repository) => {
+                sites.push((OWNER_OCCURRENCE_KEY, owner.clone(), &repository.verified_by));
             }
             Spec::Service(service) => {
                 sites.push((OWNER_OCCURRENCE_KEY, owner.clone(), &service.verified_by));
@@ -1451,6 +1459,7 @@ impl<'a, 'c> BindingProjector<'a, 'c> {
                     TriggerActivation::Schedule { cron, tz } => {
                         BindingActivation::Schedule { cron, tz }
                     }
+                    TriggerActivation::PullRequest {} => BindingActivation::PullRequest,
                     TriggerActivation::GroupEnd { after } => {
                         let (sources, order_by) = self
                             .group_sources(occurrence, &subject, site, &verifier_card_uid)
@@ -3113,6 +3122,7 @@ mod tests {
             message: None,
             updated_at: None,
             verification: None,
+            repository: None,
         });
         card.relationships.inbound = vec!["different-live-edge".to_owned()];
         let second = immutable_card_blob_bytes(card).expect("blob serializes");

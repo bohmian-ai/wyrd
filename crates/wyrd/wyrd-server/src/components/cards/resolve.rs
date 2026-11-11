@@ -8,7 +8,7 @@ use wyrd_spec::card::drift::{DriftSignal, DriftSpec};
 use wyrd_spec::card::operator::OperatorSpec;
 use wyrd_spec::card::trigger::{TriggerActivation, TriggerSpec};
 use wyrd_spec::card::verifier::{InputSlot, SourceField, VerificationBinding, VerifierSpec};
-use wyrd_spec::envelope::Spec;
+use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::graph::BindingSite;
 use wyrd_spec::ids::{CardName, CardUid};
@@ -316,7 +316,9 @@ impl EffectiveSpecs {
                         subjects: &subjects,
                         site: site_index,
                     };
-                    self.validate_binding(conn, binding, &field, group).await?;
+                    let repository = submission.kind == CardKind::Repository;
+                    self.validate_binding(conn, binding, &field, group, repository)
+                        .await?;
                 }
             }
         }
@@ -335,7 +337,9 @@ impl EffectiveSpecs {
     /// Verifier with source inputs is bound only by a `group_end` Trigger,
     /// which reacts through `on_verdict_change` alone and resolves its sources
     /// through [`Self::validate_sources`]; `on_verdict_change` belongs to a
-    /// `group_end` binding only.
+    /// `group_end` binding only. A `pull_request` Trigger activates only a
+    /// binding of a Repository (`repository`), and a Repository binding's
+    /// Trigger, when it has one, is always `pull_request`.
     ///
     /// # Errors
     /// Returns the activation-mismatch and Operator refusals
@@ -349,6 +353,7 @@ impl EffectiveSpecs {
         binding: &VerificationBinding,
         field: &str,
         group: GroupSite<'_, '_>,
+        repository: bool,
     ) -> Result<(), WyrdError> {
         let verifier = self.load(conn, Some(&binding.verifier)).await?;
         let trigger = match &binding.runs_on {
@@ -367,6 +372,21 @@ impl EffectiveSpecs {
             message: format!("{field} {reason}"),
             details: json!({ "field": field }),
         };
+        if let Some(Spec::Trigger(trigger)) = &trigger {
+            let pull_request = matches!(trigger.activation, TriggerActivation::PullRequest {});
+            if pull_request && !repository {
+                return Err(mismatch(
+                    format!("{field}.runs_on"),
+                    "is a pull_request Trigger, which activates only a Repository binding",
+                ));
+            }
+            if repository && !pull_request {
+                return Err(mismatch(
+                    format!("{field}.runs_on"),
+                    "must be the pull_request activation on a Repository",
+                ));
+            }
+        }
         if group_end && !binding.on_failure.is_empty() {
             return Err(mismatch(
                 format!("{field}.on_failure"),

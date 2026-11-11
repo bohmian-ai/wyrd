@@ -45,7 +45,10 @@ pub(crate) async fn prepare(
     }
     validate_source_set(&submissions, &input.artifact_sources)?;
     Ok(PreparedDeclaration {
-        request: DeclareCardRequest { submissions },
+        request: DeclareCardRequest {
+            submissions,
+            repository: input.repository.clone(),
+        },
         artifact_sources: input.artifact_sources.clone(),
     })
 }

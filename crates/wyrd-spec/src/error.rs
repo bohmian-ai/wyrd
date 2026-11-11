@@ -1731,6 +1731,49 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// A Repository declaration could not select its version: the family's
+    /// selected version changed after this declaration began.
+    #[error("[WYRD_REGISTRY_409_REPOSITORY_SELECTION_CONFLICT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REGISTRY_409_REPOSITORY_SELECTION_CONFLICT",
+        status = 409,
+        title = "Repository selection changed during declaration",
+        remediation = "Another declaration selected details.selected first; its Cards stay registered. Read the Repository Card, then declare again to select your policy over it."
+    )]
+    RegistryRepositorySelectionConflict {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A Repository's name and provider identity disagree with an established Repository family.
+    #[error("[WYRD_REGISTRY_409_REPOSITORY_IDENTITY_CONFLICT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REGISTRY_409_REPOSITORY_IDENTITY_CONFLICT",
+        status = 409,
+        title = "Repository identity conflict",
+        remediation = "A provider repository keeps one Repository Card family: omit the [repository.metadata] name override, or set it to details.established_name; a name already used by another repository needs a different override."
+    )]
+    RegistryRepositoryIdentityConflict {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A Repository declaration names no provider repository.
+    #[error("[WYRD_REGISTRY_400_REPOSITORY_IDENTITY_MISSING] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REGISTRY_400_REPOSITORY_IDENTITY_MISSING",
+        status = 400,
+        title = "Repository identity missing",
+        remediation = "Declare from a checkout whose origin remote is the connected repository, pass --repository <git-remote-url>, or set [repository.spec] repository_id."
+    )]
+    RegistryRepositoryIdentityMissing {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// Transient Postgres or RLS misconfiguration; retry with backoff.
     #[error("[WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE] {message}")]
     #[wyrd_error(
@@ -2444,7 +2487,7 @@ pub enum WyrdError {
         code = "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH",
         status = 400,
         title = "Trigger activation does not match Verifier",
-        remediation = "Attach a schedule Trigger only to a Verifier whose samples slots declare the recorded features it judges; attach a group_end Trigger only to a Verifier with source inputs, reacting through on_verdict_change; supply other evidence through verify or submit."
+        remediation = "Attach a schedule Trigger only to a Verifier whose samples slots declare the recorded features it judges; attach a group_end Trigger only to a Verifier with source inputs, reacting through on_verdict_change; use the pull_request Trigger exactly on Repository bindings; supply other evidence through verify or submit."
     )]
     SpecTriggerActivationMismatch {
         /// Human-readable error message.
@@ -4128,6 +4171,9 @@ impl WyrdError {
             | Self::RegistryUnresolvedDependency { message, details }
             | Self::RegistryVersionConflict { message, details }
             | Self::RegistrySpecDrift { message, details }
+            | Self::RegistryRepositorySelectionConflict { message, details }
+            | Self::RegistryRepositoryIdentityConflict { message, details }
+            | Self::RegistryRepositoryIdentityMissing { message, details }
             | Self::RegistryUnavailable { message, details }
             | Self::RegistryDependencyCycle { message, details }
             | Self::RegistryUnresolvedInlineReference { message, details }

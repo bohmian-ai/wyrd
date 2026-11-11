@@ -3111,6 +3111,7 @@ impl PreparedPythonCard {
                     artifacts: manifest.entries,
                 }],
                 artifact_sources: manifest.sources,
+                repository: None,
             },
             tempdir: saved.tempdir,
         })

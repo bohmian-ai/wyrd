@@ -25,7 +25,7 @@ use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::registry::{CardUploadEntry, DeclareCardResponse};
 use wyrd_spec::storage::{
-    DownloadInitRequest, DownloadInitResponse, DownloadPlan, StorageBackendKind, UploadInitRequest,
+    DownloadInitRequest, DownloadInitResponse, StorageBackendKind, UploadInitRequest,
     UploadInitResponse, UploadPlan,
 };
 use wyrd_spec::verification::execution::{EvidenceFile, EvidencePlanRequest, EvidencePlanResponse};
@@ -354,18 +354,7 @@ async fn run_client_server_journey(
         )
         .await
         .expect("download init succeeds");
-    let plan = if relative_path.starts_with("local/") {
-        let base_url = srv.base_url().expect("bound server exposes base URL");
-        DownloadPlan {
-            get_url: format!(
-                "{base_url}/v1/cards/download/local?path={}",
-                wyrd_storage::tenant_path::build(tenant, card_uid.as_str(), relative_path)
-            ),
-            ttl_secs: 0,
-        }
-    } else {
-        download.plan
-    };
+    let plan = download.plan;
     // The download outcome is held rather than asserted so a transfer failure
     // still reaches the cleanup below; a panic here would strand the uploaded
     // artifact in a durable cloud bucket.

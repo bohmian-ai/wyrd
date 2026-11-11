@@ -245,7 +245,8 @@ impl Custody {
     /// Relative paths of every object in the local store.
     ///
     /// # Panics
-    /// Panics if a store directory or entry cannot be read.
+    /// Panics if a store directory or entry cannot be read, or a walked path
+    /// is not under the store root.
     fn stored(&self) -> Vec<String> {
         let mut pending = vec![self.root.path().to_path_buf()];
         let mut paths = Vec::new();

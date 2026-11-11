@@ -400,8 +400,8 @@ impl SnapshotStore for CodeReviewMetadata {
 impl ContextStore for CodeReviewMetadata {
     /// Record `record`, keeping an existing record's original stamps.
     ///
-    /// A repeat after an interrupted call returns the original record's
-    /// stamps unchanged.
+    /// A repeat after an interrupted call keeps the original record and
+    /// returns its stamps unchanged.
     ///
     /// # Errors
     /// Returns [`PersistenceError::Backend`] on a refused identity or a
@@ -506,8 +506,9 @@ impl ContextStore for CodeReviewMetadata {
     /// Delete every context of `identity`, returning their object keys.
     ///
     /// A repeat after an interrupted delete succeeds but returns only the
-    /// keys of contexts still recorded; keys removed by the interrupted call
-    /// are not returned again.
+    /// keys of contexts still recorded. Keys removed by the interrupted call
+    /// are not returned again, so their objects are no longer named by this
+    /// result.
     ///
     /// # Errors
     /// Returns [`PersistenceError::Backend`] on a refused identity, a

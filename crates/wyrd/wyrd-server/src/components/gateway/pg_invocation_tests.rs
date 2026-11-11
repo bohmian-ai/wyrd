@@ -6375,7 +6375,10 @@ async fn lane_wait_spends_the_agent_call_budget() {
     assert_eq!(dispatch.seen().len(), 3, "nor dispatched");
     assert_eq!(
         audit_decisions(&scribe, tenant)[decisions..],
-        [("gateway.invoke".to_owned(), "allowed".to_owned()); 2],
+        [
+            ("gateway.invoke".to_owned(), "allowed".to_owned()),
+            ("gateway.invoke".to_owned(), "allowed".to_owned()),
+        ],
         "its completed requested and fallback invoke decisions stay audited"
     );
     shutdown.cancel();

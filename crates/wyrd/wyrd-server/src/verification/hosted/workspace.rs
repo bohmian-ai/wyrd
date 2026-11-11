@@ -1,7 +1,8 @@
 //! Bounded per-call scratch workspaces for Agent calls and code.
 //!
-//! [`Workspaces`] admits at most [`HostedLimits::max_workspaces`] concurrent
-//! workspaces per process and refuses, rather than queues, the next one. [`Workspaces::open`] reads each declared file
+//! [`Workspaces`] admits at most its lane's
+//! [`LaneLimits::workspaces`](super::LaneLimits::workspaces) concurrent
+//! workspaces and refuses, rather than queues, the next one. [`Workspaces::open`] reads each declared file
 //! through [`TenantEvidence`], then materializes it under a fresh temporary
 //! directory: files and JSON under `inputs/`, uploaded evidence declared as
 //! an archive unpacked in place after [`zip_guard`] or the equivalent tar.gz
@@ -41,7 +42,7 @@ use super::tools::{invocation, structured};
 use super::{HostedLimits, extract_refused};
 use wyrd_spec::verification::state::AcceptedPublication;
 
-/// Process-wide admission of scratch workspaces.
+/// One execution lane's admission of scratch workspaces.
 pub struct Workspaces {
     /// One permit per concurrent workspace.
     permits: Arc<Semaphore>,
@@ -50,13 +51,24 @@ pub struct Workspaces {
 }
 
 impl Workspaces {
-    /// Admission of at most `limits.max_workspaces` concurrent workspaces.
+    /// Admission of at most `workspaces` concurrent workspaces, each
+    /// enforcing `limits`.
     #[must_use]
-    pub fn new(limits: HostedLimits) -> Self {
+    pub fn new(limits: HostedLimits, workspaces: usize) -> Self {
         Self {
-            permits: Arc::new(Semaphore::new(limits.max_workspaces)),
+            permits: Arc::new(Semaphore::new(workspaces)),
             limits,
         }
+    }
+
+    /// Every workspace this lane has free, held until the returned permit
+    /// drops, so a test can saturate the lane.
+    ///
+    /// # Panics
+    /// Panics when admission is closed or taken concurrently.
+    #[cfg(feature = "test-support")]
+    pub fn hold_for_test(&self) -> OwnedSemaphorePermit {
+        super::hold_all(&self.permits)
     }
 
     /// Materialize `files`, keyed by `/inputs/...` path, for one invocation.

@@ -30,6 +30,7 @@ async fn idle_sandbox(limits: HostedLimits) -> Arc<Sandbox> {
                 monty_min_workers: 0,
                 ..limits
             },
+            limits.queued,
         )
         .await
         .expect("an empty pool starts"),
@@ -221,7 +222,7 @@ fn reading_tools_need_a_declared_workspace() {
                 BTreeMap::new(),
                 limits,
             )),
-            Arc::new(Workspaces::new(limits)),
+            Arc::new(Workspaces::new(limits, limits.queued.workspaces)),
             idle_sandbox(limits).await,
             limits,
         );
@@ -284,7 +285,7 @@ fn retries_keep_their_actions_spent_time() {
                 BTreeMap::new(),
                 limits,
             )),
-            Arc::new(Workspaces::new(limits)),
+            Arc::new(Workspaces::new(limits, limits.queued.workspaces)),
             idle_sandbox(limits).await,
             limits,
         );

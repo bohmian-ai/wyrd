@@ -12,8 +12,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{TimeDelta, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
+use tokio::sync::Semaphore;
 use url::Url;
 use vala_bifrost_redux::scribe::geometry::{ScribeGeometry, ScribeGeometryError};
 use wyrd_auth_oidc::{AddressPolicy, ScreenedHttp};
@@ -28,6 +30,7 @@ use wyrd_telemetry::TelemetryConfig;
 use wyrd_utils::secret::read_secret_file;
 
 use crate::boot::data_root::DEFAULT_BIFROST_DATA_DIR;
+use crate::verification::RuntimeLimits;
 use crate::verification::hosted::HostedLimits;
 
 /// Errors raised during configuration loading or validation.
@@ -1745,9 +1748,59 @@ pub struct VerificationConfig {
     /// credentials come from.
     #[serde(default)]
     pub operator_keys: OperatorKeysConfig,
-    /// The Deployment limits, read only from `WYRD_VERIFICATION_*` at startup.
+    /// `verify` calls one process runs at once; unset keeps the default.
+    /// `WYRD_VERIFICATION_DIRECT_EXECUTIONS` overrides it.
+    #[serde(default)]
+    pub direct_executions: Option<usize>,
+    /// Queued executions one process runs at once; unset keeps the default.
+    /// `WYRD_VERIFICATION_QUEUED_EXECUTIONS` overrides it.
+    #[serde(default)]
+    pub queued_executions: Option<usize>,
+    /// Ceiling of one queued execution from its first claim, in
+    /// milliseconds; unset keeps the default.
+    /// `WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS` overrides it.
+    #[serde(default)]
+    pub execution_timeout_ms: Option<u64>,
+    /// What every Python worker process of both lanes together is counted
+    /// against at startup, in mebibytes; unset keeps the default.
+    /// `WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB` overrides it.
+    #[serde(default)]
+    pub monty_pool_memory_mib: Option<u64>,
+    /// Capacity `verify` calls hold apart from queued executions.
+    /// `WYRD_VERIFICATION_DIRECT_*` overrides each value.
+    #[serde(default)]
+    pub direct: VerificationLaneConfig,
+    /// Capacity queued executions hold apart from `verify` calls.
+    /// `WYRD_VERIFICATION_QUEUED_*` overrides each value.
+    #[serde(default)]
+    pub queued: VerificationLaneConfig,
+    /// The resolved Deployment limits: defaults, then the file capacities
+    /// above, then `WYRD_VERIFICATION_*`, validated at startup.
     #[serde(skip)]
     pub limits: HostedLimits,
+    /// The resolved runtime bounds; only the queued execution slots and the
+    /// queued execution deadline are configurable, resolved as `limits` is.
+    #[serde(skip)]
+    pub runtime: RuntimeLimits,
+}
+
+/// One verification execution lane's capacity in the server TOML file; an
+/// unset value keeps the lane's default.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationLaneConfig {
+    /// Workspaces the lane holds open at once.
+    #[serde(default)]
+    pub workspaces: Option<usize>,
+    /// Python workers alive at once for the lane.
+    #[serde(default)]
+    pub python_workers: Option<usize>,
+    /// Python operations of the lane waiting for a worker.
+    #[serde(default)]
+    pub python_waiters: Option<usize>,
+    /// Gateway model calls the lane makes at once.
+    #[serde(default)]
+    pub model_calls: Option<usize>,
 }
 
 /// Serde default for [`VerificationConfig::enabled`].
@@ -1761,42 +1814,129 @@ impl Default for VerificationConfig {
         Self {
             enabled: default_verification_enabled(),
             operator_keys: OperatorKeysConfig::default(),
+            direct_executions: None,
+            queued_executions: None,
+            execution_timeout_ms: None,
+            monty_pool_memory_mib: None,
+            direct: VerificationLaneConfig::default(),
+            queued: VerificationLaneConfig::default(),
             limits: HostedLimits::default(),
+            runtime: RuntimeLimits::default(),
         }
     }
 }
 
 impl VerificationConfig {
-    /// Apply every `WYRD_VERIFICATION_*` Deployment limit and the Monty
-    /// worker path, then refuse inconsistent limits.
+    /// Resolve [`Self::limits`] and [`Self::runtime`]: the approved defaults,
+    /// then each execution capacity, the Python pool budget, and the queued
+    /// deadline from its `WYRD_VERIFICATION_*` variable when set, else from
+    /// the file; then every other `WYRD_VERIFICATION_*` Deployment limit;
+    /// then refuse inconsistent merged limits, whatever their source.
     ///
-    /// Each limit is a positive integer; `_MIB`/`_KIB` are binary units and
-    /// `_MS` milliseconds. Unset variables keep the approved defaults.
+    /// Each value is checked only once it wins, so a valid variable repairs
+    /// a stale file value. Each limit is a positive integer; `_MIB`/`_KIB`
+    /// are binary units and `_ms`/`_MS` milliseconds. Admission counts must
+    /// fit a semaphore, each lane's Python workers plus waiters included, and
+    /// the queued deadline must be a timestamp from now. Unset values keep
+    /// the approved defaults.
     ///
     /// # Errors
-    /// Returns [`ConfigError::BadEnvVar`] naming a variable that is empty,
-    /// not a positive integer, or overflows its unit, and
-    /// [`ConfigError::Invalid`] naming the variables of an inconsistent pair.
-    fn apply_limits_env(&mut self) -> Result<(), ConfigError> {
+    /// Returns [`ConfigError::Invalid`] naming a winning file value that is
+    /// zero, overflows its unit, or exceeds its runtime representation,
+    /// [`ConfigError::BadEnvVar`] naming a variable that is empty, not a
+    /// positive integer, overflows its unit, or exceeds its runtime
+    /// representation, and [`ConfigError::Invalid`] naming the variables of
+    /// an inconsistent pair or an unrepresentable Python admission total.
+    fn resolve_limits(&mut self) -> Result<(), ConfigError> {
         /// One kibibyte.
         const KIB: u64 = 1024;
         /// One mebibyte.
         const MIB: u64 = 1024 * KIB;
         let limits = &mut self.limits;
+        for (lane, file, table, prefix) in [
+            (
+                &mut limits.direct,
+                self.direct,
+                "verification.direct",
+                "WYRD_VERIFICATION_DIRECT",
+            ),
+            (
+                &mut limits.queued,
+                self.queued,
+                "verification.queued",
+                "WYRD_VERIFICATION_QUEUED",
+            ),
+        ] {
+            for (name, value, max, target) in [
+                (
+                    "workspaces",
+                    file.workspaces,
+                    Semaphore::MAX_PERMITS,
+                    &mut lane.workspaces,
+                ),
+                (
+                    "python_workers",
+                    file.python_workers,
+                    usize::MAX,
+                    &mut lane.python_workers,
+                ),
+                (
+                    "python_waiters",
+                    file.python_waiters,
+                    usize::MAX,
+                    &mut lane.python_waiters,
+                ),
+                (
+                    "model_calls",
+                    file.model_calls,
+                    Semaphore::MAX_PERMITS,
+                    &mut lane.model_calls,
+                ),
+            ] {
+                set_count(
+                    &format!("{table}.{name}"),
+                    value,
+                    &format!("{prefix}_{}", name.to_uppercase()),
+                    max,
+                    target,
+                )?;
+            }
+        }
+        set_count(
+            "verification.direct_executions",
+            self.direct_executions,
+            "WYRD_VERIFICATION_DIRECT_EXECUTIONS",
+            Semaphore::MAX_PERMITS,
+            &mut limits.direct_executions,
+        )?;
+        set_count(
+            "verification.queued_executions",
+            self.queued_executions,
+            "WYRD_VERIFICATION_QUEUED_EXECUTIONS",
+            Semaphore::MAX_PERMITS,
+            &mut self.runtime.execution_slots,
+        )?;
+        if let Some(timeout) = Selected::of(
+            "verification.execution_timeout_ms",
+            self.execution_timeout_ms,
+            "WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS",
+        )? {
+            self.runtime.execution_timeout = timeout.deadline()?;
+        }
+        if let Some(pool) = Selected::of(
+            "verification.monty_pool_memory_mib",
+            self.monty_pool_memory_mib,
+            "WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB",
+        )? {
+            limits.monty_pool_memory_bytes = pool
+                .value
+                .checked_mul(MIB)
+                .ok_or_else(|| pool.refuse("overflows the limit's range"))?;
+        }
         set_scaled(
             "WYRD_VERIFICATION_MONTY_MIN_WORKERS",
             1,
             &mut limits.monty_min_workers,
-        )?;
-        set_scaled(
-            "WYRD_VERIFICATION_MONTY_MAX_WORKERS",
-            1,
-            &mut limits.monty_max_workers,
-        )?;
-        set_scaled(
-            "WYRD_VERIFICATION_MONTY_MAX_WAITERS",
-            1,
-            &mut limits.monty_max_waiters,
         )?;
         set_scaled(
             "WYRD_VERIFICATION_MONTY_MEMORY_MIB",
@@ -1807,11 +1947,6 @@ impl VerificationConfig {
             "WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB",
             MIB,
             &mut limits.monty_process_memory_bytes,
-        )?;
-        set_scaled(
-            "WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB",
-            MIB,
-            &mut limits.monty_pool_memory_bytes,
         )?;
         set_millis(
             "WYRD_VERIFICATION_CODE_TIMEOUT_MS",
@@ -1876,16 +2011,17 @@ impl VerificationConfig {
             KIB,
             &mut limits.tool_result_max_bytes,
         )?;
-        set_scaled(
-            "WYRD_VERIFICATION_MAX_WORKSPACES",
-            1,
-            &mut limits.max_workspaces,
-        )?;
         set_millis("WYRD_VERIFICATION_TIMEOUT_MS", &mut limits.verify_timeout)?;
         let inconsistent = [
             (
-                limits.monty_min_workers > limits.monty_max_workers,
-                "WYRD_VERIFICATION_MONTY_MIN_WORKERS exceeds WYRD_VERIFICATION_MONTY_MAX_WORKERS",
+                limits.monty_min_workers > limits.direct.python_workers,
+                "WYRD_VERIFICATION_MONTY_MIN_WORKERS exceeds \
+                 WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS",
+            ),
+            (
+                limits.monty_min_workers > limits.queued.python_workers,
+                "WYRD_VERIFICATION_MONTY_MIN_WORKERS exceeds \
+                 WYRD_VERIFICATION_QUEUED_PYTHON_WORKERS",
             ),
             (
                 limits.monty_memory_bytes >= limits.monty_process_memory_bytes,
@@ -1898,9 +2034,16 @@ impl VerificationConfig {
                  WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB",
             ),
             (
-                limits.live_workers().is_none(),
+                !limits.worker_fits(),
                 "WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB cannot hold \
                  WYRD_VERIFICATION_MONTY_MEMORY_MIB plus Monty's allocator headroom",
+            ),
+            (
+                !limits.lanes_fit(),
+                "WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB cannot hold \
+                 WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS plus \
+                 WYRD_VERIFICATION_QUEUED_PYTHON_WORKERS at \
+                 WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB each",
             ),
             (
                 limits.file_max_bytes > limits.files_max_bytes,
@@ -1916,8 +2059,129 @@ impl VerificationConfig {
                 message: message.to_owned(),
             });
         }
+        // Each lane admits its workers plus its waiters through one semaphore.
+        for (lane, prefix) in [
+            (limits.direct, "WYRD_VERIFICATION_DIRECT"),
+            (limits.queued, "WYRD_VERIFICATION_QUEUED"),
+        ] {
+            if lane
+                .python_workers
+                .checked_add(lane.python_waiters)
+                .is_none_or(|admissions| admissions > Semaphore::MAX_PERMITS)
+            {
+                return Err(ConfigError::Invalid {
+                    message: format!(
+                        "{prefix}_PYTHON_WAITERS plus {prefix}_PYTHON_WORKERS exceed the {} \
+                         Python admissions a lane can hold",
+                        Semaphore::MAX_PERMITS
+                    ),
+                });
+            }
+        }
         Ok(())
     }
+}
+
+/// One verification setting's winning raw value, before unit conversion:
+/// its environment variable when set, else its server TOML file value, so a
+/// valid override repairs a stale file value and a refusal names the input
+/// that won.
+struct Selected<'a> {
+    /// The environment variable or TOML key the value came from.
+    name: &'a str,
+    /// Whether `name` is an environment variable.
+    env: bool,
+    /// The positive value.
+    value: u64,
+}
+
+impl<'a> Selected<'a> {
+    /// Select the positive integer in `key` over the file's `value` for
+    /// `file_key`; `None` when neither is set.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::BadEnvVar`] when `key` is set but empty or not
+    /// a positive integer, and [`ConfigError::Invalid`] naming `file_key`
+    /// when the file's value wins and is zero.
+    fn of(
+        file_key: &'a str,
+        value: Option<u64>,
+        key: &'a str,
+    ) -> Result<Option<Self>, ConfigError> {
+        if let Some(value) = env_positive(key)? {
+            return Ok(Some(Self {
+                name: key,
+                env: true,
+                value,
+            }));
+        }
+        match value {
+            Some(0) => Err(ConfigError::Invalid {
+                message: format!("{file_key} must be positive"),
+            }),
+            value => Ok(value.map(|value| Self {
+                name: file_key,
+                env: false,
+                value,
+            })),
+        }
+    }
+
+    /// The refusal of this value as its source's error, `reason` saying why.
+    fn refuse(&self, reason: &str) -> ConfigError {
+        let value = self.value;
+        if self.env {
+            ConfigError::BadEnvVar {
+                key: self.name.to_owned(),
+                message: format!("{value} {reason}"),
+            }
+        } else {
+            ConfigError::Invalid {
+                message: format!("{} {value} {reason}", self.name),
+            }
+        }
+    }
+
+    /// This millisecond count as a queued execution deadline. The runner
+    /// binds it as signed milliseconds, PostgreSQL adds it to the statement
+    /// time as an interval, and the queue reads that timestamp back as a
+    /// `DateTime<Utc>`; a timestamp from now that fits `DateTime<Utc>` also
+    /// fits the interval's signed microseconds.
+    ///
+    /// # Errors
+    /// Returns this value's refusal when it exceeds signed milliseconds or
+    /// ends past the latest `DateTime<Utc>` from now.
+    fn deadline(&self) -> Result<Duration, ConfigError> {
+        let timeout = Duration::from_millis(self.value);
+        TimeDelta::from_std(timeout)
+            .ok()
+            .and_then(|delta| Utc::now().checked_add_signed(delta))
+            .map(|_| timeout)
+            .ok_or_else(|| self.refuse("cannot be represented as a queued execution deadline"))
+    }
+}
+
+/// Overwrite `target` with the winning count of `key` or the file's `value`
+/// for `file_key`, refusing one above `max`.
+///
+/// # Errors
+/// Returns every error of [`Selected::of`], and the winner's refusal when it
+/// exceeds `max`.
+fn set_count(
+    file_key: &str,
+    value: Option<usize>,
+    key: &str,
+    max: usize,
+    target: &mut usize,
+) -> Result<(), ConfigError> {
+    let value = value.map(|count| u64::try_from(count).unwrap_or(u64::MAX));
+    if let Some(selected) = Selected::of(file_key, value, key)? {
+        *target = usize::try_from(selected.value)
+            .ok()
+            .filter(|count| *count <= max)
+            .ok_or_else(|| selected.refuse(&format!("exceeds the runtime's limit of {max}")))?;
+    }
+    Ok(())
 }
 
 /// Overwrite `target` with the positive integer in `key` times `unit`.
@@ -3623,7 +3887,7 @@ impl WyrdServerConfig {
 
         // verification.operator_keys (WYRD_OPERATOR_KEK_*)
         self.verification.operator_keys.apply_env()?;
-        self.verification.apply_limits_env()?;
+        self.verification.resolve_limits()?;
 
         // github (WYRD_GITHUB_*)
         self.github.apply_env()?;
@@ -4266,7 +4530,10 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
     use std::sync::Mutex;
 
+    use chrono::{DateTime, Utc};
+
     use super::*;
+    use crate::verification::hosted::LaneLimits;
     use vala_bifrost_redux::resources::{
         ORACLE_PARTITION_WORKING_MEMORY_BYTES, ResourcePlan, oracle_worker_slots,
     };
@@ -4645,9 +4912,287 @@ maintenance_interval_secs = 45
         }
     }
 
+    /// The server TOML file sets each lane's execution capacities, the
+    /// direct and queued execution slots, the Python pool budget, and the
+    /// queued deadline; values it
+    /// leaves out keep their defaults, and an environment variable overrides
+    /// its file value alone, repairing a file value that is zero, overflows
+    /// its unit, or is no representable deadline; an invalid variable refuses
+    /// even over a valid file value. A winning zero, overflowing, or
+    /// unrepresentable file value is refused naming its key: a count above
+    /// the semaphore maximum, which itself applies, or a deadline past the
+    /// latest `DateTime<Utc>` from now, while one just inside applies. File
+    /// values meet the same merged checks as environment values: lane
+    /// workers too many or too large for the pool, workers plus waiters above
+    /// the semaphore maximum, or fewer than the prewarmed workers, refuse; a
+    /// negative count does not parse.
+    ///
+    /// # Panics
+    /// Panics when a file value is not resolved, the environment does not
+    /// win, or a bad file or environment value is accepted or refused under
+    /// another name.
+    #[test]
+    fn verification_capacity_file_values_resolve_under_env() {
+        /// Every capacity setting the file carries.
+        const FILE: &str = "
+            [verification]
+            direct_executions = 7
+            queued_executions = 9
+            execution_timeout_ms = 7200000
+            monty_pool_memory_mib = 4096
+            [verification.direct]
+            workspaces = 3
+            python_workers = 1
+            python_waiters = 5
+            model_calls = 11
+            [verification.queued]
+            workspaces = 13
+            python_workers = 4
+            python_waiters = 17
+            model_calls = 19
+        ";
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        let file = |contents: &str| {
+            toml::from_str::<WyrdServerConfig>(contents).map(|config| config.verification)
+        };
+        let mut config = file(FILE).expect("the file parses");
+        config.resolve_limits().expect("file values apply");
+        assert_eq!(
+            (
+                config.limits.direct_executions,
+                config.runtime.execution_slots,
+                config.runtime.execution_timeout,
+                config.limits.monty_pool_memory_bytes,
+            ),
+            (7, 9, Duration::from_hours(2), 4096 * 1024 * 1024)
+        );
+        assert_eq!(
+            (config.limits.direct, config.limits.queued),
+            (
+                LaneLimits {
+                    workspaces: 3,
+                    python_workers: 1,
+                    python_waiters: 5,
+                    model_calls: 11,
+                },
+                LaneLimits {
+                    workspaces: 13,
+                    python_workers: 4,
+                    python_waiters: 17,
+                    model_calls: 19,
+                }
+            )
+        );
+        assert_eq!(
+            (config.limits.verify_timeout, config.runtime.lease),
+            (
+                HostedLimits::default().verify_timeout,
+                RuntimeLimits::default().lease
+            ),
+            "settings the file cannot carry keep their defaults"
+        );
+        temp_env::with_vars(
+            [
+                ("WYRD_VERIFICATION_DIRECT_EXECUTIONS", Some("2")),
+                ("WYRD_VERIFICATION_QUEUED_MODEL_CALLS", Some("23")),
+                ("WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB", Some("8192")),
+            ],
+            || {
+                let mut config = file(FILE).expect("the file parses");
+                config.resolve_limits().expect("overrides apply");
+                assert_eq!(
+                    (
+                        config.limits.direct_executions,
+                        config.limits.queued.model_calls,
+                        config.limits.queued.workspaces,
+                        config.runtime.execution_slots,
+                        config.limits.monty_pool_memory_bytes,
+                    ),
+                    (2, 23, 13, 9, 8192 * 1024 * 1024),
+                    "the environment wins over the file, value by value"
+                );
+            },
+        );
+        // A valid environment value repairs a stale file value that is zero,
+        // overflows its unit, or is no representable deadline.
+        let stale = "
+            [verification]
+            queued_executions = 0
+            monty_pool_memory_mib = 9223372036854775807
+            execution_timeout_ms = 9223372036854775807
+        ";
+        temp_env::with_vars(
+            [
+                ("WYRD_VERIFICATION_QUEUED_EXECUTIONS", Some("9")),
+                ("WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB", Some("8192")),
+                ("WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS", Some("7200000")),
+            ],
+            || {
+                let mut config = file(stale).expect("the file parses");
+                config
+                    .resolve_limits()
+                    .expect("the environment wins over invalid file values");
+                assert_eq!(
+                    (
+                        config.runtime.execution_slots,
+                        config.limits.monty_pool_memory_bytes,
+                        config.runtime.execution_timeout,
+                    ),
+                    (9, 8192 * 1024 * 1024, Duration::from_hours(2))
+                );
+            },
+        );
+        for (key, value, contents) in [
+            (
+                "WYRD_VERIFICATION_QUEUED_EXECUTIONS",
+                "0",
+                "[verification]\nqueued_executions = 9",
+            ),
+            (
+                "WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS",
+                "18446744073709551615",
+                "[verification]\nexecution_timeout_ms = 7200000",
+            ),
+        ] {
+            temp_env::with_vars([(key, Some(value))], || {
+                let error = file(contents)
+                    .expect("the file parses")
+                    .resolve_limits()
+                    .expect_err("an invalid environment winner refuses");
+                assert!(error.to_string().contains(key), "{key}: {error}");
+            });
+        }
+        for (contents, named) in [
+            (
+                "[verification]\nqueued_executions = 0",
+                "verification.queued_executions",
+            ),
+            (
+                "[verification]\nexecution_timeout_ms = 0",
+                "verification.execution_timeout_ms",
+            ),
+            (
+                "[verification.direct]\nmodel_calls = 0",
+                "verification.direct.model_calls",
+            ),
+            (
+                "[verification.queued]\nworkspaces = 0",
+                "verification.queued.workspaces",
+            ),
+            (
+                "[verification]\nmonty_pool_memory_mib = 0",
+                "verification.monty_pool_memory_mib",
+            ),
+            (
+                "[verification]\nmonty_pool_memory_mib = 9223372036854775807",
+                "verification.monty_pool_memory_mib",
+            ),
+            (
+                "[verification.queued]\npython_workers = 18",
+                "WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS plus",
+            ),
+            (
+                "[verification]\nmonty_pool_memory_mib = 1536\n\
+                 [verification.direct]\npython_workers = 1\n\
+                 [verification.queued]\npython_workers = 4",
+                "WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS plus",
+            ),
+            (
+                "[verification.direct]\npython_workers = 9223372036854775807\n\
+                 [verification.queued]\npython_workers = 9223372036854775807",
+                "WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS plus",
+            ),
+        ] {
+            let error = file(contents)
+                .expect("the file parses")
+                .resolve_limits()
+                .expect_err("a bad file value refuses");
+            assert!(error.to_string().contains(named), "{contents}: {error}");
+        }
+        // Every admission count must fit a semaphore, and a deadline must be a
+        // timestamp from now: signed milliseconds bound as an interval of
+        // signed microseconds and read back as a `DateTime<Utc>`.
+        let permits = tokio::sync::Semaphore::MAX_PERMITS;
+        let mut config = file(&format!("[verification]\ndirect_executions = {permits}"))
+            .expect("the file parses");
+        config
+            .resolve_limits()
+            .expect("the most permits a semaphore holds apply");
+        assert_eq!(config.limits.direct_executions, permits);
+        let hour = 3_600_000;
+        let room = (DateTime::<Utc>::MAX_UTC - Utc::now()).num_milliseconds();
+        let mut config = file(&format!(
+            "[verification]\nexecution_timeout_ms = {}",
+            room - hour
+        ))
+        .expect("the file parses");
+        config
+            .resolve_limits()
+            .expect("a deadline inside the timestamp range applies");
+        assert_eq!(
+            config.runtime.execution_timeout,
+            Duration::from_millis(u64::try_from(room - hour).expect("positive"))
+        );
+        for (contents, named) in [
+            (
+                "[verification]\ndirect_executions = 9223372036854775807".to_owned(),
+                "verification.direct_executions",
+            ),
+            (
+                format!("[verification]\nqueued_executions = {}", permits + 1),
+                "verification.queued_executions",
+            ),
+            (
+                format!("[verification.direct]\nmodel_calls = {}", permits + 1),
+                "verification.direct.model_calls",
+            ),
+            (
+                format!("[verification.queued]\nworkspaces = {}", permits + 1),
+                "verification.queued.workspaces",
+            ),
+            (
+                format!("[verification.direct]\npython_waiters = {permits}"),
+                "WYRD_VERIFICATION_DIRECT_PYTHON_WAITERS plus",
+            ),
+            (
+                "[verification]\nexecution_timeout_ms = 9223372036854775807".to_owned(),
+                "verification.execution_timeout_ms",
+            ),
+            (
+                format!("[verification]\nexecution_timeout_ms = {}", room + hour),
+                "verification.execution_timeout_ms",
+            ),
+        ] {
+            let error = file(&contents)
+                .expect("the file parses")
+                .resolve_limits()
+                .expect_err("an unrepresentable file value refuses");
+            assert!(error.to_string().contains(named), "{contents}: {error}");
+        }
+        temp_env::with_vars([("WYRD_VERIFICATION_MONTY_MIN_WORKERS", Some("3"))], || {
+            let error = file("[verification.direct]\npython_workers = 2")
+                .expect("the file parses")
+                .resolve_limits()
+                .expect_err("fewer file workers than prewarmed ones refuse");
+            assert!(
+                error
+                    .to_string()
+                    .contains("WYRD_VERIFICATION_MONTY_MIN_WORKERS exceeds"),
+                "{error}"
+            );
+        });
+        assert!(
+            file("[verification.queued]\nworkspaces = -1").is_err(),
+            "a negative count does not parse"
+        );
+    }
+
     /// Unset Deployment limits keep the approved defaults; set ones apply
-    /// in their binary units; malformed, zero, overflowing, and inconsistent
-    /// values refuse startup naming the variable.
+    /// in their binary units; malformed, zero, overflowing, inconsistent, and
+    /// unrepresentable values refuse startup naming the variable: a count
+    /// above the semaphore maximum, a Python admission total that overflows,
+    /// and a queued deadline beyond signed milliseconds or the timestamp
+    /// range.
     ///
     /// # Panics
     /// Panics when a limit is misparsed or a bad value is accepted.
@@ -4655,42 +5200,133 @@ maintenance_interval_secs = 45
     fn verification_limits_env_applies_and_refuses() {
         let _guard = ENV_LOCK.lock().expect("environment test lock");
         let mut config = VerificationConfig::default();
-        config.apply_limits_env().expect("defaults apply");
+        config.resolve_limits().expect("defaults apply");
         assert_eq!(config.limits, HostedLimits::default());
+        assert_eq!(config.runtime, RuntimeLimits::default());
         temp_env::with_vars(
             [
                 ("WYRD_VERIFICATION_FILE_MAX_MIB", Some("5")),
                 ("WYRD_VERIFICATION_TOOL_RESULT_MAX_KIB", Some("8")),
                 ("WYRD_VERIFICATION_TIMEOUT_MS", Some("1500")),
+                ("WYRD_VERIFICATION_DIRECT_EXECUTIONS", Some("3")),
+                ("WYRD_VERIFICATION_DIRECT_WORKSPACES", Some("5")),
+                ("WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS", Some("1")),
+                ("WYRD_VERIFICATION_DIRECT_PYTHON_WAITERS", Some("7")),
+                ("WYRD_VERIFICATION_DIRECT_MODEL_CALLS", Some("9")),
+                ("WYRD_VERIFICATION_QUEUED_EXECUTIONS", Some("11")),
+                ("WYRD_VERIFICATION_QUEUED_WORKSPACES", Some("13")),
+                ("WYRD_VERIFICATION_QUEUED_PYTHON_WORKERS", Some("4")),
+                ("WYRD_VERIFICATION_QUEUED_PYTHON_WAITERS", Some("17")),
+                ("WYRD_VERIFICATION_QUEUED_MODEL_CALLS", Some("19")),
+                ("WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS", Some("7200000")),
             ],
             || {
                 let mut config = VerificationConfig::default();
-                config.apply_limits_env().expect("overrides apply");
+                config.resolve_limits().expect("overrides apply");
                 assert_eq!(config.limits.file_max_bytes, 5 * 1024 * 1024);
                 assert_eq!(config.limits.tool_result_max_bytes, 8 * 1024);
                 assert_eq!(config.limits.verify_timeout, Duration::from_millis(1500));
+                assert_eq!(config.limits.direct_executions, 3);
+                assert_eq!(
+                    config.limits.direct,
+                    LaneLimits {
+                        workspaces: 5,
+                        python_workers: 1,
+                        python_waiters: 7,
+                        model_calls: 9,
+                    }
+                );
+                assert_eq!(
+                    config.limits.queued,
+                    LaneLimits {
+                        workspaces: 13,
+                        python_workers: 4,
+                        python_waiters: 17,
+                        model_calls: 19,
+                    }
+                );
+                assert_eq!(config.runtime.execution_slots, 11);
+                assert_eq!(config.runtime.execution_timeout, Duration::from_hours(2));
+                assert_eq!(
+                    config.runtime.lease,
+                    RuntimeLimits::default().lease,
+                    "only the queued slots and deadline are configurable"
+                );
             },
         );
         for (key, value) in [
-            ("WYRD_VERIFICATION_MAX_WORKSPACES", "0"),
+            ("WYRD_VERIFICATION_DIRECT_WORKSPACES", "0"),
+            ("WYRD_VERIFICATION_QUEUED_MODEL_CALLS", "-2"),
+            ("WYRD_VERIFICATION_QUEUED_EXECUTIONS", "many"),
+            ("WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS", "0"),
             ("WYRD_VERIFICATION_CODE_TIMEOUT_MS", "ten"),
             ("WYRD_VERIFICATION_SCRATCH_MAX_MIB", "-1"),
             ("WYRD_VERIFICATION_FILES_MAX_MIB", "18446744073709551615"),
+            (
+                "WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS",
+                "18446744073709551615",
+            ),
+            (
+                "WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS",
+                "9223372036854775807",
+            ),
+            (
+                "WYRD_VERIFICATION_QUEUED_PYTHON_WAITERS",
+                "18446744073709551615",
+            ),
         ] {
             temp_env::with_vars([(key, Some(value))], || {
                 let error = VerificationConfig::default()
-                    .apply_limits_env()
+                    .resolve_limits()
                     .expect_err("bad value refuses");
+                assert!(error.to_string().contains(key), "{key}: {error}");
+            });
+        }
+        let over = (tokio::sync::Semaphore::MAX_PERMITS + 1).to_string();
+        for key in [
+            "WYRD_VERIFICATION_DIRECT_EXECUTIONS",
+            "WYRD_VERIFICATION_QUEUED_EXECUTIONS",
+            "WYRD_VERIFICATION_QUEUED_MODEL_CALLS",
+            "WYRD_VERIFICATION_DIRECT_WORKSPACES",
+        ] {
+            temp_env::with_vars([(key, Some(over.as_str()))], || {
+                let error = VerificationConfig::default()
+                    .resolve_limits()
+                    .expect_err("a count no semaphore holds refuses");
                 assert!(error.to_string().contains(key), "{key}: {error}");
             });
         }
         for (vars, named) in [
             (
                 [
-                    ("WYRD_VERIFICATION_MONTY_MIN_WORKERS", "9"),
-                    ("WYRD_VERIFICATION_MONTY_MAX_WORKERS", "8"),
+                    ("WYRD_VERIFICATION_MONTY_MIN_WORKERS", "3"),
+                    ("WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS", "2"),
                 ],
-                "WYRD_VERIFICATION_MONTY_MIN_WORKERS",
+                "WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS",
+            ),
+            (
+                [
+                    ("WYRD_VERIFICATION_MONTY_MIN_WORKERS", "2"),
+                    ("WYRD_VERIFICATION_QUEUED_PYTHON_WORKERS", "1"),
+                ],
+                "WYRD_VERIFICATION_QUEUED_PYTHON_WORKERS",
+            ),
+            (
+                [
+                    ("WYRD_VERIFICATION_QUEUED_PYTHON_WORKERS", "4"),
+                    ("WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB", "2048"),
+                ],
+                "WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS plus",
+            ),
+            (
+                [
+                    ("WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS", "2"),
+                    (
+                        "WYRD_VERIFICATION_QUEUED_PYTHON_WORKERS",
+                        "18446744073709551615",
+                    ),
+                ],
+                "WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS plus",
             ),
             (
                 [
@@ -4723,7 +5359,7 @@ maintenance_interval_secs = 45
         ] {
             temp_env::with_vars(vars.map(|(key, value)| (key, Some(value))), || {
                 let error = VerificationConfig::default()
-                    .apply_limits_env()
+                    .resolve_limits()
                     .expect_err("inconsistent limits refuse");
                 assert!(error.to_string().contains(named), "{named}: {error}");
             });

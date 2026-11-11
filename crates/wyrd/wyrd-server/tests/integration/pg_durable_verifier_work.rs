@@ -46,6 +46,7 @@ use wyrd_server::verification::scheduler::GroupHandoff;
 use wyrd_server::verification::state::{
     Checkpoint, Decision, RunState, StateError, StateRow, revision_batch, stand_in_identity,
 };
+use wyrd_server::verification::telemetry::ExecutionMode;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Attribution;
 use wyrd_spec::card::verifier::{Action, VerifierSpec};
@@ -1000,7 +1001,7 @@ async fn publication_limits_survive_reclaim() {
         })
         .await
         .expect_err("the object inventory cannot be read by this caller");
-    let mounted = Workspaces::new(limits)
+    let mounted = Workspaces::new(limits, limits.queued.workspaces)
         .open(
             &BTreeMap::from([(
                 "/inputs/edge".to_owned(),
@@ -1162,7 +1163,7 @@ async fn publication_mounts_preserve_status_and_lineage() {
             ),
         ),
     ]);
-    let workspaces = Workspaces::new(limits);
+    let workspaces = Workspaces::new(limits, limits.queued.workspaces);
     let mounted = workspaces
         .open(&files, &evidence)
         .await
@@ -1466,7 +1467,7 @@ fn agent_engine(
                 leased.server.state().clone(),
                 caller.clone(),
                 Arc::clone(&evidence),
-                Arc::new(Workspaces::new(limits)),
+                Arc::new(Workspaces::new(limits, limits.queued.workspaces)),
                 Arc::clone(sandbox),
                 limits,
             )
@@ -1552,7 +1553,11 @@ async fn retained_publications_keep_their_busy_attempt() {
     let leased = Leased::start().await;
     let limits = saturable();
     let caller = leased.publisher([Permission::tool_invoke_any()]);
-    let sandbox = Arc::new(Sandbox::start(worker(), limits).await.expect("pool starts"));
+    let sandbox = Arc::new(
+        Sandbox::start(worker(), limits, limits.queued)
+            .await
+            .expect("pool starts"),
+    );
     let none = serde_json::Map::new();
     let far = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
     // One admitted operation holds the only worker admission while pending.
@@ -1707,7 +1712,11 @@ async fn agent_publications_reach_a_recovered_consumer() {
     let leased = Leased::start().await;
     let limits = saturable();
     let caller = leased.publisher([Permission::tool_invoke_any()]);
-    let sandbox = Arc::new(Sandbox::start(worker(), limits).await.expect("pool starts"));
+    let sandbox = Arc::new(
+        Sandbox::start(worker(), limits, limits.queued)
+            .await
+            .expect("pool starts"),
+    );
     let none = serde_json::Map::new();
     let far = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
     // One admitted operation holds the only worker admission while pending.
@@ -1863,7 +1872,7 @@ async fn agent_publications_reach_a_recovered_consumer() {
         attempts(&leased.accepted().await),
         [("draft".to_owned(), 1), ("consume".to_owned(), 1)]
     );
-    let mounted = Workspaces::new(limits)
+    let mounted = Workspaces::new(limits, limits.queued.workspaces)
         .open(
             &BTreeMap::from([(
                 "/inputs/report.md".to_owned(),
@@ -2056,7 +2065,11 @@ async fn dropped_agent_work_makes_no_later_call() {
         .expect("the execution state claims");
     let limits = saturable();
     let caller = leased.publisher([Permission::tool_invoke_any()]);
-    let sandbox = Arc::new(Sandbox::start(worker(), limits).await.expect("pool starts"));
+    let sandbox = Arc::new(
+        Sandbox::start(worker(), limits, limits.queued)
+            .await
+            .expect("pool starts"),
+    );
     let model = Arc::new(MockProvider::new(ProviderName::OpenAi));
     for name in ["early", "after"] {
         model.push_response(answer(
@@ -4070,6 +4083,7 @@ async fn concurrent_settlements_release_their_hosted_dependent() {
                     drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
                     clock: BlockClock::default(),
                     execution: Some(Arc::clone(state)),
+                    mode: ExecutionMode::Queued,
                 },
             )
             .expect("the engine builds")

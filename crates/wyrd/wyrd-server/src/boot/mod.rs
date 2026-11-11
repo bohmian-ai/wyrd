@@ -72,7 +72,7 @@ use crate::state::{
     Scribe, ScribeCoordinationRuntime, ServerSettings,
 };
 use crate::verification::hosted::blocks::HostedBlocks;
-use crate::verification::{RuntimeLimits, Verification, VerificationRuntime};
+use crate::verification::{Verification, VerificationRuntime};
 
 /// Cadence of the leader's Forge maintenance timer when `[forge]` sets no
 /// `maintenance_interval_secs`; [`resolve_forge_config`] applies it.
@@ -1411,7 +1411,9 @@ impl AppState {
             && !held
             && let Some(runtime) = VerificationRuntime::builder(self)
                 .limits(
-                    RuntimeLimits::default()
+                    config
+                        .verification
+                        .runtime
                         .within_server_drain(Duration::from_millis(config.shutdown.drain_ms)),
                 )
                 .build()

@@ -84,6 +84,9 @@ use wyrd_types::variant::{variant_field, variant_storage_type};
 
 use super::query::{ServerJourneyError, audit_rows, scheduled_context};
 
+/// Direct verification keeps running while queued capacity is held.
+mod isolated_capacity;
+
 /// Upper bound on the wait for the remote runner to settle the run.
 const WAIT: Duration = Duration::from_mins(1);
 

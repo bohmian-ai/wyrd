@@ -623,13 +623,23 @@ mod tests {
         );
     }
 
-    /// Production defaults retain 16 process-wide and 4 per-tenant Operator
+    /// Production defaults retain 64 queued execution slots under a
+    /// five-minute execution deadline, 16 process-wide and 4 per-tenant Operator
     /// deliveries, a 30-second drain, and Operator
     /// dispatches of three attempts, each capped at 30 seconds, retried after
     /// 30 seconds and then two minutes, inside a five-minute deadline.
+    ///
+    /// # Panics
+    /// Panics when a default queued slot count, execution deadline, Operator
+    /// delivery ceiling, drain, or dispatch retry schedule differs from its
+    /// specified value.
     #[test]
     fn production_defaults_are_the_specified_ceilings() {
         let limits = RuntimeLimits::default();
+        assert_eq!(
+            (limits.execution_slots, limits.execution_timeout),
+            (64, Duration::from_mins(5))
+        );
         assert_eq!(
             (
                 limits.operator_global_permits,

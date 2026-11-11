@@ -35,8 +35,8 @@ use wyrd_spec::card::verifier::{Action, Check, CodeCall, CodeSource};
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::verification::execution::CallProvenance;
 
-use super::HostedLimits;
 use super::evidence::TenantEvidence;
+use super::{HostedLimits, LaneLimits};
 
 /// The sandbox global holding the JSON-encoded entrypoint arguments.
 const INPUTS_GLOBAL: &str = "_wyrd_inputs";
@@ -55,7 +55,7 @@ pub struct Sandbox {
     /// Hardened worker processes.
     pool: Arc<Pool>,
     /// Admission: one permit per running or waiting operation.
-    admission: Semaphore,
+    admission: Arc<Semaphore>,
     /// Every admission permit, which [`Self::shutdown`] holds once no
     /// operation is running or waiting.
     capacity: u32,
@@ -64,24 +64,31 @@ pub struct Sandbox {
 }
 
 impl Sandbox {
-    /// Start the pool over the worker binary at `worker`, prewarming
-    /// `monty_min_workers`.
+    /// Start one lane's pool over the worker binary at `worker`, prewarming
+    /// `monty_min_workers` of its `lane.python_workers`.
     ///
     /// Memory is bounded portably: each worker's global allocator stops its
     /// whole heap at the operation budget plus Monty's headroom, which must
-    /// fit the process ceiling, and live workers are capped so that their
-    /// process ceilings together fit the pool ceiling. Idle workers count,
-    /// because the cap is on live processes.
+    /// fit the process ceiling, and the live workers of both lanes are
+    /// counted at their process ceilings against the shared pool ceiling.
+    /// Idle workers count, because the cap is on live processes.
     ///
     /// # Errors
-    /// Returns [`PoolError::Spawn`] when the limits cannot hold even one
-    /// worker within its ceilings or a prewarmed worker cannot start.
-    pub async fn start(worker: PathBuf, limits: HostedLimits) -> Result<Self, PoolError> {
-        let workers = limits.live_workers().ok_or_else(|| {
-            PoolError::Spawn(
-                "the Monty memory limits cannot hold one worker within its ceilings".into(),
-            )
-        })?;
+    /// Returns [`PoolError::Spawn`] when the limits cannot hold the lanes'
+    /// workers within their ceilings, the lane holds no worker, or a
+    /// prewarmed worker cannot start.
+    pub async fn start(
+        worker: PathBuf,
+        limits: HostedLimits,
+        lane: LaneLimits,
+    ) -> Result<Self, PoolError> {
+        let workers = lane.python_workers;
+        if workers == 0 || !limits.worker_fits() || !limits.lanes_fit() {
+            return Err(PoolError::Spawn(
+                "the Monty memory limits cannot hold the lane's workers within their ceilings"
+                    .into(),
+            ));
+        }
         let mut config = PoolConfig::subprocess(worker);
         config.min_processes = limits.monty_min_workers.min(workers);
         config.max_processes = workers;
@@ -89,13 +96,23 @@ impl Sandbox {
         config.max_checkouts_per_worker = Some(1);
         // ponytail: replacements spawn on demand, so the warm set shrinks to
         // zero under load; prewarm replacements if spawn latency matters.
-        let capacity = workers + limits.monty_max_waiters;
+        let capacity = workers + lane.python_waiters;
         Ok(Self {
             pool: Arc::new(Pool::new(config).await?),
-            admission: Semaphore::new(capacity),
+            admission: Arc::new(Semaphore::new(capacity)),
             capacity: u32::try_from(capacity).unwrap_or(u32::MAX),
             limits,
         })
+    }
+
+    /// Every admission this lane has free, held until the returned permit
+    /// drops, so a test can saturate the lane without running Python.
+    ///
+    /// # Panics
+    /// Panics when admission is closed or taken concurrently.
+    #[cfg(feature = "test-support")]
+    pub fn hold_for_test(&self) -> tokio::sync::OwnedSemaphorePermit {
+        super::hold_all(&self.admission)
     }
 
     /// Settle every admitted operation, refuse new ones, and reap the idle

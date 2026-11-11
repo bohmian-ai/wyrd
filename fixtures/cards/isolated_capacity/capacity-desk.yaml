@@ -1,0 +1,13 @@
+# The subject of the isolated capacity story: a Service verified by one
+# Verifier per hosted admission, so each lane resource can be held alone.
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: capacity-desk
+  version: 1.0.0
+spec:
+  verified_by:
+    - verifier: ./answer-check.yaml
+    - verifier: ./python-check.yaml
+    - verifier: ./scratch-check.yaml
+    - verifier: ./model-check.yaml

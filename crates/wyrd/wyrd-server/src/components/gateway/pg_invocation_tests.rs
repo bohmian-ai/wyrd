@@ -85,6 +85,8 @@ struct Scripted {
     script: Mutex<VecDeque<Step>>,
     /// Deployment names in dispatch order.
     seen: Mutex<Vec<String>>,
+    /// Caller deadlines of the dispatched attempts, in dispatch order.
+    deadlines: Mutex<Vec<tokio::time::Instant>>,
     /// Notified when a parked attempt starts.
     entered: Notify,
     /// Releases a parked attempt.
@@ -110,12 +112,20 @@ impl Scripted {
 
 #[async_trait]
 impl ProviderDispatch for Scripted {
-    /// Records the deployment and plays the next step.
+    /// Records the deployment and deadline and plays the next step.
+    ///
+    /// # Panics
+    /// Panics when the seen, deadlines, or script lock is poisoned by a
+    /// panicking holder.
     async fn dispatch(&self, attempt: ProviderAttempt<'_>) -> AttemptResult {
         self.seen
             .lock()
             .expect("seen")
             .push(attempt.deployment.name.as_str().to_owned());
+        self.deadlines
+            .lock()
+            .expect("deadlines")
+            .push(attempt.deadline);
         let step = self.script.lock().expect("script").pop_front();
         match step {
             Some(Step::Return(result)) => result,
@@ -3413,9 +3423,10 @@ async fn gateway_capture_follows_policy_and_never_affects_the_call() {
 ///
 /// While every reservable slot is held, a call with a short deadline is
 /// refused with `WYRD_GATEWAY_429_CAPTURE_STAGING_FULL` after waiting out
-/// that deadline, before any provider sees it and with nothing captured. A
-/// call admitted while the slots are held waits, is admitted once they are
-/// released, answers, and its capture row is written.
+/// that deadline, before any provider sees it and with nothing captured; a
+/// call bound to an earlier instant than its relative timeout is refused the
+/// same way at that bound. A call admitted while the slots are held waits, is
+/// admitted once they are released, answers, and its capture row is written.
 ///
 /// # Panics
 /// Panics when the Postgres fixture, a seed or call, or an assertion fails.
@@ -3464,6 +3475,33 @@ async fn capturing_call_waits_for_a_capture_slot_and_refuses_at_its_deadline() {
     assert!(
         dispatch.seen().is_empty(),
         "a refused call reaches no provider"
+    );
+
+    // A bound call waits for its slot until its bound, not its far longer
+    // relative timeout, and is refused the same way.
+    let started = tokio::time::Instant::now();
+    let refused = GatewayInvocation::new(&state)
+        .bounded(started + Duration::from_millis(200))
+        .run(
+            &caller,
+            request("dep-a/a", Some((1000, 500)), Duration::from_secs(10)),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("no capture slot frees before the bound");
+    let waited = started.elapsed();
+    assert!(
+        matches!(refused.error, WyrdError::GatewayCaptureStagingFull { .. }) && !refused.dispatched,
+        "{:?}",
+        refused.error
+    );
+    assert!(
+        (Duration::from_millis(200)..Duration::from_secs(2)).contains(&waited),
+        "the bound ended the capture-slot wait after {waited:?}"
+    );
+    assert!(
+        dispatch.seen().is_empty(),
+        "a refused bound call reaches no provider"
     );
 
     let release = tokio::spawn(async move {
@@ -6026,4 +6064,419 @@ async fn gateway_agent_calls_start_only_on_a_compatible_adapter() {
         .await
         .expect("a direct client call keeps protocol translation");
     assert_eq!(dispatch.seen(), ["dep-a", "claude", "claude"]);
+}
+
+/// A lane-bound Agent call spends one budget across its lane wait and its
+/// gateway call. With the lane's only permit held, a short call times out
+/// within its budget and nothing is dispatched. A call admitted after
+/// waiting out half its budget reaches the provider with only the remainder
+/// as its deadline, so a provider that never answers ends the call by the
+/// original deadline rather than a full budget after admission. A cancelled
+/// wait ends at once. A call whose lane opens halfway through its budget but
+/// whose cold snapshot read is held past the original deadline is refused
+/// with the gateway deadline at that deadline while that read is still
+/// blocked, undispatched, and a call dropped there keeps nothing.
+/// A call admitted after a lane wait and a delayed snapshot reaches the
+/// provider with the deadline fixed before its lane wait. A ledger write held
+/// past the deadline still hands off: no attempt starts, and its concurrency
+/// hold is settled before the answer, so the next call is admitted. A bound
+/// that passes once preparation and a capture slot are in hand refuses the
+/// call before its ledger write, uncaptured, with its completed invoke
+/// decisions still audited. No expiry
+/// or cancellation keeps a permit, the gateway captures each expired call as
+/// timed out, and the next call is answered.
+///
+/// # Panics
+/// Panics when a setup step fails, a wait outlives its budget, a call is
+/// dispatched while the lane is held or past its deadline, a held snapshot
+/// read outlives the call's deadline, a dispatched deadline is not the one
+/// fixed before the lane wait, an expired admission dispatches or keeps its
+/// hold, a permit is kept, an expired call is not captured, or a cancelled
+/// call is not accounted as cancelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lane_wait_spends_the_agent_call_budget() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let dispatch = Scripted::shared();
+    let (state, scribe) = RecordingScribe::attach(replica(&fixture, dispatch.clone()).await);
+    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
+    capture_metadata(&state, tenant).await;
+    let permits = Arc::new(Semaphore::new(1));
+    let agent =
+        super::ServerWyrdGatewayCaller::new(state.clone(), invoker(tenant, 1, [open_access()]))
+            .admitted("queued", Arc::clone(&permits));
+    let chat = |timeout: Duration| skald_agent::WyrdGatewayCall {
+        request: skald_spec::ProviderRequest::OpenAiChatCompletion(
+            serde_json::from_value(json!({"model": "a", "max_tokens": 4,
+                    "messages": [{"role": "user", "content": "hi"}]}))
+            .expect("chat request"),
+        ),
+        model: model("dep-a/a"),
+        provider: skald_spec::ProviderName::OpenAi,
+        timeout,
+    };
+    let call = |timeout: Duration| {
+        let agent = agent.clone();
+        let call = chat(timeout);
+        async move {
+            skald_agent::WyrdGatewayCaller::call(&agent, call, &CancellationToken::new()).await
+        }
+    };
+
+    let held = Arc::clone(&permits)
+        .try_acquire_owned()
+        .expect("the lane's only permit");
+    let waited = tokio::time::Instant::now();
+    let expired = tokio::time::timeout(Duration::from_secs(10), call(Duration::from_millis(300)))
+        .await
+        .expect("the lane wait ends")
+        .expect_err("a call whose lane stays held times out");
+    let waited = waited.elapsed();
+    assert!(
+        (Duration::from_millis(300)..Duration::from_secs(1)).contains(&waited),
+        "the lane wait ends at the call's own budget, after {waited:?}"
+    );
+    assert!(
+        matches!(expired, skald_providers::ProviderError::Timeout { .. }),
+        "{expired:?}"
+    );
+    assert!(dispatch.seen().is_empty(), "nothing is dispatched");
+    assert_eq!(permits.available_permits(), 0, "the wait took no permit");
+
+    // The lane is still held, so the call waits; its cancelled token ends the
+    // wait well inside its long budget.
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let waited = tokio::time::Instant::now();
+    let abandoned =
+        skald_agent::WyrdGatewayCaller::call(&agent, chat(Duration::from_secs(30)), &cancelled)
+            .await
+            .expect_err("a cancelled lane wait ends the call");
+    assert!(
+        matches!(abandoned, skald_providers::ProviderError::Timeout { .. })
+            && waited.elapsed() < Duration::from_secs(5),
+        "{abandoned:?} after {:?}",
+        waited.elapsed()
+    );
+    assert!(
+        dispatch.seen().is_empty(),
+        "a cancelled wait dispatches nothing"
+    );
+    assert_eq!(
+        permits.available_permits(),
+        0,
+        "the cancelled wait took no permit"
+    );
+
+    // The lane opens halfway through a short budget, then the call's cold
+    // snapshot read waits on a held pricing table past the original deadline;
+    // the call refuses by that deadline while the read is still blocked.
+    let budget = Duration::from_secs(1);
+    let superuser = fixture.superuser_pool().expect("superuser pool");
+    let mut barrier = superuser.begin().await.expect("barrier begins");
+    sqlx::query("LOCK TABLE wyrd.gateway_model_pricing IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *barrier)
+        .await
+        .expect("snapshot reads held");
+    let started = tokio::time::Instant::now();
+    let waiting = tokio::spawn(call(budget));
+    // Elapsed time is the measured quantity: half the budget goes to the lane.
+    tokio::time::sleep(budget / 2).await;
+    drop(held);
+    await_lock_waiters(&fixture, 1).await;
+    let expired = tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .expect("the call ends while its snapshot is held")
+        .expect("the call joins")
+        .expect_err("admission past the original deadline refuses");
+    let ended = started.elapsed();
+    match expired {
+        skald_providers::ProviderError::RemoteProblem(problem) => {
+            assert_eq!(problem.code, "WYRD_GATEWAY_504_DEADLINE_EXCEEDED");
+        }
+        other => panic!("unexpected expiry: {other:?}"),
+    }
+    assert!(
+        (budget..budget + budget / 4).contains(&ended),
+        "the held snapshot ended the call at its deadline, after {ended:?}"
+    );
+    assert!(
+        dispatch.seen().is_empty(),
+        "nothing is dispatched past the deadline"
+    );
+    assert_eq!(
+        permits.available_permits(),
+        1,
+        "the refused call kept no permit"
+    );
+    barrier.commit().await.expect("barrier releases");
+
+    // A call dropped while its held snapshot read is bounded is cancelled
+    // there: it dispatches nothing and keeps no permit.
+    let mut barrier = superuser.begin().await.expect("barrier begins");
+    sqlx::query("LOCK TABLE wyrd.gateway_model_pricing IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *barrier)
+        .await
+        .expect("snapshot reads held");
+    let dropped = tokio::spawn(call(Duration::from_secs(30)));
+    await_lock_waiters(&fixture, 1).await;
+    dropped.abort();
+    assert!(dropped.await.is_err_and(|error| error.is_cancelled()));
+    assert!(
+        dispatch.seen().is_empty(),
+        "a dropped call dispatches nothing"
+    );
+    assert_eq!(
+        permits.available_permits(),
+        1,
+        "a dropped call keeps no permit"
+    );
+    barrier.commit().await.expect("barrier releases");
+    let held = Arc::clone(&permits)
+        .try_acquire_owned()
+        .expect("the lane's only permit");
+
+    let budget = Duration::from_secs(2);
+    dispatch.push(Step::Hang);
+    let mut barrier = superuser.begin().await.expect("barrier begins");
+    sqlx::query("LOCK TABLE wyrd.gateway_model_pricing IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *barrier)
+        .await
+        .expect("snapshot reads held");
+    let started = tokio::time::Instant::now();
+    let waiting = tokio::spawn(call(budget));
+    // Elapsed time is the measured quantity: the call spends half its budget
+    // waiting for the lane and a quarter on its held snapshot read before it
+    // is dispatched.
+    tokio::time::sleep(budget / 2).await;
+    drop(held);
+    await_lock_waiters(&fixture, 1).await;
+    tokio::time::sleep(budget / 4).await;
+    barrier.commit().await.expect("barrier releases");
+    let expired = waiting
+        .await
+        .expect("the call joins")
+        .expect_err("a provider that never answers times out");
+    let ended = started.elapsed();
+    match expired {
+        skald_providers::ProviderError::RemoteProblem(problem) => {
+            assert_eq!(problem.code, "WYRD_GATEWAY_504_DEADLINE_EXCEEDED");
+        }
+        other => panic!("unexpected expiry: {other:?}"),
+    }
+    let deadlines = dispatch.deadlines.lock().expect("deadlines").clone();
+    assert_eq!(dispatch.seen(), ["dep-a"]);
+    assert!(
+        (started + budget..=started + budget + budget / 8).contains(&deadlines[0]),
+        "the provider's deadline is the one fixed before the lane wait, not the \
+         remainder after admission"
+    );
+    assert!(
+        ended < budget + budget / 4,
+        "the call ended after {ended:?}"
+    );
+    assert_eq!(permits.available_permits(), 1, "the expiry kept no permit");
+    drain_gateway(&state).await;
+    let outcomes: Vec<Value> = scribe
+        .calls()
+        .into_iter()
+        .map(|row| row["outcome"].clone())
+        .collect();
+    assert_eq!(
+        outcomes,
+        ["timed_out"],
+        "GatewayInvocation accounts the expired call"
+    );
+
+    dispatch.push(Step::Return(AttemptResult::Completed {
+        body: ResponseBody::Json(
+            serde_json::value::to_raw_value(&json!({
+                "id": "chatcmpl-test", "object": "chat.completion", "created": 0, "model": "a",
+                "choices": [{"index": 0, "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "ok"}}]
+            }))
+            .expect("json"),
+        ),
+        usage: usage(1, 1),
+        capture: None,
+    }));
+    call(Duration::from_secs(10))
+        .await
+        .expect("the next call is admitted and answered");
+    assert_eq!(dispatch.seen(), ["dep-a", "dep-a"]);
+    assert_eq!(permits.available_permits(), 1);
+
+    // A tenant concurrency limit makes admission's ledger write take the
+    // tenant's admission lock. Held past the call's deadline, the write still
+    // hands off to settlement: no attempt starts, the call's concurrency hold
+    // is released before its answer, and the next call is admitted at once.
+    let limit = serde_json::to_value(GatewayLimit {
+        subject: GatewayLimitSubject::Tenant,
+        target: GatewayPolicyTarget::All,
+        requests_per_minute: None,
+        tokens_per_minute: None,
+        concurrent_calls: NonZeroU64::new(1),
+    })
+    .expect("limit encodes");
+    configure(&state, tenant, json!([limit]), json!([]), "allow_unpriced").await;
+    let mut lock = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(\
+         hashtextextended('wyrd.gateway_admission:' || wyrd.current_tenant()::text, 0))",
+    )
+    .execute(&mut **lock.transaction())
+    .await
+    .expect("admission lock");
+    let budget = Duration::from_secs(1);
+    let started = tokio::time::Instant::now();
+    let waiting = tokio::spawn(call(budget));
+    await_lock_waiters(&fixture, 1).await;
+    // Elapsed time is the measured quantity: the deadline passes while the
+    // ledger write waits.
+    tokio::time::sleep_until(started + budget + budget / 4).await;
+    lock.commit().await.expect("admission lock releases");
+    let expired = waiting
+        .await
+        .expect("the call joins")
+        .expect_err("an admission that ends past the deadline times out");
+    match expired {
+        skald_providers::ProviderError::RemoteProblem(problem) => {
+            assert_eq!(problem.code, "WYRD_GATEWAY_504_DEADLINE_EXCEEDED");
+        }
+        other => panic!("unexpected expiry: {other:?}"),
+    }
+    assert_eq!(
+        dispatch.seen(),
+        ["dep-a", "dep-a"],
+        "an admission past the deadline starts no attempt"
+    );
+    assert_eq!(permits.available_permits(), 1, "the expiry kept no permit");
+    dispatch.push(Step::Return(AttemptResult::Completed {
+        body: ResponseBody::Json(
+            serde_json::value::to_raw_value(&json!({
+                "id": "chatcmpl-test", "object": "chat.completion", "created": 0, "model": "a",
+                "choices": [{"index": 0, "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "ok"}}]
+            }))
+            .expect("json"),
+        ),
+        usage: usage(1, 1),
+        capture: None,
+    }));
+    call(Duration::from_secs(10))
+        .await
+        .expect("the expired call's concurrency hold was settled before its answer");
+    assert_eq!(dispatch.seen(), ["dep-a", "dep-a", "dep-a"]);
+    drain_gateway(&state).await;
+    let outcomes: Vec<Value> = scribe
+        .calls()
+        .into_iter()
+        .map(|row| row["outcome"].clone())
+        .collect();
+    assert_eq!(
+        outcomes.get(2),
+        Some(&json!("timed_out")),
+        "the expired admission is accounted as timed out: {outcomes:?}"
+    );
+
+    // With the snapshot cache listening, preparation and an open capture slot
+    // complete without waiting, so a bound that has already passed reaches
+    // the check before the ledger write: the call is refused there, never
+    // admitted, executed, or captured.
+    let shutdown = CancellationToken::new();
+    let (_, listener) = state
+        .gateway
+        .refresh_worker(fixture.wyrd_postgres(), shutdown.clone());
+    let listening = tokio::spawn(listener);
+    let administration = GatewayAdministration::new(&state);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while state.gateway.snapshots().cached(tenant).is_none() {
+            administration
+                .snapshot(tenant)
+                .await
+                .expect("snapshot loads");
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the snapshot is cached once the listener subscribes");
+    let captured = scribe.calls().len();
+    let decisions = audit_decisions(&scribe, tenant).len();
+    let failure = GatewayInvocation::new(&state)
+        .bounded(tokio::time::Instant::now())
+        .run(
+            &invoker(tenant, 1, [open_access()]),
+            request("dep-a/a", None, Duration::from_secs(10)),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("a call whose bound passed refuses");
+    assert!(
+        matches!(failure.error, WyrdError::GatewayDeadlineExceeded { .. })
+            && !failure.settled
+            && !failure.dispatched,
+        "the passed bound refuses before admission: {:?}",
+        failure.error
+    );
+    drain_gateway(&state).await;
+    assert_eq!(
+        scribe.calls().len(),
+        captured,
+        "a call refused before the ledger is never captured"
+    );
+    assert_eq!(dispatch.seen().len(), 3, "nor dispatched");
+    assert_eq!(
+        audit_decisions(&scribe, tenant)[decisions..],
+        [
+            ("gateway.invoke".to_owned(), "allowed".to_owned()),
+            ("gateway.invoke".to_owned(), "allowed".to_owned()),
+        ],
+        "its completed requested and fallback invoke decisions stay audited"
+    );
+
+    // A lane-bound call its caller cancels mid-attempt is accounted as
+    // cancelled, not as the timeout its bound would have produced.
+    dispatch.push(Step::Park(completed(1, 1)));
+    let token = CancellationToken::new();
+    let cancelling = {
+        let agent = agent.clone();
+        let call = chat(Duration::from_secs(30));
+        let token = token.clone();
+        tokio::spawn(
+            async move { skald_agent::WyrdGatewayCaller::call(&agent, call, &token).await },
+        )
+    };
+    dispatch.entered.notified().await;
+    token.cancel();
+    cancelling
+        .await
+        .expect("the call joins")
+        .expect_err("a cancelled call fails");
+    dispatch.release.notify_one();
+    assert_eq!(
+        permits.available_permits(),
+        1,
+        "the cancelled call kept no permit"
+    );
+    drain_gateway(&state).await;
+    let outcomes: Vec<Value> = scribe
+        .calls()
+        .into_iter()
+        .map(|row| row["outcome"].clone())
+        .collect();
+    assert_eq!(
+        outcomes.last(),
+        Some(&json!("cancelled")),
+        "caller cancellation stays distinct from expiry: {outcomes:?}"
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| *outcome == "timed_out")
+            .count(),
+        2,
+        "the expired calls stay timed out: {outcomes:?}"
+    );
+    shutdown.cancel();
+    listening.await.expect("the listener stops");
 }

@@ -37,6 +37,21 @@ pub(crate) fn statement_caller(
     }
 }
 
+/// Every free permit of `permits`, held until the returned permit drops, so
+/// a test can saturate an idle lane.
+///
+/// # Panics
+/// Panics when `permits` is closed or a permit is taken concurrently.
+#[cfg(feature = "test-support")]
+pub(crate) fn hold_all(
+    permits: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> tokio::sync::OwnedSemaphorePermit {
+    let free = u32::try_from(permits.available_permits()).unwrap_or(u32::MAX);
+    std::sync::Arc::clone(permits)
+        .try_acquire_many_owned(free)
+        .expect("a test saturates an open, idle admission")
+}
+
 /// An extractor refusal as the terminal block error it always is.
 pub(crate) fn extract_refused(error: wyrd_loader::ExtractError) -> vala_verify::blocks::BlockError {
     vala_verify::blocks::BlockError::Terminal { reason: error.0 }
@@ -72,20 +87,22 @@ pub struct HostedLimits {
     pub work_write_max_bytes: u64,
     /// Largest serialized tool result, in bytes.
     pub tool_result_max_bytes: usize,
-    /// Most concurrent workspaces per process.
-    pub max_workspaces: usize,
-    /// Prewarmed Python worker processes.
+    /// Most concurrently running direct `verify` executions per process;
+    /// queued executions are bounded by the runtime's own execution slots.
+    pub direct_executions: usize,
+    /// Capacity reserved for direct `verify` executions.
+    pub direct: LaneLimits,
+    /// Capacity reserved for queued executions, continuations included.
+    pub queued: LaneLimits,
+    /// Prewarmed Python worker processes of each lane.
     pub monty_min_workers: usize,
-    /// Most live Python worker processes.
-    pub monty_max_workers: usize,
-    /// Most Python operations waiting for a worker.
-    pub monty_max_waiters: usize,
     /// Monty allocation budget per Python operation, in bytes.
     pub monty_memory_bytes: u64,
     /// Memory ceiling of one worker process, in bytes; must hold the
     /// operation budget plus Monty's allocator headroom.
     pub monty_process_memory_bytes: u64,
-    /// Combined memory ceiling of every live worker process, in bytes.
+    /// Combined memory ceiling of every live worker process of both lanes,
+    /// in bytes.
     pub monty_pool_memory_bytes: u64,
     /// One complete Python operation, from checkout wait to result.
     pub code_timeout: Duration,
@@ -108,25 +125,46 @@ impl HostedLimits {
         }
     }
 
-    /// Most live workers the memory ceilings allow: `monty_max_workers`,
-    /// lowered until every live worker's process ceiling fits the pool
-    /// ceiling together.
-    ///
-    /// Returns `None` when one operation's allocator ceiling (budget plus
-    /// Monty's headroom) exceeds the process ceiling, or the pool ceiling
-    /// cannot hold one worker.
+    /// Whether one operation's allocator ceiling (budget plus Monty's
+    /// headroom) fits the worker process ceiling.
     #[must_use]
-    pub fn live_workers(&self) -> Option<usize> {
-        let ceiling =
-            memory_limit_with_headroom(usize::try_from(self.monty_memory_bytes).ok(), false)?;
-        if u64::try_from(ceiling).ok()? > self.monty_process_memory_bytes {
-            return None;
-        }
-        let fit =
-            usize::try_from(self.monty_pool_memory_bytes / self.monty_process_memory_bytes.max(1))
-                .ok()?;
-        Some(fit.min(self.monty_max_workers)).filter(|&workers| workers > 0)
+    pub fn worker_fits(&self) -> bool {
+        memory_limit_with_headroom(usize::try_from(self.monty_memory_bytes).ok(), false)
+            .and_then(|ceiling| u64::try_from(ceiling).ok())
+            .is_some_and(|ceiling| ceiling <= self.monty_process_memory_bytes)
     }
+
+    /// Whether the live workers of both lanes, each counted at its process
+    /// ceiling, fit the pool ceiling together; a combined count too large to
+    /// represent never fits.
+    #[must_use]
+    pub fn lanes_fit(&self) -> bool {
+        self.direct
+            .python_workers
+            .checked_add(self.queued.python_workers)
+            .and_then(|workers| u64::try_from(workers).ok())
+            .and_then(|workers| workers.checked_mul(self.monty_process_memory_bytes))
+            .is_some_and(|total| total <= self.monty_pool_memory_bytes)
+    }
+}
+
+/// The admission capacity one execution lane owns alone.
+///
+/// Direct and queued executions each hold a lane; neither borrows the
+/// other's free capacity, so a saturated queue cannot starve direct `verify`
+/// and direct traffic cannot take what queued work was given. Shared CPU,
+/// Postgres, gateway, and provider capacity are not partitioned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaneLimits {
+    /// Most concurrent workspaces.
+    pub workspaces: usize,
+    /// Most live Python worker processes.
+    pub python_workers: usize,
+    /// Most Python operations waiting for a worker.
+    pub python_waiters: usize,
+    /// Most concurrent gateway model calls; a further call waits for one to
+    /// finish before it reaches gateway admission.
+    pub model_calls: usize,
 }
 
 impl Default for HostedLimits {
@@ -146,13 +184,23 @@ impl Default for HostedLimits {
             scratch_max_bytes: 250 * MIB,
             work_write_max_bytes: 50 * MIB,
             tool_result_max_bytes: 64 * 1024,
-            max_workspaces: 16,
-            monty_min_workers: 2,
-            monty_max_workers: 8,
-            monty_max_waiters: 16,
+            direct_executions: 256,
+            direct: LaneLimits {
+                workspaces: 16,
+                python_workers: 4,
+                python_waiters: 16,
+                model_calls: 256,
+            },
+            queued: LaneLimits {
+                workspaces: 48,
+                python_workers: 12,
+                python_waiters: 48,
+                model_calls: 256,
+            },
+            monty_min_workers: 1,
             monty_memory_bytes: 256 * MIB,
             monty_process_memory_bytes: 384 * MIB,
-            monty_pool_memory_bytes: 2048 * MIB,
+            monty_pool_memory_bytes: 8192 * MIB,
             code_timeout: Duration::from_secs(10),
             agent_code_budget: Duration::from_secs(60),
             verify_timeout: Duration::from_secs(60),
@@ -160,39 +208,71 @@ impl Default for HostedLimits {
     }
 }
 
-/// Memory ceilings bound the live worker count on every platform.
+/// Memory ceilings bound both lanes' live workers on every platform.
 #[cfg(test)]
 mod tests {
     use super::HostedLimits;
 
-    /// The defaults fit five 384 MiB workers in 2 GiB; a pool ceiling below
-    /// one worker or a process ceiling below the allocator ceiling refuses.
+    /// The default lanes hold sixteen 384 MiB workers in an 8 GiB pool, 64
+    /// workspaces, and 64 waiters, with one prewarmed worker per lane; 256
+    /// direct executions and 256 model calls in each lane. Workers past the
+    /// pool, a combined worker count too large to represent, a pool below the
+    /// lanes, or a process ceiling below the allocator ceiling refuses.
     ///
     /// # Panics
-    /// Panics when the worker cap ignores either ceiling.
+    /// Panics when a lane default or a memory ceiling is ignored.
     #[test]
-    fn memory_ceilings_cap_live_workers() {
+    fn lanes_split_the_memory_ceilings() {
         let limits = HostedLimits::default();
-        assert_eq!(limits.live_workers(), Some(5));
+        assert!(limits.worker_fits() && limits.lanes_fit());
         assert_eq!(
-            HostedLimits {
-                monty_max_workers: 3,
+            (
+                limits.direct.python_workers + limits.queued.python_workers,
+                limits.direct.workspaces + limits.queued.workspaces,
+                limits.direct.python_waiters + limits.queued.python_waiters,
+                2 * limits.monty_min_workers,
+            ),
+            (16, 64, 64, 2)
+        );
+        assert_eq!(
+            (
+                (limits.direct.python_workers, limits.queued.python_workers),
+                (limits.direct.python_waiters, limits.queued.python_waiters),
+                (limits.direct.workspaces, limits.queued.workspaces),
+                limits.monty_pool_memory_bytes,
+                limits.monty_min_workers,
+            ),
+            ((4, 12), (16, 48), (16, 48), 8192 * 1024 * 1024, 1)
+        );
+        assert_eq!(
+            (
+                limits.direct_executions,
+                limits.direct.model_calls,
+                limits.queued.model_calls,
+            ),
+            (256, 256, 256)
+        );
+        let mut wider = limits;
+        wider.queued.python_workers += 6;
+        assert!(!wider.lanes_fit(), "twenty-two workers exceed 8 GiB");
+        wider.queued.python_workers = usize::MAX;
+        assert!(
+            !wider.lanes_fit(),
+            "an unrepresentable worker count refuses"
+        );
+        assert!(
+            !HostedLimits {
+                monty_pool_memory_bytes: limits.monty_process_memory_bytes,
                 ..limits
             }
-            .live_workers(),
-            Some(3)
+            .lanes_fit()
         );
-        for impossible in [
-            HostedLimits {
-                monty_pool_memory_bytes: limits.monty_process_memory_bytes - 1,
-                ..limits
-            },
-            HostedLimits {
+        assert!(
+            !HostedLimits {
                 monty_process_memory_bytes: limits.monty_memory_bytes,
                 ..limits
-            },
-        ] {
-            assert_eq!(impossible.live_workers(), None);
-        }
+            }
+            .worker_fits()
+        );
     }
 }

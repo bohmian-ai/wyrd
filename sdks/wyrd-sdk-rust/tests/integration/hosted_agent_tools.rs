@@ -34,7 +34,7 @@ use wyrd_ai::verify::{Submission, VerificationExecutionStatus};
 use wyrd_ai::{StepStatus, VerificationResult, WyrdClient};
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::auth::TokenAudience;
-use wyrd_testing::server::{HostedLimits, WyrdTestServer};
+use wyrd_testing::server::{HostedLimits, LaneLimits, WyrdTestServer};
 
 use crate::local_development::configure_gateway;
 use crate::support::{Deployment, declare, pull};
@@ -643,24 +643,28 @@ impl PublishDesk {
 /// # Panics
 /// Panics when the upstream's URL does not parse.
 pub(crate) fn builder(upstream: &MockServer) -> wyrd_testing::server::WyrdTestServerBuilder {
-    workspaces(upstream, HostedLimits::default().max_workspaces)
+    workspaces(upstream, HostedLimits::default().queued.workspaces)
 }
 
-/// [`builder`]'s server admitting at most `max_workspaces` concurrent
-/// Agent workspaces across every execution and tenant.
+/// [`builder`]'s server admitting at most `queued_workspaces` concurrent
+/// queued Agent workspaces across every execution and tenant.
 ///
 /// # Panics
 /// Panics when the upstream's URL does not parse.
 pub(crate) fn workspaces(
     upstream: &MockServer,
-    max_workspaces: usize,
+    queued_workspaces: usize,
 ) -> wyrd_testing::server::WyrdTestServerBuilder {
+    let limits = HostedLimits::default();
     WyrdTestServer::builder()
         .with_verification_limits_for_test(HostedLimits {
             monty_min_workers: 0,
             work_write_max_bytes: WORK as u64,
-            max_workspaces,
-            ..HostedLimits::default()
+            queued: LaneLimits {
+                workspaces: queued_workspaces,
+                ..limits.queued
+            },
+            ..limits
         })
         .with_verification_runtime_for_test()
         .with_gateway_provider_root_for_test(upstream.uri().parse().expect("upstream URL parses"))

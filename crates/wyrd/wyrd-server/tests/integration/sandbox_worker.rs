@@ -12,9 +12,9 @@ use monty_pool::{MountSpec, MountSpecMode};
 use serde_json::{Map, Value, json};
 use tokio::time::Instant;
 use vala_verify::blocks::BlockError;
-use wyrd_server::verification::hosted::HostedLimits;
 use wyrd_server::verification::hosted::sandbox::{CodeRun, Sandbox};
 use wyrd_server::verification::hosted::workspace::{Staged, Workspace};
+use wyrd_server::verification::hosted::{HostedLimits, LaneLimits};
 
 /// The worker binary: this package's `wyrd-server`, which serves as its own
 /// worker, launched once to completion before its path is first returned.
@@ -45,7 +45,7 @@ pub(crate) fn worker() -> PathBuf {
         .clone()
 }
 
-/// A sandbox under `limits` with no prewarmed workers.
+/// A queued-lane sandbox under `limits` with no prewarmed workers.
 ///
 /// # Panics
 /// Panics when the pool cannot start.
@@ -56,6 +56,7 @@ async fn start(limits: HostedLimits) -> Sandbox {
             monty_min_workers: 0,
             ..limits
         },
+        limits.queued,
     )
     .await
     .expect("pool starts")
@@ -400,7 +401,11 @@ async fn sandbox_contains_runaway_code() {
             ..HostedLimits::default()
         },
     ] {
-        assert!(Sandbox::start(worker(), limits).await.is_err());
+        assert!(
+            Sandbox::start(worker(), limits, limits.queued)
+                .await
+                .is_err()
+        );
     }
 }
 
@@ -413,8 +418,11 @@ async fn sandbox_contains_runaway_code() {
 #[tokio::test]
 async fn sandbox_bounds_workers_and_waiters() {
     let sandbox = start(HostedLimits {
-        monty_max_workers: 1,
-        monty_max_waiters: 1,
+        queued: LaneLimits {
+            python_workers: 1,
+            python_waiters: 1,
+            ..HostedLimits::default().queued
+        },
         code_timeout: Duration::from_secs(2),
         ..HostedLimits::default()
     })
@@ -451,7 +459,10 @@ async fn sandbox_bounds_workers_and_waiters() {
 #[tokio::test]
 async fn sandbox_shutdown_settles_checkouts_and_reaps_workers() {
     let busy = start(HostedLimits {
-        monty_max_workers: 1,
+        queued: LaneLimits {
+            python_workers: 1,
+            ..HostedLimits::default().queued
+        },
         code_timeout: Duration::from_secs(2),
         ..HostedLimits::default()
     })

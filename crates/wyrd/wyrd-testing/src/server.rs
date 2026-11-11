@@ -69,8 +69,14 @@ use wyrd_server::state::{
     BifrostShutdownReport, BifrostTestControls, EngineWorker, QueryStreamFault,
     QueryStreamFaultController, ScribeCoordinationRuntime, TestHooks,
 };
+/// The runtime bounds [`WyrdTestServerBuilder::with_verification_runtime_limits_for_test`] takes.
+pub use wyrd_server::verification::RuntimeLimits;
+/// The lane resource a journey saturates through `HostedBlocks::hold_for_test`.
+pub use wyrd_server::verification::hosted::blocks::LaneAdmission;
 /// The hosted Verifier limits [`WyrdTestServerBuilder::with_verification_limits_for_test`] takes.
-pub use wyrd_server::verification::hosted::HostedLimits;
+pub use wyrd_server::verification::hosted::{HostedLimits, LaneLimits};
+/// The execution lane a journey selects hosted capacity by.
+pub use wyrd_server::verification::telemetry::ExecutionMode;
 use wyrd_server::{AppState, WyrdServer, WyrdServerConfig, build_router};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::NodeId;
@@ -572,6 +578,9 @@ pub struct WyrdTestServerBuilder {
     /// Hosted Verifier Deployment limits; `None` keeps the defaults with no
     /// prewarmed worker.
     verification_limits: Option<HostedLimits>,
+    /// Queued runtime bounds; `None` keeps the production defaults. Boxed
+    /// so the builder a journey holds across awaits stays small.
+    verification_runtime_limits: Option<Box<RuntimeLimits>>,
     /// Hosted Verifier worker executable replacing the shipped same-profile
     /// `wyrd-server`, so a journey can prove a bad worker fails startup.
     verification_worker: Option<std::path::PathBuf>,
@@ -700,6 +709,7 @@ impl Default for WyrdTestServerBuilder {
             mcp_context_probe: false,
             operator_keys: None,
             verification_limits: None,
+            verification_runtime_limits: None,
             verification_worker: None,
         }
     }
@@ -4584,6 +4594,15 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Run the queued runtime under `limits` instead of the production
+    /// defaults, through the same configuration production reads its queued
+    /// execution slots and deadline from.
+    #[must_use]
+    pub fn with_verification_runtime_limits_for_test(mut self, limits: RuntimeLimits) -> Self {
+        self.verification_runtime_limits = Some(Box::new(limits));
+        self
+    }
+
     /// Start the hosted Verifier blocks over `worker` instead of the shipped
     /// same-profile `wyrd-server`, through the same startup input production
     /// fills with its own executable.
@@ -5320,6 +5339,9 @@ impl WyrdTestServerBuilder {
             monty_min_workers: 0,
             ..HostedLimits::default()
         });
+        if let Some(limits) = self.verification_runtime_limits.take() {
+            config.verification.runtime = *limits;
+        }
         let (operator_keys, operator_keys_dir) = match self.operator_keys.take() {
             Some(config) => (config, None),
             None => generated_operator_keys()?,

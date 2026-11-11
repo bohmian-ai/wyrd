@@ -5,7 +5,7 @@
  * evidence exported over stock OTLP. Nothing here mocks the server or the BFF.
  */
 import { execFileSync, spawn } from 'node:child_process';
-import { closeSync, mkdtempSync, openSync, readFileSync, statSync } from 'node:fs';
+import { closeSync, mkdtempSync, openSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -1034,6 +1034,103 @@ test('authenticated card browsing and prompt comparison', async ({ ui }) => {
   await viewer.goto(inventory);
   await expect.poll(() => viewer.getByRole('region', { name: 'Cards', exact: true }).textContent()).toContain('WYRD_PERMISSION_403_DENIED_RBAC');
   expect(await serverHtml(viewer, `${detail}?kind=Prompt&name=${prompt.name}&version=1.1.0`)).toContain('WYRD_PERMISSION_403_DENIED_RBAC');
+});
+
+test('an exact Verifier Card page draws its declared graph and where it runs', async ({ ui }) => {
+  const cards = await Cards.connect({ client: WyrdClient.connect({ serverUrl: ui.serverUrl, credential: ui.adminKey }) });
+  // A Service bound to a three-step Verifier, and a second version of a small Verifier.
+  const receipt = await cards.declareFromPath(fixture('cards/verifier_building_blocks/policy-desk.yaml'));
+  const review = declared(receipt, 'policy-review');
+  const promise = fixture('cards/declare_and_pull/no-refund-promise.yaml');
+  const older = declared(await cards.declareFromPath(promise));
+  const next = join(mkdtempSync(join(tmpdir(), 'wyrd-ui-verifier-')), 'no-refund-promise.yaml');
+  writeFileSync(next, readFileSync(promise, 'utf8').replace('version: 1.0.0', 'version: 1.1.0'));
+  await cards.declareFromPath(next);
+
+  const page = await humanSignIn(ui.browser, ui.base, TENANT, await invitation(ui.serverUrl, ui.adminKey, 'admin'));
+  const detail = `${ui.base}/t/${TENANT}/cards/detail`;
+  await page.goto(`${detail}?kind=Verifier&name=${review.name}&version=${review.version}`);
+  const graph = page.getByRole('region', { name: 'Graph', exact: true });
+  const node = (key: string) => graph.locator(`[data-node="${key}"]`);
+  const selected = () => graph.locator('[data-node][aria-pressed="true"]').evaluateAll((nodes) => nodes.map((each) => each.getAttribute('data-node')));
+
+  // The declaration as registered: description, stage headings, every node and dependency.
+  await expect.poll(() => graph.locator('[data-node]').count()).toBe(14);
+  expect(await page.getByText('A support answer follows its refund policy and was looked up, not guessed.').count()).toBe(1);
+  expect(await graph.locator('[data-stage]').allTextContents()).toEqual(['Inputs', 'Steps', 'After all steps']);
+  expect(await graph.locator('[data-edge]').count()).toBe(13);
+  expect(await node('step:refund-rules').textContent()).toContain('needs policy-text');
+  expect(await graph.textContent()).not.toMatch(/passed|failed|running/i);
+  expect(await page.getByRole('link', { name: /Results/ }).count()).toBe(0);
+
+  // Selecting a step shows its declaration; arrow keys move the selection and focus with it.
+  await node('step:refund-rules').click();
+  expect(await selected()).toEqual(['step:refund-rules']);
+  await expect.poll(() => page.getByRole('region', { name: 'Step refund-rules', exact: true }).textContent()).toContain('timeout_seconds: 5');
+  await page.keyboard.press('ArrowRight');
+  expect(await selected()).toEqual(['req:follows-policy']);
+  expect(await page.evaluate(() => document.activeElement?.getAttribute('data-node'))).toBe('req:follows-policy');
+  await expect.poll(() => page.getByRole('region', { name: 'Requirement follows-policy', exact: true }).textContent()).toContain('judged after every step');
+  await page.keyboard.press('ArrowLeft');
+  expect((await selected())[0]).toMatch(/^(step|req):(refund-rules|limit-found|answer-facts)$/);
+
+  // Nothing is authored: a drag across a node moves no node relative to another, and Delete removes none.
+  const gap = async () => ((await node('step:refund-rules').boundingBox())?.x ?? NaN) - ((await node('input:answer').boundingBox())?.x ?? NaN);
+  const before = await gap();
+  const box = await node('step:refund-rules').boundingBox();
+  if (!box) throw new Error('the step has no box');
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width / 2 + 90, box.y + box.height / 2 + 30, { steps: 6 });
+  await page.mouse.up();
+  await page.keyboard.press('Delete');
+  expect(await gap()).toBeCloseTo(before, 0);
+  expect(await graph.locator('[data-node]').count()).toBe(14);
+  expect(await graph.locator('[data-edge]').count()).toBe(13);
+
+  // Zoom is a view control only.
+  const zoom = graph.locator('[data-zoom]');
+  await graph.getByRole('button', { name: 'Fit' }).click();
+  const fitted = await zoom.textContent();
+  await graph.getByRole('button', { name: 'Zoom in' }).click();
+  expect(await zoom.textContent()).not.toBe(fitted);
+  await graph.getByRole('button', { name: '100%' }).click();
+  expect(await zoom.textContent()).toBe('100%');
+  await graph.getByRole('button', { name: 'Fit' }).click();
+  expect(await zoom.textContent()).toBe(fitted);
+
+  // A phone-width screen keeps every node; the graph pans instead of shrinking below its minimum.
+  await page.setViewportSize({ width: 390, height: 800 });
+  await page.reload();
+  await expect.poll(() => graph.locator('[data-node]').count()).toBe(14);
+  expect(await zoom.textContent()).toBe('60%');
+  await node('req:follows-policy').focus();
+  await page.keyboard.press('Enter');
+  expect(await selected()).toEqual(['req:follows-policy']);
+  await page.setViewportSize({ width: 1280, height: 720 });
+
+  // Where it runs: the Service's own binding, which opens that exact Service.
+  const runs = page.getByRole('region', { name: 'Runs on', exact: true });
+  await expect.poll(() => runs.textContent()).toContain('the whole Card · explicit invocation only');
+  await page.getByRole('navigation', { name: `${review.name} sections` }).getByRole('button', { name: 'YAML' }).click();
+  await expect.poll(() => page.getByRole('region', { name: 'YAML', exact: true }).textContent()).toContain('kind: Verifier');
+  await page.getByRole('navigation', { name: `${review.name} sections` }).getByRole('button', { name: 'Graph' }).click();
+  await runs.getByRole('button', { name: 'policy-desk@1.0.0' }).click();
+  await page.waitForURL((url) => url.searchParams.get('kind') === 'Service' && url.searchParams.get('name') === 'policy-desk');
+
+  // An older version says so and changes nothing; choosing the newest is exact and drops the note.
+  await page.goto(`${detail}?kind=Verifier&name=${older.name}&version=1.0.0`);
+  await expect.poll(() => page.getByText(/You are viewing/).textContent()).toContain('the newest registered version is 1.1.0');
+  await expect.poll(() => graph.locator('[data-node]').count()).toBe(2);
+  expect(await runs.textContent()).toContain('No binding runs this exact version.');
+  await page.getByLabel('Version').selectOption('1.1.0');
+  await expect.poll(() => new URL(page.url()).searchParams.get('version')).toBe('1.1.0');
+  await expect.poll(() => page.getByText(/You are viewing/).count()).toBe(0);
+
+  // A missing version is not found and never another version; a principal holding no role is denied.
+  expect(await serverHtml(page, `${detail}?kind=Verifier&name=${review.name}&version=9.9.9`)).toContain('WYRD_REGISTRY_404_CARD_NOT_FOUND');
+  const viewer = await signIn(ui.browser, ui.base, TENANT, ui.readerKey);
+  expect(await serverHtml(viewer, `${detail}?kind=Verifier&name=${review.name}&version=${review.version}`)).toContain('WYRD_PERMISSION_403_DENIED_RBAC');
 });
 
 /** The repository root, where `mise run dev:full` runs. */

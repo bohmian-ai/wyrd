@@ -20,7 +20,9 @@ import {
   loadPromptMessages,
   loadPromptVariables,
   loadRelationshipList,
+  loadRunsOn,
   loadUsedBy,
+  loadVerifierDefinition,
   loadVersionDiff,
   loadChart,
   loadFacetRail,
@@ -68,8 +70,8 @@ async function appBridgeView(doc: unknown, answer: (name: string, args: Record<s
     void setTimeout(() => target.dispatchEvent(new target.MessageEvent('message', { data, source })));
   view.postMessage = deliver(view, host);
   // jsdom has no ResizeObserver; ext-apps observes the body to report its size.
-  // Its windows also lack structuredClone, which every real host provides.
-  Object.assign(view, { ResizeObserver: class { observe() {} disconnect() {} }, structuredClone });
+  // Its windows also lack structuredClone and matchMedia, which every real host provides.
+  Object.assign(view, { ResizeObserver: class { observe() {} disconnect() {} }, structuredClone, matchMedia: window.matchMedia });
   // ext-apps traces every message at debug level on both sides.
   for (const each of [view.console, console]) vi.spyOn(each, 'debug').mockImplementation(() => {});
   host.postMessage = deliver(host, view);
@@ -684,4 +686,135 @@ test('card and prompt components use authorized host reads and actions', async (
   expect(app.document.querySelector('[data-panel="messages"]')?.textContent).toContain('{{ticket}}');
   expect(app.calls.map((call) => call.name).sort()).toEqual(['cards.get', 'cards.get', 'cards.get', 'cards.list']);
   expect(app.calls.find((call) => call.name === 'cards.list')?.arguments).toMatchObject({ kind: 'Prompt', limit: 50 });
+});
+
+test('an exact Verifier definition and where it runs load through every authorized host', async ({ server, seeded: _seeded }) => {
+  const cards = await Cards.connect();
+  // A Service bound to a three-step Verifier, a component-bound Verifier and a drift Verifier nothing binds.
+  const receipt = await cards.declareFromPath(fixture('cards/verifier_building_blocks/policy-desk.yaml'));
+  const desk = exact(declared(receipt));
+  const review = exact(declared(receipt, 'policy-review'));
+  const promise = exact(declared(await cards.declareFromPath(fixture('cards/declare_and_pull/support-desk.yaml')), 'no-refund-promise'));
+  const drift = exact(declared(await cards.declareFromPath(fixture('cards/mcp_investigation/drift-verifier.yaml'))));
+  const tenant = 'ui-verifier-foreign';
+  const foreignKey = server.bootstrapServiceInTenant(server.seedTenant(tenant), ['admin'], 'ui-verifier-admin');
+
+  const client = WyrdClient.connect();
+  const mcp = await mcpOver(server.baseUrl, client);
+  try {
+    for (const [surface, executor] of [['node', nodeExecutor(client)], ['mcp', mcp.executor]] as const) {
+      const context = { executor };
+      // The declared graph: every input, step and requirement, and the dependencies its references name.
+      const definition = await loadVerifierDefinition({ cardRef: review }, context);
+      if (definition.result.state !== 'populated') throw new Error(`${surface}: ${JSON.stringify(definition.result)}`);
+      const { graph, spec } = definition.result.data;
+      expect(spec.description).toBe('A support answer follows its refund policy and was looked up, not guessed.');
+      expect(graph.inputs.map((input) => [input.id, input.kind])).toEqual([['answer', 'json'], ['policy', 'media'], ['trace', 'trace']]);
+      expect(graph.steps.map((step) => [step.id, step.kind, step.needs, step.requirements.map((each) => each.id)])).toEqual([
+        ['policy-text', 'extract', [], ['policy-has-text']],
+        ['refund-rules', 'agent', ['policy-text'], ['limit-found']],
+        ['answer-facts', 'code', ['refund-rules'], []]
+      ]);
+      expect(graph.requirements.map((each) => each.id)).toEqual(['refund-within-limit', 'policy-looked-up', 'answer-drafted-after-lookup', 'lookup-read-refunds', 'follows-policy', 'names-the-policy']);
+      expect(graph.edges).toHaveLength(13);
+      expect(graph.edges).toEqual(
+        expect.arrayContaining([
+          { source: 'input:policy', target: 'step:policy-text' },
+          { source: 'step:answer-facts', target: 'req:refund-within-limit', label: 'within_limit' },
+          { source: 'input:trace', target: 'req:policy-looked-up' },
+          { source: 'step:refund-rules', target: 'req:follows-policy' }
+        ])
+      );
+      // Drift-shaped: one samples input judged by one whole-Verifier requirement.
+      expect((await loadVerifierDefinition({ cardRef: drift }, context)).result).toMatchObject({
+        state: 'populated',
+        data: { graph: { inputs: [{ id: 'latency', kind: 'samples' }], steps: [], requirements: [{ kind: 'drift' }], edges: [{ source: 'input:latency', target: 'req:latency-under-threshold' }] } }
+      });
+
+      // Where it runs: the Service itself, one component of another Service, and nothing.
+      expect((await loadRunsOn({ cardRef: review }, context)).result).toMatchObject({
+        state: 'populated',
+        data: [{ ref: { kind: 'Service', name: 'policy-desk', uid: desk.uid }, bindings: { state: 'populated', data: [{ when: 'explicit invocation only' }] } }]
+      });
+      expect((await loadRunsOn({ cardRef: promise }, context)).result).toMatchObject({
+        state: 'populated',
+        data: [{ ref: { kind: 'Service', name: 'support-desk' }, bindings: { state: 'populated', data: [{ subject: 'agent', when: 'explicit invocation only' }] } }]
+      });
+      expect((await loadRunsOn({ cardRef: drift }, context)).result).toMatchObject({ state: 'empty', reason: 'No binding runs this exact version.' });
+
+      // A missing version and a Card of another kind are refused, never replaced by another version.
+      for (const load of [loadVerifierDefinition, loadRunsOn]) {
+        expect((await load({ cardRef: { ...review, version: '9.9.9', uid: undefined } }, context)).result).toMatchObject({
+          state: 'error',
+          problem: { code: 'WYRD_REGISTRY_404_CARD_NOT_FOUND' }
+        });
+        expect((await load({ cardRef: desk }, context)).result).toMatchObject({
+          state: 'error',
+          problem: { code: 'WYRD_SPEC_400_VALIDATION', detail: 'policy-desk@1.0.0 is a Service Card, not a Verifier' }
+        });
+      }
+    }
+  } finally {
+    await mcp.close();
+  }
+
+  // A principal without card permission sees both denied after one read each.
+  const runs: WireRequest[][] = [];
+  const queryOnly = nodeExecutor(WyrdClient.connect({ credential: server.scopedApiKey('ui_verifier_denied', ['bifrost_query:read']) }));
+  const denied: { executor: Executor } = { executor: { run: ((requests, signal) => (runs.push([...requests]), queryOnly.run(requests, signal))) as Executor['run'] } };
+  for (const loaded of [await loadVerifierDefinition({ cardRef: review }, denied), await loadRunsOn({ cardRef: review }, denied)])
+    expect(loaded.result).toMatchObject({ state: 'denied', problem: { code: DENIED } });
+  expect(runs.map((requests) => requests.length)).toEqual([1, 1]);
+
+  // BFF: another tenant's browser session cannot read this tenant's Verifier.
+  env.WYRD_SERVER_URL = server.baseUrl;
+  const url = new URL(`http://ui.test/t/${tenant}/ui/load`);
+  const cookies = jar();
+  await browserSessions.signInWithApiKey(tenant, foreignKey, url, cookies);
+  const browserSession = await browserSessions.read(tenant, url, cookies);
+  for (const component of ['VerifierDefinition', 'RunsOn']) {
+    const response = await loadPanel({
+      locals: { browserSession },
+      request: new Request(url, { method: 'POST', body: JSON.stringify({ component, input: { cardRef: review }, range: RANGE }), headers: { 'content-type': 'application/json' } })
+    } as never);
+    expect(await response.json(), component).toMatchObject({ result: { state: 'error', problem: { code: 'WYRD_REGISTRY_404_CARD_NOT_FOUND' } } });
+  }
+
+  // Custom app: its server loads the same props with WYRD_API_KEY and never returns the key.
+  for (const component of ['VerifierDefinition', 'RunsOn']) {
+    const response = await loadExamplePanel({
+      request: new Request('http://app.test/view/load', { method: 'POST', body: JSON.stringify({ component, input: { cardRef: review }, range: RANGE }) })
+    } as never);
+    const text = await response.text();
+    expect(text).not.toContain(server.apiKey);
+    expect(JSON.parse(text), component).toMatchObject({ result: { state: 'populated' } });
+  }
+
+  // The built HTML draws the registered declaration and its binding through host tools/call alone.
+  const [verifier, service] = await nodeExecutor(client).run([
+    { op: 'cards.get_by_ref', card_ref: review },
+    { op: 'cards.get_by_ref', card_ref: desk }
+  ]);
+  if (!verifier.ok || !service.ok) throw new Error('the registered Cards did not read back');
+  const app = await appBridgeView(
+    {
+      version: 'wyrd.view/v1',
+      catalogId: 'wyrd.ui/v1',
+      range: RANGE,
+      panels: [
+        { id: 'definition', component: 'VerifierDefinition', input: { cardRef: review } },
+        { id: 'runs', component: 'RunsOn', input: { cardRef: review } }
+      ]
+    },
+    (name, args) => (name === 'cards.get' ? { card: (args.card_ref as { kind: string }).kind === 'Service' ? service.value : verifier.value } : notFound)
+  );
+  await vi.waitFor(() => expect(app.document.querySelector('[data-panel="runs"]')?.textContent).toContain('policy-desk'));
+  const drawn = app.document.querySelector('[data-panel="definition"]') as Element;
+  await vi.waitFor(() => expect(drawn.querySelector('[data-node]')).not.toBeNull());
+  expect([...drawn.querySelectorAll('[data-node]')].map((node) => node.getAttribute('data-node'))).toEqual(
+    expect.arrayContaining(['input:policy', 'step:refund-rules', 'req:limit-found', 'req:follows-policy'])
+  );
+  expect(drawn.querySelectorAll('[data-edge]')).toHaveLength(13);
+  // Both panels read the Verifier; the view issues that identical read once, then the owner's.
+  expect(app.calls.map((call) => call.name)).toEqual(['cards.get', 'cards.get', 'cards.get']);
 });

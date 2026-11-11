@@ -135,3 +135,87 @@ using this receipt's selected binding; a manually seeded binding is insufficient
 | O-33 | Output ¶2 | Authoring, identity override, offline-check, rollback and empty-list guidance | docs guide + docs:check |
 | O-34 | Proof AC-011 | Typed receipts/errors/served schemas match across SDK, CLI, HTTP/MCP | journeys assert same codes; served schema contains Repository |
 | O-35 | Proof | tenant isolation and contract checks pass | check:tenant-isolation, codegen:check |
+
+## Evidence
+
+Journeys: `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs` (Rust SDK and CLI), `sdks/wyrd-sdk-python/tests/integration/test_repository_declaration.py`,
+`sdks/wyrd-sdk-ts/wyrd/tests/integration/repository-declaration.test.ts` (same four
+scenarios and codes), MCP `crates/wyrd/wyrd-mcp/tests/bifrost/mcp/github.rs::an_agent_reads_the_selected_repository_policy`.
+Story fixtures: `fixtures/cards/repository_declaration/`.
+
+| Obligation | Implementation evidence | Assertion | Verification evidence | Result |
+|---|---|---|---|---|
+| O-01 minimal TOML declares inferred Repository root | `wyrd-config/src/config.rs::RepositoryConfig`, `wyrd-loader/src/repository.rs`, `wyrd-cli/src/card.rs::declare_tree` | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:171`, `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:355` | Rust journey `toml_policy_is_selected_only_once_declared`, `cli_checks_offline_and_declares_the_policy` | PASS |
+| O-02 YAML Repository same lifecycle | `Spec::Repository` through `cards/saga` and `components/cards/service.rs` | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:254-258` | `yaml_repository_declares_through_the_same_lifecycle` (Rust/Python/TS) | PASS |
+| O-03 ordinary YAML declaration unchanged | `wyrd-sql/src/queries/cards/repository.rs` `COALESCE(ready)` for non-Repository roots | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:162` (plain Verifier YAML declares), `crates/wyrd/wyrd-sql/tests/integration/pg_cards_declare.rs:1374` (no Repository root settles nothing) | `declare_and_pull::*` 15/15 and `pg_cards_declare` in `mise run test:cards:integration` | PASS |
+| O-04 remote is a hint; unselected repo refused | `components/cards/service.rs::resolve_repositories` via `GithubConnections::verify_repository` | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:285` | `repository_identity_is_verified_by_the_connection` (Rust/Python/TS) | PASS |
+| O-05 metadata/spec overrides win, still verified | `RepositoryMetadata`/`RepositoryIdentity` in loader | `crates/shared/wyrd-loader/src/lib.rs:555`; `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:258` (explicit `repository_id` verified to `acme/web`); `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:298` (name override verified against family) | loader lib; journeys | PASS |
+| O-06 explicit identity outside a checkout | `--repository` → `load_with_repository` | `crates/shared/wyrd-loader/src/lib.rs:555` | `cargo nextest run -p wyrd-loader --lib` | PASS |
+| O-07 missing identity refuses | `WYRD_REGISTRY_400_REPOSITORY_IDENTITY_MISSING` | `crates/shared/wyrd-loader/src/lib.rs:604` | wyrd-loader lib | PASS |
+| O-08 only selected Verifiers; unrelated YAML absent | loader builds root from `[repository.verified_by]` only | `crates/shared/wyrd-loader/src/lib.rs:502`, `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:178` | loader lib; Rust journey | PASS |
+| O-09 local and registered refs | `RepositoryBindings::verifier: Vec<Ref>` | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:193` (`changed.toml` = path + registered answer-check → 2 bindings, `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:196`) | Rust/Python/TS journeys | PASS |
+| O-10 local validation before registration | loader validates listed Verifiers before `Cards::declare` | `crates/shared/wyrd-loader/src/lib.rs:635`, `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:348` (no client resolved) | loader lib; CLI journey | PASS |
+| O-11 first registration infers name | `wyrd-spec/src/card/repository.rs::infer_card_name` | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:172` | Rust journey | PASS |
+| O-12 rename preserves family | `repository_family_name` lookup in `resolve_repositories` | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:307` | Rust journey (rename observed through reconnect) | PASS |
+| O-13 explicit conflicting name refused | `WYRD_REGISTRY_409_REPOSITORY_IDENTITY_CONFLICT` | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:298` | Rust/Python/TS journeys | PASS |
+| O-14 no provider IO in loader | `wyrd-loader/src/repository.rs:128` reads only `.git/config` | `crates/shared/wyrd-loader/src/repository.rs:175` | `mise run check:deps` rc=0; wyrd-loader lib | PASS |
+| O-15 `--check` local, deferred labels | `wyrd-cli/src/card.rs::check_tree` | `crates/wyrd/wyrd-cli/src/card.rs:1154`, `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:335` | wyrd-cli lib; CLI journey (Rust/Python/TS) | PASS |
+| O-16 Repository ordinary kind, closed shape | `wyrd-spec/src/card/repository.rs`, `envelope.rs` | `crates/wyrd-spec/src/card/mod.rs:2591`, `crates/wyrd-spec/src/card/repository.rs:221` | wyrd-spec lib | PASS |
+| O-17 verifier array → singular bindings | loader expansion | `crates/shared/wyrd-loader/src/lib.rs:502`, `crates/wyrd/wyrd-config/src/config.rs:305` | loader/config lib | PASS |
+| O-18 projections accept Repository | `gen_schemas.rs`, `gen_ts_types.py`, Python `Kind::Repository`, TS exports | Python `first.root.kind == CardKind.Repository`; TS `toMatchObject({kind:"Repository"})`; `pg_openapi_contract.rs:1537-1549` | `codegen:check` rc=0; py/ts journeys; openapi 24/24 | PASS |
+| O-19 reuse / auto-version / pin conflict | normal saga hashing; `seed_version` | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:188`, `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:193`, `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:210` | Rust/Python/TS journeys | PASS |
+| O-20 select only after graph ready | `settle_repository_selection` waits for every owned Card Active | `crates/wyrd/wyrd-sql/tests/integration/pg_cards_declare.rs:1388` | `pg_cards_declare::repository_selection_settles_once_against_the_expected_prior` | PASS |
+| O-21 failed declaration keeps selection; deps survive | settle not reached / `Pending` | `crates/wyrd/wyrd-sql/tests/integration/pg_cards_declare.rs:1420-1425` (unready keeps previous), `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:214-219` | SQL integration; Rust journey | PASS |
+| O-22 distinct race: one selects, other conflicts | CAS on expected prior | `crates/wyrd/wyrd-sql/tests/integration/pg_cards_declare.rs:1441` | SQL integration | PASS |
+| O-23 identical target reuses | target equality | `crates/wyrd/wyrd-sql/tests/integration/pg_cards_declare.rs:1407` | SQL integration | PASS |
+| O-24 delayed completion cannot undo newer | settled outcome kept | `crates/wyrd/wyrd-sql/tests/integration/pg_cards_declare.rs:1441-1445` | SQL integration | PASS |
+| O-25 rollback by old exact version | new operation with old target | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:224-226`, `crates/wyrd/wyrd-sql/tests/integration/pg_cards_declare.rs:1461` | Rust journey; SQL integration | PASS |
+| O-26 Active ≠ selected; no new tables | `selected_at` column + partial unique index | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:200`, `crates/wyrd/wyrd-sql/tests/integration/pg_cards_declare.rs:1449`; migration has 0 `CREATE TABLE` | journey; `grep -ci "create table"` = 0 | PASS |
+| O-27 empty list, connection stays active | complete desired state | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:234-237` | Rust/Python/TS journeys | PASS |
+| O-28 closed pull_request; refused off Repository | `TriggerActivation::PullRequest {}`; `resolve.rs:376-388` | `crates/wyrd-spec/src/card/mod.rs:2617-2618`, `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:264` | wyrd-spec lib; Rust journey | PASS |
+| O-29 design + root catalog amended | `architecture/wyrd-design.md` (Kind catalog, Repository per-kind, Trigger, Repository selection, Pre-declaration, Reference slots, Workspace config, Reference-direction); `AGENTS.md` 13 kinds | docs diff | `mise run docs:check` rc=0 | PASS |
+| O-30 receipt root/outcomes + status | `RepositoryStatus` on `status.repository`; `status.verification` | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:171-183` | journeys | PASS |
+| O-31 receipt follows committed selection | settle at end of `initialize_uploads`/`complete_card` | `sdks/wyrd-sdk-rust/tests/integration/repository_declaration.rs:180` (status read right after receipt is selected) | journeys | PASS |
+| O-32 projections on every surface | Rust/Python/TS/CLI/MCP/HTTP | per-surface journeys; MCP `github.rs:253` | `mise run test:cards:integration`, `py:test` selector, `ts` selector, MCP selector | PASS |
+| O-33 authoring guide | `docs/src/content/docs/build-and-verify/declare/declare-a-repository.md` embeds the journey fixtures | docs page | `mise run docs:check` rc=0 | PASS |
+| O-34 same receipts/errors/served schemas | identical codes asserted in three SDK journeys; served OpenAPI | `pg_openapi_contract.rs:1537-1549`; journeys | openapi 24/24; journeys | PASS |
+| O-35 tenant isolation + contract checks | raw-query justification in `queries/cards/repository.rs` | — | `check:tenant-isolation` rc=0, `codegen:check` rc=0 | PASS |
+
+Non-goals stayed excluded: no PR event producer (task 006), no deferred
+subscriptions (task 007), no new PostgreSQL tables, no provider IO in the loader.
+
+### Diagnoses
+
+- **Symptom:** every plain YAML declare returned `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE`.
+  **Evidence:** trace `decoding column "ready": unexpected null`. **Cause:** the
+  selection settle's LEFT JOIN produced a NULL `ready` when the operation has no
+  Repository target. **Fix site:** `wyrd-sql/src/queries/cards/repository.rs`
+  (`COALESCE(..., false)`), the single owner every `complete_card` routes through;
+  regression `crates/wyrd/wyrd-sql/tests/integration/pg_cards_declare.rs:1374`.
+- **Symptom:** `WYRD_LOADER_400_PATH_ESCAPE` for `../code-review.yaml`. **Cause:**
+  the loader workspace is the `wyrd.toml` directory. **Fix site:** fixture layout
+  (`policies/*.toml` copied to the checkout root), no loader change.
+- **Symptom:** remote host did not match the configured mock host. **Cause:**
+  `RepositoryRemote::parse` dropped a non-default web port. **Fix site:**
+  `wyrd-spec/src/card/repository.rs` (RED `web_remote_keeps_its_port`).
+- **Symptom:** rename via `installation_repositories added` not followed.
+  **Cause:** task 002 follows only removals. **Fix site:** test observes a rename
+  by disconnect + reconnect, which re-reads repositories; no production change.
+
+### Process exceptions
+
+- Spec, loader, config, SQL, server and projection code were written before
+  their tests. RED was observed only for `web_remote_keeps_its_port` and the
+  OpenAPI `Spec` `oneOf` count (14 → 15). The SQL, CLI, Python, TypeScript and
+  MCP journeys, the unready-selection case and the off-Repository refusal passed
+  on first run against existing behavior.
+
+### Commands
+
+- `mise run fmt`, `mise run lints`, `mise run codegen:check`,
+  `mise run check:tenant-isolation`, `mise run check:deps`, `mise run docs:check`: rc=0.
+- `mise exec -- cargo nextest run --locked -p wyrd-spec -p wyrd-loader -p wyrd-config -p wyrd-cli -p wyrd-client --lib`: 1215 passed.
+- `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server -p wyrd-sql --lib'`: 693 passed.
+- `mise run test:cards:integration` (includes `pg_cards_declare`, `declare_and_pull`, `repository_declaration::`): rc=0.
+- Python `test_repository_declaration.py` 4 passed; TS `repository-declaration.test.ts` 4 passed; MCP `an_agent_reads_the_selected_repository_policy` passed; `pg_openapi_contract` 24 passed.
+- `git diff --check`: clean.

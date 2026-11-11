@@ -1804,7 +1804,9 @@ mod edit_tests {
     /// A format's name, builder, and rich text part.
     type Format = (&'static str, Build, fn(&str) -> Value);
 
+    /// Every editable format, built through its public builder.
     fn formats() -> [Format; 4] {
+        /// Owned copies of `messages`.
         fn texts(messages: &[&str]) -> Vec<String> {
             messages.iter().map(|text| (*text).to_owned()).collect()
         }
@@ -1872,10 +1874,20 @@ mod edit_tests {
         ]
     }
 
+    /// `prompt` with `vars` bound by the native Prompt.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the bind fails.
     fn bind(prompt: &Prompt, vars: &[(&str, &str)]) -> Prompt {
         Prompt::from_native(prompt.native().bind(vars).expect("binds"))
     }
 
+    /// The missing variable a refused render names.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `result` is not a missing-variable refusal.
     fn missing(result: Result<ProviderRequest, crate::error::PromptBuilderError>) -> String {
         match result {
             Err(PromptBuilderError::Skald(SkaldError::MissingVariable(name))) => name,
@@ -1883,6 +1895,11 @@ mod edit_tests {
         }
     }
 
+    /// The JSON of `prompt` rendered with `vars`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the render fails.
     fn rendered(prompt: &Prompt, vars: &[(&str, &str)]) -> String {
         serde_json::to_string(&prompt.render_native(vars).expect("renders")).expect("json")
     }

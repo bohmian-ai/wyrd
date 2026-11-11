@@ -1102,6 +1102,7 @@ fn split_request_text_parts(request: &mut ProviderRequest) -> Vec<String> {
     names
 }
 
+/// Splits media placeholders out of the non-system `OpenAI` Chat `messages`.
 fn split_openai_chat(
     messages: &mut [crate::wire::openai_chat::OpenAiChatMessage],
     names: &mut Vec<String>,
@@ -1232,6 +1233,7 @@ fn openai_response_text_segments(
         .collect()
 }
 
+/// Splits media placeholders out of the text blocks of Anthropic `messages`.
 fn split_anthropic(
     messages: &mut [crate::wire::anthropic_messages::AnthropicMessage],
     names: &mut Vec<String>,
@@ -1284,6 +1286,7 @@ fn anthropic_text_segments(
         .collect()
 }
 
+/// Splits media placeholders out of the text parts of GenerateContent `contents`.
 fn split_google(contents: &mut [GoogleContent], names: &mut Vec<String>) {
     for content in contents {
         let mut out = Vec::new();

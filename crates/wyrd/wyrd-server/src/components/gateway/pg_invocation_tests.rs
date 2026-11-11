@@ -6052,7 +6052,8 @@ async fn gateway_agent_calls_start_only_on_a_compatible_adapter() {
 /// past the deadline still hands off: no attempt starts, and its concurrency
 /// hold is settled before the answer, so the next call is admitted. A bound
 /// that passes once preparation and a capture slot are in hand refuses the
-/// call before its ledger write, uncaptured. No expiry
+/// call before its ledger write, uncaptured, with its completed invoke
+/// decisions still audited. No expiry
 /// or cancellation keeps a permit, the gateway captures each expired call as
 /// timed out, and the next call is answered.
 ///
@@ -6348,6 +6349,7 @@ async fn lane_wait_spends_the_agent_call_budget() {
     .await
     .expect("the snapshot is cached once the listener subscribes");
     let captured = scribe.calls().len();
+    let decisions = audit_decisions(&scribe, tenant).len();
     let failure = GatewayInvocation::new(&state)
         .bounded(tokio::time::Instant::now())
         .run(
@@ -6371,6 +6373,11 @@ async fn lane_wait_spends_the_agent_call_budget() {
         "a call refused before the ledger is never captured"
     );
     assert_eq!(dispatch.seen().len(), 3, "nor dispatched");
+    assert_eq!(
+        audit_decisions(&scribe, tenant)[decisions..],
+        [("gateway.invoke".to_owned(), "allowed".to_owned()); 2],
+        "its completed requested and fallback invoke decisions stay audited"
+    );
     shutdown.cancel();
     listening.await.expect("the listener stops");
 }

@@ -166,24 +166,25 @@ impl Gateway {
     /// Wait until every accepted call's work, including accounting that
     /// settles after its response, has finished or `deadline` passes, then
     /// persist the quota usage it charged to `postgres` within the same
-    /// deadline.
+    /// deadline, retrying failed writes until they commit.
     ///
     /// Admission already refuses new calls once the shutdown token is
     /// cancelled; closing the tracker here makes its wait complete once
-    /// empty. Returns whether the work drained. Usage that cannot be
-    /// persisted before the deadline is lost with the process. Cancelling
-    /// the wait leaves the tracker closed and its tasks running.
+    /// empty. Returns whether the work drained and its usage was persisted.
+    /// Usage that cannot be persisted before the deadline is lost with the
+    /// process. Cancelling the wait leaves the tracker closed and its tasks
+    /// running.
     pub async fn drain(&self, postgres: &WyrdPostgres, deadline: tokio::time::Instant) -> bool {
         self.tasks.close();
         let drained = tokio::time::timeout_at(deadline, self.tasks.wait())
             .await
             .is_ok();
-        if tokio::time::timeout_at(deadline, self.usage.flush(postgres))
+        let persisted = tokio::time::timeout_at(deadline, self.usage.drain(postgres))
             .await
-            .is_err()
-        {
+            .is_ok();
+        if !persisted {
             tracing::warn!("gateway usage was not persisted before the shutdown deadline");
         }
-        drained
+        drained && persisted
     }
 }

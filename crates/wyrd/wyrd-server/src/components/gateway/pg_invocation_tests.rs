@@ -1299,6 +1299,121 @@ async fn snapshot_reload_recovers_from_a_transient_load_failure() {
     drain_gateway(&state).await;
 }
 
+/// Shutdown drain retries usage a failed write left unpersisted: a write
+/// that fails while storage recovers before the deadline commits each
+/// server's usage once and reports a clean drain, and one that keeps
+/// failing returns at its deadline reporting an incomplete drain.
+///
+/// Each replica's background work stops first, as in server shutdown, so
+/// only drain writes. Storage fails by the usage window table disappearing.
+///
+/// # Panics
+/// Panics when the fixture or a call fails, drain misreports, overruns its
+/// deadline, or a server's usage is persisted other than once.
+#[tokio::test]
+async fn gateway_drain_retries_usage_writes_until_commit_or_deadline() {
+    let traces = TraceBuffer::default();
+    let _traces = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(traces.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish(),
+    );
+    let failures = || {
+        traces
+            .text()
+            .matches("gateway usage synchronization failed")
+            .count()
+    };
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let limits = json!([serde_json::to_value(GatewayLimit {
+        subject: GatewayLimitSubject::Tenant,
+        target: GatewayPolicyTarget::All,
+        requests_per_minute: NonZeroU64::new(100),
+        tokens_per_minute: None,
+        concurrent_calls: None,
+    })
+    .expect("limit encodes")]);
+    let (recovering, lost) = (Scripted::shared(), Scripted::shared());
+    let recovering_state = replica(&fixture, recovering.clone()).await;
+    let lost_state = replica(&fixture, lost.clone()).await;
+    configure(
+        &recovering_state,
+        tenant,
+        limits,
+        json!([]),
+        "allow_unpriced",
+    )
+    .await;
+    warm(&lost_state, [tenant]).await;
+    let caller = invoker(tenant, 1, [open_access()]);
+    for (state, dispatch) in [(&recovering_state, &recovering), (&lost_state, &lost)] {
+        dispatch.push(Step::Return(completed(10, 5)));
+        GatewayInvocation::new(state)
+            .invoke(&caller, request("dep-a/a", None, Duration::from_secs(30)))
+            .await
+            .expect("the call is admitted");
+        state.shutdown_token.cancel();
+    }
+
+    let admin = fixture.superuser_pool().expect("superuser pool");
+    let rename = |sql: &'static str| {
+        let admin = admin.clone();
+        async move {
+            sqlx::query(sql)
+                .execute(&admin)
+                .await
+                .expect("usage window table renames");
+        }
+    };
+    rename("ALTER TABLE wyrd.gateway_usage_windows RENAME TO gateway_usage_windows_hidden").await;
+
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_millis(500);
+    assert!(
+        !lost_state
+            .gateway
+            .drain(lost_state.postgres.wyrd(), deadline)
+            .await,
+        "usage still unpersisted at the deadline is an incomplete drain"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "drain returns at its deadline"
+    );
+
+    let before = failures();
+    let restore = async {
+        while failures() == before {
+            tokio::task::yield_now().await;
+        }
+        rename("ALTER TABLE wyrd.gateway_usage_windows_hidden RENAME TO gateway_usage_windows")
+            .await;
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let (drained, ()) = tokio::join!(
+        recovering_state
+            .gateway
+            .drain(recovering_state.postgres.wyrd(), deadline),
+        restore,
+    );
+    assert!(drained, "a write that recovers before the deadline drains");
+    let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
+    let requests: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(requests), 0)::bigint FROM wyrd.gateway_usage_windows",
+    )
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("window requests read");
+    conn.commit().await.expect("window read commits");
+    assert_eq!(
+        requests, 1,
+        "the recovered server's call is persisted once and the lost one never"
+    );
+}
+
 /// The ledger fences replayed reservations, an abandoned expired reservation
 /// is never settled and so keeps counting at its full reserved cost, and a
 /// deadline-exceeded call captures unknown usage and cost and settles at the

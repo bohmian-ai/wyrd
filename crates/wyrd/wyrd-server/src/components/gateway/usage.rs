@@ -62,6 +62,10 @@ const IDLE_REFRESH: Duration = Duration::from_secs(10);
 /// How recently a tenant must have admitted a call to refresh actively.
 const RECENT: Duration = Duration::from_secs(60);
 
+/// Wait between [`GatewayUsage::drain`] attempts to persist usage a failed
+/// synchronization left behind.
+const DRAIN_RETRY: Duration = Duration::from_millis(250);
+
 /// How long a persisted concurrency count lasts unless renewed.
 const CONCURRENCY_LEASE: Duration = Duration::from_secs(30);
 
@@ -204,19 +208,32 @@ struct TenantUsage {
     dirty: bool,
     /// Serializes the tenant's synchronizations, so a later one never
     /// commits or installs before an earlier one.
+    ///
+    /// Each [`GatewayUsage::sync`] holds a clone from before it waits until
+    /// it returns or is dropped, and a tenant with an outstanding clone is
+    /// never [`clean`](Self::clean), so eviction cannot replace this
+    /// serialization while a synchronization may still install.
     sync: Arc<tokio::sync::Mutex<()>>,
     /// When the tenant last admitted a covered call.
     used: Option<Instant>,
 }
 
 impl TenantUsage {
-    /// Whether nothing would be lost by forgetting the tenant.
+    /// Whether nothing would be lost by forgetting the tenant: no usage is
+    /// held and no synchronization is in flight.
     fn clean(&self) -> bool {
-        !self.dirty
+        Arc::strong_count(&self.sync) == 1
+            && !self.dirty
             && self.pending == 0
             && self.windows.is_empty()
             && self.active.is_empty()
             && self.reservations.is_empty()
+    }
+
+    /// Whether the tenant holds usage no committed synchronization has
+    /// persisted yet; committed window and concurrency totals are not.
+    fn unpersisted(&self) -> bool {
+        self.dirty || self.pending > 0
     }
 
     /// Whether the tenant is due a synchronization at `now`.
@@ -634,10 +651,25 @@ impl GatewayUsage {
         }
     }
 
-    /// Persists every tenant holding unpersisted usage or running calls
-    /// once, as the final step of shutdown drain.
+    /// Persists every tenant holding usage or running calls once and
+    /// refreshes its shared view, logging failures.
     pub(crate) async fn flush(&self, postgres: &WyrdPostgres) {
         self.sync_where(postgres, |usage| !usage.clean()).await;
+    }
+
+    /// Flushes, then retries every [`DRAIN_RETRY`] each tenant whose usage
+    /// is still unpersisted until all of it commits, as the final step of
+    /// shutdown drain.
+    ///
+    /// Each retry replaces rows and fences entries, so a write that failed
+    /// or committed uncertainly is counted once. Never returns while storage
+    /// keeps failing; shutdown drain bounds it by its deadline.
+    pub(crate) async fn drain(&self, postgres: &WyrdPostgres) {
+        self.flush(postgres).await;
+        while self.tenants().iter().any(|(_, usage)| usage.unpersisted()) {
+            tokio::time::sleep(DRAIN_RETRY).await;
+            self.sync_where(postgres, TenantUsage::unpersisted).await;
+        }
     }
 }
 
@@ -671,6 +703,10 @@ mod tests {
     use super::*;
 
     /// A shared view with no other usage, committed now.
+    ///
+    /// # Panics
+    /// Panics when `usage` is at capacity with no clean tenant to evict, so
+    /// `tenant` is not retained.
     fn fresh(usage: &GatewayUsage, tenant: DataTenantId) {
         GatewayUsage::retain(&mut usage.tenants(), tenant);
         let batch = usage.batch(tenant).expect("batch");
@@ -714,6 +750,9 @@ mod tests {
     /// A tenant without a view refuses and is woken; admission charges
     /// local headroom once, keeps tenants apart, and releases concurrency on
     /// settlement.
+    ///
+    /// # Panics
+    /// Panics when a decision differs from the one described.
     #[test]
     fn local_admission_spends_headroom_once_per_tenant() {
         let usage = GatewayUsage::default();
@@ -749,6 +788,10 @@ mod tests {
 
     /// A reservation counts in full until committed, then only the part the
     /// committed spend lacks; settlement lowers it to its actual cost.
+    ///
+    /// # Panics
+    /// Panics when a decision, acknowledgement, or pending count differs from
+    /// the one described.
     #[test]
     fn budget_reservations_count_once_across_refreshes() {
         let usage = GatewayUsage::default();
@@ -810,5 +853,197 @@ mod tests {
         );
         let pending = usage.tenants().peek(&tenant).map(|usage| usage.pending);
         assert_eq!(pending, Some(1), "the settlement awaits persistence");
+    }
+
+    /// A view older than [`STALE_AFTER`] and a full pending buffer each
+    /// refuse with the retryable 503, charge nothing, and wake background
+    /// recovery; a committed refresh or acknowledgement restores admission.
+    ///
+    /// # Panics
+    /// Panics when a refusal differs, charges, or does not wake recovery, or
+    /// when recovery does not restore admission.
+    #[test]
+    fn stale_and_full_usage_refuse_until_background_recovery() {
+        use futures_util::FutureExt as _;
+
+        let usage = GatewayUsage::default();
+        let tenant = DataTenantId::new_v7();
+        let window = window_floor(Utc::now());
+        let refused = |limits: &[LimitCharge], budgets: Vec<BudgetCharge>| {
+            let error = usage
+                .admit(tenant, window, limits, budgets)
+                .expect_err("refused before charging");
+            assert_eq!(error.code(), "WYRD_SERVER_503_SERVICE_UNAVAILABLE");
+            assert!(
+                usage.wake.notified().now_or_never().is_some(),
+                "refusal wakes background recovery"
+            );
+        };
+
+        fresh(&usage, tenant);
+        if let Some(shared) = usage
+            .tenants()
+            .peek_mut(&tenant)
+            .and_then(|usage| usage.shared.as_mut())
+        {
+            shared.at = Instant::now()
+                .checked_sub(STALE_AFTER)
+                .expect("the clock has run longer than the staleness bound");
+        }
+        refused(&[one_request("k")], Vec::new());
+        fresh(&usage, tenant);
+
+        let cost = |text: &str| GatewayCost::parse(text).expect("cost");
+        let key = budget_key(
+            &GatewayPolicySubject::Tenant,
+            window,
+            window + TimeDelta::days(1),
+        );
+        let reservation = || BudgetCharge {
+            key: key.clone(),
+            amount: cost("10"),
+            reserve: cost("0"),
+            reservation: Some((Uuid::new_v4(), created())),
+        };
+        let fill = (0..PENDING_ENTRIES).map(|_| reservation()).collect();
+        assert_eq!(
+            usage.admit(tenant, window, &[], fill).expect("fills"),
+            Outcome::Admitted
+        );
+        refused(&[one_request("k")], vec![reservation()]);
+        let batch = usage.batch(tenant).expect("batch");
+        usage.apply(tenant, &batch, GatewayUsageView::default());
+
+        assert_eq!(
+            usage
+                .admit(tenant, window, &[one_request("k")], vec![reservation()])
+                .expect("admits"),
+            Outcome::Admitted,
+            "neither refusal charged the one-request limit"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pg_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use wyrd_dev_fixtures::pg::PgFixture;
+
+    use super::*;
+
+    /// Usage retaining at most one tenant.
+    fn one_tenant() -> Arc<GatewayUsage> {
+        Arc::new(GatewayUsage {
+            tenants: Mutex::new(LruCache::new(NonZeroUsize::MIN)),
+            ..GatewayUsage::default()
+        })
+    }
+
+    /// The synchronization serialization `usage` holds for `tenant`.
+    ///
+    /// # Panics
+    /// Panics when `tenant` is not retained.
+    fn serial(usage: &GatewayUsage, tenant: DataTenantId) -> Arc<tokio::sync::Mutex<()>> {
+        usage
+            .tenants()
+            .peek(&tenant)
+            .map(|usage| Arc::clone(&usage.sync))
+            .expect("tenant retained")
+    }
+
+    /// Handles to `tenant`'s serialization, counting the one this takes.
+    fn handles(usage: &GatewayUsage, tenant: DataTenantId) -> usize {
+        Arc::strong_count(&serial(usage, tenant))
+    }
+
+    /// Waits until a synchronization of `tenant` takes a handle to its
+    /// serialization beyond the `before` already counted.
+    ///
+    /// # Panics
+    /// Panics when none starts within ten seconds.
+    async fn in_flight(usage: &GatewayUsage, tenant: DataTenantId, before: usize) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while handles(usage, tenant) <= before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the synchronization starts");
+    }
+
+    /// A synchronization waiting on or holding its tenant's serialization
+    /// keeps that tenant from eviction even when it holds no usage, so
+    /// capacity pressure refuses other tenants rather than replacing the
+    /// serialization; completion and cancellation each release it.
+    ///
+    /// # Panics
+    /// Panics when the fixture or a synchronization fails, the in-flight
+    /// tenant is evicted or its serialization replaced, or a finished
+    /// synchronization still pins its tenant.
+    #[tokio::test]
+    async fn in_flight_synchronization_pins_its_tenant() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let postgres = fixture.wyrd_postgres().clone();
+        let tenant = fixture.data_tenant_id();
+        let other = fixture
+            .seed_additional_tenant("usage-eviction-other")
+            .await
+            .expect("other tenant seeds");
+        let usage = one_tenant();
+        usage.sync(&postgres, tenant).await.expect("first view");
+        assert!(
+            usage
+                .tenants()
+                .peek(&tenant)
+                .is_some_and(TenantUsage::clean),
+            "the tenant holds no usage"
+        );
+        let original = serial(&usage, tenant);
+
+        let held = Arc::clone(&original).lock_owned().await;
+        let before = handles(&usage, tenant);
+        let waiting = tokio::spawn({
+            let (usage, postgres) = (Arc::clone(&usage), postgres.clone());
+            async move { usage.sync(&postgres, tenant).await }
+        });
+        in_flight(&usage, tenant, before).await;
+        let refused = usage
+            .sync(&postgres, other)
+            .await
+            .expect_err("an in-flight tenant is not evicted");
+        assert_eq!(refused.code(), "WYRD_SERVER_503_SERVICE_UNAVAILABLE");
+        let window = window_floor(Utc::now());
+        assert!(usage.admit(other, window, &[], Vec::new()).is_err());
+        assert!(Arc::ptr_eq(&serial(&usage, tenant), &original));
+        drop(held);
+        waiting
+            .await
+            .expect("synchronization joins")
+            .expect("synchronization commits");
+        drop(original);
+
+        usage
+            .sync(&postgres, other)
+            .await
+            .expect("a finished synchronization releases its tenant");
+        let held = serial(&usage, other).lock_owned().await;
+        let before = handles(&usage, other);
+        let cancelled = tokio::spawn({
+            let (usage, postgres) = (Arc::clone(&usage), postgres.clone());
+            async move { usage.sync(&postgres, other).await }
+        });
+        in_flight(&usage, other, before).await;
+        cancelled.abort();
+        assert!(
+            cancelled.await.is_err_and(|error| error.is_cancelled()),
+            "the waiting synchronization is cancelled"
+        );
+        drop(held);
+        usage
+            .sync(&postgres, tenant)
+            .await
+            .expect("a cancelled synchronization releases its tenant");
     }
 }

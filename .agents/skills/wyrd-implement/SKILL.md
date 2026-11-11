@@ -25,12 +25,19 @@ instructions and inspect the nearest owner, callers, consumers, tests,
 manifests, generated projections, and `mise.toml`.
 
 Before editing, record an `## Obligations` ledger in the task or remediation
-file. List every observation the contract requires: each acceptance row,
-scenario and case-table cell, public-surface requirement, lifecycle case,
-constraint, and validated finding. A cell naming several cases yields several
-obligations. Give each an ID, the task line it comes from, and the planned
-assertion. Test names are mechanics, not obligations; a matching selector proves
-only the assertions the test contains.
+file covering its distinct required outcomes and material invariants. Reuse
+approved requirement and acceptance IDs where possible; add a local ID only
+for a distinct promise without a suitable reference. Describe each promise once,
+citing its contract source and planned proof. Group related scenarios and
+surface variants beneath it, keeping every required negative, concurrency,
+tenancy, and lifecycle case visible. Split a row only for an independently
+meaningful outcome, invariant, or failure condition; do not target a row count.
+
+The ledger records the existing contract: it cannot add requirements or prescribe
+private implementation structure. An obligation does not imply a separate test,
+helper, implementation step, or production mechanism. One test may prove several
+obligations, and one obligation may need several forms of evidence. Test names
+are mechanics; a matching selector proves only the assertions the test contains.
 
 A conversation summary is not the contract. After any context compaction, and
 again before recording evidence, re-read the task file and reconcile the ledger
@@ -121,8 +128,8 @@ standard way cannot satisfy is open, not a known limit.
 
 A subagent receives the verbatim task text and ledger IDs of the obligations it
 owns, plus the repository rules for its write set, never a paraphrase. It
-returns per-obligation evidence; verify each assertion before accepting its
-work.
+returns per-obligation evidence; verify the assertions or inspect the cited
+non-runtime proof, as appropriate, before accepting its work.
 
 ## Verify and record evidence
 
@@ -133,28 +140,38 @@ final tracked and untracked diff audit. Do not run full user-journey suites or
 broad aggregates for a task or remediation; they run once at change review. Derive corrected commands when task text is stale, without
 substituting weaker proof.
 
-Record RED for each scenario: the selected test and its missing-behavior
-failure. Production code written before its failing test is a process
-exception to record, not a pass.
+Record RED for each new or changed behavioral scenario: the selected test and
+its missing-behavior failure. Production code written before its failing test
+is a process exception to record, not a pass. Already-correct behavior may use
+existing proof; documentation and structural constraints do not need artificial
+RED failures.
 
 Append compact evidence to the task or remediation task, one row per ledger
 obligation:
 
-| Obligation | Implementation evidence | Assertion | Verification evidence | Result |
+| Obligation and required cases | Implementation evidence | Proof location | Verification evidence | Result |
 |---|---|---|---|---|
 | `<ID: observation>` | `<location>` | `<file:line>` | `<test or check>` | `PASS | FAIL` |
 
-An obligation without an assertion that proves it is `FAIL`. "Known limit",
-"deviation", "covered by design", and "covered elsewhere" without a cited
-assertion are not `PASS`.
+Use evidence appropriate to the claim: runtime assertions at the required test
+tier for behavior, cited source/diff inspection for structural constraints,
+content review for documentation, and generated-output checks for projections.
+A successful build or docs check alone does not prove required behavior or
+document content. Shared evidence may cover multiple obligations; identify the
+cases it proves without duplicating the evidence. A grouped row passes only
+when every required case has proof. An obligation without adequate cited proof
+is `FAIL`; "known limit", "deviation", "covered by design", or "covered elsewhere"
+alone is not `PASS`.
 
 Also confirm that every non-goal remained excluded and no unrelated file was
 changed. Record commands and material limits without narrating implementation.
 
 Before returning `IMPLEMENTED`, spawn a fresh read-only checker with only the
 task file, the ledger, and the diff, never your summary. It answers: which
-obligation lacks an assertion that proves it? Resolve or mark `FAIL` every
-obligation it names.
+rows duplicate promises, lack a contract source, or prescribe private mechanics;
+which required outcomes or cases are missing; and which lack appropriate proof?
+Correct the ledger without changing the contract, then resolve or mark `FAIL`
+every unproven required outcome or case.
 
 Return `IMPLEMENTED` only when every obligation is `PASS`. Otherwise return
 `BLOCKED` with the open obligation IDs, or `SPEC_REVISION_REQUIRED` when closing

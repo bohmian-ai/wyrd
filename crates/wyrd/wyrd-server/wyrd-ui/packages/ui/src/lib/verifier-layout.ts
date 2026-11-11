@@ -57,10 +57,6 @@ const STEP_H = 80;
 const NODE_H = 52; // inputs and requirements: a title row and one line of detail
 const REQ_ROW = 28;
 const CHIP_ROW = 20;
-// The longest step status and requirement outcome words: a node keeps room for them, so a recorded execution drawn on
-// this layout never resizes it.
-const STATUS = 'waiting for approval';
-const OUTCOME = 'not judged yet';
 
 const ROW_GAP = 16; // between nodes stacked in one column
 const CHAIN_GAP = 40; // between the steps of a single chain, which stack vertically
@@ -77,10 +73,9 @@ const stepWidth = (step: DefinitionStep) =>
   Math.max(
     mono(step.id, 13) + 6 + tag(step.kind, 10.4),
     mono(step.detail, 11),
-    mono(STATUS, 11) + 17,
     mono(needsText(step), 11),
     step.chips.reduce((sum, chip) => sum + tag(chip, 10) + 6, 0),
-    ...step.requirements.map((each) => 18 + mono(each.id, 12) + 12 + mono(OUTCOME, 11))
+    ...step.requirements.map((each) => 18 + mono(each.id, 12) + 12)
   ) + PAD;
 
 interface Box {
@@ -165,7 +160,7 @@ export function layoutDefinition(graph: DefinitionGraph): LaidDefinition {
     add(step.key, 'step', stepWidth(step), main + REQ_ROW * step.requirements.length, main);
   }
   for (const each of graph.requirements)
-    add(each.key, 'req', Math.max(18 + mono(each.id, 13) + 6 + tag(each.kind, 10.4), sans(each.statement, 12), mono(OUTCOME, 11)) + PAD, NODE_H);
+    add(each.key, 'req', Math.max(18 + mono(each.id, 13) + 6 + tag(each.kind, 10.4), sans(each.statement, 12)) + PAD, NODE_H);
 
   const steps = graph.steps.map((step) => step.key);
   const isStep = (id: string) => id.startsWith('step:');
@@ -330,7 +325,7 @@ export function layoutDefinition(graph: DefinitionGraph): LaidDefinition {
     });
     let best = lanes;
     let bestCost = Infinity;
-    // ponytail: exhaustive ordering up to six lanes per gap; wider gaps keep declaration order.
+    // Exhaustive ordering up to six lanes per gap; wider gaps keep declaration order.
     for (const order of lanes.length <= 6 ? permutations(lanes) : [lanes]) {
       let cost = 0;
       order.forEach((lane, i) =>

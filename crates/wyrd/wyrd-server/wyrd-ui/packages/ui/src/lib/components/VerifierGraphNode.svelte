@@ -84,7 +84,6 @@
   .gn.sel {
     border-color: var(--declare);
     background: var(--declare-soft);
-    box-shadow: inset 2px 0 0 var(--declare);
   }
   button {
     display: flex;
@@ -176,7 +175,8 @@
     padding: 0 10px;
   }
   .attached.sel {
+    outline: 1px solid var(--declare);
+    outline-offset: -1px;
     background: var(--declare-soft);
-    box-shadow: inset 2px 0 0 var(--declare);
   }
 </style>

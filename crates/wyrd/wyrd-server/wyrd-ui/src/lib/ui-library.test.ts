@@ -2340,8 +2340,8 @@ test('verifier graph is read-only, selectable and keyboard and zoom operable', a
   expect(shown.container.querySelector('[data-outcome], [data-status], .failed, .dim, .bad')).toBeNull();
   expect(shown.container).toHaveTextContent('No execution state is shown.');
 
-  // No authoring gesture: nothing is draggable, connectable or selectable for Svelte Flow, and Delete removes nothing.
-  expect(shown.container.querySelector('.svelte-flow__node.draggable, .svelte-flow__node.selectable, .svelte-flow__node.connectable, .svelte-flow__handle.connectable, .svelte-flow__edge.selectable')).toBeNull();
+  // No authoring gesture: nothing is draggable, connectable, reconnectable or selectable for Svelte Flow.
+  expect(shown.container.querySelector('.svelte-flow__node.draggable, .svelte-flow__node.selectable, .svelte-flow__node.connectable, .svelte-flow__handle.connectable, .svelte-flow__edge.selectable, .svelte-flow__edgeupdater')).toBeNull();
   await fireEvent.click(node('step:classify'));
   for (const key of ['Delete', 'Backspace']) await fireEvent.keyDown(node('step:classify'), { key });
   expect(shown.container.querySelectorAll('[data-node]')).toHaveLength(9);

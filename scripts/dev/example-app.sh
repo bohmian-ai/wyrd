@@ -84,10 +84,12 @@ setup() {
 JSON
   uv run --no-sync python -m scripts.deploy
   # The Cards board's representative registry: a Model with a file, two
-  # versions of one Prompt and the Agent using the newer one.
+  # versions of one Prompt, the Agent using the newer one, and a Service
+  # bound to multi-step Verifiers.
   local card
   for card in declare_and_pull/support-model.yaml ui_cards/support-reply-1.0.0.yaml \
-    ui_cards/support-reply-1.1.0.yaml ui_cards/reply-agent.yaml; do
+    ui_cards/support-reply-1.1.0.yaml ui_cards/reply-agent.yaml \
+    verifier_building_blocks/policy-desk.yaml; do
     uv run --no-sync wyrd declare "$root/fixtures/cards/$card" >/dev/null
   done
 }

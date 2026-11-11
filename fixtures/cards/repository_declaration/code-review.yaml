@@ -1,0 +1,13 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: code-review
+  version: 1.0.0
+spec:
+  description: The pull request answer is "approve".
+  inputs:
+    answer: {type: json}
+  requirements:
+    - id: approves
+      statement: The answer is "approve"
+      check: {kind: assert, path: inputs.answer, operator: equals, expected: "approve"}

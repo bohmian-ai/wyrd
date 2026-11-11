@@ -1,0 +1,6 @@
+[repository.verified_by]
+verifier = [
+  "./code-review.yaml",
+  { kind = "Verifier", name = "answer-check", version = "9.9.9" },
+]
+runs_on = { kind = "pull_request" }

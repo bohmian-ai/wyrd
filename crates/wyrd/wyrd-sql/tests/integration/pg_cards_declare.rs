@@ -1340,7 +1340,8 @@ async fn selection(fixture: &PgFixture, card: &CardUid) -> (Option<CardUid>, Rep
 /// completion of a raced declaration conflicts without undoing the newer
 /// selection and keeps answering that conflict, and a deliberate new
 /// declaration of the older exact version rolls the family back. An Active
-/// version is not thereby selected.
+/// version is not thereby selected, and a declaration without a Repository
+/// root settles nothing.
 ///
 /// # Panics
 /// Panics when a settle outcome or the stored selection differs.
@@ -1349,6 +1350,29 @@ async fn repository_selection_settles_once_against_the_expected_prior() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let old = repository_card("1.0.0");
     let new = repository_card("1.1.0");
+
+    let plain = DeclarationOperationId::new(Uuid::now_v7());
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    insert_declaration_operation(
+        &mut conn,
+        NewDeclarationOperation {
+            operation_id: plain,
+            attribution: Attribution::direct(PrincipalId::new(Uuid::from_u128(7))),
+            idempotency_key: "plain",
+            request_hash: "plain",
+        },
+    )
+    .await
+    .expect("operation inserts");
+    conn.commit().await.expect("declaration commits");
+    assert_eq!(
+        settle(&fixture, plain).await,
+        RepositorySelection::None,
+        "a declaration without a Repository root has nothing to settle"
+    );
 
     let (delayed, old_uid) = repository_declaration(
         &fixture,

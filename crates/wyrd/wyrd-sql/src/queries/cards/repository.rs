@@ -151,10 +151,10 @@ pub async fn settle_repository_selection(
 ) -> Result<RepositorySelection, WyrdError> {
     let row: Option<SelectionRow> = sqlx::query_as(
         "SELECT o.selection, o.selection_target_uid, o.selection_expected_uid, t.name,
-                (t.status = 'active' AND NOT EXISTS (
+                COALESCE(t.status = 'active' AND NOT EXISTS (
                     SELECT 1 FROM wyrd.cards c
                      WHERE c.declaration_operation_id = o.operation_id
-                       AND c.status <> 'active')) AS ready
+                       AND c.status <> 'active'), false) AS ready
            FROM wyrd.card_declaration_operations o
            LEFT JOIN wyrd.cards t ON t.card_uid = o.selection_target_uid
           WHERE o.operation_id = $1

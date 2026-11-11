@@ -28,6 +28,8 @@ mod principal_roles;
 mod query_bifrost;
 /// Common analytical SQL over part-published, part-live tables.
 mod query_coverage;
+/// A connected repository's review policy, declared and selected.
+mod repository_declaration;
 mod saved_user_auth;
 mod scheduled_drift_alerts_operator;
 /// Every handle's `connect` forms against a real server.

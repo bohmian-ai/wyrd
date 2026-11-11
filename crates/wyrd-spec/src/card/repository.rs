@@ -65,7 +65,8 @@ pub struct RepositorySpec {
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct RepositoryRemote {
-    /// Lowercase remote host without user information or port.
+    /// Lowercase remote host without user information; a web remote keeps a
+    /// non-default port, as the configured provider host does.
     pub host: String,
     /// `owner/name` path of the remote, without a `.git` suffix.
     pub full_name: String,
@@ -80,18 +81,23 @@ impl RepositoryRemote {
     #[must_use]
     pub fn parse(url: &str) -> Option<Self> {
         let url = url.trim();
-        let (authority, path) = if let Some((_, rest)) = url.split_once("://") {
-            rest.split_once('/')?
+        let (scheme, (authority, path)) = if let Some((scheme, rest)) = url.split_once("://") {
+            (scheme, rest.split_once('/')?)
         } else {
             // scp-like `user@host:path`; a Windows drive or local path has no `@`.
             let (authority, path) = url.split_once(':')?;
             if !authority.contains('@') {
                 return None;
             }
-            (authority, path)
+            ("ssh", (authority, path))
         };
-        let host = authority.rsplit('@').next()?;
-        let host = host.split(':').next()?.to_ascii_lowercase();
+        let host = authority.rsplit('@').next()?.to_ascii_lowercase();
+        let host = match (scheme, host.split_once(':')) {
+            ("https", Some((name, "443"))) | ("http", Some((name, "80"))) => name.to_owned(),
+            ("https" | "http", _) => host,
+            (_, Some((name, _))) => name.to_owned(),
+            (_, None) => host,
+        };
         let path = path.trim_matches('/');
         let path = path.strip_suffix(".git").unwrap_or(path);
         let (owner, name) = path.split_once('/')?;
@@ -145,6 +151,7 @@ mod tests {
             "ssh://git@github.com:22/Acme/Widget.git",
             "git@github.com:Acme/Widget.git",
             "git://GitHub.com/Acme/Widget.git",
+            "https://github.com:443/Acme/Widget.git",
         ] {
             assert_eq!(
                 RepositoryRemote::parse(url),
@@ -155,6 +162,24 @@ mod tests {
                 "{url}"
             );
         }
+    }
+
+    /// A web remote keeps a non-default port, which is part of the
+    /// configured provider host; a transport port is not.
+    ///
+    /// # Panics
+    /// Panics when the port is dropped from a web remote or kept elsewhere.
+    #[test]
+    fn web_remote_keeps_its_port() {
+        let host = |url| RepositoryRemote::parse(url).map(|remote| remote.host);
+        assert_eq!(
+            host("https://git.example:8443/acme/widget"),
+            Some("git.example:8443".to_owned())
+        );
+        assert_eq!(
+            host("ssh://git@git.example:2222/acme/widget"),
+            Some("git.example".to_owned())
+        );
     }
 
     /// Local paths and URLs without exactly `owner/name` are not remotes.

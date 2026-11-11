@@ -1,0 +1,9 @@
+apiVersion: wyrd/v1
+kind: Repository
+metadata:
+  name: web
+spec:
+  repository_id: "2"
+  verified_by:
+    - verifier: ./code-review.yaml
+      runs_on: {kind: pull_request}

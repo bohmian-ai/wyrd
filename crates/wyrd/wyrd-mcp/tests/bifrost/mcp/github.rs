@@ -5,16 +5,18 @@
 //! a browser signed in as the same principal completes it on the GitHub App
 //! mock, and the agent reads and releases it; no answer carries a token, code
 //! or key. A writer sees the read tool but not the write tools, and is
-//! refused all three when it names them.
+//! refused all three when it names them. An agent reads a declared
+//! Repository's served selection and lists the Repository family.
 
 /// The Postgres-backed half of the GitHub connection journey.
 mod pg_tests {
-    use crate::connectivity::{McpJourneyError, discover, problem, structured, transport};
+    use crate::connectivity::{McpJourneyError, client, discover, problem, structured, transport};
 
     use rmcp::ClientServiceExt as _;
     use rmcp::model::{CallToolRequestParams, CallToolResult};
     use secrecy::ExposeSecret as _;
     use serde_json::json;
+    use wyrd_client::cards::Cards;
     use wyrd_client::transport::credential::ResolvedCredential;
     use wyrd_testing::WyrdTestServer;
     use wyrd_testing::github::{GithubAppMock, GithubBrowser};
@@ -181,6 +183,109 @@ mod pg_tests {
             );
         }
         writer_client.cancel().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// A Repository declared through the SDK reads back over MCP with its
+    /// served selection and binding, and `cards.list` filters the family by
+    /// the `Repository` kind.
+    ///
+    /// # Errors
+    ///
+    /// Returns server startup, bootstrap, connection, declaration, MCP
+    /// transport, or tool-call failures.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn an_agent_reads_the_selected_repository_policy() -> Result<(), McpJourneyError> {
+        let mock = GithubAppMock::start()?;
+        mock.add_installation(101, &[(2, "acme/web")]);
+        mock.add_user("octo", &[101]);
+        mock.sign_in("octo");
+        mock.install_target(101);
+        let server = WyrdTestServer::builder()
+            .with_github_app_for_test(&mock)
+            .start_bound()
+            .await?;
+        let admin = server
+            .bootstrap_service("mcp-repo-admin", &["admin"])
+            .await?;
+        let key = admin
+            .api_key()
+            .ok_or("a service bootstraps with a machine key")?
+            .expose_secret()
+            .to_owned();
+        let credential = || ResolvedCredential::ApiKey(key.clone().into());
+        let agent =
+            ().serve_with_lifecycle(transport(&server, credential(), None)?, discover())
+                .await?;
+        let receipt = structured(agent.call_tool(call("github_connection.connect")).await?)?;
+        let mut browser = GithubBrowser::sign_in(
+            server.base_url().ok_or("bound")?,
+            server.pg_fixture().tenant_slug(),
+            &key,
+        )
+        .await?;
+        let url = receipt["authorization_url"]
+            .as_str()
+            .ok_or("connect returns the install URL")?;
+        assert_eq!(browser.open(url).await?.status, 200);
+        let cards = Cards::connect_with(&client(&server, credential())?).await?;
+        let declared = Box::pin(cards.declare_from_path(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../fixtures/cards/repository_declaration/repository.yaml"
+        )))
+        .await?;
+
+        let read = structured(
+            agent
+                .call_tool(
+                    CallToolRequestParams::new("cards.get").with_arguments(
+                        json!({ "card_ref": declared.root })
+                            .as_object()
+                            .cloned()
+                            .ok_or("an object")?,
+                    ),
+                )
+                .await?,
+        )?;
+        let card = &read["card"];
+        assert_eq!(card["kind"], "Repository");
+        assert_eq!(card["spec"]["repository_id"], "2");
+        assert_eq!(
+            card["status"]["repository"],
+            json!({
+                "selected": true,
+                "selected_version": declared.root.version,
+                "full_name": "acme/web",
+            })
+        );
+        assert_eq!(
+            card["status"]["verification"]["binding_ids"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        let listed = structured(
+            agent
+                .call_tool(
+                    CallToolRequestParams::new("cards.list").with_arguments(
+                        json!({ "kind": "Repository" })
+                            .as_object()
+                            .cloned()
+                            .ok_or("an object")?,
+                    ),
+                )
+                .await?,
+        )?;
+        let names: Vec<_> = listed["items"]
+            .as_array()
+            .ok_or("items")?
+            .iter()
+            .map(|item| item["name"].clone())
+            .collect();
+        assert_eq!(names, [json!("web")]);
+        agent.cancel().await?;
         server.shutdown().await?;
         Ok(())
     }

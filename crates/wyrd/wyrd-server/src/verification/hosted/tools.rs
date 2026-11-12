@@ -333,7 +333,7 @@ impl Invocation {
 
     /// Retain `args`' source under its name for this step attempt, keyed by
     /// provider tool call `call_id`, and return the `{name, kind}` receipt
-    /// once the execution state accepted it.
+    /// once the live execution state holds it.
     ///
     /// # Errors
     /// Returns a Validation refusal for an invalid name or not exactly one

@@ -61,28 +61,6 @@ impl HeldLease {
     pub fn lost(&self) -> &CancellationToken {
         &self.lost
     }
-
-    /// Confirm in PostgreSQL that this lease still holds its run, renewing it
-    /// as a tick would, and cancel [`lost`](Self::lost) when it does not.
-    ///
-    /// Work about to leave the process, such as a result write, confirms
-    /// first, so a holder whose lease expired or was reclaimed since its last
-    /// renewal stops before writing.
-    ///
-    /// # Errors
-    /// Returns [`SqlError`] when the connection, statement, or commit fails;
-    /// the lease is then neither confirmed nor cancelled.
-    pub async fn confirm(&self) -> Result<bool, SqlError> {
-        let held = self
-            .renewal
-            .renew_tenant(self.tenant, &[self.token])
-            .await?
-            .contains(&self.token);
-        if !held {
-            self.lost.cancel();
-        }
-        Ok(held)
-    }
 }
 
 impl Drop for HeldLease {
@@ -154,7 +132,7 @@ impl LeaseRenewal {
     /// the fenced run's token comes back missing and its work is cancelled;
     /// renewing early only re-extends leases already past a third. While the
     /// listener is down the tick remains the bound.
-    pub(super) async fn run(&self, stop: CancellationToken) {
+    pub async fn run(&self, stop: CancellationToken) {
         let cancelled = Notify::new();
         let listener = self.postgres.listener(CANCELLED_CHANNEL);
         let listen = listener.watch(stop.clone(), |_| {}, |_| cancelled.notify_one());

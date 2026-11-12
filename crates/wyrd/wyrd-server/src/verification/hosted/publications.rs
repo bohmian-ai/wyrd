@@ -263,24 +263,21 @@ impl<'a> Publications<'a> {
     ) -> Result<Option<Result<PublicationKind, ToolError>>, ToolError> {
         let digest = digest(arguments)?;
         let publication = self.publication(call, probe);
-        let held = self
-            .run
-            .publication_receipt(PublicationCall {
-                publication: &publication,
-                call_id: &call.id,
-                arguments: &digest,
-                objects: &[],
-                retained_bytes: 0,
-            })
-            .await;
+        let held = self.run.publication_receipt(PublicationCall {
+            publication: &publication,
+            call_id: &call.id,
+            arguments: &digest,
+            objects: &[],
+            retained_bytes: 0,
+        });
         Ok(held.map(|held| answer(call, held)))
     }
 
     /// Accept `content` under `call`'s producer and name with the digest of
     /// its canonical `arguments` and the completed descriptor of each of its
     /// manifest files into the execution's state, within its publication
-    /// budget; the receipt is returned only once the state's revision is
-    /// accepted.
+    /// budget; the receipt answers from the live state, which the
+    /// execution's background flush persists.
     ///
     /// # Errors
     /// Returns a `publication_name` refusal when another call already holds
@@ -304,22 +301,19 @@ impl<'a> Publications<'a> {
         };
         let digest = digest(arguments)?;
         let publication = self.publication(call, content);
-        let accepted = self
-            .run
-            .accept_publication(
-                PublicationCall {
-                    publication: &publication,
-                    call_id: &call.id,
-                    arguments: &digest,
-                    objects,
-                    retained_bytes,
-                },
-                PublicationBudget {
-                    max_count: self.limits.publications_max,
-                    max_bytes: self.limits.files_max_bytes,
-                },
-            )
-            .await;
+        let accepted = self.run.accept_publication(
+            PublicationCall {
+                publication: &publication,
+                call_id: &call.id,
+                arguments: &digest,
+                objects,
+                retained_bytes,
+            },
+            PublicationBudget {
+                max_count: self.limits.publications_max,
+                max_bytes: self.limits.files_max_bytes,
+            },
+        );
         if accepted == PublicationAcceptance::Accepted {
             return Ok(publication.content.kind());
         }

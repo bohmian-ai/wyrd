@@ -9,16 +9,15 @@
 //! with it and executed by the tenant SYSTEM principal; a scheduled window
 //! first scores its drift requirements through [`DriftEngine`]. Each attempt
 //! ends in exactly one fenced transition the runner applies itself. Every
-//! terminal decision, from an attempt or from a terminal delivery the queue
-//! owes, ends in one operation, [`conclude`]: the decision the execution's
-//! state already accepted wins, else the offered one is recorded; a selected
-//! outcome becomes one result payload, staged on an outbox slot reserved
-//! before any work (a full reserved share defers instead) on the process
-//! [`ScribeOutbox`] attributed to the execution's subject and SYSTEM; and only
-//! once Scribe acknowledges the decision and its result does the matching
-//! fenced transaction settle it, so a visible settlement always has its
-//! records durable. A decision not acknowledged stays owed: an attempt's
-//! completion is deferred, and a failure is terminated with its delivery due.
+//! terminal decision ends in one operation, [`conclude`]: the decision the
+//! execution's state already accepted wins, else the offered one is recorded
+//! in memory, and the claim, still holding its claim permit and its renewed
+//! lease, awaits the state's background persistence off its computation. A
+//! selected outcome then becomes one result payload, staged on a reserved
+//! outbox slot of the process [`ScribeOutbox`] attributed to the execution's
+//! subject and SYSTEM, waiting for capacity in background, and only once
+//! Scribe acknowledges it does the matching fenced transaction settle it, so
+//! a visible settlement always has its records durable.
 //! A retryable failure is retried within the attempt budget; work abandoned
 //! by shutdown is released with its attempt refunded; and work whose lease is
 //! lost stops without settling. While an execution is in
@@ -47,7 +46,6 @@ use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_verify::blocks::{Checkpoints, DriftChecks, EngineError};
 use wyrd_runtime::AcceptedAuthority;
-use wyrd_runtime::outbox::Reservation;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, PrincipalId};
 use wyrd_spec::card::agent::ExecutionRoute;
@@ -64,8 +62,8 @@ use wyrd_spec::verification::{TaskId, VerificationExecutionStatus, VerifierReadi
 use wyrd_sql::queries::auth::service_accounts::system_principal_id;
 use wyrd_sql::queries::cards::get_card_for_reconciliation;
 use wyrd_sql::queries::verifier_executions::{
-    ClaimedExecution, Completion, EnqueueRefusal, ExecutionInput, PendingDelivery, RetryOutcome,
-    TerminalDelivery, TerminalStatus, VerifierExecutionQueue,
+    ClaimedExecution, Completion, EnqueueRefusal, ExecutionInput, RetryOutcome, TerminalDelivery,
+    TerminalStatus, VerifierExecutionQueue,
 };
 use wyrd_sql::{OperatorPool, SqlError, TenantConn, WyrdPostgres};
 
@@ -83,17 +81,13 @@ use super::hosted::blocks::{Execution, HostedBlocks};
 use super::inputs::{InputResolver, InputRow};
 use super::leases::{HeldLease, LeaseRenewal};
 use super::results::{ResultPayloadBuilder, ResultRun};
-use super::state::{DECISION_TIMEOUT, Decision, RunState, StateError, StateRow};
+use super::state::{Decision, RunState, StateError, StateRow};
 use super::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
 use crate::components::auth::Caller;
 use crate::components::gateway::GatewayCallContext;
 use crate::query::scheduled::ScheduledQueryCaller;
-use crate::scribe_outbox::{ScribeOutbox, ScribeSink, ScribeWrite};
+use crate::scribe_outbox::{ScribeOutbox, ScribeWrite};
 use crate::state::AppState;
-
-/// A selected outcome's result write and the outbox slot reserved for it
-/// before any work.
-pub(super) type StagedResult = (Reservation<ScribeSink>, ScribeWrite);
 
 /// Stable error code when the exact Verifier Card cannot be loaded or is not
 /// a Verifier.
@@ -106,8 +100,8 @@ pub const VERIFIER_INVALID: &str = "verifier_invalid";
 pub const EXECUTION_INTERRUPTED: &str = "execution_interrupted";
 /// Stable error code when a completed result could not be encoded.
 pub const RESULT_INVALID: &str = "result_invalid";
-/// Stable error code when Scribe did not acknowledge a selected result, so
-/// its delivery is deferred.
+/// Stable error code when Scribe did not accept a selected result, so the
+/// attempt is retried within its budget.
 pub const RESULT_UNDELIVERED: &str = "result_undelivered";
 /// Stable error code when a block was refused process capacity, so the
 /// execution is deferred.
@@ -138,6 +132,9 @@ const PUBLICATION_BOUND: Duration = Duration::from_mins(5);
 
 /// First wait before a failed settlement is tried again.
 const PERSIST_INITIAL: Duration = Duration::from_millis(50);
+/// How long a result write waits for outbox capacity in one reservation
+/// before it waits again; the lease's loss ends the wait at once.
+const CAPACITY_WAIT: Duration = Duration::from_secs(60);
 /// Longest wait between settlement attempts.
 const PERSIST_MAX: Duration = Duration::from_secs(5);
 
@@ -158,12 +155,9 @@ pub enum Transition {
     },
     /// Try the same execution and input again within its attempt budget.
     Retry(VerificationError),
-    /// Settle without a verdict, the decision acknowledged in the
-    /// execution's state.
+    /// Settle without a verdict, the decision accepted in the execution's
+    /// state when the execution has one.
     Terminate(TerminalStatus, VerificationError),
-    /// Settle without a verdict, the decision not acknowledged in the
-    /// execution's state, so its delivery stays owed.
-    Owe(TerminalStatus, VerificationError),
     /// Return the run to its queue with its attempt refunded.
     Release,
     /// Return the run to its queue with its attempt refunded, due after one
@@ -215,31 +209,6 @@ pub struct Custody {
     cards: Option<(CardRef, CardRef)>,
 }
 
-/// One claimed terminal delivery the queue owes, which never computes.
-pub struct DeliveryClaim {
-    /// The owed decision and its frozen identities.
-    pending: PendingDelivery,
-    /// What recording it needs.
-    custody: Custody,
-}
-
-/// One claim of [`VerifierRunner`].
-pub enum RunnerClaim {
-    /// An execution attempt, which may compute.
-    Attempt(Box<AttemptClaim>),
-    /// An owed terminal delivery.
-    Delivery(Box<DeliveryClaim>),
-}
-
-/// The fenced queue work one transition settles.
-#[derive(Clone, Copy)]
-enum Work<'a> {
-    /// An attempt, fenced by its lease.
-    Attempt(&'a ClaimedExecution),
-    /// A delivery, fenced by its claim.
-    Delivery(&'a PendingDelivery),
-}
-
 /// The terminal decision one claim offers its execution's state.
 enum Offer {
     /// The decision the recovered state already accepted.
@@ -250,7 +219,16 @@ enum Offer {
     Failed(TerminalStatus, VerificationError),
 }
 
-/// The frozen identities one execution's records carry, from either claim.
+/// A claimed execution's prepared input: its drift checks, pinned evidence,
+/// accepted routes, and application Run.
+type Prepared = (
+    DriftChecks,
+    BTreeMap<SlotName, InputDeclaration>,
+    BTreeMap<TaskId, ExecutionRoute>,
+    Option<RunId>,
+);
+
+/// The frozen identities one execution's records carry.
 #[derive(Clone, Copy)]
 struct Frozen<'a> {
     /// The identities every result row repeats.
@@ -280,27 +258,6 @@ impl<'a> Frozen<'a> {
             },
             verifier_uid: &run.verifier_card_uid,
             subject: run.attribution.sub_principal_id,
-        }
-    }
-
-    /// The identities owed delivery `pending` froze.
-    fn delivery(pending: &'a PendingDelivery) -> Self {
-        let (run_id, window) = input_parts(&pending.input);
-        Self {
-            run: ResultRun {
-                execution_id: pending.execution_id,
-                run_id,
-                verifier_version: &pending.verifier_version,
-                card_uid: &pending.card_uid,
-                owner_card_uid: pending.owner_card_uid.as_ref(),
-                group_id: pending.group_id.as_ref(),
-                deployment_environment: pending.deployment_environment.as_deref(),
-                binding_id: pending.binding_id,
-                trigger: pending.trigger.as_ref(),
-                window,
-            },
-            verifier_uid: &pending.verifier_card_uid,
-            subject: pending.sub_principal_id,
         }
     }
 
@@ -515,20 +472,17 @@ impl VerifierRunner {
     /// Run the execution and map the attempt to a transition.
     ///
     /// A refused target is [recorded](Self::record) without computing. An
-    /// execution without a SYSTEM principal owes its failure until one
-    /// exists. One outbox slot is then reserved for its result; when the
-    /// reserved share is full the execution defers without spending an
-    /// attempt, so a full outbox backs claims off instead of losing results.
-    /// The attempt then claims the execution's state under its lease token
-    /// and recovers its accepted revision: state a newer claim owns loses the
-    /// lease, and state that cannot be read or is in another format defers
-    /// the execution, so it never restarts as fresh. A decision the state
-    /// already accepted is concluded again without running the engine; an
-    /// [`exhausted`](ClaimedExecution::exhausted) claim of state that decided
-    /// nothing errors. An execution whose `deadline` has already passed times
-    /// out without dispatching anything. Otherwise the engine runs from the
-    /// recovered invocations until `deadline`; a completed outcome, a
-    /// terminal failure, or a retryable failure of the final attempt is
+    /// execution without a SYSTEM principal terminates errored with no state
+    /// record. The attempt then recovers its accepted revision, whose writer
+    /// stops once `lease` is lost: state that cannot be read or is in another
+    /// format defers the execution, so it never restarts as fresh. A decision
+    /// the state already accepted is concluded again without running the
+    /// engine; an [`exhausted`](ClaimedExecution::exhausted) claim of state
+    /// that decided nothing errors. An execution whose `deadline` has already
+    /// passed times out without dispatching anything. Otherwise the input is
+    /// [prepared](Self::prepare) and the engine runs from the recovered
+    /// invocations, both until `deadline`; a completed outcome, a terminal
+    /// failure, or a retryable failure of the final attempt is
     /// [concluded](conclude), and an earlier retryable failure or a deferral
     /// settles as it is. Never fails: every failure becomes the
     /// [`Transition`] it maps to.
@@ -538,7 +492,7 @@ impl VerifierRunner {
         run: &ClaimedExecution,
         verifier: Result<Arc<Target>, Refused>,
         deadline: tokio::time::Instant,
-        lease: &Arc<HeldLease>,
+        lease: &HeldLease,
         telemetry: &ExecutionTelemetry,
     ) -> Transition {
         let frozen = Frozen::attempt(run);
@@ -552,16 +506,14 @@ impl VerifierRunner {
                         frozen,
                         &custody,
                         (TerminalStatus::Errored, error),
-                        Some(lease),
+                        deadline,
+                        lease,
                     )
                     .await;
             }
         };
         let Some(system) = system_principal(verifier.system_principal) else {
             return system_missing();
-        };
-        let Ok(slot) = self.outbox.reserve(1) else {
-            return busy();
         };
         let state = match self
             .state(tenant, run, frozen, &verifier, system, deadline, lease)
@@ -570,7 +522,7 @@ impl VerifierRunner {
             Ok(state) => Arc::new(state),
             Err(transition) => return transition,
         };
-        let offer = if let Some(decision) = Decision::of(&state.snapshot().await) {
+        let offer = if let Some(decision) = Decision::of(&state.snapshot()) {
             Offer::Accepted(decision)
         } else if run.exhausted {
             Offer::Failed(
@@ -585,17 +537,12 @@ impl VerifierRunner {
             let outcome = if deadline <= tokio::time::Instant::now() {
                 timed_out()
             } else {
-                telemetry
-                    .phase(
-                        Phase::Engine,
-                        tokio::time::timeout_at(
-                            deadline,
-                            self.dispatch(tenant, run, &verifier.spec, system, &state, telemetry),
-                        )
-                        .instrument(tracing::info_span!("verification.engine")),
-                    )
-                    .await
-                    .unwrap_or_else(|_| timed_out())
+                tokio::time::timeout_at(
+                    deadline,
+                    self.compute(tenant, run, &verifier.spec, system, &state, telemetry),
+                )
+                .await
+                .unwrap_or_else(|_| timed_out())
             };
             match outcome {
                 EngineOutcome::Completed(outcome) => Offer::Selected(outcome, started_at),
@@ -607,35 +554,32 @@ impl VerifierRunner {
                 EngineOutcome::Deferred(error) => return Transition::Defer(error),
             }
         };
-        conclude(tenant, frozen, system, &state, offer, slot, Some(lease)).await
+        conclude(tenant, frozen, system, &state, offer, lease, &self.outbox).await
     }
 
-    /// Record `failure` as the decision of an execution that computes
-    /// nothing more, a target refused at claim or a delivery the queue owes,
-    /// through [`conclude`], as the tenant SYSTEM principal in `custody`.
+    /// Record `failure` as the decision of a claimed execution whose target
+    /// was refused, which computes nothing, through [`conclude`], as the
+    /// tenant SYSTEM principal in `custody`, until `deadline`.
     ///
     /// The accepted state is recovered first, and a decision it already
     /// holds wins; otherwise the failure is recorded under the state's
     /// identity, else the custody Cards' with the frozen group and owner. A
-    /// queued attempt's `lease` is confirmed before the failure is recorded.
-    /// A missing SYSTEM principal or identity leaves the decision owed, and
-    /// unreadable state or a full reserved share defers it, so nothing is
-    /// assumed absent.
+    /// missing SYSTEM principal or identity terminates with no state record,
+    /// and unreadable state defers, so nothing is assumed absent.
     async fn record(
         &self,
         tenant: DataTenantId,
         frozen: Frozen<'_>,
         custody: &Custody,
         (status, error): (TerminalStatus, VerificationError),
-        lease: Option<&Arc<HeldLease>>,
+        deadline: tokio::time::Instant,
+        lease: &HeldLease,
     ) -> Transition {
-        let Some(system) = system_principal(custody.system) else {
-            return Transition::Owe(status, error);
-        };
-        let Ok(slot) = self.outbox.reserve(1) else {
-            return busy();
-        };
         let execution_id = frozen.run.execution_id;
+        let Some(system) = system_principal(custody.system) else {
+            tracing::warn!(%execution_id, "the tenant has no SYSTEM principal; the failure is not recorded in the execution state");
+            return Transition::Terminate(status, error);
+        };
         let recovered = async {
             let query = self
                 .reader(tenant, system, None)
@@ -658,8 +602,8 @@ impl VerifierRunner {
             .clone()
             .or_else(|| custody.cards.clone().map(|cards| frozen.identity(cards)));
         let Some(identity) = identity else {
-            tracing::warn!(%execution_id, "the execution's identity cannot be read; its decision stays owed");
-            return Transition::Owe(status, error);
+            tracing::warn!(%execution_id, "the execution's identity cannot be read; the failure is not recorded in the execution state");
+            return Transition::Terminate(status, error);
         };
         let offer = match Decision::of(&accepted) {
             Some(decision) => Offer::Accepted(decision),
@@ -669,25 +613,17 @@ impl VerifierRunner {
             Arc::clone(&self.outbox),
             tenant,
             frozen.row(system, identity),
-            tokio::time::Instant::now() + DECISION_TIMEOUT,
-            lease.cloned(),
+            deadline,
+            Some(lease.lost().clone()),
             accepted,
             revision,
         );
-        conclude(
-            tenant,
-            frozen,
-            system,
-            &state,
-            offer,
-            slot,
-            lease.map(AsRef::as_ref),
-        )
-        .await
+        conclude(tenant, frozen, system, &state, offer, lease, &self.outbox).await
     }
 
     /// Recover the execution's accepted state as `system` for this attempt,
-    /// whose revisions confirm `lease` and are awaited until `deadline`.
+    /// whose engine runs until `deadline` and whose writer stops once `lease`
+    /// is lost.
     ///
     /// # Errors
     /// Returns the [`Transition`] a state that cannot be recovered ends this
@@ -701,7 +637,7 @@ impl VerifierRunner {
         verifier: &Target,
         system: PrincipalId,
         deadline: tokio::time::Instant,
-        lease: &Arc<HeldLease>,
+        lease: &HeldLease,
     ) -> Result<RunState, Transition> {
         let execution_id = run.lease.execution_id;
         let query = self
@@ -719,30 +655,17 @@ impl VerifierRunner {
                 frozen.identity((verifier.verifier.clone(), verifier.subject.clone())),
             ),
             deadline,
-            Some(Arc::clone(lease)),
+            Some(lease.lost().clone()),
             &InputResolver::new(&query, None),
         )
         .await
         .map_err(|error| state_failure(execution_id, &error))
     }
 
-    /// Run `spec` over the claimed execution's frozen input.
-    ///
-    /// A scheduled window first scores every drift requirement over its
-    /// frozen population as the tenant's SYSTEM read authority, then runs
-    /// with no pinned evidence; a submission runs over its recorded inputs
-    /// and route overrides; a group selection runs over its resolved source
-    /// lists; all three are read from the execution's input record on every
-    /// attempt. The engine
-    /// executes as the authority accepted with the execution, executed by
-    /// `system`, with model calls attributed to the verified Card and the
-    /// submission's application Run. Every attempt before the last defers a
-    /// not-yet-landed trace, so the queue retries the same execution under
-    /// its backoff; the last attempt judges it inconclusive and completes
-    /// under the Verifier's decision rule. The engine checkpoints through
-    /// `state` and runs until its writer's deadline. Under `test-support` a
-    /// scripted outcome, when queued, replaces the engine.
-    async fn dispatch(
+    /// Prepare the claimed execution's frozen input, then run the engine
+    /// over it in its `engine` phase. Under `test-support` a scripted
+    /// outcome, when queued, replaces both.
+    async fn compute(
         &self,
         tenant: DataTenantId,
         run: &ClaimedExecution,
@@ -757,47 +680,88 @@ impl VerifierRunner {
         {
             return outcome;
         }
-        let (drift, evidence, routes, run_id) = match &run.input {
+        let prepared = match self.prepare(tenant, run, spec, system, telemetry).await {
+            Ok(prepared) => prepared,
+            Err(outcome) => return outcome,
+        };
+        telemetry
+            .phase(
+                Phase::Engine,
+                self.dispatch(run, spec, system, state, telemetry, prepared)
+                    .instrument(tracing::info_span!("verification.engine")),
+            )
+            .await
+    }
+
+    /// Read the claimed execution's frozen input before its engine runs.
+    ///
+    /// A scheduled window first scores every drift requirement over its
+    /// frozen population as the tenant's SYSTEM read authority, then runs
+    /// with no pinned evidence; a submission runs over its recorded inputs
+    /// and route overrides; a group selection runs over its resolved source
+    /// lists; all three are read from the execution's input record on every
+    /// attempt.
+    ///
+    /// # Errors
+    /// Returns the [`EngineOutcome`] the execution ends this attempt in.
+    async fn prepare(
+        &self,
+        tenant: DataTenantId,
+        run: &ClaimedExecution,
+        spec: &Arc<VerifierSpec>,
+        system: PrincipalId,
+        telemetry: &ExecutionTelemetry,
+    ) -> Result<Prepared, EngineOutcome> {
+        Ok(match &run.input {
             ExecutionInput::Scheduled { .. } => {
                 let selected = self
                     .recorded(tenant, run, system, async |_, row| row.schedule().map(Some))
-                    .await;
-                let checks = match selected {
-                    Ok(selected) => {
-                        self.drift
-                            .checks(tenant, run, system, spec, &selected, telemetry)
-                            .await
-                    }
-                    Err(outcome) => Err(outcome),
-                };
-                match checks {
-                    Ok(drift) => (drift, BTreeMap::new(), BTreeMap::new(), None),
-                    Err(outcome) => return outcome,
-                }
+                    .await?;
+                let drift = self
+                    .drift
+                    .checks(tenant, run, system, spec, &selected, telemetry)
+                    .await?;
+                (drift, BTreeMap::new(), BTreeMap::new(), None)
             }
             ExecutionInput::Submitted { run_id } => {
-                match self.supplied(tenant, run, system).await {
-                    Ok((evidence, routes)) => (
-                        DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
-                        evidence,
-                        routes,
-                        run_id.clone(),
-                    ),
-                    Err(outcome) => return outcome,
-                }
+                let (evidence, routes) = self.supplied(tenant, run, system).await?;
+                (
+                    DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
+                    evidence,
+                    routes,
+                    run_id.clone(),
+                )
             }
             ExecutionInput::Grouped | ExecutionInput::PullRequest { .. } => {
-                match self.supplied(tenant, run, system).await {
-                    Ok((evidence, routes)) => (
-                        DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
-                        evidence,
-                        routes,
-                        None,
-                    ),
-                    Err(outcome) => return outcome,
-                }
+                let (evidence, routes) = self.supplied(tenant, run, system).await?;
+                (
+                    DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
+                    evidence,
+                    routes,
+                    None,
+                )
             }
-        };
+        })
+    }
+
+    /// Run `spec` over the claimed execution's `prepared` input.
+    ///
+    /// The engine executes as the authority accepted with the execution,
+    /// executed by `system`, with model calls attributed to the verified Card
+    /// and the submission's application Run. Every attempt before the last
+    /// defers a not-yet-landed trace, so the queue retries the same execution
+    /// under its backoff; the last attempt judges it inconclusive and
+    /// completes under the Verifier's decision rule. The engine records its
+    /// progress in `state` and runs until its writer's deadline.
+    async fn dispatch(
+        &self,
+        run: &ClaimedExecution,
+        spec: &Arc<VerifierSpec>,
+        system: PrincipalId,
+        state: &Arc<RunState>,
+        telemetry: &ExecutionTelemetry,
+        (drift, evidence, routes, run_id): Prepared,
+    ) -> EngineOutcome {
         let caller = Caller::accepted(&run.authority, system);
         let engine = match telemetry.time(Phase::Setup, || {
             self.blocks.engine(
@@ -833,7 +797,7 @@ impl VerifierRunner {
                 ));
             }
         };
-        let recorded = state.snapshot().await;
+        let recorded = state.snapshot();
         let engine = engine.with_checkpoints(Arc::clone(state) as Arc<dyn Checkpoints>, &recorded);
         match engine
             .run(Arc::clone(spec), evidence, state.deadline())
@@ -952,17 +916,15 @@ impl VerifierRunner {
         ))
     }
 
-    /// Apply `transition` to `work` in one tenant transaction.
+    /// Apply `transition` to claimed `run` in one tenant transaction.
     ///
-    /// A delivery is settled by [`Self::settle_delivery`]. For an attempt, a
-    /// [`Transition::Complete`], whose result Scribe already acknowledged,
+    /// A [`Transition::Complete`], whose result Scribe already acknowledged,
     /// first joins the group commit through [`Completions`], which settles it
     /// in one transaction with the tenant's other completing runs; only when
     /// no batch committed it does it settle alone here. A failed commit
     /// retried under the same lease completes the run with the same result
     /// ID, and a lost lease leaves the result written for a run another claim
-    /// re-executes. A [`Transition::Terminate`] owes nothing more; a
-    /// [`Transition::Owe`] leaves its delivery due.
+    /// re-executes.
     ///
     /// Returns the stable outcome label: `completed`, `retrying`,
     /// `exhausted`, `cancelled`, `timed_out`, `errored`,
@@ -975,16 +937,12 @@ impl VerifierRunner {
     async fn settle(
         &self,
         tenant: DataTenantId,
-        work: Work<'_>,
+        run: &ClaimedExecution,
         transition: Transition,
     ) -> Result<&'static str, SqlError> {
-        let run = match work {
-            _ if transition == Transition::LeaseLost => return Ok("stale_lease"),
-            Work::Delivery(pending) => {
-                return self.settle_delivery(tenant, pending, transition).await;
-            }
-            Work::Attempt(run) => run,
-        };
+        if transition == Transition::LeaseLost {
+            return Ok("stale_lease");
+        }
         let lease = run.lease;
         if let Transition::Complete {
             result_id,
@@ -1043,19 +1001,6 @@ impl VerifierRunner {
                     .await?,
                 terminal_label(status),
             ),
-            Transition::Owe(status, error) => {
-                tracing::warn!(
-                    execution_id = %lease.execution_id,
-                    code = %error.code,
-                    "the execution's terminal decision is not acknowledged; its delivery stays owed"
-                );
-                settled(
-                    self.queue
-                        .terminate(&mut conn, lease, status, &error, TerminalDelivery::Owed)
-                        .await?,
-                    terminal_label(status),
-                )
-            }
             Transition::Release => settled(
                 self.queue
                     .release(&mut conn, lease, chrono::Duration::zero())
@@ -1080,44 +1025,6 @@ impl VerifierRunner {
         Ok(outcome)
     }
 
-    /// Settle owed delivery `pending` by `transition` under its claim's
-    /// fence, in one tenant transaction.
-    ///
-    /// A decision acknowledged in the execution's state retires the delivery;
-    /// any other transition makes it due again after one poll interval. Only
-    /// the latest claim of the delivery changes it.
-    ///
-    /// Returns `delivered`, `redelivering`, or `stale_lease`.
-    ///
-    /// # Errors
-    /// Returns [`SqlError`] when the transaction fails; nothing is applied.
-    async fn settle_delivery(
-        &self,
-        tenant: DataTenantId,
-        pending: &PendingDelivery,
-        transition: Transition,
-    ) -> Result<&'static str, SqlError> {
-        let mut conn = self.postgres.tenant_conn(tenant).await?;
-        let outcome = match transition {
-            Transition::Complete { .. } | Transition::Terminate(..) => {
-                settled(self.queue.delivered(&mut conn, pending).await?, "delivered")
-            }
-            transition => {
-                if let Some(error) = transition.error() {
-                    tracing::info!(execution_id = %pending.execution_id, code = %error.code, "the terminal delivery is not acknowledged yet");
-                }
-                settled(
-                    self.queue
-                        .redeliver(&mut conn, pending, self.poll())
-                        .await?,
-                    "redelivering",
-                )
-            }
-        };
-        conn.commit().await?;
-        Ok(outcome)
-    }
-
     /// The poll interval, after which deferred work is due again.
     fn poll(&self) -> chrono::Duration {
         chrono::Duration::from_std(self.limits.poll_interval)
@@ -1126,14 +1033,13 @@ impl VerifierRunner {
 }
 
 impl LeasedWork for VerifierRunner {
-    type Claim = RunnerClaim;
+    type Claim = AttemptClaim;
 
     const CAPABILITY: RuntimeCapability = RuntimeCapability::Runner;
     /// Verifier activity is counted per kind by [`ExecutionTelemetry`].
     const ACTIVE_GAUGE: Option<&'static str> = None;
 
-    /// Every tenant with runnable executions or due terminal deliveries,
-    /// most overdue first.
+    /// Every tenant with runnable executions, most overdue first.
     ///
     /// # Errors
     /// Returns [`SqlError`] when the cross-tenant read fails.
@@ -1144,14 +1050,10 @@ impl LeasedWork for VerifierRunner {
             .await?)
     }
 
-    /// Claim up to `limit` of the tenant's due terminal deliveries and
-    /// runnable runs, each under its own fresh lease, and resolve what each
-    /// needs in the same transaction.
-    ///
-    /// Deliveries take at most half of `limit`, so neither kind starves the
-    /// other; runs take the rest in one statement. A delivery, and a run
-    /// whose target is refused, reads the tenant SYSTEM principal and exact
-    /// Cards its record needs.
+    /// Claim up to `limit` of the tenant's runnable runs in one statement,
+    /// each under its own fresh lease, and resolve what each needs in the
+    /// same transaction. A run whose target is refused reads the tenant
+    /// SYSTEM principal and exact Cards its record needs.
     ///
     /// Each claimed run gets its `verification.attempt` span only once its
     /// row names the run's scrubbed identity and cause, so
@@ -1169,25 +1071,10 @@ impl LeasedWork for VerifierRunner {
         &self,
         conn: &mut TenantConn<'_>,
         limit: u32,
-    ) -> Result<Vec<RunnerClaim>, SqlError> {
+    ) -> Result<Vec<AttemptClaim>, SqlError> {
         let lease = chrono::Duration::from_std(self.limits.lease)
             .unwrap_or_else(|_| chrono::Duration::minutes(10));
-        let owed = self
-            .queue
-            .claim_deliveries(conn, lease, limit.div_ceil(2))
-            .await?;
         let mut claims = Vec::with_capacity(limit as usize);
-        for pending in owed {
-            let custody = custody(conn, &pending.verifier_card_uid, &pending.card_uid).await?;
-            claims.push(RunnerClaim::Delivery(Box::new(DeliveryClaim {
-                pending,
-                custody,
-            })));
-        }
-        let limit = limit.saturating_sub(u32::try_from(claims.len()).unwrap_or(limit));
-        if limit == 0 {
-            return Ok(claims);
-        }
         let resolving = Instant::now();
         let deadline = chrono::Duration::from_std(self.limits.execution_timeout)
             .unwrap_or_else(|_| chrono::Duration::minutes(5));
@@ -1236,18 +1123,17 @@ impl LeasedWork for VerifierRunner {
             .instrument(tracing::info_span!(parent: &span, "verification.load"))
             .instrument(span.clone())
             .await?;
-            claims.push(RunnerClaim::Attempt(Box::new(AttemptClaim {
+            claims.push(AttemptClaim {
                 run,
                 verifier,
                 loaded: (resolving, Instant::now()),
                 span,
-            })));
+            });
         }
         Ok(claims)
     }
 
-    /// Execute one claimed run, or record one owed delivery, and apply its
-    /// single transition.
+    /// Execute one claimed run and apply its single transition.
     ///
     /// Records a run's spawn-to-first-execution delay since `spawned_at` on
     /// its attempt span. The claim loop tracks the task until settlement. Cancellation through `abandon`
@@ -1258,25 +1144,11 @@ impl LeasedWork for VerifierRunner {
     async fn process(
         self: Arc<Self>,
         tenant: DataTenantId,
-        claim: RunnerClaim,
+        claim: AttemptClaim,
         stop: CancellationToken,
         abandon: CancellationToken,
         spawned_at: Instant,
     ) -> bool {
-        let claim = match claim {
-            RunnerClaim::Attempt(claim) => *claim,
-            RunnerClaim::Delivery(claim) => {
-                let span = tracing::info_span!(
-                    "verification.delivery",
-                    execution_id = %claim.pending.execution_id,
-                    outcome = Empty,
-                );
-                return self
-                    .deliver_owed(tenant, &claim, &abandon)
-                    .instrument(span)
-                    .await;
-            }
-        };
         let AttemptClaim {
             run,
             verifier,
@@ -1293,20 +1165,13 @@ impl LeasedWork for VerifierRunner {
     }
 
     /// Release a run claimed after shutdown began, with its attempt refunded
-    /// and without executing it; a delivery is left due again once its
-    /// claim passes.
+    /// and without executing it.
     ///
     /// Uses the same fenced release transition as the drain. A failed release
     /// is logged; the lease then expires into a reclaim.
-    async fn release_late(&self, tenant: DataTenantId, claim: &RunnerClaim) {
-        let RunnerClaim::Attempt(claim) = claim else {
-            return;
-        };
+    async fn release_late(&self, tenant: DataTenantId, claim: &AttemptClaim) {
         let run = &claim.run;
-        match self
-            .settle(tenant, Work::Attempt(run), Transition::Release)
-            .await
-        {
+        match self.settle(tenant, run, Transition::Release).await {
             Ok(outcome) => {
                 tracing::info!(execution_id = %run.lease.execution_id, outcome, "claim committed after shutdown began; released");
             }
@@ -1387,10 +1252,8 @@ impl VerifierRunner {
         let settled = telemetry
             .phase(
                 Phase::Settlement,
-                persist(lost, || {
-                    self.settle(tenant, Work::Attempt(run), transition.clone())
-                })
-                .instrument(tracing::info_span!("verification.settle")),
+                persist(lost, || self.settle(tenant, run, transition.clone()))
+                    .instrument(tracing::info_span!("verification.settle")),
             )
             .await;
         drop(held);
@@ -1429,139 +1292,104 @@ impl VerifierRunner {
         telemetry.finish(outcome, failed);
         refused
     }
-
-    /// Record one owed delivery's decision without computing and settle it
-    /// under its claim's fence.
-    ///
-    /// The delivery runs through [`Self::record`], the operation a refused
-    /// attempt also ends in, and a settlement whose transaction fails is
-    /// retried with backoff until `abandon`. Returns whether admission
-    /// backpressure deferred it.
-    async fn deliver_owed(
-        &self,
-        tenant: DataTenantId,
-        claim: &DeliveryClaim,
-        abandon: &CancellationToken,
-    ) -> bool {
-        let pending = &claim.pending;
-        let transition = tokio::select! {
-            biased;
-            () = abandon.cancelled() => Transition::Release,
-            recorded = self.record(
-                tenant,
-                Frozen::delivery(pending),
-                &claim.custody,
-                (pending.status, pending.error.clone()),
-                None,
-            ) => recorded,
-        };
-        let refused = matches!(transition, Transition::Defer(_));
-        let outcome = match persist(abandon, || {
-            self.settle(tenant, Work::Delivery(pending), transition.clone())
-        })
-        .await
-        {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                tracing::error!(execution_id = %pending.execution_id, %error, "settling a terminal delivery failed; it is due again once its claim passes");
-                "settlement_failed"
-            }
-        };
-        tracing::Span::current().record("outcome", outcome);
-        refused
-    }
 }
 
 /// End one claim with its execution's one terminal decision, the operation
-/// every attempt and every owed delivery settles through.
+/// every attempt settles through.
 ///
-/// `offer` is resolved against `state`, which keeps a decision it already
-/// accepted and returns the decision once an accepted revision holds it. A
-/// failure then settles [`Transition::Terminate`]. A selected outcome is
-/// built into its result write, staged on `slot`, and settles only once
-/// Scribe acknowledges it, through [`deliver`]. A failure the state cannot
-/// record settles [`Transition::Owe`], so its delivery stays owed; a
-/// selection it cannot record maps through [`state_failure`], since nothing
-/// was decided.
+/// `offer` is resolved against `state` in memory, which keeps a decision it
+/// already accepted, and the claim then awaits [`RunState::persisted`] off
+/// its computation, holding its claim permit and its renewed `lease`, so a
+/// redelivery reuses the same decision and result identity. A failure then
+/// settles [`Transition::Terminate`]. A selected outcome is built into its
+/// result write and settles only once Scribe accepts it, through
+/// [`deliver`]. A decision whose persistence fails maps through
+/// [`state_failure`], and a lost lease settles nothing.
 async fn conclude(
     tenant: DataTenantId,
     frozen: Frozen<'_>,
     system: PrincipalId,
     state: &RunState,
     offer: Offer,
-    slot: Reservation<ScribeSink>,
-    lease: Option<&HeldLease>,
+    lease: &HeldLease,
+    outbox: &Arc<ScribeOutbox>,
 ) -> Transition {
     let execution_id = frozen.run.execution_id;
     let decided = match offer {
         Offer::Accepted(decision) => Ok(decision),
-        Offer::Selected(outcome, started_at) => state
-            .select(&outcome, started_at)
-            .await
-            .map_err(|error| state_failure(execution_id, &error)),
-        Offer::Failed(status, error) => match state.fail(execution_status(status), &error).await {
-            Ok(decision) => Ok(decision),
-            Err(unrecorded) => {
-                tracing::warn!(%execution_id, error = %unrecorded, "an execution's failure was not acknowledged");
-                Err(Transition::Owe(status, error))
-            }
-        },
+        Offer::Selected(outcome, started_at) => state.select(&outcome, started_at),
+        Offer::Failed(status, error) => state.fail(execution_status(status), &error),
     };
+    let decided = match decided {
+        Ok(decided) => decided,
+        Err(_) if lease.lost().is_cancelled() => return Transition::LeaseLost,
+        Err(error) => return state_failure(execution_id, &error),
+    };
+    tokio::select! {
+        biased;
+        () = lease.lost().cancelled() => return Transition::LeaseLost,
+        persisted = state.persisted() => match persisted {
+            Ok(()) => {}
+            Err(_) if lease.lost().is_cancelled() => return Transition::LeaseLost,
+            Err(error) => return state_failure(execution_id, &error),
+        },
+    }
     match decided {
-        Err(transition) => transition,
-        Ok(Decision::Failed(failure)) => {
+        Decision::Failed(failure) => {
             Transition::Terminate(terminal_status(failure.status), failure.error)
         }
-        Ok(Decision::Selected(selected)) => match result(frozen, &selected, system) {
-            Ok((transition, write)) => deliver(tenant, transition, (slot, write), lease).await,
+        Decision::Selected(selected) => match result(frozen, &selected, system) {
+            Ok((transition, write)) => deliver(tenant, transition, write, lease, outbox).await,
             Err(transition) => transition,
         },
     }
 }
 
-/// Hand a selected outcome's `result` to Scribe and return the transition
+/// Hand a selected outcome's `write` to Scribe and return the transition
 /// the claim settles with once Scribe answers.
 ///
-/// A queued attempt's `lease` is confirmed first, so a holder whose lease
-/// expired or was reclaimed since its last renewal writes no result.
-/// `transition` stands once Scribe acknowledges every row of the result, so
-/// the work settles only with its result durable. A result Scribe drops,
-/// rejects, or leaves unacknowledged for [`DECISION_TIMEOUT`] defers with
-/// [`RESULT_UNDELIVERED`], and the next claim delivers the same selected
-/// result again. A lost lease stops waiting as the engine does; each caller
-/// races its own abandoning shutdown around this wait.
+/// The write takes a reserved outbox slot, waiting in background while the
+/// outbox is full, so it is never shed. `transition` stands once Scribe
+/// acknowledges every row of the result, so the work settles only with its
+/// result durable. A result Scribe rejects, or whose acknowledgement is
+/// lost, retries the attempt with [`RESULT_UNDELIVERED`] within its budget,
+/// and the next claim delivers the same selected result again. A lost
+/// `lease` ends the wait; each caller races its own abandoning shutdown
+/// around this one.
 async fn deliver(
     tenant: DataTenantId,
     transition: Transition,
-    (slot, mut write): StagedResult,
-    lease: Option<&HeldLease>,
+    mut write: ScribeWrite,
+    lease: &HeldLease,
+    outbox: &Arc<ScribeOutbox>,
 ) -> Transition {
-    if let Some(held) = lease
-        && !matches!(persist(held.lost(), || held.confirm()).await, Ok(true))
-    {
-        return Transition::LeaseLost;
-    }
     let (sender, acked) = tokio::sync::oneshot::channel();
     if let ScribeWrite::Result { acked, .. } = &mut write {
         *acked
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sender);
     }
-    slot.stage(tenant, write);
-    let lost = async {
-        match lease {
-            Some(held) => held.lost().cancelled().await,
-            None => std::future::pending().await,
+    let lost = lease.lost();
+    let slot = loop {
+        tokio::select! {
+            biased;
+            () = lost.cancelled() => return Transition::LeaseLost,
+            reserved = outbox.reserve_until(1, Instant::now() + CAPACITY_WAIT) => {
+                if let Ok(slot) = reserved {
+                    break slot;
+                }
+            }
         }
     };
+    slot.stage(tenant, write);
     tokio::select! {
         biased;
-        () = lost => Transition::LeaseLost,
-        delivered = tokio::time::timeout(DECISION_TIMEOUT, acked) => match delivered {
-            Ok(Ok(())) => transition,
-            Ok(Err(_)) | Err(_) => Transition::Defer(failure(
+        () = lost.cancelled() => Transition::LeaseLost,
+        delivered = acked => match delivered {
+            Ok(()) => transition,
+            Err(_) => Transition::Retry(failure(
                 RESULT_UNDELIVERED,
-                "Scribe did not acknowledge the verification result",
+                "Scribe did not accept the verification result",
             )),
         },
     }
@@ -1574,7 +1402,7 @@ async fn deliver(
 /// settlement records as the execution's result, and the selected interval,
 /// so every delivery of one selected outcome writes the same result. The
 /// write is attributed to the execution's subject with `system` as actor,
-/// and returned rather than staged, so [`deliver`] stages it only while an
+/// and returned rather than staged, so [`deliver`] stages it only while the
 /// attempt still holds its lease.
 ///
 /// # Errors
@@ -1749,24 +1577,16 @@ fn system_principal(system: Option<PrincipalId>) -> Option<PrincipalId> {
     system.filter(|principal| principal.as_uuid().get_version_num() == 7)
 }
 
-/// How an execution without a SYSTEM principal ends: errored, its decision
-/// owed until one exists to record it.
+/// How an execution without a SYSTEM principal ends: errored, with no state
+/// record, since there is no principal to write it as.
 fn system_missing() -> Transition {
-    Transition::Owe(
+    Transition::Terminate(
         TerminalStatus::Errored,
         failure(
             SYSTEM_PRINCIPAL_MISSING,
             "the tenant has no SYSTEM principal to execute the Verifier as",
         ),
     )
-}
-
-/// How a claim ends when the reserved result share is full.
-fn busy() -> Transition {
-    Transition::Defer(failure(
-        RUNTIME_BUSY,
-        "the verification result staging share is full",
-    ))
 }
 
 /// Run `operation` until it succeeds, retrying failures with doubling backoff
@@ -1801,10 +1621,7 @@ impl Transition {
     /// The stable error this transition settles with, when it carries one.
     fn error(&self) -> Option<&VerificationError> {
         match self {
-            Self::Retry(error)
-            | Self::Terminate(_, error)
-            | Self::Owe(_, error)
-            | Self::Defer(error) => Some(error),
+            Self::Retry(error) | Self::Terminate(_, error) | Self::Defer(error) => Some(error),
             Self::Complete { .. } | Self::Release | Self::LeaseLost => None,
         }
     }

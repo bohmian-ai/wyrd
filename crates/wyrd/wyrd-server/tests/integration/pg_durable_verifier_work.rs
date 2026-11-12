@@ -40,7 +40,7 @@ use wyrd_server::verification::hosted::sandbox::Sandbox;
 use wyrd_server::verification::hosted::tools::HostedTools;
 use wyrd_server::verification::hosted::workspace::{Workspace, Workspaces};
 use wyrd_server::verification::inputs::InputResolver;
-use wyrd_server::verification::leases::LeaseRenewal;
+use wyrd_server::verification::leases::{HeldLease, LeaseRenewal};
 use wyrd_server::verification::results::{ResultPayloadBuilder, ResultRun};
 use wyrd_server::verification::scheduler::GroupHandoff;
 use wyrd_server::verification::state::{
@@ -79,8 +79,11 @@ struct Leased {
     server: WyrdTestServer,
     /// The claimed execution's lease.
     lease: ExecutionLease,
-    /// The lease renewal owner every writer's lease registers with.
-    renewal: Arc<LeaseRenewal>,
+    /// The lease renewal owner every writer's lease registers with, renewing
+    /// and hearing cancellations until the guard drops.
+    renewal: (Arc<LeaseRenewal>, tokio_util::sync::DropGuard),
+    /// Every writer's held lease, renewed until the test ends.
+    held: std::sync::Mutex<Vec<HeldLease>>,
     /// The tenant's SYSTEM principal, which reads the state back.
     system: PrincipalId,
     /// The first claim's state writer.
@@ -138,14 +141,20 @@ impl Leased {
             VerifierExecutionQueue::default(),
             std::time::Duration::from_secs(300),
         ));
+        let renewing = CancellationToken::new();
+        tokio::spawn({
+            let (renewal, renewing) = (Arc::clone(&renewal), renewing.clone());
+            async move { renewal.run(renewing).await }
+        });
         let outbox = Arc::clone(server.state().bifrost.scribe_outbox());
-        let run = Self::writer(&server, outbox, &renewal, system, &claimed)
+        let (run, lease) = Self::writer(&server, outbox, &renewal, system, &claimed)
             .await
             .expect("the execution state claims");
         Self {
             server,
             lease: claimed.lease,
-            renewal,
+            renewal: (renewal, renewing.drop_guard()),
+            held: std::sync::Mutex::new(vec![lease]),
             system,
             run,
             verifier: claimed.verifier_card_uid,
@@ -185,7 +194,7 @@ impl Leased {
     }
 
     /// Recover `claimed`'s execution state for its lease, as a worker would,
-    /// staging its revisions on `outbox`.
+    /// staging its revisions on `outbox`, with the lease it holds.
     ///
     /// # Errors
     /// Returns the [`StateError`] refusing the recovery read.
@@ -199,7 +208,7 @@ impl Leased {
         renewal: &Arc<LeaseRenewal>,
         system: PrincipalId,
         claimed: &ClaimedExecution,
-    ) -> Result<Arc<RunState>, StateError> {
+    ) -> Result<(Arc<RunState>, HeldLease), StateError> {
         let tenant = server.data_tenant_id();
         let query = Self::query(server, system).await;
         let lease = renewal.hold(tenant, claimed.lease.token, &CancellationToken::new());
@@ -218,11 +227,11 @@ impl Leased {
                 attribution: Attribution::new(claimed.attribution.sub_principal_id, system),
             },
             tokio::time::Instant::now() + std::time::Duration::from_secs(300),
-            Some(Arc::new(lease)),
+            Some(lease.lost().clone()),
             &InputResolver::new(&query, None),
         )
         .await?;
-        Ok(Arc::new(run))
+        Ok((Arc::new(run), lease))
     }
 
     /// The execution's accepted state, read back from Bifrost.
@@ -325,7 +334,13 @@ impl Leased {
             .pop()
             .expect("the expired lease is reclaimable");
         conn.commit().await.expect("the reclaim commits");
-        Self::writer(&self.server, outbox, &self.renewal, self.system, &claimed).await
+        let (run, lease) =
+            Self::writer(&self.server, outbox, &self.renewal.0, self.system, &claimed).await?;
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(lease);
+        Ok(run)
     }
 
     /// The execution's deadline on the database clock.
@@ -1546,7 +1561,7 @@ async fn retained_publications_keep_their_busy_attempt() {
         },
     )]);
     let run = async |state: &Arc<RunState>, spec: &Arc<VerifierSpec>| {
-        let recorded = state.snapshot().await.invocations;
+        let recorded = state.snapshot().invocations;
         agent_engine(&leased, state, &caller, &model, &sandbox, recorded)
             .run(Arc::clone(spec), evidence.clone(), far)
             .await
@@ -1734,7 +1749,7 @@ async fn agent_publications_reach_a_recovered_consumer() {
     assert_eq!(model.remaining(), 0);
 
     let current = leased.reclaim().await;
-    let recovered = current.snapshot().await;
+    let recovered = current.snapshot();
     assert_eq!(
         attempts(&recovered),
         [("draft".to_owned(), 1)],
@@ -2077,7 +2092,6 @@ async fn dropped_agent_work_makes_no_later_call() {
     assert!(
         current
             .publications(&TaskId::new("draft").expect("task"))
-            .await
             .iter()
             .all(|accepted| accepted.publication.name.as_str() != "after"),
         "a dropped run publishes nothing later"
@@ -2130,7 +2144,7 @@ async fn invocations_resume_from_bifrost_with_original_bounds() {
 
     let current = leased.reclaim().await;
     assert_eq!(
-        attempts(&current.snapshot().await),
+        attempts(&current.snapshot()),
         [("review".to_owned(), 1), ("judge".to_owned(), 1)]
     );
     current
@@ -2214,11 +2228,11 @@ async fn publications_recover_exact_descriptors_from_run_state() {
         .json(&call("p2", &producer, "verdict"), json!({"ok": true}))
         .await
         .expect("the value publishes");
-    let accepted = leased.run.publications(&task).await;
+    let accepted = leased.run.publications(&task);
 
     let current = leased.reclaim().await;
     assert_eq!(
-        current.publications(&task).await,
+        current.publications(&task),
         accepted,
         "the reclaim recovers the exact accepted publications"
     );
@@ -2292,18 +2306,21 @@ async fn terminal_selection_and_inspection_use_run_state() {
     let selected = leased
         .run
         .select(&outcome(VerificationVerdict::Failed), chrono::Utc::now())
-        .await
         .expect("the outcome is selected");
+    leased
+        .run
+        .persisted()
+        .await
+        .expect("the selection is accepted");
 
     let current = leased.reclaim().await;
     assert_eq!(
-        current.snapshot().await.terminal.map(Decision::Selected),
+        current.snapshot().terminal.map(Decision::Selected),
         Some(selected.clone())
     );
     assert_eq!(
         current
             .select(&outcome(VerificationVerdict::Passed), chrono::Utc::now())
-            .await
             .expect("the selection reads"),
         selected,
         "a reclaim re-delivers the selected outcome and identity"
@@ -3070,8 +3087,7 @@ async fn failures_read_back_from_state_instead_of_the_queue_payload() {
     leased
         .run
         .fail(VerificationExecutionStatus::Errored, &engine)
-        .await
-        .expect("the failure is accepted");
+        .expect("the failure is recorded");
     leased
         .run
         .fail(
@@ -3081,8 +3097,12 @@ async fn failures_read_back_from_state_instead_of_the_queue_payload() {
                 message: "a later failure".to_owned(),
             },
         )
+        .expect("a repeated failure answers the first");
+    leased
+        .run
+        .persisted()
         .await
-        .expect("a repeated failure is accepted");
+        .expect("the failure is accepted");
     let mut conn = leased
         .server
         .tenant_conn_for(leased.server.data_tenant_id())
@@ -3485,7 +3505,7 @@ async fn batched_checkpoints_recover_exactly_the_accepted_batch() {
         "the held revision does not hold the sensitive check"
     );
     drop(sensitive_started);
-    assert_eq!(attempts(&first.snapshot().await).len(), 2);
+    assert_eq!(attempts(&first.snapshot()).len(), 2);
     held.release
         .add_permits(tokio::sync::Semaphore::MAX_PERMITS);
     factual_started
@@ -3498,10 +3518,7 @@ async fn batched_checkpoints_recover_exactly_the_accepted_batch() {
     );
 
     let current = leased.reclaim().await;
-    assert_eq!(
-        attempts(&current.snapshot().await),
-        [("factual".to_owned(), 1)]
-    );
+    assert_eq!(attempts(&current.snapshot()), [("factual".to_owned(), 1)]);
     assert!(
         first.begin(&Producer::plain(&combine, 1)).await.is_err(),
         "the replaced writer's batch is refused"
@@ -4034,7 +4051,7 @@ async fn concurrent_settlements_release_their_hosted_dependent() {
     let verifier = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid");
     let routes = BTreeMap::new();
     let run = async |state: &Arc<RunState>| {
-        let recorded = state.snapshot().await.invocations;
+        let recorded = state.snapshot().invocations;
         blocks
             .engine(
                 leased.server.state(),
@@ -4077,7 +4094,7 @@ async fn concurrent_settlements_release_their_hosted_dependent() {
         })
         .await
         .expect("each revision reaches Scribe");
-        if combine(&writer.snapshot().await) {
+        if combine(&writer.snapshot()) {
             break settlements(&leased.accepted().await);
         }
         held.release.add_permits(1);

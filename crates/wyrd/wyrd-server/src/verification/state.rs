@@ -1,35 +1,40 @@
 //! The recoverable state of one running Verifier execution.
 //!
 //! [`RunState`] is the one owner of an execution's [`ExecutionState`] while
-//! it runs, for direct and queued executions alike. Every revision is one
-//! `bifrost.verification.execution_events` row written under a batch id
-//! derived from its execution and revision, so the first batch Scribe fences
-//! keeps the revision and another writer's different rows for it are refused
-//! as a batch conflict. Recovery finds the accepted revision from those
-//! generic batch fences, which commit before any acknowledgement and are
-//! never removed, and reads exactly that revision's row: no fence is
+//! it runs, for direct and queued executions alike. Steps validate and change
+//! the live state in memory under a short lock and return at once: no step
+//! waits for SQL, a lease confirmation, outbox capacity, or a Scribe
+//! acknowledgement. A background flush persists the state: it freezes every
+//! change so far into the next complete revision, one at a time, so changes
+//! made while a revision is in flight coalesce into the one after it. Every
+//! revision is one `bifrost.verification.execution_events` row written under
+//! a batch id derived from its execution and revision, so the first batch
+//! Scribe fences keeps the revision and another writer's different rows for
+//! it are refused as a batch conflict. Recovery finds the accepted revision
+//! from those generic batch fences, which commit before any acknowledgement
+//! and are never removed, and reads exactly that revision's row: no fence is
 //! authoritative absence, and a fenced revision not visible yet, such as one
 //! a Scribe unavailable to the read still holds, is
-//! [`StateError::Unavailable`], never older or empty state. A direct
-//! execution's identity is new, so it starts fresh with no read. Steps change
-//! the live state in memory under a short lock and wait, outside it, for an
-//! accepted revision holding their change before its effect escapes. At most
-//! one revision per execution is pending: it freezes every change made so
-//! far into one complete revision staged on the process Scribe outbox, while
-//! later changes accumulate for the revision after it. A revision refused or
-//! whose acceptance is unknown breaks the state: nothing more is released,
-//! and the attempt recovers the accepted revision again. A delayed old
-//! worker that still passes its lease check can race a replacement for one
-//! revision; whichever batch is fenced first keeps it, and the other writer
-//! breaks.
+//! [`StateError::Unavailable`], never older or empty state. Live progress not
+//! yet accepted is lost with its process.
+//!
+//! A queued writer stages each revision on a reserved outbox slot, waiting
+//! for capacity in background, and retries until it is accepted or its lease
+//! is lost; a refused revision, an unknown acceptance, or a lost lease breaks
+//! the writer, whose next step then fails. Its terminal custody awaits
+//! [`RunState::persisted`] off its computation. A direct execution's identity
+//! is new, so it starts fresh with no read, and its revisions are best
+//! effort: staged unreserved, shed and counted lost when the outbox is full,
+//! after which it persists nothing more and keeps running. A delayed old
+//! worker can race a replacement for one revision; whichever batch is fenced
+//! first keeps it, and the other writer breaks.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use chrono::{DateTime, Utc};
-use futures_util::FutureExt as _;
-use futures_util::future::{BoxFuture, Shared};
 use sha2::{Digest as _, Sha256};
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
+use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::contracts::committed_batches;
 use vala_bifrost_redux::tables::staged::StagedRow;
 use wyrd_spec::DataTenantId;
@@ -49,7 +54,6 @@ use wyrd_spec::verification::state::{
 use wyrd_spec::verification::{VerificationError, VerificationExecutionStatus};
 
 use super::inputs::InputResolver;
-use super::leases::HeldLease;
 use super::results::{ResultPayloadBuilder, ResultRun};
 use crate::scribe_outbox::{ScribeOutbox, ScribeWrite, revision_batch_id};
 use crate::state::AppState;
@@ -62,11 +66,6 @@ const STATE_TABLE: &str = "bifrost.verification.execution_events";
 /// accepted revision.
 // ponytail: a linear walk of PROBE revisions per statement; gallop if executions grow far past it.
 const PROBE: i64 = 256;
-
-/// How long a terminal decision's revision is awaited at least, so a
-/// decision made at or past its writer's deadline, such as a timeout, is
-/// still recorded.
-pub(super) const DECISION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The batch identity of `revision` of `execution`'s state, which the
 /// outbox writes under its [`revision_fence`].
@@ -233,20 +232,9 @@ pub enum PublicationAcceptance {
     StaleLease,
 }
 
-/// One revision's acceptance, shared by every caller waiting on it, so a
-/// cancelled waiter leaves the others to drive it.
-type Acceptance = Shared<BoxFuture<'static, Result<(), StateError>>>;
-
-/// The one frozen revision of an execution awaiting acceptance.
-#[derive(Clone)]
-struct Pending {
-    /// Its revision.
-    revision: i64,
-    /// The last change it holds: it holds every ticket up to this one.
-    covers: u64,
-    /// Its acceptance.
-    accepted: Acceptance,
-}
+/// How long a queued writer waits for outbox capacity in one reservation
+/// before it waits again; its lease's loss ends the wait at once.
+const CAPACITY_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The live state, and how much of it Scribe accepted from this writer.
 struct Held {
@@ -259,11 +247,15 @@ struct Held {
     revision: i64,
     /// The last change the accepted revision holds.
     covered: u64,
-    /// The frozen revision awaiting acceptance, at most one.
-    pending: Option<Pending>,
-    /// Set once a revision was refused, could not be staged, or its
-    /// acceptance is unknown.
+    /// Whether the background flush is running; at most one per writer, so
+    /// at most one frozen revision of the execution exists at a time.
+    writing: bool,
+    /// Set once a queued revision was refused, its acceptance is unknown, or
+    /// the writer's lease was lost; this writer records nothing more.
     broken: bool,
+    /// Set once a direct revision was not accepted; the direct execution
+    /// keeps running and persists nothing more.
+    abandoned: bool,
 }
 
 impl Held {
@@ -274,85 +266,135 @@ impl Held {
             changes: 0,
             revision,
             covered: 0,
-            pending: None,
+            writing: false,
             broken: false,
+            abandoned: false,
         }
-    }
-
-    /// Records one change applied to the live state and returns its ticket.
-    const fn changed(&mut self) -> u64 {
-        self.changes += 1;
-        self.changes
     }
 }
 
-/// How one writer stages revisions: everything a revision is written with
-/// except its state, shared with the pending revision's acceptance.
-struct StateScribe {
+/// One writer's live state and its background persistence: everything a
+/// revision is written with, shared with the flush that writes it.
+struct Writer {
     /// The outbox every revision is staged on.
     outbox: Arc<ScribeOutbox>,
     /// The execution's tenant.
     tenant: DataTenantId,
     /// The identities every revision's row records.
     row: Arc<StateRow>,
-    /// The instant this writer's attempt ends; no revision is awaited past
-    /// it.
-    deadline: tokio::time::Instant,
-    /// The queued execution's lease, confirmed before each revision is
-    /// frozen so a cancelled, expired, or reclaimed run stops changing its
-    /// state; `None` for a direct execution.
-    lease: Option<Arc<HeldLease>>,
+    /// The queued execution's lease-loss token, which ends its writes and
+    /// fails its later changes; `None` for a direct execution, whose
+    /// revisions are best effort.
+    lost: Option<CancellationToken>,
+    /// The live state and its acceptance, locked only to read or change
+    /// memory, never across encoding or IO.
+    held: Mutex<Held>,
+    /// Notified whenever the flush accepts a revision, breaks, or stops.
+    flushed: Notify,
 }
 
-impl StateScribe {
-    /// Whether this writer may freeze another revision: its lease, when it
-    /// has one, still holds its run.
-    async fn confirmed(&self) -> bool {
-        match &self.lease {
-            Some(lease) => matches!(lease.confirm().await, Ok(true)),
-            None => true,
+impl Writer {
+    /// The live state under its short lock.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Held> {
+        self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether this writer may change the state: nothing broke it and its
+    /// lease, when it has one, has not been lost.
+    fn current(&self, held: &Held) -> bool {
+        !held.broken
+            && !self
+                .lost
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+    }
+
+    /// Record one change applied to `held`'s state and start the background
+    /// flush unless one is running or persistence was abandoned.
+    fn changed(self: &Arc<Self>, held: &mut Held) {
+        held.changes += 1;
+        if !held.writing && !held.abandoned {
+            held.writing = true;
+            tokio::spawn(Arc::clone(self).flush());
         }
     }
 
-    /// Stage `state` as `revision` under the revision's batch identity,
-    /// which every retry and every writer of it keeps, and wait for Scribe to
-    /// accept it until `deadline`. The outbox writer prepares the revision's row, so this
-    /// caller does no encoding. It holds no connection while it waits, so it
-    /// may wait unpolled until a waiter drives it.
+    /// Persist every change in background until an accepted revision holds
+    /// the latest one, the writer breaks, or persistence is abandoned.
     ///
-    /// # Errors
-    /// Returns [`StateError::Stale`] when the revision is refused, such as
-    /// when another writer's rows already hold it or it cannot be encoded,
-    /// or unacknowledged by `deadline`, and [`StateError::Unavailable`] when
-    /// no outbox capacity frees by it.
-    async fn write(
-        self: Arc<Self>,
-        revision: i64,
-        state: ExecutionState,
-        deadline: tokio::time::Instant,
-    ) -> Result<(), StateError> {
-        let slot = self
-            .outbox
-            .reserve_until(1, deadline.into_std())
-            .await
-            .map_err(|full| StateError::Unavailable(full.to_string()))?;
+    /// Each turn freezes the live state, every change so far, into the next
+    /// revision under the short lock, then writes it outside the lock, so
+    /// changes made while a revision is in flight coalesce into the one after
+    /// it and only one frozen copy exists at a time.
+    async fn flush(self: Arc<Self>) {
+        loop {
+            let (revision, covers, state) = {
+                let mut held = self.lock();
+                if held.broken || held.abandoned || held.covered >= held.changes {
+                    held.writing = false;
+                    drop(held);
+                    self.flushed.notify_waiters();
+                    return;
+                }
+                (held.revision + 1, held.changes, held.state.clone())
+            };
+            let accepted = self.write(revision, state).await;
+            {
+                let mut held = self.lock();
+                if accepted {
+                    held.revision = revision;
+                    held.covered = covers;
+                } else if self.lost.is_some() {
+                    tracing::warn!(execution_id = %self.row.execution_id, revision, "an execution state revision was not accepted; its writer stops");
+                    held.broken = true;
+                } else {
+                    tracing::warn!(execution_id = %self.row.execution_id, revision, "a direct execution state revision was not accepted; its state is not persisted further");
+                    held.abandoned = true;
+                }
+            }
+            self.flushed.notify_waiters();
+        }
+    }
+
+    /// Stage `state` as `revision` under the revision's batch identity and
+    /// wait for Scribe to accept it, returning whether it did.
+    ///
+    /// A queued revision takes a reserved outbox slot, waiting for capacity
+    /// while the outbox is full, so it is never shed; its lease's loss ends
+    /// the wait. A direct revision is staged unreserved: a full outbox sheds
+    /// and counts it lost. The outbox writer prepares the row, so this does
+    /// no encoding, and nothing here holds the state's lock.
+    async fn write(&self, revision: i64, state: ExecutionState) -> bool {
         let (sender, acked) = oneshot::channel();
-        slot.stage(
-            self.tenant,
-            ScribeWrite::ExecutionState {
-                batch: revision_batch(self.row.execution_id, revision),
-                checkpoint: Arc::new(Checkpoint::new(revision, state, Arc::clone(&self.row))),
-                attribution: self.row.attribution,
-                acked: Mutex::new(Some(sender)),
-            },
-        );
-        match tokio::time::timeout_at(deadline, acked).await {
-            Ok(Ok(())) => Ok(()),
-            _ => Err(StateError::Stale),
+        let write = ScribeWrite::ExecutionState {
+            batch: revision_batch(self.row.execution_id, revision),
+            checkpoint: Arc::new(Checkpoint::new(revision, state, Arc::clone(&self.row))),
+            attribution: self.row.attribution,
+            acked: Mutex::new(Some(sender)),
+        };
+        let Some(lost) = &self.lost else {
+            self.outbox.stage(self.tenant, write);
+            return acked.await.is_ok();
+        };
+        let slot = loop {
+            tokio::select! {
+                biased;
+                () = lost.cancelled() => return false,
+                reserved = self.outbox.reserve_until(1, std::time::Instant::now() + CAPACITY_WAIT) => {
+                    if let Ok(slot) = reserved {
+                        break slot;
+                    }
+                }
+            }
+        };
+        slot.stage(self.tenant, write);
+        tokio::select! {
+            biased;
+            () = lost.cancelled() => false,
+            acked = acked => acked.is_ok(),
         }
     }
 }
-
 /// One frozen revision staged on the Scribe outbox, whose writer prepares
 /// its row on the outbox's bounded encoding pool, once, so every retry of
 /// the revision submits the same row.
@@ -507,19 +549,22 @@ impl Checkpoint {
 }
 
 /// The recoverable state of one running execution and its only writer.
+///
+/// Steps change the live state in memory and return at once; a background
+/// flush persists it as revisions. A queued execution's terminal custody
+/// awaits [`Self::persisted`] off its computation.
 pub struct RunState {
-    /// How revisions are staged.
-    scribe: Arc<StateScribe>,
-    /// The live state and its acceptance, locked only to read or change
-    /// memory, never across IO.
-    held: tokio::sync::Mutex<Held>,
+    /// The live state and its background persistence.
+    writer: Arc<Writer>,
+    /// The instant this writer's attempt ends.
+    deadline: tokio::time::Instant,
 }
 
 impl RunState {
     /// Recover `tenant`'s execution state for a new writer whose attempt
     /// ends at `deadline`, through `records`, whose read authority must cover
-    /// `bifrost.verification.execution_events`. `lease`, when the execution
-    /// is queued, is confirmed before each revision is frozen.
+    /// `bifrost.verification.execution_events`. `lost`, when the execution
+    /// is queued, is its lease-loss token.
     ///
     /// # Errors
     /// Returns [`StateError::Unavailable`] when the accepted revision cannot
@@ -531,18 +576,18 @@ impl RunState {
         tenant: DataTenantId,
         row: StateRow,
         deadline: tokio::time::Instant,
-        lease: Option<Arc<HeldLease>>,
+        lost: Option<CancellationToken>,
         records: &InputResolver<'_>,
     ) -> Result<Self, StateError> {
         let (revision, state) = Self::accepted(app, tenant, row.execution_id, records).await?;
         Ok(Self::at(
-            outbox, tenant, row, deadline, lease, state, revision,
+            outbox, tenant, row, deadline, lost, state, revision,
         ))
     }
 
     /// The state of an execution identity no writer ever advanced, such as
-    /// a direct execution's, for a new writer with no lease, waiting for each
-    /// revision's acceptance until `deadline`.
+    /// a direct execution's, for a new writer with no lease whose revisions
+    /// are best effort.
     ///
     /// A direct execution's identity is new to its request and never
     /// resumed, so its state starts fresh and nothing is read.
@@ -565,33 +610,35 @@ impl RunState {
     }
 
     /// A writer of `state`, accepted at `revision`, which records `row`'s
-    /// identity unless the state already holds one.
+    /// identity unless the state already holds one. `lost` is a queued
+    /// execution's lease-loss token; `None` makes revisions best effort.
     pub(crate) fn at(
         outbox: Arc<ScribeOutbox>,
         tenant: DataTenantId,
         row: StateRow,
         deadline: tokio::time::Instant,
-        lease: Option<Arc<HeldLease>>,
+        lost: Option<CancellationToken>,
         mut state: ExecutionState,
         revision: i64,
     ) -> Self {
         state.identity.get_or_insert_with(|| row.identity.clone());
         Self {
-            scribe: Arc::new(StateScribe {
+            writer: Arc::new(Writer {
                 outbox,
                 tenant,
                 row: Arc::new(row),
-                deadline,
-                lease,
+                lost,
+                held: Mutex::new(Held::new(state, revision)),
+                flushed: Notify::new(),
             }),
-            held: tokio::sync::Mutex::new(Held::new(state, revision)),
+            deadline,
         }
     }
 
-    /// The instant this writer's attempt ends; no revision is awaited past it.
+    /// The instant this writer's attempt ends.
     #[must_use]
-    pub fn deadline(&self) -> tokio::time::Instant {
-        self.scribe.deadline
+    pub const fn deadline(&self) -> tokio::time::Instant {
+        self.deadline
     }
 
     /// The accepted revision and state of `execution`, without writing it,
@@ -660,20 +707,56 @@ impl RunState {
         }
     }
 
-    /// A copy of the live state, which holds changes still awaiting
-    /// acceptance once steps run.
-    pub async fn snapshot(&self) -> ExecutionState {
-        self.held.lock().await.state.clone()
+    /// A copy of the live state, which may hold changes not yet accepted.
+    #[must_use]
+    pub fn snapshot(&self) -> ExecutionState {
+        self.writer.lock().state.clone()
+    }
+
+    /// Wait until an accepted revision holds every change made so far,
+    /// without driving anything: the background flush writes them.
+    ///
+    /// A queued execution's terminal custody awaits this off its
+    /// computation before its result is delivered; a cancelled waiter
+    /// retracts nothing.
+    ///
+    /// # Errors
+    /// Returns [`StateError::Stale`] once the writer broke or lost its
+    /// lease, and [`StateError::Unavailable`] once a direct execution
+    /// abandoned persistence.
+    pub async fn persisted(&self) -> Result<(), StateError> {
+        loop {
+            let notified = self.writer.flushed.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let held = self.writer.lock();
+                if !self.writer.current(&held) {
+                    return Err(StateError::Stale);
+                }
+                if held.covered >= held.changes {
+                    return Ok(());
+                }
+                if held.abandoned {
+                    return Err(StateError::Unavailable(
+                        "the direct execution's state was not accepted".to_owned(),
+                    ));
+                }
+            }
+            notified.await;
+        }
     }
 
     /// The terminal decision the state holds, selecting `outcome` with a
-    /// new result identity first when it holds none, returned once an
-    /// accepted revision holds it. A recorded failure is never superseded:
-    /// once either is decided, every later entry delivers the same decision.
+    /// new result identity first when it holds none. A recorded failure is
+    /// never superseded: once either is decided, every later entry returns
+    /// the same decision. The decision is live; [`Self::persisted`] awaits
+    /// its acceptance.
     ///
     /// # Errors
-    /// Returns the [`Self::durable`] errors.
-    pub async fn select(
+    /// Returns [`StateError::Stale`] when a new decision cannot be recorded
+    /// because the writer broke or lost its lease.
+    pub fn select(
         &self,
         outcome: &ExecutedOutcome,
         started_at: DateTime<Utc>,
@@ -686,17 +769,15 @@ impl RunState {
                 outcome: outcome.clone(),
             })
         })
-        .await
     }
 
     /// The terminal decision the state holds, recording that the execution
     /// ended without an outcome, as `status` with `error`, first when it
-    /// holds none, returned once an accepted revision holds it. A selected
-    /// outcome or an earlier failure is kept.
+    /// holds none. A selected outcome or an earlier failure is kept.
     ///
     /// # Errors
-    /// Returns the [`Self::durable`] errors.
-    pub async fn fail(
+    /// As [`Self::select`].
+    pub fn fail(
         &self,
         status: VerificationExecutionStatus,
         error: &VerificationError,
@@ -708,134 +789,97 @@ impl RunState {
                 ended_at: Utc::now(),
             })
         })
-        .await
     }
 
-    /// The decision the state holds, else `decision()` recorded as it,
-    /// returned once an accepted revision holds it. The check and the
-    /// change share one memory lock, so two deciders never both decide. A
-    /// revision holding the decision is awaited for at least
-    /// [`DECISION_TIMEOUT`], even past the writer's deadline.
+    /// The decision the state holds, else `decision()` recorded as it. The
+    /// check and the change share one memory lock, so two deciders never
+    /// both decide.
     ///
     /// # Errors
-    /// Returns the [`Self::durable`] errors.
-    async fn decide(&self, decision: impl FnOnce() -> Decision) -> Result<Decision, StateError> {
-        let (decided, ticket) = {
-            let mut held = self.held.lock().await;
-            if let Some(decided) = Decision::of(&held.state) {
-                (decided, held.changes)
-            } else {
-                let decided = decision();
-                match &decided {
-                    Decision::Selected(selected) => {
-                        held.state.terminal = Some(selected.clone());
-                    }
-                    Decision::Failed(failure) => held.state.failure = Some(failure.clone()),
-                }
-                (decided, held.changed())
-            }
-        };
-        let deadline = self
-            .scribe
-            .deadline
-            .max(tokio::time::Instant::now() + DECISION_TIMEOUT);
-        self.durable(ticket, deadline).await?;
+    /// As [`Self::select`].
+    fn decide(&self, decision: impl FnOnce() -> Decision) -> Result<Decision, StateError> {
+        let mut held = self.writer.lock();
+        if let Some(decided) = Decision::of(&held.state) {
+            return Ok(decided);
+        }
+        if !self.writer.current(&held) {
+            return Err(StateError::Stale);
+        }
+        let decided = decision();
+        match &decided {
+            Decision::Selected(selected) => held.state.terminal = Some(selected.clone()),
+            Decision::Failed(failure) => held.state.failure = Some(failure.clone()),
+        }
+        self.writer.changed(&mut held);
         Ok(decided)
     }
 
-    /// The receipt `call` already holds, when it holds one, once an
-    /// accepted revision holds it, without changing the state.
-    pub async fn publication_receipt(
-        &self,
-        call: PublicationCall<'_>,
-    ) -> Option<PublicationAcceptance> {
-        let (found, ticket) = {
-            let held = self.held.lock().await;
-            if held.broken {
-                return Some(PublicationAcceptance::StaleLease);
-            }
-            (receipt(&held.state, call)?, held.changes)
-        };
-        Some(self.receipt_once_accepted(found, ticket).await)
+    /// The receipt `call` already holds in the live state, when it holds
+    /// one, without changing the state; [`PublicationAcceptance::StaleLease`]
+    /// once the writer broke or lost its lease, so a replay is never the
+    /// first success of a cancelled, expired, or reclaimed run.
+    #[must_use]
+    pub fn publication_receipt(&self, call: PublicationCall<'_>) -> Option<PublicationAcceptance> {
+        let held = self.writer.lock();
+        if !self.writer.current(&held) {
+            return Some(PublicationAcceptance::StaleLease);
+        }
+        receipt(&held.state, call)
     }
 
-    /// Accept `call`'s publication, once, within `budget`: the same call
-    /// with the same name and arguments replays, another holder of the name
-    /// in the attempt, or the same call under another name or arguments,
-    /// conflicts, and a publication over a cumulative ceiling is refused. Every answer but a refusal over a ceiling is returned only
-    /// once an accepted revision holds the publication it names.
-    pub async fn accept_publication(
+    /// Accept `call`'s publication into the live state, once, within
+    /// `budget`: the same call with the same name and arguments replays,
+    /// another holder of the name in the attempt, or the same call under
+    /// another name or arguments, conflicts, and a publication over a
+    /// cumulative ceiling is refused. A writer that broke or lost its lease
+    /// answers [`PublicationAcceptance::StaleLease`] and changes nothing.
+    #[must_use]
+    pub fn accept_publication(
         &self,
         call: PublicationCall<'_>,
         budget: PublicationBudget,
     ) -> PublicationAcceptance {
-        let (found, ticket) = {
-            let mut held = self.held.lock().await;
-            if held.broken {
-                return PublicationAcceptance::StaleLease;
-            }
-            if let Some(found) = receipt(&held.state, call) {
-                (found, held.changes)
-            } else {
-                let publications = &held.state.publications;
-                if publications.len() >= budget.max_count as usize {
-                    return PublicationAcceptance::OverBudget(PublicationLimit::Count);
-                }
-                let retained = publications
-                    .iter()
-                    .map(|accepted| accepted.retained_bytes)
-                    .sum::<u64>();
-                if retained.saturating_add(call.retained_bytes) > budget.max_bytes {
-                    return PublicationAcceptance::OverBudget(PublicationLimit::Bytes);
-                }
-                let state = &mut held.state;
-                state.sequence += 1;
-                state.publications.push(AcceptedPublication {
-                    sequence: state.sequence,
-                    publication: call.publication.clone(),
-                    call_id: call.call_id.to_owned(),
-                    arguments: *call.arguments,
-                    objects: call.objects.to_vec(),
-                    retained_bytes: call.retained_bytes,
-                });
-                (PublicationAcceptance::Accepted, held.changed())
-            }
-        };
-        self.receipt_once_accepted(found, ticket).await
-    }
-
-    /// `found` once an accepted revision holds change `ticket` and the
-    /// writer's lease, when it has one, still holds its run, or
-    /// [`PublicationAcceptance::StaleLease`] otherwise.
-    ///
-    /// The lease is confirmed outside the memory lock even when an accepted
-    /// revision already held the change, so a replay is never the first
-    /// success of a cancelled, expired, or reclaimed run.
-    async fn receipt_once_accepted(
-        &self,
-        found: PublicationAcceptance,
-        ticket: u64,
-    ) -> PublicationAcceptance {
-        if let Err(error) = self.durable(ticket, self.scribe.deadline).await {
-            tracing::warn!(execution_id = %self.scribe.row.execution_id, %error, "a publication was not accepted");
+        let mut held = self.writer.lock();
+        if !self.writer.current(&held) {
             return PublicationAcceptance::StaleLease;
         }
-        if !self.scribe.confirmed().await {
-            self.held.lock().await.broken = true;
-            return PublicationAcceptance::StaleLease;
+        if let Some(found) = receipt(&held.state, call) {
+            return found;
         }
-        found
+        let publications = &held.state.publications;
+        if publications.len() >= budget.max_count as usize {
+            return PublicationAcceptance::OverBudget(PublicationLimit::Count);
+        }
+        let retained = publications
+            .iter()
+            .map(|accepted| accepted.retained_bytes)
+            .sum::<u64>();
+        if retained.saturating_add(call.retained_bytes) > budget.max_bytes {
+            return PublicationAcceptance::OverBudget(PublicationLimit::Bytes);
+        }
+        let state = &mut held.state;
+        state.sequence += 1;
+        state.publications.push(AcceptedPublication {
+            sequence: state.sequence,
+            publication: call.publication.clone(),
+            call_id: call.call_id.to_owned(),
+            arguments: *call.arguments,
+            objects: call.objects.to_vec(),
+            retained_bytes: call.retained_bytes,
+        });
+        self.writer.changed(&mut held);
+        PublicationAcceptance::Accepted
     }
 
     /// Every publication `step` recorded in the live state, grouped by item,
     /// iteration, and attempt, in acceptance order within an attempt. Each
     /// was accepted before its step settled, so a dependent of the settled
-    /// step reads only accepted publications.
-    pub async fn publications(&self, step: &TaskId) -> Vec<AcceptedPublication> {
+    /// step reads its publications from memory.
+    #[must_use]
+    pub fn publications(&self, step: &TaskId) -> Vec<AcceptedPublication> {
         let mut found: Vec<_> = self
-            .held
+            .writer
             .lock()
-            .await
             .state
             .publications
             .iter()
@@ -854,106 +898,26 @@ impl RunState {
         found
     }
 
-    /// Apply `change` to the live state as one change and wait until an
-    /// accepted revision holds it. `change` returns `false` when it changed
-    /// nothing, which waits for nothing.
+    /// Apply `change` to the live state as one change; the background flush
+    /// persists it. `change` returns `false` when it changed nothing.
     ///
     /// # Errors
-    /// Returns [`StateError::Stale`] when the state is broken, and the
-    /// [`Self::durable`] errors.
-    async fn change(
+    /// Returns a bounded reason when the writer broke or lost its lease, or
+    /// `change`'s own refusal.
+    fn change(
         &self,
         change: impl FnOnce(&mut ExecutionState) -> Result<bool, String>,
     ) -> Result<(), String> {
-        let ticket = {
-            let mut held = self.held.lock().await;
-            if held.broken {
-                return Err(StateError::Stale.to_string());
-            }
-            if !change(&mut held.state)? {
-                return Ok(());
-            }
-            held.changed()
-        };
-        self.durable(ticket, self.scribe.deadline)
-            .await
-            .map_err(|error| error.to_string())
-    }
-
-    /// Wait until an accepted revision holds change `ticket`, awaiting a
-    /// revision this call freezes until `deadline`.
-    ///
-    /// Joins the pending revision, or, when none is pending, confirms the
-    /// lease outside the lock and freezes the live state, every change so
-    /// far, into the next revision. A revision
-    /// frozen before `ticket` is awaited and then the next one frozen, so
-    /// changes made while a revision is pending share the revision after it.
-    /// The memory lock is held only to read and update this bookkeeping and
-    /// to copy the frozen state; staging and acceptance run outside it, in
-    /// the shared acceptance any waiter drives, so a cancelled waiter
-    /// neither retracts the revision nor strands the others.
-    ///
-    /// # Errors
-    /// Returns [`StateError::Stale`] when the state is broken or the lease
-    /// no longer holds, and the [`StateScribe::write`] errors of a revision
-    /// holding `ticket`; each breaks the state.
-    async fn durable(&self, ticket: u64, deadline: tokio::time::Instant) -> Result<(), StateError> {
-        let mut confirmed = false;
-        loop {
-            let pending = {
-                let mut held = self.held.lock().await;
-                if held.broken {
-                    return Err(StateError::Stale);
-                }
-                if held.covered >= ticket {
-                    return Ok(());
-                }
-                if let Some(pending) = &held.pending {
-                    confirmed = false;
-                    pending.clone()
-                } else if !confirmed {
-                    drop(held);
-                    if !self.scribe.confirmed().await {
-                        self.held.lock().await.broken = true;
-                        return Err(StateError::Stale);
-                    }
-                    confirmed = true;
-                    continue;
-                } else {
-                    confirmed = false;
-                    let revision = held.revision + 1;
-                    let pending = Pending {
-                        revision,
-                        covers: held.changes,
-                        accepted: Arc::clone(&self.scribe)
-                            .write(revision, held.state.clone(), deadline)
-                            .boxed()
-                            .shared(),
-                    };
-                    held.pending = Some(pending.clone());
-                    pending
-                }
-            };
-            let accepted = pending.accepted.await;
-            let mut held = self.held.lock().await;
-            if held
-                .pending
-                .as_ref()
-                .is_some_and(|current| current.revision == pending.revision)
-            {
-                held.pending = None;
-                if accepted.is_ok() {
-                    held.revision = pending.revision;
-                    held.covered = pending.covers;
-                } else {
-                    held.broken = true;
-                }
-            }
-            accepted?;
+        let mut held = self.writer.lock();
+        if !self.writer.current(&held) {
+            return Err(StateError::Stale.to_string());
         }
+        if change(&mut held.state)? {
+            self.writer.changed(&mut held);
+        }
+        Ok(())
     }
 }
-
 /// The receipt `call` holds in `state`: replayed with the accepted kind for
 /// the same call, name, and arguments, a conflict for any other holder of
 /// the name in the producer attempt or for the same call under another name
@@ -981,11 +945,10 @@ fn receipt(state: &ExecutionState, call: PublicationCall<'_>) -> Option<Publicat
 
 #[async_trait::async_trait]
 impl vala_verify::blocks::Checkpoints for RunState {
-    /// Record that the attempt `producer` started, returning once an
-    /// accepted revision holds it.
+    /// Record in the live state that the attempt `producer` started.
     ///
     /// # Errors
-    /// Returns a bounded reason when no accepted revision will hold it.
+    /// Returns a bounded reason when the writer broke or lost its lease.
     async fn begin(&self, producer: &Producer) -> Result<(), String> {
         self.change(|state| {
             state.sequence += 1;
@@ -996,19 +959,18 @@ impl vala_verify::blocks::Checkpoints for RunState {
             });
             Ok(true)
         })
-        .await
     }
 
     /// Remove the unsettled attempt `producer`, refused capacity or its
     /// definition before it retained anything, so a later attempt replays
-    /// it, returning once an accepted revision no longer holds it.
+    /// it, from the live state.
     ///
     /// An attempt that already accepted a publication keeps its record: its
     /// retained work stays attributed to it, so the attempt is spent and
     /// restoration starts fresh work at the next attempt.
     ///
     /// # Errors
-    /// Returns a bounded reason when no accepted revision will reflect it.
+    /// Returns a bounded reason when the writer broke or lost its lease.
     async fn forget(&self, producer: &Producer) -> Result<(), String> {
         self.change(|state| {
             if state
@@ -1024,15 +986,14 @@ impl vala_verify::blocks::Checkpoints for RunState {
                 .retain(|record| &record.producer != producer || record.settlement.is_some());
             Ok(state.invocations.len() != recorded)
         })
-        .await
     }
 
-    /// Commit `settled` as the settlement of the attempt `producer`, once,
-    /// returning once an accepted revision holds it.
+    /// Record `settled` in the live state as the settlement of the attempt
+    /// `producer`, once.
     ///
     /// # Errors
     /// Returns a bounded reason when the attempt is not recorded unsettled or
-    /// no accepted revision will hold the settlement.
+    /// the writer broke or lost its lease.
     async fn settle(
         &self,
         producer: &Producer,
@@ -1047,17 +1008,15 @@ impl vala_verify::blocks::Checkpoints for RunState {
             record.settlement = Some(settled.clone());
             Ok(true)
         })
-        .await
     }
 
-    /// Record the scheduling decision `control` once, returning once an
-    /// accepted revision holds it; recording the same decision again changes
-    /// nothing.
+    /// Record the scheduling decision `control` in the live state once;
+    /// recording the same decision again changes nothing.
     ///
     /// # Errors
     /// Returns a bounded reason when another decision about the same step is
-    /// already recorded, since a recorded decision is final, or no accepted
-    /// revision will hold it.
+    /// already recorded, since a recorded decision is final, or the writer
+    /// broke or lost its lease.
     async fn control(&self, control: &ControlRecord) -> Result<(), String> {
         self.change(|state| {
             match state
@@ -1075,7 +1034,6 @@ impl vala_verify::blocks::Checkpoints for RunState {
                 }
             }
         })
-        .await
     }
 }
 
@@ -1107,8 +1065,11 @@ mod tests {
     use wyrd_spec::verification::state::ExecutionState;
     use wyrd_spec::verification::{TaskId, VerificationVerdict};
 
+    use tokio_util::sync::CancellationToken;
+
     use super::{
-        Decision, PublicationAcceptance, PublicationBudget, PublicationCall, RunState, StateRow,
+        Decision, PublicationAcceptance, PublicationBudget, PublicationCall, RunState, StateError,
+        StateRow,
     };
     use crate::components::gateway::recording::TableGate;
     use crate::scribe_outbox::{ScribeSink, ScribeTable};
@@ -1128,15 +1089,20 @@ mod tests {
     /// Panics when a fresh UUID is not a Card UID, or when called outside a
     /// Tokio runtime, where the outbox cannot spawn its writer.
     fn held_state() -> (RunState, Arc<TableGate>) {
-        held_at(ExecutionState::fresh(), 0)
+        held_at(ExecutionState::fresh(), 0, None)
     }
 
-    /// A direct execution's writer of `state`, accepted at `revision`,
-    /// written through a Scribe that holds every revision until released.
+    /// A writer of `state`, accepted at `revision`, written through a Scribe
+    /// that holds every revision until released; queued under the lease-loss
+    /// token `lost`, direct when `None`.
     ///
     /// # Panics
     /// Panics as [`held_state`] does.
-    fn held_at(state: ExecutionState, revision: i64) -> (RunState, Arc<TableGate>) {
+    fn held_at(
+        state: ExecutionState,
+        revision: i64,
+        lost: Option<CancellationToken>,
+    ) -> (RunState, Arc<TableGate>) {
         let scribe = Arc::new(TableGate::new(ScribeTable::ExecutionEvents));
         let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _, None);
         let (verifier, subject) = (uid(), uid());
@@ -1158,7 +1124,7 @@ mod tests {
             DataTenantId::new_v7(),
             row,
             tokio::time::Instant::now() + Duration::from_secs(30),
-            None,
+            lost,
             state,
             revision,
         );
@@ -1188,6 +1154,16 @@ mod tests {
         tokio::time::timeout(Duration::ZERO, future).await.is_err()
     }
 
+    /// Waits for `state`'s outcome of [`RunState::persisted`].
+    ///
+    /// # Panics
+    /// Panics when it does not settle within ten seconds.
+    async fn settled(state: &RunState) -> Result<(), StateError> {
+        tokio::time::timeout(Duration::from_secs(10), state.persisted())
+            .await
+            .expect("persistence settles")
+    }
+
     /// The text of every revision Scribe accepted, in order.
     fn revisions(scribe: &TableGate) -> Vec<String> {
         scribe
@@ -1199,97 +1175,81 @@ mod tests {
             .collect()
     }
 
-    /// Proves a sibling step records its progress while another step's
-    /// revision awaits Scribe, and that each step returns only once a
-    /// revision holding its own change is accepted.
+    /// Proves an engine transition completes from memory while Scribe holds
+    /// every revision.
     ///
     /// # Panics
-    /// Panics when the sibling cannot record, a step returns before its
-    /// change is accepted, or a revision holds the wrong changes.
+    /// Panics when a transition waits for a persistence acknowledgement.
     #[tokio::test]
-    async fn siblings_record_progress_while_a_revision_is_held() {
-        let (factual_id, sensitive_id) = (task("factual-check"), task("sensitive-check"));
-        let (state, scribe) = held_state();
-        let factual_id_attempt = Producer::plain(&factual_id, 1);
-        let mut factual = Box::pin(state.begin(&factual_id_attempt));
-        assert!(pending(&mut factual).await);
-        arrived(&scribe).await;
-
-        let sensitive_id_attempt = Producer::plain(&sensitive_id, 1);
-        let mut sensitive = Box::pin(state.begin(&sensitive_id_attempt));
-        assert!(
-            pending(&mut sensitive).await,
-            "B waits for its own revision"
-        );
-        let live = tokio::time::timeout(Duration::from_secs(1), state.snapshot())
-            .await
-            .expect("memory is not locked across a held revision");
-        assert_eq!(live.invocations.len(), 2, "B recorded its start");
-
-        scribe.release.add_permits(1);
-        factual.await.expect("A's revision is accepted");
-        assert!(
-            pending(&mut sensitive).await,
-            "A's revision does not hold B"
-        );
-        arrived(&scribe).await;
-        scribe.release.add_permits(1);
-        sensitive.await.expect("B's revision is accepted");
-
-        let accepted = revisions(&scribe);
-        assert_eq!(accepted.len(), 2);
-        assert!(accepted[0].contains("factual-check") && !accepted[0].contains("sensitive-check"));
-        assert!(accepted[1].contains("factual-check") && accepted[1].contains("sensitive-check"));
+    async fn transitions_complete_while_persistence_is_held() {
+        let (state, _scribe) = held_state();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            state.begin(&Producer::plain(&task("factual-check"), 1)),
+        )
+        .await
+        .expect("begin completes from memory")
+        .expect("begin is recorded");
     }
 
-    /// Proves changes recorded while a revision is held share the next
-    /// revision, a cancelled waiter neither retracts its change nor strands
-    /// another waiter, and a revision whose every waiter left is still
-    /// driven by the next one.
+    /// Proves siblings record progress from memory while a revision is held,
+    /// their changes coalesce into the one next revision, and a cancelled
+    /// persistence waiter neither retracts a change nor strands another.
     ///
     /// # Panics
-    /// Panics when the changes take more than two revisions, a cancelled
-    /// change is lost, or a remaining waiter is not released.
+    /// Panics when a step waits, the changes take more than two revisions,
+    /// or persistence is reported before the last change is accepted.
     #[tokio::test]
-    async fn held_changes_share_the_next_revision_across_cancelled_waiters() {
-        let (factual_id, sensitive_id, tone_id) = (
-            task("factual-check"),
-            task("sensitive-check"),
-            task("tone-check"),
-        );
+    async fn held_changes_coalesce_into_the_next_revision() {
         let (state, scribe) = held_state();
-        let factual_id_attempt = Producer::plain(&factual_id, 1);
-        let mut first = Box::pin(state.begin(&factual_id_attempt));
-        assert!(pending(&mut first).await);
-        arrived(&scribe).await;
-        drop(first);
-        let sensitive_id_attempt = Producer::plain(&sensitive_id, 1);
-        let mut second = Box::pin(state.begin(&sensitive_id_attempt));
-        assert!(pending(&mut second).await);
-        drop(second);
-        let tone_id_attempt = Producer::plain(&tone_id, 1);
-        let mut third = Box::pin(state.begin(&tone_id_attempt));
-        assert!(pending(&mut third).await);
-
-        scribe.release.add_permits(2);
-        third
+        let names = ["factual-check", "sensitive-check", "tone-check"];
+        state
+            .begin(&Producer::plain(&task(names[0]), 1))
             .await
-            .expect("the remaining waiter drives both revisions");
+            .expect("recorded");
+        arrived(&scribe).await;
+        let mut cancelled = Box::pin(state.persisted());
+        assert!(pending(&mut cancelled).await, "revision 1 is held");
+        drop(cancelled);
+        for name in &names[1..] {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                state.begin(&Producer::plain(&task(name), 1)),
+            )
+            .await
+            .expect("a sibling records while a revision is held")
+            .expect("recorded");
+        }
+        assert_eq!(state.snapshot().invocations.len(), 3);
+
+        let mut waiter = Box::pin(state.persisted());
+        scribe.release.add_permits(1);
+        arrived(&scribe).await;
+        assert!(
+            pending(&mut waiter).await,
+            "revision 1 does not hold the siblings"
+        );
+        scribe.release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(10), waiter)
+            .await
+            .expect("persistence settles")
+            .expect("revision 2 holds every change");
+
         let accepted = revisions(&scribe);
         assert_eq!(accepted.len(), 2, "three changes take two revisions");
-        assert!(!accepted[0].contains("sensitive-check"));
-        for name in ["factual-check", "sensitive-check", "tone-check"] {
-            assert!(accepted[1].contains(name), "{name} is in the batch");
+        assert!(accepted[0].contains(names[0]) && !accepted[0].contains(names[1]));
+        for name in names {
+            assert!(accepted[1].contains(name), "{name} is in revision 2");
         }
     }
 
-    /// Proves concurrent terminal selections share one result identity and
-    /// neither returns before its revision is accepted.
+    /// Proves repeated terminal selections share one result identity,
+    /// decided from memory, and one revision persists it.
     ///
     /// # Panics
-    /// Panics when a selection returns early or the identities differ.
+    /// Panics when the identities differ or more than one revision is written.
     #[tokio::test]
-    async fn duplicate_selections_share_one_accepted_result() {
+    async fn duplicate_selections_share_one_result() {
         let (state, scribe) = held_state();
         let outcome = ExecutedOutcome {
             verdict: VerificationVerdict::Passed,
@@ -1298,22 +1258,11 @@ mod tests {
             evidence: BTreeMap::new(),
         };
         let started = chrono::Utc::now();
-        let mut first = Box::pin(state.select(&outcome, started));
-        assert!(pending(&mut first).await);
-        arrived(&scribe).await;
-        let mut second = Box::pin(state.select(&outcome, started));
-        assert!(
-            pending(&mut second).await,
-            "a pending selection is not a result"
-        );
-
+        let first = state.select(&outcome, started).expect("selected");
+        let second = state.select(&outcome, started).expect("selected");
+        assert_eq!(first, second, "both share one selected result");
         scribe.release.add_permits(1);
-        let (first, second) = (first.await, second.await);
-        assert_eq!(
-            first.expect("selected"),
-            second.expect("selected"),
-            "both share one selected result"
-        );
+        settled(&state).await.expect("the selection is accepted");
         assert_eq!(revisions(&scribe).len(), 1);
     }
 
@@ -1335,8 +1284,7 @@ mod tests {
                 wyrd_spec::verification::VerificationExecutionStatus::Errored,
                 &error("engine"),
             )
-            .await
-            .expect("the failure is accepted");
+            .expect("the failure is recorded");
         assert!(matches!(failed, Decision::Failed(_)));
         let outcome = ExecutedOutcome {
             verdict: VerificationVerdict::Passed,
@@ -1346,27 +1294,94 @@ mod tests {
         };
         let selected = state
             .select(&outcome, chrono::Utc::now())
-            .await
             .expect("the decision reads");
         let refailed = state
             .fail(
                 wyrd_spec::verification::VerificationExecutionStatus::TimedOut,
                 &error("later"),
             )
-            .await
             .expect("the decision reads");
         assert_eq!((&selected, &refailed), (&failed, &failed));
-        assert!(state.snapshot().await.terminal.is_none());
+        assert!(state.snapshot().terminal.is_none());
+        settled(&state).await.expect("the failure is accepted");
         assert_eq!(revisions(&scribe).len(), 1);
     }
 
-    /// Proves a refused revision releases no waiter and stops the writer.
+    /// Proves a refused revision breaks a queued writer: its persistence
+    /// waiter fails and its later changes are refused.
     ///
     /// # Panics
-    /// Panics when a waiter is released or a later change is accepted.
+    /// Panics when the writer keeps accepting changes or reports persistence.
     #[tokio::test]
-    async fn a_refused_revision_releases_nothing() {
-        let (factual_id, sensitive_id) = (task("factual-check"), task("sensitive-check"));
+    async fn a_refused_revision_breaks_a_queued_writer() {
+        let (state, scribe) = held_at(ExecutionState::fresh(), 0, Some(CancellationToken::new()));
+        scribe
+            .inner
+            .refuse_next(vala_bifrost_redux::contracts::ScribeError::BatchConflict);
+        scribe
+            .release
+            .add_permits(tokio::sync::Semaphore::MAX_PERMITS);
+        state
+            .begin(&Producer::plain(&task("factual-check"), 1))
+            .await
+            .expect("recorded in memory");
+        assert!(matches!(settled(&state).await, Err(StateError::Stale)));
+        assert!(
+            state
+                .begin(&Producer::plain(&task("sensitive-check"), 1))
+                .await
+                .is_err()
+        );
+        assert!(revisions(&scribe).is_empty());
+    }
+
+    /// Proves a lost lease ends a queued writer's held revision and refuses
+    /// every later change, decision, and publication.
+    ///
+    /// # Panics
+    /// Panics when the lost writer still records or reports persistence.
+    #[tokio::test]
+    async fn a_lost_lease_stops_a_queued_writer() {
+        let lost = CancellationToken::new();
+        let (state, scribe) = held_at(ExecutionState::fresh(), 0, Some(lost.clone()));
+        state
+            .begin(&Producer::plain(&task("factual-check"), 1))
+            .await
+            .expect("recorded in memory");
+        arrived(&scribe).await;
+        lost.cancel();
+        assert!(matches!(settled(&state).await, Err(StateError::Stale)));
+        assert!(
+            state
+                .begin(&Producer::plain(&task("sensitive-check"), 1))
+                .await
+                .is_err()
+        );
+        let error = wyrd_spec::verification::VerificationError {
+            code: "engine".to_owned(),
+            message: "engine".to_owned(),
+        };
+        assert!(matches!(
+            state.fail(
+                wyrd_spec::verification::VerificationExecutionStatus::Errored,
+                &error
+            ),
+            Err(StateError::Stale)
+        ));
+        assert_eq!(
+            publish(&state, ("draft", 1), "p1", "a", serde_json::json!(1)),
+            PublicationAcceptance::StaleLease
+        );
+        assert_eq!(state.snapshot().invocations.len(), 1);
+    }
+
+    /// Proves a direct writer whose revision is not accepted keeps running
+    /// from memory and persists nothing more.
+    ///
+    /// # Panics
+    /// Panics when the direct execution stops progressing or writes again.
+    #[tokio::test]
+    async fn a_direct_writer_keeps_running_after_its_revision_is_lost() {
         let (state, scribe) = held_state();
         scribe
             .inner
@@ -1374,13 +1389,23 @@ mod tests {
         scribe
             .release
             .add_permits(tokio::sync::Semaphore::MAX_PERMITS);
-        assert!(state.begin(&Producer::plain(&factual_id, 1)).await.is_err());
-        assert!(
-            state
-                .begin(&Producer::plain(&sensitive_id, 1))
-                .await
-                .is_err()
-        );
+        state
+            .begin(&Producer::plain(&task("factual-check"), 1))
+            .await
+            .expect("recorded");
+        assert!(matches!(
+            settled(&state).await,
+            Err(StateError::Unavailable(_))
+        ));
+        state
+            .begin(&Producer::plain(&task("sensitive-check"), 1))
+            .await
+            .expect("the direct execution keeps progressing");
+        assert_eq!(state.snapshot().invocations.len(), 2);
+        assert!(matches!(
+            settled(&state).await,
+            Err(StateError::Unavailable(_))
+        ));
         assert!(revisions(&scribe).is_empty());
     }
 
@@ -1389,7 +1414,7 @@ mod tests {
     ///
     /// # Panics
     /// Panics when `name` is invalid or `value` does not serialize.
-    async fn publish(
+    fn publish(
         state: &RunState,
         (task_id, attempt): (&str, u32),
         call: &str,
@@ -1407,23 +1432,21 @@ mod tests {
             },
             content: PublicationContent::Json { value },
         };
-        state
-            .accept_publication(
-                PublicationCall {
-                    publication: &publication,
-                    call_id: call,
-                    arguments: &Sha256Hex::digest(
-                        &serde_jcs::to_vec(&arguments).expect("arguments serialize"),
-                    ),
-                    objects: &[],
-                    retained_bytes: 1,
-                },
-                PublicationBudget {
-                    max_count: 16,
-                    max_bytes: 1024,
-                },
-            )
-            .await
+        state.accept_publication(
+            PublicationCall {
+                publication: &publication,
+                call_id: call,
+                arguments: &Sha256Hex::digest(
+                    &serde_jcs::to_vec(&arguments).expect("arguments serialize"),
+                ),
+                objects: &[],
+                retained_bytes: 1,
+            },
+            PublicationBudget {
+                max_count: 16,
+                max_bytes: 1024,
+            },
+        )
     }
 
     /// Proves one provider call keeps the one name and arguments it was
@@ -1443,15 +1466,15 @@ mod tests {
             .add_permits(tokio::sync::Semaphore::MAX_PERMITS);
         let draft = ("draft", 1);
         assert_eq!(
-            publish(&live, draft, "p1", "a", serde_json::json!(1)).await,
+            publish(&live, draft, "p1", "a", serde_json::json!(1)),
             PublicationAcceptance::Accepted
         );
         assert_eq!(
-            publish(&live, draft, "p1", "b", serde_json::json!(1)).await,
+            publish(&live, draft, "p1", "b", serde_json::json!(1)),
             PublicationAcceptance::Conflict,
             "a live call cannot take a second name"
         );
-        let (restored, scribe) = held_at(live.snapshot().await, 1);
+        let (restored, scribe) = held_at(live.snapshot(), 1, None);
         scribe
             .release
             .add_permits(tokio::sync::Semaphore::MAX_PERMITS);
@@ -1467,19 +1490,18 @@ mod tests {
             ("p2", "a", 1, PublicationAcceptance::Conflict),
         ] {
             assert_eq!(
-                publish(&restored, draft, call, name, serde_json::json!(value)).await,
+                publish(&restored, draft, call, name, serde_json::json!(value)),
                 expected,
                 "{call} {name} {value}"
             );
         }
         assert_eq!(
-            publish(&restored, ("draft", 2), "p1", "a", serde_json::json!(3)).await,
+            publish(&restored, ("draft", 2), "p1", "a", serde_json::json!(3)),
             PublicationAcceptance::Accepted,
             "a fresh attempt may reuse the name and call ID"
         );
         let kept: Vec<(u32, String, Value)> = restored
             .snapshot()
-            .await
             .publications
             .into_iter()
             .map(|accepted| {

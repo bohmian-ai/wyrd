@@ -117,7 +117,7 @@ impl TenantEvidence {
         step: &TaskId,
     ) -> Result<Vec<AcceptedPublication>, BlockError> {
         Ok(match &self.execution {
-            Some(state) => state.publications(step).await,
+            Some(state) => state.publications(step),
             None => Vec::new(),
         })
     }

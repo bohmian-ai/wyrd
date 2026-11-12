@@ -717,7 +717,7 @@ impl<'a> VerificationControl<'a> {
                 }
                 Err(error) => return ("errored", Err(WyrdError::internal(error.to_string()))),
             };
-            let selected = match state.select(&outcome, started_at).await {
+            let selected = match state.select(&outcome, started_at) {
                 Ok(Decision::Selected(selected)) => selected,
                 Ok(Decision::Failed(failure)) => {
                     return ("errored", Err(WyrdError::internal(failure.error.message)));
@@ -758,7 +758,7 @@ impl<'a> VerificationControl<'a> {
                 code: error.code().to_owned(),
                 message: error.to_string(),
             };
-            if let Err(unrecorded) = state.fail(status, &failure).await {
+            if let Err(unrecorded) = state.fail(status, &failure) {
                 tracing::warn!(%execution_id, error = %unrecorded, "a direct execution's failure was not retained");
             }
         }

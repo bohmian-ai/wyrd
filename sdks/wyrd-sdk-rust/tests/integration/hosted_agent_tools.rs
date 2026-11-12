@@ -1371,8 +1371,8 @@ async fn assert_writes_only(desk: &PublishDesk, result: &VerificationResult, que
 /// only `fs.write` acting for a principal granted every tool, both write
 /// scratch while each read, code, and publish call is denied with nothing
 /// returned or published. Cancelling a queued execution while its drafter
-/// waits on the model keeps the publication accepted before the
-/// cancellation and accepts nothing later.
+/// waits on the model, once its first publication is accepted, keeps that
+/// publication and accepts nothing later.
 ///
 /// # Panics
 /// Panics when a principal does not seed, a verification or cancellation
@@ -1436,13 +1436,28 @@ async fn tool_calls_recheck_permissions_and_revocation() {
     let execution = Execution::connect_with(*queued.id(), &desk.deployment.admin())
         .await
         .expect("the execution handle connects");
+    let page = ExecutionPageQuery {
+        limit: None,
+        cursor: None,
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while execution
+        .publications(&page)
+        .await
+        .expect("the publications read")
+        .items
+        .is_empty()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the early publication was never accepted"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     let cancelled = execution.cancel().await.expect("the execution cancels");
     assert_eq!(cancelled.status, VerificationExecutionStatus::Cancelled);
     let listed: Vec<(String, u32)> = execution
-        .publications(&ExecutionPageQuery {
-            limit: None,
-            cursor: None,
-        })
+        .publications(&page)
         .await
         .expect("the publications read")
         .items

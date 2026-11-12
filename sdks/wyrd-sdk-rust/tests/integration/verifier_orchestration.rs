@@ -601,17 +601,36 @@ impl Desk {
             .expect("the tenant provisions")
     }
 
-    /// The accepted Bifrost state of `execution`.
+    /// The accepted Bifrost state of `execution` once it satisfies `ready`.
+    ///
+    /// Steps change state in memory and persist it in background, so a step
+    /// the test has seen run may not be accepted yet; this reads again
+    /// until it is.
     ///
     /// # Panics
-    /// Panics when the state cannot be read or no revision was accepted.
-    async fn accepted(&self, execution: ExecutionId) -> ExecutionState {
-        self.fixture()
-            .await
-            .execution_state(self.deployment.server().state(), execution)
-            .await
-            .expect("the accepted state reads")
-            .expect("the execution accepted progress")
+    /// Panics when the state cannot be read or no accepted revision
+    /// satisfies `ready` within 30 seconds.
+    async fn accepted(
+        &self,
+        execution: ExecutionId,
+        ready: impl Fn(&ExecutionState) -> bool,
+    ) -> ExecutionState {
+        let fixture = self.fixture().await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let state = fixture
+                .execution_state(self.deployment.server().state(), execution)
+                .await
+                .expect("the accepted state reads");
+            match state {
+                Some(state) if ready(&state) => return state,
+                last => assert!(
+                    std::time::Instant::now() < deadline,
+                    "the accepted state never became ready: {last:?}"
+                ),
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// Wait for the taken-over `execution` to settle.
@@ -1822,16 +1841,13 @@ async fn logical_control_state_resumes_from_bifrost() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let server = desk.deployment.server();
-    let fixture = VerificationFixture::provision(server.state(), server.data_tenant_id())
-        .await
-        .expect("the tenant provisions");
-    let accepted = fixture
-        .execution_state(server.state(), execution)
-        .await
-        .expect("the accepted state reads")
-        .expect("the execution accepted progress");
     let map = TaskId::new("map").expect("step");
     let extra = TaskId::new("extra").expect("step");
+    let accepted = desk
+        .accepted(execution, |state| {
+            state.speculation(&extra) != Speculation::None
+        })
+        .await;
     assert!(
         accepted.controls.contains(&ControlRecord::Items {
             step: map.clone(),
@@ -2183,7 +2199,11 @@ async fn refinement_progresses_while_persistence_is_held() {
         "a direct execution keeps no execution state"
     );
     assert!(
-        fixture.executions().await.expect("executions read").is_empty(),
+        fixture
+            .executions()
+            .await
+            .expect("executions read")
+            .is_empty(),
         "a direct execution admits no queue record"
     );
     let execution = Execution::connect_with(direct.execution_id, &desk.deployment.admin())
@@ -2379,7 +2399,11 @@ async fn speculative_recovery_cannot_resurrect_content() {
     let mut before = Vec::new();
     for ((question, speculation, ..), execution) in cases.iter().zip(&executions) {
         desk.stalled_in("CONSOLIDATE:", question).await;
-        let accepted = desk.accepted(*execution).await;
+        let accepted = desk
+            .accepted(*execution, |state| {
+                state.speculation(&extra) != Speculation::None
+            })
+            .await;
         assert_eq!(accepted.speculation(&extra), *speculation, "{question}");
         before.push((
             desk.asked("COMPARE:", question).await.len(),

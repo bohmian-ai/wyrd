@@ -934,8 +934,9 @@ impl VerifierRunner {
     ///
     /// A [`Transition::Complete`], whose result Scribe already acknowledged,
     /// first joins the group commit through [`Completions`], which settles it
-    /// in one transaction with the tenant's other completing runs; only when
-    /// no batch committed it does it settle alone here. A failed commit
+    /// in one transaction with the tenant's other completing runs. A failed
+    /// batch returns its error, so the caller's retry rejoins a later batch;
+    /// only when no flush task remains does the run settle alone here. A failed commit
     /// retried under the same lease completes the run with the same result
     /// ID, and a lost lease leaves the result written for a run another claim
     /// re-executes.
@@ -972,7 +973,7 @@ impl VerifierRunner {
                 summary: summary.clone(),
                 drift: *drift,
             };
-            if let Some(settlement) = self.completions.complete(tenant, completion).await {
+            if let Some(settlement) = self.completions.complete(tenant, completion).await? {
                 return Ok(settled(settlement, "completed"));
             }
         }

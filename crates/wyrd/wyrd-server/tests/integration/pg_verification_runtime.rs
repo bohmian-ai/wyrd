@@ -2499,6 +2499,76 @@ async fn held_persistence_bounds_queued_custody_by_claim_permits() {
     }
 }
 
+/// A failed group commit retries its runs as a group rather than settling
+/// each run in its own transaction.
+///
+/// A test-only trigger fails the first batched completion statement once
+/// and records, for every completion that commits, whether the batched
+/// statement or the single-run statement applied it. Three queued runs
+/// compute while their claims are held, so they complete together; every
+/// run then commits through the batched statement on its first attempt.
+///
+/// # Panics
+/// Panics when the fault cannot be installed, no batch failed, or any run
+/// commits through the single-run statement or retries its attempt.
+#[tokio::test]
+async fn failed_group_commits_retry_as_groups() {
+    let harness = Harness::start().await;
+    for statement in [
+        "CREATE SEQUENCE public.batch_failures",
+        "CREATE TABLE public.completion_paths (execution_id uuid NOT NULL, batched boolean NOT NULL)",
+        "CREATE FUNCTION public.fail_first_batch() RETURNS trigger LANGUAGE plpgsql \
+         SECURITY DEFINER AS $$ DECLARE batched boolean := \
+         current_query() LIKE '%complete_verifier_executions%'; BEGIN \
+         IF batched AND nextval('public.batch_failures') = 1 THEN \
+         RAISE EXCEPTION 'test-only batched completion failure'; END IF; \
+         INSERT INTO public.completion_paths VALUES (NEW.execution_id, batched); \
+         RETURN NEW; END $$",
+        "CREATE TRIGGER fail_first_batch BEFORE UPDATE ON wyrd.verifier_executions \
+         FOR EACH ROW WHEN (NEW.status = 'completed') \
+         EXECUTE FUNCTION public.fail_first_batch()",
+    ] {
+        sqlx::query(statement)
+            .execute(&harness.assertion)
+            .await
+            .expect("the batch fault installs");
+    }
+    let mut runs = Vec::new();
+    for _ in 0..3 {
+        runs.push(harness.submit().await);
+    }
+    let script = EngineScript::default();
+    script.hold();
+    for _ in 0..3 {
+        script.push(EngineOutcome::Completed(unscored_report()));
+    }
+    let runtime = harness.spawn(&Harness::limits(), &script);
+    wait_until("every claim computes", || script.entered() == 3).await;
+    script.release();
+    for run in &runs {
+        let row = harness.wait_execution(*run, status("completed")).await;
+        assert_eq!(row.attempts, 1, "{run} completes on its first attempt");
+    }
+    runtime.stop().await;
+    let failures: i64 = sqlx::query_scalar("SELECT last_value FROM public.batch_failures")
+        .fetch_one(&harness.assertion)
+        .await
+        .expect("the failure count reads");
+    assert!(failures >= 1, "the first batch failed");
+    let mut paths: Vec<(Uuid, bool)> =
+        sqlx::query_as("SELECT execution_id, batched FROM public.completion_paths")
+            .fetch_all(&harness.assertion)
+            .await
+            .expect("the completion paths read");
+    paths.sort();
+    let mut expected: Vec<(Uuid, bool)> = runs.iter().map(|run| (run.as_uuid(), true)).collect();
+    expected.sort();
+    assert_eq!(
+        paths, expected,
+        "every run commits once through the batched statement"
+    );
+}
+
 /// Stage `harness`'s submitted execution's selected result while its
 /// settlement never commits, on its final attempt when `final_attempt`, and
 /// return the execution and its stopping runtime.

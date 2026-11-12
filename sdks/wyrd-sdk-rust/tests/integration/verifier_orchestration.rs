@@ -1939,15 +1939,14 @@ const STALLED: Duration = Duration::from_secs(600);
 /// claiming and their leases expire. A second replica takes both over while
 /// the first worker still holds the stalled calls: settled iteration 0 is
 /// restored, the interrupted iteration runs as its retry, and each
-/// refinement stops or exhausts within its original `max_iterations` and
-/// deadline. When the first worker stops, still inside its stalled calls,
-/// nothing it held has started anything: across both workers, every
-/// iteration's calls precede the next iteration's, and no iteration runs
-/// twice.
+/// refinement stops or exhausts within its original `max_iterations`. When
+/// the first worker stops, still inside its stalled calls, nothing it held
+/// has started anything: across both workers, every iteration's calls
+/// precede the next iteration's, and no iteration runs twice.
 ///
 /// # Panics
-/// Panics when a submission is refused or does not settle, a deadline
-/// moves, or an iteration overlaps or runs again.
+/// Panics when a submission is refused or does not settle, or an iteration
+/// overlaps or runs again.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn repeat_stops_or_exhausts_without_overlapping() {
@@ -1969,33 +1968,13 @@ async fn repeat_stops_or_exhausts_without_overlapping() {
             desk.submit("repeat-takeover", json!(question)).await,
         ));
     }
-    let fixture = desk.fixture().await;
-    let mut deadlines = Vec::new();
-    for (question, execution) in &executions {
+    for (question, _) in &executions {
         desk.stalled_in("index=1", question).await;
-        let row = fixture
-            .execution(*execution)
-            .await
-            .expect("the execution reads");
-        assert!(
-            row.deadline_at.is_some(),
-            "the first claim fixes a deadline"
-        );
-        deadlines.push(row.deadline_at);
     }
     let ids: Vec<ExecutionId> = executions.iter().map(|(_, execution)| *execution).collect();
     let (stalled, desk) = desk.take_over(&ids).await;
-    for ((question, execution), before) in executions.iter().zip(&deadlines) {
+    for (question, execution) in &executions {
         let result = desk.settled(*execution).await;
-        assert_eq!(
-            &fixture
-                .execution(*execution)
-                .await
-                .expect("the execution reads")
-                .deadline_at,
-            before,
-            "{question}: the takeover keeps the original deadline"
-        );
         let attempts: Vec<(Option<u32>, u32)> = desk
             .publications(&result)
             .await

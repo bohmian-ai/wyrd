@@ -2012,9 +2012,11 @@ preparation and is never treated as absence. A snapshot that does not decode
 as a supported `ExecutionState` format defers with `execution_state_incompatible`.
 A revision the old owner froze just before takeover may still be accepted ahead
 of the replacement's and is then inherited; this rare interval is accepted and no
-PostgreSQL ownership table closes it. Execution failures and cancellations are
-recorded in the state with the execution's exact identity, so retained reads need
-neither the queue row nor the source Cards.
+PostgreSQL ownership table closes it. An attempt's execution failure is recorded
+in the state with the execution's exact identity before the queue settles it, so
+retained reads of it need neither the queue row nor the source Cards. A
+cancellation or revocation settles only the queue row, which owns that status; a
+running holder learns of it through its lost token and records nothing more.
 
 Queue leases renew on the PostgreSQL clock; expiry never revives an old lease.
 The background lease-renewal owner sets each claim's local lost/cancelled token

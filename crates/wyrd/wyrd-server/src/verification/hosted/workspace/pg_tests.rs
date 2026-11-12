@@ -21,13 +21,12 @@ fn workspace_cleans_up_on_drop() {
             max_workspaces: 1,
             ..HostedLimits::default()
         };
-        let evidence =
-            TenantEvidence::new(test_state().await, test_caller([]), BTreeMap::new(), limits);
+        let evidence = TenantEvidence::new(test_state().await, test_caller([]), limits);
         let workspaces = Workspaces::new(limits);
         let files = BTreeMap::from([(
             "/inputs/a.json".to_owned(),
             CallInput {
-                value: CallValue::Json(json!({"a": 1})),
+                value: CallValue::Json(json!({"a": 1}).into()),
                 sources: BTreeSet::new(),
             },
         )]);
@@ -57,13 +56,12 @@ fn cancelled_open_returns_its_admission() {
             max_workspaces: 1,
             ..HostedLimits::default()
         };
-        let evidence =
-            TenantEvidence::new(test_state().await, test_caller([]), BTreeMap::new(), limits);
+        let evidence = TenantEvidence::new(test_state().await, test_caller([]), limits);
         let workspaces = Workspaces::new(limits);
         let files = BTreeMap::from([(
             "/inputs/a.txt".to_owned(),
             CallInput {
-                value: CallValue::Json(json!("line\n".repeat(10_000))),
+                value: CallValue::Json(json!("line\n".repeat(10_000)).into()),
                 sources: BTreeSet::new(),
             },
         )]);

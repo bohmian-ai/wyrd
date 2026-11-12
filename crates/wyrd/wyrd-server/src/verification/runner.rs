@@ -51,7 +51,7 @@ use wyrd_spec::card::operator::DriftCounts;
 use wyrd_spec::card::verifier::VerifierSpec;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{SlotName, VerificationResultId};
-use wyrd_spec::verification::execution::{InputDeclaration, VerificationOutcome};
+use wyrd_spec::verification::execution::{ExecutedOutcome, InputDeclaration};
 use wyrd_spec::verification::{TaskId, VerifierReadiness};
 use wyrd_spec::verification::{VerificationError, VerificationVerdict};
 use wyrd_sql::queries::verifier_executions::{
@@ -477,27 +477,28 @@ impl VerifierRunner {
             },
         };
         let caller = Caller::accepted(&run.authority, system);
-        let engine = match self.blocks.engine(
-            &self.state,
-            Execution {
-                caller: &caller,
-                evidence: &evidence,
-                routes: &routes,
-                subject: GatewayCallContext {
-                    workload_card_uid: run
-                        .owner_card_uid
-                        .as_ref()
-                        .or_else(|| run.authority.owning_root())
-                        .cloned(),
-                    subject_card_uid: Some(run.card_uid.clone()),
-                    run_id,
-                    deployment_environment: run.deployment_environment.clone(),
+        let engine = match telemetry.time(Phase::Setup, || {
+            self.blocks.engine(
+                &self.state,
+                Execution {
+                    caller: &caller,
+                    routes: &routes,
+                    subject: GatewayCallContext {
+                        workload_card_uid: run
+                            .owner_card_uid
+                            .as_ref()
+                            .or_else(|| run.authority.owning_root())
+                            .cloned(),
+                        subject_card_uid: Some(run.card_uid.clone()),
+                        run_id,
+                        deployment_environment: run.deployment_environment.clone(),
+                    },
+                    defer_unlanded_traces: run.attempt < run.max_attempts,
+                    drift,
+                    clock: telemetry.clock(),
                 },
-                defer_unlanded_traces: run.attempt < run.max_attempts,
-                drift,
-                clock: telemetry.clock(),
-            },
-        ) {
+            )
+        }) {
             Ok(engine) => engine,
             Err(error) => {
                 tracing::warn!(execution_id = %run.lease.execution_id, %error, "the execution engine cannot be built");
@@ -963,7 +964,7 @@ impl VerifierRunner {
 /// write.
 fn result(
     run: &ClaimedExecution,
-    outcome: &VerificationOutcome,
+    outcome: &ExecutedOutcome,
     system: PrincipalId,
     started_at: DateTime<Utc>,
 ) -> (Transition, Option<ScribeWrite>) {

@@ -13,6 +13,14 @@ hand an approved specification to `$wyrd-plan`.
 
 ## Establish authority
 
+When `changes/active/<slug>/design/notes.md` exists, read it and its relevant
+supplemental files as design reference material. Carry forward agreed intent,
+constraints, evidence, and material open questions; distinguish user decisions
+from agent assumptions and suggested private mechanics. A finalized design is
+not spec approval. Revalidate material claims and resolve standards conflicts
+with the user, including any required owner-document update, before approval;
+do not silently discard a proposed standards change or treat it as enacted.
+
 Read `AGENTS.md` and the Doctrine section plus the owning sections of
 [Wyrd design](../../../architecture/wyrd-design.md). Read
 [spec-driven development](../../../changes/spec-driven-development.md),

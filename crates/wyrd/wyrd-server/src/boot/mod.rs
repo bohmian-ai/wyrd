@@ -390,7 +390,7 @@ async fn build_bifrost_external_dependencies(
         })
         .collect();
     let runtime_resources = BifrostRuntimeResources::detect_with_transport_message_limit(
-        config.resources.policy(
+        config.resource_policy(
             resource_roles,
             Some(data_root.oracle_spill().to_path_buf()),
             Some(data_root.volume_roots()),
@@ -401,6 +401,36 @@ async fn build_bifrost_external_dependencies(
     let resources = runtime_resources
         .compose_roles()
         .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
+    // Every Bifrost consumer below sizes itself from this one plan, so an
+    // operator comparing hosts reads the whole resolved configuration here.
+    let plan = resources.plan();
+    let sources = resources.sources();
+    let overrides = config.scribe.worker_overrides();
+    tracing::info!(
+        effective_cpu = plan.effective_cpu,
+        cpu_source = ?sources.cpu,
+        memory_limit_bytes = plan.memory_limit_bytes,
+        memory_source = ?sources.memory,
+        server_memory_min_bytes = plan.server_memory_min_bytes,
+        managed_memory_bytes = plan.managed_memory_bytes,
+        bifrost_memory_cap_bytes = ?config.resources.memory_limit_bytes,
+        scratch_limit_bytes = plan.scratch_limit_bytes,
+        scratch_source = ?sources.scratch,
+        scribe_coordination_threads = plan.scribe_workers.coordination_threads,
+        scribe_ingress_cpu_threads = plan.scribe_workers.ingress_cpu_threads,
+        scribe_persistence_cpu_threads = plan.scribe_workers.persistence_cpu_threads,
+        explicit_coordination_threads = ?overrides.coordination_threads,
+        explicit_ingress_cpu_threads = ?overrides.ingress_cpu_threads,
+        explicit_persistence_cpu_threads = ?overrides.persistence_cpu_threads,
+        outbox_writers = crate::scribe_outbox::SCRIBE_WRITERS,
+        outbox_lanes = crate::scribe_outbox::SCRIBE_LANES,
+        outbox_deliveries_per_writer = crate::scribe_outbox::FRAMES_IN_FLIGHT,
+        outbox_deliveries = crate::scribe_outbox::SCRIBE_DELIVERIES,
+        outbox_capacity_items = config.scribe.outbox_capacity,
+        outbox_capacity_bytes = config.scribe.outbox_bytes,
+        oracle_query_slot_limit = ?plan.oracle_query_slot_limit,
+        "Bifrost resource configuration resolved"
+    );
     // Boot order is resources -> storage owner -> catalog. The owner's cache
     // budget is a share of this node's managed memory and is allocated only for
     // an Oracle-serving target, so it cannot be resolved before the resource
@@ -504,6 +534,7 @@ pub async fn compose_bifrost(
         .map_err(Box::new)?;
     let scribe_config = bifrost_config.scribe;
     let resource_plan = bifrost_resources.plan();
+    let scribe_workers = resource_plan.scribe_workers;
     let pod_memory_limit = resource_plan.managed_memory_bytes;
     if roles.contains(&BifrostRuntimeRole::Scribe) {
         let scribe_resources = bifrost_resources.scribe().ok_or_else(|| {
@@ -584,14 +615,13 @@ pub async fn compose_bifrost(
         // coordination task: the configured shard-owner lanes plus the
         // reconciliation and persistence loops. It is deliberately separate from
         // the request runtime so a saturated ingest path cannot starve shard
-        // progress, and its thread count derives from
-        // `default_scribe_coordination_threads` (available parallelism,
-        // floored at two). Only the `Handle` is handed to
+        // progress, and its thread count is the resource plan's resolved
+        // coordination workers. Only the `Handle` is handed to
         // consumers; the `Runtime` value itself is moved into the single
         // non-`Clone` `ScribeCoordinationRuntime` owner returned below, which must
         // outlive Scribe role drain and releases the executor without blocking.
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(scribe_config.coordination_threads)
+            .worker_threads(scribe_workers.coordination_threads)
             .thread_name_fn(|| {
                 static THREAD_INDEX: std::sync::atomic::AtomicUsize =
                     std::sync::atomic::AtomicUsize::new(0);
@@ -612,12 +642,12 @@ pub async fn compose_bifrost(
             .as_ref()
             .map_or(Duration::ZERO, |controls| controls.scribe_wal_sync_delay);
         let execution_pools = ScribeExecutionPools::new(
-            ScribeIngressCpuPool::try_new_with_capacity(scribe_config.ingress_cpu_threads, 256)
+            ScribeIngressCpuPool::try_new_with_capacity(scribe_workers.ingress_cpu_threads, 256)
                 .map_err(|error| {
                     ServerBootError::Scribe(format!("ingress CPU pool failed: {error}"))
                 })?,
             ScribePersistenceCpuPool::try_new_with_capacity(
-                scribe_config.persistence_cpu_threads,
+                scribe_workers.persistence_cpu_threads,
                 64,
             )
             .map_err(|error| {
@@ -652,7 +682,7 @@ pub async fn compose_bifrost(
             immutable_limit_bytes: geometry
                 .shard_generation_rotation_usize()
                 .saturating_mul(2)
-                .saturating_mul(scribe_config.persistence_cpu_threads)
+                .saturating_mul(scribe_workers.persistence_cpu_threads)
                 .min(pod_memory_limit / 2),
         };
         #[cfg(feature = "test-support")]
@@ -669,7 +699,7 @@ pub async fn compose_bifrost(
         let persistence = ScribePersistenceConfig::new(
             Arc::new(postgres.vala().clone()),
             64,
-            scribe_config.persistence_cpu_threads,
+            scribe_workers.persistence_cpu_threads,
         )
         .with_operator_pool(postgres.operator_pool().ok_or_else(|| {
             ServerBootError::Scribe(
@@ -2349,6 +2379,10 @@ mod tests {
             oracle_enabled: false,
             forge_enabled: true,
             scratch_limit_bytes: 1024 * 1024 * 1024,
+            scribe_workers: vala_bifrost_redux::resources::ScribeWorkers::resolve(
+                6,
+                vala_bifrost_redux::resources::ScribeWorkerOverrides::default(),
+            ),
         };
         let forge_runtime = ForgeRuntimeConfig::default();
         let worker = super::forge_compaction_worker_config(&plan, &forge_runtime);

@@ -9,6 +9,7 @@
 //! any number of distinct Agents, and no call can see another's media,
 //! tools, or workspace.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
@@ -21,7 +22,7 @@ use skald_agent::{
 use skald_prompt::Prompt;
 use skald_providers::ProviderError;
 use skald_runtime::{ProviderRegistry, SkaldRuntimeError};
-use skald_spec::{MediaRef, ResponseType};
+use skald_spec::{MediaRef, PreparedSchemas, ResponseType};
 use tokio::time::Instant;
 use wyrd_spec::card::agent::{AgentSpec, BuiltinTool, ExecutionRoute};
 use wyrd_spec::card::verifier::{Action, AgentCall, Check, InputSlot};
@@ -37,6 +38,34 @@ use super::{
     ActionExecutor, ActionOutput, BlockCall, BlockError, CallInput, CallValue, CheckExecutor,
     CheckOutput, EngineError, Position, verdict_from,
 };
+
+/// Histogram of one Agent call's phases, seconds, labelled `phase`:
+/// `resolve` (the Agent, its Prompt, and the route), `bind` (inputs and
+/// citation slots into the Prompt), `run` (the Agent loop, its tools and model
+/// calls), and, for a check, `verdict` (the answer against the Verdict format)
+/// and `cite` (citations against reachable evidence). It is benchmark-only
+/// timing: recorded only once [`wyrd_benchmark::install`] has run, so a build
+/// without the `bench` feature never records or times it.
+pub const AGENT_PHASE_DURATION_SECONDS: &str = "wyrd_verification_agent_phase_duration_seconds";
+
+/// One benchmark-only Agent phase's start: `None` unless the benchmark
+/// recorder is installed, so an ordinary build reads no clock.
+fn phase_start() -> Option<std::time::Instant> {
+    wyrd_benchmark::enabled().then(std::time::Instant::now)
+}
+
+/// Records the Agent `phase` begun at `started` into
+/// [`AGENT_PHASE_DURATION_SECONDS`] and returns the next phase's start.
+fn phase_end(
+    phase: &'static str,
+    started: Option<std::time::Instant>,
+) -> Option<std::time::Instant> {
+    let started = started?;
+    let now = std::time::Instant::now();
+    metrics::histogram!(AGENT_PHASE_DURATION_SECONDS, "phase" => phase)
+        .record(now.duration_since(started).as_secs_f64());
+    Some(now)
+}
 
 /// Resolves a registered Agent Card into its pure Agent spec.
 #[async_trait]
@@ -111,7 +140,10 @@ pub trait EvidenceReader: Send + Sync {
     /// `slots` before any block runs.
     ///
     /// `evidence` holds the caller's slots plus one undeclared slot per
-    /// fixed Artifact attachment file; every admitted slot is citable.
+    /// fixed Artifact attachment file; every admitted slot is citable. It is
+    /// the run's one evidence backing: a reader that keeps it for later
+    /// citations keeps an [`Arc::downgrade`] view, so the engine moves the
+    /// evidence uncopied into its outcome once every block has settled.
     ///
     /// [`VerificationEngine::run`](super::VerificationEngine::run) calls it
     /// once, after its own slot validation, for checks only the host can
@@ -125,7 +157,7 @@ pub trait EvidenceReader: Send + Sync {
     async fn admit(
         &self,
         _slots: &BTreeMap<SlotName, InputSlot>,
-        _evidence: &BTreeMap<SlotName, InputDeclaration>,
+        _evidence: &Arc<BTreeMap<SlotName, InputDeclaration>>,
     ) -> Result<(), EngineError> {
         Ok(())
     }
@@ -151,6 +183,9 @@ pub struct AgentExecutor {
     toolset: Option<Arc<dyn AgentToolset>>,
     /// Whole-route replacements keyed by step or requirement ID.
     routes: BTreeMap<TaskId, ExecutionRoute>,
+    /// Response and Verdict schema preparation, shared with the host's other
+    /// executions when it lends one.
+    schemas: Arc<PreparedSchemas>,
 }
 
 impl AgentExecutor {
@@ -170,7 +205,17 @@ impl AgentExecutor {
             gateway: None,
             toolset: None,
             routes: BTreeMap::new(),
+            schemas: Arc::default(),
         }
+    }
+
+    /// Reuse `schemas` to prepare each call's narrowed response schema and
+    /// declared Verdict format, so executions with unchanged schemas skip
+    /// meta-validation and compilation. Every answer is still validated.
+    #[must_use]
+    pub fn with_prepared_schemas(mut self, schemas: Arc<PreparedSchemas>) -> Self {
+        self.schemas = schemas;
+        self
     }
 
     /// Read native media placeholders' evidence through `reader`.
@@ -202,16 +247,20 @@ impl AgentExecutor {
         self
     }
 
-    /// Resolve the Agent and its Prompt, keeping each Card identity.
+    /// Resolve the Agent and its Prompt, keeping each Card identity; an
+    /// inline Agent is borrowed from the call, not copied.
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for a loader-only path reference and
     /// the resolvers' errors.
-    async fn resolve(&self, agent: &InlineableRef<AgentSpec>) -> Result<Resolved, BlockError> {
+    async fn resolve<'a>(
+        &self,
+        agent: &'a InlineableRef<AgentSpec>,
+    ) -> Result<Resolved<'a>, BlockError> {
         let spec = match agent {
-            InlineableRef::Ref(card) => self.agents.resolve(card).await?,
+            InlineableRef::Ref(card) => Cow::Owned(self.agents.resolve(card).await?),
             InlineableRef::Sibling { sibling } => return Err(unbound_sibling("Agent", sibling)),
-            InlineableRef::Inline(spec) => (**spec).clone(),
+            InlineableRef::Inline(spec) => Cow::Borrowed(&**spec),
             InlineableRef::Path(path) => return Err(unresolved_path("Agent", path)),
         };
         let prompt = match &spec.prompt {
@@ -248,13 +297,14 @@ impl AgentExecutor {
         }
     }
 
-    /// Bind `inputs` to the Prompt placeholders on a per-call Prompt copy.
+    /// Bind `inputs` to the placeholders of `prompt`, the call's own copy.
     ///
     /// Input keys must equal the Prompt's text and media placeholders. JSON
     /// strings render raw and other JSON as JSON text; evidence binds as
     /// provider-native media, which Skald checks against the placeholder kind.
     /// Non-empty `slots` narrow the copy's Verdict citation slots, so the
-    /// provider and the Agent's validation admit only the reachable ones.
+    /// provider and the Agent's validation admit only the reachable ones;
+    /// the prepared schemas reuse an earlier narrowing to the same slots.
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for a placeholder mismatch, evidence
@@ -263,24 +313,23 @@ impl AgentExecutor {
     /// provider rejects, plus the reader's errors.
     async fn bind(
         &self,
-        prompt: &Prompt,
+        prompt: Prompt,
         inputs: &BTreeMap<String, CallInput>,
         slots: &BTreeSet<SlotName>,
     ) -> Result<(Prompt, Vec<(String, String)>), BlockError> {
-        let native = prompt.native();
-        let placeholders: BTreeSet<&str> = native
+        let mut bound = prompt.into_native();
+        let placeholders: BTreeSet<&str> = bound
             .variables
             .iter()
-            .chain(&native.media_variables)
+            .chain(&bound.media_variables)
             .map(String::as_str)
             .collect();
         if placeholders != inputs.keys().map(String::as_str).collect() {
             return Err(terminal("Agent inputs must match the Prompt placeholders"));
         }
-        let mut bound = native.clone();
         let mut vars = Vec::new();
         for (name, input) in inputs {
-            let is_media = native.media_variables.contains(name);
+            let is_media = bound.media_variables.contains(name);
             match (&input.value, is_media) {
                 (CallValue::Json(value), false) => vars.push((name.clone(), render(value))),
                 (CallValue::Evidence(evidence), true) => {
@@ -308,8 +357,13 @@ impl AgentExecutor {
             }
         }
         if !slots.is_empty() {
+            // Slot names are identifiers, so the joined set names it exactly.
+            let names: Vec<&str> = slots.iter().map(SlotName::as_str).collect();
+            let edit = format!("verdict-slots:{}", names.join(","));
             bound
-                .edit_response_schema_mut(|schema| Verdict::restrict_slots(schema, slots))
+                .edit_response_schema_mut(&self.schemas, &edit, |schema| {
+                    Verdict::restrict_slots(schema, slots);
+                })
                 .map_err(|error| BlockError::Terminal {
                     reason: format!("the Verdict citation slots cannot be narrowed: {error}"),
                 })?;
@@ -345,9 +399,12 @@ impl AgentExecutor {
         slots: &BTreeSet<SlotName>,
         deadline: Instant,
     ) -> Result<Invoked, BlockError> {
+        let started = phase_start();
         let resolved = self.resolve(&call.agent).await?;
         let route = self.route(id, &resolved.spec.execution_route)?;
-        let (prompt, vars) = self.bind(&resolved.prompt, inputs, slots).await?;
+        let started = phase_end("resolve", started);
+        let (prompt, vars) = self.bind(resolved.prompt, inputs, slots).await?;
+        let started = phase_end("bind", started);
         let declared = resolved
             .spec
             .tool_names
@@ -375,8 +432,9 @@ impl AgentExecutor {
             Some(session) => session.resolve(&declared, &records)?,
             None => Vec::new(),
         };
-        let mut agent = Agent::new(prompt.clone())
-            .with_id(id.as_str())
+        let prompt = Arc::new(prompt);
+        let mut agent = Agent::from_resolved(id.as_str(), Arc::clone(&prompt))
+            .with_prepared_schemas(Arc::clone(&self.schemas))
             .with_tools(tools)
             .with_run_config(run_config_from_agent_run_config_spec(
                 &resolved.spec.run_config,
@@ -408,6 +466,7 @@ impl AgentExecutor {
         let run = run
             .expect("the loop only stops early for a raised refusal")
             .map_err(block_error)?;
+        phase_end("run", started);
         Ok(Invoked {
             structured: run.structured_output,
             text: run.output,
@@ -499,11 +558,14 @@ impl CheckExecutor for AgentExecutor {
                 "the check Agent's Prompt declares no Verdict format",
             ));
         };
-        let mut verdict = verdict_from(schema, Value::Object(answer))?;
+        let started = phase_start();
+        let mut verdict = verdict_from(&self.schemas, schema, Value::Object(answer))?;
+        let started = phase_end("verdict", started);
         let citations = std::mem::take(&mut verdict.citations);
         if let Some(reader) = &self.evidence {
             verdict.citations = reader.cited(&reachable, citations).await?;
         }
+        phase_end("cite", started);
         if verdict.outcome == VerificationVerdict::Passed && verdict.citations.is_empty() {
             verdict.outcome = VerificationVerdict::Inconclusive;
             verdict.reason = format!(
@@ -521,9 +583,9 @@ impl CheckExecutor for AgentExecutor {
 }
 
 /// An Agent and Prompt resolved for one call.
-struct Resolved {
-    /// The Agent body.
-    spec: AgentSpec,
+struct Resolved<'a> {
+    /// The Agent body, borrowed when the call declares it inline.
+    spec: Cow<'a, AgentSpec>,
     /// The Agent Card, when referenced.
     agent_ref: Option<CardRef>,
     /// The runtime Prompt.
@@ -539,12 +601,15 @@ struct Invoked {
     /// The final text answer.
     text: String,
     /// The bound Prompt that ran.
-    prompt: Prompt,
+    prompt: Arc<Prompt>,
     /// Agent, Prompt, and effective route.
     provenance: CallProvenance,
     /// Tool calls in call order.
     tool_calls: Vec<wyrd_spec::verification::execution::ToolCallRecord>,
 }
+
+/// The stable code of a server that cannot take the call now.
+const SERVER_UNAVAILABLE: &str = "WYRD_SERVER_503_SERVICE_UNAVAILABLE";
 
 /// Classify an Agent run failure.
 ///
@@ -554,9 +619,23 @@ struct Invoked {
 /// an unregistered provider, may clear on retry. Structured output still
 /// invalid when the Agent's iteration budget ran out carries its stable code
 /// and schema locations only. It is terminal, like every non-provider
-/// failure except an Agent timeout.
+/// failure except an Agent timeout. A gateway answering
+/// [`SERVER_UNAVAILABLE`] is the serving process draining, shedding load, or
+/// still loading the tenant's gateway configuration, so the block is
+/// [`BlockError::Busy`] and its execution runs again later instead of being
+/// judged.
 #[must_use]
 pub fn block_error(error: AgentError) -> BlockError {
+    if let AgentError::Provider(SkaldRuntimeError::Provider {
+        source: ProviderError::RemoteProblem(problem),
+        ..
+    }) = &error
+        && problem.code == SERVER_UNAVAILABLE
+    {
+        return BlockError::Busy {
+            reason: format!("{}: {}", problem.code, problem.message),
+        };
+    }
     let reason = match &error {
         AgentError::Provider(SkaldRuntimeError::Provider {
             source: ProviderError::RemoteProblem(problem),
@@ -616,5 +695,54 @@ pub(crate) fn render(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use skald_providers::RemoteProblem;
+    use skald_spec::ProviderName;
+
+    use super::*;
+
+    /// An Agent failure carrying the gateway problem `code`.
+    fn gateway_problem(code: &str, status: u16) -> AgentError {
+        AgentError::Provider(SkaldRuntimeError::from_provider(
+            ProviderName::OpenAi,
+            ProviderError::RemoteProblem(Box::new(RemoteProblem {
+                code: code.to_owned(),
+                status,
+                message: "gateway configuration is loading; retry shortly".to_owned(),
+                field: None,
+                remediation: String::new(),
+            })),
+        ))
+    }
+
+    /// A gateway that cannot serve the call yet makes the block busy, so the
+    /// execution runs again instead of judging it; a capacity refusal keeps
+    /// the shared retry classification.
+    ///
+    /// # Panics
+    /// Panics when an unavailable gateway is not busy, a capacity refusal is
+    /// not retryable, or a permission refusal is not terminal.
+    #[test]
+    fn unavailable_gateway_is_busy_and_other_problems_are_classified() {
+        assert_eq!(
+            block_error(gateway_problem(SERVER_UNAVAILABLE, 503)),
+            BlockError::Busy {
+                reason: "WYRD_SERVER_503_SERVICE_UNAVAILABLE: \
+                         gateway configuration is loading; retry shortly"
+                    .to_owned()
+            }
+        );
+        assert!(matches!(
+            block_error(gateway_problem("WYRD_GATEWAY_429_LIMIT_EXCEEDED", 429)),
+            BlockError::Retryable { .. }
+        ));
+        assert!(matches!(
+            block_error(gateway_problem("WYRD_PERMISSION_403_DENIED_RBAC", 403)),
+            BlockError::Terminal { .. }
+        ));
     }
 }

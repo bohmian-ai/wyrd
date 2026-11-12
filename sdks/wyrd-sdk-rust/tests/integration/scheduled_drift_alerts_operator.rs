@@ -189,15 +189,17 @@ async fn failed_schedule_alerts_its_operator_on_the_connection_origin() {
         (requirement.id.as_str(), requirement.outcome),
         ("latency-unshifted", RequirementOutcome::Failed)
     );
+    let details = watch.deployment.details(result.execution_id).await;
+    let recorded = &details.outcome.requirements[0];
     assert!(
         matches!(
-            &requirement.provenance,
+            &recorded.provenance,
             Some(CallProvenance::Drift { window: Some(window) }) if window.start < window.end
         ),
         "{:?}",
-        requirement.provenance
+        recorded.provenance
     );
-    let check = serde_json::to_value(&requirement.check).expect("the check serializes");
+    let check = serde_json::to_value(&recorded.check).expect("the check serializes");
     assert_eq!(
         check["signal"]["baseline_ref"]["name"], "latency-baseline",
         "{check}"
@@ -354,7 +356,9 @@ async fn ready_spc_baseline_charts_a_scheduled_window() {
         (requirement.id.as_str(), requirement.outcome),
         ("latency-in-control", RequirementOutcome::Failed)
     );
-    let check = serde_json::to_value(&requirement.check).expect("the check serializes");
+    let details = watch.deployment.details(result.execution_id).await;
+    let check =
+        serde_json::to_value(&details.outcome.requirements[0].check).expect("the check serializes");
     assert_eq!(check["method"], "Spc", "{check}");
     let Some(RequirementDetail::Drift(report)) = &requirement.detail else {
         panic!("a drift requirement carries its report: {requirement:?}");
@@ -567,7 +571,8 @@ async fn scheduled_binding_scores_every_requirement() {
         assert_eq!(result.outcome.verdict, verdict);
         assert_eq!(result.subject, watch.service.root);
         assert_eq!(result.verifier.name.as_str(), "latency-error-budget");
-        let mut judged: Vec<_> = result
+        let details = watch.deployment.details(result.execution_id).await;
+        let mut judged: Vec<_> = details
             .outcome
             .requirements
             .iter()
@@ -580,7 +585,7 @@ async fn scheduled_binding_scores_every_requirement() {
                     "{:?}",
                     requirement.provenance
                 );
-                (requirement.id.as_str(), requirement.outcome)
+                (requirement.result.id.as_str(), requirement.result.outcome)
             })
             .collect();
         judged.sort_by_key(|(id, _)| *id);

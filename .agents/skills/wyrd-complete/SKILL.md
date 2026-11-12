@@ -53,6 +53,11 @@ Markdown containing:
 8. links to current architecture, contracts, code owners, and tests.
 
 The record is historical context, not a replacement for current architecture.
+When the reviewed packet contains `design/`, consult its notes and relevant
+supplements to preserve lasting rationale consistent with the approved spec
+and shipped behavior. Exploratory proposals are not shipped facts. Condense
+useful context into the completed record before retiring the folder; do not
+leave links to files that completion will delete or copy the design transcript.
 Do not retain task checklists, Red-Green mechanics, review conversation, command
 transcripts, agent metadata, branch scheduling, or worktree state. Do not create
 an ADR for every change; link a focused existing or newly approved decision

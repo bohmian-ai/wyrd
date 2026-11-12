@@ -22,6 +22,7 @@ use super::{
     BuiltinEndpoints, HttpProviderDispatch, IngressDialect, MediaRequest, Prepared,
     UnsupportedRequest,
 };
+use crate::RequestJson;
 use crate::credential::ProviderSecret;
 use crate::engine::{
     AttemptResult, AttemptUsage, FailureClass, ProviderAttempt, ProviderDispatch, ResponseBody,
@@ -64,28 +65,54 @@ fn model_of(deployment: &ProviderDeployment) -> &ModelId {
     &deployment.models.as_ref().expect("fixture lists its model")[0]
 }
 
-/// Prepares `body` for the fixture model of `deployment`.
+/// `body` as it arrives at ingress as compact text, which an object body
+/// keeps undecoded.
+///
+/// # Panics
+///
+/// Panics when `body` does not serialize.
+fn request(body: &Value) -> RequestJson {
+    RequestJson::parse(serde_json::to_vec(body).expect("json").into()).expect("request decodes")
+}
+
+/// Prepares `body`, as it arrives at ingress, for the fixture model of
+/// `deployment`.
+///
+/// The arrived body is leaked so the prepared request may borrow it for the
+/// rest of the test.
 ///
 /// # Errors
 ///
 /// Returns the [`UnsupportedRequest`] of [`super::prepare`].
-fn prepare(
+fn prepare<'a>(
     ingress: IngressDialect,
     operation: GatewayOperation,
     stream: bool,
     body: &Value,
-    deployment: &ProviderDeployment,
+    deployment: &'a ProviderDeployment,
     media: Option<&MediaRequest>,
-) -> Result<Prepared, UnsupportedRequest> {
+) -> Result<Prepared<'a>, UnsupportedRequest> {
     super::prepare(
         ingress,
         operation,
         stream,
-        body,
+        Box::leak(Box::new(request(body))),
         deployment,
         model_of(deployment),
         media,
     )
+}
+
+/// The JSON a prepared native request sends upstream.
+///
+/// # Panics
+///
+/// Panics when `prepared` is a translated request.
+fn native_json(prepared: &Prepared<'_>) -> Value {
+    let Prepared::Native(body) = prepared else {
+        panic!("native request expected, got {prepared:?}");
+    };
+    serde_json::to_value(body).expect("native body serializes")
 }
 
 /// Bearer authentication through credential `cred`.
@@ -150,7 +177,7 @@ async fn attempt_mode(
             deployment,
             model: model_of(deployment),
             credential: secret.as_ref(),
-            body,
+            body: &request(body),
             media: None,
             batch: None,
             stream,
@@ -306,6 +333,10 @@ async fn answer(server: &MockServer, route: &str, name: &str, value: &str, body:
 /// An OpenAI-compatible deployment receives the caller body unchanged except
 /// for the native model, authenticated only by the provider credential, and
 /// its usage is normalized and kept canonically.
+///
+/// A large body with escapes and extension members reaches the provider
+/// byte-identical apart from its model, serialized once into a buffer sized
+/// up front that never grows and keeps little spare capacity.
 #[tokio::test]
 async fn compatible_passthrough_rewrites_model_and_uses_provider_credential() {
     let server = MockServer::start().await;
@@ -362,6 +393,214 @@ async fn compatible_passthrough_rewrites_model_and_uses_provider_credential() {
             .all(|name| !name.as_str().starts_with("wyrd-")),
         "no gateway or caller headers reach the provider"
     );
+
+    let extended = json!({
+        "messages": [{"role": "user", "content": format!("{}\"\\\n☃\u{0}", "x".repeat(1 << 20))}],
+        "model": "deepseek/deepseek-chat",
+        "vendor": {"nested": [1, -2.5, u64::MAX, null, true, {}]},
+    });
+    let result = attempt(
+        &dispatch(&server),
+        IngressDialect::OpenAi,
+        &target,
+        Some("sk-deepseek"),
+        &extended,
+    )
+    .await;
+    assert!(
+        matches!(result, AttemptResult::Completed { .. }),
+        "{result:?}"
+    );
+    let requests = server.received_requests().await.expect("recording");
+    let mut expected = extended.clone();
+    expected["model"] = json!("deepseek-chat");
+    assert_eq!(
+        String::from_utf8(requests[1].body.clone()).expect("utf-8 body"),
+        serde_json::to_string(&expected).expect("serializes"),
+        "only the model changes, escapes and extensions included"
+    );
+    let decoded = RequestJson::from(extended.clone());
+    let arrived = request(&extended);
+    assert!(arrived.text().is_some(), "compact object text is kept");
+    for (model, body) in [Some("deepseek-chat"), None]
+        .into_iter()
+        .flat_map(|model| [(model, &decoded), (model, &arrived)])
+    {
+        let native = super::NativeBody { body, model };
+        let json = native.to_json().expect("serializes");
+        assert_eq!(json, serde_json::to_vec(&native).expect("serializes"));
+        if body.text().is_none() {
+            assert_eq!(
+                json.capacity(),
+                skald_providers::RequestBody::from(native).len_hint(),
+                "the body serializes into its up-front buffer without growing"
+            );
+        }
+        assert!(
+            json.capacity() <= json.len() + json.len() / 16,
+            "{}",
+            json.capacity()
+        );
+    }
+}
+
+/// Native preparation borrows the caller's body in planning and at dispatch.
+///
+/// Preparing a native body for two deployments shares the caller's one JSON
+/// object rather than copying it, yet each upstream request carries its own
+/// deployment's model in the caller's member position with every other
+/// member byte-identical, a body without a model gains one, and the caller's
+/// body is never changed between attempts. A non-object body is still
+/// refused before dispatch.
+///
+/// # Panics
+///
+/// Panics when a prepared body is copied or an upstream request differs.
+#[tokio::test]
+async fn request_preparation_avoids_duplicate_body_materialization() {
+    let server = MockServer::start().await;
+    let reply = json!({"id": "c1", "choices": []});
+    for route in ["/first/chat/completions", "/second/chat/completions"] {
+        answer(&server, route, "authorization", "Bearer sk", reply.clone()).await;
+    }
+    let target = |model: &str, route: &str| {
+        deployment(
+            model,
+            json!({"openai_compatible": {"base_url": format!("{}/{route}/", server.uri())}}),
+            bearer(),
+        )
+    };
+    let first = target("acme/first-model", "first");
+    let second = target("acme/second-model", "second");
+    let body = json!({
+        "stream": false,
+        "model": "acme/requested",
+        "messages": [{"role": "user", "content": "x".repeat(64 * 1024)}],
+        "metadata": {"nested": [1, {"deep": true}]},
+    });
+    let caller = body.clone();
+    let object = body.as_object().expect("object body");
+    let arrived = request(&body);
+    assert!(arrived.text().is_some(), "compact object text is kept");
+
+    for (deployment, native) in [(&first, "first-model"), (&second, "second-model")] {
+        let prepared = super::prepare(
+            IngressDialect::OpenAi,
+            GatewayOperation::ChatCompletions,
+            false,
+            &arrived,
+            deployment,
+            model_of(deployment),
+            None,
+        )
+        .expect("a native body is representable");
+        let Prepared::Native(native_body) = &prepared else {
+            panic!("native request expected, got {prepared:?}");
+        };
+        assert!(
+            std::ptr::eq(native_body.body, std::ptr::from_ref(&arrived)),
+            "preparation borrows the caller's body"
+        );
+        let mut expected = object.clone();
+        expected.insert("model".to_owned(), json!(native));
+        assert_eq!(
+            serde_json::to_string(native_body).expect("serializes"),
+            serde_json::to_string(&expected).expect("serializes"),
+            "only the model changes, in place"
+        );
+    }
+
+    let modelless = request(&json!({"input": "hi"}));
+    let applied = super::NativeBody {
+        body: &modelless,
+        model: Some("first-model"),
+    };
+    assert_eq!(
+        serde_json::to_string(&applied).expect("serializes"),
+        r#"{"input":"hi","model":"first-model"}"#,
+        "an absent model follows the caller's members"
+    );
+
+    let refusal = prepare(
+        IngressDialect::OpenAi,
+        GatewayOperation::ChatCompletions,
+        false,
+        &json!(["not", "an", "object"]),
+        &first,
+        None,
+    )
+    .expect_err("a non-object body is refused");
+    assert_eq!(refusal.field, "body", "{refusal}");
+
+    let dispatch = dispatch(&server);
+    for deployment in [&first, &second] {
+        let result = attempt(
+            &dispatch,
+            IngressDialect::OpenAi,
+            deployment,
+            Some("sk"),
+            &body,
+        )
+        .await;
+        let AttemptResult::Completed { body: answer, .. } = result else {
+            panic!("completion expected, got {result:?}");
+        };
+        assert_eq!(parsed(&answer), reply);
+    }
+    assert_eq!(body, caller, "attempts never change the caller's body");
+    let requests = server.received_requests().await.expect("recording");
+    assert_eq!(requests.len(), 2, "one upstream request per attempt");
+    for (request, native) in requests.iter().zip(["first-model", "second-model"]) {
+        let mut expected = caller.clone();
+        expected["model"] = json!(native);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&request.body).expect("json body"),
+            expected
+        );
+    }
+}
+
+/// Credential scrubbing of a captured answer edits it in place.
+///
+/// Secret-free strings keep their allocations, a string or key holding the
+/// secret loses every occurrence, and a short or encoded secret is still
+/// judged as before.
+///
+/// # Panics
+///
+/// Panics when secret-free content is reallocated or a secret survives.
+#[test]
+fn capture_scrubbing_rebuilds_only_secret_holding_content() {
+    let secret = "sk-scrub-secret";
+    let value = json!({
+        "id": "chatcmpl-1",
+        "choices": [{"message": {"content": "x".repeat(4096)}}],
+        "echo": format!("key={secret};again={secret}"),
+        format!("{secret}-key"): "named",
+    });
+    let content = value["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("content")
+        .as_ptr();
+    let scrubbed = super::without_secret(value, secret);
+    assert_eq!(
+        scrubbed["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("content")
+            .as_ptr(),
+        content,
+        "secret-free content keeps its allocation"
+    );
+    assert_eq!(scrubbed["echo"], "key=;again=");
+    assert_eq!(scrubbed["-key"], "named");
+    assert!(!scrubbed.to_string().contains(secret), "{scrubbed}");
+    assert!(!super::holds_encoded_secret(&scrubbed, secret));
+    let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{secret}!"));
+    assert!(super::holds_encoded_secret(
+        &json!({"b64": encoded}),
+        secret
+    ));
+    assert!(!super::holds_encoded_secret(&json!(["c2stc2"]), secret));
 }
 
 /// Noncanonical native answer bytes reach the caller unchanged.
@@ -758,18 +997,19 @@ fn operations_and_dialects_are_matched_to_the_adapter() {
         .expect_err(field);
         assert_eq!(error.field, field, "{error}");
     }
+    let body = json!({"model": "acme/m", "input": "hi"});
     let embeddings = prepare(
         IngressDialect::OpenAi,
         GatewayOperation::Embeddings,
         false,
-        &json!({"model": "acme/m", "input": "hi"}),
+        &body,
         &compatible,
         None,
     )
     .expect("compatible embeddings pass through");
     assert_eq!(
-        embeddings,
-        Prepared::Native(json!({"model": "m", "input": "hi"}))
+        native_json(&embeddings),
+        json!({"model": "m", "input": "hi"})
     );
 }
 
@@ -1011,7 +1251,7 @@ async fn embeddings_preserve_batches_and_reject_invalid_requests() {
             deployment: &target,
             model: model_of(&target),
             credential: Some(&secret),
-            body: &body,
+            body: &request(&body),
             media: None,
             batch: None,
             stream: false,
@@ -1250,7 +1490,7 @@ async fn open_stream(
             deployment: &deployment,
             model: model_of(&deployment),
             credential: Some(&secret),
-            body: &body,
+            body: &request(&body),
             media: None,
             batch: None,
             stream: true,
@@ -1695,6 +1935,278 @@ fn provider_usage_is_typed_and_bounded() {
     }
 }
 
+/// A native answer decoded only for its usage, when capture is unselected,
+/// keeps its exact bytes and reads the same usage, or fails the same way, as
+/// the selected capture's whole decode: wire precedence, the last duplicate,
+/// escaped names, null, malformed, oversized, and overflowing usage,
+/// top-level arrays and scalars, and the nesting limit all agree, while only
+/// the usage member is ever decoded.
+///
+/// # Panics
+///
+/// Panics when the two decodes disagree, the bytes change, an unselected
+/// answer returns a decoded copy, or the usage read holds anything but the
+/// usage member.
+#[test]
+fn raw_metadata_usage_matches_selected_capture_without_materializing_content() {
+    let padding = "x".repeat(1 << 16);
+    let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
+    let cases = [
+        (super::Wire::OpenAi, json!({"choices": [{"message": {"content": padding}}], "usage": {"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8}}).to_string()),
+        (super::Wire::OpenAi, r#"{"usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}, "usage": {"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9}}"#.to_owned()),
+        (super::Wire::OpenAi, r#"{"usage": {"input_tokens": 2, "output_tokens": 4, "total_tokens": 6}}"#.to_owned()),
+        (super::Wire::OpenAi, r#"{"choices": {"usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}}"#.to_owned()),
+        (super::Wire::OpenAi, r#"{"usage": null}"#.to_owned()),
+        (super::Wire::OpenAi, r#"{"usage": "3 tokens"}"#.to_owned()),
+        (super::Wire::OpenAi, format!(r#"{{"usage": {{"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8, "padding": "{padding}"}}}}"#)),
+        (super::Wire::Anthropic, json!({"usage": {"input_tokens": u64::MAX, "output_tokens": 1, "cache_read_input_tokens": 1}}).to_string()),
+        (super::Wire::Google, r#"{"usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1}, "usage_metadata": {"promptTokenCount": 4, "candidatesTokenCount": 2}}"#.to_owned()),
+        (super::Wire::Google, r#"{"usage_metadata": null, "usageMetadata": {"promptTokenCount": 4, "candidatesTokenCount": 2}}"#.to_owned()),
+        (super::Wire::Jev, r#"[{"usage": {"input_tokens": 1, "output_tokens": 1}}]"#.to_owned()),
+        (super::Wire::Jev, "42".to_owned()),
+        (super::Wire::OpenAi, format!(r#"{{"usage": {{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}, "deep": {deep}}}"#)),
+        (super::Wire::OpenAi, format!(r#"{{"usage": {{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2, "deep": {deep}}}}}"#)),
+    ];
+    let mut known = 0;
+    for (wire, body) in cases {
+        let complete = |capture| {
+            super::complete(
+                super::Answer::Native(body.clone()),
+                wire,
+                false,
+                capture,
+                "id",
+                "m",
+            )
+        };
+        let label = &body[..body.len().min(96)];
+        match (complete(false), complete(true)) {
+            (Ok((raw, usage, decoded)), Ok((selected_raw, selected, Some(whole)))) => {
+                assert_eq!(raw.get(), body, "{label}");
+                assert_eq!(selected_raw.get(), body, "{label}");
+                assert!(decoded.is_none(), "{label}");
+                assert_eq!(usage, selected, "{label}");
+                assert_eq!(usage, super::usage(wire, &whole), "{label}");
+                known += usize::from(usage.normalized.is_some());
+                let member = super::usage_member(wire, &body).expect("the answer decodes");
+                let names = super::usage_names(wire);
+                let expected = names.iter().find_map(|name| whole.get(name)).cloned();
+                assert_eq!(member, expected, "{label}");
+            }
+            (
+                Err(super::Unmapped::Unrepresentable(usage)),
+                Err(super::Unmapped::Unrepresentable(selected)),
+            ) => {
+                assert_eq!(usage, selected, "{label}");
+                assert!(super::usage_member(wire, &body).is_err(), "{label}");
+            }
+            (unselected, selected) => {
+                panic!("{label}: unselected {unselected:?} disagrees with selected {selected:?}")
+            }
+        }
+    }
+    assert_eq!(known, 5, "the cases that carry representable usage");
+}
+
+/// Native answer text maps exactly as the former two-scan path did, where
+/// Skald first validated a `RawValue` and the adapter then decoded the
+/// usage member, or the whole answer for capture: the same trimmed answer
+/// bytes, usage, decoded capture copy, and failure class, now from one pass
+/// that keeps the answer's own allocation. Through dispatch, the relayed
+/// bytes are the provider's without surrounding whitespace, text that is not
+/// JSON fails as an upstream failure, JSON a value decode refuses fails as
+/// rejected, and a refusal still relays.
+///
+/// # Panics
+///
+/// Panics when the single pass disagrees with the former path, copies an
+/// answer it could keep, or dispatch classifies an answer differently.
+#[tokio::test]
+async fn native_response_validation_preserves_usage_capture_and_answer_bytes() {
+    use super::{Answer, Unmapped, Wire};
+    use serde_json::value::RawValue;
+
+    // `Ok` holds the relayed text, usage, and capture copy; `Err` whether the
+    // answer was not JSON at all.
+    type Mapped = Result<(String, AttemptUsage, Option<Value>), bool>;
+
+    let usage = r#"{"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8}"#;
+    let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
+    let corpus = [
+        (Wire::OpenAi, format!(" \n{{\"id\": \"a\", \"usage\": {usage}}}\n\n")),
+        (Wire::OpenAi, format!(r#"{{"usage": {{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}, "usage": {usage}}}"#)),
+        (Wire::OpenAi, format!(r#"{{"usage": {usage}, "text": "\"é\n"}}"#)),
+        (Wire::Google, r#"{"usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1}, "usage_metadata": {"promptTokenCount": 4, "candidatesTokenCount": 2}}"#.to_owned()),
+        (Wire::Anthropic, json!({"usage": {"input_tokens": u64::MAX, "output_tokens": 1, "cache_read_input_tokens": 1}}).to_string()),
+        (Wire::Jev, format!("[{{\"usage\": {usage}}}]")),
+        (Wire::OpenAi, "42".to_owned()),
+        (Wire::OpenAi, "\"text\"".to_owned()),
+        (Wire::OpenAi, "null".to_owned()),
+        (Wire::OpenAi, String::new()),
+        (Wire::OpenAi, " \t".to_owned()),
+        (Wire::OpenAi, "{\"usage\":".to_owned()),
+        (Wire::OpenAi, "{} x".to_owned()),
+        (Wire::OpenAi, "{}{}".to_owned()),
+        (Wire::OpenAi, "{\"a\": 1,}".to_owned()),
+        (Wire::OpenAi, r#"{"n": 1e400}"#.to_owned()),
+        (Wire::OpenAi, r#"{"n": -1e400, "usage": null}"#.to_owned()),
+        (Wire::OpenAi, r#"{"s": "\ud800"}"#.to_owned()),
+        (Wire::OpenAi, format!(r#"{{"usage": {usage}, "deep": {deep}}}"#)),
+        (Wire::OpenAi, format!(r#"{{"deep": {}{}}}"#, "[".repeat(126), "]".repeat(126))),
+    ];
+    let mut outcomes = [0_usize; 3];
+    for (wire, body) in &corpus {
+        let wire = *wire;
+        for capture in [false, true] {
+            let former: Mapped = match RawValue::from_string(body.clone()) {
+                Err(_) => Err(true),
+                Ok(raw) if capture => serde_json::from_str::<Value>(raw.get())
+                    .map(|whole| {
+                        (
+                            raw.get().to_owned(),
+                            super::usage(wire, &whole),
+                            Some(whole),
+                        )
+                    })
+                    .map_err(|_| false),
+                Ok(raw) => super::usage_member(wire, raw.get())
+                    .map(|member| {
+                        let usage = member.map_or_else(AttemptUsage::default, |member| {
+                            super::counted(wire, &member)
+                        });
+                        (raw.get().to_owned(), usage, None)
+                    })
+                    .map_err(|_| false),
+            };
+            // A reader's buffer usually has spare capacity, which a kept
+            // answer keeps rather than shrinking into a fresh allocation.
+            let mut text = String::with_capacity(body.len() + 64);
+            text.push_str(body);
+            let (backing, capacity) = (text.as_ptr(), text.capacity());
+            let single = super::complete(Answer::Native(text), wire, false, capture, "id", "m");
+            let kept = matches!(&single, Ok((answer, ..)) if answer.get().as_ptr() == backing);
+            let single: Mapped = match single {
+                Ok((answer, usage, decoded)) => {
+                    let answer = answer.into_string();
+                    if kept {
+                        assert_eq!(
+                            answer.capacity(),
+                            capacity,
+                            "{body:?}: a kept answer is not shrunk"
+                        );
+                    }
+                    Ok((answer, usage, decoded))
+                }
+                Err(Unmapped::Undecodable(_)) => Err(true),
+                Err(Unmapped::Unrepresentable(usage)) => {
+                    assert_eq!(usage, AttemptUsage::default(), "{body:?}");
+                    Err(false)
+                }
+            };
+            assert_eq!(single, former, "{body:?} capture {capture}");
+            if let Ok((answer, ..)) = &single {
+                assert_eq!(
+                    kept,
+                    answer.len() == body.len(),
+                    "{body:?}: the answer's allocation is kept"
+                );
+            }
+            outcomes[match single {
+                Ok(_) => 0,
+                Err(false) => 1,
+                Err(true) => 2,
+            }] += 1;
+        }
+    }
+    assert_eq!(
+        outcomes,
+        [20, 8, 12],
+        "completed, unrepresentable, undecodable cases"
+    );
+
+    let server = MockServer::start().await;
+    let answer = format!("{{\"id\": \"chatcmpl-1\", \"choices\": [], \"usage\": {usage}}}");
+    for (user, status, body) in [
+        ("exact", 200, format!("  {answer}\r\n")),
+        ("malformed", 200, "{\"usage\":".to_owned()),
+        ("range", 200, r#"{"n": 1e400}"#.to_owned()),
+        ("refused", 400, r#"{"error": {"message": "no"}}"#.to_owned()),
+    ] {
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(json!({"user": user})))
+            .respond_with(ResponseTemplate::new(status).set_body_raw(body, "application/json"))
+            .mount(&server)
+            .await;
+    }
+    let dispatch = dispatch(&server);
+    let target = deployment("openai/gpt-5", json!("openai"), bearer());
+    let chat = |user: &str| json!({"model": "m", "messages": [], "user": user});
+    let exact = attempt(
+        &dispatch,
+        IngressDialect::OpenAi,
+        &target,
+        Some("cred"),
+        &chat("exact"),
+    )
+    .await;
+    let AttemptResult::Completed {
+        body: ResponseBody::Json(relayed),
+        usage: counted,
+        capture: None,
+    } = exact
+    else {
+        panic!("native answer expected: {exact:?}");
+    };
+    assert_eq!(
+        relayed.get(),
+        answer,
+        "relayed without surrounding whitespace"
+    );
+    assert!(counted.normalized.is_some(), "{counted:?}");
+    let captured = capturing(&dispatch, &target, "cred", &chat("exact"), false).await;
+    let AttemptResult::Completed {
+        body: ResponseBody::Json(relayed),
+        capture: Some(ResponseCapture::Json(copy)),
+        usage: selected,
+    } = captured
+    else {
+        panic!("captured answer expected: {captured:?}");
+    };
+    assert_eq!(relayed.get(), answer);
+    assert_eq!(copy, serde_json::from_str::<Value>(&answer).expect("json"));
+    assert_eq!(selected, counted, "capture reads the same usage");
+    for (user, expected) in [
+        ("malformed", FailureClass::Upstream),
+        ("range", FailureClass::Rejected),
+    ] {
+        let failed = attempt(
+            &dispatch,
+            IngressDialect::OpenAi,
+            &target,
+            Some("cred"),
+            &chat(user),
+        )
+        .await;
+        assert!(
+            matches!(&failed, AttemptResult::Failed { class, .. } if *class == expected),
+            "{user}: {failed:?}"
+        );
+    }
+    let refused = attempt(
+        &dispatch,
+        IngressDialect::OpenAi,
+        &target,
+        Some("cred"),
+        &chat("refused"),
+    )
+    .await;
+    assert!(
+        matches!(&refused, AttemptResult::Refused { status: 400, body, .. } if body["error"]["message"] == "no"),
+        "{refused:?}"
+    );
+}
+
 /// A provider refusal echoing the resolved credential, plainly or behind a
 /// JSON escape that decoding would restore, reaches the caller without it,
 /// native or translated, keeping the status and the rest of the message.
@@ -1773,7 +2285,7 @@ async fn media_attempt(
             deployment,
             model: model_of(deployment),
             credential: Some(&secret),
-            body,
+            body: &request(body),
             media: Some(media),
             batch: None,
             stream: false,
@@ -1873,7 +2385,7 @@ async fn media_routes_relay_json_binary_and_text_answers() {
     )
     .await;
     assert!(
-        matches!(&transcribed, AttemptResult::Completed { body: ResponseBody::Media(answer), .. } if answer.bytes == b"hello"),
+        matches!(&transcribed, AttemptResult::Completed { body: ResponseBody::Media(answer), .. } if answer.bytes == b"hello"[..]),
         "{transcribed:?}"
     );
     let requests = server.received_requests().await.expect("recording");
@@ -1921,7 +2433,7 @@ async fn media_capturing(
             deployment,
             model: model_of(deployment),
             credential: Some(&secret),
-            body,
+            body: &request(body),
             media: Some(&media),
             batch: None,
             stream: false,
@@ -1973,7 +2485,7 @@ async fn selected_media_capture_copies_benign_bytes_and_drops_credentials() {
             &benign,
             Some(ResponseCapture::Media(MediaAnswer {
                 content_type: "audio/mpeg".to_owned(),
-                bytes: benign.clone(),
+                bytes: benign.clone().into(),
             })),
         ),
         ("benign", false, &benign, None),
@@ -2231,11 +2743,12 @@ fn media_files_are_matched_to_the_route() {
             "file",
         ),
     ]);
+    let body = json!({"model": "acme/m", "prompt": "hat"});
     let edit = prepare(
         IngressDialect::OpenAi,
         GatewayOperation::Images,
         false,
-        &json!({"model": "acme/m", "prompt": "hat"}),
+        &body,
         &compatible,
         Some(&media_of(
             OpenAiMediaRoute::ImageEdits,
@@ -2243,10 +2756,7 @@ fn media_files_are_matched_to_the_route() {
         )),
     )
     .expect("an edit with images and a mask passes through");
-    assert_eq!(
-        edit,
-        Prepared::Native(json!({"model": "m", "prompt": "hat"}))
-    );
+    assert_eq!(native_json(&edit), json!({"model": "m", "prompt": "hat"}));
 }
 
 /// Batches lifecycle actions reach the `OpenAI` Files and Batches routes: an
@@ -2300,7 +2810,7 @@ async fn batch_actions_reach_their_routes_with_native_files() {
                     deployment: target,
                     model: model_of(target),
                     credential: Some(secret),
-                    body: &body,
+                    body: &request(&body),
                     media: None,
                     batch: Some(&action),
                     stream: false,
@@ -2358,7 +2868,7 @@ async fn batch_actions_reach_their_routes_with_native_files() {
     else {
         panic!("file content expected: {content:?}");
     };
-    assert_eq!(answer.bytes, b"{\"custom_id\":\"a\"}\n");
+    assert_eq!(answer.bytes, &b"{\"custom_id\":\"a\"}\n"[..]);
 }
 
 /// A non-`OpenAI` adapter rejects Batches before dispatch.
@@ -2513,7 +3023,7 @@ async fn embeddings_attempt(encoding: &str, answer: &Value) -> AttemptResult {
             deployment: &target,
             model: model_of(&target),
             credential: Some(&secret),
-            body: &body,
+            body: &request(&body),
             media: None,
             batch: None,
             stream: false,
@@ -2761,7 +3271,7 @@ async fn capturing(
             deployment,
             model: model_of(deployment),
             credential: Some(&secret),
-            body,
+            body: &request(body),
             media: None,
             batch: None,
             stream,
@@ -2785,7 +3295,9 @@ async fn capturing(
 async fn selected_capture_is_scrubbed_bounded_and_leaves_answers_unchanged() {
     const CANARY: &str = "sk-capture-canary-77";
     let server = MockServer::start().await;
-    let answer = format!(r#"{{"id":"c1","choices":[],"meta":{{"echo":{{"note":"{CANARY}"}}}}}}"#);
+    let answer = format!(
+        r#"{{"id":"c1","choices":[],"meta":{{"echo":{{"note":"{CANARY}"}}}},"x":"\u00e9 é","usage":{{"total_tokens":8,"prompt_tokens":3,"completion_tokens":5}}}}"#
+    );
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .and(wiremock::matchers::body_partial_json(
@@ -2827,7 +3339,7 @@ async fn selected_capture_is_scrubbed_bounded_and_leaves_answers_unchanged() {
     let AttemptResult::Completed {
         body: ResponseBody::Json(raw),
         capture: Some(ResponseCapture::Json(capture)),
-        ..
+        usage,
     } = buffered
     else {
         panic!("captured JSON expected: {buffered:?}");
@@ -2835,6 +3347,24 @@ async fn selected_capture_is_scrubbed_bounded_and_leaves_answers_unchanged() {
     assert_eq!(raw.get(), answer, "the caller's answer is unchanged");
     assert!(!capture.to_string().contains(CANARY), "{capture}");
     assert_eq!(capture["meta"]["echo"]["note"], "");
+    assert_eq!(capture["x"], "é é");
+    assert!(usage.normalized.is_some(), "{usage:?}");
+    // The usage decode is the capture's only decode, and only when selected.
+    for selected in [true, false] {
+        let (bytes, mapped, decoded) = super::complete(
+            super::Answer::Native(answer.clone()),
+            super::Wire::OpenAi,
+            false,
+            selected,
+            "c1",
+            "m",
+        )
+        .expect("native answer maps");
+        assert_eq!(bytes.get(), answer, "the caller's answer is unchanged");
+        assert_eq!(mapped, usage);
+        let expected = selected.then(|| serde_json::from_str::<Value>(&answer).expect("json"));
+        assert_eq!(decoded, expected, "selected: {selected}");
+    }
     let unselected = attempt(
         &dispatch,
         IngressDialect::OpenAi,
@@ -2897,7 +3427,7 @@ async fn image_capturing(
             deployment,
             model: model_of(deployment),
             credential: Some(&secret),
-            body: &json!({"model": "openai/gpt-4o", "prompt": prompt}),
+            body: &request(&json!({"model": "openai/gpt-4o", "prompt": prompt})),
             media: Some(&media),
             batch: None,
             stream: false,
@@ -3138,7 +3668,7 @@ async fn held_open_streams_settle_at_their_terminator() {
                 deployment: &target,
                 model: model_of(&target),
                 credential: Some(&secret),
-                body: &body,
+                body: &request(&body),
                 media: None,
                 batch: None,
                 stream: true,
@@ -3366,7 +3896,7 @@ async fn jev_attempt(
             deployment: &target,
             model: model_of(&target),
             credential: Some(&secret),
-            body,
+            body: &request(body),
             media: None,
             batch: None,
             stream: false,

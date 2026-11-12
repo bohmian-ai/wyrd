@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 pub(crate) mod os;
 
-pub use os::{HostLoad, PEAK_SAMPLE_INTERVAL_MS, PeakSampler};
+pub use os::{HostLoad, MemoryReadings, PEAK_SAMPLE_INTERVAL_MS, PeakSampler};
 
 use secrecy::{ExposeSecret, SecretString};
 use tempfile::TempDir;
@@ -348,28 +348,36 @@ impl LocalServer {
         self.root.path().join("storage")
     }
 
-    /// Scrapes `/metrics` and parses the Prometheus text exposition.
+    /// The standard counters, gauges, and histogram counts of one benchmark
+    /// snapshot ([`Self::timings`]), keyed as series: the benchmark server
+    /// runs no Prometheus recorder or exposition.
     ///
     /// # Errors
     ///
-    /// Returns an error when the endpoint does not answer 200.
+    /// Returns an error when the snapshot cannot be read or is incomplete
+    /// ([`Metrics::of_snapshot`]).
     pub async fn metrics(&self) -> Result<Metrics> {
-        let url = format!("http://127.0.0.1:{METRICS_PORT}/metrics");
-        let response = reqwest::get(url).await?.error_for_status()?;
-        Ok(Metrics::parse(&response.text().await?))
+        Ok(Metrics::of_snapshot(&self.timings().await?)?)
     }
 
-    /// Reads the server's cumulative benchmark timing snapshot from the
-    /// loopback metrics listener, which serving enables unless the caller's
-    /// environment turned it off.
+    /// Reads the server's cumulative benchmark snapshot, its timings and
+    /// standard metrics, from the loopback metrics listener of the benchmark
+    /// recorder that serving installs.
     ///
     /// # Errors
     ///
     /// Returns an error when the endpoint does not answer 200 with a
     /// snapshot.
-    pub async fn timings(&self) -> Result<wyrd_telemetry::timing::TimingSnapshot> {
-        let url = format!("http://127.0.0.1:{METRICS_PORT}/benchmark/timings");
+    pub async fn timings(&self) -> Result<wyrd_benchmark::BenchmarkSnapshot> {
+        let url = format!("http://127.0.0.1:{METRICS_PORT}/benchmark/snapshot");
         Ok(reqwest::get(url).await?.error_for_status()?.json().await?)
+    }
+
+    /// The loopback URL a `bench` build serves its heap profile at, which
+    /// [`crate::profile::HeapProfiler`] starts and reads.
+    #[must_use]
+    pub fn heap_profile_url(&self) -> String {
+        format!("http://127.0.0.1:{METRICS_PORT}/benchmark/heap")
     }
 
     /// Microseconds of user plus system CPU the server process has used so
@@ -383,6 +391,15 @@ impl LocalServer {
     /// `None` once it was stopped.
     pub fn memory_peak(&self) -> Option<PeakSampler> {
         self.pid().map(PeakSampler::start)
+    }
+
+    /// The server's resident memory now, bytes, or `None` once it is gone
+    /// or unreadable.
+    pub fn resident_memory(&self) -> Option<u64> {
+        self.memory_peak()?
+            .finish()
+            .ok()
+            .map(|readings| readings.opening)
     }
 
     /// Sends `SIGTERM`, as `Ctrl-C` in the guide does, waits for a clean
@@ -481,13 +498,127 @@ impl Drop for LocalServer {
     }
 }
 
-/// One `/metrics` scrape: every series and its value.
+/// Per-bound increase between two cumulative bucket readings; a bound absent
+/// from `before` counts from zero.
+fn deltas(before: &[(f64, f64)], after: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let prior = |bound: f64| {
+        before
+            .iter()
+            .find(|(b, _)| b.to_bits() == bound.to_bits())
+            .map_or(0.0, |(_, count)| *count)
+    };
+    after
+        .iter()
+        .map(|(bound, count)| (*bound, count - prior(*bound)))
+        .collect()
+}
+
+/// A production Prometheus histogram, used by metrics contract tests.
+/// Benchmark latency distributions live in `wyrd-benchmark`.
+#[derive(Debug, Default, Clone)]
+pub struct Histogram {
+    /// Cumulative `le` buckets.
+    pub buckets: Vec<(f64, f64)>,
+    /// Observed seconds.
+    pub sum: f64,
+    /// Observations.
+    pub count: f64,
+}
+
+impl Histogram {
+    /// The histogram of every `family` series whose labels contain each of
+    /// `labels` in one scrape, summed across those series.
+    #[must_use]
+    pub fn read(metrics: &Metrics, family: &str, labels: &[&str]) -> Self {
+        Self {
+            buckets: metrics.buckets(family, labels),
+            sum: metrics.sum(&format!("{family}_sum"), labels),
+            count: metrics.sum(&format!("{family}_count"), labels),
+        }
+    }
+
+    /// The observations `after` added to `self`; a bucket bound or series
+    /// absent from `self` counts from zero.
+    #[must_use]
+    pub fn since(&self, after: &Self) -> Self {
+        Self {
+            buckets: deltas(&self.buckets, &after.buckets),
+            sum: after.sum - self.sum,
+            count: after.count - self.count,
+        }
+    }
+
+    /// Exact mean, seconds, from `_sum` / `_count`, or `None` without
+    /// observations.
+    #[must_use]
+    pub fn mean(&self) -> Option<f64> {
+        (self.count > 0.0).then(|| self.sum / self.count)
+    }
+}
+
+/// Every series of one read and its value: a production `/metrics`
+/// exposition, or a benchmark snapshot's standard metrics.
 pub struct Metrics(BTreeMap<String, f64>);
 
 impl Metrics {
-    /// Parses a Prometheus text exposition, skipping comments. Scrapes come
-    /// from [`LocalServer::metrics`]; tests of scrape consumers build one
-    /// from literal text.
+    /// The standard metrics of a benchmark `snapshot` as series: each
+    /// counter's total, each gauge's value, and each histogram's
+    /// observation count as `<family>_count`, labelled as Prometheus names
+    /// them. Histogram distributions are read from the snapshot itself. A
+    /// family the server never emitted is absent and sums to zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the snapshot is incomplete evidence: its bounds dropped
+    /// an observation, so a series may be absent, or a series refused an
+    /// update, so its value may be stale. Either would read as a settled
+    /// zero.
+    pub fn of_snapshot(
+        snapshot: &wyrd_benchmark::BenchmarkSnapshot,
+    ) -> std::result::Result<Self, String> {
+        if snapshot.dropped > 0 {
+            return Err(format!(
+                "the server's series bounds dropped {} observations, so its metrics are incomplete",
+                snapshot.dropped
+            ));
+        }
+        if let Some(refused) = snapshot.metrics.iter().find(|metric| metric.rejected > 0) {
+            return Err(format!(
+                "metric `{}` refused {} updates, so its value is stale",
+                refused.name, refused.rejected
+            ));
+        }
+        Ok(Self(
+            snapshot
+                .metrics
+                .iter()
+                .map(|metric| {
+                    let (suffix, value) = match &metric.value {
+                        wyrd_benchmark::MetricValue::Counter { total } => ("", *total as f64),
+                        wyrd_benchmark::MetricValue::Gauge { value, .. } => ("", *value),
+                        wyrd_benchmark::MetricValue::Histogram { count, .. } => {
+                            ("_count", *count as f64)
+                        }
+                    };
+                    let labels: Vec<String> = metric
+                        .labels
+                        .iter()
+                        .map(|(label, value)| format!("{label}=\"{value}\""))
+                        .collect();
+                    let series = if labels.is_empty() {
+                        format!("{}{suffix}", metric.name)
+                    } else {
+                        format!("{}{suffix}{{{}}}", metric.name, labels.join(","))
+                    };
+                    (series, value)
+                })
+                .collect(),
+        ))
+    }
+
+    /// Parses a Prometheus text exposition, skipping comments: a production
+    /// server's `/metrics` in its metrics contract tests, or literal text in
+    /// tests of scrape consumers. A benchmark reads [`Self::of_snapshot`].
     pub fn parse(exposition: &str) -> Self {
         Self(
             exposition
@@ -682,6 +813,104 @@ impl Drop for OperatorRun {
 #[cfg(test)]
 mod tests {
     use super::Metrics;
+
+    /// A benchmark snapshot of `metrics` that refused `dropped` series.
+    fn snapshot(
+        metrics: Vec<wyrd_benchmark::MetricSnapshot>,
+        dropped: u64,
+    ) -> wyrd_benchmark::BenchmarkSnapshot {
+        wyrd_benchmark::BenchmarkSnapshot {
+            process: "p".to_owned(),
+            pid: 1,
+            taken_ns: 0,
+            method: wyrd_benchmark::Method::current(),
+            series: Vec::new(),
+            scans: Vec::new(),
+            metrics,
+            dropped,
+            invalid_labels: 0,
+        }
+    }
+
+    /// One `name` series labelled `labels` holding `value`, `rejected`
+    /// updates refused.
+    fn metric(
+        name: &str,
+        labels: &[(&str, &str)],
+        rejected: u64,
+        value: wyrd_benchmark::MetricValue,
+    ) -> wyrd_benchmark::MetricSnapshot {
+        wyrd_benchmark::MetricSnapshot {
+            name: name.to_owned(),
+            labels: labels
+                .iter()
+                .map(|(label, value)| ((*label).to_owned(), (*value).to_owned()))
+                .collect(),
+            rejected,
+            value,
+        }
+    }
+
+    /// A complete snapshot keeps every counter, gauge, and histogram count
+    /// and reads a never-emitted family as zero; one whose bounds dropped a
+    /// series, or whose gauge refused an update, is not evidence of a
+    /// settled server, since the absent or stale gauge would read as zero.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a complete snapshot loses a value or an incomplete one
+    /// converts.
+    #[test]
+    fn snapshot_conversion_rejects_incomplete_metric_evidence() {
+        let backlog = |rejected| {
+            metric(
+                "outbox_pending",
+                &[("outbox", "scribe")],
+                rejected,
+                wyrd_benchmark::MetricValue::Gauge {
+                    value: 0.0,
+                    peak: 4.0,
+                },
+            )
+        };
+        let healthy = vec![
+            metric(
+                "writes_total",
+                &[("outcome", "ok")],
+                0,
+                wyrd_benchmark::MetricValue::Counter { total: 7 },
+            ),
+            backlog(0),
+            metric(
+                "write_seconds",
+                &[],
+                0,
+                wyrd_benchmark::MetricValue::Histogram {
+                    unit: wyrd_benchmark::HistogramUnit::Nanoseconds,
+                    count: 3,
+                    buckets: wyrd_benchmark::Buckets::default(),
+                },
+            ),
+        ];
+        let metrics = Metrics::of_snapshot(&snapshot(healthy.clone(), 0)).expect("complete");
+        assert_eq!(metrics.sum("writes_total", &["outcome=\"ok\""]), 7.0);
+        assert_eq!(metrics.sum("outbox_pending", &["outbox=\"scribe\""]), 0.0);
+        assert_eq!(metrics.sum("write_seconds_count", &[]), 3.0);
+        assert_eq!(metrics.sum("never_emitted_total", &[]), 0.0);
+
+        let dropped = Metrics::of_snapshot(&snapshot(Vec::new(), 1));
+        assert!(
+            dropped.is_err_and(|error| error.contains("dropped")),
+            "a dropped registration leaves its backlog gauge absent"
+        );
+        let mut stale = healthy;
+        stale[1] = backlog(1);
+        assert!(
+            Metrics::of_snapshot(&snapshot(stale, 0))
+                .is_err_and(|error| error.contains("outbox_pending")),
+            "a refused update leaves its gauge stale"
+        );
+    }
 
     /// Series of one family sum across label sets; other families and
     /// same-prefix families do not leak in.

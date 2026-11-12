@@ -974,6 +974,34 @@ Content-Type: application/json
 { "amount": 100 }
 ```
 
+#### Gateway quota enforcement
+
+Gateway request, token, concurrency and spending-budget checks use a per-server
+cache of tenant policy, refreshed shared usage and pending local reservations.
+Each server reserves atomically against its local view before provider dispatch.
+Quota admission and accounting do not await PostgreSQL; the existing Gateway
+background lifecycle batches usage writes and refreshes shared state. This
+guarantee excludes explicit authentication/token exchanges and administration.
+
+Enforcement across servers is approximate, including monetary budgets. A
+configured quota is not a strict cluster-wide ceiling: delayed visibility and
+loss of unflushed usage on abrupt process death can permit overshoot. Pending
+usage is memory-owned; no crash-safe local ledger is required. Background writes
+preserve tenant isolation and combine server contributions without losing local
+pending reservations or double-counting retried/committed updates. Local
+concurrency releases when execution ends, including stream completion.
+
+Missing usable policy/usage, unhealthy refresh or full pending-accounting state
+refuses quota-covered work before dispatch with retryable
+`503 WYRD_SERVER_503_SERVICE_UNAVAILABLE` until background recovery succeeds.
+Unknown policy is not assumed unrestricted. Cache misses do not substitute a
+synchronous quota-path database read. Buffers and background work remain bounded
+under the existing Gateway lifecycle, and normal shutdown drains accepted work;
+an expired shutdown deadline may lose unflushed usage.
+
+These approximate quota rules never relax permission checks, tenant isolation,
+credential handling, or the capture-slot reservation required before dispatch.
+
 #### Request correlator — `Wyrd-Request-Id`
 
 A Wyrd-owned, request-scoped opaque ID that joins every hop of a logical
@@ -1024,7 +1052,13 @@ Server spans export twice from one tracer provider:
   filter `WYRD_LOG`/`RUST_LOG`; neither filter nor the ratio can remove a
   tenant copy, because catalog spans and events at `info` or above always
   record. Logs are written whatever the sampling decision, so an error in
-  an unsampled request is still logged inside its request span.
+  an unsampled request is still logged inside its request span. At `info`
+  a direct verification opens only the request span,
+  `verification.execute`, the GenAI spans, `gateway.call`,
+  `gateway.execute`, and `gateway.attempt`; its in-process phases
+  (`verification.handle`, `verification.load`, `verification.engine`, and
+  the gateway's authorize, route, admit, translate, account, and capture
+  spans) are `debug` spans, whose timing the phase metrics already carry.
 - A server span whose parent or one of whose links is a sampled client span
   also writes, with its catalog descendants, to the requesting tenant's
   `bifrost.traces.spans` on the process Scribe outbox, with the same trace,
@@ -1038,11 +1072,16 @@ Server spans export twice from one tracer provider:
   caller's attempt, its catalog descendants, and its gateway calls' captured
   attempts read back from the enqueuing trace's timeline. The tenant copy carries only the
   behavior-span catalog — the request span, `verification.*`, the Agent
-  loop's `invoke_agent`, `chat`, and `execute_tool`, `dispatch`,
-  `agent.gateway.call`, `gateway.*` except `gateway.attempt`,
-  `bifrost.gate.*`, `bifrost.oracle.query`, and OTLP ingest — and only spans
+  loop's `invoke_agent` and `execute_tool`, one OpenTelemetry GenAI
+  inference span per model call named after its `gen_ai.operation.name`
+  (`chat`, `generate_content`, or `embeddings`), `gateway.*` except
+  `gateway.attempt`, `bifrost.gate.*`, `bifrost.oracle.query`, and OTLP
+  ingest — at `info` or above, and only spans
   whose ancestors up to the span that opened the copy are all catalog
-  spans. It keeps only safe
+  spans. A catalog span below `info`, recorded only at higher operator
+  verbosity, is not copied: its copied children name its nearest copied
+  ancestor as their parent, so the tenant copy is the same at every
+  operator verbosity. It keeps only safe
   attributes (`wyrd.*`, `gen_ai.*`, and HTTP, RPC, and error semantic
   conventions); the tenant id is never a span attribute. The copy is
   non-blocking and never fails the request, and it works with or without an
@@ -1736,6 +1775,7 @@ execution; scheduled executions have no `run_id`.
 | `POST /v1/verification/execute` | Exact Verifier and subject, optional Run and `group_id`, named input declarations, optional route overrides → `200 VerificationResult` |
 | `POST /v1/verification/enqueue` | The same Run evidence with `Idempotency-Key` → `202 { execution_id }` |
 | `GET /v1/verification/executions/{execution_id}` | Status, terminal error, result when visible, and a group execution's `group_id`, owner, and source selection once its input record is visible; a direct execution's completed status once its records are visible |
+| `GET /v1/verification/executions/{execution_id}/details` | `200 VerificationDetails` once the execution's complete records are visible; otherwise `404 WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND`, including unknown, not-yet-recorded, and no-longer-readable executions; same `cards:read` authority and audit as the status read |
 | `GET /v1/verification/bindings/{binding_id}` | Readiness, cadence, `last_execution_id`, and a `group_end` binding's frozen settings and source bindings |
 
 File contents never pass through Postgres or a verification request body; an
@@ -1808,8 +1848,9 @@ uses `last_execution_id` for its latest admitted execution, not an application
 Run or an unaccepted staged submission.
 
 MCP projects the HTTP contracts as `verification.evidence`,
-`verification.execute`, `verification.enqueue`, and
-`verification.get_execution`, with retained `verification.get_binding`.
+`verification.execute`, `verification.enqueue`,
+`verification.get_execution`, and `verification.get_execution_details`, with
+retained `verification.get_binding`.
 The old `verification.start_run` and `verification.get_run` have no aliases.
 Read tools remain discoverable; write scopes supplement domain authorization.
 
@@ -1832,22 +1873,31 @@ Scribe, so a completed execution can lack a retained result. Leases renew on
 the PostgreSQL clock once a third of the lease has passed; an expired lease is
 never revived, and a renewal that no longer finds the token cancels that work.
 
-A `VerificationResult` carries `execution_id`, optional `run_id`, the exact
-`verifier` and `subject`, and an `outcome` of `verdict`, `requirements`
-(`id`, `step`, `statement`, `outcome`, `reason`, `actual`, `citations`,
-`detail`, `check` provenance), `steps` (`id`, `status`, `output`, `attempts`,
-`duration_ms`, `reason`, `provenance`, `tool_calls`), and pinned `evidence`.
+A `VerificationResult` is the compact decision that direct execution, status,
+wait, and typed reads return. It carries `execution_id`, optional `run_id`,
+the exact `verifier` and `subject`, optional `deployment_environment`, and an
+`outcome` of only `verdict` and `requirements` (`id`, `step`, `statement`,
+`outcome`, `reason`, `actual`, `citations`, custom `data`, and `detail`).
+Check configuration, provenance, steps, and evidence are absent, not null.
+`VerificationDetails` is the explicit descriptive read of what one completed
+execution ran: the same identity and judgments, each requirement's exact
+authored `check` and `provenance`, `steps` (`id`, `status`, `output`,
+`attempts`, `duration_ms`, `reason`, `provenance`, `tool_calls`), and pinned
+`evidence`. Checks decode as authored data: neither the server's readback nor
+client decoding compiles, renders, or executes a Prompt. SDKs expose it only
+as `Execution.details` and its typed sibling; no other read requests it.
 Provenance records code hash and runtime, extraction version, Agent and Prompt
 versions, effective routes, drift baselines and windows, and input digests.
 `bifrost.verification.results` is the canonical payload-free result summary,
 `bifrost.verification.execution_outputs` holds each result's `requirements`
 and `steps`, and `bifrost.verification.execution_inputs` holds each
 execution's one input record: declarations for direct and submitted work, a
-selector for group and schedule work, and queued activation context. A
-returned `VerificationResult` is assembled from the three by one reader:
-verdict from the summary, breakdown from outputs by result ID, evidence from
-inputs by execution ID (a group's resolved slot lists; an empty map for
-scheduled Drift). PostgreSQL stores no input values; a queued execution's
+selector for group and schedule work, and queued activation context. One
+reader assembles both projections from the three: verdict from the summary
+and requirements from outputs by result ID; details add the outputs' checks,
+provenance, and steps and the evidence from inputs by execution ID (a group's
+resolved slot lists; an empty map for scheduled Drift). The compact result
+drops those fields at the response, never in storage. PostgreSQL stores no input values; a queued execution's
 selected `result_id` stays authoritative. A direct execution has no queue
 row: its status is read from records whose input origin is `direct`, and is
 `completed` once they are visible. Unknown IDs remain not found.

@@ -1,9 +1,10 @@
 //! `OpenAI` Chat Completions translation to and from Google `GenerateContent`,
 //! shared by the Gemini and Vertex adapters.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
+use skald_spec::SharedSchema;
 use skald_spec::wire::google_generate::{
     GoogleContent, GoogleFinishReason, GoogleFunctionCall, GoogleFunctionCallingConfig,
     GoogleFunctionDeclaration, GoogleFunctionResponse, GoogleGenerateContentRequest,
@@ -11,10 +12,12 @@ use skald_spec::wire::google_generate::{
     GoogleInlineData, GooglePart, GoogleTool, GoogleToolConfig, GoogleUsageMetadata,
 };
 use skald_spec::wire::openai_chat::{
-    OpenAiChatChoice, OpenAiChatMessage, OpenAiChatRequest, OpenAiChatResponse, OpenAiChatSettings,
-    OpenAiChatToolChoice, OpenAiCompletionTokensDetails, OpenAiContentPart, OpenAiFunction,
-    OpenAiJsonSchema, OpenAiMessageContent, OpenAiPromptTokensDetails, OpenAiResponseFormat,
-    OpenAiTool, OpenAiToolCall, OpenAiToolChoiceMode, OpenAiToolFunctionCall, OpenAiUsage,
+    OpenAiChatChoice, OpenAiChatMessage, OpenAiChatMessageView, OpenAiChatRequest,
+    OpenAiChatRequestView, OpenAiChatResponse, OpenAiChatSettings, OpenAiChatSettingsView,
+    OpenAiChatToolChoice, OpenAiCompletionTokensDetails, OpenAiContentPart, OpenAiContentPartView,
+    OpenAiFunction, OpenAiMessageContent, OpenAiMessageContentView, OpenAiPromptTokensDetails,
+    OpenAiResponseFormat, OpenAiResponseFormatView, OpenAiTool, OpenAiToolCall,
+    OpenAiToolChoiceMode, OpenAiToolFunctionCall, OpenAiUsage,
 };
 
 use super::UnsupportedRequest;
@@ -22,14 +25,8 @@ use super::UnsupportedRequest;
 /// Adapter name used in rejections.
 const ADAPTER: &str = "google";
 
-/// Translates a chat completion request into `GenerateContent`.
-///
-/// Leading system messages become `system_instruction`; assistant turns use
-/// the `model` role; consecutive same-role turns merge; tool results become
-/// `function_response` parts named by the function of the matching earlier
-/// call, carrying a JSON-object result as-is or text as `{"content": ...}`.
-/// `n`, penalties, seed, stop sequences, and JSON output map onto the
-/// generation config.
+/// Checks that a chat completion request has a faithful `GenerateContent`
+/// form, on its borrowed projection, without building it.
 ///
 /// # Errors
 ///
@@ -39,10 +36,8 @@ const ADAPTER: &str = "google";
 /// parts, custom or strict tools, allowed-tools choices, disabling parallel
 /// tool calls, a tool result without a matching call, and any other member
 /// without a `GenerateContent` equivalent.
-pub(super) fn request(
-    chat: OpenAiChatRequest,
-) -> Result<GoogleGenerateContentRequest, UnsupportedRequest> {
-    let OpenAiChatRequest {
+pub(super) fn check(chat: &OpenAiChatRequestView<'_>) -> Result<(), UnsupportedRequest> {
+    let OpenAiChatRequestView {
         model: _,
         messages,
         response_format,
@@ -53,16 +48,16 @@ pub(super) fn request(
         parallel_tool_calls,
         settings,
     } = chat;
-    let OpenAiChatSettings {
-        temperature,
-        top_p,
-        max_tokens,
-        max_completion_tokens,
-        n,
-        stop,
-        presence_penalty,
-        frequency_penalty,
-        seed,
+    let OpenAiChatSettingsView {
+        temperature: _,
+        top_p: _,
+        max_tokens: _,
+        max_completion_tokens: _,
+        n: _,
+        stop: _,
+        presence_penalty: _,
+        frequency_penalty: _,
+        seed: _,
         logit_bias,
         user,
         reasoning_effort,
@@ -78,11 +73,11 @@ pub(super) fn request(
         top_logprobs,
         extra,
     } = settings;
-    super::streamable(ADAPTER, stream, stream_options.as_ref(), tools.is_some())?;
+    super::streamable(ADAPTER, *stream, stream_options.as_ref(), tools.is_some())?;
     super::reject_present(
         ADAPTER,
         &[
-            ("parallel_tool_calls", parallel_tool_calls == Some(false)),
+            ("parallel_tool_calls", *parallel_tool_calls == Some(false)),
             ("logit_bias", logit_bias.is_some()),
             ("user", user.is_some()),
             ("reasoning_effort", reasoning_effort.is_some()),
@@ -92,15 +87,147 @@ pub(super) fn request(
             ("prompt_cache_key", prompt_cache_key.is_some()),
             ("service_tier", service_tier.is_some()),
             ("safety_identifier", safety_identifier.is_some()),
-            ("store", store == Some(true)),
+            ("store", *store == Some(true)),
             ("metadata", metadata.is_some()),
-            ("logprobs", logprobs == Some(true)),
+            ("logprobs", *logprobs == Some(true)),
             ("top_logprobs", top_logprobs.is_some()),
         ],
     )?;
-    super::reject_extra(ADAPTER, &extra)?;
-    let (system, offset) = super::system_prefix(&messages)?;
-    let (response_mime_type, response_json_schema) = output(response_format)?;
+    super::reject_extra(ADAPTER, extra)?;
+    let offset = super::system_prefix(messages)?;
+    if let Some(OpenAiResponseFormatView::JsonSchema { json_schema }) = response_format
+        && (json_schema.schema.is_none() || json_schema.description.is_some())
+    {
+        return Err(UnsupportedRequest::new(
+            "response_format",
+            "a json_schema format needs a schema and no description for the google adapter",
+        ));
+    }
+    let mut calls: HashSet<&str> = HashSet::new();
+    for (index, message) in messages.iter().enumerate().skip(offset) {
+        conversation_message(message, &format!("messages[{index}]"), &mut calls)?;
+    }
+    super::function_tools(ADAPTER, tools.as_deref().unwrap_or_default())?;
+    super::tool_choice(ADAPTER, tool_choice.as_ref())
+}
+
+/// Checks one conversational message that follows the system prefix,
+/// recording the ids of its tool calls in `calls` for later tool results.
+///
+/// # Errors
+///
+/// Returns [`UnsupportedRequest`] for an unsupported member or role, absent
+/// user content, remote image URLs, a detail hint, audio or file parts,
+/// non-text assistant or tool content, invalid tool calls, a tool result
+/// without a matching earlier call, or a message that translates to no parts.
+fn conversation_message<'a>(
+    message: &OpenAiChatMessageView<'a>,
+    field: &str,
+    calls: &mut HashSet<&'a str>,
+) -> Result<(), UnsupportedRequest> {
+    super::plain_message(message, field)?;
+    let parts = match message.role {
+        "user" => match &message.content {
+            None => {
+                return Err(UnsupportedRequest::new(
+                    format!("{field}.content"),
+                    "is required",
+                ));
+            }
+            Some(OpenAiMessageContentView::Text(_)) => true,
+            Some(OpenAiMessageContentView::Parts(parts)) => {
+                for (index, part) in parts.iter().enumerate() {
+                    let field = format!("{field}.content[{index}]");
+                    match part {
+                        OpenAiContentPartView::Text { .. } => {}
+                        OpenAiContentPartView::ImageUrl { image_url } => {
+                            if !super::image(image_url, &field)? {
+                                return Err(UnsupportedRequest::new(
+                                    format!("{field}.image_url.url"),
+                                    "must be a base64 data URL for the google adapter",
+                                ));
+                            }
+                        }
+                        OpenAiContentPartView::InputAudio { .. }
+                        | OpenAiContentPartView::File { .. } => {
+                            return Err(UnsupportedRequest::new(
+                                field,
+                                "audio and file parts are not supported by the google adapter",
+                            ));
+                        }
+                    }
+                }
+                !parts.is_empty()
+            }
+        },
+        "assistant" => {
+            let text = super::text_only(message.content.as_ref(), field)?;
+            let tool_calls = message.tool_calls.as_deref().unwrap_or_default();
+            for call in tool_calls {
+                calls.insert(call.id);
+                super::arguments(call, field)?;
+            }
+            text || !tool_calls.is_empty()
+        }
+        "tool" => {
+            if !message.tool_call_id.is_some_and(|id| calls.contains(id)) {
+                return Err(UnsupportedRequest::new(
+                    format!("{field}.tool_call_id"),
+                    "must name a tool call of an earlier assistant message",
+                ));
+            }
+            super::text_only(message.content.as_ref(), field)?;
+            true
+        }
+        _ => {
+            return Err(UnsupportedRequest::new(
+                format!("{field}.role"),
+                "must be user, assistant, or tool",
+            ));
+        }
+    };
+    if parts {
+        Ok(())
+    } else {
+        Err(UnsupportedRequest::new(
+            format!("{field}.content"),
+            "a message needs content",
+        ))
+    }
+}
+
+/// Translates a chat completion request [`check`] admitted into
+/// `GenerateContent`.
+///
+/// Leading system messages become `system_instruction`; assistant turns use
+/// the `model` role; consecutive same-role turns merge; tool results become
+/// `function_response` parts named by the function of the matching earlier
+/// call, carrying a JSON-object result as-is or text as `{"content": ...}`.
+/// `n`, penalties, seed, stop sequences, and JSON output map onto the
+/// generation config. Members [`check`] rejects are not represented.
+pub(super) fn request(chat: OpenAiChatRequest) -> GoogleGenerateContentRequest {
+    let OpenAiChatRequest {
+        messages,
+        response_format,
+        tools,
+        tool_choice,
+        settings,
+        ..
+    } = chat;
+    let OpenAiChatSettings {
+        temperature,
+        top_p,
+        max_tokens,
+        max_completion_tokens,
+        n,
+        stop,
+        presence_penalty,
+        frequency_penalty,
+        seed,
+        ..
+    } = settings;
+    let (system, offset) = super::system_text(&messages);
+    let (response_mime_type, response_json_schema) = output(response_format);
     let generation = GoogleGenerationConfig {
         temperature,
         top_p,
@@ -114,41 +241,32 @@ pub(super) fn request(
         seed,
         ..GoogleGenerationConfig::default()
     };
-    Ok(GoogleGenerateContentRequest {
-        contents: conversation(&messages[offset..], offset)?,
+    GoogleGenerateContentRequest {
+        contents: conversation(&messages[offset..]),
         system_instruction: system.map(|text| GoogleContent {
             role: "user".to_owned(),
             parts: vec![GooglePart::Text { text }],
         }),
-        tools: tools.map(translate_tools).transpose()?,
-        tool_config: choice(tool_choice)?,
+        tools: tools.map(translate_tools),
+        tool_config: choice(tool_choice),
         settings: GoogleGenerateSettings {
             generation_config: (generation != GoogleGenerationConfig::default())
                 .then_some(generation),
             ..GoogleGenerateSettings::default()
         },
-    })
+    }
 }
 
-/// Translates the conversational messages that follow the system prefix.
-///
-/// # Errors
-///
-/// Returns [`UnsupportedRequest`] for an unknown role, unsupported content, or
-/// a tool result without a matching earlier call.
-fn conversation(
-    messages: &[OpenAiChatMessage],
-    offset: usize,
-) -> Result<Vec<GoogleContent>, UnsupportedRequest> {
+/// Translates the checked conversational messages that follow the system
+/// prefix.
+fn conversation(messages: &[OpenAiChatMessage]) -> Vec<GoogleContent> {
     let mut calls: HashMap<&str, &str> = HashMap::new();
     let mut contents: Vec<GoogleContent> = Vec::new();
-    for (index, message) in messages.iter().enumerate() {
-        let field = format!("messages[{}]", index + offset);
-        super::plain_message(message, &field)?;
+    for message in messages {
         let (role, parts) = match message.role.as_str() {
-            "user" => ("user", user_parts(message.content.as_ref(), &field)?),
+            "user" => ("user", user_parts(message.content.as_ref())),
             "assistant" => {
-                let mut parts: Vec<_> = super::text_content(message.content.as_ref(), &field)?
+                let mut parts: Vec<_> = super::text_content(message.content.as_ref())
                     .map(|text| GooglePart::Text { text })
                     .into_iter()
                     .collect();
@@ -157,26 +275,20 @@ fn conversation(
                     parts.push(GooglePart::FunctionCall {
                         function_call: GoogleFunctionCall {
                             name: call.function.name.clone(),
-                            args: super::arguments(call, &field)?,
+                            args: super::arguments_value(call),
                         },
                         thought_signature: None,
                     });
                 }
                 ("model", parts)
             }
-            "tool" => {
+            _ => {
                 let name = message
                     .tool_call_id
                     .as_deref()
                     .and_then(|id| calls.get(id))
-                    .ok_or_else(|| {
-                        UnsupportedRequest::new(
-                            format!("{field}.tool_call_id"),
-                            "must name a tool call of an earlier assistant message",
-                        )
-                    })?;
-                let text =
-                    super::text_content(message.content.as_ref(), &field)?.unwrap_or_default();
+                    .map_or_else(String::new, |name| (*name).to_owned());
+                let text = super::text_content(message.content.as_ref()).unwrap_or_default();
                 let response = match serde_json::from_str::<Value>(&text) {
                     Ok(object @ Value::Object(_)) => object,
                     _ => json!({"content": text}),
@@ -184,26 +296,11 @@ fn conversation(
                 (
                     "user",
                     vec![GooglePart::FunctionResponse {
-                        function_response: GoogleFunctionResponse {
-                            name: (*name).to_owned(),
-                            response,
-                        },
+                        function_response: GoogleFunctionResponse { name, response },
                     }],
                 )
             }
-            _ => {
-                return Err(UnsupportedRequest::new(
-                    format!("{field}.role"),
-                    "must be user, assistant, or tool",
-                ));
-            }
         };
-        if parts.is_empty() {
-            return Err(UnsupportedRequest::new(
-                format!("{field}.content"),
-                "a message needs content",
-            ));
-        }
         match contents.last_mut() {
             Some(last) if last.role == role => last.parts.extend(parts),
             _ => contents.push(GoogleContent {
@@ -212,146 +309,91 @@ fn conversation(
             }),
         }
     }
-    Ok(contents)
+    contents
 }
 
-/// Translates user content: text and base64 `data:` images.
-///
-/// # Errors
-///
-/// Returns [`UnsupportedRequest`] for absent content, remote image URLs, a
-/// detail hint, or audio and file parts.
-fn user_parts(
-    content: Option<&OpenAiMessageContent>,
-    field: &str,
-) -> Result<Vec<GooglePart>, UnsupportedRequest> {
+/// Translates checked user content: text and base64 `data:` images.
+fn user_parts(content: Option<&OpenAiMessageContent>) -> Vec<GooglePart> {
     match content {
-        None => Err(UnsupportedRequest::new(
-            format!("{field}.content"),
-            "is required",
-        )),
-        Some(OpenAiMessageContent::Text(text)) => Ok(vec![GooglePart::Text { text: text.clone() }]),
+        None => Vec::new(),
+        Some(OpenAiMessageContent::Text(text)) => vec![GooglePart::Text { text: text.clone() }],
         Some(OpenAiMessageContent::Parts(parts)) => parts
             .iter()
-            .enumerate()
-            .map(|(index, part)| {
-                let field = format!("{field}.content[{index}]");
-                match part {
-                    OpenAiContentPart::Text { text } => Ok(GooglePart::Text { text: text.clone() }),
-                    OpenAiContentPart::ImageUrl { image_url } => {
-                        match super::image(image_url, &field)? {
-                            Some((mime_type, data)) => Ok(GooglePart::InlineData {
-                                inline_data: GoogleInlineData { mime_type, data },
-                            }),
-                            None => Err(UnsupportedRequest::new(
-                                format!("{field}.image_url.url"),
-                                "must be a base64 data URL for the google adapter",
-                            )),
+            .filter_map(|part| match part {
+                OpenAiContentPart::Text { text } => Some(GooglePart::Text { text: text.clone() }),
+                OpenAiContentPart::ImageUrl { image_url } => {
+                    super::data_url(&image_url.url).map(|(mime_type, data)| {
+                        GooglePart::InlineData {
+                            inline_data: GoogleInlineData {
+                                mime_type: mime_type.to_owned(),
+                                data: data.to_owned(),
+                            },
                         }
-                    }
-                    OpenAiContentPart::InputAudio { .. } | OpenAiContentPart::File { .. } => {
-                        Err(UnsupportedRequest::new(
-                            field,
-                            "audio and file parts are not supported by the google adapter",
-                        ))
-                    }
+                    })
                 }
+                OpenAiContentPart::InputAudio { .. } | OpenAiContentPart::File { .. } => None,
             })
             .collect(),
     }
 }
 
-/// Translates function tools into one declaration list.
-///
-/// # Errors
-///
-/// Returns [`UnsupportedRequest`] for custom tools or strict functions.
-fn translate_tools(tools: Vec<OpenAiTool>) -> Result<Vec<GoogleTool>, UnsupportedRequest> {
+/// Translates checked non-strict function tools into one declaration list.
+fn translate_tools(tools: Vec<OpenAiTool>) -> Vec<GoogleTool> {
     let declarations = tools
         .into_iter()
-        .enumerate()
-        .map(|(index, tool)| match tool {
+        .filter_map(|tool| match tool {
             OpenAiTool::Function {
                 function:
                     OpenAiFunction {
                         name,
                         description,
                         parameters,
-                        strict,
+                        ..
                     },
-            } if strict != Some(true) => Ok(GoogleFunctionDeclaration::json_schema(
+            } => Some(GoogleFunctionDeclaration::json_schema(
                 name,
                 description,
                 super::parameters(parameters),
             )),
-            _ => Err(UnsupportedRequest::new(
-                format!("tools[{index}]"),
-                "only non-strict function tools are supported by the google adapter",
-            )),
+            OpenAiTool::Custom { .. } => None,
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(vec![GoogleTool {
+        .collect();
+    vec![GoogleTool {
         function_declarations: Some(declarations),
         google_search: None,
         google_search_retrieval: None,
         code_execution: None,
         url_context: None,
-    }])
+    }]
 }
 
-/// Translates the tool choice into a function-calling config.
-///
-/// # Errors
-///
-/// Returns [`UnsupportedRequest`] for allowed-tools and custom-tool choices.
-fn choice(
-    choice: Option<OpenAiChatToolChoice>,
-) -> Result<Option<GoogleToolConfig>, UnsupportedRequest> {
-    let (mode, allowed) = match choice {
-        None => return Ok(None),
-        Some(OpenAiChatToolChoice::Mode(OpenAiToolChoiceMode::None)) => ("NONE", None),
-        Some(OpenAiChatToolChoice::Mode(OpenAiToolChoiceMode::Auto)) => ("AUTO", None),
-        Some(OpenAiChatToolChoice::Mode(OpenAiToolChoiceMode::Required)) => ("ANY", None),
-        Some(OpenAiChatToolChoice::Function(named)) => ("ANY", Some(vec![named.function.name])),
-        Some(OpenAiChatToolChoice::Allowed(_) | OpenAiChatToolChoice::Custom(_)) => {
-            return Err(UnsupportedRequest::new(
-                "tool_choice",
-                "allowed-tools and custom-tool choices are not supported by the google adapter",
-            ));
-        }
+/// Translates a checked tool choice into a function-calling config.
+fn choice(choice: Option<OpenAiChatToolChoice>) -> Option<GoogleToolConfig> {
+    let (mode, allowed) = match choice? {
+        OpenAiChatToolChoice::Mode(OpenAiToolChoiceMode::None) => ("NONE", None),
+        OpenAiChatToolChoice::Mode(OpenAiToolChoiceMode::Auto) => ("AUTO", None),
+        OpenAiChatToolChoice::Mode(OpenAiToolChoiceMode::Required) => ("ANY", None),
+        OpenAiChatToolChoice::Function(named) => ("ANY", Some(vec![named.function.name])),
+        OpenAiChatToolChoice::Allowed(_) | OpenAiChatToolChoice::Custom(_) => return None,
     };
-    Ok(Some(GoogleToolConfig {
+    Some(GoogleToolConfig {
         function_calling_config: GoogleFunctionCallingConfig {
             mode: mode.to_owned(),
             allowed_function_names: allowed,
         },
-    }))
+    })
 }
 
-/// Translates a response format into a response MIME type and schema.
-///
-/// # Errors
-///
-/// Returns [`UnsupportedRequest`] for a schema-less or described JSON schema.
-fn output(
-    format: Option<OpenAiResponseFormat>,
-) -> Result<(Option<String>, Option<Value>), UnsupportedRequest> {
+/// Translates a checked response format into a response MIME type and
+/// schema.
+fn output(format: Option<OpenAiResponseFormat>) -> (Option<String>, Option<SharedSchema>) {
     let json = || Some("application/json".to_owned());
     match format {
-        None | Some(OpenAiResponseFormat::Text) => Ok((None, None)),
-        Some(OpenAiResponseFormat::JsonObject) => Ok((json(), None)),
-        Some(OpenAiResponseFormat::JsonSchema {
-            json_schema:
-                OpenAiJsonSchema {
-                    schema: Some(schema),
-                    description: None,
-                    ..
-                },
-        }) => Ok((json(), Some(Value::Object(schema)))),
-        Some(OpenAiResponseFormat::JsonSchema { .. }) => Err(UnsupportedRequest::new(
-            "response_format",
-            "a json_schema format needs a schema and no description for the google adapter",
-        )),
+        None | Some(OpenAiResponseFormat::Text) => (None, None),
+        Some(OpenAiResponseFormat::JsonObject) => (json(), None),
+        Some(OpenAiResponseFormat::JsonSchema { json_schema }) => {
+            (json(), json_schema.schema.map(Into::into))
+        }
     }
 }
 

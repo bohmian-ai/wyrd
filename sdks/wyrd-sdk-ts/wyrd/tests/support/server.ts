@@ -11,6 +11,7 @@ import {
   Principals,
   type SpanRecord,
   verify,
+  type VerificationDetails,
   type VerificationExecutionState,
   type VerificationResult,
   WyrdClient,
@@ -120,6 +121,16 @@ export async function binding(cards: Cards, owner: CardRef): Promise<string> {
     throw new Error(`${owner.name} declares no verification binding`);
   }
   return id;
+}
+
+/**
+ * What execution `id` ran, read as the ambient administrator once its result
+ * is visible.
+ */
+export async function details(id: string): Promise<VerificationDetails> {
+  const execution = await verify.Execution.connect(id);
+  await execution.wait({ timeoutMs: 60_000 });
+  return execution.details();
 }
 
 /**

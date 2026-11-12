@@ -87,6 +87,7 @@ WIRE_ROOTS = [
     "OperatorConnectionView",
     "UpdateOperatorConnectionRequest",
     "ExecutionPlan",
+    "VerificationDetails",
     "VerificationExecutionState",
     "VerificationResult",
 ]

@@ -14,13 +14,14 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use reqwest::Method;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use skald_spec::MediaFormat;
+use wyrd_benchmark::Observation;
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::card::verifier::{InputSlot as SlotSpec, VerifierSpec};
 use wyrd_spec::error::WyrdError;
@@ -420,6 +421,10 @@ impl Target<'_> {
     /// [`EXECUTE_RESPONSE_GRACE`] even when its configured timeout is
     /// shorter, so a slow execution ends in the server's 504.
     ///
+    /// The invocation's preparation, from `started` through evidence
+    /// pinning and request assembly, is added to `observation`'s `prepare`
+    /// component before the execution request.
+    ///
     /// # Errors
     /// Returns the local file and slot refusals of [`RunEvidence::pin`] and
     /// the server's refusal of the evidence plan, upload, or execution.
@@ -428,15 +433,22 @@ impl Target<'_> {
     /// Dropping the future abandons the request; uploads already sent stay
     /// as deduplicated tenant evidence.
     pub(crate) async fn execute(
-        &self,
+        self,
         client: &WyrdClient,
         run: RunEvidence,
+        observation: &mut Observation,
+        started: Option<Instant>,
     ) -> Result<VerificationResult, WyrdError> {
-        let request = self.request(run.pin(client).await?);
+        let request = self.into_request(run.pin(client).await?);
+        observation.since("prepare", started);
         client
-            .with_min_request_timeout(EXECUTION_DEADLINE + EXECUTE_RESPONSE_GRACE)
             .http
-            .request_json(Method::POST, "/v1/verification/execute", Some(&request))
+            .request_json_with_min_timeout(
+                Method::POST,
+                "/v1/verification/execute",
+                Some(&request),
+                EXECUTION_DEADLINE + EXECUTE_RESPONSE_GRACE,
+            )
             .await
     }
 
@@ -455,11 +467,11 @@ impl Target<'_> {
     /// Dropping the future after the request was sent may still leave a
     /// staged submission whose ID the caller never learns.
     pub(crate) async fn enqueue(
-        &self,
+        self,
         client: &WyrdClient,
         run: RunEvidence,
     ) -> Result<Execution, WyrdError> {
-        let request = self.request(run.pin(client).await?);
+        let request = self.into_request(run.pin(client).await?);
         let key = format!("verification-submit-{}", uuid::Uuid::now_v7());
         let response: EnqueueVerificationResponse = client
             .http
@@ -468,16 +480,17 @@ impl Target<'_> {
         Ok(Execution::new(response.execution_id, client.clone()))
     }
 
-    /// The wire request for this target and pinned declarations.
-    fn request(&self, inputs: BTreeMap<SlotName, InputDeclaration>) -> VerificationRequest {
+    /// The wire request for this target and pinned declarations, taking the
+    /// target's identities.
+    fn into_request(self, inputs: BTreeMap<SlotName, InputDeclaration>) -> VerificationRequest {
         VerificationRequest {
-            verifier_card_uid: self.verifier_card_uid.clone(),
-            card_uid: self.card_uid.clone(),
-            run_id: Some(self.run_id.clone()),
-            group_id: self.group_id.clone(),
+            verifier_card_uid: self.verifier_card_uid,
+            card_uid: self.card_uid,
+            run_id: Some(self.run_id),
+            group_id: self.group_id,
             inputs,
             execution_route_overrides: BTreeMap::new(),
-            deployment_environment: self.deployment_environment.clone(),
+            deployment_environment: self.deployment_environment,
         }
     }
 }

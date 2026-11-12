@@ -766,7 +766,7 @@ where
                 _ => None,
             },
             Action::Agent(call) => match &(self.resolve)(&call.agent)?.prompt.response_type {
-                ResponseType::JsonSchema { schema, .. } => Some(schema.clone()),
+                ResponseType::JsonSchema { schema, .. } => Some(Value::clone(schema)),
                 ResponseType::Text => Some(json!({ "type": "string" })),
             },
             Action::Code(_) => None,

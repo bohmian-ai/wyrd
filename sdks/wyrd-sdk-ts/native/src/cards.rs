@@ -911,7 +911,7 @@ struct HydratedAgentProjection<'a> {
 /// exactly what the Rust and Python surfaces report.
 fn hydrated_prompt<'a>(card: &'a Card, prompt: &'a Prompt) -> HydratedPromptProjection<'a> {
     let (response_schema, response_schema_name) = match &prompt.response_type {
-        ResponseType::JsonSchema { name, schema } => (Some(schema), Some(name.as_str())),
+        ResponseType::JsonSchema { name, schema } => (Some(&**schema), Some(name.as_str())),
         ResponseType::Text => (None, None),
     };
     HydratedPromptProjection {

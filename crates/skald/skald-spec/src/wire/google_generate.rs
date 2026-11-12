@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::wire::common::TokenUsage;
+use crate::wire::common::{SharedSchema, TokenUsage};
 
 /// `POST /v1beta/models/{model}:generateContent`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -241,11 +241,11 @@ pub struct GoogleGenerationConfig {
     /// Response schema in Gemini's OpenAPI-subset `Schema`, which refuses
     /// `additionalProperties`. Accepted for native bodies; Skald never emits it.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub response_schema: Option<Value>,
+    pub response_schema: Option<SharedSchema>,
     /// Response schema as JSON Schema, which Gemini and Vertex accept
     /// natively. Skald emits this field for structured output.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub response_json_schema: Option<Value>,
+    pub response_json_schema: Option<SharedSchema>,
     /// Presence penalty.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub presence_penalty: Option<f32>,

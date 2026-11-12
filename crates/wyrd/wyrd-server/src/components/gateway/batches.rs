@@ -20,7 +20,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use wyrd_gateway::{BatchAction, BatchInput, IngressDialect, ResponseBody, UploadContent};
+use wyrd_gateway::{
+    BatchAction, BatchInput, IngressDialect, RequestJson, ResponseBody, UploadContent,
+};
 use wyrd_runtime::{Action, PermissionScope, Resource};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::GatewayAccess;
@@ -73,7 +75,7 @@ impl BatchAnswer {
     fn object(object: &impl serde::Serialize) -> Result<Self, WyrdError> {
         Ok(Self {
             status: 200,
-            body: ResponseBody::Json(to_raw_value(object).map_err(internal)?),
+            body: ResponseBody::Json(to_raw_value(object).map_err(internal)?.into()),
         })
     }
 }
@@ -278,7 +280,7 @@ impl<'a> GatewayBatches<'a> {
             ingress: IngressDialect::OpenAi,
             model,
             fallback: None,
-            body,
+            body: RequestJson::from(body),
             media: None,
             batch: Some(action),
             deployment,

@@ -1,27 +1,31 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields)]
-pub struct OpenAiEmbeddingsRequest {
-    pub model: String,
-    pub input: OpenAiEmbeddingsInput,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub encoding_format: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dimensions: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub user: Option<String>,
+crate::wire_contract! {
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+    #[serde(deny_unknown_fields)]
+    pub struct OpenAiEmbeddingsRequest as OpenAiEmbeddingsRequestView {
+        pub model: String,
+        pub input: OpenAiEmbeddingsInput,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub encoding_format: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub dimensions: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub user: Option<String>,
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[serde(untagged)]
-pub enum OpenAiEmbeddingsInput {
-    One(String),
-    Many(Vec<String>),
-    Tokens(Vec<u32>),
-    TokenBatches(Vec<Vec<u32>>),
+crate::wire_contract! {
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+    #[serde(untagged)]
+    pub enum OpenAiEmbeddingsInput as OpenAiEmbeddingsInputView {
+        One(String),
+        Many(Vec<String>),
+        Tokens(Vec<u32>),
+        TokenBatches(Vec<Vec<u32>>),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

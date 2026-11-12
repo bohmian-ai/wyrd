@@ -1518,7 +1518,9 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
 /// Binding status, evidence planning, direct execution, enqueue, and
 /// execution status publish their typed request and response schemas,
 /// enqueue answers `202 Accepted`, direct execution answers `200` with its
-/// result and documents its stable refusals, and no other Verification
+/// compact result and documents its stable refusals, execution details are
+/// their own read whose requirements add the check and provenance the
+/// compact requirements omit, and no other Verification
 /// operation is routed: evidence plans target the shared storage upload
 /// routes. The served
 /// document names no retired evaluation identifier — neither an abbreviation
@@ -1531,7 +1533,7 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
 /// method, status, or schema reference differs, or when the document names a
 /// retired evaluation identifier.
 #[tokio::test]
-async fn verification_contract_publishes_five_typed_operations_and_the_local_upload() {
+async fn verification_contract_publishes_six_typed_operations_and_the_local_upload() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -1557,6 +1559,7 @@ async fn verification_contract_publishes_five_typed_operations_and_the_local_upl
             ("/v1/verification/evidence", "post"),
             ("/v1/verification/execute", "post"),
             ("/v1/verification/executions/{execution_id}", "get"),
+            ("/v1/verification/executions/{execution_id}/details", "get"),
         ])
     );
 
@@ -1598,6 +1601,51 @@ async fn verification_contract_publishes_five_typed_operations_and_the_local_upl
         )
         .as_deref(),
         Some("#/components/schemas/VerificationExecutionState")
+    );
+    assert_eq!(
+        schema_ref(
+            &paths["/v1/verification/executions/{execution_id}/details"]["get"],
+            "200"
+        )
+        .as_deref(),
+        Some("#/components/schemas/VerificationDetails")
+    );
+    let fields = |name: &str| -> BTreeSet<String> {
+        let mut found = BTreeSet::new();
+        let mut pending = vec![&document["components"]["schemas"][name]];
+        while let Some(schema) = pending.pop() {
+            let schema = resolve_schema(&document, schema);
+            if let Some(properties) = schema["properties"].as_object() {
+                found.extend(properties.keys().cloned());
+            }
+            if let Some(arms) = schema["allOf"].as_array() {
+                pending.extend(arms);
+            }
+        }
+        found
+    };
+    assert_eq!(
+        fields("VerificationOutcome"),
+        BTreeSet::from(["verdict".to_owned(), "requirements".to_owned()])
+    );
+    let compact = fields("RequirementResult");
+    assert!(
+        !compact.contains("check") && !compact.contains("provenance"),
+        "{compact:?}"
+    );
+    let outcome = fields("OutcomeDetails");
+    assert!(
+        ["verdict", "requirements", "steps", "evidence"]
+            .iter()
+            .all(|field| outcome.contains(*field)),
+        "{outcome:?}"
+    );
+    let described = fields("RequirementDetails");
+    assert!(
+        compact.is_subset(&described)
+            && described.contains("check")
+            && described.contains("provenance"),
+        "{described:?}"
     );
     let execute = &paths["/v1/verification/execute"]["post"];
     assert_eq!(

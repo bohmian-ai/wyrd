@@ -428,6 +428,12 @@ impl WyrdMcpHandler {
                     .await
                     .map_err(wyrd_error_to_mcp)
             }
+            verification::GET_EXECUTION_DETAILS => {
+                let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
+                self.mcp_get_execution_details(caller, request.arguments)
+                    .await
+                    .map_err(wyrd_error_to_mcp)
+            }
             name @ (verification::EVIDENCE | verification::EXECUTE | verification::ENQUEUE) => {
                 let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
                 // Authorized and audited by the operation, like revocation.

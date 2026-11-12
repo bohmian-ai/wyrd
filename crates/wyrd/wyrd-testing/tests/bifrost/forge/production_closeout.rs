@@ -241,6 +241,7 @@ impl CloseoutJourney {
                     cpu_source: ResourceSource::Injected,
                 }),
                 oracle_query_slot_limit: None,
+                ..TestOracleResources::default()
             });
         }
         if !profile.production_resources {

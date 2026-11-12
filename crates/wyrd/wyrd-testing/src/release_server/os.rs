@@ -156,44 +156,58 @@ impl HostLoad {
     }
 }
 
-/// A background thread recording the highest resident memory one process
-/// reaches from [`PeakSampler::start`] until [`PeakSampler::finish`].
+/// The resident memory one process held over a window, bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryReadings {
+    /// The first reading, taken as the window opened.
+    pub opening: u64,
+    /// The largest reading.
+    pub peak: u64,
+}
+
+/// A background thread recording the resident memory one process holds
+/// when [`PeakSampler::start`] runs and the highest it reaches until
+/// [`PeakSampler::finish`].
 ///
 /// The OS keeps no portable resettable peak, so the window's peak is the
 /// largest of readings taken every [`PEAK_SAMPLE_INTERVAL`].
 pub struct PeakSampler {
     /// Set to end the sampling loop.
     stop: Arc<AtomicBool>,
-    /// The sampling thread, returning the peak it saw; taken by `finish`.
-    thread: Option<JoinHandle<u64>>,
+    /// The sampling thread, returning what it read; taken by `finish`.
+    thread: Option<JoinHandle<Option<MemoryReadings>>>,
 }
 
 impl PeakSampler {
     /// Starts sampling process `pid`'s resident memory on a new thread.
     ///
     /// The thread reads until stopped or the process exits, keeping the
-    /// largest reading.
+    /// first and the largest reading.
     pub(crate) fn start(pid: u32) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = Arc::clone(&stop);
         let thread = std::thread::spawn(move || {
             let pid = Pid::from_u32(pid);
             let mut system = System::new();
-            let mut peak = 0;
+            let mut readings: Option<MemoryReadings> = None;
             while refresh_process(
                 &mut system,
                 pid,
                 ProcessRefreshKind::nothing().with_memory(),
             ) {
-                peak = system
-                    .process(pid)
-                    .map_or(peak, |process| peak.max(process.memory()));
+                if let Some(memory) = system.process(pid).map(sysinfo::Process::memory) {
+                    let seen = readings.get_or_insert(MemoryReadings {
+                        opening: memory,
+                        peak: memory,
+                    });
+                    seen.peak = seen.peak.max(memory);
+                }
                 if stopped.load(Ordering::Relaxed) {
                     break;
                 }
                 std::thread::sleep(PEAK_SAMPLE_INTERVAL);
             }
-            peak
+            readings
         });
         Self {
             stop,
@@ -201,18 +215,18 @@ impl PeakSampler {
         }
     }
 
-    /// Stops sampling and returns the peak resident memory seen, in bytes.
+    /// Stops sampling and returns the opening and peak resident memory.
     ///
     /// # Errors
     ///
     /// Returns an error when the sampling thread panicked or never read the
     /// process.
-    pub(crate) fn finish(mut self) -> io::Result<u64> {
+    pub(crate) fn finish(mut self) -> io::Result<MemoryReadings> {
         self.stop.store(true, Ordering::Relaxed);
         let thread = self.thread.take().expect("a sampler is finished once");
         match thread.join() {
-            Ok(0) => Err(io::Error::other("the process was never sampled")),
-            Ok(peak) => Ok(peak),
+            Ok(Some(readings)) if readings.peak > 0 => Ok(readings),
+            Ok(_) => Err(io::Error::other("the process was never sampled")),
             Err(_) => Err(io::Error::other("the memory sampler panicked")),
         }
     }
@@ -247,6 +261,10 @@ mod tests {
             None,
             "a missing process reads nothing"
         );
-        assert!(sampler.finish().expect("sampled peak") > 0);
+        let memory = sampler.finish().expect("sampled memory");
+        assert!(
+            0 < memory.opening && memory.opening <= memory.peak,
+            "{memory:?}"
+        );
     }
 }

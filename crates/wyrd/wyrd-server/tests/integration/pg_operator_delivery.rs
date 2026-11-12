@@ -35,7 +35,7 @@ use wyrd_spec::card::verifier::Check;
 use wyrd_spec::ids::{CardUid, ExecutionId, FeatureName};
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
-    RequirementDetail, RequirementOutcome, RequirementResult, VerificationOutcome,
+    ExecutedOutcome, ExecutedRequirement, RequirementDetail, RequirementOutcome, RequirementResult,
 };
 use wyrd_spec::verification::{
     DriftReport, DriftVerdict, FeatureDriftReport, FrozenTarget, VerificationVerdict,
@@ -549,18 +549,20 @@ fn failing_script(runs: usize) -> EngineScript {
         .collect(),
         verdict: DriftVerdict::Drift,
     };
-    let outcome = VerificationOutcome {
+    let outcome = ExecutedOutcome {
         verdict: VerificationVerdict::Failed,
-        requirements: vec![RequirementResult {
-            id: TaskId::new("drift").expect("task id"),
-            step: None,
-            statement: "The window does not drift.".to_owned(),
-            outcome: RequirementOutcome::Failed,
-            reason: "latency drifted".to_owned(),
-            actual: None,
-            citations: Vec::new(),
-            data: None,
-            detail: Some(RequirementDetail::Drift(report)),
+        requirements: vec![ExecutedRequirement {
+            result: RequirementResult {
+                id: TaskId::new("drift").expect("task id"),
+                step: None,
+                statement: "The window does not drift.".to_owned(),
+                outcome: RequirementOutcome::Failed,
+                reason: "latency drifted".to_owned(),
+                actual: None,
+                citations: Vec::new(),
+                data: None,
+                detail: Some(RequirementDetail::Drift(report)),
+            },
             check: serde_json::from_value::<Check>(json!({
                 "kind": "drift", "on": "inputs.samples", "method": "Custom",
                 "signal": { "kind": "Metric", "name": "latency_ms" },
@@ -580,8 +582,8 @@ fn failing_script(runs: usize) -> EngineScript {
 }
 
 /// A passed outcome with no requirements, which dispatches no Operator.
-fn passed_outcome() -> VerificationOutcome {
-    VerificationOutcome {
+fn passed_outcome() -> ExecutedOutcome {
+    ExecutedOutcome {
         verdict: VerificationVerdict::Passed,
         requirements: Vec::new(),
         steps: Vec::new(),

@@ -3,6 +3,15 @@
 version = 4
 
 [[package]]
+name = "addr2line"
+version = "0.27.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e567177890eb1617b1f774005b66b26b2377afd138a2ca37aae7d8f0c81429d4"
+dependencies = [
+ "gimli",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -202,7 +211,7 @@ dependencies = [
  "crc32fast",
  "digest 0.10.7",
  "log",
- "miniz_oxide",
+ "miniz_oxide 0.8.9",
  "num-bigint 0.4.8",
  "quad-rand",
  "rand 0.9.5",
@@ -233,7 +242,7 @@ version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4087686b4b0a3427190bae57a1d9a478dbb2d40c5dc1bd6e2b6d797913bdd348"
 dependencies = [
- "object",
+ "object 0.37.3",
 ]
 
 [[package]]
@@ -278,7 +287,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 [[package]]
 name = "arrow"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -298,7 +307,7 @@ dependencies = [
 [[package]]
 name = "arrow-arith"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -311,7 +320,7 @@ dependencies = [
 [[package]]
 name = "arrow-array"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "ahash",
  "arrow-buffer",
@@ -329,7 +338,7 @@ dependencies = [
 [[package]]
 name = "arrow-buffer"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "bytes",
  "half",
@@ -340,7 +349,7 @@ dependencies = [
 [[package]]
 name = "arrow-cast"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -361,7 +370,7 @@ dependencies = [
 [[package]]
 name = "arrow-cmp"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -371,7 +380,7 @@ dependencies = [
 [[package]]
 name = "arrow-csv"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -385,7 +394,7 @@ dependencies = [
 [[package]]
 name = "arrow-data"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "arrow-buffer",
  "arrow-schema",
@@ -397,7 +406,7 @@ dependencies = [
 [[package]]
 name = "arrow-flight"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -417,7 +426,7 @@ dependencies = [
 [[package]]
 name = "arrow-ipc"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -432,7 +441,7 @@ dependencies = [
 [[package]]
 name = "arrow-json"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -456,7 +465,7 @@ dependencies = [
 [[package]]
 name = "arrow-ord"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -469,7 +478,7 @@ dependencies = [
 [[package]]
 name = "arrow-row"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -481,7 +490,7 @@ dependencies = [
 [[package]]
 name = "arrow-schema"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "serde_core",
  "serde_json",
@@ -490,7 +499,7 @@ dependencies = [
 [[package]]
 name = "arrow-select"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "ahash",
  "arrow-array",
@@ -504,7 +513,7 @@ dependencies = [
 [[package]]
 name = "arrow-string"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -809,6 +818,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "backtrace"
+version = "0.3.77"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42f4220217f3288537b83684130f42fad43320b1c3b805f1910d683d52ded24f"
+dependencies = [
+ "addr2line",
+ "cfg-if",
+ "libc",
+ "miniz_oxide 0.9.1",
+ "object 0.40.0",
+ "rustc-demangle",
+ "windows-link",
+]
+
+[[package]]
 name = "base16ct"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -990,7 +1014,7 @@ dependencies = [
 [[package]]
 name = "bohmian-parquet-variant"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "arrow-schema",
  "chrono",
@@ -1003,7 +1027,7 @@ dependencies = [
 [[package]]
 name = "bohmian-parquet-variant-compute"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -1019,7 +1043,7 @@ dependencies = [
 [[package]]
 name = "bohmian-parquet-variant-json"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "arrow-schema",
  "base64 0.23.1",
@@ -3340,7 +3364,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
- "miniz_oxide",
+ "miniz_oxide 0.8.9",
  "zlib-rs",
 ]
 
@@ -3629,6 +3653,12 @@ dependencies = [
  "opaque-debug",
  "polyval",
 ]
+
+[[package]]
+name = "gimli"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1033caf0b349c518623b5396bfb2cf0bddf44f0306d543a250e5743297aafd10"
 
 [[package]]
 name = "glob"
@@ -3995,7 +4025,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=469cf4aff3aaee824f2ec3ce685c61411a08640e#469cf4aff3aaee824f2ec3ce685c61411a08640e"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=e849bc4fa46430e6278a4c201106cdd68dc5b244#e849bc4fa46430e6278a4c201106cdd68dc5b244"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -4054,7 +4084,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-sql"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=469cf4aff3aaee824f2ec3ce685c61411a08640e#469cf4aff3aaee824f2ec3ce685c61411a08640e"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=e849bc4fa46430e6278a4c201106cdd68dc5b244#e849bc4fa46430e6278a4c201106cdd68dc5b244"
 dependencies = [
  "async-trait",
  "iceberg",
@@ -4065,7 +4095,7 @@ dependencies = [
 [[package]]
 name = "iceberg-compaction-core"
 version = "0.1.0"
-source = "git+https://github.com/bohmian-ai/iceberg-compaction?rev=41662c25186808c5b6dd0f1e031dbb61d08ab0c0#41662c25186808c5b6dd0f1e031dbb61d08ab0c0"
+source = "git+https://github.com/bohmian-ai/iceberg-compaction?rev=764fe2a8bbf2a8d1577ca27fec76751ac91c07ff#764fe2a8bbf2a8d1577ca27fec76751ac91c07ff"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4093,7 +4123,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=469cf4aff3aaee824f2ec3ce685c61411a08640e#469cf4aff3aaee824f2ec3ce685c61411a08640e"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=e849bc4fa46430e6278a4c201106cdd68dc5b244#e849bc4fa46430e6278a4c201106cdd68dc5b244"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4980,6 +5010,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "miniz_oxide"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
+dependencies = [
+ "adler2",
+]
+
+[[package]]
 name = "mio"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5510,6 +5549,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "object"
+version = "0.40.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd229a0361b9d0d4396176e02d65897f487eebeab7caa6d443855ee152ca0b9c"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "object_store"
 version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5797,7 +5845,7 @@ dependencies = [
 [[package]]
 name = "parquet"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "ahash",
  "arrow-array",
@@ -6274,7 +6322,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "petgraph 0.8.3",
@@ -6295,7 +6343,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -7133,6 +7181,12 @@ checksum = "5a4edc941f215495170a1bda0beeeb31db2fdcd67beecfe7f29d94b2663e1965"
 dependencies = [
  "get-size2",
 ]
+
+[[package]]
+name = "rustc-demangle"
+version = "0.1.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b74b56ffa8bb2830709a538c2cbcae9aa062db0d2a42563bfb09bdaae44020eb"
 
 [[package]]
 name = "rustc-hash"
@@ -9170,6 +9224,7 @@ dependencies = [
  "workspace-hack",
  "wyrd-auth-verify",
  "wyrd-bench",
+ "wyrd-benchmark",
  "wyrd-dev-fixtures",
  "wyrd-queue",
  "wyrd-runtime",
@@ -9250,6 +9305,7 @@ dependencies = [
  "uuid",
  "vala-drift",
  "workspace-hack",
+ "wyrd-benchmark",
  "wyrd-skald-agent",
  "wyrd-skald-prompt",
  "wyrd-skald-providers",
@@ -9895,8 +9951,6 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-core",
- "tracing-log",
- "tracing-subscriber",
  "twox-hash",
  "typenum",
  "url",
@@ -10088,6 +10142,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrd-benchmark"
+version = "0.4.1"
+dependencies = [
+ "backtrace",
+ "flate2",
+ "hdrhistogram",
+ "http",
+ "metrics",
+ "num-traits",
+ "prost",
+ "serde",
+ "tracing",
+ "tracing-subscriber",
+ "ulid",
+ "workspace-hack",
+ "wyrd-benchmark",
+]
+
+[[package]]
 name = "wyrd-cards"
 version = "0.4.1"
 dependencies = [
@@ -10206,6 +10279,7 @@ dependencies = [
  "vala-bifrost-redux",
  "wiremock",
  "workspace-hack",
+ "wyrd-benchmark",
  "wyrd-cards",
  "wyrd-loader",
  "wyrd-queue",
@@ -10285,6 +10359,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bigdecimal",
+ "bytes",
  "chrono",
  "metrics",
  "rcgen",
@@ -10303,6 +10378,7 @@ dependencies = [
  "uuid",
  "wiremock",
  "workspace-hack",
+ "wyrd-benchmark",
  "wyrd-crypt",
  "wyrd-skald-providers",
  "wyrd-skald-spec",
@@ -10610,6 +10686,7 @@ dependencies = [
  "wyrd-auth-issue",
  "wyrd-auth-oidc",
  "wyrd-auth-verify",
+ "wyrd-benchmark",
  "wyrd-client",
  "wyrd-crypt",
  "wyrd-dev-fixtures",
@@ -10618,6 +10695,7 @@ dependencies = [
  "wyrd-queue",
  "wyrd-runtime",
  "wyrd-semver",
+ "wyrd-server",
  "wyrd-skald-agent",
  "wyrd-skald-prompt",
  "wyrd-skald-providers",
@@ -10697,6 +10775,8 @@ version = "0.4.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "bytes",
+ "http",
  "httpdate",
  "insta",
  "jsonwebtoken",
@@ -10872,10 +10952,8 @@ dependencies = [
 name = "wyrd-telemetry"
 version = "0.4.1"
 dependencies = [
- "hdrhistogram",
  "http",
  "metrics",
- "num-traits",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-proto",
@@ -10951,6 +11029,7 @@ dependencies = [
  "wyrd-auth-issue",
  "wyrd-auth-oidc",
  "wyrd-auth-verify",
+ "wyrd-benchmark",
  "wyrd-client",
  "wyrd-crypt",
  "wyrd-dev-fixtures",
@@ -11000,6 +11079,7 @@ dependencies = [
  "tracing",
  "uuid",
  "workspace-hack",
+ "wyrd-benchmark",
  "wyrd-spec",
  "wyrd-telemetry",
  "wyrd-tls",

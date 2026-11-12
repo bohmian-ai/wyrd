@@ -28,12 +28,21 @@ use crate::scribe::parquet_writer::{
     ArtifactPlan, BoundedParquetArtifactSet, RowGroupStats, encode_ordered_claim,
 };
 
-/// Rows decoded from each run at a time while merging one claim.
+/// Most rows decoded from each run at a time while sampling or merging one claim.
 ///
-/// The merge holds one decoded batch per run, so this is what bounds a claim's
-/// Arrow footprint: members, not object size, decide how much memory assembly
-/// owns.
+/// Rows alone never bound a claim's memory: a batch is also shaped to
+/// [`MERGE_BATCH_BYTES`] from its run's footer, so wide rows decode in fewer
+/// rows per batch.
 pub(crate) const MERGE_BATCH_ROWS: usize = 8 * 1024;
+
+/// Decoded bytes one run batch, and one merged batch, is shaped to.
+///
+/// The merge holds one decoded batch per run and one merged batch, each
+/// charged to the Scribe persistence reservation while held, so members and
+/// row width, not object size, decide how much memory assembly owns. A row
+/// wider than this target is still decoded alone, so an accepted row always
+/// progresses when its own bytes can be reserved.
+pub(crate) const MERGE_BATCH_BYTES: usize = 4 * 1024 * 1024;
 
 /// One claim's validated runs, ready for the blocking merge and encode.
 #[derive(Debug, Clone)]
@@ -259,13 +268,15 @@ impl ClaimAssembler {
     pub fn encode(&self, request: AssembleClaimRequest<'_>) -> Result<AssembledClaim, ScribeError> {
         let variant_layout =
             ClaimVariantSample::new(request.runs.claim, request.runs.runs(), &request.schema)
-                .layout()?;
-        let merge = StagedRunMerge::open(
+                .layout(&request.memory)?;
+        let mut merge = StagedRunMerge::open(
             request.runs.runs(),
-            request.schema,
+            Arc::clone(&request.schema),
+            variant_layout.clone(),
             request.tenant,
             request.layout,
             MERGE_BATCH_ROWS,
+            &request.memory,
         )?;
         let (artifacts, row_group_stats) = encode_ordered_claim(
             ArtifactPlan {
@@ -278,7 +289,8 @@ impl ClaimAssembler {
             },
             &request.memory,
             variant_layout.clone(),
-            merge,
+            request.schema,
+            &mut merge,
         )?;
         let rows = artifacts.iter().try_fold(0_u64, |sum, artifact| {
             u64::try_from(artifact.row_count)

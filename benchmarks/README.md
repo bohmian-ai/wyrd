@@ -55,6 +55,18 @@ configuration declares server limits.
 
 ## Measurement
 
+- **One recorder.** A benchmark server installs `wyrd-benchmark` as its only
+  metrics recorder before it registers any metric: request timings,
+  counters, gauges and diagnostic histograms all land in the snapshots it
+  serves at `/benchmark/snapshot` on the loopback metrics port, and no
+  Prometheus recorder or exporter runs. A duration that has both a timing
+  and a production histogram is recorded only as the timing. The recorder,
+  every benchmark-only timing (such as an Agent check's
+  `wyrd_verification_agent_phase_duration_seconds{phase}`), and the heap
+  sampler exist only in a `wyrd-server` built with the `bench` feature, which
+  `bench:build` uses; a shipped build keeps only operational metrics, installs
+  Prometheus, and refuses `WYRD_METRICS_BENCHMARK_SNAPSHOT`. CPU and heap
+  profiles and the OS's CPU and memory readings remain separate sources.
 - **Latency is server-side.** Each judged request is timed inside the server
   from handler entry until its result is ready, its write is acknowledged, or
   its response is handed off, into bounded HDR histograms (3 significant
@@ -165,7 +177,9 @@ What each engine covers:
     the same server timing histograms, to locate a slow tail. Phase
     readings are diagnostic: they never judge and never invalidate.
   - L2 `competing` overlaps direct and background verification with their
-    evidence writes.
+    evidence writes. Submission, queue-wait and durable-ack means and the
+    component breakdown come from the same benchmark histograms. Means
+    retain bucket bounds rather than claiming exact precision.
 - **Gateway.**
   - L1 `overhead` runs buffered, streamed, and 64 KiB capture calls at
     1 and 64 clients. Added overhead p99 must be below 500 µs at 64.
@@ -186,9 +200,10 @@ Flags:
 
 | Flag | Applies to | Effect |
 |---|---|---|
-| `--profile` | every command | Adds optional samply captures under `target/benchmarks/` (see [Profiling](#profiling)). |
+| `--profile` | every command | Adds optional samply CPU captures and per-step server heap profiles under `target/benchmarks/` (see [Profiling](#profiling)). |
 | `--allow-dirty` | every command | Records a dirty source (see [Source](#source)). |
 | `--steps a,b` | engine commands | Runs a declared subset; the record lists every omitted step and never claims full coverage. |
+| `--pace <requests/s>` | `bench:l1:gateway` | Offers every window open loop at that rate, at most one open call per step client, with each missed or capped arrival counted as an error. It is a matched-load diagnostic: the record names the rate in its `workload` control, adds post-drain resident and governed memory by owner to each repetition's observations, and stays under `target/benchmarks/`. |
 
 `bench:l1` accepts only `--profile`, `--allow-dirty`, and `--smoke`, and
 passes them to every engine.
@@ -238,7 +253,7 @@ INVALID, appends to history:
 benchmarks/history/<engine>/<experiment>/YYYYMMDDTHHMMSSZ-<sha9>.json
 ```
 
-A `--steps`, `--profile`, or `--allow-dirty` run writes the same record under
+A `--steps`, `--profile`, `--pace` or dirty `--allow-dirty` run writes the same record under
 `target/benchmarks/<engine>/<experiment>/` and a smoke under
 `target/benchmarks/smoke/`; neither ever enters history.
 
@@ -248,8 +263,8 @@ a `-<n>` suffix. A record holds:
 - the command and non-secret configuration;
 - the host, build, and source;
 - the declared controls and criteria;
-- every repetition's metrics, units, sample counts, and server and driver
-  CPU;
+- every repetition's metrics, units, sample counts, server and driver CPU,
+  and the server's opening and peak resident memory;
 - every criterion's outcome, every reason, and the verdict.
 
 Raw evidence stays under `target/benchmarks/<engine>/<experiment>/<UTC
@@ -259,6 +274,26 @@ can be reproduced after `target/` is gone:
 ```bash
 target/profiling/release/capacity report benchmarks/history/bifrost/parquet/<record>.json
 ```
+
+A step's detail ends with its `diagnostics`: readings stored in each
+repetition as `diagnostic.<observation>.<stat>` (`count`, and `p50_us`,
+`p95_us`, `p99_us`, `mean_us`), judged by no criterion. Each observation is
+listed with its declared boundary and population, then one line per
+repetition with its count, nearest-rank bucket bounds, and mean bounds, so a
+slow repetition is never hidden behind a median. All are wall time, not CPU
+time; observations overlap (Gateway `queue_delay` includes `phase.admit`, and
+`server_elapsed` contains every request phase), so their values are never
+added, and percentiles are never subtracted. An inapplicable observation,
+such as Gateway `phase.relay` for a buffered call, says so; a missing
+required one makes the repetition INVALID; a record that predates
+diagnostics says they are unavailable. Gateway L1 records each phase of
+`wyrd_gateway_phase_duration_seconds`, `queue_delay`, the answer handoff's
+`server_elapsed`, `provider_excluded`, and `residual`, and the Scribe
+`outbox_write.scribe` batch writes, each over its own window population.
+
+When reporting a run, paste this report, fresh or regenerated with
+`capacity report <record>`, and append interpretation below it. Do not
+replace it with hand-built tables or extract results from raw snapshots.
 
 ## History
 
@@ -296,8 +331,39 @@ INVALID. `--allow-dirty` measures it anyway and records the SHA-256 of
 
 ## Profiling
 
-`--profile` runs `samply record` against each server process with the same
+`--profile [cpu|heap|both]` selects the captures; bare `--profile` is
+`both`. A CPU capture runs `samply record` against each server process with the same
 invocation on every platform, and saves the captures under the run's
 `target/benchmarks/` artifacts. A profile is diagnostic only. When samply is
 missing or a capture fails, the record carries a note instead, and the
 verdict is unchanged.
+
+A heap capture (`heap` or `both`) profiles the server. Once the fixtures are
+loaded, the run asks the `bench` server build to start sampling its heap:
+about one allocation per 512 KiB allocated, recorded with its call stack,
+through the same mimalloc allocator the server always uses. After each
+measured step, the run saves `profiles/heap-<step>.pb.gz`, a symbolized pprof
+profile with Go's four heap sample types: `alloc_space` and `alloc_objects`
+count everything the steps so far allocated, freed or not, and `inuse_space`
+and `inuse_objects` what they still hold. Memory allocated before sampling
+started is in neither.
+
+Resident memory can grow far past `inuse_space`: memory a step allocates and
+frees before it ends is gone from `inuse_space`, but the allocator may keep
+its pages. `alloc_space` shows which code allocated it.
+
+```bash
+pprof -top profiles/heap-<step>.pb.gz                      # what is held after <step>
+pprof -top -base profiles/heap-<earlier>.pb.gz profiles/heap-<step>.pb.gz  # what <step> still holds beyond <earlier>
+pprof -top -sample_index=alloc_space -base profiles/heap-<earlier>.pb.gz profiles/heap-<step>.pb.gz  # what <step> allocated
+```
+
+`pprof` is Google's profile viewer (`go install github.com/google/pprof@latest`);
+`-http=:8080` opens a flame graph. Each stack starts at the code that asked
+for memory, with the allocator and the standard library's `Vec` and `Box`
+plumbing trimmed. Inlined frames carry short names in the bench build's
+line-table debug info; `-lines` shows their files and lines.
+
+Every repetition also records `opening_memory_bytes`, the server's resident
+memory as its window opened, beside `peak_memory_bytes`. Peak minus opening
+is the memory that window added, in profiled and unprofiled runs alike.

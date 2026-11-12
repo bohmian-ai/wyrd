@@ -203,6 +203,24 @@ impl NativeExecution {
         })
     }
 
+    /// Reads what the completed execution ran: each requirement's authored
+    /// check and provenance, every step, and the pinned evidence.
+    ///
+    /// # Errors
+    /// Returns a napi error only when the details cannot be projected; read
+    /// failures, including `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND`, are
+    /// returned in [`NativeLifecycleResult`].
+    #[napi]
+    pub fn details<'env>(
+        &self,
+        env: &'env Env,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let execution = self.execution.clone();
+        crate::trace::spawn(env, async move {
+            NativeLifecycleResult::outcome(execution.details().await)
+        })
+    }
+
     /// Polls until a result, the execution's terminal error, or `timeout_ms`.
     ///
     /// # Errors

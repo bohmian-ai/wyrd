@@ -512,13 +512,14 @@ async fn judged_answer_passes_the_agent_check() {
             locator: Locator::JsonPointer(String::new()),
         }]
     );
+    let details = assistant.deployment.details(result.execution_id).await;
+    let provenance = &details.outcome.requirements[0].provenance;
     assert!(
         matches!(
-            &requirement.provenance,
+            provenance,
             Some(CallProvenance::Agent { agent: Some(agent), .. }) if agent.name.as_str() == "judge-agent"
         ),
-        "{:?}",
-        requirement.provenance
+        "{provenance:?}"
     );
     let judged = assistant
         .judge
@@ -1486,7 +1487,7 @@ async fn grouped_support_resumes() {
     );
     assert_eq!(snapshot.sources[&slot].execution_ids.len(), 6);
     assert_eq!(snapshot.sources[&slot].execution_ids[5], replayed);
-    let outcome = judged.result.expect("the result is visible").outcome;
+    let outcome = deployment.details(judged.execution_id).await.outcome;
     assert_eq!(
         serde_json::to_value(&outcome.evidence[&slot]).expect("evidence encodes"),
         json!({"kind": "json", "value": turns}),
@@ -2071,7 +2072,7 @@ async fn grouped_coding_uses_declared_sources() {
         .group_execution(&coding.binding, None, WAIT)
         .await;
 
-    let outcome = judged.result.expect("the result is visible").outcome;
+    let outcome = deployment.details(judged.execution_id).await.outcome;
     let evidence = |slot: &str| {
         serde_json::to_value(&outcome.evidence[&slot.parse().expect("slot name")])
             .expect("evidence encodes")
@@ -2088,7 +2089,7 @@ async fn grouped_coding_uses_declared_sources() {
     let judged_requirements: Vec<_> = outcome
         .requirements
         .iter()
-        .map(|requirement| (requirement.id.as_str(), requirement.outcome))
+        .map(|requirement| (requirement.result.id.as_str(), requirement.result.outcome))
         .collect();
     assert_eq!(
         judged_requirements,
@@ -2465,10 +2466,9 @@ async fn grouped_sampled_frames_use_visible_outcomes() {
             "empty_selection".to_owned()
         )
     );
-    let evidence = &judged
-        .result
-        .as_ref()
-        .expect("the result is visible")
+    let evidence = deployment
+        .details(judged.execution_id)
+        .await
         .outcome
         .evidence;
     assert_eq!(
@@ -2534,11 +2534,7 @@ async fn grouped_sampled_frames_use_visible_outcomes() {
         .iter()
         .map(|id| if id == unbadged { "failed" } else { "passed" })
         .collect();
-    let outcome = &judged
-        .result
-        .as_ref()
-        .expect("the result is visible")
-        .outcome;
+    let outcome = deployment.details(judged.execution_id).await.outcome;
     assert_eq!(
         serde_json::to_value(&outcome.evidence[&outcomes]).expect("evidence encodes"),
         json!({ "kind": "json", "value": expected }),
@@ -2572,11 +2568,7 @@ async fn grouped_sampled_frames_use_visible_outcomes() {
             .map(Execution::id)
             .collect::<BTreeSet<_>>()
     );
-    let outcome = &judged
-        .result
-        .as_ref()
-        .expect("the result is visible")
-        .outcome;
+    let outcome = deployment.details(judged.execution_id).await.outcome;
     assert_eq!(
         serde_json::to_value(&outcome.evidence[&outcomes]).expect("evidence encodes"),
         json!({ "kind": "json", "value": vec!["passed"; 21] }),
@@ -2641,10 +2633,9 @@ async fn grouped_sampled_frames_use_visible_outcomes() {
     );
     assert_eq!(
         serde_json::to_value(
-            &judged
-                .result
-                .as_ref()
-                .expect("the result is visible")
+            &deployment
+                .details(judged.execution_id)
+                .await
                 .outcome
                 .evidence[&outcomes]
         )
@@ -2850,6 +2841,7 @@ async fn grouped_conversations_coexist_with_drift() {
             .await
             .expect("the execution reads");
         let result = state.result.expect("the result is visible");
+        let details = deployment.details(*id).await;
         judged.push((
             state.group_id.expect("a group execution names its group"),
             state
@@ -2858,7 +2850,7 @@ async fn grouped_conversations_coexist_with_drift() {
                 .sources[&slot]
                 .execution_ids
                 .len(),
-            serde_json::to_value(&result.outcome.evidence[&slot]).expect("evidence encodes"),
+            serde_json::to_value(&details.outcome.evidence[&slot]).expect("evidence encodes"),
             result.outcome.verdict,
         ));
     }
@@ -2900,13 +2892,17 @@ async fn grouped_conversations_coexist_with_drift() {
     assistant.deployment.shutdown().await;
 }
 
-/// One evidence slot of `execution`'s result as JSON.
+/// One pinned evidence slot of `execution` as JSON, read from its details.
 ///
 /// # Panics
-/// Panics when the execution has no result or no such slot.
-fn evidence(execution: &VerificationExecutionState, slot: &str) -> serde_json::Value {
-    let result = execution.result.as_ref().expect("the result is visible");
-    serde_json::to_value(&result.outcome.evidence[&slot.parse().expect("slot name")])
+/// Panics when the details do not read or have no such slot.
+async fn evidence(
+    deployment: &Deployment,
+    execution: &VerificationExecutionState,
+    slot: &str,
+) -> serde_json::Value {
+    let details = deployment.details(execution.execution_id).await;
+    serde_json::to_value(&details.outcome.evidence[&slot.parse().expect("slot name")])
         .expect("evidence encodes")
 }
 
@@ -3008,7 +3004,7 @@ async fn grouped_executions_include_late_evidence() {
         .expect("the first execution completes");
     let first = execution.status().await.expect("the execution reads");
     assert_eq!(
-        evidence(&first, "answer"),
+        evidence(deployment, &first, "answer").await,
         json!({"kind": "json", "value": ["first answer"]})
     );
 
@@ -3016,12 +3012,12 @@ async fn grouped_executions_include_late_evidence() {
         .group_execution(&late.binding, Some(&first_id), WAIT)
         .await;
     assert_eq!(
-        evidence(&next, "answer"),
+        evidence(deployment, &next, "answer").await,
         json!({"kind": "json", "value": ["first answer", "second answer", "late answer"]}),
         "one next execution covers every answer recorded during the first"
     );
     assert_eq!(
-        evidence(&next, "agreed"),
+        evidence(deployment, &next, "agreed").await,
         json!({"kind": "json", "value": ["passed", "passed", null]}),
         "the still-running judgment is pinned null"
     );
@@ -3030,7 +3026,7 @@ async fn grouped_executions_include_late_evidence() {
         .group_execution(&late.binding, Some(&next.execution_id), WAIT)
         .await;
     assert_eq!(
-        evidence(&settled, "agreed"),
+        evidence(deployment, &settled, "agreed").await,
         json!({"kind": "json", "value": ["passed", "passed", "passed"]}),
         "the late judgment is judged by exactly one more execution"
     );
@@ -3242,7 +3238,7 @@ async fn verification_staging_refuses_and_recovers() {
         .await;
     assert_eq!(judged.group_id.as_ref(), Some(&group));
     assert_eq!(
-        evidence(&judged, "turns"),
+        evidence(&assistant.deployment, &judged, "turns").await,
         json!({"kind": "json", "value": [{"answer": "pressured"}]}),
         "the refused grouped turn staged nothing"
     );

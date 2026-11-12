@@ -635,10 +635,7 @@ impl PyOpenAiJsonSchema {
         self.s()
             .schema
             .as_ref()
-            .map(|m| {
-                wyrd_utils::py::json_to_pyobject(py, &serde_json::Value::Object(m.clone()))
-                    .map_err(Into::into)
-            })
+            .map(|m| wyrd_utils::py::json_to_pyobject(py, m.shared()).map_err(Into::into))
             .transpose()
     }
     #[getter]

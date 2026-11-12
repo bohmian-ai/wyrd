@@ -1,8 +1,12 @@
-//! Prometheus metrics recorder + scrape endpoint.
+//! The process metrics backend and its listener.
 //!
-//! The recorder is installed once at startup; `track_metrics`
-//! (`http/middleware/metrics.rs`) records per-request counters/histograms into
-//! it, and `/metrics` renders the current snapshot on a dedicated listener.
+//! One backend is selected and installed once at startup, before any metric
+//! is registered: the production Prometheus recorder, whose `/metrics`
+//! renders the current exposition, or, for an explicit benchmark on a
+//! loopback listener, the [`wyrd_benchmark`] recorder, whose snapshot route
+//! replaces `/metrics`. `track_metrics` (`http/middleware/metrics.rs`) and
+//! every other owner record through the standard `metrics` facade into
+//! whichever one was installed.
 
 use std::future::ready;
 use std::sync::Arc;
@@ -162,6 +166,10 @@ pub const GATEWAY_ATTEMPT_DURATION_SECONDS: &str = "wyrd_gateway_attempt_duratio
 pub const GATEWAY_TIME_TO_FIRST_BYTE_SECONDS: &str = "wyrd_gateway_time_to_first_byte_seconds";
 /// A governed call's receipt until its execution task started.
 pub const GATEWAY_QUEUE_DELAY_SECONDS: &str = "wyrd_gateway_queue_delay_seconds";
+/// One controlled wait of a governed call, recorded only while
+/// benchmarking: its execution task's dispatch, the caller's resumption on
+/// its answer, or its provider header wait and body receipt.
+pub const GATEWAY_WAIT_SECONDS: &str = "wyrd_gateway_wait_seconds";
 
 /// Gateway latency families sharing [`VERIFICATION_DURATION_BUCKETS`], so a
 /// sub-millisecond overhead p99 is resolvable.
@@ -220,6 +228,57 @@ pub enum MetricsError {
     /// A global recorder was already installed in this process.
     #[error("failed to install metrics recorder")]
     Install(#[source] metrics_exporter_prometheus::BuildError),
+    /// Another recorder was installed before the benchmark recorder.
+    #[error("failed to install the benchmark recorder")]
+    Benchmark(#[source] metrics::SetRecorderError<wyrd_benchmark::BenchmarkRecorder>),
+    /// The benchmark recorder was requested from a build without the `bench`
+    /// feature, which has no recorder to install.
+    #[error("the benchmark recorder requires a wyrd-server built with the `bench` feature")]
+    BenchmarkUnavailable,
+}
+
+/// The process's one metrics backend, selected once at startup.
+#[derive(Clone)]
+pub enum MetricsBackend {
+    /// The production Prometheus recorder and its render handle.
+    Prometheus(PrometheusHandle),
+    /// The [`wyrd_benchmark`] recorder of an explicit benchmark server.
+    Benchmark,
+}
+
+impl MetricsBackend {
+    /// Installs the benchmark recorder when `benchmark`, which configuration
+    /// allows only on a loopback metrics listener, and the production
+    /// Prometheus recorder otherwise, then registers the Gate families into
+    /// it. Call once per process, before any metric is registered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MetricsError`] when bucket setup fails, a recorder is
+    /// already installed, or `benchmark` is requested from a build without
+    /// the `bench` feature; nothing falls back to the other backend.
+    pub fn install(benchmark: bool) -> Result<Self, MetricsError> {
+        if !benchmark {
+            return install_recorder().map(Self::Prometheus);
+        }
+        #[cfg(not(feature = "bench"))]
+        return Err(MetricsError::BenchmarkUnavailable);
+        #[cfg(feature = "bench")]
+        {
+            wyrd_benchmark::install().map_err(MetricsError::Benchmark)?;
+            vala_bifrost_redux::gate::initialize_gate_metrics();
+            Ok(Self::Benchmark)
+        }
+    }
+
+    /// The Prometheus render handle; `None` for the benchmark backend.
+    #[must_use]
+    pub fn prometheus(&self) -> Option<&PrometheusHandle> {
+        match self {
+            Self::Prometheus(handle) => Some(handle),
+            Self::Benchmark => None,
+        }
+    }
 }
 
 /// Error returned while composing Wyrd's process-wide telemetry runtime.
@@ -233,30 +292,34 @@ pub enum TelemetryRuntimeError {
     Metrics(#[source] MetricsError),
 }
 
-/// Server-owned composition of canonical tracing and Prometheus backends.
+/// Server-owned composition of canonical tracing and the metrics backend.
 ///
 /// The runtime is installed once before server or standalone Forge role
 /// composition. `AppState` retains only [`TelemetryGuard`]; the enclosing
-/// lifecycle retains this owner and its read-only render handle.
+/// lifecycle retains this owner and its metrics backend.
 pub struct WyrdTelemetryRuntime {
     /// Guard that owns the process tracing provider lifetime.
     guard: Arc<TelemetryGuard>,
-    /// Handle for the one process-global production Prometheus recorder.
-    prometheus: PrometheusHandle,
+    /// The one process-global metrics backend.
+    metrics: MetricsBackend,
 }
 
 impl WyrdTelemetryRuntime {
-    /// Install the production tracing subscriber and Prometheus recorder.
+    /// Install the production tracing subscriber and the metrics backend
+    /// `benchmark` selects ([`MetricsBackend::install`]).
     ///
     /// # Errors
     ///
     /// Returns [`TelemetryRuntimeError`] when either process-global backend
     /// cannot be installed. Callers must retain the returned runtime until
     /// every role has stopped.
-    pub fn install(config: TelemetryConfig) -> Result<Self, TelemetryRuntimeError> {
+    pub fn install(
+        config: TelemetryConfig,
+        benchmark: bool,
+    ) -> Result<Self, TelemetryRuntimeError> {
+        let metrics = MetricsBackend::install(benchmark).map_err(TelemetryRuntimeError::Metrics)?;
         let guard = Arc::new(wyrd_telemetry::init(config).map_err(TelemetryRuntimeError::Tracing)?);
-        let prometheus = install_recorder().map_err(TelemetryRuntimeError::Metrics)?;
-        Ok(Self { guard, prometheus })
+        Ok(Self { guard, metrics })
     }
 
     /// Return the tracing-provider lifetime guard passed into application state.
@@ -265,10 +328,17 @@ impl WyrdTelemetryRuntime {
         Arc::clone(&self.guard)
     }
 
-    /// Return the production Prometheus render handle retained by lifecycle owners.
+    /// Return the metrics backend retained by lifecycle owners.
     #[must_use]
-    pub fn prometheus(&self) -> PrometheusHandle {
-        self.prometheus.clone()
+    pub fn metrics(&self) -> MetricsBackend {
+        self.metrics.clone()
+    }
+
+    /// Return the production Prometheus render handle; `None` for a
+    /// benchmark server.
+    #[must_use]
+    pub fn prometheus(&self) -> Option<PrometheusHandle> {
+        self.metrics.prometheus().cloned()
     }
 }
 
@@ -288,7 +358,7 @@ pub fn install_capture_runtime(
     Ok((
         WyrdTelemetryRuntime {
             guard: Arc::new(guard),
-            prometheus,
+            metrics: MetricsBackend::Prometheus(prometheus),
         },
         traces,
     ))
@@ -361,27 +431,61 @@ pub(crate) fn test_prometheus_handle() -> PrometheusHandle {
         .clone()
 }
 
-/// The metrics listener's read-only benchmark timing snapshot route.
-pub const BENCHMARK_TIMINGS_PATH: &str = "/benchmark/timings";
+/// The benchmark metrics listener's read-only snapshot route.
+pub const BENCHMARK_SNAPSHOT_PATH: &str = "/benchmark/snapshot";
 
-/// Build the metrics router: `GET /metrics` renders the Prometheus snapshot.
+/// Build the metrics router for the installed `backend`.
 ///
-/// With `benchmark_snapshot`, which configuration allows only on a loopback
-/// listener, this process starts recording benchmark timing histograms and
-/// `GET` [`BENCHMARK_TIMINGS_PATH`] returns their cumulative
-/// [`wyrd_telemetry::timing::TimingSnapshot`] as JSON: bounded aggregate
-/// distributions and counters only, with no request identity, tenant,
-/// payload, query, or reset. The Prometheus recorder is untouched.
-pub fn metrics_router(handle: PrometheusHandle, benchmark_snapshot: bool) -> Router {
-    let router = Router::new().route("/metrics", get(move || ready(handle.render())));
-    if !benchmark_snapshot {
-        return router;
-    }
-    wyrd_telemetry::timing::enable();
-    router.route(
-        BENCHMARK_TIMINGS_PATH,
-        get(|| ready(axum::Json(wyrd_telemetry::timing::snapshot()))),
-    )
+/// The Prometheus backend serves `GET /metrics`, the rendered exposition.
+/// The benchmark backend, which configuration allows only on a loopback
+/// listener, serves no exposition: `GET` [`BENCHMARK_SNAPSHOT_PATH`] returns
+/// the cumulative [`wyrd_benchmark::BenchmarkSnapshot`] as JSON, bounded
+/// aggregate timings, counters, gauges, and histograms only, with no
+/// request identity, tenant, payload, query, or reset.
+///
+/// A benchmark `bench` build also serves [`wyrd_benchmark::heap::PATH`]:
+/// `POST` starts heap sampling and `GET` returns the sampled allocations,
+/// allocated and still live, as a gzipped pprof profile of sizes and code
+/// locations only.
+pub fn metrics_router(backend: MetricsBackend) -> Router {
+    let MetricsBackend::Prometheus(handle) = backend else {
+        return benchmark_router();
+    };
+    Router::new().route("/metrics", get(move || ready(handle.render())))
+}
+
+/// The benchmark backend's snapshot router.
+fn benchmark_router() -> Router {
+    let router = Router::new().route(
+        BENCHMARK_SNAPSHOT_PATH,
+        get(|| ready(axum::Json(wyrd_benchmark::snapshot()))),
+    );
+    #[cfg(feature = "bench")]
+    let router = router.route(
+        wyrd_benchmark::heap::PATH,
+        get(heap_profile).post(|| {
+            wyrd_benchmark::heap::start();
+            ready(axum::http::StatusCode::NO_CONTENT)
+        }),
+    );
+    router
+}
+
+/// The sampled heap profile, rendered on a blocking thread because
+/// symbolizing takes a while.
+///
+/// # Errors
+///
+/// Answers 500 when rendering panicked.
+#[cfg(feature = "bench")]
+async fn heap_profile() -> Result<impl axum::response::IntoResponse, axum::http::StatusCode> {
+    let profile = tokio::task::spawn_blocking(wyrd_benchmark::heap::profile)
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        profile,
+    ))
 }
 
 /// Serve the metrics router on an already-bound `listener` until `shutdown`.
@@ -447,14 +551,41 @@ mod tests {
         HANDLE.get_or_init(test_prometheus_handle)
     }
 
-    #[test]
-    fn recorder_installs_and_renders() {
+    /// Ordinary startup installs the Prometheus recorder, serves no
+    /// benchmark route, and accumulates no benchmark state from either the
+    /// standard metrics or an explicit request timing.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the render is not exposition text, a benchmark route is
+    /// served, or the benchmark registry recorded anything.
+    #[tokio::test]
+    async fn recorder_installs_and_renders() {
         let handle = get_handle();
         let output = handle.render();
         assert!(
             output.is_empty() || output.contains('#'),
             "render must produce valid Prometheus text (empty or starting with # HELP/# TYPE): got {output:?}"
         );
+        let router = metrics_router(MetricsBackend::Prometheus(handle.clone()));
+        for path in [BENCHMARK_SNAPSHOT_PATH, "/benchmark/heap"] {
+            assert_eq!(fetch(&router, "GET", path).await.0, StatusCode::NOT_FOUND);
+        }
+        metrics::counter!(HTTP_REQUESTS_TOTAL).increment(1);
+        wyrd_benchmark::record_timing(
+            &tracing::Span::none(),
+            "bifrost.query",
+            "success",
+            std::time::Duration::from_micros(1),
+            None,
+        );
+        assert!(!wyrd_benchmark::enabled());
+        let snapshot = wyrd_benchmark::snapshot();
+        assert!(
+            snapshot.series.is_empty() && snapshot.metrics.is_empty(),
+            "an ordinary process accumulates no benchmark observation"
+        );
+        assert!(handle.render().contains(HTTP_REQUESTS_TOTAL));
     }
 
     /// Every qualification p99 family renders the configured histogram shape.
@@ -511,7 +642,7 @@ mod tests {
     #[tokio::test]
     async fn metrics_router_serves_metrics() {
         let handle = get_handle();
-        let router = metrics_router(handle.clone(), false);
+        let router = metrics_router(MetricsBackend::Prometheus(handle.clone()));
 
         let response = router
             .oneshot(
@@ -567,15 +698,80 @@ mod tests {
         )
     }
 
-    /// The snapshot route of an enabled router, parsed.
+    /// The snapshot route of a benchmark router, parsed.
     ///
     /// # Panics
     ///
-    /// Panics when the route does not answer 200 with a `TimingSnapshot`.
-    async fn timings(router: &Router) -> wyrd_telemetry::timing::TimingSnapshot {
-        let (status, body) = fetch(router, "GET", BENCHMARK_TIMINGS_PATH).await;
+    /// Panics when the route does not answer 200 with a `BenchmarkSnapshot`.
+    async fn timings(router: &Router) -> wyrd_benchmark::BenchmarkSnapshot {
+        let (status, body) = fetch(router, "GET", BENCHMARK_SNAPSHOT_PATH).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        serde_json::from_str(&body).expect("the snapshot is a TimingSnapshot")
+        serde_json::from_str(&body).expect("the snapshot is a BenchmarkSnapshot")
+    }
+
+    /// This process's benchmark router, installing the benchmark backend.
+    ///
+    /// # Panics
+    ///
+    /// Panics when another recorder was installed first.
+    fn benchmark() -> Router {
+        let backend = MetricsBackend::install(true).expect("the benchmark backend installs");
+        assert!(matches!(backend, MetricsBackend::Benchmark));
+        metrics_router(backend)
+    }
+
+    /// Benchmark startup installs only the benchmark recorder, before the
+    /// Gate families register: their series, and every later counter,
+    /// gauge, and histogram, reach its snapshot, no Prometheus exposition is
+    /// served, and the production recorder cannot be installed beside it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a Prometheus backend is installed or served, a
+    /// registration is missing from the snapshot, or a fallback succeeds.
+    #[tokio::test]
+    async fn benchmark_mode_installs_only_benchmark_recorder() {
+        let router = benchmark();
+        assert!(wyrd_benchmark::enabled());
+        assert!(MetricsBackend::Benchmark.prometheus().is_none());
+        assert!(
+            matches!(install_recorder(), Err(MetricsError::Install(_))),
+            "no Prometheus recorder installs beside the benchmark recorder"
+        );
+        assert!(
+            matches!(
+                WyrdTelemetryRuntime::install(TelemetryConfig::default(), false),
+                Err(TelemetryRuntimeError::Metrics(MetricsError::Install(_)))
+            ),
+            "there is no live switch to the production backend"
+        );
+        assert_eq!(
+            fetch(&router, "GET", "/metrics").await.0,
+            StatusCode::NOT_FOUND
+        );
+        let before = timings(&router).await;
+        assert!(
+            before
+                .metrics
+                .iter()
+                .any(|metric| metric
+                    .matches("bifrost_gate_requests_total", &[("operation", "write")])),
+            "series registered at startup land in the benchmark recorder"
+        );
+        metrics::counter!(HTTP_REQUESTS_TOTAL, "status" => "200").increment(3);
+        metrics::gauge!(VERIFICATION_ACTIVE_RUNS, "mode" => "direct").increment(2.0);
+        metrics::histogram!(OUTBOX_WRITE_SECONDS, "outbox" => "scribe").record(0.002);
+        let interval = timings(&router).await.since(&before).expect("one process");
+        assert_eq!(interval.counter(HTTP_REQUESTS_TOTAL, &[]), Some(3));
+        assert!(interval.metrics.iter().any(|metric| matches!(
+            metric.value,
+            wyrd_benchmark::IntervalValue::Gauge { value, .. }
+                if metric.name == VERIFICATION_ACTIVE_RUNS && value.to_bits() == 2.0_f64.to_bits()
+        )));
+        let writes = interval
+            .histogram(OUTBOX_WRITE_SECONDS, &[("outbox", "scribe")])
+            .expect("the outbox write");
+        assert_eq!(writes.len(), 1);
     }
 
     /// The server's boundary timings reach the snapshot as separate
@@ -591,10 +787,10 @@ mod tests {
     #[tokio::test]
     async fn benchmark_timings_preserve_server_boundaries() {
         use std::time::Duration;
-        let router = metrics_router(get_handle().clone(), true);
+        let router = benchmark();
         let before = timings(&router).await;
         let record = |boundary, elapsed: u64, excluded: Option<u64>| {
-            wyrd_telemetry::record_timing(
+            wyrd_benchmark::record_timing(
                 &tracing::Span::none(),
                 boundary,
                 "success",
@@ -640,7 +836,7 @@ mod tests {
             verification
                 .excluded
                 .as_ref()
-                .map(wyrd_telemetry::timing::Distribution::len),
+                .map(wyrd_benchmark::Distribution::len),
             Some(2)
         );
         let head = series("gateway.stream.head")
@@ -669,27 +865,28 @@ mod tests {
         assert!(query.problems().is_empty());
     }
 
-    /// The benchmark snapshot is absent from an ordinary metrics router;
-    /// when enabled it is a GET-only, reset-free, cumulative readout of
-    /// bounded aggregates from one process identity, carrying no request
-    /// identity or payload, while `/metrics` still renders the recorder.
+    /// The benchmark snapshot, served only by the opt-in benchmark backend
+    /// (an ordinary router serves none, as [`recorder_installs_and_renders`]
+    /// proves), is a GET-only, reset-free, cumulative readout of bounded
+    /// aggregates from one process identity, carrying no request identity or
+    /// payload.
     ///
     /// # Panics
     ///
-    /// Panics when the route exists unrequested, accepts a mutation, resets,
-    /// leaks an identity, or replaces the Prometheus output.
+    /// Panics when the route accepts a mutation, resets, or leaks an
+    /// identity.
     #[tokio::test]
     async fn benchmark_snapshots_are_local_read_only_and_opt_in() {
-        let handle = get_handle();
-        let ordinary = metrics_router(handle.clone(), false);
+        let router = benchmark();
+        #[cfg(not(feature = "bench"))]
         assert_eq!(
-            fetch(&ordinary, "GET", BENCHMARK_TIMINGS_PATH).await.0,
-            StatusCode::NOT_FOUND
+            fetch(&router, "GET", "/benchmark/heap").await.0,
+            StatusCode::NOT_FOUND,
+            "only a bench build serves heap profiles"
         );
-        let router = metrics_router(handle.clone(), true);
         let secret = "tenant-7f3a-trace-4bf92f3577b34da6a3ce929d0e0e4736";
         let span = tracing::info_span!("request", tenant = secret);
-        wyrd_telemetry::record_timing(
+        wyrd_benchmark::record_timing(
             &span,
             "bifrost.gate.write",
             "success",
@@ -699,12 +896,12 @@ mod tests {
         let first = timings(&router).await;
         for method in ["POST", "PUT", "DELETE"] {
             assert_eq!(
-                fetch(&router, method, BENCHMARK_TIMINGS_PATH).await.0,
+                fetch(&router, method, BENCHMARK_SNAPSHOT_PATH).await.0,
                 StatusCode::METHOD_NOT_ALLOWED,
                 "{method} must not reach the readout"
             );
         }
-        let (status, reset) = fetch(&router, "GET", "/benchmark/timings?reset=true").await;
+        let (status, reset) = fetch(&router, "GET", "/benchmark/snapshot?reset=true").await;
         assert_eq!(status, StatusCode::OK);
         assert!(
             !reset.contains(secret),
@@ -715,15 +912,9 @@ mod tests {
         assert!(second.taken_ns >= first.taken_ns);
         let interval = second.since(&first).expect("a query string resets nothing");
         assert!(interval.series.is_empty(), "repeated reads record nothing");
-        assert!(second.series.len() <= wyrd_telemetry::timing::MAX_SERIES);
-        assert_eq!(second.method, wyrd_telemetry::timing::Method::current());
-        metrics::counter!(HTTP_REQUESTS_TOTAL).increment(1);
-        let (status, text) = fetch(&router, "GET", "/metrics").await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(
-            text.contains(HTTP_REQUESTS_TOTAL),
-            "the recorder still renders"
-        );
+        assert!(second.series.len() <= wyrd_benchmark::MAX_SERIES);
+        assert!(second.metrics.len() <= wyrd_benchmark::MAX_METRIC_SERIES);
+        assert_eq!(second.method, wyrd_benchmark::Method::current());
     }
 
     #[tokio::test]
@@ -783,5 +974,41 @@ mod tests {
             !output.contains("etc/passwd"),
             "raw URI path must never appear as a metric label (unbounded cardinality); got:\n{output}"
         );
+    }
+
+    /// A `bench` build's heap route starts sampling on `POST`, serves a
+    /// gzipped profile on `GET`, and refuses every other method.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a method is answered wrongly.
+    #[cfg(feature = "bench")]
+    #[tokio::test]
+    async fn bench_heap_profile_starts_and_serves() {
+        let router = benchmark();
+        let call = |method: &str| {
+            let request = Request::builder()
+                .method(method)
+                .uri(wyrd_benchmark::heap::PATH)
+                .body(Body::empty())
+                .expect("request builds");
+            router.clone().oneshot(request)
+        };
+        assert_eq!(
+            call("POST").await.expect("POST").status(),
+            StatusCode::NO_CONTENT
+        );
+        let response = call("GET").await.expect("GET");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(&body[..2], [0x1f, 0x8b], "a gzip stream");
+        for method in ["PUT", "DELETE"] {
+            assert_eq!(
+                call(method).await.expect(method).status(),
+                StatusCode::METHOD_NOT_ALLOWED
+            );
+        }
     }
 }

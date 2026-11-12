@@ -127,27 +127,29 @@ Status is not the verdict. A completed execution of a passing check and of a fai
 
 ## 3. Read the evidence
 
-The result explains itself; you rarely need SQL:
+The result holds each judgment. What the execution ran, its steps, each check with its provenance, and the pinned inputs, is one explicit read of the execution's details; you rarely need SQL:
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
 
 ```python
-for step in result.steps:
-    print(step["id"], step["status"], step["attempts"], step.get("reason"))
 for requirement in result.requirements:
     print(requirement["id"], requirement["outcome"], requirement["reason"], requirement["citations"])
+details = verify.Execution.connect(result.execution_id).details()
+for step in details["outcome"]["steps"]:
+    print(step["id"], step["status"], step["attempts"], step.get("reason"))
 ```
 
 </LangTab>
 <LangTab lang="rust">
 
 ```rust
-for step in &result.outcome.steps {
-    println!("{} {:?} {} {:?}", step.id, step.status, step.attempts, step.reason);
-}
 for requirement in &result.outcome.requirements {
     println!("{} {:?} {}", requirement.id, requirement.outcome, requirement.reason);
+}
+let details = Execution::connect(result.execution_id).await?.details().await?;
+for step in &details.outcome.steps {
+    println!("{} {:?} {} {:?}", step.id, step.status, step.attempts, step.reason);
 }
 ```
 
@@ -155,11 +157,12 @@ for requirement in &result.outcome.requirements {
 <LangTab lang="typescript">
 
 ```typescript
-for (const step of result.outcome.steps) {
-  console.log(step.id, step.status, step.attempts, step.reason, step.tool_calls);
-}
 for (const requirement of result.outcome.requirements) {
   console.log(requirement.id, requirement.outcome, requirement.reason, requirement.citations);
+}
+const details = await (await verify.Execution.connect(result.execution_id)).details();
+for (const step of details.outcome.steps) {
+  console.log(step.id, step.status, step.attempts, step.reason, step.tool_calls);
 }
 ```
 
@@ -168,10 +171,13 @@ for (const requirement of result.outcome.requirements) {
 
 | Where | What it tells you |
 | --- | --- |
-| `outcome.evidence` | The exact inputs judged, by slot, with file digests |
-| `outcome.steps[]` | Whether each step `succeeded`, `failed`, or was `skipped`, how many attempts it took, and every tool it called with argument and output digests |
-| `outcome.requirements[]` | Each verdict, its reason, the actual value, citations into the original files, and the check's provenance: code hash, extraction version, Agent and Prompt versions, effective model route, drift window and baseline |
-| `outcome.requirements[].data` | The custom data an `agent` or `code` check returned, when it declares a [custom data](/reference/verifier-card/#custom-data) schema; absent otherwise, or when the data failed its schema |
+| `result.outcome.requirements[]` | Each verdict, its reason, the actual value, and citations into the original files |
+| `result.outcome.requirements[].data` | The custom data an `agent` or `code` check returned, when it declares a [custom data](/reference/verifier-card/#custom-data) schema; absent otherwise, or when the data failed its schema |
+| `details.outcome.evidence` | The exact inputs judged, by slot, with file digests |
+| `details.outcome.steps[]` | Whether each step `succeeded`, `failed`, or was `skipped`, how many attempts it took, and every tool it called with argument and output digests |
+| `details.outcome.requirements[]` | The same judgments, each with its check as written and its provenance: code hash, extraction version, Agent and Prompt versions, effective model route, drift window and baseline |
+
+Details are readable once the execution's records are stored; until then, and for an unknown execution, the read answers `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND`. Over MCP, use `verification.get_execution_details`.
 
 An `inconclusive` requirement whose step `failed` means the evidence could not be prepared; read the step `reason`. One with a citation reason means a judge passed without valid evidence.
 

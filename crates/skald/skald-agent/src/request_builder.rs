@@ -110,8 +110,9 @@ pub fn extract_messages(agent: &str, request: &ProviderRequest) -> AgentResult<V
 /// Starts from `seed_messages`, appends each conversation turn in the
 /// request's own dialect (OpenAI Responses turns as native `input` items,
 /// including replayed reasoning and function-call items), and replaces the
-/// `template` messages with the result. The template's model, settings, and
-/// tools are kept unchanged.
+/// `template` messages with the result in place. The template's model,
+/// settings, tools, and response schema are kept unchanged, so the Agent loop
+/// reuses one request for every iteration.
 ///
 /// # Errors
 ///
@@ -120,12 +121,12 @@ pub fn extract_messages(agent: &str, request: &ProviderRequest) -> AgentResult<V
 /// match the template's dialect.
 pub fn request_from_conversation(
     agent: &str,
-    template: ProviderRequest,
+    template: &mut ProviderRequest,
     seed_messages: &[MessageNum],
     conversation: &Conversation,
-) -> AgentResult<ProviderRequest> {
+) -> AgentResult<()> {
     let mut messages = seed_messages.to_vec();
-    let provider = validate_prompt_loop_request(agent, &template)?;
+    let provider = validate_prompt_loop_request(agent, template)?;
     for turn in conversation.turns() {
         append_turn_message(agent, provider, &mut messages, turn)?;
     }
@@ -192,7 +193,8 @@ pub fn assistant_message(agent: &str, response: &ProviderResponse) -> AgentResul
     }
 }
 
-/// Replace the messages of a provider-native request with accumulated history.
+/// Replace the messages of a provider-native request with accumulated
+/// history, in place.
 ///
 /// An OpenAI Responses request's `input` becomes the concatenated items of
 /// its native Responses messages.
@@ -203,15 +205,15 @@ pub fn assistant_message(agent: &str, response: &ProviderResponse) -> AgentResul
 /// match the request dialect, and [`AgentError::Prompt`] when the request
 /// shape cannot drive the loop.
 pub fn rebuild_request_messages(
-    mut template: ProviderRequest,
+    template: &mut ProviderRequest,
     new_messages: &[MessageNum],
-) -> AgentResult<ProviderRequest> {
+) -> AgentResult<()> {
     let mismatch = |provider: ProviderName| AgentError::LoopMessageType {
         provider,
         detail: "provider-native loop history contains a mismatched message variant".to_owned(),
     };
 
-    match &mut template {
+    match template {
         ProviderRequest::OpenAiChatCompletion(req) => {
             req.messages.clear();
             for msg in new_messages {
@@ -262,7 +264,7 @@ pub fn rebuild_request_messages(
             });
         }
     }
-    Ok(template)
+    Ok(())
 }
 
 fn append_turn_message(
@@ -523,14 +525,14 @@ mod tests {
 
     #[test]
     fn rebuild_request_messages_anthropic_filters_out_system_role() {
-        let template = anthropic_request(vec![]);
+        let mut result = anthropic_request(vec![]);
         let new_messages = vec![
             MessageNum::Anthropic(anthropic_message("system", "ignored")),
             MessageNum::Anthropic(anthropic_message("user", "kept")),
             MessageNum::Anthropic(anthropic_message("assistant", "kept")),
         ];
 
-        let result = rebuild_request_messages(template, &new_messages)
+        rebuild_request_messages(&mut result, &new_messages)
             .expect("Anthropic rebuild must succeed");
         let ProviderRequest::AnthropicMessage(request) = result else {
             panic!("expected Anthropic request");
@@ -546,15 +548,14 @@ mod tests {
 
     #[test]
     fn rebuild_request_messages_gemini_filters_out_system_role() {
-        let template = gemini_request(vec![]);
+        let mut result = gemini_request(vec![]);
         let new_messages = vec![
             MessageNum::Gemini(google_message("system", "ignored")),
             MessageNum::Gemini(google_message("user", "kept")),
             MessageNum::Gemini(google_message("model", "kept")),
         ];
 
-        let result =
-            rebuild_request_messages(template, &new_messages).expect("Gemini rebuild must succeed");
+        rebuild_request_messages(&mut result, &new_messages).expect("Gemini rebuild must succeed");
         let ProviderRequest::GeminiGenerateContent(request) = result else {
             panic!("expected Gemini request");
         };
@@ -569,13 +570,13 @@ mod tests {
 
     #[test]
     fn rebuild_request_messages_rejects_mismatched_variant() {
-        let template = anthropic_request(vec![]);
+        let mut template = anthropic_request(vec![]);
         let new_messages = vec![MessageNum::OpenAi(Box::new(openai_message(
             "user",
             "wrong provider",
         )))];
 
-        let err = rebuild_request_messages(template, &new_messages)
+        let err = rebuild_request_messages(&mut template, &new_messages)
             .expect_err("variant mismatch must fail");
 
         assert_eq!(err.code(), "SKALD_AGENT_422_LOOP_MESSAGE_TYPE");

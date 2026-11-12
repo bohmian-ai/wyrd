@@ -20,6 +20,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use skald_spec::wire::jev::{JevRequest, JevResponse};
 
+// Native dialect requests validate through their owned decode.
+skald_spec::borrowed_as_self!(
+    GatewayAnthropicMessagesRequest,
+    GatewayGeminiGenerateContentRequest,
+    GatewayJevRequest,
+);
+
 /// `POST /v1/messages` request: an Anthropic Messages body whose `model` is an
 /// exact Anthropic model id.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

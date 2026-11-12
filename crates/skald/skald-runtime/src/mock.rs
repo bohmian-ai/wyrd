@@ -133,11 +133,11 @@ impl MockExpectation {
 
 #[async_trait]
 impl Provider for MockProvider {
-    async fn send(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+    async fn send(&self, request: &ProviderRequest) -> Result<ProviderResponse, ProviderError> {
         let exchange = self.response_queue().pop_front();
         let Some(exchange) = exchange else {
             return if self.echo {
-                Ok(ProviderResponse::text(last_user_text(&request)))
+                Ok(ProviderResponse::text(last_user_text(request)))
             } else {
                 Err(ProviderError::bad_request(
                     "mock",
@@ -149,7 +149,7 @@ impl Provider for MockProvider {
         if let Some(expected) = &exchange.expected {
             let expected = serde_json::to_value(expected)
                 .map_err(|error| ProviderError::decode("mock", error))?;
-            let actual = serde_json::to_value(&request)
+            let actual = serde_json::to_value(request)
                 .map_err(|error| ProviderError::decode("mock", error))?;
             if expected != actual {
                 return Err(ProviderError::bad_request(
@@ -162,7 +162,7 @@ impl Provider for MockProvider {
         exchange.response
     }
 
-    async fn stream(&self, _request: ProviderRequest) -> Result<ProviderStream, ProviderError> {
+    async fn stream(&self, _request: &ProviderRequest) -> Result<ProviderStream, ProviderError> {
         self.stream_queue()
             .pop_front()
             .ok_or_else(|| ProviderError::bad_request("mock", "mock stream queue is empty"))?

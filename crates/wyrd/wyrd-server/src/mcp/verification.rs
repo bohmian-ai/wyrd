@@ -1,8 +1,9 @@
 //! Verification control-plane capabilities over MCP.
 //!
 //! Typed projections of the same server operations HTTP serves: the
-//! `verification.*` tools read binding and execution status, plan evidence
-//! uploads, verify now, and enqueue a background execution. Authorization,
+//! `verification.*` tools read binding and execution status and execution
+//! details, plan evidence uploads, verify now, and enqueue a background
+//! execution. Authorization,
 //! audit, tenancy, idempotency, and error mapping stay with
 //! [`VerificationControl`], so this module only parses arguments and
 //! projects answers.
@@ -16,7 +17,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{BindingId, ExecutionId, IdempotencyKey};
 use wyrd_spec::verification::VerificationBindingStatus;
 use wyrd_spec::verification::execution::{
-    EnqueueVerificationResponse, EvidencePlanRequest, EvidencePlanResponse,
+    EnqueueVerificationResponse, EvidencePlanRequest, EvidencePlanResponse, VerificationDetails,
     VerificationExecutionState, VerificationRequest, VerificationResult,
 };
 
@@ -30,6 +31,9 @@ pub(super) const GET_BINDING: &str = "verification.get_binding";
 
 /// Wire name of the execution status read.
 pub(super) const GET_EXECUTION: &str = "verification.get_execution";
+
+/// Wire name of the execution details read.
+pub(super) const GET_EXECUTION_DETAILS: &str = "verification.get_execution_details";
 
 /// Wire name of the evidence upload plan.
 pub(super) const EVIDENCE: &str = "verification.evidence";
@@ -48,11 +52,12 @@ struct GetBindingArgs {
     binding_id: BindingId,
 }
 
-/// Arguments of `verification.get_execution`.
+/// Arguments of `verification.get_execution` and
+/// `verification.get_execution_details`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct GetExecutionArgs {
-    /// Execution ID returned by `verification.enqueue`.
+    /// Execution ID returned by `verification.execute` or `verification.enqueue`.
     execution_id: ExecutionId,
 }
 
@@ -87,8 +92,20 @@ pub(super) fn descriptors_unscoped() -> Vec<Tool> {
             GET_EXECUTION,
             "Read a verification execution",
             "Read one Verifier execution's status, terminal error, Operator dispatch statuses, \
-             and its result once published. A just-enqueued execution may briefly be not found, \
-             and a completed one may briefly lack its result; poll again. Requires cards:read.",
+             and its compact result once published: the verdict and each requirement's \
+             outcome, reason, actual, citations, custom data, and drift detail. A \
+             just-enqueued execution may briefly be not found, and a completed one may \
+             briefly lack its result; poll again. Requires cards:read.",
+            true,
+        ),
+        tool::<GetExecutionArgs, VerificationDetails>(
+            GET_EXECUTION_DETAILS,
+            "Read verification execution details",
+            "Read what one completed Verifier execution ran: each requirement's exact authored \
+             check and provenance, every step with its tool calls, and the pinned evidence \
+             declarations, beside the same judgments as its result. Not found until the \
+             complete records are visible, and when they are unknown or no longer readable. \
+             Requires cards:read.",
             true,
         ),
     ]
@@ -116,7 +133,8 @@ pub(super) fn write_descriptors() -> Vec<Tool> {
             "Verify now",
             "Execute one exact Verifier about one subject Card over named input declarations \
              (inline JSON, uploaded files by digest, Artifact files, or a trace) and return the \
-             verdict with its requirement and step breakdown within a 60-second deadline. A \
+             compact verdict and requirement judgments within a 60-second deadline; read what \
+             ran through verification.get_execution_details. A \
              failed verdict is a successful result; no Operator fires. A drift Verifier is \
              refused: it judges scheduled windows. Requires verifier:run on the Verifier.",
             false,
@@ -180,6 +198,24 @@ impl WyrdMcpHandler {
         )
     }
 
+    /// Read one completed verification execution's details.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the arguments are invalid, the caller lacks
+    /// `cards:read`, complete details are not visible, or a read fails.
+    pub(super) async fn mcp_get_execution_details(
+        &self,
+        caller: Caller,
+        arguments: Option<JsonMap<String, JsonValue>>,
+    ) -> Result<CallToolResult, WyrdError> {
+        let args: GetExecutionArgs = parse_args(arguments, GET_EXECUTION_DETAILS)?;
+        structured(
+            &VerificationControl::new(&self.state)
+                .get_execution_details(&caller, args.execution_id)
+                .await?,
+        )
+    }
+
     /// Run one verification write tool: `evidence`, `execute`, or `enqueue`.
     ///
     /// Decodes the arguments exactly as the HTTP body; `enqueue` also takes
@@ -215,7 +251,7 @@ impl WyrdMcpHandler {
                 &control
                     .execute(
                         &caller,
-                        &serde_json::from_value(arguments).map_err(invalid)?,
+                        serde_json::from_value(arguments).map_err(invalid)?,
                         None,
                         None,
                     )

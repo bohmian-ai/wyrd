@@ -7,7 +7,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use skald_prompt::Prompt;
-use skald_spec::Prompt as PromptSpec;
+use skald_spec::{PreparedSchemas, Prompt as PromptSpec};
 use skald_tool::{AgentTool, ToolError, ToolResolver};
 use wyrd_spec::{
     AgentCard, AgentRunConfigSpec, AgentSpec, CardMetadata, ExecutionRoute,
@@ -187,8 +187,17 @@ pub struct AgentCallbacks {
 pub struct Agent {
     /// Local Card metadata used for envelope projection.
     pub(crate) meta: CardMetadata,
-    /// Preserved durable prompt reference.
-    pub(crate) prompt_ref: InlineableRef<PromptSpec>,
+    /// Preserved durable prompt reference: set when the Agent was built from
+    /// one, otherwise derived on first read as the inline native form of
+    /// [`Self::authored_prompt`], so constructing an Agent never copies its
+    /// Prompt.
+    pub(crate) prompt_ref: OnceLock<InlineableRef<PromptSpec>>,
+    /// Prompt the Agent was constructed with or explicitly retargeted to.
+    ///
+    /// An unset [`Self::prompt_ref`] derives from this shared handle rather
+    /// than the public [`Self::prompt`] field, so assigning that field never
+    /// changes the exported reference, whatever order reads happen in.
+    authored_prompt: Arc<Prompt>,
     /// Runtime-local tool names preserved for YAML round trips.
     pub(crate) tool_names: Vec<String>,
     /// Stable id used for tracing and diagnostics.
@@ -226,6 +235,10 @@ pub struct Agent {
     /// Host-supplied gateway seam a `wyrd_gateway` route dispatches through.
     /// Runtime state only, never serialized.
     pub(crate) gateway_caller: Option<Arc<dyn WyrdGatewayCaller>>,
+    /// Response-schema preparation reused across this Agent's runs, or
+    /// across a host's calls when it lends one with
+    /// [`Self::with_prepared_schemas`]. Runtime state only, never serialized.
+    pub(crate) schemas: Arc<PreparedSchemas>,
 }
 
 impl fmt::Debug for Agent {
@@ -256,8 +269,7 @@ impl Agent {
     /// run.
     #[must_use]
     pub fn new(prompt: Prompt) -> Self {
-        let prompt_ref = InlineableRef::from(prompt.clone().into_native());
-        Self::from_resolved_parts(generate_agent_id(), prompt_ref, prompt)
+        Self::from_resolved_parts(generate_agent_id(), OnceLock::new(), prompt)
     }
 
     /// Build an Agent from an already-shared resolved Prompt.
@@ -266,8 +278,7 @@ impl Agent {
     /// prompt handle.
     #[must_use]
     pub fn from_resolved(id: impl Into<String>, prompt: Arc<Prompt>) -> Self {
-        let prompt_ref = InlineableRef::from(prompt.as_ref().clone().into_native());
-        Self::from_resolved_arc_parts(id.into(), prompt_ref, prompt)
+        Self::from_resolved_arc_parts(id.into(), OnceLock::new(), prompt)
     }
 
     /// Build an Agent from a prompt reference and resolver.
@@ -284,7 +295,7 @@ impl Agent {
         let prompt = resolve_prompt_ref(&prompt_ref, resolver)?;
         Ok(Self::from_resolved_parts(
             generate_agent_id(),
-            prompt_ref,
+            OnceLock::from(prompt_ref),
             prompt,
         ))
     }
@@ -299,9 +310,9 @@ impl Agent {
     /// Return a copy retargeted to a resolved Prompt.
     #[must_use]
     pub fn with_prompt(mut self, prompt: impl Into<Arc<Prompt>>) -> Self {
-        let prompt = prompt.into();
-        self.prompt_ref = InlineableRef::from(prompt.as_ref().clone().into_native());
-        self.prompt = prompt;
+        self.prompt_ref = OnceLock::new();
+        self.prompt = prompt.into();
+        self.authored_prompt = Arc::clone(&self.prompt);
         self
     }
 
@@ -315,7 +326,8 @@ impl Agent {
         resolver: &dyn PromptResolver,
     ) -> Result<Self, WyrdError> {
         self.prompt = Arc::new(resolve_prompt_ref(&prompt_ref, resolver)?);
-        self.prompt_ref = prompt_ref;
+        self.authored_prompt = Arc::clone(&self.prompt);
+        self.prompt_ref = OnceLock::from(prompt_ref);
         Ok(self)
     }
 
@@ -361,6 +373,16 @@ impl Agent {
     #[must_use]
     pub fn with_gateway_caller(mut self, caller: Arc<dyn WyrdGatewayCaller>) -> Self {
         self.gateway_caller = Some(caller);
+        self
+    }
+
+    /// Reuse `schemas` to prepare each outgoing response schema, so a host
+    /// running many Agents with unchanged schemas compiles each once.
+    /// The answer is still validated against the exact schema each request
+    /// sends.
+    #[must_use]
+    pub fn with_prepared_schemas(mut self, schemas: Arc<PreparedSchemas>) -> Self {
+        self.schemas = schemas;
         self
     }
 
@@ -568,10 +590,17 @@ impl Agent {
         self.meta.version.as_deref()
     }
 
-    /// Return the preserved prompt reference.
+    /// Return the preserved prompt reference, or for an Agent built from a
+    /// resolved Prompt, the inline native form of the Prompt it was built
+    /// with or retargeted to through [`Self::with_prompt`].
+    ///
+    /// Reassigning the public [`Self::prompt`] field changes what runs, not
+    /// what this exports.
     #[must_use]
     pub fn prompt_ref(&self) -> &InlineableRef<PromptSpec> {
-        &self.prompt_ref
+        self.prompt_ref.get_or_init(|| {
+            InlineableRef::from(self.authored_prompt.as_ref().clone().into_native())
+        })
     }
 
     /// Return preserved runtime-local tool names.
@@ -754,20 +783,24 @@ impl Agent {
         self.run_with(providers.as_ref(), None, input).await
     }
 
+    /// Builds an Agent with identity `id` that owns `prompt`; see
+    /// [`Self::from_resolved_arc_parts`] for the reference and default-field
+    /// contract.
     fn from_resolved_parts(
         id: String,
-        prompt_ref: InlineableRef<PromptSpec>,
+        prompt_ref: OnceLock<InlineableRef<PromptSpec>>,
         prompt: Prompt,
     ) -> Self {
         Self::from_resolved_arc_parts(id, prompt_ref, Arc::new(prompt))
     }
 
     /// Builds an Agent with identity `id` over an already resolved shared
-    /// Prompt and its authored reference; every other field takes its default,
+    /// Prompt and its authored reference (empty to derive it from the Prompt
+    /// on first read); every other field takes its default,
     /// including the native execution route and no gateway caller.
     fn from_resolved_arc_parts(
         id: String,
-        prompt_ref: InlineableRef<PromptSpec>,
+        prompt_ref: OnceLock<InlineableRef<PromptSpec>>,
         prompt: Arc<Prompt>,
     ) -> Self {
         Self {
@@ -775,6 +808,7 @@ impl Agent {
             prompt_ref,
             tool_names: Vec::new(),
             id,
+            authored_prompt: Arc::clone(&prompt),
             prompt,
             run_config: RunConfig::default(),
             authored_run_config: None,
@@ -786,6 +820,7 @@ impl Agent {
             provider_override: None,
             execution_route: ExecutionRoute::Native {},
             gateway_caller: None,
+            schemas: Arc::default(),
         }
     }
 
@@ -797,7 +832,7 @@ impl Agent {
     #[must_use]
     pub fn to_spec(&self) -> AgentSpec {
         AgentSpec {
-            prompt: self.prompt_ref.clone(),
+            prompt: self.prompt_ref().clone(),
             execution_route: self.execution_route.clone(),
             tool_names: self.tool_names.clone(),
             run_config: self.run_config_spec(),

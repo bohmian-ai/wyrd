@@ -48,9 +48,9 @@ const TICKS_SECONDS: f64 = 0.02;
 /// one-client windows, as a share of it.
 const DRIFT: f64 = 0.25;
 
-/// Least share of a sequential `/metrics` scrape's round trip the server
-/// spends rendering it on CPU: the exposition is rendered in memory, and
-/// loopback transfer and the driver's read take the rest.
+/// Least share of a sequential benchmark snapshot read's round trip the
+/// server spends serializing it on CPU: the snapshot is serialized in
+/// memory, and loopback transfer and the driver's read take the rest.
 const SCRAPE_FLOOR: f64 = 0.3;
 
 /// Bytes per MiB.
@@ -83,11 +83,12 @@ pub fn burn(length: Duration) {
     }
 }
 
-/// Scrapes the server's metrics listener, or `None` when it does not answer.
+/// Reads the server's benchmark snapshot as metrics, or `None` when it does
+/// not answer or its snapshot is incomplete ([`Metrics::of_snapshot`]).
 async fn scrape() -> Option<Metrics> {
-    let url = format!("http://127.0.0.1:{METRICS_PORT}/metrics");
+    let url = format!("http://127.0.0.1:{METRICS_PORT}/benchmark/snapshot");
     let response = reqwest::get(url).await.ok()?.error_for_status().ok()?;
-    Some(Metrics::parse(&response.text().await.ok()?))
+    Metrics::of_snapshot(&response.json().await.ok()?).ok()
 }
 
 /// Scrapes once the server's Scribe outbox holds nothing pending, so every
@@ -108,10 +109,10 @@ async fn settled_scrape() -> Option<Metrics> {
     }
 }
 
-/// Scrapes `/metrics` one request after another for `length` and returns
-/// the seconds the requests were in flight.
+/// Reads the benchmark snapshot one request after another for `length` and
+/// returns the seconds the requests were in flight.
 async fn scrape_loop(length: Duration) -> f64 {
-    let url = format!("http://127.0.0.1:{METRICS_PORT}/metrics");
+    let url = format!("http://127.0.0.1:{METRICS_PORT}/benchmark/snapshot");
     let client = reqwest::Client::new();
     let end = Instant::now() + length;
     let mut busy = Duration::ZERO;
@@ -162,6 +163,10 @@ impl Workload for Controlled {
 
     fn processes(&self) -> Vec<u32> {
         self.inner.processes()
+    }
+
+    fn heap_profile_url(&self) -> Option<String> {
+        self.inner.heap_profile_url()
     }
 
     async fn measure(
@@ -259,18 +264,20 @@ async fn fresh_database() {
 /// Runs `engine`'s smoke-scale plan at `level` from `rest` through the
 /// shared runner with the wrapper's controls, three [`WINDOW`]s per L1 step,
 /// publishes the record, and reads it back. Each run starts from a
-/// [`fresh_database`].
+/// [`fresh_database`], with the driver's benchmark recorder started as
+/// `l1`/`l2` start it.
 ///
 /// # Panics
 ///
-/// Panics when the plan cannot be declared, the record does not read back
-/// unchanged, or the smoke is not VALID.
+/// Panics when another recorder is installed, the plan cannot be declared,
+/// the record does not read back unchanged, or the smoke is not VALID.
 async fn measured(
     engine: Engine,
     level: Level,
     rest: &[&str],
     directory: &std::path::Path,
 ) -> Measured {
+    crate::start_benchmark().expect("the only recorder");
     fresh_database().await;
     let root = repository();
     let mut arguments = line(rest);
@@ -308,7 +315,7 @@ async fn measured(
     let artifacts = directory.join(format!("{}-{}", engine.name(), declaration.experiment));
     let options = Options {
         artifacts: artifacts.clone(),
-        profiler: None,
+        profile: None,
         interrupt: CancellationToken::new(),
     };
     let record = run(

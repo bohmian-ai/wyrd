@@ -14,7 +14,7 @@ use tokio::sync::{Barrier, Notify};
 use wyrd_spec::vala::ids::{SpanId, TraceId};
 use wyrd_spec::vala::trace::{InstrumentationScope, Resource, SpanKind, SpanRecord, SpanStatus};
 use wyrd_spec::verification::DriftWindow;
-use wyrd_spec::verification::execution::Verdict;
+use wyrd_spec::verification::execution::{ExecutedRequirement, Verdict};
 
 use super::*;
 use crate::InMemoryTraceSource;
@@ -258,7 +258,7 @@ async fn run(
     engine: &VerificationEngine,
     spec: &Arc<VerifierSpec>,
     inputs: Value,
-) -> Result<VerificationOutcome, EngineError> {
+) -> Result<ExecutedOutcome, EngineError> {
     let evidence = inputs
         .as_object()
         .expect("object")
@@ -282,11 +282,11 @@ async fn run(
 }
 
 /// Outcome and reason of each requirement by ID.
-fn outcomes(outcome: &VerificationOutcome) -> BTreeMap<&str, RequirementOutcome> {
+fn outcomes(outcome: &ExecutedOutcome) -> BTreeMap<&str, RequirementOutcome> {
     outcome
         .requirements
         .iter()
-        .map(|result| (result.id.as_str(), result.outcome))
+        .map(|requirement| (requirement.result.id.as_str(), requirement.result.outcome))
         .collect()
 }
 
@@ -294,11 +294,19 @@ fn outcomes(outcome: &VerificationOutcome) -> BTreeMap<&str, RequirementOutcome>
 ///
 /// # Panics
 /// Panics when `outcome` has no requirement `id`.
-fn requirement<'a>(outcome: &'a VerificationOutcome, id: &str) -> &'a RequirementResult {
+fn requirement<'a>(outcome: &'a ExecutedOutcome, id: &str) -> &'a RequirementResult {
+    &recorded(outcome, id).result
+}
+
+/// The recorded requirement, check and provenance included.
+///
+/// # Panics
+/// Panics when `outcome` has no requirement `id`.
+fn recorded<'a>(outcome: &'a ExecutedOutcome, id: &str) -> &'a ExecutedRequirement {
     outcome
         .requirements
         .iter()
-        .find(|result| result.id.as_str() == id)
+        .find(|requirement| requirement.result.id.as_str() == id)
         .expect("requirement result")
 }
 
@@ -306,7 +314,7 @@ fn requirement<'a>(outcome: &'a VerificationOutcome, id: &str) -> &'a Requiremen
 ///
 /// # Panics
 /// Panics when `outcome` has no step `id`.
-fn step<'a>(outcome: &'a VerificationOutcome, id: &str) -> &'a StepResult {
+fn step<'a>(outcome: &'a ExecutedOutcome, id: &str) -> &'a StepResult {
     outcome
         .steps
         .iter()
@@ -415,7 +423,10 @@ async fn no_step_verifier_judges_inputs_and_traces() {
     );
     let failed = requirement(&outcome, "no-guarantee");
     assert_eq!(failed.actual, Some(json!("A guaranteed refund applies.")));
-    assert_eq!(failed.check, spec.requirements[0].check);
+    assert_eq!(
+        recorded(&outcome, "no-guarantee").check,
+        spec.requirements[0].check
+    );
     assert!(requirement(&outcome, "lost").reason.contains("not found"));
     assert_eq!(outcome.verdict, VerificationVerdict::Failed);
     assert_eq!(outcome.evidence, evidence);
@@ -428,20 +439,27 @@ async fn no_step_verifier_judges_inputs_and_traces() {
 
 /// Context capture applies the existing rule to actual values: `hash`
 /// stores the digest and `redact` stores nothing, without changing outcomes.
+/// A hashed digest is the SHA-256 of exactly the compact `serde_json` bytes,
+/// pinned against hand-written bytes for nested, escaped and Unicode values.
 ///
 /// # Panics
 /// Panics when a captured actual value differs.
 #[tokio::test(start_paused = true)]
 async fn context_capture_hashes_or_redacts_actual_values() {
+    use sha2::Digest as _;
+
     let script = Arc::new(Script::default());
     for (capture, expected) in [
         (
             "hash",
             Some(Value::String(
-                crate::assertion::capture_actual(Some(json!(4)), ContextCapture::Hash)
-                    .expect("hash")
-                    .and_then(|v| v.as_str().map(str::to_owned))
-                    .expect("digest"),
+                crate::assertion::capture_actual(
+                    Some(std::borrow::Cow::Owned(json!(4))),
+                    ContextCapture::Hash,
+                )
+                .expect("hash")
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .expect("digest"),
             )),
         ),
         ("redact", None),
@@ -460,6 +478,39 @@ async fn context_capture_hashes_or_redacts_actual_values() {
         .expect("outcome");
         assert_eq!(outcome.verdict, VerificationVerdict::Passed);
         assert_eq!(requirement(&outcome, "count").actual, expected, "{capture}");
+    }
+
+    // Digests of the compact serde_json bytes, written out by hand: member
+    // order as parsed, `"`, `\\`, newline and control escapes, and raw UTF-8.
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "requirements": [{"id": "count", "statement": "Count", "check": {"kind": "assert", "path": "inputs.answer", "operator": "is_not_null"}}],
+        "context_capture": "hash"
+    }));
+    let answer: Value = serde_json::from_str(
+        r#"{"z":[1,-2.5,true,null,{"y":{}}],"a":"\u00e9 \u2603 \"q\" \\ \n \u0001"}"#,
+    )
+    .expect("answer");
+    for (answer, bytes) in [
+        (
+            answer,
+            "{\"z\":[1,-2.5,true,null,{\"y\":{}}],\"a\":\"\u{e9} \u{2603} \\\"q\\\" \\\\ \\n \\u0001\"}",
+        ),
+        (json!("\u{1f980}"), "\"\u{1f980}\""),
+    ] {
+        let outcome = run(
+            &engine(&script, InMemoryTraceSource::new(), 1),
+            &spec,
+            json!({"answer": answer}),
+        )
+        .await
+        .expect("outcome");
+        let digest = format!("{:x}", sha2::Sha256::digest(bytes.as_bytes()));
+        assert_eq!(
+            requirement(&outcome, "count").actual,
+            Some(Value::String(digest)),
+            "{bytes}"
+        );
     }
 }
 
@@ -615,7 +666,12 @@ async fn dependents_wait_for_upstream_step_requirements() {
     let ids: Vec<_> = outcome
         .requirements
         .iter()
-        .map(|r| (r.id.as_str(), r.step.as_ref().map(TaskId::as_str)))
+        .map(|r| {
+            (
+                r.result.id.as_str(),
+                r.result.step.as_ref().map(TaskId::as_str),
+            )
+        })
         .collect();
     assert_eq!(
         ids,
@@ -2019,8 +2075,10 @@ async fn unlanded_traces_defer_only_a_deferring_engine() {
         judged
             .requirements
             .iter()
-            .all(|result| result.outcome == RequirementOutcome::Inconclusive
-                && result.reason.contains("not yet landed")),
+            .all(
+                |requirement| requirement.result.outcome == RequirementOutcome::Inconclusive
+                    && requirement.result.reason.contains("not yet landed")
+            ),
         "{judged:?}"
     );
     assert_eq!(judged.verdict, VerificationVerdict::Inconclusive);

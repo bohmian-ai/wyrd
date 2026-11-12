@@ -23,7 +23,7 @@ use wyrd_spec::reference::CardRef;
 use wyrd_spec::registry::GetCardResponse;
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
-    RequirementDetail, RequirementOutcome, RequirementResult, VerificationOutcome,
+    ExecutedOutcome, ExecutedRequirement, RequirementDetail, RequirementOutcome, RequirementResult,
 };
 use wyrd_spec::verification::{DriftWindow, VerificationVerdict};
 use wyrd_testing::WyrdTestServer;
@@ -144,18 +144,20 @@ impl EvidenceInvestigation {
         let seed = server.verification_fixture().await?;
         let now = chrono::Utc::now();
         let failed = |id: &str, statement: &str, detail, check| -> Result<_, McpJourneyError> {
-            Ok(VerificationOutcome {
+            Ok(ExecutedOutcome {
                 verdict: VerificationVerdict::Failed,
-                requirements: vec![RequirementResult {
-                    id: TaskId::new(id)?,
-                    step: None,
-                    statement: statement.to_owned(),
-                    outcome: RequirementOutcome::Failed,
-                    reason: "seeded failure".to_owned(),
-                    actual: None,
-                    citations: Vec::new(),
-                    data: None,
-                    detail,
+                requirements: vec![ExecutedRequirement {
+                    result: RequirementResult {
+                        id: TaskId::new(id)?,
+                        step: None,
+                        statement: statement.to_owned(),
+                        outcome: RequirementOutcome::Failed,
+                        reason: "seeded failure".to_owned(),
+                        actual: None,
+                        citations: Vec::new(),
+                        data: None,
+                        detail,
+                    },
                     check: serde_json::from_value::<Check>(check)?,
                     provenance: None,
                 }],

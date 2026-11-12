@@ -1,5 +1,7 @@
 //! Deterministic comparisons and evidence capture for Verifier `assert` checks.
 
+use std::borrow::Cow;
+
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use wyrd_spec::verification::ContextCapture;
@@ -8,9 +10,9 @@ use wyrd_spec::verification::{ComparisonOperator, TaskId};
 use crate::error::ExecError;
 use crate::operators;
 
-/// The compared outcome of one assertion: passed, observed actual, the
-/// expected value compared, and a failure message.
-pub(crate) type Compared = (bool, Option<Value>, Value, Option<String>);
+/// The compared outcome of one assertion: passed, the observed actual,
+/// borrowed when it is the compared input itself, and a failure message.
+pub(crate) type Compared<'a> = (bool, Option<Cow<'a, Value>>, Option<String>);
 
 /// Compare one `observed` value with `expected` under `operator`.
 ///
@@ -19,12 +21,12 @@ pub(crate) type Compared = (bool, Option<Value>, Value, Option<String>);
 /// # Errors
 /// Returns [`ExecError::OperatorTypeMismatch`] for `task_id` when the
 /// operator cannot compare the values.
-pub(crate) fn evaluate_single(
+pub(crate) fn evaluate_single<'a>(
     task_id: &TaskId,
     operator: &ComparisonOperator,
-    expected: &Value,
-    observed: &Value,
-) -> Result<Compared, ExecError> {
+    expected: &'a Value,
+    observed: &'a Value,
+) -> Result<Compared<'a>, ExecError> {
     let verdict = operators::evaluate_operator(observed, operator, expected).map_err(|error| {
         ExecError::OperatorTypeMismatch {
             task_id: task_id.clone(),
@@ -37,12 +39,7 @@ pub(crate) fn evaluate_single(
     } else {
         Some(format!("operator {operator:?} returned false"))
     };
-    Ok((
-        verdict.passed,
-        verdict.observed,
-        verdict.expected.unwrap_or_else(|| expected.clone()),
-        message,
-    ))
+    Ok((verdict.passed, verdict.observed, message))
 }
 
 /// Compare every element of the `observed` array with `expected`; the
@@ -54,12 +51,12 @@ pub(crate) fn evaluate_single(
 /// # Errors
 /// Returns [`ExecError::OperatorTypeMismatch`] for `task_id` when
 /// `observed` is not an array or the operator cannot compare an element.
-pub(crate) fn evaluate_item_mode(
+pub(crate) fn evaluate_item_mode<'a>(
     task_id: &TaskId,
     operator: &ComparisonOperator,
     expected: &Value,
-    observed: &Value,
-) -> Result<Compared, ExecError> {
+    observed: &'a Value,
+) -> Result<Compared<'a>, ExecError> {
     let mismatch = |reason: String| ExecError::OperatorTypeMismatch {
         task_id: task_id.clone(),
         operator: format!("{operator:?}"),
@@ -88,27 +85,23 @@ pub(crate) fn evaluate_item_mode(
             items.len(),
         ))
     };
-    Ok((
-        failures == 0,
-        Some(observed.clone()),
-        expected.clone(),
-        message,
-    ))
+    Ok((failures == 0, Some(Cow::Borrowed(observed)), message))
 }
 
-/// Apply `capture` to one stored `actual` value: kept verbatim for `full`,
+/// Apply `capture` to one `actual` value: kept verbatim for `full`,
 /// replaced by its SHA-256 hex digest for `hash`, and dropped for `redact`.
 ///
-/// The one capture rule shared by Verifier requirement results.
+/// The one capture rule shared by Verifier requirement results. A borrowed
+/// value is copied only when `full` stores it; `hash` reads it in place.
 ///
 /// # Errors
 /// Returns `ContextHashFailed` if hashing cannot serialize the value.
 pub fn capture_actual(
-    actual: Option<serde_json::Value>,
+    actual: Option<Cow<'_, Value>>,
     capture: ContextCapture,
-) -> Result<Option<serde_json::Value>, ExecError> {
+) -> Result<Option<Value>, ExecError> {
     match capture {
-        ContextCapture::Full => Ok(actual),
+        ContextCapture::Full => Ok(actual.map(Cow::into_owned)),
         ContextCapture::Hash => actual
             .as_ref()
             .map(|value| hash_context_value(value).map(serde_json::Value::String))
@@ -126,17 +119,17 @@ pub fn capture_actual(
 /// `serde_json/preserve_order`, so key order is insertion or parse order, not
 /// sorted: equal objects built in different key orders hash differently.
 /// This is not RFC 8785 JCS; changing the byte form changes every stored
-/// digest.
+/// digest. The bytes stream straight into the hasher, so no serialized copy
+/// of `value` is held.
 ///
 /// # Errors
 /// Returns [`ExecError::ContextHashFailed`] with the serializer message when
 /// `serde_json` cannot serialize `value`.
 fn hash_context_value(value: &serde_json::Value) -> Result<String, ExecError> {
-    let bytes = serde_json::to_vec(value).map_err(|error| ExecError::ContextHashFailed {
+    let mut hasher = Sha256::new();
+    serde_json::to_writer(&mut hasher, value).map_err(|error| ExecError::ContextHashFailed {
         reason: error.to_string(),
     })?;
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
     Ok(format!("{:x}", hasher.finalize()))
 }
 
@@ -154,7 +147,7 @@ mod tests {
     /// Panics when capture fails or the captured value differs from the input.
     #[test]
     fn context_capture_full_keeps_actual_verbatim() {
-        let actual = capture_actual(Some(json!({"x": 1})), ContextCapture::Full)
+        let actual = capture_actual(Some(Cow::Owned(json!({"x": 1}))), ContextCapture::Full)
             .expect("context capture succeeds");
         assert_eq!(actual, Some(json!({"x": 1})));
     }
@@ -166,9 +159,12 @@ mod tests {
     /// returns anything other than 64 lowercase hex characters.
     #[test]
     fn context_capture_hash_replaces_with_sha256_hex() {
-        let actual = capture_actual(Some(json!({"x": 1, "y": "v"})), ContextCapture::Hash)
-            .expect("context capture succeeds")
-            .expect("actual is present");
+        let actual = capture_actual(
+            Some(Cow::Borrowed(&json!({"x": 1, "y": "v"}))),
+            ContextCapture::Hash,
+        )
+        .expect("context capture succeeds")
+        .expect("actual is present");
         let hex = actual.as_str().expect("actual is hash string");
         assert_eq!(hex.len(), 64, "sha256 hex must be 64 chars");
         assert!(
@@ -183,7 +179,7 @@ mod tests {
     /// Panics when capture fails or still returns a value.
     #[test]
     fn context_capture_redact_drops_actual() {
-        let actual = capture_actual(Some(json!("pii")), ContextCapture::Redact)
+        let actual = capture_actual(Some(Cow::Owned(json!("pii"))), ContextCapture::Redact)
             .expect("context capture succeeds");
         assert!(actual.is_none());
     }

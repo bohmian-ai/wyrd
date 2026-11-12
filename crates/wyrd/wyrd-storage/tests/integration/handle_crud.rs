@@ -129,7 +129,8 @@ async fn run_handle_crud(handle: &StorageHandle) {
 /// Panics when the environment is incomplete, selects a backend other than
 /// `kind`, or the handle cannot be built.
 async fn configured_handle(kind: StorageBackendKind) -> Arc<StorageHandle> {
-    wyrd_testing::capacity::install_tracing();
+    // An earlier handle in the same process may already have installed it.
+    let _ = wyrd_testing::capacity::install_tracing();
     let settings = settings::from_env().expect("WYRD_STORAGE_URL configures storage");
     assert_eq!(
         settings.backend.kind(),

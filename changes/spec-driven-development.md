@@ -100,6 +100,21 @@ same author check; never claim independence for a self-review.
 
 ## Change artifact lifecycle
 
+An optional `$wyrd-design` conversation starts the packet at
+`changes/active/<slug>/design/notes.md`, with supplemental files only as needed.
+It records the problem, desired outcome, implementation proposal, evidence,
+decisions, and open questions before a spec exists. Design status is
+`exploring` or `finalized`; the user decides when to finalize. Neither status
+grants spec approval or implementation readiness. Design may propose changes
+to repository standards, recording the exact conflict and the user's decision
+without silently changing authority. Required authority updates must be
+resolved before spec approval.
+
+`wyrd-spec` and `wyrd-plan` read this folder when present as reference material,
+revalidating its claims and distinguishing user constraints from proposed
+private mechanics. The approved spec remains the behavioral contract. No
+design folder is required for changes that start directly with specification.
+
 Use one tracked, repository-local change packet while work is active. Keep the
 packet with the implementation so ordinary branches, worktrees, pull requests,
 and task branches all see the same approved authority without ignored files,
@@ -119,6 +134,8 @@ Store the active packet under:
 
 ```text
 changes/active/<slug>/
+|-- design/                    optional pre-spec research and proposal
+|   `-- notes.md
 |-- spec.md
 `-- tasks/
     |-- TASK-001-<name>.md
@@ -152,6 +169,12 @@ deviations, requirement-to-evidence closure, delivery references, and links to
 the current architecture authority. It does not preserve task checklists,
 Red-Green mechanics, review conversation, command transcripts, worktree state,
 or agent scheduling.
+
+When a packet contains design notes or supplements, completion also preserves
+lasting rationale consistent with the approved spec and shipped behavior.
+Exploratory proposals are not shipped facts. Condense useful context into the
+completed record and avoid links to design files that will be deleted with the
+active packet.
 
 Current architecture remains authoritative. Completion verifies that every
 lasting contract or material design change is already reflected in its owning

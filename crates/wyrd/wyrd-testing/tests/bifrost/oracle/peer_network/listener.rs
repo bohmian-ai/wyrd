@@ -549,7 +549,7 @@ async fn a_frame_above_the_tonic_default_is_acknowledged_and_retained(
     );
     let batch = vala_bifrost_redux::tables::staged::StagedRow::project(&[
         vala_bifrost_redux::tables::audit::projection::stage_audit_event(
-            &event,
+            event.clone(),
             chrono::Utc::now(),
         )?,
     ])?;

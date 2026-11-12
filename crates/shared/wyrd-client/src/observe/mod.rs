@@ -34,6 +34,7 @@ use wyrd_spec::verification::execution::VerificationResult;
 
 use crate::bifrost::{BifrostClientError, Correlation, WriterTable};
 use crate::state::{BoundVerifier, WyrdState};
+use crate::transport::trace;
 use crate::verify::{Execution, Inputs, Projected, RunEvidence, Submission, Target};
 
 pub use lifecycle::DRIFT_OBSERVATIONS_TABLE;
@@ -301,23 +302,39 @@ impl Observe<'_> {
     ///
     /// # Cancellation
     /// Dropping the future abandons the request; it is never retried.
+    ///
+    /// In a benchmark process the whole flow is one `client.verify`
+    /// observation whose `prepare` component covers binding resolution,
+    /// projection, evidence pinning, and request assembly, before its
+    /// execution request's own logical call; a failed verdict is a successful
+    /// flow.
     pub async fn verify(
         &self,
         verifier: &str,
         inputs: impl Into<Inputs>,
     ) -> Result<VerificationResult, WyrdError> {
-        let state = &self.run.state;
-        let bound = state.bound_verifier(&self.run.subject, verifier)?;
-        let target = self.target(&bound);
-        match target.project(inputs.into())? {
-            Projected::Run(run) => target.execute(state.client()?, run).await,
-            Projected::Window(_) => Err(WyrdError::VerificationInputUnsupported {
-                message:
-                    "a scheduled-window Verifier judges recorded samples; record them with submit"
+        let mut observation =
+            wyrd_benchmark::Observation::start("client.verify", trace::benchmark_cohort);
+        let started = observation.now();
+        let result = async {
+            let state = &self.run.state;
+            let target = self.target(state.bound_verifier(&self.run.subject, verifier)?);
+            match target.project(inputs.into())? {
+                Projected::Run(run) => {
+                    target
+                        .execute(state.client()?, run, &mut observation, started)
+                        .await
+                }
+                Projected::Window(_) => Err(WyrdError::VerificationInputUnsupported {
+                    message: "a scheduled-window Verifier judges recorded samples; record them with submit"
                         .to_owned(),
-                details: json!({ "verifier": verifier }),
-            }),
+                    details: json!({ "verifier": verifier }),
+                }),
+            }
         }
+        .await;
+        observation.settle(&result);
+        result
     }
 
     /// [`Observe::verify`], with every requirement's custom `data` decoded
@@ -413,7 +430,7 @@ impl Observe<'_> {
         inputs: impl Into<Inputs>,
     ) -> Result<Option<StagedRun>, WyrdError> {
         let bound = self.run.state.bound_verifier(&self.run.subject, verifier)?;
-        match self.target(&bound).project(inputs.into())? {
+        match self.target(bound).project(inputs.into())? {
             Projected::Run(evidence) => Ok(Some(StagedRun {
                 verifier: verifier.to_owned(),
                 group_id: self.group_id.clone(),
@@ -448,18 +465,17 @@ impl Observe<'_> {
     /// As [`Observe::submit`].
     async fn enqueue_run(&self, staged: StagedRun) -> Result<Execution, WyrdError> {
         let state = &self.run.state;
-        let bound = state.bound_verifier(&self.run.subject, &staged.verifier)?;
-        let mut target = self.target(&bound);
+        let mut target = self.target(state.bound_verifier(&self.run.subject, &staged.verifier)?);
         target.group_id = staged.group_id;
         target.enqueue(state.client()?, staged.evidence).await
     }
 
-    /// The execution target of `bound` for this view's Run.
-    fn target<'a>(&self, bound: &BoundVerifier<'a>) -> Target<'a> {
+    /// The execution target of `bound` for this view's Run, taking its UIDs.
+    fn target<'a>(&self, bound: BoundVerifier<'a>) -> Target<'a> {
         Target {
             spec: bound.spec,
-            verifier_card_uid: bound.verifier_card_uid.clone(),
-            card_uid: bound.card_uid.clone(),
+            verifier_card_uid: bound.verifier_card_uid,
+            card_uid: bound.card_uid,
             run_id: self.run.run_id.clone(),
             group_id: self.group_id.clone(),
             deployment_environment: self.run.state.deployment_environment().map(str::to_owned),

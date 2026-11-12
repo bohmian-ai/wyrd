@@ -414,11 +414,14 @@ typed columns:
     only writes a row again. Rows therefore repeat across replicas and
     restarts, and readers aggregate by `series_id`, never counting rows as
     series.
-- Three tables hold each verification fact once. A result read assembles the
-  public `VerificationResult` from them: the verdict from `results`,
-  `requirements` and `steps` from `execution_outputs` by `result_id`, and
-  `evidence` from `execution_inputs` by `execution_id`. Detail is never
-  copied between them, and no other table projects drift detail.
+- Three tables hold each verification fact once. One reader assembles both
+  public projections from them: the verdict from `results`, `requirements`
+  and `steps` from `execution_outputs` by `result_id`, and `evidence` from
+  `execution_inputs` by `execution_id`. The compact `VerificationResult`
+  keeps the verdict and each requirement's judgment; `VerificationDetails`
+  adds checks, provenance, steps, and evidence. Projection never changes
+  what is stored. Detail is never copied between them, and no other table
+  projects drift detail.
 - `bifrost.verification.results` is the payload-free summary of one result:
   result, execution, Run, Verifier, subject, binding, group, trigger, and
   window identity, execution status, the verdict, and timing. It carries no
@@ -486,11 +489,20 @@ at any depth before rows leave the scan.
   stratum's sampled non-null values hold it with one compatible type. The seed
   is the claim, so a re-run claim writes the same objects. Each element of a
   Variant inside a List counts as one observation, and one layout covers every
-  element. The sample holds counters, never rows. The sample and the claim
-  merge read complete values — typed leaves plus residual reconstructed by the
-  recursive `unshred_variants` — so a key a staged run kept only in its
-  residual stays discoverable; runs of different layouts merge only after
-  their footers name the claim's logical schema and tenant.
+  element. The sample holds counters, never rows. The sample inspects the
+  complete logical value of only the selected observations — typed leaves
+  together with their residual, read in place exactly as reconstruction would
+  produce them — so a key a staged run kept only in its residual stays
+  discoverable. Selected observations may be reconstructed at most; sampling
+  never needs to. Runs of different layouts merge only after
+  their footers name the claim's logical schema and tenant; a run already in
+  the claim's physical layout passes through without a Variant round trip,
+  and only an incompatible run is reconstructed and reshredded. The sample,
+  the merge, and the writer decode in byte-shaped batches whose workspace —
+  decoded width from the footer's unencoded payload bytes plus fixed leaf
+  widths, tripled while a run converts — is reserved on the Scribe governed
+  root before it is decoded, so a claim that does not fit fails `IngestBusy`
+  instead of exceeding the root.
 - **Learned layouts.** A successful claim assembly installs its layout in a
   process-local advisory cache keyed by exact tenant, table, and table
   version, in completion order; entries are bounded in count and charged to
@@ -1179,6 +1191,20 @@ Every Wyrd pod has at least 4 GiB of memory; boot refuses a detected limit
 below that floor, so the smallest supported pod has a 3-GiB cap and a
 1.5-GiB query grant.
 
+Each process resolves one immutable resource configuration at startup, before
+any consumer starts, from its own observed CPU, memory, and scratch, never a
+peer's. `WYRD_BIFROST_EFFECTIVE_CPU` may only lower the observed CPU `C`.
+Scribe, Oracle, Forge, storage, and transport size themselves from that
+configuration or a capability derived from it; none probes the host. Omitted Scribe coordination, ingress, and persistence worker
+counts derive from `C` (`B = max(C - 2, 2)`: ingress `max(B / 3, 1)`,
+persistence `max(B - ingress, 1)`, coordination `max(C, 2)`); an explicit
+worker count keeps its value. The process Scribe outbox does not scale with
+`C`: it runs four slice writers and four ordered lanes per tenant, with eight
+concurrent frame deliveries per writer and 32 across the process. Queue capacities, database pools,
+WAL IO, and Scribe shard counts do not scale with `C` either. Startup logs the resolved
+configuration, its sources, explicit overrides, and queue limits. Usage and
+pressure counters stay live; only the configuration is fixed.
+
 Only fallible cooperative reservation is hard-limited. Growth DataFusion does
 not let fail is still real memory, so it is charged to an explicit process
 headroom counter that makes later fallible growth refuse sooner. Dependency
@@ -1363,8 +1389,9 @@ Python, TypeScript, and MCP.
 
 `bifrost.system.audit_log` is the authoritative retained audit history. Every
 audit event is staged in memory on the process Scribe outbox, whose one
-background writer cuts each tenant's writes into producer lanes keyed by
-request, Verifier execution, or a queued submission's idempotency key, lets a
+logical dispatcher cuts each tenant's writes into its fixed producer lanes keyed by
+request, Verifier execution, or a queued submission's idempotency key, hands
+independent lanes' slices to concurrent slice writers, lets a
 lane's slice linger until its oldest write is 50 ms old or it holds 4,096 writes
 or 32 MiB of accounted bytes, as a Kafka producer's `linger.ms` and `batch.size`
 do, takes at most 32 MiB of a lane's backlog per slice, so a large backlog is
@@ -1383,6 +1410,9 @@ platform audit principal, the one principal Scribe admits for the reserved
 system owner's audit history. A retryable failure resubmits the identical
 slice, so Scribe's durable batch-id fence absorbs a write whose
 acknowledgement was lost; later arrivals in that lane wait for the next slice.
+A delivery stays counted against the process ceiling from encoding through
+Scribe's acknowledgement, including blocking encoding whose waiter was
+cancelled; the count bounds concurrency, not bytes.
 Producer lanes are independent of Scribe shards, which keep their own routing,
 WAL, and fence. A row carries
 only decision content: there is no chain, sequence, or publication progress,

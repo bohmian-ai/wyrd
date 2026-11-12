@@ -54,6 +54,7 @@ from .support import (
     Receiver,
     client_of,
     declare,
+    details,
     pull,
     rooted,
     service_key,
@@ -195,8 +196,9 @@ def requirement(result: verify.VerificationResult, id: str) -> RequirementResult
 
 
 def step(result: verify.VerificationResult, id: str) -> StepResult:
-    """The step ``id`` of ``result``."""
-    [found] = [each for each in result.steps if each["id"] == id]
+    """The step ``id`` that ``result``'s execution ran, read from its details."""
+    steps = details(result.execution_id)["outcome"]["steps"]
+    [found] = [each for each in steps if each["id"] == id]
     return found
 
 
@@ -607,7 +609,7 @@ def test_stored_evidence_readback_uses_canonical_records(desk: WyrdState) -> Non
 
     assert status["result"]["execution_id"] == execution.id
     assert status["result"]["outcome"]["verdict"] == result.verdict
-    assert list(status["result"]["outcome"]["evidence"].values()) == [
+    assert list(execution.details()["outcome"]["evidence"].values()) == [
         {
             "kind": "file",
             "sha256": hashlib.sha256(content).hexdigest(),
@@ -756,7 +758,9 @@ def test_custom_verdict_data_survives_readback(
     status = execution.status()
     assert status["result"]["outcome"]["requirements"] == waited.requirements
 
-    assert retained(wyrd_server, waited.execution_id) == status["result"]["outcome"]["requirements"]
+    assert (
+        retained(wyrd_server, waited.execution_id) == execution.details()["outcome"]["requirements"]
+    )
 
     for marker, data in EXACT_DATA.items():
         text = f"{marker} refunds"
@@ -766,7 +770,10 @@ def test_custom_verdict_data_survives_readback(
         assert requirement(waited, "well-formed")["data"] == data, marker
         status = execution.status()
         assert status["result"]["outcome"]["requirements"] == waited.requirements, marker
-        assert retained(wyrd_server, waited.execution_id) == waited.requirements, marker
+        assert (
+            retained(wyrd_server, waited.execution_id)
+            == execution.details()["outcome"]["requirements"]
+        ), marker
 
 
 def retained(wyrd_server: WyrdTestServer, execution_id: str) -> object:
@@ -854,6 +861,44 @@ def test_custom_verdict_data_is_typed_on_return(desk: WyrdState) -> None:
     with pytest.raises(WyrdError) as slot:
         desk.run().observe.verify_typed("scored-review", Scored, data_type={"text": "x"})
     assert slot.value.code == "WYRD_VERIFICATION_400_INPUT_INVALID"
+
+
+def test_verification_decisions_and_details_are_separate_reads(
+    desk: WyrdState, receiver: Receiver
+) -> None:
+    direct = desk.run().observe.verify_typed("scored-review", Scored, answer={"text": SCORED_TEXT})
+    for each in direct.requirements:
+        assert "check" not in each and "provenance" not in each, each
+    assert not hasattr(direct, "steps") and not hasattr(direct, "evidence")
+    judged = len(receiver.to("/v1/chat/completions"))
+
+    execution = verify.Execution.connect(direct.execution_id)
+    assert execution.wait_typed(WAIT_SECONDS, Scored).requirements == direct.requirements
+    described = execution.details_typed(Scored)
+
+    assert (described["execution_id"], described["outcome"]["verdict"]) == (
+        direct.execution_id,
+        direct.verdict,
+    )
+    assert described["verifier"]["name"] == direct.verifier.name
+    assert [
+        {key: value for key, value in each.items() if key not in ("check", "provenance")}
+        for each in described["outcome"]["requirements"]
+    ] == direct.requirements
+    checks = {each["id"]: each["check"] for each in described["outcome"]["requirements"]}
+    assert checks["on-topic"]["kind"] == "agent", checks["on-topic"]
+    assert isinstance(checks["on-topic"]["agent"], dict), "the inline Agent is kept as authored"
+    on_topic = next(
+        each for each in described["outcome"]["requirements"] if each["id"] == "on-topic"
+    )
+    assert on_topic["provenance"]["kind"] == "agent", on_topic
+    [tally] = described["outcome"]["steps"]
+    assert (tally["id"], tally["status"]) == ("tally", "succeeded")
+    assert described["outcome"]["evidence"]["answer"] == {
+        "kind": "json",
+        "value": {"text": SCORED_TEXT},
+    }
+    assert len(receiver.to("/v1/chat/completions")) == judged, "details judge nothing again"
 
 
 def test_typed_verdict_data_mismatch_keeps_original_result(
@@ -1499,7 +1544,7 @@ def test_artifact_workspace_refusals_preserve_authority(
     undeclared = probe.state.run().observe.verify(
         probe.verifier, script=[{"tool": "fs.list", "arguments": {"path": "/inputs"}}]
     )
-    assert "is not attached" in step(undeclared, "probe").get("reason", ""), undeclared.steps
+    assert "is not attached" in step(undeclared, "probe").get("reason", ""), undeclared.requirements
     assert all(
         secret not in json.dumps(each.body) for each in receiver.to("/v1/chat/completions")[asked:]
     ), "no refused path hands the protected line to the model"

@@ -1178,6 +1178,696 @@ async fn live_query_routes_only_relevant_scribes() -> Result<(), JourneyError> {
     Ok(())
 }
 
+/// Queries over a Variant layout a claim taught keep their exact SQL answers
+/// while covered paths read only the learned leaves, in process and across
+/// role-separated peers.
+///
+/// A first cohort is read from its canonical memory generation, then
+/// published, and the claim teaches the Scribe a layout; a second cohort
+/// opens a generation that pins it. Over each cohort's memory the same
+/// covered projection, filter-only `COUNT`, null/missing/mixed path, and
+/// whole-root query return the documents' exact values. Covered queries and
+/// `to_json` reconstruct no Variant column, while a bare root output
+/// reconstructs the learned one. A caller without query permission is
+/// refused before any Scribe fragment runs, and a cancelled learned read
+/// releases its producer, snapshot, and follower memory.
+///
+/// # Errors
+///
+/// Returns an error when a cluster, ingest, publication, or query fails, or
+/// an answer, layout, reconstruction count, refusal, or release differs.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn learned_variant_memory_queries_preserve_source_contract() -> Result<(), JourneyError> {
+    for spec in [
+        BifrostClusterSpec::one_mixed(),
+        BifrostClusterSpec::role_separated(),
+    ] {
+        prove_learned_variant_memory(spec).await?;
+    }
+    Ok(())
+}
+
+/// A scalar subquery in a live projection returns its current value through
+/// the public query surface on both mixed and role-separated clusters.
+///
+/// Rows live only in Scribe memory. A no-`WHERE` projection of the scalar
+/// beside a column, a computed output nesting it, and a Variant path beside
+/// it each return every row with the subquery's value, however the server
+/// plans the scalar; after a second write raises the maximum, the same SQL
+/// returns the new value. Every query reaches a Scribe fragment.
+///
+/// # Errors
+///
+/// Returns an error when a cluster, ingest or query fails, or an answer or
+/// fragment count differs.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn scalar_subquery_outputs_survive_live_projection_absorption() -> Result<(), JourneyError> {
+    for spec in [
+        BifrostClusterSpec::one_mixed(),
+        BifrostClusterSpec::role_separated(),
+    ] {
+        prove_live_scalar_outputs(spec).await?;
+    }
+    Ok(())
+}
+
+/// Drives one topology through
+/// [`scalar_subquery_outputs_survive_live_projection_absorption`].
+///
+/// # Errors
+///
+/// Returns an error when any of its steps fails.
+async fn prove_live_scalar_outputs(spec: BifrostClusterSpec) -> Result<(), JourneyError> {
+    let cluster = WyrdTestCluster::start_spec(spec).await?;
+    let tenant = cluster.data_tenant_id();
+    let ingress = cluster
+        .servers()
+        .find(|server| server.bifrost_scribe().is_some())
+        .ok_or("missing Scribe ingress")?;
+    let table = unique_table("oracle_live_scalar_output");
+    let table_fqn = format!("bifrost.bifrost.{table}");
+    let schema: SchemaRef = Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("value", DataType::Int64, false),
+        wyrd_types::variant::variant_field("v", true),
+    ]));
+    register_table_with(
+        ingress,
+        tenant,
+        &table,
+        schema
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect(),
+    )
+    .await?;
+    let writer = writer(ingress, "live-scalar-writer").await?;
+    let reader = client(ingress, "live-scalar-reader").await?;
+    let fragments = || {
+        cluster
+            .servers()
+            .filter_map(|server| server.state().bifrost_ingest())
+            .map(|ingest| ingest.fragment_inspection().0)
+            .sum::<u64>()
+    };
+    let mut values = Vec::new();
+    for batch in [1_i64..=3, 4..=6] {
+        writer
+            .write(
+                &table_fqn,
+                &schema,
+                batch.clone().map(|value| {
+                    serde_json::json!({"value": value, "v": {"a": format!("a{value}")}})
+                        .to_string()
+                        .into_bytes()
+                }),
+            )
+            .await?;
+        values.extend(batch);
+        cluster.refresh_oracle_snapshots().await?;
+        let max = values.iter().max().ok_or("no rows were written")?;
+        let scalar = format!("(SELECT max(value) FROM {table_fqn})");
+        for (sql, expected) in [
+            (
+                format!("SELECT value, {scalar} AS m FROM {table_fqn} ORDER BY value"),
+                values
+                    .iter()
+                    .map(|value| vec![value.to_string(), max.to_string()])
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                format!("SELECT value + {scalar} AS s FROM {table_fqn} ORDER BY s"),
+                values
+                    .iter()
+                    .map(|value| vec![(value + max).to_string()])
+                    .collect(),
+            ),
+            (
+                format!("SELECT v ->> 'a' AS a, {scalar} AS m FROM {table_fqn} ORDER BY a"),
+                values
+                    .iter()
+                    .map(|value| vec![format!("a{value}"), max.to_string()])
+                    .collect(),
+            ),
+        ] {
+            let before = fragments();
+            let (_, rows) = run_rows(&reader, &sql).await?;
+            if rows != expected {
+                return Err(format!("`{sql}` returned {rows:?}, expected {expected:?}").into());
+            }
+            if fragments() == before {
+                return Err(format!("`{sql}` never reached a Scribe fragment").into());
+            }
+        }
+    }
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Forty `(value, document)` rows from `first` mixing typed, mistyped, null,
+/// list, nested, and missing Variant keys.
+fn variant_documents(first: i64) -> Vec<(i64, serde_json::Value)> {
+    (first..first + 40)
+        .map(|value| {
+            let document = match value % 4 {
+                0 => serde_json::json!({"a": value, "b": format!("s{value}")}),
+                1 => serde_json::json!({"a": value, "c": [1, value]}),
+                2 => serde_json::json!({"a": format!("text{value}"), "b": null}),
+                _ => serde_json::json!({"a": value, "d": {"e": value}}),
+            };
+            (value, document)
+        })
+        .collect()
+}
+
+/// Runs one public query and returns its rendered rows with the Variant
+/// columns the Scribe reconstructed while answering it.
+///
+/// # Errors
+///
+/// Returns the query error, or an error when it does not settle successfully.
+async fn reconstructing_rows(
+    client: &WyrdClient,
+    sql: &str,
+) -> Result<(Vec<Vec<String>>, usize), JourneyError> {
+    let before = vala_bifrost_redux::scribe::memtable::variant_reconstructions_for_test();
+    let (_, rows) = run_rows(client, sql).await?;
+    let reconstructed =
+        vala_bifrost_redux::scribe::memtable::variant_reconstructions_for_test() - before;
+    Ok((rows, reconstructed))
+}
+
+/// Proves one cohort's answers against its documents, wherever its rows live.
+///
+/// `root_reconstructs` states whether a bare root output must reconstruct a
+/// Variant column: only a learned generation in memory does, and a covered
+/// query never does. `documents` are the cohort's `(value, v)` rows in
+/// ascending `value`, and its queries cover the closed range between the
+/// first and last, including a nested key and a list element.
+///
+/// # Errors
+///
+/// Returns a query error, an error when `documents` is empty or a `to_json`
+/// row does not render as a value and its JSON, or a description of the
+/// differing answer.
+async fn prove_variant_answers(
+    reader: &WyrdClient,
+    table_fqn: &str,
+    documents: &[(i64, serde_json::Value)],
+    root_reconstructs: bool,
+) -> Result<(), JourneyError> {
+    let (Some((first, _)), Some((last, _))) = (documents.first(), documents.last()) else {
+        return Err("a cohort needs at least one document".into());
+    };
+    let range = format!("value BETWEEN {first} AND {last}");
+    let text = |value: &serde_json::Value| match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Null => "absent".to_owned(),
+        other => other.to_string(),
+    };
+    let covered = [
+        (
+            format!(
+                "SELECT value, v ->> 'a' AS a, v ->> 'a' AS again FROM {table_fqn} \
+                 WHERE {range} ORDER BY value"
+            ),
+            documents
+                .iter()
+                .map(|(value, document)| {
+                    vec![
+                        value.to_string(),
+                        text(&document["a"]),
+                        text(&document["a"]),
+                    ]
+                })
+                .collect::<Vec<_>>(),
+        ),
+        (
+            format!(
+                "SELECT count(*) FROM {table_fqn} WHERE {range} AND v ->> 'b' = 's{}'",
+                first + 4
+            ),
+            vec![vec!["1".to_owned()]],
+        ),
+        (
+            format!(
+                "SELECT value, coalesce(v ->> 'b', 'absent') FROM {table_fqn} \
+                 WHERE {range} AND v ->> 'a' IS NOT NULL ORDER BY value"
+            ),
+            documents
+                .iter()
+                .map(|(value, document)| vec![value.to_string(), text(&document["b"])])
+                .collect(),
+        ),
+        (
+            format!(
+                "SELECT value, coalesce(v -> 'd' ->> 'e', 'absent') FROM {table_fqn} \
+                 WHERE {range} AND v -> 'c' ->> 1 IS NULL ORDER BY value"
+            ),
+            documents
+                .iter()
+                .filter(|(_, document)| document["c"][1].is_null())
+                .map(|(value, document)| vec![value.to_string(), text(&document["d"]["e"])])
+                .collect(),
+        ),
+    ];
+    for (sql, expected) in covered {
+        let (rows, reconstructed) = reconstructing_rows(reader, &sql).await?;
+        if rows != expected {
+            return Err(format!("`{sql}` returned {rows:?}, expected {expected:?}").into());
+        }
+        if reconstructed != 0 {
+            return Err(format!("`{sql}` reconstructed {reconstructed} Variant columns").into());
+        }
+    }
+    // `to_json` is a computed output, so it reads the learned layout and its
+    // residuals directly, without reconstruction.
+    let sql = format!("SELECT value, to_json(v) FROM {table_fqn} WHERE {range} ORDER BY value");
+    let (rows, reconstructed) = reconstructing_rows(reader, &sql).await?;
+    if reconstructed != 0 {
+        return Err(format!("`{sql}` reconstructed {reconstructed} Variant columns").into());
+    }
+    let roots = rows
+        .iter()
+        .map(|row| match row.as_slice() {
+            [value, json] => Ok((
+                value.parse::<i64>()?,
+                serde_json::from_str::<serde_json::Value>(json)?,
+            )),
+            _ => Err(format!("`{sql}` rendered {row:?}").into()),
+        })
+        .collect::<Result<Vec<_>, JourneyError>>()?;
+    if roots != documents {
+        return Err(format!("the whole root returned {roots:?}").into());
+    }
+    // The root itself is a bare output, which a learned generation can only
+    // return by reconstructing it.
+    let sql = format!("SELECT v FROM {table_fqn} WHERE {range}");
+    let (rows, reconstructed) = reconstructing_rows(reader, &sql).await?;
+    if rows.len() != documents.len() {
+        return Err(format!("`{sql}` returned {} rows", rows.len()).into());
+    }
+    if (reconstructed != 0) != root_reconstructs {
+        return Err(format!(
+            "the whole root reconstructed {reconstructed} Variant columns \
+             (expected reconstruction={root_reconstructs})"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Drives one topology through canonical and learned Variant memory.
+///
+/// # Errors
+///
+/// Returns an error when any step of
+/// [`learned_variant_memory_queries_preserve_source_contract`] fails.
+async fn prove_learned_variant_memory(spec: BifrostClusterSpec) -> Result<(), JourneyError> {
+    let cluster = WyrdTestCluster::start_spec(spec).await?;
+    let tenant = cluster.data_tenant_id();
+    let ingress = cluster
+        .servers()
+        .find(|server| server.bifrost_scribe().is_some())
+        .ok_or("missing Scribe ingress")?;
+    let scribe = ingress.bifrost_scribe().ok_or("missing Scribe")?;
+    let table = unique_table("oracle_learned_variant");
+    let table_ref = TableRef::new(BifrostNamespace::Bifrost, &table);
+    let table_fqn = format!("bifrost.bifrost.{table}");
+    let schema: SchemaRef = Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("value", DataType::Int64, false),
+        wyrd_types::variant::variant_field("v", true),
+    ]));
+    register_table_with(
+        ingress,
+        tenant,
+        &table,
+        schema
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect(),
+    )
+    .await?;
+    let writer = writer(ingress, "learned-variant-writer").await?;
+    let write = |documents: Vec<(i64, serde_json::Value)>| {
+        let writer = &writer;
+        let table_fqn = &table_fqn;
+        let schema = &schema;
+        async move {
+            writer
+                .write(
+                    table_fqn,
+                    schema,
+                    documents.iter().map(|(value, document)| {
+                        serde_json::json!({"value": value, "v": document})
+                            .to_string()
+                            .into_bytes()
+                    }),
+                )
+                .await?;
+            Ok::<_, JourneyError>(documents)
+        }
+    };
+    let reader = client(ingress, "learned-variant-reader").await?;
+    let layouts = || {
+        scribe
+            .writable_variant_layouts_for_test(tenant, &table_ref)
+            .ok()
+    };
+    let fragments = || {
+        cluster
+            .servers()
+            .filter_map(|server| server.state().bifrost_ingest())
+            .map(|ingest| ingest.fragment_inspection().0)
+            .sum::<u64>()
+    };
+
+    let canonical = write(variant_documents(0)).await?;
+    if layouts() != Some(vec![false]) {
+        return Err(format!("a cold Scribe opened {:?}", layouts()).into());
+    }
+    cluster.refresh_oracle_snapshots().await?;
+    prove_variant_answers(&reader, &table_fqn, &canonical, false).await?;
+    ingress.flush_bifrost().await?;
+    if scribe
+        .learned_variant_layout_for_test(tenant, &table_ref)
+        .is_none()
+    {
+        return Err("the published claim taught no layout".into());
+    }
+    let learned = write(variant_documents(40)).await?;
+    if layouts() != Some(vec![true]) {
+        return Err(format!("the generation after learning opened {:?}", layouts()).into());
+    }
+    cluster.refresh_oracle_snapshots().await?;
+    prove_variant_answers(&reader, &table_fqn, &learned, true).await?;
+
+    ingress
+        .seed_role(
+            "learned_variant_no_query",
+            &[Permission::bifrost_table_read()],
+        )
+        .await?;
+    let unprivileged = client_from_bootstrap(
+        ingress,
+        ingress
+            .bootstrap_service_in_tenant(
+                tenant,
+                "learned-variant-unprivileged",
+                &["learned_variant_no_query"],
+            )
+            .await?,
+    )?;
+    let before = fragments();
+    let sql = format!("SELECT v ->> 'a' FROM {table_fqn}");
+    if let Ok(rows) = run_rows(&unprivileged, &sql).await {
+        return Err(format!("a caller without query permission read {rows:?}").into());
+    }
+    if fragments() != before {
+        return Err("a refused caller ran a Scribe fragment".into());
+    }
+
+    // The producer pauses before a second batch, so the read needs two.
+    write(variant_documents(80)).await?;
+    cluster.refresh_oracle_snapshots().await?;
+    let case = "cancelled learned read";
+    let query = wyrd_client::Bifrost::query_only(&reader);
+    let stream = open_paused_live_query(&query, &sql, case).await?;
+    query.cancel(stream.request_id()).await?;
+    await_live_released(&cluster, case).await?;
+    vala_bifrost_redux::scribe::tail_rpc::scribe_live_production_pause_for_test().release();
+    drop(stream);
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// The same Variant queries agree as their rows move from memory to staged
+/// runs to publication, on mixed and role-separated clusters.
+///
+/// A canonical cohort is read from memory, from its staged runs and from its
+/// publication, whose claim teaches a layout; a learned cohort is then read
+/// through the same three tiers. Every tier returns the cohort's exact
+/// values, types and cardinality for scalar, repeated, COUNT, null-test,
+/// nested, list, `to_json` and whole-root reads, and a covered read never
+/// reconstructs a Variant column. A learned file reads fewer bytes for a
+/// covered key than for its whole root, so each staged or published file
+/// decodes only that key's leaves. A query held over staged and memory rows
+/// while they publish returns each of them once, as does a new query of the
+/// successor cut, and a caller without query permission reads nothing.
+///
+/// # Errors
+///
+/// Returns an error when a cluster, ingest, staging, publication or query
+/// fails, or an answer, layout, byte, refusal or row-once check differs.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn variant_leaf_queries_agree_across_source_transitions() -> Result<(), JourneyError> {
+    for spec in [
+        BifrostClusterSpec::one_mixed(),
+        BifrostClusterSpec::role_separated(),
+    ] {
+        prove_variant_source_transitions(spec).await?;
+    }
+    Ok(())
+}
+
+/// Returns the compressed file bytes the cluster's Oracles scanned for one
+/// public query.
+///
+/// # Errors
+///
+/// Returns a telemetry or query error.
+async fn scanned_bytes(
+    cluster: &WyrdTestCluster,
+    reader: &WyrdClient,
+    sql: &str,
+) -> Result<f64, JourneyError> {
+    let checkpoint = cluster
+        .telemetry()
+        .checkpoint()
+        .map_err(|error| error.to_string())?;
+    run_rows(reader, sql).await?;
+    let delta = cluster
+        .telemetry()
+        .delta_since(&checkpoint)
+        .map_err(|error| error.to_string())?;
+    Ok(sum_metric(&delta, "oracle_query_bytes_scanned_total"))
+}
+
+/// Proves that the learned cohort `documents`, served by files, reads fewer
+/// bytes for a covered key than for its whole root.
+///
+/// # Errors
+///
+/// Returns a query error, or an error naming `tier` when the covered read
+/// scans no fewer bytes.
+async fn prove_learned_file_leaves(
+    cluster: &WyrdTestCluster,
+    reader: &WyrdClient,
+    table_fqn: &str,
+    documents: &[(i64, serde_json::Value)],
+    tier: &str,
+) -> Result<(), JourneyError> {
+    let (Some((first, _)), Some((last, _))) = (documents.first(), documents.last()) else {
+        return Err("a cohort needs at least one document".into());
+    };
+    let range = format!("value BETWEEN {first} AND {last}");
+    let leaf = scanned_bytes(
+        cluster,
+        reader,
+        &format!("SELECT value, v ->> 'a' FROM {table_fqn} WHERE {range}"),
+    )
+    .await?;
+    let root = scanned_bytes(
+        cluster,
+        reader,
+        &format!("SELECT value, v FROM {table_fqn} WHERE {range}"),
+    )
+    .await?;
+    if leaf <= 0.0 || leaf >= root {
+        return Err(
+            format!("{tier}: a covered key scanned {leaf} bytes, its whole root {root}").into(),
+        );
+    }
+    Ok(())
+}
+
+/// Drives one topology through
+/// [`variant_leaf_queries_agree_across_source_transitions`].
+///
+/// # Errors
+///
+/// Returns an error when any of its steps fails.
+async fn prove_variant_source_transitions(spec: BifrostClusterSpec) -> Result<(), JourneyError> {
+    let cluster = WyrdTestCluster::start_spec(spec).await?;
+    let tenant = cluster.data_tenant_id();
+    let ingress = cluster
+        .servers()
+        .find(|server| server.bifrost_scribe().is_some())
+        .ok_or("missing Scribe ingress")?;
+    let scribe = ingress.bifrost_scribe().ok_or("missing Scribe")?;
+    let table = unique_table("oracle_variant_transitions");
+    let table_ref = TableRef::new(BifrostNamespace::Bifrost, &table);
+    let table_fqn = format!("bifrost.bifrost.{table}");
+    let schema: SchemaRef = Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("value", DataType::Int64, false),
+        wyrd_types::variant::variant_field("v", true),
+    ]));
+    register_table_with(
+        ingress,
+        tenant,
+        &table,
+        schema
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect(),
+    )
+    .await?;
+    let writer = writer(ingress, "variant-transitions-writer").await?;
+    let write = |documents: Vec<(i64, serde_json::Value)>| {
+        let writer = &writer;
+        let table_fqn = &table_fqn;
+        let schema = &schema;
+        async move {
+            writer
+                .write(
+                    table_fqn,
+                    schema,
+                    documents.iter().map(|(value, document)| {
+                        serde_json::json!({"value": value, "v": document})
+                            .to_string()
+                            .into_bytes()
+                    }),
+                )
+                .await?;
+            Ok::<_, JourneyError>(documents)
+        }
+    };
+    let reader = client(ingress, "variant-transitions-reader").await?;
+    let stage = || async {
+        ingress.stage_bifrost_writable_for_test().await?;
+        staged_runs(ingress, tenant, &table).await?;
+        cluster.refresh_oracle_snapshots().await?;
+        Ok::<_, JourneyError>(())
+    };
+    let publish = || async {
+        ingress.flush_bifrost().await?;
+        cluster.refresh_oracle_snapshots().await?;
+        Ok::<_, JourneyError>(())
+    };
+
+    let canonical = write(variant_documents(0)).await?;
+    cluster.refresh_oracle_snapshots().await?;
+    prove_variant_answers(&reader, &table_fqn, &canonical, false).await?;
+    stage().await?;
+    prove_variant_answers(&reader, &table_fqn, &canonical, false).await?;
+    publish().await?;
+    prove_variant_answers(&reader, &table_fqn, &canonical, false).await?;
+    if scribe
+        .learned_variant_layout_for_test(tenant, &table_ref)
+        .is_none()
+    {
+        return Err("the published claim taught no layout".into());
+    }
+
+    let learned = write(variant_documents(40)).await?;
+    if scribe
+        .writable_variant_layouts_for_test(tenant, &table_ref)
+        .ok()
+        != Some(vec![true])
+    {
+        return Err("the generation after learning is not learned".into());
+    }
+    cluster.refresh_oracle_snapshots().await?;
+    prove_variant_answers(&reader, &table_fqn, &learned, true).await?;
+    stage().await?;
+    prove_variant_answers(&reader, &table_fqn, &learned, false).await?;
+    prove_learned_file_leaves(&cluster, &reader, &table_fqn, &learned, "staged").await?;
+
+    ingress
+        .seed_role(
+            "variant_transitions_no_query",
+            &[Permission::bifrost_table_read()],
+        )
+        .await?;
+    let unprivileged = client_from_bootstrap(
+        ingress,
+        ingress
+            .bootstrap_service_in_tenant(
+                tenant,
+                "variant-transitions-unprivileged",
+                &["variant_transitions_no_query"],
+            )
+            .await?,
+    )?;
+    let sql = format!("SELECT value, v ->> 'a' FROM {table_fqn} WHERE value >= 40");
+    if let Ok(rows) = run_rows(&unprivileged, &sql).await {
+        return Err(format!("a caller without query permission read {rows:?}").into());
+    }
+
+    // A query held over the staged cohort and a memory cohort sees each of
+    // their rows once while both publish under it.
+    let held_rows = write(variant_documents(80)).await?;
+    cluster.refresh_oracle_snapshots().await?;
+    let mut expected = learned
+        .iter()
+        .chain(&held_rows)
+        .map(|(value, document)| {
+            vec![
+                value.to_string(),
+                match &document["a"] {
+                    serde_json::Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                },
+            ]
+        })
+        .collect::<Vec<_>>();
+    expected.sort();
+    let case = "query held across publication";
+    let query = wyrd_client::Bifrost::query_only(&reader);
+    let stream = open_paused_live_query(&query, &sql, case).await?;
+    let drain = tokio::spawn(async move {
+        let mut stream = stream;
+        let mut rows = Vec::new();
+        while let Some(batch) = stream.next_batch().await? {
+            rows.extend(render_rows(&batch)?);
+        }
+        let terminal = stream.terminal().ok_or("query terminal missing")?;
+        if terminal.outcome != QueryTerminalOutcome::Success {
+            return Err(format!("the held query ended {:?}", terminal.error).into());
+        }
+        Ok::<_, JourneyError>(rows)
+    });
+    // Retirement waits for the held query's capture, so the flush finishes
+    // only after the query drains; the query is released once its rows are
+    // published.
+    let (published, held) = tokio::join!(publish(), async {
+        await_published(ingress, tenant, &table).await?;
+        vala_bifrost_redux::scribe::tail_rpc::scribe_live_production_pause_for_test().release();
+        tokio::time::timeout(LIVE_SETTLE_TIMEOUT, drain).await??
+    });
+    published?;
+    let mut held = held?;
+    held.sort();
+    if held != expected {
+        return Err(format!("{case} returned {held:?}").into());
+    }
+    let (_, mut successor) = run_rows(&reader, &sql).await?;
+    successor.sort();
+    if successor != expected {
+        return Err(format!("the successor cut returned {successor:?}").into());
+    }
+    prove_variant_answers(&reader, &table_fqn, &learned, false).await?;
+    prove_learned_file_leaves(&cluster, &reader, &table_fqn, &learned, "published").await?;
+    await_live_released(&cluster, case).await?;
+    cluster.shutdown().await?;
+    Ok(())
+}
+
 /// Drains one public grouped count into `(filter_key, matched)` rows and its path.
 ///
 /// # Errors
@@ -1355,7 +2045,7 @@ pub(crate) const LIVE_DEADLINE_MS: i64 = 120_000;
 /// Bound on waiting for a paused, cancelled, or dropped live read to settle.
 pub(crate) const LIVE_SETTLE_TIMEOUT: Duration = Duration::from_mins(1);
 
-/// Returns the query-memory bytes the writer Scribe's follower views hold.
+/// Returns the query-memory bytes every Scribe pod's follower views hold.
 ///
 /// A follower charges only the bytes its `DataFusion` consumers actually hold
 /// on the pod's one governed pool, attributed to query memory. A paused
@@ -1364,17 +2054,21 @@ pub(crate) const LIVE_SETTLE_TIMEOUT: Duration = Duration::from_mins(1);
 ///
 /// # Errors
 ///
-/// Returns an error when the node carries no Scribe or its root snapshot fails.
+/// Returns an error when the cluster carries no Scribe or a root snapshot
+/// fails.
 fn writer_follower_bytes(cluster: &WyrdTestCluster) -> Result<usize, JourneyError> {
-    Ok(cluster
-        .server(0)
-        .ok_or("missing writer node")?
-        .state()
-        .bifrost_ingest()
-        .ok_or("writer node has no Scribe runtime")?
-        .resources()
-        .snapshot()?
-        .oracle_query_memory_used_bytes)
+    let mut held = None;
+    for ingest in cluster
+        .servers()
+        .filter_map(|server| server.state().bifrost_ingest())
+    {
+        let bytes = ingest
+            .resources()
+            .snapshot()?
+            .oracle_query_memory_used_bytes;
+        held = Some(held.unwrap_or(0) + bytes);
+    }
+    held.ok_or_else(|| "the cluster has no Scribe runtime".into())
 }
 
 /// Reports whether the leader node still admits the live query.
@@ -2089,6 +2783,38 @@ async fn staged_runs(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     Err(format!("{table} never became served only by staged runs").into())
+}
+
+/// Waits until every live authority serving `table` on `server` is a
+/// publication, so no memtable or staged run still owns its rows.
+///
+/// # Errors
+///
+/// Returns an error when the authority registry is unreadable, or when the
+/// table is not served only by publications within the bound.
+async fn await_published(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+    table: &str,
+) -> Result<(), JourneyError> {
+    for _ in 0..200 {
+        let mut published = false;
+        let mut unpublished = false;
+        for live in server.bifrost_live_authorities_for_test()? {
+            if live.key.tenant != tenant || live.key.table.name != table {
+                continue;
+            }
+            match live.authority {
+                HotAuthority::Published { .. } => published = true,
+                HotAuthority::Memtable | HotAuthority::StagedRun { .. } => unpublished = true,
+            }
+        }
+        if published && !unpublished {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err(format!("{table} never became served only by publications").into())
 }
 
 /// Rewrites one staged run in place so its footer names `foreign` as tenant.

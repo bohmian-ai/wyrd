@@ -5,7 +5,6 @@
 mod context;
 mod export;
 mod log_writer;
-pub mod timing;
 
 pub use context::{
     caller_sampled, continued_context, current_context, inbound_context, serve_linked_work,
@@ -372,44 +371,6 @@ pub fn link_remote_span(
     ));
 }
 
-/// Records one request's server timing at an owning boundary into the
-/// bounded benchmark histograms under `parent`'s request classification.
-///
-/// `elapsed` is the owner's monotonic time from handler entry to `boundary`
-/// (result ready, write acknowledged, or response handoff), and `excluded`
-/// the union of the waits the owner does not count as its own work, such as
-/// provider exchanges or Verifier blocks, when the boundary has any, with
-/// the closed `boundary` and `outcome` labels. Nothing is recorded until
-/// [`timing::enable`]; see [`timing`].
-pub fn record_timing(
-    parent: &tracing::Span,
-    boundary: &'static str,
-    outcome: &'static str,
-    elapsed: std::time::Duration,
-    excluded: Option<std::time::Duration>,
-) {
-    timing::record(parent, boundary, outcome, elapsed, excluded, &[]);
-}
-
-/// Records one request's server timing as [`record_timing`] does, plus each
-/// `(boundary, duration)` of `parts`: a component of the same request, such
-/// as one execution phase, recorded as an observation of its own boundary
-/// under the same outcome and classification.
-///
-/// The request and its parts are recorded under one lock acquisition, so a
-/// snapshot holds either all of them or none, and a part costs no more
-/// lock traffic than the request already pays.
-pub fn record_timing_parts(
-    parent: &tracing::Span,
-    boundary: &'static str,
-    outcome: &'static str,
-    elapsed: std::time::Duration,
-    excluded: Option<std::time::Duration>,
-    parts: &[(&'static str, std::time::Duration)],
-) {
-    timing::record(parent, boundary, outcome, elapsed, excluded, parts);
-}
-
 /// Resolve the effective log filter from multiple sources in priority order.
 ///
 /// Priority: `WYRD_LOG` env var → `RUST_LOG` env var → `config.filter` field → `"info"`.
@@ -496,7 +457,6 @@ pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard, WyrdError> {
         resolve_filter(&config),
         resolve_trace_filter(&config),
         provider.tracer("wyrd"),
-        false,
         writer,
     )
     .try_init()
@@ -556,7 +516,6 @@ pub fn init_test_capture(
         resolve_filter(&config),
         EnvFilter::new("trace"),
         provider.tracer("wyrd"),
-        true,
         std::io::stdout,
     )
     .try_init()
@@ -581,15 +540,16 @@ pub fn init_test_capture(
 /// diagnostic verbosity, and, whatever either filter says, every span and
 /// event the tenant copy needs: catalog spans and events at `INFO` or above,
 /// the verbosity the tenant catalog is defined at. Neither filter can
-/// therefore remove a tenant copy. With `level` set, each exported span also
-/// carries its `tracing` level. Spans carry no busy/idle times, thread, or
+/// therefore remove a tenant copy. Each span carries its `tracing` level,
+/// which the tenant copy reads to pass over catalog spans below `INFO` that
+/// operator verbosity records, so neither filter can add to a tenant copy
+/// either; the copy drops the attribute. Spans carry no busy/idle times, thread, or
 /// code location: each costs work on every span or every poll of an
 /// instrumented future, and no tenant copy keeps them.
 fn subscriber<W>(
     logs: EnvFilter,
     traces: EnvFilter,
     tracer: opentelemetry_sdk::trace::Tracer,
-    level: bool,
     writer: W,
 ) -> impl tracing::Subscriber + Send + Sync
 where
@@ -612,7 +572,7 @@ where
         .with(
             tracing_opentelemetry::layer()
                 .with_tracer(tracer)
-                .with_level(level)
+                .with_level(true)
                 .with_tracked_inactivity(false)
                 .with_threads(false)
                 .with_location(false)
@@ -730,8 +690,8 @@ mod tests {
     /// operator sampling `ratio`, and return the tenant copies and the
     /// operator's spans by name, and the log output.
     ///
-    /// The request runs a catalog child, a debug diagnostic span, an info
-    /// event, and an error event.
+    /// The request runs a catalog child holding a debug diagnostic span
+    /// with its own catalog child, an info event, and an error event.
     ///
     /// # Panics
     ///
@@ -762,7 +722,6 @@ mod tests {
             EnvFilter::new(logs),
             EnvFilter::new(traces),
             provider.tracer("wyrd"),
-            false,
             move || writer.clone(),
         );
         tracing::subscriber::with_default(subscriber, || {
@@ -778,7 +737,9 @@ mod tests {
                     ),
                 });
                 tracing::info_span!("verification.run").in_scope(|| {
-                    tracing::debug_span!("verification.detail").in_scope(|| {});
+                    tracing::debug_span!("verification.detail").in_scope(|| {
+                        tracing::info_span!("verification.step").in_scope(|| {});
+                    });
                     tracing::info!("verification step");
                     tracing::error!(error.type = "timeout", "verification failed");
                 });
@@ -807,7 +768,7 @@ mod tests {
     #[test]
     fn production_filters_preserve_tenant_traces() {
         let (tenant, operator, logs) = serve("info", "info", 0.0);
-        assert_eq!(tenant, ["verification.run", "request"]);
+        assert_eq!(tenant, ["verification.step", "verification.run", "request"]);
         assert!(
             operator.is_empty(),
             "ratio zero exports nothing: {operator:?}"
@@ -821,17 +782,31 @@ mod tests {
             "the error carries its request's span context: {failure}"
         );
         assert!(!serve("off", "info", 0.0).2.contains("verification failed"));
-        for (logs, traces) in [("off", "info"), ("error", "error"), ("info", "off")] {
+        for (logs, traces) in [
+            ("off", "info"),
+            ("error", "error"),
+            ("info", "off"),
+            ("off", "debug"),
+            ("debug", "trace"),
+        ] {
             assert_eq!(
                 serve(logs, traces, 0.0).0,
                 tenant,
                 "logs {logs:?}, traces {traces:?}"
             );
         }
-        assert_eq!(serve("off", "info", 1.0).1, ["verification.run", "request"]);
+        assert_eq!(
+            serve("off", "info", 1.0).1,
+            ["verification.step", "verification.run", "request"]
+        );
         assert_eq!(
             serve("off", "debug", 1.0).1,
-            ["verification.detail", "verification.run", "request"]
+            [
+                "verification.step",
+                "verification.detail",
+                "verification.run",
+                "request"
+            ]
         );
     }
 
@@ -1253,215 +1228,6 @@ mod tests {
             spans[0].attributes.get("component"),
             Some(&"wyrd".to_owned())
         );
-        guard.shutdown();
-    }
-
-    /// Concurrent observations under labelled requests land exactly once in
-    /// their own case and phase series, as does each recorded part under
-    /// its own boundary; interval snapshots conserve counts,
-    /// keep zero, bound each percentile by its bucket, and report
-    /// out-of-range, negative, reset, and replaced-process evidence.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the test pipeline does not initialize or any count,
-    /// bound, or invalidity is wrong.
-    #[test]
-    fn benchmark_histograms_preserve_bounded_intervals() {
-        use super::timing::{self, CASE_HEADER, PHASE_HEADER};
-        use std::time::Duration;
-
-        let (guard, _capture) = super::init_test_capture(super::TelemetryConfig::default())
-            .expect("test telemetry pipeline initializes");
-        let request = |case: &str, phase: &str| {
-            let span = tracing::info_span!("request");
-            let mut headers = http::HeaderMap::new();
-            headers.insert(CASE_HEADER, case.parse().expect("header value"));
-            headers.insert(PHASE_HEADER, phase.parse().expect("header value"));
-            timing::label_request(&span, &headers);
-            span
-        };
-        let unlabelled = tracing::info_span!("request");
-        let ignored = request("point-lookup", "warmup");
-        super::record_timing(&ignored, "bifrost.query", "success", Duration::ZERO, None);
-        timing::enable();
-        assert_eq!(
-            timing::snapshot().series.len(),
-            0,
-            "nothing is recorded before enable, and labels set then are ignored"
-        );
-        let started = timing::snapshot();
-
-        let warmup = request("point-lookup", "warmup");
-        for _ in 0..10 {
-            super::record_timing(
-                &warmup,
-                "bifrost.query",
-                "success",
-                Duration::from_micros(3),
-                None,
-            );
-        }
-        let warm = timing::snapshot();
-        let point = request("point-lookup", "repetition-1");
-        let scan = request("full-scan", "repetition-1");
-        std::thread::scope(|threads| {
-            for thread in 0..8_u64 {
-                let (point, scan, unlabelled) = (&point, &scan, &unlabelled);
-                threads.spawn(move || {
-                    for i in 0..1_000_u64 {
-                        let elapsed = Duration::from_nanos(thread * 1_000 + i);
-                        super::record_timing(point, "bifrost.query", "success", elapsed, None);
-                        if i % 10 == 0 {
-                            super::record_timing(scan, "bifrost.query", "success", elapsed, None);
-                            super::record_timing(
-                                unlabelled,
-                                "bifrost.query",
-                                "success",
-                                elapsed,
-                                None,
-                            );
-                        }
-                    }
-                });
-            }
-        });
-        let gateway = request("buffered-1kib-capture-metadata", "repetition-1");
-        super::record_timing(
-            &gateway,
-            "gateway.buffered",
-            "success",
-            Duration::from_micros(500),
-            Some(Duration::from_micros(400)),
-        );
-        super::record_timing(
-            &gateway,
-            "gateway.buffered",
-            "success",
-            Duration::from_nanos(10),
-            Some(Duration::from_nanos(11)),
-        );
-        super::record_timing(
-            &gateway,
-            "gateway.buffered",
-            "success",
-            Duration::from_secs(600),
-            Some(Duration::ZERO),
-        );
-        let verify = request("direct-verify", "repetition-1");
-        super::record_timing_parts(
-            &verify,
-            "verification.direct",
-            "success",
-            Duration::from_micros(300),
-            Some(Duration::from_micros(10)),
-            &[
-                ("verification.direct.engine", Duration::from_micros(100)),
-                ("verification.direct.stage", Duration::ZERO),
-            ],
-        );
-        let _invalid = request("drop table", "repetition-1");
-        let measured = timing::snapshot();
-
-        let warmed = warm.since(&started).expect("same process");
-        assert_eq!(warmed.series.len(), 1);
-        assert_eq!(warmed.series[0].phase, "warmup");
-        assert_eq!(warmed.series[0].count, 10);
-
-        let interval = measured.since(&warm).expect("same process");
-        let series = |case: &str, boundary: &str| {
-            interval
-                .series
-                .iter()
-                .find(|series| {
-                    series.case == case
-                        && series.boundary == boundary
-                        && series.outcome == "success"
-                })
-                .unwrap_or_else(|| panic!("no {case} {boundary} series"))
-        };
-        let engine = series("direct-verify", "verification.direct.engine");
-        let at = engine.elapsed.quantile(1.0).expect("one part");
-        assert_eq!(
-            engine.count, 1,
-            "a part is one observation of its own boundary"
-        );
-        assert!(at.lowest <= 100_000 && 100_000 <= at.highest);
-        assert!(engine.excluded.is_none() && engine.problems().is_empty());
-        assert_eq!(
-            series("direct-verify", "verification.direct.stage").count,
-            1
-        );
-        assert_eq!(series("direct-verify", "verification.direct").count, 1);
-        let point = series("point-lookup", "bifrost.query");
-        assert_eq!(point.phase, "repetition-1");
-        assert_eq!((point.count, point.elapsed.len()), (8_000, 8_000));
-        assert!(point.problems().is_empty(), "{:?}", point.problems());
-        assert_eq!(series("full-scan", "bifrost.query").count, 800);
-        assert_eq!(series(timing::UNLABELLED, "bifrost.query").count, 800);
-        assert!(
-            interval
-                .series
-                .iter()
-                .all(|series| series.phase != "warmup"),
-            "warmup observations stay in the warmup interval"
-        );
-        let zero = point.elapsed.quantile(0.0).expect("observations");
-        assert_eq!(
-            (zero.lowest, zero.highest),
-            (0, 0),
-            "zero is counted exactly"
-        );
-        let p99 = point.elapsed.quantile(0.99).expect("observations");
-        assert_eq!(p99.rank, 7_920);
-        assert!(p99.lowest <= 7_919 && 7_919 <= p99.highest);
-        assert!(p99.highest - p99.lowest <= 7_919 / 1_000);
-        let whole = measured.since(&started).expect("same process");
-        let total: u64 = whole.series.iter().map(|series| series.count).sum();
-        assert_eq!(
-            total,
-            10 + 8_000 + 800 + 800 + 3 + 3,
-            "each observation and part once"
-        );
-
-        let gateway = series("buffered-1kib-capture-metadata", "gateway.buffered");
-        assert_eq!(gateway.count, 3);
-        let residual = gateway.residual.as_ref().expect("residual component");
-        assert_eq!(
-            residual.len(),
-            1,
-            "only the in-range, non-negative residual"
-        );
-        let half = gateway.elapsed.quantile(0.0).expect("observation");
-        assert!(half.lowest <= 10 && 10 <= half.highest);
-        let problems = gateway.problems().join("; ");
-        assert!(
-            problems.contains("2 durations outside the trackable range"),
-            "{problems}"
-        );
-        assert!(
-            problems.contains("1 excluded waits exceeding elapsed time"),
-            "{problems}"
-        );
-        assert!(
-            problems.contains("2 elapsed observations for 3 requests"),
-            "{problems}"
-        );
-        assert_eq!(
-            interval.invalid_labels, 1,
-            "the unknown declaration is counted once"
-        );
-
-        let mut replaced = measured.clone();
-        replaced.process = "another".to_owned();
-        assert!(replaced.since(&warm).is_err_and(|e| e.contains("replaced")));
-        assert!(
-            warm.since(&measured).is_err(),
-            "a reversed interval is a reset"
-        );
-        let mut reset = measured.clone();
-        reset.series.retain(|series| series.case != "point-lookup");
-        assert!(reset.since(&warm).is_err(), "a vanished series is a reset");
         guard.shutdown();
     }
 }

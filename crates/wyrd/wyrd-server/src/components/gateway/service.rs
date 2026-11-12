@@ -37,7 +37,7 @@ use wyrd_sql::queries::gateway::{
     upsert_gateway_pricing,
 };
 use wyrd_sql::row_types::gateway::{GatewayCredentialRow, GatewayPricingRow};
-use wyrd_sql::{SqlError, TenantConn};
+use wyrd_sql::{SqlError, TenantConn, WyrdPostgres};
 
 use crate::audit;
 use crate::components::auth::Caller;
@@ -615,20 +615,16 @@ impl<'a> GatewayAdministration<'a> {
         .await
     }
 
-    /// The immutable admission snapshot of the tenant configuration.
+    /// The immutable snapshot of the tenant configuration.
     ///
     /// Served from the process [`GatewaySnapshots`](super::snapshots::GatewaySnapshots)
-    /// cache with no IO while it holds the tenant; otherwise every table is
-    /// read by one SQL statement, so the snapshot is consistent even while
-    /// administrators replace resources, and the result is cached. It
-    /// performs no authorization: the runtime calls it only after admitting a
-    /// verified invocation. It never carries credential plaintext —
-    /// environment bindings carry only the operator reference and external
-    /// secrets only their opaque backend reference.
+    /// cache with no IO while it holds the tenant; otherwise loaded by
+    /// [`Self::load`] and cached. Model listing and Batches use it; call
+    /// admission never loads and instead reads the cache alone. It performs
+    /// no authorization: callers use it only after verifying the caller.
     ///
     /// # Errors
-    /// Returns `ServiceUnavailable` when storage fails and `Internal` when a
-    /// stored document no longer decodes.
+    /// Returns the errors of [`Self::load`].
     pub async fn snapshot(
         &self,
         tenant: DataTenantId,
@@ -638,27 +634,36 @@ impl<'a> GatewayAdministration<'a> {
             return Ok(snapshot);
         }
         let generation = snapshots.fill_generation();
-        let mut conn = self
-            .postgres
-            .tenant_conn(tenant)
+        let snapshot = load_snapshot(self.postgres.wyrd(), self.config, tenant).await?;
+        Ok(snapshots.insert(tenant, generation, snapshot).0)
+    }
+
+    /// Makes `tenant`'s committed configuration and a shared usage view
+    /// serve on this server right after an administrative write commits, so
+    /// the administrator's next call needs no background load. Each reload
+    /// starts after the commit, so one racing that commit's own notification
+    /// is retried; failures leave the background reload to recover.
+    pub(crate) async fn warm(&self, tenant: DataTenantId) {
+        let snapshots = self.state.gateway.snapshots();
+        for _ in 0..3 {
+            if matches!(
+                snapshots
+                    .reload(self.postgres.wyrd(), self.config, tenant)
+                    .await,
+                Ok(true)
+            ) {
+                break;
+            }
+        }
+        if let Err(error) = self
+            .state
+            .gateway
+            .usage()
+            .sync(self.postgres.wyrd(), tenant)
             .await
-            .map_err(unavailable)?;
-        let row = gateway_snapshot(&mut conn).await.map_err(unavailable)?;
-        conn.commit().await.map_err(unavailable)?;
-        let credentials: Vec<StoredCredential> = decode(row.credentials)?;
-        let mut governance: GatewayGovernancePolicy = decode_or_default(row.governance)?;
-        governance.pricing = decode(row.pricing)?;
-        let snapshot = GatewayTenantSnapshot {
-            deployments: decode(row.deployments)?,
-            credentials: credentials
-                .into_iter()
-                .map(|stored| self.credential_snapshot(stored))
-                .collect(),
-            fallback: decode_or_default(row.fallback)?,
-            governance,
-            capture: capture_from(row.capture)?,
-        };
-        Ok(snapshots.insert(tenant, generation, snapshot))
+        {
+            tracing::warn!(tenant = %tenant.as_uuid(), error = %error, "gateway usage refresh failed");
+        }
     }
 
     /// Authorizes one operation, stages its decision, and runs it.
@@ -666,7 +671,8 @@ impl<'a> GatewayAdministration<'a> {
     /// The decision is staged on the process audit outbox exactly once, before
     /// any work starts; a denial is refused there. Otherwise a fresh tenant
     /// transaction is handed to `work`, which MUST commit it as its final
-    /// fallible step.
+    /// fallible step. A successful write then warms this server's caches
+    /// ([`Self::warm`]).
     ///
     /// # Errors
     /// Returns the mapped permission denial, an unavailable store, or `work`'s
@@ -688,7 +694,11 @@ impl<'a> GatewayAdministration<'a> {
             .tenant_conn(caller.data_tenant_id)
             .await
             .map_err(unavailable)?;
-        work(conn).await
+        let result = work(conn).await;
+        if result.is_ok() && *required == Permission::gateway_write() {
+            self.warm(caller.data_tenant_id).await;
+        }
+        result
     }
 
     /// Validates, seals, and upserts one credential on the caller's open
@@ -881,45 +891,6 @@ impl<'a> GatewayAdministration<'a> {
                 }
             })
     }
-
-    /// Builds one credential's runtime resolution inputs, attaching the
-    /// operator reference and the assignment the resolver re-checks before
-    /// dispatch.
-    fn credential_snapshot(&self, stored: StoredCredential) -> GatewayCredentialSnapshot {
-        let StoredCredential {
-            name,
-            provider,
-            source,
-            state,
-            secret_ciphertext,
-        } = stored;
-        let assignment = self.config.assignment(&source).cloned();
-        let source = match source {
-            ProviderCredentialSourceView::Environment { binding } => {
-                GatewayCredentialSource::Environment {
-                    secret: self
-                        .config
-                        .credential_bindings
-                        .get(&binding)
-                        .map(|configured| configured.secret.clone()),
-                    binding,
-                }
-            }
-            ProviderCredentialSourceView::ExternalSecret { backend, reference } => {
-                GatewayCredentialSource::ExternalSecret { backend, reference }
-            }
-            ProviderCredentialSourceView::ManagedSecret => GatewayCredentialSource::ManagedSecret {
-                sealed: sealed(secret_ciphertext),
-            },
-        };
-        GatewayCredentialSnapshot {
-            name,
-            provider,
-            state,
-            source,
-            assignment,
-        }
-    }
 }
 
 /// Credential object as emitted by the snapshot statement.
@@ -935,6 +906,79 @@ struct StoredCredential {
     state: ProviderCredentialState,
     /// Base64 sealing-keyring envelope of a managed secret; absent otherwise.
     secret_ciphertext: Option<String>,
+}
+
+/// Reads `tenant`'s gateway configuration in one SQL statement, so the
+/// snapshot is consistent even while administrators replace resources, and
+/// attaches `config`'s credential bindings. It never carries credential
+/// plaintext — environment bindings carry only the operator reference and
+/// external secrets only their opaque backend reference.
+///
+/// # Errors
+/// Returns `ServiceUnavailable` when storage fails and `Internal` when a
+/// stored document no longer decodes.
+pub(super) async fn load_snapshot(
+    postgres: &WyrdPostgres,
+    config: &GatewayConfig,
+    tenant: DataTenantId,
+) -> Result<GatewayTenantSnapshot, WyrdError> {
+    let mut conn = postgres.tenant_conn(tenant).await.map_err(unavailable)?;
+    let row = gateway_snapshot(&mut conn).await.map_err(unavailable)?;
+    conn.commit().await.map_err(unavailable)?;
+    let credentials: Vec<StoredCredential> = decode(row.credentials)?;
+    let mut governance: GatewayGovernancePolicy = decode_or_default(row.governance)?;
+    governance.pricing = decode(row.pricing)?;
+    Ok(GatewayTenantSnapshot {
+        deployments: decode(row.deployments)?,
+        credentials: credentials
+            .into_iter()
+            .map(|stored| credential_snapshot(config, stored))
+            .collect(),
+        fallback: decode_or_default(row.fallback)?,
+        governance,
+        capture: capture_from(row.capture)?,
+    })
+}
+
+/// Builds one credential's runtime resolution inputs, attaching the
+/// operator reference and the assignment the resolver re-checks before
+/// dispatch.
+fn credential_snapshot(
+    config: &GatewayConfig,
+    stored: StoredCredential,
+) -> GatewayCredentialSnapshot {
+    let StoredCredential {
+        name,
+        provider,
+        source,
+        state,
+        secret_ciphertext,
+    } = stored;
+    let assignment = config.assignment(&source).cloned();
+    let source = match source {
+        ProviderCredentialSourceView::Environment { binding } => {
+            GatewayCredentialSource::Environment {
+                secret: config
+                    .credential_bindings
+                    .get(&binding)
+                    .map(|configured| configured.secret.clone()),
+                binding,
+            }
+        }
+        ProviderCredentialSourceView::ExternalSecret { backend, reference } => {
+            GatewayCredentialSource::ExternalSecret { backend, reference }
+        }
+        ProviderCredentialSourceView::ManagedSecret => GatewayCredentialSource::ManagedSecret {
+            sealed: sealed(secret_ciphertext),
+        },
+    };
+    GatewayCredentialSnapshot {
+        name,
+        provider,
+        state,
+        source,
+        assignment,
+    }
 }
 
 /// Decodes the sealed envelope of a managed secret from its snapshot column.

@@ -133,29 +133,26 @@ impl Registered {
         }
     }
 
-    /// Evidence citing `slots`, read as a user of `tenant` holding
-    /// `permissions`, under `limits`.
+    /// Evidence read as a user of `tenant` holding `permissions`, under
+    /// `limits`, citing what it admits.
     fn evidence(
         &self,
         tenant: DataTenantId,
         permissions: impl IntoIterator<Item = Permission>,
-        slots: BTreeMap<SlotName, InputDeclaration>,
         limits: HostedLimits,
     ) -> TenantEvidence {
         TenantEvidence::new(
             self.server.state().clone(),
             user(tenant, permissions),
-            slots,
             limits,
         )
     }
 
-    /// Evidence the server's own tenant may read, citing `slots`.
-    fn readable(&self, slots: BTreeMap<SlotName, InputDeclaration>) -> TenantEvidence {
+    /// Evidence the server's own tenant may read, citing what it admits.
+    fn readable(&self) -> TenantEvidence {
         self.evidence(
             self.server.data_tenant_id(),
             [Permission::card_read()],
-            slots,
             HostedLimits::default(),
         )
     }
@@ -227,7 +224,12 @@ fn notes() -> SlotName {
 async fn artifact_evidence_and_code_reach_every_consumer() {
     let registered = Registered::start().await;
     let declaration = registered.file("notes.txt");
-    let evidence = Arc::new(registered.readable(BTreeMap::from([(notes(), declaration.clone())])));
+    let evidence = Arc::new(registered.readable());
+    let pinned = Arc::new(BTreeMap::from([(notes(), declaration.clone())]));
+    evidence
+        .admit(&BTreeMap::new(), &pinned)
+        .await
+        .expect("the notes are admitted");
 
     let (bytes, format) = evidence.read(&declaration).await.expect("the file reads");
     assert_eq!(
@@ -298,7 +300,7 @@ async fn artifact_evidence_and_code_reach_every_consumer() {
             inputs: BTreeMap::from([(
                 "x".to_owned(),
                 CallInput {
-                    value: CallValue::Json(json!(1)),
+                    value: CallValue::Json(json!(1).into()),
                     sources: BTreeSet::new(),
                 },
             )]),
@@ -334,19 +336,14 @@ async fn artifact_reads_refuse_before_use() {
         .await
         .expect("the other tenant seeds");
     let card = &registered.card;
-    let readable = registered.readable(BTreeMap::new());
+    let readable = registered.readable();
     let refused = |result: Result<(Vec<u8>, Option<skald_spec::MediaFormat>), BlockError>| {
         let error = result.expect_err("refused");
         assert!(matches!(error, BlockError::Terminal { .. }), "{error}");
     };
 
     for (tenant, permissions) in [(tenant, Vec::new()), (other, vec![Permission::card_read()])] {
-        let evidence = registered.evidence(
-            tenant,
-            permissions,
-            BTreeMap::new(),
-            HostedLimits::default(),
-        );
+        let evidence = registered.evidence(tenant, permissions, HostedLimits::default());
         refused(evidence.artifact(card, Some("notes.txt")).await);
     }
     let prompt = CardRef {
@@ -368,7 +365,6 @@ async fn artifact_reads_refuse_before_use() {
     let cramped = registered.evidence(
         tenant,
         [Permission::card_read()],
-        BTreeMap::new(),
         HostedLimits {
             file_max_bytes: 4,
             ..HostedLimits::default()
@@ -430,21 +426,16 @@ async fn evidence_metadata_is_resolved_once() {
         format: skald_spec::MediaFormat::Json,
         filename: None,
     };
-    let declared = BTreeMap::from([
+    let declared = Arc::new(BTreeMap::from([
         (doc.clone(), file.clone()),
         (notes(), registered.file("notes.txt")),
-    ]);
+    ]));
     let executor = PrincipalId::new(uuid::Uuid::now_v7());
     let caller = Caller {
         executed_by: Some(executor),
         ..user(tenant, [Permission::card_read()])
     };
-    let evidence = TenantEvidence::new(
-        server.state().clone(),
-        caller,
-        BTreeMap::new(),
-        HostedLimits::default(),
-    );
+    let evidence = TenantEvidence::new(server.state().clone(), caller, HostedLimits::default());
     let before = server
         .bifrost_read_decision_count()
         .await
@@ -536,24 +527,14 @@ async fn evidence_metadata_is_resolved_once() {
         .await
         .expect("the other tenant seeds");
     for (tenant, permissions) in [(tenant, Vec::new()), (other, vec![Permission::card_read()])] {
-        let refused = registered.evidence(
-            tenant,
-            permissions,
-            BTreeMap::new(),
-            HostedLimits::default(),
-        );
+        let refused = registered.evidence(tenant, permissions, HostedLimits::default());
         let error = refused
             .artifact(&registered.card, Some("notes.txt"))
             .await
             .expect_err("the Card read is refused");
         assert!(matches!(error, BlockError::Terminal { .. }), "{error}");
     }
-    let foreign = registered.evidence(
-        other,
-        [Permission::card_read()],
-        BTreeMap::new(),
-        HostedLimits::default(),
-    );
+    let foreign = registered.evidence(other, [Permission::card_read()], HostedLimits::default());
     let error = foreign
         .read(&file)
         .await
@@ -673,7 +654,7 @@ fn document(value: Value) -> BTreeMap<String, CallInput> {
     BTreeMap::from([(
         "document".to_owned(),
         CallInput {
-            value: CallValue::Json(value),
+            value: CallValue::Json(value.into()),
             sources: BTreeSet::from([notes()]),
         },
     )])
@@ -755,12 +736,12 @@ async fn recovered_authority_bounds_every_agent_tool() {
         ..HostedLimits::default()
     };
     let declaration = registered.file("notes.txt");
-    let evidence = Arc::new(TenantEvidence::new(
-        state.clone(),
-        caller.clone(),
-        BTreeMap::from([(notes(), declaration.clone())]),
-        limits,
-    ));
+    let evidence = Arc::new(TenantEvidence::new(state.clone(), caller.clone(), limits));
+    let pinned = Arc::new(BTreeMap::from([(notes(), declaration.clone())]));
+    evidence
+        .admit(&BTreeMap::new(), &pinned)
+        .await
+        .expect("the notes are admitted");
     let tools = HostedTools::new(
         state,
         caller,
@@ -985,9 +966,13 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
     let evidence = Arc::new(registered.evidence(
         registered.server.data_tenant_id(),
         [Permission::card_read(), Permission::tool_invoke_any()],
-        BTreeMap::from([(notes(), registered.file("notes.txt"))]),
         limits,
     ));
+    let pinned = Arc::new(BTreeMap::from([(notes(), registered.file("notes.txt"))]));
+    evidence
+        .admit(&BTreeMap::new(), &pinned)
+        .await
+        .expect("the notes are admitted");
     let sandbox = Arc::new(Sandbox::start(worker(), limits).await.expect("pool starts"));
     let workspaces = Arc::new(Workspaces::new(limits));
     let none = serde_json::Map::new();
@@ -1014,7 +999,7 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
         BTreeMap::from([(
             "x".to_owned(),
             CallInput {
-                value: CallValue::Json(json!(1)),
+                value: CallValue::Json(json!(1).into()),
                 sources: BTreeSet::new(),
             },
         )])
@@ -1320,7 +1305,6 @@ async fn artifact_evidence_is_admitted_against_its_slot_and_the_combined_limit()
                     state,
                     Execution {
                         caller,
-                        evidence: &evidence,
                         routes: &routes,
                         subject: GatewayCallContext::default(),
                         defer_unlanded_traces: false,

@@ -102,6 +102,10 @@ export interface AgentRunConfigSpec {
 
 /**
  * Agent authoring body inside a Wyrd Agent Card envelope.
+ *
+ * `F` is the inline Prompt's form: [`Compiled`] to execute, or
+ * [`Authored`] for a descriptive read of retained evidence that never
+ * compiles. Both forms share one wire form.
  */
 export interface AgentSpec {
   /**
@@ -669,6 +673,9 @@ export interface CatboostMeta {
 
 /**
  * A verdict-producing requirement check.
+ *
+ * `F` is an inline Agent's Prompt form, as in [`AgentSpec`]: compiled to
+ * execute, authored to describe retained evidence.
  */
 export type Check = CheckAssert | CheckTrace | CheckAgent | CheckCode | CheckDrift;
 
@@ -2414,6 +2421,10 @@ export interface GatewayFallbackPolicy {
 /**
  * The tenant's single gateway governance policy.
  *
+ * Each server enforces limits and budgets against its own charges plus the
+ * other servers' usage it refreshes in the background, so enforcement
+ * across servers is approximate and can briefly overshoot.
+ *
  * The default is the empty policy: no limits or budgets, no active pricing,
  * and `unknown_cost: allow_unpriced`.
  */
@@ -3961,6 +3972,29 @@ export interface Origin {
 }
 
 /**
+ * Overall verdict with its full requirement and step breakdown and the
+ * pinned evidence.
+ */
+export interface OutcomeDetails {
+  /**
+   * The pinned original evidence, by slot.
+   */
+  readonly evidence: Readonly<Record<string, InputDeclaration>>;
+  /**
+   * Every requirement, step requirements included.
+   */
+  readonly requirements: readonly RequirementDetails[];
+  /**
+   * Every step in plan order.
+   */
+  readonly steps: readonly StepResult[];
+  /**
+   * The `decide` rule applied to every applicable requirement.
+   */
+  readonly verdict: VerificationVerdict;
+}
+
+/**
  * PagerDuty Events API v2 severities.
  */
 export type PagerDutySeverity = "critical" | "error" | "warning" | "info";
@@ -5450,15 +5484,9 @@ export interface RequirementDetailDrift {
 }
 
 /**
- * One requirement's outcome. Only `not_applicable` leaves the `decide`
- * denominator.
+ * The judgment of one requirement with the exact check that produced it.
  */
-export type RequirementOutcome = "passed" | "failed" | "inconclusive" | "not_applicable";
-
-/**
- * The judgment of one requirement.
- */
-export interface RequirementResult {
+export interface RequirementDetails {
   /**
    * The compared actual value, when capture permits it.
    */
@@ -5468,7 +5496,8 @@ export interface RequirementResult {
    */
   readonly check: Check;
   /**
-   * Validated original-evidence citations.
+   * Validated original-evidence citations: the original slot and locator,
+   * never a promise that the input body is echoed or fetchable.
    */
   readonly citations?: readonly Citation[];
   /**
@@ -5493,6 +5522,57 @@ export interface RequirementResult {
    * What executed the check, for Agent, code, and drift checks.
    */
   readonly provenance?: CallProvenance | null;
+  /**
+   * Why the outcome holds.
+   */
+  readonly reason: string;
+  /**
+   * The requirement statement.
+   */
+  readonly statement: string;
+  /**
+   * Owning step of a step requirement.
+   */
+  readonly step?: TaskId | null;
+}
+
+/**
+ * One requirement's outcome. Only `not_applicable` leaves the `decide`
+ * denominator.
+ */
+export type RequirementOutcome = "passed" | "failed" | "inconclusive" | "not_applicable";
+
+/**
+ * The judgment of one requirement.
+ */
+export interface RequirementResult {
+  /**
+   * The compared actual value, when capture permits it.
+   */
+  readonly actual?: JsonValue;
+  /**
+   * Validated original-evidence citations: the original slot and locator,
+   * never a promise that the input body is echoed or fetchable.
+   */
+  readonly citations?: readonly Citation[];
+  /**
+   * Custom data an Agent or code check returned under its declared
+   * `verdict` format; absent when none was declared or the output was
+   * rejected.
+   */
+  readonly data?: Readonly<Record<string, JsonValue>>;
+  /**
+   * Check-specific detail.
+   */
+  readonly detail?: RequirementDetail | null;
+  /**
+   * Requirement ID.
+   */
+  readonly id: TaskId;
+  /**
+   * The outcome.
+   */
+  readonly outcome: RequirementOutcome;
   /**
    * Why the outcome holds.
    */
@@ -6871,6 +6951,45 @@ export interface VerificationBinding {
 }
 
 /**
+ * `GET /v1/verification/executions/{execution_id}/details` response: what
+ * one execution ran and how it judged.
+ *
+ * The same identity and judgments as its [`VerificationResult`], plus each
+ * requirement's exact authored check and provenance, every step, and the
+ * pinned evidence declarations. `T` is the custom-data type, as in
+ * [`VerificationResult`]. `F` is the inline Agent Prompt form: a read
+ * keeps the [`Authored`] form and never compiles, renders, or executes a
+ * Prompt; an engine records the [`Compiled`] form it ran.
+ */
+export interface VerificationDetails {
+  /**
+   * The deployment environment tag the execution was invoked with, or
+   * absent when the invocation carried none.
+   */
+  readonly deployment_environment?: string | null;
+  /**
+   * Server-issued execution identity.
+   */
+  readonly execution_id: ExecutionId;
+  /**
+   * Verdict, requirement and step breakdown, and evidence.
+   */
+  readonly outcome: OutcomeDetails;
+  /**
+   * The caller's application Run, when there is one.
+   */
+  readonly run_id?: RunId | null;
+  /**
+   * The exact subject judged.
+   */
+  readonly subject: CardRef;
+  /**
+   * The exact Verifier executed.
+   */
+  readonly verifier: CardRef;
+}
+
+/**
  * Structured, secret-free execution or delivery error.
  */
 export interface VerificationError {
@@ -6939,21 +7058,13 @@ export interface VerificationExecutionState {
 export type VerificationExecutionStatus = "pending" | "running" | "retrying" | "completed" | "cancelled" | "timed_out" | "errored";
 
 /**
- * Overall verdict with its requirement and step breakdown.
+ * Overall verdict with its requirement judgments.
  */
 export interface VerificationOutcome {
-  /**
-   * The pinned original evidence, by slot.
-   */
-  readonly evidence: Readonly<Record<string, InputDeclaration>>;
   /**
    * Every requirement, step requirements included.
    */
   readonly requirements: readonly RequirementResult[];
-  /**
-   * Every step in plan order.
-   */
-  readonly steps: readonly StepResult[];
   /**
    * The `decide` rule applied to every applicable requirement.
    */
@@ -6961,8 +7072,11 @@ export interface VerificationOutcome {
 }
 
 /**
- * The attributable result of one Verifier execution.
+ * The attributable decision of one Verifier execution.
  *
+ * The compact default every execution, status, and wait read returns: the
+ * verdict and each requirement's judgment, without the check configuration,
+ * provenance, steps, or evidence that [`VerificationDetails`] describes.
  * `T` is the type of each requirement's custom `data`: JSON objects on the
  * wire, or a caller's type after a typed SDK read.
  */
@@ -6977,7 +7091,7 @@ export interface VerificationResult {
    */
   readonly execution_id: ExecutionId;
   /**
-   * Verdict, breakdown, and evidence.
+   * Verdict and requirement judgments.
    */
   readonly outcome: VerificationOutcome;
   /**

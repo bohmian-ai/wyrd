@@ -66,8 +66,21 @@ impl VertexClient {
     /// headers are invalid, and [`ProviderError::Connect`],
     /// [`ProviderError::Timeout`], or [`ProviderError::Upstream`] when the
     /// exchange fails.
-    pub async fn send_raw(&self, body: &RawValue) -> ProviderResult<Box<RawValue>> {
-        raw::send_raw(
+    pub async fn send_raw(&self, body: Vec<u8>) -> ProviderResult<Box<RawValue>> {
+        let answer = self.send_raw_text(body).await?;
+        raw::answer_json("vertex", answer)
+    }
+
+    /// Posts a caller-built body exactly as [`Self::send_raw`] does and
+    /// returns the successful answer as text without validating it as JSON,
+    /// for a caller that validates it in its own single pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::send_raw`] other than the answer's JSON
+    /// [`ProviderError::Decode`].
+    pub async fn send_raw_text(&self, body: Vec<u8>) -> ProviderResult<String> {
+        raw::send_raw_text(
             &self.transport,
             "vertex",
             &self.auth.model_url(&self.model, "generateContent"),
@@ -89,7 +102,7 @@ impl VertexClient {
     ///
     /// Returns the errors of [`super::open_stream`], or
     /// [`ProviderError::Decode`] when the auth headers are invalid.
-    pub async fn stream_raw(&self, body: &RawValue) -> ProviderResult<super::ProviderByteStream> {
+    pub async fn stream_raw(&self, body: Vec<u8>) -> ProviderResult<super::ProviderByteStream> {
         super::open_stream(
             &self.transport,
             "vertex",
@@ -104,7 +117,16 @@ impl VertexClient {
 
     /// Sends a native Vertex request: a Google GenerateContent body to the
     /// project/location `generateContent` endpoint, or a Predict body.
-    pub async fn send_native(&self, request: ProviderRequest) -> ProviderResult<ProviderResponse> {
+    ///
+    /// # Errors
+    /// Returns [`ProviderError::VariantMismatch`] for a request this client
+    /// does not serve, [`ProviderError::Auth`] when its credentials cannot be
+    /// presented, [`ProviderError::Status`] for a non-success answer,
+    /// [`ProviderError::Connect`], [`ProviderError::Upstream`], or
+    /// [`ProviderError::Timeout`] when the exchange fails, and
+    /// [`ProviderError::Decode`] when the body cannot be encoded or the answer
+    /// decoded.
+    pub async fn send_native(&self, request: &ProviderRequest) -> ProviderResult<ProviderResponse> {
         match request {
             ProviderRequest::GeminiGenerateContent(request) => {
                 let url = self.auth.model_url(&self.model, "generateContent");
@@ -133,7 +155,7 @@ impl VertexClient {
                 Ok(ProviderResponse::VertexPredict(response))
             }
             ProviderRequest::RawV1 { body, .. } => {
-                let body = serde_json::value::to_raw_value(&body)
+                let body = serde_json::to_vec(&body)
                     .map_err(|error| ProviderError::decode("vertex", error))?;
                 let url = format!("{}/raw", self.auth.model_url(&self.model, "predict"));
                 let response = raw::send_raw(
@@ -141,7 +163,7 @@ impl VertexClient {
                     "vertex",
                     &url,
                     self.auth.headers().await?,
-                    &body,
+                    body,
                     &self.retry,
                 )
                 .await?;
@@ -149,7 +171,7 @@ impl VertexClient {
             }
             other => Err(ProviderError::variant_mismatch(
                 "vertex",
-                super::request_variant_label(&other),
+                super::request_variant_label(other),
             )),
         }
     }
@@ -157,17 +179,17 @@ impl VertexClient {
 
 #[async_trait]
 impl ProviderClient for VertexClient {
-    async fn send(&self, request: ProviderRequest) -> ProviderResult<ProviderResponse> {
+    async fn send(&self, request: &ProviderRequest) -> ProviderResult<ProviderResponse> {
         self.send_native(request).await
     }
 
-    async fn stream(&self, request: ProviderRequest) -> ProviderResult<ProviderStream> {
+    async fn stream(&self, request: &ProviderRequest) -> ProviderResult<ProviderStream> {
         match request {
             ProviderRequest::GeminiGenerateContent(request) => {
                 let url = self.auth.model_url(&self.model, "streamGenerateContent");
                 let body = serde_json::to_vec(&request)
                     .map_err(|error| ProviderError::decode("vertex", error))?;
-                let text = super::send_bytes_with_retry(
+                let answer = super::send_bytes_with_retry(
                     &self.transport,
                     "vertex",
                     reqwest::Method::POST,
@@ -177,12 +199,13 @@ impl ProviderClient for VertexClient {
                     &self.retry,
                 )
                 .await?;
-                let events = decode_jsonl_events("vertex", text.as_bytes())?;
+                let events =
+                    decode_jsonl_events("vertex", String::from_utf8_lossy(&answer).as_bytes())?;
                 Ok(ProviderStream::Google(events))
             }
             other => Err(ProviderError::variant_mismatch(
                 "vertex",
-                super::request_variant_label(&other),
+                super::request_variant_label(other),
             )),
         }
     }
@@ -210,7 +233,7 @@ mod vertex_embed {
         let request: VertexPredictRequest =
             serde_json::from_str(&request_body).expect("fixture parses");
         let response = common::vertex_client(&server.uri(), "text-embedding-004")
-            .send(ProviderRequest::VertexPredict(request))
+            .send(&ProviderRequest::VertexPredict(request))
             .await
             .expect("request succeeds");
 
@@ -241,7 +264,7 @@ mod vertex_generate {
         let request: GoogleGenerateContentRequest =
             serde_json::from_str(&request_body).expect("fixture parses");
         let response = common::vertex_client(&server.uri(), "gemini-2.5-flash")
-            .send(ProviderRequest::GeminiGenerateContent(request))
+            .send(&ProviderRequest::GeminiGenerateContent(request))
             .await
             .expect("request succeeds");
 

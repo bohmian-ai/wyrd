@@ -18,7 +18,7 @@ use prost::Message;
 use sha2::{Digest as _, Sha256};
 
 /// Version of the private Oracle physical extension envelope.
-pub const ORACLE_PHYSICAL_CODEC_VERSION: u32 = 1;
+pub const ORACLE_PHYSICAL_CODEC_VERSION: u32 = 2;
 /// Only extension type accepted by the Oracle follower.
 pub const ORACLE_REMOTE_SCAN_TAG: &str = "wyrd.oracle.remote_scan";
 
@@ -97,15 +97,38 @@ struct OracleExtensionEnvelope {
     payload: Vec<u8>,
 }
 
-/// Identity payload for one remote scan placeholder.
+/// Identity and read requirements of one remote scan placeholder.
+///
+/// The requirements are expressions over the signed closure schema, which the
+/// follower parses only against the closure it derives from its own
+/// authenticated schema, so the plan fingerprint binds what the data owner
+/// evaluates.
 #[derive(Clone, PartialEq, Message)]
-pub(crate) struct RemoteScanPayload {
+pub struct RemoteScanPayload {
     /// Stable request-local scan identifier.
     #[prost(string, tag = "1")]
     pub(crate) scan_id: String,
     /// Fingerprint of the expected provider schema.
     #[prost(string, tag = "2")]
     pub(crate) schema_fingerprint: String,
+    /// Exact filter the data owner applies before producing any row.
+    #[prost(message, optional, tag = "3")]
+    pub(crate) filter: Option<datafusion_proto::protobuf::PhysicalExprNode>,
+    /// Ordered outputs the data owner produces in place of the closure;
+    /// absent means the closure itself.
+    #[prost(message, optional, tag = "4")]
+    pub(crate) outputs: Option<RemoteScanOutputs>,
+}
+
+/// Ordered output expressions of one remote scan and their names.
+#[derive(Clone, PartialEq, Message)]
+pub(crate) struct RemoteScanOutputs {
+    /// Output expressions over the signed closure schema, in output order.
+    #[prost(message, repeated, tag = "1")]
+    pub(crate) exprs: Vec<datafusion_proto::protobuf::PhysicalExprNode>,
+    /// Output field names, index-aligned with `exprs`.
+    #[prost(string, repeated, tag = "2")]
+    pub(crate) names: Vec<String>,
 }
 
 /// Leaf a live Scribe fragment carries in place of the Scribe's own source.
@@ -118,6 +141,11 @@ pub struct RemoteSourcePlaceholderExec {
     scan_id: String,
     /// Expected provider schema fingerprint.
     schema_fingerprint: String,
+    /// Exact filter over the closure the data owner applies.
+    filter: Option<Arc<dyn PhysicalExpr>>,
+    /// Ordered outputs over the closure the data owner produces, or `None`
+    /// for the closure itself.
+    outputs: Option<datafusion::physical_expr::projection::ProjectionExprs>,
     /// Empty executable carrying the placeholder schema and plan properties.
     empty: datafusion::physical_plan::empty::EmptyExec,
 }
@@ -133,8 +161,31 @@ impl RemoteSourcePlaceholderExec {
         Self {
             scan_id: scan_id.into(),
             schema_fingerprint: schema_fingerprint.into(),
+            filter: None,
+            outputs: None,
             empty: datafusion::physical_plan::empty::EmptyExec::new(schema),
         }
+    }
+
+    /// Makes the data owner apply `filter` exactly and produce `outputs`,
+    /// both over this placeholder's closure schema, which then becomes the
+    /// schema of `outputs`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a plan error when `outputs` do not plan over the closure.
+    pub(crate) fn with_requirements(
+        mut self,
+        filter: Option<Arc<dyn PhysicalExpr>>,
+        outputs: Option<datafusion::physical_expr::projection::ProjectionExprs>,
+    ) -> Result<Self> {
+        if let Some(outputs) = &outputs {
+            let schema = outputs.project_schema(&self.empty.schema())?;
+            self.empty = datafusion::physical_plan::empty::EmptyExec::new(Arc::new(schema));
+        }
+        self.filter = filter;
+        self.outputs = outputs;
+        Ok(self)
     }
 
     /// Returns the stable scan identity.
@@ -170,17 +221,24 @@ impl DisplayAs for RemoteSourcePlaceholderExec {
 }
 
 impl ExecutionPlan for RemoteSourcePlaceholderExec {
-    /// Visits every physical expression this plan owns.
-    ///
-    /// This plan owns no `PhysicalExpr`, so the traversal reports
-    /// [`TreeNodeRecursion::Continue`] without invoking `f`.
+    /// Visits the filter, then every output expression, that the data owner
+    /// evaluates.
     ///
     /// # Errors
-    /// Never returns an error; the signature is fixed by the trait.
+    /// Returns the visitor's error.
     fn apply_expressions(
         &self,
-        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
     ) -> DataFusionResult<TreeNodeRecursion> {
+        let outputs = self
+            .outputs
+            .iter()
+            .flat_map(datafusion::physical_expr::projection::ProjectionExprs::iter);
+        for expr in self.filter.iter().chain(outputs.map(|output| &output.expr)) {
+            if f(expr)? == TreeNodeRecursion::Stop {
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
         Ok(TreeNodeRecursion::Continue)
     }
 
@@ -324,6 +382,23 @@ impl OraclePhysicalExtensionCodec {
     }
 }
 
+/// Test-only observation of the exact filter a remote scan placeholder ships.
+///
+/// Decodes `bytes`, a placeholder's extension node, through the same
+/// preflight the follower runs, so a journey outside the crate can inspect
+/// the signed filter without the payload's other contents becoming public.
+/// Present only under `test-support`.
+///
+/// # Errors
+/// Returns the preflight's plan error when `bytes` is not a valid remote scan
+/// extension.
+#[cfg(feature = "test-support")]
+pub fn remote_scan_filter_for_test(
+    bytes: &[u8],
+) -> Result<Option<datafusion_proto::protobuf::PhysicalExprNode>> {
+    Ok(OraclePhysicalExtensionCodec::preflight_extension(bytes)?.filter)
+}
+
 impl PhysicalExtensionCodec for OraclePhysicalExtensionCodec {
     /// Reconstructs only a pre-resolved role-local provider for the authenticated scan.
     ///
@@ -355,7 +430,8 @@ impl PhysicalExtensionCodec for OraclePhysicalExtensionCodec {
             })
     }
 
-    /// Encodes only the Wyrd remote-scan placeholder in the fixed v1 envelope.
+    /// Encodes only the Wyrd remote-scan placeholder, with its requirements,
+    /// in the fixed envelope.
     ///
     /// # Errors
     /// Returns a plan error for any other extension type or protobuf failure.
@@ -370,12 +446,30 @@ impl PhysicalExtensionCodec for OraclePhysicalExtensionCodec {
                 "unsupported Oracle physical extension".to_owned(),
             ));
         };
+        let encode = |expr: &Arc<dyn PhysicalExpr>| {
+            datafusion_proto::physical_plan::to_proto::serialize_physical_expr(expr, self)
+        };
+        let outputs = scan
+            .outputs
+            .as_ref()
+            .map(|outputs| {
+                Ok::<_, DataFusionError>(RemoteScanOutputs {
+                    exprs: outputs
+                        .iter()
+                        .map(|output| encode(&output.expr))
+                        .collect::<Result<_>>()?,
+                    names: outputs.iter().map(|output| output.alias.clone()).collect(),
+                })
+            })
+            .transpose()?;
         OracleExtensionEnvelope {
             codec_version: ORACLE_PHYSICAL_CODEC_VERSION,
             type_tag: ORACLE_REMOTE_SCAN_TAG.to_owned(),
             payload: RemoteScanPayload {
                 scan_id: scan.scan_id.clone(),
                 schema_fingerprint: scan.schema_fingerprint.clone(),
+                filter: scan.filter.as_ref().map(encode).transpose()?,
+                outputs,
             }
             .encode_to_vec(),
         }
@@ -540,6 +634,8 @@ mod tests {
             payload: RemoteScanPayload {
                 scan_id: scan_id.to_owned(),
                 schema_fingerprint: "sha256:schema".to_owned(),
+                filter: None,
+                outputs: None,
             }
             .encode_to_vec(),
         }

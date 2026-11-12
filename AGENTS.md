@@ -199,6 +199,7 @@ Planning lives in `changes/`; the workflow is
 
 | Skill | Use |
 |---|---|
+| `$wyrd-design` | explore a change with a design partner; record the problem, outcome, evidence, and simplest implementation proposal before spec |
 | `$wyrd-spec` | fix intent and expensive decisions; only human approval makes a spec authoritative |
 | `$wyrd-plan` | split an approved spec into outcome-complete tasks |
 | `$wyrd-implement` | implement one task with evidence (add `wyrd-ui` in the UI tree) |

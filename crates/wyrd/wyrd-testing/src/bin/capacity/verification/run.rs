@@ -5,7 +5,7 @@
 //! An L1 repetition is closed loop: N clients each send the next direct
 //! `verify` once the last answers, for the window. An L2 repetition is open
 //! loop: direct and background arrivals follow the [`Schedule`] through
-//! capacity, overload, and recovery while `/metrics` is read at each phase
+//! capacity, overload, and recovery while the benchmark snapshot is read at each phase
 //! boundary and every second of recovery, then the queue drains before the
 //! next repetition, so each starts from the same empty backlog.
 //!
@@ -28,21 +28,25 @@ use wyrd_testing::release_server::PEAK_SAMPLE_INTERVAL_MS;
 use async_trait::async_trait;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
+use wyrd_benchmark::{BenchmarkSnapshot, Distribution, IntervalValue};
 use wyrd_client::state::WyrdState;
 use wyrd_client::transport::trace::with_benchmark_labels;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::verification::VerificationVerdict;
-use wyrd_telemetry::timing::{Distribution, TimingSnapshot};
 use wyrd_testing::capacity::{
-    Expected, Histogram, HistogramKey, NANOS_PER_MS, Population, Readings, ResourceWindow,
-    Selection, Telemetry, Window, driver_cpu_seconds, elapsed, release_binary,
+    Expected, NANOS_PER_MS, Population, ResourceWindow, Window, driver_cpu_seconds, elapsed,
+    release_binary,
 };
 use wyrd_testing::experiment::{
     ExperimentError, Level, Phase, Reading, Repetition, Step, Workload,
 };
+use wyrd_testing::gateway_capture::{FIXTURE_ROOT, GatewayCapture, PacedUpstream, Pacing};
 use wyrd_testing::release_server::{LocalServer, Metrics};
 
-use crate::verification::workload::{ASSERT_VERIFIER, Tenant, context, failing};
+use crate::gateway::run::{PHASE_SECONDS, WAIT_SECONDS, WAITS};
+use crate::verification::workload::{
+    ASSERT_VERIFIER, JUDGE_SLOT, JUDGE_VERIFIER, Tenant, context, failing,
+};
 use crate::verification::{
     ADMISSION_REFUSAL, APPLICATIONS, BACKLOG_LIMIT_SECONDS, CLIENTS, OVERHEAD_LIMIT_MS,
     OVERHEAD_TAILS, PHASE_TIMINGS, RECOVERY_LIMIT, STAGES, Schedule,
@@ -51,10 +55,10 @@ use crate::verification::{
 /// The declared server process whose CPU each repetition sums.
 const PROCESS: &str = "wyrd-server";
 
-/// How often recovery reads `/metrics` again.
+/// How often recovery reads the benchmark snapshot again.
 const POLL: Duration = Duration::from_secs(1);
 
-/// How often a drain reads `/metrics` again.
+/// How often a drain reads the benchmark snapshot again.
 const DRAIN_POLL: Duration = Duration::from_millis(100);
 
 /// How long a drain is watched before it is recorded as unfinished.
@@ -78,38 +82,42 @@ const COMPLETED: &str = "completed";
 /// The benchmark case of a direct `verify`.
 const DIRECT_CASE: &str = "direct-verify";
 
+/// The benchmark case of a direct `verify` of the judge Verifier, whose
+/// Agent check makes one local model call.
+pub(crate) const MODEL_CASE: &str = "direct-verify-model";
+
 /// The benchmark case of a queued `submit`.
 const QUEUED_CASE: &str = "queued-verify";
 
 /// A `submit` request's arrival until it was staged.
-const SUBMIT: &str = "wyrd_verification_submit_seconds";
+pub(crate) const SUBMIT: &str = "wyrd_verification_submit_seconds";
 
 /// A queued run's wait from claimable to claimed.
-const QUEUE_WAIT: &str = "wyrd_verification_queue_wait_seconds";
+pub(crate) const QUEUE_WAIT: &str = "wyrd_verification_queue_wait_seconds";
 
-/// Scribe's acknowledgement of staged evidence.
-const SCRIBE_ACK: &str = "bifrost_scribe_ack_seconds";
+/// Scribe's acknowledgement of a deduplicated retry; a benchmarked server
+/// records every other acknowledgement only as [`SCRIBE_WRITE`].
+pub(crate) const SCRIBE_ACK: &str = "bifrost_scribe_ack_seconds";
 
-/// The series filter of a staged submission.
-const STAGED: &str = "outcome=\"staged\"";
+/// Scribe's timing of one acknowledged append, its acknowledgement time.
+pub(crate) const SCRIBE_WRITE: &str = "bifrost.scribe.write";
 
-/// The series filter of work that came from `submit`, which the server
+/// The series label of a staged submission.
+pub(crate) const STAGED: (&str, &str) = ("outcome", "staged");
+
+/// The series label of work that came from `submit`, which the server
 /// records as a `manual` execution origin.
-const SUBMITTED: &str = "origin=\"manual\"";
-
-/// The server histograms an L2 repetition reports as diagnostic means.
-const HISTOGRAMS: [HistogramKey; 3] = [
-    (SUBMIT, &[STAGED]),
-    (QUEUE_WAIT, &[SUBMITTED]),
-    (SCRIBE_ACK, &[]),
-];
+pub(crate) const SUBMITTED: (&str, &str) = ("origin", "manual");
 
 /// The verification runtime's component histograms, each with the label that
-/// names its components: execution phases, Verifier blocks, queue SQL, each
-/// outbox's write, and the Scribe acknowledgement, WAL, and lane times.
-const BREAKDOWN: [(&str, &str); 9] = [
+/// names its components: queued execution phases, Verifier blocks, Agent call
+/// phases, queue SQL, each outbox's write, and the Scribe queue, WAL, and lane
+/// times. A direct execution's phases are its `verification.direct.*` timing
+/// parts.
+const BREAKDOWN: [(&str, &str); 10] = [
     ("wyrd_verification_phase_duration_seconds", "phase"),
     ("wyrd_verification_block_duration_seconds", "kind"),
+    ("wyrd_verification_agent_phase_duration_seconds", "phase"),
     ("wyrd_verification_store_duration_seconds", "op"),
     ("outbox_write_seconds", "outbox"),
     ("bifrost_scribe_queue_wait_seconds", ""),
@@ -119,12 +127,46 @@ const BREAKDOWN: [(&str, &str); 9] = [
     ("wyrd_postgres_pool_acquire_seconds", "outcome"),
 ];
 
-/// Everything a verification window reads from `/metrics`.
-const SELECTION: Selection = Selection {
-    histograms: &HISTOGRAMS,
-    breakdown: &BREAKDOWN,
-    prefix: "wyrd_verification_",
-};
+/// The driver root of a direct `verify`'s one logical execution request,
+/// whose response body sizes each repetition reports.
+pub const HTTP_ROOT: &str = "client.http";
+
+/// The driver roots each direct `verify` records once, with their
+/// components: the SDK flow and its preparation, its one logical execution
+/// request, and that request's one attempt.
+pub const DRIVER_ROOTS: [(&str, bool, &[&str]); 3] = [
+    ("client.verify", false, &["prepare"]),
+    (
+        HTTP_ROOT,
+        false,
+        &["serialize", "auth", "send", "body", "decode"],
+    ),
+    ("client.http.attempt", false, &[]),
+];
+
+/// The driver root of the local provider's one answer per successful model
+/// verification, with its components; the provider runs in this process.
+pub const FIXTURE_ROOTS: [(&str, bool, &[&str]); 1] = [(FIXTURE_ROOT, false, &["parse", "answer"])];
+
+/// Why an assertion step has no local provider observations.
+const NO_PROVIDER: &str = "an assertion check calls no provider";
+
+/// The Gateway phases an in-process Agent check's model call records once
+/// each: the native caller authenticates and parses nothing, and a buffered
+/// call relays no stream.
+pub(crate) const GATEWAY_PHASES: [&str; 8] = [
+    "snapshot",
+    "authorize",
+    "route",
+    "admit",
+    "credential",
+    "translate",
+    "account",
+    "capture",
+];
+
+/// The prefix of a direct execution's phase timing parts.
+const DIRECT_PARTS: &str = "verification.direct.";
 
 /// Component observations kept per L1 repetition, largest total first.
 const COMPONENT_ROWS: usize = 15;
@@ -132,8 +174,12 @@ const COMPONENT_ROWS: usize = 15;
 /// Which public call an arrival makes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Op {
-    /// `observe.verify`: direct execution, judged before it answers.
+    /// `observe.verify` of the assertion Verifier: direct execution, judged
+    /// before it answers.
     Verify,
+    /// `observe.verify` of the judge Verifier: a direct execution whose one
+    /// Agent check calls the local model through the Gateway.
+    Judge,
     /// `observe.submit`: staged for one queued execution.
     Submit,
 }
@@ -143,7 +189,18 @@ impl Op {
     const fn case(self) -> &'static str {
         match self {
             Self::Verify => DIRECT_CASE,
+            Self::Judge => MODEL_CASE,
             Self::Submit => QUEUED_CASE,
+        }
+    }
+
+    /// The direct call `step` declares: [`Self::Judge`] for a `model` check,
+    /// else [`Self::Verify`].
+    fn direct(step: &Step) -> Self {
+        if step.text("check") == Some("model") {
+            Self::Judge
+        } else {
+            Self::Verify
         }
     }
 }
@@ -218,17 +275,25 @@ pub struct Bench {
     server: Option<LocalServer>,
     /// One application per client or rotation slot.
     states: Vec<WyrdState>,
+    /// Whether the run has model steps, so it binds the judge Verifier.
+    model: bool,
+    /// The local provider the judge's Gateway deployment calls, while a
+    /// model run is prepared.
+    provider: Option<PacedUpstream>,
 }
 
 impl Bench {
-    /// A workload at `level` keeping its files under `logs`; nothing starts
-    /// until [`Workload::prepare`].
-    pub const fn new(level: Level, logs: PathBuf) -> Self {
+    /// A workload at `level` keeping its files under `logs`, binding the
+    /// judge Verifier when `model`; nothing starts until
+    /// [`Workload::prepare`].
+    pub const fn new(level: Level, logs: PathBuf, model: bool) -> Self {
         Self {
             level,
             logs,
             server: None,
             states: Vec::new(),
+            model,
+            provider: None,
         }
     }
 
@@ -244,13 +309,31 @@ impl Bench {
     }
 
     /// Starts the release server through the guide and provisions the
-    /// tenant's applications for the level.
+    /// tenant's applications for the level; a model run first starts the
+    /// instant local provider answering a passing Verdict that cites
+    /// [`JUDGE_SLOT`].
     ///
     /// # Errors
     ///
-    /// Returns a workload error for a server or provisioning failure.
+    /// Returns a workload error for a provider, server, or provisioning
+    /// failure.
     async fn start(&mut self) -> Result<(), ExperimentError> {
         std::fs::create_dir_all(&self.logs).map_err(ExperimentError::workload)?;
+        if self.model {
+            let instant = Pacing {
+                buffered_delay: Duration::ZERO,
+                buffered_bytes: 0,
+                stream_delay: Duration::ZERO,
+                chunks: 0,
+                chunk_interval: Duration::ZERO,
+            };
+            let verdict = GatewayCapture::verdict_completion(JUDGE_SLOT);
+            self.provider = Some(
+                PacedUpstream::answering(instant, 0, &verdict)
+                    .await
+                    .map_err(ExperimentError::workload)?,
+            );
+        }
         let binary = release_binary().map_err(ExperimentError::workload)?;
         let server = LocalServer::start(&binary, &["bench"], &[])
             .await
@@ -267,6 +350,7 @@ impl Bench {
             setup,
             &self.logs.join("tenants"),
             applications,
+            self.provider.as_ref().map(PacedUpstream::uri).as_deref(),
         ))
         .await
         .map_err(ExperimentError::workload)?;
@@ -276,10 +360,12 @@ impl Bench {
     }
 
     /// One L1 repetition: `step`'s clients each run closed-loop direct
-    /// `verify` for `window`, labelled with `phase`, judged by each
-    /// acknowledged call's exact server timing. Work, seconds, and CPU stop
-    /// at the window's end; calls then in flight drain into the cohort and
-    /// count late.
+    /// `verify` of the Verifier its check names ([`Op::direct`]) for
+    /// `window`, labelled with `phase`, judged by each acknowledged call's
+    /// exact server timing. A model step also owes one local provider answer
+    /// per acknowledged call when none was refused. Work, seconds, and CPU
+    /// stop at the window's end; calls then in flight drain into the cohort
+    /// and count late.
     ///
     /// # Errors
     ///
@@ -304,16 +390,18 @@ impl Bench {
                 ))
             })?;
         let before = timings(server).await?;
+        let driver_before = wyrd_benchmark::snapshot();
         let first = scrape(server).await?;
-        let (opened, _) = Window::open(server, SELECTION)
+        let (opened, _) = Window::open(server)
             .await
             .map_err(ExperimentError::workload)?;
         let stop = Instant::now() + window;
+        let op = Op::direct(step);
         let (measured, usage, _) = opened
             .measure(
                 server,
                 stop.into_std(),
-                drive(&self.states[..clients], stop, phase.label()),
+                drive(&self.states[..clients], op, stop, phase.label()),
             )
             .await
             .map_err(ExperimentError::workload)?;
@@ -323,11 +411,11 @@ impl Bench {
             processes: vec![PROCESS.to_owned()],
             server_cpu_seconds: usage.server_cpu_seconds,
             peak_memory_bytes: usage.peak_memory_bytes,
+            opening_memory_bytes: usage.opening_memory_bytes,
             memory_interval_ms: PEAK_SAMPLE_INTERVAL_MS,
             driver_cpu_seconds: usage.driver_cpu_seconds,
             ..Repetition::default()
         };
-        let telemetry = &usage.telemetry;
         let acknowledged = measured.latencies_us.len() as u64;
         let population = Population::collect(
             server,
@@ -335,13 +423,52 @@ impl Bench {
             &[Expected {
                 boundary: DIRECT_TIMING,
                 outcome: COMPLETED,
-                case: DIRECT_CASE,
+                case: op.case(),
                 phase: phase.label(),
                 count: acknowledged,
             }],
         )
         .await;
         population.validate(&mut repetition, "measured");
+        let cohort = (op.case(), phase.label());
+        let mut roots = DRIVER_ROOTS.to_vec();
+        if op == Op::Judge && measured.errors.is_empty() {
+            roots.extend(FIXTURE_ROOTS);
+        }
+        let owed: Vec<Expected<'_>> = roots
+            .iter()
+            .map(|(boundary, _, _)| Expected {
+                boundary,
+                outcome: wyrd_benchmark::SUCCESS,
+                case: cohort.0,
+                phase: cohort.1,
+                count: acknowledged,
+            })
+            .collect();
+        let driver = Population::collect_driver(&driver_before, &owed).await;
+        driver.validate(&mut repetition, "measured");
+        driver.diagnose_roots(
+            &mut repetition,
+            cohort,
+            &roots,
+            measured.errors.is_empty().then_some(acknowledged),
+        );
+        driver.response_bytes(
+            &mut repetition,
+            HTTP_ROOT,
+            cohort,
+            measured.errors.is_empty().then_some(acknowledged),
+        );
+        if op == Op::Verify {
+            for (root, _, components) in FIXTURE_ROOTS {
+                let root = format!("driver.{root}");
+                repetition.inapplicable(&root, NO_PROVIDER);
+                for component in components {
+                    repetition.inapplicable(&format!("{root}.{component}"), NO_PROVIDER);
+                }
+            }
+        }
+        set_gateway(&mut repetition, &population, op, measured.errors.is_empty());
         population.percentiles(
             &mut repetition,
             DIRECT_TIMING,
@@ -386,7 +513,7 @@ impl Bench {
         repetition.set("errors", Reading::count(measured.unexpected(None)));
         repetition.set("wrong", Reading::count(measured.wrong));
         repetition.set("lost_writes", lost_writes(&first, &last));
-        if !observed_components(telemetry) {
+        if !observed_components(&population) {
             repetition.invalid.push(
                 "the verification runtime recorded no component observation in the window"
                     .to_owned(),
@@ -394,7 +521,7 @@ impl Bench {
         }
         repetition
             .observations
-            .extend(components(telemetry, measured.latencies_us.len()));
+            .extend(components(&population, measured.latencies_us.len()));
         if !measured.errors.is_empty() {
             repetition
                 .observations
@@ -483,6 +610,7 @@ impl Bench {
             processes: vec![PROCESS.to_owned()],
             server_cpu_seconds: used.first().and_then(|used| used.cpu_seconds),
             peak_memory_bytes: used.first().and_then(|used| used.peak_memory),
+            opening_memory_bytes: used.first().and_then(|used| used.opening_memory),
             memory_interval_ms: PEAK_SAMPLE_INTERVAL_MS,
             driver_cpu_seconds: driver,
             ..Repetition::default()
@@ -527,11 +655,11 @@ impl Bench {
             repetition.set(&format!("{name}.direct_p99_ms"), verify.percentile(0.99));
             repetition.set(
                 &format!("{name}.submit_mean_ms"),
-                mean(&telemetry.histogram((SUBMIT, &[STAGED]))),
+                mean_ms(telemetry.histogram(SUBMIT, &[STAGED])),
             );
             repetition.set(
                 &format!("{name}.queue_wait_mean_ms"),
-                mean(&telemetry.histogram((QUEUE_WAIT, &[SUBMITTED]))),
+                mean_ms(telemetry.histogram(QUEUE_WAIT, &[SUBMITTED])),
             );
             for tally in [verify, submit] {
                 if !tally.errors.is_empty() {
@@ -608,9 +736,13 @@ impl Bench {
             schedule.backlog_seconds(observed.backlog[2] - backlog_start),
         );
         repetition.set("drain_seconds", drain);
-        let acks = observed.whole.histogram((SCRIBE_ACK, &[]));
-        repetition.set("evidence_acks", Reading::exact(acks.count));
-        repetition.set("evidence_ack_mean_ms", mean(&acks));
+        let acks = acknowledgements(&observed.whole);
+        repetition.set(
+            "evidence_acks",
+            acks.as_ref()
+                .map_or_else(Reading::missing, |acks| Reading::count(acks.len())),
+        );
+        repetition.set("evidence_ack_mean_ms", mean_ms(acks));
         Ok(repetition)
     }
 }
@@ -637,6 +769,10 @@ impl Workload for Bench {
             .and_then(LocalServer::pid)
             .into_iter()
             .collect()
+    }
+
+    fn heap_profile_url(&self) -> Option<String> {
+        self.server.as_ref().map(LocalServer::heap_profile_url)
     }
 
     /// Runs `step` for `window`: closed loop at L1, the whole open-loop
@@ -672,6 +808,7 @@ impl Workload for Bench {
     /// copied. An unstarted workload finishes without error.
     async fn finish(&mut self) -> Result<(), ExperimentError> {
         self.states.clear();
+        self.provider = None;
         let Some(server) = self.server.take() else {
             return Ok(());
         };
@@ -683,10 +820,10 @@ impl Workload for Bench {
     }
 }
 
-/// What one L2 repetition read from `/metrics`.
+/// One L2 repetition's benchmark timings and resource observations.
 struct Observed {
-    /// Each phase's telemetry, in [`STAGES`] order.
-    stages: [Telemetry; 3],
+    /// Each phase's benchmark timing interval, in [`STAGES`] order.
+    stages: [Population; 3],
     /// Queued backlog items at each phase's end.
     backlog: [f64; 3],
     /// Each recovery read: its offset from recovery's start and the queued
@@ -695,18 +832,18 @@ struct Observed {
     /// The recovered backlog bound: capacity's backlog plus
     /// [`BACKLOG_LIMIT_SECONDS`] of offered work.
     bound: f64,
-    /// The whole window's telemetry.
-    whole: Telemetry,
+    /// The whole window's benchmark timing interval.
+    whole: Population,
     /// The server's timing snapshot at each read, by its planned offset
     /// from the schedule's start, the start itself first.
-    timings: Vec<(Duration, TimingSnapshot)>,
+    timings: Vec<(Duration, BenchmarkSnapshot)>,
 }
 
 /// A window's completed direct executions, placed by when they ended: by
 /// the timing snapshots taken at its phase boundaries and recovery reads.
 struct Ended<'a> {
     /// Each snapshot by its offset from the schedule's start.
-    snapshots: &'a [(Duration, TimingSnapshot)],
+    snapshots: &'a [(Duration, BenchmarkSnapshot)],
 }
 
 impl Ended<'_> {
@@ -753,7 +890,7 @@ fn overhead_p99(population: &Population) -> Reading {
         })
 }
 
-/// Reads `/metrics` and the timing snapshot at each phase boundary of
+/// Reads the benchmark snapshot at each phase boundary of
 /// `schedule` from `start`, and every [`POLL`] through recovery, keeping
 /// each recovery read's backlog for the recovery judgment; `first` is the
 /// pair read at the start. Freezes server CPU and returns the driver CPU
@@ -766,25 +903,19 @@ async fn observe(
     server: &LocalServer,
     schedule: &Schedule,
     start: Instant,
-    (first, opened_timings): (&Metrics, &TimingSnapshot),
+    (_first, opened_timings): (&Metrics, &BenchmarkSnapshot),
     (mut resources, driver_before): (ResourceWindow, Option<f64>),
 ) -> Result<(Observed, ResourceWindow, Option<f64>), ExperimentError> {
     let [_, overload, recovery] = schedule.stages();
     let mut snapshots = vec![(Duration::ZERO, opened_timings.clone())];
-    let whole = Readings::read(first, SELECTION);
-    let opened = Readings::read(first, SELECTION);
     tokio::time::sleep_until(start + overload.start).await;
     let at_overload = scrape(server).await?;
     snapshots.push((overload.start, timings(server).await?));
-    let capacity = opened.since(&at_overload);
-    let opened = Readings::read(&at_overload, SELECTION);
     tokio::time::sleep_until(start + recovery.start).await;
     let at_recovery = scrape(server).await?;
     snapshots.push((recovery.start, timings(server).await?));
-    let overloaded = opened.since(&at_recovery);
     let backlog_capacity = backlog(&at_overload);
     let bound = backlog_capacity + BACKLOG_LIMIT_SECONDS * schedule.offered();
-    let opened = Readings::read(&at_recovery, SELECTION);
     let mut ticks = Vec::new();
     let mut offset = recovery.start;
     let mut driver = None;
@@ -802,7 +933,16 @@ async fn observe(
             break metrics;
         }
     };
-    let recovering = opened.since(&last_metrics);
+    let interval = |from: usize, to: usize| {
+        Population::between(&snapshots[from].1, snapshots[to].1.clone())
+            .map_err(ExperimentError::workload)
+    };
+    let stages = [
+        interval(0, 1)?,
+        interval(1, 2)?,
+        interval(2, snapshots.len() - 1)?,
+    ];
+    let whole = interval(0, snapshots.len() - 1)?;
     let observed = Observed {
         backlog: [
             backlog_capacity,
@@ -811,8 +951,8 @@ async fn observe(
         ],
         ticks,
         bound,
-        stages: [capacity, overloaded, recovering],
-        whole: whole.since(&last_metrics),
+        stages,
+        whole,
         timings: snapshots,
     };
     Ok((observed, resources, driver))
@@ -860,7 +1000,7 @@ where
     let [_, _, recovery] = schedule.stages();
     for (index, stage) in schedule.stages().into_iter().enumerate() {
         let rate = match op {
-            Op::Verify => stage.direct_rate,
+            Op::Verify | Op::Judge => stage.direct_rate,
             Op::Submit => stage.submit_rate,
         };
         for arrival in 0u32.. {
@@ -940,7 +1080,7 @@ async fn drain(server: &LocalServer, stopped: Instant) -> Result<Reading, Experi
 }
 
 /// Queued verification items: the queue depth plus both [`OUTBOXES`].
-fn backlog(metrics: &Metrics) -> f64 {
+pub(crate) fn backlog(metrics: &Metrics) -> f64 {
     metrics.sum("wyrd_verification_queue_depth", &[])
         + OUTBOXES
             .iter()
@@ -953,17 +1093,13 @@ fn backlog(metrics: &Metrics) -> f64 {
 /// # Errors
 ///
 /// Returns the read failure as a workload error.
-async fn timings(server: &LocalServer) -> Result<TimingSnapshot, ExperimentError> {
+async fn timings(server: &LocalServer) -> Result<BenchmarkSnapshot, ExperimentError> {
     server.timings().await.map_err(ExperimentError::workload)
 }
 
-/// Scrapes the server's `/metrics`.
-///
-/// # Errors
-///
 /// Scribe outbox writes lost for any reason between two scrapes, shed audit
 /// decisions included; missing when a counter went backwards.
-fn lost_writes(first: &Metrics, last: &Metrics) -> Reading {
+pub(crate) fn lost_writes(first: &Metrics, last: &Metrics) -> Reading {
     let labels = ["outbox=\"scribe\""];
     let lost = last.sum("outbox_events_lost_total", &labels)
         - first.sum("outbox_events_lost_total", &labels);
@@ -974,15 +1110,20 @@ fn lost_writes(first: &Metrics, last: &Metrics) -> Reading {
     }
 }
 
-/// Returns the scrape failure as a workload error.
+/// Reads the server's benchmark snapshot as metrics.
+///
+/// # Errors
+///
+/// Returns the read failure as a workload error.
 async fn scrape(server: &LocalServer) -> Result<Metrics, ExperimentError> {
     server.metrics().await.map_err(ExperimentError::workload)
 }
 
-/// Runs one closed-loop client per state making direct `verify` calls,
-/// labelled `phase`, admitted until `stop`, client `i` presenting
-/// application `i`'s key; a call answering at or after `stop` is late.
-async fn drive(states: &[WyrdState], stop: Instant, phase: &'static str) -> Measured {
+/// Runs one closed-loop client per state making direct `op` calls,
+/// labelled with `op`'s case and `phase`, admitted until `stop`, client `i`
+/// presenting application `i`'s key; a call answering at or after `stop` is
+/// late.
+async fn drive(states: &[WyrdState], op: Op, stop: Instant, phase: &'static str) -> Measured {
     let sequence = Arc::new(AtomicU64::new(0));
     let mut tasks = JoinSet::new();
     for state in states {
@@ -992,8 +1133,7 @@ async fn drive(states: &[WyrdState], stop: Instant, phase: &'static str) -> Meas
             while Instant::now() < stop {
                 let next = sequence.fetch_add(1, Ordering::Relaxed);
                 let sent = Instant::now();
-                let outcome =
-                    with_benchmark_labels(DIRECT_CASE, phase, call(&state, Op::Verify, next)).await;
+                let outcome = with_benchmark_labels(op.case(), phase, call(&state, op, next)).await;
                 measured.record(micros(sent), outcome, Instant::now() >= stop);
             }
             measured
@@ -1015,7 +1155,8 @@ async fn drive(states: &[WyrdState], stop: Instant, phase: &'static str) -> Meas
 /// # Errors
 ///
 /// Returns the client's or server's refusal; a direct verdict other than the
-/// expected one is `Ok(false)`, not an error.
+/// expected one is `Ok(false)`, not an error. A judged call expects a pass
+/// whose requirement cites [`JUDGE_SLOT`].
 async fn call(state: &WyrdState, op: Op, sequence: u64) -> Result<bool, WyrdError> {
     let run = state.run_for_card("model")?;
     let observe = run.observe();
@@ -1032,6 +1173,16 @@ async fn call(state: &WyrdState, op: Op, sequence: u64) -> Result<bool, WyrdErro
                 VerificationVerdict::Passed
             };
             Ok(judged.outcome.verdict == expected)
+        }
+        Op::Judge => {
+            let judged = observe.verify(JUDGE_VERIFIER, context(sequence)).await?;
+            let cited = judged.outcome.requirements.iter().any(|requirement| {
+                requirement
+                    .citations
+                    .iter()
+                    .any(|citation| citation.slot.as_str() == JUDGE_SLOT)
+            });
+            Ok(judged.outcome.verdict == VerificationVerdict::Passed && cited)
         }
     }
 }
@@ -1084,9 +1235,41 @@ fn set_phases(repetition: &mut Repetition, population: &Population) {
     }
 }
 
+/// Sets the server's `gateway.phase.<phase>` and `gateway.wait.<wait>`
+/// diagnostics for each [`GATEWAY_PHASES`] phase and every controlled wait
+/// a judge's in-process model call records, each over its own histogram
+/// population, nested in the Verifier block and never summed. An assertion
+/// step calls no provider, so each is inapplicable; on a judge step without
+/// errors each is required.
+fn set_gateway(repetition: &mut Repetition, population: &Population, op: Op, clean: bool) {
+    let observations = GATEWAY_PHASES
+        .iter()
+        .map(|phase| {
+            (
+                format!("gateway.phase.{phase}"),
+                PHASE_SECONDS,
+                ("phase", *phase),
+            )
+        })
+        .chain(WAITS.iter().map(|wait| {
+            (
+                format!("gateway.wait.{wait}"),
+                WAIT_SECONDS,
+                ("wait", *wait),
+            )
+        }));
+    for (observation, family, label) in observations {
+        if op == Op::Verify {
+            repetition.inapplicable(&observation, NO_PROVIDER);
+        } else {
+            repetition.diagnose(&observation, population.histogram(family, &[label]), clean);
+        }
+    }
+}
+
 /// The mean, milliseconds, of a nanosecond `distribution` as the bounds of
 /// its bucketed total, or why there is none.
-fn mean_ms(distribution: Result<Distribution, String>) -> Reading {
+pub(crate) fn mean_ms(distribution: Result<Distribution, String>) -> Reading {
     match distribution {
         Err(reason) => Reading::missing(reason),
         Ok(distribution) if distribution.is_empty() => {
@@ -1104,37 +1287,102 @@ fn mean_ms(distribution: Result<Distribution, String>) -> Reading {
     }
 }
 
-/// A server histogram's exact mean, milliseconds.
-fn mean(histogram: &Histogram) -> Reading {
-    histogram.mean().map_or_else(
-        || Reading::missing("no observation in the window"),
-        |seconds| Reading::exact(seconds * 1e3),
-    )
+/// Every Scribe acknowledgement in `population`: each timed append and
+/// each deduplicated retry's histogram observation.
+///
+/// # Errors
+///
+/// Returns why neither was recorded: no timed append and the retry
+/// histogram's [`Population::histogram`] refusal (absent, or it refused a
+/// value), or the merge's range refusal when both exist.
+pub(crate) fn acknowledgements(population: &Population) -> Result<Distribution, String> {
+    let retries = population.histogram(SCRIBE_ACK, &[]);
+    match (population.elapsed(SCRIBE_WRITE, "success"), retries) {
+        (Some(mut appends), Ok(retries)) => appends.add(&retries).map(|()| appends),
+        (Some(appends), Err(_)) => Ok(appends),
+        (None, retries) => retries,
+    }
 }
 
-/// Whether `telemetry` holds any verification runtime component
+/// The runtime's component times over a window, largest total first: each
+/// [`BREAKDOWN`] histogram series and each direct execution phase part,
+/// keyed `family{label=value}` with the `wyrd_verification_` prefix and the
+/// `_seconds` unit dropped, or by part boundary.
+///
+/// # Panics
+///
+/// Panics when two duration distributions do not merge, which every
+/// nanosecond HDR histogram's shared configuration rules out.
+fn component_totals(population: &Population) -> BTreeMap<String, Distribution> {
+    let mut components = BTreeMap::<String, Distribution>::new();
+    let mut add = |key: String, distribution: &Distribution| match components.get_mut(&key) {
+        Some(total) => {
+            total
+                .add(distribution)
+                .expect("invariant: every duration histogram shares one HDR configuration");
+        }
+        None => {
+            components.insert(key, distribution.clone());
+        }
+    };
+    for (family, label) in BREAKDOWN {
+        let name = family
+            .trim_start_matches("wyrd_verification_")
+            .trim_end_matches("_seconds");
+        for metric in population
+            .metrics
+            .iter()
+            .filter(|metric| metric.name == family)
+        {
+            let IntervalValue::Histogram { distribution, .. } = &metric.value else {
+                continue;
+            };
+            let key = match metric.labels.get(label) {
+                Some(value) => format!("{name}{{{label}={value}}}"),
+                None => name.to_owned(),
+            };
+            add(key, distribution);
+        }
+    }
+    for series in &population.series {
+        if series.boundary.starts_with(DIRECT_PARTS) {
+            add(series.boundary.clone(), &series.elapsed);
+        }
+    }
+    components.retain(|_, distribution| !distribution.is_empty());
+    components
+}
+
+/// Whether `population` holds any verification runtime component
 /// observation, as every executed `verify` records its phases and Verifier
 /// blocks.
-fn observed_components(telemetry: &Telemetry) -> bool {
-    telemetry.breakdown.values().any(|(_, count)| *count > 0.0)
+pub(crate) fn observed_components(population: &Population) -> bool {
+    !component_totals(population).is_empty()
 }
 
 /// The runtime's component times over a window, largest total first: each
 /// component's milliseconds per acknowledged call beside its mean per
-/// observation. Components nest and background work overlaps calls, so they
-/// are read beside the client latency, never summed.
-fn components(telemetry: &Telemetry, acknowledged: usize) -> Vec<String> {
+/// observation, as the bounds of its bucketed total. Components nest and
+/// background work overlaps calls, so they are read beside the client
+/// latency, never summed.
+pub(crate) fn components(population: &Population, acknowledged: usize) -> Vec<String> {
     let calls = acknowledged.max(1) as f64;
-    let mut components: Vec<(&String, &(f64, f64))> = telemetry.breakdown.iter().collect();
-    components.sort_by(|left, right| right.1.0.total_cmp(&left.1.0));
+    let mut components: Vec<(String, (u64, u64), u64)> = component_totals(population)
+        .into_iter()
+        .map(|(key, distribution)| (key, distribution.total_bounds(), distribution.len()))
+        .collect();
+    components.sort_by_key(|(_, (_, high), _)| std::cmp::Reverse(*high));
     components
         .into_iter()
         .take(COMPONENT_ROWS)
-        .map(|(component, (seconds, count))| {
+        .map(|(component, (low, high), count)| {
+            let ms = |nanos: u64, per: f64| nanos as f64 / NANOS_PER_MS / per;
             format!(
-                "component {component}: {:.4} ms/call, {:.4} ms mean over {count:.0}",
-                seconds * 1e3 / calls,
-                seconds * 1e3 / count.max(f64::EPSILON)
+                "component {component}: {:.4}..{:.4} ms/call, {:.4}..{:.4} ms mean over {count}",
+                ms(low, calls),
+                ms(high, calls),
+                ms(low, count as f64),
+                ms(high, count as f64)
             )
         })
         .collect()
@@ -1161,6 +1409,209 @@ mod tests {
 
     use super::{ADMISSION_REFUSAL, Measured, Op, admission, arrivals};
     use crate::verification::Schedule;
+
+    /// Diagnostic means, acknowledgements, and components come from the
+    /// benchmark recorder's snapshots: the production submission, queue-wait,
+    /// and component histograms through the standard `metrics` interface,
+    /// and the timed Scribe appends and direct phases through their timing
+    /// parts, each observation counted once.
+    ///
+    /// # Panics
+    /// Panics when a benchmark observation is missing, counted twice, or its
+    /// bounds exclude the recorded duration.
+    #[test]
+    fn diagnostics_use_benchmark_distributions() {
+        wyrd_benchmark::install().expect("the benchmark recorder installs");
+        let before = wyrd_benchmark::snapshot();
+        metrics::histogram!(super::SUBMIT, "outcome" => "staged").record(0.000_2);
+        metrics::histogram!(super::SUBMIT, "outcome" => "refused").record(9.0);
+        metrics::histogram!(super::QUEUE_WAIT, "origin" => "manual").record(0.000_3);
+        metrics::histogram!(super::SCRIBE_ACK).record(0.000_4);
+        metrics::histogram!("outbox_write_seconds", "outbox" => "scribe").record(0.000_05);
+        metrics::histogram!("wyrd_verification_agent_phase_duration_seconds", "phase" => "run")
+            .record(0.000_3);
+        let span = tracing::Span::none();
+        wyrd_benchmark::record_timing(
+            &span,
+            super::SCRIBE_WRITE,
+            "success",
+            Duration::from_micros(400),
+            None,
+        );
+        wyrd_benchmark::record_timing_parts(
+            &span,
+            super::DIRECT_TIMING,
+            super::COMPLETED,
+            Duration::from_micros(150),
+            None,
+            &[("verification.direct.engine", Duration::from_micros(100))],
+        );
+        let population =
+            wyrd_testing::capacity::Population::between(&before, wyrd_benchmark::snapshot())
+                .expect("one process");
+        let acks = super::acknowledgements(&population);
+        assert_eq!(acks.as_ref().map(wyrd_benchmark::Distribution::len), Ok(2));
+        for (distribution, expected, samples) in [
+            (
+                population.histogram(super::SUBMIT, &[super::STAGED]),
+                0.2,
+                1,
+            ),
+            (
+                population.histogram(super::QUEUE_WAIT, &[super::SUBMITTED]),
+                0.3,
+                1,
+            ),
+            (acks, 0.4, 2),
+        ] {
+            let reading = super::mean_ms(distribution);
+            assert!(reading.above.is_some_and(|low| low < expected));
+            assert!(reading.value.is_some_and(|high| expected <= high));
+            assert_eq!(reading.samples, Some(samples));
+        }
+        assert!(super::observed_components(&population));
+        let components = super::components(&population, 1);
+        assert_eq!(components.len(), 3, "{components:?}");
+        assert!(components[0].starts_with("component agent_phase_duration{phase=run}:"));
+        assert!(components[1].starts_with("component verification.direct.engine:"));
+        assert!(components[2].starts_with("component outbox_write{outbox=scribe}:"));
+        assert!(
+            !super::observed_components(&wyrd_testing::capacity::Population::default()),
+            "an empty window has no component"
+        );
+    }
+
+    /// A judge step reports each recorded Gateway phase and wait under its
+    /// own `gateway.phase.*` or `gateway.wait.*` label with its actual
+    /// observation count, from the server's histograms alone; an assertion
+    /// step marks every one inapplicable; and a judge window without a
+    /// recorded phase is invalid rather than zero.
+    ///
+    /// # Panics
+    /// Panics when a label, count, or inapplicable reason is wrong.
+    #[test]
+    fn diagnostics_include_gateway_phases_and_waits() {
+        use wyrd_testing::experiment::{DIAGNOSTIC, Repetition};
+        wyrd_benchmark::install().expect("the benchmark recorder installs");
+        let before = wyrd_benchmark::snapshot();
+        for (calls, phase) in (1_u32..).zip(super::GATEWAY_PHASES) {
+            for _ in 0..calls {
+                metrics::histogram!(super::PHASE_SECONDS, "operation" => "chat", "phase" => phase)
+                    .record(0.000_01);
+            }
+        }
+        for wait in super::WAITS {
+            metrics::histogram!(super::WAIT_SECONDS, "operation" => "chat", "wait" => wait)
+                .record(0.000_02);
+        }
+        let population =
+            wyrd_testing::capacity::Population::between(&before, wyrd_benchmark::snapshot())
+                .expect("one process");
+        let mut judge = Repetition::default();
+        super::set_gateway(&mut judge, &population, Op::Judge, true);
+        assert!(judge.invalid.is_empty(), "{:?}", judge.invalid);
+        for (calls, phase) in (1_u64..).zip(super::GATEWAY_PHASES) {
+            let count = judge.reading(&format!("{DIAGNOSTIC}gateway.phase.{phase}.count"));
+            assert_eq!(count.value, Some(calls as f64), "{phase}");
+        }
+        for wait in super::WAITS {
+            let mean = judge.reading(&format!("{DIAGNOSTIC}gateway.wait.{wait}.mean_us"));
+            assert!(
+                mean.value.is_some_and(|high| 20.0 <= high),
+                "{wait}: {mean:?}"
+            );
+            assert!(mean.above.is_some_and(|low| low < 20.0), "{wait}: {mean:?}");
+        }
+        let mut assertion = Repetition::default();
+        super::set_gateway(&mut assertion, &population, Op::Verify, true);
+        let reason = assertion
+            .reading(&format!("{DIAGNOSTIC}gateway.phase.admit.count"))
+            .reason;
+        assert_eq!(
+            reason.as_deref(),
+            Some("inapplicable: an assertion check calls no provider")
+        );
+        let mut empty = Repetition::default();
+        let none = wyrd_testing::capacity::Population::default();
+        super::set_gateway(&mut empty, &none, Op::Judge, true);
+        assert_eq!(
+            empty.invalid.len(),
+            super::GATEWAY_PHASES.len() + super::WAITS.len()
+        );
+    }
+
+    /// A model step drives the judge under its own case while assertion
+    /// steps keep theirs and their alternating expectations; the provider's
+    /// answer is a passing Verdict citing the judge's slot with fixed usage;
+    /// and a direct execution's Verifier block, which holds the model call,
+    /// stays out of its overhead residual.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a model step is driven as an assertion, the fixture's
+    /// answer is not a valid cited Verdict, or the provider time reaches the
+    /// residual.
+    #[test]
+    fn model_results_keep_provider_exclusion_and_expected_outcomes() {
+        use wyrd_testing::experiment::Step;
+
+        let model = Step::measured(
+            "direct-verify-model-c1",
+            serde_json::json!({ "clients": 1, "op": "verify", "check": "model" }),
+        );
+        let assertion = Step::measured(
+            "direct-verify-c1",
+            serde_json::json!({ "clients": 1, "op": "verify" }),
+        );
+        assert_eq!(Op::direct(&model), Op::Judge);
+        assert_eq!(Op::direct(&model).case(), super::MODEL_CASE);
+        assert_eq!(Op::direct(&assertion), Op::Verify);
+        assert_eq!(Op::direct(&assertion).case(), super::DIRECT_CASE);
+        let expected: Vec<bool> = (0..4).map(crate::verification::workload::failing).collect();
+        assert_eq!(expected, [false, true, false, true]);
+
+        let completion = wyrd_testing::gateway_capture::GatewayCapture::verdict_completion(
+            crate::verification::workload::JUDGE_SLOT,
+        );
+        let content = completion["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("the answer is text");
+        let verdict: wyrd_spec::verification::execution::Verdict =
+            serde_json::from_str(content).expect("the answer is a Verdict");
+        assert_eq!(
+            verdict.outcome,
+            wyrd_spec::verification::VerificationVerdict::Passed
+        );
+        assert_eq!(
+            verdict
+                .citations
+                .iter()
+                .map(|citation| citation.slot.as_str())
+                .collect::<Vec<_>>(),
+            [crate::verification::workload::JUDGE_SLOT]
+        );
+        assert_eq!(completion["usage"]["total_tokens"], 15);
+
+        wyrd_benchmark::install().expect("the benchmark recorder installs");
+        let before = wyrd_benchmark::snapshot();
+        wyrd_benchmark::record_timing_parts(
+            &tracing::Span::none(),
+            super::DIRECT_TIMING,
+            super::COMPLETED,
+            Duration::from_micros(1_000),
+            Some(Duration::from_micros(900)),
+            &[("verification.direct.engine", Duration::from_micros(950))],
+        );
+        let population =
+            wyrd_testing::capacity::Population::between(&before, wyrd_benchmark::snapshot())
+                .expect("one process");
+        let residual = super::mean_ms(population.residuals(super::DIRECT_TIMING, super::COMPLETED));
+        assert!(
+            residual.value.is_some_and(|high| high < 0.9),
+            "the provider's block is excluded: {residual:?}"
+        );
+        assert!(residual.above.is_some_and(|low| low < 0.1));
+    }
 
     /// Once a stalled call carries the clock past the window end, every
     /// remaining due arrival is missed rather than admitted after the
@@ -1318,7 +1769,7 @@ mod tests {
         use async_trait::async_trait;
         use tokio::time::Instant;
         use tokio_util::sync::CancellationToken;
-        use wyrd_testing::capacity::{Window, release_binary};
+        use wyrd_testing::capacity::{ResourceWindow, release_binary};
         use wyrd_testing::experiment::{
             ExperimentError, Level, Options, Phase, Record, Repetition, Step, Timing, Verdict,
             Workload, run,
@@ -1327,7 +1778,7 @@ mod tests {
 
         use crate::tests::pg_tests::burn;
         use crate::verification::declare;
-        use crate::verification::run::{Bench, SELECTION, drive};
+        use crate::verification::run::{Bench, Op, drive};
         use crate::verification::tests::base;
 
         /// The step calibrated: one closed-loop client.
@@ -1385,6 +1836,10 @@ mod tests {
                 self.bench.processes()
             }
 
+            fn heap_profile_url(&self) -> Option<String> {
+                self.bench.heap_profile_url()
+            }
+
             async fn measure(
                 &mut self,
                 step: &Step,
@@ -1438,11 +1893,13 @@ mod tests {
         ///
         /// # Panics
         ///
-        /// Panics when a reading falls outside its reference, the observation
-        /// cost exceeds its allowance, or a check accepts a wrong reading.
+        /// Panics when another recorder is installed, a reading falls outside
+        /// its reference, the observation cost exceeds its allowance, or a
+        /// check accepts a wrong reading.
         #[tokio::test]
         #[ignore = "needs the release server from `mise run bench:build`, the Postgres wrapper and a quiet host"]
         async fn the_measurement_path_agrees_with_independent_references() {
+            wyrd_benchmark::install().expect("the benchmark recorder installs");
             let directory = tempfile::tempdir().expect("directory");
             let mut declaration = declare(Level::One, &[], base(Level::One)).expect("L1 declares");
             declaration.selection = Some(vec![STEP.to_owned()]);
@@ -1455,11 +1912,11 @@ mod tests {
             };
             let options = Options {
                 artifacts: directory.path().join("artifacts"),
-                profiler: None,
+                profile: None,
                 interrupt: CancellationToken::new(),
             };
             let mut workload = Calibration {
-                bench: Bench::new(Level::One, directory.path().join("logs")),
+                bench: Bench::new(Level::One, directory.path().join("logs"), false),
             };
             let record = run(
                 declaration.seal(),
@@ -1525,17 +1982,14 @@ mod tests {
                 .reading("verifications_after_window")
                 .value
                 .expect("late");
-            let recorded: u64 = plain
-                .reconciliation
-                .iter()
-                .map(|cohort| cohort.recorded)
-                .sum();
-            assert_eq!(
-                recorded as f64,
-                verifications + late,
-                "{:?}",
-                plain.reconciliation
-            );
+            assert!(!plain.reconciliation.is_empty(), "no cohort reconciled");
+            for cohort in &plain.reconciliation {
+                assert_eq!(
+                    cohort.recorded as f64,
+                    verifications + late,
+                    "each reconciled boundary records every call once: {cohort:?}"
+                );
+            }
 
             let bench = &mut workload.bench;
             let server = bench.server.as_mut().expect("the server still runs");
@@ -1550,17 +2004,41 @@ mod tests {
                 "collection off serves no timing readout"
             );
             let states = &bench.states[..1];
-            drive(states, Instant::now() + Duration::from_secs(1), "warmup").await;
-            let (opened, _) = Window::open(server, SELECTION).await.expect("open");
-            let stop = Instant::now() + WINDOW;
-            let (measured, usage, _) = opened
-                .measure(server, stop.into_std(), drive(states, stop, "repetition-1"))
-                .await
-                .expect("control window");
+            drive(
+                states,
+                Op::Verify,
+                Instant::now() + Duration::from_secs(1),
+                "warmup",
+            )
+            .await;
+            // A server without collection serves no snapshot to scrape, so
+            // the control window reads only its resources, frozen at the
+            // stop before in-flight calls drain, as `Window::measure` does.
+            let mut resources = ResourceWindow::open([server]);
+            let started = Instant::now();
+            let stop = started + WINDOW;
+            let (measured, seconds) = {
+                let mut work = std::pin::pin!(drive(states, Op::Verify, stop, "repetition-1"));
+                let early = tokio::select! {
+                    measured = &mut work => Some(measured),
+                    () = tokio::time::sleep_until(stop) => None,
+                };
+                resources.freeze([server]);
+                let seconds = started.elapsed().as_secs_f64();
+                match early {
+                    Some(measured) => (measured, seconds),
+                    None => (work.await, seconds),
+                }
+            };
+            let control_cpu = resources
+                .finish([server], seconds)
+                .first()
+                .and_then(|used| used.cpu_seconds)
+                .expect("control server CPU");
             assert!(measured.errors.is_empty(), "{:?}", measured.errors);
             let control = per_verification(
-                usage.seconds,
-                usage.server_cpu_seconds.expect("control server CPU"),
+                seconds,
+                control_cpu,
                 (measured.latencies_us.len() as u64 - measured.late) as f64,
             );
             let enabled = per_verification(

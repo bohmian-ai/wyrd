@@ -69,22 +69,24 @@ fn projection_error(signal: &str, error: &TableError) -> IngestError {
     }
 }
 /// Record the bounded-cardinality Gate request families used by D24, and
-/// a write's server time through [`wyrd_telemetry::record_timing`] at
+/// a write's server time through [`wyrd_benchmark::record_timing`] at
 /// boundary `bifrost.gate.write` under the current span's benchmark
-/// classification; no benchmark reads a query's Gate time, so it records
+/// classification, in place of its duration histogram, so a benchmark
+/// counts it once; no benchmark reads a query's Gate time, so it records
 /// none.
 fn record_gate_request(operation: &'static str, outcome: &'static str, elapsed: Duration) {
-    if operation == "write" {
-        wyrd_telemetry::record_timing(
+    metrics::counter!("bifrost_gate_requests_total", "operation" => operation, "outcome" => outcome)
+        .increment(1);
+    if operation == "write" && wyrd_benchmark::enabled() {
+        wyrd_benchmark::record_timing(
             &tracing::Span::current(),
             "bifrost.gate.write",
             outcome,
             elapsed,
             None,
         );
+        return;
     }
-    metrics::counter!("bifrost_gate_requests_total", "operation" => operation, "outcome" => outcome)
-        .increment(1);
     metrics::histogram!(
         "bifrost_gate_request_duration_seconds",
         "operation" => operation,
@@ -2974,15 +2976,16 @@ mod tests {
 
     /// A native write's `bifrost.gate.write` observation runs until Scribe
     /// admitted it durably, so a 30 ms append is inside it; a write refused
-    /// before Scribe is its own `failed` observation.
+    /// before Scribe is its own `failed` observation; the request counter
+    /// counts both and no duration histogram counts either again.
     ///
     /// # Panics
     /// Panics when an outcome, count, or elapsed bound is wrong.
     #[tokio::test]
     async fn histogram_write_boundary_includes_durable_append() {
-        use wyrd_telemetry::timing;
+        use wyrd_benchmark as timing;
 
-        timing::enable();
+        timing::install().expect("the benchmark recorder installs");
         let before = timing::snapshot();
         let gate = Gate::<RecordingAudit>::with_test_scribe(
             Arc::new(SlowScribe),
@@ -3033,6 +3036,20 @@ mod tests {
             "through the durable append: {lowest} ns"
         );
         assert_eq!(series("failed").count, 1);
+        assert!(
+            interval
+                .histogram(
+                    "bifrost_gate_request_duration_seconds",
+                    &[("operation", "write")]
+                )
+                .is_err(),
+            "the duration histogram would count each timed write twice"
+        );
+        assert_eq!(
+            interval.counter("bifrost_gate_requests_total", &[("operation", "write")]),
+            Some(2),
+            "the request counter still counts both writes"
+        );
     }
 
     /// Query request lifecycles emit one exact terminal and drain active work.

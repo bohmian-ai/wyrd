@@ -1,6 +1,6 @@
 # GitHub Verifier pipeline tasks
 
-These nine tasks derive from **approved spec revision 5 and contracts**, approved
+The original nine tasks derive from **approved spec revision 5 and contracts**, approved
 by the user on 2026-11-10. They apply the current repository `wyrd-plan` skill.
 Revision 4 applies the approved installation storage amendment. Revision 5 uses
 GitHub.com’s documented App flow and removes the Enterprise Server compatibility
@@ -9,9 +9,10 @@ and proof. Task 003 is complete following its PASS verdict; FIND-003-1 through
 FIND-003-8 are closed. Task 004 targets approved spec revision 6 for the user-directed
 storage amendment and is complete following the
 [final PASS verdict](../review/004-pinned-pr-preparation-r3/verdict.md);
-FIND-004-1 and FIND-004-2 are closed. Task 006 and its remediation are complete following the
+FIND-004-1 and FIND-004-2 are closed. Task 006 and its remediation received the
 [PASS verdict](../review/006-pr-admission-r2/verdict.md); FIND-006-1 through
-FIND-006-7 are closed. Other tasks retain their existing statuses
+FIND-006-7 remain historically closed, but maintainer acceptance is reopened
+pending Task 010. Other tasks retain their existing statuses
 and revision 5 basis. Verification evidence lives in the owning tasks and reviews.
 
 The selected path is existing connect/authorization→Card declaration saga→Scribe
@@ -35,14 +36,19 @@ acquisition/comparison/index/context and remains standalone.
 | [003](003-repository-declaration.md) | **Complete.** Ready exact Repository receipt, selected policy/bindings and activation lifecycle for 006/007 |
 | [004](004-pinned-pr-preparation.md) | **Complete.** Reviewed pinned/baseline-aware ReviewPipeline revision, ObjectStorage adapter and PostgreSQL SnapshotStore/ContextStore metadata tables/adapters for 005 |
 | [005](005-pull-request-extraction.md) | Accepted typed extraction and retained exact source/context for ordinary reviewers and 009 rendering |
-| [006](006-pr-admission-and-supersession.md) | **Complete.** Durable queued ExecutionIds with frozen policy/source/generation and cancellation fences for 005/007/008/009 |
+| [006](006-pr-admission-and-supersession.md) | **Historical PASS; acceptance reopened pending 010.** Durable queued ExecutionIds with frozen policy/source/generation and cancellation fences for 005/007/008/009 |
 | [007](007-deferred-evidence-and-resumption.md) | Durable source-matched evidence, waiting inspection and same-execution park/continuation lifecycle for 008/009 |
 | [008](008-approval-steps.md) | Exact pending approval identities, accepted decisions and continuation/progress for 009 |
 | [009](009-reports-and-github-delivery.md) | Optional standard report/helper authoring and recoverable Checks/comments with independent delivery inspection |
+| [010](010-nonblocking-verification-execution.md) | **Proposed; blocks renewed 006 acceptance and 005/007–009.** Approved runtime spec revision 7; shared memory-owned engine, preserved preparation, bounded background terminal retention/lease/group-commit settlement, claim backpressure and resource-scaling proof; keeps Bifrost unchanged and PR/GitHub/Task 004 metadata |
 
-Numbering preserves the agreed nine behavioral pieces, not a linear execution
-order. A valid sequence is 001/002, then 003/004, then 006, then 005/007, then 008,
-then 009. Only real prerequisite outputs appear in task metadata. In particular,
+Task 010 targets approved runtime spec revision 7 and must be completed before
+renewed 006 acceptance or 005/007–009 execution. Their older runtime assumptions need
+alignment as listed in 010; existing task metadata does not waive this prerequisite.
+
+Numbering preserves the original nine behavioral pieces, not a linear execution
+order. The original sequence was 001/002, then 003/004, then 006, then 005/007,
+then 008/009; 010 now precedes 005/007–009 and renewed 006 acceptance. Only real prerequisite outputs appear in task metadata. In particular,
 005 waits for 006's accepted PR activation. 006 can prove admission with a normal
 declared queued Verifier; 005 then proves the actual pinned extraction consumer.
 
@@ -83,6 +89,11 @@ values through production paths. Private fixture shortcuts may support unit test
 but cannot replace connect→declare→admit→extract or acceptance→park→resume and
 retained report→provider reconciliation journeys. Static already-correct behavior
 uses source/contract proof rather than needless production changes/tests.
+
+Runtime revision 7 adds REQ-017–018 and AC-012–014. Task 010 owns shared memory
+execution, bounded background custody/lease/group settlement, source-preserving
+recovery, matched resource-scaling proof and unreleased-schema cleanup. Its
+O1–O7 table maps these obligations; 005 and 007–009 consume the corrected runtime.
 
 ## Existing verification owners and runners
 

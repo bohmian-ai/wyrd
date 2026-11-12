@@ -1,11 +1,30 @@
-# Public contracts — approved revision 5
+# Public contracts — approved revision 7
 
 These shapes make [spec.md](spec.md) reviewable. Existing CardRef, File,
 execution, receipt, typed permission and problem+json contracts remain canonical.
 The user approved these shapes with specification revision 3 on 2026-11-10.
 Revision 4 changes installation storage. Revision 5 selects the documented
-GitHub.com App flow. These public shapes are unchanged.
+GitHub.com App flow. Revision 7 records approved execution/receipt semantics
+below; public shapes remain unchanged.
 JSON objects are closed unless an existing referenced type says otherwise.
+
+## Execution and receipt semantics — revision 7
+
+Direct and queued work use the same memory-owned engine under spec REQ-017.
+Necessary preparation/cold loads remain supported. Live step/publication success
+and direct results do not certify retained evidence. Validated extraction values
+feed Prompt/workspace consumers without a persistence ACK; recovery uses exact
+actually accepted evidence. No new response fields or retry-cache contract.
+
+Queued computation releases compute resources at terminal selection. Separately
+bounded background custody retains state and renews the claim until canonical
+terminal evidence is accepted and token-fenced group settlement completes. Full
+tracking pauses new claims. A fully blocked execution also releases compute before
+its parked-checkpoint ACK; background custody retires that delivery after ACK.
+Positive deferred-evidence and approval receipts retain durable acceptance semantics.
+Process death may lose unaccepted progress/results; preserve accepted identities,
+spend and original deadline without promising conservation of unpersisted spend.
+Bifrost contracts and external upload completion remain unchanged.
 
 ## Repository and declaration
 

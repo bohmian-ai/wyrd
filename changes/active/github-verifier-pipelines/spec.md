@@ -1,7 +1,7 @@
 ---
 id: SPEC-github-verifier-pipelines
-revision: 6
-status: draft
+revision: 7
+status: approved
 ---
 
 # GitHub Verifier pipelines
@@ -16,7 +16,8 @@ the result; it does not own execution or review policy.
 Repository review needs one declared policy, automatic PR admission, pinned
 source evidence and durable execution. Later evidence and human decisions must
 allow the same review to continue without occupying workers or restarting
-completed work. Results must reach GitHub without making GitHub the execution
+durably accepted completed work. Unpersisted execution progress may be lost on
+process death as specified in REQ-017. Results must reach GitHub without making GitHub the execution
 owner or requiring a UI.
 
 This change connects repository declaration, GitHub events and evidence
@@ -168,8 +169,9 @@ not duplicate selection or indexing.
 
 **REQ-007 — Normal evidence consumption.** Entire extraction output or individual
 fields bind through ordinary Agent inputs and workspace mappings. Prompt binding
-injects actual selected source text; workspace JSON holds the same accepted
-values. No filesystem-discovery step is required, no implicit injection into
+injects actual selected source text; workspace JSON holds the same validated live
+values. Dependent consumption does not wait for checkpoint/Scribe acceptance;
+recovery reuses only actually persisted exact extraction evidence (REQ-017). No filesystem-discovery step is required, no implicit injection into
 unrelated Agents, no invented evidence publication name and no required source
 checkout. Pinned Agent/Prompt owns policy; repository guidance comes from pinned
 base source, while PR edits to guidance are evidence. Reuse library context and
@@ -220,14 +222,17 @@ occurrence refuses. No authority expansion, quorum or silent approval of a new
 source head. Rejection is data, not a crash; consumers requiring approval must
 explicitly require approved. A standard helper fails rejection/expiry.
 
-**REQ-011 — Park and resume.** Acknowledge the canonical pending checkpoint before
-retiring its current queue delivery. No runnable/active branches means release
-runner capacity, renewable execution lease and invocation-owned workspace,
-Python/model resources. Queue continuation restores the same accepted execution
-without replaying settled predecessors or replenishing retries/spend/deadline.
-Missing evidence and approval expiry are bounded by the original execution
-deadline; operator execution ceilings must support intended approval periods.
-Cancellation, revocation and supersession also apply while parked.
+**REQ-011 — Park and resume.** When no branches remain active/runnable, release
+execution, workspace, Python and model capacity immediately. Bounded background
+custody retains/renews the claim and acknowledges the canonical pending checkpoint
+before retiring its current queue delivery and releasing the renewing lease.
+No execution permit remains attached to that ACK. Continuation restores the same
+execution and accepted state without replaying durably settled predecessors or
+replenishing accepted spend/retries or the original deadline. A crash before
+checkpoint acceptance can repeat unpersisted work under REQ-017. Missing evidence
+and approval expiry remain bounded by the original execution deadline; operator
+execution ceilings must support intended approval periods. Cancellation,
+revocation and supersession apply while parked.
 
 ### Deliver and operate
 
@@ -277,20 +282,90 @@ write scopes; reads remain discoverable. Expose isolated capacities and original
 execution ceiling through normal operator configuration. Documentation teaches
 App setup, declaration, publication, approval and diagnosis without a UI.
 
+**REQ-017 — Memory execution and bounded background completion.** Direct and
+queued execution use the same stateful engine. Preserve existing request/claim
+preparation, authorization and necessary cold loads; do not add a cold-cache
+refusal/retry contract. Once prepared, engine transitions validate and mutate
+live state, release dependents and select one terminal result without SQL lease
+confirmation, outbox reservation/staging or persistence ACK. Actual model/tool,
+Python and validated physical file IO remain work subject to existing limits;
+model-response time counts against its per-call budget.
+
+Background persistence observes/coalesces live progress, freezes consistent
+snapshots, accounts retained memory and uses existing bounded encoding/outbox
+owners. Do not serialize/count/copy the whole growing state per mutation or hold
+its lock across encoding/IO. Direct returns its selected result and releases
+compute independently of persistence; its evidence publication remains bounded
+and best effort. VerificationResult remains compact and retained
+VerificationDetail(s) may be absent even after direct success.
+
+Queued terminal selection releases execution/workspace/Python/model resources.
+Separate bounded background tracking retains finished state, renews its claim,
+retries persistence and performs token-fenced queue settlement after canonical
+terminal evidence acceptance. A shed terminal offer is not queue completion.
+Account for admitted running claims so every one can finish without waiting for
+tracking space. Full tracking pauses new claims rather than running computation;
+isolated direct capacity remains available. This is live memory custody, not a
+new durable result mirror or stronger crash guarantee.
+
+The existing background lease owner renews claims and updates local cancellation;
+execution checks local tokens and original deadlines. Preserve cancellation
+notification responsiveness. Admission, claim, renewal, cancellation and settlement
+use short tenant-scoped group transactions, set-based batches and bounded retry
+work. Release connections after commit; never hold them over compute/provider,
+Bifrost, file or encoding waits. A low-traffic batch can contain one row; do not
+build a transaction/connection per row by construction.
+
+Preserve resource-scaling gateway snapshots, in-memory quota accounting and
+background settlement/capture. Remove capture-capacity waiting only for
+verification-originated calls, without weaker authorization or changes to
+standalone gateway behavior. Server-produced publication files retain validated
+object IO and exact descriptors but use background inventory persistence rather
+than external client upload-session SQL/inventory ACK on engine publication.
+External upload completion contracts remain unchanged. Bifrost implementation,
+query semantics, catalog and durable-write/WAL/fence contracts remain unchanged;
+Agent access continues through Agent tools, with no new Verifier query surface.
+
+A crash can lose unaccepted progress/results and direct requests do not resume.
+Queued recovery retains ExecutionId, exact accepted input/source/policy, accepted
+spend and original deadline; it can repeat later work/effects/spend. Unavailable
+recovery never means absence. Accepted terminal decisions are reused without
+computation. Preserve existing revision identity/conflict/replay behavior and
+allowed old-frozen-revision race; queue/source authority controls current
+continuation, settlement and provider writes. Do not add synchronous per-step
+SQL or invent instantaneous cross-replica revocation.
+
+**REQ-018 — Runtime baseline and schema correction.** Preserve resource-scaling
+latency, throughput, server CPU efficiency and memory behavior using matched full
+verification benchmarks and existing targets, including direct p99 overhead below
+500 microseconds at 64 clients and L2 backlog at most one second of offered work,
+drain at most 60 seconds and recovery within 30 seconds. No new 5% regression
+allowance is selected. Correct verdicts and healthy-load evidence reconciliation
+remain necessary; benchmark validity or exit zero alone is insufficient.
+
+Remove the unreleased generic execution-state/terminal-delivery SQL scaffolding
+identified in task 010 and its dependent runtime references. Preserve existing
+queue coordination, role grants, tenant isolation, background cancellation
+responsiveness and approved GitHub/PR, Task 004 metadata and resource-scaling
+schema. No replacement generic execution tables/columns or SQL payload mirror.
+This authorizes cleanup of unreleased branch-only migrations, never rewriting
+released/applied deployment history or resetting a user database.
+
 ## Durability and security invariants
 
 | ID | Must remain true | Failure prevented |
 |---|---|---|
 | INV-001 | Authenticated tenant and current permission constrain all operations; evidence matches stable repository/source identity while execution lineage retains exact Card/policy versions | Cross-tenant evidence or credentials becoming authority |
-| INV-002 | Bifrost owns accepted execution evidence/decisions/checkpoints; existing Postgres rows coordinate claims, activation and owed delivery; Task 004 metadata tables serve only the library snapshot/context protocols | Competing execution truth or a second payload store |
-| INV-003 | A positive consequential receipt follows durable acceptance; every accepted handoff can be rediscovered after restart | Lost acknowledged evidence, approval or queue work |
+| INV-002 | Bifrost owns accepted execution evidence/decisions/checkpoints; existing Postgres rows coordinate claims, activation and delivery, with bounded live terminal custody under REQ-017; Task 004 metadata tables serve only the library snapshot/context protocols | Competing execution truth or a second payload store |
+| INV-003 | Positive durable control receipts follow acceptance and survive restart; memory execution/publication success and ordinary staged submission are not durability certificates (REQ-017) | Lost acknowledged evidence, approval or queue work |
 | INV-004 | Recovery returns exact accepted state, authoritative absence or explicit unavailability | Replaying settled work or treating unavailable evidence as fresh state |
-| INV-005 | Existing source/policy, publication identity, budgets and deadline survive retry/resumption | A retry judging different code or silently replenishing authority/spend |
-| INV-006 | Stale/cancelled/superseded actors cannot release new work or publish as the current review | Late writes reviving an obsolete generation |
+| INV-005 | Accepted source/policy, publication identity, spent budgets and original deadline survive retry/resumption; unpersisted progress/spend can be lost under REQ-017 | A retry judging different code or silently replenishing authority/spend |
+| INV-006 | Local cancellation stops further engine work when observed; current token/generation fences protect continuation/settlement and provider writes; already-issued IO and the existing old-frozen-revision interval remain possible | Late writes reviving an obsolete generation |
 | INV-007 | New Postgres tables limited to wyrd.github_installations and Task 004 library snapshot/context metadata; no new database service or generic broker/workflow engine; no secrets in Cards/TOML/results | Unnecessary infrastructure or credential disclosure |
 
-Use existing upload completion/exact File custody, Scribe acknowledgement/batch
-fences and tenant queue transactions. There is no Bifrost/Postgres atomic
+Use existing external upload completion/exact File custody, background Scribe
+acknowledgement/batch fences and tenant queue transactions. Server-produced
+publication inventory follows REQ-017. There is no Bifrost/Postgres atomic
 transaction. [Recovery research](research.md#existing-owner-extensions) identifies
 specific extension points and ACK ordering; implementation may choose private
 mechanics that preserve these guarantees.
@@ -311,11 +386,14 @@ without production GitHub credentials.
 | AC-004 | Cold/warm pinned extraction, full/incremental and unusable baseline, Prompt plus workspace consumption, context omissions and model limit | Exact source/context preserved and reused; missing/incomplete review never a clean pass | 006,007 |
 | AC-005 | Publish before consumer starts/while waiting/while running/no execution/no subscription; identical/conflicting retry; wrong tenant/Card/commit/type | Repository/commit/input matching independent of policy version; existing subscribers receive evidence, later subscribers get no historical replay; retries deduplicate and conflicts refuse | 008,009 |
 | AC-006 | Parallel branch plus deferred input/approval, all blocked, authorized/rejected/expired decision, stale occurrence and unauthorized caller | Peers continue, blocked work releases capacity; same execution resumes once under original authority | 010,011 |
-| AC-007 | Controlled crash before/after evidence/decision ACK, park settlement, queue commit and recovery reads | Accepted work survives and progresses; unavailable state is not absence; no second approval or computation replay | 009,010,011 |
+| AC-007 | Controlled crash before/after evidence/decision ACK, park settlement, queue commit and recovery reads | Accepted work survives; unavailable state is not absence; no second accepted approval or replay of durably settled predecessors; unpersisted work can repeat under REQ-017 | 009,010,011 |
 | AC-008 | No/one/multiple/malformed report; every severity, absent location, valid/invalid suggested edit | Exact report convention; honest verdict/conclusion; no invented source anchor or applied source change | 012,013 |
 | AC-009 | GitHub timeout after remote success, annotation batch retry, restart, new head/access removal during delivery | Reconciliation avoids duplicates; provider retry does not rerun verification or claim stale success | 005,014 |
 | AC-010 | Hold queued execution/workspace/Python/model admission saturated while calling direct-eligible Verifier | Direct reserved resources still execute; queued-only direct call refuses before work | 015 |
 | AC-011 | Fresh reader follows CLI/SDK docs and uses execution, evidence, approval and delivery inspection | Complete journey without UI or hidden manual orchestration; schemas/errors match served operations | 016 |
+| AC-012 | Hold Scribe/outbox and background SQL replies while direct/queued graphs advance; fill terminal tracking, then restore persistence; crash/reclaim before/after acceptance and race cancellation/takeover | Engine progresses from memory, compute permits free, tracking bounded with room for running claims, new claims back off, direct remains isolated; restored persistence yields the same terminal evidence then batched fenced settlement; only unpersisted work may repeat | 011,015,017 |
+| AC-013 | Matched full immutable resource-scaling/candidate verification benchmarks with healthy evidence reconciliation | Existing latency/L2 targets met and RS throughput/CPU/memory baseline preserved; no invented tolerance or exit-zero-only performance claim | 018 |
+| AC-014 | Fresh isolated migration comparison and affected consumer/SQL tests | Only permitted GitHub/PR/Task 004 deltas beyond main plus RS; no generic execution payload schema, preserved grants/RLS/cancellation responsiveness and no Bifrost runtime redesign | 018 |
 
 ## Authority reconciliation and approval
 
@@ -334,7 +412,11 @@ Specification approval covers the behavior and public contracts in this packet.
 It does not claim implementation readiness. Revision 4 selects the installation
 table; private column layout and query mechanics remain implementation-owned.
 Revision 5 uses GitHub.com’s documented installation and authorization flow.
-The user’s direction to simplify this scope authorizes this revision.
+The user’s direction to simplify this scope authorized revision 5. The user
+also directed Task 004 storage (revision 6), agreed the finalized
+[nonblocking execution design](design/approved-nonblocking-execution.md), requested
+task 010 revision and explicitly approved the runtime spec revision in this
+conversation. Revision 7 records that agreement without adding new decisions.
 
 Owning architecture still needs the approved amendments for Repository/Card
 roots, closed PR activation, TOML roots, deferred publication/approval, scoped
@@ -352,6 +434,8 @@ readiness. Implementation tasks derive from this approved revision.
 | 3 | approved 2026-11-10 | Apply approved source-based evidence matching; remove publication Card-version overrides, public reactivation rules, extra App management workflow and prescribed permission/layout additions; audit supporting contracts. User explicitly approved this revision and its contracts for planning. |
 | 4 | approved 2026-11-10 | User approved and requested the storage amendment: allow only wyrd.github_installations, preserve OIDC trust, reuse flow-separated login state and revise task 002 proof. Public contracts and other task behavior are unchanged. |
 | 5 | approved 2026-11-10 | User directed the conventional GitHub App flow and removal of the Enterprise Server compatibility decision. Scope the provider to GitHub.com with its documented installation and OAuth protections. |
+| 6 | approved storage direction | Task 004 ObjectStorage over existing object storage and PostgreSQL SnapshotStore/ContextStore with their required metadata-table exception; reconcile the previously stale draft frontmatter. |
+| 7 | approved in current conversation | Shared memory execution, preserved preparation/Bifrost, bounded background queued completion and leases/group commit, explicit crash loss, compute-free park handoffs, resource-scaling proof and unreleased execution-schema cleanup. |
 
 Authority: [Wyrd doctrine/Verifier](../../../architecture/wyrd-design.md),
 [Bifrost](../../../architecture/bifrost-design.md),
@@ -361,10 +445,14 @@ Design: [current index](design/notes.md), [declaration](design/approved-declarat
 [extraction](design/approved-code-review-support.md),
 [publication/approval](design/approved-deferred-inputs.md),
 [reports](design/approved-report-delivery.md),
-[App/runtime](design/approved-runtime-and-github.md).
+[App/runtime](design/approved-runtime-and-github.md),
+[nonblocking execution](design/approved-nonblocking-execution.md).
 
-Revision 6 (draft) records the user-directed Task 004 storage correction:
-`ObjectStorage` over existing object storage, PostgreSQL `SnapshotStore` and
-`ContextStore`, and their required metadata-table exception. Revision 5 approval
-does not approve this amendment; renewed approval is required before affected
-implementation proceeds. Other behavior and completed review evidence are unchanged.
+Revision 7 supersedes conflicting earlier execution ACK/SQL requirements for this
+change. Required owner-document updates remain task work before affected runtime
+changes; approval does not claim they have landed or that runtime tests passed.
+
+The maintainer reaffirmed revision 7 approval after task 010 was clarified to
+reuse the existing ClaimLoop permit through background persistence/settlement
+and retain the existing cancellation-notification migration, trigger and listener.
+These reuse clarifications preserve this revision's behavior and add no subsystem.

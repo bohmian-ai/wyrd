@@ -1,6 +1,6 @@
 # GitHub Verifier pipelines
 
-Status: exploring (Task 004 storage amendment; prior decisions preserved)
+Status: finalized (approved revision 7; existing runner lifecycle clarified)
 
 ## Problem
 
@@ -51,7 +51,10 @@ Wyrd owners, without a UI or a separate workflow system.
 
 ## Proposed implementation
 
-The following direction is approved; links own the detailed decisions.
+The following direction is approved; links own the detailed decisions. For
+verification runtime ownership and persistence, the later
+[nonblocking execution agreement](approved-nonblocking-execution.md) supersedes
+conflicting earlier runtime descriptions. It leaves Bifrost unchanged.
 
 ```toml
 [repository.verified_by]
@@ -152,7 +155,8 @@ where they agree with current approved records. They do not reopen decisions.
 
 ## Standards conflicts
 
-Repository authority still needs updating before specification approval:
+Repository authority still needs the approved owner updates before affected
+production changes:
 
 - Native Card catalog/root/composition/reference and binding rules gain Repository.
 - Trigger rules gain closed pull_request activation; old rules exclude pushes.
@@ -209,10 +213,14 @@ choices do not need another design decision. They belong to implementation.
 
 ## Handoff
 
-Design was finalized for approved specification revision 5 and its public
-contracts. It is resumed for the user-directed Task 004 storage correction.
-[Spec revision 6](../spec.md) is draft; Task 004 targets it and remains proposed
-pending renewed spec approval. Other tasks retain their revision 5 basis.
+The original design was finalized for specification revision 5 and its public
+contracts. Task 004 storage approval and the runtime correction are now recorded
+in approved spec revision 7. The finalized nonblocking execution agreement owns
+the runtime flow; owner-document reconciliation remains task work before affected
+production implementation.
+[Spec revision 7](../spec.md) is approved and retains the Task 004 storage
+amendment. Historical task/review revisions remain recorded at their original
+bases; current runtime follow-through uses revision 7.
 Revision 4 selects dedicated installation storage; revision 5 selects GitHub.com’s
 documented App flow. The [task packet](../tasks/README.md) records these bases. Task 002 owns the dedicated table, flow-separated authorization state,
 security/runtime authority updates and connected proof. Document approval does
@@ -240,3 +248,48 @@ the existing deployment. See [storage flow and proof](approved-code-review-suppo
 Accepted execution evidence remains in Bifrost. Exact Wyrd table names and
 private module placement remain implementation-owned. No production change
 or runtime verification is claimed.
+
+### Task 010 runtime correction — agreed design
+
+The maintainer agreed the bounded execution/background flow and requested task
+010 revision. [Nonblocking execution](approved-nonblocking-execution.md) records
+the connected direct/queued flow, bounded terminal custody, lease/group-commit
+ownership, gateway/storage edges, crash semantics and proof. It supersedes the
+previous task's cache-only refusal, terminal-on-shed completion, cancellation
+notification removal and invented 5% regression tolerance.
+
+Direct and queued use the same memory-owned engine. Preserve existing preparation,
+including cold loads, and resource-scaling optimizations. Release compute resources
+at terminal selection; retain queued finished state in separately bounded background
+tracking, renew its claim, persist terminal evidence, then batch-settle the queue.
+Full tracking pauses new claims rather than running work. Bifrost stays unchanged;
+Agent access continues through Agent tools. No new generic execution SQL schema.
+
+The supplemental design is finalized and the maintainer explicitly approved
+spec revision 7. Task 010 remains proposed;
+contradictory architecture and dependent wording must be reconciled before
+affected production work. Task 004 storage and
+other prior decisions above remain intact. No production changes, tests or
+benchmarks are claimed by this planning revision.
+
+### Task 010 design/readiness review
+
+The [source-backed task review](task-010-design-review.md) originally requested
+clarification of recording-error and lease-loss cleanup. The maintainer requested
+the smallest update: keep the existing runner as claim owner through background
+persistence/settlement, shorten only compute-permit lifetime, and preserve its
+existing error/cancellation/lease-loss paths. Task 010 now states that ownership
+and requires O4/O5 to verify cleanup through the changed lifetime. No separate
+completion manager, retry service, repair workflow or public failure policy is
+selected. Spec revision 7 is unchanged. Runtime compatibility/performance remain
+implementation proof, not claims made by the wording update.
+
+### Ponytail task revision — existing bounds and notifications
+
+The maintainer requested the evidence-backed task revisions: reuse ClaimLoop's
+existing permit for the whole claim lifetime, distinguish it from computation-owned
+resources in O2/O4/O5, and keep the cancellation-notification migration/trigger/
+listener rather than deleting and rebuilding them. Claim permits bound running
+plus completing work; per-run/outbox byte limits remain. No second tracker,
+semaphore, completion manager or public behavior change is selected. Task 010 and
+the runtime supplement now use this interpretation; spec revision 7 is unchanged.

@@ -1126,6 +1126,12 @@ export declare class NativeRun {
    * reuse the cached schema and producer. Resolving is buffered submission;
    * state shutdown drains it.
    *
+   * The write runs as a spawned task that owns a clone of the Run, so
+   * discarding the returned promise does not cancel it: the row may still
+   * be admitted. A successful outcome admitted exactly one row, so repeating
+   * it writes another; a refused outcome admitted none and may be retried.
+   * Admission and queue retries follow `RunBifrost::write`.
+   *
    * # Errors
    *
    * Returns a napi error only when the outcome cannot be projected; a

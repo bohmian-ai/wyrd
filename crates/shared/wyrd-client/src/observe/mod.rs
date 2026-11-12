@@ -500,6 +500,20 @@ impl RunBifrost<'_> {
     /// `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup,
     /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, and
     /// `WYRD_CLIENT_429_QUEUE_FULL` when the producer is saturated.
+    ///
+    /// # Cancellation
+    /// The only suspension point is the first-use table description, which
+    /// precedes admission; dropping the future there admits no row and caches
+    /// nothing. Admission is one synchronous, all-or-none enqueue, so there is
+    /// no partial progress: the row is either refused or handed to the queue,
+    /// and an admitted row is never retracted.
+    ///
+    /// # Retry
+    /// Not idempotent: repeating a call that returned `Ok` admits a second row.
+    /// After an error no row was admitted, so the caller may retry the same
+    /// row, after draining or backing off on `WYRD_CLIENT_429_QUEUE_FULL`. The
+    /// queue's own publish retries resend an admitted row under its sealed
+    /// batch's identity and are independent of caller retries.
     pub async fn write<T: Serialize>(&self, table: &str, row: &T) -> Result<(), WyrdError> {
         self.write_value(table, &to_value(row, "write row")?).await
     }
@@ -513,6 +527,9 @@ impl RunBifrost<'_> {
     /// # Errors
     /// As [`RunBifrost::write`], plus an invalid-observation error when `json`
     /// is not valid JSON.
+    ///
+    /// # Cancellation
+    /// As [`RunBifrost::write`], including its retry contract.
     #[cfg(feature = "internal")]
     pub async fn write_json(&self, table: &str, json: &str) -> Result<(), WyrdError> {
         self.write_value(table, &parse_json(json, "write row")?)
@@ -523,6 +540,9 @@ impl RunBifrost<'_> {
     ///
     /// # Errors
     /// As [`RunBifrost::write`].
+    ///
+    /// # Cancellation
+    /// As [`RunBifrost::write`], including its retry contract.
     async fn write_value(&self, table: &str, row: &Value) -> Result<(), WyrdError> {
         if !table.starts_with(DATASETS_PREFIX) || table[DATASETS_PREFIX.len()..].contains('.') {
             return Err(invalid_observation(

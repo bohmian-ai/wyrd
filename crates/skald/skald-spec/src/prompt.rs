@@ -52,10 +52,10 @@ pub struct Prompt {
     /// When absent, native dispatch uses the request dialect's default
     /// provider. Gateway routes select their own upstream and ignore it.
     pub provider: Option<ProviderName>,
-    /// The authored form this Prompt was compiled from, when it still
-    /// describes the request; absent after construction from a request or a
-    /// binding, when the native form is derived from the request instead.
-    pub(crate) authored: Option<Box<Authored>>,
+    /// The authored form this Prompt was compiled from and what that compile
+    /// produced; absent after construction from a request or a binding, when
+    /// the native form is derived from the request instead. Clones share it.
+    pub(crate) authored: Option<Arc<Compiled>>,
     /// Media kind each portable `${media:name}` binding requires, derived
     /// from its image or document block at compile time. Native placeholders
     /// carry no kind and are absent; the list survives text and media binds.
@@ -72,50 +72,19 @@ pub struct Prompt {
     pub(crate) body_variables: Vec<String>,
 }
 
-/// The authored form a Prompt was compiled from and a fingerprint of the
-/// request it compiled to, which lets [`Prompt::authored`] see that the
-/// public fields are unchanged without compiling the form again.
-#[derive(Debug, Clone)]
-pub(crate) struct Authored {
+/// An authored Prompt beside the request, model, and dispatch provider its
+/// compile produced. Compiling is deterministic, so while a Prompt's public
+/// fields still equal these, the authored form describes it exactly.
+#[derive(Debug)]
+pub(crate) struct Compiled {
     /// The authored form.
-    pub(crate) form: AuthoredPrompt,
-    /// [`request_fingerprint`] of the compiled request.
-    pub(crate) request: u64,
-}
-
-/// A hash of `request`'s serialization, streamed without buffering it.
-///
-/// Equal fingerprints stand for an unchanged request; a request that
-/// serializes differently, even one equal to it, hashes differently.
-pub(crate) fn request_fingerprint(request: &ProviderRequest) -> u64 {
-    use std::hash::Hasher;
-    /// Feeds written bytes to the hasher.
-    struct Sink(
-        /// The hasher the serialized request streams into.
-        std::hash::DefaultHasher,
-    );
-    impl std::io::Write for Sink {
-        /// Feeds `bytes` to the hasher and accepts all of them.
-        ///
-        /// # Errors
-        /// Never fails; hashing does no IO.
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.write(bytes);
-            Ok(bytes.len())
-        }
-        /// Does nothing; the hasher buffers nothing to flush.
-        ///
-        /// # Errors
-        /// Never fails.
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut sink = Sink(std::hash::DefaultHasher::new());
-    // A request that does not serialize hashes its written prefix, so at
-    // worst `authored` falls back to compiling the form again.
-    let _ = serde_json::to_writer(&mut sink, request);
-    sink.0.finish()
+    pub(crate) authored: AuthoredPrompt,
+    /// The compiled request.
+    pub(crate) request: ProviderRequest,
+    /// The compiled model.
+    pub(crate) model: String,
+    /// The compiled dispatch provider.
+    pub(crate) provider: Option<ProviderName>,
 }
 
 /// A named authored response format and the schema its host resolved.
@@ -825,8 +794,7 @@ impl Prompt {
     /// This is the form it was compiled from while that form still compiles
     /// to the current request, model, and provider; otherwise, such as after a
     /// caller mutated the public fields, it is the native form derived from
-    /// the request. An unchanged model, provider, and request fingerprint
-    /// show the form still applies without compiling it again.
+    /// the request.
     ///
     /// # Errors
     ///
@@ -834,23 +802,12 @@ impl Prompt {
     /// Prompt format, such as embeddings or a raw body.
     pub fn authored(&self) -> SkaldResult<std::borrow::Cow<'_, AuthoredPrompt>> {
         match self.authored.as_deref() {
-            Some(Authored { form, request })
-                if self.model == form.model
-                    && self.provider.as_ref() == Some(&form.provider)
-                    && *request == request_fingerprint(&self.request) =>
+            Some(compiled)
+                if compiled.request == self.request
+                    && compiled.model == self.model
+                    && compiled.provider == self.provider =>
             {
-                Ok(std::borrow::Cow::Borrowed(form))
-            }
-            // A resolved named format's schema lives only in the request, so
-            // that form never recompiles equal here and falls back to native.
-            Some(Authored { form, .. })
-                if form.compile_resolved(None).is_ok_and(|compiled| {
-                    compiled.request == self.request
-                        && compiled.model == self.model
-                        && compiled.provider == self.provider
-                }) =>
-            {
-                Ok(std::borrow::Cow::Borrowed(form))
+                Ok(std::borrow::Cow::Borrowed(&compiled.authored))
             }
             _ => AuthoredPrompt::native(self.provider(), &self.model, &self.request)
                 .map(std::borrow::Cow::Owned),

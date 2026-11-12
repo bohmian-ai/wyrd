@@ -15,7 +15,7 @@ use serde_json::{Map, Value};
 use crate::error::{SkaldError, SkaldResult};
 use crate::media::{MediaKind, MediaRef, MediaSource};
 use crate::prompt::{
-    NamedFormat, Prompt, check_model, check_output_schema, media_placeholder_regex,
+    Compiled, NamedFormat, Prompt, check_model, check_output_schema, media_placeholder_regex,
 };
 use crate::request::{ProviderName, ProviderRequest};
 use crate::wire::anthropic_messages::{
@@ -445,9 +445,11 @@ impl AuthoredPrompt {
             name: named.name().to_owned(),
             resolved: named_resolved,
         });
-        prompt.authored = Some(Box::new(crate::prompt::Authored {
-            form: self.clone(),
-            request: crate::prompt::request_fingerprint(&prompt.request),
+        prompt.authored = Some(std::sync::Arc::new(Compiled {
+            authored: self.clone(),
+            request: prompt.request.clone(),
+            model: prompt.model.clone(),
+            provider: prompt.provider.clone(),
         }));
         Ok(prompt)
     }

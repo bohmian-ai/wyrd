@@ -5165,6 +5165,69 @@ export interface PublicationSummary {
 }
 
 /**
+ * The pull request source one queued execution was admitted for.
+ *
+ * Every execution of one admission shares its `generation`. A newer
+ * source of the same pull request supersedes the generation: its unfinished
+ * executions are cancelled with code `pull_request_superseded`. A close or
+ * draft conversion cancels them with `pull_request_closed` or
+ * `pull_request_draft`, and losing the repository through removal,
+ * suspension or disconnect with `repository_access_lost`. Settled history
+ * keeps these pins.
+ */
+export interface PullRequestActivation {
+  /**
+   * Base branch and commit.
+   */
+  readonly base: PullRequestRef;
+  /**
+   * Provider delivery that admitted the source, for matching the
+   * provider's delivery log.
+   */
+  readonly delivery_id: string;
+  /**
+   * The admission every execution of this source shares.
+   */
+  readonly generation: string;
+  /**
+   * Head branch and commit.
+   */
+  readonly head: PullRequestRef;
+  /**
+   * Stable provider id of the head repository; differs from
+   * `repository_id` for a fork and is absent once the fork is deleted.
+   */
+  readonly head_repository_id?: RepositoryId | null;
+  /**
+   * Provider web host, such as `github.com`.
+   */
+  readonly host: string;
+  /**
+   * Pull request number in the base repository.
+   */
+  readonly number: number;
+  /**
+   * Stable provider id of the base repository.
+   */
+  readonly repository_id: RepositoryId;
+}
+
+/**
+ * One side of a pull request as an admission pinned it: the branch name
+ * then and the exact commit.
+ */
+export interface PullRequestRef {
+  /**
+   * Branch name when the source was admitted.
+   */
+  readonly ref: string;
+  /**
+   * Exact commit SHA the execution reviews.
+   */
+  readonly sha: string;
+}
+
+/**
  * Server-derived class of one query: how Oracle admits and executes it.
  *
  * Never a request field. Oracle reads it from the one physical root it built:
@@ -7306,6 +7369,11 @@ export interface VerificationExecutionState {
    * Binding owner of a background execution.
    */
   readonly owner_card_uid?: CardUid | null;
+  /**
+   * The pull request source a `pull_request` binding execution was
+   * admitted for, frozen at admission.
+   */
+  readonly pull_request?: PullRequestActivation | null;
   /**
    * The result once completed and visible.
    */

@@ -12,9 +12,12 @@ mod pg_tests {
     };
     use wyrd_ai::cli;
     use wyrd_ai::github::{GithubConnection, GithubConnectionState};
+    use wyrd_ai::verify::Execution;
     use wyrd_spec::envelope::RepositoryStatus;
+    use wyrd_spec::verification::VerificationExecutionStatus;
+    use wyrd_spec::verification::execution::VerificationExecutionState;
     use wyrd_testing::WyrdTestServer;
-    use wyrd_testing::github::{GithubAppMock, GithubBrowser};
+    use wyrd_testing::github::{GithubAppMock, GithubBrowser, PullRequest};
 
     use crate::support::{Deployment, declare, declared, fixture};
 
@@ -527,5 +530,125 @@ mod pg_tests {
                 .selected
         );
         deployment.shutdown().await;
+    }
+
+    /// The binding's newest execution, read through the SDK.
+    ///
+    /// # Panics
+    /// Panics when the binding has no execution or a read fails.
+    async fn newest(
+        deployment: &Deployment,
+        binding: &wyrd_spec::ids::BindingId,
+    ) -> VerificationExecutionState {
+        let id = deployment
+            .binding_status(binding)
+            .await
+            .last_execution_id
+            .expect("the binding has an execution");
+        inspect(deployment, id).await
+    }
+
+    /// Execution `id`'s status, read through the SDK.
+    ///
+    /// # Panics
+    /// Panics when the read fails.
+    async fn inspect(
+        deployment: &Deployment,
+        id: wyrd_ai::ExecutionId,
+    ) -> VerificationExecutionState {
+        Execution::connect_with(id, &deployment.admin())
+            .await
+            .expect("the execution handle connects")
+            .status()
+            .await
+            .expect("the execution reads")
+    }
+
+    /// Deliver `action` on `acme/api` PR 7 from GitHub's current state.
+    ///
+    /// # Panics
+    /// Panics when the delivery is not acknowledged.
+    async fn deliver(mock: &GithubAppMock, deployment: &Deployment, action: &str) {
+        let payload = mock.pull_request_event(101, 1, 7, action);
+        let status = mock
+            .deliver(
+                deployment.server().base_url().expect("bound"),
+                "pull_request",
+                &payload,
+            )
+            .await
+            .expect("delivery sends");
+        assert_eq!(status, 202, "{action}");
+    }
+
+    /// An opened pull request on the declared repository admits one queued
+    /// execution per binding, pinned to its base and head; a pushed head
+    /// supersedes it and a close cancels the newer one, both still
+    /// inspectable with their pins and stable cancellation codes.
+    ///
+    /// # Panics
+    /// Panics when admission, pins or cancellation differ.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the repository-managed Postgres journey lifecycle"]
+    async fn pull_requests_admit_pinned_executions_and_supersede_them() {
+        let (mock, deployment, _connection, _key) = connected().await;
+        let cards = deployment.cards().await;
+        let checkout = checkout(&mock, "acme/api");
+        let root = declare_toml(&cards, &checkout, "minimal")
+            .await
+            .expect("minimal wyrd.toml declares")
+            .root;
+        let binding = cards
+            .get(CardSelector::exact(root))
+            .await
+            .expect("the Repository reads")
+            .status
+            .and_then(|status| status.verification)
+            .expect("the Repository serves its bindings")
+            .binding_ids[0]
+            .clone();
+
+        mock.set_pull_request(1, 7, PullRequest::open(1, "b1", "a1"));
+        deliver(&mock, &deployment, "opened").await;
+        let opened = newest(&deployment, &binding).await;
+        assert_eq!(opened.status, VerificationExecutionStatus::Pending);
+        let pins = opened.pull_request.as_ref().expect("PR pins are served");
+        assert_eq!(
+            (
+                pins.number,
+                pins.repository_id.as_str(),
+                pins.base.ref_name.as_str()
+            ),
+            (7, "1", "main")
+        );
+        assert_eq!(
+            (pins.base.sha.as_str(), pins.head.sha.as_str()),
+            ("b1", "a1")
+        );
+
+        mock.edit_pull_request(1, 7, |pr| pr.head_sha = "b2".to_owned());
+        deliver(&mock, &deployment, "synchronize").await;
+        let pushed = newest(&deployment, &binding).await;
+        assert_ne!(pushed.execution_id, opened.execution_id);
+        let superseded = inspect(&deployment, opened.execution_id.clone()).await;
+        assert_eq!(superseded.status, VerificationExecutionStatus::Cancelled);
+        assert_eq!(
+            superseded.error.map(|error| error.code).as_deref(),
+            Some("pull_request_superseded")
+        );
+        assert_eq!(
+            superseded.pull_request.map(|pins| pins.head.sha).as_deref(),
+            Some("a1"),
+            "history keeps its pins"
+        );
+
+        mock.edit_pull_request(1, 7, |pr| pr.open = false);
+        deliver(&mock, &deployment, "closed").await;
+        let closed = inspect(&deployment, pushed.execution_id).await;
+        assert_eq!(closed.status, VerificationExecutionStatus::Cancelled);
+        assert_eq!(
+            closed.error.map(|error| error.code).as_deref(),
+            Some("pull_request_closed")
+        );
     }
 }

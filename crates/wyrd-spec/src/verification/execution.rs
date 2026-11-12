@@ -223,9 +223,11 @@ pub struct PullRequestRef {
 ///
 /// Every execution of one admission shares its `generation`. A newer
 /// source of the same pull request supersedes the generation: its unfinished
-/// executions are cancelled with code `pull_request_superseded`, and a close
-/// or draft conversion cancels them with `pull_request_closed` or
-/// `pull_request_draft`. Settled history keeps these pins.
+/// executions are cancelled with code `pull_request_superseded`. A close or
+/// draft conversion cancels them with `pull_request_closed` or
+/// `pull_request_draft`, and losing the repository through removal,
+/// suspension or disconnect with `repository_access_lost`. Settled history
+/// keeps these pins.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]

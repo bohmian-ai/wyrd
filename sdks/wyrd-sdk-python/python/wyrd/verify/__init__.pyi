@@ -486,6 +486,30 @@ class CancelledExecution(TypedDict):
     execution_id: str
     status: ExecutionStatus
 
+PullRequestRef = TypedDict("PullRequestRef", {"ref": str, "sha": str})
+"""One side of a pull request as an admission pinned it: the branch name then and the exact commit."""
+
+class PullRequestActivation(TypedDict):
+    """The pull request source a queued execution was admitted for.
+
+    Every execution of one admission shares its ``generation``. A newer source
+    of the same pull request cancels unfinished work with
+    ``pull_request_superseded``; close, draft conversion and lost repository
+    access cancel it with ``pull_request_closed``, ``pull_request_draft`` and
+    ``repository_access_lost``. Settled history keeps these pins.
+    """
+
+    generation: str
+    host: str
+    repository_id: str
+    number: int
+    base: PullRequestRef
+    head: PullRequestRef
+    head_repository_id: NotRequired[str | None]
+    """Differs from ``repository_id`` for a fork; absent once the fork is deleted."""
+    delivery_id: str
+    """Provider delivery that admitted the source."""
+
 class ExecutionState(TypedDict, Generic[DataT]):
     """``Execution.status()``: the lifecycle, terminal error, visible result, and grouping."""
 
@@ -497,6 +521,7 @@ class ExecutionState(TypedDict, Generic[DataT]):
     group_id: NotRequired[str]
     owner_card_uid: NotRequired[str]
     group: NotRequired[GroupSnapshot]
+    pull_request: NotRequired[PullRequestActivation]
 
 class File:
     """A local file to verify, read only when ``verify`` or ``submit`` uses it.

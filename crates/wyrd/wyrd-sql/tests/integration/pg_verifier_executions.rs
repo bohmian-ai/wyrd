@@ -4644,11 +4644,12 @@ async fn pull_request_generations_reserve_activate_and_supersede() {
 
 /// Closing a PR cancels its unfinished executions with the close code and
 /// deactivates its generation, keeping settled history; access loss does
-/// the same for the repository's PRs; a binding refused at admission
-/// settles errored with its pins and runs nothing.
+/// the same for the repository's PRs, and a reservation it cancels is never
+/// activated; a binding refused at admission settles errored with its pins
+/// and runs nothing.
 ///
 /// # Panics
-/// Panics when a cancellation, deactivation or refusal differs.
+/// Panics when a cancellation, deactivation, activation or refusal differs.
 #[tokio::test]
 async fn pull_request_ends_access_loss_and_refusals_settle_durably() {
     let fixture = PgFixture::start().await.expect("fixture starts");
@@ -4729,5 +4730,23 @@ async fn pull_request_ends_access_loss_and_refusals_settle_durably() {
     assert_eq!(
         state.error.map(|error| error.code).as_deref(),
         Some("repository_access_lost")
+    );
+
+    let reserved_at = database_now(&mut conn).await;
+    let (reserved, _) = queue
+        .reserve_pull_request(&mut conn, &pins("d"), reserved_at, &targets[..1])
+        .await
+        .expect("a generation reserves");
+    queue
+        .cancel_pull_request_repositories(&mut conn, "github.com", Some(&["42".to_owned()]))
+        .await
+        .expect("repository cancels");
+    assert!(
+        queue
+            .activate_pull_requests(&mut conn, &reserved)
+            .await
+            .expect("activation runs")
+            .is_empty(),
+        "a reservation cancelled by access loss is never activated"
     );
 }

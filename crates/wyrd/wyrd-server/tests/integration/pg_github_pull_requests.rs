@@ -39,6 +39,12 @@ const ON_PULL_REQUEST: &str = "apiVersion: wyrd/v1\nkind: Trigger\nmetadata:\n  
 /// [`POLICY`] re-declared binding only `a-review`.
 const POLICY_V2: &str = "apiVersion: wyrd/v1\nkind: Repository\nmetadata:\n  name: policy\n  version: 1.0.1\nspec:\n  repository_id: \"4242\"\n  verified_by:\n    - verifier: ./a-review.yaml\n      runs_on: {kind: pull_request}\n";
 
+/// [`POLICY`] re-declared binding no Verifier.
+const POLICY_EMPTY: &str = "apiVersion: wyrd/v1\nkind: Repository\nmetadata:\n  name: policy\n  version: 1.0.2\nspec:\n  repository_id: \"4242\"\n  verified_by: []\n";
+
+/// [`POLICY`] re-declared again with both bindings, after [`POLICY_EMPTY`].
+const POLICY_RESTORED: &str = "apiVersion: wyrd/v1\nkind: Repository\nmetadata:\n  name: policy\n  version: 1.0.3\nspec:\n  repository_id: \"4242\"\n  verified_by:\n    - verifier: ./a-review.yaml\n      runs_on: {kind: pull_request}\n    - verifier: ./z-review.yaml\n      runs_on: ./on-pull-request.yaml\n";
+
 /// An exact queued Verifier named `name`.
 fn review_verifier(name: &str) -> String {
     format!(
@@ -1053,6 +1059,110 @@ async fn completed_baseline_survives_when_a_new_head_supersedes_running_work() {
         assert_eq!(late, Settlement::StaleLease, "A's worker is fenced");
     }
     conn.commit().await.expect("commits");
+}
+
+/// A new head supersedes unfinished work even after the Repository was
+/// re-declared binding no Verifier: the re-declaration itself changes
+/// nothing, the new head cancels and fences queued and running work,
+/// keeps the completed baseline and admits nothing, and the cancelled
+/// generation is never replayed as current once Verifiers are bound again.
+///
+/// # Panics
+/// Panics when the empty policy sweeps, leaves older work runnable, admits
+/// work, or replays the cancelled generation.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_head_supersedes_work_when_the_policy_binds_nothing() {
+    let deployment = Deployment::start().await;
+    let mock = &deployment.mock;
+    mock.set_pull_request(REPOSITORY, 29, PullRequest::open(REPOSITORY, "b1", "p0"));
+    assert_eq!(deployment.send(29, "opened").await.0, StatusCode::ACCEPTED);
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = deployment.conn().await;
+    for claimed in deployment.claim(2).await {
+        let settled = queue
+            .complete(
+                &mut conn,
+                claimed.lease,
+                VerificationResultId::new_v7(),
+                VerificationVerdict::Passed,
+                "P passes",
+                None,
+            )
+            .await
+            .expect("P completes");
+        assert_eq!(settled, Settlement::Applied);
+    }
+    conn.commit().await.expect("P commits");
+    mock.edit_pull_request(REPOSITORY, 29, |pr| pr.head_sha = "a1".to_owned());
+    assert_eq!(
+        deployment.send(29, "synchronize").await.0,
+        StatusCode::ACCEPTED
+    );
+    let running = deployment.claim(1).await.pop().expect("one of A runs");
+
+    deployment.declare(POLICY_EMPTY, "pull-request-policy-empty").await;
+    let before = deployment.rows(29).await;
+    assert_eq!(
+        summary(&before),
+        [
+            ("completed", None, "p0"),
+            ("completed", None, "p0"),
+            ("running", None, "a1"),
+            ("pending", None, "a1"),
+        ],
+        "selecting the empty policy sweeps nothing"
+    );
+
+    mock.edit_pull_request(REPOSITORY, 29, |pr| pr.head_sha = "b2".to_owned());
+    assert_eq!(
+        deployment.send(29, "synchronize").await.0,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        summary(&deployment.rows(29).await),
+        [
+            ("completed", None, "p0"),
+            ("completed", None, "p0"),
+            ("cancelled", Some("pull_request_superseded"), "a1"),
+            ("cancelled", Some("pull_request_superseded"), "a1"),
+        ],
+        "the new head cancels A, keeps P and admits nothing"
+    );
+    let mut conn = deployment.conn().await;
+    let late = queue
+        .complete(
+            &mut conn,
+            running.lease,
+            VerificationResultId::new_v7(),
+            VerificationVerdict::Passed,
+            "A finished late",
+            None,
+        )
+        .await
+        .expect("settlement runs");
+    conn.commit().await.expect("commits");
+    assert_eq!(late, Settlement::StaleLease, "A's worker is fenced");
+
+    deployment
+        .declare(POLICY_RESTORED, "pull-request-policy-restored")
+        .await;
+    mock.edit_pull_request(REPOSITORY, 29, |pr| pr.head_sha = "a1".to_owned());
+    assert_eq!(
+        deployment.send(29, "synchronize").await.0,
+        StatusCode::ACCEPTED
+    );
+    let rows = deployment.rows(29).await;
+    assert_eq!(
+        summary(&rows[4..]),
+        [("pending", None, "a1"), ("pending", None, "a1")],
+        "returning to A admits a new generation instead of replaying the cancelled one"
+    );
+    assert!(
+        rows[4..]
+            .iter()
+            .all(|row| before.iter().all(|old| old.execution_id != row.execution_id)),
+        "the new generation has new executions"
+    );
 }
 
 /// Re-declaring the Repository changes only later admissions: an open PR's

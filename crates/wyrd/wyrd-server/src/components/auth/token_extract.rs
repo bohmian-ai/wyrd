@@ -5,9 +5,8 @@ use std::sync::Arc;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
-use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
-use wyrd_auth_verify::AccessTokenClaims;
+use wyrd_auth_verify::{AccessTokenClaims, AuthError};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::WORKLOAD_UID_HEADER;
 use wyrd_spec::error::WyrdError;
@@ -96,17 +95,13 @@ pub(crate) fn extract_wyrd_access_token(
 pub(crate) fn tenant_from_unverified_access_token(
     token: &str,
 ) -> Result<DataTenantId, WyrdErrorResponse> {
-    let payload = token.split('.').nth(1).ok_or_else(bad_token_format)?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .map_err(|_| bad_token_format())?;
-    let claims: AccessTokenClaims = serde_json::from_slice(&bytes).map_err(|_| {
-        WyrdErrorResponse::from(WyrdError::Unauthenticated {
+    AccessTokenClaims::unverified_tenant(token).map_err(|error| match error {
+        AuthError::BadTokenFormat => bad_token_format(),
+        _ => WyrdErrorResponse::from(WyrdError::Unauthenticated {
             message: "token is not a tenant access token".to_owned(),
             details: serde_json::json!({ "plane": "tenant" }),
-        })
-    })?;
-    Ok(claims.principal.tenant_id)
+        }),
+    })
 }
 
 pub(crate) fn bad_token_format() -> WyrdErrorResponse {

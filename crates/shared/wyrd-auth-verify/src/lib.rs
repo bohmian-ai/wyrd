@@ -789,6 +789,43 @@ impl From<&Principal> for TokenPrincipalRef {
 }
 
 impl AccessTokenClaims {
+    /// The tenant the unverified claims of compact access `token` name,
+    /// read only to select the tenant [`TokenVerifier::verify_on`] then
+    /// verifies the token against.
+    ///
+    /// Only `principal.tenant_id` is decoded; the verifier decodes and
+    /// checks every claim once the signature verifies.
+    ///
+    /// # Errors
+    /// Returns [`AuthError::BadTokenFormat`] when `token` is not a compact
+    /// JWT with a base64url payload, and [`AuthError::InvalidToken`] when
+    /// the payload names no tenant.
+    pub fn unverified_tenant(token: &str) -> Result<DataTenantId, AuthError> {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        /// The one claim read before verification.
+        #[derive(Deserialize)]
+        struct Claims {
+            /// Subject, of which only the tenant is read.
+            principal: Principal,
+        }
+
+        /// The subject's tenant.
+        #[derive(Deserialize)]
+        struct Principal {
+            /// Tenant the token claims to belong to.
+            tenant_id: DataTenantId,
+        }
+
+        let payload = token.split('.').nth(1).ok_or(AuthError::BadTokenFormat)?;
+        let bytes = URL_SAFE_NO_PAD
+            .decode(payload)
+            .map_err(|_| AuthError::BadTokenFormat)?;
+        serde_json::from_slice::<Claims>(&bytes)
+            .map(|claims| claims.principal.tenant_id)
+            .map_err(|_| AuthError::InvalidToken)
+    }
+
     /// Convert verified claims into a runtime verified-token envelope.
     ///
     /// The runtime principal is built directly from the claims: its effective

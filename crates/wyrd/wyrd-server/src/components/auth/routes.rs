@@ -7,7 +7,6 @@ use axum::extract::{Extension, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 
-use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
 use wyrd_auth::callback::LoginCompletion;
 use wyrd_auth_verify::{AccessTokenClaims, VerifiedToken};
@@ -540,16 +539,7 @@ pub(crate) fn store_unavailable(error: wyrd_sql::SqlError) -> WyrdError {
 /// Returns [`WyrdError::BadTokenFormat`] when `token` is not a compact JWT
 /// with decodable claims.
 fn tenant_from_unverified_access_token(token: &str) -> Result<wyrd_spec::DataTenantId, WyrdError> {
-    let payload = token
-        .split('.')
-        .nth(1)
-        .ok_or_else(bad_subject_token_format)?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .map_err(|_| bad_subject_token_format())?;
-    let claims: AccessTokenClaims =
-        serde_json::from_slice(&bytes).map_err(|_| bad_subject_token_format())?;
-    Ok(claims.principal.tenant_id)
+    AccessTokenClaims::unverified_tenant(token).map_err(|_| bad_subject_token_format())
 }
 
 /// The refusal of a subject token that is not a compact JWT.

@@ -410,11 +410,12 @@ impl AuthoredPrompt {
     /// Returns every [`compile`](Self::compile) refusal.
     pub(crate) fn compile_resolved(
         &self,
-        resolved: Option<Map<String, Value>>,
+        mut resolved: Option<Map<String, Value>>,
     ) -> SkaldResult<Prompt> {
         check_model(&self.model)?;
+        let named_resolved = resolved.is_some();
         let (named, schema) = match &self.response_format {
-            Some(ResponseFormat::Named(named)) => (Some(named), resolved.clone()),
+            Some(ResponseFormat::Named(named)) => (Some(named), resolved.take()),
             Some(ResponseFormat::Schema(schema)) => (None, Some(schema.clone())),
             None => (None, None),
         };
@@ -442,7 +443,7 @@ impl AuthoredPrompt {
         prompt.media_kinds = media_kinds;
         prompt.named_format = named.map(|named| NamedFormat {
             name: named.name().to_owned(),
-            schema: resolved,
+            resolved: named_resolved,
         });
         prompt.authored = Some(std::sync::Arc::new(Compiled {
             authored: self.clone(),

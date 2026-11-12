@@ -92,9 +92,9 @@ pub(crate) struct Compiled {
 pub(crate) struct NamedFormat {
     /// The authored format name.
     pub(crate) name: String,
-    /// The resolved schema; `None` until compiled through
-    /// [`AuthoredPrompt::compile_with`].
-    pub(crate) schema: Option<serde_json::Map<String, Value>>,
+    /// Whether its host resolved the schema, which then lives only in the
+    /// request; false until compiled through [`AuthoredPrompt::compile_with`].
+    pub(crate) resolved: bool,
 }
 
 /// Prompts are equal when they serialize to the same authored form; a
@@ -985,11 +985,7 @@ impl Prompt {
     /// format its host has not resolved, and the missing-variable, media,
     /// and binding errors otherwise.
     pub fn render(&self, vars: &[(&str, &str)]) -> SkaldResult<ProviderRequest> {
-        if let Some(format) = self
-            .named_format
-            .as_ref()
-            .filter(|format| format.schema.is_none())
-        {
+        if let Some(format) = self.named_format.as_ref().filter(|format| !format.resolved) {
             return Err(invalid(
                 "response_format",
                 &format!(

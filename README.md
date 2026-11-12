@@ -16,9 +16,33 @@
   <a href="https://discord.gg/K5bf23yPNb">Discord</a>
 </p>
 
-Wyrd is open-source infrastructure for building your own verification system for AI/ML in production. Register what you ship at exact versions, record what it does, and judge that behavior with checks you compose: a one-line assertion, a model judge that cites your policy document, or a check across a six-hour agent run.
+# You built the system. How do you know it's behaving correctly?
 
-Your app sends Wyrd what it did. Wyrd returns a verdict for each requirement, with a reason, and keeps it beside the exact versions it judged. Start from a use case:
+Verifying application behavior shouldn't mean building your own infrastructure from scratch.
+
+Every system has its own requirements, workflows, and definitions of correct behavior. But turning those expectations into repeatable checks often means stitching together evaluation frameworks, observability tools, custom scripts, and data pipelines. Your team ends up maintaining the plumbing as well as the requirements that matter to your application.
+
+**Wyrd provides open-source building blocks for creating your own verification systems.** Compose the checks, evidence, and workflows your application needs, from local development through production.
+
+## Declare. Observe. Verify.
+
+**Declare requirements. Observe real behavior. Verify the evidence.**
+
+1. **Declare.** Describe your Services, components, and Verifiers in versioned YAML. Bind reusable checks to the exact versions they verify.
+2. **Observe.** Record what happens during a Run: application data, telemetry, model calls, and the evidence your checks need.
+3. **Verify.** Evaluate that evidence against your requirements. Get a verdict for each requirement, with a reason, tied to the exact subject and Verifier versions.
+
+Your application decides when to verify and what to do with the result. Wyrd provides the verification engine, versioning, and evidence storage so you can focus on defining correct behavior.
+
+## What can you build?
+
+- **Development verification workflows.** Check application and agent behavior before release, then reuse the same Verifiers on live traffic.
+- **Agent verification.** Combine checks on individual actions with trace checks and grouped-session verification for multi-step workflows.
+- **Custom evaluation platforms.** Compose deterministic assertions, Python checks, model judgments, and domain-specific requirements.
+- **Continuous production verification.** Check requests inline, submit checks in the background, or monitor drift on a schedule. Investigate failures using the recorded execution evidence.
+- **Team verification standards.** Define, version, and reuse verification requirements across Services and applications.
+
+Build the verification system you need. Start with a workflow:
 
 <p align="center">
   <a href="https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/#policy-verification"><img src="https://img.shields.io/badge/Policy%20verification-555555" alt="Use case: Policy verification"></a>
@@ -29,37 +53,24 @@ Your app sends Wyrd what it did. Wyrd returns a verdict for each requirement, wi
   <a href="https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/#drift-monitoring"><img src="https://img.shields.io/badge/Drift%20monitoring-555555" alt="Use case: Drift monitoring"></a>
 </p>
 
-[What can I build?](https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/) walks through each one. They are examples: the same primitives build any verification you need.
+[What can I build?](https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/) explains these compositions, and [Recipes](https://docs.bohmian.ai/wyrd/build-and-verify/verify/verifier-recipes/) provides Verifier examples.
 
-## How Wyrd fits your stack
+## Example: verify a support answer against your refund policy
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/wyrd-stack-dark.svg">
-  <img src=".github/assets/wyrd-stack-light.svg" alt="Your app, CI, and your coding agent call one Wyrd server. CI and your app declare Services and Verifiers; your app verifies against the verification engine and sends telemetry, its own data, and evidence to Bifrost; your coding agent reads evidence over MCP. The server keeps declarations in Postgres and evidence in object storage." width="100%">
-</picture>
+The existing [support-desk example](examples/support-desk/) shows how the building blocks fit together in a working application, with Python, Rust, and TypeScript implementations:
 
-1. **Declare.** Describe what you ship in YAML and bind Verifiers to it, from CI with `wyrd declare` or from your code. Each declaration has a version, so a changed prompt is a new version.
-2. **Observe.** Your app sends Bifrost, Wyrd's data plane, everything it produces as it runs: telemetry, its own data, and the evidence it submits to verify. Bifrost keeps all of it queryable with SQL beside every verdict.
-3. **Verify.** Your app sends a result to a Verifier and gets a verdict for each requirement, with a reason.
+1. **Declare the requirement.** Bind a `policy-check` Verifier to the support Agent. An Agent step reads the refund-policy PDF, a deterministic assertion rejects the phrase "guaranteed refund", and a model judge checks the answer against the policy findings, citing the policy page.
+2. **Observe the request.** The application records a ticket, a request span, and its gateway model call under the same Run.
+3. **Verify the answer.** Use `verify` for an immediate verdict or `submit` for a background check. The example's answer "You have a guaranteed refund." fails the deterministic requirement; each requirement has its own outcome and reason.
+4. **Investigate with evidence.** Query Bifrost to join the ticket, span, model call, and verdict for that Run. The application can use the result to decide whether to accept, hold, or escalate an answer.
 
-The Python, Rust, and TypeScript SDKs, the CLI, MCP, and HTTP all call one server, so a verdict reads the same from each. [Architecture](https://docs.bohmian.ai/wyrd/understand/architecture/) shows what a team deployment runs.
+The application owns the support workflow and its policy. Wyrd executes the checks and retains the evidence. [Read and run the example](examples/support-desk/README.md) after configuring its server and `gpt-4o` deployment, or start with the smaller, model-free quickstart below.
 
-## Why Wyrd
+## Quickstart
 
-Most AI tools hand you their evaluators, their UI, and their datastore. Your checks end up shaped by what the product supports, and your evidence lives where the product keeps it.
+<a id="install"></a>
 
-Wyrd gives you the primitives instead, and you build the verification layer your system needs: a code reviewer that reads the diff and your style guide, a payment check that cites your policy document, drift on a classical model, a check across a six-hour agent run.
-
-| You get | So you don't have to |
-| --- | --- |
-| Verification primitives you compose into steps and checks | Fit your rules into one vendor's evaluator types |
-| Checks as versioned YAML in your repo, run in CI, inline, in the background, per session, or on a schedule | Keep one set of evals for CI and another for production |
-| One data plane for telemetry, model calls, your app's rows, and verdicts, as Iceberg tables in your object store, queried with SQL | Join evidence across four tools' stores and APIs |
-| Registration and versioning for the whole service: agents, prompts, models, data, MCP servers | Guess which version produced a result |
-| An LLM gateway and service identity, so every call and verdict names the account and release behind it | Bolt attribution on after the fact |
-| Apache 2.0 and self-hosted, ingesting standard OpenTelemetry (OTLP) from any exporter | Re-instrument your app with a vendor SDK, or send your data to someone else's cloud |
-
-## Install
+### Install and start a local server
 
 You need PostgreSQL 16 and one of Python 3.11, Rust 1.95, or Node.js 22.18, on macOS (Apple silicon) or Linux.
 
@@ -77,7 +88,9 @@ pnpm add wyrd-ai@0.4.1
 
 Start a local server with `wyrd init` (`uv run wyrd init` or `pnpm wyrd init`), or let your coding agent do it with `wyrd init guided`. [Set up Wyrd](https://docs.bohmian.ai/wyrd/get-started/setup/) has the details.
 
-## Example
+<a id="example"></a>
+
+### Declare and verify your first requirement
 
 Declare one requirement: a support answer never promises a guaranteed refund.
 
@@ -217,6 +230,37 @@ failed: operator NotContains returned false
 ```
 
 [Run your first verification](https://docs.bohmian.ai/wyrd/get-started/quickstart/) walks through it. This assertion is the simplest check. A Verifier can also run Python, judge with an Agent that reads your uploaded policy files and cites them, judge a whole session, or watch for drift on a schedule; see [What can I build?](https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/) and [Recipes](https://docs.bohmian.ai/wyrd/build-and-verify/verify/verifier-recipes/).
+
+## Architecture and technical details
+
+### How Wyrd fits your stack
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/wyrd-stack-dark.svg">
+  <img src=".github/assets/wyrd-stack-light.svg" alt="Your app, CI, and your coding agent call one Wyrd server. CI and your app declare Services and Verifiers; your app verifies against the verification engine and sends telemetry, its own data, and evidence to Bifrost; your coding agent reads evidence over MCP. The server keeps declarations in Postgres and evidence in object storage." width="100%">
+</picture>
+
+The Python, Rust, and TypeScript SDKs, CLI, MCP, and HTTP all call one server. Declare from CI with `wyrd declare` or from your code, record executions, and retrieve verdicts through the same API contracts.
+
+- **Verification engine.** Executes the steps and checks you compose into Verifiers, with results tied to versioned declarations.
+- **Bifrost OLAP warehouse.** Built on DataFusion and Apache Iceberg, Bifrost stores and queries your application's own tables alongside telemetry, model calls, and verification evidence. It provides read-only SQL over those tables in your object store, with a Postgres catalog. See [Bifrost](https://docs.bohmian.ai/wyrd/understand/bifrost/).
+- **LLM gateway.** Provides access to configured model-provider deployments for application calls and model-judged checks.
+- **Identity and authorization.** Service accounts, roles, and tenant boundaries control access and attribute activity to its caller.
+
+Postgres holds declarations, identities, and coordination state; object storage holds evidence, artifacts, and analytical tables. [Architecture](https://docs.bohmian.ai/wyrd/understand/architecture/) explains a team deployment.
+
+<a id="why-wyrd"></a>
+
+### Building blocks you can reuse
+
+| You get | So you don't have to |
+| --- | --- |
+| Verification primitives you compose into steps and checks | Fit your rules into one vendor's evaluator types |
+| Checks as versioned YAML in your repo, run in CI, inline, in the background, per session, or on a schedule | Keep one set of evals for CI and another for production |
+| One data plane for telemetry, model calls, your app's rows, and verdicts, as Iceberg tables in your object store, queried with SQL | Join evidence across four tools' stores and APIs |
+| Registration and versioning for the whole service: agents, prompts, models, data, MCP servers | Guess which version produced a result |
+| An LLM gateway and service identity, so every call and verdict names the account and release behind it | Bolt attribution on after the fact |
+| Apache 2.0 and self-hosted, ingesting standard OpenTelemetry (OTLP) from any exporter | Re-instrument your app with a vendor SDK, or send your data to someone else's cloud |
 
 ## Already have tools?
 

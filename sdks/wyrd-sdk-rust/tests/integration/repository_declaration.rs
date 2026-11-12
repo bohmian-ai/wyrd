@@ -14,6 +14,7 @@ mod pg_tests {
     use wyrd_ai::github::{GithubConnection, GithubConnectionState};
     use wyrd_ai::verify::Execution;
     use wyrd_spec::envelope::RepositoryStatus;
+    use wyrd_spec::ids::RepositoryId;
     use wyrd_spec::verification::VerificationExecutionStatus;
     use wyrd_spec::verification::execution::VerificationExecutionState;
     use wyrd_testing::WyrdTestServer;
@@ -623,6 +624,14 @@ mod pg_tests {
         assert_eq!(
             (pins.base.sha.as_str(), pins.head.sha.as_str()),
             ("b1", "a1")
+        );
+        assert_eq!(
+            pins.head_repository_id.as_ref().map(RepositoryId::as_str),
+            Some("1")
+        );
+        assert!(
+            !pins.delivery_id.is_empty(),
+            "the admitting delivery is named"
         );
 
         mock.edit_pull_request(1, 7, |pr| pr.head_sha = "b2".to_owned());

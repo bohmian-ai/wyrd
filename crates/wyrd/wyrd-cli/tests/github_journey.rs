@@ -336,6 +336,12 @@ mod pg_tests {
             serde_json::json!({ "ref": "main", "sha": "b1" })
         );
         assert_eq!(admitted["pull_request"]["head"]["sha"], "a1");
+        assert_eq!(admitted["pull_request"]["head_repository_id"], "2");
+        assert!(
+            admitted["pull_request"]["delivery_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+        );
         let released = json("disconnect", &github("disconnect", &base, &admin).await);
         assert_eq!(released["state"], "not_connected");
         assert_eq!(released["installation_id"], Value::Null);

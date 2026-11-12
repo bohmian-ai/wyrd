@@ -338,6 +338,12 @@ mod pg_tests {
             json!({ "ref": "main", "sha": "b1" })
         );
         assert_eq!(admitted["pull_request"]["head"]["sha"], "a1");
+        assert_eq!(admitted["pull_request"]["head_repository_id"], "2");
+        assert!(
+            admitted["pull_request"]["delivery_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+        );
         mock.edit_pull_request(2, 7, |pr| pr.head_sha = "b2".to_owned());
         let pushed = mock.pull_request_event(101, 2, 7, "synchronize");
         assert_eq!(mock.deliver(base, "pull_request", &pushed).await?, 202);

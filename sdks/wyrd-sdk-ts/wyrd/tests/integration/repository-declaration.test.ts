@@ -172,7 +172,9 @@ test("pull requests admit pinned executions and supersede them", async ({ server
     repository_id: "1",
     base: { ref: "main", sha: "b1" },
     head: { sha: "a1" },
+    head_repository_id: "1",
   });
+  expect(opened.pull_request?.delivery_id).toBeTruthy();
 
   github.setPullRequest(1, 7, "b1", "b2");
   const pushed = await deliver("synchronize");

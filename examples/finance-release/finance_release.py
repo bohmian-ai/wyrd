@@ -49,6 +49,7 @@ policy = Artifact.from_path(
     "company-sharing-policy", "1.0.0", "company-sharing-policy.pdf"
 ).extract(True)
 
+# ANCHOR: run-config
 # `policy-judge`: a model that reads the policy with `fs.read` and returns a
 # verdict on the release.
 policy_judge = Agent(
@@ -66,6 +67,7 @@ policy_judge = Agent(
     tool_names=["fs.read"],
     run_config=AgentRunConfig(max_iterations=3),
 )
+# ANCHOR_END: run-config
 
 # An Agent check: `policy-judge` sees the report and the recipient, and reads
 # the policy from `/inputs/policy.json`.

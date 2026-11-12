@@ -833,12 +833,12 @@ fn yaml_and_code_share_diagnostics() {
             .and_then(wyrd_loader::build_declaration_input)
             .map_err(WyrdError::from)
             .expect_err("the YAML spec is not an object");
-        let from_code = CardDefinition(Card::with_spec(
+        let from_code = CardDefinition(Arc::new(Card::with_spec(
             CardKind::Service,
             "shared",
             Some("1.0.0"),
             Body::authored(raw),
-        ))
+        )))
         .declaration()
         .expect_err("the raw spec is not an object");
         let file_label = file.display().to_string();
@@ -856,12 +856,12 @@ fn yaml_and_code_share_diagnostics() {
             "raw {yaml} refuses alike"
         );
     }
-    CardDefinition(Card::with_spec(
+    CardDefinition(Arc::new(Card::with_spec(
         CardKind::Service,
         "shared",
         Some("1.0.0"),
         Body::authored(json!({})),
-    ))
+    )))
     .declaration()
     .expect("an empty object is a valid Service spec");
 }
@@ -1815,4 +1815,130 @@ fn local_artifact_siblings_match_the_whole_capture() {
         serde_json::to_value(&selected).expect("serializes"),
         "the omitted sibling binds the full registered version and UID"
     );
+}
+
+/// Every Card definition `card` captures, at any depth, in capture order;
+/// a definition captured twice appears twice.
+fn descendants(card: &Card) -> Vec<&Card> {
+    let mut found = Vec::new();
+    for captures in card.spec.captures.values() {
+        for definition in &captures.cards {
+            let child: &Card = &definition.0;
+            found.push(child);
+            found.extend(descendants(child));
+        }
+    }
+    found
+}
+
+/// A chain of `length` Services, each the sole component of the next, over
+/// one Agent.
+fn service_chain(length: usize) -> Service {
+    let mut service =
+        Service::new("chain-0", "1.0.0").components([Component::new("agent", reviewer())]);
+    for index in 1..length {
+        service = Service::new(format!("chain-{index}"), "1.0.0")
+            .components([Component::new("inner", service)]);
+    }
+    service
+}
+
+/// A copied definition shares every captured descendant instead of copying
+/// it, and a graph's snapshot borrows each descendant from its root rather
+/// than retaining a flattened copy beside the nested capture.
+///
+/// # Panics
+/// Panics when the chain does not capture eight descendants, a copy does not
+/// share them, the graph refuses the definition or holds other than nine
+/// Cards, or a graph Card is not borrowed from the root.
+#[test]
+fn captures_share_descendants_and_graphs_borrow_them() {
+    let root = CardDefinition::from(service_chain(8));
+    let copy = root.clone();
+    let (original, copied) = (descendants(&root.0), descendants(&copy.0));
+    assert_eq!(original.len(), 8, "seven inner Services and the Agent");
+    assert!(
+        original
+            .iter()
+            .zip(&copied)
+            .all(|(left, right)| std::ptr::eq(*left, *right)),
+        "a copy shares its captured descendants"
+    );
+
+    let mut graph = Graph::default();
+    graph.absorb(&root.0).expect("one definition per identity");
+    assert_eq!(graph.cards.len(), 9, "each Card joins the graph once");
+    let root_card: &Card = &root.0;
+    for card in &graph.cards {
+        let card: &Card = card;
+        assert!(
+            std::ptr::eq(card, root_card)
+                || original.iter().any(|known| std::ptr::eq(card, *known)),
+            "{} is borrowed from the root, not copied",
+            card.name
+        );
+    }
+}
+
+/// Definitions equal in content but copied separately, such as one child
+/// passed to many parents, still join the graph once, and the snapshot
+/// keeps no full spec for sibling matching when nothing publishes first.
+///
+/// # Panics
+/// Panics when the fixture does not declare, a shared child joins the graph
+/// more than once, or the snapshot retains sibling-matching targets.
+#[test]
+fn shared_children_join_once_and_plain_graphs_keep_no_targets() {
+    let child = Service::new("child", "1.0.0").components([Component::new("agent", reviewer())]);
+    let parents = Service::new("parents", "1.0.0").components((0..4).map(|index| {
+        let parent = Service::new(format!("parent-{index}"), "1.0.0")
+            .components([Component::new("child", child.clone())]);
+        Component::new(format!("parent-{index}"), parent)
+    }));
+    let declaration = CardDefinition::from(parents)
+        .declaration()
+        .expect("equal copies are one submission");
+    assert_eq!(
+        declaration
+            .input
+            .as_ref()
+            .map(|input| input.submissions.len()),
+        Some(7),
+        "the Agent, the child, four parents, and the root"
+    );
+    assert!(
+        declaration.targets.is_empty(),
+        "no local Artifact needs sibling targets"
+    );
+}
+
+/// A [`Table`] authors the same Service `tables` entry as its canonical
+/// object, and a JSON entry stays accepted beside it.
+///
+/// # Panics
+/// Panics when the canonical YAML or the authored tables do not decode as a
+/// Service spec, or when the two differ.
+#[test]
+fn tables_match_their_canonical_entries() {
+    let schema = json!({
+        "type": "object",
+        "properties": { "answer": { "type": "string" } },
+        "required": ["answer"],
+    });
+    let mut service = Service::new("tabled", None).tables([Table::new("replies", schema)]);
+    service.add_table(Table::from(
+        json!({ "name": "plain", "schema": { "type": "object" } }),
+    ));
+    let canonical: ServiceSpec = yaml(
+        r"
+tables:
+  - name: replies
+    schema: {type: object, properties: {answer: {type: string}}, required: [answer]}
+  - name: plain
+    schema: {type: object}
+",
+    );
+    let authored: ServiceSpec =
+        serde_json::from_value(service.spec()).expect("authored tables decode as a Service spec");
+    assert_eq!(authored, canonical);
 }

@@ -1124,6 +1124,25 @@ ID, and the request's root Card cannot say which card a correlated record
 belongs to — the subject Card must be carried on that row. Generic telemetry
 may omit a subject Card.
 
+Run-scoped caller-table writes use `run.bifrost.write(row)` for the state's
+shared active table, or `write_to(table, row)` (`writeTo` in TypeScript) for a
+named `bifrost.datasets.<name>` destination without changing that binding.
+Rust uses its normal method accessor. With no chosen startup table, a root
+Service's sole declared table becomes active; no or multiple declarations
+infer none. Describing the inferred table is a startup precondition: failure
+prevents that state's entire Bifrost writer from starting, including fixed-table
+observations, while ordinary verification and the server remain available.
+The existing failed-start retry and closed-state rules apply. Missing active
+selection returns `WYRD_VALA_412_NO_ACTIVE_TABLE`; scoped writes outside
+`bifrost.datasets` return `WYRD_SDK_400_INVALID_OBSERVATION`.
+The state projects Bifrost's existing table-switch operation. Every Run shares
+the binding; callers needing distinct concurrent destinations use named writes.
+Each admitted row retains its destination, exact subject Card UID and Run ID.
+Switching retains prior table producers in the same shutdown drain. Write
+return means buffered submission, not durable admission or complete row-schema
+validation; successful state shutdown is the existing drain barrier. Fixed
+system destinations, direct Bifrost operations and authorization are unchanged.
+
 Python `Run` values are synchronous context managers for optional ambient span
 correlation. Entering a scope best-effort attaches the selected Card UID and
 run ID to Python OpenTelemetry context, annotates an active recording span,
@@ -2388,7 +2407,7 @@ version: `new(name, None)` in Rust, `Kind(name)` in Python, and
 An omitted version is never invented by the client: the server selects it at
 registration, exactly as for a YAML file that omits `metadata.version`. Each
 sub-value (`Component`, `Binding`, `InputSlot`, `Step`, `Requirement`,
-`Action`, `Check`) takes the fields that identify it. Constructor arguments
+`Table`, `Action`, `Check`) takes the fields that identify it. Constructor arguments
 are fixed: no later method edits them, so a different name, version, alias,
 reference, id, action, check, or check operand means constructing another
 value. Every `Action` constructor returns an `Action` and every `Check`
@@ -2400,7 +2419,9 @@ values to executable arguments (`addInput`/`bindInput` in TypeScript). Their
 canonical `inputs` maps and whole-map setters retain their names. Rust accepts
 bare JSON Schemas and Python accepts schema dictionaries or supported model
 classes without a mandatory JSON-slot wrapper; a Python Verifier's `inputs`
-may also be one Pydantic model class whose fields are its named slots.
+may also be one Pydantic model class whose fields are its named slots,
+and a Python Service `Table`'s `schema` may be a model class whose field
+order is the column order. Pydantic is the optional `wyrd-ai[pydantic]` extra.
 Explicit canonical slot forms and distinct non-JSON slot constructors remain
 available. Execution references stay strings such as `inputs.report.text`.
 Fields accept their canonical typed values as well as canonical JSON: the

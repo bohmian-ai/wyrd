@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vitest";
 
 import * as wyrd from "wyrd-ai";
-import { Observe, verify } from "wyrd-ai";
+import { Observe, RunBifrost, verify } from "wyrd-ai";
 
 type NativeRun = Parameters<typeof Observe.fromNative>[0];
 
@@ -22,14 +22,17 @@ function fakeRun(result: Record<string, unknown> = { valueJson: "null" }, submis
       calls.push(args);
       return value;
     };
-  const native = { record: answer(result), verify: answer(result), submit: answer(submission) };
-  return { observe: Observe.fromNative(native as unknown as NativeRun), calls };
+  const native = { write: answer(result), verify: answer(result), submit: answer(submission) } as unknown as NativeRun;
+  return { observe: Observe.fromNative(native), bifrost: RunBifrost.fromNative(native), calls };
 }
 
 /** Every JSON-carrying method, called with `value`, so a refusal must hold for each. */
-function everyCall(observe: Observe, value: () => unknown): (() => Promise<unknown>)[] {
+function everyCall(
+  { observe, bifrost }: { observe: Observe; bifrost: RunBifrost },
+  value: () => unknown,
+): (() => Promise<unknown>)[] {
   return [
-    () => observe.record("bifrost.datasets.events", value()),
+    () => bifrost.writeTo("bifrost.datasets.events", value()),
     () => observe.verify("policy-check", { answer: value() as never }),
     () => observe.submit("policy-check", { answer: value() as never }),
   ];
@@ -195,6 +198,7 @@ describe("internal native run wrapper", () => {
       "Requirement",
       "Service",
       "Step",
+      "Table",
       "Trigger",
       "Verifier",
     ]);
@@ -241,9 +245,9 @@ describe("internal native run wrapper", () => {
     ["Date", () => ({ a: new Date(0) })],
     ["cycle", cycle],
   ])("%s is refused before native", async ([, value]) => {
-    const { observe, calls } = fakeRun();
+    const { calls, ...run } = fakeRun();
 
-    for (const call of everyCall(observe, value)) {
+    for (const call of everyCall(run, value)) {
       await expect(Promise.resolve().then(call)).rejects.toMatchObject({ code: "WYRD_SPEC_400_VALIDATION" });
     }
     expect(calls).toEqual([]);
@@ -262,11 +266,11 @@ describe("internal native run wrapper", () => {
     ["array accessor", (d) => Object.defineProperty([0], 0, d), ["yes"]],
     ["nested array accessor", (d) => ({ b: Object.defineProperty([0], 0, d) }), { b: ["yes"] }],
   ])("%s is read once and native gets its first value", async ([, input, expected]) => {
-    const { observe, calls } = fakeRun();
+    const { calls, ...run } = fakeRun();
     const accessors = [readOnce("yes"), readOnce("yes"), readOnce("yes")];
     let next = 0;
 
-    for (const [index, call] of everyCall(observe, () => input(accessors[next++].descriptor)).entries()) {
+    for (const [index, call] of everyCall(run, () => input(accessors[next++].descriptor)).entries()) {
       await call();
       expect(accessors[index].counter.reads).toBe(1);
     }
@@ -274,9 +278,9 @@ describe("internal native run wrapper", () => {
   });
 
   test("accessor whose first value is unsupported is read once and refused", async () => {
-    const { observe, calls } = fakeRun();
+    const { calls, ...run } = fakeRun();
 
-    for (const call of everyCall(observe, () => ({ b: Object.defineProperty({}, "a", readOnce(1n).descriptor) }))) {
+    for (const call of everyCall(run, () => ({ b: Object.defineProperty({}, "a", readOnce(1n).descriptor) }))) {
       await expect(Promise.resolve().then(call)).rejects.toMatchObject({ code: "WYRD_SPEC_400_VALIDATION" });
     }
     expect(calls).toEqual([]);

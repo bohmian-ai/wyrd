@@ -966,8 +966,13 @@ fn require_uid(card_ref: &CardRef) -> Result<(), WyrdError> {
 /// Collect the graph identities of submissions eligible as sibling targets.
 ///
 /// Graph-ready submissions are all pinned, so every submission is eligible.
-pub(super) fn sibling_identities(submissions: &[CardSubmission]) -> BTreeSet<CardRefIdentity> {
-    submissions.iter().filter_map(submission_identity).collect()
+pub(super) fn sibling_identities<'a>(
+    submissions: impl IntoIterator<Item = &'a CardSubmission>,
+) -> BTreeSet<CardRefIdentity> {
+    submissions
+        .into_iter()
+        .filter_map(submission_identity)
+        .collect()
 }
 
 /// A pinned submission's exact identity key, or `None` when unpinned.

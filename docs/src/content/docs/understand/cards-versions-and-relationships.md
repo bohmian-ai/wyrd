@@ -38,6 +38,8 @@ verifier: ./no-refund-promise.yaml
 verifier: {kind: Verifier, name: no-refund-promise, version: 1.0.0}
 ```
 
+In [code](/build-and-verify/declare/author-in-code/), a definition passed where a reference goes takes the place of the file.
+
 So a declared Service records exactly which Cards it was built from, and a verdict points back to exactly what ran. A Card moves to a new version of a dependency only when its reference changes and it is declared again.
 
 `metadata.version` is optional. Without it, Wyrd records `0.1.0`, then the next patch version each time the content changes. Declaring unchanged content keeps the current version. Re-declaring an exact version with different content fails with `WYRD_REGISTRY_409_SPEC_DRIFT`.

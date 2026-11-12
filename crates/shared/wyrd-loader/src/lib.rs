@@ -115,7 +115,7 @@ pub fn load(path: &Path) -> Result<LoadedTree, LoadError> {
     let mut diagnostics = resolve::resolve_tree(&mut cards, &sandbox, &config);
 
     // 6. Validate.
-    diagnostics.extend(validate::validate_tree(&cards));
+    diagnostics.extend(validate::validate_tree(&mut cards));
 
     // 7. Topological sort.
     let order = match order::order_cards(&cards) {
@@ -134,14 +134,13 @@ pub fn load(path: &Path) -> Result<LoadedTree, LoadError> {
     }
 
     // 8. Build loaded cards in topological order.
-    let mut loaded_cards = Vec::with_capacity(order.len());
-    for index in order {
-        let card = &cards[index];
-        loaded_cards.push(LoadedCard {
-            submission: order::submission_for(card).map_err(LoadError::single)?,
-            source_path: card.source_path.clone(),
-        });
-    }
+    let loaded_cards = order
+        .into_iter()
+        .map(|(index, submission)| LoadedCard {
+            submission,
+            source_path: cards[index].source_path.clone(),
+        })
+        .collect();
 
     Ok(LoadedTree {
         cards: loaded_cards,
@@ -176,14 +175,18 @@ pub fn parse_card_value(
 /// external reference, and then pass the same validation and dependency
 /// ordering a file tree does. Each card's `source_path` only labels its
 /// diagnostics. In-memory cards carry no artifact manifest: a heavy Artifact
-/// is published on its own first, as a file-authored one is.
+/// is published on its own first, as a file-authored one is. The cards are
+/// borrowed mutably only for validation's reference visitor and are left
+/// unchanged.
 ///
 /// # Errors
 /// Returns `LoadError` with every error-severity diagnostic the file
 /// pipeline would report for the same cards, such as duplicate identities,
 /// invalid Verifiers or bindings, unresolved paths, authored UIDs, cycles,
 /// and composition errors.
-pub fn declaration_input_from_cards(cards: &[AuthoredCard]) -> Result<DeclarationInput, LoadError> {
+pub fn declaration_input_from_cards(
+    cards: &mut [AuthoredCard],
+) -> Result<DeclarationInput, LoadError> {
     let diagnostics = validate::validate_tree(cards);
     if diagnostics
         .iter()
@@ -191,12 +194,11 @@ pub fn declaration_input_from_cards(cards: &[AuthoredCard]) -> Result<Declaratio
     {
         return Err(LoadError::multiple(diagnostics));
     }
-    let order = order::order_cards(cards).map_err(LoadError::multiple)?;
-    let submissions = order
+    let submissions = order::order_cards(cards)
+        .map_err(LoadError::multiple)?
         .into_iter()
-        .map(|index| order::submission_for(&cards[index]))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(LoadError::single)?;
+        .map(|(_, submission)| submission)
+        .collect();
     Ok(DeclarationInput {
         submissions,
         artifact_sources: BTreeMap::new(),

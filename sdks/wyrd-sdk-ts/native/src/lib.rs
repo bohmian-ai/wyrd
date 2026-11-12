@@ -181,12 +181,13 @@ pub struct NativeLifecycleResult {
 }
 
 impl NativeLifecycleResult {
-    /// Builds one successful JSON lifecycle projection.
+    /// Builds one successful JSON lifecycle projection, serializing `value`
+    /// straight to its JSON text.
     ///
     /// # Errors
     ///
     /// Returns a napi error when the canonical lifecycle value cannot be serialized.
-    fn success(value: &Value) -> Result<Self> {
+    fn success<T: Serialize + ?Sized>(value: &T) -> Result<Self> {
         Ok(Self {
             value_json: Some(serde_json::to_string(&value).map_err(napi_error)?),
             error_code: None,
@@ -205,7 +206,7 @@ impl NativeLifecycleResult {
     /// Returns a napi error when the successful value cannot be serialized.
     fn outcome<T: Serialize>(result: StdResult<T, WyrdError>) -> Result<Self> {
         match result {
-            Ok(value) => Self::success(&serde_json::to_value(value).map_err(napi_error)?),
+            Ok(value) => Self::success(&value),
             Err(error) => Ok(Self::from_wyrd(&error)),
         }
     }
@@ -962,79 +963,6 @@ impl NativeBifrost {
         u32::try_from(self.client.producer_count()).unwrap_or(u32::MAX)
     }
 
-    /// Rows dropped by the fire-and-forget observation path, saturating at
-    /// `i64::MAX`.
-    ///
-    /// Always zero for [`NativeBifrost::insert`], which refuses rather than
-    /// drops.
-    #[napi(getter)]
-    pub fn dropped(&self) -> i64 {
-        i64::try_from(self.client.dropped()).unwrap_or(i64::MAX)
-    }
-
-    /// Records one telemetry row fire-and-forget through
-    /// [`wyrd_client::bifrost::observe::record`].
-    ///
-    /// The row names its own `table` and JSON Schema rather than this client's
-    /// bound table, so instrumentation never disturbs the application's
-    /// binding. A producer refusal, such as a full queue, is counted on
-    /// [`NativeBifrost::dropped`] instead of returned. The first row for a
-    /// table this client has not described records on a background task
-    /// once the describe returns its table version; a failed describe is
-    /// counted the same way. That record is admitted before the task starts,
-    /// so a following `flush` or `shutdown` waits for it.
-    ///
-    /// # Errors
-    ///
-    /// Returns a napi error only when the outcome cannot be encoded or the
-    /// background describe cannot be scheduled; an
-    /// unparsable or unmappable schema and an invalid Card UID are
-    /// returned in [`NativeLifecycleResult`].
-    #[napi]
-    pub fn record(
-        &self,
-        env: Env,
-        table: String,
-        schema_json: String,
-        row: String,
-        subject_card_uid: Option<String>,
-        run_id: Option<String>,
-    ) -> Result<NativeLifecycleResult> {
-        let (schema, correlation) = match telemetry_schema(&schema_json)
-            .and_then(|schema| Ok((schema, correlation(subject_card_uid.as_deref(), run_id)?)))
-        {
-            Ok(parsed) => parsed,
-            Err(error) => return Ok(NativeLifecycleResult::failure(&error)),
-        };
-        let row = row.into_bytes();
-        if let Some(described) = self.client.cached_writer_table(&table) {
-            crate::trace::traced(env, || {
-                wyrd_client::bifrost::observe::record(
-                    &self.client,
-                    &described.with_schema(schema),
-                    row,
-                    correlation,
-                );
-            });
-        } else {
-            let client = Arc::clone(&self.client);
-            let admitted = client.admit_record();
-            crate::trace::spawn(&env, async move {
-                wyrd_client::bifrost::observe::describe_and_record(
-                    &client,
-                    &table,
-                    schema,
-                    row,
-                    correlation,
-                    admitted,
-                )
-                .await;
-                Ok(())
-            })?;
-        }
-        NativeLifecycleResult::success(&serde_json::Value::Null)
-    }
-
     /// Starts one terminal-safe query through the Rust SDK owner.
     ///
     /// Expected request, Gate, authentication, and transport failures are
@@ -1096,9 +1024,7 @@ impl NativeBifrost {
         let client = self.client.clone();
         crate::trace::spawn(env, async move {
             match client.running().await {
-                Ok(queries) => NativeLifecycleResult::success(
-                    &serde_json::to_value(queries).map_err(napi_error)?,
-                ),
+                Ok(queries) => NativeLifecycleResult::success(&queries),
                 Err(error) => Ok(NativeLifecycleResult::failure(&error)),
             }
         })
@@ -1128,9 +1054,7 @@ impl NativeBifrost {
                 }
             };
             match client.status(&request_id).await {
-                Ok(summary) => NativeLifecycleResult::success(
-                    &serde_json::to_value(summary).map_err(napi_error)?,
-                ),
+                Ok(summary) => NativeLifecycleResult::success(&summary),
                 Err(error) => Ok(NativeLifecycleResult::failure(&error)),
             }
         })
@@ -1160,9 +1084,7 @@ impl NativeBifrost {
                 }
             };
             match client.cancel(&request_id).await {
-                Ok(response) => NativeLifecycleResult::success(
-                    &serde_json::to_value(response).map_err(napi_error)?,
-                ),
+                Ok(response) => NativeLifecycleResult::success(&response),
                 Err(error) => Ok(NativeLifecycleResult::failure(&error)),
             }
         })
@@ -1216,9 +1138,7 @@ impl NativeBifrost {
         let client = self.client.clone();
         crate::trace::spawn(env, async move {
             match client.list_tables().await {
-                Ok(entries) => NativeLifecycleResult::success(
-                    &serde_json::to_value(entries).map_err(napi_error)?,
-                ),
+                Ok(entries) => NativeLifecycleResult::success(&entries),
                 Err(error) => Ok(NativeLifecycleResult::failure(&error)),
             }
         })
@@ -1246,9 +1166,7 @@ impl NativeBifrost {
         let client = self.client.clone();
         crate::trace::spawn(env, async move {
             match client.describe_table(&namespace, &name).await {
-                Ok(description) => NativeLifecycleResult::success(
-                    &serde_json::to_value(description).map_err(napi_error)?,
-                ),
+                Ok(description) => NativeLifecycleResult::success(&description),
                 Err(error) => Ok(NativeLifecycleResult::failure(&error)),
             }
         })
@@ -1317,9 +1235,7 @@ impl NativeBifrost {
                 )),
             };
             match altered {
-                Ok(description) => NativeLifecycleResult::success(
-                    &serde_json::to_value(description).map_err(napi_error)?,
-                ),
+                Ok(description) => NativeLifecycleResult::success(&description),
                 Err(error) => Ok(NativeLifecycleResult::failure(&error)),
             }
         })
@@ -1567,19 +1483,6 @@ impl NativeBifrostQueryStream {
             .map(|terminal| terminal.clone())
             .map_err(|_| napi::Error::from_reason("terminal lock poisoned".to_owned()))
     }
-}
-
-/// Maps one telemetry row's JSON Schema text to its Arrow schema through the
-/// shared `wyrd-queue` mapper.
-///
-/// # Errors
-///
-/// Returns the shared validation refusal for unparsable text and the mapper's
-/// error for a document that does not map to Arrow.
-fn telemetry_schema(schema_json: &str) -> StdResult<SchemaRef, BifrostClientError> {
-    let schema: Value = serde_json::from_str(schema_json)
-        .map_err(|error| validation_error(format!("invalid JSON schema: {error}"), "schema"))?;
-    Ok(Arc::new(wyrd_types::json_schema_to_arrow(&schema)?))
 }
 
 /// Parses the optional per-row correlation at the Node boundary.

@@ -1140,12 +1140,10 @@ fn plan_declaration_graph(
     submissions: &[CardSubmission],
 ) -> Result<(TopoOrder, RootPick, Vec<CardSubmission>), WyrdError> {
     let graph_submissions = graph_ready_submissions(submissions).map_err(graph_error)?;
-    let siblings = sibling_identities(&graph_submissions);
+    let siblings = sibling_identities(graph_submissions.iter().map(|graph| &graph.submission));
     for graph in &graph_submissions {
-        let spec = Spec::from_kind_and_value(&graph.kind, graph.spec.clone())
-            .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
-        validate_and_collect_refs(&spec, &siblings, &mut Vec::new())?;
-        if let Some(error) = spec_binding_errors(&spec).into_iter().next() {
+        validate_and_collect_refs(&graph.spec, &siblings, &mut Vec::new())?;
+        if let Some(error) = spec_binding_errors(&graph.spec).into_iter().next() {
             return Err(error);
         }
     }
@@ -1153,6 +1151,10 @@ fn plan_declaration_graph(
     let order = topo_sort(&nodes, &edges).map_err(graph_error)?;
     let root = pick_root(&order).map_err(graph_error)?;
     validate_composition(&graph_submissions, &root).map_err(graph_error)?;
+    let graph_submissions = graph_submissions
+        .into_iter()
+        .map(|graph| graph.submission)
+        .collect();
     Ok((order, root, graph_submissions))
 }
 

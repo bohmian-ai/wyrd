@@ -24,6 +24,7 @@ from typing import Any
 import pytest
 from pydantic import BaseModel, ConfigDict
 from wyrd import WyrdError
+from wyrd.bifrost import Bifrost
 from wyrd.cards import CardKind, Cards, DeclarationReceipt
 from wyrd.cards import CardRef as RegisteredRef
 from wyrd.client import WyrdClient
@@ -1144,3 +1145,70 @@ def test_finance_release_example(finance_reader: Path) -> None:
         "  release-check: failed\n"
         "    not passed: The report names no bank account.\n"
     )
+
+
+AUTHOR_IN_CODE = FIXTURES.parent / "examples/author-in-code"
+"""The Author in code guide's program and readback query."""
+
+
+class ReplyRow(BaseModel):
+    """A ``refund_replies`` row read back with the Card and Run that wrote it."""
+
+    answer: str
+    verdict: str
+    subject_card_uid: str
+    run_id: str
+
+
+def test_author_in_code_example(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The guide's program declares versionless Cards, verifies, and writes attributed rows.
+
+    It prints the selected exact Service and Agent references, a passing and
+    a failing verdict; an unchanged rerun prints the same references; the
+    readback query returns each answer under the Agent and its own Run; and a
+    changed requirement gives the Service a new version and keeps the Agent's.
+    """
+    reader = tmp_path / "author-in-code"
+    reader.mkdir()
+    for name in ("author.py", "replies.sql"):
+        shutil.copy(AUTHOR_IN_CODE / name, reader)
+    monkeypatch.chdir(reader)
+    monkeypatch.setenv("WYRD_CONFIG_HOME", str(tmp_path / "config"))
+
+    def printed() -> list[str]:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            runpy.run_path(str(reader / "author.py"), run_name="__main__")
+        return out.getvalue().splitlines()
+
+    with WyrdTestServer(verification_runtime=True, mutate_env=False) as server:
+        monkeypatch.setenv("WYRD_SERVER_URL", server.base_url)
+        monkeypatch.setenv("WYRD_GRPC_URL", server.grpc_url)
+        monkeypatch.setenv("WYRD_API_KEY", server.tenant_admin_key())
+
+        first = printed()
+        service, agent, *verdicts = first
+        assert service.startswith("service: Service/refund-replies@0.1.0#"), first
+        assert agent.startswith("agent:   Agent/refund-agent@0.1.0#"), first
+        assert verdicts == [
+            "passed: Your refund request is approved.",
+            "failed: You have a guaranteed refund.",
+        ]
+        assert printed() == first, "an unchanged declaration keeps every version"
+
+        server.flush_bifrost()
+        agent_uid = agent.rsplit("#", 1)[1]
+        rows = Bifrost().sql((reader / "replies.sql").read_text(), model=ReplyRow)
+        assert {(row.answer, row.verdict) for row in rows} == {
+            ("Your refund request is approved.", "passed"),
+            ("You have a guaranteed refund.", "failed"),
+        } and len(rows) == 4, rows
+        assert {row.subject_card_uid for row in rows} == {agent_uid}, rows
+        assert len({row.run_id for row in rows}) == 4, "each answer has its own Run"
+
+        program = reader / "author.py"
+        program.write_text(program.read_text().replace('"guaranteed refund")', '"guaranteed")'))
+        changed_service, changed_agent, *_ = printed()
+        assert changed_service.startswith("service: Service/refund-replies@"), changed_service
+        assert changed_service != service, "a changed Verifier gives its Service a new version"
+        assert changed_agent == agent, "the unchanged Agent keeps its version"

@@ -1502,15 +1502,15 @@ fn drift_refuses_unsupported_inputs() {
     }
 }
 
-// ── Scenario 5: the generic record path ────────────────────────────────────
+// ── Scenario 5: the Run-scoped write path ─────────────────────────────────
 
 /// The first call describes the table once; later calls reuse its schema.
 ///
 /// # Panics
-/// Panics when startup or either record fails, or the server sees more
+/// Panics when startup or either write fails, or the server sees more
 /// than one describe for the table across the run and its sibling Card view.
 #[tokio::test]
-async fn record_describes_a_dataset_table_once() {
+async fn write_describes_a_dataset_table_once() {
     let server = DescribeServer::start(fixed_table_bodies());
     server.publish(
         "bifrost.datasets.app_events",
@@ -1523,14 +1523,14 @@ async fn record_describes_a_dataset_table_once() {
     start_over(&state, &server).await.expect("startup");
     let run = state.run();
 
-    run.observe()
-        .record("bifrost.datasets.app_events", &json!({ "event": "done" }))
+    run.bifrost()
+        .write_to("bifrost.datasets.app_events", &json!({ "event": "done" }))
         .await
-        .expect("first record describes then enqueues");
+        .expect("first write describes then enqueues");
     run.for_card("model")
         .expect("model view")
-        .observe()
-        .record("bifrost.datasets.app_events", &json!({ "event": "scored" }))
+        .bifrost()
+        .write_to("bifrost.datasets.app_events", &json!({ "event": "scored" }))
         .await
         .expect("a sibling view reuses the cached schema");
 
@@ -1545,11 +1545,11 @@ async fn record_describes_a_dataset_table_once() {
 /// producer, while two distinct tables keep their own destinations.
 ///
 /// # Panics
-/// Panics when startup or any raced record fails, either table is
+/// Panics when startup or any raced write fails, either table is
 /// described more than once, the pool holds other than two producers, or the
 /// two cached writer tables share a name.
 #[tokio::test]
-async fn concurrent_first_records_describe_each_table_once() {
+async fn concurrent_first_writes_describe_each_table_once() {
     let server = DescribeServer::start(fixed_table_bodies());
     for table in ["bifrost.datasets.first", "bifrost.datasets.second"] {
         server.publish(
@@ -1560,7 +1560,7 @@ async fn concurrent_first_records_describe_each_table_once() {
     let (_bundle, state) = state_fixture();
     start_over(&state, &server).await.expect("startup");
     let run = state.run();
-    let observe = run.observe();
+    let bifrost = run.bifrost();
     let row = json!({ "event": "raced" });
 
     let results = futures_util::future::join_all((0..8).map(|index| {
@@ -1569,7 +1569,7 @@ async fn concurrent_first_records_describe_each_table_once() {
         } else {
             "bifrost.datasets.second"
         };
-        observe.record(table, &row)
+        bifrost.write_to(table, &row)
     }))
     .await;
 
@@ -1599,11 +1599,11 @@ async fn concurrent_first_records_describe_each_table_once() {
 /// A reserved or system-managed table is refused before any describe.
 ///
 /// # Panics
-/// Panics when startup fails, a record to a reserved, system, or
+/// Panics when startup fails, a write to a reserved, system, or
 /// malformed table succeeds or refuses with a code other than
 /// `WYRD_SDK_400_INVALID_OBSERVATION`, or the refusal reached a describe.
 #[tokio::test]
-async fn record_refuses_reserved_and_system_tables() {
+async fn write_refuses_reserved_and_system_tables() {
     let server = DescribeServer::start(fixed_table_bodies());
     let (_bundle, state) = state_fixture();
     start_over(&state, &server).await.expect("startup");
@@ -1621,8 +1621,8 @@ async fn record_refuses_reserved_and_system_tables() {
     ] {
         let before = server.calls(table);
         let error = run
-            .observe()
-            .record(table, &json!({ "event": "done" }))
+            .bifrost()
+            .write_to(table, &json!({ "event": "done" }))
             .await
             .expect_err("only registered bifrost.datasets tables are caller-owned");
         assert_eq!(error.code(), "WYRD_SDK_400_INVALID_OBSERVATION", "{table}");
@@ -1637,21 +1637,125 @@ async fn record_refuses_reserved_and_system_tables() {
 /// An unknown dataset table fails at describe, before queue admission.
 ///
 /// # Panics
-/// Panics when startup fails, or recording to the unregistered table
+/// Panics when startup fails, or writing to the unregistered table
 /// succeeds or refuses with a status other than 404.
 #[tokio::test]
-async fn record_refuses_an_unknown_dataset_table() {
+async fn write_refuses_an_unknown_dataset_table() {
     let server = DescribeServer::start(fixed_table_bodies());
     let (_bundle, state) = state_fixture();
     start_over(&state, &server).await.expect("startup");
 
     let error = state
         .run()
-        .observe()
-        .record("bifrost.datasets.absent", &json!({ "event": "done" }))
+        .bifrost()
+        .write_to("bifrost.datasets.absent", &json!({ "event": "done" }))
         .await
         .expect_err("an unregistered table must refuse");
     assert_eq!(error.status(), 404);
+}
+
+/// A root Service's sole declared table becomes the active table at
+/// startup, so `write(row)` names no table and performs no further describe.
+///
+/// # Panics
+/// Panics when startup or the write fails, or the table is described other
+/// than once.
+#[tokio::test]
+async fn a_sole_declared_table_is_active_after_startup() {
+    let server = DescribeServer::start(fixed_table_bodies());
+    let table = "bifrost.datasets.replies";
+    server.publish(
+        table,
+        &description(table, vec![Field::new("event", DataType::Utf8, false)]),
+    );
+    let bundle = TestBundle::complete_service_with_tables(&["replies"]);
+    let state = WyrdState::from_path(bundle.path()).expect("fixture bundle loads");
+    start_over(&state, &server).await.expect("startup");
+
+    state
+        .run()
+        .bifrost()
+        .write(&json!({ "event": "done" }))
+        .await
+        .expect("the declared table is active");
+
+    assert_eq!(server.calls(table), 1, "described once, at startup");
+}
+
+/// With several declared tables none is active: `write(row)` refuses until
+/// the caller binds one, and switching tables changes where it writes.
+///
+/// # Panics
+/// Panics when startup fails, the unbound write succeeds or refuses with
+/// another code, or a write after binding fails.
+#[tokio::test]
+async fn several_declared_tables_need_an_explicit_active_table() {
+    let server = DescribeServer::start(fixed_table_bodies());
+    for table in ["bifrost.datasets.first", "bifrost.datasets.second"] {
+        server.publish(
+            table,
+            &description(table, vec![Field::new("event", DataType::Utf8, false)]),
+        );
+    }
+    let bundle = TestBundle::complete_service_with_tables(&["first", "second"]);
+    let state = WyrdState::from_path(bundle.path()).expect("fixture bundle loads");
+    start_over(&state, &server).await.expect("startup");
+    let run = state.run();
+    let row = json!({ "event": "done" });
+
+    let error = run
+        .bifrost()
+        .write(&row)
+        .await
+        .expect_err("no table is active");
+    assert_eq!(error.code(), "WYRD_VALA_412_NO_ACTIVE_TABLE");
+    assert_eq!(
+        server.calls("bifrost.datasets.first"),
+        0,
+        "nothing activated"
+    );
+
+    for table in ["bifrost.datasets.first", "bifrost.datasets.second"] {
+        state.use_table_by_name(table).await.expect("table binds");
+        run.bifrost()
+            .write(&row)
+            .await
+            .expect("writes the active table");
+        let started = state.started_bifrost().expect("started");
+        assert_eq!(
+            started.bifrost.active_writer_table().expect("active").fqn(),
+            table
+        );
+    }
+    let started = state.started_bifrost().expect("started");
+    assert_eq!(
+        started.bifrost.producer_count(),
+        2,
+        "one producer per table"
+    );
+}
+
+/// An active table outside `bifrost.datasets` is refused before admission.
+///
+/// # Panics
+/// Panics when startup or binding fails, or the write is admitted.
+#[tokio::test]
+async fn write_refuses_an_active_system_table() {
+    let server = DescribeServer::start(fixed_table_bodies());
+    let (_bundle, state) = state_fixture();
+    start_over(&state, &server).await.expect("startup");
+    state
+        .use_table_by_name(DRIFT_OBSERVATIONS_TABLE)
+        .await
+        .expect("a system table binds on the handle");
+
+    let error = state
+        .run()
+        .bifrost()
+        .write(&json!({ "event": "done" }))
+        .await
+        .expect_err("a run never writes a system table");
+    assert_eq!(error.code(), "WYRD_SDK_400_INVALID_OBSERVATION");
 }
 
 /// A state created with a client keeps it for every server call: its clones

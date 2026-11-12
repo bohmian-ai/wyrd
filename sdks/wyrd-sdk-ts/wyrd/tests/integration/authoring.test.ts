@@ -11,13 +11,16 @@
 // release naming `PROVIDER-UNCERTAIN`, fails one naming
 // `BANK-ACCOUNT-DEMO-001`, and otherwise passes citing the report text and the
 // policy line permitting `external-audit`.
+import { execFileSync } from "node:child_process";
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import { expect, vi } from "vitest";
+import { z } from "zod";
 
 import {
+  Bifrost,
   type CardTypes,
   Cards,
   type DeclarationReceipt,
@@ -927,4 +930,40 @@ test("definitions_register_all_kinds", async ({ cards }) => {
       "Operator",
     ].sort(),
   );
+});
+
+const AUTHOR_IN_CODE = resolve(import.meta.dirname, "../../../../../examples/author-in-code");
+const ReplyRow = z.object({
+  answer: z.string(),
+  verdict: z.string(),
+  subject_card_uid: z.string(),
+  run_id: z.string(),
+});
+
+test("author_in_code_example_declares_verifies_and_writes", async ({ server }) => {
+  const reader = mkdtempSync(join(tmpdir(), "wyrd-ts-author-in-code-"));
+  const printed = () =>
+    execFileSync(process.execPath, [join(AUTHOR_IN_CODE, "author.ts")], { cwd: reader, encoding: "utf8" });
+
+  const first = printed();
+  expect(first).toMatch(
+    /^service: Service\/refund-replies@0\.1\.0#[0-9a-f-]+\nagent: {3}Agent\/refund-agent@0\.1\.0#[0-9a-f-]+\n/,
+  );
+  expect(first.split("\n").slice(2)).toEqual([
+    "passed: Your refund request is approved.",
+    "failed: You have a guaranteed refund.",
+    "",
+  ]);
+  expect(printed(), "an unchanged declaration keeps every version").toBe(first);
+
+  server.flushBifrost();
+  const agentUid = /agent: +\S+#(\S+)/.exec(first)?.[1];
+  const sql = readFileSync(join(AUTHOR_IN_CODE, "replies.sql"), "utf8");
+  const rows = await (await Bifrost.connect()).sql(sql, [], ReplyRow);
+  expect(rows).toHaveLength(4);
+  expect(new Set(rows.map(({ answer, verdict }) => `${verdict}: ${answer}`))).toEqual(
+    new Set(["passed: Your refund request is approved.", "failed: You have a guaranteed refund."]),
+  );
+  expect(new Set(rows.map(({ subject_card_uid }) => subject_card_uid))).toEqual(new Set([agentUid]));
+  expect(new Set(rows.map(({ run_id }) => run_id)).size, "each answer has its own Run").toBe(4);
 });

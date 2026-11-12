@@ -38,6 +38,11 @@ export declare class NativeAuthored {
    */
   static component(alias: string, reference: NativeValue): NativeAuthored
   /**
+   * The Service table `name` in `bifrost.datasets` with the JSON Schema
+   * object `schema`, whose `properties` order is the column order.
+   */
+  static table(name: string, schema: any): NativeAuthored
+  /**
    * Bind `verifier`: a Verifier, an exact `CardRef`, or a reference path.
    *
    * # Errors
@@ -423,35 +428,6 @@ export declare class NativeBifrost {
   shutdown(): Promise<NativeLifecycleResult>
   /** Number of distinct table producers currently pooled. */
   get producerCount(): number
-  /**
-   * Rows dropped by the fire-and-forget observation path, saturating at
-   * `i64::MAX`.
-   *
-   * Always zero for [`NativeBifrost::insert`], which refuses rather than
-   * drops.
-   */
-  get dropped(): number
-  /**
-   * Records one telemetry row fire-and-forget through
-   * [`wyrd_client::bifrost::observe::record`].
-   *
-   * The row names its own `table` and JSON Schema rather than this client's
-   * bound table, so instrumentation never disturbs the application's
-   * binding. A producer refusal, such as a full queue, is counted on
-   * [`NativeBifrost::dropped`] instead of returned. The first row for a
-   * table this client has not described records on a background task
-   * once the describe returns its table version; a failed describe is
-   * counted the same way. That record is admitted before the task starts,
-   * so a following `flush` or `shutdown` waits for it.
-   *
-   * # Errors
-   *
-   * Returns a napi error only when the outcome cannot be encoded or the
-   * background describe cannot be scheduled; an
-   * unparsable or unmappable schema and an invalid Card UID are
-   * returned in [`NativeLifecycleResult`].
-   */
-  record(table: string, schemaJson: string, row: string, subjectCardUid?: string | undefined | null, runId?: string | undefined | null): NativeLifecycleResult
   /**
    * Starts one terminal-safe query through the Rust SDK owner.
    *
@@ -1159,10 +1135,18 @@ export declare class NativeRun {
    */
   submit(verifier: string, inputs: Array<NativeVerifierInput>, groupId?: string | undefined | null): Promise<NativeSubmission>
   /**
-   * Emits one row into a registered `bifrost.datasets` table.
+   * Buffers one row for a registered `bifrost.datasets` table.
    *
    * Asynchronous because the first call for a table describes it; later calls
-   * reuse the cached schema and producer.
+   * reuse the cached schema and producer. Resolving is buffered submission;
+   * state shutdown drains it.
+   *
+   * The write runs as a spawned task that owns a clone of the Run, so
+   * discarding the returned promise does not cancel it: the row may still
+   * be admitted. A successful outcome admitted exactly one row, so repeating
+   * it writes another; a refused outcome admitted none and may be retried.
+   * Admission and queue retries follow `RunBifrost::write_to`. `table`
+   * names the destination; `None` writes the state's active table.
    *
    * # Errors
    *
@@ -1170,7 +1154,7 @@ export declare class NativeRun {
    * reserved, unknown, or unauthorized table and the lifecycle refusals are
    * returned in [`NativeLifecycleResult`].
    */
-  record(table: string, rowJson: string): Promise<NativeLifecycleResult>
+  write(table: string | undefined | null, rowJson: string): Promise<NativeLifecycleResult>
 }
 
 /**
@@ -1537,6 +1521,17 @@ export declare class NativeWyrdState {
    * fixed-table failures are returned in [`NativeLifecycleResult`].
    */
   startBifrost(table?: NativeTableConfig | undefined | null, clientByteLimitBytes?: number | undefined | null): Promise<NativeLifecycleResult>
+  /**
+   * Binds the registered `<namespace>.<name>` table as the active table a
+   * run's default write targets, describing it first.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the outcome cannot be projected; the
+   * lifecycle refusals and the describe error are returned in
+   * [`NativeLifecycleResult`].
+   */
+  useTableByName(table: string): Promise<NativeLifecycleResult>
   /**
    * Opens one invocation over this state, targeting `alias` or the root Service.
    *

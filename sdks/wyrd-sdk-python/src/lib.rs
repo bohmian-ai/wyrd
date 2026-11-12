@@ -117,7 +117,6 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     register_submodule(py, "wyrd._wyrd.gateway_admin", &gateway_admin)?;
 
     let observe = PyModule::new(py, "observe")?;
-    bifrost::register_observe(&observe)?;
     observe::register_run(&observe)?;
     m.add_submodule(&observe)?;
     register_submodule(py, "wyrd._wyrd.observe", &observe)?;

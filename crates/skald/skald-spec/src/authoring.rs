@@ -15,7 +15,7 @@ use serde_json::{Map, Value};
 use crate::error::{SkaldError, SkaldResult};
 use crate::media::{MediaKind, MediaRef, MediaSource};
 use crate::prompt::{
-    Compiled, NamedFormat, Prompt, check_model, check_output_schema, media_placeholder_regex,
+    NamedFormat, Prompt, check_model, check_output_schema, media_placeholder_regex,
 };
 use crate::request::{ProviderName, ProviderRequest};
 use crate::wire::anthropic_messages::{
@@ -445,11 +445,9 @@ impl AuthoredPrompt {
             name: named.name().to_owned(),
             resolved: named_resolved,
         });
-        prompt.authored = Some(std::sync::Arc::new(Compiled {
-            authored: self.clone(),
-            request: prompt.request.clone(),
-            model: prompt.model.clone(),
-            provider: prompt.provider.clone(),
+        prompt.authored = Some(Box::new(crate::prompt::Authored {
+            form: self.clone(),
+            request: crate::prompt::request_fingerprint(&prompt.request),
         }));
         Ok(prompt)
     }
@@ -933,7 +931,11 @@ fn openai_chat(
     }
     messages.extend(turns.into_iter().map(|turn| {
         let content = if turn.plain {
-            OpenAiMessageContent::Text(turn.parts.concat())
+            // A plain turn lowers to one part, which moves rather than copies.
+            OpenAiMessageContent::Text(match <[String; 1]>::try_from(turn.parts) {
+                Ok([text]) => text,
+                Err(parts) => parts.concat(),
+            })
         } else {
             OpenAiMessageContent::Parts(
                 turn.parts
@@ -2293,6 +2295,36 @@ mod tests {
         });
         let prompt = compile(native.clone()).expect("role-less native compiles");
         assert_eq!(serde_json::to_value(&prompt).expect("prompt json"), native);
+    }
+
+    /// A compiled Prompt lends its retained authored form while the request
+    /// is unchanged, and stops lending it once an edit changes the request.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the form is not borrowed, or a stale form survives an edit.
+    #[test]
+    fn authored_form_is_lent_only_while_the_request_is_unchanged() {
+        let authored: AuthoredPrompt = serde_json::from_value(json!({"provider": "openai", "model": "m", "messages": [{"role": "user", "content": "{{claim}}"}], "response_format": {"type": "object", "properties": {"slot": {"type": "string"}}}}))
+            .expect("authored decodes");
+        let mut prompt = authored.compile().expect("compiles");
+        assert!(matches!(
+            prompt.authored().expect("authored form"),
+            std::borrow::Cow::Borrowed(form) if *form == authored
+        ));
+
+        prompt
+            .edit_response_schema_mut(
+                &crate::prompt::PreparedSchemas::default(),
+                "order",
+                |schema| {
+                    schema["properties"]["slot"]["enum"] = json!(["order"]);
+                },
+            )
+            .expect("narrowed schema is valid");
+        let edited = prompt.authored().expect("native form");
+        assert!(matches!(edited, std::borrow::Cow::Owned(_)));
+        assert_ne!(*edited, authored);
     }
 
     /// Proves a host-named `response_format`: scalar and expanded forms

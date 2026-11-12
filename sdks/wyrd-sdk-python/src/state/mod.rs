@@ -46,8 +46,9 @@ use registry::PythonCardRegistry;
 /// Immutable Python projection of one complete Card envelope.
 #[pyclass(module = "wyrd.state", name = "CardEnvelope", frozen)]
 pub struct PyCardEnvelope {
-    /// Complete native Card retained as the projection source of truth.
-    card: Card,
+    /// Complete native Card retained as the projection source of truth,
+    /// shared with the hydrated state that loaded it.
+    card: Arc<Card>,
     /// Exact identity validated during bundle loading or by the registry read.
     card_ref: CardRef,
     /// Stable aliases resolving to this exact Card; nonempty for hydrated
@@ -297,6 +298,18 @@ impl PyWyrdState {
             ),
         )
         .map_err(WyrdPyError::from)
+    }
+
+    /// Bind the registered `"<namespace>.<name>"` table as the active table
+    /// `run.bifrost.write(row)` writes, describing it first. The previous
+    /// table's producer keeps draining.
+    ///
+    /// # Errors
+    /// Raises `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup,
+    /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, and the server's describe
+    /// error for an unknown, unauthorized, or unavailable table.
+    fn use_table_by_name(&self, py: Python<'_>, table: &str) -> CardPyResult<()> {
+        crate::trace::block_on(py, self.inner.use_table_by_name(table)).map_err(WyrdPyError::from)
     }
 
     /// Fix this state's Service release and deployment environment before
@@ -781,7 +794,7 @@ impl PyCardEnvelope {
             uid: card.metadata.uid.clone(),
         };
         Ok(Self {
-            card,
+            card: Arc::new(card),
             card_ref,
             aliases: Vec::new(),
         })
@@ -1197,7 +1210,7 @@ impl PythonStateHydrator<'_> {
                 Py::new(
                     py,
                     PyCardEnvelope {
-                        card: card.clone(),
+                        card: Arc::clone(card),
                         card_ref,
                         aliases,
                     },
@@ -1231,7 +1244,7 @@ impl PythonStateHydrator<'_> {
         let state = self.state;
         let mut values = BTreeMap::new();
         for (key, envelope) in state.cards_of_kind(CardKind::Prompt) {
-            let mut card = PromptCard::from_card(envelope.clone()).map_err(|_| {
+            let mut card = PromptCard::from_card(Card::clone(envelope)).map_err(|_| {
                 runtime_hydration_error(state, key, "prompt", "prompt holder construction failed")
             })?;
             card.hydrate_prompt(py).map_err(|_| {
@@ -1274,7 +1287,7 @@ impl PythonStateHydrator<'_> {
         let state = self.state;
         let mut values = BTreeMap::new();
         for (key, envelope) in state.cards_of_kind(CardKind::Agent) {
-            let mut card = PyAgentCard::from_card(py, envelope.clone()).map_err(|_| {
+            let mut card = PyAgentCard::from_card(py, Card::clone(envelope)).map_err(|_| {
                 runtime_hydration_error(state, key, "prompt", "agent holder construction failed")
             })?;
             let prompt_key = state
@@ -1317,7 +1330,7 @@ impl PythonStateHydrator<'_> {
         let config = &self.config;
         let mut values = BTreeMap::new();
         for (key, envelope) in state.cards_of_kind(CardKind::Model) {
-            let mut card = ModelCard::from_card(envelope.clone()).map_err(|_| {
+            let mut card = ModelCard::from_card(Card::clone(envelope)).map_err(|_| {
                 runtime_hydration_error(state, key, "interface", "model holder construction failed")
             })?;
             let interface = config.interfaces.get(key).map(|value| value.bind(py));
@@ -1374,7 +1387,7 @@ impl PythonStateHydrator<'_> {
         let config = &self.config;
         let mut values = BTreeMap::new();
         for (key, envelope) in state.cards_of_kind(CardKind::Data) {
-            let mut card = DataCard::from_card(envelope.clone()).map_err(|_| {
+            let mut card = DataCard::from_card(Card::clone(envelope)).map_err(|_| {
                 runtime_hydration_error(state, key, "interface", "data holder construction failed")
             })?;
             let interface = config.interfaces.get(key).map(|value| value.bind(py));
@@ -2144,7 +2157,7 @@ impl PyCards {
             ..requested
         };
         Ok(PyCardEnvelope {
-            card,
+            card: Arc::new(card),
             card_ref,
             aliases: Vec::new(),
         })

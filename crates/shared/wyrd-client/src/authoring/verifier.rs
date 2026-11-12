@@ -62,7 +62,7 @@ fields!(Verifier [card.spec] {
 impl From<Verifier> for CardDefinition {
     /// The same Card, keeping what it references.
     fn from(verifier: Verifier) -> Self {
-        Self(verifier.card)
+        Self(std::sync::Arc::new(verifier.card))
     }
 }
 

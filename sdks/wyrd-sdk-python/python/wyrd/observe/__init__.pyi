@@ -5,7 +5,6 @@ from typing import Any, Literal
 from typing_extensions import TypeVar
 
 from ..verify import DataModel, Execution, Recorded, VerificationResult
-from ._telemetry import record
 
 _Model = TypeVar("_Model", bound=DataModel)
 
@@ -33,7 +32,12 @@ class Run:
 
     @property
     def observe(self) -> Observe:
-        """The emit surface for this view."""
+        """The verification and submission surface for this view."""
+        ...
+
+    @property
+    def bifrost(self) -> RunBifrost:
+        """The caller-table write surface for this view."""
         ...
 
     def for_card(self, alias: str) -> Run:
@@ -79,10 +83,10 @@ class Run:
         ...
 
 class Observe:
-    """Verification and caller-table records on one scoped run.
+    """Verification and submission on one scoped run.
 
-    Returning from ``record`` is queue admission, not a durable
-    acknowledgement. ``WyrdState.shutdown()`` is the durability barrier.
+    Recording window samples through ``submit`` is queue admission, not a
+    durable acknowledgement. ``WyrdState.shutdown()`` is the durability barrier.
     """
 
     def verify(
@@ -184,12 +188,44 @@ class Observe:
         """
         ...
 
-    def record(self, table: str, row: Mapping[str, Any] | Any) -> None:
-        """Emit one row into a registered ``bifrost.datasets.<name>`` table.
+class RunBifrost:
+    """Caller-table writes attributed to one scoped run.
+
+    Every row carries this view's Card UID and the run's ``run_id``.
+    Returning from ``write`` is buffered submission, not a durable
+    acknowledgement: a successful ``WyrdState.shutdown()`` drains the queue.
+    """
+
+    def write(self, row: Mapping[str, Any] | Any) -> None:
+        """Buffer one row for the state's active table.
+
+        The active table is the root Service's sole declared table, else the
+        one bound by ``start_bifrost(table=...)`` or
+        ``WyrdState.use_table_by_name``. It was described when bound, so this
+        performs no IO; the row is durable only once ``WyrdState.shutdown()``
+        succeeds.
+
+        Args:
+            row: a mapping with ``str`` keys, a dataclass instance, or a
+                Pydantic model instance, with any JSON values.
+
+        Raises:
+            WyrdError: ``WYRD_VALA_412_NO_ACTIVE_TABLE`` when no table is
+                active, ``WYRD_SDK_400_INVALID_OBSERVATION`` when it is outside
+                ``bifrost.datasets``, and otherwise as ``write_to``.
+        """
+        ...
+
+    def write_to(self, table: str, row: Mapping[str, Any] | Any) -> None:
+        """Buffer one row for a named ``bifrost.datasets.<name>`` table.
+
+        The active table is unchanged, so concurrent runs may each write their
+        own table this way.
 
         The first call for a table blocks to describe it; later calls reuse
         the cached schema and producer. Row values are checked against that
-        schema when the queue seals a batch, not here.
+        schema when the queue seals a batch, not here, and the row is durable
+        only once ``WyrdState.shutdown()`` succeeds.
 
         Args:
             table: the registered ``"bifrost.datasets.<name>"`` table.
@@ -210,5 +246,5 @@ class Observe:
 __all__ = [
     "Observe",
     "Run",
-    "record",
+    "RunBifrost",
 ]

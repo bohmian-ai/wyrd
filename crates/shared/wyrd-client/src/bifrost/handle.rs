@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, PoisonError};
 
 use arrow::record_batch::RecordBatch;
@@ -41,8 +41,7 @@ struct ProducerKey {
 /// pool and still drains on the next flush.
 ///
 /// This type is crate-private. `Bifrost` is the public write door, and
-/// backpressure asymmetry lives above it — `Bifrost::insert` propagates
-/// queue-full while [`crate::bifrost::observe::record`] swallows and counts it.
+/// `Bifrost::insert` propagates queue-full to its caller.
 pub(crate) struct WriterPool {
     scope: ClientScope,
     sink: Arc<dyn BatchSink<ClientByteGuard>>,
@@ -55,8 +54,6 @@ pub(crate) struct WriterPool {
     direct_sends: Mutex<usize>,
     /// Wakes shutdown whenever an admitted direct send settles.
     direct_settled: Condvar,
-    dropped: AtomicU64,
-    drop_warned: AtomicBool,
 }
 
 /// Point-in-time settlement accounting for one [`crate::bifrost::Bifrost`] client.
@@ -98,8 +95,6 @@ impl WriterPool {
             closed: AtomicBool::new(false),
             direct_sends: Mutex::new(0),
             direct_settled: Condvar::new(),
-            dropped: AtomicU64::new(0),
-            drop_warned: AtomicBool::new(false),
         }
     }
 
@@ -114,12 +109,6 @@ impl WriterPool {
     #[must_use]
     pub(crate) fn producer_count(&self) -> usize {
         self.producers.lock().expect("producer pool poisoned").len()
-    }
-
-    /// Rows dropped by the fire-and-forget observe path under backpressure.
-    #[must_use]
-    pub(crate) fn dropped(&self) -> u64 {
-        self.dropped.load(Ordering::SeqCst)
     }
 
     /// Returns the bounded ownership and control state for this client handle.
@@ -383,20 +372,6 @@ impl WriterPool {
         first_error.map_or(Ok(()), Err)
     }
 
-    /// Record one fire-and-forget drop: bump the counter and warn once.
-    ///
-    /// The observe path calls this after swallowing a queue-full so telemetry
-    /// backpressure is visible in metrics without ever surfacing to the caller.
-    pub(crate) fn note_drop(&self) {
-        self.dropped.fetch_add(1, Ordering::SeqCst);
-        if !self.drop_warned.swap(true, Ordering::SeqCst) {
-            tracing::warn!(
-                "vala observe: telemetry record dropped under queue backpressure \
-                 (fire-and-forget; further drops counted silently)"
-            );
-        }
-    }
-
     /// Get-or-create the pooled producer for `(scope, Record, table,
     /// table_version)`.
     ///
@@ -504,6 +479,7 @@ mod tests {
     use arrow::array::Int64Array;
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
+    use std::sync::atomic::AtomicU64;
     use std::time::Duration;
     use tokio::sync::Notify;
     use wyrd_queue::{DurableBatchAck, MockSink, SealedBatch, SinkError};

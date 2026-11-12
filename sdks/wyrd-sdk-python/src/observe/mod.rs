@@ -292,16 +292,71 @@ impl PyRun {
         false
     }
 
-    /// The emit surface for this view.
+    /// The verification and submission surface for this view.
     #[getter]
     fn observe(&self) -> PyObserveHandle {
         PyObserveHandle {
             run: Run::clone(&self.inner),
         }
     }
+
+    /// The caller-table write surface for this view.
+    #[getter]
+    fn bifrost(&self) -> PyRunBifrost {
+        PyRunBifrost {
+            run: Run::clone(&self.inner),
+        }
+    }
 }
 
-/// Python wrapper for the record, verify, and submit calls on one scoped run.
+/// Python wrapper for the caller-table write on one scoped run.
+///
+/// It owns its own view clone rather than borrowing the `Run`, because a Python
+/// caller keeps `run.bifrost` alive independently of the object it came from.
+#[pyclass(module = "wyrd._wyrd.observe", name = "RunBifrost", frozen)]
+pub struct PyRunBifrost {
+    /// The view every row correlates to.
+    run: Run,
+}
+
+#[pymethods]
+impl PyRunBifrost {
+    /// Buffer one row for the state's active table: the root Service's sole
+    /// declared table, else the one bound by `start_bifrost(table=...)` or
+    /// `WyrdState.use_table_by_name`. Performs no IO; `WyrdState.shutdown()`
+    /// drains it.
+    ///
+    /// # Errors
+    /// Raises `WYRD_VALA_412_NO_ACTIVE_TABLE` when no table is active,
+    /// `WYRD_SDK_400_INVALID_OBSERVATION` when it is outside
+    /// `bifrost.datasets`, and otherwise as `write_to`.
+    fn write(&self, py: Python<'_>, row: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
+        let json = json_text(py, "row", row)?;
+        crate::trace::block_on(py, self.run.bifrost().write_json(None, &json))
+            .map_err(WyrdPyError::from)
+    }
+
+    /// Buffer one row for a named registered caller-owned table, leaving the
+    /// active table unchanged.
+    ///
+    /// Blocking: the first call for a table describes it. Later calls reuse the
+    /// writer's cached schema and producer and perform no schema lookup.
+    /// Returning is buffered submission; `WyrdState.shutdown()` drains it.
+    ///
+    /// # Errors
+    /// Raises `WYRD_SPEC_400_VALIDATION` for a row of another shape,
+    /// `WYRD_SDK_400_INVALID_OBSERVATION` for a table outside
+    /// `bifrost.datasets`, `WYRD_SDK_400_BIFROST_NOT_STARTED`,
+    /// `WYRD_SDK_409_BIFROST_CLOSED`, `WYRD_CLIENT_429_QUEUE_FULL`, and the
+    /// server's error for an unknown, unauthorized, or unavailable table.
+    fn write_to(&self, py: Python<'_>, table: &str, row: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
+        let json = json_text(py, "row", row)?;
+        crate::trace::block_on(py, self.run.bifrost().write_json(Some(table), &json))
+            .map_err(WyrdPyError::from)
+    }
+}
+
+/// Python wrapper for the verify and submit calls on one scoped run.
 ///
 /// It owns its own view clone rather than borrowing the `Run`, because a Python
 /// caller keeps `run.observe` alive independently of the object it came from.
@@ -313,23 +368,6 @@ pub struct PyObserveHandle {
 
 #[pymethods]
 impl PyObserveHandle {
-    /// Emit one row into a registered caller-owned table.
-    ///
-    /// Blocking: the first call for a table describes it. Later calls reuse the
-    /// writer's cached schema and producer and perform no schema lookup.
-    ///
-    /// # Errors
-    /// Raises `WYRD_SPEC_400_VALIDATION` for a row of another shape,
-    /// `WYRD_SDK_400_INVALID_OBSERVATION` for a table outside
-    /// `bifrost.datasets`, `WYRD_SDK_400_BIFROST_NOT_STARTED`,
-    /// `WYRD_SDK_409_BIFROST_CLOSED`, `WYRD_CLIENT_429_QUEUE_FULL`, and the
-    /// server's error for an unknown, unauthorized, or unavailable table.
-    fn record(&self, py: Python<'_>, table: &str, row: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
-        let json = json_text(py, "row", row)?;
-        crate::trace::block_on(py, self.observe().record_json(table, &json))
-            .map_err(WyrdPyError::from)
-    }
-
     /// Execute the bound Verifier `verifier` on this view's subject now.
     ///
     /// Pass one positional value for a single-slot Verifier or one keyword
@@ -431,5 +469,6 @@ impl PyObserveHandle {
 pub fn register_run(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyRun>()?;
     module.add_class::<PyObserveHandle>()?;
+    module.add_class::<PyRunBifrost>()?;
     Ok(())
 }

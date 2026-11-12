@@ -39,6 +39,10 @@ name = "finance_release"
 path = "finance-release/finance_release.rs"
 
 [[bin]]
+name = "author_in_code"
+path = "author-in-code/author.rs"
+
+[[bin]]
 name = "support_desk"
 path = "support-desk/rust/main.rs"
 

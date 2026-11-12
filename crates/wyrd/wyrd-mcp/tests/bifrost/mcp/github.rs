@@ -19,7 +19,20 @@ mod pg_tests {
     use wyrd_client::cards::Cards;
     use wyrd_client::transport::credential::ResolvedCredential;
     use wyrd_testing::WyrdTestServer;
-    use wyrd_testing::github::{GithubAppMock, GithubBrowser};
+    use wyrd_testing::github::{GithubAppMock, GithubBrowser, PullRequest};
+
+    /// The tool `name` with `arguments`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `arguments` is not an object.
+    fn call_with(
+        name: &'static str,
+        arguments: &serde_json::Value,
+    ) -> Result<CallToolRequestParams, McpJourneyError> {
+        Ok(CallToolRequestParams::new(name)
+            .with_arguments(arguments.as_object().cloned().ok_or("an object")?))
+    }
 
     /// The tool `name` with no arguments.
     fn call(name: &'static str) -> CallToolRequestParams {
@@ -189,7 +202,9 @@ mod pg_tests {
 
     /// A Repository declared through the SDK reads back over MCP with its
     /// served selection and binding, and `cards.list` filters the family by
-    /// the `Repository` kind.
+    /// the `Repository` kind. A pull request on it admits an execution the
+    /// agent finds through the binding, pinned to its base and head, and a
+    /// pushed head cancels it as superseded with its pins kept.
     ///
     /// # Errors
     ///
@@ -285,6 +300,52 @@ mod pg_tests {
             .map(|item| item["name"].clone())
             .collect();
         assert_eq!(names, [json!("web")]);
+
+        let binding = card["status"]["verification"]["binding_ids"][0].clone();
+        let base = server.base_url().ok_or("bound")?;
+        let newest = async || -> Result<serde_json::Value, McpJourneyError> {
+            let read = structured(
+                agent
+                    .call_tool(call_with(
+                        "verification.get_binding",
+                        &json!({ "binding_id": binding }),
+                    )?)
+                    .await?,
+            )?;
+            Ok(read["last_execution_id"].clone())
+        };
+        let execution =
+            async |id: &serde_json::Value| -> Result<serde_json::Value, McpJourneyError> {
+                structured(
+                    agent
+                        .call_tool(call_with(
+                            "verification.get_execution",
+                            &json!({ "execution_id": id }),
+                        )?)
+                        .await?,
+                )
+            };
+        mock.set_pull_request(2, 7, PullRequest::open(2, "b1", "a1"));
+        let opened = mock.pull_request_event(101, 2, 7, "opened");
+        assert_eq!(mock.deliver(base, "pull_request", &opened).await?, 202);
+        let first = newest().await?;
+        let admitted = execution(&first).await?;
+        assert_eq!(admitted["status"], "pending");
+        assert_eq!(admitted["pull_request"]["number"], 7);
+        assert_eq!(admitted["pull_request"]["repository_id"], "2");
+        assert_eq!(
+            admitted["pull_request"]["base"],
+            json!({ "ref": "main", "sha": "b1" })
+        );
+        assert_eq!(admitted["pull_request"]["head"]["sha"], "a1");
+        mock.edit_pull_request(2, 7, |pr| pr.head_sha = "b2".to_owned());
+        let pushed = mock.pull_request_event(101, 2, 7, "synchronize");
+        assert_eq!(mock.deliver(base, "pull_request", &pushed).await?, 202);
+        assert_ne!(newest().await?, first);
+        let superseded = execution(&first).await?;
+        assert_eq!(superseded["status"], "cancelled");
+        assert_eq!(superseded["error"]["code"], "pull_request_superseded");
+        assert_eq!(superseded["pull_request"]["head"]["sha"], "a1");
         agent.cancel().await?;
         server.shutdown().await?;
         Ok(())

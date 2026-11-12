@@ -41,11 +41,21 @@ acquisition/comparison/index/context and remains standalone.
 | [008](008-approval-steps.md) | **Requires 010.** Exact pending approval identities, accepted decisions and continuation/progress for 009 |
 | [009](009-reports-and-github-delivery.md) | **Requires 010.** Optional standard report/helper authoring and recoverable Checks/comments with independent provider retry that never recomputes verification; no new SQL delivery fields |
 | [010](010-nonblocking-verification-execution.md) | **Proposed; blocks renewed 006 acceptance and 005/007–009.** Approved runtime spec revision 7; shared memory-owned engine, preserved preparation, bounded background terminal retention/lease/group-commit settlement, claim backpressure and resource-scaling proof; keeps Bifrost unchanged and PR/GitHub/Task 004 metadata |
+| [010-R1](010-R1-restore-direct-verification-baseline.md) | **Proposed remediation; blocks 010 acceptance and its dependents.** Maintainer-agreed direct resource-scaling restoration, destination batching and consumer closure; queued-only resumable state on the same engine; full L1 verification/gateway/Bifrost with no regression. L2 measurement is excluded. |
 
 Task 010 targets approved runtime spec revision 7 and must be completed before
 renewed 006 acceptance or 005/007–009 execution. Tasks 005 and 007–009 list 010 in
 `depends_on` and carry the corrected runtime handoffs: live extraction, background
 park/ACK custody and independent provider retry.
+
+The maintainer subsequently agreed the
+[benchmark remediation amendment](../design/task-010-benchmark-remediation.md)
+and requested 010-R1, with L1 measurement only across all three engines.
+010-R1 supersedes conflicting direct-state/inspection and L2 qualification text
+in 010. It uses 010's existing implementation rather than requiring 010 to pass
+first. Reconcile the agreed amendment in spec/contracts and owning architecture
+before affected production edits. This records the user's decision, not an
+invented approval of another spec revision or a runtime PASS.
 
 Numbering preserves the original nine behavioral pieces, not a linear execution
 order. The original sequence was 001/002, then 003/004, then 006, then 005/007,

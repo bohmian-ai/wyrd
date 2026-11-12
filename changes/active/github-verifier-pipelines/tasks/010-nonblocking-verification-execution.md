@@ -14,6 +14,14 @@ blocks: [TASK-005, TASK-007, TASK-008, TASK-009, TASK-006-acceptance]
 
 # Execute verification from memory with bounded background persistence
 
+**Remediation amendment:** the maintainer agreed
+[the independent recommendation](../design/task-010-benchmark-remediation.md)
+and requested [TASK-010-R1](010-R1-restore-direct-verification-baseline.md).
+Its direct recording/consumer boundaries and L1-only verification, gateway and
+Bifrost qualification supersede conflicting instructions below. Historical
+implementation/test evidence does not establish acceptance; Task 010 and its
+dependents remain unaccepted until the remediation passes.
+
 ## Outcome, agreement and prerequisite
 
 A direct request and a prepared queued claim use the same verification engine.

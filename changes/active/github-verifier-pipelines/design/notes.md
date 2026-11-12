@@ -1,6 +1,64 @@
 # GitHub Verifier pipelines
 
-Status: finalized (approved revision 7; existing runner lifecycle clarified)
+Status: finalized (remediation agreed; L1-only measurement)
+
+## Benchmark regression remediation
+
+The candidate's recorded verification L1 run is INVALID, with shed Scribe
+writes and severe staging-full refusals. The maintainer requires **no regression
+in verification, gateway or Bifrost benchmarks** against the comparable clean
+resource-scaling baseline, regardless of functionality added by this packet.
+Correctness, evidence retention, latency, throughput, CPU efficiency and memory
+remain acceptance requirements; VALID or exit zero alone does not establish
+performance acceptance. Do not weaken benchmarks or invent a regression allowance.
+
+The maintainer rejected the conversation's proposed repairs and requested a
+fresh independent diagnosis and decision-complete recommendation. The maintainer
+then fixed these remediation constraints:
+
+- PostgreSQL, Scribe and other persistence work must use batching and group
+  commit, rather than one durable operation per record by construction.
+- Direct executions must not carry resumable execution state. Resumability and
+  durable execution state belong to queued verification. Do not substitute a
+  terminal-only direct execution-state snapshot for this decision.
+- Direct and queued verification continue to use the same engine.
+- Direct recording must align with the actual resource-scaling verify path.
+  The maintainer's `VerificationResults` shorthand refers to preserving that
+  existing workflow, not inventing a reduced projection. Inspection of the
+  resource-scaling worktree finds two outbox items projected into
+  `execution_inputs`, `execution_outputs` and compact `results` rows; normal
+  permission audits and gateway captures remain. It has no `RunState`,
+  checkpoint/history publication or SQL execution row. The request reserves
+  two slots and prepares staged rows; Arrow construction, durable delivery and
+  acknowledgement happen in background through destination-batched frames.
+  Source: `resource-scaling` worktree `service.rs::stage_direct`,
+  `results.rs::VerificationResults::build` and `scribe_outbox.rs::frames`.
+  This restores existing recording behavior rather than adding direct custody.
+
+The [independent diagnosis and repair recommendation](task-010-benchmark-remediation.md)
+proposes restoring the actual resource-scaling direct path and destination
+batching, while retaining queued state/recovery and existing group commit.
+It covers direct readers and hosted consumers as well as result production.
+The maintainer agreed this recommendation and requested one remediation task,
+with **L1 measurement only** for verification, gateway and Bifrost. This also
+settles the proposed queued-only publication receipts/history boundary. Current
+direct checkpoint and inspection requirements in revision 7 and
+`architecture/wyrd-design.md` require reconciliation with this explicit amendment
+before affected production changes. The supplement identifies those updates;
+unrelated approved behavior remains unchanged.
+
+Independent research used existing code, contracts, history, benchmark records
+and logs. No production changes or benchmark/load experiments ran. The agreed
+handoff is [TASK-010-R1](../tasks/010-R1-restore-direct-verification-baseline.md).
+It includes authority reconciliation before affected implementation. No new spec
+revision or approval is claimed by these design notes; the task records the
+maintainer's explicit amendment alongside approved revision 7.
+
+The subsequent goal-alignment review tightened observable proof without changing
+the agreed repair: queued-only direct capabilities refuse before any step;
+bounded queued claim-tracking exhaustion still permits direct work while its
+delivery is available; all five L1 experiments measure the same final candidate
+revision. L2 remains excluded. No further material design decision was found.
 
 ## Problem
 

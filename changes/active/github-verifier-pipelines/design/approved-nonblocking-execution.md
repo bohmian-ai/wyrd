@@ -2,6 +2,14 @@
 
 Status: finalized
 
+The maintainer subsequently agreed the
+[benchmark remediation amendment](task-010-benchmark-remediation.md) and requested
+TASK-010-R1, with L1-only qualification across verification, gateway and Bifrost.
+That amendment supersedes this supplement's direct resumable-state/checkpoint
+descriptions and L2 measurement requirement. Queued memory execution, recovery,
+bounded custody and group commit remain required. Read the amendment for the
+agreed direct recording and consumer boundaries.
+
 The maintainer agreed this flow and requested revision of task 010 in the current
 design conversation. The maintainer subsequently explicitly approved spec revision 7 recording
 this design. Contradictory owning architecture still requires reconciliation

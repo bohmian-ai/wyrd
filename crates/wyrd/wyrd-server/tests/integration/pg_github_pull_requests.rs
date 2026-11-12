@@ -27,8 +27,13 @@ const REPOSITORY: u64 = 4242;
 const UNSELECTED: u64 = 4343;
 /// The connected installation.
 const INSTALLATION: u64 = 101;
-/// The Repository binding two queued review Verifiers to pull requests.
-const POLICY: &str = "apiVersion: wyrd/v1\nkind: Repository\nmetadata:\n  name: policy\n  version: 1.0.0\nspec:\n  repository_id: \"4242\"\n  verified_by:\n    - verifier: ./a-review.yaml\n      runs_on: {kind: pull_request}\n    - verifier: ./z-review.yaml\n      runs_on: {kind: pull_request}\n";
+/// The Repository binding two queued review Verifiers to pull requests:
+/// `a-review` through an inline Trigger, `z-review` through the referenced
+/// [`ON_PULL_REQUEST`] Trigger Card.
+const POLICY: &str = "apiVersion: wyrd/v1\nkind: Repository\nmetadata:\n  name: policy\n  version: 1.0.0\nspec:\n  repository_id: \"4242\"\n  verified_by:\n    - verifier: ./a-review.yaml\n      runs_on: {kind: pull_request}\n    - verifier: ./z-review.yaml\n      runs_on: ./on-pull-request.yaml\n";
+
+/// A referenced `pull_request` Trigger Card.
+const ON_PULL_REQUEST: &str = "apiVersion: wyrd/v1\nkind: Trigger\nmetadata:\n  name: on-pull-request\n  version: 1.0.0\nspec:\n  description: Every ready pull request.\n  kind: pull_request\n";
 
 /// [`POLICY`] re-declared binding only `a-review`.
 const POLICY_V2: &str = "apiVersion: wyrd/v1\nkind: Repository\nmetadata:\n  name: policy\n  version: 1.0.1\nspec:\n  repository_id: \"4242\"\n  verified_by:\n    - verifier: ./a-review.yaml\n      runs_on: {kind: pull_request}\n";
@@ -144,6 +149,7 @@ impl Deployment {
         for (name, contents) in [
             ("a-review.yaml", review_verifier("a-review")),
             ("z-review.yaml", review_verifier("z-review")),
+            ("on-pull-request.yaml", ON_PULL_REQUEST.to_owned()),
             ("policy.yaml", policy.to_owned()),
         ] {
             std::fs::write(dir.path().join(name), contents).expect("card file writes");
@@ -203,6 +209,29 @@ impl Deployment {
                FROM wyrd.verifier_executions
               WHERE origin = 'pull_request' AND (pull_request->>'number')::bigint = $1
               ORDER BY pr_observed_at, binding_id",
+        )
+        .bind(i64::try_from(number).expect("small"))
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .expect("executions read");
+        conn.commit().await.expect("read commits");
+        rows
+    }
+
+    /// The frozen Verifier name and version and the admitting Repository
+    /// version of every execution of PR `number`, in [`Self::rows`] order.
+    ///
+    /// # Panics
+    /// Panics when the read fails.
+    async fn frozen(&self, number: u64) -> Vec<(String, String, String)> {
+        let mut conn = self.conn().await;
+        let rows = sqlx::query_as(
+            "SELECT v.name, v.version, o.version
+               FROM wyrd.verifier_executions e
+               JOIN wyrd.cards v ON v.card_uid = e.verifier_card_uid
+               JOIN wyrd.cards o ON o.card_uid = e.owner_card_uid
+              WHERE e.origin = 'pull_request' AND (e.pull_request->>'number')::bigint = $1
+              ORDER BY e.pr_observed_at, e.binding_id",
         )
         .bind(i64::try_from(number).expect("small"))
         .fetch_all(&mut **conn.transaction())
@@ -327,19 +356,55 @@ async fn pull_request_lifecycle_admits_supersedes_and_ends_through_the_webhook()
     );
     assert!(a.iter().all(|row| !row.reserved));
     let served = deployment.status(a[0].execution_id).await;
-    assert_eq!(served["pull_request"]["head"]["sha"], "a1");
-    assert_eq!(served["pull_request"]["base"]["ref"], "main");
-    assert_eq!(served["pull_request"]["repository_id"], "4242");
-    assert_eq!(served["pull_request"]["number"], 7);
-    assert_eq!(served["pull_request"]["delivery_id"], opened.as_str());
-
-    mock.lose_answer(&opened);
-    let asked = GithubConnections::new(deployment.server.state())
-        .recover_deliveries()
-        .await
-        .expect("the delivery log reads");
     assert_eq!(
-        asked, 1,
+        served["pull_request"],
+        json!({
+            "host": mock.host(),
+            "repository_id": "4242",
+            "number": 7,
+            "base": {"ref": "main", "sha": "b1"},
+            "head": {"ref": "feature", "sha": "a1"},
+            "head_repository_id": "4242",
+            "delivery_id": opened,
+            "generation": served["pull_request"]["generation"],
+        }),
+        "the execution is pinned to GitHub's current source"
+    );
+    let text = served.to_string();
+    for secret in mock.secrets() {
+        assert!(!text.contains(&secret), "a credential is never served");
+    }
+    assert_eq!(
+        deployment.frozen(7).await,
+        [
+            ("a-review".into(), "1.0.0".into(), "1.0.0".into()),
+            ("z-review".into(), "1.0.0".into(), "1.0.0".into()),
+        ],
+        "inline and referenced pull_request Triggers each bind one Verifier"
+    );
+
+    let title = json!({
+        "action": "edited",
+        "number": 7,
+        "changes": {"title": {"from": "old"}},
+        "repository": {"id": REPOSITORY},
+        "installation": {"id": INSTALLATION},
+    });
+    let (status, other) = mock
+        .deliver_new(deployment.base(), "pull_request", &title)
+        .await
+        .expect("delivery sends");
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let recover = || async {
+        GithubConnections::new(deployment.server.state())
+            .recover_deliveries()
+            .await
+            .expect("the delivery log reads")
+    };
+    mock.lose_answer(&opened);
+    assert_eq!(
+        recover().await,
+        1,
         "only the delivery without a 2xx answer is redelivered"
     );
     assert_eq!(
@@ -348,12 +413,24 @@ async fn pull_request_lifecycle_admits_supersedes_and_ends_through_the_webhook()
         "the recovered redelivery is answered"
     );
     assert_eq!(
-        GithubConnections::new(deployment.server.state())
-            .recover_deliveries()
-            .await
-            .expect("the delivery log reads"),
+        recover().await,
         0,
-        "a recovered delivery is not redelivered again"
+        "an answered delivery is not redelivered"
+    );
+    for _ in 0..2 {
+        mock.lose_answer(&opened);
+        assert_eq!(recover().await, 1);
+    }
+    mock.lose_answer(&opened);
+    assert_eq!(
+        recover().await,
+        0,
+        "recovery stops after three redeliveries"
+    );
+    assert_eq!(
+        mock.delivery_attempts(&other),
+        [(202, false)],
+        "an answered delivery is never redelivered"
     );
     assert_eq!(
         mock.redeliver(&opened).await.expect("redelivers"),
@@ -593,10 +670,12 @@ async fn burst_of_forty_one_pull_requests_admits_each_binding_once() {
     assert_eq!(served["pull_request"]["repository_id"], "4242");
 }
 
-/// A delivery interrupted after its generation was reserved, with its input
-/// handoff still unacknowledged, is answered with no 2xx; after a restart,
-/// failed-delivery recovery redelivers it and completes the same frozen
-/// fanout under the same execution IDs, never a second generation.
+/// A delivery interrupted after its generation was reserved, with one
+/// binding already due and the rest of its handoff unacknowledged, is
+/// answered with no 2xx; after a restart, failed-delivery recovery
+/// redelivers it and completes the same frozen fanout under the same
+/// execution IDs, never a second generation or a second run of the due
+/// binding.
 ///
 /// # Panics
 /// Panics when the interrupted delivery is acknowledged, or recovery admits
@@ -631,6 +710,16 @@ async fn interrupted_handoff_completes_the_same_fanout_after_restart() {
         2,
         "the generation is frozen before the handoff"
     );
+    let mut conn = deployment.conn().await;
+    let partial = VerifierExecutionQueue::default()
+        .activate_pull_requests(
+            &mut conn,
+            &[wyrd_spec::ids::ExecutionId::new(reserved[0].execution_id).expect("a v7 id")],
+        )
+        .await
+        .expect("activation runs");
+    conn.commit().await.expect("activation commits");
+    assert_eq!(partial.len(), 1, "one binding of the fanout is already due");
     let restarted = Box::pin(
         deployment
             .server
@@ -713,8 +802,8 @@ async fn revoked_accountable_principal_settles_a_durable_refusal() {
     let rows = deployment.rows(3).await;
     assert_eq!(rows.len(), 2);
     assert!(
-        rows.iter()
-            .all(|row| row.status == "errored" && row.code.is_some()),
+        rows.iter().all(|row| row.status == "errored"
+            && row.code.as_deref() == Some("WYRD_AUTH_401_CREDENTIAL_REVOKED")),
         "{rows:?}"
     );
     let queue = VerifierExecutionQueue::default();
@@ -848,6 +937,40 @@ async fn policy_reselection_affects_only_later_admissions() {
         [("pending", None, "b2")],
         "the new generation uses the new policy's one binding"
     );
+    assert_eq!(
+        deployment.frozen(5).await,
+        [
+            ("a-review".into(), "1.0.0".into(), "1.0.0".into()),
+            ("z-review".into(), "1.0.0".into(), "1.0.0".into()),
+            ("a-review".into(), "1.0.0".into(), "1.0.1".into()),
+        ],
+        "each generation freezes the policy selected when it was admitted"
+    );
+
+    mock.edit_pull_request(REPOSITORY, 5, |pr| pr.base_ref = "release".to_owned());
+    let retargeted = json!({
+        "action": "edited",
+        "number": 5,
+        "changes": {"base": {"ref": {"from": "main"}}},
+        "repository": {"id": REPOSITORY},
+        "installation": {"id": INSTALLATION},
+    });
+    let (status, _) = mock
+        .deliver_new(deployment.base(), "pull_request", &retargeted)
+        .await
+        .expect("delivery sends");
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let rows = deployment.rows(5).await;
+    assert_eq!(
+        summary(&rows[2..]),
+        [
+            ("cancelled", Some("pull_request_superseded"), "b2"),
+            ("pending", None, "b2"),
+        ],
+        "a base branch change at the same head is a new generation"
+    );
+    let served = deployment.status(rows[3].execution_id).await;
+    assert_eq!(served["pull_request"]["base"]["ref"], "release");
 }
 
 /// Installation suspension and disconnect cancel unfinished PR work with
@@ -878,6 +1001,19 @@ async fn suspension_disconnect_and_ineligible_pull_requests_owe_no_work() {
     assert!(
         deployment.rows(13).await.is_empty(),
         "an unselected repository admits nothing"
+    );
+
+    mock.add_installation(999, &[(5151, "elsewhere/repo")]);
+    mock.set_pull_request(5151, 15, PullRequest::open(5151, "b1", "e1"));
+    let payload = mock.pull_request_event(999, 5151, 15, "opened");
+    let (status, _) = mock
+        .deliver_new(deployment.base(), "pull_request", &payload)
+        .await
+        .expect("delivery sends");
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert!(
+        deployment.rows(15).await.is_empty(),
+        "an installation no tenant connected admits nothing"
     );
 
     mock.set_pull_request(REPOSITORY, 14, PullRequest::open(REPOSITORY, "b1", "s1"));
@@ -945,6 +1081,34 @@ async fn suspension_disconnect_and_ineligible_pull_requests_owe_no_work() {
         [
             ("cancelled", Some("repository_access_lost"), "b2"),
             ("cancelled", Some("repository_access_lost"), "b2"),
+        ]
+    );
+}
+
+/// Uninstalling the App cancels the connected tenant's unfinished PR work
+/// with `repository_access_lost`.
+///
+/// # Panics
+/// Panics when the uninstall leaves PR work due.
+#[tokio::test(flavor = "multi_thread")]
+async fn uninstalling_the_app_cancels_unfinished_pull_request_work() {
+    let deployment = Deployment::start().await;
+    deployment
+        .mock
+        .set_pull_request(REPOSITORY, 16, PullRequest::open(REPOSITORY, "b1", "a1"));
+    assert_eq!(deployment.send(16, "opened").await.0, StatusCode::ACCEPTED);
+    let deleted = json!({"action": "deleted", "installation": {"id": INSTALLATION}});
+    let status = deployment
+        .mock
+        .deliver(deployment.base(), "installation", &deleted)
+        .await
+        .expect("delivery sends");
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(
+        summary(&deployment.rows(16).await),
+        [
+            ("cancelled", Some("repository_access_lost"), "a1"),
+            ("cancelled", Some("repository_access_lost"), "a1"),
         ]
     );
 }

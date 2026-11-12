@@ -1,6 +1,6 @@
 ---
 title: Repositories
-description: Declare a connected GitHub repository's review policy from wyrd.toml, check it offline, and roll it back or empty it.
+description: Declare a connected GitHub repository's review policy from wyrd.toml, check it offline, watch its pull requests run, and roll it back or empty it.
 pillar: wyrd
 section: Build and verify
 topic: Declare
@@ -67,6 +67,33 @@ Pass the remote with `wyrd declare wyrd.toml --repository https://github.com/acm
 
 </Aside>
 
+## 5. Watch a pull request run
+
+Open a pull request on the repository. When GitHub delivers the event, Wyrd queues one execution per binding of the selected policy. Find the newest one from the binding the Repository lists under `status.verification.binding_ids`:
+
+```bash
+wyrd execution status --execution-id <execution_id>
+```
+
+Its `pull_request` field shows what the execution was pinned to when GitHub's delivery was accepted: the pull request `number`, the `base` and `head` branch and exact commit, the head repository (it differs for a fork), and the `delivery_id` that admitted it. The policy is always the repository's selected version at that moment, never `wyrd.toml` from the pull request's own branch.
+
+Opening, reopening, marking ready for review, pushing commits and changing the base branch queue a new run. Draft pull requests and title or description edits queue nothing. When a newer run replaces an unfinished one, the older one ends `cancelled` with one of these error codes and keeps its pins:
+
+| Code | Why |
+| --- | --- |
+| `pull_request_superseded` | A newer head or base was pushed |
+| `pull_request_closed` | The pull request was closed or merged |
+| `pull_request_draft` | The pull request was converted to a draft |
+| `repository_access_lost` | The repository was removed from the installation, the installation was suspended, or the tenant disconnected GitHub |
+
+Declaring a new policy changes only runs queued afterwards; runs already queued keep the policy they started with. Runs act as the principal that declared the selected policy: if it can no longer run Verifiers, each run ends `errored` with the permission refusal and nothing executes.
+
+<Aside type="note" title="When GitHub reports a failed delivery">
+
+Wyrd answers GitHub only after the run is durably queued, so an interrupted delivery shows as failed in the App's delivery log. The server checks that log every minute and asks GitHub to redeliver each failed delivery, up to three times. A redelivery reuses the run queued for the original delivery, so nothing runs twice. You can also select **Redeliver** on the delivery in the App's settings.
+
+</Aside>
+
 ## If it fails
 
 | You see | Fix |
@@ -75,6 +102,7 @@ Pass the remote with `wyrd declare wyrd.toml --repository https://github.com/acm
 | `WYRD_REGISTRY_409_REPOSITORY_IDENTITY_CONFLICT` | The repository is already declared under another name: remove `name` from `[repository.metadata]` |
 | `WYRD_REGISTRY_409_SPEC_DRIFT` | A pinned `version` already holds other content: pin the content it holds, or remove `version` |
 | `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` | Declare the referenced Verifier first, or list its file path instead |
+| A pull request queues no run | Mark it ready for review if it is a draft, and check that the repository is still selected for the installation |
 
 ## Next
 

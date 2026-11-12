@@ -282,6 +282,20 @@ writer, archive handoff, replica protocol or object-publication/Iceberg wait.
 The WAL guarantee requires retained Scribe storage; permanent loss of unpublished
 WAL remains outside automatic recovery. Recovery may wait for its owner/volume.
 
+Pull-request activation answers GitHub's webhook only after the generation's
+executions are committed due, or after obsolete or refusal settlement commits.
+A crash after reservation, an ambiguous Scribe ACK or a failed queue commit
+leaves the reserved rows not yet due and the delivery unanswered or non-2xx.
+GitHub never redelivers on its own, so every replica scans the App delivery
+log each minute and requests a redelivery for each delivery without a 2xx
+attempt, at most three per delivery. The redelivery re-stages the reserved
+rows with their stored pins and identical Scribe batch identity and makes
+them due; it never resamples policy, so no binding runs twice. After the
+bound is exhausted, an operator redelivers from the App's delivery log, or the
+next pull-request event admits the current source. Disconnect, suspension and
+repository removal cancel the affected unfinished executions with
+`repository_access_lost` in the access change's own transaction.
+
 Existing File completion, session recovery, integrity, inventory acknowledgement
 and evidence retention retain their owners. Accepted descriptors stay with run
 state from acceptance onward; there is no PostgreSQL-to-Bifrost root transfer or

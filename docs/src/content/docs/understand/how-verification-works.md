@@ -52,7 +52,7 @@ Files are mounted unchanged and unparsed. `fs.read` and `fs.search` serve raw te
 
 ## Bindings
 
-A binding attaches a Verifier to what it checks, under `verified_by`. It can sit on a Service, on one of its components (an Agent, Model, Data, Prompt, or any other Card the Service uses), or on a standalone Agent. `support-reply` binds `no-refund-promise` to the whole Service. A binding can also name a Trigger in `runs_on`, so the server runs it on a schedule, and Operators in `on_failure`.
+A binding attaches a Verifier to what it checks, under `verified_by`. It can sit on a Service, on one of its components (an Agent, Model, Data, Prompt, or any other Card the Service uses), or on a standalone Agent. `support-reply` binds `no-refund-promise` to the whole Service. A binding can also name a Trigger in `runs_on`, so the server runs it on a schedule, and Operators in `on_failure`. On a [Repository](/build-and-verify/declare/declare-a-repository/), the `pull_request` Trigger queues one execution per binding for each new head or base of a ready pull request. Each execution is pinned to that source and to the policy selected when GitHub's delivery was accepted, and a newer source cancels the older one's unfinished work.
 
 ## verify and submit
 

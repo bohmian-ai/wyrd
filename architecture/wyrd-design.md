@@ -2222,7 +2222,36 @@ flushes it before its dependencies close. A hard kill loses
 only unwritten requests, and every loss the process observes is counted and
 logged.
 
-External pushes are deliberately not an activation.
+For `pull_request`, the server admits from a signature-verified GitHub
+`pull_request` delivery for a connected, selected repository. Opened,
+reopened, ready-for-review, synchronize and base-changing edits are observed;
+other edits, and every event while the pull request is a draft, are not. The
+server takes a PostgreSQL observation time, then reads the pull request's
+current state from GitHub; the delivered payload never decides the source.
+Under a per-pull-request lock, an observation older than the newest accepted
+one or the last deactivation is obsolete and owes no work. Otherwise the
+current base ref, head commit and head repository identify a generation, and
+the selected Repository version's `pull_request` bindings, its declaring
+principal and the Verifier and Trigger versions are frozen into one reserved
+execution per binding before any hand-off. A newer generation cancels every
+unfinished execution of the older one with `pull_request_superseded` and
+fences its running leases; close, draft conversion and loss of repository
+access cancel with `pull_request_closed`, `pull_request_draft` and
+`repository_access_lost`. Settled history keeps its pins, and a policy
+re-declaration affects only later generations.
+
+The reserved executions then follow the same Scribe hand-off and outbox as
+`submit`, keyed by execution so a replay stages identical rows, and become
+due only when the outbox commits them. A delivery is answered 2xx only after
+every execution of its generation is due, or after durable obsolete or
+refusal settlement establishes that no work is owed; a refusal settles as an
+`errored` execution, and an unavailable authority store answers non-2xx. A
+redelivery of an accepted generation re-stages the stored pins, never a newer
+policy. GitHub does not redeliver failed deliveries on its own, so the GitHub
+owner scans the App's delivery log and asks GitHub to redeliver each delivery
+without a 2xx attempt, a bounded number of times.
+
+Other external pushes are deliberately not an activation.
 
 ### Operator
 A failure reaction. Performs exactly one action — a typed notification or a

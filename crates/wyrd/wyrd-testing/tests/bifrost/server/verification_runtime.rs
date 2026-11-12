@@ -3178,7 +3178,8 @@ async fn await_queued(
     }
 }
 
-/// Role a delegated enqueue needs from both its subject and actor.
+/// Role a delegated enqueue and its execution view need from both its
+/// subject and actor.
 const QUEUED_RUNNER: &str = "queued_runner";
 
 /// Role only the subject holds, so a delegated execution's accepted
@@ -3213,7 +3214,11 @@ async fn queued_subject_authority_survives_restart() -> Result<(), ServerJourney
     server
         .seed_role(
             QUEUED_RUNNER,
-            &[Permission::card_read(), Permission::verifier_run_any()],
+            &[
+                Permission::card_read(),
+                Permission::verifier_run_any(),
+                Permission::verifier_read_any(),
+            ],
         )
         .await?;
     server

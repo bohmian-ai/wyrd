@@ -2078,8 +2078,10 @@ current caller grants and recorded immutable identities, without requiring sourc
 retrieval or leftover queue rows. The server reads accepted/recovered execution
 state and exact references; clients
 do not choose a backend. Ordinary registry/principal control-plane reads retain
-their owners. Existing shared upload/session machinery is reused for publications,
-with accepted descriptor custody in the run state from acceptance onward.
+their owners. A publication file is stored by the storage owner's validated
+server-side put, which opens no upload session; its object-inventory fact is
+recorded in background, and accepted descriptor custody is in the run state from
+acceptance onward. External File uploads keep their upload-session contract.
 
 Every work record names who the work was for (`sub_principal_id`) and who
 performed it (`act_principal_id`). A direct caller A records A/A and a

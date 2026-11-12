@@ -8,8 +8,9 @@
 //! creates no File. A call that already committed recovers its stored
 //! receipt before touching scratch or storage.
 //! Otherwise content is frozen under the workspace's writer lock, each file
-//! completed as an ordinary verification File through the shared storage
-//! lifecycle, and only then named by a manifest accepted into the
+//! stored as a verification File by the storage owner's validated
+//! server-side put, its inventory fact recorded in the background, and only
+//! then named by a manifest accepted into the
 //! execution's [`RunState`] with each file's completed descriptor, charged
 //! to the execution's cumulative publication budget, so a publication is
 //! never visible with partial content, a writer that lost the state accepts
@@ -21,14 +22,14 @@ use std::sync::Arc;
 use serde_json::Value;
 use skald_tool::ToolError;
 use wyrd_spec::auth::Sha256Hex;
-use wyrd_spec::error::{WyrdError, storage::WyrdStorageError};
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::storage::StoredObjectRef;
 use wyrd_spec::verification::PublicationName;
 use wyrd_spec::verification::execution::{
     Producer, Publication, PublicationContent, PublicationFile, PublicationKind,
     PublicationManifest,
 };
-use wyrd_storage::service::{StorageCaller, file_upload_init, reconcile_upload};
+use wyrd_storage::service::{StorageCaller, put_file};
 use wyrd_storage::tenant_path;
 
 use super::HostedLimits;
@@ -195,51 +196,40 @@ impl<'a> Publications<'a> {
         self.accept(call, &arguments, content, &objects)
     }
 
-    /// Complete `bytes`, whose digest is `sha256`, as one verification File
-    /// through the shared storage lifecycle, record it in the object
-    /// inventory, and return the verified descriptor completion produced.
+    /// Store `bytes`, whose digest is `sha256`, as one verification File
+    /// through the storage owner's validated server-side put, record it in
+    /// the object inventory in the background, and return its verified
+    /// descriptor.
+    ///
+    /// The inventory write never gates the publication: a failure is logged
+    /// and the File's descriptor still names its bytes.
     ///
     /// # Errors
-    /// Returns the storage, verification, or inventory failure.
+    /// Returns the storage failure or an inventory fact that cannot be built.
     async fn complete(
         &self,
         sha256: Sha256Hex,
         bytes: Vec<u8>,
     ) -> Result<StoredObjectRef, WyrdError> {
-        let storage = StorageCaller {
+        let caller = StorageCaller {
             data_tenant_id: self.caller.data_tenant_id,
         };
-        let postgres = self.state.postgres.wyrd();
-        let init = file_upload_init(
-            &self.state.storage,
-            postgres,
-            &storage,
-            &sha256,
-            bytes.len() as u64,
-        )
-        .await?;
-        let path = tenant_path::evidence(self.caller.data_tenant_id, &sha256, &init.upload_id);
-        self.state
-            .storage
-            .put_object(&path, bytes)
-            .await
-            .map_err(|error| WyrdError::from(WyrdStorageError::from(error)))?;
-        let completed = reconcile_upload(
-            &self.state.storage,
-            postgres,
-            &storage,
-            init.upload_id.clone(),
-        )
-        .await?;
-        let fact = completed_file(self.state, &init.upload_id, &completed.stored)?;
-        ObjectInventory::new(self.state)
-            .record(
-                self.caller.data_tenant_id,
-                self.caller.attribution(),
-                &[fact],
-            )
-            .await?;
-        Ok(completed.stored)
+        let file = put_file(&self.state.storage, &caller, &sha256, bytes).await?;
+        let fact = completed_file(self.state, &file.upload_id, &file.stored)?;
+        let (state, tenant, attribution) = (
+            self.state.clone(),
+            self.caller.data_tenant_id,
+            self.caller.attribution(),
+        );
+        tokio::spawn(async move {
+            if let Err(error) = ObjectInventory::new(&state)
+                .record(tenant, attribution, &[fact])
+                .await
+            {
+                tracing::warn!(%error, "a publication file's inventory fact was not recorded");
+            }
+        });
+        Ok(file.stored)
     }
 
     /// The receipt `call` already holds, when it holds one: the accepted

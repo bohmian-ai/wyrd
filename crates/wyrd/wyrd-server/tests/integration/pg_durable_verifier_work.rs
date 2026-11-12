@@ -338,6 +338,35 @@ impl Leased {
         Ok(run)
     }
 
+    /// The bytes of the File `content` retained for `caller`, read by digest
+    /// once its background inventory fact has published.
+    ///
+    /// # Panics
+    /// Panics when the File does not read within thirty seconds.
+    async fn retained(&self, caller: &Caller, limits: HostedLimits, content: &[u8]) -> Vec<u8> {
+        let file = InputDeclaration::File {
+            sha256: wyrd_spec::auth::Sha256Hex::digest(content),
+            size_bytes: content.len() as u64,
+            format: MediaFormat::Markdown,
+            filename: None,
+        };
+        let evidence = TenantEvidence::new(self.server.state().clone(), caller.clone(), limits);
+        let read = async {
+            loop {
+                self.server
+                    .flush_bifrost()
+                    .await
+                    .expect("the File inventory publishes");
+                if let Ok((bytes, _)) = evidence.read(&file).await {
+                    return bytes;
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(30), read)
+            .await
+            .expect("the retained File reads")
+    }
+
     /// Wait until every writer's background persistence settles: an
     /// accepted revision holds its every change, or it stopped.
     ///
@@ -509,21 +538,11 @@ async fn file_and_json_publications_are_immutable() {
         Some(PublicationContent::Json { value: Value::Null }),
         "an explicit null is a value, not an absence"
     );
-    leased
-        .server
-        .flush_bifrost()
-        .await
-        .expect("the File inventory publishes");
-    let (bytes, _) = TenantEvidence::new(leased.server.state().clone(), caller.clone(), limits)
-        .read(&InputDeclaration::File {
-            sha256,
-            size_bytes: report.len() as u64,
-            format: MediaFormat::Markdown,
-            filename: None,
-        })
-        .await
-        .expect("the retained File reads");
-    assert_eq!(bytes, report.as_bytes(), "scratch writes never reach it");
+    assert_eq!(
+        leased.retained(&caller, limits, report.as_bytes()).await,
+        report.as_bytes(),
+        "scratch writes never reach it"
+    );
 
     let file = publications
         .path(&call("c4", &producer, "big"), &workspace, "/work/big.bin")
@@ -538,6 +557,63 @@ async fn file_and_json_publications_are_immutable() {
         leased.settled().await;
         assert_eq!(leased.read(&producer, refused).await, None);
     }
+    leased
+        .server
+        .shutdown()
+        .await
+        .expect("test server shuts down");
+}
+
+/// A server-produced publication file is stored by the server's own
+/// validated put: it opens no external upload session, and once its
+/// background inventory fact publishes, the retained File reads exactly.
+///
+/// # Panics
+/// Panics when the publication is refused, an upload session row exists,
+/// or the retained File does not read back.
+#[tokio::test(flavor = "multi_thread")]
+async fn server_produced_files_open_no_upload_session() {
+    let leased = Leased::start().await;
+    let limits = HostedLimits::default();
+    let caller = leased.publisher([]);
+    let workspace = Arc::new(Workspace::materialize(Vec::new(), limits, None).expect("workspace"));
+    let report = "server produced\n";
+    put(&workspace, "report.md", report.as_bytes());
+    let publications = Publications::new(leased.server.state(), &caller, &leased.run, limits);
+    let producer = Producer {
+        step_id: TaskId::new("review").expect("task"),
+        item_index: None,
+        iteration_index: None,
+        attempt: 1,
+    };
+
+    publications
+        .path(
+            &call("c1", &producer, "report"),
+            &workspace,
+            "/work/report.md",
+        )
+        .await
+        .expect("the file publishes");
+
+    let mut conn = leased
+        .server
+        .tenant_conn_for(leased.server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let sessions: i64 = sqlx::query_scalar("SELECT count(*) FROM wyrd.storage_multipart_uploads")
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("upload sessions count");
+    conn.commit().await.expect("read commits");
+    assert_eq!(
+        sessions, 0,
+        "a server-produced file opens no upload session"
+    );
+    assert_eq!(
+        leased.retained(&caller, limits, report.as_bytes()).await,
+        report.as_bytes()
+    );
     leased
         .server
         .shutdown()

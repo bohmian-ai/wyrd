@@ -660,6 +660,74 @@ async fn finish_upload(
     })
 }
 
+/// A File the server itself produced, stored by [`put_file`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredFile {
+    /// The identity naming the File's evidence location, which its
+    /// inventory fact records.
+    pub upload_id: UploadId,
+    /// The stored object's verified descriptor.
+    pub stored: StoredObjectRef,
+}
+
+/// Store `bytes`, a File the server itself produced whose digest is
+/// `sha256`, at a fresh tenant evidence location, and verify it as a
+/// completed upload is verified.
+///
+/// The server already holds the bytes, so no upload session exists: the
+/// size limit, tenant evidence path, backend write, and head verification
+/// of [`file_upload_init`] and [`reconcile_upload`] run without their
+/// session SQL. Recording the File in the object inventory is the caller's.
+///
+/// # Errors
+/// Returns the size-limit refusal, the backend write or head failure, and
+/// the size or encryption refusal of a stored object that does not verify.
+#[instrument(skip(storage, caller, bytes), fields(tenant = %caller.data_tenant_id, %sha256, len = bytes.len()))]
+pub async fn put_file(
+    storage: &StorageHandle,
+    caller: &StorageCaller,
+    sha256: &wyrd_spec::auth::Sha256Hex,
+    bytes: Vec<u8>,
+) -> Result<StoredFile, WyrdError> {
+    let expected = bytes.len() as u64;
+    plan_upload(
+        expected,
+        storage.backend(),
+        storage.multipart_threshold_bytes(),
+    )
+    .map_err(|_| {
+        map_storage_error(StorageError::ArtifactTooLarge {
+            actual: expected,
+            limit: MAX_OBJECT_SIZE_BYTES,
+        })
+    })?;
+    let upload_id = UploadId::new();
+    let validated = tenant_path::evidence(caller.data_tenant_id, sha256, &upload_id);
+    storage
+        .put_object(&validated, bytes)
+        .await
+        .map_err(map_storage_error)?;
+    let head = storage
+        .signer()
+        .head_for_verification(&validated)
+        .await
+        .map_err(map_storage_error)?;
+    if let Some((error, _)) = head_refusal(storage, expected, &head) {
+        return Err(map_storage_error(error));
+    }
+    Ok(StoredFile {
+        upload_id,
+        stored: StoredObjectRef {
+            storage_path: validated.full,
+            size_bytes: head.size_bytes,
+            sha256: base64::engine::general_purpose::STANDARD.encode(sha256.as_bytes()),
+            content_type: head.content_type,
+            sse_marker: head.sse_marker,
+            created_at: chrono::Utc::now(),
+        },
+    })
+}
+
 /// Abort an in-flight upload; an already terminal upload answers
 /// `aborted: false`.
 ///
@@ -1560,48 +1628,47 @@ async fn verify_object_head(
             serde_json::json!({ "upload_id": upload_uuid, "expected_size_bytes": row.expected_size_bytes }),
         )
     })?;
+    let Some((error, reason)) = head_refusal(state.storage, expected, head) else {
+        return Ok(());
+    };
+    let error = map_storage_error(error);
+    let error_code = error.code().to_owned();
+    let status_code = i32::from(error.status());
+    mark_failed(
+        state,
+        caller,
+        upload_uuid,
+        validated,
+        row.backend,
+        FailureContext {
+            reason,
+            status_code,
+            error_code: Some(&error_code),
+        },
+    )
+    .await?;
+    Err(error)
+}
+
+/// The refusal a stored object's `head` earns, with the failure reason an
+/// upload session records for it: a size other than `expected`, or no
+/// encryption marker when `storage` requires one.
+fn head_refusal(
+    storage: &StorageHandle,
+    expected: u64,
+    head: &HeadInfo,
+) -> Option<(StorageError, &'static str)> {
     if head.size_bytes != expected {
-        let error = map_storage_error(StorageError::SizeMismatch {
-            expected,
-            actual: head.size_bytes,
-        });
-        let error_code = error.code().to_owned();
-        let status_code = i32::from(error.status());
-        mark_failed(
-            state,
-            caller,
-            upload_uuid,
-            validated,
-            row.backend,
-            FailureContext {
-                reason: "size_mismatch",
-                status_code,
-                error_code: Some(&error_code),
+        return Some((
+            StorageError::SizeMismatch {
+                expected,
+                actual: head.size_bytes,
             },
-        )
-        .await?;
-        return Err(error);
+            "size_mismatch",
+        ));
     }
-    if state.storage.require_encryption() && head.sse_marker.is_none() {
-        let error = map_storage_error(StorageError::EncryptionMissing);
-        let error_code = error.code().to_owned();
-        let status_code = i32::from(error.status());
-        mark_failed(
-            state,
-            caller,
-            upload_uuid,
-            validated,
-            row.backend,
-            FailureContext {
-                reason: "encryption_missing",
-                status_code,
-                error_code: Some(&error_code),
-            },
-        )
-        .await?;
-        return Err(error);
-    }
-    Ok(())
+    (storage.require_encryption() && head.sse_marker.is_none())
+        .then_some((StorageError::EncryptionMissing, "encryption_missing"))
 }
 
 async fn mark_failed(

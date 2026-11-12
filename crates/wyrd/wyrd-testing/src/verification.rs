@@ -676,7 +676,9 @@ impl VerificationFixture {
     /// Claim the tenant's next due execution as a worker would, begin
     /// attempt 1 of each named step in first-use order in its Bifrost state,
     /// and accept each `(step, name, content)` through the hosted publication
-    /// backend of `state`, leaving the execution leased and unfinished.
+    /// backend of `state`, leaving the execution leased and unfinished. It
+    /// returns once an accepted revision holds every publication, so readers
+    /// of the accepted state see them.
     ///
     /// Only for a server running no verification runtime, which would race
     /// for the claim.
@@ -684,7 +686,8 @@ impl VerificationFixture {
     /// # Errors
     /// Returns [`VerificationFixtureError::NotEnqueued`] when nothing is
     /// claimable, [`VerificationFixtureError::Card`] when a name, workspace
-    /// write, or publication is refused, or a connection or statement error.
+    /// write, or publication is refused or never persists, or a connection
+    /// or statement error.
     pub async fn publish(
         &self,
         state: &AppState,
@@ -759,6 +762,7 @@ impl VerificationFixture {
                 .await
                 .map_err(|e| refused(&e))?;
         }
+        run.persisted().await.map_err(|e| refused(&e))?;
         Ok(claimed.lease.execution_id)
     }
 

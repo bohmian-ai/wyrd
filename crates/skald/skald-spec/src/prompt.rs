@@ -37,9 +37,10 @@ pub struct Prompt {
     pub request: ProviderRequest,
     /// Provider model identifier.
     pub model: String,
-    /// Text placeholder names `render` requires, derived from the request.
+    /// Text placeholder names `render` requires: those the request was
+    /// constructed with or a content edit authored, less those bound since.
     pub variables: Vec<String>,
-    /// Media placeholder names `bind_media` fills, derived from the request.
+    /// Media placeholder names `bind_media` fills, declared like `variables`.
     pub media_variables: Vec<String>,
     /// Expected response shape, derived from the request's output field.
     pub response_type: ResponseType,
@@ -51,7 +52,7 @@ pub struct Prompt {
     /// The authored form this Prompt was compiled from, when it still
     /// describes the request; absent after construction from a request or a
     /// binding, when the native form is derived from the request instead.
-    pub(crate) authored: Option<Box<AuthoredPrompt>>,
+    pub(crate) authored: Option<Box<Authored>>,
     /// Media kind each portable `${media:name}` binding requires, derived
     /// from its image or document block at compile time. Native placeholders
     /// carry no kind and are absent; the list survives text and media binds.
@@ -59,6 +60,59 @@ pub struct Prompt {
     /// The host-named response format this Prompt was authored with; it
     /// survives binds so an unresolved name keeps refusing to render.
     pub(crate) named_format: Option<NamedFormat>,
+    /// The `variables` the replaceable system slot still declares: Responses
+    /// `instructions`, Anthropic `system`, or GenerateContent
+    /// `system_instruction`. Replacing that slot replaces these alone.
+    pub(crate) system_variables: Vec<String>,
+    /// The `variables` the rest of the request still declares, including
+    /// `OpenAI` Chat system messages, which a system edit never replaces.
+    pub(crate) body_variables: Vec<String>,
+}
+
+/// The authored form a Prompt was compiled from and a fingerprint of the
+/// request it compiled to, which lets [`Prompt::authored`] see that the
+/// public fields are unchanged without compiling the form again.
+#[derive(Debug, Clone)]
+pub(crate) struct Authored {
+    /// The authored form.
+    pub(crate) form: AuthoredPrompt,
+    /// [`request_fingerprint`] of the compiled request.
+    pub(crate) request: u64,
+}
+
+/// A hash of `request`'s serialization, streamed without buffering it.
+///
+/// Equal fingerprints stand for an unchanged request; a request that
+/// serializes differently, even one equal to it, hashes differently.
+pub(crate) fn request_fingerprint(request: &ProviderRequest) -> u64 {
+    use std::hash::Hasher;
+    /// Feeds written bytes to the hasher.
+    struct Sink(
+        /// The hasher the serialized request streams into.
+        std::hash::DefaultHasher,
+    );
+    impl std::io::Write for Sink {
+        /// Feeds `bytes` to the hasher and accepts all of them.
+        ///
+        /// # Errors
+        /// Never fails; hashing does no IO.
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.write(bytes);
+            Ok(bytes.len())
+        }
+        /// Does nothing; the hasher buffers nothing to flush.
+        ///
+        /// # Errors
+        /// Never fails.
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut sink = Sink(std::hash::DefaultHasher::new());
+    // A request that does not serialize hashes its written prefix, so at
+    // worst `authored` falls back to compiling the form again.
+    let _ = serde_json::to_writer(&mut sink, request);
+    sink.0.finish()
 }
 
 /// A named authored response format and the schema its host resolved.
@@ -382,10 +436,148 @@ impl Prompt {
             authored: None,
             media_kinds: Vec::new(),
             named_format: None,
+            system_variables: Vec::new(),
+            body_variables: Vec::new(),
         };
-        prompt.normalize_media_placeholders_mut()?;
+        scan_system_for_media(&prompt.request)?;
+        prompt.media_variables =
+            dedupe_preserve_order(split_request_text_parts(&mut prompt.request));
         prompt.variables = extract_text_variables(&prompt.request)?;
+        (prompt.system_variables, prompt.body_variables) =
+            slot_variables(&mut prompt.request, &prompt.variables)?;
         Ok(prompt)
+    }
+
+    /// This Prompt with conversation turns appended by `append`, declaring
+    /// only what those turns author.
+    ///
+    /// `append` must only add turns after the existing conversation. Text
+    /// placeholders anywhere in the new turns, including tool results, become
+    /// required `variables`, and their `${media:name}` placeholders are split
+    /// out for [`bind_media`](Self::bind_media). Earlier turns are not
+    /// rescanned, so placeholder-looking text an earlier bind supplied stays
+    /// data. Media kinds, a named format, the destination, bindings, and the
+    /// response type are kept; the authored form no longer describes the
+    /// request, so serialization falls back to the native form.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of `append`, and [`SkaldError::MediaInSystemMessage`]
+    /// when a new `OpenAI` Chat system turn holds a media placeholder.
+    pub fn appended<E: From<SkaldError>>(
+        mut self,
+        append: impl FnOnce(&mut ProviderRequest) -> Result<(), E>,
+    ) -> Result<Self, E> {
+        let start = turn_count(&self.request);
+        append(&mut self.request)?;
+        let mut media = Vec::new();
+        let names = match &mut self.request {
+            ProviderRequest::OpenAiChatCompletion(request) => {
+                let turns = request.messages.get_mut(start..).unwrap_or_default();
+                for turn in turns.iter().filter(|turn| turn.role == "system") {
+                    scan_openai_chat_content(turn.content.as_ref())?;
+                }
+                split_openai_chat(turns, &mut media);
+                extract_text_variables(turns)?
+            }
+            ProviderRequest::OpenAiResponses(request) => match &mut request.input {
+                OpenAiResponsesInput::Items(items) => {
+                    let turns = items.get_mut(start..).unwrap_or_default();
+                    split_openai_response_items(turns, &mut media);
+                    extract_text_variables(turns)?
+                }
+                OpenAiResponsesInput::Text(_) => Vec::new(),
+            },
+            ProviderRequest::AnthropicMessage(request) => {
+                let turns = request.messages.get_mut(start..).unwrap_or_default();
+                split_anthropic(turns, &mut media);
+                extract_text_variables(turns)?
+            }
+            ProviderRequest::GeminiGenerateContent(request) => {
+                let turns = request.contents.get_mut(start..).unwrap_or_default();
+                split_google(turns, &mut media);
+                extract_text_variables(turns)?
+            }
+            ProviderRequest::OpenAiEmbeddings(_)
+            | ProviderRequest::GoogleBatchEmbed(_)
+            | ProviderRequest::VertexPredict(_)
+            | ProviderRequest::JevSystemOne(_)
+            | ProviderRequest::RawV1 { .. } => Vec::new(),
+        };
+        self.media_variables.extend(media);
+        self.media_variables = dedupe_preserve_order(std::mem::take(&mut self.media_variables));
+        self.declare(&names);
+        self.body_variables.extend(names);
+        self.body_variables = dedupe_preserve_order(std::mem::take(&mut self.body_variables));
+        self.authored = None;
+        Ok(self)
+    }
+
+    /// This Prompt with its system text set to `text`, declaring what `text`
+    /// authors.
+    ///
+    /// Responses, Anthropic, and GenerateContent replace their system slot,
+    /// so requirements only the replaced text declared are dropped; `OpenAI`
+    /// Chat inserts another system message first and keeps the earlier ones.
+    /// Everything else is kept as by [`appended`](Self::appended).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SkaldError::ProviderUnsupported`] when the request format
+    /// has no system text, [`SkaldError::MediaInSystemMessage`] when `text`
+    /// holds a media placeholder, and a serialization error when the request
+    /// cannot be scanned.
+    pub fn system_replaced(mut self, text: String) -> SkaldResult<Self> {
+        scan_text_for_system_media(&text)?;
+        let names = extract_text_variables(&text)?;
+        match &mut self.request {
+            ProviderRequest::OpenAiChatCompletion(request) => {
+                request.messages.insert(
+                    0,
+                    crate::wire::openai_chat::OpenAiChatMessage {
+                        role: "system".to_owned(),
+                        content: Some(OpenAiMessageContent::Text(text)),
+                        ..Default::default()
+                    },
+                );
+                self.declare(&names);
+                self.body_variables.extend(names);
+                self.body_variables =
+                    dedupe_preserve_order(std::mem::take(&mut self.body_variables));
+                self.authored = None;
+                return Ok(self);
+            }
+            ProviderRequest::OpenAiResponses(request) => request.instructions = Some(text),
+            ProviderRequest::AnthropicMessage(request) => {
+                request.system = Some(AnthropicSystem::Blocks(vec![AnthropicSystemBlock::Text {
+                    text,
+                    cache_control: None,
+                }]));
+            }
+            ProviderRequest::GeminiGenerateContent(request) => {
+                request.system_instruction = Some(GoogleContent {
+                    role: "user".to_owned(),
+                    parts: vec![GooglePart::Text { text }],
+                });
+            }
+            other => return Err(SkaldError::provider_unsupported(other.provider(), "system")),
+        }
+        let replaced = std::mem::replace(&mut self.system_variables, names.clone());
+        let body = &self.body_variables;
+        self.variables
+            .retain(|name| !replaced.contains(name) || names.contains(name) || body.contains(name));
+        self.declare(&names);
+        self.authored = None;
+        Ok(self)
+    }
+
+    /// Adds `names` absent from `variables` after the existing ones.
+    fn declare(&mut self, names: &[String]) {
+        for name in names {
+            if !self.variables.contains(name) {
+                self.variables.push(name.clone());
+            }
+        }
     }
 
     /// Return the authored form this Prompt serializes as.
@@ -393,18 +585,24 @@ impl Prompt {
     /// This is the form it was compiled from while that form still compiles
     /// to the current request, model, and provider; otherwise, such as after a
     /// caller mutated the public fields, it is the native form derived from
-    /// the request.
+    /// the request. An unchanged model, provider, and request fingerprint
+    /// show the form still applies without compiling it again.
     ///
     /// # Errors
     ///
     /// Returns [`SkaldError::PromptInvalid`] when the request kind is not a
     /// Prompt format, such as embeddings or a raw body.
     pub fn authored(&self) -> SkaldResult<std::borrow::Cow<'_, AuthoredPrompt>> {
-        // ponytail: recompiles to detect public-field mutation; make the
-        // fields private if Prompt serialization ever shows up in a profile.
         match self.authored.as_deref() {
-            Some(authored)
-                if authored
+            Some(Authored { form, request })
+                if self.model == form.model
+                    && self.provider.as_ref() == Some(&form.provider)
+                    && *request == request_fingerprint(&self.request) =>
+            {
+                Ok(std::borrow::Cow::Borrowed(form))
+            }
+            Some(Authored { form, .. })
+                if form
                     .compile_resolved(
                         self.named_format
                             .as_ref()
@@ -416,7 +614,7 @@ impl Prompt {
                             && compiled.provider == self.provider
                     }) =>
             {
-                Ok(std::borrow::Cow::Borrowed(authored))
+                Ok(std::borrow::Cow::Borrowed(form))
             }
             _ => AuthoredPrompt::native(self.provider(), &self.model, &self.request)
                 .map(std::borrow::Cow::Owned),
@@ -478,17 +676,6 @@ impl Prompt {
         }
     }
 
-    /// Split `${media:name}` tokens into isolated provider-native text parts.
-    ///
-    /// This is idempotent and rejects media placeholders in system content.
-    pub fn normalize_media_placeholders_mut(&mut self) -> SkaldResult<()> {
-        scan_system_for_media(&self.request)?;
-        let mut names = split_request_text_parts(&mut self.request);
-        names.extend(self.media_variables.iter().cloned());
-        self.media_variables = dedupe_preserve_order(names);
-        Ok(())
-    }
-
     /// Return a copy with the supplied `${name}` or `{{name}}` placeholders bound.
     ///
     /// This is the reusable primitive behind higher-level prompt binding. It performs
@@ -521,8 +708,10 @@ impl Prompt {
         replace_string_leaves(&mut request, vars);
         self.request = serde_json::from_value(request).map_err(SkaldError::deserialize)?;
         self.authored = None;
-        self.variables
-            .retain(|name| !vars.iter().any(|(key, _)| key == name));
+        let unbound = |name: &String| !vars.iter().any(|(key, _)| key == name);
+        self.variables.retain(unbound);
+        self.system_variables.retain(unbound);
+        self.body_variables.retain(unbound);
         Ok(())
     }
 
@@ -564,7 +753,6 @@ impl Prompt {
         }
         let provider = self.provider();
         check_media_source(&self.request, provider.clone(), name, media)?;
-        self.normalize_media_placeholders_mut()?;
         match &mut self.request {
             ProviderRequest::OpenAiChatCompletion(request) => {
                 bind_media_openai_chat(request, name, media)?;
@@ -618,16 +806,15 @@ impl Prompt {
                 ),
             ));
         }
-        let mut prompt = self.clone();
-        prompt.normalize_media_placeholders_mut()?;
-        if let Some(name) = prompt.media_variables.first() {
+        if let Some(name) = self.media_variables.first() {
             return Err(SkaldError::MissingMediaVariable { name: name.clone() });
         }
-        for name in &prompt.variables {
+        for name in &self.variables {
             vars.iter()
                 .find(|(key, _)| key == name)
                 .ok_or_else(|| SkaldError::missing_variable(name))?;
         }
+        let mut prompt = self.clone();
         prompt.bind_mut(vars)?;
         Ok(prompt.request)
     }
@@ -787,14 +974,51 @@ impl ResponseType {
     }
 }
 
-/// Collects the distinct `${name}` and `{{name}}` placeholders in the
-/// serialized request, in first-appearance order; `${media:...}` placeholders
-/// are not text variables.
+/// `value`'s JSON text, written once into a buffer of its exact length
+/// instead of a string grown by reallocation.
 ///
 /// # Errors
-/// Returns a serialization error when the request does not serialize.
-fn extract_text_variables(request: &ProviderRequest) -> SkaldResult<Vec<String>> {
-    let json = serde_json::to_string(request).map_err(SkaldError::serialize)?;
+/// Returns a serialization error when `value` does not serialize.
+fn json_text(value: &(impl Serialize + ?Sized)) -> SkaldResult<String> {
+    /// Counts written bytes.
+    struct Count(
+        /// The number of serialized bytes written so far.
+        usize,
+    );
+    impl std::io::Write for Count {
+        /// Adds `bytes`' length to the count and accepts all of them.
+        ///
+        /// # Errors
+        /// Never fails; counting does no IO.
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        /// Does nothing; the count buffers nothing to flush.
+        ///
+        /// # Errors
+        /// Never fails.
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, value).map_err(SkaldError::serialize)?;
+    let mut json = Vec::with_capacity(count.0);
+    serde_json::to_writer(&mut json, value).map_err(SkaldError::serialize)?;
+    String::from_utf8(json).map_err(|error| {
+        SkaldError::serialize(<serde_json::Error as serde::ser::Error>::custom(error))
+    })
+}
+
+/// Collects the distinct `${name}` and `{{name}}` placeholders in the
+/// serialized `value`, such as a request or appended turns, in
+/// first-appearance order; `${media:...}` placeholders are not text variables.
+///
+/// # Errors
+/// Returns a serialization error when `value` does not serialize.
+fn extract_text_variables(value: &(impl Serialize + ?Sized)) -> SkaldResult<Vec<String>> {
+    let json = json_text(value)?;
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for capture in text_placeholder_regex().captures_iter(&json) {
@@ -807,6 +1031,66 @@ fn extract_text_variables(request: &ProviderRequest) -> SkaldResult<Vec<String>>
         }
     }
     Ok(out)
+}
+
+/// The text variables `request`'s replaceable system slot declares and those
+/// the rest of it declares, given the whole request's `variables`.
+///
+/// A format without a slot, such as `OpenAI` Chat, whose system messages are
+/// conversation turns, declares every variable in its rest. Otherwise the
+/// slot is scanned alone and the body with the slot taken out and restored.
+///
+/// # Errors
+/// Returns a serialization error when the request does not serialize.
+fn slot_variables(
+    request: &mut ProviderRequest,
+    variables: &[String],
+) -> SkaldResult<(Vec<String>, Vec<String>)> {
+    /// The text variables of `body`'s system slot and of the rest of it.
+    ///
+    /// The slot is taken out while the rest is scanned and put back before
+    /// either result is returned, so `body` is unchanged on every path.
+    ///
+    /// # Errors
+    /// Returns a serialization error when the slot or the rest does not
+    /// serialize.
+    fn scan<B: Serialize, T: Serialize>(
+        body: &mut B,
+        slot: fn(&mut B) -> &mut Option<T>,
+    ) -> SkaldResult<(Vec<String>, Vec<String>)> {
+        let taken = slot(body).take();
+        let rest = extract_text_variables(body);
+        let system = extract_text_variables(&taken);
+        *slot(body) = taken;
+        Ok((system?, rest?))
+    }
+    match request {
+        ProviderRequest::OpenAiResponses(body) => scan(body, |body| &mut body.instructions),
+        ProviderRequest::AnthropicMessage(body) => scan(body, |body| &mut body.system),
+        ProviderRequest::GeminiGenerateContent(body) => {
+            scan(body, |body| &mut body.system_instruction)
+        }
+        _ => Ok((Vec::new(), variables.to_vec())),
+    }
+}
+
+/// The number of conversation turns in `request`; Responses text shorthand
+/// is one turn, and a format without turns has none.
+fn turn_count(request: &ProviderRequest) -> usize {
+    match request {
+        ProviderRequest::OpenAiChatCompletion(request) => request.messages.len(),
+        ProviderRequest::OpenAiResponses(request) => match &request.input {
+            OpenAiResponsesInput::Text(_) => 1,
+            OpenAiResponsesInput::Items(items) => items.len(),
+        },
+        ProviderRequest::AnthropicMessage(request) => request.messages.len(),
+        ProviderRequest::GeminiGenerateContent(request) => request.contents.len(),
+        ProviderRequest::OpenAiEmbeddings(_)
+        | ProviderRequest::GoogleBatchEmbed(_)
+        | ProviderRequest::VertexPredict(_)
+        | ProviderRequest::JevSystemOne(_)
+        | ProviderRequest::RawV1 { .. } => 0,
+    }
 }
 
 fn dedupe_preserve_order(items: Vec<String>) -> Vec<String> {
@@ -898,15 +1182,26 @@ fn scan_text_for_system_media(text: &str) -> SkaldResult<()> {
     Ok(())
 }
 
+/// Splits every `${media:name}` token in `request`'s non-system text into
+/// its own provider-native text part, in place, and returns the placeholder
+/// names in order of appearance, with repeats.
+///
+/// [`Prompt::new`] refuses system media before calling this and
+/// deduplicates the names. Formats without conversation text, such as
+/// embeddings or raw bodies, are left unchanged and yield no names.
 fn split_request_text_parts(request: &mut ProviderRequest) -> Vec<String> {
     let mut names = Vec::new();
     match request {
         ProviderRequest::OpenAiChatCompletion(request) => {
-            split_openai_chat(request, &mut names);
+            split_openai_chat(&mut request.messages, &mut names);
         }
         ProviderRequest::OpenAiResponses(request) => split_openai_responses(request, &mut names),
-        ProviderRequest::AnthropicMessage(request) => split_anthropic(request, &mut names),
-        ProviderRequest::GeminiGenerateContent(request) => split_google(request, &mut names),
+        ProviderRequest::AnthropicMessage(request) => {
+            split_anthropic(&mut request.messages, &mut names);
+        }
+        ProviderRequest::GeminiGenerateContent(request) => {
+            split_google(&mut request.contents, &mut names);
+        }
         ProviderRequest::OpenAiEmbeddings(_)
         | ProviderRequest::GoogleBatchEmbed(_)
         | ProviderRequest::VertexPredict(_)
@@ -916,8 +1211,12 @@ fn split_request_text_parts(request: &mut ProviderRequest) -> Vec<String> {
     names
 }
 
-fn split_openai_chat(request: &mut OpenAiChatRequest, names: &mut Vec<String>) {
-    for message in &mut request.messages {
+/// Splits media placeholders out of the non-system `OpenAI` Chat `messages`.
+fn split_openai_chat(
+    messages: &mut [crate::wire::openai_chat::OpenAiChatMessage],
+    names: &mut Vec<String>,
+) {
+    for message in messages {
         if message.role == "system" {
             continue;
         }
@@ -930,22 +1229,19 @@ fn split_openai_chat_content(
     names: &mut Vec<String>,
 ) -> Option<OpenAiMessageContent> {
     match content {
-        Some(OpenAiMessageContent::Text(text)) => {
-            let segments = split_text_on_media(&text);
-            if has_placeholder(&segments) {
-                Some(OpenAiMessageContent::Parts(openai_text_segments(
-                    segments, names,
-                )))
-            } else {
-                Some(OpenAiMessageContent::Text(text))
-            }
+        Some(OpenAiMessageContent::Text(text)) if media_placeholder_regex().is_match(&text) => {
+            Some(OpenAiMessageContent::Parts(openai_text_segments(
+                split_text_on_media(&text),
+                names,
+            )))
         }
+        Some(OpenAiMessageContent::Text(text)) => Some(OpenAiMessageContent::Text(text)),
         Some(OpenAiMessageContent::Parts(parts)) => {
             let mut out = Vec::new();
             for part in parts {
                 match part {
                     OpenAiContentPart::Text { text } => {
-                        out.extend(openai_text_segments(split_text_on_media(&text), names));
+                        out.extend(openai_text_segments(media_segments(text), names));
                     }
                     other => out.push(other),
                 }
@@ -984,21 +1280,27 @@ fn split_openai_responses(request: &mut OpenAiResponsesRequest, names: &mut Vec<
     {
         return;
     }
-    for item in request.input.items_mut() {
+    split_openai_response_items(request.input.items_mut(), names);
+}
+
+/// Splits media placeholders out of the text parts of Responses message
+/// `items`.
+fn split_openai_response_items(items: &mut [OpenAiResponseItem], names: &mut Vec<String>) {
+    for item in items {
         if let OpenAiResponseItem::Message { content, .. } = item {
             let mut out = Vec::new();
             for part in std::mem::take(content) {
                 match part {
                     OpenAiResponseContentPart::InputText { text } => {
                         out.extend(openai_response_text_segments(
-                            split_text_on_media(&text),
+                            media_segments(text),
                             names,
                             false,
                         ));
                     }
                     OpenAiResponseContentPart::OutputText { text } => {
                         out.extend(openai_response_text_segments(
-                            split_text_on_media(&text),
+                            media_segments(text),
                             names,
                             true,
                         ));
@@ -1037,8 +1339,12 @@ fn openai_response_text_segments(
         .collect()
 }
 
-fn split_anthropic(request: &mut AnthropicMessagesRequest, names: &mut Vec<String>) {
-    for message in &mut request.messages {
+/// Splits media placeholders out of the text blocks of Anthropic `messages`.
+fn split_anthropic(
+    messages: &mut [crate::wire::anthropic_messages::AnthropicMessage],
+    names: &mut Vec<String>,
+) {
+    for message in messages {
         let mut out = Vec::new();
         for block in std::mem::take(&mut message.content) {
             match block {
@@ -1047,7 +1353,7 @@ fn split_anthropic(request: &mut AnthropicMessagesRequest, names: &mut Vec<Strin
                     cache_control,
                     citations,
                 } => out.extend(anthropic_text_segments(
-                    split_text_on_media(&text),
+                    media_segments(text),
                     names,
                     cache_control,
                     citations,
@@ -1086,13 +1392,14 @@ fn anthropic_text_segments(
         .collect()
 }
 
-fn split_google(request: &mut GoogleGenerateContentRequest, names: &mut Vec<String>) {
-    for content in &mut request.contents {
+/// Splits media placeholders out of the text parts of GenerateContent `contents`.
+fn split_google(contents: &mut [GoogleContent], names: &mut Vec<String>) {
+    for content in contents {
         let mut out = Vec::new();
         for part in std::mem::take(&mut content.parts) {
             match part {
                 GooglePart::Text { text } => {
-                    out.extend(google_text_segments(split_text_on_media(&text), names));
+                    out.extend(google_text_segments(media_segments(text), names));
                 }
                 other => out.push(other),
             }
@@ -1117,10 +1424,16 @@ fn google_text_segments(segments: Vec<TextSegment>, names: &mut Vec<String>) -> 
         .collect()
 }
 
-fn has_placeholder(segments: &[TextSegment]) -> bool {
-    segments
-        .iter()
-        .any(|segment| matches!(segment, TextSegment::Placeholder(_)))
+/// [`split_text_on_media`] for owned text, which moves text without a media
+/// placeholder into its one segment instead of copying it.
+fn media_segments(text: String) -> Vec<TextSegment> {
+    if text.is_empty() {
+        Vec::new()
+    } else if media_placeholder_regex().is_match(&text) {
+        split_text_on_media(&text)
+    } else {
+        vec![TextSegment::Text(text)]
+    }
 }
 
 fn bind_media_openai_chat(
@@ -2010,6 +2323,8 @@ mod prompt_render {
             authored: None,
             media_kinds: Vec::new(),
             named_format: None,
+            system_variables: Vec::new(),
+            body_variables: Vec::new(),
         }
     }
 

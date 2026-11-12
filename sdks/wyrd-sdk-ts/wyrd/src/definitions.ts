@@ -1,0 +1,2683 @@
+/**
+ * Card definitions in the Card YAML's own vocabulary, backed by the shared
+ * Rust `wyrd_client::verify` values and exported as the `verify` namespace.
+ *
+ * Each named Card class, such as {@link Service} or {@link Verifier}, is
+ * constructed as `new Service(name, options)`; `options.version` is optional,
+ * and an omitted version is assigned at registration. An Agent's prompt is
+ * the original native {@link Prompt}, such as `Prompt.openaiChat(model)`. Each sub-value, such
+ * as {@link Component} or {@link Step}, with the fields that identify it.
+ * Every other method is named for the YAML field it edits, in camelCase, and
+ * takes that field's YAML value: options and nested objects keep the YAML's
+ * snake_case keys, references stay strings such as `inputs.report.text`, and
+ * operators stay `"equals"` or their object form. A setter such as
+ * {@link Service.verifiedBy} replaces the whole field; an add method such as
+ * {@link Service.addVerifiedBy} appends one entry. Both mutate the receiver and
+ * return it.
+ *
+ * Construction and editing never validate, read files, or touch the network,
+ * so an incomplete definition or one with a forward reference can be
+ * assembled freely. A Card or exact {@link CardRef} may stand at any reference
+ * position, nested in plain objects included; passing a child copies its
+ * current value, so later edits to the child change nothing already passed.
+ * {@link AuthoredCard.validate} runs the shared Rust validation, and
+ * `Cards.declare` and `WyrdState.declare` register the graph, publishing each
+ * local Artifact first.
+ *
+ * @module
+ */
+
+import { createRequire } from "node:module";
+
+import type { NativeAuthored as NativeAuthoredHandle, NativeValue as NativeValueHandle } from "../index.cjs";
+import type * as Wire from "./card-types.js";
+import {
+  authoredNative,
+  authoredOf,
+  holdAuthored,
+  jsonSnapshot,
+  lifecycleValue,
+  type NativeErrorMetadata,
+  projectedError,
+} from "./native.js";
+
+const require = createRequire(import.meta.url);
+const { NativeAuthored, NativeValue } = require("../index.cjs") as typeof import("../index.cjs");
+
+/**
+ * `T` as authored: wherever the YAML takes an exact Card reference, an
+ * {@link AuthoredCard} or {@link CardRef} too; wherever it takes a code source
+ * or Artifact selection, a {@link CodeSource} or {@link ArtifactFile} too; and
+ * wherever it takes a canonical sub-value, that value's authoring class too.
+ */
+export type Authorable<T> = [Wire.JsonValue] extends [T]
+  ? T
+  : Same<T, Wire.Action> extends true
+    ? Shape<T> | Action
+    : Same<T, Wire.Check> extends true
+      ? Shape<T> | Check
+      : AuthorableMember<T>;
+
+/**
+ * Whether `A` and `B` are the same type. An agent or code action and check
+ * share their canonical shape, so only the whole union tells them apart.
+ */
+type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
+
+/** {@link Authorable} for each member of `T`. */
+type AuthorableMember<T> = T extends Wire.CardRef
+  ? T | AuthoredCard | CardRef
+  : T extends Wire.Prompt
+    ? Shape<T> | Prompt
+    : T extends Wire.CodeSourceInline | Wire.CodeSourceArtifact
+      ? Shape<T> | CodeSource | ArtifactFile
+      : T extends Wire.WorkspaceSourceArtifact
+        ? Shape<T> | ArtifactFile
+        : T extends Wire.Step
+          ? Shape<T> | Step
+          : T extends Wire.Requirement
+            ? Shape<T> | Requirement
+            : T extends Wire.ServiceComponent
+              ? Shape<T> | Component
+              : T extends Wire.ServiceTable
+                ? Shape<T> | Table
+                : T extends Wire.VerificationBinding
+                  ? Shape<T> | Binding
+                  : T extends Wire.TypedInputSlot
+                    ? Shape<T> | InputSlot
+                    : Shape<T>;
+
+/** The members of `T`, each {@link Authorable}. */
+type Shape<T> = T extends readonly (infer U)[]
+  ? readonly Authorable<U>[]
+  : T extends object
+    ? { readonly [K in keyof T]: Authorable<T[K]> }
+    : T;
+
+/** `S`'s fields as authored, each optional. */
+type Fields<S> = { readonly [K in keyof S]?: Authorable<S[K]> };
+
+/** The value the field `K` of `S` takes. */
+type Value<S, K extends keyof S> = Exclude<S[K], undefined>;
+
+/** One entry of the list field `K` of `S`. */
+type Item<S, K extends keyof S> = NonNullable<S[K]> extends readonly (infer U)[] ? U : never;
+
+/** One entry's value of the map field `K` of `S`. */
+type Entry<S, K extends keyof S> = NonNullable<S[K]> extends { readonly [key: string]: infer V } ? V : never;
+
+/** `Omit` applied to each member of the union `T`. */
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
+
+/**
+ * One verification binding: a {@link Binding} or its canonical object, or a
+ * {@link Verifier}, exact {@link CardRef} or reference path bound with no
+ * trigger or Operators.
+ */
+export type BindingArg = Authorable<Wire.VerificationBinding> | Verifier | CardRef | string;
+
+/**
+ * One Verifier input slot: an {@link InputSlot}, a canonical slot object, a
+ * source slot's reference string, or the bare JSON Schema of a `json` slot.
+ * Values are schemas, never examples to infer one from.
+ */
+export type InputSlotArg = InputSlot | Wire.InputSlot | Readonly<Record<string, Wire.JsonValue>> | boolean;
+
+/** Service spec fields as authored. */
+type ServiceFields = Omit<Fields<Wire.ServiceSpec>, "verified_by"> & { readonly verified_by?: readonly BindingArg[] };
+/** Agent spec fields as authored. */
+type AgentFields = Omit<Fields<Wire.AgentSpec>, "verified_by"> & { readonly verified_by?: readonly BindingArg[] };
+/** Verifier spec fields as authored. */
+type VerifierFields = Omit<Fields<Wire.VerifierSpec>, "inputs"> & {
+  readonly inputs?: Readonly<Record<string, InputSlotArg>>;
+};
+/** Artifact spec fields as authored. */
+type ArtifactFields = Fields<Wire.ArtifactSpec>;
+/** Model spec fields as authored. */
+type ModelFields = Fields<Wire.ModelSpec>;
+/** Data spec fields as authored. */
+type DataFields = Fields<Wire.DataSpec>;
+/** Experiment spec fields as authored. */
+type ExperimentFields = Fields<Wire.ExperimentSpec>;
+/** Mcp spec fields as authored. */
+type McpFields = Fields<Wire.McpSpec>;
+/** Audit spec fields as authored. */
+type AuditFields = Fields<Wire.AuditSpec>;
+/** Trigger spec fields as authored: the activation keys of either form, flat. */
+type TriggerFields = Fields<
+  Pick<Wire.TriggerSpec, "description" | "kind"> &
+    Pick<Wire.TriggerSpecSchedule, "cron" | "tz"> &
+    Pick<Wire.TriggerSpecGroupEnd, "after">
+>;
+/** Operator spec fields as authored: the flattened `action` object apart. */
+type OperatorFields = Fields<Pick<Wire.OperatorSpec, "description" | "budget">> & {
+  readonly action?: DistributiveOmit<Wire.OperatorSpec, "description" | "budget">;
+};
+/** Service component fields as authored. */
+type ComponentFields = Omit<Fields<Wire.ServiceComponent>, "verified_by"> & {
+  readonly verified_by?: readonly BindingArg[];
+};
+/** Verification binding fields as authored. */
+type BindingFields = Fields<Wire.VerificationBinding>;
+/** Step fields as authored. */
+type StepFields = Fields<Wire.Step>;
+/** Input slot fields as authored. */
+type InputSlotFields = Fields<Pick<Wire.TypedInputSlotMedia, "max_bytes">>;
+/** Action fields as authored. */
+type ActionFields = Fields<Pick<Wire.ActionAgent, "inputs" | "workspace"> & Pick<Wire.ActionCode, "runtime">>;
+/** Check fields as authored. */
+type CheckFields = Fields<
+  Pick<Wire.CheckAgent, "inputs" | "workspace"> & Pick<Wire.CheckCode, "runtime" | "response_format">
+>;
+
+/**
+ * A Card's optional `version`; omitted, registration assigns it and
+ * references to the Card resolve to the version registered.
+ */
+type Versioned = { readonly version?: string };
+
+/** {@link Service} spec options. */
+export type ServiceOptions = ServiceFields & Versioned;
+/** {@link Agent} spec options. */
+export type AgentOptions = AgentFields & Versioned;
+/** {@link Verifier} spec options. */
+export type VerifierOptions = VerifierFields & Versioned;
+/** {@link Artifact} spec options. */
+export type ArtifactOptions = ArtifactFields & Versioned;
+/** {@link Model} spec options. */
+export type ModelOptions = ModelFields & Versioned;
+/** {@link Data} spec options. */
+export type DataOptions = DataFields & Versioned;
+/** {@link Experiment} spec options. */
+export type ExperimentOptions = ExperimentFields & Versioned;
+/** {@link Mcp} spec options. */
+export type McpOptions = McpFields & Versioned;
+/** {@link Audit} spec options. */
+export type AuditOptions = AuditFields & Versioned;
+/** {@link Trigger} spec options. */
+export type TriggerOptions = TriggerFields & Versioned;
+/** {@link Operator} spec options. */
+export type OperatorOptions = OperatorFields & Versioned;
+/** {@link Component} fields other than its alias and reference. */
+export type ComponentOptions = Omit<ComponentFields, "alias" | "ref">;
+/** {@link Binding} fields other than its Verifier. */
+export type BindingOptions = Omit<BindingFields, "verifier">;
+/** {@link Step} fields other than its ID and action. */
+export type StepOptions = Omit<StepFields, "id" | "action">;
+/** {@link InputSlot.media} fields other than its formats. */
+export type MediaSlotOptions = InputSlotFields;
+/** {@link Action.agent} fields other than its Agent. */
+export type AgentActionOptions = Omit<Fields<Wire.ActionAgent>, "kind" | "agent">;
+/** {@link Action.code} fields other than its source and entrypoint. */
+export type CodeActionOptions = Omit<Fields<Wire.ActionCode>, "kind" | "source" | "entrypoint">;
+/** {@link Check.agent} fields other than its Agent. */
+export type AgentCheckOptions = Omit<Fields<Wire.CheckAgent>, "kind" | "agent">;
+/** {@link Check.code} fields other than its source and entrypoint. */
+export type CodeCheckOptions = Omit<Fields<Wire.CheckCode>, "kind" | "source" | "entrypoint">;
+
+/**
+ * `input` as one native argument: its JSON snapshot, with each authoring
+ * value inside copied at its position.
+ *
+ * @throws a `WYRD_SPEC_400_VALIDATION` `WyrdError` naming `field` for a value
+ * JSON cannot carry exactly.
+ */
+function argument(field: string, input: unknown): NativeValueHandle {
+  const snapshot = jsonSnapshot(field, input, authoredNative);
+  return NativeValue.compose(
+    snapshot.value,
+    snapshot.holes.map(({ path }) => [...path]),
+    snapshot.holes.map(({ hole }) => hole),
+  );
+}
+
+/** A new authoring value of `prototype`'s class over `native`. */
+function adopt<T extends object>(prototype: T, native: NativeAuthoredHandle): T {
+  const value = Object.create(prototype) as T;
+  holdAuthored(value, native);
+  return value;
+}
+
+/** Set the field `field` of `owner` from `input` and return `owner`. */
+function set<T extends object>(owner: T, field: string, input: unknown): T {
+  authoredOf(owner).set(field, argument(field, input));
+  return owner;
+}
+
+/** Append `input` to the list `field` of `owner` and return `owner`. */
+function add<T extends object>(owner: T, field: string, input: unknown): T {
+  authoredOf(owner).add(field, argument(field, input));
+  return owner;
+}
+
+/** Insert the entry `key` into the map `field` of `owner` and return `owner`. */
+function insert<T extends object>(owner: T, field: string, key: string, input: unknown): T {
+  authoredOf(owner).insert(field, key, argument(field, input));
+  return owner;
+}
+
+/** Set every defined field of `options` on `owner`, in key order. */
+function apply(owner: object, options: object): void {
+  for (const [field, input] of Object.entries(options)) {
+    if (input !== undefined) {
+      set(owner, field, input);
+    }
+  }
+}
+
+/**
+ * A named Card under construction: its labels and annotations, its exact
+ * reference, its spec as authored, and validation of the graph it roots.
+ */
+export abstract class AuthoredCard {
+  /**
+   * Hold `native` as this Card's shared Rust value.
+   *
+   * @param native - The native Card.
+   */
+  protected constructor(native: NativeAuthoredHandle) {
+    holdAuthored(this, native);
+  }
+
+  /**
+   * Set the whole `metadata.labels` map.
+   *
+   * @param labels - The new labels.
+   * @returns This Card.
+   */
+  labels(labels: Readonly<Record<string, string>>): this {
+    return set(this, "labels", labels);
+  }
+
+  /**
+   * Insert the label `key`; a repeated key is refused at validation.
+   *
+   * @param key - The label key.
+   * @param value - The label value.
+   * @returns This Card.
+   */
+  addLabel(key: string, value: string): this {
+    return insert(this, "labels", key, value);
+  }
+
+  /**
+   * Set the whole `metadata.annotations` map.
+   *
+   * @param annotations - The new annotations.
+   * @returns This Card.
+   */
+  annotations(annotations: Readonly<Record<string, string>>): this {
+    return set(this, "annotations", annotations);
+  }
+
+  /**
+   * Insert the annotation `key`; a repeated key is refused at validation.
+   *
+   * @param key - The annotation key.
+   * @param value - The annotation value.
+   * @returns This Card.
+   */
+  addAnnotation(key: string, value: string): this {
+    return insert(this, "annotations", key, value);
+  }
+
+  /**
+   * The exact reference this Card registers as, or `undefined` while it has
+   * no version and registration assigns one.
+   *
+   * @returns The reference, when the version is known.
+   */
+  cardRef(): CardRef | undefined {
+    const native = authoredOf(this).cardRef();
+    return native == null ? undefined : adopt(CardRef.prototype, native);
+  }
+
+  /**
+   * The spec as authored so far, before validation; a {@link CodeSource.file}
+   * position is `null` until its graph is validated.
+   *
+   * @returns The authored spec JSON.
+   */
+  spec(): Wire.JsonValue {
+    return authoredOf(this).spec() as Wire.JsonValue;
+  }
+
+  /**
+   * Validate the complete graph this Card roots exactly as its declaration
+   * would, reading each local code file, without registering or uploading
+   * anything.
+   *
+   * @throws `WyrdError` from the shared validation, such as
+   * `WYRD_LOADER_400_INVALID_ENVELOPE` naming each refused YAML field path.
+   */
+  validate(): void {
+    lifecycleValue<null>(authoredOf(this).validate());
+  }
+}
+
+/** A Service Card: a running system, its components, and the Verifiers that check it. */
+export class Service extends AuthoredCard {
+  /**
+   * An empty Service Card named `name`, at `options.version` when given, else
+   * at the version registration assigns, with any spec fields given in
+   * `options`; nothing is validated until its graph is.
+   *
+   * @param name - The Card name.
+   * @param options - The optional version and spec fields, each set as its
+   * setter sets it.
+   */
+  constructor(name: string, options: ServiceOptions = {}) {
+    const { version, ...fields } = options;
+    super(NativeAuthored.card("Service", name, version));
+    apply(this, fields);
+  }
+
+  /**
+   * Set `description`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `description`.
+   * @returns This value.
+   */
+  description(value: Value<ServiceFields, "description">): this {
+    return set(this, "description", value);
+  }
+
+  /**
+   * Set `service_type`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `service_type`.
+   * @returns This value.
+   */
+  serviceType(value: Value<ServiceFields, "service_type">): this {
+    return set(this, "service_type", value);
+  }
+
+  /**
+   * Set `entry_point`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `entry_point`.
+   * @returns This value.
+   */
+  entryPoint(value: Value<ServiceFields, "entry_point">): this {
+    return set(this, "entry_point", value);
+  }
+
+  /**
+   * Set `runtime`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `runtime`.
+   * @returns This value.
+   */
+  runtime(value: Value<ServiceFields, "runtime">): this {
+    return set(this, "runtime", value);
+  }
+
+  /**
+   * Set `content_hash`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `content_hash`.
+   * @returns This value.
+   */
+  contentHash(value: Value<ServiceFields, "content_hash">): this {
+    return set(this, "content_hash", value);
+  }
+
+  /**
+   * Set `lock_hash`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `lock_hash`.
+   * @returns This value.
+   */
+  lockHash(value: Value<ServiceFields, "lock_hash">): this {
+    return set(this, "lock_hash", value);
+  }
+
+  /**
+   * Set the whole `components` list, replacing every earlier entry and whatever it referenced.
+   *
+   * @param items - The new entries.
+   * @returns This value.
+   */
+  components(items: Value<ServiceFields, "components">): this {
+    return set(this, "components", items);
+  }
+
+  /**
+   * Append one entry to `components`; a repeated ID is refused at validation.
+   *
+   * @param item - The entry.
+   * @returns This value.
+   */
+  addComponent(item: Item<ServiceFields, "components">): this {
+    return add(this, "components", item);
+  }
+
+  /**
+   * Set the whole `verified_by` list, replacing every earlier entry and whatever it referenced.
+   *
+   * @param items - The new entries.
+   * @returns This value.
+   */
+  verifiedBy(items: Value<ServiceFields, "verified_by">): this {
+    return set(this, "verified_by", items);
+  }
+
+  /**
+   * Append one entry to `verified_by`; a repeated ID is refused at validation.
+   *
+   * @param item - The entry.
+   * @returns This value.
+   */
+  addVerifiedBy(item: Item<ServiceFields, "verified_by">): this {
+    return add(this, "verified_by", item);
+  }
+
+  /**
+   * Set the whole `tables` list, replacing every earlier entry and whatever it referenced.
+   *
+   * @param items - The new entries.
+   * @returns This value.
+   */
+  tables(items: Value<ServiceFields, "tables">): this {
+    return set(this, "tables", items);
+  }
+
+  /**
+   * Append one entry to `tables`; a repeated ID is refused at validation.
+   *
+   * @param item - The entry.
+   * @returns This value.
+   */
+  addTable(item: Item<ServiceFields, "tables">): this {
+    return add(this, "tables", item);
+  }
+
+  /**
+   * Set the whole `credential_refs` list, replacing every earlier entry and whatever it referenced.
+   *
+   * @param items - The new entries.
+   * @returns This value.
+   */
+  credentialRefs(items: Value<ServiceFields, "credential_refs">): this {
+    return set(this, "credential_refs", items);
+  }
+
+  /**
+   * Append one entry to `credential_refs`; a repeated ID is refused at validation.
+   *
+   * @param item - The entry.
+   * @returns This value.
+   */
+  addCredentialRef(item: Item<ServiceFields, "credential_refs">): this {
+    return add(this, "credential_refs", item);
+  }
+
+  /**
+   * Set the whole `deployment` map, replacing every earlier entry and whatever it referenced.
+   *
+   * @param entries - The new entries.
+   * @returns This value.
+   */
+  deployment(entries: Value<ServiceFields, "deployment">): this {
+    return set(this, "deployment", entries);
+  }
+
+  /**
+   * Insert the entry `key` into `deployment`; a repeated key is refused at validation.
+   *
+   * @param key - The entry's key.
+   * @param value - The entry's value.
+   * @returns This value.
+   */
+  addDeployment(key: string, value: Entry<ServiceFields, "deployment">): this {
+    return insert(this, "deployment", key, value);
+  }
+
+  /**
+   * Set the whole `service_config` map, replacing every earlier entry and whatever it referenced.
+   *
+   * @param entries - The new entries.
+   * @returns This value.
+   */
+  serviceConfig(entries: Value<ServiceFields, "service_config">): this {
+    return set(this, "service_config", entries);
+  }
+
+  /**
+   * Insert the entry `key` into `service_config`; a repeated key is refused at validation.
+   *
+   * @param key - The entry's key.
+   * @param value - The entry's value.
+   * @returns This value.
+   */
+  addServiceConfig(key: string, value: Entry<ServiceFields, "service_config">): this {
+    return insert(this, "service_config", key, value);
+  }
+
+  /**
+   * Set the whole `metadata` map, replacing every earlier entry and whatever it referenced.
+   *
+   * @param entries - The new entries.
+   * @returns This value.
+   */
+  metadata(entries: Value<ServiceFields, "metadata">): this {
+    return set(this, "metadata", entries);
+  }
+
+  /**
+   * Insert the entry `key` into `metadata`; a repeated key is refused at validation.
+   *
+   * @param key - The entry's key.
+   * @param value - The entry's value.
+   * @returns This value.
+   */
+  addMetadata(key: string, value: Entry<ServiceFields, "metadata">): this {
+    return insert(this, "metadata", key, value);
+  }
+}
+
+/** An Agent Card: a prompt run through an execution route with tools. */
+export class Agent extends AuthoredCard {
+  /**
+   * An empty Agent Card named `name`, at `options.version` when given, else
+   * at the version registration assigns, with any spec fields given in
+   * `options`; nothing is validated until its graph is.
+   *
+   * @param name - The Card name.
+   * @param options - The optional version and spec fields, each set as its
+   * setter sets it.
+   */
+  constructor(name: string, options: AgentOptions = {}) {
+    const { version, ...fields } = options;
+    super(NativeAuthored.card("Agent", name, version));
+    apply(this, fields);
+  }
+
+  /**
+   * Set `prompt`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `prompt`.
+   * @returns This value.
+   */
+  prompt(value: Value<AgentFields, "prompt">): this {
+    return set(this, "prompt", value);
+  }
+
+  /**
+   * Set `execution_route`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `execution_route`.
+   * @returns This value.
+   */
+  executionRoute(value: Value<AgentFields, "execution_route">): this {
+    return set(this, "execution_route", value);
+  }
+
+  /**
+   * Set `run_config`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `run_config`.
+   * @returns This value.
+   */
+  runConfig(value: Value<AgentFields, "run_config">): this {
+    return set(this, "run_config", value);
+  }
+
+  /**
+   * Set the whole `tool_names` list, replacing every earlier entry and whatever it referenced.
+   *
+   * @param items - The new entries.
+   * @returns This value.
+   */
+  toolNames(items: Value<AgentFields, "tool_names">): this {
+    return set(this, "tool_names", items);
+  }
+
+  /**
+   * Append one entry to `tool_names`; a repeated ID is refused at validation.
+   *
+   * @param item - The entry.
+   * @returns This value.
+   */
+  addToolName(item: Item<AgentFields, "tool_names">): this {
+    return add(this, "tool_names", item);
+  }
+
+  /**
+   * Set the whole `verified_by` list, replacing every earlier entry and whatever it referenced.
+   *
+   * @param items - The new entries.
+   * @returns This value.
+   */
+  verifiedBy(items: Value<AgentFields, "verified_by">): this {
+    return set(this, "verified_by", items);
+  }
+
+  /**
+   * Append one entry to `verified_by`; a repeated ID is refused at validation.
+   *
+   * @param item - The entry.
+   * @returns This value.
+   */
+  addVerifiedBy(item: Item<AgentFields, "verified_by">): this {
+    return add(this, "verified_by", item);
+  }
+}
+
+/** A Model Card: a trained model's interface, task, and signature. */
+export class Model extends AuthoredCard {
+  /**
+   * An empty Model Card named `name`, at `options.version` when given, else
+   * at the version registration assigns, with any spec fields given in
+   * `options`; nothing is validated until its graph is.
+   *
+   * @param name - The Card name.
+   * @param options - The optional version and spec fields, each set as its
+   * setter sets it.
+   */
+  constructor(name: string, options: ModelOptions = {}) {
+    const { version, ...fields } = options;
+    super(NativeAuthored.card("Model", name, version));
+    apply(this, fields);
+  }
+
+  /**
+   * Set `interface`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `interface`.
+   * @returns This value.
+   */
+  interface(value: Value<ModelFields, "interface">): this {
+    return set(this, "interface", value);
+  }
+
+  /**
+   * Set `task_type`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `task_type`.
+   * @returns This value.
+   */
+  taskType(value: Value<ModelFields, "task_type">): this {
+    return set(this, "task_type", value);
+  }
+
+  /**
+   * Set `signature`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `signature`.
+   * @returns This value.
+   */
+  signature(value: Value<ModelFields, "signature">): this {
+    return set(this, "signature", value);
+  }
+
+  /**
+   * Set `sample_input`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `sample_input`.
+   * @returns This value.
+   */
+  sampleInput(value: Value<ModelFields, "sample_input">): this {
+    return set(this, "sample_input", value);
+  }
+
+  /**
+   * Set the whole `card_refs` list, replacing every earlier entry and whatever it referenced.
+   *
+   * @param items - The new entries.
+   * @returns This value.
+   */
+  cardRefs(items: Value<ModelFields, "card_refs">): this {
+    return set(this, "card_refs", items);
+  }
+
+  /**
+   * Append one entry to `card_refs`; a repeated ID is refused at validation.
+   *
+   * @param item - The entry.
+   * @returns This value.
+   */
+  addCardRef(item: Item<ModelFields, "card_refs">): this {
+    return add(this, "card_refs", item);
+  }
+}
+
+/** A Data Card: a dataset's interface, schema, splits, and target columns. */
+export class Data extends AuthoredCard {
+  /**
+   * An empty Data Card named `name`, at `options.version` when given, else
+   * at the version registration assigns, with any spec fields given in
+   * `options`; nothing is validated until its graph is.
+   *
+   * @param name - The Card name.
+   * @param options - The optional version and spec fields, each set as its
+   * setter sets it.
+   */
+  constructor(name: string, options: DataOptions = {}) {
+    const { version, ...fields } = options;
+    super(NativeAuthored.card("Data", name, version));
+    apply(this, fields);
+  }
+
+  /**
+   * Set `interface`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `interface`.
+   * @returns This value.
+   */
+  interface(value: Value<DataFields, "interface">): this {
+    return set(this, "interface", value);
+  }
+
+  /**
+   * Set `schema`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `schema`.
+   * @returns This value.
+   */
+  schema(value: Value<DataFields, "schema">): this {
+    return set(this, "schema", value);
+  }
+
+  /**
+   * Set `sql`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `sql`.
+   * @returns This value.
+   */
+  sql(value: Value<DataFields, "sql">): this {
+    return set(this, "sql", value);
+  }
+
+  /**
+   * Set `stats`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `stats`.
+   * @returns This value.
+   */
+  stats(value: Value<DataFields, "stats">): this {
+    return set(this, "stats", value);
+  }
+
+  /**
+   * Set the whole `card_refs` list, replacing every earlier entry and whatever it referenced.
+   *
+   * @param items - The new entries.
+   * @returns This value.
+   */
+  cardRefs(items: Value<DataFields, "card_refs">): this {
+    return set(this, "card_refs", items);
+  }
+
+  /**
+   * Append one entry to `card_refs`; a repeated ID is refused at validation.
+   *
+   * @param item - The entry.
+   * @returns This value.
+   */
+  addCardRef(item: Item<DataFields, "card_refs">): this {
+    return add(this, "card_refs", item);
+  }
+
+  /**
+   * Set the whole `target_columns` list, replacing every earlier entry and whatever it referenced.
+   *
+   * @param items - The new entries.
+   * @returns This value.
+   */
+  targetColumns(items: Value<DataFields, "target_columns">): this {
+    return set(this, "target_columns", items);
+  }
+
+  /**
+   * Append one entry to `target_columns`; a repeated ID is refused at validation.
+   *
+   * @param item - The entry.
+   * @returns This value.
+   */
+  addTargetColumn(item: Item<DataFields, "target_columns">): this {
+    return add(this, "target_columns", item);
+  }
+
+  /**
+   * Set the whole `splits` map, replacing every earlier entry and whatever it referenced.
+   *
+   * @param entries - The new entries.
+   * @returns This value.
+   */
+  splits(entries: Value<DataFields, "splits">): this {
+    return set(this, "splits", entries);
+  }
+
+  /**
+   * Insert the entry `key` into `splits`; a repeated key is refused at validation.
+   *
+   * @param key - The entry's key.
+   * @param value - The entry's value.
+   * @returns This value.
+   */
+  addSplit(key: string, value: Entry<DataFields, "splits">): this {
+    return insert(this, "splits", key, value);
+  }
+}
+
+/** An Experiment Card: the targets and parameters of a set of runs, with their summary metrics and best run. */
+export class Experiment extends AuthoredCard {
+  /**
+   * An empty Experiment Card named `name`, at `options.version` when given, else
+   * at the version registration assigns, with any spec fields given in
+   * `options`; nothing is validated until its graph is.
+   *
+   * @param name - The Card name.
+   * @param options - The optional version and spec fields, each set as its
+   * setter sets it.
+   */
+  constructor(name: string, options: ExperimentOptions = {}) {
+    const { version, ...fields } = options;
+    super(NativeAuthored.card("Experiment", name, version));
+    apply(this, fields);
+  }
+
+  /**
+   * Set `experiment_type`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `experiment_type`.
+   * @returns This value.
+   */
+  experimentType(value: Value<ExperimentFields, "experiment_type">): this {
+    return set(this, "experiment_type", value);
+  }
+
+  /**
+   * Set `description`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `description`.
+   * @returns This value.
+   */
+  description(value: Value<ExperimentFields, "description">): this {
+    return set(this, "description", value);
+  }
+
+  /**
+   * Set `best_run_ref`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `best_run_ref`.
+   * @returns This value.
+   */
+  bestRunRef(value: Value<ExperimentFields, "best_run_ref">): this {
+    return set(this, "best_run_ref", value);
+  }
+
+  /**
+   * Set the whole `target_refs` list, replacing every earlier entry and whatever it referenced.
+   *
+   * @param items - The new entries.
+   * @returns This value.
+   */
+  targetRefs(items: Value<ExperimentFields, "target_refs">): this {
+    return set(this, "target_refs", items);
+  }
+
+  /**
+   * Append one entry to `target_refs`; a repeated ID is refused at validation.
+   *
+   * @param item - The entry.
+   * @returns This value.
+   */
+  addTargetRef(item: Item<ExperimentFields, "target_refs">): this {
+    return add(this, "target_refs", item);
+  }
+
+  /**
+   * Set the whole `run_refs` list, replacing every earlier entry and whatever it referenced.
+   *
+   * @param items - The new entries.
+   * @returns This value.
+   */
+  runRefs(items: Value<ExperimentFields, "run_refs">): this {
+    return set(this, "run_refs", items);
+  }
+
+  /**
+   * Append one entry to `run_refs`; a repeated ID is refused at validation.
+   *
+   * @param item - The entry.
+   * @returns This value.
+   */
+  addRunRef(item: Item<ExperimentFields, "run_refs">): this {
+    return add(this, "run_refs", item);
+  }
+
+  /**
+   * Set the whole `summary_metrics` list, replacing every earlier entry and whatever it referenced.
+   *
+   * @param items - The new entries.
+   * @returns This value.
+   */
+  summaryMetrics(items: Value<ExperimentFields, "summary_metrics">): this {
+    return set(this, "summary_metrics", items);
+  }
+
+  /**
+   * Append one entry to `summary_metrics`; a repeated ID is refused at validation.
+   *
+   * @param item - The entry.
+   * @returns This value.
+   */
+  addSummaryMetric(item: Item<ExperimentFields, "summary_metrics">): this {
+    return add(this, "summary_metrics", item);
+  }
+
+  /**
+   * Set the whole `card_refs` list, replacing every earlier entry and whatever it referenced.
+   *
+   * @param items - The new entries.
+   * @returns This value.
+   */
+  cardRefs(items: Value<ExperimentFields, "card_refs">): this {
+    return set(this, "card_refs", items);
+  }
+
+  /**
+   * Append one entry to `card_refs`; a repeated ID is refused at validation.
+   *
+   * @param item - The entry.
+   * @returns This value.
+   */
+  addCardRef(item: Item<ExperimentFields, "card_refs">): this {
+    return add(this, "card_refs", item);
+  }
+
+  /**
+   * Set the whole `default_parameters` map, replacing every earlier entry and whatever it referenced.
+   *
+   * @param entries - The new entries.
+   * @returns This value.
+   */
+  defaultParameters(entries: Value<ExperimentFields, "default_parameters">): this {
+    return set(this, "default_parameters", entries);
+  }
+
+  /**
+   * Insert the entry `key` into `default_parameters`; a repeated key is refused at validation.
+   *
+   * @param key - The entry's key.
+   * @param value - The entry's value.
+   * @returns This value.
+   */
+  addDefaultParameter(key: string, value: Entry<ExperimentFields, "default_parameters">): this {
+    return insert(this, "default_parameters", key, value);
+  }
+
+  /**
+   * Set the whole `details` map, replacing every earlier entry and whatever it referenced.
+   *
+   * @param entries - The new entries.
+   * @returns This value.
+   */
+  details(entries: Value<ExperimentFields, "details">): this {
+    return set(this, "details", entries);
+  }
+
+  /**
+   * Insert the entry `key` into `details`; a repeated key is refused at validation.
+   *
+   * @param key - The entry's key.
+   * @param value - The entry's value.
+   * @returns This value.
+   */
+  addDetail(key: string, value: Entry<ExperimentFields, "details">): this {
+    return insert(this, "details", key, value);
+  }
+}
+
+/** An Mcp Card: an MCP server and the tools it exposes. */
+export class Mcp extends AuthoredCard {
+  /**
+   * An empty Mcp Card named `name`, at `options.version` when given, else
+   * at the version registration assigns, with any spec fields given in
+   * `options`; nothing is validated until its graph is.
+   *
+   * @param name - The Card name.
+   * @param options - The optional version and spec fields, each set as its
+   * setter sets it.
+   */
+  constructor(name: string, options: McpOptions = {}) {
+    const { version, ...fields } = options;
+    super(NativeAuthored.card("Mcp", name, version));
+    apply(this, fields);
+  }
+
+  /**
+   * Set `description`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `description`.
+   * @returns This value.
+   */
+  description(value: Value<McpFields, "description">): this {
+    return set(this, "description", value);
+  }
+
+  /**
+   * Set `server_name`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `server_name`.
+   * @returns This value.
+   */
+  serverName(value: Value<McpFields, "server_name">): this {
+    return set(this, "server_name", value);
+  }
+
+  /**
+   * Set `transport`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `transport`.
+   * @returns This value.
+   */
+  transport(value: Value<McpFields, "transport">): this {
+    return set(this, "transport", value);
+  }
+
+  /**
+   * Set the whole `tool_refs` list, replacing every earlier entry and whatever it referenced.
+   *
+   * @param items - The new entries.
+   * @returns This value.
+   */
+  toolRefs(items: Value<McpFields, "tool_refs">): this {
+    return set(this, "tool_refs", items);
+  }
+
+  /**
+   * Append one entry to `tool_refs`; a repeated ID is refused at validation.
+   *
+   * @param item - The entry.
+   * @returns This value.
+   */
+  addToolRef(item: Item<McpFields, "tool_refs">): this {
+    return add(this, "tool_refs", item);
+  }
+
+  /**
+   * Set the whole `scopes` list, replacing every earlier entry and whatever it referenced.
+   *
+   * @param items - The new entries.
+   * @returns This value.
+   */
+  scopes(items: Value<McpFields, "scopes">): this {
+    return set(this, "scopes", items);
+  }
+
+  /**
+   * Append one entry to `scopes`; a repeated ID is refused at validation.
+   *
+   * @param item - The entry.
+   * @returns This value.
+   */
+  addScope(item: Item<McpFields, "scopes">): this {
+    return add(this, "scopes", item);
+  }
+
+  /**
+   * Set the whole `details` map, replacing every earlier entry and whatever it referenced.
+   *
+   * @param entries - The new entries.
+   * @returns This value.
+   */
+  details(entries: Value<McpFields, "details">): this {
+    return set(this, "details", entries);
+  }
+
+  /**
+   * Insert the entry `key` into `details`; a repeated key is refused at validation.
+   *
+   * @param key - The entry's key.
+   * @param value - The entry's value.
+   * @returns This value.
+   */
+  addDetail(key: string, value: Entry<McpFields, "details">): this {
+    return insert(this, "details", key, value);
+  }
+}
+
+/** An Audit Card: subjects, policies, and evidence. */
+export class Audit extends AuthoredCard {
+  /**
+   * An empty Audit Card named `name`, at `options.version` when given, else
+   * at the version registration assigns, with any spec fields given in
+   * `options`; nothing is validated until its graph is.
+   *
+   * @param name - The Card name.
+   * @param options - The optional version and spec fields, each set as its
+   * setter sets it.
+   */
+  constructor(name: string, options: AuditOptions = {}) {
+    const { version, ...fields } = options;
+    super(NativeAuthored.card("Audit", name, version));
+    apply(this, fields);
+  }
+
+  /**
+   * Set `description`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `description`.
+   * @returns This value.
+   */
+  description(value: Value<AuditFields, "description">): this {
+    return set(this, "description", value);
+  }
+
+  /**
+   * Set the whole `subject_refs` list, replacing every earlier entry and whatever it referenced.
+   *
+   * @param items - The new entries.
+   * @returns This value.
+   */
+  subjectRefs(items: Value<AuditFields, "subject_refs">): this {
+    return set(this, "subject_refs", items);
+  }
+
+  /**
+   * Append one entry to `subject_refs`; a repeated ID is refused at validation.
+   *
+   * @param item - The entry.
+   * @returns This value.
+   */
+  addSubjectRef(item: Item<AuditFields, "subject_refs">): this {
+    return add(this, "subject_refs", item);
+  }
+
+  /**
+   * Set the whole `policy_refs` list, replacing every earlier entry and whatever it referenced.
+   *
+   * @param items - The new entries.
+   * @returns This value.
+   */
+  policyRefs(items: Value<AuditFields, "policy_refs">): this {
+    return set(this, "policy_refs", items);
+  }
+
+  /**
+   * Append one entry to `policy_refs`; a repeated ID is refused at validation.
+   *
+   * @param item - The entry.
+   * @returns This value.
+   */
+  addPolicyRef(item: Item<AuditFields, "policy_refs">): this {
+    return add(this, "policy_refs", item);
+  }
+
+  /**
+   * Set the whole `evidence_refs` list, replacing every earlier entry and whatever it referenced.
+   *
+   * @param items - The new entries.
+   * @returns This value.
+   */
+  evidenceRefs(items: Value<AuditFields, "evidence_refs">): this {
+    return set(this, "evidence_refs", items);
+  }
+
+  /**
+   * Append one entry to `evidence_refs`; a repeated ID is refused at validation.
+   *
+   * @param item - The entry.
+   * @returns This value.
+   */
+  addEvidenceRef(item: Item<AuditFields, "evidence_refs">): this {
+    return add(this, "evidence_refs", item);
+  }
+
+  /**
+   * Set the whole `details` map, replacing every earlier entry and whatever it referenced.
+   *
+   * @param entries - The new entries.
+   * @returns This value.
+   */
+  details(entries: Value<AuditFields, "details">): this {
+    return set(this, "details", entries);
+  }
+
+  /**
+   * Insert the entry `key` into `details`; a repeated key is refused at validation.
+   *
+   * @param key - The entry's key.
+   * @param value - The entry's value.
+   * @returns This value.
+   */
+  addDetail(key: string, value: Entry<AuditFields, "details">): this {
+    return insert(this, "details", key, value);
+  }
+}
+
+/** A Trigger Card: when a binding's Verifier runs. */
+export class Trigger extends AuthoredCard {
+  /**
+   * An empty Trigger Card named `name`, at `options.version` when given, else
+   * at the version registration assigns, with any spec fields given in
+   * `options`; nothing is validated until its graph is.
+   *
+   * @param name - The Card name.
+   * @param options - The optional version and spec fields, each set as its
+   * setter sets it.
+   */
+  constructor(name: string, options: TriggerOptions = {}) {
+    const { version, ...fields } = options;
+    super(NativeAuthored.card("Trigger", name, version));
+    apply(this, fields);
+  }
+
+  /**
+   * Set `description`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `description`.
+   * @returns This value.
+   */
+  description(value: Value<TriggerFields, "description">): this {
+    return set(this, "description", value);
+  }
+
+  /**
+   * Set `kind`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `kind`.
+   * @returns This value.
+   */
+  kind(value: Value<TriggerFields, "kind">): this {
+    return set(this, "kind", value);
+  }
+
+  /**
+   * Set `cron`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `cron`.
+   * @returns This value.
+   */
+  cron(value: Value<TriggerFields, "cron">): this {
+    return set(this, "cron", value);
+  }
+
+  /**
+   * Set `tz`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `tz`.
+   * @returns This value.
+   */
+  tz(value: Value<TriggerFields, "tz">): this {
+    return set(this, "tz", value);
+  }
+
+  /**
+   * Set `after`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `after`.
+   * @returns This value.
+   */
+  after(value: Value<TriggerFields, "after">): this {
+    return set(this, "after", value);
+  }
+}
+
+/** An Operator Card: what runs when a binding's Verifier fails or changes verdict. */
+export class Operator extends AuthoredCard {
+  /**
+   * An empty Operator Card named `name`, at `options.version` when given, else
+   * at the version registration assigns, with any spec fields given in
+   * `options`; nothing is validated until its graph is.
+   *
+   * @param name - The Card name.
+   * @param options - The optional version and spec fields, each set as its
+   * setter sets it.
+   */
+  constructor(name: string, options: OperatorOptions = {}) {
+    const { version, ...fields } = options;
+    super(NativeAuthored.card("Operator", name, version));
+    apply(this, fields);
+  }
+
+  /**
+   * Set `description`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `description`.
+   * @returns This value.
+   */
+  description(value: Value<OperatorFields, "description">): this {
+    return set(this, "description", value);
+  }
+
+  /**
+   * Set `action`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `action`.
+   * @returns This value.
+   */
+  action(value: Value<OperatorFields, "action">): this {
+    return set(this, "action", value);
+  }
+
+  /**
+   * Set `budget`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `budget`.
+   * @returns This value.
+   */
+  budget(value: Value<OperatorFields, "budget">): this {
+    return set(this, "budget", value);
+  }
+}
+/**
+ * A Verifier Card: the evidence it accepts, the steps that compute over it,
+ * and the requirements that judge it.
+ */
+export class Verifier extends AuthoredCard {
+  /**
+   * An empty Verifier Card named `name`, at `options.version` when given, else
+   * at the version registration assigns, with any spec fields given in
+   * `options`; nothing is validated until its graph is.
+   *
+   * @param name - The Card name.
+   * @param options - The optional version and spec fields, each set as its
+   * setter sets it.
+   */
+  constructor(name: string, options: VerifierOptions = {}) {
+    const { version, ...fields } = options;
+    super(NativeAuthored.card("Verifier", name, version));
+    apply(this, fields);
+  }
+
+  /**
+   * The step stages the server would execute, after validating this Verifier
+   * as its YAML file would be. A step runs after every step it names in
+   * `depends_on` and every step whose output or status it references; steps
+   * with no edge between them share a stage.
+   *
+   * @returns The execution plan.
+   * @throws `WyrdError` `WYRD_LOADER_400_INVALID_ENVELOPE` for a field that
+   * does not decode, and the shared Verifier validation's refusal.
+   */
+  plan(): Wire.ExecutionPlan {
+    return lifecycleValue<Wire.ExecutionPlan>(authoredOf(this).plan());
+  }
+
+  /**
+   * Set `description`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `description`.
+   * @returns This value.
+   */
+  description(value: Value<VerifierFields, "description">): this {
+    return set(this, "description", value);
+  }
+
+  /**
+   * Set `decide`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `decide`.
+   * @returns This value.
+   */
+  decide(value: Value<VerifierFields, "decide">): this {
+    return set(this, "decide", value);
+  }
+
+  /**
+   * Set `context_capture`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `context_capture`.
+   * @returns This value.
+   */
+  contextCapture(value: Value<VerifierFields, "context_capture">): this {
+    return set(this, "context_capture", value);
+  }
+
+  /**
+   * Set `order_by`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `order_by`.
+   * @returns This value.
+   */
+  orderBy(value: Value<VerifierFields, "order_by">): this {
+    return set(this, "order_by", value);
+  }
+
+  /**
+   * Set the whole `steps` list, replacing every earlier entry and whatever it referenced.
+   *
+   * @param items - The new entries.
+   * @returns This value.
+   */
+  steps(items: Value<VerifierFields, "steps">): this {
+    return set(this, "steps", items);
+  }
+
+  /**
+   * Append one entry to `steps`; a repeated ID is refused at validation.
+   *
+   * @param item - The entry.
+   * @returns This value.
+   */
+  addStep(item: Item<VerifierFields, "steps">): this {
+    return add(this, "steps", item);
+  }
+
+  /**
+   * Set the whole `requirements` list, replacing every earlier entry and whatever it referenced.
+   *
+   * @param items - The new entries.
+   * @returns This value.
+   */
+  requirements(items: Value<VerifierFields, "requirements">): this {
+    return set(this, "requirements", items);
+  }
+
+  /**
+   * Append one entry to `requirements`; a repeated ID is refused at validation.
+   *
+   * @param item - The entry.
+   * @returns This value.
+   */
+  addRequirement(item: Item<VerifierFields, "requirements">): this {
+    return add(this, "requirements", item);
+  }
+
+  /**
+   * Set the whole `inputs` map, replacing every earlier entry and whatever it referenced.
+   *
+   * @param entries - The new entries.
+   * @returns This value.
+   */
+  inputs(entries: Value<VerifierFields, "inputs">): this {
+    return set(this, "inputs", entries);
+  }
+
+  /**
+   * Insert the entry `key` into `inputs`; a repeated key is refused at validation.
+   *
+   * @param key - The entry's key.
+   * @param value - The entry's value.
+   * @returns This value.
+   */
+  addInput(key: string, value: Entry<VerifierFields, "inputs">): this {
+    return insert(this, "inputs", key, value);
+  }
+}
+
+/**
+ * An Artifact Card: a local file or directory published before the graph that
+ * references it, or an Artifact defined only by its spec, declared in its
+ * graph like any sibling Card.
+ */
+export class Artifact extends AuthoredCard {
+  /**
+   * An empty Artifact Card named `name`, at `options.version` when given, else
+   * at the version registration assigns, with any spec fields given in
+   * `options`; nothing is validated until its graph is.
+   *
+   * @param name - The Card name.
+   * @param options - The optional version and spec fields, each set as its
+   * setter sets it.
+   */
+  constructor(name: string, options: ArtifactOptions = {}) {
+    const { version, ...fields } = options;
+    super(NativeAuthored.card("Artifact", name, version));
+    apply(this, fields);
+  }
+
+  /**
+   * The `file` Artifact named `name`, at `options.version` when given,
+   * published from the file or directory at `path` before its graph; nothing
+   * is read until it is published.
+   *
+   * @param name - The Card name.
+   * @param path - The local file or directory.
+   * @param options - The optional version and spec fields, each set as its
+   * setter sets it.
+   * @returns The local Artifact.
+   */
+  static fromPath(name: string, path: string, options: ArtifactOptions = {}): Artifact {
+    const { version, ...fields } = options;
+    const artifact = adopt(Artifact.prototype, NativeAuthored.artifactFromPath(name, version, path));
+    apply(artifact, fields);
+    return artifact;
+  }
+
+  /**
+   * Set whether supported documents are extracted beside their originals when
+   * the local source is published.
+   *
+   * @param extract - Whether to extract.
+   * @returns This Artifact.
+   */
+  extract(extract: boolean): this {
+    authoredOf(this).extract(extract);
+    return this;
+  }
+
+  /**
+   * Select the fixed file or directory prefix `path` of this exact Artifact
+   * version; a local Artifact is published first.
+   *
+   * @param path - The file, or directory prefix.
+   * @returns The selection.
+   */
+  file(path: string): ArtifactFile {
+    return adopt(ArtifactFile.prototype, authoredOf(this).file(path));
+  }
+
+  /**
+   * Set `artifact_kind`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `artifact_kind`.
+   * @returns This value.
+   */
+  artifactKind(value: Value<ArtifactFields, "artifact_kind">): this {
+    return set(this, "artifact_kind", value);
+  }
+
+  /**
+   * Set `content_type`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `content_type`.
+   * @returns This value.
+   */
+  contentType(value: Value<ArtifactFields, "content_type">): this {
+    return set(this, "content_type", value);
+  }
+
+  /**
+   * Set `size_bytes`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `size_bytes`.
+   * @returns This value.
+   */
+  sizeBytes(value: Value<ArtifactFields, "size_bytes">): this {
+    return set(this, "size_bytes", value);
+  }
+
+  /**
+   * Set `integrity`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `integrity`.
+   * @returns This value.
+   */
+  integrity(value: Value<ArtifactFields, "integrity">): this {
+    return set(this, "integrity", value);
+  }
+
+  /**
+   * Set `schema_ref`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `schema_ref`.
+   * @returns This value.
+   */
+  schemaRef(value: Value<ArtifactFields, "schema_ref">): this {
+    return set(this, "schema_ref", value);
+  }
+
+  /**
+   * Set `framework_adapter`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `framework_adapter`.
+   * @returns This value.
+   */
+  frameworkAdapter(value: Value<ArtifactFields, "framework_adapter">): this {
+    return set(this, "framework_adapter", value);
+  }
+
+  /**
+   * Set `external_uri`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `external_uri`.
+   * @returns This value.
+   */
+  externalUri(value: Value<ArtifactFields, "external_uri">): this {
+    return set(this, "external_uri", value);
+  }
+
+  /**
+   * Set the whole `artifact_uris` list, replacing every earlier entry and whatever it referenced.
+   *
+   * @param items - The new entries.
+   * @returns This value.
+   */
+  artifactUris(items: Value<ArtifactFields, "artifact_uris">): this {
+    return set(this, "artifact_uris", items);
+  }
+
+  /**
+   * Append one entry to `artifact_uris`; a repeated ID is refused at validation.
+   *
+   * @param item - The entry.
+   * @returns This value.
+   */
+  addArtifactUri(item: Item<ArtifactFields, "artifact_uris">): this {
+    return add(this, "artifact_uris", item);
+  }
+
+  /**
+   * Set the whole `metadata` map, replacing every earlier entry and whatever it referenced.
+   *
+   * @param entries - The new entries.
+   * @returns This value.
+   */
+  metadata(entries: Value<ArtifactFields, "metadata">): this {
+    return set(this, "metadata", entries);
+  }
+
+  /**
+   * Insert the entry `key` into `metadata`; a repeated key is refused at validation.
+   *
+   * @param key - The entry's key.
+   * @param value - The entry's value.
+   * @returns This value.
+   */
+  addMetadata(key: string, value: Entry<ArtifactFields, "metadata">): this {
+    return insert(this, "metadata", key, value);
+  }
+}
+
+/**
+ * One Bifrost dataset table a Service declares: its name inside
+ * `bifrost.datasets` and the JSON Schema whose `properties` order is its
+ * column order.
+ */
+export class Table {
+  /** Type-only identity: no other value is a Table, whatever its shape. */
+  declare private readonly family: "Table";
+
+  /**
+   * The table `name` with the JSON Schema object `schema`.
+   *
+   * @param name - The table name.
+   * @param schema - The JSON Schema of the table's fields, in column order.
+   */
+  constructor(name: string, schema: Wire.ServiceTable["schema"]) {
+    holdAuthored(this, NativeAuthored.table(name, snapshot("schema", schema)));
+  }
+}
+
+/** One Service component: an alias for a referenced Card and the Verifiers that check it. */
+export class Component {
+  /** Type-only identity: no other value is a Component, whatever its shape. */
+  declare private readonly family: "Component";
+
+  /**
+   * The component `alias` for `ref`: a Card, an exact {@link CardRef}, or a
+   * reference path, with any other fields given in `options`.
+   *
+   * @param alias - The component alias.
+   * @param ref - The referenced Card.
+   * @param options - Other fields, each set as its setter sets it.
+   */
+  constructor(alias: string, ref: Value<ComponentFields, "ref">, options: ComponentOptions = {}) {
+    holdAuthored(this, NativeAuthored.component(alias, argument("ref", ref)));
+    apply(this, options);
+  }
+
+  /**
+   * Set `source`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `source`.
+   * @returns This value.
+   */
+  source(value: Value<ComponentFields, "source">): this {
+    return set(this, "source", value);
+  }
+
+  /**
+   * Set the whole `verified_by` list, replacing every earlier entry and whatever it referenced.
+   *
+   * @param items - The new entries.
+   * @returns This value.
+   */
+  verifiedBy(items: Value<ComponentFields, "verified_by">): this {
+    return set(this, "verified_by", items);
+  }
+
+  /**
+   * Append one entry to `verified_by`; a repeated ID is refused at validation.
+   *
+   * @param item - The entry.
+   * @returns This value.
+   */
+  addVerifiedBy(item: Item<ComponentFields, "verified_by">): this {
+    return add(this, "verified_by", item);
+  }
+
+  /**
+   * Set the whole `credential_refs` list, replacing every earlier entry and whatever it referenced.
+   *
+   * @param items - The new entries.
+   * @returns This value.
+   */
+  credentialRefs(items: Value<ComponentFields, "credential_refs">): this {
+    return set(this, "credential_refs", items);
+  }
+
+  /**
+   * Append one entry to `credential_refs`; a repeated ID is refused at validation.
+   *
+   * @param item - The entry.
+   * @returns This value.
+   */
+  addCredentialRef(item: Item<ComponentFields, "credential_refs">): this {
+    return add(this, "credential_refs", item);
+  }
+
+  /**
+   * Set the whole `config` map, replacing every earlier entry and whatever it referenced.
+   *
+   * @param entries - The new entries.
+   * @returns This value.
+   */
+  config(entries: Value<ComponentFields, "config">): this {
+    return set(this, "config", entries);
+  }
+
+  /**
+   * Insert the entry `key` into `config`; a repeated key is refused at validation.
+   *
+   * @param key - The entry's key.
+   * @param value - The entry's value.
+   * @returns This value.
+   */
+  addConfig(key: string, value: Entry<ComponentFields, "config">): this {
+    return insert(this, "config", key, value);
+  }
+}
+
+/** One verification binding: the Verifier to run, when it runs, and the Operators that react to its verdicts. */
+export class Binding {
+  /** Type-only identity: no other value is a Binding, whatever its shape. */
+  declare private readonly family: "Binding";
+
+  /**
+   * Bind `verifier`: a {@link Verifier}, an exact {@link CardRef}, or a
+   * reference path, with any other fields given in `options`.
+   *
+   * @param verifier - The Verifier.
+   * @param options - Other fields, each set as its setter sets it.
+   */
+  constructor(verifier: Value<BindingFields, "verifier">, options: BindingOptions = {}) {
+    holdAuthored(this, NativeAuthored.binding(argument("verifier", verifier)));
+    apply(this, options);
+  }
+
+  /**
+   * Set `runs_on`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `runs_on`.
+   * @returns This value.
+   */
+  runsOn(value: Value<BindingFields, "runs_on">): this {
+    return set(this, "runs_on", value);
+  }
+
+  /**
+   * Set the whole `on_failure` list, replacing every earlier entry and whatever it referenced.
+   *
+   * @param items - The new entries.
+   * @returns This value.
+   */
+  onFailure(items: Value<BindingFields, "on_failure">): this {
+    return set(this, "on_failure", items);
+  }
+
+  /**
+   * Append one entry to `on_failure`; a repeated ID is refused at validation.
+   *
+   * @param item - The entry.
+   * @returns This value.
+   */
+  addOnFailure(item: Item<BindingFields, "on_failure">): this {
+    return add(this, "on_failure", item);
+  }
+
+  /**
+   * Set the whole `on_verdict_change` list, replacing every earlier entry and whatever it referenced.
+   *
+   * @param items - The new entries.
+   * @returns This value.
+   */
+  onVerdictChange(items: Value<BindingFields, "on_verdict_change">): this {
+    return set(this, "on_verdict_change", items);
+  }
+
+  /**
+   * Append one entry to `on_verdict_change`; a repeated ID is refused at validation.
+   *
+   * @param item - The entry.
+   * @returns This value.
+   */
+  addOnVerdictChange(item: Item<BindingFields, "on_verdict_change">): this {
+    return add(this, "on_verdict_change", item);
+  }
+}
+
+/** One data-producing Verifier step. */
+export class Step {
+  /** Type-only identity: no other value is a Step, whatever its shape. */
+  declare private readonly family: "Step";
+
+  /**
+   * The step `id` running `action`, with any other fields given in `options`.
+   *
+   * @param id - The step ID.
+   * @param action - An {@link Action} or its canonical object.
+   * @param options - Other fields, each set as its setter sets it.
+   */
+  constructor(id: string, action: Value<StepFields, "action">, options: StepOptions = {}) {
+    holdAuthored(this, NativeAuthored.step(id, argument("action", action)));
+    apply(this, options);
+  }
+
+  /**
+   * Set `when`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `when`.
+   * @returns This value.
+   */
+  when(value: Value<StepFields, "when">): this {
+    return set(this, "when", value);
+  }
+
+  /**
+   * Set `timeout_seconds`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `timeout_seconds`.
+   * @returns This value.
+   */
+  timeoutSeconds(value: Value<StepFields, "timeout_seconds">): this {
+    return set(this, "timeout_seconds", value);
+  }
+
+  /**
+   * Set `retries`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `retries`.
+   * @returns This value.
+   */
+  retries(value: Value<StepFields, "retries">): this {
+    return set(this, "retries", value);
+  }
+
+  /**
+   * Set the whole `depends_on` list, replacing every earlier entry and whatever it referenced.
+   *
+   * @param items - The new entries.
+   * @returns This value.
+   */
+  dependsOn(items: Value<StepFields, "depends_on">): this {
+    return set(this, "depends_on", items);
+  }
+
+  /**
+   * Append one entry to `depends_on`; a repeated ID is refused at validation.
+   *
+   * @param item - The entry.
+   * @returns This value.
+   */
+  addDependsOn(item: Item<StepFields, "depends_on">): this {
+    return add(this, "depends_on", item);
+  }
+
+  /**
+   * Set the whole `requirements` list, replacing every earlier entry and whatever it referenced.
+   *
+   * @param items - The new entries.
+   * @returns This value.
+   */
+  requirements(items: Value<StepFields, "requirements">): this {
+    return set(this, "requirements", items);
+  }
+
+  /**
+   * Append one entry to `requirements`; a repeated ID is refused at validation.
+   *
+   * @param item - The entry.
+   * @returns This value.
+   */
+  addRequirement(item: Item<StepFields, "requirements">): this {
+    return add(this, "requirements", item);
+  }
+}
+
+/** One requirement, producing exactly one verdict. */
+export class Requirement {
+  /** Type-only identity: no other value is a Requirement, whatever its shape. */
+  declare private readonly family: "Requirement";
+
+  /**
+   * The requirement `id` claiming `statement`, judged by `check`.
+   *
+   * @param id - The requirement ID.
+   * @param statement - The claim.
+   * @param check - A {@link Check} or its canonical object.
+   */
+  constructor(id: string, statement: string, check: Authorable<Wire.Check>) {
+    holdAuthored(this, NativeAuthored.requirement(id, statement, argument("check", check)));
+  }
+}
+
+/**
+ * One named evidence slot of a Verifier. Evidence a caller omits stays
+ * missing, never `null`; a `json` slot's schema alone decides whether a
+ * supplied `null` is admitted.
+ */
+export class InputSlot {
+  /** Type-only identity: no other value is a InputSlot, whatever its shape. */
+  declare private readonly family: "InputSlot";
+
+  private constructor() {}
+
+  /**
+   * A JSON value constrained by the JSON Schema `schema`.
+   *
+   * @param schema - The JSON Schema.
+   * @returns The slot.
+   */
+  static json(schema: Wire.JsonValue): InputSlot {
+    return adopt(InputSlot.prototype, NativeAuthored.slotJson(argument("schema", schema)));
+  }
+
+  /**
+   * A pinned file in one of `formats`, such as `"pdf"`.
+   *
+   * @param formats - The accepted formats.
+   * @param options - Other fields, each set as its setter sets it.
+   * @returns The slot.
+   */
+  static media(formats: Wire.TypedInputSlotMedia["formats"], options: MediaSlotOptions = {}): InputSlot {
+    const slot = adopt(InputSlot.prototype, NativeAuthored.slotMedia(argument("formats", formats)));
+    apply(slot, options);
+    return slot;
+  }
+
+  /**
+   * A trace resolved through tenant-scoped trace reads.
+   *
+   * @returns The slot.
+   */
+  static trace(): InputSlot {
+    return adopt(InputSlot.prototype, NativeAuthored.slotTrace());
+  }
+
+  /**
+   * Recorded measurements of `features` for a scheduled window.
+   *
+   * @param features - The measured features.
+   * @returns The slot.
+   */
+  static samples(features: Wire.TypedInputSlotSamples["features"]): InputSlot {
+    return adopt(InputSlot.prototype, NativeAuthored.slotSamples(argument("features", features)));
+  }
+
+  /**
+   * A group Verifier's input authored as the source reference `text`, such as
+   * `verifiers.<name>.inputs.<slot>`.
+   *
+   * @param text - The source reference.
+   * @returns The slot.
+   */
+  static source(text: string): InputSlot {
+    return adopt(InputSlot.prototype, NativeAuthored.slotSource(text));
+  }
+
+  /**
+   * Set `max_bytes`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `max_bytes`.
+   * @returns This value.
+   */
+  maxBytes(value: Value<InputSlotFields, "max_bytes">): this {
+    return set(this, "max_bytes", value);
+  }
+}
+
+/** A step action: extract, an Agent call, or sandboxed code. */
+export class Action {
+  /** Type-only identity: no other value is a Action, whatever its shape. */
+  declare private readonly family: "Action";
+
+  private constructor() {}
+
+  /**
+   * Extract text and structure from the media slot `from`, such as
+   * `inputs.report`.
+   *
+   * @param from - The media slot reference.
+   * @returns The action.
+   */
+  static extract(from: Wire.ActionExtract["from"]): Action {
+    return adopt(Action.prototype, NativeAuthored.actionExtract(from));
+  }
+
+  /**
+   * Invoke `agent`: an {@link Agent}, an exact {@link CardRef}, a reference
+   * path, or inline Agent JSON.
+   *
+   * @param agent - The Agent.
+   * @param options - Other fields, each set as its setter sets it.
+   * @returns The action.
+   */
+  static agent(agent: Authorable<Wire.ActionAgent["agent"]>, options: AgentActionOptions = {}): Action {
+    const action = adopt(Action.prototype, NativeAuthored.actionAgent(argument("agent", agent)));
+    apply(action, options);
+    return action;
+  }
+
+  /**
+   * Run `entrypoint` of `source` as sandboxed code returning JSON data.
+   *
+   * @param source - A {@link CodeSource}, {@link ArtifactFile}, or canonical source.
+   * @param entrypoint - The function to run.
+   * @param options - Other fields, each set as its setter sets it.
+   * @returns The action.
+   */
+  static code(
+    source: Authorable<Wire.ActionCode["source"]>,
+    entrypoint: string,
+    options: CodeActionOptions = {},
+  ): Action {
+    const action = adopt(Action.prototype, NativeAuthored.actionCode(argument("source", source), entrypoint));
+    apply(action, options);
+    return action;
+  }
+
+  /**
+   * Set `runtime`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `runtime`.
+   * @returns This value.
+   */
+  runtime(value: Value<ActionFields, "runtime">): this {
+    return set(this, "runtime", value);
+  }
+
+  /**
+   * Set the whole `inputs` map, replacing every earlier entry and whatever it referenced.
+   *
+   * @param entries - The new entries.
+   * @returns This value.
+   */
+  inputs(entries: Value<ActionFields, "inputs">): this {
+    return set(this, "inputs", entries);
+  }
+
+  /**
+   * Insert the entry `key` into `inputs`; a repeated key is refused at validation.
+   *
+   * @param key - The entry's key.
+   * @param value - The entry's value.
+   * @returns This value.
+   */
+  bindInput(key: string, value: Entry<ActionFields, "inputs">): this {
+    return insert(this, "inputs", key, value);
+  }
+
+  /**
+   * Set the whole `workspace` map, replacing every earlier entry and whatever it referenced.
+   *
+   * @param entries - The new entries.
+   * @returns This value.
+   */
+  workspace(entries: Value<ActionFields, "workspace">): this {
+    return set(this, "workspace", entries);
+  }
+
+  /**
+   * Insert the entry `key` into `workspace`; a repeated key is refused at validation.
+   *
+   * @param key - The entry's key.
+   * @param value - The entry's value.
+   * @returns This value.
+   */
+  addWorkspace(key: string, value: Entry<ActionFields, "workspace">): this {
+    return insert(this, "workspace", key, value);
+  }
+}
+
+/** A verdict-producing requirement check. */
+export class Check {
+  /** Type-only identity: no other value is a Check, whatever its shape. */
+  declare private readonly family: "Check";
+
+  private constructor() {}
+
+  /**
+   * Compare the one value at `path` with `expected` by `operator`, such as
+   * `"equals"` or its object form.
+   *
+   * @param path - The compared reference.
+   * @param operator - The comparison operator.
+   * @param expected - The expected value.
+   * @returns The check.
+   */
+  static assert(path: string, operator: Wire.CheckAssert["operator"], expected: Wire.JsonValue): Check {
+    return adopt(
+      Check.prototype,
+      NativeAuthored.checkAssert(path, argument("operator", operator), argument("expected", expected)),
+    );
+  }
+
+  /**
+   * Compare every value `each` selects through `[*]` with `expected` by
+   * `operator`.
+   *
+   * @param each - The reference selecting each compared value.
+   * @param operator - The comparison operator.
+   * @param expected - The expected value.
+   * @returns The check.
+   */
+  static each(each: string, operator: Wire.CheckAssert["operator"], expected: Wire.JsonValue): Check {
+    return adopt(
+      Check.prototype,
+      NativeAuthored.checkEach(each, argument("operator", operator), argument("expected", expected)),
+    );
+  }
+
+  /**
+   * Compare the spans `span_selector` selects in the trace slot `on` with
+   * `expected` by `operator`.
+   *
+   * @param on - The trace slot reference.
+   * @param spanSelector - The span selector.
+   * @param operator - The comparison operator.
+   * @param expected - The expected value.
+   * @returns The check.
+   */
+  static trace(
+    on: string,
+    spanSelector: Wire.CheckTrace["span_selector"],
+    operator: Wire.CheckTrace["operator"],
+    expected: Wire.JsonValue,
+  ): Check {
+    return adopt(
+      Check.prototype,
+      NativeAuthored.checkTrace(on, spanSelector, argument("operator", operator), argument("expected", expected)),
+    );
+  }
+
+  /**
+   * Judge with `agent`, which returns the Verdict schema.
+   *
+   * @param agent - The Agent.
+   * @param options - Other fields, each set as its setter sets it.
+   * @returns The check.
+   */
+  static agent(agent: Authorable<Wire.CheckAgent["agent"]>, options: AgentCheckOptions = {}): Check {
+    const check = adopt(Check.prototype, NativeAuthored.checkAgent(argument("agent", agent)));
+    apply(check, options);
+    return check;
+  }
+
+  /**
+   * Judge with `entrypoint` of `source`, which returns the Verdict schema.
+   *
+   * @param source - A {@link CodeSource}, {@link ArtifactFile}, or canonical source.
+   * @param entrypoint - The function to run.
+   * @param options - Other fields, each set as its setter sets it.
+   * @returns The check.
+   */
+  static code(source: Authorable<Wire.CheckCode["source"]>, entrypoint: string, options: CodeCheckOptions = {}): Check {
+    const check = adopt(Check.prototype, NativeAuthored.checkCode(argument("source", source), entrypoint));
+    apply(check, options);
+    return check;
+  }
+
+  /**
+   * Judge statistical drift over the samples slot `on` with the drift fields
+   * `spec`: method, signal, condition, and profile. A {@link Data} Card or
+   * exact {@link CardRef} may stand at `signal.baseline_ref`.
+   *
+   * @param on - The samples slot reference.
+   * @param spec - The drift fields.
+   * @returns The check.
+   */
+  static drift(on: string, spec: Authorable<Omit<Wire.CheckDrift, "kind" | "on">>): Check {
+    return adopt(Check.prototype, NativeAuthored.checkDrift(on, argument("spec", spec)));
+  }
+
+  /**
+   * Set `runtime`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `runtime`.
+   * @returns This value.
+   */
+  runtime(value: Value<CheckFields, "runtime">): this {
+    return set(this, "runtime", value);
+  }
+
+  /**
+   * Set `response_format`, replacing its earlier value and whatever it referenced.
+   *
+   * @param value - The new `response_format`.
+   * @returns This value.
+   */
+  responseFormat(value: Value<CheckFields, "response_format">): this {
+    return set(this, "response_format", value);
+  }
+
+  /**
+   * Set the whole `inputs` map, replacing every earlier entry and whatever it referenced.
+   *
+   * @param entries - The new entries.
+   * @returns This value.
+   */
+  inputs(entries: Value<CheckFields, "inputs">): this {
+    return set(this, "inputs", entries);
+  }
+
+  /**
+   * Insert the entry `key` into `inputs`; a repeated key is refused at validation.
+   *
+   * @param key - The entry's key.
+   * @param value - The entry's value.
+   * @returns This value.
+   */
+  bindInput(key: string, value: Entry<CheckFields, "inputs">): this {
+    return insert(this, "inputs", key, value);
+  }
+
+  /**
+   * Set the whole `workspace` map, replacing every earlier entry and whatever it referenced.
+   *
+   * @param entries - The new entries.
+   * @returns This value.
+   */
+  workspace(entries: Value<CheckFields, "workspace">): this {
+    return set(this, "workspace", entries);
+  }
+
+  /**
+   * Insert the entry `key` into `workspace`; a repeated key is refused at validation.
+   *
+   * @param key - The entry's key.
+   * @param value - The entry's value.
+   * @returns This value.
+   */
+  addWorkspace(key: string, value: Entry<CheckFields, "workspace">): this {
+    return insert(this, "workspace", key, value);
+  }
+}
+
+/**
+ * One response format for a {@link Prompt}: plain text, a JSON object, a
+ * named JSON Schema, or the canonical Verdict with an optional custom `data`
+ * schema, which the native builder expands.
+ */
+export type ResponseFormat =
+  | { readonly type: "text" }
+  | { readonly type: "json_object" }
+  | { readonly type: "json_schema"; readonly name: string; readonly schema: Readonly<Record<string, Wire.JsonValue>> }
+  | { readonly type: "verdict"; readonly data?: Readonly<Record<string, Wire.JsonValue>> };
+
+/** The options every {@link Prompt} factory takes, by the native builder's names. */
+export type PromptOptions = {
+  /** System text: the system message, or OpenAI Responses `instructions`. */
+  readonly system?: string;
+  /** One user message, or several, in order. */
+  readonly messages?: string | readonly string[];
+  /** The response format emitted into the native request. */
+  readonly responseFormat?: ResponseFormat;
+  /** The structured-output format; wins over `responseFormat`. */
+  readonly output?: ResponseFormat;
+  /** The provider's native generation settings, by their wire names. */
+  readonly settings?: Readonly<Record<string, Wire.JsonValue>>;
+};
+
+/** {@link Prompt.openaiChat} options, by the native builder's names. */
+export type OpenAiChatOptions = PromptOptions & {
+  /** OpenAI prompt cache key. */
+  readonly promptCacheKey?: string;
+};
+
+/**
+ * One native content part, or several, in the Prompt's request format, such
+ * as an OpenAI Chat `{ type: "image_url", image_url: { url } }` part; a
+ * `${media:name}` placeholder in it is bound by {@link Prompt.bindMedia}.
+ */
+export type PromptContent =
+  | Readonly<Record<string, Wire.JsonValue>>
+  | readonly Readonly<Record<string, Wire.JsonValue>>[];
+
+/** A media reference {@link Prompt.bindMedia} binds to a `${media:name}` placeholder. */
+export type MediaRef = {
+  /** Image or document media. */
+  readonly kind: "image" | "document";
+  /** Where the provider reads it. */
+  readonly source:
+    | { readonly type: "url"; readonly url: string; readonly mime_type?: string }
+    | { readonly type: "base64"; readonly mime_type: string; readonly data: string }
+    | { readonly type: "file"; readonly uri: string; readonly mime_type?: string };
+};
+
+/** The Prompt `built` names, or its native refusal thrown as a {@link WyrdError}. */
+function builtPrompt(built: NativeAuthoredHandle | NativeErrorMetadata): Prompt {
+  if (!(built instanceof NativeAuthored)) {
+    throw projectedError(built) ?? new TypeError("the Prompt builder returned no Prompt");
+  }
+  return adopt(Prompt.prototype, built);
+}
+
+/** The JSON snapshot of `value`, refused as `field` when it is not plain JSON. */
+function snapshot(field: string, value: unknown): Wire.JsonValue {
+  return jsonSnapshot(field, value).value as Wire.JsonValue;
+}
+
+/**
+ * The original native Prompt, built by the shared Rust Prompt builder and
+ * held inline at an Agent's `prompt`; it registers with its Agent. Each
+ * operation returns a new Prompt and leaves this one unchanged.
+ */
+export class Prompt {
+  /** Type-only identity: no other value is a Prompt, whatever its shape. */
+  declare private readonly family: "Prompt";
+
+  private constructor() {}
+
+  /** The native `provider` Prompt for `model` from the snapshot of `options`. */
+  private static build(provider: string, model: string, options: OpenAiChatOptions): Prompt {
+    const { messages, ...rest } = options;
+    const named = { ...rest, messages: typeof messages === "string" ? [messages] : messages };
+    const value = snapshot(
+      "options",
+      Object.fromEntries(Object.entries(named).filter(([, option]) => option !== undefined)),
+    );
+    return builtPrompt(NativeAuthored.prompt(provider, model, value));
+  }
+
+  /**
+   * The native OpenAI Chat Prompt for `model`.
+   *
+   * @param model - The literal model name, such as `gpt-4o`.
+   * @param options - Messages, response format, output and settings.
+   * @returns The Prompt.
+   * @throws `WyrdError` from the native builder, such as
+   * `WYRD_PROMPT_400_EMPTY_MODEL`, or `WYRD_PROMPT_400_INVALID` and
+   * `WYRD_SPEC_400_VALIDATION` for malformed or non-JSON options.
+   */
+  static openaiChat(model: string, options: OpenAiChatOptions = {}): Prompt {
+    return Prompt.build("openai_chat", model, options);
+  }
+
+  /**
+   * The native OpenAI Responses Prompt for `model`; `system` is its `instructions`.
+   *
+   * @param model - The literal model name.
+   * @param options - Messages, response format, output and settings.
+   * @returns The Prompt.
+   * @throws `WyrdError` from the native builder, as {@link Prompt.openaiChat} does.
+   */
+  static openaiResponses(model: string, options: PromptOptions = {}): Prompt {
+    return Prompt.build("openai_responses", model, options);
+  }
+
+  /**
+   * The native Anthropic Messages Prompt for `model`.
+   *
+   * @param model - The literal model name.
+   * @param options - Messages, response format, output and settings.
+   * @returns The Prompt.
+   * @throws `WyrdError` from the native builder, as {@link Prompt.openaiChat} does.
+   */
+  static anthropic(model: string, options: PromptOptions = {}): Prompt {
+    return Prompt.build("anthropic", model, options);
+  }
+
+  /**
+   * The native Gemini `GenerateContent` Prompt for `model`.
+   *
+   * @param model - The literal model name.
+   * @param options - Messages, response format, output and settings.
+   * @returns The Prompt.
+   * @throws `WyrdError` from the native builder, as {@link Prompt.openaiChat} does.
+   */
+  static gemini(model: string, options: PromptOptions = {}): Prompt {
+    return Prompt.build("gemini", model, options);
+  }
+
+  /**
+   * The native Vertex `GenerateContent` Prompt for `model`.
+   *
+   * @param model - The literal model name.
+   * @param options - Messages, response format, output and settings.
+   * @returns The Prompt.
+   * @throws `WyrdError` from the native builder, as {@link Prompt.openaiChat} does.
+   */
+  static vertex(model: string, options: PromptOptions = {}): Prompt {
+    return Prompt.build("vertex", model, options);
+  }
+
+  /**
+   * This Prompt with its system text set.
+   *
+   * @param text - The system text.
+   * @returns The new Prompt.
+   * @throws `WyrdError` when the request format has no system slot.
+   */
+  system(text: string): Prompt {
+    return builtPrompt(authoredOf(this).promptMessage("system", snapshot("text", text)));
+  }
+
+  /**
+   * This Prompt with one user turn appended.
+   *
+   * @param content - Text, or native content parts in the request format.
+   * @returns The new Prompt.
+   * @throws `WyrdError`, such as `WYRD_PROMPT_400_INVALID` for parts the format does not take.
+   */
+  user(content: string | PromptContent): Prompt {
+    return builtPrompt(authoredOf(this).promptMessage("user", snapshot("content", content)));
+  }
+
+  /**
+   * This Prompt with one assistant turn appended.
+   *
+   * @param content - Text, or native content parts in the request format.
+   * @returns The new Prompt.
+   * @throws `WyrdError`, as {@link Prompt.user} does.
+   */
+  assistant(content: string | PromptContent): Prompt {
+    return builtPrompt(authoredOf(this).promptMessage("assistant", snapshot("content", content)));
+  }
+
+  /**
+   * This Prompt with the result of tool call `toolUseId` appended.
+   *
+   * @param toolUseId - The tool call's id.
+   * @param content - The tool's result text.
+   * @param isError - Whether the call failed.
+   * @returns The new Prompt.
+   * @throws `WyrdError` when the request format has no tool results.
+   */
+  toolResult(toolUseId: string, content: string, isError = false): Prompt {
+    return builtPrompt(authoredOf(this).promptToolResult(toolUseId, content, isError));
+  }
+
+  /**
+   * This Prompt with text variables bound.
+   *
+   * @param vars - Each `{{name}}` variable's text.
+   * @returns The new Prompt.
+   * @throws `WyrdError` for an undeclared variable or a non-string value.
+   */
+  bind(vars: Readonly<Record<string, string>>): Prompt {
+    return builtPrompt(authoredOf(this).promptBind(snapshot("vars", vars)));
+  }
+
+  /**
+   * This Prompt with the media placeholder `name` bound.
+   *
+   * @param name - The `${media:name}` placeholder.
+   * @param media - The media reference.
+   * @returns The new Prompt.
+   * @throws `WyrdError` for an undeclared placeholder or a malformed reference.
+   */
+  bindMedia(name: string, media: MediaRef): Prompt {
+    return builtPrompt(authoredOf(this).promptBindMedia(name, snapshot("media", media)));
+  }
+
+  /**
+   * The native provider request this Prompt renders.
+   *
+   * @param vars - Each still-unbound `{{name}}` variable's text.
+   * @returns The provider request, in its wire shape.
+   * @throws `WyrdError` for an unbound or undeclared variable.
+   */
+  render(vars: Readonly<Record<string, string>> = {}): Wire.JsonValue {
+    return lifecycleValue<Wire.JsonValue>(authoredOf(this).promptRender(snapshot("vars", vars)));
+  }
+}
+
+/**
+ * An exact Card reference: kind, name, and one version, kept as authored until
+ * validation. At a reference position it stays an external reference to a
+ * registered Card and nothing is uploaded for it; registration pins its UID.
+ */
+export class CardRef {
+  /** Type-only identity: no other value is a CardRef, whatever its shape. */
+  declare private readonly family: "CardRef";
+
+  /**
+   * The exact reference to the `kind` Card `name` at `version`.
+   *
+   * @param kind - The referenced kind.
+   * @param name - The referenced name.
+   * @param version - The referenced exact version.
+   */
+  constructor(kind: Wire.CardKind, name: string, version: string) {
+    holdAuthored(this, NativeAuthored.reference(kind, name, version));
+  }
+
+  /** The exact reference to the Data Card `name` at `version`. */
+  static data(name: string, version: string): CardRef {
+    return new CardRef("Data", name, version);
+  }
+
+  /** The exact reference to the Model Card `name` at `version`. */
+  static model(name: string, version: string): CardRef {
+    return new CardRef("Model", name, version);
+  }
+
+  /** The exact reference to the Artifact Card `name` at `version`. */
+  static artifact(name: string, version: string): CardRef {
+    return new CardRef("Artifact", name, version);
+  }
+
+  /** The exact reference to the Experiment Card `name` at `version`. */
+  static experiment(name: string, version: string): CardRef {
+    return new CardRef("Experiment", name, version);
+  }
+
+  /** The exact reference to the Prompt Card `name` at `version`. */
+  static prompt(name: string, version: string): CardRef {
+    return new CardRef("Prompt", name, version);
+  }
+
+  /** The exact reference to the Agent Card `name` at `version`. */
+  static agent(name: string, version: string): CardRef {
+    return new CardRef("Agent", name, version);
+  }
+
+  /** The exact reference to the Mcp Card `name` at `version`. */
+  static mcp(name: string, version: string): CardRef {
+    return new CardRef("Mcp", name, version);
+  }
+
+  /** The exact reference to the Service Card `name` at `version`. */
+  static service(name: string, version: string): CardRef {
+    return new CardRef("Service", name, version);
+  }
+
+  /** The exact reference to the Audit Card `name` at `version`. */
+  static audit(name: string, version: string): CardRef {
+    return new CardRef("Audit", name, version);
+  }
+
+  /** The exact reference to the Verifier Card `name` at `version`. */
+  static verifier(name: string, version: string): CardRef {
+    return new CardRef("Verifier", name, version);
+  }
+
+  /** The exact reference to the Trigger Card `name` at `version`. */
+  static trigger(name: string, version: string): CardRef {
+    return new CardRef("Trigger", name, version);
+  }
+
+  /** The exact reference to the Operator Card `name` at `version`. */
+  static operator(name: string, version: string): CardRef {
+    return new CardRef("Operator", name, version);
+  }
+
+  /** The referenced kind. */
+  get kind(): Wire.CardKind {
+    return authoredOf(this).identity().kind as Wire.CardKind;
+  }
+
+  /** The referenced name, as authored. */
+  get name(): string {
+    return authoredOf(this).identity().name;
+  }
+
+  /** The referenced version, as authored. */
+  get version(): string {
+    return authoredOf(this).identity().version;
+  }
+
+  /**
+   * Select the fixed file or directory prefix `path` of this registered
+   * Artifact version, with no local source and nothing uploaded.
+   *
+   * @param path - The file, or directory prefix.
+   * @returns The selection.
+   */
+  file(path: string): ArtifactFile {
+    return adopt(ArtifactFile.prototype, authoredOf(this).file(path));
+  }
+}
+
+/**
+ * A fixed file or directory prefix of one exact Artifact version, mounted into
+ * a workspace or run as code; built by {@link Artifact.file} or
+ * {@link CardRef.file}. A local Artifact's selection publishes that Artifact
+ * before its graph.
+ */
+export class ArtifactFile {
+  /** Type-only identity: no other value is a ArtifactFile, whatever its shape. */
+  declare private readonly family: "ArtifactFile";
+
+  private constructor() {}
+}
+
+/**
+ * The source of a code action or check: inline text, or a local file captured
+ * as inline text when its graph is validated. An {@link ArtifactFile} is the
+ * third canonical form.
+ */
+export class CodeSource {
+  /** Type-only identity: no other value is a CodeSource, whatever its shape. */
+  declare private readonly family: "CodeSource";
+
+  private constructor() {}
+
+  /**
+   * Run `text`, embedded in the Card as `{inline: text}`.
+   *
+   * @param text - The source text.
+   * @returns The source.
+   */
+  static inline(text: string): CodeSource {
+    return adopt(CodeSource.prototype, NativeAuthored.codeInline(text));
+  }
+
+  /**
+   * Run the UTF-8 file at `path`, read when the graph is validated or declared
+   * and embedded as `{inline: text}`; nothing is read now, and each snapshot
+   * reads the file afresh.
+   *
+   * @param path - The local file.
+   * @returns The source.
+   */
+  static file(path: string): CodeSource {
+    return adopt(CodeSource.prototype, NativeAuthored.codeFile(path));
+  }
+}

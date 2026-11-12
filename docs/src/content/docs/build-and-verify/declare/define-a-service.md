@@ -1,19 +1,19 @@
 ---
 title: Services
-description: Declare a Service from YAML files, with each component at an exact version and a table for the rows it records, then read back what the server stored.
+description: Declare a Service from YAML files, with its components and a table for the rows it records, then read back the exact versions the server stored.
 pillar: wyrd
 section: Build and verify
 topic: Declare
 order: 1
 ---
 
-Declare the Service your app runs: the components it is built from, each at an exact version, and the tables it records rows into. Every verdict then names exactly what it checked.
+Declare the Service your app runs: the components it is built from and the tables it records rows into. The server stores each one at an exact version, so every verdict names exactly what it checked.
 
-You need a running server from [Set up Wyrd](/get-started/setup/). This page builds the `support-desk` Service; the finished files are in `examples/support-desk-app/service/`.
+You need a running server from [Set up Wyrd](/get-started/setup/). This page builds the `support-desk` Service; the finished files are in `examples/support-desk-app/service/`. To build the same Cards in Python, Rust, or TypeScript instead, see [Author in code](/build-and-verify/declare/author-in-code/).
 
 ## 1. Write the components
 
-Each component is its own YAML file with an exact `metadata.version`. The support desk has an Agent and the Prompt it runs, and the Agent points at the Prompt by relative path:
+Each component is its own YAML file. `metadata.version` is optional: without it, declaration selects the version. The support desk has an Agent and the Prompt it runs, and the Agent points at the Prompt by relative path:
 
 <Tabs>
 <Tab label="support-agent.yaml">
@@ -60,7 +60,7 @@ spec:
       ref: ./support-prompt.yaml
 ```
 
-A `ref` can also name a component that is already declared, such as `{kind: Model, name: churn-classifier, version: 1.4.2}`. Every reference names one exact version, never a range.
+A `ref` can also name a component that is already declared, such as `{kind: Model, name: churn-classifier, version: 1.4.2}`. A reference to a declared Card names one exact version, never a range.
 
 ## 3. Check it
 
@@ -80,7 +80,7 @@ It declares every file the Service references, dependencies first, creates the `
 
 <Aside type="note" title="From code">
 
-`WyrdState.declare("support-desk.yaml")` declares the same files and returns the Service ready to use, as in [Write a Verifier](/build-and-verify/verify/author-a-verifier/#3-call-it-and-read-the-verdict).
+`WyrdState.declare("support-desk.yaml")` declares the same files and returns the Service ready to use, as in [Write a Verifier](/build-and-verify/verify/author-a-verifier/#3-call-it-and-read-the-verdict). [Author in code](/build-and-verify/declare/author-in-code/) builds the Cards themselves in code.
 
 </Aside>
 
@@ -129,7 +129,7 @@ It prints one line per component, with its alias and exact version. Fetching `su
 
 ## 6. Change a component
 
-A declared version never changes. To change the Prompt, set a new `version` in `support-prompt.yaml`, then bump the Agent and the Service that reference it, since they now point at different content. Declare again: the new Service version records the new Prompt, and verdicts from the old version still name the old one.
+A declared version never changes. Edit `support-prompt.yaml`, then declare again. A changed file without a `version` gets a new one from declaration, and so does every file without a `version` that references it. A file with a `version` needs a new one whenever its content changes: here the Prompt, and the Agent and the Service that now reference a different Prompt. The new Service version records the new Prompt, and verdicts from the old version still name the old one.
 
 <Aside type="note" title="Set the space once">
 
@@ -148,8 +148,8 @@ A file's own `metadata.space` still wins.
 
 | You see | Fix |
 | --- | --- |
-| `WYRD_LOADER_400_INVALID_ENVELOPE` | Fix the file `details.diagnostics` names: a missing `apiVersion` or `kind`, a path to no file, or a missing exact `version` |
-| `WYRD_REGISTRY_409_SPEC_DRIFT` | That version is already declared with different content: bump its `version` |
+| `WYRD_LOADER_400_INVALID_ENVELOPE` | Fix the file `details.diagnostics` names: a missing `kind` or `metadata.name`, or a path to no file |
+| `WYRD_REGISTRY_409_SPEC_DRIFT` | That version is already declared with different content: set a new `version`, or remove it so declaration selects one |
 | `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` | Declare the referenced component first, or fix the `ref` |
 | `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH` | The table exists with different columns: keep its schema, or use a new table name |
 

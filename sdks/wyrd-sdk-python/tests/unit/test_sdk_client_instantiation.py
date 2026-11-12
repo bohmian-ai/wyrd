@@ -84,7 +84,7 @@ def test_local_access_never_connects(monkeypatch: pytest.MonkeyPatch) -> None:
         previous = bifrost.use_table(second)
         assert previous is not None and previous.fqn == first.fqn
         assert bifrost.table is not None and bifrost.table.fqn == second.fqn
-        assert (bifrost.dropped, bifrost.producer_count) == (0, 0)
+        assert bifrost.producer_count == 0
 
     async def on_the_event_loop() -> None:
         local(AsyncBifrost(table=first))

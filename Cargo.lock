@@ -10211,6 +10211,7 @@ dependencies = [
  "wyrd-queue",
  "wyrd-runtime",
  "wyrd-semver",
+ "wyrd-skald-prompt",
  "wyrd-skald-spec",
  "wyrd-spec",
  "wyrd-testing",

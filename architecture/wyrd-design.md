@@ -255,11 +255,16 @@ services.
     durable identity or an authored `Path`; `InlineableRef<T>` additionally
     permits an inline child body. `Path` is loader-only. During composite
     declaration, the loader may rewrite an authored path to the
-    declaration-only `Sibling { sibling: CardRef }` form so the server can
+    declaration-only `Sibling { sibling: SiblingRef }` form so the server can
     distinguish a target submitted in the same request from an external Card
-    referenced with `Ref(CardRef)`. The server validates both forms and
-    rewrites them to UID-bearing `Ref(CardRef)` before hashing, relationship
-    derivation, blob persistence, or any read response. `Sibling` is not a
+    referenced with `Ref(CardRef)`. A `SiblingRef` is `kind`, `name`, and an
+    optional `version`: with a version it names that submitted target, without
+    one the sole submission of that kind and name; several such submissions
+    make the link ambiguous and it is refused
+    (`WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY`). The server validates both
+    forms and rewrites them to the target's full registered `Ref(CardRef)`,
+    selected version and UID, before hashing, relationship derivation, blob
+    persistence, or any read response. `Sibling` is not a
     durable reference form, and there is no separate selector reference enum.
     The server, registry, and evaluator reject unresolved paths at their
     boundaries.
@@ -1079,6 +1084,25 @@ view's exact subject `card_uid`. Switching Cards never requires a distinct Run
 ID, and the request's root Card cannot say which card a correlated record
 belongs to — the subject Card must be carried on that row. Generic telemetry
 may omit a subject Card.
+
+Run-scoped caller-table writes use `run.bifrost.write(row)` for the state's
+shared active table, or `write_to(table, row)` (`writeTo` in TypeScript) for a
+named `bifrost.datasets.<name>` destination without changing that binding.
+Rust uses its normal method accessor. With no chosen startup table, a root
+Service's sole declared table becomes active; no or multiple declarations
+infer none. Describing the inferred table is a startup precondition: failure
+prevents that state's entire Bifrost writer from starting, including fixed-table
+observations, while ordinary verification and the server remain available.
+The existing failed-start retry and closed-state rules apply. Missing active
+selection returns `WYRD_VALA_412_NO_ACTIVE_TABLE`; scoped writes outside
+`bifrost.datasets` return `WYRD_SDK_400_INVALID_OBSERVATION`.
+The state projects Bifrost's existing table-switch operation. Every Run shares
+the binding; callers needing distinct concurrent destinations use named writes.
+Each admitted row retains its destination, exact subject Card UID and Run ID.
+Switching retains prior table producers in the same shutdown drain. Write
+return means buffered submission, not durable admission or complete row-schema
+validation; successful state shutdown is the existing drain barrier. Fixed
+system destinations, direct Bifrost operations and authorization are unchanged.
 
 Python `Run` values are synchronous context managers for optional ambient span
 correlation. Entering a scope best-effort attaches the selected Card UID and
@@ -2324,11 +2348,16 @@ is available only at `InlineableRef<T>` slots.
 
 ### In-memory authoring
 
-`wyrd-client::authoring` (`wyrd_ai::authoring` in Rust; the Python and
-TypeScript SDKs project it) builds the same Cards in code, in the Card YAML's
-own vocabulary. Each named Card type takes `new(name, version)`; each
+`wyrd-client::authoring` builds the same Cards in code, in the Card YAML's own
+vocabulary. Rust exposes it as `wyrd_ai::verify`, Python as `wyrd.verify`,
+and TypeScript as the `verify` namespace of `wyrd-ai`; there is no separate
+authoring module. Each named Card type takes its name and an optional
+version: `new(name, None)` in Rust, `Kind(name)` in Python, and
+`new Kind(name, { version })` in TypeScript, where `version` may be left out.
+An omitted version is never invented by the client: the server selects it at
+registration, exactly as for a YAML file that omits `metadata.version`. Each
 sub-value (`Component`, `Binding`, `InputSlot`, `Step`, `Requirement`,
-`Action`, `Check`) takes the fields that identify it. Constructor arguments
+`Table`, `Action`, `Check`) takes the fields that identify it. Constructor arguments
 are fixed: no later method edits them, so a different name, version, alias,
 reference, id, action, check, or check operand means constructing another
 value. Every `Action` constructor returns an `Action` and every `Check`
@@ -2339,21 +2368,30 @@ declares evidence, while `Action.bind_input` and `Check.bind_input` bind existin
 values to executable arguments (`addInput`/`bindInput` in TypeScript). Their
 canonical `inputs` maps and whole-map setters retain their names. Rust accepts
 bare JSON Schemas and Python accepts schema dictionaries or supported model
-classes without a mandatory JSON-slot wrapper. Explicit canonical slot forms
-and distinct non-JSON slot constructors remain available. Execution
-references stay strings such as `inputs.report.text`, operators stay strings
-or their parameterized objects, and nested objects stay canonical JSON. A
-setter consumes the value and replaces its whole field, together with
-everything that field referenced; an `add_*` method appends one entry in
+classes without a mandatory JSON-slot wrapper; a Python Verifier's `inputs`
+may also be one Pydantic model class whose fields are its named slots,
+and a Python Service `Table`'s `schema` may be a model class whose field
+order is the column order. Pydantic is the optional `wyrd-ai[pydantic]` extra.
+Explicit canonical slot forms and distinct non-JSON slot constructors remain
+available. Execution references stay strings such as `inputs.report.text`.
+Fields accept their canonical typed values as well as canonical JSON: the
+original Prompt (`openai_chat` in Rust, `Prompt.openai_chat` in Python,
+`Prompt.openaiChat` in TypeScript) at an Agent's `prompt`, and in Python
+`ComparisonOperator`, `ExecutionRoute`, and `AgentRunConfig`; the Prompt's
+`ResponseFormat.verdict(data=...)` extends the canonical Verdict with typed
+`data`. Authoring converts these to the canonical form and adds no validation
+of its own. A setter consumes the value and replaces its whole field, together
+with everything that field referenced; an `add_*` method appends one entry in
 place. A Service binds each Component's own Verifiers through
 `Component::verified_by`; Model verification belongs on its Component.
 
 Construction and editing do no domain validation, file reads, or network IO,
 so incomplete values and forward references are allowed. An attempted
 duplicate add is kept, not dropped, and refused when validated. A Card value
-at a reference position contributes a sibling definition, captured by value;
-an exact `CardRef` stays an external reference; a local Artifact is always
-referenced externally by exact name and version and published first.
+at a reference position contributes a sibling definition, captured by value,
+whose sibling reference carries the Card's version only when it has one; an
+exact `CardRef` stays an external reference. A local Artifact is referenced
+as a sibling, published first, and then bound to its registered reference.
 `CodeSource::file` records a path that each snapshot reads.
 
 `validate()` and `CardDefinition::declaration` snapshot the graph, read its
@@ -2366,9 +2404,12 @@ Every call validates afresh; nothing caches a result. The declaration emits
 one submission per distinct identity; definitions are compared as decoded, so
 an omitted default and its explicit value are one submission, and two that
 decode differently, or a local Artifact and a Card of its identity without
-that source, refuse with `WYRD_SPEC_400_DUPLICATE_SUBMISSION`. A local
-Artifact's own references are captured and validated as any Card's. No local
-path reaches a submission.
+that source, refuse with `WYRD_SPEC_400_DUPLICATE_SUBMISSION`. Two explicit
+versions of one kind and name are distinct submissions; a versionless sibling
+that names several submissions is refused with a
+`WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` diagnostic. A local Artifact's own
+references are captured and validated as any Card's. No local path reaches a
+submission.
 
 `Cards::declare` accepts a native `DeclarationInput`, a path, or an authored
 Card; `WyrdState::declare(_with)` accept a path or an authored Card and pull
@@ -2380,7 +2421,10 @@ local Artifact declared as the root is its own publication, and its receipt
 is the declaration's. There is no
 rollback: a graph refused after publication, or a dropped future, leaves each
 published Artifact registered for reuse by reference. Code-authored and
-file-authored forms of one graph register identical content and identities.
+file-authored forms of one graph register identical content and identities,
+with or without versions: the server binds each link to its target's
+registered reference before hashing the parent, so a changed child gives its
+versionless parents new versions through the existing version selection.
 
 ### Pre-declaration matrix (Rule 14)
 
@@ -2471,7 +2515,8 @@ A path string is **client-side authoring sugar**, not a durable wire variant.
 It targets a full Card envelope on disk; the loader reads it without declaring.
 Apply submits it as an independent Card and rewrites the referring slot to an explicit
 declaration reference. When the target is part of the same composite
-submission, the declaration reference is `Sibling { sibling: CardRef }`;
+submission, the declaration reference is `Sibling { sibling: SiblingRef }`,
+carrying the target's version only when its file names one;
 an authored external `ref: CardRef` remains `Ref(CardRef)`. This preserves
 binding intent instead of inferring it from identity. The server validates
 both forms and rewrites them to UID-bearing `Ref(CardRef)` before hashing,
@@ -2483,11 +2528,12 @@ relationship derivation, or durable persistence. The server, registry, and
 - Absolute paths are allowed but discouraged (breaks portability across
   machines and CI).
 - The referenced file is a **full card envelope** — `kind` + `metadata`
-  (`name`, `version`) + `spec`, plus `apiVersion`, which authored
+  (`name`, optional `version`) + `spec`, plus `apiVersion`, which authored
   files may omit and which then defaults to `wyrd/v1`; the declaration wire
   always carries it explicitly. Declaration derives the
-  child's identity from that `metadata`, and the parent slot becomes a `ref:`
-  to it. This is what makes a `path:` target reusable and lineage-anchoring,
+  child's identity from that `metadata`; an omitted version is selected by the
+  server at registration, and the parent slot becomes a `ref:` to the
+  registered child. This is what makes a `path:` target reusable and lineage-anchoring,
   unlike `inline:`.
 - Path imports **are declared as independent cards**, in dependency order,
   ahead of the parent that references them. A heavy-card envelope reached by

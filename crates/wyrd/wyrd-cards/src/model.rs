@@ -300,7 +300,16 @@ impl ModelCard {
             .into_iter()
             .map(|reference| match reference {
                 Ref::Ref(card_ref) => Ok(card_ref),
-                Ref::Sibling { sibling } => Ok(sibling),
+                Ref::Sibling { sibling } => {
+                    sibling
+                        .to_card_ref()
+                        .ok_or_else(|| WyrdError::ModelValidation {
+                            message: format!(
+                                "ModelCard contains versionless sibling reference: {sibling}"
+                            ),
+                            details: serde_json::Value::Null,
+                        })
+                }
                 Ref::Path(path) => Err(WyrdError::ModelValidation {
                     message: format!(
                         "ModelCard contains unresolved card reference path: {}",

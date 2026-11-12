@@ -27,12 +27,20 @@ name = "client_request"
 path = "rust/client_request.rs"
 
 [[bin]]
+name = "client_profile"
+path = "rust/client_profile.rs"
+
+[[bin]]
 name = "quickstart"
 path = "quickstart/quickstart.rs"
 
 [[bin]]
 name = "finance_release"
 path = "finance-release/finance_release.rs"
+
+[[bin]]
+name = "author_in_code"
+path = "author-in-code/author.rs"
 
 [[bin]]
 name = "support_desk"

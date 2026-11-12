@@ -246,19 +246,16 @@ pub async fn serve(desk: &Desk) -> Result<Vec<Served>, Error> {
         let question = question(index);
         let request = async {
             let answer = answer(state, &run, &question).await?;
-            let observe = run.observe();
-            observe
-                .record(
-                    "bifrost.datasets.tickets",
-                    &TicketRow {
-                        ticket_id: format!("T-{index}"),
-                        question: &question,
-                        answer: &answer,
-                        refund: question.contains("refund"),
-                    },
-                )
+            run.bifrost()
+                .write(&TicketRow {
+                    ticket_id: format!("T-{index}"),
+                    question: &question,
+                    answer: &answer,
+                    refund: question.contains("refund"),
+                })
                 .await?;
-            match observe
+            match run
+                .observe()
                 .submit("policy-check", policy_check(&answer))
                 .await?
             {

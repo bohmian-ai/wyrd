@@ -22,10 +22,9 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use skald_spec::MediaFormat;
 use wyrd_spec::auth::Sha256Hex;
-use wyrd_spec::card::verifier::{InputSlot, VerifierSpec};
+use wyrd_spec::card::verifier::{InputSlot as SlotSpec, VerifierSpec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardUid, GroupId, SlotName};
-use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::ids::{RunId, TraceId};
 use wyrd_spec::verification::EXECUTION_DEADLINE;
 use wyrd_spec::verification::execution::{
@@ -40,6 +39,19 @@ mod execution;
 use crate::storage::upload::sha256_file;
 use crate::storage::{FileSource, WyrdStorageClient};
 pub use execution::Execution;
+
+pub use crate::authoring::{
+    Action, Agent, Artifact, ArtifactFile, Audit, Binding, CardDefinition, CardRef, Check,
+    CodeSource, Component, Data, Declaration, ExecutionPlan, Experiment, FieldValue, InputSlot,
+    LocalArtifact, Mcp, Model, Operator, Requirement, Service, Step, Table, Trigger, Verifier,
+};
+pub use skald_prompt::{
+    AnthropicOptions, GeminiOptions, OpenAiChatOptions, OpenAiResponsesOptions, Prompt,
+    PromptBuilderError, ResponseFormat, ResponseFormatKind, VertexOptions, anthropic, gemini,
+    openai_chat, openai_responses, vertex,
+};
+pub use wyrd_spec::AgentRunConfigSpec;
+pub use wyrd_spec::verification::ComparisonOperator;
 
 /// Time an execute response may take to arrive after the server's
 /// [`EXECUTION_DEADLINE`] elapses: upload, audit, and the 504 answer itself.
@@ -173,7 +185,7 @@ enum Upload {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactRef {
     /// The exact Artifact Card.
-    artifact: CardRef,
+    artifact: wyrd_spec::reference::CardRef,
     /// The file inside it; required when it holds several.
     path: Option<String>,
 }
@@ -185,7 +197,7 @@ impl ArtifactRef {
     /// * `artifact` - The exact registered Artifact Card.
     /// * `path` - The file inside the Artifact, when it holds several.
     #[must_use]
-    pub fn new(artifact: CardRef, path: Option<String>) -> Self {
+    pub fn new(artifact: wyrd_spec::reference::CardRef, path: Option<String>) -> Self {
         Self { artifact, path }
     }
 }
@@ -335,7 +347,7 @@ impl Target<'_> {
             .spec
             .inputs
             .values()
-            .any(|slot| matches!(slot, InputSlot::Samples { .. }));
+            .any(|slot| matches!(slot, SlotSpec::Samples { .. }));
         let mut features = Map::new();
         let mut run = RunEvidence::default();
         for (name, value) in named {
@@ -351,11 +363,11 @@ impl Target<'_> {
                     )
                 })?;
             match (kind, value) {
-                (InputSlot::Json { .. }, Input::Value(value)) => {
+                (SlotSpec::Json { .. }, Input::Value(value)) => {
                     run.declarations
                         .insert(slot.clone(), InputDeclaration::Json { value });
                 }
-                (InputSlot::Trace { .. }, Input::Value(Value::String(text))) => {
+                (SlotSpec::Trace { .. }, Input::Value(Value::String(text))) => {
                     let trace_id = text.parse::<TraceId>().map_err(|_| {
                         input_invalid(
                             "a trace slot takes a 32-hex-digit trace ID",
@@ -365,12 +377,12 @@ impl Target<'_> {
                     run.declarations
                         .insert(slot.clone(), InputDeclaration::Trace { trace_id });
                 }
-                (InputSlot::Media { .. }, Input::Artifact(ArtifactRef { artifact, path })) => {
+                (SlotSpec::Media { .. }, Input::Artifact(ArtifactRef { artifact, path })) => {
                     run.declarations
                         .insert(slot.clone(), InputDeclaration::Artifact { artifact, path });
                 }
                 (
-                    InputSlot::Media {
+                    SlotSpec::Media {
                         formats, max_bytes, ..
                     },
                     Input::File(file),
@@ -378,7 +390,7 @@ impl Target<'_> {
                     .files
                     .push((slot.clone(), file, formats.clone(), *max_bytes)),
                 (
-                    InputSlot::Samples {
+                    SlotSpec::Samples {
                         features: names, ..
                     },
                     Input::Value(value),
@@ -600,13 +612,13 @@ fn samples(
 }
 
 /// The authored name of a slot type, for a structured refusal.
-fn slot_type(slot: &InputSlot) -> &'static str {
+fn slot_type(slot: &SlotSpec) -> &'static str {
     match slot {
-        InputSlot::Json { .. } => "json",
-        InputSlot::Media { .. } => "media",
-        InputSlot::Trace { .. } => "trace",
-        InputSlot::Samples { .. } => "samples",
-        InputSlot::Source(_) => "source",
+        SlotSpec::Json { .. } => "json",
+        SlotSpec::Media { .. } => "media",
+        SlotSpec::Trace { .. } => "trace",
+        SlotSpec::Samples { .. } => "samples",
+        SlotSpec::Source(_) => "source",
     }
 }
 

@@ -3,7 +3,8 @@ import { DataType, Table, tableFromIPC, tableToIPC, type Field, type RecordBatch
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createRequire } from "node:module";
 
-import type { AuthoredCard } from "./authoring.js";
+import * as definitions from "./definitions.js";
+import type { AuthoredCard } from "./definitions.js";
 import {
   authoredOf,
   IncompleteQueryStreamError,
@@ -1097,9 +1098,6 @@ export class QueryResult {
   }
 }
 
-/** Reads a {@link Bifrost}'s native handle for {@link record}. */
-let bifrostNative: (bifrost: Bifrost) => NativeBifrost;
-
 /**
  * The one Bifrost client: query any authorized table, write to the active one.
  *
@@ -1110,10 +1108,6 @@ let bifrostNative: (bifrost: Bifrost) => NativeBifrost;
  */
 export class Bifrost {
   readonly #native: NativeBifrost;
-
-  static {
-    bifrostNative = (bifrost) => bifrost.#native;
-  }
 
   private constructor(native: NativeBifrost) {
     this.#native = native;
@@ -1367,14 +1361,6 @@ export class Bifrost {
   }
 
   /**
-   * Rows dropped by the fire-and-forget observation path; always zero for
-   * {@link Bifrost.insert}, which refuses rather than drops.
-   */
-  get dropped(): number {
-    return this.#native.dropped;
-  }
-
-  /**
    * List active queries visible to the authenticated tenant.
    *
    * @returns Every active query.
@@ -1508,44 +1494,6 @@ export interface PullSummary {
 /** Card references cross the native boundary as text or serialized JSON. */
 function cardRefText(ref: CardRef | string): string {
   return typeof ref === "string" ? ref : JSON.stringify(ref);
-}
-
-/**
- * Record one telemetry observation, fire-and-forget.
- *
- * Telemetry names its own `table` and `schema` per call rather than using the
- * client's active binding, so an instrumented process writes its signals
- * alongside whatever the application writes. If the producer refuses the row,
- * for example because its queue is full, the row is dropped and counted on
- * {@link Bifrost.dropped} instead of throwing.
- *
- * @param bifrost - The client whose producers carry the row.
- * @param table - The destination table's `namespace.name`.
- * @param schema - The table's JSON Schema, or a schema that emits one, mapped
- * to the Arrow schema of the row.
- * @param row - One row object matching `schema`.
- * @param correlation - Optional `subjectCardUid` and `runId` stamped on the row;
- * omitted, the row is uncorrelated.
- * @throws {@link WyrdError} `WYRD_VALA_400_SCHEMA_PARSE` for a schema that
- * does not map to Arrow, or `WYRD_SPEC_400_VALIDATION` for unparsable schema
- * text or a malformed `subjectCardUid`.
- */
-export function record(
-  bifrost: Bifrost,
-  table: string,
-  schema: Readonly<Record<string, unknown>> | JsonSchemaSource,
-  row: Readonly<Record<string, unknown>>,
-  correlation: Correlation = {},
-): void {
-  lifecycleValue<null>(
-    bifrostNative(bifrost).record(
-      table,
-      jsonSchemaText(schema),
-      JSON.stringify(row),
-      correlation.subjectCardUid,
-      correlation.runId,
-    ),
-  );
 }
 
 /** Reads a {@link WyrdClient}'s native handle for the surfaces that call the server. */
@@ -1810,7 +1758,7 @@ export class Cards {
    *
    * @param root - A Card file or directory, loaded as
    * {@link Cards.declareFromPath} loads it, or the root Card from
-   * `wyrd-ai/authoring`, copied as it is now.
+   * the `verify` namespace, copied as it is now.
    * @returns The graph root and each Card's dependency-first outcome.
    * @throws {@link WyrdError} for a file that does not load or validate, from
    * the shared validation, such as `WYRD_LOADER_400_INVALID_ENVELOPE`, or the
@@ -2371,11 +2319,68 @@ function nativeInput(slot: string | undefined, value: VerifierInput): NativeVeri
   return { slot, valueJson: strictJson(slot === undefined ? "inputs" : `inputs.${slot}`, value) };
 }
 
+/** The wire Card reference, named here because `verify.CardRef` is the definition class. */
+type WireCardRef = CardRef;
+
 /**
- * Evidence values for `media` slots and the handle of one queued Verifier
- * execution: `verify.File`, `verify.ArtifactRef`, and `verify.Execution`.
+ * Card definitions and the evidence Verifiers accept: each named Card class,
+ * such as `verify.Service` or `verify.Verifier`, with its sub-values and the
+ * original native `verify.Prompt`; and `verify.File`, `verify.ArtifactRef`, and
+ * `verify.Execution` for `media` slots and queued executions.
  */
 export namespace verify {
+  export import Action = definitions.Action;
+  export import Agent = definitions.Agent;
+  export import Artifact = definitions.Artifact;
+  export import ArtifactFile = definitions.ArtifactFile;
+  export import Audit = definitions.Audit;
+  export import AuthoredCard = definitions.AuthoredCard;
+  export import Binding = definitions.Binding;
+  export import CardRef = definitions.CardRef;
+  export import Check = definitions.Check;
+  export import CodeSource = definitions.CodeSource;
+  export import Component = definitions.Component;
+  export import Data = definitions.Data;
+  export import Experiment = definitions.Experiment;
+  export import InputSlot = definitions.InputSlot;
+  export import Mcp = definitions.Mcp;
+  export import Model = definitions.Model;
+  export import Operator = definitions.Operator;
+  export import Prompt = definitions.Prompt;
+  export import Requirement = definitions.Requirement;
+  export import Service = definitions.Service;
+  export import Step = definitions.Step;
+  export import Table = definitions.Table;
+  export import Trigger = definitions.Trigger;
+  export import Verifier = definitions.Verifier;
+  export type Authorable<T> = definitions.Authorable<T>;
+  export type BindingArg = definitions.BindingArg;
+  export type InputSlotArg = definitions.InputSlotArg;
+  export type ServiceOptions = definitions.ServiceOptions;
+  export type AgentOptions = definitions.AgentOptions;
+  export type VerifierOptions = definitions.VerifierOptions;
+  export type ArtifactOptions = definitions.ArtifactOptions;
+  export type ModelOptions = definitions.ModelOptions;
+  export type DataOptions = definitions.DataOptions;
+  export type ExperimentOptions = definitions.ExperimentOptions;
+  export type McpOptions = definitions.McpOptions;
+  export type AuditOptions = definitions.AuditOptions;
+  export type TriggerOptions = definitions.TriggerOptions;
+  export type OperatorOptions = definitions.OperatorOptions;
+  export type ComponentOptions = definitions.ComponentOptions;
+  export type BindingOptions = definitions.BindingOptions;
+  export type StepOptions = definitions.StepOptions;
+  export type MediaSlotOptions = definitions.MediaSlotOptions;
+  export type AgentActionOptions = definitions.AgentActionOptions;
+  export type CodeActionOptions = definitions.CodeActionOptions;
+  export type AgentCheckOptions = definitions.AgentCheckOptions;
+  export type CodeCheckOptions = definitions.CodeCheckOptions;
+  export type ResponseFormat = definitions.ResponseFormat;
+  export type OpenAiChatOptions = definitions.OpenAiChatOptions;
+  export type PromptOptions = definitions.PromptOptions;
+  export type PromptContent = definitions.PromptContent;
+  export type MediaRef = definitions.MediaRef;
+
   /** How a {@link File} declares its format and display name. */
   export interface FileOptions {
     /** Canonical format name, such as `pdf`; omitted, the filename extension or the slot's only format decides. */
@@ -2414,7 +2419,7 @@ export namespace verify {
   export class ArtifactRef {
     constructor(
       /** The exact Artifact Card. */
-      readonly artifact: CardRef | string,
+      readonly artifact: WireCardRef | string,
       /** The file inside the Artifact, when it holds several. */
       readonly path?: string,
     ) {}
@@ -2510,7 +2515,59 @@ export namespace verify {
 }
 
 /**
- * The dataset emit and the Verifier execution available on one scoped {@link Run}.
+ * Caller-table writes attributed to one scoped {@link Run}.
+ *
+ * Every row carries the view's Card UID and the run's `runId`. Resolving a
+ * write is buffered submission, not a durable acknowledgement: a successful
+ * {@link WyrdState.shutdown} drains the queue.
+ */
+export class RunBifrost {
+  readonly #native: NativeRun;
+
+  private constructor(native: NativeRun) {
+    this.#native = native;
+  }
+
+  /** @internal Wrap the native run this surface writes through. */
+  static fromNative(native: NativeRun): RunBifrost {
+    return new RunBifrost(native);
+  }
+
+  /**
+   * Buffer one row for the state's active table: the root Service's sole
+   * declared table, else the one bound by `startBifrost({ table })` or
+   * {@link WyrdState.useTableByName}. It was described when bound, so this
+   * awaits no lookup. The row is durable only once {@link WyrdState.shutdown}
+   * succeeds.
+   *
+   * @param row - One JSON row matching the active table's columns.
+   * @throws a {@link WyrdError} `WYRD_VALA_412_NO_ACTIVE_TABLE` when no table is
+   * active, and otherwise as {@link RunBifrost.writeTo}.
+   */
+  async write(row: unknown): Promise<void> {
+    lifecycleValue<null>(await this.#native.write(undefined, strictJson("row", row)));
+  }
+
+  /**
+   * Buffer one row for a named `bifrost.datasets.<name>` table, leaving the
+   * active table unchanged, so concurrent runs may each write their own.
+   *
+   * The first call for a table describes it; later calls reuse the cached
+   * schema and producer, so only the first awaits a lookup. The row is durable
+   * only once {@link WyrdState.shutdown} succeeds.
+   *
+   * @param table - The table's `bifrost.datasets.<name>`.
+   * @param row - One JSON row matching the table's columns.
+   * @throws a {@link WyrdError} for a table outside `bifrost.datasets`, an unknown
+   * or unauthorized table, before startup, or after shutdown.
+   */
+  async writeTo(table: string, row: unknown): Promise<void> {
+    lifecycleValue<null>(await this.#native.write(table, strictJson("row", row)));
+  }
+}
+
+/**
+ * The Verifier execution and submission available on one scoped {@link Run}.
  */
 export class Observe {
   readonly #native: NativeRun;
@@ -2522,21 +2579,6 @@ export class Observe {
   /** @internal Wrap the native run this surface emits through. */
   static fromNative(native: NativeRun): Observe {
     return new Observe(native);
-  }
-
-  /**
-   * Emit one row into a registered `bifrost.datasets.<name>` table.
-   *
-   * The first call for a table describes it; later calls reuse the cached
-   * schema and producer, so only the first awaits a lookup.
-   *
-   * @param table - The table's `bifrost.datasets.<name>`.
-   * @param row - One JSON row matching the table's columns.
-   * @throws a {@link WyrdError} for a table outside `bifrost.datasets`, an unknown
-   * or unauthorized table, before startup, or after shutdown.
-   */
-  async record(table: string, row: unknown): Promise<void> {
-    lifecycleValue<null>(await this.#native.record(table, strictJson("row", row)));
   }
 
   /**
@@ -2645,9 +2687,14 @@ export class Run {
     return this.#native.alias;
   }
 
-  /** The emit surface for this view. */
+  /** The verification and submission surface for this view. */
   get observe(): Observe {
     return Observe.fromNative(this.#native);
+  }
+
+  /** The caller-table write surface for this view. */
+  get bifrost(): RunBifrost {
+    return RunBifrost.fromNative(this.#native);
   }
 
   /**
@@ -3036,7 +3083,7 @@ export class WyrdState {
    * Without `bundleDir` the graph is held in memory and no files are kept.
    *
    * @param root - The root Service: its Card file, or an authored Card from
-   * `wyrd-ai/authoring`, copied as it is now.
+   * the `verify` namespace, copied as it is now.
    * @param options - `client`, whose principal every call runs as (omitted,
    * the ambient client), and `bundleDir`, a directory the complete bundle is
    * published to and kept in, loadable offline with {@link WyrdState.fromPath}.
@@ -3121,14 +3168,14 @@ export class WyrdState {
    * @throws {@link WyrdError} `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias.
    */
   get(alias: string): HydratedCard {
-    const card = this.card(alias);
-    if (card.kind === "Agent") {
+    const { kind } = this.cardRef(alias);
+    if (kind === "Agent") {
       return this.agent(alias);
     }
-    if (card.kind === "Prompt") {
+    if (kind === "Prompt") {
       return this.prompt(alias);
     }
-    return card;
+    return lifecycleValue<HydratedCard>(this.#native.card(alias));
   }
 
   /**
@@ -3192,8 +3239,9 @@ export class WyrdState {
    * before resolving, so submitted samples can never enqueue against a
    * missing, unauthorized, or incompatible system table.
    *
-   * @param options - `table` keeps its {@link Bifrost.connect} meaning as the
-   * active write binding and does not choose a run's destination.
+   * @param options - `table` is the active table {@link RunBifrost.write}
+   * writes, in place of the root Service's sole declared table, which is
+   * active when `table` is omitted.
    * `clientByteLimitBytes` overrides the handle-wide ingestion byte budget
    * (256 MiB by default).
    * @throws {@link WyrdError} for a second start, a closed state, a byte
@@ -3205,6 +3253,20 @@ export class WyrdState {
     options: { readonly table?: TableConfig; readonly clientByteLimitBytes?: number } = {},
   ): Promise<void> {
     lifecycleValue<null>(await this.#native.startBifrost(options.table?.native, options.clientByteLimitBytes));
+  }
+
+  /**
+   * Bind a registered table as the active table {@link RunBifrost.write}
+   * writes, describing it first. Every run of this state shares it; the
+   * previous table's buffered rows still drain. Runs writing different tables
+   * concurrently use {@link RunBifrost.writeTo} instead.
+   *
+   * @param table - The registered `<namespace>.<name>` table.
+   * @throws {@link WyrdError} before startup, after shutdown, or for an
+   * unknown, unauthorized, or unavailable table.
+   */
+  async useTableByName(table: string): Promise<void> {
+    lifecycleValue<null>(await this.#native.useTableByName(table));
   }
 
   /**

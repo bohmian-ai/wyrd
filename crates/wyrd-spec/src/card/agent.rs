@@ -172,14 +172,34 @@ pub struct AgentSpec {
 fn inline_prompt<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<InlineableRef<skald_spec::Prompt>, D::Error> {
-    match InlineableRef::<skald_spec::Prompt>::deserialize(deserializer)? {
-        InlineableRef::Inline(prompt) => {
-            let authored = prompt.authored().map_err(serde::de::Error::custom)?;
-            crate::card::prompt::compile_prompt(&authored)
-                .map(|prompt| InlineableRef::Inline(Box::new(prompt)))
-                .map_err(serde::de::Error::custom)
-        }
-        other => Ok(other),
+    Ok(
+        match InlineableRef::<CompiledPrompt>::deserialize(deserializer)? {
+            InlineableRef::Inline(prompt) => InlineableRef::Inline(Box::new(prompt.0)),
+            InlineableRef::Ref(card_ref) => InlineableRef::Ref(card_ref),
+            InlineableRef::Sibling { sibling } => InlineableRef::Sibling { sibling },
+            InlineableRef::Path(path) => InlineableRef::Path(path),
+        },
+    )
+}
+
+/// An inline Agent Prompt compiled once, straight from its authored form,
+/// through [`compile_prompt`](crate::card::prompt::compile_prompt).
+struct CompiledPrompt(
+    /// The native Prompt compiled canonically from the authored form.
+    skald_spec::Prompt,
+);
+
+impl<'de> Deserialize<'de> for CompiledPrompt {
+    /// Decodes the authored Prompt form and compiles it.
+    ///
+    /// # Errors
+    /// Returns the deserializer's error for an undecodable authored form and
+    /// the compiler's refusal otherwise.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let authored = skald_spec::AuthoredPrompt::deserialize(deserializer)?;
+        crate::card::prompt::compile_prompt(&authored)
+            .map(Self)
+            .map_err(serde::de::Error::custom)
     }
 }
 

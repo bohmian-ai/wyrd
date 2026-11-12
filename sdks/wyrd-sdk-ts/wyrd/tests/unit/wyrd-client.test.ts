@@ -1,3 +1,4 @@
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 
 import { context, trace } from "@opentelemetry/api";
@@ -48,6 +49,34 @@ function sentContext(init: RequestInit | undefined): Record<string, string> {
   ];
   return Object.fromEntries(names.flatMap((name) => (headers.has(name) ? [[name, headers.get(name) ?? ""]] : [])));
 }
+
+test("state get projects only the full Card of the alias's kind", () => {
+  const { NativeWyrdState } = createRequire(import.meta.url)("../../index.cjs") as typeof import("../../index.cjs");
+  const state = WyrdState.fromPath(BUNDLE);
+  const card = vi.spyOn(NativeWyrdState.prototype, "card");
+  const agent = vi.spyOn(NativeWyrdState.prototype, "agent");
+  const prompt = vi.spyOn(NativeWyrdState.prototype, "prompt");
+  const projected = () => [card, agent, prompt].map((spy) => spy.mock.calls.length);
+  try {
+    const triage = state.get("agent_triage");
+    expect(projected()).toEqual([0, 1, 0]);
+    expect(triage.kind).toBe("Agent");
+    expect(triage.kind === "Agent" && triage.prompt().kind).toBe("Prompt");
+    Object.assign(triage.metadata, { name: "changed" });
+    expect(state.get("agent_triage").metadata.name).toBe("triage");
+
+    expect(state.get("triage_prompt").kind).toBe("Prompt");
+    expect(projected()).toEqual([0, 2, 1]);
+
+    expect(state.get("model").kind).toBe("Model");
+    expect(projected()).toEqual([1, 2, 1]);
+
+    expect(() => state.get("missing")).toThrow(expect.objectContaining({ code: "WYRD_SDK_404_UNKNOWN_ALIAS" }));
+    expect(projected()).toEqual([1, 2, 1]);
+  } finally {
+    vi.restoreAllMocks();
+  }
+});
 
 test("state httpAuth carries its own service, run, and environment", async () => {
   const sent: RequestInit[] = [];

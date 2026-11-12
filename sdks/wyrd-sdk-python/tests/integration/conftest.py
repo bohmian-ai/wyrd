@@ -60,6 +60,19 @@ RELEASE_APPROVED = (
 )
 """The finance release example judge's Verdict: every release follows the policy, citing the report."""
 
+REPORT_SUPPORTED = (
+    '{"outcome":"passed","reason":"the report matches its source",'
+    '"citations":[{"slot":"report","locator":{"json_pointer":"/text"}}]}'
+)
+"""The modular finance Service's report judge's Verdict: every report matches its source."""
+
+AUDIT_PURPOSE = (
+    '{"outcome":"passed","reason":"the release serves the appointed auditor",'
+    '"citations":[{"slot":"release","locator":{"json_pointer":"/purpose"}}],'
+    '"data":{"audit_related":true}}'
+)
+"""The modular finance Service's purpose judge's Verdict, with its typed custom data."""
+
 FOLLOWS = (
     '{"outcome":"passed","reason":"within the policy",'
     '"citations":[{"slot":"answer","locator":{"json_pointer":"/text"}}]}'
@@ -359,8 +372,9 @@ def completion(body: dict) -> tuple[int, dict]:
     ``SCORE:``) answers ``scored``. The handbook judge reads its mount and
     answers ``handbook_verdict``, and the sharing-policy judge (its prompt
     carries ``POLICY JUDGE``) reads its mount and answers ``sharing_verdict``;
-    the finance release example's judge answers ``RELEASE_APPROVED``; the
-    file probe plays ``probe_turn``. Every
+    the finance release example's judge answers ``RELEASE_APPROVED``, and the
+    modular finance Service's judges answer ``REPORT_SUPPORTED`` and
+    ``AUDIT_PURPOSE``; the file probe plays ``probe_turn``. Every
     other judge agrees.
     """
     text = json.dumps(body)
@@ -373,6 +387,10 @@ def completion(body: dict) -> tuple[int, dict]:
         )
     elif "follows the company sharing policy" in text:
         message = {"role": "assistant", "content": RELEASE_APPROVED}
+    elif "accurately summarizes the source" in text:
+        message = {"role": "assistant", "content": REPORT_SUPPORTED}
+    elif "specific financial-audit need" in text:
+        message = {"role": "assistant", "content": AUDIT_PURPOSE}
     elif "REFUND RULES" in text:
         if "PROVIDER-DOWN" in text:
             return 500, {}

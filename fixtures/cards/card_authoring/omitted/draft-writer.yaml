@@ -1,0 +1,13 @@
+# Drafts release notes.
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: draft-writer
+spec:
+  execution_route: {kind: wyrd_gateway, deployment: openai}
+  prompt:
+    provider: openai
+    model: gpt-4o
+    messages:
+      - role: user
+        content: "Draft release notes for {{change}}."

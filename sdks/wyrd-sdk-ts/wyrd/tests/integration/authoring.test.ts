@@ -1,5 +1,5 @@
-// The `card_authoring` story, authored in TypeScript through
-// `wyrd-ai/authoring`.
+// The `card_authoring` story, authored in TypeScript through the `verify`
+// namespace of `wyrd-ai`.
 //
 // Service `finance-release` composes Agents `report-reviewer` and
 // `release-controls`, each verified by its own two-step Verifier
@@ -11,41 +11,61 @@
 // release naming `PROVIDER-UNCERTAIN`, fails one naming
 // `BANK-ACCOUNT-DEMO-001`, and otherwise passes citing the report text and the
 // policy line permitting `external-audit`.
+import { execFileSync } from "node:child_process";
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import { expect, vi } from "vitest";
+import { z } from "zod";
 
 import {
+  Bifrost,
   type CardTypes,
   Cards,
   type DeclarationReceipt,
   type VerificationResult,
+  verify,
   WyrdClient,
   WyrdError,
   WyrdState,
 } from "wyrd-ai";
-import {
-  Action,
-  Agent,
-  Artifact,
-  type ArtifactFile,
-  CardRef,
-  Check,
-  CodeSource,
-  Component,
-  type InputSlotArg,
-  Requirement,
-  Service,
-  Step,
-  Verifier,
-} from "wyrd-ai/authoring";
 
 import { judgeReply, toolCall, toolTurn } from "../support/assistant.js";
 import type { ReceivedRequest, Reply } from "../support/http-receiver.js";
 import { configureGateway } from "../support/local-development.js";
 import { fixture, serverTest } from "../support/server.js";
+
+const {
+  Action,
+  Agent,
+  Artifact,
+  Audit,
+  Binding,
+  CardRef,
+  Check,
+  CodeSource,
+  Component,
+  Data,
+  Experiment,
+  InputSlot,
+  Mcp,
+  Model,
+  Operator,
+  Prompt,
+  Requirement,
+  Service,
+  Step,
+  Trigger,
+  Verifier,
+} = verify;
+type Agent = verify.Agent;
+type Artifact = verify.Artifact;
+type ArtifactFile = verify.ArtifactFile;
+type InputSlotArg = verify.InputSlotArg;
+type Service = verify.Service;
+type Step = verify.Step;
+type Verifier = verify.Verifier;
 
 vi.setConfig({ testTimeout: 300_000 });
 
@@ -150,7 +170,8 @@ function upstream(request: ReceivedRequest): Reply {
 
 /** A policy-judge Agent `name` at `version`, as the story's Agent files declare it. */
 function policyJudge(name: string, version: string): Agent {
-  return new Agent(name, version, {
+  return new Agent(name, {
+    version,
     execution_route: { kind: "wyrd_gateway", deployment: "openai" },
     tool_names: ["fs.read"],
     run_config: { max_iterations: 3 },
@@ -193,7 +214,8 @@ function releaseInputs(): Readonly<Record<string, InputSlotArg>> {
 
 /** `report-policy` at `version`: the identifier scan with the judge reading `policy`, then context. */
 function reportPolicy(version: string, judge: Agent, policy: ArtifactFile): Verifier {
-  const verifier = new Verifier("report-policy", version, {
+  const verifier = new Verifier("report-policy", {
+    version,
     description: "The report is fit to share under the company sharing policy.",
     inputs: releaseInputs(),
   });
@@ -227,7 +249,8 @@ function reportPolicy(version: string, judge: Agent, policy: ArtifactFile): Veri
 
 /** `release-access` at `version`: independent recipient and destination steps, unused `notes`. */
 function releaseAccess(version: string, description?: string): Verifier {
-  const verifier = new Verifier("release-access", version, {
+  const verifier = new Verifier("release-access", {
+    version,
     description: description ?? "The recipient and destination may receive the report.",
     inputs: releaseInputs(),
   });
@@ -271,14 +294,14 @@ function summarizedAccess(version: string): Verifier {
 /** `finance-release` with every Card at `version`, its reviewer judged against `policy`. */
 function financeRelease(version: string, policy: ArtifactFile, access: Verifier): Service {
   const reviewer = policyJudge("report-reviewer", version);
-  return new Service("finance-release", version, { service_type: "api" })
+  return new Service("finance-release", { version, service_type: "api" })
     .addComponent(new Component("report-reviewer", reviewer).verifiedBy([reportPolicy(version, reviewer, policy)]))
     .addComponent(new Component("release-controls", policyJudge("release-controls", version)).verifiedBy([access]));
 }
 
 /** The local policy Artifact `version`, published from `source` with its documents extracted. */
 function localPolicy(version: string, source: string = POLICY): Artifact {
-  return Artifact.fromPath("company-sharing-policy", version, source).extract(true);
+  return Artifact.fromPath("company-sharing-policy", source, { version }).extract(true);
 }
 
 /** The registered policy Artifact `version`'s extracted file, used without uploading. */
@@ -617,7 +640,7 @@ test("local_artifacts_and_declaration_parity", async ({ cards, server }) => {
   );
 
   const judge = policyJudge("report-reviewer", "3.0.0");
-  const orphaned = new Service("finance-release", "3.0.0")
+  const orphaned = new Service("finance-release", { version: "3.0.0" })
     .addComponent(
       new Component("report-reviewer", judge).verifiedBy([
         reportPolicy("3.0.0", judge, localPolicy("3.0.0").file(POLICY_FILE)),
@@ -669,4 +692,276 @@ test("local_artifacts_and_declaration_parity", async ({ cards, server }) => {
   } finally {
     await directoryState.shutdown();
   }
+});
+
+/** The story's file at `omitted/<relative>`, a graph that names no version. */
+function omitted(relative: string): string {
+  return fixture(`cards/card_authoring/omitted/${relative}`);
+}
+
+/** `draft-judge` at `version`, as `omitted/draft-judge.yaml` declares it when `asks` is the file's request. */
+function draftJudge(version: string | undefined, asks: string): Agent {
+  return new Agent("draft-judge", {
+    version,
+    execution_route: { kind: "wyrd_gateway", deployment: "openai" },
+    prompt: {
+      provider: "openai",
+      model: "gpt-4o",
+      messages: [{ role: "user", content: asks }],
+      response_format: "verdict",
+    },
+  });
+}
+
+/** `draft-writer` at `version` asking `asks`, as `omitted/draft-writer.yaml` declares it with the file's request. */
+function draftWriter(version: string | undefined, asks: string): Agent {
+  return new Agent("draft-writer", {
+    version,
+    execution_route: { kind: "wyrd_gateway", deployment: "openai" },
+    prompt: { provider: "openai", model: "gpt-4o", messages: [{ role: "user", content: asks }] },
+  });
+}
+
+/** `draft-checks`, without a version, as `omitted/draft-checks.yaml` declares it, with `judge` judging the draft. */
+function draftChecks(judge: Agent): Verifier {
+  return new Verifier("draft-checks", {
+    inputs: { draft: { type: "object", required: ["text"], properties: { text: { type: "string" } } } },
+    requirements: [
+      new Requirement("has-text", "The draft has text.", Check.assert("inputs.draft.text", "is_non_empty", null)),
+      new Requirement("judged", "A judge accepts the draft.", Check.agent(judge).inputs({ draft: "inputs.draft" })),
+    ],
+  });
+}
+
+/** `drafting`, without a version, as `omitted/drafting.yaml` declares it, with `judge` judging the writer's draft. */
+function drafting(judge: Agent): Service {
+  return new Service("drafting", { service_type: "api" }).addComponent(
+    new Component("writer", draftWriter(undefined, "Draft release notes for {{change}}.")).verifiedBy([
+      draftChecks(judge),
+    ]),
+  );
+}
+
+/** `drafting-mixed`, as `omitted/mixed.yaml` declares it: a writer pinned at 1.0.0 and a versionless Verifier and judge. */
+function draftingMixed(): Service {
+  const writer = new Agent("mixed-writer", {
+    version: "1.0.0",
+    execution_route: { kind: "wyrd_gateway", deployment: "openai" },
+    prompt: {
+      provider: "openai",
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "Draft a changelog entry for {{change}}." }],
+    },
+  });
+  return new Service("drafting-mixed", { service_type: "api" }).addComponent(
+    new Component("writer", writer).verifiedBy([draftChecks(draftJudge(undefined, "Judge the draft {{draft}}."))]),
+  );
+}
+
+/** The registered reference `receipt` resolved for `name`. */
+function declared(receipt: DeclarationReceipt, name: string): DeclarationReceipt["root"] {
+  const outcome = receipt.outcomes.find((each) => each.card_ref.name === name);
+  if (outcome === undefined) {
+    throw new Error(`${name} is not declared: ${JSON.stringify(receipt)}`);
+  }
+  return outcome.card_ref;
+}
+
+/** A persisted spec, read as JSON. */
+type Spec = { readonly [key: string]: Spec } & { readonly [index: number]: Spec };
+
+/** The persisted spec of the Card `receipt` resolved for `name`. */
+async function persisted(cards: Cards, receipt: DeclarationReceipt, name: string): Promise<Spec> {
+  return (await cards.get(declared(receipt, name))).spec as unknown as Spec;
+}
+
+/** Assert every link of the `drafting` graph `receipt` declared is the full registered reference of its target. */
+async function assertBound(cards: Cards, receipt: DeclarationReceipt): Promise<void> {
+  for (const name of ["drafting", "draft-writer", "draft-checks", "draft-judge"]) {
+    const reference = declared(receipt, name);
+    expect(typeof reference.version === "string" && typeof reference.uid === "string", name).toBe(true);
+  }
+  const component = (await persisted(cards, receipt, "drafting")).components[0];
+  expect(component?.ref).toEqual(declared(receipt, "draft-writer"));
+  expect(component?.verified_by[0]?.verifier).toEqual(declared(receipt, "draft-checks"));
+  const checks = await persisted(cards, receipt, "draft-checks");
+  expect(checks.requirements[1]?.check.agent).toEqual(declared(receipt, "draft-judge"));
+}
+
+test("omitted_versions_resolve_in_composed_definitions", async ({ cards }) => {
+  const files = await cards.declare(omitted("drafting.yaml"));
+  await assertBound(cards, files);
+
+  const authored = drafting(draftJudge(undefined, "Judge the draft {{draft}}."));
+  expect(resolved(await cards.declare(authored)), "same identities and content").toEqual(resolved(files));
+  expect(resolved(await cards.declare(authored)), "unchanged replay reuses them").toEqual(resolved(files));
+
+  const mixedFiles = await cards.declare(omitted("mixed.yaml"));
+  const mixed = await cards.declare(draftingMixed());
+  expect(resolved(mixed), "same identities and content").toEqual(resolved(mixedFiles));
+  expect(declared(mixed, "mixed-writer").version).toBe("1.0.0");
+  const component = (await persisted(cards, mixed, "drafting-mixed")).components[0];
+  expect(component?.ref).toEqual(declared(mixed, "mixed-writer"));
+  expect(component?.verified_by[0]?.verifier, "the unchanged omitted Verifier is reused").toEqual(
+    declared(files, "draft-checks"),
+  );
+
+  const changed = await cards.declare(drafting(draftJudge(undefined, "Judge the draft {{draft}} strictly.")));
+  await assertBound(cards, changed);
+  const hash = (receipt: DeclarationReceipt, name: string): string | undefined =>
+    receipt.outcomes.find((each) => each.card_ref.name === name)?.spec_hash;
+  for (const name of ["draft-judge", "draft-checks", "drafting"]) {
+    const [old, next] = [declared(files, name), declared(changed, name)];
+    expect(next.version, `${name} gets a newly selected version`).not.toBe(old.version);
+    expect(next.uid, `${name} gets a new UID`).not.toBe(old.uid);
+    expect(hash(changed, name), `${name} gets a new hash`).not.toBe(hash(files, name));
+  }
+  expect(declared(changed, "draft-writer"), "the unchanged writer keeps its reference").toEqual(
+    declared(files, "draft-writer"),
+  );
+
+  const pair = (second: string | undefined): Service =>
+    new Service("draft-pair")
+      .addComponent(new Component("first", draftWriter("3.0.0", "First {{change}}.")))
+      .addComponent(new Component("second", draftWriter(second, "Second {{change}}.")));
+  const service = await persisted(cards, await cards.declare(pair("4.0.0")), "draft-pair");
+  expect([service.components[0]?.ref.version, service.components[1]?.ref.version]).toEqual(["3.0.0", "4.0.0"]);
+  const ambiguous = await cards.declare(pair(undefined)).then(
+    () => undefined,
+    (error: unknown) => error,
+  );
+  expect(ambiguous).toBeInstanceOf(WyrdError);
+  expect((ambiguous as WyrdError).code).toBe("WYRD_LOADER_400_INVALID_ENVELOPE");
+  expect((ambiguous as WyrdError).details).toMatchObject({
+    diagnostics: [{ code: "WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY" }],
+  });
+});
+
+test("definitions_register_all_kinds", async ({ cards }) => {
+  const model = await cards.declare(
+    new Model("authored-model", {
+      interface: {
+        kind: "Custom",
+        meta: { framework_version: "0.1.0", loader_module: "assistant", loader_class: "LatencyModel", extra: {} },
+      },
+      task_type: "Other",
+      signature: {
+        inputs: [{ name: "latency", dtype: "float64" }],
+        outputs: [{ name: "score", dtype: "float64" }],
+      },
+    }),
+  );
+  const kinds = new Set(declaredKinds(model));
+  const definitions = [
+    new Data("authored-data", {
+      interface: { kind: "Parquet", meta: { compression: "Snappy" } },
+      schema: { columns: [{ name: "latency", dtype: "float64" }] },
+      stats: {
+        row_count: 1,
+        col_count: 1,
+        byte_count: 1,
+        sha256: "c4f7700b380aff2662e88d034154d1890c33d3c12c8dda1a0ca9481f43bb9906",
+      },
+    }),
+    new Experiment("authored-experiment", { experiment_type: "ab" }).addTargetRef(
+      CardRef.model(model.root.name, model.root.version),
+    ),
+    new Mcp("authored-mcp", { server_name: "files", transport: "stdio" }),
+    new Audit("authored-audit", { description: "Quarterly review" }),
+    new Artifact("authored-artifact", { artifact_kind: "document", content_type: "application/pdf" }),
+  ];
+  for (const definition of definitions) {
+    for (const kind of declaredKinds(await cards.declare(definition))) {
+      kinds.add(kind);
+    }
+  }
+
+  const checks = new Verifier("authored-checks").addInput("latency", InputSlot.samples(["latency"])).addRequirement(
+    new Requirement(
+      "within-budget",
+      "Mean latency stays at or below 100 ms.",
+      Check.drift("inputs.latency", {
+        method: "Custom",
+        signal: { kind: "Metric", name: "latency" },
+        condition: { kind: "Statistical" },
+        profile: { kind: "Custom", metric_name: "latency", baseline_value: 0.0, alert_threshold: 100.0 },
+      }),
+    ),
+  );
+  const binding = new Binding(checks)
+    .runsOn(new Trigger("authored-trigger", { kind: "schedule", cron: "0 0 * * *" }))
+    .addOnFailure(
+      new Operator("authored-operator", {
+        action: { kind: "http", method: "post", url: "https://hooks.example.com/release" },
+      }),
+    );
+  const writer = new Agent("authored-agent", {
+    prompt: Prompt.openaiChat("gpt-4o", { messages: ["Draft release notes for {{change}}."] }),
+    execution_route: { kind: "wyrd_gateway", deployment: "openai" },
+  });
+  const receipt = await cards.declare(
+    new Service("authored-service", { service_type: "api" }).addComponent(
+      new Component("writer", writer).verifiedBy([binding]),
+    ),
+  );
+  for (const kind of declaredKinds(receipt)) {
+    kinds.add(kind);
+  }
+  const prompt = receipt.outcomes.find((each) => each.card_ref.kind === "Prompt");
+  expect(prompt, "the inline Prompt registers as a Prompt Card").toBeDefined();
+  expect((await persisted(cards, receipt, "authored-agent")).prompt, "the Agent references its Prompt exactly").toEqual(
+    prompt?.card_ref,
+  );
+  expect([...kinds].sort(), "every Card kind registers").toEqual(
+    [
+      "Data",
+      "Model",
+      "Artifact",
+      "Experiment",
+      "Prompt",
+      "Agent",
+      "Mcp",
+      "Service",
+      "Audit",
+      "Verifier",
+      "Trigger",
+      "Operator",
+    ].sort(),
+  );
+});
+
+const AUTHOR_IN_CODE = resolve(import.meta.dirname, "../../../../../examples/author-in-code");
+const ReplyRow = z.object({
+  answer: z.string(),
+  verdict: z.string(),
+  subject_card_uid: z.string(),
+  run_id: z.string(),
+});
+
+test("author_in_code_example_declares_verifies_and_writes", async ({ server }) => {
+  const reader = mkdtempSync(join(tmpdir(), "wyrd-ts-author-in-code-"));
+  const printed = () =>
+    execFileSync(process.execPath, [join(AUTHOR_IN_CODE, "author.ts")], { cwd: reader, encoding: "utf8" });
+
+  const first = printed();
+  expect(first).toMatch(
+    /^service: Service\/refund-replies@0\.1\.0#[0-9a-f-]+\nagent: {3}Agent\/refund-agent@0\.1\.0#[0-9a-f-]+\n/,
+  );
+  expect(first.split("\n").slice(2)).toEqual([
+    "passed: Your refund request is approved.",
+    "failed: You have a guaranteed refund.",
+    "",
+  ]);
+  expect(printed(), "an unchanged declaration keeps every version").toBe(first);
+
+  server.flushBifrost();
+  const agentUid = /agent: +\S+#(\S+)/.exec(first)?.[1];
+  const sql = readFileSync(join(AUTHOR_IN_CODE, "replies.sql"), "utf8");
+  const rows = await (await Bifrost.connect()).sql(sql, [], ReplyRow);
+  expect(rows).toHaveLength(4);
+  expect(new Set(rows.map(({ answer, verdict }) => `${verdict}: ${answer}`))).toEqual(
+    new Set(["passed: Your refund request is approved.", "failed: You have a guaranteed refund."]),
+  );
+  expect(new Set(rows.map(({ subject_card_uid }) => subject_card_uid))).toEqual(new Set([agentUid]));
+  expect(new Set(rows.map(({ run_id }) => run_id)).size, "each answer has its own Run").toBe(4);
 });

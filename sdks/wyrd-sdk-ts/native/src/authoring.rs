@@ -1,8 +1,9 @@
-//! Thin napi projection of `wyrd_client::authoring` for `wyrd-ai/authoring`.
+//! Thin napi projection of `wyrd_client::verify`'s Card definitions for the
+//! `wyrd-ai` `verify` namespace.
 //!
 //! [`NativeAuthored`] holds one shared Rust authoring value: one of the
-//! twelve named Cards, a sub-value, a [`CardRef`], an [`ArtifactFile`], or a
-//! [`CodeSource`]. Its fields are edited by their YAML names through
+//! eleven named Cards, a sub-value, a [`CardRef`], an [`ArtifactFile`], a
+//! [`CodeSource`], or an original [`Prompt`] held inline at an Agent. Its fields are edited by their YAML names through
 //! `set`, `add`, and `insert`, which dispatch to the shared setters and add
 //! methods; the TypeScript wrappers spell those as typed camelCase methods.
 //! Arguments arrive as one [`NativeValue`]: canonical JSON plus the
@@ -12,17 +13,21 @@
 //! Construction and editing never validate, read files, or touch the
 //! network; validation and declaration run the shared Rust owner.
 
+use napi::Either;
 use napi::{Error, Result, Status};
 use napi_derive::napi;
 use serde_json::Value;
-use wyrd_client::authoring::{
-    Action, Agent, Artifact, ArtifactFile, Audit, Binding, CardDefinition, CardRef, Check,
-    CodeSource, Component, Data, Experiment, FieldValue, InputSlot, Mcp, Model, Operator, Prompt,
-    Requirement, Service, Step, Trigger, Verifier,
+use wyrd_client::verify::{
+    Action, Agent, AnthropicOptions, Artifact, ArtifactFile, Audit, Binding, CardDefinition,
+    CardRef, Check, CodeSource, Component, Data, Experiment, FieldValue, GeminiOptions, InputSlot,
+    Mcp, Model, OpenAiChatOptions, OpenAiResponsesOptions, Operator, Prompt, PromptBuilderError,
+    Requirement, ResponseFormat, Service, Step, Table, Trigger, Verifier, anthropic, gemini,
+    openai_chat, openai_responses, vertex,
 };
 use wyrd_spec::envelope::CardKind;
+use wyrd_spec::error::WyrdError;
 
-use crate::NativeLifecycleResult;
+use crate::{NativeLifecycleResult, NativeWyrdError};
 
 /// The refusal of a host argument that does not fit its position.
 fn invalid(message: impl Into<String>) -> Error {
@@ -50,8 +55,6 @@ enum Authored {
     Service(Service),
     /// An Agent Card.
     Agent(Agent),
-    /// A Prompt Card.
-    Prompt(Prompt),
     /// A Verifier Card.
     Verifier(Verifier),
     /// An Artifact Card.
@@ -72,6 +75,8 @@ enum Authored {
     Operator(Operator),
     /// A Service component.
     Component(Component),
+    /// A Service table.
+    Table(Table),
     /// A verification binding.
     Binding(Binding),
     /// A Verifier step.
@@ -90,18 +95,23 @@ enum Authored {
     ArtifactFile(ArtifactFile),
     /// A code source.
     CodeSource(CodeSource),
+    /// An original Prompt, held inline at an Agent's `prompt`.
+    Prompt(Box<Prompt>),
 }
 
 /// Generate [`Authored`]'s per-family dispatch: the family name, the field
-/// edits, the Card it is, and the value it contributes at a position.
+/// edits, the Card it is, and the value it contributes at a position. A
+/// `boxed` family is held in a `Box`, keeping a large value from sizing every
+/// other variant.
 macro_rules! families {
-    (cards { $($card:ident),* } values { $($value:ident),* }) => {
+    (cards { $($card:ident),* } values { $($value:ident),* } boxed { $($boxed:ident),* }) => {
         impl Authored {
             /// The family's public name, for argument errors.
             fn name(&self) -> &'static str {
                 match self {
                     $(Self::$card(_) => stringify!($card),)*
                     $(Self::$value(_) => stringify!($value),)*
+                    $(Self::$boxed(_) => stringify!($boxed),)*
                 }
             }
 
@@ -114,6 +124,7 @@ macro_rules! families {
                 Ok(match self {
                     $(Self::$card(inner) => Self::$card(inner.set(field, value)?),)*
                     $(Self::$value(inner) => Self::$value(inner.set(field, value)?),)*
+                    $(Self::$boxed(inner) => Self::$boxed(Box::new((*inner).set(field, value)?)),)*
                 })
             }
 
@@ -125,6 +136,7 @@ macro_rules! families {
                 match self {
                     $(Self::$card(inner) => inner.add(field, value),)*
                     $(Self::$value(inner) => inner.add(field, value),)*
+                    $(Self::$boxed(inner) => inner.add(field, value),)*
                 }
             }
 
@@ -137,6 +149,7 @@ macro_rules! families {
                 match self {
                     $(Self::$card(inner) => inner.insert(field, key, value),)*
                     $(Self::$value(inner) => inner.insert(field, key, value),)*
+                    $(Self::$boxed(inner) => inner.insert(field, key, value),)*
                 }
             }
 
@@ -145,6 +158,7 @@ macro_rules! families {
                 match self {
                     $(Self::$card(card) => Some(card.into()),)*
                     $(Self::$value(_) => None,)*
+                    $(Self::$boxed(_) => None,)*
                 }
             }
 
@@ -154,6 +168,7 @@ macro_rules! families {
                 match self {
                     $(Self::$card(inner) => inner.into(),)*
                     $(Self::$value(inner) => inner.into(),)*
+                    $(Self::$boxed(inner) => (*inner).into(),)*
                 }
             }
         }
@@ -161,11 +176,12 @@ macro_rules! families {
 }
 
 families!(
-    cards { Service, Agent, Prompt, Verifier, Artifact, Model, Data, Experiment, Mcp, Audit, Trigger, Operator }
+    cards { Service, Agent, Verifier, Artifact, Model, Data, Experiment, Mcp, Audit, Trigger, Operator }
     values {
-        Component, Binding, Step, Requirement, InputSlot, Action, Check, CardRef, ArtifactFile,
-        CodeSource
+        Component, Table, Binding, Step, Requirement, InputSlot, Action, Check, CardRef,
+        ArtifactFile, CodeSource
     }
+    boxed { Prompt }
 );
 
 /// A host argument: canonical JSON plus the authoring values standing at
@@ -319,11 +335,6 @@ impl NativeValue {
                 .map(|(key, value)| Ok((key, value.field()?)))
                 .collect::<Result<FieldValue>>()?,
         })
-    }
-
-    /// Whether the argument is exactly the JSON `null`.
-    fn is_null(&self) -> bool {
-        self.value.is_null() && self.holes.is_empty()
     }
 
     /// The argument as plain JSON.
@@ -485,6 +496,7 @@ macro_rules! canonical {
 
 canonical!(
     component => Component,
+    table => Table,
     step => Step,
     requirement => Requirement,
     action => Action,
@@ -542,12 +554,10 @@ trait Fields: Sized {
 }
 
 /// Generate [`Fields`] for one family from its one-value, list, and map
-/// fields and their converters, and the list and map fields whose canonical
-/// `null` its shared clear method sets.
+/// fields and their converters.
 macro_rules! fields {
     ($(
         $ty:ident {
-            $(null { $($null:ident: $clear:ident),* $(,)? })?
             one { $($one:ident: $one_convert:ident),* $(,)? }
             list { $($list:ident, $list_add:ident: $list_convert:ident),* $(,)? }
             map { $($map:ident, $map_add:ident: $map_convert:ident),* $(,)? }
@@ -559,7 +569,6 @@ macro_rules! fields {
 
                 fn set(self, field: &str, value: NativeValue) -> Result<Self> {
                     match field {
-                        $($(stringify!($null) if value.is_null() => Ok(self.$clear()),)*)?
                         $(stringify!($one) => Ok(self.$one($one_convert(field, value)?)),)*
                         $(stringify!($list) => Ok(self.$list(items(field, value, $list_convert)?)),)*
                         $(stringify!($map) => Ok(self.$map(entries(field, value, $map_convert)?)),)*
@@ -608,7 +617,7 @@ fields! {
         }
         list {
             components, add_component: component, verified_by, add_verified_by: binding,
-            tables, add_table: json, credential_refs, add_credential_ref: json,
+            tables, add_table: table, credential_refs, add_credential_ref: json,
         }
         map {
             deployment, add_deployment: json, service_config, add_service_config: json,
@@ -618,17 +627,8 @@ fields! {
     }
     Agent {
         one { prompt: field, execution_route: json, run_config: json }
-        list { tool_names, add_tool_name: json, verified_by, add_verified_by: binding }
+        list { tool_names, add_tool_name: string, verified_by, add_verified_by: binding }
         map { labels, add_label: string, annotations, add_annotation: string }
-    }
-    Prompt {
-        null { messages: clear_messages, body: clear_body }
-        one {
-            provider: json, model: json, system: json, settings: json,
-            response_format: json, format: json,
-        }
-        list { messages, add_message: json }
-        map { body, add_body: json, labels, add_label: string, annotations, add_annotation: string }
     }
     Verifier {
         one { description: json, decide: json, context_capture: json, order_by: json }
@@ -695,6 +695,7 @@ fields! {
         list { verified_by, add_verified_by: binding, credential_refs, add_credential_ref: json }
         map { config, add_config: json }
     }
+    Table { one {} list {} map {} }
     Binding {
         one { runs_on: field }
         list { on_failure, add_on_failure: field, on_verdict_change, add_on_verdict_change: field }
@@ -720,6 +721,7 @@ fields! {
     CardRef { one {} list {} map {} }
     ArtifactFile { one {} list {} map {} }
     CodeSource { one {} list {} map {} }
+    Prompt { one {} list {} map {} }
 }
 
 /// The Card kind named `kind`.
@@ -728,6 +730,181 @@ fields! {
 /// Returns `InvalidArg` for a name that is no Card kind.
 fn kind_arg(kind: &str) -> Result<CardKind> {
     CardKind::from_wire_name(kind).ok_or_else(|| invalid(format!("unknown Card kind {kind:?}")))
+}
+
+/// The options every `Prompt` factory takes, by their builder names, as
+/// the TypeScript facade's JSON snapshot of them.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+struct PromptOptions {
+    /// System text: the system message, or OpenAI Responses `instructions`.
+    system: Option<String>,
+    /// User message strings, each one native user message.
+    messages: Vec<String>,
+    /// The response format emitted into the native request.
+    response_format: Option<PromptFormat>,
+    /// The structured-output format; wins over `response_format`.
+    output: Option<PromptFormat>,
+    /// OpenAI Chat prompt cache key.
+    prompt_cache_key: Option<String>,
+    /// The provider's native generation settings, by their wire names.
+    settings: Option<Value>,
+}
+
+/// One response format, by its `type`: plain text, a JSON object, a named
+/// JSON Schema, or the canonical Verdict with an optional custom `data`
+/// schema.
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum PromptFormat {
+    /// Plain text.
+    Text,
+    /// Any JSON object.
+    JsonObject,
+    /// A JSON Schema format named `name`.
+    JsonSchema {
+        /// The format's name.
+        name: String,
+        /// The format's schema, checked by the builder.
+        schema: Value,
+    },
+    /// The canonical Verdict.
+    Verdict {
+        /// A custom `data` schema the builder expands.
+        #[serde(default)]
+        data: Option<serde_json::Map<String, Value>>,
+    },
+}
+
+impl PromptFormat {
+    /// The shared format this names.
+    ///
+    /// # Errors
+    ///
+    /// Returns the builder's refusal of a JSON Schema format whose schema
+    /// is not a JSON object.
+    fn native(self) -> std::result::Result<ResponseFormat, PromptBuilderError> {
+        match self {
+            Self::Text => Ok(ResponseFormat::text()),
+            Self::JsonObject => Ok(ResponseFormat::json_object()),
+            Self::JsonSchema { name, schema } => ResponseFormat::json_schema(name, schema),
+            Self::Verdict { data } => Ok(ResponseFormat::verdict(data)),
+        }
+    }
+}
+
+/// `value` decoded as caller-authored Prompt input `T`, refused as the
+/// public `WYRD_PROMPT_400_INVALID` naming `field`.
+///
+/// # Errors
+///
+/// Returns [`PromptBuilderError::Validation`] when `value` is not a `T`.
+fn authored<T: serde::de::DeserializeOwned>(
+    field: &str,
+    value: Value,
+) -> std::result::Result<T, PromptBuilderError> {
+    serde_json::from_value(value)
+        .map_err(|error| PromptBuilderError::Validation(format!("{field}: {error}")))
+}
+
+/// `provider`'s native Prompt for `model` from the shared builder.
+///
+/// # Errors
+///
+/// Returns [`PromptBuilderError::InvalidProvider`] for a provider with no
+/// builder, [`PromptBuilderError::Validation`] for malformed options or a
+/// cache key outside OpenAI Chat, and the builder's own refusal.
+fn build_prompt(
+    provider: &str,
+    model: String,
+    options: Value,
+) -> std::result::Result<Prompt, PromptBuilderError> {
+    let options: PromptOptions = authored("options", options)?;
+    let response_format = options
+        .response_format
+        .map(PromptFormat::native)
+        .transpose()?;
+    let output = options.output.map(PromptFormat::native).transpose()?;
+    let settings = options
+        .settings
+        .unwrap_or_else(|| Value::Object(serde_json::Map::default()));
+    if options.prompt_cache_key.is_some() && provider != "openai_chat" {
+        return Err(PromptBuilderError::Validation(format!(
+            "promptCacheKey is an OpenAI Chat option, not a {provider} one"
+        )));
+    }
+    let (system, messages) = (options.system, options.messages);
+    match provider {
+        "openai_chat" => openai_chat(
+            model,
+            OpenAiChatOptions {
+                system,
+                messages,
+                response_format,
+                output,
+                prompt_cache_key: options.prompt_cache_key,
+                settings: authored("settings", settings)?,
+            },
+        ),
+        "openai_responses" => openai_responses(
+            model,
+            OpenAiResponsesOptions {
+                instructions: system,
+                messages,
+                response_format,
+                output,
+                settings: authored("settings", settings)?,
+            },
+        ),
+        "anthropic" => anthropic(
+            model,
+            AnthropicOptions {
+                system,
+                messages,
+                response_format,
+                output,
+                settings: authored("settings", settings)?,
+            },
+        ),
+        "gemini" | "vertex" => {
+            let options = GeminiOptions {
+                system,
+                messages,
+                response_format,
+                output,
+                settings: authored("settings", settings)?,
+            };
+            if provider == "gemini" {
+                gemini(model, options)
+            } else {
+                vertex(model, options)
+            }
+        }
+        other => Err(PromptBuilderError::InvalidProvider(other.to_owned())),
+    }
+}
+
+/// The variable bindings `vars` names, in order, as the shared Prompt
+/// binds them.
+///
+/// # Errors
+///
+/// Returns [`PromptBuilderError::Validation`] when `vars` is not an object
+/// of strings.
+fn prompt_vars(vars: Value) -> std::result::Result<Vec<(String, String)>, PromptBuilderError> {
+    let vars: std::collections::BTreeMap<String, String> = authored("vars", vars)?;
+    Ok(vars.into_iter().collect())
+}
+
+/// The Node-facing result of a Prompt operation: the new Prompt, or the
+/// builder's stable refusal as the error value.
+fn prompt_result(
+    built: std::result::Result<Prompt, PromptBuilderError>,
+) -> Either<NativeAuthored, NativeWyrdError> {
+    match built {
+        Ok(prompt) => Either::A(NativeAuthored::of(Authored::Prompt(Box::new(prompt)))),
+        Err(error) => Either::B(NativeWyrdError::from_wyrd(&WyrdError::from(error))),
+    }
 }
 
 /// An exact Card reference's identity, as authored.
@@ -765,22 +942,34 @@ impl NativeAuthored {
     fn of(inner: Authored) -> Self {
         Self { inner }
     }
+
+    /// The Prompt this value holds.
+    ///
+    /// # Errors
+    /// Returns `InvalidArg` when this value is not a Prompt.
+    fn held_prompt(&self) -> Result<&Prompt> {
+        match &self.inner {
+            Authored::Prompt(prompt) => Ok(prompt),
+            other => Err(invalid(format!("a {} is not a Prompt", other.name()))),
+        }
+    }
 }
 
 #[napi]
 impl NativeAuthored {
-    /// An empty `kind` Card named `name` at `version`; nothing is validated
-    /// until its graph is.
+    /// An empty `kind` Card named `name`, at `version` when given, else at
+    /// the version registration assigns; nothing is validated until its
+    /// graph is.
     ///
     /// # Errors
     ///
     /// Returns `InvalidArg` for a kind that is not an authorable Card kind.
     #[napi(factory)]
-    pub fn card(kind: String, name: String, version: String) -> Result<Self> {
+    pub fn card(kind: String, name: String, version: Option<String>) -> Result<Self> {
+        let version = version.as_deref();
         Ok(Self::of(match kind_arg(&kind)? {
             CardKind::Service => Authored::Service(Service::new(name, version)),
             CardKind::Agent => Authored::Agent(Agent::new(name, version)),
-            CardKind::Prompt => Authored::Prompt(Prompt::new(name, version)),
             CardKind::Verifier => Authored::Verifier(Verifier::new(name, version)),
             CardKind::Artifact => Authored::Artifact(Artifact::new(name, version)),
             CardKind::Model => Authored::Model(Model::new(name, version)),
@@ -799,11 +988,31 @@ impl NativeAuthored {
         }))
     }
 
-    /// The `file` Artifact named `name` at `version`, published from the
-    /// file or directory at `path` before its graph; nothing is read now.
+    /// The `file` Artifact named `name`, at `version` when given, published
+    /// from the file or directory at `path` before its graph; nothing is
+    /// read now.
     #[napi(factory)]
-    pub fn artifact_from_path(name: String, version: String, path: String) -> Self {
-        Self::of(Authored::Artifact(Artifact::from_path(name, version, path)))
+    pub fn artifact_from_path(name: String, version: Option<String>, path: String) -> Self {
+        Self::of(Authored::Artifact(Artifact::from_path(
+            name,
+            version.as_deref(),
+            path,
+        )))
+    }
+
+    /// The original native Prompt for `model` in `provider`'s request
+    /// format (`openai_chat`, `openai_responses`, `anthropic`, `gemini`, or
+    /// `vertex`), built by the shared Prompt builder from `options`, or the
+    /// builder's stable refusal as the error value, such as
+    /// `WYRD_PROMPT_400_EMPTY_MODEL` or `WYRD_PROMPT_400_INVALID` for
+    /// malformed options or settings.
+    #[napi]
+    pub fn prompt(
+        provider: String,
+        model: String,
+        options: Value,
+    ) -> Either<NativeAuthored, NativeWyrdError> {
+        prompt_result(build_prompt(&provider, model, options))
     }
 
     /// The component `alias` for `reference`: a Card, an exact `CardRef`,
@@ -819,6 +1028,13 @@ impl NativeAuthored {
             alias,
             reference.clone().field()?,
         ))))
+    }
+
+    /// The Service table `name` in `bifrost.datasets` with the JSON Schema
+    /// object `schema`, whose `properties` order is the column order.
+    #[napi(factory)]
+    pub fn table(name: String, schema: Value) -> Self {
+        Self::of(Authored::Table(Table::new(name, schema)))
     }
 
     /// Bind `verifier`: a Verifier, an exact `CardRef`, or a reference path.
@@ -1149,14 +1365,18 @@ impl NativeAuthored {
         }
     }
 
-    /// The exact reference this Card registers as.
+    /// The exact reference this Card registers as, or `None` while it has
+    /// no version and registration assigns one.
     ///
     /// # Errors
     ///
     /// Returns `InvalidArg` when this value is not a Card.
     #[napi]
-    pub fn card_ref(&self) -> Result<Self> {
-        Ok(Self::of(Authored::CardRef(self.declarable()?.card_ref())))
+    pub fn card_ref(&self) -> Result<Option<NativeAuthored>> {
+        Ok(self
+            .declarable()?
+            .card_ref()
+            .map(|card_ref| Self::of(Authored::CardRef(card_ref))))
     }
 
     /// This exact reference's kind, name, and version, as authored.
@@ -1213,5 +1433,108 @@ impl NativeAuthored {
             Authored::Verifier(verifier) => NativeLifecycleResult::outcome(verifier.plan()),
             other => Err(invalid(format!("a {} has no plan", other.name()))),
         }
+    }
+
+    /// A copy of this Prompt with one `role` turn appended: `system`,
+    /// `user`, or `assistant` text, or for `user` and `assistant` one native
+    /// content part or a list of them in the request format's wire shape.
+    /// The builder's refusal, such as `WYRD_PROMPT_400_INVALID` for content
+    /// the format does not take, is returned as the error value.
+    ///
+    /// # Errors
+    /// Returns `InvalidArg` when this value is not a Prompt.
+    #[napi]
+    pub fn prompt_message(
+        &self,
+        role: String,
+        content: Value,
+    ) -> Result<Either<NativeAuthored, NativeWyrdError>> {
+        let prompt = self.held_prompt()?;
+        Ok(prompt_result(match (role.as_str(), content) {
+            ("system", Value::String(text)) => prompt.with_system(text),
+            ("user", Value::String(text)) => prompt.with_user(text),
+            ("assistant", Value::String(text)) => prompt.with_assistant(text),
+            ("user" | "assistant", content) => prompt.with_content(&role, content),
+            (role, _) => Err(PromptBuilderError::Validation(format!(
+                "a {role} turn takes no content here; system takes text, user and assistant take text or native parts"
+            ))),
+        }))
+    }
+
+    /// A copy of this Prompt with the result `content` of tool call
+    /// `tool_use_id` appended, marked as a failure when `is_error`; the
+    /// builder's refusal is returned as the error value.
+    ///
+    /// # Errors
+    /// Returns `InvalidArg` when this value is not a Prompt.
+    #[napi]
+    pub fn prompt_tool_result(
+        &self,
+        tool_use_id: String,
+        content: String,
+        is_error: bool,
+    ) -> Result<Either<NativeAuthored, NativeWyrdError>> {
+        Ok(prompt_result(self.held_prompt()?.with_tool_result(
+            tool_use_id,
+            content,
+            is_error,
+        )))
+    }
+
+    /// A copy of this Prompt with the text variables `vars` bound; the
+    /// refusal of a malformed or undeclared variable is returned as the
+    /// error value.
+    ///
+    /// # Errors
+    /// Returns `InvalidArg` when this value is not a Prompt.
+    #[napi]
+    pub fn prompt_bind(&self, vars: Value) -> Result<Either<NativeAuthored, NativeWyrdError>> {
+        let prompt = self.held_prompt()?;
+        Ok(prompt_result(prompt_vars(vars).and_then(|vars| {
+            let vars: Vec<(&str, &str)> =
+                vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            Ok(Prompt::from_native(prompt.native().bind(&vars)?))
+        })))
+    }
+
+    /// A copy of this Prompt with the media placeholder `name` bound to
+    /// the `media` reference (`{kind, source}`); the refusal of a malformed
+    /// reference or an undeclared placeholder is returned as the error value.
+    ///
+    /// # Errors
+    /// Returns `InvalidArg` when this value is not a Prompt.
+    #[napi]
+    pub fn prompt_bind_media(
+        &self,
+        name: String,
+        media: Value,
+    ) -> Result<Either<NativeAuthored, NativeWyrdError>> {
+        let prompt = self.held_prompt()?;
+        Ok(prompt_result(authored("media", media).and_then(|media| {
+            Ok(Prompt::from_native(
+                prompt.native().bind_media(&name, &media)?,
+            ))
+        })))
+    }
+
+    /// The native provider request this Prompt renders with the text
+    /// variables `vars`, or the render's stable refusal, such as an unbound
+    /// variable, in the result.
+    ///
+    /// # Errors
+    /// Returns `InvalidArg` when this value is not a Prompt, and a napi
+    /// error when the rendered request cannot be serialized.
+    #[napi]
+    pub fn prompt_render(&self, vars: Value) -> Result<NativeLifecycleResult> {
+        let prompt = self.held_prompt()?;
+        NativeLifecycleResult::outcome(
+            prompt_vars(vars)
+                .and_then(|vars| {
+                    let vars: Vec<(&str, &str)> =
+                        vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                    prompt.render_native(&vars)
+                })
+                .map_err(WyrdError::from),
+        )
     }
 }

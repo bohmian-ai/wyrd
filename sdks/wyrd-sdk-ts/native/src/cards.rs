@@ -11,6 +11,7 @@ use napi::Env;
 use napi::Result;
 use napi::bindgen_prelude::PromiseRaw;
 use napi_derive::napi;
+use serde::Serialize;
 use wyrd_client::cards::{BundleMode, CardKind, CardSelector, Cards, Declarable, ListCardsRequest};
 use wyrd_client::observe::Run;
 use wyrd_client::state::{ConfigureOptions, DeclareOptions, TelemetryFlushFailure, WyrdState};
@@ -758,6 +759,30 @@ impl NativeWyrdState {
         })
     }
 
+    /// Binds the registered `<namespace>.<name>` table as the active table a
+    /// run's default write targets, describing it first.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the outcome cannot be projected; the
+    /// lifecycle refusals and the describe error are returned in
+    /// [`NativeLifecycleResult`].
+    #[napi]
+    pub fn use_table_by_name<'env>(
+        &self,
+        env: &'env Env,
+        table: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let state = self.state.clone();
+        crate::trace::spawn(env, async move {
+            let state = match &state {
+                Ok(state) => state,
+                Err(error) => return Ok(NativeLifecycleResult::from_wyrd(error)),
+            };
+            NativeLifecycleResult::outcome(Box::pin(state.use_table_by_name(&table)).await)
+        })
+    }
+
     /// Opens one invocation over this state, targeting `alias` or the root Service.
     ///
     /// Local only: no network IO, no server-side Run resource, and no Verifier
@@ -846,7 +871,10 @@ impl NativeWyrdState {
 /// Returns the unknown-alias, kind-mismatch, or invalid-bundle error the
 /// shared state's Agent lookup reports, or an invalid-bundle error when the
 /// resolved Prompt has no stored envelope.
-fn hydrated_agent(state: &WyrdState, alias: &str) -> StdResult<serde_json::Value, WyrdError> {
+fn hydrated_agent<'a>(
+    state: &'a WyrdState,
+    alias: &str,
+) -> StdResult<HydratedAgentProjection<'a>, WyrdError> {
     let agent = state.agent(alias)?;
     let prompt_key = agent.prompt_ref().to_string();
     let prompt = state
@@ -856,11 +884,23 @@ fn hydrated_agent(state: &WyrdState, alias: &str) -> StdResult<serde_json::Value
             message: "Agent prompt target has no stored envelope".to_owned(),
             details: serde_json::json!({ "alias": alias, "card_ref": agent.prompt_ref() }),
         })?;
-    Ok(serde_json::json!({
-        "card": state.card(alias)?,
-        "prompt_ref": agent.prompt_ref(),
-        "prompt": hydrated_prompt(prompt, &agent.prompt().metadata.prompt),
-    }))
+    Ok(HydratedAgentProjection {
+        card: state.card(alias)?,
+        prompt_ref: agent.prompt_ref(),
+        prompt: hydrated_prompt(prompt, &agent.prompt().metadata.prompt),
+    })
+}
+
+/// The borrowed JSON projection of a hydrated Agent, serialized once into
+/// the native result.
+#[derive(Serialize)]
+struct HydratedAgentProjection<'a> {
+    /// The Agent's stored envelope.
+    card: &'a Card,
+    /// The exact Prompt reference the Agent pins.
+    prompt_ref: &'a CardRef,
+    /// That Prompt's projection.
+    prompt: HydratedPromptProjection<'a>,
 }
 
 /// Projects a hydrated Prompt as its stored envelope plus the text variables,
@@ -869,18 +909,34 @@ fn hydrated_agent(state: &WyrdState, alias: &str) -> StdResult<serde_json::Value
 ///
 /// The derived values are read, never recomputed, so TypeScript reports
 /// exactly what the Rust and Python surfaces report.
-fn hydrated_prompt(card: &Card, prompt: &Prompt) -> serde_json::Value {
-    let (schema, name) = match &prompt.response_type {
-        ResponseType::JsonSchema { name, schema } => (Some(schema), Some(name)),
+fn hydrated_prompt<'a>(card: &'a Card, prompt: &'a Prompt) -> HydratedPromptProjection<'a> {
+    let (response_schema, response_schema_name) = match &prompt.response_type {
+        ResponseType::JsonSchema { name, schema } => (Some(schema), Some(name.as_str())),
         ResponseType::Text => (None, None),
     };
-    serde_json::json!({
-        "card": card,
-        "variables": prompt.variables,
-        "media_variables": prompt.media_variables,
-        "response_schema": schema,
-        "response_schema_name": name,
-    })
+    HydratedPromptProjection {
+        card,
+        variables: &prompt.variables,
+        media_variables: &prompt.media_variables,
+        response_schema,
+        response_schema_name,
+    }
+}
+
+/// The borrowed JSON projection of a hydrated Prompt, serialized once into
+/// the native result.
+#[derive(Serialize)]
+struct HydratedPromptProjection<'a> {
+    /// The Prompt's stored envelope.
+    card: &'a Card,
+    /// Text placeholder names the Prompt requires.
+    variables: &'a [String],
+    /// Media placeholder names the Prompt requires.
+    media_variables: &'a [String],
+    /// The response JSON Schema, or null for a plain-text Prompt.
+    response_schema: Option<&'a serde_json::Value>,
+    /// The response schema name, or null for a plain-text Prompt.
+    response_schema_name: Option<&'a str>,
 }
 
 /// Parses a Card reference passed as its text form or serialized JSON object.
@@ -1030,10 +1086,18 @@ impl NativeRun {
         })
     }
 
-    /// Emits one row into a registered `bifrost.datasets` table.
+    /// Buffers one row for a registered `bifrost.datasets` table.
     ///
     /// Asynchronous because the first call for a table describes it; later calls
-    /// reuse the cached schema and producer.
+    /// reuse the cached schema and producer. Resolving is buffered submission;
+    /// state shutdown drains it.
+    ///
+    /// The write runs as a spawned task that owns a clone of the Run, so
+    /// discarding the returned promise does not cancel it: the row may still
+    /// be admitted. A successful outcome admitted exactly one row, so repeating
+    /// it writes another; a refused outcome admitted none and may be retried.
+    /// Admission and queue retries follow `RunBifrost::write_to`. `table`
+    /// names the destination; `None` writes the state's active table.
     ///
     /// # Errors
     ///
@@ -1041,16 +1105,16 @@ impl NativeRun {
     /// reserved, unknown, or unauthorized table and the lifecycle refusals are
     /// returned in [`NativeLifecycleResult`].
     #[napi]
-    pub fn record<'env>(
+    pub fn write<'env>(
         &self,
         env: &'env Env,
-        table: String,
+        table: Option<String>,
         row_json: String,
     ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
         let run = self.run.clone();
         crate::trace::spawn(env, async move {
             NativeLifecycleResult::outcome(
-                Box::pin(run.observe().record_json(&table, &row_json)).await,
+                Box::pin(run.bifrost().write_json(table.as_deref(), &row_json)).await,
             )
         })
     }

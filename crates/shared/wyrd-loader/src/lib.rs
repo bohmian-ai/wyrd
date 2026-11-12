@@ -115,7 +115,7 @@ pub fn load(path: &Path) -> Result<LoadedTree, LoadError> {
     let mut diagnostics = resolve::resolve_tree(&mut cards, &sandbox, &config);
 
     // 6. Validate.
-    diagnostics.extend(validate::validate_tree(&cards));
+    diagnostics.extend(validate::validate_tree(&mut cards));
 
     // 7. Topological sort.
     let order = match order::order_cards(&cards) {
@@ -134,14 +134,13 @@ pub fn load(path: &Path) -> Result<LoadedTree, LoadError> {
     }
 
     // 8. Build loaded cards in topological order.
-    let mut loaded_cards = Vec::with_capacity(order.len());
-    for index in order {
-        let card = &cards[index];
-        loaded_cards.push(LoadedCard {
-            submission: order::submission_for(card).map_err(LoadError::single)?,
-            source_path: card.source_path.clone(),
-        });
-    }
+    let loaded_cards = order
+        .into_iter()
+        .map(|(index, submission)| LoadedCard {
+            submission,
+            source_path: cards[index].source_path.clone(),
+        })
+        .collect();
 
     Ok(LoadedTree {
         cards: loaded_cards,
@@ -176,14 +175,18 @@ pub fn parse_card_value(
 /// external reference, and then pass the same validation and dependency
 /// ordering a file tree does. Each card's `source_path` only labels its
 /// diagnostics. In-memory cards carry no artifact manifest: a heavy Artifact
-/// is published on its own first, as a file-authored one is.
+/// is published on its own first, as a file-authored one is. The cards are
+/// borrowed mutably only for validation's reference visitor and are left
+/// unchanged.
 ///
 /// # Errors
 /// Returns `LoadError` with every error-severity diagnostic the file
 /// pipeline would report for the same cards, such as duplicate identities,
 /// invalid Verifiers or bindings, unresolved paths, authored UIDs, cycles,
 /// and composition errors.
-pub fn declaration_input_from_cards(cards: &[AuthoredCard]) -> Result<DeclarationInput, LoadError> {
+pub fn declaration_input_from_cards(
+    cards: &mut [AuthoredCard],
+) -> Result<DeclarationInput, LoadError> {
     let diagnostics = validate::validate_tree(cards);
     if diagnostics
         .iter()
@@ -191,12 +194,11 @@ pub fn declaration_input_from_cards(cards: &[AuthoredCard]) -> Result<Declaratio
     {
         return Err(LoadError::multiple(diagnostics));
     }
-    let order = order::order_cards(cards).map_err(LoadError::multiple)?;
-    let submissions = order
+    let submissions = order::order_cards(cards)
+        .map_err(LoadError::multiple)?
         .into_iter()
-        .map(|index| order::submission_for(&cards[index]))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(LoadError::single)?;
+        .map(|(_, submission)| submission)
+        .collect();
     Ok(DeclarationInput {
         submissions,
         artifact_sources: BTreeMap::new(),
@@ -428,6 +430,51 @@ mod tests {
         );
     }
 
+    /// A path to an unversioned Card loads as a versionless sibling, and
+    /// neither Card gains a version the author did not write.
+    ///
+    /// # Panics
+    /// Panics when the tree fails to load or the sibling carries a version.
+    #[test]
+    fn path_to_unversioned_card_becomes_versionless_sibling() {
+        let temp = TempDir::new().expect("temp directory creates");
+        std::fs::write(
+            temp.path().join("prompt.yaml"),
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: prompt\nspec:\n  provider: openai\n  model: gpt-5\n  system: Be brief.\n",
+        )
+        .expect("prompt writes");
+        std::fs::write(
+            temp.path().join("service.yaml"),
+            "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: service\nspec:\n  service_type: api\n  components:\n    - alias: sibling\n      ref: prompt.yaml\n",
+        )
+        .expect("service writes");
+
+        let tree = load(&temp.path().join("service.yaml")).expect("unversioned tree loads");
+
+        assert!(
+            tree.cards
+                .iter()
+                .all(|card| card.submission.metadata.version.is_none())
+        );
+        let service = tree
+            .cards
+            .iter()
+            .find(|card| card.submission.metadata.name.as_str() == "service")
+            .expect("service is loaded");
+        assert_eq!(
+            service.submission.spec["components"][0]["ref"],
+            serde_json::json!({"sibling": {"kind": "Prompt", "name": "prompt"}})
+        );
+    }
+
+    /// A component authored as an external reference stays one, a path
+    /// component becomes a sibling, and that sibling matches the external
+    /// reference to the same Card without becoming it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the tree does not load or either component keeps the
+    /// wrong reference form.
     #[test]
     fn path_and_external_refs_keep_distinct_wire_projections() {
         let temp = TempDir::new().expect("temp directory creates");
@@ -464,6 +511,6 @@ mod tests {
         else {
             panic!("path ref becomes a sibling projection");
         };
-        assert!(external_ref.same_identity(sibling_ref));
+        assert!(sibling_ref.matches(external_ref));
     }
 }

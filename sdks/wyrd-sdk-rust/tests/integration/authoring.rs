@@ -2,7 +2,7 @@
 //! composes Agents `report-reviewer` and `release-controls`, each verified by
 //! its own two-step Verifier (`report-policy`, `release-access`), and the
 //! report judge reads the extracted `company-sharing-policy` Artifact. The
-//! graph is built in code through `wyrd_ai::authoring` and declared through
+//! graph is built in code through `wyrd_ai::verify` and declared through
 //! `Cards::declare` or `WyrdState::declare_with`, which publish a local
 //! Artifact first and then declare the graph.
 //!
@@ -17,14 +17,13 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-use wyrd_ai::authoring::{
-    Action, Agent, Artifact, ArtifactFile, Audit, Binding, CardDefinition, CardRef, Check,
-    CodeSource, Component, Data, Experiment, InputSlot, LocalArtifact, Mcp, Model, Operator,
-    Prompt, Requirement, Service, Step, Trigger, Verifier,
-};
 use wyrd_ai::cards::{CardKind, CardRef as RegisteredRef, CardSelector, Cards};
 use wyrd_ai::state::{DeclareOptions, WyrdState};
-use wyrd_ai::verify::Inputs;
+use wyrd_ai::verify::{
+    Action, Agent, Artifact, ArtifactFile, Audit, Binding, CardDefinition, CardRef, Check,
+    CodeSource, Component, Data, Experiment, InputSlot, Inputs, LocalArtifact, Mcp, Model,
+    OpenAiChatOptions, Operator, Requirement, Service, Step, Trigger, Verifier, openai_chat,
+};
 use wyrd_ai::{Locator, RequirementOutcome, StepStatus, VerificationResult, VerificationVerdict};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::registry::DeclarationOutcomeKind;
@@ -812,7 +811,10 @@ async fn local_artifacts_reuse_and_keep_versions() {
     };
     assert_eq!(published.source, source);
     assert!(published.extract);
-    assert_eq!(published.metadata.name.as_str(), local.card_ref().name());
+    assert_eq!(
+        published.metadata.name.as_str(),
+        local.card_ref().expect("a versioned Artifact").name()
+    );
     assert!(
         declaration
             .input
@@ -1353,7 +1355,6 @@ fn canonical(kind: &CardKind, value: Value) -> wyrd_ai::Spec {
 /// Panics when the spec differs or the one-Card graph does not declare.
 fn assert_authors(card: impl Into<CardDefinition>, kind: &CardKind, expected: Value) {
     let card = card.into();
-    assert_eq!(&card.card_ref().kind().clone(), kind);
     assert_eq!(
         canonical(kind, card.spec()),
         canonical(kind, expected),
@@ -1454,14 +1455,20 @@ fn public_paths_author_every_native_family() {
         &CardKind::Operator,
         pager.clone(),
     );
-    let mut prompt = Prompt::new("authored", "1.0.0")
-        .provider("openai")
-        .model("gpt-4o");
-    prompt.add_message(json!({"role": "user", "content": "Judge {{report}}"}));
+    let prompt = openai_chat(
+        "gpt-4o",
+        OpenAiChatOptions {
+            messages: vec!["Judge {{report}}".into()],
+            ..Default::default()
+        },
+    )
+    .expect("the Prompt builds");
     assert_authors(
-        prompt,
-        &CardKind::Prompt,
-        json!({"provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "Judge {{report}}"}]}),
+        Agent::new("authored", None)
+            .prompt(prompt.clone())
+            .execution_route(wyrd_ai::ExecutionRoute::Native {}),
+        &CardKind::Agent,
+        json!({"prompt": prompt.native(), "execution_route": {"kind": "native"}}),
     );
     let mut artifact = Artifact::new("authored", "1.0.0")
         .artifact_kind("document")
@@ -1815,4 +1822,392 @@ fn public_paths_author_every_native_family() {
         1,
         "the policy mounted by both calls is published once"
     );
+}
+
+/// Journeys that start a server against the repository Postgres.
+mod pg_tests {
+    use super::*;
+
+    /// The story's file at `omitted/<relative>`, a graph that names no version.
+    fn omitted(relative: &str) -> PathBuf {
+        story(&format!("omitted/{relative}"))
+    }
+
+    /// `draft-judge` at `version`, as `omitted/draft-judge.yaml` declares it
+    /// when `asks` is the file's request.
+    fn draft_judge<'v>(version: impl Into<Option<&'v str>>, asks: &str) -> Agent {
+        Agent::new("draft-judge", version)
+            .execution_route(json!({"kind": "wyrd_gateway", "deployment": "openai"}))
+            .prompt(json!({
+                "provider": "openai",
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": asks}],
+                "response_format": "verdict",
+            }))
+    }
+
+    /// `draft-writer` at `version` asking `asks`, as
+    /// `omitted/draft-writer.yaml` declares it with the file's request.
+    fn draft_writer<'v>(version: impl Into<Option<&'v str>>, asks: &str) -> Agent {
+        Agent::new("draft-writer", version)
+            .execution_route(json!({"kind": "wyrd_gateway", "deployment": "openai"}))
+            .prompt(json!({
+                "provider": "openai",
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": asks}],
+            }))
+    }
+
+    /// `draft-checks`, without a version, as `omitted/draft-checks.yaml`
+    /// declares it, with `judge` judging the draft.
+    fn draft_checks(judge: Agent) -> Verifier {
+        Verifier::new("draft-checks", None)
+        .inputs([(
+            "draft",
+            json!({"type": "object", "required": ["text"], "properties": {"text": {"type": "string"}}}),
+        )])
+        .requirements([
+            Requirement::new(
+                "has-text",
+                "The draft has text.",
+                Check::assert("inputs.draft.text", "is_non_empty", Value::Null),
+            ),
+            Requirement::new(
+                "judged",
+                "A judge accepts the draft.",
+                Check::agent(judge).inputs([("draft", "inputs.draft")]),
+            ),
+        ])
+    }
+
+    /// `drafting`, without a version, as `omitted/drafting.yaml` declares it,
+    /// with `judge` judging the writer's draft.
+    fn drafting(judge: Agent) -> Service {
+        Service::new("drafting", None)
+            .service_type("api")
+            .components([Component::new(
+                "writer",
+                draft_writer(None, "Draft release notes for {{change}}."),
+            )
+            .verified_by([draft_checks(judge)])])
+    }
+
+    /// `drafting-mixed`, without a version, as `omitted/mixed.yaml` declares
+    /// it: the writer pins `mixed-writer` 1.0.0 and the Verifier and judge
+    /// name no version.
+    fn drafting_mixed() -> Service {
+        let writer = Agent::new("mixed-writer", "1.0.0")
+        .execution_route(json!({"kind": "wyrd_gateway", "deployment": "openai"}))
+        .prompt(json!({
+            "provider": "openai",
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "Draft a changelog entry for {{change}}."}],
+        }));
+        Service::new("drafting-mixed", None)
+            .service_type("api")
+            .components([Component::new("writer", writer).verified_by([draft_checks(
+                draft_judge(None, "Judge the draft {{draft}}."),
+            )])])
+    }
+
+    /// The registered reference `receipt` resolved for `name`.
+    ///
+    /// # Panics
+    /// Panics when `receipt` declared no Card named `name`.
+    fn declared(receipt: &wyrd_ai::cards::DeclarationReceipt, name: &str) -> Value {
+        let outcome = receipt
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.card_ref.name.as_str() == name)
+            .unwrap_or_else(|| panic!("{name} is declared: {receipt:#?}"));
+        serde_json::to_value(&outcome.card_ref).expect("reference serializes")
+    }
+
+    /// The persisted spec of the Card `receipt` resolved for `name`.
+    ///
+    /// # Panics
+    /// Panics when the Card cannot be read.
+    async fn persisted(
+        cards: &Cards,
+        receipt: &wyrd_ai::cards::DeclarationReceipt,
+        name: &str,
+    ) -> Value {
+        let reference = serde_json::from_value(declared(receipt, name)).expect("reference parses");
+        let card = cards
+            .get(CardSelector::exact(reference))
+            .await
+            .expect("the declared Card reads");
+        serde_json::to_value(&card.spec).expect("spec serializes")
+    }
+
+    /// Assert every link of the `drafting` graph `receipt` declared is the full
+    /// registered reference, version and UID, of its target.
+    ///
+    /// # Panics
+    /// Panics when a reference lacks a version or UID or a parent binds another
+    /// reference than its target's.
+    async fn assert_bound(cards: &Cards, receipt: &wyrd_ai::cards::DeclarationReceipt) {
+        for name in ["drafting", "draft-writer", "draft-checks", "draft-judge"] {
+            let reference = declared(receipt, name);
+            assert!(
+                reference["version"].is_string() && reference["uid"].is_string(),
+                "{name} has a selected version and UID: {reference}"
+            );
+        }
+        let service = persisted(cards, receipt, "drafting").await;
+        let component = &service["components"][0];
+        assert_eq!(component["ref"], declared(receipt, "draft-writer"));
+        assert_eq!(
+            component["verified_by"][0]["verifier"],
+            declared(receipt, "draft-checks")
+        );
+        let checks = persisted(cards, receipt, "draft-checks").await;
+        assert_eq!(
+            checks["requirements"][1]["check"]["agent"],
+            declared(receipt, "draft-judge")
+        );
+    }
+
+    /// A graph naming no version declares the same through its YAML path and
+    /// through `wyrd_ai::verify` definitions: the server selects every version
+    /// and binds each Service component, bound Verifier, and transitive judge to
+    /// its full registered reference, and the definitions rerun the files'
+    /// identities and content. A mixed graph keeps its pinned writer and
+    /// selects the rest, alike from YAML and definitions. A judge whose content
+    /// changes without a version gets a newly selected version that propagates
+    /// into a new Verifier and Service version while the writer keeps its
+    /// reference; two explicit versions of one Agent are distinct targets;
+    /// and an omitted link that names two submissions is refused as ambiguous.
+    ///
+    /// # Panics
+    /// Panics when a declaration, reference, or refusal differs.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the repository-managed Postgres journey lifecycle"]
+    async fn omitted_versions_resolve_in_composed_definitions() {
+        let deployment = Deployment::start().await;
+        let cards = deployment.cards().await;
+        let files = cards
+            .declare(omitted("drafting.yaml"))
+            .await
+            .expect("the versionless files declare");
+        assert_bound(&cards, &files).await;
+
+        let authored = drafting(draft_judge(None, "Judge the draft {{draft}}."));
+        let receipt = cards
+            .declare(&authored)
+            .await
+            .expect("the versionless definitions declare");
+        assert_eq!(
+            resolved(&receipt),
+            resolved(&files),
+            "same identities and content"
+        );
+        let rerun = cards.declare(&authored).await.expect("the rerun declares");
+        assert_eq!(
+            resolved(&rerun),
+            resolved(&files),
+            "unchanged replay reuses them"
+        );
+
+        let mixed_files = cards
+            .declare(omitted("mixed.yaml"))
+            .await
+            .expect("the mixed-version files declare");
+        let mixed = cards
+            .declare(&drafting_mixed())
+            .await
+            .expect("the mixed-version definitions declare");
+        assert_eq!(
+            resolved(&mixed),
+            resolved(&mixed_files),
+            "same identities and content"
+        );
+        assert_eq!(declared(&mixed, "mixed-writer")["version"], "1.0.0");
+        let service = persisted(&cards, &mixed, "drafting-mixed").await;
+        assert_eq!(
+            service["components"][0]["ref"],
+            declared(&mixed, "mixed-writer")
+        );
+        assert_eq!(
+            service["components"][0]["verified_by"][0]["verifier"],
+            declared(&files, "draft-checks"),
+            "the unchanged omitted Verifier reuses its selected version"
+        );
+
+        let changed = cards
+            .declare(&drafting(draft_judge(
+                None,
+                "Judge the draft {{draft}} strictly.",
+            )))
+            .await
+            .expect("a graph with changed omitted judge content declares");
+        assert_bound(&cards, &changed).await;
+        let (before, after) = (resolved(&files), resolved(&changed));
+        for name in ["draft-judge", "draft-checks", "drafting"] {
+            let (old, new) = (&before[name], &after[name]);
+            assert!(
+                old.0.version != new.0.version && old.0.uid != new.0.uid && old.1 != new.1,
+                "{name} gets a new selected version, UID, and hash: {old:?} {new:?}"
+            );
+        }
+        assert_eq!(
+            after["draft-writer"], before["draft-writer"],
+            "the unchanged writer keeps its reference"
+        );
+
+        let pair = |second: Option<&str>| {
+            Service::new("draft-pair", None).components([
+                Component::new("first", draft_writer("3.0.0", "First {{change}}.")),
+                Component::new("second", draft_writer(second, "Second {{change}}.")),
+            ])
+        };
+        let both = cards
+            .declare(&pair(Some("4.0.0")))
+            .await
+            .expect("two explicit versions of one Agent declare");
+        let service = persisted(&cards, &both, "draft-pair").await;
+        assert_eq!(
+            [
+                &service["components"][0]["ref"]["version"],
+                &service["components"][1]["ref"]["version"]
+            ],
+            [&json!("3.0.0"), &json!("4.0.0")]
+        );
+        let ambiguous = cards
+            .declare(&pair(None))
+            .await
+            .expect_err("an omitted link naming two submissions is refused");
+        let WyrdError::LoaderInvalidEnvelope { details, .. } = &ambiguous else {
+            panic!("the shared graph check refuses the link: {ambiguous:?}");
+        };
+        assert_eq!(
+            details["diagnostics"][0]["code"], "WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY",
+            "{details}"
+        );
+        deployment.shutdown().await;
+    }
+
+    /// Definitions of every Card kind register through `Cards::declare`: the
+    /// spec-only kinds alone, and a Service whose Agent holds an inline Prompt
+    /// (registered by the server as a Prompt Card the Agent references exactly)
+    /// and binds a Verifier run by a Trigger that pages an Operator.
+    ///
+    /// # Panics
+    /// Panics when a declaration fails or a kind goes unregistered.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the repository-managed Postgres journey lifecycle"]
+    async fn definitions_register_all_kinds() {
+        let deployment = Deployment::start().await;
+        let cards = deployment.cards().await;
+        let mut kinds = Vec::new();
+        let model = cards
+        .declare(
+            Model::new("authored-model", None)
+                .interface(json!({"kind": "Custom", "meta": {"framework_version": "0.1.0", "loader_module": "assistant", "loader_class": "LatencyModel", "extra": {}}}))
+                .task_type("Other")
+                .signature(json!({"inputs": [{"name": "latency", "dtype": "float64"}], "outputs": [{"name": "score", "dtype": "float64"}]})),
+        )
+        .await
+        .expect("a Model declares");
+        let mut experiment = Experiment::new("authored-experiment", None).experiment_type("ab");
+        experiment.add_target_ref(model.root.clone());
+        let pager =
+            json!({"kind": "http", "method": "post", "url": "https://hooks.example.com/release"});
+        let definitions: Vec<CardDefinition> = vec![
+        Data::new("authored-data", None)
+            .interface(json!({"kind": "Parquet", "meta": {"compression": "Snappy"}}))
+            .schema(json!({"columns": [{"name": "latency", "dtype": "float64"}]}))
+            .stats(json!({"row_count": 1, "col_count": 1, "byte_count": 1, "sha256": "c4f7700b380aff2662e88d034154d1890c33d3c12c8dda1a0ca9481f43bb9906"}))
+            .into(),
+        experiment.into(),
+        Mcp::new("authored-mcp", None)
+            .server_name("files")
+            .transport("stdio")
+            .into(),
+        Audit::new("authored-audit", None)
+            .description("Quarterly review")
+            .into(),
+        Artifact::new("authored-artifact", None)
+            .artifact_kind("document")
+            .content_type("application/pdf")
+            .into(),
+    ];
+        kinds.extend(declared_kinds(&model));
+        for definition in &definitions {
+            kinds.extend(declared_kinds(
+                &cards
+                    .declare(definition)
+                    .await
+                    .expect("a spec-only kind declares"),
+            ));
+        }
+        let prompt = openai_chat(
+            "gpt-4o",
+            OpenAiChatOptions {
+                messages: vec!["Draft release notes for {{change}}.".into()],
+                ..Default::default()
+            },
+        )
+        .expect("the Prompt builds");
+        let mut checks = Verifier::new("authored-checks", None);
+        checks
+        .add_input("latency", InputSlot::samples(["latency"]))
+        .add_requirement(Requirement::new(
+            "within-budget",
+            "Mean latency stays at or below 100 ms.",
+            Check::drift(
+                "inputs.latency",
+                json!({
+                    "method": "Custom",
+                    "signal": {"kind": "Metric", "name": "latency"},
+                    "condition": {"kind": "Statistical"},
+                    "profile": {"kind": "Custom", "metric_name": "latency", "baseline_value": 0.0, "alert_threshold": 100.0},
+                }),
+            ),
+        ));
+        let mut binding = Binding::new(checks).runs_on(
+            Trigger::new("authored-trigger", None)
+                .kind("schedule")
+                .cron("0 0 * * *"),
+        );
+        binding.add_on_failure(Operator::new("authored-operator", None).action(pager));
+        let writer = Agent::new("authored-agent", None)
+            .prompt(prompt)
+            .execution_route(json!({"kind": "wyrd_gateway", "deployment": "openai"}));
+        let service = Service::new("authored-service", None)
+            .service_type("api")
+            .components([Component::new("writer", writer).verified_by([binding])]);
+        let receipt = cards.declare(&service).await.expect("the Service declares");
+        kinds.extend(declared_kinds(&receipt));
+        let agent = persisted(&cards, &receipt, "authored-agent").await;
+        let prompt = receipt
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.card_ref.kind == CardKind::Prompt)
+            .expect("the inline Prompt registers as a Prompt Card");
+        assert_eq!(
+            agent["prompt"],
+            serde_json::to_value(&prompt.card_ref).expect("reference serializes"),
+            "the Agent references its Prompt exactly"
+        );
+        kinds.sort_by_key(CardKind::wire_name);
+        kinds.dedup();
+        let mut every = vec![
+            CardKind::Data,
+            CardKind::Model,
+            CardKind::Artifact,
+            CardKind::Experiment,
+            CardKind::Prompt,
+            CardKind::Agent,
+            CardKind::Mcp,
+            CardKind::Service,
+            CardKind::Audit,
+            CardKind::Verifier,
+            CardKind::Trigger,
+            CardKind::Operator,
+        ];
+        every.sort_by_key(CardKind::wire_name);
+        assert_eq!(kinds, every, "every Card kind registers");
+        deployment.shutdown().await;
+    }
 }

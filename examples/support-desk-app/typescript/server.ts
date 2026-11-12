@@ -17,7 +17,7 @@ import type OpenAI from "openai";
 import { type Run, type VerificationResult, verify, WyrdClient, WyrdError, WyrdState } from "wyrd-ai";
 
 import { answer, gateway } from "./agent.ts";
-import { BUNDLE_DIR, TICKETS } from "./wyrd.ts";
+import { BUNDLE_DIR } from "./wyrd.ts";
 
 /** What a customer gets instead of an answer that promises a refund. */
 export const HANDOFF = "I've passed your question to our billing team. They reply within one business day.";
@@ -47,7 +47,7 @@ function answerInRun<T>(support: Support, question: string, check: (wyrdRun: Run
   // Spans started inside the scope carry the Run's ID.
   return wyrdRun.scope(async () => {
     const text = await answer(support.gateway, support.state, wyrdRun, question);
-    await wyrdRun.observe.record(TICKETS, { question, answer: text });
+    await wyrdRun.bifrost.write({ question, answer: text });
     return check(wyrdRun, text);
   });
   // ANCHOR_END: answer

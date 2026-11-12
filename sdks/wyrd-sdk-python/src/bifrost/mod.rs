@@ -1023,15 +1023,6 @@ impl Bifrost {
         to_python_json(py, serde_json::to_value(description))
     }
 
-    /// Rows dropped by the fire-and-forget observe path under backpressure.
-    ///
-    /// Always zero for [`Bifrost::insert`], which refuses rather than drops,
-    /// and before the first server operation. Local; never connects.
-    #[getter]
-    fn dropped(&self) -> u64 {
-        self.handle.connected().map_or(0, NativeBifrost::dropped)
-    }
-
     /// Number of distinct table producers currently pooled; zero before the
     /// first server operation. Local; never connects.
     #[getter]
@@ -1423,76 +1414,6 @@ impl PyBifrostQueryStream {
     }
 }
 
-/// Record one telemetry observation, fire-and-forget.
-///
-/// Names its own table and schema per call rather than using the client's
-/// active binding: an instrumented process writes its signals alongside
-/// whatever the application is writing, and must not disturb the table the
-/// application has bound. Queue saturation is swallowed and counted on the
-/// client's drop counter instead of being raised. The first row for a table
-/// this client has not described waits for one describe, which supplies the
-/// table version every batch names; a failed describe is counted the same way.
-///
-/// The Python facade serializes the caller's schema mapping and row before
-/// this call, so `schema` and `row` arrive as JSON text.
-///
-/// # Arguments
-/// * `bifrost` - The client whose producers carry the row.
-/// * `table` - The destination `<namespace>.<name>` table.
-/// * `schema` - The table's JSON Schema as JSON text.
-/// * `row` - One row as JSON object text.
-/// * `subject_card_uid` - The optional UID of the Card the row correlates to.
-/// * `run_id` - The optional run identifier stamped on the row.
-///
-/// # Errors
-///
-/// Raises `WyrdError` carrying `WYRD_SPEC_400_VALIDATION` for schema text that
-/// is not JSON or an invalid Card UID, and the shared mapper's
-/// `WYRD_VALA_400_SCHEMA_PARSE` for a schema with no mappable columns, the
-/// same code `TableConfig.from_json_schema` raises, and the connection error
-/// of a handle connecting on this first use.
-#[pyfunction]
-#[pyo3(signature = (bifrost, table, schema, row, subject_card_uid=None, run_id=None))]
-fn record(
-    py: Python<'_>,
-    bifrost: &Bound<'_, Bifrost>,
-    table: &str,
-    schema: &str,
-    row: &str,
-    subject_card_uid: Option<&str>,
-    run_id: Option<String>,
-) -> WyrdPyResult<()> {
-    let schema_value: Value =
-        serde_json::from_str(schema).map_err(|error| invalid_argument("schema", error))?;
-    let schema = wyrd_types::json_schema_to_arrow(&schema_value)
-        .map_err(|error| client_error(error.into()))?;
-    let schema = std::sync::Arc::new(schema);
-    let correlation = correlation(subject_card_uid, run_id)?;
-    let bifrost = bifrost.borrow();
-    let handle = bifrost.handle(py)?;
-    let row = row.as_bytes().to_vec();
-    match handle.cached_writer_table(table) {
-        Some(described) => wyrd_client::bifrost::observe::record(
-            handle,
-            &described.with_schema(schema),
-            row,
-            correlation,
-        ),
-        None => crate::trace::block_on(
-            py,
-            wyrd_client::bifrost::observe::describe_and_record(
-                handle,
-                table,
-                schema,
-                row,
-                correlation,
-                handle.admit_record(),
-            ),
-        ),
-    }
-    Ok(())
-}
-
 /// The JSON Schema `format` a Wyrd timestamp type declares itself with.
 ///
 /// `kind` is a [`wyrd_types::TimestampKind`] name; returns `None` for an
@@ -1525,15 +1446,6 @@ pub fn register_bifrost(module: &Bound<'_, PyModule>) -> PyResult<()> {
 /// Returns `PyO3` registration errors.
 pub fn register_timestamp_format(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(timestamp_format, module)?)
-}
-
-/// Register the `observe` fire-and-forget telemetry function on the module.
-///
-/// # Errors
-/// Returns `PyO3` registration errors.
-pub fn register_observe(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_function(wrap_pyfunction!(record, module)?)?;
-    Ok(())
 }
 
 /// Encodes one Rust record batch for the public Python `PyArrow` conversion.

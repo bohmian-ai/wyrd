@@ -1,0 +1,14 @@
+# Drafts changelog entries, pinned at an explicit version.
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: mixed-writer
+  version: 1.0.0
+spec:
+  execution_route: {kind: wyrd_gateway, deployment: openai}
+  prompt:
+    provider: openai
+    model: gpt-4o
+    messages:
+      - role: user
+        content: "Draft a changelog entry for {{change}}."

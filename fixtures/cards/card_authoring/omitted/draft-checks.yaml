@@ -1,0 +1,24 @@
+# The writer's Verifier: the draft has text, and a judge accepts it.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: draft-checks
+spec:
+  inputs:
+    draft:
+      type: json
+      schema:
+        type: object
+        required: [text]
+        properties:
+          text: {type: string}
+  requirements:
+    - id: has-text
+      statement: The draft has text.
+      check: {kind: assert, path: inputs.draft.text, operator: is_non_empty}
+    - id: judged
+      statement: A judge accepts the draft.
+      check:
+        kind: agent
+        agent: ./draft-judge.yaml
+        inputs: {draft: inputs.draft}

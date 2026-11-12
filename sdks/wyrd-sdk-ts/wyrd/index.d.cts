@@ -3,19 +3,30 @@
 /** One shared Rust authoring value, edited in place by its YAML field names. */
 export declare class NativeAuthored {
   /**
-   * An empty `kind` Card named `name` at `version`; nothing is validated
-   * until its graph is.
+   * An empty `kind` Card named `name`, at `version` when given, else at
+   * the version registration assigns; nothing is validated until its
+   * graph is.
    *
    * # Errors
    *
    * Returns `InvalidArg` for a kind that is not an authorable Card kind.
    */
-  static card(kind: string, name: string, version: string): NativeAuthored
+  static card(kind: string, name: string, version?: string | undefined | null): NativeAuthored
   /**
-   * The `file` Artifact named `name` at `version`, published from the
-   * file or directory at `path` before its graph; nothing is read now.
+   * The `file` Artifact named `name`, at `version` when given, published
+   * from the file or directory at `path` before its graph; nothing is
+   * read now.
    */
-  static artifactFromPath(name: string, version: string, path: string): NativeAuthored
+  static artifactFromPath(name: string, version: string | undefined | null, path: string): NativeAuthored
+  /**
+   * The original native Prompt for `model` in `provider`'s request
+   * format (`openai_chat`, `openai_responses`, `anthropic`, `gemini`, or
+   * `vertex`), built by the shared Prompt builder from `options`, or the
+   * builder's stable refusal as the error value, such as
+   * `WYRD_PROMPT_400_EMPTY_MODEL` or `WYRD_PROMPT_400_INVALID` for
+   * malformed options or settings.
+   */
+  static prompt(provider: string, model: string, options: any): NativeAuthored | NativeWyrdError
   /**
    * The component `alias` for `reference`: a Card, an exact `CardRef`,
    * or a reference path.
@@ -26,6 +37,11 @@ export declare class NativeAuthored {
    * position inside the argument.
    */
   static component(alias: string, reference: NativeValue): NativeAuthored
+  /**
+   * The Service table `name` in `bifrost.datasets` with the JSON Schema
+   * object `schema`, whose `properties` order is the column order.
+   */
+  static table(name: string, schema: any): NativeAuthored
   /**
    * Bind `verifier`: a Verifier, an exact `CardRef`, or a reference path.
    *
@@ -220,13 +236,14 @@ export declare class NativeAuthored {
    */
   file(path: string): NativeAuthored
   /**
-   * The exact reference this Card registers as.
+   * The exact reference this Card registers as, or `None` while it has
+   * no version and registration assigns one.
    *
    * # Errors
    *
    * Returns `InvalidArg` when this value is not a Card.
    */
-  cardRef(): NativeAuthored
+  cardRef(): NativeAuthored | null
   /**
    * This exact reference's kind, name, and version, as authored.
    *
@@ -265,6 +282,54 @@ export declare class NativeAuthored {
    * validation's refusal is returned in the result.
    */
   plan(): NativeLifecycleResult
+  /**
+   * A copy of this Prompt with one `role` turn appended: `system`,
+   * `user`, or `assistant` text, or for `user` and `assistant` one native
+   * content part or a list of them in the request format's wire shape.
+   * The builder's refusal, such as `WYRD_PROMPT_400_INVALID` for content
+   * the format does not take, is returned as the error value.
+   *
+   * # Errors
+   * Returns `InvalidArg` when this value is not a Prompt.
+   */
+  promptMessage(role: string, content: any): NativeAuthored | NativeWyrdError
+  /**
+   * A copy of this Prompt with the result `content` of tool call
+   * `tool_use_id` appended, marked as a failure when `is_error`; the
+   * builder's refusal is returned as the error value.
+   *
+   * # Errors
+   * Returns `InvalidArg` when this value is not a Prompt.
+   */
+  promptToolResult(toolUseId: string, content: string, isError: boolean): NativeAuthored | NativeWyrdError
+  /**
+   * A copy of this Prompt with the text variables `vars` bound; the
+   * refusal of a malformed or undeclared variable is returned as the
+   * error value.
+   *
+   * # Errors
+   * Returns `InvalidArg` when this value is not a Prompt.
+   */
+  promptBind(vars: any): NativeAuthored | NativeWyrdError
+  /**
+   * A copy of this Prompt with the media placeholder `name` bound to
+   * the `media` reference (`{kind, source}`); the refusal of a malformed
+   * reference or an undeclared placeholder is returned as the error value.
+   *
+   * # Errors
+   * Returns `InvalidArg` when this value is not a Prompt.
+   */
+  promptBindMedia(name: string, media: any): NativeAuthored | NativeWyrdError
+  /**
+   * The native provider request this Prompt renders with the text
+   * variables `vars`, or the render's stable refusal, such as an unbound
+   * variable, in the result.
+   *
+   * # Errors
+   * Returns `InvalidArg` when this value is not a Prompt, and a napi
+   * error when the rendered request cannot be serialized.
+   */
+  promptRender(vars: any): NativeLifecycleResult
 }
 
 /**
@@ -363,35 +428,6 @@ export declare class NativeBifrost {
   shutdown(): Promise<NativeLifecycleResult>
   /** Number of distinct table producers currently pooled. */
   get producerCount(): number
-  /**
-   * Rows dropped by the fire-and-forget observation path, saturating at
-   * `i64::MAX`.
-   *
-   * Always zero for [`NativeBifrost::insert`], which refuses rather than
-   * drops.
-   */
-  get dropped(): number
-  /**
-   * Records one telemetry row fire-and-forget through
-   * [`wyrd_client::bifrost::observe::record`].
-   *
-   * The row names its own `table` and JSON Schema rather than this client's
-   * bound table, so instrumentation never disturbs the application's
-   * binding. A producer refusal, such as a full queue, is counted on
-   * [`NativeBifrost::dropped`] instead of returned. The first row for a
-   * table this client has not described records on a background task
-   * once the describe returns its table version; a failed describe is
-   * counted the same way. That record is admitted before the task starts,
-   * so a following `flush` or `shutdown` waits for it.
-   *
-   * # Errors
-   *
-   * Returns a napi error only when the outcome cannot be encoded or the
-   * background describe cannot be scheduled; an
-   * unparsable or unmappable schema and an invalid Card UID are
-   * returned in [`NativeLifecycleResult`].
-   */
-  record(table: string, schemaJson: string, row: string, subjectCardUid?: string | undefined | null, runId?: string | undefined | null): NativeLifecycleResult
   /**
    * Starts one terminal-safe query through the Rust SDK owner.
    *
@@ -1089,10 +1125,18 @@ export declare class NativeRun {
    */
   submit(verifier: string, inputs: Array<NativeVerifierInput>, groupId?: string | undefined | null): Promise<NativeSubmission>
   /**
-   * Emits one row into a registered `bifrost.datasets` table.
+   * Buffers one row for a registered `bifrost.datasets` table.
    *
    * Asynchronous because the first call for a table describes it; later calls
-   * reuse the cached schema and producer.
+   * reuse the cached schema and producer. Resolving is buffered submission;
+   * state shutdown drains it.
+   *
+   * The write runs as a spawned task that owns a clone of the Run, so
+   * discarding the returned promise does not cancel it: the row may still
+   * be admitted. A successful outcome admitted exactly one row, so repeating
+   * it writes another; a refused outcome admitted none and may be retried.
+   * Admission and queue retries follow `RunBifrost::write_to`. `table`
+   * names the destination; `None` writes the state's active table.
    *
    * # Errors
    *
@@ -1100,7 +1144,7 @@ export declare class NativeRun {
    * reserved, unknown, or unauthorized table and the lifecycle refusals are
    * returned in [`NativeLifecycleResult`].
    */
-  record(table: string, rowJson: string): Promise<NativeLifecycleResult>
+  write(table: string | undefined | null, rowJson: string): Promise<NativeLifecycleResult>
 }
 
 /**
@@ -1467,6 +1511,17 @@ export declare class NativeWyrdState {
    * fixed-table failures are returned in [`NativeLifecycleResult`].
    */
   startBifrost(table?: NativeTableConfig | undefined | null, clientByteLimitBytes?: number | undefined | null): Promise<NativeLifecycleResult>
+  /**
+   * Binds the registered `<namespace>.<name>` table as the active table a
+   * run's default write targets, describing it first.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the outcome cannot be projected; the
+   * lifecycle refusals and the describe error are returned in
+   * [`NativeLifecycleResult`].
+   */
+  useTableByName(table: string): Promise<NativeLifecycleResult>
   /**
    * Opens one invocation over this state, targeting `alias` or the root Service.
    *

@@ -1185,8 +1185,29 @@ class ResponseFormat:
         """
         ...
 
+    @staticmethod
+    def verdict(data: type | JsonDict | None = None) -> ResponseFormat:
+        """Request the canonical Verdict: ``outcome``, ``reason`` and ``citations``.
+
+        The native builder emits the Verdict schema; ``data`` adds a required
+        object-valued ``data`` field with that schema.
+
+        Args:
+            data: a JSON Schema object, or a class whose ``model_json_schema()``
+                is used, such as a Pydantic model; ``None`` for a plain Verdict.
+
+        Returns:
+            the Verdict format.
+
+        Raises:
+            WyrdError: ``WYRD_PROMPT_400_INVALID_RESPONSE_SCHEMA`` when ``data``
+                is not a JSON object schema.
+        """
+        ...
+
     def to_dict(self) -> JsonDict:
-        """Return ``{"type": ...}`` plus ``name`` and ``schema`` for JSON Schema."""
+        """Return ``{"type": ...}`` plus ``name`` and ``schema`` for JSON Schema; a Verdict is
+        ``{"kind": "verdict"}`` plus its ``data`` schema when it has one."""
         ...
 
     def __str__(self) -> str:

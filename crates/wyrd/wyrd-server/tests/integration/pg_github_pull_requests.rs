@@ -1769,3 +1769,108 @@ async fn a_repository_removal_during_a_pull_request_read_admits_nothing() {
         "a read begun before the repository was removed admits nothing"
     );
 }
+
+/// The status code of `GET uri` as the caller holding `jwt`.
+///
+/// # Panics
+/// Panics when the request cannot be served.
+async fn read_as(deployment: &Deployment, jwt: &str, uri: &str) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .uri(uri)
+        .body(Body::empty())
+        .expect("request builds");
+    let response = deployment
+        .server
+        .oneshot_authenticated(jwt, request)
+        .await
+        .expect("read responds");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("body reads");
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+/// Inspecting a PR execution, and its sibling progress read, needs
+/// repository read as well as `verifier:read`, also once the queue row is
+/// gone and only the accepted state remains.
+///
+/// # Panics
+/// Panics when a caller without `cards:read` reads a PR execution, or one
+/// holding both is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn pull_request_inspection_requires_repository_read() {
+    use wyrd_runtime::Permission;
+
+    let deployment = Deployment::start_with(true).await;
+    let server = &deployment.server;
+    deployment
+        .mock
+        .set_pull_request(REPOSITORY, 30, PullRequest::open(REPOSITORY, "b1", "i1"));
+    assert_eq!(deployment.send(30, "opened").await.0, StatusCode::ACCEPTED);
+    let execution = deployment.settled(30..=30).await[0].execution_id;
+    server
+        .seed_role("pr_verifier_only", &[Permission::verifier_read_any()])
+        .await
+        .expect("role seeds");
+    server
+        .seed_role(
+            "pr_verifier_and_repository",
+            &[Permission::verifier_read_any(), Permission::card_read()],
+        )
+        .await
+        .expect("role seeds");
+    let jwt = |name: &'static str, role: &'static str| async move {
+        let Bootstrap::User { jwt, .. } = server
+            .bootstrap_user(name, &[role])
+            .await
+            .expect("reader bootstraps")
+        else {
+            panic!("user bootstrap returned a non-user principal");
+        };
+        jwt
+    };
+    let verifier_only = jwt("pr-verifier-only", "pr_verifier_only").await;
+    let both = jwt("pr-verifier-and-repository", "pr_verifier_and_repository").await;
+    let status = format!("/v1/verification/executions/{execution}");
+    let invocations = format!("{status}/invocations");
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_mins(1);
+    loop {
+        let (code, body) = read_as(&deployment, &both, &status).await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        if !body["result"].is_null() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the result never became visible"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    for uri in [&status, &invocations] {
+        let (code, body) = read_as(&deployment, &verifier_only, uri).await;
+        assert_eq!(code, StatusCode::FORBIDDEN, "{uri}: {body}");
+        assert_eq!(body["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
+        assert_eq!(read_as(&deployment, &both, uri).await.0, StatusCode::OK, "{uri}");
+    }
+
+    let mut conn = deployment.conn().await;
+    let deleted = sqlx::query("DELETE FROM wyrd.verifier_executions WHERE execution_id = $1")
+        .bind(execution)
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("the queue row deletes")
+        .rows_affected();
+    conn.commit().await.expect("delete commits");
+    assert_eq!(deleted, 1);
+    let (code, body) = read_as(&deployment, &verifier_only, &status).await;
+    assert_eq!(
+        code,
+        StatusCode::FORBIDDEN,
+        "retained PR state still needs repository read: {body}"
+    );
+    let (code, body) = read_as(&deployment, &both, &status).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "completed");
+}

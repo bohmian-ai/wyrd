@@ -22,6 +22,7 @@ use wyrd_runtime::permission::{Action, PermissionScope, Resource};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::ExecutionId;
 use wyrd_spec::storage::{DownloadInitResponse, StorageBackendKind};
+use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::verification::execution::{
     CancelExecutionResponse, EXECUTION_PAGE_DEFAULT, EXECUTION_PAGE_MAX, ExecutionInvocation,
     ExecutionPageQuery, HistoryProjection, InvocationPage, InvocationProgress,
@@ -40,7 +41,7 @@ use crate::audit;
 use crate::components::auth::Caller;
 use crate::state::registry_db_error;
 use crate::verification::hosted::publications::published_object;
-use crate::verification::inputs::InputResolver;
+use crate::verification::inputs::{InputOrigin, InputResolver};
 use crate::verification::state::RunState;
 
 /// Audit operation of an invocation page read.
@@ -319,8 +320,14 @@ impl<'a> VerificationControl<'a> {
     /// either. An execution with no accepted revision yet has fresh state at
     /// revision 0. `query` is the record reader.
     ///
+    /// A pull-request execution also needs repository read, `cards:read`,
+    /// decided and audited after `verifier:read`. Whether it is one is read
+    /// from the queue row's PR pins, or, once the row is gone, from the
+    /// accepted input record's origin; an input record not yet visible
+    /// decides nothing and the read is unavailable.
+    ///
     /// # Errors
-    /// Returns [`WyrdError::PermissionDeniedRbac`] without the grant,
+    /// Returns [`WyrdError::PermissionDeniedRbac`] without a grant,
     /// [`WyrdError::VerificationExecutionNotFound`] when the tenant has
     /// neither a queue row nor an accepted state for the execution, a
     /// registry error when a read fails, and
@@ -367,6 +374,26 @@ impl<'a> VerificationControl<'a> {
             scope: PermissionScope::Verifier(verifier),
         };
         audit::authorize(self.state, caller, &required, operation, &resource)?;
+        let pull_request = match &queued {
+            Some(queued) => queued.state.pull_request.is_some(),
+            None => {
+                InputResolver::new(&query, None)
+                    .record(execution_id)
+                    .await?
+                    .ok_or(BifrostError::QueryVisibilityUnavailable)?
+                    .origin
+                    == InputOrigin::PullRequest
+            }
+        };
+        if pull_request {
+            audit::authorize(
+                self.state,
+                caller,
+                &Permission::card_read(),
+                operation,
+                &resource,
+            )?;
+        }
         Ok(Retained {
             queued,
             revision,

@@ -98,6 +98,14 @@ impl PublicationFault {
         self.sent.lock().expect("fault lock").clone()
     }
 
+    /// The result outbox a composed runtime writes through, once one is
+    /// composed, so a test can hold its capacity while the server's own
+    /// outbox stays free.
+    #[must_use]
+    pub fn composed_outbox(&self) -> Option<Arc<ScribeOutbox>> {
+        self.outbox.get().cloned()
+    }
+
     /// The result outbox writing through these faults to `inner` and
     /// recording grouped activity through `groups`, created on first use and
     /// shared by every later caller.

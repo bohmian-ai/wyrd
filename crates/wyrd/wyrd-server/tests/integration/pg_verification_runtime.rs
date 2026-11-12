@@ -2374,6 +2374,131 @@ async fn exhausted_reconciliation_survives_source_and_capacity_outage() {
     );
 }
 
+/// While Scribe cannot accept queued work, finished queued results are held
+/// by the claims that computed them, and those claims bound how much more
+/// is claimed.
+///
+/// Three executions are queued and the whole reservable item share of the
+/// result outbox a runtime with two execution slots stages through is held
+/// before it starts; the server's own outbox, which direct work stages
+/// through, stays free. Both claims compute and select their results from memory, then
+/// keep their claims: across ten claim rounds the third execution stays
+/// queued and nothing settles, while a direct execution still answers. Once
+/// the share is released, every execution completes on its first attempt
+/// with a result Scribe received, and nothing computes twice.
+///
+/// # Panics
+/// Panics when the share cannot be held, a claim settles or a third
+/// computes while persistence is held, the direct execution is refused, or
+/// an execution does not complete once on its first attempt.
+#[tokio::test]
+async fn held_persistence_bounds_queued_custody_by_claim_permits() {
+    use crate::pg_verification_routes::execute;
+    let harness = Harness::start().await;
+    harness.log_commits().await;
+    let direct = harness
+        .seed
+        .verifier("custody-assertion", &assertion_spec())
+        .await
+        .expect("assertion Verifier registers");
+    let wyrd_testing::Bootstrap::User { jwt, .. } = harness
+        .server
+        .bootstrap_user("custody-direct", &["admin"])
+        .await
+        .expect("direct caller bootstraps")
+    else {
+        panic!("user bootstrap returned a machine principal");
+    };
+    let mut runs = Vec::new();
+    for _ in 0..3 {
+        runs.push(harness.submit().await);
+    }
+    let script = EngineScript::default();
+    for _ in 0..3 {
+        script.push(EngineOutcome::Completed(unscored_report()));
+    }
+    let limits = RuntimeLimits {
+        execution_slots: 2,
+        ..Harness::limits()
+    };
+    let composed = harness.runtime(&limits, &script, &CapabilityCrash::default());
+    let outbox = harness
+        .fault
+        .composed_outbox()
+        .expect("the runtime composed its result outbox");
+    let full = outbox
+        .reserve(usize::MAX)
+        .expect_err("no reservation holds every slot");
+    let share = outbox
+        .reserve(full.limit - full.admitted)
+        .expect("the free reservable share is held");
+    let runtime = RunningRuntime::spawn(composed);
+
+    wait_until("both claims compute", || script.entered() == 2).await;
+    // Absence is observed across ten claim rounds of the runtime.
+    tokio::time::sleep(limits.poll_interval * 10).await;
+    assert_eq!(script.entered(), 2, "no third execution is claimed");
+    let mut statuses = Vec::new();
+    for run in &runs {
+        let row = harness.seed.execution(*run).await.expect("execution reads");
+        statuses.push((row.status, row.attempts));
+    }
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        [
+            ("pending".to_owned(), 0),
+            ("running".to_owned(), 1),
+            ("running".to_owned(), 1)
+        ],
+        "the finished claims hold their results and nothing settles"
+    );
+    let (code, answered) = execute(
+        &harness.server,
+        &jwt,
+        serde_json::json!({
+            "verifier_card_uid": direct,
+            "card_uid": harness.subject,
+            "inputs": { "x": { "kind": "json", "value": 1 } },
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(
+        code,
+        axum::http::StatusCode::OK,
+        "direct work answers: {answered}"
+    );
+
+    drop(share);
+    let mut completed = Vec::new();
+    for run in &runs {
+        completed.push(harness.wait_execution(*run, status("completed")).await);
+    }
+    runtime.stop().await;
+    assert_eq!(script.entered(), 3, "nothing computes twice");
+    let sent: std::collections::BTreeSet<String> = sent_to(&harness.fault, RESULTS)
+        .await
+        .iter()
+        .map(sent_result_id)
+        .collect();
+    for (run, row) in runs.iter().zip(&completed) {
+        assert_eq!(row.attempts, 1, "{run} completes on its first attempt");
+        let result = row.result_id.map(|id| id.to_string());
+        assert!(
+            result.as_ref().is_some_and(|id| sent.contains(id)),
+            "{run} completes with a result Scribe received: {result:?} of {sent:?}"
+        );
+        let commits = harness.commits(*run).await;
+        assert!(
+            commits
+                .iter()
+                .all(|commit| commit == "running" || commit == "completed"),
+            "{run} neither retries nor errors: {commits:?}"
+        );
+    }
+}
+
 /// Stage `harness`'s submitted execution's selected result while its
 /// settlement never commits, on its final attempt when `final_attempt`, and
 /// return the execution and its stopping runtime.

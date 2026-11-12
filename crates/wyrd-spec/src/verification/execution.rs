@@ -24,7 +24,7 @@ use crate::auth::Sha256Hex;
 use crate::card::agent::{BuiltinTool, ExecutionRoute};
 use crate::card::verifier::{Check, CodeRuntime};
 use crate::error::WyrdError;
-use crate::ids::{CardUid, ExecutionId, GroupId, SlotName};
+use crate::ids::{CardUid, ExecutionId, GroupId, RepositoryId, SlotName};
 use crate::reference::CardRef;
 use crate::storage::ids::UploadId;
 use crate::storage::upload::UploadPlan;
@@ -200,6 +200,55 @@ pub struct VerificationExecutionState<T = Map<String, Value>> {
     /// The source snapshot a group execution judges.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<GroupSnapshot>,
+    /// The pull request source a `pull_request` binding execution was
+    /// admitted for, frozen at admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<PullRequestActivation>,
+}
+
+/// One side of a pull request as an admission pinned it: the branch name
+/// then and the exact commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PullRequestRef {
+    /// Branch name when the source was admitted.
+    #[serde(rename = "ref")]
+    pub ref_name: String,
+    /// Exact commit SHA the execution reviews.
+    pub sha: String,
+}
+
+/// The pull request source one queued execution was admitted for.
+///
+/// Every execution of one admission shares its `generation`. A newer
+/// source of the same pull request supersedes the generation: its unfinished
+/// executions are cancelled with code `pull_request_superseded`, and a close
+/// or draft conversion cancels them with `pull_request_closed` or
+/// `pull_request_draft`. Settled history keeps these pins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PullRequestActivation {
+    /// Provider web host, such as `github.com`.
+    pub host: String,
+    /// Stable provider id of the base repository.
+    pub repository_id: RepositoryId,
+    /// Pull request number in the base repository.
+    pub number: u64,
+    /// Base branch and commit.
+    pub base: PullRequestRef,
+    /// Head branch and commit.
+    pub head: PullRequestRef,
+    /// Stable provider id of the head repository; differs from
+    /// `repository_id` for a fork and is absent once the fork is deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_repository_id: Option<RepositoryId>,
+    /// Provider delivery that admitted the source, for matching the
+    /// provider's delivery log.
+    pub delivery_id: String,
+    /// The admission every execution of this source shares.
+    pub generation: uuid::Uuid,
 }
 
 /// The attributable result of one Verifier execution.
@@ -872,6 +921,7 @@ impl VerificationExecutionState {
             group_id,
             owner_card_uid,
             group,
+            pull_request,
         } = self;
         Ok(VerificationExecutionState {
             execution_id,
@@ -882,6 +932,7 @@ impl VerificationExecutionState {
             group_id,
             owner_card_uid,
             group,
+            pull_request,
         })
     }
 }

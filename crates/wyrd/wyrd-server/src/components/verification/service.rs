@@ -275,6 +275,7 @@ impl<'a> VerificationControl<'a> {
                 group_id: identity.and_then(|identity| identity.group_id.clone()),
                 owner_card_uid: identity.and_then(|identity| identity.owner_card_uid.clone()),
                 group: None,
+                pull_request: None,
             },
         };
         state.status = retained.status();

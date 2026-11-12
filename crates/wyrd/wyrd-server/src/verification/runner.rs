@@ -786,15 +786,17 @@ impl VerifierRunner {
                     Err(outcome) => return outcome,
                 }
             }
-            ExecutionInput::Grouped => match self.supplied(tenant, run, system).await {
-                Ok((evidence, routes)) => (
-                    DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
-                    evidence,
-                    routes,
-                    None,
-                ),
-                Err(outcome) => return outcome,
-            },
+            ExecutionInput::Grouped | ExecutionInput::PullRequest { .. } => {
+                match self.supplied(tenant, run, system).await {
+                    Ok((evidence, routes)) => (
+                        DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
+                        evidence,
+                        routes,
+                        None,
+                    ),
+                    Err(outcome) => return outcome,
+                }
+            }
         };
         let caller = Caller::accepted(&run.authority, system);
         let engine = match self.blocks.engine(
@@ -1648,7 +1650,7 @@ const fn input_parts(input: &ExecutionInput) -> (Option<&RunId>, Option<&DriftWi
     match input {
         ExecutionInput::Scheduled { window } => (None, Some(window)),
         ExecutionInput::Submitted { run_id } => (run_id.as_ref(), None),
-        ExecutionInput::Grouped => (None, None),
+        ExecutionInput::Grouped | ExecutionInput::PullRequest { .. } => (None, None),
     }
 }
 

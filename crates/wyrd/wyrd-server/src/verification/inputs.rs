@@ -47,6 +47,8 @@ pub enum InputOrigin {
     Group,
     /// A scheduled drift occurrence.
     Schedule,
+    /// A `pull_request` binding's admission of one pinned PR source.
+    PullRequest,
 }
 
 impl InputOrigin {
@@ -58,15 +60,22 @@ impl InputOrigin {
             Self::Submitted => "submitted",
             Self::Group => "group",
             Self::Schedule => "schedule",
+            Self::PullRequest => "pull_request",
         }
     }
 
     /// Decode a stored `origin`, `None` outside the closed set.
     #[must_use]
     pub fn parse(stored: &str) -> Option<Self> {
-        [Self::Direct, Self::Submitted, Self::Group, Self::Schedule]
-            .into_iter()
-            .find(|origin| origin.as_str() == stored)
+        [
+            Self::Direct,
+            Self::Submitted,
+            Self::Group,
+            Self::Schedule,
+            Self::PullRequest,
+        ]
+        .into_iter()
+        .find(|origin| origin.as_str() == stored)
     }
 }
 
@@ -267,7 +276,8 @@ impl<'q> InputResolver<'q> {
     }
 
     /// The evidence `row` judges: a supplied record's declarations, a
-    /// group's resolved slot lists, or a schedule's empty map. `None` while a
+    /// group's resolved slot lists, or the empty map of a schedule or a pull
+    /// request, whose pins the claim carries. `None` while a
     /// group source's input or selected output is not visible.
     ///
     /// # Errors
@@ -282,7 +292,7 @@ impl<'q> InputResolver<'q> {
                 InputOrigin::Direct | InputOrigin::Submitted => {
                     decode(row.inputs.clone()).map(Some)
                 }
-                InputOrigin::Schedule => Ok(Some(BTreeMap::new())),
+                InputOrigin::Schedule | InputOrigin::PullRequest => Ok(Some(BTreeMap::new())),
                 InputOrigin::Group => {
                     let selector: GroupSelector = decode(row.inputs.clone())?;
                     self.slots(&selector.slots).await
@@ -679,6 +689,7 @@ mod tests {
             (InputOrigin::Submitted, "submitted"),
             (InputOrigin::Group, "group"),
             (InputOrigin::Schedule, "schedule"),
+            (InputOrigin::PullRequest, "pull_request"),
         ] {
             assert_eq!(origin.as_str(), stored);
             assert_eq!(InputOrigin::parse(stored), Some(origin));

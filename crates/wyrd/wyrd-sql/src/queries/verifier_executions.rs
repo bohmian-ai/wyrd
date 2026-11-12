@@ -36,7 +36,9 @@ use wyrd_spec::ids::{
 };
 use wyrd_spec::vala::ids::{RunId, SpanId, TraceId};
 use wyrd_spec::verification::TaskId;
-use wyrd_spec::verification::execution::{VerificationExecutionState, VerificationRequest};
+use wyrd_spec::verification::execution::{
+    PullRequestActivation, VerificationExecutionState, VerificationRequest,
+};
 use wyrd_spec::verification::{
     DriftWindow, FrozenTarget, GroupEndSettings, OperatorDispatchState, VerificationBindingStatus,
     VerificationError, VerificationVerdict, VerifierReadiness,
@@ -44,6 +46,13 @@ use wyrd_spec::verification::{
 
 use crate::queries::verification::{BindingSchedule, InactivityTimeout, binding_activity};
 use crate::{OperatorPool, TenantConn};
+
+mod pull_requests;
+
+pub use pull_requests::{
+    PullRequestBinding, PullRequestEnd, PullRequestExecution, PullRequestGeneration,
+    PullRequestHistory, PullRequestKey, PullRequestTarget, access_lost, superseded,
+};
 
 /// Resolve a binding target's frozen identities and readiness.
 const RESOLVE_BINDING_SQL: &str = r"
@@ -453,7 +462,7 @@ const CLAIM_SQL: &str = r"
               e.sub_principal_id, e.act_principal_id, e.authority, e.attempts,
               e.max_attempts, e.lease_expires_at, e.deadline_at, e.cause_trace_id,
               e.cause_span_id, e.cause_sampled, e.group_id, e.deployment_environment,
-              candidate.exhausted,
+              e.pull_request, candidate.exhausted,
               GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - candidate.due_at)
                            * 1000)::bigint) AS queue_wait_ms,
               GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - e.created_at)
@@ -644,7 +653,8 @@ const CLAIM_DELIVERIES_SQL: &str = r"
     RETURNING e.execution_id, e.delivery_due_at, e.status, e.error, e.verifier_card_uid,
               e.verifier_version, e.card_uid, e.origin, e.owner_card_uid, e.binding_id,
               e.trigger_uid, e.trigger_digest, e.window_start, e.window_end, e.run_id,
-              e.group_id, e.deployment_environment, e.sub_principal_id, e.authority
+              e.group_id, e.deployment_environment, e.sub_principal_id, e.authority,
+              e.pull_request
 ";
 
 /// Settle the terminal delivery claimed until `$2`: retire it when `$3` is
@@ -678,7 +688,7 @@ const INACTIVE_PRINCIPALS_SQL: &str = r"
 const STATUS_SQL: &str = r"
     SELECT execution_id, status, sub_principal_id, act_principal_id,
            verifier_card_uid, card_uid, result_id, error,
-           group_id, owner_card_uid, deployment_environment
+           group_id, owner_card_uid, deployment_environment, pull_request
       FROM wyrd.verifier_executions
      WHERE execution_id = $1
 ";
@@ -895,6 +905,8 @@ pub enum ExecutionOrigin {
     Manual,
     /// A `group_end` binding's judgment of one pinned group snapshot.
     Group,
+    /// A `pull_request` binding's review of one admitted PR source.
+    PullRequest,
 }
 
 impl ExecutionOrigin {
@@ -905,6 +917,7 @@ impl ExecutionOrigin {
             Self::Schedule => "schedule",
             Self::Manual => "manual",
             Self::Group => "group",
+            Self::PullRequest => "pull_request",
         }
     }
 
@@ -918,6 +931,7 @@ impl ExecutionOrigin {
             "schedule" => Ok(Self::Schedule),
             "manual" => Ok(Self::Manual),
             "group" => Ok(Self::Group),
+            "pull_request" => Ok(Self::PullRequest),
             other => Err(SqlxError::Decode(
                 format!("unknown verifier execution origin {other:?}").into(),
             )),
@@ -943,6 +957,12 @@ pub enum ExecutionInput {
     /// A group snapshot. Its selector lives in the execution's Bifrost input
     /// record; PostgreSQL holds only the snapshot digest.
     Grouped,
+    /// A pull request source admitted for a `pull_request` binding: the
+    /// pins frozen at admission, which every attempt reviews.
+    PullRequest {
+        /// The admitted PR source.
+        pull_request: Box<PullRequestActivation>,
+    },
 }
 
 /// Who one scheduled execution serves, who accepted it, and the authority it
@@ -1140,6 +1160,19 @@ pub enum Admission {
     Scheduled(ScheduledAdmission),
     /// A group snapshot.
     Grouped(GroupedAdmission),
+    /// A reserved pull request execution, activated by
+    /// [`VerifierExecutionQueue::activate_pull_requests`].
+    PullRequest(PullRequestAdmission),
+}
+
+/// One reserved pull request execution whose input record Scribe
+/// acknowledged; everything else was frozen when it was reserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PullRequestAdmission {
+    /// The reserved execution.
+    pub execution_id: ExecutionId,
+    /// Who it serves and who accepted it.
+    pub attribution: Attribution,
 }
 
 impl Admission {
@@ -1150,6 +1183,7 @@ impl Admission {
             Self::Submitted(submission) => submission.execution_id,
             Self::Scheduled(admission) => admission.execution_id,
             Self::Grouped(admission) => admission.execution_id,
+            Self::PullRequest(admission) => admission.execution_id,
         }
     }
 
@@ -1161,6 +1195,7 @@ impl Admission {
             Self::Submitted(submission) => submission.authority.attribution(),
             Self::Scheduled(admission) => admission.authority.attribution(),
             Self::Grouped(admission) => admission.authority.attribution(),
+            Self::PullRequest(admission) => admission.attribution,
         }
     }
 }
@@ -3466,6 +3501,7 @@ impl VerifierExecutionQueue {
                         .map(|uid| stored(CardUid::from_uuid(uid)))
                         .transpose()?,
                     group: None,
+                    pull_request: row.pull_request.map(|Json(pull_request)| pull_request),
                 },
                 attribution: Attribution::new(
                     PrincipalId::new(row.sub_principal_id),
@@ -3805,6 +3841,8 @@ struct ClaimedRow {
     group_id: Option<String>,
     /// Accepted deployment environment tag.
     deployment_environment: Option<String>,
+    /// Admitted pull request pins of a `pull_request` execution.
+    pull_request: Option<Json<PullRequestActivation>>,
     /// Milliseconds the execution was claimable before this claim.
     queue_wait_ms: i64,
     /// Milliseconds since the execution was admitted.
@@ -3816,7 +3854,8 @@ struct ClaimedRow {
 }
 
 /// The single frozen input of an execution of `origin` with a scheduled
-/// window `start`..`end` or a submitted `run_id`.
+/// window `start`..`end`, a submitted `run_id`, or admitted `pull_request`
+/// pins.
 ///
 /// # Errors
 /// Returns [`SqlxError::Decode`] when the columns violate their closed shape.
@@ -3825,7 +3864,13 @@ fn frozen_input(
     start: Option<DateTime<Utc>>,
     end: Option<DateTime<Utc>>,
     run_id: Option<String>,
+    pull_request: Option<Json<PullRequestActivation>>,
 ) -> Result<ExecutionInput, SqlxError> {
+    if let (ExecutionOrigin::PullRequest, Some(Json(pull_request))) = (origin, pull_request) {
+        return Ok(ExecutionInput::PullRequest {
+            pull_request: Box::new(pull_request),
+        });
+    }
     match (origin, start, end) {
         (ExecutionOrigin::Schedule, Some(start), Some(end)) => Ok(ExecutionInput::Scheduled {
             window: DriftWindow { start, end },
@@ -3894,8 +3939,11 @@ struct DeliveryRow {
     deployment_environment: Option<String>,
     /// Subject the execution serves.
     sub_principal_id: Uuid,
-    /// Accepted effective authority; `None` for a refused group.
+    /// Accepted effective authority; `None` for a refused group or pull
+    /// request binding.
     authority: Option<Json<AcceptedAuthority>>,
+    /// Admitted pull request pins of a `pull_request` execution.
+    pull_request: Option<Json<PullRequestActivation>>,
 }
 
 impl DeliveryRow {
@@ -3926,7 +3974,13 @@ impl DeliveryRow {
             verifier_card_uid: stored(CardUid::from_uuid(self.verifier_card_uid))?,
             verifier_version: self.verifier_version,
             card_uid: stored(CardUid::from_uuid(self.card_uid))?,
-            input: frozen_input(origin, self.window_start, self.window_end, self.run_id)?,
+            input: frozen_input(
+                origin,
+                self.window_start,
+                self.window_end,
+                self.run_id,
+                self.pull_request,
+            )?,
             owner_card_uid,
             binding_id: self
                 .binding_id
@@ -3952,7 +4006,13 @@ impl ClaimedRow {
     /// negative.
     fn into_claimed(self) -> Result<ClaimedExecution, SqlxError> {
         let origin = ExecutionOrigin::parse(&self.origin)?;
-        let input = frozen_input(origin, self.window_start, self.window_end, self.run_id)?;
+        let input = frozen_input(
+            origin,
+            self.window_start,
+            self.window_end,
+            self.run_id,
+            self.pull_request,
+        )?;
         let trigger = frozen_trigger(self.trigger_uid, self.trigger_digest)?;
         Ok(ClaimedExecution {
             lease: ExecutionLease {
@@ -4057,6 +4117,8 @@ struct StatusRow {
     owner_card_uid: Option<Uuid>,
     /// Deployment environment tag supplied at acceptance.
     deployment_environment: Option<String>,
+    /// Admitted pull request pins of a `pull_request` execution.
+    pull_request: Option<Json<PullRequestActivation>>,
 }
 
 /// A dispatch row from [`DISPATCHES_SQL`].

@@ -17,7 +17,9 @@
 //! with their frozen identities through
 //! [`VerifierExecutionQueue::accept_scheduled`] and
 //! [`VerifierExecutionQueue::accept_grouped`], which move the expected
-//! cursor or consume the selected pending activity in the same transaction.
+//! cursor or consume the selected pending activity in the same transaction;
+//! pull-request executions, reserved before their inputs were staged, are
+//! made due through [`VerifierExecutionQueue::activate_pull_requests`].
 //! Replay, idempotency conflicts, and refusals are decided there, so a
 //! repeated batch accepts nothing twice. The writer grants no authority: each
 //! execution runs under the authority accepted or frozen with it. Losses
@@ -73,8 +75,9 @@ pub struct Queued {
     /// The producer's claim on the candidate's due occurrence or group;
     /// `None` for a submission.
     pub claim: Option<Arc<InFlight>>,
-    /// Where a caller's submission learns its committed outcome; `None` for
-    /// a scheduled or group candidate, which no caller awaits.
+    /// Where a caller's submission, or the pull-request delivery awaiting
+    /// its reserved execution, learns its committed outcome; `None` for a
+    /// scheduled or group candidate, which no caller awaits.
     pub reply: Option<AdmissionReply>,
 }
 
@@ -216,7 +219,9 @@ impl OutboxSink for SubmissionSink {
     /// Submissions are accepted after their targets resolve; scheduled and
     /// group candidates are admitted in binding order, the one lock order
     /// every writer uses, with their frozen identities, moving the expected
-    /// cursor or consuming the selected pending activity. A refused or
+    /// cursor or consuming the selected pending activity; reserved
+    /// pull-request executions are activated, and each awaiting delivery is
+    /// answered accepted after the commit, a replay included. A refused or
     /// conflicting item is logged; a refused or conflicting submission
     /// settled `errored` in the same transaction, so its status says why.
     /// When any execution was newly admitted, [`SubmissionSink::accepted`] is
@@ -242,6 +247,8 @@ impl OutboxSink for SubmissionSink {
         let mut submissions = Vec::new();
         let mut replies = Vec::new();
         let mut candidates = Vec::new();
+        let mut pull_requests = Vec::new();
+        let mut pull_request_replies = Vec::new();
         for item in items {
             match &item.queued().admission {
                 Admission::Submitted(submission) => {
@@ -253,6 +260,10 @@ impl OutboxSink for SubmissionSink {
                 }
                 candidate @ Admission::Grouped(admission) => {
                     candidates.push((admission.binding_id, candidate));
+                }
+                Admission::PullRequest(admission) => {
+                    pull_requests.push(admission.execution_id);
+                    pull_request_replies.push(item.queued().reply.as_ref());
                 }
             }
         }
@@ -295,10 +306,15 @@ impl OutboxSink for SubmissionSink {
                 Admission::Grouped(admission) => {
                     self.queue.accept_grouped(&mut conn, admission).await
                 }
-                Admission::Submitted(_) => continue,
+                Admission::Submitted(_) | Admission::PullRequest(_) => continue,
             };
             admitted.push(outcome.map_err(SqlError::Query)?);
         }
+        let activated = self
+            .queue
+            .activate_pull_requests(&mut conn, &pull_requests)
+            .await
+            .map_err(SqlError::Query)?;
         conn.commit().await?;
         if outcomes
             .iter()
@@ -306,6 +322,7 @@ impl OutboxSink for SubmissionSink {
             || admitted
                 .iter()
                 .any(|outcome| matches!(outcome, EnqueueOutcome::Enqueued(_)))
+            || !activated.is_empty()
         {
             self.accepted.notify_one();
         }
@@ -328,6 +345,9 @@ impl OutboxSink for SubmissionSink {
             if let Some(reply) = reply {
                 reply.send(outcome);
             }
+        }
+        for reply in pull_request_replies.into_iter().flatten() {
+            reply.send(SubmissionOutcome::Accepted);
         }
         for ((_, candidate), outcome) in candidates.iter().zip(admitted) {
             if let EnqueueOutcome::Refused(refusal) = outcome {

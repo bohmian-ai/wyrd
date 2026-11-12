@@ -42,7 +42,7 @@ use wyrd_spec::vala::managed_columns::{
 };
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
-    InputDeclaration, RequirementResult, StepResult, VerificationOutcome,
+    InputDeclaration, PullRequestActivation, RequirementResult, StepResult, VerificationOutcome,
 };
 use wyrd_spec::verification::{DriftWindow, FrozenTarget, VerificationVerdict};
 use wyrd_sql::queries::verifier_executions::Submission;
@@ -215,6 +215,8 @@ pub enum InputRecord<'r> {
     Group(&'r GroupSelector),
     /// A scheduled drift execution's frozen observation selection.
     Schedule(&'r ScheduleSelector),
+    /// A pull-request execution's frozen repository, PR, base and head pins.
+    PullRequest(&'r PullRequestActivation),
 }
 
 /// The identities of the execution a result belongs to.
@@ -387,8 +389,8 @@ impl<'a> ResultPayloadBuilder<'a> {
     /// `bifrost.verification.execution_inputs` row, recorded at `started_at`.
     ///
     /// The row's `origin` names the record kind and its `inputs` Variant holds
-    /// the supplied declarations or the selector. Every queued origin,
-    /// submitted, group, or schedule, marks the row `queue_execution`; a
+    /// the supplied declarations, the selector, or the PR pins. Every queued
+    /// origin, submitted, group, schedule, or pull request, marks the row `queue_execution`; a
     /// direct row never queues work. Only a submission records its accepted
     /// request context — route overrides, idempotency key and request
     /// digest, and the accepted authority — as the `activation` Variant.
@@ -410,6 +412,7 @@ impl<'a> ResultPayloadBuilder<'a> {
             ),
             InputRecord::Group(selector) => (InputOrigin::Group, encoded(selector)?, None),
             InputRecord::Schedule(selector) => (InputOrigin::Schedule, encoded(selector)?, None),
+            InputRecord::PullRequest(pins) => (InputOrigin::PullRequest, encoded(pins)?, None),
         };
         let activation = submission.map(|submission| Activation {
             route_overrides: &submission.request.execution_route_overrides,

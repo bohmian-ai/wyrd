@@ -75,6 +75,9 @@ pub struct SelectedRepository {
     /// The selection change that selected it: the selecting declaration's
     /// operation id.
     pub occurrence: Uuid,
+    /// The tenant principal accountable for the selecting declaration, its
+    /// `sub`, under whose current authority its bindings' work runs.
+    pub principal: Uuid,
 }
 
 /// The selected Repository row as read, before its UID is validated.
@@ -84,6 +87,8 @@ struct SelectedRepositoryRow {
     card_uid: Uuid,
     /// The selection change that selected it.
     selection_occurrence: Uuid,
+    /// The selecting declaration's accountable principal.
+    sub_principal_id: Uuid,
 }
 
 /// The selected version of a Repository family, if one is selected.
@@ -95,8 +100,10 @@ pub async fn selected_repository(
     name: &CardName,
 ) -> Result<Option<SelectedRepository>, WyrdError> {
     let row: Option<SelectedRepositoryRow> = sqlx::query_as(
-        "SELECT card_uid, selection_occurrence FROM wyrd.cards
-          WHERE kind = 'Repository' AND name = $1 AND selected_at IS NOT NULL",
+        "SELECT c.card_uid, c.selection_occurrence, o.sub_principal_id
+           FROM wyrd.cards c
+           JOIN wyrd.card_declaration_operations o ON o.operation_id = c.selection_occurrence
+          WHERE c.kind = 'Repository' AND c.name = $1 AND c.selected_at IS NOT NULL",
     )
     .bind(name.as_str())
     .fetch_optional(&mut **conn.transaction())
@@ -106,6 +113,7 @@ pub async fn selected_repository(
         Ok(SelectedRepository {
             uid: CardUid::from_uuid(row.card_uid).map_err(WyrdError::from_card_uid_error)?,
             occurrence: row.selection_occurrence,
+            principal: row.sub_principal_id,
         })
     })
     .transpose()

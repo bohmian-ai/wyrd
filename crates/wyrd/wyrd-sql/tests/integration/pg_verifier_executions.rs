@@ -21,10 +21,14 @@ use wyrd_spec::card::operator::{DriftCounts, MAX_SUMMARY_CHARS, OperatorFailureC
 use wyrd_spec::card::trigger::TriggerDuration;
 use wyrd_spec::card::verifier::{OWNER_OCCURRENCE_KEY, SourceText};
 use wyrd_spec::envelope::{Card, CardKind};
-use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, GroupId, SlotName, VerificationResultId};
+use wyrd_spec::ids::{
+    BindingId, CardUid, ExecutionId, GroupId, RepositoryId, SlotName, VerificationResultId,
+};
 use wyrd_spec::registry::DeclarationOperationId;
 use wyrd_spec::vala::ids::{RunId, SpanId, TraceId};
-use wyrd_spec::verification::execution::{InputDeclaration, VerificationRequest};
+use wyrd_spec::verification::execution::{
+    InputDeclaration, PullRequestActivation, PullRequestRef, VerificationRequest,
+};
 use wyrd_spec::verification::{
     DriftWindow, GroupEndSettings, GroupSource, OperatorDispatchStatus, VerificationError,
     VerificationExecutionStatus, VerificationVerdict, VerifierReadiness,
@@ -44,9 +48,10 @@ use wyrd_sql::queries::verification_target::VerificationTargets;
 use wyrd_sql::queries::verifier_executions::{
     Cause, ClaimedExecution, Completion, DueSettlement, EnqueueOutcome, EnqueueRefusal,
     ExecutionAuthority, ExecutionInput, ExecutionLease, ExecutionOrigin, ExecutionStatus,
-    GroupActivity, GroupSelection, PinnedGroup, Prepared, QueueCounts, RetryOutcome,
-    ScheduleOutcome, ScheduleSkip, ScheduleTick, ScheduledAdmission, Settlement, Submission,
-    SubmissionOutcome, TerminalDelivery, TerminalStatus, VerifierExecutionQueue,
+    GroupActivity, GroupSelection, PinnedGroup, Prepared, PullRequestEnd, PullRequestHistory,
+    PullRequestKey, PullRequestTarget, QueueCounts, RetryOutcome, ScheduleOutcome, ScheduleSkip,
+    ScheduleTick, ScheduledAdmission, Settlement, Submission, SubmissionOutcome, TerminalDelivery,
+    TerminalStatus, VerifierExecutionQueue,
 };
 use wyrd_sql::row_types::cards::CardStatus;
 
@@ -4405,4 +4410,314 @@ async fn queued_admission_preserves_tenant_and_input_identity() {
     );
     assert_eq!(pending_groups(&mut conn, group_binding).await, 0);
     conn.commit().await.expect("writer commits");
+}
+
+/// Register one active Repository Card owning `count` `pull_request`
+/// bindings of one ready Verifier; return the Repository and its bindings.
+///
+/// # Panics
+/// Panics when a Card or binding write fails.
+async fn repository_with_bindings(
+    conn: &mut TenantConn<'_>,
+    actor: &Principal,
+    count: usize,
+) -> (CardUid, Vec<BindingId>) {
+    let repository = insert_card(conn, actor, &service_card("acme-api")).await;
+    sqlx::query("UPDATE wyrd.cards SET kind = 'Repository', status = 'active' WHERE card_uid = $1")
+        .bind(repository.as_uuid())
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("repository card rewrites");
+    let mut bindings = Vec::new();
+    for index in 0..count {
+        let verifier =
+            register_verifier(conn, actor, &format!("review-{index}"), custom_drift()).await;
+        bindings.extend(
+            project_bindings(
+                conn,
+                &repository,
+                &CardKind::Repository,
+                &[NewBinding {
+                    subject_occurrence_key: OWNER_OCCURRENCE_KEY.to_owned(),
+                    card_uid: repository.clone(),
+                    verifier_card_uid: verifier,
+                    trigger: FrozenTarget::Digest("sha256:pull-request".to_owned()),
+                    operators: Vec::new(),
+                    activation: BindingActivation::PullRequest,
+                }],
+            )
+            .await
+            .expect("binding projects"),
+        );
+    }
+    (repository, bindings)
+}
+
+/// The pins of PR 7 of repository 42 at head `head`.
+fn pins(head: &str) -> PullRequestActivation {
+    PullRequestActivation {
+        host: "github.com".to_owned(),
+        repository_id: RepositoryId::new("42").expect("valid repository id"),
+        number: 7,
+        base: PullRequestRef {
+            ref_name: "main".to_owned(),
+            sha: "b".repeat(40),
+        },
+        head: PullRequestRef {
+            ref_name: "feature".to_owned(),
+            sha: head.repeat(40),
+        },
+        head_repository_id: Some(RepositoryId::new("42").expect("valid repository id")),
+        delivery_id: Uuid::now_v7().to_string(),
+        generation: Uuid::now_v7(),
+    }
+}
+
+/// The key of every PR these tests admit.
+fn pr_key(repository: &RepositoryId) -> PullRequestKey<'_> {
+    PullRequestKey {
+        host: "github.com",
+        repository_id: repository,
+        number: 7,
+    }
+}
+
+/// Every binding admitted under `owner`'s background authority.
+async fn pr_targets(
+    conn: &mut TenantConn<'_>,
+    owner: PrincipalId,
+    bindings: &[BindingId],
+) -> Vec<PullRequestTarget> {
+    let authority = background(conn, owner).await;
+    bindings
+        .iter()
+        .map(|binding| PullRequestTarget {
+            binding_id: *binding,
+            authority: Ok(authority.clone()),
+        })
+        .collect()
+}
+
+/// A reserved generation is frozen but unclaimable until its handoff
+/// activates it; activation is idempotent; a new source cancels the queued
+/// and the running executions of the old one, fencing the running worker,
+/// and keeps their pins; an observation older than the newest generation is
+/// obsolete.
+///
+/// # Panics
+/// Panics when a reservation, activation, claim or supersession differs.
+#[tokio::test]
+async fn pull_request_generations_reserve_activate_and_supersede() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture.tenant_conn().await.expect("tenant connection");
+    let (repository, bindings) = repository_with_bindings(&mut conn, &actor, 2).await;
+    assert_eq!(
+        queue
+            .pull_request_bindings(&mut conn, &repository)
+            .await
+            .expect("bindings read")
+            .iter()
+            .map(|binding| binding.binding_id)
+            .collect::<Vec<_>>(),
+        bindings
+    );
+    let repository_id = RepositoryId::new("42").expect("valid repository id");
+    let first = pins("a");
+    let t1 = database_now(&mut conn).await;
+    let history = queue
+        .lock_pull_request(&mut conn, pr_key(&repository_id))
+        .await
+        .expect("PR locks");
+    assert_eq!(history, PullRequestHistory::default());
+    let targets = pr_targets(&mut conn, actor.id, &bindings).await;
+    let (a, superseded) = queue
+        .reserve_pull_request(&mut conn, &first, t1, &targets)
+        .await
+        .expect("generation reserves");
+    assert_eq!((a.len(), superseded.len()), (2, 0));
+    assert!(
+        queue
+            .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 10)
+            .await
+            .expect("claim runs")
+            .is_empty(),
+        "a reserved generation is not claimable"
+    );
+    let state = status(&queue, &mut conn, a[0]).await.state;
+    assert_eq!(state.status, VerificationExecutionStatus::Pending);
+    assert_eq!(state.pull_request.as_ref(), Some(&first));
+
+    let history = queue
+        .lock_pull_request(&mut conn, pr_key(&repository_id))
+        .await
+        .expect("PR locks");
+    let current = history.current.clone().expect("a current generation");
+    assert!(current.reviews(&first) && !current.deactivated);
+    assert!(
+        current
+            .executions
+            .iter()
+            .all(|execution| execution.reserved)
+    );
+    assert!(history.obsolete(t1), "the same observation is not newer");
+
+    assert_eq!(
+        queue
+            .activate_pull_requests(&mut conn, &a)
+            .await
+            .expect("activates"),
+        a
+    );
+    assert!(
+        queue
+            .activate_pull_requests(&mut conn, &a)
+            .await
+            .expect("replay activates")
+            .is_empty(),
+        "a replayed handoff activates nothing"
+    );
+    let running = claim(&queue, &mut conn).await;
+    assert_eq!(
+        running.input,
+        ExecutionInput::PullRequest {
+            pull_request: Box::new(first.clone())
+        }
+    );
+    assert_eq!(running.origin, ExecutionOrigin::PullRequest);
+
+    let second = pins("c");
+    let t2 = database_now(&mut conn).await;
+    let (b, superseded) = queue
+        .reserve_pull_request(&mut conn, &second, t2, &targets)
+        .await
+        .expect("new generation reserves");
+    assert_eq!(b.len(), 2);
+    assert_eq!(
+        superseded.iter().copied().collect::<BTreeSet<_>>(),
+        a.iter().copied().collect::<BTreeSet<_>>()
+    );
+    for execution in &a {
+        let state = status(&queue, &mut conn, *execution).await.state;
+        assert_eq!(state.status, VerificationExecutionStatus::Cancelled);
+        assert_eq!(
+            state.error.map(|error| error.code).as_deref(),
+            Some("pull_request_superseded")
+        );
+        assert_eq!(state.pull_request.as_ref(), Some(&first), "pins are kept");
+    }
+    assert_eq!(
+        queue
+            .terminate(
+                &mut conn,
+                running.lease,
+                TerminalStatus::Errored,
+                &engine_error(),
+                TerminalDelivery::Owed,
+            )
+            .await
+            .expect("settlement runs"),
+        Settlement::StaleLease,
+        "the superseded worker is fenced"
+    );
+    let history = queue
+        .lock_pull_request(&mut conn, pr_key(&repository_id))
+        .await
+        .expect("PR locks");
+    assert!(
+        history.obsolete(t1),
+        "an observation older than B is obsolete"
+    );
+    assert!(history.current.expect("current").reviews(&second));
+}
+
+/// Closing a PR cancels its unfinished executions with the close code and
+/// deactivates its generation, keeping settled history; access loss does
+/// the same for the repository's PRs; a binding refused at admission
+/// settles errored with its pins and runs nothing.
+///
+/// # Panics
+/// Panics when a cancellation, deactivation or refusal differs.
+#[tokio::test]
+async fn pull_request_ends_access_loss_and_refusals_settle_durably() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture.tenant_conn().await.expect("tenant connection");
+    let (_, bindings) = repository_with_bindings(&mut conn, &actor, 2).await;
+    let repository_id = RepositoryId::new("42").expect("valid repository id");
+    let mut targets = pr_targets(&mut conn, actor.id, &bindings).await;
+    let refusal = VerificationError {
+        code: "WYRD_PERMISSION_403_DENIED_RBAC".to_owned(),
+        message: "the Repository owner may not run this Verifier".to_owned(),
+    };
+    targets[1].authority = Err((Attribution::direct(actor.id), refusal.clone()));
+    let observed = database_now(&mut conn).await;
+    let (executions, _) = queue
+        .reserve_pull_request(&mut conn, &pins("a"), observed, &targets)
+        .await
+        .expect("generation reserves");
+    let refused = status(&queue, &mut conn, executions[1]).await.state;
+    assert_eq!(refused.status, VerificationExecutionStatus::Errored);
+    assert_eq!(refused.error, Some(refusal));
+    assert!(refused.pull_request.is_some());
+
+    let closed_at = database_now(&mut conn).await;
+    let cancelled = queue
+        .deactivate_pull_request(
+            &mut conn,
+            pr_key(&repository_id),
+            closed_at,
+            PullRequestEnd::Closed,
+        )
+        .await
+        .expect("PR deactivates");
+    assert_eq!(cancelled, vec![executions[0]]);
+    let state = status(&queue, &mut conn, executions[0]).await.state;
+    assert_eq!(
+        state.error.map(|error| error.code).as_deref(),
+        Some("pull_request_closed")
+    );
+    assert_eq!(
+        status(&queue, &mut conn, executions[1]).await.state.status,
+        VerificationExecutionStatus::Errored,
+        "settled history keeps its status"
+    );
+    let history = queue
+        .lock_pull_request(&mut conn, pr_key(&repository_id))
+        .await
+        .expect("PR locks");
+    assert!(history.current.expect("current").deactivated);
+    assert_eq!(history.latest_at, Some(closed_at));
+
+    let reopened = database_now(&mut conn).await;
+    let (reopened_executions, _) = queue
+        .reserve_pull_request(&mut conn, &pins("a"), reopened, &targets[..1])
+        .await
+        .expect("reopened generation reserves");
+    queue
+        .activate_pull_requests(&mut conn, &reopened_executions)
+        .await
+        .expect("activates");
+    assert_eq!(
+        queue
+            .cancel_pull_request_repositories(&mut conn, "github.com", Some(&["9".to_owned()]))
+            .await
+            .expect("other repository cancels"),
+        0,
+        "another repository's loss cancels nothing here"
+    );
+    queue
+        .cancel_pull_request_repositories(&mut conn, "github.com", Some(&["42".to_owned()]))
+        .await
+        .expect("repository cancels");
+    let state = status(&queue, &mut conn, reopened_executions[0])
+        .await
+        .state;
+    assert_eq!(state.status, VerificationExecutionStatus::Cancelled);
+    assert_eq!(
+        state.error.map(|error| error.code).as_deref(),
+        Some("repository_access_lost")
+    );
 }

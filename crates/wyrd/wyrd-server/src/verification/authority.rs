@@ -254,9 +254,53 @@ impl BackgroundAuthority {
         owner: PrincipalId,
         root: &CardUid,
     ) -> Result<Result<ExecutionAuthority, AuthorityRefusal>, SqlError> {
+        let Some((issuer, system)) = self.system(conn, owner).await? else {
+            return Ok(Err(AuthorityRefusal::Unavailable));
+        };
+        Ok(Self::accepted(
+            owner,
+            system,
+            issuer.scheduled(conn, owner.as_uuid(), root).await,
+        )?)
+    }
+
+    /// The accountable/SYSTEM authority a run serving `principal`, the
+    /// tenant User or Service account accountable for the declaration that
+    /// selected its binding, is accepted under, without a selected root.
+    ///
+    /// Resolved through [`TenantTokenIssuer::accountable`] on `conn` like
+    /// [`Self::resolve`], with the same refusals.
+    ///
+    /// # Errors
+    /// As [`Self::resolve`].
+    pub async fn accountable(
+        &self,
+        conn: &mut TenantConn<'_>,
+        principal: PrincipalId,
+    ) -> Result<Result<ExecutionAuthority, AuthorityRefusal>, SqlError> {
+        let Some((issuer, system)) = self.system(conn, principal).await? else {
+            return Ok(Err(AuthorityRefusal::Unavailable));
+        };
+        Ok(Self::accepted(
+            principal,
+            system,
+            issuer.accountable(conn, principal.as_uuid()).await,
+        )?)
+    }
+
+    /// The configured issuer and the tenant SYSTEM principal, or `None`,
+    /// logged, when either is missing.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when the SYSTEM read fails.
+    async fn system(
+        &self,
+        conn: &mut TenantConn<'_>,
+        owner: PrincipalId,
+    ) -> Result<Option<(&TenantTokenIssuer, PrincipalId)>, SqlError> {
         let Some(issuer) = &self.issuer else {
             tracing::warn!(%owner, "no tenant issuer is configured; background run not accepted");
-            return Ok(Err(AuthorityRefusal::Unavailable));
+            return Ok(None);
         };
         let Some(system) = system_principal_id(conn)
             .await
@@ -264,9 +308,22 @@ impl BackgroundAuthority {
             .map(PrincipalId::new)
         else {
             tracing::warn!(%owner, "the tenant has no SYSTEM principal; background run not accepted");
-            return Ok(Err(AuthorityRefusal::Unavailable));
+            return Ok(None);
         };
-        match issuer.scheduled(conn, owner.as_uuid(), root).await {
+        Ok(Some((issuer, system)))
+    }
+
+    /// The authority `resolved` accepts with `system` as actor, or the
+    /// refusal its issuance error maps to.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] for a storage or database issuance failure.
+    fn accepted(
+        owner: PrincipalId,
+        system: PrincipalId,
+        resolved: Result<wyrd_auth_verify::VerifiedToken, IssuanceError>,
+    ) -> Result<Result<ExecutionAuthority, AuthorityRefusal>, SqlError> {
+        match resolved {
             Ok(verified) => Ok(Ok(ExecutionAuthority::background(
                 AcceptedAuthority::new(&verified.principal, &verified.delegation_chain),
                 system,

@@ -7,7 +7,7 @@
 //! explicit capture policy, and one machine principal per caller; every call
 //! is raw HTTP/1.1 keep-alive `POST /v1/chat/completions` with a `wyrd_sk_`
 //! key, timed until the complete answer is validated. All evidence comes from
-//! client timings, `/metrics`, tenant capture reads, and the OS's readings of
+//! client timings, the benchmark snapshot, tenant capture reads, and the OS's readings of
 //! the server process.
 //!
 //! - L1 `overhead` ([`run`]): closed-loop clients at 1 and 64 for each
@@ -35,8 +35,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde_json::{Value, json};
+use wyrd_testing::capacity::Population;
 use wyrd_testing::experiment::{
-    Criterion, Declaration, Derive, Direction, Engine, Level, Metric, Op, Step,
+    Criterion, Declaration, Derive, Direction, Engine, Level, Metric, Op, Role, Step,
 };
 use wyrd_testing::release_server::LocalServer;
 
@@ -76,6 +77,11 @@ pub const DEFAULT_RATE: f64 = 250.0;
 
 /// The L2 experiment's only step.
 pub const CONTENTION: &str = "contention";
+
+/// L1 flags that take a value: `--pace` offers every window open loop at
+/// that many requests/s, capped at the step's client count in flight, a
+/// matched-load diagnostic beside the closed-loop default.
+pub const OVERHEAD_FLAGS: [&str; 1] = ["--pace"];
 
 /// L2 flags that take a value.
 pub const CAPACITY_FLAGS: [&str; 4] = [
@@ -181,7 +187,7 @@ impl Case {
 /// Returns a message for an unknown argument or an invalid declared value.
 pub fn plan(context: &Context<'_>, base: Declaration) -> std::result::Result<Plan, String> {
     let valued: &[&str] = match context.level {
-        Level::One => &[],
+        Level::One => &OVERHEAD_FLAGS,
         Level::Two => &CAPACITY_FLAGS,
     };
     context.known(valued, &[])?;
@@ -190,7 +196,10 @@ pub fn plan(context: &Context<'_>, base: Declaration) -> std::result::Result<Pla
         .output(Engine::Gateway, &declaration.experiment)
         .join("server.log");
     let workload: Box<dyn wyrd_testing::experiment::Workload> = match context.level {
-        Level::One => Box::new(run::Overhead::new(log)),
+        Level::One => Box::new(run::Overhead::new(
+            log,
+            positive_rate(context.arguments, "--pace")?,
+        )),
         Level::Two => Box::new(capacity::Capacity::new(log)),
     };
     Ok(Plan {
@@ -205,7 +214,7 @@ pub fn plan(context: &Context<'_>, base: Declaration) -> std::result::Result<Pla
 ///
 /// # Errors
 ///
-/// Returns a message for an invalid `--rate` or SLO override.
+/// Returns a message for an invalid `--pace`, `--rate` or SLO override.
 pub fn declare(
     level: Level,
     arguments: &[String],
@@ -213,24 +222,39 @@ pub fn declare(
     _root: &Path,
 ) -> std::result::Result<Declaration, String> {
     match level {
-        Level::One => Ok(overhead(base)),
-        Level::Two => {
-            let rate = crate::flags::value(arguments, "--rate")?
-                .map(|value| {
-                    value
-                        .parse::<f64>()
-                        .ok()
-                        .filter(|rate| rate.is_finite() && *rate > 0.0)
-                        .ok_or_else(|| format!("--rate takes positive requests/s, got `{value}`"))
-                })
-                .transpose()?;
-            Ok(capacity_declaration(base, rate, Slo::parse(arguments)?))
-        }
+        Level::One => Ok(overhead(base, positive_rate(arguments, "--pace")?)),
+        Level::Two => Ok(capacity_declaration(
+            base,
+            positive_rate(arguments, "--rate")?,
+            Slo::parse(arguments)?,
+        )),
     }
 }
 
-/// The L1 `overhead` declaration over `base`.
-fn overhead(mut base: Declaration) -> Declaration {
+/// The positive, finite requests/s `flag` gives, or `None` without it.
+///
+/// # Errors
+///
+/// Returns a message for a repeated flag or a value that is not one.
+fn positive_rate(arguments: &[String], flag: &str) -> std::result::Result<Option<f64>, String> {
+    crate::flags::value(arguments, flag)?
+        .map(|value| {
+            value
+                .parse::<f64>()
+                .ok()
+                .filter(|rate| rate.is_finite() && *rate > 0.0)
+                .ok_or_else(|| format!("{flag} takes positive requests/s, got `{value}`"))
+        })
+        .transpose()
+}
+
+/// How the driver and its local upstream handle each call, declared so
+/// records of a different method are never compared as one.
+const FIXTURE_METHOD: &str = "prepared-borrowed: each caller's URL, credential, and content type built once, benchmark labels read per request; buffered answers and upstream requests read only by the members they judge or route by, under decoded-value rules, borrowing unescaped text";
+
+/// The L1 `overhead` declaration over `base`, offered open loop at `pace`
+/// requests/s when one is given.
+fn overhead(mut base: Declaration, pace: Option<f64>) -> Declaration {
     "overhead".clone_into(&mut base.experiment);
     base.question = format!(
         "What overhead does the gateway add to 1 KiB buffered and streamed chat with metadata capture, and 64 KiB buffered chat with metadata and with payload capture, at 1 and 64 closed-loop clients, and is its p99 strictly under {OVERHEAD_LIMIT_MS} ms at {SLO_CLIENTS} clients at every handoff point with every call answered and captured exactly once?"
@@ -240,6 +264,7 @@ fn overhead(mut base: Declaration) -> Declaration {
         ("clients".to_owned(), json!(CLIENTS)),
     ]);
     base.controls.extend([
+        ("fixture_method".to_owned(), json!(FIXTURE_METHOD)),
         (
             "fixture".to_owned(),
             json!(
@@ -249,7 +274,13 @@ fn overhead(mut base: Declaration) -> Declaration {
         (
             "workload".to_owned(),
             json!(format!(
-                "one tenant, one wyrd_sk_ key and keep-alive connection per closed-loop client; each client sends its next call when the last is validated; {}",
+                "one tenant, one wyrd_sk_ key and keep-alive connection per closed-loop client; {}; {}",
+                pace.map_or_else(
+                    || "each client sends its next call when the last is validated".to_owned(),
+                    |rate| format!(
+                        "paced: {rate} requests/s offered open loop, at most one open call per client, a missed or capped arrival counted as an error"
+                    ),
+                ),
                 Case::ALL
                     .map(|case| format!(
                         "{}: {} capture",
@@ -428,6 +459,117 @@ fn overhead_metrics() -> Vec<Metric> {
         "server: handler entry until the answer handoff (`gateway.buffered`, or a stream's head at `gateway.stream.head`), successful calls; nearest-rank bucket bounds of the server's timing histograms",
     ));
     metrics.extend(efficiency_metrics());
+    metrics.extend(diagnostic_metrics());
+    metrics
+}
+
+/// The diagnostic readings every L1 repetition reports, none judged: each
+/// Gateway phase, the queue delay, the answer handoff's components, and
+/// the Scribe outbox's batch writes, each over its own population.
+fn diagnostic_metrics() -> Vec<Metric> {
+    const WINDOW: &str = "from the window open until its calls, captures, and outbox writes drained, so late calls count";
+    let phase = |name: &str, what: &str| {
+        Metric::diagnostic(
+            &format!("phase.{name}"),
+            &format!(
+                "server: `wyrd_gateway_phase_duration_seconds{{phase={name}}}`, {what}; every call {WINDOW}"
+            ),
+        )
+    };
+    let mut metrics = [
+        (
+            "authenticate",
+            "credential extraction and verification or API-key exchange",
+        ),
+        (
+            "parse",
+            "body read and decode, validation, and header parsing",
+        ),
+        ("snapshot", "the tenant gateway snapshot load"),
+        (
+            "authorize",
+            "the model's invoke decision and Card attribution",
+        ),
+        (
+            "route",
+            "candidate planning, fallback authorization, and representability",
+        ),
+        (
+            "admit",
+            "the admission transaction, including the capture-slot reservation",
+        ),
+        (
+            "credential",
+            "provider credential resolution, summed across attempts",
+        ),
+        (
+            "translate",
+            "adapter work outside provider exchanges, summed across attempts",
+        ),
+        (
+            "account",
+            "the settlement statement, before the answer handoff",
+        ),
+        (
+            "relay",
+            "relay decoding, translation, and framing of a stream's chunks; streams only",
+        ),
+        (
+            "capture",
+            "capture projection and staging after the answer handoff; never response latency",
+        ),
+    ]
+    .into_iter()
+    .flat_map(|(name, what)| phase(name, what))
+    .collect::<Vec<_>>();
+    for (observation, boundary) in [
+        (
+            "queue_delay",
+            format!("server: `wyrd_gateway_queue_delay_seconds`, receipt in `govern` until the call's execution task started; it includes admission, so it overlaps `phase.admit` and is not exclusive scheduler delay; every call {WINDOW}"),
+        ),
+        (
+            "server_elapsed",
+            "server: handler entry until the answer handoff (`gateway.buffered`, or a stream's head at `gateway.stream.head`), succeeded calls of the cohort".to_owned(),
+        ),
+        (
+            "provider_excluded",
+            "server: the union of a call's own provider waits until the answer handoff, excluded from its residual; succeeded calls of the cohort".to_owned(),
+        ),
+        (
+            "residual",
+            "server: per call, `server_elapsed` less `provider_excluded`, computed before aggregation; succeeded calls of the cohort".to_owned(),
+        ),
+        (
+            "outbox_write.scribe",
+            format!("server: `outbox_write_seconds{{outbox=scribe}}`, one observation per Scribe outbox batch write from dispatch to settlement, {WINDOW}; a batch write, not a request phase or response latency"),
+        ),
+    ] {
+        metrics.extend(Metric::diagnostic(observation, &boundary));
+    }
+    for (wait, what) in [
+        (
+            "dispatch",
+            "the admitted call's execution task spawn until it started; admission excluded, unlike `queue_delay`",
+        ),
+        (
+            "provider_headers",
+            "ended provider exchanges' send to headers, or to failure, plus an opened stream's send to headers; includes local pool, connect, and runtime work, not remote compute alone",
+        ),
+        (
+            "provider_body",
+            "ended provider exchanges' body receipt outside every header wait",
+        ),
+        (
+            "resume",
+            "the execution task's answer send until the handler resumed on it",
+        ),
+    ] {
+        metrics.extend(Metric::diagnostic(
+            &format!("wait.{wait}"),
+            &format!("server: `wyrd_gateway_wait_seconds{{wait={wait}}}`, {what}; overlaps the phases and is never summed; every call {WINDOW}"),
+        ));
+    }
+    metrics.extend(Population::root_metrics(Role::Driver, &run::DRIVER_ROOTS));
     metrics
 }
 
@@ -526,6 +668,7 @@ fn capacity_declaration(mut base: Declaration, rate: Option<f64>, slo: Slo) -> D
         json!(["capacity", "overload", "recovery"]),
     )]);
     base.controls.extend([
+        ("fixture_method".to_owned(), json!(FIXTURE_METHOD)),
         (
             "fixture".to_owned(),
             json!({
@@ -960,6 +1103,42 @@ mod tests {
             (65_536, 65_536, false)
         );
         assert_eq!(Case::Streamed1KibCaptureMetadata.shape().expected, 32);
+    }
+
+    /// `--pace` keeps L1's steps and criteria, records the offered rate in
+    /// the workload control so a paced record never reads as closed loop,
+    /// and refuses a rate that is not positive and finite.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the paced declaration differs from the default beyond
+    /// its workload, or a bad rate is accepted.
+    #[test]
+    fn paced_overhead_records_its_rate_and_refuses_bad_ones() {
+        let closed = declare(Level::One, &line(&[]), base(Level::One), Path::new("."))
+            .expect("the L1 declaration");
+        let paced = declare(
+            Level::One,
+            &line(&["--pace", "4970"]),
+            base(Level::One),
+            Path::new("."),
+        )
+        .expect("the paced L1 declaration");
+        assert_eq!(paced.steps.len(), closed.steps.len());
+        assert_eq!(paced.criteria.len(), closed.criteria.len());
+        let workload = paced.controls["workload"].as_str().expect("a workload");
+        assert!(workload.contains("paced: 4970 requests/s"), "{workload}");
+        assert_ne!(paced.controls["workload"], closed.controls["workload"]);
+        for refused in [
+            &["--pace", "0"][..],
+            &["--pace", "nan"],
+            &["--pace", "1", "--pace", "2"],
+        ] {
+            assert!(
+                declare(Level::One, &line(refused), base(Level::One), Path::new(".")).is_err(),
+                "{refused:?}"
+            );
+        }
     }
 
     /// L2 declares one contention step at the default rate with the SLO

@@ -296,7 +296,16 @@ impl DataCard {
             .into_iter()
             .map(|reference| match reference {
                 Ref::Ref(card_ref) => Ok(card_ref),
-                Ref::Sibling { sibling } => Ok(sibling),
+                Ref::Sibling { sibling } => {
+                    sibling
+                        .to_card_ref()
+                        .ok_or_else(|| WyrdError::DataValidation {
+                            message: format!(
+                                "DataCard contains versionless sibling reference: {sibling}"
+                            ),
+                            details: serde_json::Value::Null,
+                        })
+                }
                 Ref::Path(path) => Err(WyrdError::DataValidation {
                     message: format!(
                         "DataCard contains unresolved card reference path: {}",

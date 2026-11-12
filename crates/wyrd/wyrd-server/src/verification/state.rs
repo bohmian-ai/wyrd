@@ -40,7 +40,7 @@ use wyrd_spec::storage::StoredObjectRef;
 use wyrd_spec::vala::ids::RunId;
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
-    InvocationSettlement, Producer, Publication, PublicationKind, VerificationOutcome,
+    ExecutedOutcome, InvocationSettlement, Producer, Publication, PublicationKind,
 };
 use wyrd_spec::verification::state::{
     AcceptedPublication, ControlRecord, ExecutionIdentity, ExecutionState, ExecutionStateError,
@@ -675,7 +675,7 @@ impl RunState {
     /// Returns the [`Self::durable`] errors.
     pub async fn select(
         &self,
-        outcome: &VerificationOutcome,
+        outcome: &ExecutedOutcome,
         started_at: DateTime<Utc>,
     ) -> Result<Decision, StateError> {
         self.decide(|| {
@@ -1102,7 +1102,7 @@ mod tests {
     use wyrd_spec::verification::PublicationName;
     use wyrd_spec::verification::execution::Producer;
     use wyrd_spec::verification::execution::{
-        Publication, PublicationContent, PublicationKind, VerificationOutcome,
+        ExecutedOutcome, Publication, PublicationContent, PublicationKind,
     };
     use wyrd_spec::verification::state::ExecutionState;
     use wyrd_spec::verification::{TaskId, VerificationVerdict};
@@ -1291,7 +1291,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_selections_share_one_accepted_result() {
         let (state, scribe) = held_state();
-        let outcome = VerificationOutcome {
+        let outcome = ExecutedOutcome {
             verdict: VerificationVerdict::Passed,
             requirements: Vec::new(),
             steps: Vec::new(),
@@ -1338,7 +1338,7 @@ mod tests {
             .await
             .expect("the failure is accepted");
         assert!(matches!(failed, Decision::Failed(_)));
-        let outcome = VerificationOutcome {
+        let outcome = ExecutedOutcome {
             verdict: VerificationVerdict::Passed,
             requirements: Vec::new(),
             steps: Vec::new(),

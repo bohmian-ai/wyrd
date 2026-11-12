@@ -136,6 +136,7 @@ fn agent_clone_bumps_prompt_arc() {
 
     let cloned = agent.clone();
 
-    assert_eq!(Arc::strong_count(&prompt), prompt_count + 1);
+    assert!(Arc::ptr_eq(&cloned.prompt, &agent.prompt));
+    assert!(Arc::strong_count(&prompt) > prompt_count);
     assert_eq!(cloned.tool_names(), agent.tool_names());
 }

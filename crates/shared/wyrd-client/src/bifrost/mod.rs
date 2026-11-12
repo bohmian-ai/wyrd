@@ -15,7 +15,6 @@
 //! - `BifrostIngestSink` — the `wyrd-queue` [`BatchSink`] that maps one sealed
 //!   batch onto the ingest RPC (`table`, `wyrd_batch_id`, Arrow IPC frames),
 //!   preserving `batch_id` so the server's commit dedup holds across retries.
-//! - [`observe`] — fire-and-forget telemetry that never breaks its caller.
 //!
 //! Query streaming and lifecycle — [`Bifrost::sql`], [`Bifrost::stream`],
 //! [`Bifrost::running`], [`Bifrost::status`], and [`Bifrost::cancel`] — and the
@@ -32,9 +31,8 @@
 //!
 //! `ClientScope` is a credential fingerprint the **token-opaque** client tier
 //! computes without ever decoding a JWT: `(server_url, SHA-256 of the resolved
-//! credential's secret material)`. Backpressure is asymmetric — [`Bifrost::insert`]
-//! propagates queue-full to the caller, while [`observe::record`] swallows it,
-//! counts the drop, and warns.
+//! credential's secret material)`. [`Bifrost::insert`] propagates queue-full to
+//! the caller.
 //!
 //! [`BatchSink`]: wyrd_queue::BatchSink
 
@@ -42,14 +40,13 @@ pub mod blocking;
 mod facade;
 mod grpc;
 mod handle;
-pub mod observe;
 mod query;
 pub mod rows;
 mod scope;
 mod sink;
 mod table;
 
-pub use facade::{Bifrost, BifrostOptions, QueryResult, RecordAdmission};
+pub use facade::{Bifrost, BifrostOptions, QueryResult};
 /// Binding plumbing: the explicit-option client door and the shared register
 /// outcome spelling the Python and TypeScript bindings project.
 #[cfg(feature = "internal")]
@@ -110,7 +107,7 @@ mod sdk {
     use crate::bifrost::handle::WriterPool;
     use crate::bifrost::table::WriterTable;
     use crate::bifrost::{
-        Bifrost, BifrostIngestSink, ClientScope, Correlation, IngestTransport, TableConfig, observe,
+        Bifrost, BifrostIngestSink, ClientScope, Correlation, IngestTransport, TableConfig,
     };
 
     fn config_with_key(url: &str, key: &str) -> ClientConfig {
@@ -358,31 +355,6 @@ mod sdk {
         assert_eq!((settled.producers, settled.owned_bytes), (0, 0));
     }
 
-    /// A shutdown waits for a telemetry record admitted before it, so a
-    /// record still describing its destination is enqueued rather than
-    /// refused by a pool already closed beneath it.
-    ///
-    /// # Panics
-    ///
-    /// Panics when shutdown settles while the admission is held, or fails
-    /// once it is released.
-    #[tokio::test]
-    async fn shutdown_waits_for_an_admitted_record() {
-        let bifrost = client_over(Arc::new(MockSink::new()), QueueConfig::default());
-        let admitted = bifrost.admit_record();
-        let shutdown = bifrost.shutdown();
-        tokio::pin!(shutdown);
-        tokio::select! {
-            biased;
-            _ = &mut shutdown => panic!("shutdown cannot settle while a record is admitted"),
-            () = tokio::task::yield_now() => {}
-        }
-        drop(admitted);
-        shutdown
-            .await
-            .expect("shutdown settles once the record does");
-    }
-
     /// A saturated queue reaches the caller of the public client as a stable
     /// error, rather than being counted and swallowed.
     #[test]
@@ -413,11 +385,6 @@ mod sdk {
         assert!(
             rejected > 0,
             "a saturated queue must reject on the write path"
-        );
-        assert_eq!(
-            bifrost.dropped(),
-            0,
-            "the explicit write path refuses; it never drops"
         );
     }
 
@@ -583,27 +550,6 @@ mod sdk {
                 .expect_err("shutdown stops later producer")
                 .to_string()
                 .contains("queue full")
-        );
-    }
-
-    #[test]
-    fn observe_record_swallows_and_counts_overflow() {
-        let sink = Arc::new(StallSink::default());
-        let bifrost = client_over(sink.clone(), saturating_config());
-        let table = WriterTable::new("ns.tbl", test_schema(), TableVersion::INITIAL);
-
-        // Prime the stall, then flood the same saturated producer via the telemetry
-        // path. `record` returns unit — the caller is never handed an error.
-        observe::record(&bifrost, &table, row(), correlated());
-        wait_until_started(&sink);
-
-        for i in 0..40 {
-            let payload = format!(r#"{{"id": {}}}"#, i + 1).into_bytes();
-            observe::record(&bifrost, &table, payload, correlated());
-        }
-        assert!(
-            bifrost.dropped() > 0,
-            "overflow on the telemetry path is counted, never surfaced"
         );
     }
 

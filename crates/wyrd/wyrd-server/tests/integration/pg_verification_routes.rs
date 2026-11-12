@@ -13,6 +13,7 @@
 //! unreachable through the public principal and credential routes, and that a
 //! local publication download plan is redeemed under `verifier:read` alone.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use axum::body::{Body, to_bytes};
@@ -1127,14 +1128,13 @@ async fn canonical_readback_does_not_read_payload_bytes() {
     assert_eq!(status, StatusCode::OK, "{read}");
     assert_eq!(read["status"], "completed", "{read}");
     assert_eq!(read["result"]["outcome"]["verdict"], "passed", "{read}");
+    let (status, details) = get(&server, &jwt, &format!("{uri}/details")).await;
+    assert_eq!(status, StatusCode::OK, "{details}");
+    assert_eq!(details["outcome"]["verdict"], "passed", "{details}");
     assert_eq!(
-        read["result"]["outcome"]["evidence"], judged["outcome"]["evidence"],
-        "{read}"
-    );
-    assert_eq!(
-        read["result"]["outcome"]["evidence"]["doc"]["sha256"],
+        details["outcome"]["evidence"]["doc"]["sha256"],
         Sha256Hex::digest(DOCUMENT).to_string(),
-        "{read}"
+        "{details}"
     );
     server.shutdown().await.expect("test server shuts down");
 }
@@ -1926,9 +1926,10 @@ async fn direct_execution_enforces_card_access() {
 /// file in a format its media slot refuses, a file above the slot's
 /// `max_bytes`, an unused file in an uncapped slot above the individual
 /// input-file limit but within the combined one, and files whose declared
-/// lengths together exceed the combined input-file limit. Conforming evidence still passes, an omitted
-/// optional slot reads as null, and a missing required slot stays
-/// inconclusive rather than refused. Nothing is enqueued.
+/// lengths together exceed the combined input-file limit. Omitted evidence
+/// is not refused: a check that needs it, even an `is_null` assertion, is
+/// inconclusive while an independent check on supplied evidence passes, and
+/// with every slot supplied the verdict passes. Nothing is enqueued.
 ///
 /// # Panics
 /// Panics when the server fails to start, a fixture write fails, a route
@@ -1947,9 +1948,9 @@ async fn direct_execution_refuses_nonconforming_evidence() {
             &json!({
                 "inputs": {
                     "x": { "type": "json", "schema": { "type": "integer" } },
-                    "note": { "type": "json", "required": false },
-                    "policy": { "type": "media", "formats": ["pdf"], "max_bytes": 10, "required": false },
-                    "pages": { "type": "media", "formats": ["pdf"], "required": false }
+                    "note": { "type": "json", "schema": { "type": ["string", "null"] } },
+                    "policy": { "type": "media", "formats": ["pdf"], "max_bytes": 10 },
+                    "pages": { "type": "media", "formats": ["pdf"] }
                 },
                 "requirements": [
                     { "id": "x-present", "statement": "x is present.",
@@ -2014,9 +2015,34 @@ async fn direct_execution_refuses_nonconforming_evidence() {
         );
     }
 
-    let (status, passed) = execute(&server, &jwt, body(json!({ "x": x }))).await;
+    let outcomes = |result: &Value| -> Vec<(String, String)> {
+        result["outcome"]["requirements"]
+            .as_array()
+            .expect("requirement results")
+            .iter()
+            .map(|requirement| {
+                (
+                    requirement["id"].as_str().expect("id").to_owned(),
+                    requirement["outcome"].as_str().expect("outcome").to_owned(),
+                )
+            })
+            .collect()
+    };
+    let null_note = json!({ "kind": "json", "value": null });
+    let (status, passed) = execute(&server, &jwt, body(json!({ "x": x, "note": null_note }))).await;
     assert_eq!(status, StatusCode::OK, "{passed}");
     assert_eq!(passed["outcome"]["verdict"], "passed", "{passed}");
+    let (status, omitted) = execute(&server, &jwt, body(json!({ "x": x }))).await;
+    assert_eq!(status, StatusCode::OK, "{omitted}");
+    assert_eq!(
+        outcomes(&omitted),
+        [
+            ("x-present".to_owned(), "passed".to_owned()),
+            ("no-note".to_owned(), "inconclusive".to_owned()),
+        ],
+        "{omitted}"
+    );
+    assert_eq!(omitted["outcome"]["verdict"], "inconclusive", "{omitted}");
     let (status, missing) = execute(&server, &jwt, body(json!({}))).await;
     assert_eq!(status, StatusCode::OK, "{missing}");
     assert_eq!(missing["outcome"]["verdict"], "inconclusive", "{missing}");
@@ -2611,4 +2637,386 @@ async fn local_publication_downloads_redeem_under_verifier_read() {
             );
         }
     }
+}
+
+/// A Verifier whose `tally` code step counts the answer's words, judged by
+/// a step code check returning the count as custom data, beside the
+/// top-level `answer-is-one` assertion.
+fn tallied() -> Value {
+    json!({
+        "inputs": { "answer": { "type": "json" } },
+        "steps": [{
+            "id": "tally",
+            "action": {
+                "kind": "code", "entrypoint": "tally", "inputs": { "answer": "inputs.answer" },
+                "source": { "inline": "def tally(answer):\n    return {\"words\": len(str(answer).split())}\n" }
+            },
+            "requirements": [{
+                "id": "tally-counted",
+                "statement": "The answer has words.",
+                "check": {
+                    "kind": "code", "entrypoint": "check",
+                    "inputs": { "answer": "inputs.answer", "tally": "steps.tally.output" },
+                    "response_format": { "kind": "verdict", "data": {
+                        "type": "object", "properties": { "words": { "type": "integer" } },
+                        "required": ["words"], "additionalProperties": false
+                    } },
+                    "source": { "inline": "def check(answer, tally):\n    return {\"outcome\": \"passed\", \"reason\": \"counted\", \"citations\": [{\"slot\": \"answer\", \"locator\": {\"json_pointer\": \"\"}}], \"data\": tally}\n" }
+                }
+            }]
+        }],
+        "requirements": answer_is_one()["requirements"].clone()
+    })
+}
+
+/// `details` without what only details carry: each requirement's check and
+/// provenance, and the outcome's steps and evidence.
+///
+/// # Panics
+/// Panics when `details` has no `outcome` object or its `requirements` is
+/// not a list of objects.
+fn compacted(details: &Value) -> Value {
+    let mut compact = details.clone();
+    let outcome = compact["outcome"]
+        .as_object_mut()
+        .expect("an outcome object");
+    outcome.remove("steps");
+    outcome.remove("evidence");
+    for requirement in outcome["requirements"]
+        .as_array_mut()
+        .expect("a requirements list")
+    {
+        let fields = requirement.as_object_mut().expect("a requirement object");
+        fields.remove("check");
+        fields.remove("provenance");
+    }
+    compact
+}
+
+/// Read `execution`'s details as `jwt` once its result is visible.
+///
+/// # Panics
+/// Panics when the result never becomes visible or the details read fails.
+async fn visible_details(server: &WyrdTestServer, jwt: &str, execution: &str) -> Value {
+    let uri = format!("/v1/verification/executions/{execution}");
+    let deadline = tokio::time::Instant::now() + VISIBLE;
+    loop {
+        let (status, state) = get(server, jwt, &uri).await;
+        assert!(
+            status == StatusCode::OK
+                || state["code"] == "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND",
+            "{status}: {state}"
+        );
+        if state.get("result").is_some_and(|result| !result.is_null()) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "execution {execution} never published its result: {state}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let (status, details) = get(server, jwt, &format!("{uri}/details")).await;
+    assert_eq!(status, StatusCode::OK, "{details}");
+    details
+}
+
+/// Direct and queued executions answer compact results, and their details
+/// read back exactly what ran from the retained records: the authored
+/// checks, the code step with its provenance, and the pinned answer. The
+/// details agree with the result on identity and every judgment, and a
+/// repeated read returns the same details without judging again.
+///
+/// # Panics
+/// Panics when the server fails to start, a fixture write fails, a route
+/// fails to respond, or any compact, detailed, or repeated field differs.
+#[tokio::test(flavor = "current_thread")]
+async fn details_preserve_retained_execution_evidence() {
+    let server = WyrdTestServer::builder()
+        .with_verification_runtime_for_test()
+        .start_bound()
+        .await
+        .expect("test server starts");
+    let fixture = Fixture::seed(&server).await;
+    let spec = tallied();
+    let verifier = fixture
+        .seed
+        .verifier("vr-tallied", &spec)
+        .await
+        .expect("tallied Verifier registers");
+    let (_, jwt) = user(&server, "vr-details-writer", &["editor"]).await;
+    let body = fixture.request(&verifier, json!(1));
+
+    let (status, direct) = execute(&server, &jwt, body.to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{direct}");
+    let (status, accepted) = enqueue(&server, &jwt, &body, None).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    let queued = accepted["execution_id"].as_str().expect("id").to_owned();
+    let direct_id = direct["execution_id"].as_str().expect("id").to_owned();
+    assert_eq!(
+        direct["outcome"]
+            .as_object()
+            .map(|outcome| outcome.keys().map(String::as_str).collect::<BTreeSet<_>>()),
+        Some(BTreeSet::from(["requirements", "verdict"])),
+        "{direct}"
+    );
+    assert_eq!(direct["outcome"]["verdict"], "passed", "{direct}");
+
+    server.flush_bifrost().await.expect("Scribe flushes");
+    for execution in [&direct_id, &queued] {
+        let details = visible_details(&server, &jwt, execution).await;
+        let (_, state) = get(
+            &server,
+            &jwt,
+            &format!("/v1/verification/executions/{execution}"),
+        )
+        .await;
+        assert_eq!(compacted(&details), state["result"], "{execution}");
+        let checks: Vec<&Value> = details["outcome"]["requirements"]
+            .as_array()
+            .expect("requirements")
+            .iter()
+            .map(|requirement| &requirement["check"])
+            .collect();
+        assert_eq!(
+            checks,
+            [
+                &spec["steps"][0]["requirements"][0]["check"],
+                &spec["requirements"][0]["check"]
+            ],
+            "{details}"
+        );
+        let step = &details["outcome"]["steps"][0];
+        assert_eq!(
+            (&step["id"], &step["status"], &step["output"]),
+            (&json!("tally"), &json!("succeeded"), &json!({ "words": 1 })),
+            "{details}"
+        );
+        assert_eq!(step["provenance"]["kind"], "code", "{details}");
+        assert_eq!(details["outcome"]["evidence"], body["inputs"], "{details}");
+        let (status, again) = get(
+            &server,
+            &jwt,
+            &format!("/v1/verification/executions/{execution}/details"),
+        )
+        .await;
+        assert_eq!((status, &again), (StatusCode::OK, &details));
+    }
+    assert_eq!(
+        compacted(&visible_details(&server, &jwt, &direct_id).await),
+        direct,
+        "the direct answer is the compact form of its details"
+    );
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Details report absence rather than empty evidence when what they read was
+/// never retained. A known queued execution that has not run keeps its
+/// pending status without a result while its details are not found; a
+/// completed execution whose retained result is unavailable keeps its
+/// completed status without a result while its details are not found; and a
+/// direct execution whose result recording is refused still answers its
+/// compact judgment at once, while its details are not found until the
+/// recording lands.
+///
+/// The queued execution stays queued because this server runs no Verifier
+/// runner. The unavailable result is a completed row naming a result no
+/// record holds. Recording is refused by the Scribe WAL disk-full breaker.
+///
+/// # Panics
+/// Panics when the server fails to start, a fixture write fails, a route
+/// fails to respond, or any status, code, or body differs.
+#[tokio::test(flavor = "current_thread")]
+async fn details_report_absence_when_retained_records_are_missing() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let fixture = Fixture::seed(&server).await;
+    let (_, jwt) = user(&server, "vr-absence-writer", &["editor"]).await;
+    let body = fixture.request(&fixture.assertion, json!(1));
+    let not_found = |execution: &str, (status, body): &(StatusCode, Value)| {
+        assert_eq!(
+            (*status, body["code"].as_str()),
+            (
+                StatusCode::NOT_FOUND,
+                Some("WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND")
+            ),
+            "{execution}: {body}"
+        );
+    };
+
+    let (status, accepted) = enqueue(&server, &jwt, &body, None).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    let queued = execution_id(&accepted);
+    let state = visible_execution(&server, &jwt, queued).await;
+    assert_eq!(state["status"], "pending", "{state}");
+    assert_eq!(state.get("result"), None, "{state}");
+    let details = format!("/v1/verification/executions/{queued}/details");
+    not_found("queued", &get(&server, &jwt, &details).await);
+
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let completed = sqlx::query(
+        "UPDATE wyrd.verifier_executions SET status = 'completed', \
+         result_id = $2, error = NULL, next_attempt_at = NULL, \
+         lease_token = NULL, lease_expires_at = NULL, settled_at = statement_timestamp() \
+         WHERE execution_id = $1",
+    )
+    .bind(queued.as_uuid())
+    .bind(Uuid::now_v7())
+    .execute(&pool)
+    .await
+    .expect("execution completes");
+    assert_eq!(completed.rows_affected(), 1);
+    let state = visible_execution(&server, &jwt, queued).await;
+    assert_eq!(state["status"], "completed", "{state}");
+    assert_eq!(state.get("result"), None, "{state}");
+    not_found("unretained", &get(&server, &jwt, &details).await);
+
+    server
+        .trip_bifrost_wal_disk_full_for_test()
+        .expect("the WAL breaker is reachable");
+    let (status, direct) = execute(&server, &jwt, body.to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{direct}");
+    assert_eq!(direct["outcome"]["verdict"], "passed", "{direct}");
+    assert_eq!(
+        direct["outcome"]
+            .as_object()
+            .map(|outcome| outcome.keys().map(String::as_str).collect::<BTreeSet<_>>()),
+        Some(BTreeSet::from(["requirements", "verdict"])),
+        "{direct}"
+    );
+    let direct_id = direct["execution_id"].as_str().expect("id").to_owned();
+    let uri = format!("/v1/verification/executions/{direct_id}");
+    not_found(
+        "unrecorded",
+        &get(&server, &jwt, &format!("{uri}/details")).await,
+    );
+    not_found("unrecorded status", &get(&server, &jwt, &uri).await);
+
+    server
+        .clear_bifrost_wal_disk_full_injection_for_test()
+        .expect("the WAL breaker is reachable");
+    server.flush_bifrost().await.expect("Scribe flushes");
+    assert_eq!(
+        compacted(&visible_details(&server, &jwt, &direct_id).await),
+        direct,
+        "the recording that lands is the judgment the caller received"
+    );
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Details are readable exactly where the execution status is. An unknown
+/// execution is not found, as is another tenant's. A reader holding
+/// `verifier:read` on the execution's Verifier reads them, and that decision
+/// is audited under the details operation; a caller without it, including one holding only
+/// `verifier:run`, is refused as it is refused the status, and each refusal
+/// is audited as denied.
+///
+/// # Panics
+/// Panics when the server fails to start, a fixture write fails, a route
+/// fails to respond, or any status, code, or audit expectation fails.
+#[tokio::test(flavor = "current_thread")]
+async fn details_preserve_visibility_and_read_authority() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let fixture = Fixture::seed(&server).await;
+    let (_, writer) = user(&server, "vr-visibility-writer", &["editor"]).await;
+    let (status, judged) = execute(
+        &server,
+        &writer,
+        fixture.request(&fixture.assertion, json!(1)).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{judged}");
+    let execution = judged["execution_id"].as_str().expect("id").to_owned();
+    server.flush_bifrost().await.expect("Scribe flushes");
+    let details = visible_details(&server, &writer, &execution).await;
+    let uri = format!("/v1/verification/executions/{execution}/details");
+
+    let (status, unknown) = get(
+        &server,
+        &writer,
+        &format!(
+            "/v1/verification/executions/{}/details",
+            ExecutionId::new_v7()
+        ),
+    )
+    .await;
+    assert_eq!(
+        (status, unknown["code"].as_str()),
+        (
+            StatusCode::NOT_FOUND,
+            Some("WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND")
+        ),
+        "{unknown}"
+    );
+
+    let (reader, reader_jwt) = user(&server, "vr-visibility-reader", &["viewer"]).await;
+    let (status, read) = get(&server, &reader_jwt, &uri).await;
+    assert_eq!((status, &read), (StatusCode::OK, &details));
+    assert_eq!(
+        decisions(&server, "verification.execution.details.read", reader).await,
+        vec![("verifier:read".to_owned(), "allowed".to_owned())]
+    );
+
+    server
+        .seed_role("vr_run_only", &[Permission::verifier_run_any()])
+        .await
+        .expect("run-only role seeds");
+    let denied = vec![("verifier:read".to_owned(), "denied".to_owned())];
+    for (name, roles) in [
+        ("vr-visibility-outsider", &[][..]),
+        ("vr-visibility-runner", &["vr_run_only"][..]),
+    ] {
+        let (principal, jwt) = user(&server, name, roles).await;
+        let (status, problem) = get(&server, &jwt, &uri).await;
+        let (status_read, refused) = get(
+            &server,
+            &jwt,
+            &format!("/v1/verification/executions/{execution}"),
+        )
+        .await;
+        assert_eq!(
+            (status, problem["code"].as_str()),
+            (
+                StatusCode::FORBIDDEN,
+                Some("WYRD_PERMISSION_403_DENIED_RBAC")
+            ),
+            "{name}: {problem}"
+        );
+        assert_eq!(
+            (status_read, &refused["code"]),
+            (status, &problem["code"]),
+            "{name}"
+        );
+        assert_eq!(
+            decisions(&server, "verification.execution.details.read", principal).await,
+            denied,
+            "{name}"
+        );
+    }
+
+    let other: DataTenantId = server.seed_tenant("vr-other").await.expect("tenant seeds");
+    let foreign = server
+        .bootstrap_service_in_tenant(other, "vr-other-admin", &["admin"])
+        .await
+        .expect("foreign admin bootstraps");
+    let foreign_jwt = server
+        .exchange_api_key(foreign.api_key().expect("foreign admin has an API key"))
+        .await
+        .expect("rootless exchange succeeds");
+    let (status, problem) = get(&server, &foreign_jwt, &uri).await;
+    assert_eq!(
+        (status, problem["code"].as_str()),
+        (
+            StatusCode::NOT_FOUND,
+            Some("WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND")
+        ),
+        "{problem}"
+    );
+    server.shutdown().await.expect("test server shuts down");
 }

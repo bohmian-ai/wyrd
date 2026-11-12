@@ -37,7 +37,7 @@ use vala_bifrost_redux::gate::limits::IngestLimits;
 use vala_bifrost_redux::maintenance::{StagingFilePublisher, staging_file_channel};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::resources::{
-    BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, ResourceSource,
+    BifrostRole, BifrostRuntimeResources, ResourceSource, ScribeWorkerOverrides,
     SystemResourceSnapshot,
 };
 use vala_bifrost_redux::scribe::ScribeImpl;
@@ -480,7 +480,10 @@ pub struct WyrdTestServerBuilder {
     scribe_ingest_limits: IngestLimits,
     /// Optional `scribe.outbox_capacity` the bound server's Scribe outbox admits.
     scribe_outbox_capacity: Option<usize>,
-    scribe_persistence_cpu_threads: Option<usize>,
+    /// Explicit Scribe worker counts; omitted ones derive from effective CPU.
+    scribe_workers: ScribeWorkerOverrides,
+    /// Optional `bifrost.resources.effective_cpu` cap on the injected CPU.
+    effective_cpu_cap: Option<usize>,
     /// Optional projection of production Scribe rotation limits for real-server journeys.
     scribe_geometry_for_test: Option<vala_bifrost_redux::scribe::geometry::ScribeGeometry>,
     /// Optional faults installed in the real Scribe persistence graph for journeys.
@@ -666,7 +669,8 @@ impl Default for WyrdTestServerBuilder {
             scribe_admission: None,
             scribe_ingest_limits: IngestLimits::default(),
             scribe_outbox_capacity: None,
-            scribe_persistence_cpu_threads: None,
+            scribe_workers: ScribeWorkerOverrides::default(),
+            effective_cpu_cap: None,
             scribe_geometry_for_test: None,
             scribe_persistence_faults_for_test: None,
             role_timing: None,
@@ -4853,7 +4857,27 @@ impl WyrdTestServerBuilder {
     /// budget instead of inheriting the host's parallelism.
     #[must_use]
     pub const fn with_scribe_persistence_cpu_threads_for_test(mut self, threads: usize) -> Self {
-        self.scribe_persistence_cpu_threads = Some(threads);
+        self.scribe_workers.persistence_cpu_threads = Some(threads);
+        self
+    }
+
+    /// Sets the explicit `scribe.coordination_threads`,
+    /// `scribe.ingress_cpu_threads`, and `scribe.persistence_cpu_threads`;
+    /// `None` leaves a count to the resource plan.
+    #[must_use]
+    pub(crate) const fn with_scribe_workers_for_test(
+        mut self,
+        workers: ScribeWorkerOverrides,
+    ) -> Self {
+        self.scribe_workers = workers;
+        self
+    }
+
+    /// Sets `bifrost.resources.effective_cpu`, the operator cap that may only
+    /// lower the injected or detected CPU.
+    #[must_use]
+    pub(crate) const fn with_effective_cpu_cap_for_test(mut self, cpu: usize) -> Self {
+        self.effective_cpu_cap = Some(cpu);
         self
     }
 
@@ -5184,20 +5208,27 @@ impl WyrdTestServerBuilder {
             memory_source: ResourceSource::Injected,
             cpu_source: ResourceSource::Injected,
         });
+        // The same configuration boot reads, projected onto the resource
+        // policy through the production translation.
+        let mut bifrost_config = wyrd_server::config::BifrostRuntimeConfig::default();
+        bifrost_config.resources.effective_cpu = self.effective_cpu_cap;
+        bifrost_config.resources.oracle_query_slot_limit = self.oracle_query_slot_limit;
+        bifrost_config.resources.oracle_partition_scan_bytes = self.oracle_partition_scan_bytes;
+        bifrost_config.scribe.coordination_threads = self.scribe_workers.coordination_threads;
+        bifrost_config.scribe.ingress_cpu_threads = self.scribe_workers.ingress_cpu_threads;
+        bifrost_config.scribe.persistence_cpu_threads = self.scribe_workers.persistence_cpu_threads;
+        bifrost_config.scribe.ingest_request_bytes = self.scribe_ingest_limits.max_frame_bytes;
+        if let Some(capacity) = self.scribe_outbox_capacity {
+            bifrost_config.scribe.outbox_capacity = capacity;
+        }
+        bifrost_config.storage = self.bifrost_storage_io;
+        if let Some(oracle) = self.oracle_runtime.clone() {
+            bifrost_config.oracle = oracle;
+        }
         let runtime_resources =
             BifrostRuntimeResources::from_snapshot_with_transport_message_limit(
                 snapshot,
-                BifrostResourcePolicy {
-                    roles: resource_roles,
-                    server_memory_min_bytes: None,
-                    bifrost_memory_limit_bytes: None,
-                    scratch_limit_bytes: None,
-                    effective_cpu: None,
-                    oracle_query_slot_limit: self.oracle_query_slot_limit,
-                    oracle_partition_scan_bytes: self.oracle_partition_scan_bytes,
-                    scratch_root: Some(scratch_root),
-                    volume_roots,
-                },
+                bifrost_config.resource_policy(resource_roles, Some(scratch_root), volume_roots),
                 self.scribe_ingest_limits.max_frame_bytes,
             )
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
@@ -5301,19 +5332,9 @@ impl WyrdTestServerBuilder {
             .transpose()?;
         let mut config = WyrdServerConfig {
             role: target,
+            bifrost: bifrost_config,
             ..WyrdServerConfig::default()
         };
-        config.bifrost.scribe.ingest_request_bytes = self.scribe_ingest_limits.max_frame_bytes;
-        if let Some(capacity) = self.scribe_outbox_capacity {
-            config.bifrost.scribe.outbox_capacity = capacity;
-        }
-        if let Some(threads) = self.scribe_persistence_cpu_threads {
-            config.bifrost.scribe.persistence_cpu_threads = threads;
-        }
-        config.bifrost.storage = self.bifrost_storage_io;
-        if let Some(oracle) = self.oracle_runtime.clone() {
-            config.bifrost.oracle = oracle;
-        }
         config.forge = ForgeRuntimeConfig {
             maintenance_interval_secs: Some(self.forge_interval.as_secs()),
             ..ForgeRuntimeConfig::default()
@@ -6175,6 +6196,7 @@ mod production_composition_tests {
                 bifrost_memory_limit_bytes: None,
                 scratch_limit_bytes: None,
                 effective_cpu: None,
+                scribe_workers: vala_bifrost_redux::resources::ScribeWorkerOverrides::default(),
                 oracle_query_slot_limit: None,
                 oracle_partition_scan_bytes: None,
                 scratch_root: Some(scratch.path().to_owned()),

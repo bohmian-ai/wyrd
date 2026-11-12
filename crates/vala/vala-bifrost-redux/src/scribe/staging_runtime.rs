@@ -789,7 +789,9 @@ impl ScribeStagingRuntime {
     /// `members` are the members restore keeps. The schema is read from their
     /// runs only: a key can also hold the leftovers of a claim that already
     /// committed, and restore has removed those members' runs by the time it
-    /// rebuilds the key.
+    /// rebuilds the key. The run writer's footer identity keys are dropped from
+    /// the reconstructed schema, so a resumed claim seals the same bytes as the
+    /// claim the live context assembled.
     ///
     /// # Errors
     ///
@@ -811,11 +813,18 @@ impl ScribeStagingRuntime {
                 detail: "a recovered staged key names no run to read its schema from".to_owned(),
             })?;
         let physical = Arc::clone(crate::scribe::member_stager::preflight_run(&run)?.schema());
-        let schema = Arc::new(crate::schema::logical_schema(&physical).map_err(|detail| {
-            ScribeError::Internal {
+        let mut schema =
+            crate::schema::logical_schema(&physical).map_err(|detail| ScribeError::Internal {
                 detail: format!("reconstruct a recovered staged run's logical schema: {detail}"),
-            }
-        })?);
+            })?;
+        for key in [
+            crate::parquet::footer::KEY_SCHEMA,
+            crate::parquet::footer::KEY_OBJECT,
+            crate::parquet::footer::KEY_TENANT,
+        ] {
+            schema.metadata.remove(key);
+        }
+        let schema = Arc::new(schema);
         if crate::parquet::footer::schema_fingerprint(schema.as_ref()) != key.schema_fingerprint() {
             return Err(ScribeError::Internal {
                 detail: "a recovered staged run's schema is not the schema its key names"

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::wire::anthropic_citation::AnthropicCitationV1;
-use crate::wire::common::TokenUsage;
+use crate::wire::common::{SharedSchema, TokenUsage};
 
 /// `POST /v1/messages`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -237,7 +237,7 @@ pub enum AnthropicOutputFormat {
     /// JSON schema enforced by Anthropic at generation time.
     JsonSchema {
         /// JSON Schema object describing the response shape.
-        schema: Value,
+        schema: SharedSchema,
     },
 }
 

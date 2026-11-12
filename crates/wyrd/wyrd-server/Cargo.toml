@@ -8,8 +8,11 @@ repository = { workspace = true }
 authors = { workspace = true }
 
 [features]
-# The benchmark Scribe stage/publish control; only `bench:build` enables it.
-bench = []
+# Benchmark-only server surfaces: the benchmark recorder and its snapshot,
+# every benchmark timing, the Scribe stage/publish control, and the sampled
+# heap profile. Only `bench:build` enables it; a build without it records only
+# operational metrics and refuses `metrics.benchmark_snapshot`.
+bench = ["wyrd-benchmark/bench"]
 cloud = ["wyrd-storage/cloud", "vala-bifrost-redux/cloud"]
 storage-emulator = ["cloud", "wyrd-storage/emulator"]
 test-support = [
@@ -25,6 +28,7 @@ path = "src/main.rs"
 
 [dependencies]
 bohmian-code-review-pipeline = { workspace = true }
+wyrd-benchmark = { workspace = true }
 mimalloc = { workspace = true }
 async-stream = { workspace = true }
 futures-util = { workspace = true }
@@ -126,6 +130,9 @@ zip = { workspace = true }
 [dev-dependencies]
 bohmian-code-review-pipeline = { workspace = true, features = ["testing"] }
 sha1 = { workspace = true }
+# The benchmark recorder, snapshot, and heap routes are proved in every lane
+# that builds this crate's tests.
+wyrd-server = { path = ".", features = ["bench"] }
 object_store = { workspace = true }
 workspace-hack.workspace = true
 tracing-subscriber = { workspace = true }

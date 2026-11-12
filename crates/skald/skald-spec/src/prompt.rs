@@ -1,5 +1,7 @@
-use std::collections::HashSet;
-use std::sync::OnceLock;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -13,6 +15,7 @@ use crate::wire::anthropic_messages::{
     AnthropicContentBlock, AnthropicDocumentSource, AnthropicImageSource, AnthropicMessagesRequest,
     AnthropicMessagesSettings, AnthropicSystem, AnthropicSystemBlock,
 };
+use crate::wire::common::SharedSchema;
 use crate::wire::google_generate::{
     GoogleContent, GoogleFileData, GoogleGenerateContentRequest, GoogleGenerateSettings,
     GoogleInlineData, GooglePart,
@@ -37,9 +40,10 @@ pub struct Prompt {
     pub request: ProviderRequest,
     /// Provider model identifier.
     pub model: String,
-    /// Text placeholder names `render` requires, derived from the request.
+    /// Text placeholder names `render` requires: those the request was
+    /// constructed with or a content edit authored, less those bound since.
     pub variables: Vec<String>,
-    /// Media placeholder names `bind_media` fills, derived from the request.
+    /// Media placeholder names `bind_media` fills, declared like `variables`.
     pub media_variables: Vec<String>,
     /// Expected response shape, derived from the request's output field.
     pub response_type: ResponseType,
@@ -48,10 +52,10 @@ pub struct Prompt {
     /// When absent, native dispatch uses the request dialect's default
     /// provider. Gateway routes select their own upstream and ignore it.
     pub provider: Option<ProviderName>,
-    /// The authored form this Prompt was compiled from, when it still
-    /// describes the request; absent after construction from a request or a
-    /// binding, when the native form is derived from the request instead.
-    pub(crate) authored: Option<Box<AuthoredPrompt>>,
+    /// The authored form this Prompt was compiled from and what that compile
+    /// produced; absent after construction from a request or a binding, when
+    /// the native form is derived from the request instead. Clones share it.
+    pub(crate) authored: Option<Arc<Compiled>>,
     /// Media kind each portable `${media:name}` binding requires, derived
     /// from its image or document block at compile time. Native placeholders
     /// carry no kind and are absent; the list survives text and media binds.
@@ -59,6 +63,28 @@ pub struct Prompt {
     /// The host-named response format this Prompt was authored with; it
     /// survives binds so an unresolved name keeps refusing to render.
     pub(crate) named_format: Option<NamedFormat>,
+    /// The `variables` the replaceable system slot still declares: Responses
+    /// `instructions`, Anthropic `system`, or GenerateContent
+    /// `system_instruction`. Replacing that slot replaces these alone.
+    pub(crate) system_variables: Vec<String>,
+    /// The `variables` the rest of the request still declares, including
+    /// `OpenAI` Chat system messages, which a system edit never replaces.
+    pub(crate) body_variables: Vec<String>,
+}
+
+/// An authored Prompt beside the request, model, and dispatch provider its
+/// compile produced. Compiling is deterministic, so while a Prompt's public
+/// fields still equal these, the authored form describes it exactly.
+#[derive(Debug)]
+pub(crate) struct Compiled {
+    /// The authored form.
+    pub(crate) authored: AuthoredPrompt,
+    /// The compiled request.
+    pub(crate) request: ProviderRequest,
+    /// The compiled model.
+    pub(crate) model: String,
+    /// The compiled dispatch provider.
+    pub(crate) provider: Option<ProviderName>,
 }
 
 /// A named authored response format and the schema its host resolved.
@@ -66,9 +92,9 @@ pub struct Prompt {
 pub(crate) struct NamedFormat {
     /// The authored format name.
     pub(crate) name: String,
-    /// The resolved schema; `None` until compiled through
-    /// [`AuthoredPrompt::compile_with`].
-    pub(crate) schema: Option<serde_json::Map<String, Value>>,
+    /// Whether its host resolved the schema, which then lives only in the
+    /// request; false until compiled through [`AuthoredPrompt::compile_with`].
+    pub(crate) resolved: bool,
 }
 
 /// Prompts are equal when they serialize to the same authored form; a
@@ -153,8 +179,8 @@ pub enum ResponseType {
     JsonSchema {
         /// Schema name used in diagnostics and provider-native structured output fields.
         name: String,
-        /// JSON Schema object.
-        schema: serde_json::Value,
+        /// JSON Schema object, shared with the request that sends it.
+        schema: SharedSchema,
     },
 }
 
@@ -270,6 +296,243 @@ pub fn check_output_schema(schema: &Value, field: &str, object_root: bool) -> Sk
     Ok(())
 }
 
+/// Most distinct schemas one [`PreparedSchemas`] map keeps, and most edits
+/// it keeps of one schema, before it forgets them all.
+const PREPARED_SCHEMAS: usize = 256;
+
+/// Immutable preparation of exact JSON Schemas reused across calls: the
+/// compiled validator of each schema, which schemas already passed
+/// [`check_output_schema`] for an object-root or any-root destination, and
+/// what each named edit of a schema produced.
+///
+/// A host whose lifetime spans many calls owns one and lends it to each call
+/// that sends or checks a schema, so repeated calls with an unchanged schema
+/// skip meta-validation, compilation, and re-editing. A schema seen before
+/// is found by the identity of its [`SharedSchema`]; any other is found by a
+/// structural hash and matched by exact equality, so a lookup never
+/// serializes or copies the schema: a changed, narrowed, or hook-replaced
+/// schema is a different entry and is prepared again, never validated by a
+/// stale entry.
+/// It holds only schemas, their validators, and edit names, never request
+/// contents, media, tools, or caller authority. Each map is bounded at
+/// [`PREPARED_SCHEMAS`] schemas; reaching the bound forgets every entry,
+/// after which schemas are prepared again.
+#[derive(Debug, Default)]
+pub struct PreparedSchemas {
+    /// Schemas with their compiled validators.
+    validators: Mutex<SchemaMap<Arc<jsonschema::Validator>>>,
+    /// Schemas that passed [`check_output_schema`] for an any-root (index 0)
+    /// or object-root (index 1) destination.
+    checked: [Mutex<SchemaMap<()>>; 2],
+    /// Schemas with the schema each named edit produced from them.
+    edited: Mutex<SchemaMap<Vec<(String, SharedSchema)>>>,
+}
+
+/// Where a [`SchemaMap`] keeps one schema: its [`schema_hash`] and its
+/// position among the schemas of that hash.
+type Slot = (u64, usize);
+
+/// Values kept per schema, found by the identity of a [`SharedSchema`] seen
+/// before and by content otherwise.
+///
+/// Every schema it holds, kept or merely seen, is held by a clone, so no
+/// other schema can take its address and a shared schema cannot change
+/// while held: [`SharedSchema::make_mut`] copies a held schema first.
+#[derive(Debug)]
+struct SchemaMap<T> {
+    /// Kept schemas with their values, by [`schema_hash`].
+    entries: HashMap<u64, Vec<(SharedSchema, T)>>,
+    /// Each schema seen, by [`SharedSchema::address`], with where its equal
+    /// kept schema is.
+    seen: HashMap<usize, (SharedSchema, Slot)>,
+}
+
+impl<T> Default for SchemaMap<T> {
+    /// An empty map.
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            seen: HashMap::new(),
+        }
+    }
+}
+
+impl<T> SchemaMap<T> {
+    /// Where `schema` is kept, found in `map` by identity or else by
+    /// content, with the map still locked; `Err` carries its hash when it is
+    /// not kept. The hash is computed unlocked.
+    fn locate<'a>(
+        map: &'a Mutex<Self>,
+        schema: &SharedSchema,
+    ) -> (MutexGuard<'a, Self>, Result<Slot, u64>) {
+        let lock = || map.lock().unwrap_or_else(PoisonError::into_inner);
+        let held = lock();
+        if let Some((_, slot)) = held.seen.get(&schema.address()) {
+            let slot = *slot;
+            return (held, Ok(slot));
+        }
+        drop(held);
+        let hash = schema_hash(schema);
+        let mut held = lock();
+        let index = held
+            .entries
+            .get(&hash)
+            .and_then(|entries| entries.iter().position(|(known, _)| known == schema));
+        match index {
+            Some(index) => {
+                held.see(schema, (hash, index));
+                (held, Ok((hash, index)))
+            }
+            None => (held, Err(hash)),
+        }
+    }
+
+    /// Records that `schema` is the schema kept at `slot`, forgetting
+    /// everything first at the bound.
+    fn see(&mut self, schema: &SharedSchema, slot: Slot) {
+        if self.seen.len() >= PREPARED_SCHEMAS {
+            self.seen.clear();
+        }
+        self.seen.insert(schema.address(), (schema.clone(), slot));
+    }
+
+    /// Keeps `schema`, whose hash is `hash`, with `value`, forgetting every
+    /// entry first at the bound, and returns its slot.
+    fn keep(&mut self, schema: &SharedSchema, hash: u64, value: T) -> Slot {
+        if self.entries.len() >= PREPARED_SCHEMAS {
+            self.entries.clear();
+            self.seen.clear();
+        }
+        let entries = self.entries.entry(hash).or_default();
+        entries.push((schema.clone(), value));
+        let slot = (hash, entries.len() - 1);
+        self.see(schema, slot);
+        slot
+    }
+
+    /// The value kept at `slot`.
+    ///
+    /// # Panics
+    /// Never panics for a slot this map returned under the same lock: slots
+    /// are forgotten together with the entries they point to.
+    fn value(&mut self, (hash, index): Slot) -> &mut T {
+        &mut self
+            .entries
+            .get_mut(&hash)
+            .and_then(|entries| entries.get_mut(index))
+            .expect("a located slot is kept")
+            .1
+    }
+}
+
+/// Structural hash of `schema`, computed without serializing it; equal
+/// schemas with the same key order hash equally.
+fn schema_hash(schema: &Value) -> u64 {
+    /// Feeds `value` to `state`, tagging each node so shapes cannot collide.
+    fn feed(value: &Value, state: &mut impl Hasher) {
+        match value {
+            Value::Null => 0u8.hash(state),
+            Value::Bool(flag) => (1u8, flag).hash(state),
+            Value::Number(number) => (2u8, number).hash(state),
+            Value::String(text) => (3u8, text).hash(state),
+            Value::Array(values) => {
+                (4u8, values.len()).hash(state);
+                for value in values {
+                    feed(value, state);
+                }
+            }
+            Value::Object(fields) => {
+                (5u8, fields.len()).hash(state);
+                for (key, value) in fields {
+                    key.hash(state);
+                    feed(value, state);
+                }
+            }
+        }
+    }
+    let mut state = DefaultHasher::new();
+    feed(schema, &mut state);
+    state.finish()
+}
+
+impl PreparedSchemas {
+    /// The compiled validator of `schema`, compiled now unless an equal
+    /// schema was compiled before; `None` when it does not compile, which is
+    /// never kept.
+    ///
+    /// # Panics
+    /// Never panics: a poisoned lock is recovered, since every entry is
+    /// complete once inserted.
+    #[must_use]
+    pub fn validator(&self, schema: &SharedSchema) -> Option<Arc<jsonschema::Validator>> {
+        let hash = match SchemaMap::locate(&self.validators, schema) {
+            (mut held, Ok(slot)) => return Some(Arc::clone(held.value(slot))),
+            (_, Err(hash)) => hash,
+        };
+        // Compiled unlocked: concurrent first calls may each compile once.
+        let validator = Arc::new(jsonschema::validator_for(schema).ok()?);
+        let mut held = self
+            .validators
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        held.keep(schema, hash, Arc::clone(&validator));
+        Some(validator)
+    }
+
+    /// [`check_output_schema`] of `schema`, skipped when an equal schema
+    /// already passed it with the same `object_root`; only a pass is kept.
+    ///
+    /// # Errors
+    /// Returns [`check_output_schema`]'s refusal at `field`.
+    pub fn check(&self, schema: &SharedSchema, field: &str, object_root: bool) -> SkaldResult<()> {
+        let checked = &self.checked[usize::from(object_root)];
+        let hash = match SchemaMap::locate(checked, schema) {
+            (_, Ok(_)) => return Ok(()),
+            (_, Err(hash)) => hash,
+        };
+        check_output_schema(schema, field, object_root)?;
+        let mut held = checked.lock().unwrap_or_else(PoisonError::into_inner);
+        held.keep(schema, hash, ());
+        Ok(())
+    }
+
+    /// The schema the edit named `edit` produced from `schema` before.
+    #[must_use]
+    fn edited(&self, schema: &SharedSchema, edit: &str) -> Option<SharedSchema> {
+        let (mut held, slot) = SchemaMap::locate(&self.edited, schema);
+        let edits = held.value(slot.ok()?);
+        edits
+            .iter()
+            .find(|(name, _)| name == edit)
+            .map(|(_, edited)| edited.clone())
+    }
+
+    /// Keeps `edited` as what the edit named `edit` produces from `schema`.
+    fn keep_edited(&self, schema: &SharedSchema, edit: &str, edited: SharedSchema) {
+        let (mut held, slot) = SchemaMap::locate(&self.edited, schema);
+        let slot = match slot {
+            Ok(slot) => slot,
+            Err(hash) => held.keep(schema, hash, Vec::new()),
+        };
+        let edits = held.value(slot);
+        if edits.len() >= PREPARED_SCHEMAS {
+            edits.clear();
+        }
+        edits.push((edit.to_owned(), edited));
+    }
+}
+
+/// Native body path of the OpenAI Chat response schema.
+const CHAT_SCHEMA_FIELD: &str = "body.response_format.json_schema.schema";
+/// Native body path of the OpenAI Responses response schema.
+const RESPONSES_SCHEMA_FIELD: &str = "body.text.format.schema";
+/// Native body path of the Anthropic output schema.
+const ANTHROPIC_SCHEMA_FIELD: &str = "body.output_config.format.schema";
+/// Native body path of the GenerateContent JSON Schema.
+const GEMINI_JSON_SCHEMA_FIELD: &str = "body.generation_config.response_json_schema";
+/// Native body path of the GenerateContent OpenAPI-subset schema.
+const GEMINI_SCHEMA_FIELD: &str = "body.generation_config.response_schema";
+
 /// Native body path of a request's output schema, and whether its
 /// destination requires an object root (OpenAI with `strict: true`).
 ///
@@ -280,11 +543,11 @@ fn output_schema_field(request: &ProviderRequest) -> (&'static str, bool) {
 
     match request {
         ProviderRequest::OpenAiChatCompletion(request) => (
-            "body.response_format.json_schema.schema",
+            CHAT_SCHEMA_FIELD,
             matches!(&request.response_format, Some(OpenAiResponseFormat::JsonSchema { json_schema }) if json_schema.strict == Some(true)),
         ),
         ProviderRequest::OpenAiResponses(request) => (
-            "body.text.format.schema",
+            RESPONSES_SCHEMA_FIELD,
             matches!(
                 request.text.as_ref().and_then(|text| text.format.as_ref()),
                 Some(OpenAiTextResponseFormat::JsonSchema {
@@ -293,7 +556,7 @@ fn output_schema_field(request: &ProviderRequest) -> (&'static str, bool) {
                 })
             ),
         ),
-        ProviderRequest::AnthropicMessage(_) => ("body.output_config.format.schema", false),
+        ProviderRequest::AnthropicMessage(_) => (ANTHROPIC_SCHEMA_FIELD, false),
         ProviderRequest::GeminiGenerateContent(request)
             if request
                 .settings
@@ -301,9 +564,9 @@ fn output_schema_field(request: &ProviderRequest) -> (&'static str, bool) {
                 .as_ref()
                 .is_some_and(|config| config.response_json_schema.is_some()) =>
         {
-            ("body.generation_config.response_json_schema", false)
+            (GEMINI_JSON_SCHEMA_FIELD, false)
         }
-        _ => ("body.generation_config.response_schema", false),
+        _ => (GEMINI_SCHEMA_FIELD, false),
     }
 }
 
@@ -382,10 +645,148 @@ impl Prompt {
             authored: None,
             media_kinds: Vec::new(),
             named_format: None,
+            system_variables: Vec::new(),
+            body_variables: Vec::new(),
         };
-        prompt.normalize_media_placeholders_mut()?;
+        scan_system_for_media(&prompt.request)?;
+        prompt.media_variables =
+            dedupe_preserve_order(split_request_text_parts(&mut prompt.request));
         prompt.variables = extract_text_variables(&prompt.request)?;
+        (prompt.system_variables, prompt.body_variables) =
+            slot_variables(&mut prompt.request, &prompt.variables)?;
         Ok(prompt)
+    }
+
+    /// This Prompt with conversation turns appended by `append`, declaring
+    /// only what those turns author.
+    ///
+    /// `append` must only add turns after the existing conversation. Text
+    /// placeholders anywhere in the new turns, including tool results, become
+    /// required `variables`, and their `${media:name}` placeholders are split
+    /// out for [`bind_media`](Self::bind_media). Earlier turns are not
+    /// rescanned, so placeholder-looking text an earlier bind supplied stays
+    /// data. Media kinds, a named format, the destination, bindings, and the
+    /// response type are kept; the authored form no longer describes the
+    /// request, so serialization falls back to the native form.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of `append`, and [`SkaldError::MediaInSystemMessage`]
+    /// when a new `OpenAI` Chat system turn holds a media placeholder.
+    pub fn appended<E: From<SkaldError>>(
+        mut self,
+        append: impl FnOnce(&mut ProviderRequest) -> Result<(), E>,
+    ) -> Result<Self, E> {
+        let start = turn_count(&self.request);
+        append(&mut self.request)?;
+        let mut media = Vec::new();
+        let names = match &mut self.request {
+            ProviderRequest::OpenAiChatCompletion(request) => {
+                let turns = request.messages.get_mut(start..).unwrap_or_default();
+                for turn in turns.iter().filter(|turn| turn.role == "system") {
+                    scan_openai_chat_content(turn.content.as_ref())?;
+                }
+                split_openai_chat(turns, &mut media);
+                extract_text_variables(turns)?
+            }
+            ProviderRequest::OpenAiResponses(request) => match &mut request.input {
+                OpenAiResponsesInput::Items(items) => {
+                    let turns = items.get_mut(start..).unwrap_or_default();
+                    split_openai_response_items(turns, &mut media);
+                    extract_text_variables(turns)?
+                }
+                OpenAiResponsesInput::Text(_) => Vec::new(),
+            },
+            ProviderRequest::AnthropicMessage(request) => {
+                let turns = request.messages.get_mut(start..).unwrap_or_default();
+                split_anthropic(turns, &mut media);
+                extract_text_variables(turns)?
+            }
+            ProviderRequest::GeminiGenerateContent(request) => {
+                let turns = request.contents.get_mut(start..).unwrap_or_default();
+                split_google(turns, &mut media);
+                extract_text_variables(turns)?
+            }
+            ProviderRequest::OpenAiEmbeddings(_)
+            | ProviderRequest::GoogleBatchEmbed(_)
+            | ProviderRequest::VertexPredict(_)
+            | ProviderRequest::JevSystemOne(_)
+            | ProviderRequest::RawV1 { .. } => Vec::new(),
+        };
+        self.media_variables.extend(media);
+        self.media_variables = dedupe_preserve_order(std::mem::take(&mut self.media_variables));
+        self.declare(&names);
+        self.body_variables.extend(names);
+        self.body_variables = dedupe_preserve_order(std::mem::take(&mut self.body_variables));
+        self.authored = None;
+        Ok(self)
+    }
+
+    /// This Prompt with its system text set to `text`, declaring what `text`
+    /// authors.
+    ///
+    /// Responses, Anthropic, and GenerateContent replace their system slot,
+    /// so requirements only the replaced text declared are dropped; `OpenAI`
+    /// Chat inserts another system message first and keeps the earlier ones.
+    /// Everything else is kept as by [`appended`](Self::appended).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SkaldError::ProviderUnsupported`] when the request format
+    /// has no system text, [`SkaldError::MediaInSystemMessage`] when `text`
+    /// holds a media placeholder, and a serialization error when the request
+    /// cannot be scanned.
+    pub fn system_replaced(mut self, text: String) -> SkaldResult<Self> {
+        scan_text_for_system_media(&text)?;
+        let names = extract_text_variables(&text)?;
+        match &mut self.request {
+            ProviderRequest::OpenAiChatCompletion(request) => {
+                request.messages.insert(
+                    0,
+                    crate::wire::openai_chat::OpenAiChatMessage {
+                        role: "system".to_owned(),
+                        content: Some(OpenAiMessageContent::Text(text)),
+                        ..Default::default()
+                    },
+                );
+                self.declare(&names);
+                self.body_variables.extend(names);
+                self.body_variables =
+                    dedupe_preserve_order(std::mem::take(&mut self.body_variables));
+                self.authored = None;
+                return Ok(self);
+            }
+            ProviderRequest::OpenAiResponses(request) => request.instructions = Some(text),
+            ProviderRequest::AnthropicMessage(request) => {
+                request.system = Some(AnthropicSystem::Blocks(vec![AnthropicSystemBlock::Text {
+                    text,
+                    cache_control: None,
+                }]));
+            }
+            ProviderRequest::GeminiGenerateContent(request) => {
+                request.system_instruction = Some(GoogleContent {
+                    role: "user".to_owned(),
+                    parts: vec![GooglePart::Text { text }],
+                });
+            }
+            other => return Err(SkaldError::provider_unsupported(other.provider(), "system")),
+        }
+        let replaced = std::mem::replace(&mut self.system_variables, names.clone());
+        let body = &self.body_variables;
+        self.variables
+            .retain(|name| !replaced.contains(name) || names.contains(name) || body.contains(name));
+        self.declare(&names);
+        self.authored = None;
+        Ok(self)
+    }
+
+    /// Adds `names` absent from `variables` after the existing ones.
+    fn declare(&mut self, names: &[String]) {
+        for name in names {
+            if !self.variables.contains(name) {
+                self.variables.push(name.clone());
+            }
+        }
     }
 
     /// Return the authored form this Prompt serializes as.
@@ -400,23 +801,13 @@ impl Prompt {
     /// Returns [`SkaldError::PromptInvalid`] when the request kind is not a
     /// Prompt format, such as embeddings or a raw body.
     pub fn authored(&self) -> SkaldResult<std::borrow::Cow<'_, AuthoredPrompt>> {
-        // ponytail: recompiles to detect public-field mutation; make the
-        // fields private if Prompt serialization ever shows up in a profile.
         match self.authored.as_deref() {
-            Some(authored)
-                if authored
-                    .compile_resolved(
-                        self.named_format
-                            .as_ref()
-                            .and_then(|format| format.schema.clone()),
-                    )
-                    .is_ok_and(|compiled| {
-                        compiled.request == self.request
-                            && compiled.model == self.model
-                            && compiled.provider == self.provider
-                    }) =>
+            Some(compiled)
+                if compiled.request == self.request
+                    && compiled.model == self.model
+                    && compiled.provider == self.provider =>
             {
-                Ok(std::borrow::Cow::Borrowed(authored))
+                Ok(std::borrow::Cow::Borrowed(&compiled.authored))
             }
             _ => AuthoredPrompt::native(self.provider(), &self.model, &self.request)
                 .map(std::borrow::Cow::Owned),
@@ -478,17 +869,6 @@ impl Prompt {
         }
     }
 
-    /// Split `${media:name}` tokens into isolated provider-native text parts.
-    ///
-    /// This is idempotent and rejects media placeholders in system content.
-    pub fn normalize_media_placeholders_mut(&mut self) -> SkaldResult<()> {
-        scan_system_for_media(&self.request)?;
-        let mut names = split_request_text_parts(&mut self.request);
-        names.extend(self.media_variables.iter().cloned());
-        self.media_variables = dedupe_preserve_order(names);
-        Ok(())
-    }
-
     /// Return a copy with the supplied `${name}` or `{{name}}` placeholders bound.
     ///
     /// This is the reusable primitive behind higher-level prompt binding. It performs
@@ -517,12 +897,12 @@ impl Prompt {
     /// and a deserialization error when the substituted request no longer
     /// decodes as its provider variant.
     pub fn bind_mut(&mut self, vars: &[(&str, &str)]) -> SkaldResult<()> {
-        let mut request = serde_json::to_value(&self.request).map_err(SkaldError::serialize)?;
-        replace_string_leaves(&mut request, vars);
-        self.request = serde_json::from_value(request).map_err(SkaldError::deserialize)?;
+        substitute(&mut self.request, vars)?;
         self.authored = None;
-        self.variables
-            .retain(|name| !vars.iter().any(|(key, _)| key == name));
+        let unbound = |name: &String| !vars.iter().any(|(key, _)| key == name);
+        self.variables.retain(unbound);
+        self.system_variables.retain(unbound);
+        self.body_variables.retain(unbound);
         Ok(())
     }
 
@@ -564,7 +944,6 @@ impl Prompt {
         }
         let provider = self.provider();
         check_media_source(&self.request, provider.clone(), name, media)?;
-        self.normalize_media_placeholders_mut()?;
         match &mut self.request {
             ProviderRequest::OpenAiChatCompletion(request) => {
                 bind_media_openai_chat(request, name, media)?;
@@ -605,11 +984,7 @@ impl Prompt {
     /// format its host has not resolved, and the missing-variable, media,
     /// and binding errors otherwise.
     pub fn render(&self, vars: &[(&str, &str)]) -> SkaldResult<ProviderRequest> {
-        if let Some(format) = self
-            .named_format
-            .as_ref()
-            .filter(|format| format.schema.is_none())
-        {
+        if let Some(format) = self.named_format.as_ref().filter(|format| !format.resolved) {
             return Err(invalid(
                 "response_format",
                 &format!(
@@ -618,18 +993,17 @@ impl Prompt {
                 ),
             ));
         }
-        let mut prompt = self.clone();
-        prompt.normalize_media_placeholders_mut()?;
-        if let Some(name) = prompt.media_variables.first() {
+        if let Some(name) = self.media_variables.first() {
             return Err(SkaldError::MissingMediaVariable { name: name.clone() });
         }
-        for name in &prompt.variables {
+        for name in &self.variables {
             vars.iter()
                 .find(|(key, _)| key == name)
                 .ok_or_else(|| SkaldError::missing_variable(name))?;
         }
-        prompt.bind_mut(vars)?;
-        Ok(prompt.request)
+        let mut request = self.request.clone();
+        substitute(&mut request, vars)?;
+        Ok(request)
     }
 
     /// Applies `edit` to the response schema inside the native request and
@@ -638,92 +1012,231 @@ impl Prompt {
     ///
     /// A host uses it on a per-call copy, for example to narrow a schema to
     /// what one invocation may answer; the edit is the host's, and Skald
-    /// never interprets it. A Prompt without a response schema is unchanged.
+    /// never interprets it. `name` names the edit: the same name applied to
+    /// an equal schema must produce an equal schema, so `schemas` reuses the
+    /// schema an earlier edit of that name produced, shared rather than
+    /// edited again. A Prompt without a response schema is unchanged.
     ///
     /// # Errors
     ///
     /// Returns [`SkaldError::PromptInvalid`] at the schema's native body path
     /// when the edited schema is invalid for its destination (see
-    /// [`check_output_schema`]).
-    pub fn edit_response_schema_mut(&mut self, edit: impl FnOnce(&mut Value)) -> SkaldResult<()> {
+    /// [`check_output_schema`]), leaving the Prompt unchanged; `schemas`
+    /// skips that check for an edited schema it already passed.
+    pub fn edit_response_schema_mut(
+        &mut self,
+        schemas: &PreparedSchemas,
+        name: &str,
+        edit: impl FnOnce(&mut Value),
+    ) -> SkaldResult<()> {
+        let Some((_, schema)) = ResponseType::schema(&self.request) else {
+            return Ok(());
+        };
+        let schema = schema.clone();
+        let (field, object_root) = output_schema_field(&self.request);
+        let (edited, kept) = if let Some(edited) = schemas.edited(&schema, name) {
+            (edited, true)
+        } else {
+            let mut edited = schema.clone();
+            edit(edited.make_mut());
+            (edited, false)
+        };
+        schemas.check(&edited, field, object_root)?;
+        if !kept {
+            schemas.keep_edited(&schema, name, edited.clone());
+        }
+        if let Some((_, field)) = self.request.take_response_schema() {
+            self.request.set_response_schema(field, edited);
+        }
+        self.response_type = ResponseType::of(&self.request);
+        Ok(())
+    }
+}
+
+/// Replaces each `${name}` and `{{name}}` in `vars` inside the JSON string
+/// leaves of `request`, in `vars` order: the one substitution behind
+/// [`Prompt::bind_mut`] and [`Prompt::render`].
+///
+/// Each pattern is built once per call rather than once per leaf, and a leaf
+/// holding neither `$` nor `{{` is left untouched without a scan per name.
+/// The response schema, the largest subtree, is taken out first and
+/// substituted in place, copied only when it holds a placeholder, so only
+/// the rest of the request makes the JSON round trip; with no `vars`
+/// nothing changes and nothing is serialized.
+///
+/// # Errors
+///
+/// Returns a serialization error when `request` cannot be serialized and a
+/// deserialization error when the substituted request no longer decodes as
+/// its provider variant; `request` is then unchanged.
+fn substitute(request: &mut ProviderRequest, vars: &[(&str, &str)]) -> SkaldResult<()> {
+    if vars.is_empty() {
+        return Ok(());
+    }
+    let patterns: Vec<_> = vars
+        .iter()
+        .map(|(name, value)| (format!("${{{name}}}"), format!("{{{{{name}}}}}"), *value))
+        .collect();
+    let schema = request.take_response_schema();
+    let substituted = serde_json::to_value(&*request)
+        .map_err(SkaldError::serialize)
+        .and_then(|mut value| {
+            replace_string_leaves(&mut value, &patterns);
+            serde_json::from_value::<ProviderRequest>(value).map_err(SkaldError::deserialize)
+        });
+    let schema = schema.map(|(mut schema, field)| {
+        // A schema without placeholders stays shared rather than copied.
+        if substituted.is_ok() && has_patterns(&schema, &patterns) {
+            replace_string_leaves(schema.make_mut(), &patterns);
+        }
+        (schema, field)
+    });
+    let result = substituted.map(|substituted| *request = substituted);
+    if let Some((schema, field)) = schema {
+        request.set_response_schema(field, schema);
+    }
+    result
+}
+
+impl ProviderRequest {
+    /// Moves the structured-output schema out of this request, returning it
+    /// with its native body path (see [`output_schema_field`]) and leaving
+    /// the field absent; `None` when the request declares no schema.
+    ///
+    /// Rendering takes it before the rest of the request round-trips and
+    /// puts it back with [`set_response_schema`](Self::set_response_schema),
+    /// so the schema is never copied.
+    fn take_response_schema(&mut self) -> Option<(SharedSchema, &'static str)> {
         use crate::wire::anthropic_messages::AnthropicOutputFormat;
         use crate::wire::openai_chat::OpenAiResponseFormat;
         use crate::wire::openai_responses::OpenAiTextResponseFormat;
 
-        /// Applies `edit` to an object-typed schema field.
-        fn object(schema: &mut serde_json::Map<String, Value>, edit: impl FnOnce(&mut Value)) {
-            let mut value = Value::Object(std::mem::take(schema));
-            edit(&mut value);
-            if let Value::Object(edited) = value {
-                *schema = edited;
-            }
-        }
-        match &mut self.request {
-            ProviderRequest::OpenAiChatCompletion(request) => {
-                if let Some(OpenAiResponseFormat::JsonSchema { json_schema }) =
-                    &mut request.response_format
-                    && let Some(schema) = &mut json_schema.schema
-                {
-                    object(schema, edit);
-                }
-            }
+        match self {
+            ProviderRequest::OpenAiChatCompletion(request) => match &mut request.response_format {
+                Some(OpenAiResponseFormat::JsonSchema { json_schema }) => json_schema
+                    .schema
+                    .take()
+                    .map(|schema| (schema.into(), CHAT_SCHEMA_FIELD)),
+                _ => None,
+            },
             ProviderRequest::OpenAiResponses(request) => {
-                if let Some(OpenAiTextResponseFormat::JsonSchema {
-                    schema: Some(schema),
-                    ..
-                }) = request.text.as_mut().and_then(|text| text.format.as_mut())
-                {
-                    object(schema, edit);
+                match request.text.as_mut().and_then(|text| text.format.as_mut()) {
+                    Some(OpenAiTextResponseFormat::JsonSchema { schema, .. }) => schema
+                        .take()
+                        .map(|schema| (schema.into(), RESPONSES_SCHEMA_FIELD)),
+                    _ => None,
                 }
             }
             ProviderRequest::AnthropicMessage(request) => {
-                if let Some(config) = &mut request.output_config {
+                request.output_config.as_mut().map(|config| {
                     let AnthropicOutputFormat::JsonSchema { schema } = &mut config.format;
-                    edit(schema);
+                    let schema = std::mem::replace(schema, SharedSchema::new(Value::Null));
+                    (schema, ANTHROPIC_SCHEMA_FIELD)
+                })
+            }
+            ProviderRequest::GeminiGenerateContent(request) => {
+                let config = request.settings.generation_config.as_mut()?;
+                match config.response_json_schema.take() {
+                    Some(schema) => Some((schema, GEMINI_JSON_SCHEMA_FIELD)),
+                    None => config
+                        .response_schema
+                        .take()
+                        .map(|schema| (schema, GEMINI_SCHEMA_FIELD)),
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Puts `schema` back at `field`, a native body path
+    /// [`take_response_schema`](Self::take_response_schema) returned for a
+    /// request of this kind and format; any other path, or a non-object
+    /// schema for an object-typed field, leaves the request unchanged.
+    fn set_response_schema(&mut self, field: &str, schema: SharedSchema) {
+        use crate::wire::anthropic_messages::AnthropicOutputFormat;
+        use crate::wire::openai_chat::OpenAiResponseFormat;
+        use crate::wire::openai_responses::OpenAiTextResponseFormat;
+
+        match self {
+            ProviderRequest::OpenAiChatCompletion(request) if field == CHAT_SCHEMA_FIELD => {
+                if let Some(OpenAiResponseFormat::JsonSchema { json_schema }) =
+                    &mut request.response_format
+                    && let Ok(schema) = schema.try_into()
+                {
+                    json_schema.schema = Some(schema);
+                }
+            }
+            ProviderRequest::OpenAiResponses(request) if field == RESPONSES_SCHEMA_FIELD => {
+                if let Some(OpenAiTextResponseFormat::JsonSchema { schema: slot, .. }) =
+                    request.text.as_mut().and_then(|text| text.format.as_mut())
+                    && let Ok(schema) = schema.try_into()
+                {
+                    *slot = Some(schema);
+                }
+            }
+            ProviderRequest::AnthropicMessage(request) if field == ANTHROPIC_SCHEMA_FIELD => {
+                if let Some(config) = &mut request.output_config {
+                    let AnthropicOutputFormat::JsonSchema { schema: slot } = &mut config.format;
+                    *slot = schema;
                 }
             }
             ProviderRequest::GeminiGenerateContent(request) => {
                 if let Some(config) = &mut request.settings.generation_config {
-                    let schema = if config.response_json_schema.is_some() {
-                        &mut config.response_json_schema
-                    } else {
-                        &mut config.response_schema
-                    };
-                    if let Some(schema) = schema {
-                        edit(schema);
+                    if field == GEMINI_JSON_SCHEMA_FIELD {
+                        config.response_json_schema = Some(schema);
+                    } else if field == GEMINI_SCHEMA_FIELD {
+                        config.response_schema = Some(schema);
                     }
                 }
             }
             _ => {}
         }
-        self.response_type = ResponseType::of(&self.request);
-        if let ResponseType::JsonSchema { schema, .. } = &self.response_type {
-            let (field, object_root) = output_schema_field(&self.request);
-            check_output_schema(schema, field, object_root)?;
-        }
-        Ok(())
     }
 }
 
-fn replace_string_leaves(value: &mut Value, vars: &[(&str, &str)]) {
+/// Replaces each `(dollar, mustache, value)` pattern pair inside the string
+/// leaves of `value`, in order; see [`substitute`].
+fn replace_string_leaves(value: &mut Value, patterns: &[(String, String, &str)]) {
     match value {
         Value::String(text) => {
-            for (name, replacement) in vars {
-                *text = text.replace(&format!("${{{name}}}"), replacement);
-                *text = text.replace(&format!("{{{{{name}}}}}"), replacement);
+            if !text.contains('$') && !text.contains("{{") {
+                return;
+            }
+            for (dollar, mustache, replacement) in patterns {
+                for pattern in [dollar, mustache] {
+                    if text.contains(pattern.as_str()) {
+                        *text = text.replace(pattern.as_str(), replacement);
+                    }
+                }
             }
         }
         Value::Array(values) => {
             for value in values {
-                replace_string_leaves(value, vars);
+                replace_string_leaves(value, patterns);
             }
         }
         Value::Object(values) => {
             for value in values.values_mut() {
-                replace_string_leaves(value, vars);
+                replace_string_leaves(value, patterns);
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+/// Whether any string leaf of `value` holds a pattern [`replace_string_leaves`]
+/// would replace.
+fn has_patterns(value: &Value, patterns: &[(String, String, &str)]) -> bool {
+    match value {
+        Value::String(text) => {
+            (text.contains('$') || text.contains("{{"))
+                && patterns.iter().any(|(dollar, mustache, _)| {
+                    text.contains(dollar.as_str()) || text.contains(mustache.as_str())
+                })
+        }
+        Value::Array(values) => values.iter().any(|value| has_patterns(value, patterns)),
+        Value::Object(values) => values.values().any(|value| has_patterns(value, patterns)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
     }
 }
 
@@ -733,25 +1246,31 @@ impl ResponseType {
     /// rendering and request hooks may change the schema a Prompt declared.
     ///
     /// Portable schemas carry the name `response`; Anthropic and
-    /// GenerateContent declare no schema name, so they use the same one.
+    /// GenerateContent declare no schema name, so they use the same one. The
+    /// schema is shared with `request`, not copied.
     pub fn of(request: &ProviderRequest) -> Self {
+        Self::schema(request).map_or(Self::Text, |(name, schema)| Self::JsonSchema {
+            name: name.to_owned(),
+            schema: schema.clone(),
+        })
+    }
+
+    /// The schema name and response schema `request` sends, borrowed from its
+    /// structured-output field as [`Self::of`] reads it, or `None` for a text
+    /// response.
+    #[must_use]
+    pub fn schema(request: &ProviderRequest) -> Option<(&str, &SharedSchema)> {
         use crate::wire::anthropic_messages::AnthropicOutputFormat;
         use crate::wire::openai_chat::OpenAiResponseFormat;
         use crate::wire::openai_responses::OpenAiTextResponseFormat;
 
-        let named = |name: &str, schema: Value| ResponseType::JsonSchema {
-            name: name.to_owned(),
-            schema,
-        };
         match request {
             ProviderRequest::OpenAiChatCompletion(request) => match &request.response_format {
                 Some(OpenAiResponseFormat::JsonSchema { json_schema }) => json_schema
                     .schema
-                    .clone()
-                    .map_or(ResponseType::Text, |schema| {
-                        named(&json_schema.name, Value::Object(schema))
-                    }),
-                _ => ResponseType::Text,
+                    .as_ref()
+                    .map(|schema| (json_schema.name.as_str(), schema.shared())),
+                _ => None,
             },
             ProviderRequest::OpenAiResponses(request) => {
                 match request.text.as_ref().and_then(|text| text.format.as_ref()) {
@@ -759,18 +1278,18 @@ impl ResponseType {
                         name,
                         schema: Some(schema),
                         ..
-                    }) => named(name, Value::Object(schema.clone())),
-                    _ => ResponseType::Text,
+                    }) => Some((name.as_str(), schema.shared())),
+                    _ => None,
                 }
             }
-            ProviderRequest::AnthropicMessage(request) => match &request.output_config {
-                Some(config) => match &config.format {
-                    AnthropicOutputFormat::JsonSchema { schema } => {
-                        named("response", schema.clone())
-                    }
-                },
-                None => ResponseType::Text,
-            },
+            ProviderRequest::AnthropicMessage(request) => {
+                request
+                    .output_config
+                    .as_ref()
+                    .map(|config| match &config.format {
+                        AnthropicOutputFormat::JsonSchema { schema } => ("response", schema),
+                    })
+            }
             ProviderRequest::GeminiGenerateContent(request) => request
                 .settings
                 .generation_config
@@ -778,23 +1297,60 @@ impl ResponseType {
                 .and_then(|config| {
                     config
                         .response_json_schema
-                        .clone()
-                        .or_else(|| config.response_schema.clone())
+                        .as_ref()
+                        .or(config.response_schema.as_ref())
                 })
-                .map_or(ResponseType::Text, |schema| named("response", schema)),
-            _ => ResponseType::Text,
+                .map(|schema| ("response", schema)),
+            _ => None,
         }
     }
 }
 
-/// Collects the distinct `${name}` and `{{name}}` placeholders in the
-/// serialized request, in first-appearance order; `${media:...}` placeholders
-/// are not text variables.
+/// `value`'s JSON text, written once into a buffer of its exact length
+/// instead of a string grown by reallocation.
 ///
 /// # Errors
-/// Returns a serialization error when the request does not serialize.
-fn extract_text_variables(request: &ProviderRequest) -> SkaldResult<Vec<String>> {
-    let json = serde_json::to_string(request).map_err(SkaldError::serialize)?;
+/// Returns a serialization error when `value` does not serialize.
+fn json_text(value: &(impl Serialize + ?Sized)) -> SkaldResult<String> {
+    /// Counts written bytes.
+    struct Count(
+        /// The number of serialized bytes written so far.
+        usize,
+    );
+    impl std::io::Write for Count {
+        /// Adds `bytes`' length to the count and accepts all of them.
+        ///
+        /// # Errors
+        /// Never fails; counting does no IO.
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        /// Does nothing; the count buffers nothing to flush.
+        ///
+        /// # Errors
+        /// Never fails.
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, value).map_err(SkaldError::serialize)?;
+    let mut json = Vec::with_capacity(count.0);
+    serde_json::to_writer(&mut json, value).map_err(SkaldError::serialize)?;
+    String::from_utf8(json).map_err(|error| {
+        SkaldError::serialize(<serde_json::Error as serde::ser::Error>::custom(error))
+    })
+}
+
+/// Collects the distinct `${name}` and `{{name}}` placeholders in the
+/// serialized `value`, such as a request or appended turns, in
+/// first-appearance order; `${media:...}` placeholders are not text variables.
+///
+/// # Errors
+/// Returns a serialization error when `value` does not serialize.
+fn extract_text_variables(value: &(impl Serialize + ?Sized)) -> SkaldResult<Vec<String>> {
+    let json = json_text(value)?;
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for capture in text_placeholder_regex().captures_iter(&json) {
@@ -807,6 +1363,66 @@ fn extract_text_variables(request: &ProviderRequest) -> SkaldResult<Vec<String>>
         }
     }
     Ok(out)
+}
+
+/// The text variables `request`'s replaceable system slot declares and those
+/// the rest of it declares, given the whole request's `variables`.
+///
+/// A format without a slot, such as `OpenAI` Chat, whose system messages are
+/// conversation turns, declares every variable in its rest. Otherwise the
+/// slot is scanned alone and the body with the slot taken out and restored.
+///
+/// # Errors
+/// Returns a serialization error when the request does not serialize.
+fn slot_variables(
+    request: &mut ProviderRequest,
+    variables: &[String],
+) -> SkaldResult<(Vec<String>, Vec<String>)> {
+    /// The text variables of `body`'s system slot and of the rest of it.
+    ///
+    /// The slot is taken out while the rest is scanned and put back before
+    /// either result is returned, so `body` is unchanged on every path.
+    ///
+    /// # Errors
+    /// Returns a serialization error when the slot or the rest does not
+    /// serialize.
+    fn scan<B: Serialize, T: Serialize>(
+        body: &mut B,
+        slot: fn(&mut B) -> &mut Option<T>,
+    ) -> SkaldResult<(Vec<String>, Vec<String>)> {
+        let taken = slot(body).take();
+        let rest = extract_text_variables(body);
+        let system = extract_text_variables(&taken);
+        *slot(body) = taken;
+        Ok((system?, rest?))
+    }
+    match request {
+        ProviderRequest::OpenAiResponses(body) => scan(body, |body| &mut body.instructions),
+        ProviderRequest::AnthropicMessage(body) => scan(body, |body| &mut body.system),
+        ProviderRequest::GeminiGenerateContent(body) => {
+            scan(body, |body| &mut body.system_instruction)
+        }
+        _ => Ok((Vec::new(), variables.to_vec())),
+    }
+}
+
+/// The number of conversation turns in `request`; Responses text shorthand
+/// is one turn, and a format without turns has none.
+fn turn_count(request: &ProviderRequest) -> usize {
+    match request {
+        ProviderRequest::OpenAiChatCompletion(request) => request.messages.len(),
+        ProviderRequest::OpenAiResponses(request) => match &request.input {
+            OpenAiResponsesInput::Text(_) => 1,
+            OpenAiResponsesInput::Items(items) => items.len(),
+        },
+        ProviderRequest::AnthropicMessage(request) => request.messages.len(),
+        ProviderRequest::GeminiGenerateContent(request) => request.contents.len(),
+        ProviderRequest::OpenAiEmbeddings(_)
+        | ProviderRequest::GoogleBatchEmbed(_)
+        | ProviderRequest::VertexPredict(_)
+        | ProviderRequest::JevSystemOne(_)
+        | ProviderRequest::RawV1 { .. } => 0,
+    }
 }
 
 fn dedupe_preserve_order(items: Vec<String>) -> Vec<String> {
@@ -898,15 +1514,26 @@ fn scan_text_for_system_media(text: &str) -> SkaldResult<()> {
     Ok(())
 }
 
+/// Splits every `${media:name}` token in `request`'s non-system text into
+/// its own provider-native text part, in place, and returns the placeholder
+/// names in order of appearance, with repeats.
+///
+/// [`Prompt::new`] refuses system media before calling this and
+/// deduplicates the names. Formats without conversation text, such as
+/// embeddings or raw bodies, are left unchanged and yield no names.
 fn split_request_text_parts(request: &mut ProviderRequest) -> Vec<String> {
     let mut names = Vec::new();
     match request {
         ProviderRequest::OpenAiChatCompletion(request) => {
-            split_openai_chat(request, &mut names);
+            split_openai_chat(&mut request.messages, &mut names);
         }
         ProviderRequest::OpenAiResponses(request) => split_openai_responses(request, &mut names),
-        ProviderRequest::AnthropicMessage(request) => split_anthropic(request, &mut names),
-        ProviderRequest::GeminiGenerateContent(request) => split_google(request, &mut names),
+        ProviderRequest::AnthropicMessage(request) => {
+            split_anthropic(&mut request.messages, &mut names);
+        }
+        ProviderRequest::GeminiGenerateContent(request) => {
+            split_google(&mut request.contents, &mut names);
+        }
         ProviderRequest::OpenAiEmbeddings(_)
         | ProviderRequest::GoogleBatchEmbed(_)
         | ProviderRequest::VertexPredict(_)
@@ -916,8 +1543,12 @@ fn split_request_text_parts(request: &mut ProviderRequest) -> Vec<String> {
     names
 }
 
-fn split_openai_chat(request: &mut OpenAiChatRequest, names: &mut Vec<String>) {
-    for message in &mut request.messages {
+/// Splits media placeholders out of the non-system `OpenAI` Chat `messages`.
+fn split_openai_chat(
+    messages: &mut [crate::wire::openai_chat::OpenAiChatMessage],
+    names: &mut Vec<String>,
+) {
+    for message in messages {
         if message.role == "system" {
             continue;
         }
@@ -930,22 +1561,19 @@ fn split_openai_chat_content(
     names: &mut Vec<String>,
 ) -> Option<OpenAiMessageContent> {
     match content {
-        Some(OpenAiMessageContent::Text(text)) => {
-            let segments = split_text_on_media(&text);
-            if has_placeholder(&segments) {
-                Some(OpenAiMessageContent::Parts(openai_text_segments(
-                    segments, names,
-                )))
-            } else {
-                Some(OpenAiMessageContent::Text(text))
-            }
+        Some(OpenAiMessageContent::Text(text)) if media_placeholder_regex().is_match(&text) => {
+            Some(OpenAiMessageContent::Parts(openai_text_segments(
+                split_text_on_media(&text),
+                names,
+            )))
         }
+        Some(OpenAiMessageContent::Text(text)) => Some(OpenAiMessageContent::Text(text)),
         Some(OpenAiMessageContent::Parts(parts)) => {
             let mut out = Vec::new();
             for part in parts {
                 match part {
                     OpenAiContentPart::Text { text } => {
-                        out.extend(openai_text_segments(split_text_on_media(&text), names));
+                        out.extend(openai_text_segments(media_segments(text), names));
                     }
                     other => out.push(other),
                 }
@@ -984,21 +1612,27 @@ fn split_openai_responses(request: &mut OpenAiResponsesRequest, names: &mut Vec<
     {
         return;
     }
-    for item in request.input.items_mut() {
+    split_openai_response_items(request.input.items_mut(), names);
+}
+
+/// Splits media placeholders out of the text parts of Responses message
+/// `items`.
+fn split_openai_response_items(items: &mut [OpenAiResponseItem], names: &mut Vec<String>) {
+    for item in items {
         if let OpenAiResponseItem::Message { content, .. } = item {
             let mut out = Vec::new();
             for part in std::mem::take(content) {
                 match part {
                     OpenAiResponseContentPart::InputText { text } => {
                         out.extend(openai_response_text_segments(
-                            split_text_on_media(&text),
+                            media_segments(text),
                             names,
                             false,
                         ));
                     }
                     OpenAiResponseContentPart::OutputText { text } => {
                         out.extend(openai_response_text_segments(
-                            split_text_on_media(&text),
+                            media_segments(text),
                             names,
                             true,
                         ));
@@ -1037,8 +1671,12 @@ fn openai_response_text_segments(
         .collect()
 }
 
-fn split_anthropic(request: &mut AnthropicMessagesRequest, names: &mut Vec<String>) {
-    for message in &mut request.messages {
+/// Splits media placeholders out of the text blocks of Anthropic `messages`.
+fn split_anthropic(
+    messages: &mut [crate::wire::anthropic_messages::AnthropicMessage],
+    names: &mut Vec<String>,
+) {
+    for message in messages {
         let mut out = Vec::new();
         for block in std::mem::take(&mut message.content) {
             match block {
@@ -1047,7 +1685,7 @@ fn split_anthropic(request: &mut AnthropicMessagesRequest, names: &mut Vec<Strin
                     cache_control,
                     citations,
                 } => out.extend(anthropic_text_segments(
-                    split_text_on_media(&text),
+                    media_segments(text),
                     names,
                     cache_control,
                     citations,
@@ -1086,13 +1724,14 @@ fn anthropic_text_segments(
         .collect()
 }
 
-fn split_google(request: &mut GoogleGenerateContentRequest, names: &mut Vec<String>) {
-    for content in &mut request.contents {
+/// Splits media placeholders out of the text parts of GenerateContent `contents`.
+fn split_google(contents: &mut [GoogleContent], names: &mut Vec<String>) {
+    for content in contents {
         let mut out = Vec::new();
         for part in std::mem::take(&mut content.parts) {
             match part {
                 GooglePart::Text { text } => {
-                    out.extend(google_text_segments(split_text_on_media(&text), names));
+                    out.extend(google_text_segments(media_segments(text), names));
                 }
                 other => out.push(other),
             }
@@ -1117,10 +1756,16 @@ fn google_text_segments(segments: Vec<TextSegment>, names: &mut Vec<String>) -> 
         .collect()
 }
 
-fn has_placeholder(segments: &[TextSegment]) -> bool {
-    segments
-        .iter()
-        .any(|segment| matches!(segment, TextSegment::Placeholder(_)))
+/// [`split_text_on_media`] for owned text, which moves text without a media
+/// placeholder into its one segment instead of copying it.
+fn media_segments(text: String) -> Vec<TextSegment> {
+    if text.is_empty() {
+        Vec::new()
+    } else if media_placeholder_regex().is_match(&text) {
+        split_text_on_media(&text)
+    } else {
+        vec![TextSegment::Text(text)]
+    }
 }
 
 fn bind_media_openai_chat(
@@ -1637,6 +2282,25 @@ mod placeholder_syntax_tests {
         assert!(vars.is_empty());
     }
 
+    /// Proves `render` substitutes exactly as `bind_mut` does, including a
+    /// bound value that names a later variable and a lone `$` that names none.
+    ///
+    /// # Panics
+    /// Panics when the Prompt does not build, render, or bind, or the two
+    /// requests differ.
+    #[test]
+    fn render_matches_bind_mut() {
+        let prompt = Prompt::new(
+            openai_request_with_user("${a} costs $5 and {{b}}"),
+            "gpt-test",
+        )
+        .expect("prompt builds");
+        let vars = [("a", "${b}"), ("b", "two")];
+        let mut bound = prompt.clone();
+        bound.bind_mut(&vars).expect("binds");
+        assert_eq!(prompt.render(&vars).expect("renders"), bound.request);
+    }
+
     /// Proves `${name}` placeholders render.
     ///
     /// # Panics
@@ -2010,6 +2674,8 @@ mod prompt_render {
             authored: None,
             media_kinds: Vec::new(),
             named_format: None,
+            system_variables: Vec::new(),
+            body_variables: Vec::new(),
         }
     }
 
@@ -2178,7 +2844,7 @@ mod prompt_render {
     fn response_type_json_schema_roundtrips() {
         let response_type = ResponseType::JsonSchema {
             name: "answer".to_string(),
-            schema: json!({"type": "object"}),
+            schema: json!({"type": "object"}).into(),
         };
         let json = serde_json::to_string(&response_type).unwrap();
         assert_eq!(
@@ -2198,11 +2864,99 @@ mod response_schema_edit {
     use crate::wire::openai_chat::{OpenAiJsonSchema, OpenAiResponseFormat};
     use crate::{Prompt, ProviderRequest, ResponseType, common};
 
-    /// An edit reaches both the sent request and the derived response type,
-    /// and an edit the destination rejects fails construction-time checks.
+    /// Rendering still substitutes inside every structured kind's response
+    /// schema, and the schema detached for decoding returns to its field.
     ///
     /// # Panics
-    /// Panics when the edit is lost on either side or an invalid edit passes.
+    /// Panics when a rendered request differs from the same request written
+    /// with the value in place, such as a lost or unsubstituted schema.
+    #[test]
+    fn render_substitutes_and_keeps_every_response_schema() {
+        let schema = json!({"type": "object", "description": "for {{name}}"});
+        for body in [
+            json!({"provider": "open_ai_chat_completion", "body": {
+                "model": "m", "messages": [{"role": "user", "content": "hi {{name}}"}],
+                "response_format": {"type": "json_schema",
+                    "json_schema": {"name": "answer", "schema": schema}}}}),
+            json!({"provider": "open_ai_responses", "body": {
+                "model": "m", "input": "hi {{name}}",
+                "text": {"format": {"type": "json_schema", "name": "answer", "schema": schema}}}}),
+            json!({"provider": "anthropic_message", "body": {
+                "model": "m", "max_tokens": 16,
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "hi {{name}}"}]}],
+                "output_config": {"format": {"type": "json_schema", "schema": schema}}}}),
+            json!({"provider": "gemini_generate_content", "body": {
+                "contents": [{"role": "user", "parts": [{"text": "hi {{name}}"}]}],
+                "generation_config": {"response_json_schema": schema}}}),
+            json!({"provider": "gemini_generate_content", "body": {
+                "contents": [{"role": "user", "parts": [{"text": "hi {{name}}"}]}],
+                "generation_config": {"response_schema": schema}}}),
+        ] {
+            let expected: ProviderRequest = common::typed(
+                serde_json::from_str(&body.to_string().replace("{{name}}", "Ada")).expect("json"),
+            );
+            let mut rendered: ProviderRequest = common::typed(body);
+            super::substitute(&mut rendered, &[("name", "Ada")]).expect("renders");
+            assert_eq!(rendered, expected);
+        }
+    }
+
+    /// A Prompt's response type shares the schema its request sends, a
+    /// render that leaves the schema unchanged keeps sharing it, and an edit
+    /// of one copy copies the schema instead of changing the other.
+    ///
+    /// # Panics
+    /// Panics when a schema is copied without a change or an edit leaks into
+    /// another copy.
+    #[test]
+    fn response_schema_is_shared_until_changed() {
+        let body = json!({"provider": "open_ai_chat_completion", "body": {
+            "model": "m", "messages": [{"role": "user", "content": "hi {{name}}"}],
+            "response_format": {"type": "json_schema", "json_schema": {"name": "answer",
+                "schema": {"type": "object", "properties": {"slot": {"type": "string"}}}}}}});
+        let prompt = Prompt::new(common::typed(body), "m").expect("builds");
+        let sent = |request: &ProviderRequest| {
+            ResponseType::schema(request)
+                .expect("structured request")
+                .1
+                .clone()
+        };
+        let ResponseType::JsonSchema {
+            schema: derived, ..
+        } = &prompt.response_type
+        else {
+            panic!("structured Prompt");
+        };
+        assert!(derived.ptr_eq(&sent(&prompt.request)));
+        let rendered = prompt.render(&[("name", "Ada")]).expect("renders");
+        assert!(sent(&rendered).ptr_eq(&sent(&prompt.request)));
+
+        let mut narrowed = prompt.clone();
+        narrowed
+            .edit_response_schema_mut(
+                &crate::prompt::PreparedSchemas::default(),
+                "order",
+                |schema| {
+                    schema["properties"]["slot"]["enum"] = json!(["order"]);
+                },
+            )
+            .expect("narrowed schema is valid");
+        assert!(!sent(&narrowed.request).ptr_eq(&sent(&prompt.request)));
+        assert_eq!(
+            sent(&prompt.request)["properties"]["slot"].get("enum"),
+            None
+        );
+    }
+
+    /// An edit reaches both the sent request and the derived response type,
+    /// the same named edit of an equal schema reuses the schema it produced
+    /// without editing again, another name edits anew, and an edit the
+    /// destination rejects fails construction-time checks and changes
+    /// nothing.
+    ///
+    /// # Panics
+    /// Panics when the edit is lost on either side, a named edit runs again,
+    /// or an invalid edit passes or changes the Prompt.
     #[test]
     fn edit_response_schema_reaches_request_and_type() {
         let mut request = common::openai_chat_request();
@@ -2212,15 +2966,18 @@ mod response_schema_edit {
                 description: None,
                 schema: json!({"type": "object", "properties": {"slot": {"type": "string"}}})
                     .as_object()
-                    .cloned(),
+                    .cloned()
+                    .map(Into::into),
                 strict: Some(false),
             },
         });
         let model = request.model.clone();
-        let mut prompt =
+        let declared =
             Prompt::new(ProviderRequest::OpenAiChatCompletion(request), &model).expect("builds");
+        let mut prompt = declared.clone();
+        let schemas = crate::prompt::PreparedSchemas::default();
         prompt
-            .edit_response_schema_mut(|schema| {
+            .edit_response_schema_mut(&schemas, "order", |schema| {
                 schema["properties"]["slot"]["enum"] = json!(["order"]);
             })
             .expect("narrowed schema is valid");
@@ -2234,10 +2991,44 @@ mod response_schema_edit {
                 .contains("order")
         );
 
+        let sent = |prompt: &Prompt| {
+            ResponseType::schema(&prompt.request)
+                .expect("structured request")
+                .1
+                .clone()
+        };
+
+        let mut again = declared.clone();
+        again
+            .edit_response_schema_mut(&schemas, "order", |_| panic!("edited again"))
+            .expect("reuses the earlier edit");
+        assert!(sent(&again).ptr_eq(&sent(&prompt)));
+        let ResponseType::JsonSchema { schema, .. } = &again.response_type else {
+            panic!("structured Prompt");
+        };
+        assert!(schema.ptr_eq(&sent(&prompt)));
+
+        let mut other = declared.clone();
+        other
+            .edit_response_schema_mut(&schemas, "refund", |schema| {
+                schema["properties"]["slot"]["enum"] = json!(["refund"]);
+            })
+            .expect("narrowed schema is valid");
+        assert_eq!(
+            sent(&other)["properties"]["slot"]["enum"],
+            json!(["refund"])
+        );
+
+        let before = sent(&prompt);
         assert!(
             prompt
-                .edit_response_schema_mut(|schema| *schema = json!({"type": 5}))
+                .edit_response_schema_mut(&schemas, "invalid", |schema| *schema =
+                    json!({"type": 5}))
                 .is_err()
+        );
+        assert!(
+            sent(&prompt).ptr_eq(&before),
+            "a refused edit changed the Prompt"
         );
     }
 }

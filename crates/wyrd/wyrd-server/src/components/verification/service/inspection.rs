@@ -195,9 +195,9 @@ fn invocation(state: &ExecutionState, entry: InvocationRecord) -> ExecutionInvoc
         ),
         Some(InvocationSettlement::Requirement { result }) => (
             InvocationProgress::Requirement {
-                outcome: result.outcome,
+                outcome: result.result.outcome,
             },
-            Some(result.reason),
+            Some(result.result.reason),
         ),
     };
     ExecutionInvocation {

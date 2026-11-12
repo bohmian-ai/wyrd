@@ -14,7 +14,7 @@ mod reads;
 mod saga;
 
 pub use engine::RegistryContext;
-pub use handle::{CardSelector, Cards};
+pub use handle::{CardSelector, Cards, Declarable};
 pub use progress::{DeclarationPhase, DeclarationProgressEvent, DeclarationProgressSink};
 pub use pull::{
     BundleArtifactManifest, BundleCardManifest, BundleManifest, BundleMode, CardGraphPuller,

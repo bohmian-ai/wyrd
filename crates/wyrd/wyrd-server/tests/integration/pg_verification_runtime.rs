@@ -53,7 +53,7 @@ use wyrd_spec::vala::ids::TraceId;
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::InputDeclaration;
 use wyrd_spec::verification::execution::{
-    RequirementDetail, RequirementOutcome, RequirementResult, VerificationOutcome,
+    ExecutedOutcome, ExecutedRequirement, RequirementDetail, RequirementOutcome, RequirementResult,
 };
 use wyrd_spec::verification::state::ExecutionState;
 use wyrd_spec::verification::{
@@ -708,21 +708,23 @@ fn drift_outcome(
     verdict: VerificationVerdict,
     outcome: RequirementOutcome,
     report: DriftReport,
-) -> VerificationOutcome {
-    VerificationOutcome {
+) -> ExecutedOutcome {
+    ExecutedOutcome {
         verdict,
-        requirements: vec![RequirementResult {
-            id: drift_requirement(),
-            step: None,
-            item_index: None,
-            iteration_index: None,
-            statement: "The window does not drift.".to_owned(),
-            outcome,
-            reason: "scripted".to_owned(),
-            actual: None,
-            citations: Vec::new(),
-            data: None,
-            detail: Some(RequirementDetail::Drift(report)),
+        requirements: vec![ExecutedRequirement {
+            result: RequirementResult {
+                id: drift_requirement(),
+                step: None,
+                item_index: None,
+                iteration_index: None,
+                statement: "The window does not drift.".to_owned(),
+                outcome,
+                reason: "scripted".to_owned(),
+                actual: None,
+                citations: Vec::new(),
+                data: None,
+                detail: Some(RequirementDetail::Drift(report)),
+            },
             check: serde_json::from_value::<Check>(serde_json::json!({
                 "kind": "drift", "on": "inputs.samples", "method": "Custom",
                 "signal": { "kind": "Metric", "name": "latency_ms" },
@@ -740,7 +742,7 @@ fn drift_outcome(
 ///
 /// # Panics
 /// Panics when a static feature name is invalid.
-fn drifting_report() -> VerificationOutcome {
+fn drifting_report() -> ExecutedOutcome {
     let features = [
         ("latency", 3.0, DriftVerdict::Drift),
         ("tokens", 0.1, DriftVerdict::NoDrift),
@@ -775,7 +777,7 @@ fn drifting_report() -> VerificationOutcome {
 ///
 /// # Panics
 /// Panics when the static drift check is invalid.
-fn unscored_report() -> VerificationOutcome {
+fn unscored_report() -> ExecutedOutcome {
     drift_outcome(
         VerificationVerdict::Inconclusive,
         RequirementOutcome::Inconclusive,
@@ -914,7 +916,10 @@ async fn attempts_record_queue_wait_phases_terminal_latency_and_one_trace() {
         .await;
     runtime.stop().await;
 
-    let rendered = telemetry.prometheus().render();
+    let rendered = telemetry
+        .prometheus()
+        .expect("the capture runtime installs Prometheus")
+        .render();
     let count = |series: &str| -> u64 {
         rendered
             .lines()
@@ -1327,9 +1332,16 @@ async fn verification_records_have_one_payload_owner() {
             state["result"]["outcome"]["verdict"], verdict,
             "{id}: {state}"
         );
+        let (code, details) = call(
+            axum::http::Method::GET,
+            format!("/v1/verification/executions/{id}/details"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(code, axum::http::StatusCode::OK, "{id}: {details}");
         assert!(
-            state["result"]["outcome"]["requirements"][0]["check"].is_object(),
-            "the output reassembles its requirement detail: {id}: {state}"
+            details["outcome"]["requirements"][0]["check"].is_object(),
+            "the output reassembles its requirement detail: {id}: {details}"
         );
     }
 }
@@ -4905,13 +4917,15 @@ async fn tenant_spans(
 }
 
 /// Asserts that `tenant` holds exactly the behavior spans of the request the
-/// caller span `caller` parents, each with the operator's ids and parents,
-/// stamped with `principal`, and keeping only safe attributes.
+/// caller span `caller` parents, each with the operator's ids and, as its
+/// parent, its nearest operator ancestor the tenant also holds, stamped with
+/// `principal`, and keeping only safe attributes.
 ///
 /// # Panics
 /// Panics when the tenant copy is missing a behavior span, holds a span the
-/// operator did not export or another request's span, names another
-/// principal, or keeps an attribute outside the allowlist.
+/// operator did not export or another request's span, names a parent other
+/// than its nearest held ancestor, names another principal, or keeps an
+/// attribute outside the allowlist.
 fn assert_tenant_copy(
     tenant: &[TenantSpan],
     operator: &[wyrd_telemetry::CapturedSpan],
@@ -4941,13 +4955,23 @@ fn assert_tenant_copy(
         );
     }
     for span in tenant {
-        assert!(
-            operator
+        let exported = operator
+            .iter()
+            .find(|exported| exported.span_id == span.span_id && exported.name == span.name)
+            .unwrap_or_else(|| panic!("the operator exported the tenant span: {span:#?}"));
+        let mut parent = exported.parent_span_id.as_str();
+        while parent != caller && !tenant.iter().any(|held| held.span_id == parent) {
+            parent = operator
                 .iter()
-                .any(|exported| exported.span_id == span.span_id
-                    && exported.parent_span_id == span.parent_span_id
-                    && exported.name == span.name),
-            "the tenant copy keeps the operator's ids and parent: {span:#?}"
+                .find(|ancestor| ancestor.span_id == parent)
+                .map_or_else(
+                    || panic!("{parent} is an operator span: {span:#?}"),
+                    |ancestor| ancestor.parent_span_id.as_str(),
+                );
+        }
+        assert_eq!(
+            span.parent_span_id, parent,
+            "the tenant copy names its nearest held ancestor: {span:#?}"
         );
         assert_eq!(span.sub_principal_id, principal.to_string(), "{span:#?}");
         assert_eq!(span.act_principal_id, principal.to_string(), "{span:#?}");

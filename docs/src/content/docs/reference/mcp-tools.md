@@ -39,7 +39,8 @@ Tool names contain dots, which many model providers refuse, so each framework fo
 | `cards.list` | `cards:read` | List filters and optional cursor → `{items, next_cursor}` | List Card summaries |
 | `cards.get` | `cards:read` | `{card_ref}` or `{kind, card_uid}` → `{card, created_at, updated_at}` | Read one Card; pass exactly one form |
 | `verification.get_binding` | `cards:read` | `{binding_id}` → binding status | Read one binding |
-| `verification.get_execution` | `verifier:read` on the execution's Verifier | `{execution_id}` → execution status | Read one execution |
+| `verification.get_execution` | `verifier:read` on the execution's Verifier | `{execution_id}` → execution status with its compact result | Read one execution |
+| `verification.get_execution_details` | `verifier:read` on the execution's Verifier | `{execution_id}` → execution details: checks, provenance, steps, and pinned evidence | Read what one completed execution ran |
 | `verification.list_invocations` | `verifier:read` on the execution's Verifier | `{execution_id, limit?, cursor?}` → `{execution_id, status, items, next_cursor, history}` | Page invocation attempts and their progress |
 | `verification.list_publications` | `verifier:read` on the execution's Verifier | `{execution_id, limit?, cursor?}` → `{execution_id, items, next_cursor}` | Page publication names, kinds, and producers |
 | `verification.get_publication` | `verifier:read` on the execution's Verifier | `{execution_id, step_id, name, attempt, item_index?, iteration_index?}` → publication | Read one publication's JSON value or manifest |

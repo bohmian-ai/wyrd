@@ -1,0 +1,14 @@
+# Judges a draft.
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: draft-judge
+spec:
+  execution_route: {kind: wyrd_gateway, deployment: openai}
+  prompt:
+    provider: openai
+    model: gpt-4o
+    messages:
+      - role: user
+        content: "Judge the draft {{draft}}."
+    response_format: verdict

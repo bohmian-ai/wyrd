@@ -23,6 +23,8 @@ mod operators;
 /// `wyrd.auth`: the Python projection of the tenant principal handle.
 mod principals;
 #[cfg(feature = "python")]
+mod prompt;
+#[cfg(feature = "python")]
 mod state;
 #[cfg(feature = "testing")]
 mod testing;
@@ -93,7 +95,7 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
 
     let prompt = PyModule::new(py, "prompt")?;
-    skald_prompt::register_prompt(&prompt)?;
+    prompt::register(&prompt)?;
     m.add_submodule(&prompt)?;
     register_submodule(py, "wyrd._wyrd.prompt", &prompt)?;
 
@@ -118,7 +120,6 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     register_submodule(py, "wyrd._wyrd.gateway_admin", &gateway_admin)?;
 
     let observe = PyModule::new(py, "observe")?;
-    bifrost::register_observe(&observe)?;
     observe::register_run(&observe)?;
     m.add_submodule(&observe)?;
     register_submodule(py, "wyrd._wyrd.observe", &observe)?;

@@ -52,6 +52,93 @@ pub struct CardRefIdentity {
     pub version: String,
 }
 
+/// Declaration-only reference to another submission in the same request.
+///
+/// A sibling names its target by kind and name and may omit the version: the
+/// server selects omitted versions during declaration, then replaces every
+/// sibling with the target's exact registered [`CardRef`] before the parent is
+/// hashed and persisted. An explicit version matches the submission with that
+/// exact version; an omitted version matches the sole submission with that
+/// kind and name, and several candidates make the link ambiguous. Siblings
+/// never appear in durable specs.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SiblingRef {
+    /// Target submission kind.
+    pub kind: CardKind,
+    /// Target submission name.
+    pub name: CardName,
+    /// Target submission version, when the author pinned one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<VersionBlock>,
+}
+
+impl SiblingRef {
+    /// The exact identity key, when this sibling carries a version.
+    #[must_use]
+    pub fn identity_key(&self) -> Option<CardRefIdentity> {
+        self.version.as_ref().map(|version| CardRefIdentity {
+            kind: self.kind.clone(),
+            name: self.name.clone(),
+            version: version.as_str().to_owned(),
+        })
+    }
+
+    /// The exact UID-free [`CardRef`] this sibling names, when it carries a
+    /// version.
+    #[must_use]
+    pub fn to_card_ref(&self) -> Option<CardRef> {
+        Some(CardRef {
+            kind: self.kind.clone(),
+            name: self.name.clone(),
+            version: self.version.clone()?,
+            uid: None,
+        })
+    }
+
+    /// True when `card_ref` is a submission this sibling may name: the same
+    /// kind and name, and the same version when this sibling has one.
+    #[must_use]
+    pub fn matches(&self, card_ref: &CardRef) -> bool {
+        self.kind == card_ref.kind
+            && self.name == card_ref.name
+            && self
+                .version
+                .as_ref()
+                .is_none_or(|version| version == &card_ref.version)
+    }
+}
+
+impl From<&CardRef> for SiblingRef {
+    /// The sibling naming `card_ref`'s exact kind, name, and version, as a
+    /// graph rewrites a submitted target; the UID is dropped because a
+    /// sibling names a submission, not a registered Card.
+    fn from(card_ref: &CardRef) -> Self {
+        Self {
+            kind: card_ref.kind.clone(),
+            name: card_ref.name.clone(),
+            version: Some(card_ref.version.clone()),
+        }
+    }
+}
+
+impl fmt::Display for SiblingRef {
+    /// Writes `Kind/name`, with `@version` only when the sibling names one,
+    /// so diagnostics show an omitted version as omitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns the formatter's error when writing fails.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.kind.wire_name(), self.name)?;
+        if let Some(version) = &self.version {
+            write!(f, "@{version}")?;
+        }
+        Ok(())
+    }
+}
+
 /// A reference position that requires durable identity.
 ///
 /// Loaders rewrite `Path` values to `Sibling` values before submitting a request;
@@ -63,10 +150,10 @@ pub struct CardRefIdentity {
 pub enum Ref {
     /// A direct reference to a registered Card.
     Ref(CardRef),
-    /// A loader-projected reference to another submission in the same request.
+    /// A declaration-only reference to another submission in the same request.
     Sibling {
-        /// Exact identity of the sibling submission.
-        sibling: CardRef,
+        /// Identity of the sibling submission; its version may be omitted.
+        sibling: SiblingRef,
     },
     /// A local authored path awaiting loader resolution.
     #[cfg_attr(feature = "server", schema(value_type = String))]
@@ -86,8 +173,8 @@ impl<'de> Deserialize<'de> for Ref {
         /// The wire shape of [`Ref::Sibling`].
         #[derive(Deserialize)]
         struct Sibling {
-            /// Exact identity of the sibling submission.
-            sibling: CardRef,
+            /// Identity of the sibling submission.
+            sibling: SiblingRef,
         }
         let value = serde_json::Value::deserialize(deserializer)?;
         match value {
@@ -105,15 +192,16 @@ impl<'de> Deserialize<'de> for Ref {
 }
 
 impl Ref {
-    /// Return the resolved [`CardRef`] when this ref carries durable identity.
+    /// Return the exact [`CardRef`] when this is a durable reference.
     ///
-    /// Returns `None` for [`Ref::Path`] values that a loader has not yet
-    /// rewritten. Both [`Ref::Ref`] and [`Ref::Sibling`] carry durable identity.
+    /// Returns `None` for a declaration-only [`Ref::Sibling`] and for a
+    /// [`Ref::Path`] a loader has not yet rewritten; declaration replaces both
+    /// with an exact reference before a spec is persisted.
     #[must_use]
     pub fn as_card_ref(&self) -> Option<&CardRef> {
         match self {
-            Self::Ref(card_ref) | Self::Sibling { sibling: card_ref } => Some(card_ref),
-            Self::Path(_) => None,
+            Self::Ref(card_ref) => Some(card_ref),
+            Self::Sibling { .. } | Self::Path(_) => None,
         }
     }
 
@@ -121,17 +209,30 @@ impl Ref {
     #[must_use]
     pub fn as_card_ref_mut(&mut self) -> Option<&mut CardRef> {
         match self {
-            Self::Ref(card_ref) | Self::Sibling { sibling: card_ref } => Some(card_ref),
-            Self::Path(_) => None,
+            Self::Ref(card_ref) => Some(card_ref),
+            Self::Sibling { .. } | Self::Path(_) => None,
         }
     }
 
-    /// Return the exact identity when this is a loader-projected sibling.
+    /// Return the sibling identity when this is a declaration-only sibling.
     #[must_use]
-    pub fn as_sibling(&self) -> Option<&CardRef> {
+    pub fn as_sibling(&self) -> Option<&SiblingRef> {
         match self {
             Self::Sibling { sibling } => Some(sibling),
             Self::Ref(_) | Self::Path(_) => None,
+        }
+    }
+
+    /// The kind, name, and version (when known) of the Card this slot names,
+    /// whether it is a durable reference or a sibling.
+    ///
+    /// Returns `None` for an unresolved path.
+    #[must_use]
+    pub fn target(&self) -> Option<SiblingRef> {
+        match self {
+            Self::Ref(card_ref) => Some(card_ref.into()),
+            Self::Sibling { sibling } => Some(sibling.clone()),
+            Self::Path(_) => None,
         }
     }
 }
@@ -154,10 +255,10 @@ impl From<CardRef> for Ref {
 pub enum InlineableRef<T> {
     /// A direct reference to a registered Card.
     Ref(CardRef),
-    /// A loader-projected reference to another submission in the same request.
+    /// A declaration-only reference to another submission in the same request.
     Sibling {
-        /// Exact identity of the sibling submission.
-        sibling: CardRef,
+        /// Identity of the sibling submission; its version may be omitted.
+        sibling: SiblingRef,
     },
     /// An embedded child spec.
     Inline(Box<T>),
@@ -180,8 +281,8 @@ impl<'de, T: DeserializeOwned> Deserialize<'de> for InlineableRef<T> {
         /// The wire shape of [`InlineableRef::Sibling`].
         #[derive(Deserialize)]
         struct Sibling {
-            /// Exact identity of the sibling submission.
-            sibling: CardRef,
+            /// Identity of the sibling submission.
+            sibling: SiblingRef,
         }
         let value = serde_json::Value::deserialize(deserializer)?;
         if let Ok(card_ref) = CardRef::deserialize(&value) {
@@ -212,16 +313,16 @@ fn looks_like_card_ref(value: &serde_json::Value) -> bool {
 }
 
 impl<T> InlineableRef<T> {
-    /// Return the resolved [`CardRef`] when this ref carries durable identity.
+    /// Return the exact [`CardRef`] when this is a durable reference.
     ///
-    /// Returns `None` for [`InlineableRef::Path`] (loader has not resolved
-    /// it yet) and [`InlineableRef::Inline`] (the body is embedded, not
-    /// referenced). Both card-reference variants carry durable identity.
+    /// Returns `None` for a declaration-only [`InlineableRef::Sibling`], an
+    /// [`InlineableRef::Path`] the loader has not resolved, and an
+    /// [`InlineableRef::Inline`] body, which is embedded, not referenced.
     #[must_use]
     pub fn as_card_ref(&self) -> Option<&CardRef> {
         match self {
-            Self::Ref(card_ref) | Self::Sibling { sibling: card_ref } => Some(card_ref),
-            Self::Inline(_) | Self::Path(_) => None,
+            Self::Ref(card_ref) => Some(card_ref),
+            Self::Sibling { .. } | Self::Inline(_) | Self::Path(_) => None,
         }
     }
 
@@ -229,7 +330,20 @@ impl<T> InlineableRef<T> {
     #[must_use]
     pub fn as_card_ref_mut(&mut self) -> Option<&mut CardRef> {
         match self {
-            Self::Ref(card_ref) | Self::Sibling { sibling: card_ref } => Some(card_ref),
+            Self::Ref(card_ref) => Some(card_ref),
+            Self::Sibling { .. } | Self::Inline(_) | Self::Path(_) => None,
+        }
+    }
+
+    /// The kind, name, and version (when known) of the Card this slot names,
+    /// whether it is a durable reference or a sibling.
+    ///
+    /// Returns `None` for an inline body or an unresolved path.
+    #[must_use]
+    pub fn target(&self) -> Option<SiblingRef> {
+        match self {
+            Self::Ref(card_ref) => Some(card_ref.into()),
+            Self::Sibling { sibling } => Some(sibling.clone()),
             Self::Inline(_) | Self::Path(_) => None,
         }
     }
@@ -252,9 +366,9 @@ impl<T> InlineableRef<T> {
         }
     }
 
-    /// Return the exact identity when this is a loader-projected sibling.
+    /// Return the sibling identity when this is a declaration-only sibling.
     #[must_use]
-    pub fn as_sibling(&self) -> Option<&CardRef> {
+    pub fn as_sibling(&self) -> Option<&SiblingRef> {
         match self {
             Self::Sibling { sibling } => Some(sibling),
             Self::Ref(_) | Self::Inline(_) | Self::Path(_) => None,
@@ -470,14 +584,14 @@ pub fn unresolved_card_ref_paths(spec: &Spec) -> Vec<PathBuf> {
     paths
 }
 
-/// Return every registration-only sibling Card reference in declaration order.
+/// Return every registration-only sibling reference in declaration order.
 ///
 /// Siblings express request-time registration intent rather than durable Card
 /// identity. The typed visitor includes nested inline Agent and Prompt bodies,
 /// so this helper lets persistence and read projections reject that intent
 /// without traversing serialized JSON.
 #[must_use]
-pub fn registration_only_sibling_refs(spec: &Spec) -> Vec<CardRef> {
+pub fn registration_only_sibling_refs(spec: &Spec) -> Vec<SiblingRef> {
     let mut spec = spec.clone();
     let mut siblings = Vec::new();
     ReferenceSlotVisitor::visit(&mut spec, |slot| {
@@ -737,10 +851,16 @@ mod tests {
         assert_eq!(card_ref, parsed);
     }
 
+    /// A sibling serializes under its explicit `sibling` wrapper and parses
+    /// back to the same reference.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the sibling does not round-trip through that wire shape.
     #[test]
     fn sibling_ref_uses_explicit_wire_wrapper() {
         let reference = Ref::Sibling {
-            sibling: sample_ref(),
+            sibling: SiblingRef::from(&sample_ref()),
         };
         let json = serde_json::to_value(&reference).expect("sibling ref serializes");
         assert_eq!(json, serde_json::json!({"sibling": sample_ref()}));
@@ -1086,7 +1206,7 @@ mod tests {
         service.components.push(ServiceComponent {
             alias: "top-level".to_owned(),
             card_ref: Ref::Sibling {
-                sibling: top_level.clone(),
+                sibling: SiblingRef::from(&top_level),
             },
             verified_by: Vec::new(),
             source: None,
@@ -1095,15 +1215,18 @@ mod tests {
         });
         let spec = nested_judge(InlineableRef::Inline(Box::new(nested_agent(
             InlineableRef::Sibling {
-                sibling: nested.clone(),
+                sibling: SiblingRef::from(&nested),
             },
         ))));
 
         assert_eq!(
             registration_only_sibling_refs(&Spec::Service(service)),
-            vec![top_level]
+            vec![SiblingRef::from(&top_level)]
         );
-        assert_eq!(registration_only_sibling_refs(&spec), vec![nested]);
+        assert_eq!(
+            registration_only_sibling_refs(&spec),
+            vec![SiblingRef::from(&nested)]
+        );
     }
 
     /// Confirm durable refs, paths, and inline bodies are not classified as siblings.
@@ -1163,7 +1286,7 @@ mod tests {
             decode(serde_json::json!({ "sibling": card_ref }))
                 .expect("sibling decodes")
                 .as_sibling(),
-            Some(&sample_ref())
+            Some(&SiblingRef::from(&sample_ref()))
         );
         assert!(
             decode(serde_json::json!({ "kind": "group_end", "after": "365d" }))

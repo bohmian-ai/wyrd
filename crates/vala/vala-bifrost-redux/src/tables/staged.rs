@@ -6,6 +6,7 @@
 //! Variants rather than a one-row Arrow batch, and [`StagedRow::project`]
 //! appends a run of rows sharing one schema straight into one dense batch.
 
+use std::borrow::Borrow;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -138,21 +139,24 @@ impl StagedRow {
     }
 
     /// Build `rows`, which share the first row's schema, into one batch,
-    /// each column allocated once for its values.
+    /// each column allocated once for its values. Rows may be owned or
+    /// borrowed, so a caller holding them elsewhere projects without copying
+    /// any.
     ///
     /// # Errors
     ///
     /// Returns [`ArrowError::SchemaError`] when `rows` is empty or a row
     /// fills another schema, and the Arrow error when the batch cannot be
     /// assembled.
-    pub fn project(rows: &[Self]) -> Result<RecordBatch, ArrowError> {
+    pub fn project<R: Borrow<Self>>(rows: &[R]) -> Result<RecordBatch, ArrowError> {
         let schema = rows
             .first()
-            .map(|row| Arc::clone(&row.schema))
+            .map(|row| Arc::clone(&row.borrow().schema))
             .ok_or_else(|| ArrowError::SchemaError("no rows to project".to_owned()))?;
         if rows
             .iter()
-            .any(|row| !Arc::ptr_eq(&row.schema, &schema) && row.schema != schema)
+            .map(Borrow::borrow)
+            .any(|row: &Self| !Arc::ptr_eq(&row.schema, &schema) && row.schema != schema)
         {
             return Err(ArrowError::SchemaError(
                 "staged rows of different schemas".to_owned(),
@@ -176,9 +180,9 @@ impl StagedRow {
     ///
     /// Panics when `rows` is empty or a row has no cell at `index`; callers
     /// pass a non-empty run of one schema's rows.
-    fn column(rows: &[Self], index: usize, data_type: &DataType) -> ArrayRef {
-        let cells = rows.iter().map(|row| &row.cells[index]);
-        match &rows[0].cells[index] {
+    fn column<R: Borrow<Self>>(rows: &[R], index: usize, data_type: &DataType) -> ArrayRef {
+        let cells = rows.iter().map(|row| &row.borrow().cells[index]);
+        match &rows[0].borrow().cells[index] {
             Cell::Text(_) => {
                 let bytes = cells.clone().map(Cell::owned_bytes).sum();
                 let mut column = StringBuilder::with_capacity(rows.len(), bytes);

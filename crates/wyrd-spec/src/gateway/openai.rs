@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use skald_spec::wire::borrowed::Borrowed;
 use skald_spec::wire::openai_chat::{OpenAiChatRequest, OpenAiChatResponse};
 use skald_spec::wire::openai_embeddings::{OpenAiEmbeddingUsage, OpenAiEmbeddingsRequest};
 use skald_spec::wire::openai_responses::{OpenAiResponsesRequest, OpenAiResponsesResponse};
@@ -30,6 +31,11 @@ pub struct GatewayChatCompletionsRequest(
     /// The Chat Completions body, decoded and relayed as the native `OpenAI` shape.
     pub OpenAiChatRequest,
 );
+
+/// A transparent wrapper validates exactly as its body.
+impl<'a> Borrowed<'a> for GatewayChatCompletionsRequest {
+    type View = <OpenAiChatRequest as Borrowed<'a>>::View;
+}
 
 /// Buffered `POST /v1/chat/completions` answer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -48,6 +54,11 @@ pub struct GatewayResponsesRequest(
     pub OpenAiResponsesRequest,
 );
 
+/// A transparent wrapper validates exactly as its body.
+impl<'a> Borrowed<'a> for GatewayResponsesRequest {
+    type View = <OpenAiResponsesRequest as Borrowed<'a>>::View;
+}
+
 /// Buffered `POST /v1/responses` answer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
@@ -64,6 +75,11 @@ pub struct GatewayEmbeddingsRequest(
     /// The Embeddings body, decoded and relayed as the native `OpenAI` shape.
     pub OpenAiEmbeddingsRequest,
 );
+
+/// A transparent wrapper validates exactly as its body.
+impl<'a> Borrowed<'a> for GatewayEmbeddingsRequest {
+    type View = <OpenAiEmbeddingsRequest as Borrowed<'a>>::View;
+}
 
 /// `POST /v1/embeddings` answer: one embedding per input, in input order.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -102,31 +118,33 @@ pub enum GatewayEmbeddingVector {
     Base64(String),
 }
 
-/// `POST /v1/images/generations` request.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct GatewayImageGenerationRequest {
-    /// Exact `<provider>/<model>` projection.
-    pub model: String,
-    /// Description of the images to generate.
-    pub prompt: String,
-    /// Number of images.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub n: Option<u32>,
-    /// Image size, such as `1024x1024`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub size: Option<String>,
-    /// Image quality.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub quality: Option<String>,
-    /// `url` or `b64_json`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub response_format: Option<String>,
-    /// End-user identifier.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user: Option<String>,
-    /// Supported provider extensions, relayed unchanged.
-    #[serde(flatten)]
-    pub extra: Map<String, Value>,
+skald_spec::wire_contract! {
+    /// `POST /v1/images/generations` request.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+    pub struct GatewayImageGenerationRequest as GatewayImageGenerationRequestView {
+        /// Exact `<provider>/<model>` projection.
+        pub model: String,
+        /// Description of the images to generate.
+        pub prompt: String,
+        /// Number of images.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub n: Option<u32>,
+        /// Image size, such as `1024x1024`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub size: Option<String>,
+        /// Image quality.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub quality: Option<String>,
+        /// `url` or `b64_json`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub response_format: Option<String>,
+        /// End-user identifier.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub user: Option<String>,
+        /// Supported provider extensions, relayed unchanged.
+        #[serde(flatten)]
+        pub extra: Map<String, Value>,
+    }
 }
 
 /// Binary content published as an `OpenAPI` binary string: one uploaded file
@@ -228,27 +246,29 @@ pub struct GatewayImage {
     pub extra: Map<String, Value>,
 }
 
-/// `POST /v1/audio/speech` request.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct GatewaySpeechRequest {
-    /// Exact `<provider>/<model>` projection.
-    pub model: String,
-    /// Text to speak.
-    pub input: String,
-    /// Voice name.
-    pub voice: String,
-    /// Delivery instructions.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instructions: Option<String>,
-    /// Audio format, such as `mp3`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub response_format: Option<String>,
-    /// Playback speed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub speed: Option<f64>,
-    /// Supported provider extensions, relayed unchanged.
-    #[serde(flatten)]
-    pub extra: Map<String, Value>,
+skald_spec::wire_contract! {
+    /// `POST /v1/audio/speech` request.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+    pub struct GatewaySpeechRequest as GatewaySpeechRequestView {
+        /// Exact `<provider>/<model>` projection.
+        pub model: String,
+        /// Text to speak.
+        pub input: String,
+        /// Voice name.
+        pub voice: String,
+        /// Delivery instructions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub instructions: Option<String>,
+        /// Audio format, such as `mp3`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub response_format: Option<String>,
+        /// Playback speed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub speed: Option<f64>,
+        /// Supported provider extensions, relayed unchanged.
+        #[serde(flatten)]
+        pub extra: Map<String, Value>,
+    }
 }
 
 /// `POST /v1/audio/transcriptions` form.
@@ -365,21 +385,23 @@ pub struct GatewayFileDeleted {
     pub deleted: bool,
 }
 
-/// `POST /v1/batches` request; an identical request converges on one batch.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct GatewayBatchCreateRequest {
-    /// Wyrd id of the uploaded input file.
-    pub input_file_id: String,
-    /// The endpoint every input file request targets.
-    pub endpoint: String,
-    /// Completion window, such as `24h`.
-    pub completion_window: String,
-    /// Caller metadata.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<BTreeMap<String, String>>,
-    /// Supported provider extensions, relayed unchanged.
-    #[serde(flatten)]
-    pub extra: Map<String, Value>,
+skald_spec::wire_contract! {
+    /// `POST /v1/batches` request; an identical request converges on one batch.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+    pub struct GatewayBatchCreateRequest as GatewayBatchCreateRequestView {
+        /// Wyrd id of the uploaded input file.
+        pub input_file_id: String,
+        /// The endpoint every input file request targets.
+        pub endpoint: String,
+        /// Completion window, such as `24h`.
+        pub completion_window: String,
+        /// Caller metadata.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub metadata: Option<BTreeMap<String, String>>,
+        /// Supported provider extensions, relayed unchanged.
+        #[serde(flatten)]
+        pub extra: Map<String, Value>,
+    }
 }
 
 /// `OpenAI` batch object with Wyrd batch and file ids.

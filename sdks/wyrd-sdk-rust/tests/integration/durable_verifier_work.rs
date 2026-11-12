@@ -13,6 +13,7 @@ use wyrd_ai::verify::Execution;
 use wyrd_testing::verification::VerificationFixture;
 
 use crate::support::{declare, declared};
+use crate::verifier_building_blocks::step;
 use crate::verify_in_real_time::{Assistant, enqueue_as, enqueue_response};
 
 /// How long a test waits for a queued execution to settle.
@@ -189,7 +190,7 @@ async fn action_checkpoint_survives_unfinished_requirements() {
         .await
         .expect("the recovered execution settles");
     assert_eq!(result.outcome.verdict, VerificationVerdict::Passed);
-    let review = &result.outcome.steps[0];
+    let review = step(&assistant.deployment, &result, "review").await;
     assert_eq!((review.id.as_str(), review.attempts), ("review", 1));
     let judged = (
         calls(&assistant, REVIEW).await,

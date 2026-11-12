@@ -16,7 +16,7 @@ use wyrd_spec::vala::trace::{InstrumentationScope, Resource, SpanKind, SpanRecor
 use wyrd_spec::verification::DriftWindow;
 use wyrd_spec::verification::PublicationName;
 use wyrd_spec::verification::execution::{
-    Producer, ProducerInvocation, PublicationCollection, Speculation, Verdict,
+    ExecutedRequirement, Producer, ProducerInvocation, PublicationCollection, Speculation, Verdict,
 };
 
 use super::*;
@@ -236,7 +236,7 @@ impl ActionExecutor for Script {
                 let inputs = call
                     .inputs
                     .iter()
-                    .map(|(name, input)| (name.clone(), json(input)))
+                    .map(|(name, input)| (name.clone(), json(input).into_owned()))
                     .collect();
                 Ok(output(&Value::Object(inputs)))
             }
@@ -317,7 +317,7 @@ async fn run(
     engine: &VerificationEngine,
     spec: &Arc<VerifierSpec>,
     inputs: Value,
-) -> Result<VerificationOutcome, EngineError> {
+) -> Result<ExecutedOutcome, EngineError> {
     let evidence = inputs
         .as_object()
         .expect("object")
@@ -341,11 +341,11 @@ async fn run(
 }
 
 /// Outcome and reason of each requirement by ID.
-fn outcomes(outcome: &VerificationOutcome) -> BTreeMap<&str, RequirementOutcome> {
+fn outcomes(outcome: &ExecutedOutcome) -> BTreeMap<&str, RequirementOutcome> {
     outcome
         .requirements
         .iter()
-        .map(|result| (result.id.as_str(), result.outcome))
+        .map(|requirement| (requirement.result.id.as_str(), requirement.result.outcome))
         .collect()
 }
 
@@ -353,11 +353,19 @@ fn outcomes(outcome: &VerificationOutcome) -> BTreeMap<&str, RequirementOutcome>
 ///
 /// # Panics
 /// Panics when `outcome` has no requirement `id`.
-fn requirement<'a>(outcome: &'a VerificationOutcome, id: &str) -> &'a RequirementResult {
+fn requirement<'a>(outcome: &'a ExecutedOutcome, id: &str) -> &'a RequirementResult {
+    &recorded(outcome, id).result
+}
+
+/// The recorded requirement, check and provenance included.
+///
+/// # Panics
+/// Panics when `outcome` has no requirement `id`.
+fn recorded<'a>(outcome: &'a ExecutedOutcome, id: &str) -> &'a ExecutedRequirement {
     outcome
         .requirements
         .iter()
-        .find(|result| result.id.as_str() == id)
+        .find(|requirement| requirement.result.id.as_str() == id)
         .expect("requirement result")
 }
 
@@ -365,7 +373,7 @@ fn requirement<'a>(outcome: &'a VerificationOutcome, id: &str) -> &'a Requiremen
 ///
 /// # Panics
 /// Panics when `outcome` has no step `id`.
-fn step<'a>(outcome: &'a VerificationOutcome, id: &str) -> &'a StepResult {
+fn step<'a>(outcome: &'a ExecutedOutcome, id: &str) -> &'a StepResult {
     outcome
         .steps
         .iter()
@@ -474,7 +482,10 @@ async fn no_step_verifier_judges_inputs_and_traces() {
     );
     let failed = requirement(&outcome, "no-guarantee");
     assert_eq!(failed.actual, Some(json!("A guaranteed refund applies.")));
-    assert_eq!(failed.check, spec.requirements[0].check);
+    assert_eq!(
+        recorded(&outcome, "no-guarantee").check,
+        spec.requirements[0].check
+    );
     assert!(requirement(&outcome, "lost").reason.contains("not found"));
     assert_eq!(outcome.verdict, VerificationVerdict::Failed);
     assert_eq!(outcome.evidence, evidence);
@@ -487,20 +498,27 @@ async fn no_step_verifier_judges_inputs_and_traces() {
 
 /// Context capture applies the existing rule to actual values: `hash`
 /// stores the digest and `redact` stores nothing, without changing outcomes.
+/// A hashed digest is the SHA-256 of exactly the compact `serde_json` bytes,
+/// pinned against hand-written bytes for nested, escaped and Unicode values.
 ///
 /// # Panics
 /// Panics when a captured actual value differs.
 #[tokio::test(start_paused = true)]
 async fn context_capture_hashes_or_redacts_actual_values() {
+    use sha2::Digest as _;
+
     let script = Arc::new(Script::default());
     for (capture, expected) in [
         (
             "hash",
             Some(Value::String(
-                crate::assertion::capture_actual(Some(json!(4)), ContextCapture::Hash)
-                    .expect("hash")
-                    .and_then(|v| v.as_str().map(str::to_owned))
-                    .expect("digest"),
+                crate::assertion::capture_actual(
+                    Some(std::borrow::Cow::Owned(json!(4))),
+                    ContextCapture::Hash,
+                )
+                .expect("hash")
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .expect("digest"),
             )),
         ),
         ("redact", None),
@@ -519,6 +537,39 @@ async fn context_capture_hashes_or_redacts_actual_values() {
         .expect("outcome");
         assert_eq!(outcome.verdict, VerificationVerdict::Passed);
         assert_eq!(requirement(&outcome, "count").actual, expected, "{capture}");
+    }
+
+    // Digests of the compact serde_json bytes, written out by hand: member
+    // order as parsed, `"`, `\\`, newline and control escapes, and raw UTF-8.
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "requirements": [{"id": "count", "statement": "Count", "check": {"kind": "assert", "path": "inputs.answer", "operator": "is_not_null"}}],
+        "context_capture": "hash"
+    }));
+    let answer: Value = serde_json::from_str(
+        r#"{"z":[1,-2.5,true,null,{"y":{}}],"a":"\u00e9 \u2603 \"q\" \\ \n \u0001"}"#,
+    )
+    .expect("answer");
+    for (answer, bytes) in [
+        (
+            answer,
+            "{\"z\":[1,-2.5,true,null,{\"y\":{}}],\"a\":\"\u{e9} \u{2603} \\\"q\\\" \\\\ \\n \\u0001\"}",
+        ),
+        (json!("\u{1f980}"), "\"\u{1f980}\""),
+    ] {
+        let outcome = run(
+            &engine(&script, InMemoryTraceSource::new(), 1),
+            &spec,
+            json!({"answer": answer}),
+        )
+        .await
+        .expect("outcome");
+        let digest = format!("{:x}", sha2::Sha256::digest(bytes.as_bytes()));
+        assert_eq!(
+            requirement(&outcome, "count").actual,
+            Some(Value::String(digest)),
+            "{bytes}"
+        );
     }
 }
 
@@ -674,7 +725,12 @@ async fn dependents_wait_for_upstream_step_requirements() {
     let ids: Vec<_> = outcome
         .requirements
         .iter()
-        .map(|r| (r.id.as_str(), r.step.as_ref().map(TaskId::as_str)))
+        .map(|r| {
+            (
+                r.result.id.as_str(),
+                r.result.step.as_ref().map(TaskId::as_str),
+            )
+        })
         .collect();
     assert_eq!(
         ids,
@@ -953,23 +1009,34 @@ async fn elapsed_deadline_refuses_ready_work() {
     }
 }
 
-/// A missing required slot is inconclusive, an omitted optional slot is
-/// `null` for an explicit null assertion, and a child of an omitted slot or
-/// an absent output field is missing rather than `null`.
+/// Omitted evidence stays missing, never `null`: an assertion on an omitted
+/// slot or its child, an action binding it, a `when` condition reading it,
+/// and a trace check on an omitted trace are inconclusive, never passed or
+/// intentionally skipped, and an absent output field is missing too. An
+/// independent supplied-input check still runs and passes, and the overall
+/// verdict aggregates as before.
 ///
 /// # Panics
-/// Panics when an outcome differs.
+/// Panics when an outcome, reason, call, or verdict differs.
 #[tokio::test(start_paused = true)]
-async fn missing_and_optional_evidence_resolve_honestly() {
+async fn missing_evidence_is_inconclusive_never_null() {
     let assert = |id: &str, path: &str, operator: &str| json!({"id": id, "statement": id, "check": {"kind": "assert", "path": path, "operator": operator}});
     let spec = verifier(json!({
-        "inputs": {"answer": {"type": "json"}, "note": {"type": "json", "required": false}, "policy": {"type": "media", "formats": ["pdf"]}},
-        "steps": [{"id": "pages", "action": {"kind": "extract", "from": "inputs.policy"},
-                   "requirements": [assert("has-pages", "steps.pages.output.pages", "is_not_null")]}],
+        "inputs": {"answer": {"type": "json"}, "note": {"type": "json"}, "policy": {"type": "media", "formats": ["pdf"]}, "trace": {"type": "trace"}},
+        "steps": [
+            {"id": "pages", "action": {"kind": "extract", "from": "inputs.policy"},
+             "requirements": [assert("has-pages", "steps.pages.output.pages", "is_not_null")]},
+            {"id": "reads-note", "action": code_action(json!({"note": "inputs.note"})),
+             "requirements": [assert("note-read", "steps.reads-note.output", "is_not_null")]},
+            {"id": "gated", "when": {"path": "inputs.note", "operator": "is_null"},
+             "action": code_action(json!({"x": "inputs.answer"})),
+             "requirements": [assert("gated-ran", "inputs.answer", "is_not_null")]}
+        ],
         "requirements": [
             assert("no-note", "inputs.note", "is_null"),
             assert("note-text", "inputs.note.text", "is_null"),
             assert("absent-field", "inputs.answer.missing", "is_null"),
+            {"id": "no-call", "statement": "no-call", "check": {"kind": "trace", "on": "inputs.trace", "span_selector": "$.spans[?(@.name == 'call')]", "operator": "is_empty"}},
             assert("present", "inputs.answer.text", "is_not_null")
         ]
     }));
@@ -980,27 +1047,40 @@ async fn missing_and_optional_evidence_resolve_honestly() {
         json!({"answer": {"text": "hi"}}),
     )
     .await
-    .expect("outcome");
+    .expect("omission is not a refusal");
     assert_eq!(
         outcomes(&outcome),
         BTreeMap::from([
             ("has-pages", RequirementOutcome::Inconclusive),
-            ("no-note", RequirementOutcome::Passed),
+            ("note-read", RequirementOutcome::Inconclusive),
+            ("gated-ran", RequirementOutcome::Inconclusive),
+            ("no-note", RequirementOutcome::Inconclusive),
             ("note-text", RequirementOutcome::Inconclusive),
             ("absent-field", RequirementOutcome::Inconclusive),
+            ("no-call", RequirementOutcome::Inconclusive),
             ("present", RequirementOutcome::Passed),
         ])
     );
-    assert!(
-        step(&outcome, "pages")
-            .reason
-            .as_deref()
-            .is_some_and(|r| r.contains("`policy` was not supplied"))
-    );
+    for (id, slot) in [
+        ("pages", "policy"),
+        ("reads-note", "note"),
+        ("gated", "note"),
+    ] {
+        assert!(
+            step(&outcome, id)
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains(&format!("`{slot}` was not supplied"))),
+            "{id}: {:?}",
+            step(&outcome, id).reason
+        );
+    }
     assert!(
         script.calls().is_empty(),
-        "extract without evidence is never called"
+        "no block runs on missing evidence: {:?}",
+        script.calls()
     );
+    assert_eq!(outcome.verdict, VerificationVerdict::Inconclusive);
 }
 
 /// Supplied evidence that does not conform to its declared slot is refused
@@ -1016,7 +1096,7 @@ async fn nonconforming_evidence_is_refused_before_any_block() {
     let spec = verifier(json!({
         "inputs": {
             "x": {"type": "json", "schema": {"type": "integer"}},
-            "policy": {"type": "media", "formats": ["pdf"], "max_bytes": 10, "required": false}
+            "policy": {"type": "media", "formats": ["pdf"], "max_bytes": 10}
         },
         "steps": [{"id": "draft", "action": code_action(json!({"x": "inputs.x"}))}],
         "requirements": [{"id": "x", "statement": "x", "check": {"kind": "assert", "path": "inputs.x", "operator": "is_not_null"}}]
@@ -1100,6 +1180,42 @@ async fn nonconforming_evidence_is_refused_before_any_block() {
         .await
         .expect("conforming evidence runs");
     assert_eq!(outcome.verdict, VerificationVerdict::Passed);
+}
+
+/// A supplied `null` is admitted or refused by the slot's schema alone: a
+/// schema admitting `null` passes it through as `null`, and one rejecting
+/// `null` refuses it before any block runs.
+///
+/// # Panics
+/// Panics when a null-admitting slot refuses `null`, a null-rejecting one
+/// admits it, or an admitted `null` does not read as `null`.
+#[tokio::test(start_paused = true)]
+async fn supplied_null_follows_the_slot_schema() {
+    let spec = verifier(json!({
+        "inputs": {
+            "nullable": {"type": "json", "schema": {"type": ["object", "null"]}},
+            "strict": {"type": "json", "schema": {"type": "object"}},
+        },
+        "requirements": [
+            {"id": "nullable", "statement": "n", "check": {"kind": "assert", "path": "inputs.nullable", "operator": "is_null"}},
+        ]
+    }));
+    let script = Arc::new(Script::default());
+    let engine = engine(&script, InMemoryTraceSource::new(), 1);
+    let admitted = run(&engine, &spec, json!({"nullable": null}))
+        .await
+        .expect("a null-admitting slot admits null");
+    assert_eq!(admitted.verdict, VerificationVerdict::Passed);
+    let refused = run(&engine, &spec, json!({"strict": null})).await;
+    assert!(
+        matches!(&refused, Err(EngineError::InputInvalid(reason)) if reason.contains("strict")),
+        "{refused:?}"
+    );
+    assert!(
+        script.calls().is_empty(),
+        "no block ran: {:?}",
+        script.calls()
+    );
 }
 
 /// No requirements, or only not-applicable ones, is inconclusive.
@@ -2086,8 +2202,10 @@ async fn unlanded_traces_defer_only_a_deferring_engine() {
         judged
             .requirements
             .iter()
-            .all(|result| result.outcome == RequirementOutcome::Inconclusive
-                && result.reason.contains("not yet landed")),
+            .all(
+                |requirement| requirement.result.outcome == RequirementOutcome::Inconclusive
+                    && requirement.result.reason.contains("not yet landed")
+            ),
         "{judged:?}"
     );
     assert_eq!(judged.verdict, VerificationVerdict::Inconclusive);
@@ -2896,8 +3014,8 @@ async fn array_fanout_freezes_and_orders_items() {
         outcome
             .requirements
             .iter()
-            .filter(|result| result.id.as_str() == "per")
-            .map(|result| (result.item_index, result.outcome))
+            .filter(|result| result.result.id.as_str() == "per")
+            .map(|result| (result.result.item_index, result.result.outcome))
             .collect::<Vec<_>>(),
         (0..3)
             .map(|item| (Some(item), RequirementOutcome::Passed))
@@ -2912,8 +3030,8 @@ async fn array_fanout_freezes_and_orders_items() {
         outcome
             .requirements
             .iter()
-            .find(|result| result.id.as_str() == "empty-covers")
-            .map(|result| result.outcome),
+            .find(|result| result.result.id.as_str() == "empty-covers")
+            .map(|result| result.result.outcome),
         Some(RequirementOutcome::Inconclusive),
         "an empty fanout alone passes no requirement"
     );
@@ -3137,8 +3255,8 @@ async fn repeat_refines_one_iteration_at_a_time() {
         outcome
             .requirements
             .iter()
-            .filter(|result| result.id.as_str() == "seen")
-            .map(|result| result.iteration_index)
+            .filter(|result| result.result.id.as_str() == "seen")
+            .map(|result| result.result.iteration_index)
             .collect::<Vec<_>>(),
         vec![Some(0), Some(1), Some(2)]
     );

@@ -7,8 +7,12 @@
 //! `GET /v1/verification/executions/{execution_id}` reports
 //! [`VerificationExecutionState`]. Execution status stays separate from the
 //! verdict: a failed requirement is a normal result, never a transport error.
+//! Every result read returns the compact [`VerificationResult`];
+//! `GET /v1/verification/executions/{execution_id}/details` alone returns
+//! the descriptive [`VerificationDetails`].
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::LazyLock;
 
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
@@ -21,7 +25,7 @@ use super::{
     VerificationExecutionStatus, VerificationVerdict,
 };
 use crate::auth::Sha256Hex;
-use crate::card::agent::{BuiltinTool, ExecutionRoute};
+use crate::card::agent::{Authored, BuiltinTool, Compiled, ExecutionRoute, PromptForm};
 use crate::card::verifier::{Check, CodeRuntime};
 use crate::error::WyrdError;
 use crate::ids::{CardUid, ExecutionId, GroupId, RepositoryId, SlotName};
@@ -253,8 +257,11 @@ pub struct PullRequestActivation {
     pub generation: uuid::Uuid,
 }
 
-/// The attributable result of one Verifier execution.
+/// The attributable decision of one Verifier execution.
 ///
+/// The compact default every execution, status, and wait read returns: the
+/// verdict and each requirement's judgment, without the check configuration,
+/// provenance, steps, or evidence that [`VerificationDetails`] describes.
 /// `T` is the type of each requirement's custom `data`: JSON objects on the
 /// wire, or a caller's type after a typed SDK read.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -275,12 +282,12 @@ pub struct VerificationResult<T = Map<String, Value>> {
     /// absent when the invocation carried none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployment_environment: Option<String>,
-    /// Verdict, breakdown, and evidence.
+    /// Verdict and requirement judgments.
     #[cfg_attr(feature = "server", schema(value_type = VerificationOutcome))]
     pub outcome: VerificationOutcome<T>,
 }
 
-/// Overall verdict with its requirement and step breakdown.
+/// Overall verdict with its requirement judgments.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[schemars(rename = "VerificationOutcome")]
@@ -291,10 +298,6 @@ pub struct VerificationOutcome<T = Map<String, Value>> {
     /// Every requirement, step requirements included.
     #[cfg_attr(feature = "server", schema(value_type = Vec<RequirementResult>))]
     pub requirements: Vec<RequirementResult<T>>,
-    /// Every step in plan order.
-    pub steps: Vec<StepResult>,
-    /// The pinned original evidence, by slot.
-    pub evidence: BTreeMap<SlotName, InputDeclaration>,
 }
 
 /// The judgment of one requirement.
@@ -325,7 +328,8 @@ pub struct RequirementResult<T = Map<String, Value>> {
     /// The compared actual value, when capture permits it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actual: Option<Value>,
-    /// Validated original-evidence citations.
+    /// Validated original-evidence citations: the original slot and locator,
+    /// never a promise that the input body is echoed or fetchable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub citations: Vec<Citation>,
     /// Custom data an Agent or code check returned under its declared
@@ -341,12 +345,95 @@ pub struct RequirementResult<T = Map<String, Value>> {
     /// Check-specific detail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<RequirementDetail>,
+}
+
+/// `GET /v1/verification/executions/{execution_id}/details` response: what
+/// one execution ran and how it judged.
+///
+/// The same identity and judgments as its [`VerificationResult`], plus each
+/// requirement's exact authored check and provenance, every step, and the
+/// pinned evidence declarations. `T` is the custom-data type, as in
+/// [`VerificationResult`]. `F` is the inline Agent Prompt form: a read
+/// keeps the [`Authored`] form and never compiles, renders, or executes a
+/// Prompt; an engine records the [`Compiled`] form it ran.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(bound(
+    serialize = "T: Serialize",
+    deserialize = "T: serde::de::DeserializeOwned"
+))]
+#[schemars(rename = "VerificationDetails", bound = "T: JsonSchema, F: PromptForm")]
+#[cfg_attr(feature = "server", schema(bound = ""))]
+pub struct VerificationDetails<T = Map<String, Value>, F: PromptForm = Authored> {
+    /// Server-issued execution identity.
+    pub execution_id: ExecutionId,
+    /// The caller's application Run, when there is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<RunId>,
+    /// The exact Verifier executed.
+    pub verifier: CardRef,
+    /// The exact subject judged.
+    pub subject: CardRef,
+    /// The deployment environment tag the execution was invoked with, or
+    /// absent when the invocation carried none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_environment: Option<String>,
+    /// Verdict, requirement and step breakdown, and evidence.
+    #[cfg_attr(feature = "server", schema(value_type = OutcomeDetails))]
+    pub outcome: OutcomeDetails<T, F>,
+}
+
+/// Overall verdict with its full requirement and step breakdown and the
+/// pinned evidence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(bound(
+    serialize = "T: Serialize",
+    deserialize = "T: serde::de::DeserializeOwned"
+))]
+#[schemars(rename = "OutcomeDetails", bound = "T: JsonSchema, F: PromptForm")]
+#[cfg_attr(feature = "server", schema(bound = ""))]
+pub struct OutcomeDetails<T = Map<String, Value>, F: PromptForm = Authored> {
+    /// The `decide` rule applied to every applicable requirement.
+    pub verdict: VerificationVerdict,
+    /// Every requirement, step requirements included.
+    #[cfg_attr(feature = "server", schema(value_type = Vec<RequirementDetails>))]
+    pub requirements: Vec<RequirementDetails<T, F>>,
+    /// Every step in plan order.
+    pub steps: Vec<StepResult>,
+    /// The pinned original evidence, by slot.
+    pub evidence: BTreeMap<SlotName, InputDeclaration>,
+}
+
+/// The judgment of one requirement with the exact check that produced it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(bound(
+    serialize = "T: Serialize",
+    deserialize = "T: serde::de::DeserializeOwned"
+))]
+#[schemars(rename = "RequirementDetails", bound = "T: JsonSchema, F: PromptForm")]
+#[cfg_attr(feature = "server", schema(bound = ""))]
+pub struct RequirementDetails<T = Map<String, Value>, F: PromptForm = Authored> {
+    /// The judgment, exactly as the compact result carries it.
+    #[serde(flatten)]
+    #[cfg_attr(feature = "server", schema(value_type = RequirementResult))]
+    pub result: RequirementResult<T>,
     /// The exact check configuration that ran.
-    pub check: Check,
+    #[schemars(with = "Check")]
+    #[cfg_attr(feature = "server", schema(value_type = Check))]
+    pub check: Check<F>,
     /// What executed the check, for Agent, code, and drift checks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<CallProvenance>,
 }
+
+/// The full outcome an engine produces and records: details holding each
+/// check in the compiled form it ran.
+pub type ExecutedOutcome = OutcomeDetails<Map<String, Value>, Compiled>;
+
+/// One requirement of an [`ExecutedOutcome`].
+pub type ExecutedRequirement = RequirementDetails<Map<String, Value>, Compiled>;
 
 /// One requirement's outcome. Only `not_applicable` leaves the `decide`
 /// denominator.
@@ -470,8 +557,8 @@ pub enum InvocationSettlement {
     },
     /// A requirement's check was judged.
     Requirement {
-        /// The reported requirement result.
-        result: Box<RequirementResult>,
+        /// The reported requirement with the exact check that judged it.
+        result: Box<ExecutedRequirement>,
     },
 }
 
@@ -961,11 +1048,6 @@ impl VerificationResult {
             deployment_environment,
             outcome,
         } = self;
-        let requirements = outcome
-            .requirements
-            .into_iter()
-            .map(RequirementResult::decode_data)
-            .collect::<Result<_, _>>()?;
         Ok(VerificationResult {
             execution_id,
             run_id,
@@ -974,11 +1056,87 @@ impl VerificationResult {
             deployment_environment,
             outcome: VerificationOutcome {
                 verdict: outcome.verdict,
-                requirements,
+                requirements: outcome
+                    .requirements
+                    .into_iter()
+                    .map(RequirementResult::decode_data)
+                    .collect::<Result<_, _>>()?,
+            },
+        })
+    }
+}
+
+impl VerificationDetails {
+    /// These details with every present requirement `data` decoded as `T`,
+    /// with the [`VerificationResult::decode_data`] semantics.
+    ///
+    /// # Errors
+    /// Returns the [`VerificationResult::decode_data`] error.
+    pub fn decode_data<T: DeserializeOwned>(self) -> Result<VerificationDetails<T>, WyrdError> {
+        let Self {
+            execution_id,
+            run_id,
+            verifier,
+            subject,
+            deployment_environment,
+            outcome,
+        } = self;
+        Ok(VerificationDetails {
+            execution_id,
+            run_id,
+            verifier,
+            subject,
+            deployment_environment,
+            outcome: OutcomeDetails {
+                verdict: outcome.verdict,
+                requirements: outcome
+                    .requirements
+                    .into_iter()
+                    .map(|requirement| {
+                        Ok(RequirementDetails {
+                            result: requirement.result.decode_data()?,
+                            check: requirement.check,
+                            provenance: requirement.provenance,
+                        })
+                    })
+                    .collect::<Result<_, WyrdError>>()?,
                 steps: outcome.steps,
                 evidence: outcome.evidence,
             },
         })
+    }
+}
+
+impl<T, F: PromptForm> OutcomeDetails<T, F> {
+    /// The compact decision of this outcome: its verdict and each
+    /// requirement's judgment, without checks, provenance, steps, or
+    /// evidence.
+    #[must_use]
+    pub fn compact(self) -> VerificationOutcome<T> {
+        VerificationOutcome {
+            verdict: self.verdict,
+            requirements: self
+                .requirements
+                .into_iter()
+                .map(|requirement| requirement.result)
+                .collect(),
+        }
+    }
+}
+
+impl<T, F: PromptForm> VerificationDetails<T, F> {
+    /// The compact [`VerificationResult`] of these details: the same
+    /// identity and judgments.
+    #[must_use]
+    pub fn compact(self) -> VerificationResult<T> {
+        VerificationResult {
+            execution_id: self.execution_id,
+            run_id: self.run_id,
+            verifier: self.verifier,
+            subject: self.subject,
+            deployment_environment: self.deployment_environment,
+            outcome: self.outcome.compact(),
+        }
     }
 }
 
@@ -1013,11 +1171,37 @@ impl RequirementResult {
             citations: self.citations,
             data,
             detail: self.detail,
-            check: self.check,
-            provenance: self.provenance,
         })
     }
 }
+
+/// The generated closed Verdict schema without `data`, the plain `verdict`
+/// format every expanded one extends. Generated once: it depends only on the
+/// Verdict type, and every compiled Prompt and decoded inline Agent check
+/// resolves it.
+///
+/// # Panics
+///
+/// Panics on first use if the generated schema is not an object declaring
+/// `properties`, an invariant of the derived schema.
+static PLAIN_VERDICT: LazyLock<Map<String, Value>> = LazyLock::new(|| {
+    let Ok(mut generated) = serde_json::to_value(crate::schema::schema_for::<Verdict>()) else {
+        unreachable!("a generated root schema serializes to a JSON object");
+    };
+    portable(&mut generated);
+    let Value::Object(mut schema) = generated else {
+        unreachable!("a generated root schema serializes to a JSON object");
+    };
+    if let Some(required) = schema.get_mut("required").and_then(Value::as_array_mut) {
+        required.retain(|name| name != "data");
+    }
+    schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .expect("the generated Verdict schema declares properties")
+        .remove("data");
+    schema
+});
 
 impl Verdict {
     /// Resolves a `verdict` response format to the schema its responses
@@ -1058,25 +1242,7 @@ impl Verdict {
                 ),
             ));
         }
-        let Ok(mut generated) = serde_json::to_value(crate::schema::schema_for::<Self>()) else {
-            unreachable!("a generated root schema serializes to a JSON object");
-        };
-        portable(&mut generated);
-        let Value::Object(mut schema) = generated else {
-            unreachable!("a generated root schema serializes to a JSON object");
-        };
-        let required = |schema: &mut Map<String, Value>| {
-            schema
-                .get_mut("required")
-                .and_then(Value::as_array_mut)
-                .map(|required| required.retain(|name| name != "data"))
-        };
-        required(&mut schema);
-        let properties = schema
-            .get_mut("properties")
-            .and_then(Value::as_object_mut)
-            .expect("the generated Verdict schema declares properties");
-        properties.remove("data");
+        let mut schema = PLAIN_VERDICT.clone();
         let Some(data) = format.data() else {
             return Ok(schema);
         };
@@ -1323,13 +1489,13 @@ mod tests {
         }
     }
 
-    /// A result with every locator kind, drift detail, provenance, tool calls
-    /// with and without returned output, and a skipped step keeps its
+    /// Details with every locator kind, drift detail, provenance, tool calls
+    /// with and without returned output, and a skipped step keep their
     /// documented wire form; records without a returned size, naming a
     /// non-built-in tool, or with a non-canonical digest are refused.
     ///
     /// # Panics
-    /// Panics when the documented result does not round-trip.
+    /// Panics when the documented details do not round-trip.
     #[test]
     fn verification_result_round_trips_documented_outcome() {
         let result = json!({
@@ -1368,8 +1534,8 @@ mod tests {
                 "evidence": {"contract": {"kind": "file", "sha256": "b".repeat(64), "size_bytes": 4, "format": "pdf"}}
             }
         });
-        let parsed: VerificationResult =
-            serde_json::from_value(result.clone()).expect("documented result");
+        let parsed: VerificationDetails =
+            serde_json::from_value(result.clone()).expect("documented details");
         assert_eq!(serde_json::to_value(&parsed).expect("serialize"), result);
         assert!(
             serde_json::from_value::<Verdict>(
@@ -1455,6 +1621,207 @@ mod tests {
         let problem = serde_json::to_string(&error.problem()).expect("problem");
         assert!(!problem.contains("customer-secret"), "{problem}");
         assert!(!error.to_string().contains("customer-secret"), "{error}");
+    }
+
+    /// The full stored record of an execution judging every outcome kind:
+    /// failed custom data, drift detail, citations, an inline Agent check
+    /// whose named `response_format` only a compiler resolves, steps, and
+    /// evidence.
+    fn recorded(prompt: &Value) -> Value {
+        json!({
+            "execution_id": "0195a4b8-3c1d-7e00-8000-000000000001",
+            "run_id": "run-1",
+            "verifier": {"kind": "Verifier", "name": "judge", "version": "1.0.0"},
+            "subject": {"kind": "Agent", "name": "drafter", "version": "1.0.0"},
+            "deployment_environment": "prod",
+            "outcome": {
+                "verdict": "failed",
+                "requirements": [{
+                    "id": "grounded", "statement": "Cites the policy", "outcome": "failed",
+                    "reason": "no citation", "actual": {"score": 0.25},
+                    "citations": [{"slot": "policy", "locator": {"page": 2}}],
+                    "data": {"score": 0.25},
+                    "check": {"kind": "agent", "agent": {
+                        "prompt": prompt,
+                        "execution_route": {"kind": "wyrd_gateway", "deployment": "judge"}
+                    }, "inputs": {"answer": "inputs.answer"}},
+                    "provenance": {"kind": "agent", "route": {"kind": "wyrd_gateway", "deployment": "judge"}}
+                }, {
+                    "id": "present", "statement": "Has an answer", "outcome": "passed",
+                    "reason": "present",
+                    "check": {"kind": "assert", "path": "inputs.answer", "operator": "is_not_null"}
+                }, {
+                    "id": "named", "statement": "Judged by the registered Agent",
+                    "outcome": "inconclusive", "reason": "provider refused",
+                    "check": {"kind": "agent", "agent": {"kind": "Agent", "name": "judge", "version": "1.0.0"}}
+                }, {
+                    "id": "stable", "step": "structure", "statement": "Inputs are stable",
+                    "outcome": "not_applicable", "reason": "step skipped",
+                    "detail": {"drift": {"method": "Psi", "features": {}, "verdict": "NoDrift"}},
+                    "check": {"kind": "assert", "path": "inputs.answer", "operator": "is_not_null"}
+                }],
+                "steps": [{"id": "structure", "status": "skipped", "attempts": 0, "duration_ms": 0, "reason": "when was false"}],
+                "evidence": {"answer": {"kind": "json", "value": {"text": "yes"}}}
+            }
+        })
+    }
+
+    /// The portable inline Prompt [`recorded`] judges with, declaring custom
+    /// data through the named `verdict` format.
+    fn portable_prompt() -> Value {
+        json!({
+            "provider": "openai", "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "{{answer}}"}],
+            "response_format": {"kind": "verdict", "data": {
+                "type": "object", "properties": {"score": {"type": "number"}},
+                "required": ["score"], "additionalProperties": false
+            }}
+        })
+    }
+
+    /// The compact result keeps identity and every judgment field, custom
+    /// data and drift detail included, for each outcome kind, and omits the
+    /// check, provenance, steps, and evidence as absent keys rather than
+    /// nulls. Projecting stored details and decoding the stored record
+    /// directly agree; typed data decodes failed requirements and refuses a
+    /// mismatch without changing the decision. The published schema
+    /// declares no configuration field.
+    ///
+    /// # Panics
+    /// Panics when a retained field is lost, an omitted field is present, or
+    /// the projections disagree.
+    #[test]
+    fn compact_results_preserve_judgments_without_configuration() {
+        /// The caller's model of the judge's custom data.
+        #[derive(Debug, PartialEq, Deserialize)]
+        struct Judge {
+            /// The judge's score.
+            score: f64,
+        }
+
+        let record = recorded(&portable_prompt());
+        let mut expected = record.clone();
+        let outcome = expected["outcome"].as_object_mut().expect("outcome");
+        outcome.remove("steps");
+        outcome.remove("evidence");
+        for requirement in outcome["requirements"]
+            .as_array_mut()
+            .expect("requirements")
+        {
+            let fields = requirement.as_object_mut().expect("requirement");
+            fields.remove("check");
+            fields.remove("provenance");
+        }
+        let projected = serde_json::from_value::<VerificationDetails>(record.clone())
+            .expect("details")
+            .compact();
+        assert_eq!(
+            serde_json::to_value(&projected).expect("serialize"),
+            expected
+        );
+        let direct: VerificationResult =
+            serde_json::from_value(record).expect("a compact read of the full record");
+        assert_eq!(direct, projected, "both projections agree");
+        let outcomes: Vec<_> = projected
+            .outcome
+            .requirements
+            .iter()
+            .map(|requirement| requirement.outcome)
+            .collect();
+        assert_eq!(
+            outcomes,
+            [
+                RequirementOutcome::Failed,
+                RequirementOutcome::Passed,
+                RequirementOutcome::Inconclusive,
+                RequirementOutcome::NotApplicable,
+            ]
+        );
+
+        let typed = projected.clone().decode_data::<Judge>().expect("typed");
+        assert_eq!(
+            typed.outcome.requirements[0].data,
+            Some(Judge { score: 0.25 })
+        );
+        assert_eq!(typed.outcome.verdict, projected.outcome.verdict);
+        assert!(projected.decode_data::<BTreeMap<String, String>>().is_err());
+
+        let schema = serde_json::to_value(crate::schema::schema_for::<VerificationResult>())
+            .expect("schema");
+        let definitions = &schema["$defs"];
+        let names = |definition: &str| -> BTreeSet<String> {
+            definitions[definition]["properties"]
+                .as_object()
+                .expect(definition)
+                .keys()
+                .cloned()
+                .collect()
+        };
+        assert_eq!(
+            names("VerificationOutcome"),
+            BTreeSet::from(["verdict".to_owned(), "requirements".to_owned()])
+        );
+        assert!(names("RequirementResult").is_disjoint(&BTreeSet::from([
+            "check".to_owned(),
+            "provenance".to_owned()
+        ])));
+    }
+
+    /// Details keep each inline Agent's authored Prompt, portable and
+    /// native, and a registered Agent reference exactly as recorded, and
+    /// agree with the compact result. Decoding never compiles: a Prompt
+    /// naming a format no compiler resolves still describes what was
+    /// recorded, while the executable form refuses it. Structural integrity
+    /// is still checked.
+    ///
+    /// # Panics
+    /// Panics when the details change a recorded field, compile a Prompt, or
+    /// admit a malformed record.
+    #[test]
+    fn execution_details_preserve_authored_checks_without_compilation() {
+        let native = json!({
+            "provider": "anthropic", "model": "claude", "format": "messages",
+            "body": {"max_tokens": 64, "messages": [{"role": "user", "content": [{"type": "text", "text": "{{answer}}"}]}]},
+            "response_format": "verdict"
+        });
+        let unresolvable = {
+            let mut prompt = portable_prompt();
+            prompt["response_format"] = json!("not-a-format");
+            prompt
+        };
+        for prompt in [portable_prompt(), native, unresolvable.clone()] {
+            let record = recorded(&prompt);
+            let details: VerificationDetails =
+                serde_json::from_value(record.clone()).expect("details decode as recorded");
+            assert_eq!(serde_json::to_value(&details).expect("serialize"), record);
+            let Check::Agent(call) = &details.outcome.requirements[0].check else {
+                panic!("an Agent check stays an Agent check");
+            };
+            assert_eq!(
+                call.agent
+                    .as_inline()
+                    .map(|agent| agent.prompt.as_inline().is_some()),
+                Some(true),
+                "the inline Agent keeps its inline authored Prompt"
+            );
+            assert_eq!(
+                details.outcome.requirements[2].check,
+                serde_json::from_value(record["outcome"]["requirements"][2]["check"].clone())
+                    .expect("registered Agent reference")
+            );
+            let compact: VerificationResult = serde_json::from_value(record).expect("compact");
+            assert_eq!(details.compact(), compact, "identity and judgments agree");
+        }
+        assert!(
+            serde_json::from_value::<
+                VerificationDetails<Map<String, Value>, crate::card::agent::Compiled>,
+            >(recorded(&unresolvable))
+            .is_err(),
+            "the executable form compiles, and refuses the unresolvable format"
+        );
+        let mut malformed = recorded(&portable_prompt());
+        malformed["outcome"]["requirements"][1]["check"]["extra"] = json!(true);
+        assert!(serde_json::from_value::<VerificationDetails>(malformed).is_err());
     }
 
     /// Custom Verdict data obeys the inclusive size and depth bounds: exact

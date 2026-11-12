@@ -102,6 +102,10 @@ export interface AgentRunConfigSpec {
 
 /**
  * Agent authoring body inside a Wyrd Agent Card envelope.
+ *
+ * `F` is the inline Prompt's form: [`Compiled`] to execute, or
+ * [`Authored`] for a descriptive read of retained evidence that never
+ * compiles. Both forms share one wire form.
  */
 export interface AgentSpec {
   /**
@@ -249,6 +253,32 @@ export interface ArtifactSpec {
    * Size in bytes.
    */
   readonly size_bytes?: number | null;
+}
+
+/**
+ * Audit artifact or evidence bundle metadata.
+ */
+export interface AuditSpec {
+  /**
+   * Audit description.
+   */
+  readonly description?: string | null;
+  /**
+   * Free-form details.
+   */
+  readonly details?: Readonly<Record<string, NonSecretValue>>;
+  /**
+   * Evidence artifact references.
+   */
+  readonly evidence_refs?: readonly Ref[];
+  /**
+   * Policy references.
+   */
+  readonly policy_refs?: readonly Ref[];
+  /**
+   * Subject Card references.
+   */
+  readonly subject_refs?: readonly Ref[];
 }
 
 /**
@@ -658,6 +688,9 @@ export interface CatboostMeta {
 
 /**
  * A verdict-producing requirement check.
+ *
+ * `F` is an inline Agent's Prompt form, as in [`AgentSpec`]: compiled to
+ * execute, authored to describe retained evidence.
  */
 export type Check = CheckAssert | CheckTrace | CheckAgent | CheckCode | CheckDrift;
 
@@ -2164,6 +2197,25 @@ export interface ExecutionPageQuery {
 }
 
 /**
+ * Topologically sorted task DAG.
+ *
+ * Stages are produced in dependency-layer order. Stage 0 contains all tasks
+ * with no dependencies. Each later stage contains tasks whose dependencies
+ * were all emitted by earlier stages.
+ */
+export interface ExecutionPlan {
+  /**
+   * Topological execution layers in dependency order.
+   */
+  readonly stages: readonly Stage[];
+  /**
+   * Total task count across all stages. Equals `tasks.len()` from the
+   * input map.
+   */
+  readonly task_count: number;
+}
+
+/**
  * Where an Agent's model calls go.
  *
  * Required on every Agent and replaceable whole for one invocation; it is
@@ -2189,6 +2241,48 @@ export interface ExecutionRouteWyrdGateway {
    */
   readonly deployment: ProviderDeploymentName;
   readonly kind: "wyrd_gateway";
+}
+
+/**
+ * Grouping and comparison context for related runs.
+ */
+export interface ExperimentSpec {
+  /**
+   * Best run reference.
+   */
+  readonly best_run_ref?: RunRef | null;
+  /**
+   * Artifact references.
+   */
+  readonly card_refs?: readonly Ref[];
+  /**
+   * Default parameters applied to runs.
+   */
+  readonly default_parameters?: Readonly<Record<string, ParameterValue>>;
+  /**
+   * Experiment description.
+   */
+  readonly description?: string | null;
+  /**
+   * Free-form details.
+   */
+  readonly details?: Readonly<Record<string, NonSecretValue>>;
+  /**
+   * Experiment type.
+   */
+  readonly experiment_type?: string | null;
+  /**
+   * Associated runs.
+   */
+  readonly run_refs?: readonly RunRef[];
+  /**
+   * Summary metrics for comparison.
+   */
+  readonly summary_metrics?: readonly MetricEntry[];
+  /**
+   * Primary target Cards.
+   */
+  readonly target_refs?: readonly Ref[];
 }
 
 /**
@@ -2520,6 +2614,10 @@ export interface GatewayFallbackPolicy {
 
 /**
  * The tenant's single gateway governance policy.
+ *
+ * Each server enforces limits and budgets against its own charges plus the
+ * other servers' usage it refreshes in the background, so enforcement
+ * across servers is approximate and can briefly overshoot.
  *
  * The default is the empty policy: no limits or budgets, no active pricing,
  * and `unknown_cost: allow_unpriced`.
@@ -3082,13 +3180,13 @@ export type Inequality = "Eq" | "Ne" | "Gt" | "Ge" | "Lt" | "Le" | "In";
 export type InlineableRef_for_AgentSpec = CardRef | InlineableRef_for_AgentSpecSibling | AgentSpec | string;
 
 /**
- * A loader-projected reference to another submission in the same request.
+ * A declaration-only reference to another submission in the same request.
  */
 export interface InlineableRef_for_AgentSpecSibling {
   /**
-   * Exact identity of the sibling submission.
+   * Identity of the sibling submission; its version may be omitted.
    */
-  readonly sibling: CardRef;
+  readonly sibling: SiblingRef;
 }
 
 /**
@@ -3101,13 +3199,13 @@ export interface InlineableRef_for_AgentSpecSibling {
 export type InlineableRef_for_OperatorSpec = CardRef | InlineableRef_for_OperatorSpecSibling | OperatorSpec | string;
 
 /**
- * A loader-projected reference to another submission in the same request.
+ * A declaration-only reference to another submission in the same request.
  */
 export interface InlineableRef_for_OperatorSpecSibling {
   /**
-   * Exact identity of the sibling submission.
+   * Identity of the sibling submission; its version may be omitted.
    */
-  readonly sibling: CardRef;
+  readonly sibling: SiblingRef;
 }
 
 /**
@@ -3120,13 +3218,13 @@ export interface InlineableRef_for_OperatorSpecSibling {
 export type InlineableRef_for_Prompt = CardRef | InlineableRef_for_PromptSibling | Prompt | string;
 
 /**
- * A loader-projected reference to another submission in the same request.
+ * A declaration-only reference to another submission in the same request.
  */
 export interface InlineableRef_for_PromptSibling {
   /**
-   * Exact identity of the sibling submission.
+   * Identity of the sibling submission; its version may be omitted.
    */
-  readonly sibling: CardRef;
+  readonly sibling: SiblingRef;
 }
 
 /**
@@ -3139,13 +3237,13 @@ export interface InlineableRef_for_PromptSibling {
 export type InlineableRef_for_TriggerSpec = CardRef | InlineableRef_for_TriggerSpecSibling | TriggerSpec | string;
 
 /**
- * A loader-projected reference to another submission in the same request.
+ * A declaration-only reference to another submission in the same request.
  */
 export interface InlineableRef_for_TriggerSpecSibling {
   /**
-   * Exact identity of the sibling submission.
+   * Identity of the sibling submission; its version may be omitted.
    */
-  readonly sibling: CardRef;
+  readonly sibling: SiblingRef;
 }
 
 /**
@@ -3215,7 +3313,7 @@ export interface InputDeclarationTrace {
 }
 
 /**
- * One named evidence slot. Slots are required unless `required: false`.
+ * One named evidence slot. Missing evidence leaves the checks that need it inconclusive.
  */
 export type InputSlot = TypedInputSlot | SourceText;
 
@@ -3469,6 +3567,36 @@ export interface LocatorSlide {
   readonly slide: number;
 }
 
+/**
+ * MCP server or tool catalog metadata.
+ */
+export interface McpSpec {
+  /**
+   * MCP description.
+   */
+  readonly description?: string | null;
+  /**
+   * Free-form details.
+   */
+  readonly details?: Readonly<Record<string, NonSecretValue>>;
+  /**
+   * Required scopes.
+   */
+  readonly scopes?: readonly string[];
+  /**
+   * Server name.
+   */
+  readonly server_name: string;
+  /**
+   * Tool references.
+   */
+  readonly tool_refs?: readonly Ref[];
+  /**
+   * Transport descriptor.
+   */
+  readonly transport?: string | null;
+}
+
 export type MediaFormat = "png" | "jpeg" | "gif" | "webp" | "pdf" | "text" | "markdown" | "csv" | "json" | "html" | "docx" | "xlsx" | "pptx" | "doc" | "xls" | "ppt" | "tar_gz" | "zip";
 
 /**
@@ -3587,6 +3715,36 @@ export interface Metadata {
    * post-register.
    */
   readonly version?: VersionSpec | null;
+}
+
+/**
+ * Metric summary entry.
+ */
+export interface MetricEntry {
+  /**
+   * Metric creation timestamp.
+   */
+  readonly created_at?: string | null;
+  /**
+   * Whether this metric came from evaluation.
+   */
+  readonly is_evaluation?: boolean;
+  /**
+   * Metric name.
+   */
+  readonly name: string;
+  /**
+   * Optional step.
+   */
+  readonly step?: number | null;
+  /**
+   * Metric event timestamp.
+   */
+  readonly timestamp?: string | null;
+  /**
+   * Numeric metric value.
+   */
+  readonly value: number;
 }
 
 /**
@@ -4144,6 +4302,29 @@ export interface Origin {
 }
 
 /**
+ * Overall verdict with its full requirement and step breakdown and the
+ * pinned evidence.
+ */
+export interface OutcomeDetails {
+  /**
+   * The pinned original evidence, by slot.
+   */
+  readonly evidence: Readonly<Record<string, InputDeclaration>>;
+  /**
+   * Every requirement, step requirements included.
+   */
+  readonly requirements: readonly RequirementDetails[];
+  /**
+   * Every step in plan order.
+   */
+  readonly steps: readonly StepResult[];
+  /**
+   * The `decide` rule applied to every applicable requirement.
+   */
+  readonly verdict: VerificationVerdict;
+}
+
+/**
  * PagerDuty Events API v2 severities.
  */
 export type PagerDutySeverity = "critical" | "error" | "warning" | "info";
@@ -4160,6 +4341,51 @@ export interface PandasMeta {
    * Installed pandas version inferred by the Python boundary.
    */
   readonly framework_version: string;
+}
+
+/**
+ * Typed parameter value for experiments, runs, workflows, and tools.
+ */
+export type ParameterValue = ParameterValueInt | ParameterValueFloat | ParameterValueStr | ParameterValueBool | ParameterValueJson;
+
+/**
+ * Boolean value.
+ */
+export interface ParameterValueBool {
+  readonly type: "bool";
+  readonly value: boolean;
+}
+
+/**
+ * Floating-point value.
+ */
+export interface ParameterValueFloat {
+  readonly type: "float";
+  readonly value: number;
+}
+
+/**
+ * Integer value.
+ */
+export interface ParameterValueInt {
+  readonly type: "int";
+  readonly value: number;
+}
+
+/**
+ * Structured JSON value.
+ */
+export interface ParameterValueJson {
+  readonly type: "json";
+  readonly value: JsonValue;
+}
+
+/**
+ * String value.
+ */
+export interface ParameterValueStr {
+  readonly type: "str";
+  readonly value: string;
 }
 
 export type ParameterizedComparisonOperator = ParameterizedComparisonOperatorInRange | ParameterizedComparisonOperatorNotInRange | ParameterizedComparisonOperatorApproximatelyEquals | ParameterizedComparisonOperatorMatchesRegex | ParameterizedComparisonOperatorNotMatchesRegex | ParameterizedComparisonOperatorHasMinLength | ParameterizedComparisonOperatorHasMaxLength | ParameterizedComparisonOperatorLength | ParameterizedComparisonOperatorLengthGreaterThan | ParameterizedComparisonOperatorLengthLessThan | ParameterizedComparisonOperatorIsType | ParameterizedComparisonOperatorWithinAbsTolerance | ParameterizedComparisonOperatorWithinPctTolerance | ParameterizedComparisonOperatorWithinStdDev | ParameterizedComparisonOperatorBetweenPercentiles | ParameterizedComparisonOperatorDivergenceLessThan | ParameterizedComparisonOperatorCosineSimilarityAtLeast;
@@ -5343,13 +5569,13 @@ export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "
 export type Ref = CardRef | RefSibling | string;
 
 /**
- * A loader-projected reference to another submission in the same request.
+ * A declaration-only reference to another submission in the same request.
  */
 export interface RefSibling {
   /**
-   * Exact identity of the sibling submission.
+   * Identity of the sibling submission; its version may be omitted.
    */
-  readonly sibling: CardRef;
+  readonly sibling: SiblingRef;
 }
 
 /**
@@ -5418,7 +5644,7 @@ export interface RegisteredArtifactCard {
 }
 
 /**
- * Registered `Audit` Card envelope; its spec is not typed yet.
+ * Registered `Audit` Card envelope.
  */
 export interface RegisteredAuditCard {
   /**
@@ -5440,7 +5666,7 @@ export interface RegisteredAuditCard {
   /**
    * Kind-specific spec payload.
    */
-  readonly spec: Readonly<Record<string, JsonValue>>;
+  readonly spec: AuditSpec;
   /**
    * Optional server-derived status.
    */
@@ -5450,7 +5676,7 @@ export interface RegisteredAuditCard {
 /**
  * One registered Card envelope as `cards.get` returns it, discriminated by `kind`.
  */
-export type RegisteredCard = RegisteredDataCard | RegisteredModelCard | RegisteredArtifactCard | RegisteredPromptCard | RegisteredAgentCard | RegisteredVerifierCard | RegisteredServiceCard | RegisteredTriggerCard | RegisteredOperatorCard | RegisteredRepositoryCard | RegisteredUntypedCard;
+export type RegisteredCard = RegisteredDataCard | RegisteredModelCard | RegisteredArtifactCard | RegisteredExperimentCard | RegisteredPromptCard | RegisteredAgentCard | RegisteredMcpCard | RegisteredServiceCard | RegisteredAuditCard | RegisteredVerifierCard | RegisteredTriggerCard | RegisteredOperatorCard | RegisteredRepositoryCard | RegisteredUntypedCard;
 
 /**
  * Registered `Data` Card envelope.
@@ -5483,7 +5709,7 @@ export interface RegisteredDataCard {
 }
 
 /**
- * Registered `Experiment` Card envelope; its spec is not typed yet.
+ * Registered `Experiment` Card envelope.
  */
 export interface RegisteredExperimentCard {
   /**
@@ -5505,7 +5731,7 @@ export interface RegisteredExperimentCard {
   /**
    * Kind-specific spec payload.
    */
-  readonly spec: Readonly<Record<string, JsonValue>>;
+  readonly spec: ExperimentSpec;
   /**
    * Optional server-derived status.
    */
@@ -5513,7 +5739,7 @@ export interface RegisteredExperimentCard {
 }
 
 /**
- * Registered `Mcp` Card envelope; its spec is not typed yet.
+ * Registered `Mcp` Card envelope.
  */
 export interface RegisteredMcpCard {
   /**
@@ -5535,7 +5761,7 @@ export interface RegisteredMcpCard {
   /**
    * Kind-specific spec payload.
    */
-  readonly spec: Readonly<Record<string, JsonValue>>;
+  readonly spec: McpSpec;
   /**
    * Optional server-derived status.
    */
@@ -5785,7 +6011,7 @@ export interface RegisteredTriggerCard {
 /**
  * Registered Card envelope of a kind whose spec is not typed yet.
  */
-export type RegisteredUntypedCard = RegisteredExperimentCard | RegisteredPolicyCard | RegisteredMcpCard | RegisteredAuditCard | RegisteredSourceCard;
+export type RegisteredUntypedCard = RegisteredPolicyCard | RegisteredSourceCard;
 
 /**
  * Registered `Verifier` Card envelope.
@@ -5964,15 +6190,9 @@ export interface RequirementDetailDrift {
 }
 
 /**
- * One requirement's outcome. Only `not_applicable` leaves the `decide`
- * denominator.
+ * The judgment of one requirement with the exact check that produced it.
  */
-export type RequirementOutcome = "passed" | "failed" | "inconclusive" | "not_applicable";
-
-/**
- * The judgment of one requirement.
- */
-export interface RequirementResult {
+export interface RequirementDetails {
   /**
    * The compared actual value, when capture permits it.
    */
@@ -5982,7 +6202,8 @@ export interface RequirementResult {
    */
   readonly check: Check;
   /**
-   * Validated original-evidence citations.
+   * Validated original-evidence citations: the original slot and locator,
+   * never a promise that the input body is echoed or fetchable.
    */
   readonly citations?: readonly Citation[];
   /**
@@ -6017,6 +6238,67 @@ export interface RequirementResult {
    * What executed the check, for Agent, code, and drift checks.
    */
   readonly provenance?: CallProvenance | null;
+  /**
+   * Why the outcome holds.
+   */
+  readonly reason: string;
+  /**
+   * The requirement statement.
+   */
+  readonly statement: string;
+  /**
+   * Owning step of a step requirement.
+   */
+  readonly step?: TaskId | null;
+}
+
+/**
+ * One requirement's outcome. Only `not_applicable` leaves the `decide`
+ * denominator.
+ */
+export type RequirementOutcome = "passed" | "failed" | "inconclusive" | "not_applicable";
+
+/**
+ * The judgment of one requirement.
+ */
+export interface RequirementResult {
+  /**
+   * The compared actual value, when capture permits it.
+   */
+  readonly actual?: JsonValue;
+  /**
+   * Validated original-evidence citations: the original slot and locator,
+   * never a promise that the input body is echoed or fetchable.
+   */
+  readonly citations?: readonly Citation[];
+  /**
+   * Custom data an Agent or code check returned under its declared
+   * `verdict` format; absent when none was declared or the output was
+   * rejected.
+   */
+  readonly data?: Readonly<Record<string, JsonValue>>;
+  /**
+   * Check-specific detail.
+   */
+  readonly detail?: RequirementDetail | null;
+  /**
+   * Requirement ID.
+   */
+  readonly id: TaskId;
+  /**
+   * Zero-based fanout item of the owning step's invocation this instance
+   * judged; absent without fanout.
+   */
+  readonly item_index?: number | null;
+  /**
+   * Zero-based repeat iteration of the owning step's invocation this
+   * instance judged; absent without repeat.
+   */
+  readonly iteration_index?: number | null;
+  /**
+   * The outcome.
+   */
+  readonly outcome: RequirementOutcome;
   /**
    * Why the outcome holds.
    */
@@ -6158,6 +6440,86 @@ export type RoleSource = "idp" | "direct";
  * before the server first sees the run.
  */
 export type RunId = string;
+
+/**
+ * Execution kind recorded as a Run.
+ */
+export type RunKind = RunKindTraining | RunKindInference | RunKindOfflineEvaluation | RunKindDriftCheck | RunKindImport | RunKindWorkflow | RunKindRemediation | RunKindExternal;
+
+/**
+ * Drift check execution.
+ */
+export interface RunKindDriftCheck {
+  readonly type: "drift_check";
+}
+
+/**
+ * Externally defined execution kind.
+ */
+export interface RunKindExternal {
+  readonly type: "external";
+  readonly value: string;
+}
+
+/**
+ * Import execution.
+ */
+export interface RunKindImport {
+  readonly type: "import";
+}
+
+/**
+ * Inference execution.
+ */
+export interface RunKindInference {
+  readonly type: "inference";
+}
+
+/**
+ * Offline or batch evaluation execution.
+ */
+export interface RunKindOfflineEvaluation {
+  readonly type: "offline_evaluation";
+}
+
+/**
+ * Autonomous remediation execution.
+ */
+export interface RunKindRemediation {
+  readonly type: "remediation";
+}
+
+/**
+ * Training execution.
+ */
+export interface RunKindTraining {
+  readonly type: "training";
+}
+
+/**
+ * Workflow execution.
+ */
+export interface RunKindWorkflow {
+  readonly type: "workflow";
+}
+
+/**
+ * Reference to a Run.
+ */
+export interface RunRef {
+  /**
+   * Run kind.
+   */
+  readonly kind: RunKind;
+  /**
+   * Query/display labels.
+   */
+  readonly labels?: Readonly<Record<string, LabelValue>>;
+  /**
+   * Run UID. Promoted to `RunUid` in the Runs phase.
+   */
+  readonly uid: string;
+}
 
 /**
  * The current non-terminal lifecycle state of an admitted Oracle query.
@@ -6409,6 +6771,32 @@ export interface ServiceTable {
  * SHA-256 digest as exactly 64 lowercase hexadecimal characters.
  */
 export type Sha256Hex = string;
+
+/**
+ * Declaration-only reference to another submission in the same request.
+ *
+ * A sibling names its target by kind and name and may omit the version: the
+ * server selects omitted versions during declaration, then replaces every
+ * sibling with the target's exact registered [`CardRef`] before the parent is
+ * hashed and persisted. An explicit version matches the submission with that
+ * exact version; an omitted version matches the sole submission with that
+ * kind and name, and several candidates make the link ambiguous. Siblings
+ * never appear in durable specs.
+ */
+export interface SiblingRef {
+  /**
+   * Target submission kind.
+   */
+  readonly kind: CardKind;
+  /**
+   * Target submission name.
+   */
+  readonly name: CardName;
+  /**
+   * Target submission version, when the author pinned one.
+   */
+  readonly version?: VersionBlock | null;
+}
 
 /**
  * Config for the Sklearn model interface.
@@ -6793,6 +7181,22 @@ export interface SqlMeta {
 }
 
 /**
+ * One topological execution layer.
+ *
+ * Tasks within a stage are independent and may execute in parallel.
+ */
+export interface Stage {
+  /**
+   * Zero-based topological layer index.
+   */
+  readonly index: number;
+  /**
+   * Task ids in this stage, sorted lexicographically for determinism.
+   */
+  readonly tasks: readonly TaskId[];
+}
+
+/**
  * Server-derived Card status.
  */
 export interface Status {
@@ -7146,11 +7550,15 @@ export interface TriggerSpecSchedule {
 /**
  * Card kinds whose `spec` and `status` `cards.get` types.
  */
-export type TypedCardKind = "Data" | "Model" | "Artifact" | "Prompt" | "Agent" | "Verifier" | "Service" | "Trigger" | "Operator" | "Repository";
+export type TypedCardKind = "Data" | "Model" | "Artifact" | "Experiment" | "Prompt" | "Agent" | "Mcp" | "Service" | "Audit" | "Verifier" | "Trigger" | "Operator" | "Repository";
 
 /**
- * One named evidence slot. Slots are required unless `required: false`;
- * samples and source slots are always required.
+ * One named evidence slot.
+ *
+ * No slot is optional: evidence a caller omits stays missing, never `null`,
+ * so every check that needs it is inconclusive while independent checks
+ * still run. A `json` slot's schema alone decides whether a supplied `null`
+ * is admitted.
  */
 export type TypedInputSlot = TypedInputSlotJson | TypedInputSlotMedia | TypedInputSlotTrace | TypedInputSlotSamples;
 
@@ -7158,10 +7566,6 @@ export type TypedInputSlot = TypedInputSlotJson | TypedInputSlotMedia | TypedInp
  * A JSON value, optionally constrained by JSON Schema.
  */
 export interface TypedInputSlotJson {
-  /**
-   * Whether a caller must supply the slot.
-   */
-  readonly required?: boolean;
   /**
    * JSON Schema the value must satisfy.
    */
@@ -7181,19 +7585,14 @@ export interface TypedInputSlotMedia {
    * Lower size bound than the deployment limit.
    */
   readonly max_bytes?: number | null;
-  /**
-   * Whether a caller must supply the slot.
-   */
-  readonly required?: boolean;
   readonly type: "media";
 }
 
 /**
  * Feature measurements or metric samples recorded for a scheduled window.
  *
- * Always required: a schedule binding supplies every samples slot of its
- * Verifier from the subject's recorded measurements, so the slot has no
- * `required` field and no drift check can be omitted by configuration.
+ * A schedule binding supplies every samples slot of its Verifier from
+ * the subject's recorded measurements.
  */
 export interface TypedInputSlotSamples {
   /**
@@ -7207,10 +7606,6 @@ export interface TypedInputSlotSamples {
  * A trace resolved through tenant-scoped trace reads.
  */
 export interface TypedInputSlotTrace {
-  /**
-   * Whether a caller must supply the slot.
-   */
-  readonly required?: boolean;
   readonly type: "trace";
 }
 
@@ -7321,6 +7716,45 @@ export interface VerificationBinding {
 }
 
 /**
+ * `GET /v1/verification/executions/{execution_id}/details` response: what
+ * one execution ran and how it judged.
+ *
+ * The same identity and judgments as its [`VerificationResult`], plus each
+ * requirement's exact authored check and provenance, every step, and the
+ * pinned evidence declarations. `T` is the custom-data type, as in
+ * [`VerificationResult`]. `F` is the inline Agent Prompt form: a read
+ * keeps the [`Authored`] form and never compiles, renders, or executes a
+ * Prompt; an engine records the [`Compiled`] form it ran.
+ */
+export interface VerificationDetails {
+  /**
+   * The deployment environment tag the execution was invoked with, or
+   * absent when the invocation carried none.
+   */
+  readonly deployment_environment?: string | null;
+  /**
+   * Server-issued execution identity.
+   */
+  readonly execution_id: ExecutionId;
+  /**
+   * Verdict, requirement and step breakdown, and evidence.
+   */
+  readonly outcome: OutcomeDetails;
+  /**
+   * The caller's application Run, when there is one.
+   */
+  readonly run_id?: RunId | null;
+  /**
+   * The exact subject judged.
+   */
+  readonly subject: CardRef;
+  /**
+   * The exact Verifier executed.
+   */
+  readonly verifier: CardRef;
+}
+
+/**
  * Structured, secret-free execution or delivery error.
  */
 export interface VerificationError {
@@ -7394,21 +7828,13 @@ export interface VerificationExecutionState {
 export type VerificationExecutionStatus = "pending" | "running" | "retrying" | "completed" | "cancelled" | "timed_out" | "errored";
 
 /**
- * Overall verdict with its requirement and step breakdown.
+ * Overall verdict with its requirement judgments.
  */
 export interface VerificationOutcome {
-  /**
-   * The pinned original evidence, by slot.
-   */
-  readonly evidence: Readonly<Record<string, InputDeclaration>>;
   /**
    * Every requirement, step requirements included.
    */
   readonly requirements: readonly RequirementResult[];
-  /**
-   * Every step in plan order.
-   */
-  readonly steps: readonly StepResult[];
   /**
    * The `decide` rule applied to every applicable requirement.
    */
@@ -7416,8 +7842,11 @@ export interface VerificationOutcome {
 }
 
 /**
- * The attributable result of one Verifier execution.
+ * The attributable decision of one Verifier execution.
  *
+ * The compact default every execution, status, and wait read returns: the
+ * verdict and each requirement's judgment, without the check configuration,
+ * provenance, steps, or evidence that [`VerificationDetails`] describes.
  * `T` is the type of each requirement's custom `data`: JSON objects on the
  * wire, or a caller's type after a typed SDK read.
  */
@@ -7432,7 +7861,7 @@ export interface VerificationResult {
    */
   readonly execution_id: ExecutionId;
   /**
-   * Verdict, breakdown, and evidence.
+   * Verdict and requirement judgments.
    */
   readonly outcome: VerificationOutcome;
   /**

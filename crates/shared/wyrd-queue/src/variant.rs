@@ -25,8 +25,8 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, AsArray, BinaryBuilder, StructArray, make_array};
-use arrow::buffer::NullBuffer;
+use arrow::array::{Array, ArrayRef, AsArray, BinaryArray, BinaryBuilder, StructArray, make_array};
+use arrow::buffer::{Buffer, NullBuffer, OffsetBuffer};
 use arrow::compute::cast;
 use arrow::datatypes::TimestampMicrosecondType;
 use arrow::error::ArrowError;
@@ -412,6 +412,24 @@ impl EncodedVariant {
     #[must_use]
     pub fn encoded_bytes(&self) -> usize {
         self.metadata.len() + self.value.len()
+    }
+
+    /// Move this value into a one-row canonical storage column.
+    ///
+    /// The column's `metadata` and `value` children take ownership of the
+    /// encoded buffers, so the value is never copied; the row is valid. It is
+    /// the same column [`VariantColumnBuilder`] builds for this one value.
+    #[must_use]
+    pub fn into_column(self) -> ArrayRef {
+        let child = |bytes: Vec<u8>| -> ArrayRef {
+            let offsets = OffsetBuffer::from_lengths([bytes.len()]);
+            Arc::new(BinaryArray::new(offsets, Buffer::from_vec(bytes), None))
+        };
+        Arc::new(StructArray::new(
+            variant_storage_fields(),
+            vec![child(self.metadata), child(self.value)],
+            None,
+        ))
     }
 }
 
@@ -2227,6 +2245,34 @@ mod tests {
         assert_eq!(
             variant_cell_to_json(column.as_ref(), 1).expect("null"),
             Value::Null
+        );
+    }
+
+    /// A value moved into its own column keeps its bytes and builds the
+    /// builder's column.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the column copies the value or differs from the builder's.
+    #[test]
+    fn a_value_moves_into_its_column_without_a_copy() {
+        let encoded = EncodedVariant::from_json(&json!({"a": [1, {"b": "c"}]})).expect("encodes");
+        let built = [Some(&encoded)]
+            .into_iter()
+            .collect::<VariantColumnBuilder>()
+            .finish();
+        let value = encoded.value().as_ptr();
+        let column = encoded.into_column();
+        assert_eq!(column.to_data(), built.to_data());
+        assert_eq!(
+            column
+                .as_struct()
+                .column(1)
+                .as_binary::<i32>()
+                .values()
+                .as_ptr(),
+            value,
+            "the column owns the encoded buffer"
         );
     }
 

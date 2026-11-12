@@ -52,9 +52,9 @@ use wyrd_spec::auth::Attribution;
 use wyrd_spec::card::verifier::{Action, VerifierSpec};
 use wyrd_spec::ids::{CardUid, ExecutionId, GroupId, SlotName};
 use wyrd_spec::verification::execution::{
-    InputDeclaration, InvocationSettlement, Producer, ProducerInvocation, PublicationCollection,
-    PublicationContent, PublicationFile, PublicationKind, PublicationManifest, Speculation,
-    StepStatus, VerificationOutcome, VerificationResult,
+    ExecutedOutcome, InputDeclaration, InvocationSettlement, Producer, ProducerInvocation,
+    PublicationCollection, PublicationContent, PublicationFile, PublicationKind,
+    PublicationManifest, Speculation, StepStatus, VerificationResult,
 };
 use wyrd_spec::verification::state::{EXECUTION_STATE_FORMAT, ExecutionState, InvocationRecord};
 use wyrd_spec::verification::{PublicationName, TaskId};
@@ -485,20 +485,15 @@ async fn file_and_json_publications_are_immutable() {
         .flush_bifrost()
         .await
         .expect("the File inventory publishes");
-    let (bytes, _) = TenantEvidence::new(
-        leased.server.state().clone(),
-        caller.clone(),
-        BTreeMap::new(),
-        limits,
-    )
-    .read(&InputDeclaration::File {
-        sha256,
-        size_bytes: report.len() as u64,
-        format: MediaFormat::Markdown,
-        filename: None,
-    })
-    .await
-    .expect("the retained File reads");
+    let (bytes, _) = TenantEvidence::new(leased.server.state().clone(), caller.clone(), limits)
+        .read(&InputDeclaration::File {
+            sha256,
+            size_bytes: report.len() as u64,
+            format: MediaFormat::Markdown,
+            filename: None,
+        })
+        .await
+        .expect("the retained File reads");
     assert_eq!(bytes, report.as_bytes(), "scratch writes never reach it");
 
     let file = publications
@@ -985,13 +980,8 @@ async fn publication_limits_survive_reclaim() {
         )),
         ..caller
     };
-    let evidence = TenantEvidence::new(
-        leased.server.state().clone(),
-        blind,
-        BTreeMap::new(),
-        limits,
-    )
-    .with_execution(Arc::clone(&leased.run));
+    let evidence = TenantEvidence::new(leased.server.state().clone(), blind, limits)
+        .with_execution(Arc::clone(&leased.run));
     evidence
         .read(&InputDeclaration::File {
             sha256: wyrd_spec::auth::Sha256Hex::digest(b"12345678"),
@@ -1084,13 +1074,8 @@ async fn publication_mounts_preserve_status_and_lineage() {
         .await
         .expect("the File inventory publishes");
 
-    let evidence = TenantEvidence::new(
-        leased.server.state().clone(),
-        caller.clone(),
-        BTreeMap::new(),
-        limits,
-    )
-    .with_execution(Arc::clone(&leased.run));
+    let evidence = TenantEvidence::new(leased.server.state().clone(), caller.clone(), limits)
+        .with_execution(Arc::clone(&leased.run));
     let answer = BTreeSet::from([SlotName::new("answer").expect("slot")]);
     let named = |producer: &Producer, name: &str| CallInput {
         value: CallValue::Publication {
@@ -1263,12 +1248,7 @@ async fn publication_mounts_preserve_status_and_lineage() {
             "{error}"
         );
     }
-    let direct = TenantEvidence::new(
-        leased.server.state().clone(),
-        caller,
-        BTreeMap::new(),
-        limits,
-    );
+    let direct = TenantEvidence::new(leased.server.state().clone(), caller, limits);
     let unbound = workspaces
         .open(
             &BTreeMap::from([("/inputs/x".to_owned(), named(&second, "report"))]),
@@ -1446,13 +1426,8 @@ fn agent_engine(
 ) -> VerificationEngine {
     let limits = saturable();
     let evidence = Arc::new(
-        TenantEvidence::new(
-            leased.server.state().clone(),
-            caller.clone(),
-            BTreeMap::new(),
-            limits,
-        )
-        .with_execution(Arc::clone(run)),
+        TenantEvidence::new(leased.server.state().clone(), caller.clone(), limits)
+            .with_execution(Arc::clone(run)),
     );
     let mut providers = ProviderRegistry::new();
     providers.register(Arc::clone(model) as _);
@@ -1613,7 +1588,7 @@ async fn retained_publications_keep_their_busy_attempt() {
     model.push_response(publish("report", "attempt 2"));
     model.push_response(answer(Some("{}"), &[]));
     let outcome = run(&current, &draft).await.expect("the retry runs");
-    let step = |outcome: &VerificationOutcome, id: &str| {
+    let step = |outcome: &ExecutedOutcome, id: &str| {
         outcome
             .steps
             .iter()
@@ -1770,13 +1745,8 @@ async fn agent_publications_reach_a_recovered_consumer() {
         executed_by: Some(PrincipalId::new(uuid::Uuid::new_v4())),
         ..caller.clone()
     };
-    let evidence = TenantEvidence::new(
-        leased.server.state().clone(),
-        blind.clone(),
-        BTreeMap::new(),
-        limits,
-    )
-    .with_execution(Arc::clone(&current));
+    let evidence = TenantEvidence::new(leased.server.state().clone(), blind.clone(), limits)
+        .with_execution(Arc::clone(&current));
     let unread = evidence
         .read(&InputDeclaration::File {
             sha256: wyrd_spec::auth::Sha256Hex::digest(KEPT),
@@ -2120,8 +2090,8 @@ async fn dropped_agent_work_makes_no_later_call() {
 }
 
 /// A verdict-only outcome with no requirement or step.
-fn outcome(verdict: VerificationVerdict) -> VerificationOutcome {
-    VerificationOutcome {
+fn outcome(verdict: VerificationVerdict) -> ExecutedOutcome {
+    ExecutedOutcome {
         verdict,
         requirements: Vec::new(),
         steps: Vec::new(),
@@ -2272,13 +2242,8 @@ async fn publications_recover_exact_descriptors_from_run_state() {
             ("review".to_owned(), 1, "verdict".to_owned()),
         ]
     );
-    let evidence = TenantEvidence::new(
-        leased.server.state().clone(),
-        caller,
-        BTreeMap::new(),
-        limits,
-    )
-    .with_execution(Arc::clone(&current));
+    let evidence = TenantEvidence::new(leased.server.state().clone(), caller, limits)
+        .with_execution(Arc::clone(&current));
     let recovered = evidence
         .publications(&task)
         .await
@@ -3355,7 +3320,7 @@ async fn direct_and_queued_use_bifrost_run_state() {
             .expect("the state reads")
             .expect("a direct execution claims its state");
         assert_eq!(
-            state.terminal.map(|selected| selected.outcome),
+            state.terminal.map(|selected| selected.outcome.compact()),
             Some(result.outcome.clone()),
             "the direct result is the outcome its state selected"
         );
@@ -4067,7 +4032,7 @@ async fn concurrent_settlements_release_their_hosted_dependent() {
     let spec = Arc::new(spec);
     let caller = leased.publisher([]);
     let verifier = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid");
-    let (evidence, routes) = (BTreeMap::new(), BTreeMap::new());
+    let routes = BTreeMap::new();
     let run = async |state: &Arc<RunState>| {
         let recorded = state.snapshot().await.invocations;
         blocks
@@ -4076,7 +4041,6 @@ async fn concurrent_settlements_release_their_hosted_dependent() {
                 Execution {
                     caller: &caller,
                     verifier: &verifier,
-                    evidence: &evidence,
                     routes: &routes,
                     subject: GatewayCallContext::default(),
                     defer_unlanded_traces: false,

@@ -6,7 +6,7 @@ use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::envelope::{CardKind, Metadata, Spec};
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::reference::SiblingRef;
 
 use super::error::{Diagnostic, LoadError};
 use super::path::PathSandbox;
@@ -246,6 +246,20 @@ fn parse_single_envelope(path: &Path, raw: serde_yaml::Value) -> Result<Authored
     })
 }
 
+/// Decode one Card envelope authored in memory exactly as one YAML document
+/// is decoded, so equal content yields equal Cards and diagnostics.
+///
+/// # Errors
+/// Returns [`parse_single_envelope`]'s diagnostics, labelled with `path`.
+pub(crate) fn parse_value(
+    path: &Path,
+    envelope: serde_json::Value,
+) -> Result<AuthoredCard, Diagnostic> {
+    let raw = serde_yaml::to_value(envelope)
+        .map_err(|error| Diagnostic::yaml_syntax(path.into(), &error))?;
+    parse_single_envelope(path, raw)
+}
+
 fn materialize_inline_files(
     value: &mut serde_yaml::Value,
     source_path: &Path,
@@ -335,27 +349,17 @@ fn is_inlineable_body(key: &str, value: &serde_yaml::Value, agent_action: bool) 
     !has_identity_field
 }
 
-/// Build the exact reference identity required by a resolved spec slot.
+/// Build the sibling identity a resolved path slot points at.
 ///
-/// The reference is the Card's flat `kind`/`name` and its exact authored
-/// version, without a UID: the server assigns UIDs at declaration.
-///
-/// # Errors
-/// Returns an invalid-envelope diagnostic when the Card's `metadata.version`
-/// is not an exact pin.
-pub(crate) fn card_ref_for(card: &AuthoredCard) -> Result<CardRef, Diagnostic> {
-    let version = card.metadata.resolved_pin().cloned().ok_or_else(|| {
-        Diagnostic::invalid_envelope(
-            card.source_path.clone(),
-            "Path references require an exact metadata.version pin".to_string(),
-        )
-    })?;
-    Ok(CardRef {
+/// The sibling is the Card's flat `kind`/`name` and, when the Card pins one,
+/// its exact version. A Card without a pinned version yields a versionless
+/// sibling; the server selects that version during declaration.
+pub(crate) fn sibling_for(card: &AuthoredCard) -> SiblingRef {
+    SiblingRef {
         kind: card.kind.clone(),
         name: card.metadata.name.clone(),
-        version,
-        uid: None,
-    })
+        version: card.metadata.resolved_pin().cloned(),
+    }
 }
 
 #[cfg(test)]

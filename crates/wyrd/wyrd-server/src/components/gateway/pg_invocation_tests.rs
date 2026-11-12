@@ -10,7 +10,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use axum::Json;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -60,9 +59,8 @@ use wyrd_storage::{LocalSigner, StorageHandle};
 use super::capture::object_path;
 use super::capture::recording::RecordingScribe;
 use super::ledger::{Accounted, GatewayLedger, LedgerCall};
-use super::pg_administration_tests::{
-    admin, audit_decisions, await_lock_waiters, sealing_keyring, test_state,
-};
+use super::pg_administration_tests::{admin, audit_decisions, sealing_keyring, test_state};
+use super::routes::JsonBody;
 use super::{GatewayAdministration, GatewayCallRequest, GatewayCallResponse, GatewayInvocation};
 use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
@@ -158,9 +156,21 @@ impl ProviderDispatch for Held {
     }
 }
 
-/// Builds one server replica over `fixture` whose engine uses `dispatch`.
+/// Starts `state`'s gateway background work, as a booted server does, and
+/// waits until its snapshot listener is live, so administrative writes warm
+/// the replica's caches and calls are admitted from them.
+async fn serving(state: AppState) -> AppState {
+    let (_, worker) = state
+        .gateway
+        .refresh_worker(state.postgres.wyrd(), state.shutdown_token.clone());
+    tokio::spawn(worker);
+    state.gateway.snapshots().listening().await;
+    state
+}
+
+/// Builds one serving replica over `fixture` whose engine uses `dispatch`.
 async fn replica(fixture: &PgFixture, dispatch: Arc<dyn ProviderDispatch>) -> AppState {
-    test_state(fixture).await.with_owners_for_test(|owners| {
+    serving(test_state(fixture).await.with_owners_for_test(|owners| {
         owners.gateway = crate::components::gateway::Gateway::new(
             crate::config::GatewayConfig::default(),
             GatewayEngine::new(
@@ -169,7 +179,8 @@ async fn replica(fixture: &PgFixture, dispatch: Arc<dyn ProviderDispatch>) -> Ap
                 dispatch,
             ),
         );
-    })
+    }))
+    .await
 }
 
 /// Deterministic principal id `n`.
@@ -243,7 +254,9 @@ fn usage(input: u64, output: u64) -> AttemptUsage {
 fn completed(input: u64, output: u64) -> AttemptResult {
     AttemptResult::Completed {
         body: ResponseBody::Json(
-            serde_json::value::to_raw_value(&json!({"id": "chatcmpl-test"})).expect("json"),
+            serde_json::value::to_raw_value(&json!({"id": "chatcmpl-test"}))
+                .expect("json")
+                .into(),
         ),
         usage: usage(input, output),
         capture: None,
@@ -265,7 +278,7 @@ fn request(requested: &str, bound: Option<(u64, u64)>, timeout: Duration) -> Gat
         ingress: IngressDialect::OpenAi,
         model: model(requested),
         fallback: None,
-        body: json!({"model": requested, "messages": []}),
+        body: json!({"model": requested, "messages": []}).into(),
         media: None,
         batch: None,
         deployment: None,
@@ -469,11 +482,74 @@ fn failed_before_dispatch() -> AttemptResult {
     }
 }
 
-/// Sums tokens held or charged across every limit window of `tenant`.
+/// Loads `tenants`' snapshots and usage into a replica started after their
+/// configuration, as its background reload would.
+async fn warm(state: &AppState, tenants: impl IntoIterator<Item = DataTenantId>) {
+    for tenant in tenants {
+        GatewayAdministration::new(state).warm(tenant).await;
+    }
+}
+
+/// The snapshot `state` serves `tenant`.
+///
+/// # Panics
+///
+/// Panics when `state` serves no snapshot for `tenant`.
+fn served(state: &AppState, tenant: DataTenantId) -> Arc<wyrd_gateway::GatewayTenantSnapshot> {
+    state
+        .gateway
+        .snapshots()
+        .admitted(tenant)
+        .expect("tenant snapshot served")
+}
+
+/// Waits until `state`'s background reload replaces `before` as the
+/// snapshot it serves `tenant`, as after a change another writer notified.
+///
+/// # Panics
+///
+/// Panics when no reload installs within ten seconds.
+async fn reloaded(
+    state: &AppState,
+    tenant: DataTenantId,
+    before: &Arc<wyrd_gateway::GatewayTenantSnapshot>,
+) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while state
+            .gateway
+            .snapshots()
+            .admitted(tenant)
+            .is_none_or(|snapshot| Arc::ptr_eq(&snapshot, before))
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the change reloads the served snapshot");
+}
+
+/// Persists every tenant's quota usage `state` holds and refreshes its
+/// shared view, as its background work does each second.
+async fn persist(state: &AppState) {
+    state.gateway.usage().flush(state.postgres.wyrd()).await;
+}
+
+/// Synchronizes `state`'s quota usage for `tenant` now, failing the test
+/// when storage refuses.
+async fn sync(state: &AppState, tenant: DataTenantId) {
+    state
+        .gateway
+        .usage()
+        .sync(state.postgres.wyrd(), tenant)
+        .await
+        .expect("usage synchronizes");
+}
+
+/// Sums tokens every server persisted across every limit window of `tenant`.
 async fn window_tokens(fixture: &PgFixture, tenant: DataTenantId) -> i64 {
     let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
     let tokens: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(tokens), 0)::bigint FROM wyrd.gateway_limit_windows",
+        "SELECT COALESCE(SUM(tokens), 0)::bigint FROM wyrd.gateway_usage_windows",
     )
     .fetch_one(&mut **conn.transaction())
     .await
@@ -565,7 +641,7 @@ async fn managed_replica(
 ) -> AppState {
     let state = test_state(fixture).await;
     let state = state.with_owners_for_test(|owners| owners.auth.sealing_key = keyring.clone());
-    state.with_owners_for_test(|owners| {
+    serving(state.with_owners_for_test(|owners| {
         owners.gateway = crate::components::gateway::Gateway::new(
             crate::config::GatewayConfig::default(),
             GatewayEngine::new(
@@ -574,7 +650,8 @@ async fn managed_replica(
                 dispatch,
             ),
         );
-    })
+    }))
+    .await
 }
 
 /// Reads `tenant`'s stored `managed` envelope through that tenant's own
@@ -739,6 +816,7 @@ async fn gateway_managed_credentials_resolve_per_tenant_across_restart_and_rotat
     // A restarted replica booting with the same sealing key resolves
     // committed values.
     let restarted = managed_replica(&fixture, Some(sealing_keyring(1)), dispatch.clone()).await;
+    warm(&restarted, [first, second]).await;
     invoke_managed(&restarted, first).await.expect("restart");
     assert_eq!(dispatch.seen().len(), 3);
 
@@ -750,8 +828,10 @@ async fn gateway_managed_credentials_resolve_per_tenant_across_restart_and_rotat
             .with_retained(SecretKey::from_bytes([1; 32])),
     );
     let rotated = managed_replica(&fixture, Some(Arc::clone(&rotation)), dispatch.clone()).await;
+    warm(&rotated, [first, second]).await;
     invoke_managed(&rotated, first).await.expect("retained key");
     let retired = managed_replica(&fixture, Some(sealing_keyring(2)), dispatch.clone()).await;
+    warm(&retired, [first, second]).await;
     assert_refused(&retired, first, "the old key was retired before rewrap").await;
     assert_eq!(dispatch.seen().len(), 4, "the refusal did not dispatch");
 
@@ -770,6 +850,7 @@ async fn gateway_managed_credentials_resolve_per_tenant_across_restart_and_rotat
     // A replica booting with only the new key after the rewrap opens every
     // envelope. It is a fresh process, as in the rollout.
     let rewrapped = managed_replica(&fixture, Some(sealing_keyring(2)), dispatch.clone()).await;
+    warm(&rewrapped, [first, second]).await;
     for tenant in tenants {
         invoke_managed(&rewrapped, tenant)
             .await
@@ -785,9 +866,12 @@ async fn gateway_managed_credentials_resolve_per_tenant_across_restart_and_rotat
     // nothing.
     let dispatched = dispatch.seen().len();
     let foreign = managed_envelope(&fixture, second).await;
+    let snapshot = served(&rewrapped, first);
     replace_managed_envelope(&fixture, first, &foreign).await;
+    reloaded(&rewrapped, first, &snapshot).await;
     assert_refused(&rewrapped, first, "another tenant's envelope opened").await;
     let unconfigured = managed_replica(&fixture, None, dispatch.clone()).await;
+    warm(&unconfigured, [first, second]).await;
     assert_refused(
         &unconfigured,
         second,
@@ -803,7 +887,9 @@ async fn gateway_managed_credentials_resolve_per_tenant_across_restart_and_rotat
         .await
         .expect("the copied-from tenant still resolves its own key");
 
-    // Revocation is equally terminal for a managed credential.
+    // Revocation is equally terminal for a managed credential once another
+    // replica's background reload replaces the snapshot it serves.
+    let served = served(&rewrapped, second);
     GatewayAdministration::new(&state)
         .revoke_credential(
             &admin(second),
@@ -811,6 +897,7 @@ async fn gateway_managed_credentials_resolve_per_tenant_across_restart_and_rotat
         )
         .await
         .expect("revoke");
+    reloaded(&rewrapped, second, &served).await;
     assert_refused(&rewrapped, second, "a revoked credential resolved").await;
     assert_eq!(
         dispatch.seen().len(),
@@ -857,7 +944,7 @@ async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
         Ok(invoker(tenant, 1, [])),
         None,
         HeaderMap::new(),
-        Ok(Json(
+        Ok(JsonBody::from(
             json!({"model": "dep-a/a", "max_tokens": 10, "messages": []}),
         )),
     )
@@ -898,6 +985,7 @@ async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
     let broad = invoker(tenant, 1, [open_access()]);
     // A fresh replica attempts dep-a again before falling back.
     let fresh = scribe.record(replica(&fixture, dispatch.clone()).await);
+    warm(&fresh, [tenant]).await;
     let response = GatewayInvocation::new(&fresh)
         .invoke(
             &broad,
@@ -930,7 +1018,7 @@ async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
         Ok(broad),
         None,
         HeaderMap::new(),
-        Ok(Json(
+        Ok(JsonBody::from(
             json!({"model": "dep-a/a", "max_tokens": 10, "messages": []}),
         )),
     )
@@ -945,15 +1033,16 @@ async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
     );
 }
 
-/// Two replicas share limits and budgets: a parked call's concurrency lease
-/// and reservation on one replica refuse admission on the other before any
-/// dispatch, settlement releases the unused reservation, and an unbounded
-/// call is rejected where a budget applies.
+/// Two replicas share limits and budgets once their usage synchronizes: a
+/// parked call's concurrency and reservation on one replica, persisted in the
+/// background, refuse admission on the other before any dispatch, settlement
+/// releases the unused reservation, and an unbounded call is rejected where a
+/// budget applies.
 ///
 /// # Panics
 /// Panics when the Postgres fixture, a seed or call, or an assertion fails.
 #[tokio::test]
-async fn gateway_admission_holds_limits_and_budgets_across_replicas() {
+async fn gateway_admission_shares_limits_and_budgets_once_synchronized() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     let (first, second) = (Scripted::shared(), Scripted::shared());
@@ -987,6 +1076,8 @@ async fn gateway_admission_holds_limits_and_budgets_across_replicas() {
         async move { GatewayInvocation::new(&a).invoke(&held, request).await }
     });
     first.entered.notified().await;
+    sync(&a, tenant).await;
+    GatewayAdministration::new(&b).warm(tenant).await;
 
     let on_b = GatewayInvocation::new(&b);
     match on_b.invoke(&held, bounded()).await {
@@ -1032,6 +1123,7 @@ async fn gateway_admission_holds_limits_and_budgets_across_replicas() {
 
     second.push(Step::Return(completed(100, 50)));
     second.push(Step::Return(completed(100, 50)));
+    sync(&b, tenant).await;
     on_b.invoke(&other, bounded())
         .await
         .expect("settlement frees the budget");
@@ -1042,6 +1134,294 @@ async fn gateway_admission_holds_limits_and_budgets_across_replicas() {
     assert_eq!(second.seen(), ["dep-a", "dep-a"]);
     drain_gateway(&a).await;
     drain_gateway(&b).await;
+}
+
+/// Admission never assumes an unloaded tenant is unlimited and recovers in
+/// the background: a replica started after configuration refuses its first
+/// call with `ServiceUnavailable` before any dispatch and then admits once
+/// its snapshot and usage load; a restarted replica sees a running call's
+/// committed concurrency; and a policy change another replica writes
+/// applies once its notification reloads the snapshot.
+///
+/// # Panics
+///
+/// Panics when the fixture or a call fails, a cold call dispatches or is
+/// refused otherwise, or a limit applies differently.
+#[tokio::test]
+async fn usage_cache_bounds_staleness_restarts_and_policy_changes() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let (first, cold_dispatch) = (Scripted::shared(), Scripted::shared());
+    let a = replica(&fixture, first.clone()).await;
+    let concurrency = |calls: u64| {
+        json!([serde_json::to_value(GatewayLimit {
+            subject: GatewayLimitSubject::Tenant,
+            target: GatewayPolicyTarget::All,
+            requests_per_minute: None,
+            tokens_per_minute: None,
+            concurrent_calls: NonZeroU64::new(calls),
+        })
+        .expect("limit encodes")])
+    };
+    configure(&a, tenant, concurrency(1), json!([]), "allow_unpriced").await;
+    let caller = invoker(tenant, 1, [open_access()]);
+    let call = || request("dep-a/a", None, Duration::from_secs(30));
+
+    let cold = replica(&fixture, cold_dispatch.clone()).await;
+    let refused = GatewayInvocation::new(&cold)
+        .invoke(&caller, call())
+        .await
+        .expect_err("an unloaded tenant is refused");
+    assert!(
+        matches!(refused, WyrdError::ServiceUnavailable { .. }),
+        "{refused:?}"
+    );
+    cold_dispatch.push(Step::Return(completed(10, 5)));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match GatewayInvocation::new(&cold).invoke(&caller, call()).await {
+                Ok(_) => break,
+                Err(WyrdError::ServiceUnavailable { .. }) => tokio::task::yield_now().await,
+                Err(error) => panic!("a loading tenant is only refused as unavailable: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("background work loads the tenant");
+    assert_eq!(
+        cold_dispatch.seen(),
+        ["dep-a"],
+        "only the admitted call dispatched"
+    );
+    drain_gateway(&cold).await;
+
+    first.push(Step::Park(completed(10, 5)));
+    let parked = tokio::spawn({
+        let (a, caller, request) = (a.clone(), caller.clone(), call());
+        async move { GatewayInvocation::new(&a).invoke(&caller, request).await }
+    });
+    first.entered.notified().await;
+    sync(&a, tenant).await;
+    let dispatch = Scripted::shared();
+    let restarted = replica(&fixture, dispatch.clone()).await;
+    warm(&restarted, [tenant]).await;
+    let over = GatewayInvocation::new(&restarted)
+        .invoke(&caller, call())
+        .await
+        .expect_err("the running call holds the limit");
+    assert!(
+        matches!(over, WyrdError::GatewayLimitExceeded { .. }),
+        "{over:?}"
+    );
+
+    let before = served(&restarted, tenant);
+    configure(&a, tenant, concurrency(2), json!([]), "allow_unpriced").await;
+    reloaded(&restarted, tenant, &before).await;
+    dispatch.push(Step::Return(completed(10, 5)));
+    GatewayInvocation::new(&restarted)
+        .invoke(&caller, call())
+        .await
+        .expect("the raised limit admits beside the running call");
+
+    first.release.notify_one();
+    parked
+        .await
+        .expect("parked task joins")
+        .expect("parked call completes");
+    drain_gateway(&a).await;
+    drain_gateway(&restarted).await;
+}
+
+/// A snapshot reload that fails on storage stops serving the stale policy
+/// with the retryable 503 before any dispatch, and background retry installs
+/// the committed configuration once storage recovers, with no further edit.
+///
+/// The failure is the pricing table disappearing from the snapshot query
+/// while another server's change notification arrives; renaming it back
+/// sends no notification.
+///
+/// # Panics
+/// Panics when the fixture or a call fails, the stale policy keeps serving,
+/// a refused call dispatches, or the snapshot does not recover.
+#[tokio::test]
+async fn snapshot_reload_recovers_from_a_transient_load_failure() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let dispatch = Scripted::shared();
+    let state = replica(&fixture, dispatch.clone()).await;
+    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
+    let caller = invoker(tenant, 1, [open_access()]);
+    let call = || request("dep-a/a", None, Duration::from_secs(30));
+    let snapshots = state.gateway.snapshots();
+    assert!(
+        snapshots.cached(tenant).is_some(),
+        "configured tenant serves"
+    );
+
+    let admin = fixture.superuser_pool().expect("superuser pool");
+    let rename = |sql: &'static str| {
+        let admin = admin.clone();
+        async move {
+            sqlx::query(sql)
+                .execute(&admin)
+                .await
+                .expect("pricing table renames");
+        }
+    };
+    rename("ALTER TABLE wyrd.gateway_model_pricing RENAME TO gateway_model_pricing_hidden").await;
+    sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(super::snapshots::SNAPSHOT_CHANNEL)
+        .bind(tenant.as_uuid().to_string())
+        .execute(&admin)
+        .await
+        .expect("change notifies");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while snapshots.cached(tenant).is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a failed reload stops serving the stale snapshot");
+    let refused = GatewayInvocation::new(&state)
+        .invoke(&caller, call())
+        .await
+        .expect_err("a tenant without a usable snapshot is refused");
+    assert_eq!(refused.code(), "WYRD_SERVER_503_SERVICE_UNAVAILABLE");
+    assert!(
+        dispatch.seen().is_empty(),
+        "a refused call never dispatches"
+    );
+
+    rename("ALTER TABLE wyrd.gateway_model_pricing_hidden RENAME TO gateway_model_pricing").await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while snapshots.cached(tenant).is_none() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("background retry reloads once storage recovers");
+    dispatch.push(Step::Return(completed(10, 5)));
+    GatewayInvocation::new(&state)
+        .invoke(&caller, call())
+        .await
+        .expect("the recovered snapshot admits");
+    assert_eq!(dispatch.seen(), ["dep-a"]);
+    drain_gateway(&state).await;
+}
+
+/// Shutdown drain retries usage a failed write left unpersisted: a write
+/// that fails while storage recovers before the deadline commits each
+/// server's usage once and reports a clean drain, and one that keeps
+/// failing returns at its deadline reporting an incomplete drain.
+///
+/// Each replica's background work stops first, as in server shutdown, so
+/// only drain writes. Storage fails by the usage window table disappearing.
+///
+/// # Panics
+/// Panics when the fixture or a call fails, drain misreports, overruns its
+/// deadline, or a server's usage is persisted other than once.
+#[tokio::test]
+async fn gateway_drain_retries_usage_writes_until_commit_or_deadline() {
+    let traces = TraceBuffer::default();
+    let _traces = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(traces.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish(),
+    );
+    let failures = || {
+        traces
+            .text()
+            .matches("gateway usage synchronization failed")
+            .count()
+    };
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let limits = json!([serde_json::to_value(GatewayLimit {
+        subject: GatewayLimitSubject::Tenant,
+        target: GatewayPolicyTarget::All,
+        requests_per_minute: NonZeroU64::new(100),
+        tokens_per_minute: None,
+        concurrent_calls: None,
+    })
+    .expect("limit encodes")]);
+    let (recovering, lost) = (Scripted::shared(), Scripted::shared());
+    let recovering_state = replica(&fixture, recovering.clone()).await;
+    let lost_state = replica(&fixture, lost.clone()).await;
+    configure(
+        &recovering_state,
+        tenant,
+        limits,
+        json!([]),
+        "allow_unpriced",
+    )
+    .await;
+    warm(&lost_state, [tenant]).await;
+    let caller = invoker(tenant, 1, [open_access()]);
+    for (state, dispatch) in [(&recovering_state, &recovering), (&lost_state, &lost)] {
+        dispatch.push(Step::Return(completed(10, 5)));
+        GatewayInvocation::new(state)
+            .invoke(&caller, request("dep-a/a", None, Duration::from_secs(30)))
+            .await
+            .expect("the call is admitted");
+        state.shutdown_token.cancel();
+    }
+
+    let admin = fixture.superuser_pool().expect("superuser pool");
+    let rename = |sql: &'static str| {
+        let admin = admin.clone();
+        async move {
+            sqlx::query(sql)
+                .execute(&admin)
+                .await
+                .expect("usage window table renames");
+        }
+    };
+    rename("ALTER TABLE wyrd.gateway_usage_windows RENAME TO gateway_usage_windows_hidden").await;
+
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_millis(500);
+    assert!(
+        !lost_state
+            .gateway
+            .drain(lost_state.postgres.wyrd(), deadline)
+            .await,
+        "usage still unpersisted at the deadline is an incomplete drain"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "drain returns at its deadline"
+    );
+
+    let before = failures();
+    let restore = async {
+        while failures() == before {
+            tokio::task::yield_now().await;
+        }
+        rename("ALTER TABLE wyrd.gateway_usage_windows_hidden RENAME TO gateway_usage_windows")
+            .await;
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let (drained, ()) = tokio::join!(
+        recovering_state
+            .gateway
+            .drain(recovering_state.postgres.wyrd(), deadline),
+        restore,
+    );
+    assert!(drained, "a write that recovers before the deadline drains");
+    let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
+    let requests: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(requests), 0)::bigint FROM wyrd.gateway_usage_windows",
+    )
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("window requests read");
+    conn.commit().await.expect("window read commits");
+    assert_eq!(
+        requests, 1,
+        "the recovered server's call is persisted once and the lost one never"
+    );
 }
 
 /// The ledger fences replayed reservations, an abandoned expired reservation
@@ -1184,6 +1564,7 @@ async fn gateway_budget_reservations_cover_attempts_in_exact_periods() {
 
     // A fresh replica attempts both deployments.
     let fresh = replica(&fixture, dispatch.clone()).await;
+    warm(&fresh, [tenant]).await;
     dispatch.push(Step::Return(failed_before_dispatch()));
     dispatch.push(Step::Return(failed_before_dispatch()));
     let error = GatewayInvocation::new(&fresh)
@@ -1241,6 +1622,7 @@ async fn gateway_token_limits_hold_exposure_in_the_admission_window() {
         }
     });
     dispatch.entered.notified().await;
+    sync(&state, tenant).await;
     assert_eq!(window_tokens(&fixture, tenant).await, 3000);
     let invocation = GatewayInvocation::new(&state);
     let held = invocation
@@ -1298,11 +1680,8 @@ async fn gateway_token_limits_hold_exposure_in_the_admission_window() {
         model("dep-a/a"),
         None,
     );
-    let ledger = GatewayLedger::new(state.postgres.wyrd());
-    let admission = ledger
-        .admit(&call, &mut plan)
-        .await
-        .expect("past admission");
+    let ledger = GatewayLedger::new(state.gateway.usage());
+    let mut admission = ledger.admit(&call, &mut plan).expect("past admission");
     let execution = CallExecution {
         outcome: GatewayCallOutcome::Succeeded,
         response: None,
@@ -1323,14 +1702,13 @@ async fn gateway_token_limits_hold_exposure_in_the_admission_window() {
         attempt_span: tracing::Span::none(),
         timing: ExecutionTiming::default(),
     };
-    let accounted = Accounted::new(&call, &admission, &execution).expect("late accounting prices");
-    ledger
-        .settle(tenant, &accounted)
-        .await
-        .expect("late settlement");
+    let mut accounted =
+        Accounted::new(&call, &admission, &execution).expect("late accounting prices");
+    GatewayLedger::settle(&mut admission, &mut accounted);
+    sync(&state, tenant).await;
     let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
     let admitted_window: i64 = sqlx::query_scalar(
-        "SELECT tokens FROM wyrd.gateway_limit_windows WHERE window_start = date_trunc('minute', $1::timestamptz)",
+        "SELECT tokens FROM wyrd.gateway_usage_windows WHERE window_start = date_trunc('minute', $1::timestamptz)",
     )
     .bind(admitted_at)
     .fetch_one(&mut **conn.transaction())
@@ -1406,7 +1784,7 @@ async fn gateway_targeted_token_limits_settle_covered_attempts_only() {
         async move {
             let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
             let tokens: i64 = sqlx::query_scalar(
-                "SELECT tokens FROM wyrd.gateway_limit_windows WHERE limit_key = $1",
+                "SELECT tokens FROM wyrd.gateway_usage_windows WHERE limit_key = $1",
             )
             .bind(key)
             .fetch_one(&mut **conn.transaction())
@@ -1446,9 +1824,9 @@ async fn gateway_targeted_token_limits_settle_covered_attempts_only() {
             model("dep-a/a"),
             None,
         );
-        let ledger = GatewayLedger::new(state.postgres.wyrd());
-        let admission = ledger.admit(&call, &mut plan).await.expect("admission");
-        let accounted = Accounted::new(
+        let ledger = GatewayLedger::new(state.gateway.usage());
+        let mut admission = ledger.admit(&call, &mut plan).expect("admission");
+        let mut accounted = Accounted::new(
             &call,
             &admission,
             &CallExecution {
@@ -1463,28 +1841,28 @@ async fn gateway_targeted_token_limits_settle_covered_attempts_only() {
             },
         )
         .expect("accounting prices");
-        ledger.settle(tenant, &accounted).await.expect("settlement");
+        GatewayLedger::settle(&mut admission, &mut accounted);
+        sync(&state, tenant).await;
         assert_eq!((window("dep-a/a").await, window("dep-b/b").await), expected);
     }
     drain_gateway(&state).await;
 }
 
-/// Races [`RACE_CALLS`] bounded, priced calls across two replicas under
-/// `limits` and `budgets`, returning how many dispatched and every rejection.
+/// Races [`RACE_CALLS`] bounded, priced calls on one serving replica under
+/// `limits` and `budgets` while background usage persistence cannot write,
+/// returning how many dispatched and every rejection once every admitted
+/// call has answered.
 ///
-/// A superuser `SHARE` lock on the accounting ledger and the limit windows
-/// blocks only their writes, which every call makes when it charges a limit
-/// window or reserves budget after reading its limit usage and budget spend,
-/// and releases once every call waits. Without the tenant advisory lock each
-/// call therefore reads the same capacity before any charge commits and all
-/// of them dispatch; with it, one call waits on the charge while holding the
-/// advisory lock and the rest wait on that lock, so admissions serialize
-/// after release. The barrier locks no row admission reads.
+/// A superuser `SHARE` lock on the usage tables and the accounting ledger
+/// blocks every write the replica's background synchronization makes, and is
+/// held until each call has been admitted or refused and every admitted call
+/// has answered its caller, so no admission, dispatch, or buffered answer can
+/// have waited for Postgres.
 ///
 /// # Panics
 ///
-/// Panics when the Postgres fixture, tenant setup, or ledger lock fails, when
-/// the calls do not all reach the lock wait, or when a racing task panics.
+/// Panics when the Postgres fixture, tenant setup, or ledger lock fails, or
+/// when a racing task panics or an admitted call fails.
 async fn race_admissions(limits: Value, budgets: Value) -> (usize, Vec<WyrdError>) {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let tenant = fixture.data_tenant_id();
@@ -1493,23 +1871,21 @@ async fn race_admissions(limits: Value, budgets: Value) -> (usize, Vec<WyrdError
         entered,
         release: Semaphore::new(0),
     });
-    let replicas = [
-        replica(&fixture, held.clone()).await,
-        replica(&fixture, held.clone()).await,
-    ];
-    configure(&replicas[0], tenant, limits, budgets, "allow_unpriced").await;
+    let state = replica(&fixture, held.clone()).await;
+    configure(&state, tenant, limits, budgets, "allow_unpriced").await;
 
     let superuser = fixture.superuser_pool().expect("superuser pool");
     let mut barrier = superuser.begin().await.expect("barrier begins");
     sqlx::query(
-        "LOCK TABLE wyrd.gateway_accounting_entries, wyrd.gateway_limit_windows IN SHARE MODE",
+        "LOCK TABLE wyrd.gateway_accounting_entries, wyrd.gateway_usage_windows, \
+         wyrd.gateway_usage_concurrency IN SHARE MODE",
     )
     .execute(&mut *barrier)
     .await
-    .expect("admission charges held");
+    .expect("usage writes held");
     let mut calls = JoinSet::new();
     for n in 0..RACE_CALLS {
-        let state = replicas[n % 2].clone();
+        let state = state.clone();
         let caller = invoker(tenant, n as u128, [open_access()]);
         calls.spawn(async move {
             GatewayInvocation::new(&state)
@@ -1520,8 +1896,6 @@ async fn race_admissions(limits: Value, budgets: Value) -> (usize, Vec<WyrdError
                 .await
         });
     }
-    await_lock_waiters(&fixture, i64::try_from(RACE_CALLS).expect("call count")).await;
-    barrier.commit().await.expect("barrier releases");
 
     let (mut admitted, mut rejected) = (0, Vec::new());
     while admitted + rejected.len() < RACE_CALLS {
@@ -1535,31 +1909,31 @@ async fn race_admissions(limits: Value, budgets: Value) -> (usize, Vec<WyrdError
     }
     held.release.add_permits(RACE_CALLS);
     while let Some(joined) = calls.join_next().await {
-        joined
+        let response = joined
             .expect("call task joins")
-            .expect("admitted call completes");
+            .expect("admitted call answers while usage writes are held");
+        assert_eq!(response.status, 200);
     }
-    for replica in &replicas {
-        drain_gateway(replica).await;
-    }
+    barrier.commit().await.expect("barrier releases");
+    drain_gateway(&state).await;
     (admitted, rejected)
 }
 
-/// Calls raced by [`race_admissions`]; fits the test lane pool of 8
-/// connections.
+/// Calls raced by [`race_admissions`].
 const RACE_CALLS: usize = 6;
 
-/// Simultaneous admissions on two replicas dispatch exactly a tenant
-/// concurrency limit's capacity, and exactly a daily budget's capacity, and
-/// reject the rest before dispatch with the stable limit or budget error,
-/// because every replica serializes admission on the tenant advisory lock.
+/// With warm governance state and background Postgres writes held, one
+/// server's simultaneous admissions dispatch exactly a tenant concurrency
+/// limit's capacity, and exactly a daily budget's capacity, answering every
+/// admitted call and rejecting the rest before dispatch with the stable limit
+/// or budget error, because local admissions charge memory atomically.
 ///
 /// # Panics
 ///
-/// Panics when limit or budget serialization fails, when the admitted count
-/// differs from capacity, or when a rejection is not the stable error.
+/// Panics when the admitted count differs from capacity, an admitted call
+/// waits for the held writes, or a rejection is not the stable error.
 #[tokio::test]
-async fn gateway_simultaneous_admissions_across_replicas_never_oversubscribe() {
+async fn warm_governance_uses_local_reservations_without_database_waits() {
     const CAPACITY: usize = 2;
     let limit = serde_json::to_value(GatewayLimit {
         subject: GatewayLimitSubject::Tenant,
@@ -1611,7 +1985,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
     type Handler = fn(
         State<AppState>,
         Result<Caller, WyrdErrorResponse>,
-        Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+        Result<JsonBody, WyrdErrorResponse>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = axum::response::Response> + Send>,
     >;
@@ -1678,6 +2052,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         );
     });
     let (state, scribe) = RecordingScribe::attach(state);
+    let state = serving(state).await;
     capture_metadata(&state, tenant).await;
     let admin = admin(tenant);
     let gateway = GatewayAdministration::new(&state);
@@ -1722,12 +2097,12 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
             .extend(extra.as_object().expect("object").clone());
         body
     };
-    let call = |operation, body| GatewayCallRequest {
+    let call = |operation, body: Value| GatewayCallRequest {
         operation,
         ingress: IngressDialect::OpenAi,
         model: model("deepseek/deepseek-chat"),
         fallback: None,
-        body,
+        body: body.into(),
         media: None,
         batch: None,
         deployment: None,
@@ -1777,7 +2152,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         Ok(caller.clone()),
         None,
         HeaderMap::new(),
-        Ok(Json(chat(json!({"stream": true})))),
+        Ok(JsonBody::from(chat(json!({"stream": true})))),
     )
     .await;
     assert_eq!(streaming.status(), StatusCode::OK);
@@ -1844,7 +2219,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         State(state.clone()),
         Ok(caller.clone()), None,
         HeaderMap::new(),
-        Ok(Json(json!({"model": "deepseek/deepseek-chat", "input": "hi", "max_output_tokens": 8, "stream": true}))),
+        Ok(JsonBody::from(json!({"model": "deepseek/deepseek-chat", "input": "hi", "max_output_tokens": 8, "stream": true}))),
     )
     .await;
     assert_eq!(streamed_responses.status(), StatusCode::OK);
@@ -1856,7 +2231,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         State(state.clone()),
         Ok(caller.clone()),
         None,
-        Ok(Json(
+        Ok(JsonBody::from(
             json!({"model": "deepseek/deepseek-chat", "input": ["b", "a"], "dimensions": 1}),
         )),
     )
@@ -1874,7 +2249,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         State(state.clone()),
         Ok(caller.clone()),
         None,
-        Ok(Json(
+        Ok(JsonBody::from(
             json!({"model": "deepseek/deepseek-chat", "input": "a", "dimensions": 0}),
         )),
     )
@@ -1897,7 +2272,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
             Ok(caller.clone()),
             None,
             HeaderMap::new(),
-            Ok(Json(sent.clone())),
+            Ok(JsonBody::from(sent.clone())),
         )
         .await;
         assert_eq!(answered.status(), StatusCode::OK, "{input}");
@@ -1976,7 +2351,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         let refused = handler(
             State(state.clone()),
             Ok(caller.clone()),
-            Ok(Json(body.clone())),
+            Ok(JsonBody::from(body.clone())),
         )
         .await;
         assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{body}");
@@ -2031,7 +2406,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         State(state.clone()),
         Ok(caller.clone()),
         None,
-        Ok(Json(
+        Ok(JsonBody::from(
             json!({"model": "deepseek/deepseek-chat", "prompt": "a cat"}),
         )),
     )
@@ -2047,7 +2422,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         State(state.clone()),
         Ok(caller.clone()),
         None,
-        Ok(Json(
+        Ok(JsonBody::from(
             json!({"model": "deepseek/deepseek-chat", "input": "hi", "voice": "alloy"}),
         )),
     )
@@ -2202,7 +2577,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         Ok(caller.clone()),
         None,
         HeaderMap::new(),
-        Ok(Json(chat(json!({"user": "limited"})))),
+        Ok(JsonBody::from(chat(json!({"user": "limited"})))),
     )
     .await;
     assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -2279,7 +2654,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
             Ok(invoker(tenant, 7, [open_access()])),
             None,
             HeaderMap::new(),
-            Ok(Json(json!({
+            Ok(JsonBody::from(json!({
                 "model": format!("{name}/{name}"),
                 "messages": [{"role": "user", "content": "hi"}],
                 "stream": true,
@@ -2413,7 +2788,7 @@ async fn held_upstream(frame: &'static str) -> (u16, JoinHandle<bool>, Arc<Notif
 /// Panics when the fixed binding name is invalid or the HTTP gateway dispatch
 /// cannot be built.
 async fn http_replica(fixture: &PgFixture, tenant: DataTenantId, secret: &Path) -> AppState {
-    test_state(fixture).await.with_owners_for_test(|owners| {
+    let state = test_state(fixture).await.with_owners_for_test(|owners| {
         owners.gateway = crate::components::gateway::Gateway::new(
             crate::config::GatewayConfig {
                 endpoints: wyrd_gateway::BuiltinEndpoints::default(),
@@ -2443,7 +2818,8 @@ async fn http_replica(fixture: &PgFixture, tenant: DataTenantId, secret: &Path) 
                 ),
             ),
         );
-    })
+    });
+    serving(state).await
 }
 
 /// Proves the Batches lifecycle across two replicas and tenants: an upload
@@ -2643,7 +3019,7 @@ async fn gateway_batches_converge_replays_on_one_upstream_batch() {
             State(state.clone()),
             Ok(caller.clone()),
             HeaderMap::new(),
-            Ok(Json(json!({
+            Ok(JsonBody::from(json!({
                 "input_file_id": file_id,
                 "endpoint": "/v1/chat/completions",
                 "completion_window": window,
@@ -2959,7 +3335,7 @@ async fn gateway_batch_creations_release_claims_only_without_dispatch() {
             State(state.clone()),
             Ok(caller.clone()),
             HeaderMap::new(),
-            Ok(Json(json!({
+            Ok(JsonBody::from(json!({
                 "input_file_id": file_id, "endpoint": "/v1/chat/completions",
                 "completion_window": "24h", "metadata": {"n": n},
             }))),
@@ -3031,7 +3407,7 @@ async fn gateway_batch_creations_release_claims_only_without_dispatch() {
         State(c.clone()),
         Ok(invoker(tenant, 9, [])),
         HeaderMap::new(),
-        Ok(Json(json!({
+        Ok(JsonBody::from(json!({
             "input_file_id": file_id, "endpoint": "/v1/chat/completions",
             "completion_window": "24h", "metadata": {"n": "denied"},
         }))),
@@ -3042,47 +3418,38 @@ async fn gateway_batch_creations_release_claims_only_without_dispatch() {
     drain_gateway(&c).await;
     assert_eq!(audit_decisions(&scribe, tenant).len(), decisions + 1);
 
-    // A caller that leaves after the claim commits and before dispatch, here
-    // while admission on healthy replica D waits on the tenant's admission
-    // lock, has its claim released by tracked server work; the identical
-    // replay then creates once. Only a call a limit covers takes that lock.
-    let limit = serde_json::to_value(GatewayLimit {
-        subject: GatewayLimitSubject::Tenant,
-        target: GatewayPolicyTarget::All,
-        requests_per_minute: NonZeroU64::new(1000),
-        tokens_per_minute: None,
-        concurrent_calls: None,
-    })
-    .expect("limit encodes");
-    GatewayAdministration::new(&d)
-        .put_governance(
-            &admin(tenant),
-            serde_json::from_value(json!({
-                "limits": [limit], "budgets": [], "pricing": [], "unknown_cost": "allow_unpriced",
-            }))
-            .expect("governance decodes"),
-        )
-        .await
-        .expect("governance stores");
+    // A caller that leaves while its claim is held on the batch table on
+    // healthy replica D, before dispatch, has its claim committed and then
+    // released by tracked server work without a provider request; the
+    // identical replay then creates once.
     let mut lock = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
-    sqlx::query(
-        "SELECT pg_advisory_xact_lock(\
-         hashtextextended('wyrd.gateway_admission:' || wyrd.current_tenant()::text, 0))",
-    )
-    .execute(&mut **lock.transaction())
-    .await
-    .expect("admission lock");
+    sqlx::query("LOCK TABLE wyrd.gateway_batches IN EXCLUSIVE MODE")
+        .execute(&mut **lock.transaction())
+        .await
+        .expect("batch table locks");
     let abandoned = tokio::spawn(create(&d, "abandoned"));
     tokio::time::timeout(Duration::from_secs(10), async {
-        while pending().await != 2 {
+        loop {
+            let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_locks WHERE NOT granted \
+                 AND relation = 'wyrd.gateway_batches'::regclass",
+            )
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("locks read");
+            conn.commit().await.expect("read commits");
+            if waiting > 0 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("the creation claims its fence");
+    .expect("the creation waits on its claim");
     abandoned.abort();
     assert!(abandoned.await.is_err_and(|error| error.is_cancelled()));
-    lock.commit().await.expect("admission lock releases");
+    lock.commit().await.expect("batch table releases");
     drain_gateway(&d).await;
     assert_eq!(pending().await, 1, "the abandoned claim is released");
     assert_eq!(
@@ -3201,7 +3568,7 @@ async fn gateway_batch_dispatch_reauthorizes_against_its_routing_snapshot() {
             State(state.clone()),
             Ok(caller.clone()),
             HeaderMap::new(),
-            Ok(Json(json!({
+            Ok(JsonBody::from(json!({
                 "input_file_id": file_id, "endpoint": "/v1/chat/completions",
                 "completion_window": "24h", "metadata": {"n": n},
             }))),
@@ -3307,8 +3674,8 @@ async fn gateway_batch_dispatch_reauthorizes_against_its_routing_snapshot() {
 }
 
 /// Waits for every spawned gateway task — accounting and post-answer
-/// capture — then reopens the tracker, and settles the audit and Scribe
-/// outboxes.
+/// capture — then reopens the tracker, persists the replica's quota usage,
+/// and settles the audit and Scribe outboxes.
 ///
 /// Invocation audit and capture are non-blocking, so a decision row or a
 /// captured frame exists only once its outbox has written it.
@@ -3322,6 +3689,7 @@ async fn drain_gateway(state: &AppState) {
         .await
         .expect("gateway tasks drain");
     state.gateway.tasks().reopen();
+    persist(state).await;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     assert_eq!(
         state.bifrost.scribe_outbox().settle(deadline).await,
@@ -3353,6 +3721,7 @@ async fn gateway_capture_follows_policy_and_never_affects_the_call() {
     let call = || request("dep-a/a", Some((1000, 500)), Duration::from_secs(10));
 
     let (disabled, scribe) = RecordingScribe::attach(replica(&fixture, dispatch.clone()).await);
+    warm(&disabled, [tenant]).await;
     dispatch.push(Step::Return(completed(100, 50)));
     GatewayInvocation::new(&disabled)
         .invoke(&caller, call())
@@ -3373,6 +3742,7 @@ async fn gateway_capture_follows_policy_and_never_affects_the_call() {
         .expect("metadata policy stores");
 
     let (captured, scribe) = RecordingScribe::attach(replica(&fixture, dispatch.clone()).await);
+    warm(&captured, [tenant]).await;
     dispatch.push(Step::Return(failed(1000, 0)));
     dispatch.push(Step::Return(completed(100, 50)));
     let response = GatewayInvocation::new(&captured)
@@ -3409,6 +3779,7 @@ async fn gateway_capture_follows_policy_and_never_affects_the_call() {
     );
 
     let unavailable = replica(&fixture, dispatch.clone()).await;
+    warm(&unavailable, [tenant]).await;
     dispatch.push(Step::Return(completed(100, 50)));
     let answered = GatewayInvocation::new(&unavailable)
         .invoke(&caller, call())
@@ -3709,16 +4080,18 @@ async fn replica_with_fixture_catalog(
         .await
         .expect("the catalog builds against the fixture"),
     );
-    crate::test_support::test_app_state(postgres, storage, catalog).with_owners_for_test(|owners| {
-        owners.gateway = crate::components::gateway::Gateway::new(
-            crate::config::GatewayConfig::default(),
-            GatewayEngine::new(
-                CredentialResolver::default(),
-                DeploymentHealth::default(),
-                dispatch,
-            ),
-        );
-    })
+    let state = crate::test_support::test_app_state(postgres, storage, catalog)
+        .with_owners_for_test(|owners| {
+            owners.gateway = crate::components::gateway::Gateway::new(
+                crate::config::GatewayConfig::default(),
+                GatewayEngine::new(
+                    CredentialResolver::default(),
+                    DeploymentHealth::default(),
+                    dispatch,
+                ),
+            );
+        });
+    serving(state).await
 }
 
 /// Exact bytes of the captured binary answer; the marker makes their absence
@@ -3730,7 +4103,7 @@ const PAYLOAD_OBJECT_BYTES: &[u8] = b"\x89PNG\r\n\x1a\ncaptured-object-bytes";
 fn media_completed(bytes: &[u8]) -> AttemptResult {
     let answer = MediaAnswer {
         content_type: "image/png".to_owned(),
-        bytes: bytes.to_vec(),
+        bytes: bytes.to_vec().into(),
     };
     AttemptResult::Completed {
         capture: Some(ResponseCapture::Media(answer.clone())),
@@ -3996,6 +4369,7 @@ async fn gateway_payload_objects_are_authorized_convergent_and_stable_when_expir
     );
 
     let failing = replica(&fixture, dispatch.clone()).await;
+    warm(&failing, [tenant]).await;
     failing
         .storage
         .put_object(&prefix, b"not a directory".to_vec())
@@ -4095,7 +4469,7 @@ async fn gateway_selected_speech_persists_one_retrievable_object() {
                 State(state),
                 Ok(invoker(tenant, 1, [open_access()])),
                 None,
-                Ok(Json(
+                Ok(JsonBody::from(
                     json!({"model": "speech/speech", "input": "hi", "voice": voice}),
                 )),
             )
@@ -4595,6 +4969,7 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
                 ),
             );
         }));
+    let state = serving(state).await;
     let admin = admin(tenant);
     let gateway = GatewayAdministration::new(&state);
     gateway
@@ -4639,7 +5014,8 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
             "model": "deepseek/deepseek-chat",
             "user": user,
             "messages": [{"role": "user", "content": "hi"}],
-        }),
+        })
+        .into(),
         media: None,
         batch: None,
         deployment: None,
@@ -4699,7 +5075,9 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
     let stream = |user: &str| {
         let mut request = call(user);
         request.stream = true;
-        request.body["stream"] = json!(true);
+        let mut body = std::mem::take(&mut request.body).into_tree();
+        body["stream"] = json!(true);
+        request.body = body.into();
         request
     };
     let mut streams = Vec::new();
@@ -4721,7 +5099,7 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
                 &caller,
                 GatewayCallRequest {
                     operation: GatewayOperation::Images,
-                    body: json!({"model": "deepseek/deepseek-chat", "prompt": prompt}),
+                    body: json!({"model": "deepseek/deepseek-chat", "prompt": prompt}).into(),
                     media: Some(wyrd_gateway::MediaRequest {
                         route: wyrd_gateway::OpenAiMediaRoute::ImageGenerations,
                         files: Vec::new(),
@@ -5226,7 +5604,9 @@ async fn gateway_terminal_spans_classify_every_call_and_attempt() {
     let call = |name: &str, stream: bool| {
         let mut request = request(&format!("{name}/{name}"), None, Duration::from_secs(2));
         request.stream = stream;
-        request.body["stream"] = json!(stream);
+        let mut body = std::mem::take(&mut request.body).into_tree();
+        body["stream"] = json!(stream);
+        request.body = body.into();
         request
     };
     let caller = |n: u128| invoker(tenant, n, [open_access()]);
@@ -5474,23 +5854,25 @@ async fn gateway_terminal_spans_classify_every_call_and_attempt() {
     drain_gateway(&state).await;
 }
 
-/// A buffered call whose settlement fails after its provider attempt
-/// completed still answers: a failed settlement is only logged, so its
-/// request metric and published Metadata call row say `succeeded` with the
-/// call's usage, and the unsettled reservation keeps counting at its reserved
-/// cost.
+/// Background usage persistence combines servers' contributions and never
+/// counts a charge twice: a buffered call answers, and its request metric and
+/// published Metadata call row say `succeeded`, while persistence of its
+/// settlement is refused; the refused batch keeps its charges and the next
+/// synchronization commits each reservation entry once; a replayed
+/// (uncertain) write of the same absolute rows and entries adds nothing; two
+/// servers' window tokens accumulate rather than overwrite; and a call ended
+/// by its deadline frees its local concurrency for the next call.
 ///
-/// Settlement is faulted by a `NOT VALID` check constraint on the fixture's
-/// own database refusing reservation settlements, added while the attempt is
-/// parked after admission reserved, so only the settlement statement fails.
+/// Persistence is refused by a `NOT VALID` check constraint on the fixture's
+/// own database refusing reservation settlements.
 ///
 /// # Panics
 ///
-/// Panics when a fixture or the fault fails, the call fails, or a metric
-/// series, published row, log line, or ledger entry differs from those
-/// outcomes.
+/// Panics when a fixture or the fault fails, an answered call fails, or a
+/// metric series, published row, log line, persisted window, or ledger entry
+/// differs from those outcomes.
 #[tokio::test]
-async fn gateway_settlement_failure_never_changes_the_answered_call() {
+async fn background_usage_reconciles_retries_and_remote_updates() {
     let recorder = SeriesRecorder::default();
     let _metrics = metrics::set_default_local_recorder(&recorder);
     let traces = TraceBuffer::default();
@@ -5503,25 +5885,23 @@ async fn gateway_settlement_failure_never_changes_the_answered_call() {
     );
     let fixture = PgFixture::start().await.expect("fixture starts");
     let tenant = fixture.data_tenant_id();
-    let dispatch = Scripted::shared();
-    let (state, scribe) = RecordingScribe::attach(replica(&fixture, dispatch.clone()).await);
-    configure(&state, tenant, json!([]), daily_budget("1"), "reject").await;
-    capture_metadata(&state, tenant).await;
+    let (first, second) = (Scripted::shared(), Scripted::shared());
+    let (a, scribe) = RecordingScribe::attach(replica(&fixture, first.clone()).await);
+    let b = replica(&fixture, second.clone()).await;
+    let limit = serde_json::to_value(GatewayLimit {
+        subject: GatewayLimitSubject::Tenant,
+        target: GatewayPolicyTarget::All,
+        requests_per_minute: None,
+        tokens_per_minute: NonZeroU64::new(1_000_000),
+        concurrent_calls: NonZeroU64::new(1),
+    })
+    .expect("limit encodes");
+    configure(&a, tenant, json!([limit]), daily_budget("1"), "reject").await;
+    capture_metadata(&a, tenant).await;
+    GatewayAdministration::new(&b).warm(tenant).await;
     let caller = invoker(tenant, 1, [open_access()]);
+    let bounded = || request("dep-a/a", Some((1000, 500)), Duration::from_secs(30));
 
-    dispatch.push(Step::Park(completed(10, 5)));
-    let call = tokio::spawn({
-        let (state, caller) = (state.clone(), caller.clone());
-        async move {
-            GatewayInvocation::new(&state)
-                .invoke(
-                    &caller,
-                    request("dep-a/a", Some((1000, 500)), Duration::from_secs(30)),
-                )
-                .await
-        }
-    });
-    dispatch.entered.notified().await;
     let superuser = fixture.superuser_pool().expect("superuser pool");
     sqlx::query(
         "ALTER TABLE wyrd.gateway_accounting_entries ADD CONSTRAINT settlement_fault \
@@ -5530,14 +5910,19 @@ async fn gateway_settlement_failure_never_changes_the_answered_call() {
     .execute(&superuser)
     .await
     .expect("settlement fault installs");
-    dispatch.release.notify_one();
-    let response = call
+    first.push(Step::Return(completed(10, 5)));
+    let response = GatewayInvocation::new(&a)
+        .invoke(&caller, bounded())
         .await
-        .expect("call task joins")
-        .expect("a failed settlement never fails the answered call");
+        .expect("refused persistence never fails the answered call");
     assert_eq!(response.status, 200);
-    drain_gateway(&state).await;
-
+    drain_gateway(&a).await;
+    assert!(
+        traces
+            .text()
+            .contains("gateway usage synchronization failed"),
+        "the refused persistence is logged"
+    );
     let series = recorder
         .series
         .lock()
@@ -5559,17 +5944,131 @@ async fn gateway_settlement_failure_never_changes_the_answered_call() {
         "{row}"
     );
     assert!(
-        traces.text().contains("gateway call settlement failed"),
-        "the failed settlement is logged"
+        !entries(&fixture, tenant, response.call_id)
+            .await
+            .iter()
+            .any(|entry| matches!(
+                entry,
+                GatewayAccountingEntryV1::BudgetReservationSettled { .. }
+            )),
+        "nothing settled is persisted while refused"
     );
+
+    sqlx::query("ALTER TABLE wyrd.gateway_accounting_entries DROP CONSTRAINT settlement_fault")
+        .execute(&superuser)
+        .await
+        .expect("settlement fault removes");
+    persist(&a).await;
+    persist(&a).await;
     let ledger = entries(&fixture, tenant, response.call_id).await;
     assert!(
         matches!(
             ledger.as_slice(),
-            [GatewayAccountingEntryV1::BudgetReservationCreated { .. }]
+            [
+                GatewayAccountingEntryV1::BudgetReservationCreated { .. },
+                GatewayAccountingEntryV1::BudgetReservationSettled { .. }
+            ]
         ),
-        "the reservation stays unsettled: {ledger:?}"
+        "the retried batch commits each entry once: {ledger:?}"
     );
+    let (actual, _) = settlement(&ledger);
+    assert_cost(actual, "0.00006");
+    assert_eq!(window_tokens(&fixture, tenant).await, 15);
+
+    // An uncertain commit is retried with the same absolute rows and entries.
+    let replayed = {
+        let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
+        let rows: Vec<(Uuid, chrono::DateTime<Utc>, i64, i64)> = sqlx::query_as(
+            "SELECT server_id, window_start, requests, tokens FROM wyrd.gateway_usage_windows",
+        )
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .expect("windows read");
+        let (server_id, window_start, requests, tokens) = rows[0];
+        let key = serde_json::to_value((GatewayLimitSubject::Tenant, GatewayPolicyTarget::All))
+            .expect("key encodes")
+            .to_string();
+        let created: Value = sqlx::query_scalar(
+            "SELECT entry FROM wyrd.gateway_accounting_entries WHERE kind = 'budget_reservation_created'",
+        )
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("entry reads");
+        let entry_id: Uuid = sqlx::query_scalar(
+            "SELECT entry_id FROM wyrd.gateway_accounting_entries WHERE kind = 'budget_reservation_created'",
+        )
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("entry id reads");
+        wyrd_sql::queries::gateway_admission::sync_gateway_usage(
+            &mut conn,
+            &wyrd_sql::queries::gateway_admission::GatewayUsageWrite {
+                server_id,
+                windows: &[wyrd_sql::queries::gateway_admission::GatewayUsageWindow {
+                    limit_key: key,
+                    window_start,
+                    requests,
+                    tokens,
+                }],
+                window_floor: window_start,
+                concurrency: &[],
+                concurrency_lease_seconds: 30.0,
+                entries: &[wyrd_sql::queries::gateway_admission::GatewayUsageEntry {
+                    entry_id: Uuid::now_v7(),
+                    call_id: response.call_id.as_uuid(),
+                    kind: "budget_reservation_created",
+                    entry: created,
+                }],
+            },
+        )
+        .await
+        .expect("replay writes");
+        conn.commit().await.expect("replay commits");
+        entry_id
+    };
+    let ledger = entries(&fixture, tenant, response.call_id).await;
+    assert_eq!(
+        ledger.len(),
+        2,
+        "a replayed reservation is fenced: {replayed}"
+    );
+    assert_eq!(
+        window_tokens(&fixture, tenant).await,
+        15,
+        "a replay adds nothing"
+    );
+
+    second.push(Step::Return(completed(10, 5)));
+    GatewayInvocation::new(&b)
+        .invoke(&caller, bounded())
+        .await
+        .expect("the other server admits");
+    drain_gateway(&b).await;
+    assert_eq!(
+        window_tokens(&fixture, tenant).await,
+        30,
+        "servers' contributions accumulate"
+    );
+
+    first.push(Step::Hang);
+    let error = GatewayInvocation::new(&a)
+        .invoke(
+            &caller,
+            request("dep-a/a", Some((10, 10)), Duration::from_millis(300)),
+        )
+        .await
+        .expect_err("the attempt outlives the deadline");
+    assert!(
+        matches!(error, WyrdError::GatewayDeadlineExceeded { .. }),
+        "{error:?}"
+    );
+    drain_gateway(&a).await;
+    first.push(Step::Return(completed(10, 5)));
+    GatewayInvocation::new(&a)
+        .invoke(&caller, bounded())
+        .await
+        .expect("an ended call frees its concurrency");
+    drain_gateway(&a).await;
 }
 
 /// One public inference ingress that reads the `wyrd-gateway-fallback`
@@ -5636,16 +6135,30 @@ impl FallbackIngress {
         match self {
             Self::ChatCompletions => {
                 let body = json!({"model": requested, "messages": messages});
-                super::routes::chat_completions(state, caller, None, headers, Ok(Json(body))).await
+                super::routes::chat_completions(
+                    state,
+                    caller,
+                    None,
+                    headers,
+                    Ok(JsonBody::from(body)),
+                )
+                .await
             }
             Self::Responses => {
                 let body = json!({"model": requested, "input": "hi"});
-                super::routes::responses(state, caller, None, headers, Ok(Json(body))).await
+                super::routes::responses(state, caller, None, headers, Ok(JsonBody::from(body)))
+                    .await
             }
             Self::AnthropicMessages => {
                 let body = json!({"model": requested, "max_tokens": 8, "messages": messages});
-                super::ingress::anthropic_messages(state, caller, None, headers, Ok(Json(body)))
-                    .await
+                super::ingress::anthropic_messages(
+                    state,
+                    caller,
+                    None,
+                    headers,
+                    Ok(JsonBody::from(body)),
+                )
+                .await
             }
             Self::GeminiGenerateContent => {
                 let body = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]});
@@ -5663,7 +6176,7 @@ impl FallbackIngress {
                     ),
                     axum::extract::RawQuery(None),
                     headers,
-                    Ok(Json(body)),
+                    Ok(JsonBody::from(body)),
                 )
                 .await
             }
@@ -6008,12 +6521,13 @@ async fn gateway_agent_calls_start_only_on_a_compatible_adapter() {
         .expect("fallback stores");
     let caller = invoker(tenant, 1, [open_access()]);
     let agent = super::ServerWyrdGatewayCaller::new(state.clone(), caller.clone());
+    let native = skald_spec::ProviderRequest::OpenAiChatCompletion(
+        serde_json::from_value(json!({"model": "m", "max_tokens": 4,
+                "messages": [{"role": "user", "content": "hi"}]}))
+        .expect("chat request"),
+    );
     let chat = |requested: &str| skald_agent::WyrdGatewayCall {
-        request: skald_spec::ProviderRequest::OpenAiChatCompletion(
-            serde_json::from_value(json!({"model": "m", "max_tokens": 4,
-                    "messages": [{"role": "user", "content": "hi"}]}))
-            .expect("chat request"),
-        ),
+        request: &native,
         model: model(requested),
         provider: skald_spec::ProviderName::OpenAi,
         timeout: Duration::from_secs(10),
@@ -6026,7 +6540,8 @@ async fn gateway_agent_calls_start_only_on_a_compatible_adapter() {
                 "choices": [{"index": 0, "finish_reason": "stop",
                     "message": {"role": "assistant", "content": "ok"}}]
             }))
-            .expect("json"),
+            .expect("json")
+            .into(),
         ),
         usage: usage(1, 1),
         capture: None,
@@ -6057,7 +6572,8 @@ async fn gateway_agent_calls_start_only_on_a_compatible_adapter() {
             &caller,
             GatewayCallRequest {
                 body: json!({"model": "claude/m", "max_tokens": 4,
-                    "messages": [{"role": "user", "content": "hi"}]}),
+                    "messages": [{"role": "user", "content": "hi"}]})
+                .into(),
                 ..request("claude/m", None, Duration::from_secs(10))
             },
         )
@@ -6066,21 +6582,28 @@ async fn gateway_agent_calls_start_only_on_a_compatible_adapter() {
     assert_eq!(dispatch.seen(), ["dep-a", "claude", "claude"]);
 }
 
+/// The chat call to `dep-a/a` sending `request` within `timeout`.
+fn chat(
+    request: &skald_spec::ProviderRequest,
+    timeout: Duration,
+) -> skald_agent::WyrdGatewayCall<'_> {
+    skald_agent::WyrdGatewayCall {
+        request,
+        model: model("dep-a/a"),
+        provider: skald_spec::ProviderName::OpenAi,
+        timeout,
+    }
+}
+
 /// A lane-bound Agent call spends one budget across its lane wait and its
 /// gateway call. With the lane's only permit held, a short call times out
 /// within its budget and nothing is dispatched. A call admitted after
 /// waiting out half its budget reaches the provider with only the remainder
 /// as its deadline, so a provider that never answers ends the call by the
 /// original deadline rather than a full budget after admission. A cancelled
-/// wait ends at once. A call whose lane opens halfway through its budget but
-/// whose cold snapshot read is held past the original deadline is refused
-/// with the gateway deadline at that deadline while that read is still
-/// blocked, undispatched, and a call dropped there keeps nothing.
-/// A call admitted after a lane wait and a delayed snapshot reaches the
-/// provider with the deadline fixed before its lane wait. A ledger write held
-/// past the deadline still hands off: no attempt starts, and its concurrency
-/// hold is settled before the answer, so the next call is admitted. A bound
-/// that passes once preparation and a capture slot are in hand refuses the
+/// wait ends at once. A call admitted after a lane wait reaches the provider
+/// with the deadline fixed before its lane wait. A bound that passes once
+/// preparation and a capture slot are in hand refuses the
 /// call before its ledger write, uncaptured, with its completed invoke
 /// decisions still audited. No expiry
 /// or cancellation keeps a permit, the gateway captures each expired call as
@@ -6088,11 +6611,10 @@ async fn gateway_agent_calls_start_only_on_a_compatible_adapter() {
 ///
 /// # Panics
 /// Panics when a setup step fails, a wait outlives its budget, a call is
-/// dispatched while the lane is held or past its deadline, a held snapshot
-/// read outlives the call's deadline, a dispatched deadline is not the one
-/// fixed before the lane wait, an expired admission dispatches or keeps its
-/// hold, a permit is kept, an expired call is not captured, or a cancelled
-/// call is not accounted as cancelled.
+/// dispatched while the lane is held or past its deadline, a dispatched
+/// deadline is not the one fixed before the lane wait, a passed bound is
+/// admitted, a permit is kept, an expired call is not captured, or a
+/// cancelled call is not accounted as cancelled.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lane_wait_spends_the_agent_call_budget() {
     let fixture = PgFixture::start().await.expect("fixture starts");
@@ -6105,21 +6627,20 @@ async fn lane_wait_spends_the_agent_call_budget() {
     let agent =
         super::ServerWyrdGatewayCaller::new(state.clone(), invoker(tenant, 1, [open_access()]))
             .admitted("queued", Arc::clone(&permits));
-    let chat = |timeout: Duration| skald_agent::WyrdGatewayCall {
-        request: skald_spec::ProviderRequest::OpenAiChatCompletion(
-            serde_json::from_value(json!({"model": "a", "max_tokens": 4,
-                    "messages": [{"role": "user", "content": "hi"}]}))
-            .expect("chat request"),
-        ),
-        model: model("dep-a/a"),
-        provider: skald_spec::ProviderName::OpenAi,
-        timeout,
-    };
+    let native = Arc::new(skald_spec::ProviderRequest::OpenAiChatCompletion(
+        serde_json::from_value(json!({"model": "a", "max_tokens": 4,
+                "messages": [{"role": "user", "content": "hi"}]}))
+        .expect("chat request"),
+    ));
     let call = |timeout: Duration| {
-        let agent = agent.clone();
-        let call = chat(timeout);
+        let (agent, native) = (agent.clone(), Arc::clone(&native));
         async move {
-            skald_agent::WyrdGatewayCaller::call(&agent, call, &CancellationToken::new()).await
+            skald_agent::WyrdGatewayCaller::call(
+                &agent,
+                chat(&native, timeout),
+                &CancellationToken::new(),
+            )
+            .await
         }
     };
 
@@ -6148,10 +6669,13 @@ async fn lane_wait_spends_the_agent_call_budget() {
     let cancelled = CancellationToken::new();
     cancelled.cancel();
     let waited = tokio::time::Instant::now();
-    let abandoned =
-        skald_agent::WyrdGatewayCaller::call(&agent, chat(Duration::from_secs(30)), &cancelled)
-            .await
-            .expect_err("a cancelled lane wait ends the call");
+    let abandoned = skald_agent::WyrdGatewayCaller::call(
+        &agent,
+        chat(&native, Duration::from_secs(30)),
+        &cancelled,
+    )
+    .await
+    .expect_err("a cancelled lane wait ends the call");
     assert!(
         matches!(abandoned, skald_providers::ProviderError::Timeout { .. })
             && waited.elapsed() < Duration::from_secs(5),
@@ -6168,91 +6692,16 @@ async fn lane_wait_spends_the_agent_call_budget() {
         "the cancelled wait took no permit"
     );
 
-    // The lane opens halfway through a short budget, then the call's cold
-    // snapshot read waits on a held pricing table past the original deadline;
-    // the call refuses by that deadline while the read is still blocked.
-    let budget = Duration::from_secs(1);
-    let superuser = fixture.superuser_pool().expect("superuser pool");
-    let mut barrier = superuser.begin().await.expect("barrier begins");
-    sqlx::query("LOCK TABLE wyrd.gateway_model_pricing IN ACCESS EXCLUSIVE MODE")
-        .execute(&mut *barrier)
-        .await
-        .expect("snapshot reads held");
-    let started = tokio::time::Instant::now();
-    let waiting = tokio::spawn(call(budget));
-    // Elapsed time is the measured quantity: half the budget goes to the lane.
-    tokio::time::sleep(budget / 2).await;
-    drop(held);
-    await_lock_waiters(&fixture, 1).await;
-    let expired = tokio::time::timeout(Duration::from_secs(10), waiting)
-        .await
-        .expect("the call ends while its snapshot is held")
-        .expect("the call joins")
-        .expect_err("admission past the original deadline refuses");
-    let ended = started.elapsed();
-    match expired {
-        skald_providers::ProviderError::RemoteProblem(problem) => {
-            assert_eq!(problem.code, "WYRD_GATEWAY_504_DEADLINE_EXCEEDED");
-        }
-        other => panic!("unexpected expiry: {other:?}"),
-    }
-    assert!(
-        (budget..budget + budget / 4).contains(&ended),
-        "the held snapshot ended the call at its deadline, after {ended:?}"
-    );
-    assert!(
-        dispatch.seen().is_empty(),
-        "nothing is dispatched past the deadline"
-    );
-    assert_eq!(
-        permits.available_permits(),
-        1,
-        "the refused call kept no permit"
-    );
-    barrier.commit().await.expect("barrier releases");
-
-    // A call dropped while its held snapshot read is bounded is cancelled
-    // there: it dispatches nothing and keeps no permit.
-    let mut barrier = superuser.begin().await.expect("barrier begins");
-    sqlx::query("LOCK TABLE wyrd.gateway_model_pricing IN ACCESS EXCLUSIVE MODE")
-        .execute(&mut *barrier)
-        .await
-        .expect("snapshot reads held");
-    let dropped = tokio::spawn(call(Duration::from_secs(30)));
-    await_lock_waiters(&fixture, 1).await;
-    dropped.abort();
-    assert!(dropped.await.is_err_and(|error| error.is_cancelled()));
-    assert!(
-        dispatch.seen().is_empty(),
-        "a dropped call dispatches nothing"
-    );
-    assert_eq!(
-        permits.available_permits(),
-        1,
-        "a dropped call keeps no permit"
-    );
-    barrier.commit().await.expect("barrier releases");
-    let held = Arc::clone(&permits)
-        .try_acquire_owned()
-        .expect("the lane's only permit");
-
+    // The lane opens halfway through the budget and the provider never
+    // answers, so the call ends at the deadline fixed before its lane wait.
     let budget = Duration::from_secs(2);
     dispatch.push(Step::Hang);
-    let mut barrier = superuser.begin().await.expect("barrier begins");
-    sqlx::query("LOCK TABLE wyrd.gateway_model_pricing IN ACCESS EXCLUSIVE MODE")
-        .execute(&mut *barrier)
-        .await
-        .expect("snapshot reads held");
     let started = tokio::time::Instant::now();
     let waiting = tokio::spawn(call(budget));
     // Elapsed time is the measured quantity: the call spends half its budget
-    // waiting for the lane and a quarter on its held snapshot read before it
-    // is dispatched.
+    // waiting for the lane before it is dispatched.
     tokio::time::sleep(budget / 2).await;
     drop(held);
-    await_lock_waiters(&fixture, 1).await;
-    tokio::time::sleep(budget / 4).await;
-    barrier.commit().await.expect("barrier releases");
     let expired = waiting
         .await
         .expect("the call joins")
@@ -6295,7 +6744,8 @@ async fn lane_wait_spends_the_agent_call_budget() {
                 "choices": [{"index": 0, "finish_reason": "stop",
                     "message": {"role": "assistant", "content": "ok"}}]
             }))
-            .expect("json"),
+            .expect("json")
+            .into(),
         ),
         usage: usage(1, 1),
         capture: None,
@@ -6305,101 +6755,12 @@ async fn lane_wait_spends_the_agent_call_budget() {
         .expect("the next call is admitted and answered");
     assert_eq!(dispatch.seen(), ["dep-a", "dep-a"]);
     assert_eq!(permits.available_permits(), 1);
-
-    // A tenant concurrency limit makes admission's ledger write take the
-    // tenant's admission lock. Held past the call's deadline, the write still
-    // hands off to settlement: no attempt starts, the call's concurrency hold
-    // is released before its answer, and the next call is admitted at once.
-    let limit = serde_json::to_value(GatewayLimit {
-        subject: GatewayLimitSubject::Tenant,
-        target: GatewayPolicyTarget::All,
-        requests_per_minute: None,
-        tokens_per_minute: None,
-        concurrent_calls: NonZeroU64::new(1),
-    })
-    .expect("limit encodes");
-    configure(&state, tenant, json!([limit]), json!([]), "allow_unpriced").await;
-    let mut lock = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
-    sqlx::query(
-        "SELECT pg_advisory_xact_lock(\
-         hashtextextended('wyrd.gateway_admission:' || wyrd.current_tenant()::text, 0))",
-    )
-    .execute(&mut **lock.transaction())
-    .await
-    .expect("admission lock");
-    let budget = Duration::from_secs(1);
-    let started = tokio::time::Instant::now();
-    let waiting = tokio::spawn(call(budget));
-    await_lock_waiters(&fixture, 1).await;
-    // Elapsed time is the measured quantity: the deadline passes while the
-    // ledger write waits.
-    tokio::time::sleep_until(started + budget + budget / 4).await;
-    lock.commit().await.expect("admission lock releases");
-    let expired = waiting
-        .await
-        .expect("the call joins")
-        .expect_err("an admission that ends past the deadline times out");
-    match expired {
-        skald_providers::ProviderError::RemoteProblem(problem) => {
-            assert_eq!(problem.code, "WYRD_GATEWAY_504_DEADLINE_EXCEEDED");
-        }
-        other => panic!("unexpected expiry: {other:?}"),
-    }
-    assert_eq!(
-        dispatch.seen(),
-        ["dep-a", "dep-a"],
-        "an admission past the deadline starts no attempt"
-    );
-    assert_eq!(permits.available_permits(), 1, "the expiry kept no permit");
-    dispatch.push(Step::Return(AttemptResult::Completed {
-        body: ResponseBody::Json(
-            serde_json::value::to_raw_value(&json!({
-                "id": "chatcmpl-test", "object": "chat.completion", "created": 0, "model": "a",
-                "choices": [{"index": 0, "finish_reason": "stop",
-                    "message": {"role": "assistant", "content": "ok"}}]
-            }))
-            .expect("json"),
-        ),
-        usage: usage(1, 1),
-        capture: None,
-    }));
-    call(Duration::from_secs(10))
-        .await
-        .expect("the expired call's concurrency hold was settled before its answer");
-    assert_eq!(dispatch.seen(), ["dep-a", "dep-a", "dep-a"]);
     drain_gateway(&state).await;
-    let outcomes: Vec<Value> = scribe
-        .calls()
-        .into_iter()
-        .map(|row| row["outcome"].clone())
-        .collect();
-    assert_eq!(
-        outcomes.get(2),
-        Some(&json!("timed_out")),
-        "the expired admission is accounted as timed out: {outcomes:?}"
-    );
 
-    // With the snapshot cache listening, preparation and an open capture slot
-    // complete without waiting, so a bound that has already passed reaches
-    // the check before the ledger write: the call is refused there, never
-    // admitted, executed, or captured.
-    let shutdown = CancellationToken::new();
-    let (_, listener) = state
-        .gateway
-        .refresh_worker(fixture.wyrd_postgres(), shutdown.clone());
-    let listening = tokio::spawn(listener);
-    let administration = GatewayAdministration::new(&state);
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while state.gateway.snapshots().cached(tenant).is_none() {
-            administration
-                .snapshot(tenant)
-                .await
-                .expect("snapshot loads");
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the snapshot is cached once the listener subscribes");
+    // With the replica's snapshot cache warm, preparation and an open capture
+    // slot complete without waiting, so a bound that has already passed
+    // reaches the check before the ledger write: the call is refused there,
+    // never admitted, executed, or captured.
     let captured = scribe.calls().len();
     let decisions = audit_decisions(&scribe, tenant).len();
     let failure = GatewayInvocation::new(&state)
@@ -6424,7 +6785,7 @@ async fn lane_wait_spends_the_agent_call_budget() {
         captured,
         "a call refused before the ledger is never captured"
     );
-    assert_eq!(dispatch.seen().len(), 3, "nor dispatched");
+    assert_eq!(dispatch.seen().len(), 2, "nor dispatched");
     assert_eq!(
         audit_decisions(&scribe, tenant)[decisions..],
         [
@@ -6439,12 +6800,15 @@ async fn lane_wait_spends_the_agent_call_budget() {
     dispatch.push(Step::Park(completed(1, 1)));
     let token = CancellationToken::new();
     let cancelling = {
-        let agent = agent.clone();
-        let call = chat(Duration::from_secs(30));
-        let token = token.clone();
-        tokio::spawn(
-            async move { skald_agent::WyrdGatewayCaller::call(&agent, call, &token).await },
-        )
+        let (agent, native, token) = (agent.clone(), Arc::clone(&native), token.clone());
+        tokio::spawn(async move {
+            skald_agent::WyrdGatewayCaller::call(
+                &agent,
+                chat(&native, Duration::from_secs(30)),
+                &token,
+            )
+            .await
+        })
     };
     dispatch.entered.notified().await;
     token.cancel();
@@ -6474,9 +6838,7 @@ async fn lane_wait_spends_the_agent_call_budget() {
             .iter()
             .filter(|outcome| *outcome == "timed_out")
             .count(),
-        2,
-        "the expired calls stay timed out: {outcomes:?}"
+        1,
+        "the expired call stays timed out: {outcomes:?}"
     );
-    shutdown.cancel();
-    listening.await.expect("the listener stops");
 }

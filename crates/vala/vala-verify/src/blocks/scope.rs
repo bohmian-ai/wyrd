@@ -14,16 +14,15 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use wyrd_spec::card::verifier::VerifierSpec;
 use wyrd_spec::card::verifier::{PathSegment, Reference, ReferenceRoot, Requirement, VerdictField};
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
-    InputDeclaration, Producer, ProducerInvocation, PublicationCollection, RequirementOutcome,
-    RequirementResult, Speculation, StepResult, StepStatus,
+    ExecutedRequirement, InputDeclaration, Producer, ProducerInvocation, PublicationCollection,
+    RequirementOutcome, RequirementResult, Speculation, StepResult, StepStatus,
 };
 
-use super::{CallInput, CallValue};
+use super::{BoundJson, CallInput, CallValue};
 use crate::walk::RunLedger;
 
 /// Why a value is missing. Ordered so the stronger cause is the greater:
@@ -32,7 +31,7 @@ use crate::walk::RunLedger;
 pub(super) enum Cause {
     /// An intentional skip: a false `when`, or blocked only by one.
     Skipped,
-    /// A failure, timeout, or otherwise missing required value.
+    /// A failure, timeout, or otherwise missing value.
     Failed,
 }
 
@@ -56,7 +55,7 @@ pub(super) struct Missing {
 }
 
 impl Missing {
-    /// A missing value caused by a failure or absent required evidence.
+    /// A missing value caused by a failure or absent evidence.
     pub(super) fn failed(reason: impl Into<String>) -> Self {
         Self {
             cause: Cause::Failed,
@@ -88,12 +87,15 @@ impl Missing {
 /// The final state of one step as later blocks read it.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Settled {
-    /// The action produced `output`, derived from the `sources` slots.
+    /// The action succeeded, deriving its output from the `sources` slots.
+    /// The output has one owner until the run ends: this state, which
+    /// `steps.<id>.output` bindings share and which becomes the step's
+    /// reported [`StepResult::output`] once no binding holds it.
     Succeeded {
-        /// The action output.
-        output: Value,
         /// Original slots the action read.
         sources: BTreeSet<SlotName>,
+        /// The action's output.
+        output: Arc<Value>,
     },
     /// The step failed or was skipped, so it has no output.
     NoOutput {
@@ -125,7 +127,7 @@ pub(super) struct StepDone {
     pub state: Settled,
     /// Every judged instance of the step's requirements, in item, iteration,
     /// then declaration order.
-    pub requirements: Vec<RequirementResult>,
+    pub requirements: Vec<ExecutedRequirement>,
     /// Every invocation attempt, ordered by item, iteration, then attempt;
     /// the collection manifest reports them.
     pub invocations: Vec<ProducerInvocation>,
@@ -147,7 +149,7 @@ pub(super) enum Done {
     /// A step with its requirement instances.
     Step(Box<StepDone>),
     /// A judged whole-Verifier requirement, as reported.
-    Requirement(Box<RequirementResult>),
+    Requirement(Box<ExecutedRequirement>),
 }
 
 /// The ledger the engine shares with the blocks it starts, which each take a
@@ -192,10 +194,9 @@ pub(super) struct Iteration {
 /// already settled, and the invocation's own frame. Read-only; the engine
 /// owns the ledger.
 pub(super) struct Scope<'a> {
-    /// The executing Verifier, for slot declarations.
-    spec: &'a VerifierSpec,
-    /// The pinned original evidence by slot.
-    evidence: &'a BTreeMap<SlotName, InputDeclaration>,
+    /// The pinned original evidence by slot, shared with the bindings that
+    /// select from it.
+    evidence: &'a Arc<BTreeMap<SlotName, InputDeclaration>>,
     /// Blocks already settled.
     ledger: &'a Ledger,
     /// The invocation being bound.
@@ -205,12 +206,10 @@ pub(super) struct Scope<'a> {
 impl<'a> Scope<'a> {
     /// The scope over the original evidence and the blocks in `ledger`.
     pub(super) fn new(
-        spec: &'a VerifierSpec,
-        evidence: &'a BTreeMap<SlotName, InputDeclaration>,
+        evidence: &'a Arc<BTreeMap<SlotName, InputDeclaration>>,
         ledger: &'a Ledger,
     ) -> Self {
         Self {
-            spec,
             evidence,
             ledger,
             frame: Frame::default(),
@@ -220,7 +219,6 @@ impl<'a> Scope<'a> {
     /// The same scope bound for the invocation `frame`.
     pub(super) fn framed(&self, frame: Frame) -> Self {
         Self {
-            spec: self.spec,
             evidence: self.evidence,
             ledger: self.ledger,
             frame,
@@ -253,6 +251,7 @@ impl<'a> Scope<'a> {
             .requirements
             .iter()
             .rev()
+            .map(|requirement| &requirement.result)
             .find(|result| &result.id == requirement)
     }
 
@@ -284,12 +283,12 @@ impl<'a> Scope<'a> {
     ///
     /// A JSON input or step output is navigated by the reference's child
     /// selectors; a whole media or trace slot resolves to its pinned
-    /// declaration. An omitted optional slot is `null`. Step statuses and
-    /// verdict fields resolve to their wire strings.
+    /// declaration. An omitted slot is missing, never `null`. Step statuses
+    /// and verdict fields resolve to their wire strings.
     ///
     /// # Errors
     /// Returns [`Missing`] carrying the upstream cause for the output of a
-    /// step that produced none, and a failure for an omitted required slot,
+    /// step that produced none, and a failure for an omitted slot,
     /// an unsettled step or verdict, or a selector that matches nothing.
     pub(super) fn resolve(
         &self,
@@ -302,33 +301,33 @@ impl<'a> Scope<'a> {
             ReferenceRoot::Input(slot) => {
                 let sources = BTreeSet::from([slot.clone()]);
                 match self.evidence.get(slot) {
-                    Some(InputDeclaration::Json { value }) => select(value, &reference.path)
-                        .map(|value| json_input(value, sources))
-                        .ok_or_else(unresolved),
+                    Some(InputDeclaration::Json { value }) => bind(value, &reference.path, || {
+                        BoundJson::evidence(self.evidence, slot, &reference.path)
+                    })
+                    .map(|value| CallInput {
+                        value: CallValue::Json(value),
+                        sources,
+                    })
+                    .ok_or_else(unresolved),
                     Some(declaration) if reference.path.is_empty() => Ok(CallInput {
                         value: CallValue::Evidence(declaration.clone()),
                         sources,
                     }),
                     Some(_) => Err(unresolved()),
-                    None if self
-                        .spec
-                        .inputs
-                        .get(slot)
-                        .is_some_and(|slot| !slot.required()) =>
-                    {
-                        select(&Value::Null, &reference.path)
-                            .map(|value| json_input(value, sources))
-                            .ok_or_else(unresolved)
-                    }
-                    None => Err(Missing::failed(format!(
-                        "required input `{slot}` was not supplied"
-                    ))),
+                    None => Err(Missing::failed(format!("input `{slot}` was not supplied"))),
                 }
             }
             ReferenceRoot::StepOutput(step) => match self.step(step) {
-                Some(Settled::Succeeded { output, sources }) => select(output, &reference.path)
-                    .map(|value| json_input(value, sources.clone()))
-                    .ok_or_else(unresolved),
+                Some(Settled::Succeeded { sources, output }) => {
+                    bind(output, &reference.path, || {
+                        BoundJson::output(output, &reference.path)
+                    })
+                    .map(|value| CallInput {
+                        value: CallValue::Json(value),
+                        sources: sources.clone(),
+                    })
+                    .ok_or_else(unresolved)
+                }
                 Some(Settled::NoOutput { gap, .. }) => Err(Missing {
                     cause: gap.cause,
                     reason: format!(
@@ -487,12 +486,37 @@ fn collection(done: &StepDone) -> PublicationCollection {
     }
 }
 
-/// A JSON binding value.
+/// A JSON binding value the binding owns.
 fn json_input(value: Value, sources: BTreeSet<SlotName>) -> CallInput {
     CallInput {
-        value: CallValue::Json(value),
+        value: CallValue::Json(value.into()),
         sources,
     }
+}
+
+/// Bind the selection `path` makes below `value`: `shared`, pointing at the
+/// selected value where it is held, unless a wildcard builds a new array.
+/// Returns `None` when the selection matches nothing.
+fn bind(
+    value: &Value,
+    path: &[PathSegment],
+    shared: impl FnOnce() -> Option<BoundJson>,
+) -> Option<BoundJson> {
+    if path.contains(&PathSegment::Wildcard) {
+        select(value, path).map(BoundJson::from)
+    } else {
+        shared()
+    }
+}
+
+/// The one value field and index selectors name below `value`, borrowed;
+/// `None` when a selector matches nothing or is a wildcard.
+pub(super) fn find<'v>(value: &'v Value, path: &[PathSegment]) -> Option<&'v Value> {
+    path.iter().try_fold(value, |value, segment| match segment {
+        PathSegment::Field(name) => value.get(name),
+        PathSegment::Index(index) => value.get(index),
+        PathSegment::Wildcard => None,
+    })
 }
 
 /// The serde wire form of a status or outcome enum, such as `"succeeded"`.

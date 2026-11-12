@@ -9,7 +9,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import pytest
@@ -22,6 +22,9 @@ from wyrd.client import WyrdClient
 from wyrd.model import ModelInterface
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
+
+if TYPE_CHECKING:
+    from wyrd.verify import VerificationDetails
 
 FIXTURES = Path(__file__).resolve().parents[4] / "fixtures"
 """The repository-root fixture corpus shared by the Rust, Python, and TypeScript journeys."""
@@ -224,6 +227,13 @@ def client_of(
         grpc_url=server.grpc_url,
         workload_uid=workload_uid,
     )
+
+
+def details(execution_id: str, client: WyrdClient | None = None) -> VerificationDetails:
+    """What execution ``execution_id`` ran, read as ``client``, by default the ambient administrator, once its result is visible."""
+    execution = verify.Execution.connect(execution_id, client)
+    execution.wait(60.0)
+    return execution.details()
 
 
 def rooted(credential: str, service: str) -> WyrdClient:

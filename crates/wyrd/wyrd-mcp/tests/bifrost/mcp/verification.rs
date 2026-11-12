@@ -58,6 +58,9 @@ mod pg_tests {
     /// The execution status read tool.
     const GET_EXECUTION: &str = "verification.get_execution";
 
+    /// The execution details read tool.
+    const GET_EXECUTION_DETAILS: &str = "verification.get_execution_details";
+
     /// The evidence upload planning tool, offered only with `verifier:run`.
     const EVIDENCE: &str = "verification.evidence";
 
@@ -713,6 +716,25 @@ mod pg_tests {
         }
     }
 
+    /// Read what `execution_id` ran through `verification.get_execution_details`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the tool-call failure or its structured refusal.
+    async fn details(
+        client: &RunningService<RoleClient, ()>,
+        execution_id: &str,
+    ) -> Result<JsonValue, McpJourneyError> {
+        structured(
+            client
+                .call_tool(call(
+                    GET_EXECUTION_DETAILS,
+                    serde_json::json!({ "execution_id": execution_id }),
+                )?)
+                .await?,
+        )
+    }
+
     /// Run one `bifrost.query` over `sql` and return its rows.
     ///
     /// # Errors
@@ -896,6 +918,154 @@ mod pg_tests {
             "no result crosses tenants"
         );
         foreign_client.cancel().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// An agent's ordinary reads carry only the decision, and what the
+    /// execution ran is its own read.
+    ///
+    /// `verification.execute` and `verification.get_execution` answer the
+    /// compact result: the verdict and each requirement's judgment, with no
+    /// check, provenance, steps, or evidence. `verification.get_execution_details`
+    /// returns the same identity and judgments beside the authored assertion,
+    /// the empty step list, and the pinned answer. An unknown execution is not
+    /// found, and a caller holding `verifier:run` without `cards:read` is
+    /// refused the details exactly as it is refused the status.
+    ///
+    /// # Errors
+    ///
+    /// Returns server startup, bootstrap, registration, MCP transport, or
+    /// tool-call failures, or an error when the execution never settles.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a compact or detailed field, or a refusal, differs.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn execution_details_are_an_explicit_read() -> Result<(), McpJourneyError> {
+        let server = Box::pin(
+            WyrdTestServer::builder()
+                .with_verification_runtime_for_test()
+                .start_bound(),
+        )
+        .await?;
+        let admin = server
+            .bootstrap_service("mcp-details-admin", &["admin"])
+            .await?;
+        let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?).await?;
+        let fixture = register_fixture(&cards).await?;
+        let agent = server
+            .credential_registered_service(&fixture.service_ref, &["editor"])
+            .await?;
+        let agent_client = connect_rooted(&server, &agent).await?;
+        let tools = agent_client.list_all_tools().await?;
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.name.as_ref() == GET_EXECUTION_DETAILS),
+            "the details read is offered"
+        );
+
+        let request = fixture.assert_request(FAILING_ANSWER);
+        let executed = structured(
+            agent_client
+                .call_tool(call(EXECUTE, request.clone())?)
+                .await?,
+        )?;
+        let execution_id = text(&executed, "/execution_id")?.to_owned();
+        assert_eq!(
+            executed["outcome"]
+                .as_object()
+                .map(|outcome| outcome.keys().map(String::as_str).collect::<BTreeSet<_>>()),
+            Some(BTreeSet::from(["requirements", "verdict"])),
+            "{executed}"
+        );
+        let requirements = executed["outcome"]["requirements"]
+            .as_array()
+            .ok_or("compact requirements")?;
+        assert!(!requirements.is_empty(), "{executed}");
+        for requirement in requirements {
+            assert!(
+                requirement.get("check").is_none() && requirement.get("provenance").is_none(),
+                "{requirement}"
+            );
+        }
+        let state = settle(&agent_client, &execution_id).await?;
+        assert_eq!(state["result"]["outcome"], executed["outcome"], "{state}");
+
+        let described = details(&agent_client, &execution_id).await?;
+        for field in ["execution_id", "verifier", "subject"] {
+            assert_eq!(described[field], executed[field], "{field}: {described}");
+        }
+        assert_eq!(described["outcome"]["verdict"], "failed", "{described}");
+        let projected: Vec<JsonValue> = described["outcome"]["requirements"]
+            .as_array()
+            .ok_or("detailed requirements")?
+            .iter()
+            .map(|requirement| {
+                assert_eq!(requirement["check"]["kind"], "assert", "{requirement}");
+                let mut compact = requirement.clone();
+                if let Some(fields) = compact.as_object_mut() {
+                    fields.remove("check");
+                    fields.remove("provenance");
+                }
+                compact
+            })
+            .collect();
+        assert_eq!(&projected, requirements, "{described}");
+        assert_eq!(
+            described["outcome"]["steps"],
+            serde_json::json!([]),
+            "{described}"
+        );
+        assert_eq!(
+            described["outcome"]["evidence"], request["inputs"],
+            "{described}"
+        );
+
+        let unknown = rendered(
+            agent_client
+                .call_tool(call(
+                    GET_EXECUTION_DETAILS,
+                    serde_json::json!({ "execution_id": uuid::Uuid::now_v7() }),
+                )?)
+                .await,
+        )?;
+        assert!(
+            unknown.contains("WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND"),
+            "{unknown}"
+        );
+        agent_client.cancel().await?;
+
+        server
+            .seed_role("mcp_run_only", &[Permission::verifier_run_any()])
+            .await?;
+        let runner = server
+            .bootstrap_service("mcp-details-runner", &["mcp_run_only"])
+            .await?;
+        let runner_client = connect(&server, &runner).await?;
+        let refused = |result: Result<rmcp::model::CallToolResult, rmcp::ServiceError>| -> Result<String, McpJourneyError> {
+            let rendered = rendered(result)?;
+            Ok(["WYRD_PERMISSION_403_DENIED_RBAC", "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND"]
+                .into_iter()
+                .find(|code| rendered.contains(code))
+                .ok_or(rendered)?
+                .to_owned())
+        };
+        let arguments = serde_json::json!({ "execution_id": execution_id });
+        let status = refused(
+            runner_client
+                .call_tool(call(GET_EXECUTION, arguments.clone())?)
+                .await,
+        )?;
+        let detail = refused(
+            runner_client
+                .call_tool(call(GET_EXECUTION_DETAILS, arguments)?)
+                .await,
+        )?;
+        assert_eq!(detail, status, "verifier:run grants no details read");
+        runner_client.cancel().await?;
         server.shutdown().await?;
         Ok(())
     }
@@ -1371,10 +1541,11 @@ mod pg_tests {
         let state = settle(&agent_client, text(&accepted, "/execution_id")?).await?;
         assert_eq!(state["status"], "completed", "{state}");
         assert_eq!(state["result"]["outcome"]["verdict"], "passed", "{state}");
+        let described = details(&agent_client, text(&accepted, "/execution_id")?).await?;
         assert_eq!(
-            state["result"]["outcome"]["evidence"],
+            described["outcome"]["evidence"],
             serde_json::json!({ "doc": declaration }),
-            "{state}"
+            "{described}"
         );
         agent_client.cancel().await?;
         server.shutdown().await?;
@@ -1594,7 +1765,7 @@ mod pg_tests {
     /// Spans the judged execution opens beneath its request span.
     const DESCENDANTS: [&str; 4] = [
         "verification.execute",
-        "agent.gateway.call",
+        "chat",
         "gateway.call",
         "gateway.execute",
     ];
@@ -2161,10 +2332,11 @@ mod pg_tests {
             serde_json::json!([first, second]),
             "{execution}"
         );
+        let described = details(&agent_client, text(&execution, "/execution_id")?).await?;
         assert_eq!(
-            execution["result"]["outcome"]["evidence"]["turns"],
+            described["outcome"]["evidence"]["turns"],
             serde_json::json!({ "kind": "json", "value": [{ "answer": "first" }, { "answer": "second" }] }),
-            "{execution}"
+            "{described}"
         );
         assert_eq!(
             execution["result"]["outcome"]["verdict"], "passed",
@@ -2411,14 +2583,16 @@ mod pg_tests {
                 }),
             )
         };
-        let outcomes = "/result/outcome/evidence/outcomes";
+        let outcomes = "/outcome/evidence/outcomes";
         let reason = "/result/outcome/requirements/0/reason";
 
         structured(agent.client.call_tool(fact("door-44")?).await?)?;
         let empty = group_execution(&server, &agent.client, &binding_id, None).await?;
         assert_eq!(empty["group_id"], "door-44", "{empty}");
         assert_eq!(
-            empty.pointer(outcomes),
+            details(&agent.client, text(&empty, "/execution_id")?)
+                .await?
+                .pointer(outcomes),
             Some(&serde_json::json!({ "kind": "json", "value": [] }))
         );
         assert_eq!(text(&empty, reason)?, "empty_selection", "{empty}");
@@ -2473,7 +2647,9 @@ mod pg_tests {
             .map(|id| if *id == frames[1] { "failed" } else { "passed" })
             .collect();
         assert_eq!(
-            failing.pointer(outcomes),
+            details(&agent.client, text(&failing, "/execution_id")?)
+                .await?
+                .pointer(outcomes),
             Some(&serde_json::json!({ "kind": "json", "value": expected }))
         );
         assert_eq!(
@@ -2509,7 +2685,9 @@ mod pg_tests {
             "{passing}"
         );
         assert_eq!(
-            passing.pointer(outcomes),
+            details(&agent.client, text(&passing, "/execution_id")?)
+                .await?
+                .pointer(outcomes),
             Some(&serde_json::json!({ "kind": "json", "value": vec!["passed"; 21] }))
         );
         assert_eq!(
@@ -2783,7 +2961,8 @@ mod pg_tests {
     /// A trace written partly by the agent's own Service and partly by an
     /// untagged writer is judged whole by `verification.execute`. Direct
     /// execution over an absent trace answers at once with an inconclusive
-    /// requirement. `verification.enqueue` over an absent trace is
+    /// requirement, and so does one whose trace is omitted: omission never
+    /// establishes that a span did not occur. `verification.enqueue` over an absent trace is
     /// `retrying` with `evidence_unavailable`; once the spans land and the
     /// retry is due, the same execution completes and passes, with no
     /// second enqueue from the agent.
@@ -2864,6 +3043,25 @@ mod pg_tests {
         assert!(
             text(&absent, "/outcome/requirements/0/reason")?.contains("not yet landed"),
             "{absent}"
+        );
+
+        let omitted = structured(
+            agent_client
+                .call_tool(call(
+                    EXECUTE,
+                    serde_json::json!({
+                        "verifier_card_uid": verifier, "card_uid": fixture.service_uid, "inputs": {},
+                    }),
+                )?)
+                .await?,
+        )?;
+        assert_eq!(
+            text(&omitted, "/outcome/requirements/0/outcome")?,
+            "inconclusive"
+        );
+        assert!(
+            text(&omitted, "/outcome/requirements/0/reason")?.contains("`trace` was not supplied"),
+            "{omitted}"
         );
 
         let late = *uuid::Uuid::now_v7().as_bytes();
@@ -3410,9 +3608,10 @@ mod pg_tests {
     /// The stable code of a permission denial.
     const DENIED: &str = "WYRD_PERMISSION_403_DENIED_RBAC";
 
-    /// Every tool call `state`'s drafter made, from its execution result.
-    fn drafted(state: &JsonValue) -> Vec<JsonValue> {
-        state["result"]["outcome"]["steps"]
+    /// Every tool call the drafter made, from its execution's `described`
+    /// details.
+    fn drafted(described: &JsonValue) -> Vec<JsonValue> {
+        described["outcome"]["steps"]
             .as_array()
             .into_iter()
             .flatten()
@@ -3524,7 +3723,7 @@ mod pg_tests {
         let id = text(&accepted, "/execution_id")?.to_owned();
         let state = settle(&agent, &id).await?;
         assert_eq!(state["result"]["outcome"]["verdict"], "passed", "{state}");
-        let forged = drafted(&state)
+        let forged = drafted(&details(&agent, &id).await?)
             .into_iter()
             .find(|call| call["arguments"]["content"] == "forged")
             .ok_or("the /inputs write is recorded")?;
@@ -3670,7 +3869,7 @@ mod pg_tests {
         )?;
         let narrowed_id = text(&accepted, "/execution_id")?.to_owned();
         let state = settle(&narrowed, &narrowed_id).await?;
-        let calls = drafted(&state);
+        let calls = drafted(&details(&narrowed, &narrowed_id).await?);
         assert!(!calls.is_empty(), "{state}");
         for call in &calls {
             assert!(
@@ -3732,8 +3931,10 @@ mod pg_tests {
                 )?)
                 .await?,
         )?;
-        let state = settle(&unqueried, text(&accepted, "/execution_id")?).await?;
-        let investigated: Vec<(String, bool, bool, bool)> = state["result"]["outcome"]["steps"]
+        let execution = text(&accepted, "/execution_id")?.to_owned();
+        let state = settle(&unqueried, &execution).await?;
+        let described = details(&unqueried, &execution).await?;
+        let investigated: Vec<(String, bool, bool, bool)> = described["outcome"]["steps"]
             .as_array()
             .into_iter()
             .flatten()
@@ -4458,7 +4659,8 @@ mod pg_tests {
             let question = case.question;
             let id = enqueue(question).await?;
             let state = settle(agent, &id).await?;
-            let outcome = &state["result"]["outcome"];
+            let described = details(agent, &id).await?;
+            let outcome = &described["outcome"];
             let step = |id: &str| step(outcome, id);
             let statuses =
                 ["plan", "security", "style", "quote"].map(|id| step(id)["status"].clone());
@@ -4636,7 +4838,8 @@ mod pg_tests {
             )
             .await?;
         let state = settle(&desk.agent, &id).await?;
-        let outcome = &state["result"]["outcome"];
+        let described = details(&desk.agent, &id).await?;
+        let outcome = &described["outcome"];
 
         let sections = step(outcome, "sections");
         assert_eq!(
@@ -4961,7 +5164,8 @@ mod pg_tests {
                 }
             }
             let state = settle(&desk.agent, &id).await?;
-            let outcome = &state["result"]["outcome"];
+            let described = details(&desk.agent, &id).await?;
+            let outcome = &described["outcome"];
             let consolidated = outcome["requirements"]
                 .as_array()
                 .into_iter()

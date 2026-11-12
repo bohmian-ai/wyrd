@@ -58,12 +58,12 @@ impl Uploads {
         Sha256Hex::digest(bytes)
     }
 
-    /// Evidence citing `slots`, read by a tenant caller with no grants.
-    fn reader(&self, slots: BTreeMap<SlotName, InputDeclaration>) -> TenantEvidence {
+    /// Evidence read by a tenant caller with no grants, citing what it
+    /// admits.
+    fn reader(&self) -> TenantEvidence {
         TenantEvidence::new(
             self.server.state().clone(),
             user(self.server.data_tenant_id(), []),
-            slots,
             HostedLimits::default(),
         )
     }
@@ -89,7 +89,7 @@ fn file(sha256: Sha256Hex, size_bytes: u64, format: MediaFormat) -> InputDeclara
 async fn evidence_reads_only_matching_files() {
     let uploads = Uploads::start().await;
     let sha256 = uploads.put(b"%PDF-1.5 body").await;
-    let evidence = uploads.reader(BTreeMap::new());
+    let evidence = uploads.reader();
     let (bytes, format) = evidence
         .read(&file(sha256, 13, MediaFormat::Pdf))
         .await
@@ -143,7 +143,7 @@ async fn evidence_refuses_tampered_body() {
         .await
         .expect("tamper");
     let error = uploads
-        .reader(BTreeMap::new())
+        .reader()
         .read(&file(sha256, 5, MediaFormat::Text))
         .await
         .expect_err("digest mismatch");
@@ -165,7 +165,7 @@ async fn evidence_binds_native_media_only() {
     let uploads = Uploads::start().await;
     let pdf = uploads.put(b"%PDF-1.5").await;
     let csv = uploads.put(b"a,b").await;
-    let evidence = uploads.reader(BTreeMap::new());
+    let evidence = uploads.reader();
     let media = evidence
         .media(&file(pdf, 8, MediaFormat::Pdf))
         .await
@@ -199,7 +199,7 @@ async fn evidence_binds_native_media_only() {
 async fn extract_action_returns_locked_shape() {
     let uploads = Uploads::start().await;
     let sha256 = uploads.put(b"a,b\n1,2").await;
-    let evidence = uploads.reader(BTreeMap::new());
+    let evidence = uploads.reader();
     let id = TaskId::new("pull").expect("task id");
     let block: Action =
         serde_json::from_value(serde_json::json!({"kind": "extract", "from": "inputs.sheet"}))
@@ -238,9 +238,12 @@ async fn extract_action_returns_locked_shape() {
         })
     );
     assert!(
-        ActionExecutor::execute(&evidence, call(CallValue::Json(serde_json::json!(1))))
-            .await
-            .is_err()
+        ActionExecutor::execute(
+            &evidence,
+            call(CallValue::Json(serde_json::json!(1).into()))
+        )
+        .await
+        .is_err()
     );
     uploads
         .server
@@ -292,7 +295,12 @@ async fn citations_must_locate_reachable_evidence() {
             value: serde_json::json!({"rows": [{"days": 30}]}),
         },
     );
-    let evidence = uploads.reader(slots);
+    let evidence = uploads.reader();
+    let slots = std::sync::Arc::new(slots);
+    evidence
+        .admit(&BTreeMap::new(), &slots)
+        .await
+        .expect("the slots are admitted");
     let cite = |slot: &str, locator: Locator| Citation {
         slot: SlotName::new(slot).expect("slot"),
         locator,

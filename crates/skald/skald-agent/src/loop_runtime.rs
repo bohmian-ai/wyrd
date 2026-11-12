@@ -5,8 +5,8 @@ use std::sync::Arc;
 use futures::StreamExt;
 use futures::stream;
 use skald_prompt::Prompt;
-use skald_runtime::{ProviderRegistry, dispatch};
-use skald_spec::{ProviderName, ProviderRequest, ProviderResponse, ResponseType, ToolDescriptor};
+use skald_runtime::{ProviderRegistry, dispatch, genai_provider_name, record_error};
+use skald_spec::{ProviderRequest, ProviderResponse, ResponseType, ToolDescriptor};
 use skald_tool::AgentTool;
 use tracing::{Instrument, Span, field, info_span};
 
@@ -277,7 +277,7 @@ impl Agent {
     /// loop, journaling the call and its result as iteration 0.
     ///
     /// The run's output is the JSON of the keyed answers, and the typed
-    /// answer is its final response. `model` labels the `chat` span when the
+    /// answer is its final response. `model` labels the inference span when the
     /// request names none.
     ///
     /// # Errors
@@ -303,16 +303,10 @@ impl Agent {
         }
         self.append_model_journal_call(0, &request).await?;
         let provider = self.prompt.native().provider();
-        let chat = chat_span(&provider, &request, model);
-        let response = dispatch(providers, provider, request)
-            .instrument(chat.clone())
-            .await;
+        let response = dispatch(providers, provider, &request, Some(model)).await;
         let finish_reason = match &response {
             Ok(response) => response_finish_reason(response),
-            Err(error) => {
-                record_error(&chat, error.code());
-                format!("provider_error:{error}")
-            }
+            Err(error) => format!("provider_error:{error}"),
         };
         self.append_model_journal_result(0, finish_reason, response.is_err())
             .await?;
@@ -335,11 +329,33 @@ impl Agent {
         })
     }
 
+    /// Returns the structured-output check for the response schema `request`
+    /// sends, reusing `current` when it already checks that schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`StructuredOutput::new`] failure for a schema that does
+    /// not compile.
+    fn structured_output(
+        &self,
+        request: &ProviderRequest,
+        current: Option<StructuredOutput>,
+    ) -> AgentResult<Option<StructuredOutput>> {
+        let Some((_, schema)) = ResponseType::schema(request) else {
+            return Ok(None);
+        };
+        match current {
+            Some(current) if current.sends(schema) => Ok(Some(current)),
+            _ => StructuredOutput::new(&self.id, &self.schemas, schema).map(Some),
+        }
+    }
+
     /// Runs the bounded model/tool loop inside the caller's `invoke_agent` span.
     ///
-    /// Each iteration dispatches under a `chat` span, journals the call and
-    /// result, and runs requested tools concurrently under `execute_tool` spans
-    /// until the model stops calling tools or the iteration budget is spent.
+    /// Each iteration dispatches inside its GenAI inference span, journals the
+    /// call and result, and runs requested tools concurrently under
+    /// `execute_tool` spans until the model stops calling tools or the
+    /// iteration budget is spent.
     /// A structured-output run validates every final answer against the
     /// exact response schema its outgoing request sent, after rendering and
     /// `before_model` hooks; an invalid answer stays in the conversation,
@@ -359,7 +375,7 @@ impl Agent {
         inputs: RunLoopInputs<'_>,
     ) -> AgentResult<AgentRun> {
         let RunLoopInputs {
-            template,
+            mut template,
             seed_messages,
             mut conversation,
             session_id,
@@ -374,7 +390,19 @@ impl Agent {
 
         let concurrency_cap = self.run_config.tool_concurrency_cap.unwrap_or(8).max(1);
         let max_iterations = self.run_config.max_iterations;
-        let mut structured: Option<StructuredOutput> = None;
+        // The run owns one request: each iteration replaces only its
+        // messages, so tools and the response schema are never copied.
+        if !self.tools.is_empty() {
+            template = template.with_tools(tool_descriptors(&self.tools));
+        }
+        let hooked = !self.callbacks.before_model.is_empty();
+        // Without `before_model` hooks every request sends the template's
+        // schema, so its validator is looked up once per run.
+        let mut structured = if hooked {
+            None
+        } else {
+            self.structured_output(&template, None)?
+        };
 
         for iteration in 0..max_iterations {
             self.journal
@@ -383,59 +411,48 @@ impl Agent {
                 .map_err(|source| AgentError::JournalAppendFailed { source })?;
 
             let ctx = self.agent_context_with_session(session_id, iteration, &conversation);
-            let mut request = request_from_conversation(
-                &self.id,
-                template.clone(),
-                &seed_messages,
-                &conversation,
-            )?;
-            if !self.tools.is_empty() {
-                request = request.with_tools(tool_descriptors(&self.tools));
-            }
+            request_from_conversation(&self.id, &mut template, &seed_messages, &conversation)?;
 
-            request = match apply_chain_with_panic_catch(
-                &self.callbacks.before_model,
-                &ctx,
-                request.clone(),
-                "before_model",
-            )? {
-                ChainResult::Abort(error, _) => {
-                    self.append_model_journal_call_result(ModelJournalCallRecord {
-                        iteration,
-                        request: &request,
-                        finish_reason: "callback_aborted".to_owned(),
-                        synthetic: true,
-                    })
-                    .await?;
-                    return Ok(AgentRun {
-                        output: String::new(),
-                        final_response: None,
-                        iterations: iteration + 1,
-                        finish_reason: FinishReason::CallbackAborted,
-                        conversation,
-                        error: Some(error),
-                        errors: Vec::new(),
-                        structured_output: None,
-                    });
-                }
-                ChainResult::Replaced(replacement) => replacement,
+            // A hook may replace the request, so only a hooked run copies it.
+            let replaced;
+            let request = if hooked {
+                replaced = match apply_chain_with_panic_catch(
+                    &self.callbacks.before_model,
+                    &ctx,
+                    template.clone(),
+                    "before_model",
+                )? {
+                    ChainResult::Abort(error, _) => {
+                        self.append_model_journal_call_result(ModelJournalCallRecord {
+                            iteration,
+                            request: &template,
+                            finish_reason: "callback_aborted".to_owned(),
+                            synthetic: true,
+                        })
+                        .await?;
+                        return Ok(AgentRun {
+                            output: String::new(),
+                            final_response: None,
+                            iterations: iteration + 1,
+                            finish_reason: FinishReason::CallbackAborted,
+                            conversation,
+                            error: Some(error),
+                            errors: Vec::new(),
+                            structured_output: None,
+                        });
+                    }
+                    ChainResult::Replaced(replacement) => replacement,
+                };
+                // The outgoing request, after hooks, owns the schema its
+                // answer must satisfy.
+                structured = self.structured_output(&replaced, structured.take())?;
+                &replaced
+            } else {
+                &template
             };
-
-            // The outgoing request, after rendering and hooks, owns the
-            // schema its answer must satisfy.
-            structured = match ResponseType::of(&request) {
-                ResponseType::Text => None,
-                ResponseType::JsonSchema { schema, .. } => match structured.take() {
-                    Some(current) if current.schema() == &schema => Some(current),
-                    _ => Some(StructuredOutput::new(&self.id, &schema)?),
-                },
-            };
-            self.append_model_journal_call(iteration, &request).await?;
+            self.append_model_journal_call(iteration, request).await?;
             let provider = self.prompt.native().provider();
-            let chat = chat_span(&provider, &request, model);
-            let response = dispatch(providers, provider, request)
-                .instrument(chat.clone())
-                .await;
+            let response = dispatch(providers, provider, request, Some(model)).await;
             match &response {
                 Ok(response) => {
                     let finish_reason = response_finish_reason(response);
@@ -443,7 +460,6 @@ impl Agent {
                         .await?;
                 }
                 Err(error) => {
-                    record_error(&chat, error.code());
                     self.append_model_journal_result(
                         iteration,
                         format!("provider_error:{error}"),
@@ -927,29 +943,9 @@ struct RunLoopInputs<'a> {
     conversation: Conversation,
     /// Session whose turn is appended on success, when the run is session-bound.
     session_id: Option<&'a SessionId>,
-    /// Resolved model of the Prompt driving the run; the `chat` span fallback
+    /// Resolved model of the Prompt driving the run; the inference span fallback
     /// for request wire shapes that carry no model.
     model: &'a str,
-}
-
-/// Open the `chat` span for one dispatch of the effective `request` to `provider`.
-///
-/// Records the semantic name of the Prompt's dispatch target and the model the
-/// request is actually made to: the request's own model, which reflects any
-/// `before_model` replacement, or the Prompt's resolved `fallback_model` for
-/// wire shapes that omit it (Gemini, Vertex). The caller records the stable
-/// provider error code on failure. The optional
-/// `string[]` finish-reasons attribute is omitted because `tracing` fields are
-/// scalar; finish reasons stay in the journal.
-fn chat_span(provider: &ProviderName, request: &ProviderRequest, fallback_model: &str) -> Span {
-    info_span!(
-        "chat",
-        gen_ai.operation.name = "chat",
-        gen_ai.provider.name = genai_provider_name(provider),
-        gen_ai.request.model = request_model(request).unwrap_or(fallback_model),
-        error.r#type = field::Empty,
-        otel.status_code = field::Empty,
-    )
 }
 
 /// Record the run's stable error code on the current `invoke_agent` span.
@@ -957,12 +953,6 @@ fn record_agent_outcome(result: &AgentResult<AgentRun>) {
     if let Err(error) = result {
         record_error(&Span::current(), error.code());
     }
-}
-
-/// Mark `span` failed with the stable error `code` as its `error.type`.
-fn record_error(span: &Span, code: &str) {
-    span.record("error.type", code);
-    span.record("otel.status_code", "ERROR");
 }
 
 /// One model call and its result, journaled together after dispatch.
@@ -1027,21 +1017,6 @@ fn request_model(request: &ProviderRequest) -> Option<&str> {
         ProviderRequest::OpenAiEmbeddings(request) => Some(&request.model),
         ProviderRequest::AnthropicMessage(request) => Some(&request.model),
         _ => None,
-    }
-}
-
-/// OpenTelemetry GenAI `gen_ai.provider.name` value for `provider`.
-///
-/// Uses the semantic-convention well-known values; a custom provider keeps
-/// its own name.
-fn genai_provider_name(provider: &ProviderName) -> &str {
-    match provider {
-        ProviderName::OpenAi => "openai",
-        ProviderName::Anthropic => "anthropic",
-        ProviderName::Google => "gcp.gemini",
-        ProviderName::Vertex => "gcp.vertex_ai",
-        ProviderName::Jev => "jev",
-        ProviderName::Custom(name) => name,
     }
 }
 

@@ -2,14 +2,14 @@
 //!
 //! [`HttpTransport`](super::HttpTransport) and the Bifrost gRPC transport send
 //! the caller's active trace context as `traceparent`/`tracestate` on every
-//! Wyrd request through [`headers`], so server work
+//! Wyrd request through `headers`, so server work
 //! done for the request — a gateway call, or an agent-check call a verification makes
-//! — joins the caller's trace. [`outbound`] picks that context: one a foreign
+//! — joins the caller's trace. `outbound` picks that context: one a foreign
 //! runtime handed over with [`with_caller_trace`] wins, because Python's and
 //! Node's OpenTelemetry contexts never become Rust's current `tracing` span;
 //! otherwise the current `tracing` span's OpenTelemetry context, when it is
 //! valid. Without either, no trace header is sent. A queued write records a
-//! `bifrost.enqueue` PRODUCER span through [`producer`], opened in the
+//! `bifrost.enqueue` PRODUCER span through `producer`, opened in the
 //! foreign runtime's own tracer when that runtime scoped one with
 //! [`with_producer_span`].
 
@@ -33,16 +33,6 @@ tokio::task_local! {
     /// this task's requests with.
     static BENCHMARK: (&'static str, &'static str);
 }
-
-/// Header carrying a benchmark driver's closed case, which a benchmark-mode
-/// server uses only to choose a timing series.
-#[cfg(feature = "test-support")]
-const BENCHMARK_CASE_HEADER: &str = "x-wyrd-benchmark-case";
-
-/// Header carrying a benchmark driver's closed phase: the repetition or
-/// admission phase the request was admitted in.
-#[cfg(feature = "test-support")]
-const BENCHMARK_PHASE_HEADER: &str = "x-wyrd-benchmark-phase";
 
 /// W3C header carrying the caller's trace and parent span.
 pub(crate) const TRACEPARENT: &str = "traceparent";
@@ -84,7 +74,7 @@ pub async fn with_benchmark_labels<F: Future>(
 /// Foreign-runtime SDKs pass a callback that opens and ends a
 /// `bifrost.enqueue` PRODUCER span for the named table in their own tracer,
 /// under their active span, and returns its context, or `None` when that
-/// runtime has no valid span. [`producer`] calls it on the calling thread, so
+/// runtime has no valid span. `producer` calls it on the calling thread, so
 /// the span lands in the caller's own trace exporter.
 pub fn with_producer_span<R>(
     open: impl Fn(&str) -> Option<TraceContext> + 'static,
@@ -158,11 +148,25 @@ pub fn benchmark_headers() -> Vec<(&'static str, String)> {
     BENCHMARK
         .try_with(|(case, phase)| {
             vec![
-                (BENCHMARK_CASE_HEADER, (*case).to_owned()),
-                (BENCHMARK_PHASE_HEADER, (*phase).to_owned()),
+                (wyrd_benchmark::CASE_HEADER, (*case).to_owned()),
+                (wyrd_benchmark::PHASE_HEADER, (*phase).to_owned()),
             ]
         })
         .unwrap_or_default()
+}
+
+/// The benchmark cohort [`with_benchmark_labels`] scoped on this task, which
+/// classifies this process's own client observations; none outside a scope
+/// or without `test-support`. A benchmark driver classifies its own
+/// observations of calls it sends outside a Wyrd client with it.
+pub fn benchmark_cohort() -> wyrd_benchmark::Cohort {
+    #[cfg(feature = "test-support")]
+    if let Ok(cohort) =
+        BENCHMARK.try_with(|(case, phase)| wyrd_benchmark::Cohort::of(Some(case), Some(phase)))
+    {
+        return cohort;
+    }
+    wyrd_benchmark::Cohort::NONE
 }
 
 /// The current `tracing` span's valid OpenTelemetry span context as W3C

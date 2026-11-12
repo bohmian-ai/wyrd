@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use monty_pool::PoolError;
+use skald_spec::PreparedSchemas;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use vala_verify::blocks::{
     ActionExecutor, ActionOutput, AgentCardResolver, AgentExecutor, BlockCall, BlockClock,
@@ -30,9 +31,8 @@ use vala_verify::blocks::{
 use wyrd_spec::card::agent::ExecutionRoute;
 use wyrd_spec::card::verifier::{Action, Check};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{CardUid, SlotName};
+use wyrd_spec::ids::CardUid;
 use wyrd_spec::verification::TaskId;
-use wyrd_spec::verification::execution::InputDeclaration;
 
 use super::evidence::TenantEvidence;
 use super::registry::TenantRegistry;
@@ -62,6 +62,9 @@ pub struct HostedBlocks {
     direct_executions: Arc<Semaphore>,
     /// The Deployment limits every block enforces.
     limits: HostedLimits,
+    /// Agent response and Verdict schema preparation every execution reuses;
+    /// it holds schemas only, never a caller's evidence or authority.
+    schemas: Arc<PreparedSchemas>,
 }
 
 /// The block capacity one execution lane owns alone.
@@ -113,8 +116,6 @@ pub struct Execution<'a> {
     /// The executing Verifier, whose `verifier:run` authorizes loading its
     /// Agent and Prompt definitions.
     pub verifier: &'a CardUid,
-    /// The execution's pinned evidence, the only citable sources.
-    pub evidence: &'a BTreeMap<SlotName, InputDeclaration>,
     /// Per-requirement or per-step Agent route overrides.
     pub routes: &'a BTreeMap<TaskId, ExecutionRoute>,
     /// The Card and application Run model calls are attributed to.
@@ -149,6 +150,7 @@ impl HostedBlocks {
             queued: Lane::start(worker, limits, limits.queued).await?,
             direct_executions: Arc::new(Semaphore::new(limits.direct_executions)),
             limits,
+            schemas: Arc::default(),
         })
     }
 
@@ -227,7 +229,8 @@ impl HostedBlocks {
     ///
     /// The evidence reader, registry, code executor, built-in tools, and
     /// gateway caller are all bound to `execution.caller`; the evidence
-    /// reader also admits the pinned evidence before any block runs, and
+    /// reader also admits the evidence the engine run pins, sharing the
+    /// engine's one copy, before any block runs, and
     /// every block's run interval is recorded on `execution.clock`; Agent and Prompt
     /// Cards resolve through the caller's audited `verifier:run` on
     /// `execution.verifier`, and every
@@ -245,12 +248,7 @@ impl HostedBlocks {
     ) -> Result<VerificationEngine, WyrdError> {
         let caller = execution.caller;
         let lane = self.lane(execution.mode);
-        let evidence = TenantEvidence::new(
-            state.clone(),
-            caller.clone(),
-            execution.evidence.clone(),
-            self.limits,
-        );
+        let evidence = TenantEvidence::new(state.clone(), caller.clone(), self.limits);
         let evidence = Arc::new(match &execution.execution {
             Some(state) => evidence.with_execution(Arc::clone(state)),
             None => evidence,
@@ -285,7 +283,8 @@ impl HostedBlocks {
                 .attributed(Some(execution.subject))
                 .admitted(execution.mode.as_str(), Arc::clone(&lane.model_calls)),
         ))
-        .with_route_overrides(execution.routes.clone());
+        .with_route_overrides(execution.routes.clone())
+        .with_prepared_schemas(Arc::clone(&self.schemas));
         let blocks = Arc::new(Blocks {
             code: CodeExecutor::new(Arc::clone(&lane.sandbox), Arc::clone(&evidence)),
             evidence: Arc::clone(&evidence),
@@ -453,16 +452,17 @@ mod tests {
     /// 100, and whose residual is the execution less that union; its
     /// engine phase lands as one `verification.direct.engine` part holding
     /// the run, and the time outside every phase as one
-    /// `verification.direct.outside` part.
+    /// `verification.direct.outside` part; no production duration histogram
+    /// counts the execution a second time.
     ///
     /// # Panics
-    /// Panics when the run fails or the histogram observation, wait,
-    /// residual, or parts are wrong.
+    /// Panics when the run fails, the histogram observation, wait,
+    /// residual, or parts are wrong, or a production histogram repeats it.
     #[tokio::test]
     async fn histogram_overhead_excludes_real_overlapping_blocks() {
-        use wyrd_telemetry::timing;
+        use wyrd_benchmark as timing;
 
-        timing::enable();
+        timing::install().expect("the benchmark recorder installs");
         let before = timing::snapshot();
         let telemetry = ExecutionTelemetry::start(ExecutionMode::Direct, None);
         let blocks = Arc::new(Slow);
@@ -536,5 +536,225 @@ mod tests {
         assert!(phase >= lowest, "the engine phase holds the run");
         let (_, outside) = ms(Some(&interval.series[2].elapsed));
         assert!(outside < 25, "nothing ran outside the engine: {outside} ms");
+        for family in [
+            crate::app::metrics::VERIFICATION_PHASE_DURATION_SECONDS,
+            crate::app::metrics::VERIFICATION_VERIFIER_SECONDS,
+            crate::app::metrics::VERIFICATION_OVERHEAD_SECONDS,
+            crate::app::metrics::VERIFICATION_RUN_DURATION_SECONDS,
+        ] {
+            assert!(
+                interval.histogram(family, &[]).is_err(),
+                "{family} would count the timed execution twice"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod pg_tests {
+    //! Proof that a direct execution holds one copy of its evidence through
+    //! the engine and the hosted evidence reader, compares and hashes
+    //! selected JSON without disposable copies, and keeps one owner of a
+    //! successful step's output.
+
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use serde_json::{Value, json};
+    use sha2::Digest as _;
+    use vala_verify::InMemoryTraceSource;
+    use wyrd_spec::card::verifier::VerifierSpec;
+    use wyrd_spec::ids::SlotName;
+    use wyrd_spec::verification::VerificationVerdict;
+    use wyrd_spec::verification::execution::{
+        ExecutedOutcome, InputDeclaration, RequirementOutcome,
+    };
+
+    use super::*;
+    use crate::test_support::{CountingAllocator, test_caller, test_state};
+
+    /// The payload bytes a case grows by between its two measurements.
+    const GROWTH: usize = 1 << 20;
+
+    /// A code action answering one prebuilt output, so building it is the
+    /// test's work rather than the engine's.
+    struct Prebuilt(Mutex<Option<Value>>);
+
+    #[async_trait]
+    impl ActionExecutor for Prebuilt {
+        /// Answer the prebuilt output once, then `null`.
+        ///
+        /// # Errors
+        /// Never fails.
+        async fn execute(&self, _call: BlockCall<'_, Action>) -> Result<ActionOutput, BlockError> {
+            Ok(ActionOutput {
+                output: self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                    .unwrap_or(Value::Null),
+                provenance: None,
+                tool_calls: Vec::new(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl CheckExecutor for Prebuilt {
+        /// Never called: the Verifier has no executor check.
+        ///
+        /// # Errors
+        /// Always refuses.
+        async fn execute(&self, _call: BlockCall<'_, Check>) -> Result<CheckOutput, BlockError> {
+            Err(BlockError::Terminal {
+                reason: "unexpected check".to_owned(),
+            })
+        }
+    }
+
+    /// The payload-sized copies `measured` makes: its allocation growth per
+    /// payload byte between payloads of `GROWTH` and twice `GROWTH` bytes,
+    /// so fixed bookkeeping cancels out.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "byte counts of a few MiB are exact in f64"
+    )]
+    fn copies(measured: impl Fn(usize) -> usize) -> f64 {
+        let (small, large) = (measured(GROWTH), measured(2 * GROWTH));
+        large.saturating_sub(small) as f64 / GROWTH as f64
+    }
+
+    /// One JSON value holding `bytes` bytes of text.
+    fn payload(bytes: usize) -> Value {
+        json!({"text": "x".repeat(bytes), "escaped": "\"\\\n\u{e9}"})
+    }
+
+    /// A direct execution with large inline evidence judges a whole-input
+    /// assertion under hashed capture without copying the payload: the
+    /// binding points at the pinned evidence, and building the engine,
+    /// admitting the evidence to the hosted reader, and comparing and hashing
+    /// the borrowed actual value copy nothing, while the outcome returns the
+    /// original evidence and the compact-Serde digest. A successful step's
+    /// large output serves its dependent requirement and the step result with
+    /// one copy under full capture, the stored actual value, its output
+    /// owned once.
+    ///
+    /// # Panics
+    /// Panics when a run fails, its outcome differs, or it copies the
+    /// payload more often.
+    #[test]
+    fn direct_execution_reuses_evidence_without_disposable_payload_copies() {
+        let runtime = wyrd_runtime::runtime();
+        let limits = HostedLimits {
+            monty_min_workers: 0,
+            ..HostedLimits::default()
+        };
+        let blocks = runtime
+            .block_on(HostedBlocks::start(
+                PathBuf::from("/nonexistent/wyrd-server"),
+                limits,
+            ))
+            .expect("an empty pool starts");
+        let state = runtime.block_on(test_state());
+        let caller = test_caller([]);
+        let routes = BTreeMap::new();
+        let uid = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid");
+        let deadline = || tokio::time::Instant::now() + Duration::from_secs(30);
+        let verifier = |spec: Value| -> Arc<VerifierSpec> {
+            Arc::new(serde_json::from_value(spec).expect("Verifier"))
+        };
+        let passed = |outcome: &ExecutedOutcome| {
+            assert_eq!(outcome.verdict, VerificationVerdict::Passed);
+            assert_eq!(
+                outcome.requirements[0].result.outcome,
+                RequirementOutcome::Passed
+            );
+        };
+
+        let slot = SlotName::new("context").expect("slot");
+        let assertion = verifier(json!({
+            "inputs": {"context": {"type": "json"}},
+            "requirements": [{"id": "present", "statement": "The context is present", "check": {"kind": "assert", "path": "inputs.context", "operator": "is_not_null"}}],
+            "context_capture": "hash"
+        }));
+        let evidence_copies = copies(|bytes| {
+            let context = payload(bytes);
+            let evidence = BTreeMap::from([(
+                slot.clone(),
+                InputDeclaration::Json {
+                    value: context.clone(),
+                },
+            )]);
+            let expected = evidence.clone();
+            let (outcome, allocated) = CountingAllocator::measure(|| {
+                let engine = blocks
+                    .engine(
+                        &state,
+                        Execution {
+                            caller: &caller,
+                            verifier: &uid,
+                            routes: &routes,
+                            subject: GatewayCallContext::default(),
+                            defer_unlanded_traces: false,
+                            drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
+                            clock: BlockClock::default(),
+                            execution: None,
+                            mode: ExecutionMode::Direct,
+                        },
+                    )
+                    .expect("engine builds");
+                runtime.block_on(engine.run(Arc::clone(&assertion), evidence, deadline()))
+            });
+            let outcome = outcome.expect("outcome");
+            passed(&outcome);
+            assert_eq!(outcome.evidence, expected, "the original evidence returns");
+            let digest = sha2::Sha256::digest(serde_json::to_vec(&context).expect("bytes"));
+            assert_eq!(
+                outcome.requirements[0].result.actual,
+                Some(Value::String(format!("{digest:x}")))
+            );
+            allocated
+        });
+        assert!(
+            evidence_copies < 0.1,
+            "nothing copies the evidence: {evidence_copies:.2} copies"
+        );
+
+        let dependent = verifier(json!({
+            "steps": [{"id": "work", "action": {"kind": "code", "entrypoint": "run", "source": {"inline": "def run(): pass"}, "inputs": {}}}],
+            "requirements": [{"id": "present", "statement": "The output is present", "check": {"kind": "assert", "path": "steps.work.output", "operator": "is_not_null"}}]
+        }));
+        let output_copies = copies(|bytes| {
+            let output = payload(bytes);
+            let action = Arc::new(Prebuilt(Mutex::new(Some(output.clone()))));
+            let (outcome, allocated) = CountingAllocator::measure(|| {
+                let engine = VerificationEngine::new(
+                    Arc::clone(&action) as Arc<dyn ActionExecutor>,
+                    action,
+                    Arc::new(InMemoryTraceSource::new()),
+                    STEP_CONCURRENCY,
+                )
+                .with_evidence(Arc::new(TenantEvidence::new(
+                    state.clone(),
+                    caller.clone(),
+                    limits,
+                )));
+                runtime.block_on(engine.run(Arc::clone(&dependent), BTreeMap::new(), deadline()))
+            });
+            let outcome = outcome.expect("outcome");
+            passed(&outcome);
+            assert_eq!(outcome.steps[0].output.as_ref(), Some(&output));
+            assert_eq!(
+                outcome.requirements[0].result.actual.as_ref(),
+                Some(&output)
+            );
+            allocated
+        });
+        assert!(
+            output_copies < 1.1,
+            "only the stored actual value copies the output: {output_copies:.2} copies"
+        );
     }
 }

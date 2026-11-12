@@ -116,7 +116,7 @@ def test_agent_publishes_file_directory_and_json(
 ) -> None:
     result = verify_as(wyrd_server, publish_desk_bundle, "publish_every_tool", "all", "FULL-RUN")
 
-    assert requirement(result, "consumed")["outcome"] == "passed", result.steps
+    assert requirement(result, "consumed")["outcome"] == "passed", result
     assert offered(requests(receiver, "DRAFT: FULL-RUN")[0]) == [
         "code_run",
         "fs_read",

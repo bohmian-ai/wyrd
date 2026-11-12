@@ -759,7 +759,7 @@ async fn agent_writes_private_workspace_files() {
         peeker["k-write"],
         json!({ "path": "/work/mine.md", "bytes": 4 })
     );
-    let write = step(&result, "write");
+    let write = step(&desk.deployment, &result, "write").await;
     let mut recorded: Vec<(Value, bool)> = write
         .tool_calls
         .iter()
@@ -1088,7 +1088,7 @@ async fn agent_publish_retries_use_host_identity() {
         wyrd_ai::RequirementOutcome::Passed,
         "{result:?}"
     );
-    assert_eq!(step(&result, "draft").attempts, 2);
+    assert_eq!(step(&desk.deployment, &result, "draft").await.attempts, 2);
     let consumer = desk.results("CONSUME:").await;
     assert_eq!(lines(&consumer["c-report"]), RETRIED.trim_end());
     let drafted = desk.requests("DRAFT:").await;
@@ -1166,8 +1166,11 @@ async fn agent_publish_retries_use_host_identity() {
 
     let result = desk.verify("report-pipeline", "NO-PUBLISH").await;
 
-    assert_eq!(step(&result, "draft").status, StepStatus::Succeeded);
-    let consume = step(&result, "consume");
+    assert_eq!(
+        step(&desk.deployment, &result, "draft").await.status,
+        StepStatus::Succeeded
+    );
+    let consume = step(&desk.deployment, &result, "consume").await;
     assert_eq!(consume.status, StepStatus::Failed, "{result:?}");
     assert!(
         consume
@@ -1236,7 +1239,8 @@ async fn selected_hosted_tools_resolve_before_model_calls() {
     );
 
     let result = desk.verify("report-pipeline", "FULL-RUN").await;
-    let mut tools: Vec<Value> = step(&result, "draft")
+    let mut tools: Vec<Value> = step(&desk.deployment, &result, "draft")
+        .await
         .tool_calls
         .iter()
         .map(|call| serde_json::to_value(call.tool).expect("the tool serializes"))
@@ -1279,7 +1283,7 @@ async fn selected_hosted_tools_resolve_before_model_calls() {
 /// # Panics
 /// Panics when a call, publication, or the consumer differs.
 async fn assert_writes_only(desk: &PublishDesk, result: &VerificationResult, question: &str) {
-    let draft = step(result, "draft");
+    let draft = step(&desk.deployment, result, "draft").await;
     assert!(!draft.tool_calls.is_empty(), "{question}");
     for call in &draft.tool_calls {
         let tool = serde_json::to_value(call.tool).expect("the tool serializes");
@@ -1309,7 +1313,7 @@ async fn assert_writes_only(desk: &PublishDesk, result: &VerificationResult, que
     );
     assert!(desk.publications(result).await.is_empty(), "{question}");
     assert_eq!(
-        step(result, "consume").status,
+        step(&desk.deployment, result, "consume").await.status,
         StepStatus::Failed,
         "{question}"
     );
@@ -1486,7 +1490,7 @@ async fn tool_limits_release_capacity_and_preserve_provenance() {
     let receipt = json!({ "name": "big", "kind": "file" });
     assert_eq!(drafter["l-publish"], receipt);
 
-    let draft = step(&result, "draft");
+    let draft = step(&desk.deployment, &result, "draft").await;
     let publish = draft
         .tool_calls
         .iter()
@@ -1619,8 +1623,8 @@ async fn publications_follow_shared_run_state() {
     );
     assert_eq!(
         (
-            step(&result, "draft").attempts,
-            step(&result, "consume").attempts
+            step(&desk.deployment, &result, "draft").await.attempts,
+            step(&desk.deployment, &result, "consume").await.attempts
         ),
         (1, 1)
     );

@@ -13,28 +13,36 @@
 //! entry to its result, acknowledgement, or response handoff, plus the union
 //! of that request's own provider or Verifier waits and the residual between
 //! them. Each percentile is the nearest-rank bucket's bounds, judged whole.
-//! The coarse Prometheus histograms remain only as diagnostic means and
-//! component breakdowns.
+//! Diagnostic histograms, counters, and gauges come from the same benchmark
+//! snapshots; a benchmarked server runs no Prometheus recorder.
 //!
-//! A workload names the diagnostic histograms and runtime components it reads
-//! in one [`Selection`]; a [`Window`] reads them, the server's CPU and peak
-//! memory, and this process's CPU at its open and differences them into a
-//! [`Usage`] at its close. A reading the OS cannot supply, a counter that went
-//! backwards, or a lost process is `None`, never zero use.
+//! A [`Window`] reads the server's CPU and peak memory and this process's
+//! CPU at its open and differences them into a [`Usage`] at its close. A
+//! reading the OS cannot supply, a counter that went backwards, or a lost
+//! process is `None`, never zero use.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use num_traits::ToPrimitive;
 use serde::Serialize;
 use serde_json::Value;
-pub use wyrd_telemetry::timing::UNLABELLED;
-use wyrd_telemetry::timing::{
-    Distribution, IntervalScan, IntervalSeries, TimingInterval, TimingSnapshot,
+pub use wyrd_benchmark::UNLABELLED;
+use wyrd_benchmark::{
+    BenchmarkInterval, BenchmarkSnapshot, Distribution, IntervalMetric, IntervalScan,
+    IntervalSeries,
 };
 
-use crate::experiment::{Reading, Reconciled, Repetition, TimingEvidence};
+use crate::experiment::{Metric, Reading, Reconciled, Repetition, Role, TimingEvidence};
+
+/// The readings [`Population::response_bytes`] sets, with their units.
+pub const RESPONSE_BYTE_STATS: [(&str, &str); 5] = [
+    ("response_bytes_count", "responses"),
+    ("response_bytes_p50", "bytes"),
+    ("response_bytes_p99", "bytes"),
+    ("response_bytes_max", "bytes"),
+    ("response_bytes_mean", "bytes"),
+];
 use crate::release_server::{LocalServer, Metrics, PeakSampler};
 
 /// Error type of the capacity helpers, matching the benchmark binaries.
@@ -77,212 +85,6 @@ pub fn nearest_rank(samples: &[u64], q: f64, per: f64) -> Option<f64> {
     sorted.get(index).map(|sample| *sample as f64 / per)
 }
 
-/// Per-bound increase between two cumulative bucket readings; a bound absent
-/// from `before` counts from zero.
-pub fn deltas(before: &[(f64, f64)], after: &[(f64, f64)]) -> Vec<(f64, f64)> {
-    let prior = |bound: f64| {
-        before
-            .iter()
-            .find(|(b, _)| b.to_bits() == bound.to_bits())
-            .map_or(0.0, |(_, count)| *count)
-    };
-    after
-        .iter()
-        .map(|(bound, count)| (*bound, count - prior(*bound)))
-        .collect()
-}
-
-/// One server histogram's observations, cumulative in one scrape or over a
-/// window.
-#[derive(Debug, Default, Clone)]
-pub struct Histogram {
-    /// Cumulative `le` buckets.
-    pub buckets: Vec<(f64, f64)>,
-    /// Observed seconds.
-    pub sum: f64,
-    /// Observations.
-    pub count: f64,
-}
-
-impl Histogram {
-    /// The histogram of every `family` series whose labels contain each of
-    /// `labels` in one scrape, summed across those series.
-    #[must_use]
-    pub fn read(metrics: &Metrics, family: &str, labels: &[&str]) -> Self {
-        Self {
-            buckets: metrics.buckets(family, labels),
-            sum: metrics.sum(&format!("{family}_sum"), labels),
-            count: metrics.sum(&format!("{family}_count"), labels),
-        }
-    }
-
-    /// The observations `after` added to `self`; a bucket bound or series
-    /// absent from `self` counts from zero.
-    #[must_use]
-    pub fn since(&self, after: &Self) -> Self {
-        Self {
-            buckets: deltas(&self.buckets, &after.buckets),
-            sum: after.sum - self.sum,
-            count: after.count - self.count,
-        }
-    }
-
-    /// Exact mean, seconds, from `_sum` / `_count`, or `None` without
-    /// observations.
-    #[must_use]
-    pub fn mean(&self) -> Option<f64> {
-        (self.count > 0.0).then(|| self.sum / self.count)
-    }
-}
-
-/// One histogram a workload judges or reports: its family and the label
-/// matchers (`name="value"`) every selected series must contain.
-pub type HistogramKey = (&'static str, &'static [&'static str]);
-
-/// The server telemetry one workload's windows read.
-#[derive(Debug, Clone, Copy)]
-pub struct Selection {
-    /// Histograms differenced whole, each by its [`HistogramKey`].
-    pub histograms: &'static [HistogramKey],
-    /// Runtime component histograms, each with the label naming its
-    /// components; an empty label reads a family without labels as one
-    /// component.
-    pub breakdown: &'static [(&'static str, &'static str)],
-    /// Common family prefix dropped from breakdown component names.
-    pub prefix: &'static str,
-}
-
-impl Selection {
-    /// A selection reading no histogram and no component, for a workload
-    /// that keeps only the window's resources.
-    pub const RESOURCES: Self = Self {
-        histograms: &[],
-        breakdown: &[],
-        prefix: "",
-    };
-
-    /// Every selected histogram in one scrape, in selection order.
-    fn histograms(&self, metrics: &Metrics) -> Vec<Histogram> {
-        self.histograms
-            .iter()
-            .map(|(family, labels)| Histogram::read(metrics, family, labels))
-            .collect()
-    }
-
-    /// Every breakdown component's total seconds and observations in one
-    /// scrape, keyed `family{label=value}` with [`Self::prefix`] and the
-    /// `_seconds` unit dropped; a family with an empty label is the one
-    /// component `family`.
-    fn breakdown(&self, metrics: &Metrics) -> BTreeMap<String, (f64, f64)> {
-        let mut components = BTreeMap::new();
-        for (family, label) in self.breakdown {
-            let name = family
-                .trim_start_matches(self.prefix)
-                .trim_end_matches("_seconds");
-            if label.is_empty() {
-                let sum = metrics.sum(&format!("{family}_sum"), &[]);
-                let count = metrics.sum(&format!("{family}_count"), &[]);
-                components.insert(name.to_owned(), (sum, count));
-                continue;
-            }
-            let counts = metrics.by_label(&format!("{family}_count"), label);
-            for (value, sum) in metrics.by_label(&format!("{family}_sum"), label) {
-                let count = counts.get(&value).copied().unwrap_or(0.0);
-                components.insert(format!("{name}{{{label}={value}}}"), (sum, count));
-            }
-        }
-        components
-    }
-}
-
-/// A selection's telemetry in one scrape, differenced against a later one.
-#[derive(Debug, Clone)]
-pub struct Readings {
-    /// What was read.
-    selection: Selection,
-    /// Each selected histogram, in selection order.
-    histograms: Vec<Histogram>,
-    /// Each breakdown component's seconds and observations.
-    breakdown: BTreeMap<String, (f64, f64)>,
-}
-
-impl Readings {
-    /// Reads `selection` from one scrape.
-    #[must_use]
-    pub fn read(metrics: &Metrics, selection: Selection) -> Self {
-        Self {
-            selection,
-            histograms: selection.histograms(metrics),
-            breakdown: selection.breakdown(metrics),
-        }
-    }
-
-    /// What `after`, a later scrape, added: every selected histogram's
-    /// observations, and every breakdown component that gained an
-    /// observation. A series first exported after these readings counts
-    /// from zero.
-    #[must_use]
-    pub fn since(&self, after: &Metrics) -> Telemetry {
-        Telemetry {
-            selection: self.selection,
-            histograms: self
-                .histograms
-                .iter()
-                .zip(self.selection.histograms(after))
-                .map(|(before, after)| before.since(&after))
-                .collect(),
-            breakdown: self
-                .selection
-                .breakdown(after)
-                .into_iter()
-                .map(|(key, (sum, count))| {
-                    let (sum0, count0) = self.breakdown.get(&key).copied().unwrap_or_default();
-                    (key, (sum - sum0, count - count0))
-                })
-                .filter(|(_, (_, count))| *count > 0.0)
-                .collect(),
-        }
-    }
-}
-
-/// A selection's telemetry over one window.
-#[derive(Debug, Clone)]
-pub struct Telemetry {
-    /// What was read.
-    pub selection: Selection,
-    /// Each selected histogram over the window, in selection order.
-    pub histograms: Vec<Histogram>,
-    /// New seconds and observations of each breakdown component, keyed
-    /// `family{label=value}`.
-    pub breakdown: BTreeMap<String, (f64, f64)>,
-}
-
-impl Default for Telemetry {
-    /// No telemetry: an unmeasured window.
-    fn default() -> Self {
-        Self {
-            selection: Selection::RESOURCES,
-            histograms: Vec::new(),
-            breakdown: BTreeMap::new(),
-        }
-    }
-}
-
-impl Telemetry {
-    /// The window's histogram under `key`; empty when the selection did not
-    /// read it.
-    #[must_use]
-    pub fn histogram(&self, key: HistogramKey) -> Histogram {
-        self.selection
-            .histograms
-            .iter()
-            .position(|selected| *selected == key)
-            .and_then(|index| self.histograms.get(index))
-            .cloned()
-            .unwrap_or_default()
-    }
-}
-
 /// Server and driver usage over one window.
 #[derive(Debug, Default, Clone)]
 pub struct Usage {
@@ -294,21 +96,23 @@ pub struct Usage {
     /// Sampled peak server resident memory over the window, or `None` when
     /// it was never sampled.
     pub peak_memory_bytes: Option<u64>,
+    /// Server resident memory as the window opened, or `None` when it was
+    /// never sampled.
+    pub opening_memory_bytes: Option<u64>,
     /// CPU seconds this benchmark process used, to show the driver was not
     /// the bottleneck; `None` when unreadable.
     pub driver_cpu_seconds: Option<f64>,
     /// Seconds the requests in flight at the window's stop took to drain
     /// after it, outside `seconds` and both CPU readings.
     pub drain_seconds: f64,
-    /// The workload's selected telemetry over the window and its drain.
-    pub telemetry: Telemetry,
 }
 
-/// One server's resources, this process's CPU, and a selection's telemetry
-/// at a window's start, closed into a [`Usage`].
+/// One server's resources and this process's CPU at a window's start,
+/// closed into a [`Usage`].
 ///
-/// Opening and closing each scrape `/metrics` and hand that scrape back,
-/// so a workload reading further series takes them from the same scrape. The
+/// Opening and closing each read the benchmark snapshot as [`Metrics`] and
+/// hand that read back, so a workload reading further series takes them
+/// from the same scrape. The
 /// window's seconds and both CPU readings freeze together with the start of
 /// the scrape handed back and, through [`Self::measure`], before the
 /// requests in flight at the window's stop drain.
@@ -317,35 +121,29 @@ pub struct Window {
     started: Instant,
     /// Server CPU and peak memory since the start.
     resources: ResourceWindow,
-    /// The selection at start.
-    readings: Readings,
     /// This process's CPU seconds at start.
     driver_cpu_seconds: Option<f64>,
 }
 
 impl Window {
-    /// Opens a window over `server` reading `selection`, and returns the
-    /// opening scrape.
+    /// Opens a resource window over `server`, and returns the opening
+    /// scrape.
     ///
     /// # Errors
     ///
     /// Returns scrape failures.
-    pub async fn open(
-        server: &LocalServer,
-        selection: Selection,
-    ) -> Result<(Self, Metrics), Error> {
+    pub async fn open(server: &LocalServer) -> Result<(Self, Metrics), Error> {
         let metrics = server.metrics().await?;
         let window = Self {
             resources: ResourceWindow::open([server]),
-            readings: Readings::read(&metrics, selection),
             driver_cpu_seconds: driver_cpu_seconds(),
             started: Instant::now(),
         };
         Ok((window, metrics))
     }
 
-    /// Differences `server`'s resources and the selection against the open,
-    /// and returns the closing scrape.
+    /// Differences `server`'s resources against the open, and returns the
+    /// closing scrape.
     ///
     /// # Errors
     ///
@@ -361,9 +159,9 @@ impl Window {
     /// it returns share their interval; only then do the requests `work`
     /// still has in flight drain, outside all of them. `work` must admit
     /// nothing after `stop` and counts what completes after it as late.
-    /// Returns `work`'s output, the usage, whose selected telemetry also
-    /// covers the drain, and the stop scrape; a check of everything the
-    /// window caused, drain included, scrapes again afterwards.
+    /// Returns `work`'s output, the usage, and the stop scrape; a check of
+    /// everything the window caused, drain included, scrapes again
+    /// afterwards.
     ///
     /// # Errors
     ///
@@ -377,7 +175,6 @@ impl Window {
         let Self {
             started,
             mut resources,
-            readings,
             driver_cpu_seconds: driver_opened,
         } = self;
         let mut driver = None;
@@ -390,18 +187,15 @@ impl Window {
         let at_stop = at_stop?;
         let drain_seconds = stopped.elapsed().as_secs_f64();
         let seconds = stopped.duration_since(started).as_secs_f64();
-        let drained = server.metrics().await?;
         let resources = resources.finish([server], seconds);
-        let (server_cpu_seconds, peak_memory_bytes) = resources
-            .first()
-            .map_or((None, None), |used| (used.cpu_seconds, used.peak_memory));
+        let used = resources.first();
         let usage = Usage {
             seconds,
-            server_cpu_seconds,
-            peak_memory_bytes,
+            server_cpu_seconds: used.and_then(|used| used.cpu_seconds),
+            peak_memory_bytes: used.and_then(|used| used.peak_memory),
+            opening_memory_bytes: used.and_then(|used| used.opening_memory),
             driver_cpu_seconds: driver,
             drain_seconds,
-            telemetry: readings.since(&drained),
         };
         Ok((output, usage, at_stop))
     }
@@ -442,6 +236,9 @@ pub struct Resources {
     pub cores: Option<f64>,
     /// Sampled peak resident memory, bytes, or `None` when never sampled.
     pub peak_memory: Option<u64>,
+    /// Resident memory as the window opened, bytes, or `None` when never
+    /// sampled.
+    pub opening_memory: Option<u64>,
 }
 
 /// Server process CPU and sampled peak-memory readings at a window's start.
@@ -502,12 +299,14 @@ impl ResourceWindow {
                     }
                     _ => None,
                 };
+                let memory = sampler.and_then(|sampler| sampler.finish().ok());
                 Resources {
                     cpu_seconds,
                     cores: cpu_seconds
                         .filter(|_| window_seconds > 0.0)
                         .map(|cpu| cpu / window_seconds),
-                    peak_memory: sampler.and_then(|sampler| sampler.finish().ok()),
+                    peak_memory: memory.map(|memory| memory.peak),
+                    opening_memory: memory.map(|memory| memory.opening),
                 }
             })
             .collect()
@@ -558,8 +357,9 @@ const COLLECTION_WAIT: Duration = Duration::from_secs(30);
 /// differenced per window.
 #[must_use]
 pub fn timing_declaration() -> Value {
-    let method = wyrd_telemetry::timing::Method::current();
+    let method = wyrd_benchmark::Method::current();
     serde_json::json!({
+        "recorder": "wyrd-benchmark is the server's only metrics recorder: counters, gauges, and diagnostic histograms are read from the same snapshots as the timings, with no Prometheus recorder or exporter; a duration with both a timing and a production histogram is recorded only as the timing",
         "method": "server benchmark histograms: integer nanoseconds from the owning server boundary's std::time::Instant timers, recorded into bounded HDR histograms and read as cumulative snapshots from the loopback metrics listener; each window is the bucket-count difference of two snapshots of one process",
         "clock": method.clock,
         "precision": format!("{} significant digits; each percentile is judged on its whole bucket's bounds", method.significant_digits),
@@ -567,6 +367,8 @@ pub fn timing_declaration() -> Value {
         "scan_range": [1, method.highest_scan],
         "max_series": method.max_series,
         "max_scan_series": method.max_scan_series,
+        "max_metric_series": method.max_metric_series,
+        "metric_histograms": format!("fixed-point billionths: a _seconds histogram in range_ns, any other in [1, {}] billionths of its value, so fractional ratios and decimal costs keep their value", method.highest_metric),
         "percentile": "nearest rank ceil(q * N) over the window's distribution",
         "server_env": { "WYRD_METRICS_BENCHMARK_SNAPSHOT": "1" },
         "tracing": "operator span export stays at its default (disabled); no span is required for timing",
@@ -594,20 +396,24 @@ pub struct Expected<'a> {
     pub count: u64,
 }
 
-/// One window's server timing observations: the series and scan facts
-/// recorded between two snapshots of one server process, and the
-/// snapshots and reconciliation they were read from.
+/// One window's timing observations in one process: the series and scan
+/// facts recorded between two snapshots of the server, or of the driver's
+/// own recorder, and the snapshots and reconciliation they were read from.
 #[derive(Debug, Clone, Default)]
 pub struct Population {
+    /// The process the snapshots are of.
+    pub role: Role,
     /// Every timing series with an observation in the window.
     pub series: Vec<IntervalSeries>,
     /// Every scan series with a query in the window.
     pub scans: Vec<IntervalScan>,
+    /// Every standard metric series the window's later snapshot holds.
+    pub metrics: Vec<IntervalMetric>,
     /// Why the population is incomplete or untrustworthy; empty when it is
     /// complete.
     pub invalid: Vec<String>,
     /// The snapshots the window differences, once read.
-    pub snapshots: Option<(TimingSnapshot, TimingSnapshot)>,
+    pub snapshots: Option<(BenchmarkSnapshot, BenchmarkSnapshot)>,
     /// Each owed cohort's expected and recorded observations.
     pub reconciliation: Vec<Reconciled>,
 }
@@ -618,30 +424,44 @@ impl Population {
     /// recorded short or over is invalid.
     pub async fn collect(
         server: &LocalServer,
-        before: &TimingSnapshot,
+        before: &BenchmarkSnapshot,
         expected: &[Expected<'_>],
     ) -> Self {
-        Self::wait(server, before, expected, COLLECTION_WAIT).await
+        let read = move || async move {
+            server
+                .timings()
+                .await
+                .map_err(|error| format!("the timing snapshot is unreadable: {error}"))
+        };
+        Self::wait(read, Role::Server, before, expected, COLLECTION_WAIT).await
     }
 
-    /// Polls `server`'s snapshot until the counts are reached or `wait`
-    /// expires, then validates the last interval.
-    async fn wait(
-        server: &LocalServer,
-        before: &TimingSnapshot,
+    /// [`Self::collect`] over this driver process's own recorder, `before`
+    /// being its own snapshot: its clients' and local fixture's
+    /// observations, [`Role::Driver`] evidence never differenced against a
+    /// server snapshot.
+    pub async fn collect_driver(before: &BenchmarkSnapshot, expected: &[Expected<'_>]) -> Self {
+        let read = || std::future::ready(Ok(wyrd_benchmark::snapshot()));
+        Self::wait(read, Role::Driver, before, expected, COLLECTION_WAIT).await
+    }
+
+    /// Polls `read`'s snapshot of the `role` process until the counts are
+    /// reached or `wait` expires, then validates the last interval.
+    async fn wait<Read: Future<Output = Result<BenchmarkSnapshot, String>>>(
+        read: impl Fn() -> Read,
+        role: Role,
+        before: &BenchmarkSnapshot,
         expected: &[Expected<'_>],
         wait: Duration,
     ) -> Self {
         let waiting = Instant::now();
         loop {
-            let mut population = match server.timings().await {
+            let mut population = match read().await {
                 Ok(after) => match Self::between(before, after) {
-                    Ok(population) => population,
-                    Err(reason) => return Self::refused(reason),
+                    Ok(population) => Self { role, ..population },
+                    Err(reason) => return Self::refused(role, reason),
                 },
-                Err(error) => {
-                    return Self::refused(format!("the timing snapshot is unreadable: {error}"));
-                }
+                Err(reason) => return Self::refused(role, reason),
             };
             let reached = expected
                 .iter()
@@ -660,7 +480,7 @@ impl Population {
     ///
     /// Returns why the snapshots do not difference: a replaced process or a
     /// reset.
-    pub fn between(before: &TimingSnapshot, after: TimingSnapshot) -> Result<Self, String> {
+    pub fn between(before: &BenchmarkSnapshot, after: BenchmarkSnapshot) -> Result<Self, String> {
         let mut population = Self::from_interval(after.since(before)?);
         population.snapshots = Some((before.clone(), after));
         Ok(population)
@@ -678,6 +498,7 @@ impl Population {
                 ));
             }
             self.reconciliation.push(Reconciled {
+                role: self.role,
                 boundary: cohort.boundary.to_owned(),
                 outcome: cohort.outcome.to_owned(),
                 case: cohort.case.to_owned(),
@@ -707,11 +528,11 @@ impl Population {
     /// The population of `interval`, invalid for every dropped,
     /// unlabelled-by-mistake, or inconsistent observation in it.
     #[must_use]
-    pub fn from_interval(interval: TimingInterval) -> Self {
+    pub fn from_interval(interval: BenchmarkInterval) -> Self {
         let mut invalid = Vec::new();
         if interval.dropped > 0 {
             invalid.push(format!(
-                "{} timing observations overflowed the server's series bound and were dropped",
+                "{} observations overflowed the server's series bounds and were dropped",
                 interval.dropped
             ));
         }
@@ -724,6 +545,14 @@ impl Population {
         for series in &interval.series {
             invalid.extend(series.problems());
         }
+        for metric in &interval.metrics {
+            if metric.rejected > 0 {
+                invalid.push(format!(
+                    "metric {} refused {} unrepresentable updates",
+                    metric.name, metric.rejected
+                ));
+            }
+        }
         for scan in &interval.scans {
             if scan.out_of_range > 0 {
                 invalid.push(format!(
@@ -735,14 +564,16 @@ impl Population {
         Self {
             series: interval.series,
             scans: interval.scans,
+            metrics: interval.metrics,
             invalid,
             ..Self::default()
         }
     }
 
-    /// A population with no observation, invalid for `reason`.
-    fn refused(reason: String) -> Self {
+    /// A `role` population with no observation, invalid for `reason`.
+    fn refused(role: Role, reason: String) -> Self {
         Self {
+            role,
             invalid: vec![reason],
             ..Self::default()
         }
@@ -767,8 +598,25 @@ impl Population {
                 .cloned()
                 .collect(),
             invalid: self.invalid.clone(),
+            role: self.role,
             ..Self::default()
         }
+    }
+
+    /// [`IntervalMetric::counter`] over the window's metrics: `None` when
+    /// the counter was never registered.
+    #[must_use]
+    pub fn counter(&self, name: &str, labels: &[(&str, &str)]) -> Option<u64> {
+        IntervalMetric::counter(&self.metrics, name, labels)
+    }
+
+    /// [`IntervalMetric::histogram`] over the window's metrics.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the selection is not evidence.
+    pub fn histogram(&self, name: &str, labels: &[(&str, &str)]) -> Result<Distribution, String> {
+        IntervalMetric::histogram(&self.metrics, name, labels)
     }
 
     /// Observations of `boundary` of any outcome, case, and phase.
@@ -823,6 +671,165 @@ impl Population {
         })
     }
 
+    /// Sets the diagnostics of each root of `roots`, a boundary, whether it
+    /// excludes waits, and its components, for the observations of `case`
+    /// admitted in `phase`: its successful elapsed distribution as
+    /// `<role>.<boundary>`, its residual as `<role>.<boundary>.residual`
+    /// when it excludes waits, and each component's reached-call
+    /// distribution as `<role>.<boundary>.<component>`. Every one is required
+    /// evidence. With `answered`, the successful calls of an error-free
+    /// window, a component recorded for another number of calls is invalid.
+    pub fn diagnose_roots(
+        &self,
+        repetition: &mut Repetition,
+        (case, phase): (&str, &str),
+        roots: &[(&str, bool, &[&str])],
+        answered: Option<u64>,
+    ) {
+        let cohort = self.only(case, phase);
+        let role = self.role.name();
+        for (boundary, excludes, components) in roots {
+            let name = format!("{role}.{boundary}");
+            let elapsed = cohort
+                .elapsed(boundary, wyrd_benchmark::SUCCESS)
+                .ok_or_else(|| format!("no successful `{boundary}` {role} observation"));
+            repetition.diagnose(&name, elapsed, true);
+            if *excludes {
+                let residual = cohort.residuals(boundary, wyrd_benchmark::SUCCESS);
+                repetition.diagnose(&format!("{name}.residual"), residual, true);
+            }
+            for component in *components {
+                let observation = format!("{name}.{component}");
+                let distribution = self.histogram(
+                    wyrd_benchmark::COMPONENT_SECONDS,
+                    &[
+                        ("boundary", boundary),
+                        ("component", component),
+                        ("case", case),
+                        ("phase", phase),
+                    ],
+                );
+                if let (Ok(recorded), Some(answered)) =
+                    (distribution.as_ref().map(Distribution::len), answered)
+                    && recorded != answered
+                {
+                    repetition.invalid.push(format!(
+                        "diagnostic `{observation}` recorded {recorded} observations for {answered} answered calls"
+                    ));
+                }
+                repetition.diagnose(&observation, distribution, true);
+            }
+        }
+    }
+
+    /// Sets the response-body sizes, in bytes, of the successful
+    /// `boundary` calls of `case` admitted in `phase`: their count, p50, p99,
+    /// and maximum as histogram bucket bounds, and their mean from the
+    /// bucketed total's bounds, under [`RESPONSE_BYTE_STATS`]. Every one is
+    /// required evidence. With `answered`, the successful calls of an
+    /// error-free window, sizes recorded for another number of calls are
+    /// invalid.
+    pub fn response_bytes(
+        &self,
+        repetition: &mut Repetition,
+        boundary: &str,
+        (case, phase): (&str, &str),
+        answered: Option<u64>,
+    ) {
+        let sizes = self.histogram(
+            wyrd_benchmark::BODY_BYTES,
+            &[
+                ("boundary", boundary),
+                ("body", "response"),
+                ("case", case),
+                ("phase", phase),
+            ],
+        );
+        let sizes = match sizes {
+            Ok(sizes) => sizes,
+            Err(reason) => {
+                for (id, _) in RESPONSE_BYTE_STATS {
+                    repetition.set(id, Reading::missing(reason.clone()));
+                }
+                repetition
+                    .invalid
+                    .push(format!("`{boundary}` response sizes are missing: {reason}"));
+                return;
+            }
+        };
+        let samples = sizes.len();
+        if let Some(answered) = answered
+            && samples != answered
+        {
+            repetition.invalid.push(format!(
+                "`{boundary}` recorded {samples} response sizes for {answered} answered calls"
+            ));
+        }
+        let per = wyrd_benchmark::HistogramUnit::Billionths.per_unit() as f64;
+        let (low, high) = sizes.total_bounds();
+        repetition.set("response_bytes_count", Reading::count(samples));
+        for (id, q) in [
+            ("response_bytes_p50", 0.5),
+            ("response_bytes_p99", 0.99),
+            ("response_bytes_max", 1.0),
+        ] {
+            repetition.set(id, Reading::quantile(&sizes, q, per));
+        }
+        repetition.set(
+            "response_bytes_mean",
+            if samples == 0 {
+                Reading::missing("no observation")
+            } else {
+                Reading::bounded(low as f64, high as f64, per * samples as f64)
+                    .with_samples(samples)
+            },
+        );
+    }
+
+    /// The metrics [`Self::response_bytes`] fills for `boundary`'s calls
+    /// in a `role` process, so a report names what was read.
+    #[must_use]
+    pub fn response_byte_metrics(role: Role, boundary: &str) -> Vec<Metric> {
+        let role = role.name();
+        RESPONSE_BYTE_STATS
+            .map(|(id, unit)| {
+                Metric::raw(
+                    id,
+                    unit,
+                    &format!("{role}: response body bytes each successful `{boundary}` call read, the cohort's calls; histogram bucket bounds"),
+                )
+            })
+            .to_vec()
+    }
+
+    /// The diagnostic metrics [`Self::diagnose_roots`] fills for `roots`
+    /// of a `role` process, so a report names each one's boundary.
+    #[must_use]
+    pub fn root_metrics(role: Role, roots: &[(&str, bool, &[&str])]) -> Vec<Metric> {
+        let role = role.name();
+        let mut metrics = Vec::new();
+        for (boundary, excludes, components) in roots {
+            let name = format!("{role}.{boundary}");
+            metrics.extend(Metric::diagnostic(
+                &name,
+                &format!("{role}: `{boundary}` start until its successful end, the cohort's calls"),
+            ));
+            if *excludes {
+                metrics.extend(Metric::diagnostic(
+                    &format!("{name}.residual"),
+                    &format!("{role}: per call, `{boundary}` elapsed less its excluded waits, computed before aggregation"),
+                ));
+            }
+            for component in *components {
+                metrics.extend(Metric::diagnostic(
+                    &format!("{name}.{component}"),
+                    &format!("{role}: `{boundary}` `{component}` work, accumulated per call across attempts, for every call that reached it; never added to the call's elapsed"),
+                ));
+            }
+        }
+        metrics
+    }
+
     /// Observations of `boundary` whose outcome is not `outcome`.
     #[must_use]
     pub fn others(&self, boundary: &str, outcome: &str) -> u64 {
@@ -837,7 +844,8 @@ impl Population {
     #[must_use]
     pub fn health(&self) -> String {
         format!(
-            "server timing: {} observations in {} series, {} scanned queries",
+            "{} timing: {} observations in {} series, {} scanned queries",
+            self.role.name(),
             self.series.iter().map(|series| series.count).sum::<u64>(),
             self.series.len(),
             self.scans.iter().map(|scan| scan.count).sum::<u64>(),
@@ -856,6 +864,7 @@ impl Population {
         if let Some((before, after)) = &self.snapshots {
             repetition.timings.push(TimingEvidence {
                 window: window.to_owned(),
+                role: self.role,
                 before: before.clone(),
                 after: after.clone(),
                 reconciliation: self.reconciliation.clone(),
@@ -1041,28 +1050,136 @@ pub fn binary_identity(binary: &Path) -> Result<Value, Error> {
     }))
 }
 
-/// Installs a stderr log subscriber when `WYRD_LOG`, else `RUST_LOG`, is set,
-/// so client-side failures read alongside the server logs. A subscriber
-/// already installed wins.
-pub fn install_tracing() {
-    let Ok(filter) = std::env::var("WYRD_LOG").or_else(|_| std::env::var("RUST_LOG")) else {
-        return;
-    };
-    let _ = tracing::subscriber::set_global_default(
-        tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
-            .with_writer(std::io::stderr)
-            .finish(),
-    );
+/// Installs the driver's process subscriber: a `tracing_subscriber`
+/// registry, where benchmark classifications live on spans, keeping every
+/// `INFO` span, with a stderr log layer only when `WYRD_LOG`, else
+/// `RUST_LOG`, is set, so client-side failures read alongside the server
+/// logs. The log filter applies to that layer alone, so a classified span
+/// exists in the registry whether or not it is logged.
+///
+/// # Errors
+///
+/// Returns the refusal when another global subscriber is already installed:
+/// it would hide the registry the benchmark classification needs.
+pub fn install_tracing() -> Result<(), tracing_subscriber::util::TryInitError> {
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+
+    let logs = std::env::var("WYRD_LOG")
+        .or_else(|_| std::env::var("RUST_LOG"))
+        .ok()
+        .map(|filter| {
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(tracing_subscriber::EnvFilter::new(filter))
+        });
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::layer::Identity::new()
+                .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+        )
+        .with(logs)
+        .try_init()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Distribution, Expected, IntervalScan, IntervalSeries, Percentiles, Population, Readings,
-        Selection, TimingInterval, UNLABELLED, deltas, elapsed, until_stop,
+        BenchmarkInterval, Distribution, Expected, IntervalMetric, IntervalScan, IntervalSeries,
+        Percentiles, Population, UNLABELLED, elapsed, until_stop,
     };
     use crate::release_server::Metrics;
+    use wyrd_benchmark::IntervalValue;
+
+    /// A repetition reports each successful call's response body bytes as
+    /// the recorder read them: count, p50, p99, maximum, and mean, each
+    /// interval holding the exact size, in declared units, surviving a
+    /// serialized round trip. Sizes recorded for another number of answered
+    /// calls are invalid; a cohort without sizes is missing with its reason
+    /// and invalid, and a record from before sizes were read holds none.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a reading, unit, reason, or invalid reason is wrong.
+    #[test]
+    fn verification_reports_preserve_response_bytes() {
+        use crate::experiment::{Reading, Repetition, Role};
+        use wyrd_benchmark::{Cohort, Observation, SUCCESS};
+
+        use super::RESPONSE_BYTE_STATS;
+
+        wyrd_benchmark::install().expect("the benchmark recorder installs");
+        let before = wyrd_benchmark::snapshot();
+        for size in [1_000, 1_000, 4_000] {
+            let observation = Observation::start("client.http", || {
+                Cohort::of(Some("direct-verify"), Some("repetition-1"))
+            });
+            observation.bytes("response", size);
+            observation.finish(SUCCESS);
+        }
+        let population =
+            Population::between(&before, wyrd_benchmark::snapshot()).expect("one process");
+        let cohort = ("direct-verify", "repetition-1");
+        let mut repetition = Repetition::default();
+        population.response_bytes(&mut repetition, "client.http", cohort, Some(3));
+        assert!(repetition.invalid.is_empty(), "{:?}", repetition.invalid);
+        let holds = |reading: &Reading, exact: f64| {
+            reading.value.is_some_and(|high| high >= exact)
+                && reading.above.is_none_or(|low| low < exact)
+        };
+        assert_eq!(repetition.reading("response_bytes_count").value, Some(3.0));
+        for (id, exact) in [
+            ("response_bytes_p50", 1_000.0),
+            ("response_bytes_p99", 4_000.0),
+            ("response_bytes_max", 4_000.0),
+            ("response_bytes_mean", 2_000.0),
+        ] {
+            let reading = repetition.reading(id);
+            assert!(holds(&reading, exact), "{id}: {reading:?}");
+            assert_eq!(reading.samples, Some(3), "{id}");
+        }
+        let back: Repetition = serde_json::from_str(
+            &serde_json::to_string(&repetition).expect("a repetition serializes"),
+        )
+        .expect("a repetition deserializes");
+        assert_eq!(back, repetition);
+        let declared: Vec<_> = Population::response_byte_metrics(Role::Driver, "client.http")
+            .into_iter()
+            .map(|metric| (metric.id, metric.unit))
+            .collect();
+        assert_eq!(
+            declared,
+            RESPONSE_BYTE_STATS.map(|(id, unit)| (id.to_owned(), unit.to_owned()))
+        );
+
+        let mut short = Repetition::default();
+        population.response_bytes(&mut short, "client.http", cohort, Some(4));
+        assert_eq!(
+            short.invalid,
+            ["`client.http` recorded 3 response sizes for 4 answered calls"]
+        );
+        let mut unread = Repetition::default();
+        population.response_bytes(
+            &mut unread,
+            "client.http",
+            ("direct-verify", "warmup"),
+            None,
+        );
+        for (id, _) in RESPONSE_BYTE_STATS {
+            let reading = unread.reading(id);
+            assert!(
+                reading.value.is_none() && reading.reason.is_some(),
+                "{id}: {reading:?}"
+            );
+        }
+        assert_eq!(unread.invalid.len(), 1, "{:?}", unread.invalid);
+        let historical = Repetition::default().reading("response_bytes_p50");
+        assert_eq!(
+            historical.reason.as_deref(),
+            Some("`response_bytes_p50` was not read")
+        );
+    }
 
     /// Controlled delays, waits, and CPU calibrate the shared measurement
     /// path against references measured independently of it. Each request
@@ -1092,11 +1209,11 @@ mod tests {
         use crate::experiment::Reading;
         use crate::release_server::os::process_cpu_usec;
 
-        wyrd_telemetry::timing::enable();
+        wyrd_benchmark::install().expect("the benchmark recorder installs");
         let request = tracing::Span::none();
         let wait = Duration::from_millis(4);
         let work = Duration::from_millis(1);
-        let before = wyrd_telemetry::timing::snapshot();
+        let before = wyrd_benchmark::snapshot();
         let (mut outer_elapsed, mut outer_own) = (Duration::ZERO, Duration::ZERO);
         for _ in 0..20 {
             let outer = Instant::now();
@@ -1105,7 +1222,7 @@ mod tests {
             std::thread::sleep(wait);
             let excluded = waited.elapsed();
             std::thread::sleep(work);
-            wyrd_telemetry::record_timing(
+            wyrd_benchmark::record_timing(
                 &request,
                 "verification.direct",
                 "completed",
@@ -1115,7 +1232,7 @@ mod tests {
             outer_elapsed = outer_elapsed.max(outer.elapsed());
             outer_own = outer_own.max(outer.elapsed().saturating_sub(excluded));
         }
-        let interval = wyrd_telemetry::timing::snapshot()
+        let interval = wyrd_benchmark::snapshot()
             .since(&before)
             .expect("one process");
         let mut population = Population::from_interval(interval);
@@ -1228,106 +1345,6 @@ mod tests {
         assert!(early < later);
     }
 
-    /// A two-point streaming selection over one family and a breakdown by
-    /// `point`, as a gateway or verification workload names them.
-    const STREAM: Selection = Selection {
-        histograms: &[
-            (
-                "wyrd_gateway_overhead_seconds",
-                &["stream=\"true\"", "point=\"answer\""],
-            ),
-            (
-                "wyrd_gateway_overhead_seconds",
-                &["stream=\"true\"", "point=\"end\""],
-            ),
-            ("wyrd_gateway_overhead_seconds", &["stream=\"false\""]),
-        ],
-        breakdown: &[
-            ("wyrd_gateway_overhead_seconds", "point"),
-            ("outbox_write_seconds", ""),
-        ],
-        prefix: "wyrd_gateway_",
-    };
-
-    /// One `wyrd_gateway_overhead_seconds` series of `stream` and `point`
-    /// with cumulative bucket counts at bounds 0.001 and `+Inf`, and its sum.
-    fn series(stream: &str, point: &str, fast: f64, total: f64, sum: f64) -> String {
-        let labels = format!("stream=\"{stream}\",point=\"{point}\"");
-        format!(
-            "wyrd_gateway_overhead_seconds_bucket{{{labels},le=\"0.001\"}} {fast}\n\
-             wyrd_gateway_overhead_seconds_bucket{{{labels},le=\"+Inf\"}} {total}\n\
-             wyrd_gateway_overhead_seconds_sum{{{labels}}} {sum}\n\
-             wyrd_gateway_overhead_seconds_count{{{labels}}} {total}\n"
-        )
-    }
-
-    /// Shared readings keep each label selection independent, count a series
-    /// first exported mid-window from zero, give an idle selection no mean,
-    /// and keep only breakdown components that gained an observation.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a delta, mean, or component is wrong.
-    #[test]
-    fn shared_measurements_preserve_workload_deltas() {
-        let before = Metrics::parse(&format!(
-            "{}{}outbox_write_seconds_sum 2\noutbox_write_seconds_count 4\n",
-            series("true", "answer", 10.0, 10.0, 0.005),
-            series("false", "answer", 3.0, 3.0, 0.001),
-        ));
-        let after = Metrics::parse(&format!(
-            "{}{}{}outbox_write_seconds_sum 2\noutbox_write_seconds_count 4\n",
-            series("true", "answer", 1009.0, 1010.0, 0.505),
-            series("true", "end", 0.0, 20.0, 0.4),
-            series("false", "answer", 3.0, 3.0, 0.001),
-        ));
-        let telemetry = Readings::read(&before, STREAM).since(&after);
-
-        let answer = telemetry.histogram(STREAM.histograms[0]);
-        assert_eq!((answer.count, answer.sum), (1000.0, 0.5));
-        assert_eq!(answer.buckets, [(0.001, 999.0), (f64::INFINITY, 1000.0)]);
-        assert_eq!(answer.mean(), Some(0.0005));
-
-        let end = telemetry.histogram(STREAM.histograms[1]);
-        assert_eq!(end.count, 20.0);
-        assert_eq!(end.buckets, [(0.001, 0.0), (f64::INFINITY, 20.0)]);
-        assert_eq!(end.mean(), Some(0.02));
-
-        let buffered = telemetry.histogram(STREAM.histograms[2]);
-        assert_eq!(buffered.count, 0.0);
-        assert_eq!(buffered.mean(), None);
-
-        assert_eq!(
-            telemetry
-                .histogram(("wyrd_gateway_overhead_seconds", &[]))
-                .count,
-            0.0,
-            "an unselected key reads empty"
-        );
-        let components: Vec<&String> = telemetry.breakdown.keys().collect();
-        assert_eq!(
-            components,
-            ["overhead{point=answer}", "overhead{point=end}"],
-            "an idle component is dropped and the prefix and unit trimmed"
-        );
-        let (seconds, count) = telemetry.breakdown["overhead{point=answer}"];
-        assert!((seconds - 0.5).abs() < 1e-9 && (count - 1000.0).abs() < f64::EPSILON);
-    }
-
-    /// A bound missing from the earlier reading counts from zero.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a delta is wrong.
-    #[test]
-    fn deltas_count_new_bounds_from_zero() {
-        let after = [(0.1, 4.0), (f64::INFINITY, 6.0)];
-        assert_eq!(
-            deltas(&[(0.1, 1.0)], &after),
-            vec![(0.1, 3.0), (f64::INFINITY, 6.0)]
-        );
-    }
-
     /// A missing or reset cumulative reading has no growth, never zero use.
     ///
     /// # Panics
@@ -1358,8 +1375,9 @@ mod tests {
         assert_eq!(Percentiles::raw(&[], 1.0).p50, None);
     }
 
-    /// A snapshot window is invalid for every dropped, mislabelled, or
-    /// inconsistent observation and for a short or extra count; one case
+    /// A snapshot window is invalid for every dropped, mislabelled, refused,
+    /// or inconsistent observation and for a short or extra count, and keeps
+    /// its standard metrics, an unregistered one missing; one case
     /// and phase never satisfies another's count; scanned facts average as
     /// bounds of their bucketed totals and a query without one is missing,
     /// never zero.
@@ -1395,11 +1413,12 @@ mod tests {
             missing_bytes: 0,
             out_of_range: 0,
         };
-        let interval = |series, scans, dropped, invalid_labels| TimingInterval {
+        let interval = |series, scans, dropped, invalid_labels| BenchmarkInterval {
             process: "p".to_owned(),
             nanos: 1,
             series,
             scans,
+            metrics: Vec::new(),
             dropped,
             invalid_labels,
         };
@@ -1450,20 +1469,38 @@ mod tests {
         );
         assert_eq!(mixed.reconciliation[1].recorded, 1);
 
-        let broken = Population::from_interval(interval(
+        let mut broken = interval(
             vec![series(UNLABELLED, UNLABELLED, &[1], 1)],
             vec![scan(&[3], 1)],
             2,
             3,
-        ));
+        );
+        broken.metrics = vec![IntervalMetric {
+            name: "outbox_items_written_total".to_owned(),
+            labels: [("outbox".to_owned(), "scribe".to_owned())].into(),
+            rejected: 2,
+            value: IntervalValue::Counter(5),
+        }];
+        let broken = Population::from_interval(broken);
         assert_eq!(
             broken.invalid,
             [
-                "2 timing observations overflowed the server's series bound and were dropped",
+                "2 observations overflowed the server's series bounds and were dropped",
                 "3 requests declared an unknown benchmark case or phase",
                 "`bifrost.query` (success, case none, phase none) has 1 durations outside the trackable range",
                 "`bifrost.query` (success, case none, phase none) recorded 1 elapsed observations for 2 requests",
+                "metric outbox_items_written_total refused 2 unrepresentable updates",
             ]
+        );
+        assert_eq!(
+            broken.counter("outbox_items_written_total", &[("outbox", "scribe")]),
+            Some(5),
+            "the window keeps its standard metrics"
+        );
+        assert_eq!(
+            broken.counter("outbox_items_written_total", &[("outbox", "audit")]),
+            None,
+            "an unregistered counter is missing, never zero"
         );
         assert_eq!(
             broken.scanned_per_query("success")[0].value,

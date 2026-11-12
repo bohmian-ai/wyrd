@@ -28,12 +28,11 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
 use wyrd_testing::Bootstrap;
 use wyrd_testing::bifrost::shared_process_telemetry_for_test;
-use wyrd_testing::capacity::Histogram;
 use wyrd_testing::gateway_capture::{GatewayCapture, PacedUpstream, Pacing};
-use wyrd_testing::release_server::Metrics;
+use wyrd_testing::release_server::{Histogram, Metrics};
 
 use crate::harness::{
-    INVOKER_ROLE, Journey, api_key, openai_code, refusal, within_one_limit_window,
+    INVOKER_ROLE, Journey, api_key, openai_code, refusal, tokens, within_one_limit_window,
 };
 
 /// Address the failover call requests; its fallback is `acme-second/m`.
@@ -197,6 +196,130 @@ async fn a_retryable_refusal_fails_over_and_a_limit_refuses_before_dispatch() {
         dispatched,
         "a limited call reaches no provider"
     );
+}
+
+/// Proves governed calls answer from the server's in-memory governance while
+/// their usage persists in the background, and that a restarted server
+/// enforces the committed usage.
+///
+/// Every quota usage table is held against writes while a call limited to
+/// two requests per minute answers; once released, background work persists
+/// the request. The second call answers and the third is refused with the
+/// stable limit code before dispatch. A restarted, cold server refuses its
+/// first call with the retryable `503` before dispatch, loads the tenant in
+/// the background, and then refuses with the limit from committed usage.
+///
+/// # Panics
+/// Panics when a status, refusal code, persisted count, or dispatch count
+/// expectation fails.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn gateway_cached_governance_answers_before_background_accounting() {
+    let journey = Journey::start().await;
+    Mock::given(method("POST"))
+        .and(path("/first/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(GatewayCapture::completion()))
+        .mount(&journey.upstream)
+        .await;
+    deploy_compatible(&journey, "acme-first", "/first").await;
+    journey
+        .put(
+            "governance-policy",
+            json!({
+                "limits": [{"subject": "tenant", "target": "all", "requests_per_minute": 2,
+                            "tokens_per_minute": null, "concurrent_calls": null}],
+                "budgets": [],
+                "pricing": [],
+                "unknown_cost": "allow_unpriced",
+            }),
+        )
+        .await;
+    let tenant = journey.server.data_tenant_id();
+    let bearer = vec![("authorization", format!("Bearer {}", journey.caller))];
+    let call = || chat("acme-first/m");
+    within_one_limit_window(Duration::from_secs(30)).await;
+
+    let mut held = journey
+        .server
+        .tenant_conn_for(tenant)
+        .await
+        .expect("tenant conn");
+    sqlx::query(
+        "LOCK TABLE wyrd.gateway_accounting_entries, wyrd.gateway_usage_windows, \
+         wyrd.gateway_usage_concurrency IN SHARE MODE",
+    )
+    .execute(&mut **held.transaction())
+    .await
+    .expect("usage tables lock");
+    let answered = journey.post("/v1/chat/completions", &bearer, &call()).await;
+    assert_eq!(
+        answered.status().as_u16(),
+        200,
+        "the call answers while its usage cannot persist"
+    );
+    held.commit().await.expect("usage tables release");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while persisted_requests(&journey, tenant).await != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("background work persists the request");
+
+    let answered = journey.post("/v1/chat/completions", &bearer, &call()).await;
+    assert_eq!(answered.status().as_u16(), 200);
+    refusal(
+        journey.post("/v1/chat/completions", &bearer, &call()).await,
+        429,
+        "WYRD_GATEWAY_429_LIMIT_EXCEEDED",
+        openai_code,
+    )
+    .await;
+    assert_eq!(journey.upstream_calls().await.len(), 2);
+
+    let journey = journey.restart().await;
+    let bearer = vec![("authorization", format!("Bearer {}", journey.caller))];
+    refusal(
+        journey
+            .post_once("/v1/chat/completions", &bearer, &call())
+            .await,
+        503,
+        "WYRD_SERVER_503_SERVICE_UNAVAILABLE",
+        openai_code,
+    )
+    .await;
+    refusal(
+        journey.post("/v1/chat/completions", &bearer, &call()).await,
+        429,
+        "WYRD_GATEWAY_429_LIMIT_EXCEEDED",
+        openai_code,
+    )
+    .await;
+    assert_eq!(
+        journey.upstream_calls().await.len(),
+        2,
+        "no refused call reaches the provider"
+    );
+}
+
+/// Requests every server has persisted against `tenant`'s limit windows.
+///
+/// # Panics
+/// Panics when the read fails.
+async fn persisted_requests(journey: &Journey, tenant: DataTenantId) -> i64 {
+    let mut conn = journey
+        .server
+        .tenant_conn_for(tenant)
+        .await
+        .expect("tenant conn");
+    let requests: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(requests), 0)::int8 FROM wyrd.gateway_usage_windows",
+    )
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("windows read");
+    conn.commit().await.expect("read commits");
+    requests
 }
 
 /// Proves that a caller who goes away mid-call leaves settled accounting.
@@ -564,6 +687,178 @@ async fn capacity_capture_accounting_waits_for_post_response_work() {
     assert_eq!(
         journey.captured_calls(&inspector, 3).await.len(),
         3,
+        "the tenant reads every captured call"
+    );
+}
+
+/// Proves a benchmark-mode server answers, captures, and accounts through
+/// the benchmark recorder alone.
+///
+/// The process selects the benchmark backend through the server's own
+/// startup selection before the server registers any metric, so no
+/// Prometheus recorder can install beside it. A labelled buffered call and
+/// stream are answered in full; once the call tracker and the Scribe outbox
+/// drain, one snapshot interval holds each handoff timing in its case and
+/// phase with a valid population, exactly their two staged captures, the
+/// Scribe outbox writes that carried them, both calls' accounting phase,
+/// no loss, nothing pending, and nothing dropped; no production handoff
+/// histogram repeats a timed duration; and the tenant reads both captured
+/// calls.
+///
+/// # Panics
+/// Panics when a call, snapshot, count, or capture-row expectation fails.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn benchmark_mode_keeps_capture_and_snapshot_counts_without_prometheus() {
+    let backend = wyrd_server::app::metrics::MetricsBackend::install(true)
+        .expect("the benchmark backend installs first");
+    assert!(backend.prometheus().is_none());
+    assert!(
+        wyrd_server::app::metrics::install_recorder().is_err(),
+        "no Prometheus recorder installs beside the benchmark recorder"
+    );
+    let journey = Journey::start().await;
+    Mock::given(method("POST"))
+        .and(path("/timed/v1/chat/completions"))
+        .and(body_string_contains("\"stream\":true"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(
+                    GatewayCapture::chat_events("chatcmpl-1", 2),
+                    "text/event-stream",
+                )
+                .set_delay(UPSTREAM_DELAY),
+        )
+        .with_priority(1)
+        .mount(&journey.upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/timed/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(GatewayCapture::completion())
+                .set_delay(UPSTREAM_DELAY),
+        )
+        .with_priority(2)
+        .mount(&journey.upstream)
+        .await;
+    deploy_compatible(&journey, "acme-first", "/timed").await;
+    journey
+        .put(
+            "capture-policy",
+            json!({"mode": "metadata", "payload_fields": []}),
+        )
+        .await;
+    let inspector = api_key(&journey.server, "capacity_inspector", &["admin"]).await;
+    let labelled = |case: &str| {
+        vec![
+            ("authorization", format!("Bearer {}", journey.caller)),
+            (wyrd_benchmark::CASE_HEADER, case.to_owned()),
+            (wyrd_benchmark::PHASE_HEADER, "steady".to_owned()),
+        ]
+    };
+    let before = wyrd_benchmark::snapshot();
+
+    let buffered = journey
+        .post(
+            "/v1/chat/completions",
+            &labelled("buffered-1kib-capture-metadata"),
+            &chat("acme-first/m"),
+        )
+        .await;
+    assert_eq!(buffered.status().as_u16(), 200);
+    buffered.json::<Value>().await.expect("buffered answer");
+    let mut streamed = chat("acme-first/m");
+    streamed["stream"] = json!(true);
+    let streamed = journey
+        .post(
+            "/v1/chat/completions",
+            &labelled("streamed-1kib-capture-metadata"),
+            &streamed,
+        )
+        .await;
+    assert_eq!(streamed.status().as_u16(), 200);
+    assert!(
+        streamed
+            .text()
+            .await
+            .expect("complete stream")
+            .ends_with("data: [DONE]\n\n")
+    );
+    journey.drain_calls().await;
+    journey
+        .server
+        .await_audit_retained()
+        .await
+        .expect("the Scribe outbox settles");
+
+    let after = wyrd_benchmark::snapshot();
+    let (first, last) = (
+        Metrics::of_snapshot(&before).expect("a complete opening snapshot"),
+        Metrics::of_snapshot(&after).expect("a complete drained snapshot"),
+    );
+    let interval = after.since(&before).expect("one process");
+    let population = wyrd_testing::capacity::Population::from_interval(interval.clone());
+    assert!(population.invalid.is_empty(), "{:?}", population.invalid);
+    assert_eq!(interval.dropped, 0, "the server's series fit their bounds");
+    for (boundary, case) in [
+        ("gateway.buffered", "buffered-1kib-capture-metadata"),
+        ("gateway.stream.head", "streamed-1kib-capture-metadata"),
+        ("gateway.stream.end", "streamed-1kib-capture-metadata"),
+    ] {
+        let recorded: u64 = population
+            .only(case, "steady")
+            .series
+            .iter()
+            .filter(|series| series.boundary == boundary && series.outcome == "succeeded")
+            .map(|series| series.count)
+            .sum();
+        assert_eq!(recorded, 1, "{boundary} of {case}");
+    }
+    let scribe = ["outbox=\"scribe\""];
+    assert_eq!(
+        delta(
+            &first,
+            &last,
+            "wyrd_gateway_capture_total",
+            &["outcome=\"staged\""]
+        ),
+        2.0,
+        "both calls stage their capture"
+    );
+    assert!(
+        delta(&first, &last, "outbox_write_seconds_count", &scribe) > 0.0,
+        "the Scribe outbox writer ran"
+    );
+    assert_eq!(
+        delta(
+            &first,
+            &last,
+            "wyrd_gateway_phase_duration_seconds_count",
+            &["phase=\"account\""]
+        ),
+        2.0,
+        "both calls are accounted"
+    );
+    assert_eq!(
+        delta(&first, &last, "outbox_events_lost_total", &[]),
+        0.0,
+        "nothing is lost"
+    );
+    assert_eq!(
+        last.sum("outbox_pending", &scribe),
+        0.0,
+        "the drain leaves nothing pending"
+    );
+    assert!(
+        interval
+            .histogram("wyrd_gateway_duration_seconds", &[])
+            .is_err(),
+        "a timed handoff is not counted again"
+    );
+    assert_eq!(
+        journey.captured_calls(&inspector, 2).await.len(),
+        2,
         "the tenant reads every captured call"
     );
 }
@@ -1105,5 +1400,253 @@ async fn gateway_capacity_paces_streams_isolates_tenants_and_recovers() {
                 "{file} lives only under {prefix}"
             );
         }
+    }
+}
+
+/// The judge Verifier of the Verification benchmark's model steps: one Agent
+/// check over slot `answer`, routed through deployment `bench-judge` for one
+/// iteration, answering a plain cited Verdict.
+const JUDGE: &str = "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: bench-judge\n  version: 1.0.0\nspec:\n  inputs:\n    answer: {type: json}\n  requirements:\n    - id: judged\n      statement: The answer is acceptable.\n      check:\n        kind: agent\n        inputs: {answer: inputs.answer}\n        agent:\n          execution_route: {kind: wyrd_gateway, deployment: bench-judge}\n          run_config: {max_iterations: 1}\n          prompt:\n            provider: openai\n            model: gpt-4o\n            messages:\n              - {role: user, content: \"Judge {{answer}}\"}\n            response_format: verdict\n";
+
+/// The Model the judge verifies.
+const JUDGED_MODEL: &str = "apiVersion: wyrd/v1\nkind: Model\nmetadata:\n  name: bench-model\n  version: 1.0.0\nspec:\n  interface:\n    kind: Custom\n    meta:\n      framework_version: 0.1.0\n      loader_module: fixture\n      loader_class: TinyModel\n      extra: {}\n  task_type: Other\n  signature:\n    inputs:\n      - name: f0\n        dtype: float64\n    outputs:\n      - name: score\n        dtype: float64\n  card_refs: []\n";
+
+/// The Service binding the judge to the Model.
+const JUDGED_SERVICE: &str = "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: bench-service-0\n  version: 1.0.0\nspec:\n  components:\n    - alias: model\n      ref: ./model.yaml\n      verified_by:\n        - verifier: ./judge.yaml\n";
+
+/// A public client of `journey`'s server presenting `credential`.
+///
+/// # Panics
+/// Panics when the client configuration is refused.
+fn sdk(journey: &Journey, credential: &SecretString) -> wyrd_client::WyrdClient {
+    wyrd_client::WyrdClient::with_config(wyrd_client::config::ClientConfig {
+        grpc: wyrd_client::transport::GrpcConfig {
+            endpoint: journey.server.grpc_url().expect("gRPC url"),
+            connect_retries: 0,
+            ..wyrd_client::transport::GrpcConfig::default()
+        },
+        http: wyrd_client::transport::HttpConfig {
+            base_url: journey.base.clone(),
+            ..wyrd_client::transport::HttpConfig::default()
+        },
+        credential: Some(credential.clone()),
+        ..wyrd_client::config::ClientConfig::default()
+    })
+    .expect("the client builds")
+}
+
+/// Proves the Verification benchmark's model path end to end: real SDK →
+/// Verify → Agent check → Gateway → local provider.
+///
+/// A benchmark-mode server, one deployment pointing at the instant local
+/// provider, and the benchmark's judge graph declared, pulled, and loaded
+/// under the Service family's own runtime key. Each labelled `verify` passes
+/// with a citation of slot `answer` and an Agent provenance on the declared
+/// route; the provider answers exactly once per verification; one snapshot
+/// interval holds every driver, server, and provider observation in the
+/// model case with a valid population, and the Gateway phases of both
+/// calls, which have no request arrival to time; each captured call settles the
+/// provider's fixed usage; and nothing is lost or left pending. A runtime key
+/// of another Service family cannot act as this Service root and is refused
+/// before any model call.
+///
+/// # Panics
+/// Panics when a verdict, count, observation, usage, or refusal expectation
+/// fails.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn model_verification_benchmark_records_the_complete_local_path() {
+    use wyrd_client::cards::{BundleMode, CardGraphPuller, CardSelector, Cards};
+    use wyrd_client::state::WyrdState;
+    use wyrd_client::transport::trace::with_benchmark_labels;
+    use wyrd_spec::auth::{
+        CreateServicePrincipalRequest, WorkloadFamily, WorkloadKind, WorkloadRestriction,
+    };
+    use wyrd_spec::verification::VerificationVerdict;
+    use wyrd_spec::verification::execution::CallProvenance;
+
+    const CASE: &str = "direct-verify-model";
+    wyrd_server::app::metrics::MetricsBackend::install(true)
+        .expect("the benchmark backend installs first");
+    let journey = Journey::start().await;
+    let instant = Pacing {
+        buffered_delay: Duration::ZERO,
+        buffered_bytes: 0,
+        stream_delay: Duration::ZERO,
+        chunks: 0,
+        chunk_interval: Duration::ZERO,
+    };
+    let provider =
+        PacedUpstream::answering(instant, 8, &GatewayCapture::verdict_completion("answer"))
+            .await
+            .expect("the local provider binds");
+    deploy_at(
+        &journey,
+        &journey.admin,
+        "bench-judge",
+        &format!("{}/v1", provider.uri()),
+    )
+    .await;
+    journey.capture_metadata().await;
+
+    let directory = tempfile::tempdir().expect("graph directory");
+    for (name, body) in [
+        ("judge.yaml", JUDGE),
+        ("model.yaml", JUDGED_MODEL),
+        ("service.yaml", JUDGED_SERVICE),
+    ] {
+        std::fs::write(directory.path().join(name), body).expect("card file");
+    }
+    let admin = sdk(
+        &journey,
+        &api_key(&journey.server, "judge_admin", &["admin"]).await,
+    );
+    let cards = Cards::connect_with(&admin).await.expect("cards connect");
+    let service = Box::pin(cards.declare_from_path(&directory.path().join("service.yaml")))
+        .await
+        .expect("the judge graph declares");
+    let principals = wyrd_client::Principals::connect_with(&admin)
+        .await
+        .expect("principals connect");
+    let runtime = |family: &wyrd_spec::ids::CardName| CreateServicePrincipalRequest {
+        name: format!("{family}-runtime"),
+        roles: vec!["workload".to_owned()],
+        description: None,
+        workload_restriction: Some(WorkloadRestriction::Family(WorkloadFamily {
+            kind: WorkloadKind::Service,
+            name: family.clone(),
+        })),
+    };
+    let owner = principals
+        .create_service_principal(&runtime(&service.root.name))
+        .await
+        .expect("the Service runtime account is created");
+    let stranger = principals
+        .create_service_principal(&runtime(&"another-service".parse().expect("a Card name")))
+        .await
+        .expect("another family's account is created");
+    let bundle = directory.path().join("bundle");
+    Box::pin(CardGraphPuller::new(cards.registry_context()).pull(
+        &CardSelector::exact(service.root.clone()),
+        &bundle,
+        BundleMode::Complete,
+    ))
+    .await
+    .expect("the bundle pulls");
+    let key = |issued: &wyrd_spec::auth::CreateServicePrincipalResponse| {
+        SecretString::from(issued.credential.expose().to_owned())
+    };
+    let state = WyrdState::from_path_with(&bundle, sdk(&journey, &key(&owner)))
+        .expect("the application loads its bundle");
+
+    let before = wyrd_benchmark::snapshot();
+    let mut judgments = Vec::new();
+    for sequence in 0..2 {
+        let run = state.run_for_card("model").expect("a Run for the model");
+        let judged = with_benchmark_labels(
+            CASE,
+            "steady",
+            run.observe()
+                .verify("bench-judge", json!({ "sequence": sequence })),
+        )
+        .await
+        .expect("the judge answers");
+        assert_eq!(judged.outcome.verdict, VerificationVerdict::Passed);
+        let [requirement] = judged.outcome.requirements.as_slice() else {
+            panic!("one requirement: {:?}", judged.outcome.requirements);
+        };
+        assert_eq!(
+            requirement
+                .citations
+                .iter()
+                .map(|citation| citation.slot.as_str())
+                .collect::<Vec<_>>(),
+            ["answer"]
+        );
+        judgments.push(judged.execution_id);
+    }
+    assert_eq!(provider.held(), 2, "one provider answer per verification");
+
+    let refused = WyrdState::from_path_with(&bundle, sdk(&journey, &key(&stranger)))
+        .expect("the bundle loads under any key")
+        .run_for_card("model")
+        .expect("a Run for the model")
+        .observe()
+        .verify("bench-judge", json!({ "sequence": 2 }))
+        .await
+        .expect_err("another family's key is refused");
+    assert_eq!(
+        refused.code(),
+        "WYRD_AUTH_401_WORKLOAD_UID_REFUSED",
+        "{refused:?}"
+    );
+    assert_eq!(provider.held(), 2, "a refusal reaches no model");
+
+    let usage = journey.settled_usage(2).await;
+    assert_eq!(usage, [tokens(11, 4), tokens(11, 4)], "fixed usage settles");
+    journey
+        .server
+        .await_audit_retained()
+        .await
+        .expect("the Scribe outbox settles");
+    let after = wyrd_benchmark::snapshot();
+    let interval = after.since(&before).expect("one process");
+    assert_eq!(interval.dropped, 0, "every series fits its bound");
+    let population = wyrd_testing::capacity::Population::from_interval(interval);
+    assert!(population.invalid.is_empty(), "{:?}", population.invalid);
+    let cohort = population.only(CASE, "steady");
+    for (boundary, outcome) in [
+        ("client.verify", wyrd_benchmark::SUCCESS),
+        ("client.http", wyrd_benchmark::SUCCESS),
+        ("verification.direct", "completed"),
+        ("fixture.upstream", wyrd_benchmark::SUCCESS),
+    ] {
+        let recorded: u64 = cohort
+            .series
+            .iter()
+            .filter(|series| series.boundary == boundary && series.outcome == outcome)
+            .map(|series| series.count)
+            .sum();
+        assert_eq!(recorded, 2, "{boundary} in the model case");
+    }
+    let (first, last) = (
+        Metrics::of_snapshot(&before).expect("a complete opening snapshot"),
+        Metrics::of_snapshot(&after).expect("a complete drained snapshot"),
+    );
+    assert_eq!(
+        delta(
+            &first,
+            &last,
+            "wyrd_gateway_phase_duration_seconds_count",
+            &["phase=\"account\""]
+        ),
+        2.0,
+        "the Gateway governs each model call, which records phases only"
+    );
+    assert_eq!(delta(&first, &last, "outbox_events_lost_total", &[]), 0.0);
+    assert_eq!(last.sum("outbox_pending", &["outbox=\"scribe\""]), 0.0);
+
+    // What each judgment ran is an explicit read, outside the measured interval.
+    for execution in judgments {
+        let details = wyrd_client::verify::Execution::connect_with(execution, &admin)
+            .await
+            .expect("the execution handle connects")
+            .details()
+            .await
+            .expect("the retained execution has details");
+        let [requirement] = details.outcome.requirements.as_slice() else {
+            panic!("one requirement: {:?}", details.outcome.requirements);
+        };
+        assert!(
+            matches!(
+                &requirement.provenance,
+                Some(CallProvenance::Agent { route, .. })
+                    if *route == wyrd_spec::ExecutionRoute::WyrdGateway {
+                        deployment: "bench-judge".parse().expect("deployment name"),
+                    }
+            ),
+            "{:?}",
+            requirement.provenance
+        );
     }
 }

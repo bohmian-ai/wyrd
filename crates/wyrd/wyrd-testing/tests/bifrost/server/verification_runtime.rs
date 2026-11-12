@@ -72,7 +72,8 @@ use wyrd_spec::vala::managed_columns::{
 use wyrd_spec::vala::{AuditDetail, BifrostError, audit_detail_canonical_json};
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
-    InputDeclaration, RequirementDetail, RequirementOutcome, RequirementResult, VerificationOutcome,
+    ExecutedOutcome, ExecutedRequirement, InputDeclaration, RequirementDetail, RequirementOutcome,
+    RequirementResult,
 };
 use wyrd_spec::verification::{DriftReport, DriftVerdict, DriftWindow, VerificationVerdict};
 use wyrd_testing::bifrost::{BifrostClusterSpec, RawIngest, WyrdTestCluster, canonical_signals};
@@ -118,7 +119,7 @@ fn two_feature_report() -> Result<DriftReport, ServerJourneyError> {
 ///
 /// # Errors
 /// Returns an error when the requirement id or check does not decode.
-fn drift_outcome(report: Option<DriftReport>) -> Result<VerificationOutcome, ServerJourneyError> {
+fn drift_outcome(report: Option<DriftReport>) -> Result<ExecutedOutcome, ServerJourneyError> {
     let (outcome, verdict) = match report.as_ref().map(|report| report.verdict) {
         Some(DriftVerdict::Drift) => (RequirementOutcome::Failed, VerificationVerdict::Failed),
         Some(DriftVerdict::NoDrift) => (RequirementOutcome::Passed, VerificationVerdict::Passed),
@@ -127,20 +128,22 @@ fn drift_outcome(report: Option<DriftReport>) -> Result<VerificationOutcome, Ser
             VerificationVerdict::Inconclusive,
         ),
     };
-    Ok(VerificationOutcome {
+    Ok(ExecutedOutcome {
         verdict,
-        requirements: vec![RequirementResult {
-            id: TaskId::new("drift")?,
-            step: None,
-            item_index: None,
-            iteration_index: None,
-            statement: "The window does not drift.".to_owned(),
-            outcome,
-            reason: "scored by the journey".to_owned(),
-            actual: None,
-            citations: Vec::new(),
-            data: None,
-            detail: report.map(RequirementDetail::Drift),
+        requirements: vec![ExecutedRequirement {
+            result: RequirementResult {
+                id: TaskId::new("drift")?,
+                step: None,
+                item_index: None,
+                iteration_index: None,
+                statement: "The window does not drift.".to_owned(),
+                outcome,
+                reason: "scored by the journey".to_owned(),
+                actual: None,
+                citations: Vec::new(),
+                data: None,
+                detail: report.map(RequirementDetail::Drift),
+            },
             check: serde_json::from_value::<Check>(json!({
                 "kind": "assert", "path": "inputs.x", "operator": "equals", "expected": true
             }))?,
@@ -2886,9 +2889,9 @@ fn expect_eq<T: PartialEq + Debug>(
 /// back as.
 struct PublishedResults {
     /// A Drift result whose requirement scored two features.
-    scored_drift: (VerificationResultId, VerificationOutcome),
+    scored_drift: (VerificationResultId, ExecutedOutcome),
     /// A Drift result whose window could not be scored.
-    unscored_drift: (VerificationResultId, VerificationOutcome),
+    unscored_drift: (VerificationResultId, ExecutedOutcome),
     /// The Service both results judge, which also owns their bindings.
     subject: CardUid,
     /// The tenant SYSTEM principal that wrote both results.
@@ -3950,7 +3953,8 @@ async fn reloaded_authority_cannot_widen_gateway_access() -> Result<(), ServerJo
             .expect("the model reference is valid"),
         fallback: None,
         body: json!({ "model": "openai/gpt-test",
-            "messages": [{ "role": "user", "content": "hi" }] }),
+            "messages": [{ "role": "user", "content": "hi" }] })
+        .into(),
         media: None,
         batch: None,
         deployment: None,
@@ -3989,7 +3993,7 @@ async fn reloaded_authority_cannot_widen_gateway_access() -> Result<(), ServerJo
             server.base_url().ok_or("missing HTTP URL")?
         ))
         .bearer_auth(b_token().await?)
-        .json(&call(None).body)
+        .json(call(None).body.tree())
         .send()
         .await?;
     if !fresh.status().is_success() {
@@ -8244,5 +8248,168 @@ async fn custom_query_preserves_evidence_and_limits() -> Result<(), ServerJourne
         }
     }
     cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Queued SDK verification keeps its evidence under every outbox geometry.
+///
+/// A combined node at the four-CPU baseline and at sixteen CPUs, and a split
+/// Oracle/Scribe pair at sixteen CPUs whose producer has no local Scribe, each
+/// take more independent queued executions than the process has outbox
+/// lanes. A caller without the runner role is refused before anything is
+/// queued. Each
+/// accepted execution reaches the queue only once Scribe acknowledged it,
+/// completes through the real runtime, and publishes exactly one passing
+/// result attributed to the submitting service, readable through Oracle
+/// after the outbox drains and the node shuts down cleanly.
+///
+/// # Errors
+/// Returns cluster, seeding, route, runtime, or query errors, or a
+/// description of the first expectation that does not hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn scaled_outboxes_preserve_sdk_evidence() -> Result<(), ServerJourneyError> {
+    use wyrd_server::config::BifrostTarget;
+    const EXECUTIONS: usize = 40;
+    for (targets, cpu) in [
+        (&[BifrostTarget::All][..], 4),
+        (&[BifrostTarget::All][..], 16),
+        (&[BifrostTarget::Oracle, BifrostTarget::Scribe][..], 16),
+    ] {
+        let mut spec = BifrostClusterSpec::for_targets(targets);
+        for node in &mut spec.nodes {
+            if let Some(observed) = node
+                .oracle
+                .as_mut()
+                .and_then(|oracle| oracle.system_resources.as_mut())
+            {
+                observed.effective_cpu = cpu;
+            }
+        }
+        let cluster = WyrdTestCluster::start_spec(spec).await?;
+        let tenant = cluster.data_tenant_id();
+        let producer = cluster.server(0).ok_or("missing producer node")?;
+        let scribe = cluster
+            .servers()
+            .find(|server| server.bifrost_scribe().is_some())
+            .ok_or("the cluster composed no Scribe")?;
+        let seed = VerificationFixture::provision(producer.state(), tenant).await?;
+        let (subject, _) = seed.service("scaled-subject").await?;
+        let verifier = assert_verifier(&seed, "scaled-assert").await?;
+        producer
+            .seed_role(
+                QUEUED_RUNNER,
+                &[Permission::card_read(), Permission::verifier_run_any()],
+            )
+            .await?;
+        let caller = producer
+            .bootstrap_service("scaled-caller", &[QUEUED_RUNNER])
+            .await?;
+        let client = super::query::client_for(
+            producer,
+            caller.api_key().ok_or("the caller carries an API key")?,
+        )?;
+        let inputs = json!({ "x": { "kind": "json", "value": true } });
+
+        let outsider = producer.bootstrap_service("scaled-outsider", &[]).await?;
+        let refused = super::query::client_for(
+            producer,
+            outsider
+                .api_key()
+                .ok_or("the outsider carries an API key")?,
+        )?
+        .request_json::<_, Value>(
+            reqwest::Method::POST,
+            "/v1/verification/enqueue",
+            Some(&enqueue_body(&verifier, &subject, inputs.clone())),
+        )
+        .await;
+        if let Ok(accepted) = refused {
+            return Err(
+                format!("a caller without the runner role was accepted: {accepted}").into(),
+            );
+        }
+        let queued = seed.executions().await?;
+        if !queued.is_empty() {
+            return Err(format!("a refused enqueue was queued: {queued:?}").into());
+        }
+
+        let mut accepted = Vec::with_capacity(EXECUTIONS);
+        for _ in 0..EXECUTIONS {
+            let started: Value = client
+                .request_json(
+                    reqwest::Method::POST,
+                    "/v1/verification/enqueue",
+                    Some(&enqueue_body(&verifier, &subject, inputs.clone())),
+                )
+                .await?;
+            accepted.push(await_queued(&seed, &started).await?);
+        }
+        let runtime = VerificationRuntime::builder(producer.state())
+            .build()
+            .ok_or("the runtime did not compose")?;
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(runtime.run(stop.clone()));
+        let deadline = tokio::time::Instant::now() + WAIT;
+        for &execution in &accepted {
+            loop {
+                let row = seed.execution(execution).await?;
+                if row.status == "completed" {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!("{execution} never completed: {row:?}").into());
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        stop.cancel();
+        tokio::time::timeout(WAIT, task).await??;
+
+        let unwritten = producer
+            .state()
+            .bifrost
+            .scribe_outbox()
+            .settle(std::time::Instant::now() + WAIT)
+            .await;
+        if unwritten != 0 {
+            return Err(format!("{unwritten} results never reached Scribe").into());
+        }
+        scribe.flush_bifrost().await?;
+        cluster.refresh_oracle_snapshots().await?;
+        let caller_id = caller.id().as_uuid();
+        let ids = accepted
+            .iter()
+            .map(|execution| format!("'{execution}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rows = query_rows(
+            producer,
+            tenant,
+            format!(
+                "SELECT DISTINCT execution_id FROM bifrost.verification.results \
+                 WHERE CAST(execution_id AS VARCHAR) IN ({ids}) AND verdict = 'passed' \
+                 AND {SUB_PRINCIPAL_ID} = '{caller_id}' AND {SUBJECT_CARD_UID} = '{subject}'"
+            ),
+        )
+        .await?;
+        let all = query_rows(
+            producer,
+            tenant,
+            format!(
+                "SELECT result_id FROM bifrost.verification.results \
+                 WHERE CAST(execution_id AS VARCHAR) IN ({ids})"
+            ),
+        )
+        .await?;
+        if (rows, all) != (EXECUTIONS as u64, EXECUTIONS as u64) {
+            return Err(format!(
+                "{targets:?} at {cpu} CPUs: {rows} attributed executions of {all} results, \
+                 expected {EXECUTIONS} each"
+            )
+            .into());
+        }
+        cluster.shutdown().await?;
+    }
     Ok(())
 }

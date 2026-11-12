@@ -15,9 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::TaskId;
-use super::execution::{
-    InvocationSettlement, Producer, Publication, Speculation, VerificationOutcome,
-};
+use super::execution::{ExecutedOutcome, InvocationSettlement, Producer, Publication, Speculation};
 use super::{VerificationError, VerificationExecutionStatus};
 use crate::auth::Sha256Hex;
 use crate::ids::{CardUid, GroupId, VerificationResultId};
@@ -203,7 +201,7 @@ pub struct TerminalSelection {
     /// When it ended.
     pub ended_at: DateTime<Utc>,
     /// The outcome.
-    pub outcome: VerificationOutcome,
+    pub outcome: ExecutedOutcome,
 }
 
 /// Why a stored state cannot be resumed.

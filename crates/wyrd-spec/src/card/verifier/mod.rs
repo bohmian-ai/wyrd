@@ -21,7 +21,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 use skald_spec::MediaFormat;
 
-use crate::card::agent::AgentSpec;
+use crate::card::agent::{AgentSpec, Compiled, PromptForm};
 use crate::card::drift::DriftSpec;
 use crate::card::operator::OperatorSpec;
 use crate::card::prompt::ParameterName;
@@ -175,7 +175,7 @@ impl JsonSchema for InputSlotSchema {
     /// One of the typed slot objects or the source reference string.
     fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         schemars::json_schema!({
-            "description": "One named evidence slot. Slots are required unless `required: false`.",
+            "description": "One named evidence slot. Missing evidence leaves the checks that need it inconclusive.",
             "oneOf": [
                 generator.subschema_for::<InputSlot>(),
                 generator.subschema_for::<SourceText>(),
@@ -224,8 +224,12 @@ impl utoipa::ToSchema for InputSlotSchema {
     }
 }
 
-/// One named evidence slot. Slots are required unless `required: false`;
-/// samples and source slots are always required.
+/// One named evidence slot.
+///
+/// No slot is optional: evidence a caller omits stays missing, never `null`,
+/// so every check that needs it is inconclusive while independent checks
+/// still run. A `json` slot's schema alone decides whether a supplied `null`
+/// is admitted.
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -236,9 +240,6 @@ pub enum InputSlot {
         /// JSON Schema the value must satisfy.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         schema: Option<Value>,
-        /// Whether a caller must supply the slot.
-        #[serde(default = "required_default", skip_serializing_if = "is_true")]
-        required: bool,
     },
     /// A pinned file in one of the accepted formats.
     Media {
@@ -248,21 +249,13 @@ pub enum InputSlot {
         /// Lower size bound than the deployment limit.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_bytes: Option<u64>,
-        /// Whether a caller must supply the slot.
-        #[serde(default = "required_default", skip_serializing_if = "is_true")]
-        required: bool,
     },
     /// A trace resolved through tenant-scoped trace reads.
-    Trace {
-        /// Whether a caller must supply the slot.
-        #[serde(default = "required_default", skip_serializing_if = "is_true")]
-        required: bool,
-    },
+    Trace {},
     /// Feature measurements or metric samples recorded for a scheduled window.
     ///
-    /// Always required: a schedule binding supplies every samples slot of its
-    /// Verifier from the subject's recorded measurements, so the slot has no
-    /// `required` field and no drift check can be omitted by configuration.
+    /// A schedule binding supplies every samples slot of its Verifier from
+    /// the subject's recorded measurements.
     Samples {
         /// Measurement names, including metric names.
         features: Vec<FeatureName>,
@@ -294,9 +287,6 @@ enum TypedInputSlot {
         /// JSON Schema the value must satisfy.
         #[serde(default)]
         schema: Option<Value>,
-        /// Whether a caller must supply the slot.
-        #[serde(default = "required_default")]
-        required: bool,
     },
     /// [`InputSlot::Media`].
     Media {
@@ -305,16 +295,9 @@ enum TypedInputSlot {
         /// Lower size bound than the deployment limit.
         #[serde(default)]
         max_bytes: Option<u64>,
-        /// Whether a caller must supply the slot.
-        #[serde(default = "required_default")]
-        required: bool,
     },
     /// [`InputSlot::Trace`].
-    Trace {
-        /// Whether a caller must supply the slot.
-        #[serde(default = "required_default")]
-        required: bool,
-    },
+    Trace {},
     /// [`InputSlot::Samples`].
     Samples {
         /// Measurement names, including metric names.
@@ -369,33 +352,6 @@ impl<'de> Deserialize<'de> for InputSlot {
         }
         deserializer.deserialize_any(Slot)
     }
-}
-
-impl InputSlot {
-    /// Returns whether a value must be supplied for this slot.
-    #[must_use]
-    pub fn required(&self) -> bool {
-        match self {
-            Self::Json { required, .. }
-            | Self::Media { required, .. }
-            | Self::Trace { required } => *required,
-            Self::Samples { .. } | Self::Source(_) => true,
-        }
-    }
-}
-
-/// Serde default making slots required unless declared otherwise.
-fn required_default() -> bool {
-    true
-}
-
-/// Serde skip predicate omitting the default `required: true`.
-#[expect(
-    clippy::trivially_copy_pass_by_ref,
-    reason = "serde skip_serializing_if passes the field by reference"
-)]
-fn is_true(value: &bool) -> bool {
-    *value
 }
 
 /// One preparation step: an action plus the requirements judged on it.
@@ -582,12 +538,17 @@ pub enum Action {
 }
 
 /// One Agent invocation in a step or check position.
+///
+/// `F` is an inline Agent's Prompt form, as in [`AgentSpec`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(deny_unknown_fields)]
-pub struct AgentCall {
+#[cfg_attr(feature = "server", schema(bound = ""))]
+#[serde(deny_unknown_fields, bound = "")]
+#[schemars(rename = "AgentCall", bound = "F: PromptForm")]
+pub struct AgentCall<F: PromptForm = Compiled> {
     /// The Agent, inline, file-authored, or registered.
-    pub agent: InlineableRef<AgentSpec>,
+    #[cfg_attr(feature = "server", schema(value_type = InlineableRef<AgentSpec>))]
+    pub agent: InlineableRef<AgentSpec<F>>,
     /// Injected values keyed by the Prompt's text and media placeholders.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub inputs: BTreeMap<ParameterName, Reference>,
@@ -793,10 +754,19 @@ pub struct Requirement {
 }
 
 /// A verdict-producing requirement check.
+///
+/// `F` is an inline Agent's Prompt form, as in [`AgentSpec`]: compiled to
+/// execute, authored to describe retained evidence.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Check {
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    deny_unknown_fields,
+    bound = ""
+)]
+#[schemars(rename = "Check", bound = "F: PromptForm")]
+pub enum Check<F: PromptForm = Compiled> {
     /// Typed comparison over one value (`path`) or every wildcard match
     /// (`each`); exactly one is set.
     Assert {
@@ -815,7 +785,8 @@ pub enum Check {
     /// Trace assertion over a trace slot.
     Trace(TraceCheck),
     /// An Agent, with any tools it declares, returning the Verdict schema.
-    Agent(AgentCall),
+    #[cfg_attr(feature = "server", schema(value_type = AgentCall))]
+    Agent(AgentCall<F>),
     /// Sandboxed code returning the Verdict schema.
     Code(CodeCheck),
     /// Statistical drift over a samples slot.
@@ -831,7 +802,7 @@ pub enum CheckEvidence {
     Window,
 }
 
-impl Check {
+impl<F: PromptForm> Check<F> {
     /// Returns the evidence mode this check kind needs.
     #[must_use]
     pub fn evidence(&self) -> CheckEvidence {

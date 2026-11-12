@@ -1,7 +1,7 @@
 //! Deterministic leaves-first topological sorting.
 
 use super::{Edge, Node, TopoOrder, identity_key};
-use crate::reference::CardRef;
+use crate::reference::{CardRef, SiblingRef};
 
 /// Errors returned by the pure submission graph operations.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -37,7 +37,7 @@ pub enum GraphError {
         /// Authored component alias.
         alias: String,
         /// Peer card incorrectly declared as a component.
-        component: Box<CardRef>,
+        component: Box<SiblingRef>,
         /// Exact component field containing the invalid reference.
         field: String,
     },
@@ -48,6 +48,14 @@ pub enum GraphError {
         root: Box<CardRef>,
         /// Verifier submission with no incoming `verified_by` binding.
         peer: Box<CardRef>,
+    },
+    /// A sibling without a version names several submissions of its kind and name.
+    #[error("sibling {sibling} matches several submissions {candidates:?}; give it a version")]
+    AmbiguousSibling {
+        /// The versionless sibling reference.
+        sibling: SiblingRef,
+        /// Submissions it could name.
+        candidates: Vec<CardRef>,
     },
     /// A submission spec could not be decoded for typed reference traversal.
     #[error("invalid submission spec: {message}")]

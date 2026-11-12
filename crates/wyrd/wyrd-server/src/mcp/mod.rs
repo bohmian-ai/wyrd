@@ -435,6 +435,12 @@ impl WyrdMcpHandler {
                     .await
                     .map_err(wyrd_error_to_mcp)
             }
+            verification::GET_EXECUTION_DETAILS => {
+                let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
+                self.mcp_get_execution_details(caller, request.arguments)
+                    .await
+                    .map_err(wyrd_error_to_mcp)
+            }
             name @ (verification::LIST_INVOCATIONS
             | verification::LIST_PUBLICATIONS
             | verification::GET_PUBLICATION

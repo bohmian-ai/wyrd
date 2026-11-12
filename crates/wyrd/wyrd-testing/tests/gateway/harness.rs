@@ -287,11 +287,46 @@ impl Journey {
         .await;
     }
 
-    /// Posts `body` to `route` with `headers`.
+    /// Posts `body` to `route` with `headers`, retrying, as a client does,
+    /// the retryable `WYRD_SERVER_503_SERVICE_UNAVAILABLE` a server answers
+    /// while it loads a tenant's gateway state in the background.
+    ///
+    /// # Panics
+    /// Panics when the request cannot be sent or the state does not load
+    /// within ten seconds.
+    pub(crate) async fn post(
+        &self,
+        route: &str,
+        headers: &[(&str, String)],
+        body: &Value,
+    ) -> Response {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let response = self.post_once(route, headers, body).await;
+                if response.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                    return response;
+                }
+                let mut answer = http::Response::builder().status(response.status());
+                if let Some(answered) = answer.headers_mut() {
+                    *answered = response.headers().clone();
+                }
+                let bytes = response.bytes().await.expect("refusal body reads");
+                if !String::from_utf8_lossy(&bytes).contains("WYRD_SERVER_503_SERVICE_UNAVAILABLE")
+                {
+                    return Response::from(answer.body(bytes).expect("refusal rebuilds"));
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the tenant's gateway state loads")
+    }
+
+    /// Posts `body` to `route` with `headers` once.
     ///
     /// # Panics
     /// Panics when the request cannot be sent.
-    pub(crate) async fn post(
+    pub(crate) async fn post_once(
         &self,
         route: &str,
         headers: &[(&str, String)],

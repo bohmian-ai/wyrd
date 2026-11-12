@@ -17,7 +17,7 @@ use wyrd_testing::release_server::PEAK_SAMPLE_INTERVAL_MS;
 
 use async_trait::async_trait;
 use num_traits::ToPrimitive;
-use wyrd_testing::capacity::{Expected, NANOS_PER_MS, Population, Selection, Window};
+use wyrd_testing::capacity::{Expected, NANOS_PER_MS, Population, Window};
 use wyrd_testing::experiment::{ExperimentError, Phase, Reading, Repetition, Step, Workload};
 use wyrd_testing::release_server::LocalServer;
 
@@ -289,7 +289,7 @@ impl Isolated {
             }
         };
         let timings = server.timings().await.map_err(ExperimentError::workload)?;
-        let (opened, before) = Window::open(server, Selection::RESOURCES)
+        let (opened, before) = Window::open(server)
             .await
             .map_err(ExperimentError::workload)?;
         let stop = Instant::now() + window;
@@ -364,6 +364,7 @@ impl Isolated {
             processes: vec!["wyrd-server".to_owned()],
             server_cpu_seconds: usage.server_cpu_seconds,
             peak_memory_bytes: usage.peak_memory_bytes,
+            opening_memory_bytes: usage.opening_memory_bytes,
             memory_interval_ms: PEAK_SAMPLE_INTERVAL_MS,
             driver_cpu_seconds: usage.driver_cpu_seconds,
             ..Repetition::default()
@@ -801,6 +802,10 @@ impl Workload for Isolated {
             .collect()
     }
 
+    fn heap_profile_url(&self) -> Option<String> {
+        self.server.as_ref().map(LocalServer::heap_profile_url)
+    }
+
     /// Runs one closed-loop window of `step`; a warmup runs the same work.
     ///
     /// # Errors
@@ -847,7 +852,7 @@ mod tests {
 
     use std::time::Duration;
 
-    use wyrd_telemetry::timing;
+    use wyrd_benchmark as timing;
     use wyrd_testing::capacity::Population;
     use wyrd_testing::experiment::Repetition;
 
@@ -863,7 +868,7 @@ mod tests {
     /// Panics when a phase reading's samples, bounds, or reason are wrong.
     #[test]
     fn write_phases_read_back_with_populations_and_labelled_gaps() {
-        timing::enable();
+        timing::install().expect("the benchmark recorder installs");
         let before = timing::snapshot();
         let _registry = tracing::subscriber::set_default(tracing_subscriber::registry());
         let request = tracing::info_span!("request");
@@ -878,7 +883,7 @@ mod tests {
         );
         timing::label_request(&request, &headers);
         for (span, sync) in [(request, 3), (tracing::Span::none(), 90)] {
-            wyrd_telemetry::record_timing_parts(
+            wyrd_benchmark::record_timing_parts(
                 &span,
                 "bifrost.scribe.write",
                 "success",

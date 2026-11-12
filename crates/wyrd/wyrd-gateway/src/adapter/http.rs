@@ -8,7 +8,7 @@
 
 use async_trait::async_trait;
 use reqwest::header::HeaderName;
-use serde_json::value::{RawValue, to_raw_value};
+use serde_json::value::RawValue;
 use skald_providers::auth::{
     AnthropicAuth, GoogleApiKeyAuth, GoogleOAuth, JevAuth, OpenAiAuth, VertexAuth,
 };
@@ -17,15 +17,15 @@ use skald_providers::{
     OpenAiMediaRoute, OpenAiRoute, ProviderByteStream, ProviderError, ProviderResult, RetryPolicy,
     VertexClient,
 };
-use skald_spec::{ProviderRequest, ProviderResponse};
+use skald_spec::ProviderRequest;
 use url::Url;
 use wyrd_spec::gateway::{GatewayOperation, ProviderAdapter, ProviderAuth, ProviderDeployment};
 use wyrd_spec::ids::ModelId;
 
 use super::stream::{ChatChunks, Frames, MediaCapture, StreamCapture, relay, relay_media};
 use super::{
-    BatchAction, IngressDialect, MediaRequest, Prepared, Wire, complete, faithful_embeddings,
-    prepare, refusal,
+    Answer, BatchAction, IngressDialect, MediaRequest, NativeBody, Prepared, Unmapped, Wire,
+    complete, faithful_embeddings, prepare, refusal,
 };
 use crate::credential::ProviderSecret;
 use crate::engine::{
@@ -243,27 +243,27 @@ impl Client {
     async fn open(
         self,
         operation: GatewayOperation,
-        prepared: Prepared,
+        prepared: Prepared<'_>,
     ) -> ProviderResult<ProviderByteStream> {
         let body = match &prepared {
-            Prepared::Native(body) => to_raw_value(body),
-            Prepared::Anthropic(request) => to_raw_value(request),
-            Prepared::Google(request) => to_raw_value(request),
-            Prepared::Jev(request) => to_raw_value(request),
+            Prepared::Native(body) => body.to_json(),
+            Prepared::Anthropic(request) => serde_json::to_vec(request),
+            Prepared::Google(request) => serde_json::to_vec(request),
+            Prepared::Jev(request) => serde_json::to_vec(request),
         }
         .map_err(|error| ProviderError::decode("gateway", error))?;
         match (self, prepared) {
             (Self::OpenAi(client), Prepared::Native(_)) => {
-                client.stream_raw(route(operation)?, &body).await
+                client.stream_raw(route(operation)?, body).await
             }
             (Self::Anthropic(client), Prepared::Native(_) | Prepared::Anthropic(_)) => {
-                client.stream_raw(&body).await
+                client.stream_raw(body).await
             }
             (Self::Google(client), Prepared::Native(_) | Prepared::Google(_)) => {
-                client.stream_raw(&body).await
+                client.stream_raw(body).await
             }
             (Self::Vertex(client), Prepared::Native(_) | Prepared::Google(_)) => {
-                client.stream_raw(&body).await
+                client.stream_raw(body).await
             }
             (_, _) => Err(mismatch()),
         }
@@ -276,10 +276,17 @@ impl Client {
     /// Returns the Skald provider error of the exchange, or
     /// [`ProviderError::VariantMismatch`] for a client other than `OpenAI` or a
     /// translated request, which preparation rules out.
-    async fn media(self, media: &MediaRequest, prepared: Prepared) -> ProviderResult<MediaAnswer> {
+    async fn media(
+        self,
+        media: &MediaRequest,
+        prepared: Prepared<'_>,
+    ) -> ProviderResult<MediaAnswer> {
         match (self, prepared) {
+            (Self::OpenAi(client), Prepared::Native(body)) if !media.route.multipart() => {
+                client.send_media_json(media.route, media_json(body)?).await
+            }
             (Self::OpenAi(client), Prepared::Native(body)) => {
-                client.send_media(media.route, &body, &media.files).await
+                client.send_media(media.route, body, &media.files).await
             }
             (_, _) => Err(mismatch()),
         }
@@ -297,11 +304,16 @@ impl Client {
     async fn open_media(
         self,
         media: &MediaRequest,
-        prepared: Prepared,
+        prepared: Prepared<'_>,
     ) -> ProviderResult<ProviderByteStream> {
         match (self, prepared) {
+            (Self::OpenAi(client), Prepared::Native(body)) if !media.route.multipart() => {
+                client
+                    .stream_media_json(media.route, media_json(body)?)
+                    .await
+            }
             (Self::OpenAi(client), Prepared::Native(body)) => {
-                client.stream_media(media.route, &body, &media.files).await
+                client.stream_media(media.route, body, &media.files).await
             }
             (_, _) => Err(mismatch()),
         }
@@ -319,12 +331,12 @@ impl Client {
         self,
         action: &BatchAction,
         native: &str,
-        prepared: Prepared,
+        prepared: Prepared<'_>,
     ) -> ProviderResult<MediaAnswer> {
         match (self, prepared) {
             (Self::OpenAi(client), Prepared::Native(body)) => {
                 let (route, file) = action.route(native);
-                client.send_batch(&route, &body, file.as_ref()).await
+                client.send_batch(&route, body, file.as_ref()).await
             }
             (_, _) => Err(mismatch()),
         }
@@ -332,9 +344,9 @@ impl Client {
 
     /// Sends `prepared` for `operation`.
     ///
-    /// Native bodies go to the client's raw route and come back unchanged as
-    /// [`ProviderResponse::RawV1`]; translated requests go through the typed
-    /// route and come back typed.
+    /// Native bodies go to the client's raw route and come back as
+    /// [`Answer::Native`] text, unchanged and not yet validated; translated
+    /// requests go through the typed route and come back typed.
     ///
     /// # Errors
     ///
@@ -344,44 +356,45 @@ impl Client {
     async fn send(
         self,
         operation: GatewayOperation,
-        prepared: Prepared,
-    ) -> ProviderResult<ProviderResponse> {
-        let raw = |body: &serde_json::Value| {
-            to_raw_value(body).map_err(|error| ProviderError::decode("gateway", error))
+        prepared: Prepared<'_>,
+    ) -> ProviderResult<Answer> {
+        let raw = |body: &NativeBody<'_>| {
+            body.to_json()
+                .map_err(|error| ProviderError::decode("gateway", error))
         };
         let response = match (self, prepared) {
             (Self::OpenAi(client), Prepared::Native(body)) => {
-                ProviderResponse::RawV1(client.send_raw(route(operation)?, &raw(&body)?).await?)
+                Answer::Native(client.send_raw_text(route(operation)?, raw(&body)?).await?)
             }
             (Self::Anthropic(client), Prepared::Native(body)) => {
-                ProviderResponse::RawV1(client.send_raw(&raw(&body)?).await?)
+                Answer::Native(client.send_raw_text(raw(&body)?).await?)
             }
             (Self::Google(client), Prepared::Native(body)) => {
-                ProviderResponse::RawV1(client.send_raw(&raw(&body)?).await?)
+                Answer::Native(client.send_raw_text(raw(&body)?).await?)
             }
             (Self::Vertex(client), Prepared::Native(body)) => {
-                ProviderResponse::RawV1(client.send_raw(&raw(&body)?).await?)
+                Answer::Native(client.send_raw_text(raw(&body)?).await?)
             }
-            (Self::Anthropic(client), Prepared::Anthropic(request)) => {
+            (Self::Anthropic(client), Prepared::Anthropic(request)) => Answer::Typed(Box::new(
                 client
-                    .send_native(ProviderRequest::AnthropicMessage(*request))
-                    .await?
-            }
-            (Self::Google(client), Prepared::Google(request)) => {
+                    .send_native(&ProviderRequest::AnthropicMessage(*request))
+                    .await?,
+            )),
+            (Self::Google(client), Prepared::Google(request)) => Answer::Typed(Box::new(
                 client
-                    .send_native(ProviderRequest::GeminiGenerateContent(*request))
-                    .await?
-            }
-            (Self::Vertex(client), Prepared::Google(request)) => {
+                    .send_native(&ProviderRequest::GeminiGenerateContent(*request))
+                    .await?,
+            )),
+            (Self::Vertex(client), Prepared::Google(request)) => Answer::Typed(Box::new(
                 client
-                    .send_native(ProviderRequest::GeminiGenerateContent(*request))
-                    .await?
-            }
-            (Self::Jev(client), Prepared::Jev(request)) => {
+                    .send_native(&ProviderRequest::GeminiGenerateContent(*request))
+                    .await?,
+            )),
+            (Self::Jev(client), Prepared::Jev(request)) => Answer::Typed(Box::new(
                 client
-                    .send_native(ProviderRequest::JevSystemOne(*request))
-                    .await?
-            }
+                    .send_native(&ProviderRequest::JevSystemOne(*request))
+                    .await?,
+            )),
             (_, _) => return Err(mismatch()),
         };
         Ok(response)
@@ -473,14 +486,25 @@ fn failure(
 ///
 /// Returns `None` when capture is unselected, `raw` does not decode, or a
 /// string decodes from base64 to the credential.
-fn captured(attempt: &ProviderAttempt<'_>, raw: &RawValue) -> Option<ResponseCapture> {
+fn captured(attempt: &ProviderAttempt<'_>, raw: &str) -> Option<ResponseCapture> {
     if !attempt.capture {
         return None;
     }
     ResponseCapture::json(
-        serde_json::from_str(raw.get()).ok()?,
+        serde_json::from_str(raw).ok()?,
         attempt.credential.map(ProviderSecret::expose),
     )
+}
+
+/// The JSON bytes of a native media `body`, spliced from kept request text
+/// when the call arrived as it.
+///
+/// # Errors
+///
+/// Returns [`ProviderError::Decode`] when the body cannot serialize.
+fn media_json(body: NativeBody<'_>) -> ProviderResult<Vec<u8>> {
+    body.to_json()
+        .map_err(|error| ProviderError::decode("openai", error))
 }
 
 /// Capture projection of a buffered raw media `answer`, only when `attempt`
@@ -501,8 +525,12 @@ fn media_captured(attempt: &ProviderAttempt<'_>, answer: &MediaAnswer) -> Option
 /// and served `model` for a translated stream, or native passthrough.
 fn frames(attempt: &ProviderAttempt<'_>, translated: bool, id: String, model: &str) -> Frames {
     if translated {
-        let include_usage = attempt.body.pointer("/stream_options/include_usage")
-            == Some(&serde_json::Value::Bool(true));
+        let include_usage = attempt
+            .body
+            .member("stream_options")
+            .is_some_and(|options| {
+                options.get("include_usage") == Some(&serde_json::Value::Bool(true))
+            });
         Frames::Chat(ChatChunks::new(id, model, include_usage))
     } else {
         Frames::Native {
@@ -520,7 +548,7 @@ impl Client {
     async fn stream(
         self,
         attempt: &ProviderAttempt<'_>,
-        prepared: Prepared,
+        prepared: Prepared<'_>,
         wire: Wire,
         frames: Frames,
         limit: usize,
@@ -565,7 +593,7 @@ impl Client {
         self,
         media: &MediaRequest,
         attempt: &ProviderAttempt<'_>,
-        prepared: Prepared,
+        prepared: Prepared<'_>,
         limit: usize,
     ) -> AttemptResult {
         match self.open_media(media, prepared).await {
@@ -609,13 +637,13 @@ impl Client {
         self,
         action: &BatchAction,
         attempt: &ProviderAttempt<'_>,
-        prepared: Prepared,
+        prepared: Prepared<'_>,
     ) -> AttemptResult {
         match self.batch(action, attempt.model.as_str(), prepared).await {
             Ok(answer) => match serde_json::from_slice::<Box<RawValue>>(&answer.bytes) {
                 Ok(raw) if json(&answer.content_type) => AttemptResult::Completed {
-                    capture: captured(attempt, &raw),
-                    body: ResponseBody::Json(raw),
+                    capture: captured(attempt, raw.get()),
+                    body: ResponseBody::Json(raw.into()),
                     usage: AttemptUsage::default(),
                 },
                 _ => AttemptResult::Completed {
@@ -654,7 +682,7 @@ impl ProviderDispatch for HttpProviderDispatch {
             class,
             usage: AttemptUsage::default(),
         };
-        let prepared = match tracing::info_span!("gateway.translate", direction = "request")
+        let prepared = match tracing::debug_span!("gateway.translate", direction = "request")
             .in_scope(|| {
                 prepare(
                     attempt.ingress,
@@ -705,11 +733,9 @@ impl ProviderDispatch for HttpProviderDispatch {
             // A JSON media answer maps like any raw answer; other media
             // content returns unchanged with its content type.
             Some(media) => match client.media(media, prepared).await {
-                Ok(answer) if json(&answer.content_type) => {
-                    serde_json::from_slice::<Box<RawValue>>(&answer.bytes)
-                        .map(ProviderResponse::RawV1)
-                        .map_err(|error| ProviderError::decode("gateway", error))
-                }
+                Ok(answer) if json(&answer.content_type) => String::from_utf8(answer.bytes.into())
+                    .map(Answer::Native)
+                    .map_err(|error| ProviderError::decode("gateway", error)),
                 Ok(answer) => {
                     return AttemptResult::Completed {
                         capture: media_captured(&attempt, &answer),
@@ -734,25 +760,40 @@ impl ProviderDispatch for HttpProviderDispatch {
                 return failure(error, translated, attempt.credential);
             }
         };
-        let mapped = tracing::info_span!("gateway.translate", direction = "response")
-            .in_scope(|| complete(response, wire, translated, &id, model));
+        let mapped = tracing::debug_span!("gateway.translate", direction = "response")
+            .in_scope(|| complete(response, wire, translated, attempt.capture, &id, model));
         match mapped {
-            Ok((body, usage))
+            Ok((body, usage, decoded))
                 if attempt.operation != GatewayOperation::Embeddings
-                    || faithful_embeddings(attempt.body, &body) =>
+                    || faithful_embeddings(attempt.body, body.get()) =>
             {
                 AttemptResult::Completed {
-                    capture: captured(&attempt, &body),
+                    capture: match decoded {
+                        Some(decoded) => ResponseCapture::json(
+                            decoded,
+                            attempt.credential.map(ProviderSecret::expose),
+                        ),
+                        None => captured(&attempt, body.get()),
+                    },
                     body: ResponseBody::Json(body),
                     usage,
                 }
             }
             // An answer that cannot be mapped, or an embeddings answer that
             // ignores its request, fails rather than returning as success.
-            Ok((_, usage)) | Err(usage) => AttemptResult::Failed {
+            Ok((_, usage, _)) | Err(Unmapped::Unrepresentable(usage)) => AttemptResult::Failed {
                 class: FailureClass::Rejected,
                 usage,
             },
+            Err(Unmapped::Undecodable(error)) => {
+                let error = ProviderError::decode("gateway", error);
+                tracing::warn!(
+                    deployment = deployment.name.as_str(),
+                    code = error.code(),
+                    "gateway provider call failed"
+                );
+                failure(error, translated, attempt.credential)
+            }
         }
     }
 }

@@ -676,7 +676,7 @@ async fn fixed_sweeps_have_private_attempts() {
         RequirementOutcome::Passed,
         "{result:?}"
     );
-    let review = step(&result, "review");
+    let review = step(&desk.deployment, &result, "review").await;
     assert_eq!(
         (review.status, review.attempts, review.output.clone()),
         (
@@ -873,10 +873,17 @@ async fn conditions_and_collections_preserve_missing_evidence() {
     for case in cases {
         let question = case.question;
         let result = desk.verify("specialist-review", question).await;
-        let statuses = ["plan", "security", "style", "quote"].map(|id| step(&result, id).status);
+        let mut statuses = Vec::new();
+        for id in ["plan", "security", "style", "quote"] {
+            statuses.push(step(&desk.deployment, &result, id).await.status);
+        }
         assert_eq!(statuses, case.statuses, "{question}: {result:?}");
-        assert_eq!(step(&result, "general").status, Succeeded, "{question}");
-        let style = step(&result, "style");
+        assert_eq!(
+            step(&desk.deployment, &result, "general").await.status,
+            Succeeded,
+            "{question}"
+        );
+        let style = step(&desk.deployment, &result, "style").await;
         if style.status == Skipped {
             assert!(
                 style
@@ -896,7 +903,7 @@ async fn conditions_and_collections_preserve_missing_evidence() {
             assert_eq!(ran, case.called.contains(&marker), "{question}: {marker}");
         }
         if let Some((id, cause)) = case.reason {
-            let failed = step(&result, id);
+            let failed = step(&desk.deployment, &result, id).await;
             assert!(
                 failed
                     .reason
@@ -930,8 +937,8 @@ async fn conditions_and_collections_preserve_missing_evidence() {
         // A direct execution may read `completed` before its result is
         // visible, so wait for the result before reading status elsewhere.
         assert_eq!(
-            desk.settled(result.execution_id).await.outcome.steps,
-            result.outcome.steps,
+            desk.settled(result.execution_id).await.outcome,
+            result.outcome,
             "{question}"
         );
         let target = ExecutionArg {
@@ -939,9 +946,9 @@ async fn conditions_and_collections_preserve_missing_evidence() {
         };
         let status = cli(ExecutionVerb::Status(target.clone()), &desk).await;
         assert_eq!(
-            status["result"]["outcome"]["steps"],
-            serde_json::to_value(&result.outcome.steps).expect("steps serialize"),
-            "{question}: the CLI reports every branch's status: {status}"
+            status["result"]["outcome"],
+            serde_json::to_value(&result.outcome).expect("the outcome serializes"),
+            "{question}: the CLI reports the compact result: {status}"
         );
         let listed = cli(
             ExecutionVerb::Publications(PageArgs {
@@ -974,7 +981,7 @@ async fn conditions_and_collections_preserve_missing_evidence() {
     let unjudged = desk.verify("specialists-only", "NEITHER-ONLY").await;
     assert_eq!(
         (
-            step(&unjudged, "security").status,
+            step(&desk.deployment, &unjudged, "security").await.status,
             requirement(&unjudged, "secured").outcome,
             unjudged.outcome.verdict
         ),
@@ -1304,7 +1311,7 @@ async fn speculative_disposition_controls_consumer_admission() {
             "{question}: {result:?}"
         );
         assert_eq!(
-            step(&result, "extra").status,
+            step(&desk.deployment, &result, "extra").await.status,
             case.status,
             "{question}: {result:?}"
         );
@@ -1416,7 +1423,7 @@ async fn sequential_refinement_returns_final_admitted_report() {
     let desk = Desk::start().await;
 
     let result = desk.verify("refine-report", "REFINE-STOPS").await;
-    let draft = step(&result, "draft");
+    let draft = step(&desk.deployment, &result, "draft").await;
     assert_eq!(
         (draft.status, draft.output.clone()),
         (
@@ -1481,7 +1488,7 @@ async fn sequential_refinement_returns_final_admitted_report() {
         ("REFINE-BREAKS", "", &[0, 0, 1][..]),
     ] {
         let result = desk.verify("refine-report", question).await;
-        let draft = step(&result, "draft");
+        let draft = step(&desk.deployment, &result, "draft").await;
         assert_eq!(
             (draft.status, draft.output.clone()),
             (StepStatus::Failed, None),
@@ -1500,7 +1507,7 @@ async fn sequential_refinement_returns_final_admitted_report() {
             "{question}"
         );
         assert_eq!(
-            step(&result, "read").status,
+            step(&desk.deployment, &result, "read").await.status,
             StepStatus::Skipped,
             "{question}"
         );
@@ -1563,7 +1570,7 @@ async fn document_pipeline_uses_array_repeat_and_publications() {
         )
         .await;
 
-    let sections = step(&result, "sections");
+    let sections = step(&desk.deployment, &result, "sections").await;
     assert_eq!(
         (sections.status, sections.output.clone()),
         (
@@ -1586,7 +1593,7 @@ async fn document_pipeline_uses_array_repeat_and_publications() {
         BTreeSet::from(["claims at=1", "claims at=2", "intro at=0"].map(str::to_owned)),
         "the duplicate keeps its own index and the empty appendix calls no reviewer"
     );
-    let polish = step(&result, "polish");
+    let polish = step(&desk.deployment, &result, "polish").await;
     assert_eq!(
         (polish.status, polish.output.clone()),
         (
@@ -1619,13 +1626,16 @@ async fn document_pipeline_uses_array_repeat_and_publications() {
         ),
         "every item runs its own rounds in order until its condition holds"
     );
-    let appendix = step(&result, "appendix");
+    let appendix = step(&desk.deployment, &result, "appendix").await;
     assert_eq!(
         (appendix.status, appendix.output.clone()),
         (StepStatus::Succeeded, Some(json!([])))
     );
-    assert_eq!(step(&result, "escalate").status, StepStatus::Failed);
-    let summarize = step(&result, "summarize");
+    assert_eq!(
+        step(&desk.deployment, &result, "escalate").await.status,
+        StepStatus::Failed
+    );
+    let summarize = step(&desk.deployment, &result, "summarize").await;
     assert_eq!(
         (summarize.status, summarize.output.clone()),
         (
@@ -1722,7 +1732,7 @@ async fn document_pipeline_uses_array_repeat_and_publications() {
             "cards/verifier_orchestration/samples/clean-report.json",
         )
         .await;
-    let escalate = step(&clean, "escalate");
+    let escalate = step(&desk.deployment, &clean, "escalate").await;
     assert!(
         escalate.status == StepStatus::Skipped
             && escalate
@@ -1859,7 +1869,7 @@ async fn logical_control_state_resumes_from_bifrost() {
         "settled items, the decision, and the admitted review are restored"
     );
     assert_eq!(
-        step(&result, "map").output,
+        step(&desk.deployment, &result, "map").await.output,
         Some(json!([{ "done": true }, { "done": true }]))
     );
     assert_eq!(
@@ -1867,7 +1877,7 @@ async fn logical_control_state_resumes_from_bifrost() {
         [0, 0, 1, 1, 1, 2, 2],
         "iteration 0 is restored and the held iteration 1 runs once more"
     );
-    let refine = step(&result, "refine");
+    let refine = step(&desk.deployment, &result, "refine").await;
     assert_eq!(
         (refine.status, refine.output.clone()),
         (
@@ -2002,7 +2012,7 @@ async fn repeat_stops_or_exhausts_without_overlapping() {
             [(Some(0), 1), (Some(1), 2), (Some(2), 1)],
             "{question}: the interrupted iteration publishes as its retry"
         );
-        let draft = step(&result, "draft");
+        let draft = step(&desk.deployment, &result, "draft").await;
         if *question == STOPS {
             assert_eq!(
                 (draft.status, draft.output.clone()),
@@ -2178,7 +2188,11 @@ async fn speculative_recovery_cannot_resurrect_content() {
             RequirementOutcome::Passed,
             "{question}: {result:?}"
         );
-        assert_eq!(step(&result, "extra").status, *status, "{question}");
+        assert_eq!(
+            step(&desk.deployment, &result, "extra").await.status,
+            *status,
+            "{question}"
+        );
         assert_eq!(
             (
                 desk.asked("COMPARE:", question).await.len(),
@@ -2378,7 +2392,7 @@ async fn admission_bounds_fanout_across_tenants() {
         );
     }
     assert_eq!(
-        step(&a, "map").output,
+        step(&desk.deployment, &a, "map").await.output,
         Some(json!([{ "done": true }, { "done": true }, { "done": true }]))
     );
     assert_eq!(

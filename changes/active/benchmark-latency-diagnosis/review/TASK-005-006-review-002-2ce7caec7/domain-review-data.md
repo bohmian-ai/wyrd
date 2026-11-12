@@ -1,0 +1,38 @@
+# Persistent-data remediation review
+
+Result: **PASS** within the assigned persistent-data boundary. No proposed findings.
+
+Immutable subject: prior candidate `180879328ac9dde94d7504855e821980e5db0f18` → candidate `2ce7caec7d5a7bd51fb0ba1512f552b0f425ec0f`. Full cumulative context remains available from original base `0c81715f2`. This is closure and affected-path review, not a new audit of unchanged acceptance. Source was not changed; only this report was written.
+
+## Authority and coverage
+
+Read the shared round scope, task-review skill, root and SQL AGENTS rules, prior data review and TASK-006-R1 diagnosis, approved spec REQ-028–031/INV-001–004/AC-023–024/026, security posture Postgres tenant binding, and deployment-and-release expand-and-contract rules at lines 193–198. CodeGraph was used before source navigation. Inspected actual migration/query/usage delta and full affected SQL and persistence consumer bodies, plus original strict admission/settlement migrations and reservation fences.
+
+| Boundary | Source and caller coverage | Assessment |
+|---|---|---|
+| Old committed window/lease baseline → current shared usage | `gateway_admission.rs:150–183` WINDOWS_SQL and CONCURRENCY_SQL; `GatewayUsage::sync:570–619` → `apply:516–555` → `admit:329–425` | Current view sums strict counters/leases alongside other-server contributions. Its own server contribution remains excluded and local absolute state supplies that part exactly once. |
+| Current persisted contributions → old release admission | `20261111000001_gateway_usage_overlap.sql:18–137`; compared with `20261023000001_gateway_admission_statements.sql` original gateway_admit and gateway_settle | Function signature/security/binding/advisory lock and write paths stay the same; only quota read projections aggregate new rows. Old binaries invoking the retained function gain the new projection without changes. |
+| Settlement, expiry and historical ownership | Old gateway_settle; current absolute UPSERT/PRUNE SQL; GatewayUsage batch/apply/settle | Old settlement adjusts only strict counters/leases; current settlement changes only the current server absolute state. Reads sum disjoint representations. Original old lease expiry and new contribution lease expiry still determine visibility; no one-time mutable copy or dual write creates overlap. |
+| Retry and budgets | sync_gateway_usage full body and SPEND_SQL; reservation unique indexes in 20260924000001; existing PG reconciliation proof | Absolute process-keyed upserts and reservation fences remain authoritative. Common ledger is unchanged, so both releases already observe the same committed spend. Caller commits once, then applies acknowledgment. |
+| Tenant isolation | SQL accepts `&mut TenantConn`; inserted tenant from typed connection; old SQL SECURITY INVOKER and bound-tenant check; old/new FORCE RLS policies | New UNION branches inherit forced RLS, do not widen privilege or introduce a cross-tenant pool. The old function retains its reviewed statement-binding capability; the migration does not add a bypass or change existing policies. |
+| Shared synchronization authority | `TenantUsage::clean:224–234`, retain:304–320, sync:570–619 and sibling background/admin producers already identified in prior report | Arc handle is cloned while holding the tenant-map lock, before waiting; strong-count pin blocks eviction through SQL and installation, errors or cancellation. Entry identity and absolute-writer serialization cannot split under cache pressure. |
+| Focused proof | `pg_gateway_usage::previous_and_current_usage_count_once_in_both_readers`; usage PG pin test; existing `background_usage_reconciles_retries_and_remote_updates` | New proof covers both read directions, settlement, new lease expiry and tenant separation. Existing proof retains uncertain replay/ledger fencing and other-server accumulation. Pin proof exercises bounded eviction and cancellation release. |
+
+Existing-owner comparison: the additive migration changes the existing strict reader and the existing current shared-view reader, leaving their separate writers and common ledger intact. This directly implements the prior minimal recommendation. Reusing one-time baseline copying would miss subsequent old writes and settlement; dual writes would complicate exactly-once accounting. Neither is introduced. Pinning reuses the existing Arc synchronization lifetime; a separate generation/registry/coordination service is unnecessary.
+
+## Acceptance and closure matrix
+
+| Obligation | Implementation evidence | Verification evidence inspected | Result |
+|---|---|---|---|
+| FIND-006-3: old/new committed usage visible once in both readers during upgrade | New UNION ALL projections for windows; lease count plus active contribution sum; unchanged disjoint writer formats and settlement | New real-PG test charges one old call, persists two current requests, observes `(3,12,2)` total; old reader admits up to four then refuses; settlement gives `(4,7,0)` | PASS / closed |
+| Expired contributions stop counting and other tenants cannot affect admission | Current rows require expiry after statement_timestamp; old-reader contribution projection uses existing p_now; FORCE RLS on all branches | Same PG test gives an expired new contribution zero visibility, retains old live leases, and exercises an independent tenant view/admission | PASS |
+| FIND-006-4: in-flight synchronization cannot replace its authority or overwrite a replacement baseline | Arc clone retained from before mutex wait through apply; clean requires strong count exactly one | `in_flight_synchronization_pins_its_tenant` forces capacity one, retains same mutex, refuses competing tenant, then proves completion/cancellation permit eviction | PASS / closed in data boundary |
+| Preserve retries, uncertain commits and budget identity | Current upserts remain absolute under tenant/limit/window/server; ledger ON CONFLICT and reservation fences unchanged; apply after commit only | Prior accepted reconciliation evidence retained, with source rechecked around changed pinning; existing PG replay source still checks 15 tokens after retry and 30 after another server | PASS |
+| Applied migration immutability and compatible old/new overlap | A new 20261111000001 migration is added; 20261111000000 and older migrations unchanged; old function replacement retains signature/privileges | Actual Git delta; implementation records report narrow SQL/migration 23/23 and tenant-isolation PASS | PASS |
+| Shared deadline drain does not alter persistence identity | New drain retries existing replay-safe sync; writes and acknowledgment authority unchanged | Actual owner and usage source checked; detailed drain failure/recovery acceptance belongs to system/invariant reviewers | PASS for persistence semantics |
+
+No new finding or remediation recommendation is proposed. Prior DATA-001 maps to stable FIND-006-3 and is closed; prior DATA-002 maps to FIND-006-4 and is closed in this domain. Other prior findings remain for their assigned reviewers; this report does not independently accept benchmark qualification, token/trace behavior, SDK contracts or full system shutdown.
+
+## Verification limits
+
+Static source and test-source review only. No tests, migrations, builds, benchmarks or profiles were run. Reported SQL/Gateway test successes were inspected as evidence, not freshly reproduced. Candidate HEAD was rechecked at the recorded hash. Approximate cross-server visibility and accepted crash/expired-deadline memory loss remain unchanged; strict global quotas and durable local accounting were not required.

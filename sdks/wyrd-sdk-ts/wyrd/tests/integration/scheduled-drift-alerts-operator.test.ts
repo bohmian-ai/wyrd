@@ -19,7 +19,7 @@ import type { NativeWyrdTestServer } from "@wyrd/testing";
 import { z } from "zod";
 
 import { Receiver } from "../support/http-receiver.js";
-import { binding, fixture, declared, runtimeAccount, scheduledResult, serverTest } from "../support/server.js";
+import { binding, declared, details, fixture, runtimeAccount, scheduledResult, serverTest } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 240_000 });
 
@@ -158,8 +158,9 @@ test("failed schedule alerts its operator on the connection origin", async ({ se
   expect(result.outcome.requirements).toHaveLength(1);
   const [requirement] = result.outcome.requirements;
   expect([requirement?.id, requirement?.outcome]).toEqual(["latency-unshifted", "failed"]);
-  expect(requirement?.provenance).toMatchObject({ kind: "drift", window: { start: expect.any(String) } });
-  expect(requirement?.check).toMatchObject({ signal: { baseline_ref: { name: "latency-baseline" } } });
+  const [described] = (await details(result.execution_id)).outcome.requirements;
+  expect(described?.provenance).toMatchObject({ kind: "drift", window: { start: expect.any(String) } });
+  expect(described?.check).toMatchObject({ signal: { baseline_ref: { name: "latency-baseline" } } });
   const latency = requirement?.detail?.drift.features.latency;
   expect(latency?.score ?? 0).toBeGreaterThan(0.25);
 
@@ -221,7 +222,8 @@ test("ready spc baseline charts a scheduled window", async ({ server, hooks, car
   expect(result.outcome.requirements).toHaveLength(1);
   const [requirement] = result.outcome.requirements;
   expect([requirement?.id, requirement?.outcome]).toEqual(["latency-in-control", "failed"]);
-  expect(requirement?.check).toMatchObject({ method: "Spc" });
+  const [described] = (await details(result.execution_id)).outcome.requirements;
+  expect(described?.check).toMatchObject({ method: "Spc" });
   const latency = requirement?.detail?.drift.features.latency;
   expect([latency?.score, latency?.threshold], JSON.stringify(latency)).toEqual([4, 0]);
   expect(latency?.evidence).toMatchObject({
@@ -278,7 +280,7 @@ test.for([
     expect(
       Object.fromEntries(result.outcome.requirements.map((requirement) => [requirement.id, requirement.outcome])),
     ).toEqual(outcomes);
-    for (const requirement of result.outcome.requirements) {
+    for (const requirement of (await details(result.execution_id)).outcome.requirements) {
       expect(requirement.provenance).toMatchObject({ kind: "drift", window: { start: expect.any(String) } });
     }
   },

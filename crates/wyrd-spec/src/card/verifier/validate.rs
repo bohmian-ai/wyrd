@@ -623,7 +623,7 @@ where
             }
             CodeSource::Artifact { card, .. }
                 if card
-                    .as_card_ref()
+                    .target()
                     .is_some_and(|card| card.kind != CardKind::Artifact) =>
             {
                 return Err(invalid(
@@ -666,7 +666,7 @@ where
     ) -> Result<(), WyrdError> {
         if call
             .agent
-            .as_card_ref()
+            .target()
             .is_some_and(|card| card.kind != CardKind::Agent)
         {
             return Err(invalid(
@@ -1029,7 +1029,7 @@ where
                 _ => None,
             },
             Action::Agent(call) => match &(self.resolve)(&call.agent)?.prompt.response_type {
-                ResponseType::JsonSchema { schema, .. } => Some(schema.clone()),
+                ResponseType::JsonSchema { schema, .. } => Some(Value::clone(schema)),
                 ResponseType::Text => Some(json!({ "type": "string" })),
             },
             Action::Code(_) => None,
@@ -1230,7 +1230,7 @@ fn validate_workspace(
         };
         if artifact
             .card
-            .as_card_ref()
+            .target()
             .is_some_and(|card| card.kind != CardKind::Artifact)
         {
             return Err(invalid(
@@ -1393,7 +1393,7 @@ mod tests {
             "inputs": {
                 "answer": {"type": "json", "schema": {"type": "object", "properties": {"text": {"type": "string"}}, "additionalProperties": false}},
                 "policy": {"type": "media", "formats": ["pdf"]},
-                "deck": {"type": "media", "formats": ["pptx"], "required": false},
+                "deck": {"type": "media", "formats": ["pptx"]},
                 "trace": {"type": "trace"}
             },
             "steps": [
@@ -1458,10 +1458,6 @@ mod tests {
             assert_eq!(serde_json::to_value(&spec).expect("serialize"), body);
         }
         let spec = parse(&review());
-        assert_eq!(
-            spec.inputs.values().filter(|slot| slot.required()).count(),
-            3
-        );
         let plan = spec.plan().expect("plan");
         let stages: Vec<Vec<&str>> = plan
             .stages
@@ -1478,8 +1474,7 @@ mod tests {
             stages,
             vec![vec!["structure"], vec!["findings"], vec!["count"]]
         );
-        let explicit =
-            json!({"inputs": {"a": {"type": "json", "required": true}}, "decide": "all"});
+        let explicit = json!({"inputs": {"a": {"type": "json"}}, "decide": "all"});
         assert_eq!(
             serde_json::to_value(parse(&explicit)).expect("serialize"),
             json!({"inputs": {"a": {"type": "json"}}})

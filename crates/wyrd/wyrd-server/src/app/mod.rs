@@ -8,7 +8,7 @@ use tokio::task::JoinSet;
 use tracing::info;
 use wyrd_telemetry::TelemetryGuard;
 
-use crate::app::metrics::{WyrdTelemetryRuntime, metrics_router, serve_metrics};
+use crate::app::metrics::{MetricsBackend, WyrdTelemetryRuntime, metrics_router, serve_metrics};
 use crate::app::supervise::{
     TaskExit, TaskId, fallible_task, restarting_worker, supervise, worker_task,
 };
@@ -44,13 +44,11 @@ pub async fn run(mode: Option<ServeMode>) -> Result<(), BootExit> {
     let config = WyrdServerConfig::load().map_err(|e| BootExit::Config(Box::new(e)))?;
     production_guards(&config);
 
-    let telemetry_runtime = WyrdTelemetryRuntime::install(config.telemetry.clone())
-        .map_err(|error| BootExit::Other(Box::new(error)))?;
+    let telemetry_runtime =
+        WyrdTelemetryRuntime::install(config.telemetry.clone(), config.metrics.benchmark_snapshot)
+            .map_err(|error| BootExit::Other(Box::new(error)))?;
     let telemetry: Arc<TelemetryGuard> = telemetry_runtime.guard();
-    let metrics_handle = config
-        .metrics
-        .enabled
-        .then(|| telemetry_runtime.prometheus());
+    let metrics = config.metrics.enabled.then(|| telemetry_runtime.metrics());
     info!(
         service.name = config
             .telemetry
@@ -88,14 +86,14 @@ pub async fn run(mode: Option<ServeMode>) -> Result<(), BootExit> {
         workers
             .into_iter()
             .fold(
-                WyrdServer::new_with_metrics_handle(config, state, metrics_handle)
+                WyrdServer::new_with_metrics(config, state, metrics)
                     .map_err(|e| BootExit::Other(Box::new(e)))?,
                 |server, (name, worker)| server.spawn_worker(name, worker),
             )
             .serve(mode)
             .await
     } else {
-        run_forge_worker_process(&config, state, metrics_handle).await
+        run_forge_worker_process(&config, state, metrics).await
     };
 
     drop(compaction_runtime); // release Forge compaction threads after supervision drains
@@ -119,7 +117,7 @@ pub async fn run(mode: Option<ServeMode>) -> Result<(), BootExit> {
 async fn run_forge_worker_process(
     config: &WyrdServerConfig,
     state: AppState,
-    metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
+    metrics: Option<MetricsBackend>,
 ) -> Result<(), BootExit> {
     state
         .bifrost
@@ -165,15 +163,11 @@ async fn run_forge_worker_process(
         let listener = TcpListener::bind(bind).await.map_err(|error| {
             BootExit::Other(format!("metrics listener failed to bind {bind}: {error}").into())
         })?;
-        let handle = metrics_handle
-            .ok_or_else(|| BootExit::Other("metrics recorder handle is unavailable".into()))?;
+        let backend =
+            metrics.ok_or_else(|| BootExit::Other("metrics backend is unavailable".into()))?;
         set.spawn(fallible_task(
             TaskId::Metrics,
-            serve_metrics(
-                metrics_router(handle, config.metrics.benchmark_snapshot),
-                listener,
-                shutdown.clone(),
-            ),
+            serve_metrics(metrics_router(backend), listener, shutdown.clone()),
         ));
     }
     set.spawn(worker_task(
@@ -207,9 +201,9 @@ async fn run_forge_worker_process(
 pub async fn run_forge_worker_process_for_test(
     config: &WyrdServerConfig,
     state: AppState,
-    metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
+    metrics: Option<MetricsBackend>,
 ) -> Result<(), BootExit> {
-    run_forge_worker_process(config, state, metrics_handle).await
+    run_forge_worker_process(config, state, metrics).await
 }
 
 #[cfg(test)]
@@ -274,7 +268,7 @@ mod tests {
 
         // Both supervised topologies drain inside that awaited frame.
         assert!(
-            production.contains("run_forge_worker_process(&config, state, metrics_handle).await"),
+            production.contains("run_forge_worker_process(&config, state, metrics).await"),
             "the dedicated worker runner is awaited by the serving frame"
         );
         assert!(

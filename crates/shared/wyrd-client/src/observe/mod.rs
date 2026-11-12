@@ -7,7 +7,8 @@
 //! [`Run::for_card`] returns an immutable sibling view over the same invocation,
 //! so concurrent views never disturb each other's subject.
 //!
-//! [`Observe::verify`] executes a bound Verifier now and [`Observe::submit`]
+//! [`RunBifrost::write`] buffers caller-table rows through the state's one
+//! Bifrost writer. [`Observe::verify`] executes a bound Verifier now and [`Observe::submit`]
 //! queues one execution or records scheduled-window samples. Slot projection,
 //! evidence upload, and execution polling live here rather than in
 //! [`crate::bifrost`]: the facade, the producer pool, and `wyrd-queue` stay
@@ -31,13 +32,14 @@ use wyrd_spec::vala::ids::RunId;
 use wyrd_spec::vala::ids::SessionId;
 use wyrd_spec::verification::execution::VerificationResult;
 
-use crate::bifrost::{Correlation, WriterTable};
+use crate::bifrost::{BifrostClientError, Correlation, WriterTable};
 use crate::state::{BoundVerifier, WyrdState};
+use crate::transport::trace;
 use crate::verify::{Execution, Inputs, Projected, RunEvidence, Submission, Target};
 
 pub use lifecycle::DRIFT_OBSERVATIONS_TABLE;
 
-/// The only namespace `observe.record` may write.
+/// The only namespace `run.bifrost.write` may write.
 ///
 /// `bifrost.datasets` is the caller-owned registration namespace; every other
 /// Bifrost namespace is reserved for server-managed tables. Refusing the rest
@@ -160,13 +162,20 @@ impl Run {
         })
     }
 
-    /// The emit surface for this view.
+    /// The verification and submission surface for this view.
     #[must_use]
     pub fn observe(&self) -> Observe<'_> {
         Observe {
             run: self,
             group_id: None,
         }
+    }
+
+    /// The caller-table write surface for this view, over the state's one
+    /// Bifrost writer.
+    #[must_use]
+    pub fn bifrost(&self) -> RunBifrost<'_> {
+        RunBifrost { run: self }
     }
 
     /// This view's row correlation: the subject Card's UID plus invocation.
@@ -192,10 +201,10 @@ impl Run {
     }
 }
 
-/// The observation and verification surface of one scoped run.
+/// The verification and submission surface of one scoped run.
 ///
-/// Recording is not a durability acknowledgement — the queue publishes in the
-/// background and `WyrdState::shutdown` is the barrier.
+/// Recording a window sample is not a durability acknowledgement — the queue
+/// publishes in the background and `WyrdState::shutdown` is the barrier.
 #[derive(Debug)]
 pub struct Observe<'a> {
     /// The view whose subject and invocation every emit correlates to.
@@ -232,67 +241,6 @@ impl Observe<'_> {
         Ok(())
     }
 
-    /// Emit one row into a registered caller-owned table.
-    ///
-    /// Async because the first call for a table describes it; later calls reuse
-    /// the writer's cached schema and producer with no schema lookup. Returning
-    /// is neither a durability nor a whole-row-validation acknowledgement: the
-    /// queue checks row values against the described schema when it seals a
-    /// batch.
-    ///
-    /// # Arguments
-    /// * `table` - A registered `bifrost.datasets.<name>` table.
-    /// * `row` - The row, serialized to the table's columns.
-    ///
-    /// # Errors
-    /// Returns `WYRD_SDK_400_INVALID_OBSERVATION` for a table outside
-    /// `bifrost.datasets`, which is where reserved and system-managed tables are
-    /// refused before admission; the server's not-found, authorization, or
-    /// availability error for an unknown, unauthorized, or unavailable table;
-    /// and the lifecycle and queue errors of [`Observe::drift`].
-    pub async fn record<T: Serialize>(&self, table: &str, row: &T) -> Result<(), WyrdError> {
-        self.record_value(table, &to_value(row, "record row")?)
-            .await
-    }
-
-    /// Emit one row into a registered table from a foreign runtime's JSON text.
-    ///
-    /// # Arguments
-    /// * `table` - A registered `bifrost.datasets.<name>` table.
-    /// * `json` - The row as one JSON object.
-    ///
-    /// # Errors
-    /// As [`Observe::record`], plus an invalid-observation error when `json` is
-    /// not valid JSON.
-    #[cfg(feature = "internal")]
-    pub async fn record_json(&self, table: &str, json: &str) -> Result<(), WyrdError> {
-        self.record_value(table, &parse_json(json, "record row")?)
-            .await
-    }
-
-    /// Describe on first use, then enqueue one caller row.
-    ///
-    /// # Errors
-    /// As [`Observe::record`].
-    async fn record_value(&self, table: &str, row: &Value) -> Result<(), WyrdError> {
-        if !table.starts_with(DATASETS_PREFIX) || table[DATASETS_PREFIX.len()..].contains('.') {
-            return Err(invalid_observation(
-                "observe.record writes only registered `bifrost.datasets.<name>` tables",
-                json!({ "table": table }),
-            ));
-        }
-        let started = self.run.state.started_bifrost()?;
-        let destination = started.bifrost.resolve_writer_table(table).await?;
-        started.bifrost.insert_observation(
-            &destination,
-            vec![row_bytes(row)?],
-            self.run.correlation(),
-        )?;
-        Ok(())
-    }
-}
-
-impl Observe<'_> {
     /// Carry `group_id` on every execution `verify` and `submit` start from
     /// this surface.
     ///
@@ -354,23 +302,39 @@ impl Observe<'_> {
     ///
     /// # Cancellation
     /// Dropping the future abandons the request; it is never retried.
+    ///
+    /// In a benchmark process the whole flow is one `client.verify`
+    /// observation whose `prepare` component covers binding resolution,
+    /// projection, evidence pinning, and request assembly, before its
+    /// execution request's own logical call; a failed verdict is a successful
+    /// flow.
     pub async fn verify(
         &self,
         verifier: &str,
         inputs: impl Into<Inputs>,
     ) -> Result<VerificationResult, WyrdError> {
-        let state = &self.run.state;
-        let bound = state.bound_verifier(&self.run.subject, verifier)?;
-        let target = self.target(&bound);
-        match target.project(inputs.into())? {
-            Projected::Run(run) => target.execute(state.client()?, run).await,
-            Projected::Window(_) => Err(WyrdError::VerificationInputUnsupported {
-                message:
-                    "a scheduled-window Verifier judges recorded samples; record them with submit"
+        let mut observation =
+            wyrd_benchmark::Observation::start("client.verify", trace::benchmark_cohort);
+        let started = observation.now();
+        let result = async {
+            let state = &self.run.state;
+            let target = self.target(state.bound_verifier(&self.run.subject, verifier)?);
+            match target.project(inputs.into())? {
+                Projected::Run(run) => {
+                    target
+                        .execute(state.client()?, run, &mut observation, started)
+                        .await
+                }
+                Projected::Window(_) => Err(WyrdError::VerificationInputUnsupported {
+                    message: "a scheduled-window Verifier judges recorded samples; record them with submit"
                         .to_owned(),
-                details: json!({ "verifier": verifier }),
-            }),
+                    details: json!({ "verifier": verifier }),
+                }),
+            }
         }
+        .await;
+        observation.settle(&result);
+        result
     }
 
     /// [`Observe::verify`], with every requirement's custom `data` decoded
@@ -465,7 +429,7 @@ impl Observe<'_> {
         inputs: impl Into<Inputs>,
     ) -> Result<Option<StagedRun>, WyrdError> {
         let bound = self.run.state.bound_verifier(&self.run.subject, verifier)?;
-        match self.target(&bound).project(inputs.into())? {
+        match self.target(bound).project(inputs.into())? {
             Projected::Run(evidence) => Ok(Some(StagedRun {
                 verifier: verifier.to_owned(),
                 group_id: self.group_id.clone(),
@@ -500,18 +464,17 @@ impl Observe<'_> {
     /// As [`Observe::submit`].
     async fn enqueue_run(&self, staged: StagedRun) -> Result<Execution, WyrdError> {
         let state = &self.run.state;
-        let bound = state.bound_verifier(&self.run.subject, &staged.verifier)?;
-        let mut target = self.target(&bound);
+        let mut target = self.target(state.bound_verifier(&self.run.subject, &staged.verifier)?);
         target.group_id = staged.group_id;
         target.enqueue(state.client()?, staged.evidence).await
     }
 
-    /// The execution target of `bound` for this view's Run.
-    fn target<'a>(&self, bound: &BoundVerifier<'a>) -> Target<'a> {
+    /// The execution target of `bound` for this view's Run, taking its UIDs.
+    fn target<'a>(&self, bound: BoundVerifier<'a>) -> Target<'a> {
         Target {
             spec: bound.spec,
-            verifier_card_uid: bound.verifier_card_uid.clone(),
-            card_uid: bound.card_uid.clone(),
+            verifier_card_uid: bound.verifier_card_uid,
+            card_uid: bound.card_uid,
             run_id: self.run.run_id.clone(),
             group_id: self.group_id.clone(),
             deployment_environment: self.run.state.deployment_environment().map(str::to_owned),
@@ -519,7 +482,150 @@ impl Observe<'_> {
     }
 }
 
-/// Run evidence [`Observe::stage`] projected and still has to enqueue.
+/// Caller-table writes attributed to one scoped run.
+///
+/// Every row carries this view's subject Card UID and the invocation's
+/// `run_id`. Writing is buffered submission, not a durability
+/// acknowledgement: the state's queue publishes in the background and a
+/// successful `WyrdState::shutdown` is the drain barrier.
+#[derive(Debug)]
+pub struct RunBifrost<'a> {
+    /// The view whose subject and invocation every row correlates to.
+    run: &'a Run,
+}
+
+impl RunBifrost<'_> {
+    /// Buffer one row for the state's active table.
+    ///
+    /// The active table is the root Service's sole declared table, else the
+    /// one bound by `start_bifrost_with` or [`WyrdState::use_table_by_name`];
+    /// it was described when bound, so this performs no IO. Returning is
+    /// neither a durability nor a whole-row-validation acknowledgement: the
+    /// queue checks row values against the described schema when it seals a
+    /// batch, and `WyrdState::shutdown` drains it.
+    ///
+    /// # Arguments
+    /// * `row` - The row, serialized to the active table's columns.
+    ///
+    /// # Errors
+    /// Returns `WYRD_VALA_412_NO_ACTIVE_TABLE` when no table is active,
+    /// `WYRD_SDK_400_INVALID_OBSERVATION` when the active table is outside
+    /// `bifrost.datasets`, and otherwise as [`RunBifrost::write_to`].
+    ///
+    /// # Cancellation
+    /// Admission is one synchronous, all-or-none enqueue: the row is either
+    /// refused or handed to the queue, and an admitted row is never retracted.
+    ///
+    /// # Retry
+    /// As [`RunBifrost::write_to`].
+    pub async fn write<T: Serialize>(&self, row: &T) -> Result<(), WyrdError> {
+        self.write_value(None, &to_value(row, "write row")?).await
+    }
+
+    /// Buffer one row for a named registered caller-owned table, leaving the
+    /// active table unchanged.
+    ///
+    /// Async because the first call for a table describes it; later calls reuse
+    /// the writer's cached schema and producer with no schema lookup. Because
+    /// it never touches the shared active table, concurrent runs may each
+    /// write their own table through it.
+    ///
+    /// # Arguments
+    /// * `table` - A registered `bifrost.datasets.<name>` table.
+    /// * `row` - The row, serialized to the table's columns.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_400_INVALID_OBSERVATION` for a table outside
+    /// `bifrost.datasets`, which is where reserved and system-managed tables are
+    /// refused before admission; the server's not-found, authorization, or
+    /// availability error for an unknown, unauthorized, or unavailable table;
+    /// `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup,
+    /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, and
+    /// `WYRD_CLIENT_429_QUEUE_FULL` when the producer is saturated.
+    ///
+    /// # Cancellation
+    /// The only suspension point is the first-use table description, which
+    /// precedes admission; dropping the future there admits no row and caches
+    /// nothing. Admission is one synchronous, all-or-none enqueue, so there is
+    /// no partial progress: the row is either refused or handed to the queue,
+    /// and an admitted row is never retracted.
+    ///
+    /// # Retry
+    /// Not idempotent: repeating a call that returned `Ok` admits a second row.
+    /// After an error no row was admitted, so the caller may retry the same
+    /// row, after draining or backing off on `WYRD_CLIENT_429_QUEUE_FULL`. The
+    /// queue's own publish retries resend an admitted row under its sealed
+    /// batch's identity and are independent of caller retries.
+    pub async fn write_to<T: Serialize>(&self, table: &str, row: &T) -> Result<(), WyrdError> {
+        self.write_value(Some(table), &to_value(row, "write row")?)
+            .await
+    }
+
+    /// Buffer one row from a foreign runtime's JSON text, for `table` or,
+    /// when `None`, the active table.
+    ///
+    /// # Arguments
+    /// * `table` - A registered `bifrost.datasets.<name>` table, or `None`.
+    /// * `json` - The row as one JSON object.
+    ///
+    /// # Errors
+    /// As [`RunBifrost::write`] or [`RunBifrost::write_to`], plus an
+    /// invalid-observation error when `json` is not valid JSON.
+    ///
+    /// # Cancellation
+    /// As [`RunBifrost::write_to`], including its retry contract.
+    #[cfg(feature = "internal")]
+    pub async fn write_json(&self, table: Option<&str>, json: &str) -> Result<(), WyrdError> {
+        self.write_value(table, &parse_json(json, "write row")?)
+            .await
+    }
+
+    /// Resolve the destination, then enqueue one caller row.
+    ///
+    /// # Errors
+    /// As [`RunBifrost::write`] and [`RunBifrost::write_to`].
+    ///
+    /// # Cancellation
+    /// As [`RunBifrost::write_to`], including its retry contract.
+    async fn write_value(&self, table: Option<&str>, row: &Value) -> Result<(), WyrdError> {
+        if let Some(table) = table {
+            require_dataset(table)?;
+        }
+        let started = self.run.state.started_bifrost()?;
+        let destination = if let Some(table) = table {
+            started.bifrost.resolve_writer_table(table).await?
+        } else {
+            let active = started
+                .bifrost
+                .active_writer_table()
+                .ok_or(BifrostClientError::NoActiveTable)?;
+            require_dataset(active.fqn())?;
+            active
+        };
+        started.bifrost.insert_observation(
+            &destination,
+            vec![row_bytes(row)?],
+            self.run.correlation(),
+        )?;
+        Ok(())
+    }
+}
+
+/// Refuse `table` unless it is one `bifrost.datasets.<name>` table.
+///
+/// # Errors
+/// Returns `WYRD_SDK_400_INVALID_OBSERVATION` for any other table.
+fn require_dataset(table: &str) -> Result<(), WyrdError> {
+    if !table.starts_with(DATASETS_PREFIX) || table[DATASETS_PREFIX.len()..].contains('.') {
+        return Err(invalid_observation(
+            "run.bifrost.write writes only registered `bifrost.datasets.<name>` tables",
+            json!({ "table": table }),
+        ));
+    }
+    Ok(())
+}
+
+/// Run evidence a submission projected and still has to enqueue.
 #[derive(Debug)]
 pub struct StagedRun {
     /// The bound Verifier's `metadata.name`, resolved again on enqueue.

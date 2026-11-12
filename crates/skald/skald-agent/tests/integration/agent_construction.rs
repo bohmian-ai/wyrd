@@ -6,6 +6,7 @@ use skald_spec::wire::openai_chat::{
     OpenAiChatMessage, OpenAiChatRequest, OpenAiChatSettings, OpenAiMessageContent,
 };
 use skald_spec::{Prompt as SpecPrompt, ProviderName, ProviderRequest};
+use wyrd_spec::reference::InlineableRef;
 
 /// A resolved OpenAI Chat Prompt for `gpt-4o` with one system message, the
 /// base Prompt these construction tests give an Agent.
@@ -58,10 +59,44 @@ fn agent_new_uses_resolved_prompt_and_default_run_config() {
 /// original model.
 #[test]
 fn agent_with_prompt_overrides_prompt_reference() {
-    let original = openai_prompt();
+    let agent = Agent::from_resolved("a", openai_prompt()).with_prompt(model_prompt("gpt-4o-mini"));
+
+    assert_eq!(agent.prompt.native().model, "gpt-4o-mini");
+    assert_eq!(exported_model(&agent), "gpt-4o-mini");
+}
+
+/// Assigning the public `prompt` field changes what runs, never the exported
+/// reference, whether or not the reference was read before the assignment,
+/// and a clone taken after a read exports the same reference.
+///
+/// # Panics
+/// Panics when the exported model follows the runtime assignment or depends
+/// on read order.
+#[test]
+fn agent_prompt_reference_ignores_runtime_assignment_in_any_read_order() {
+    let mut unread = Agent::from_resolved("unread", openai_prompt());
+    unread.prompt = model_prompt("gpt-4o-mini");
+
+    let mut read_first = Agent::from_resolved("read-first", openai_prompt());
+    assert_eq!(exported_model(&read_first), "gpt-4o");
+    let initialized_clone = read_first.clone();
+    read_first.prompt = model_prompt("gpt-4o-mini");
+
+    for agent in [&unread, &read_first, &initialized_clone] {
+        assert_eq!(exported_model(agent), "gpt-4o", "agent {}", agent.id);
+        assert_eq!(agent.to_spec().prompt, *agent.prompt_ref());
+    }
+    assert_eq!(unread.prompt.native().model, "gpt-4o-mini");
+}
+
+/// A resolved OpenAI Chat Prompt for `model` with no messages.
+///
+/// # Panics
+/// Panics when the static request does not build a Prompt.
+fn model_prompt(model: &str) -> Arc<Prompt> {
     let prompt = SpecPrompt::new(
         ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
-            model: "gpt-4o-mini".into(),
+            model: model.into(),
             messages: vec![],
             response_format: None,
             stream: None,
@@ -71,14 +106,21 @@ fn agent_with_prompt_overrides_prompt_reference() {
             parallel_tool_calls: None,
             settings: OpenAiChatSettings::default(),
         }),
-        "gpt-4o-mini",
+        model,
     )
-    .unwrap();
-    let replacement = Arc::new(Prompt::from_native(prompt));
+    .expect("test helper setup succeeds");
+    Arc::new(Prompt::from_native(prompt))
+}
 
-    let agent = Agent::from_resolved("a", original).with_prompt(replacement.clone());
-
-    assert_eq!(agent.prompt.native().model, "gpt-4o-mini");
+/// Model of the inline Prompt `agent` exports as its reference.
+///
+/// # Panics
+/// Panics when the exported reference is not inline.
+fn exported_model(agent: &Agent) -> String {
+    let InlineableRef::Inline(spec) = agent.prompt_ref() else {
+        panic!("agent {} exports a non-inline prompt reference", agent.id);
+    };
+    spec.model.clone()
 }
 
 #[test]

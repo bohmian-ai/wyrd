@@ -33,10 +33,13 @@ tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macr
 tracing = { workspace = true }
 uuid = { workspace = true }
 vala-drift = { workspace = true }
+wyrd-benchmark = { workspace = true }
 wyrd-spec = { workspace = true }
 
 [dev-dependencies]
 metrics-exporter-prometheus = { workspace = true }
+# The Agent phase test installs the benchmark recorder.
+wyrd-benchmark = { workspace = true, features = ["bench"] }
 workspace-hack.workspace = true
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros", "test-util"] }

@@ -1,11 +1,11 @@
 //! Gateway admission and accounting ledger.
 //!
 //! [`GatewayLedger::admit`] decides a call's limits and budgets from the
-//! cached tenant snapshot. A call no limit or budget covers touches Postgres
-//! not at all. A covered call is checked and charged by one
-//! `wyrd.gateway_admit` statement, which takes the tenant's admission
-//! advisory lock, so concurrent admissions on every replica see each other's
-//! committed limit charges and budget reservations before charging their own.
+//! cached tenant snapshot and charges a covered call against this process's
+//! [`GatewayUsage`], in memory: concurrent admissions on one server never
+//! spend the same headroom, and servers see each other's usage once it has
+//! been persisted and refreshed in the background, so quotas are approximate
+//! across servers. No admission or settlement waits for Postgres.
 //!
 //! Limits use fixed one-minute request and token windows plus concurrency
 //! leases. Admission charges one request and holds the call's bounded token
@@ -19,13 +19,15 @@
 //!
 //! [`Accounted::new`] prices the call's attempts in memory; its attempt and
 //! call entries travel only with the call's capture.
-//! [`GatewayLedger::settle`] persists what admission charged, in one
-//! `wyrd.gateway_settle` statement, and only for a call that a limit or budget
-//! covered: before a buffered answer is sent, so the caller's next call
-//! never meets this call's charges, and once a stream ends.
+//! [`GatewayLedger::settle`] applies what admission charged to local usage
+//! once execution ends: before a buffered answer is sent, so the caller's
+//! next call on this server never meets this call's concurrency, and once a
+//! stream ends. Dropping an unsettled [`Admission`] ends its concurrency and
+//! leaves its holds and reservations charged in full.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
+use std::sync::Arc;
 
 use chrono::{DateTime, Datelike, Months, NaiveDate, Utc};
 use serde_json::json;
@@ -40,13 +42,10 @@ use wyrd_spec::gateway::{
     GatewayLimit, GatewayLimitSubject, GatewayPolicySubject, GatewayPolicyTarget,
     GatewayUsageAmount, ModelRef, UnknownCostPolicy,
 };
-use wyrd_sql::WyrdPostgres;
-use wyrd_sql::queries::gateway_admission::{
-    GatewayAdmissionOutcome, GatewayAdmissionWrite, GatewayAdmissions, GatewayBudgetCharge,
-    GatewayHoldDelta, GatewayLimitCharge, GatewaySettlementEntry, GatewaySettlementWrite,
-};
+use wyrd_sql::queries::gateway_admission::GatewayUsageEntry;
 
-use super::service::{encode, internal, unavailable};
+use super::service::{encode, internal};
+use super::usage::{BudgetCharge, GatewayUsage, LimitCharge, Outcome, Settled, budget_key};
 
 /// Identity, policy, and bounds of one call as the ledger sees it.
 #[derive(Debug, Clone, Copy)]
@@ -70,14 +69,27 @@ pub(crate) struct LedgerCall<'s> {
 }
 
 /// Charges admission made for one call, settled when it is accounted.
-#[derive(Debug, Clone, Default)]
+#[derive(Default)]
 pub(crate) struct Admission {
     /// Token holds charged to limit admission windows.
     holds: Vec<Hold>,
     /// Budget reservations created.
     reservations: Vec<Reservation>,
-    /// Whether the call took a concurrency lease.
-    leased: bool,
+    /// Keys of the concurrency limits the call counts against.
+    leases: Vec<String>,
+    /// The usage that was charged, its tenant, and the admission window,
+    /// until settlement or drop ends the charge's ownership.
+    charged: Option<(Arc<GatewayUsage>, DataTenantId, DateTime<Utc>)>,
+}
+
+impl Drop for Admission {
+    /// Ends the concurrency of a call that was never settled; its holds and
+    /// reservations keep counting at their admitted amounts.
+    fn drop(&mut self) {
+        if let Some((usage, tenant, window)) = self.charged.take() {
+            usage.settle(tenant, window, &[], &self.leases, Vec::new());
+        }
+    }
 }
 
 /// Tokens one admitted call holds in one limit's admission window.
@@ -108,26 +120,18 @@ pub(crate) struct Accounted {
     /// Attempt entries then the call entry, which capture projects instead
     /// of pricing the call a second time.
     pub entries: Vec<GatewayAccountingEntryV1>,
-    /// The statement settling what admission charged, or `None` when the
-    /// call charged nothing.
+    /// The settlement of what admission charged, or `None` when the call
+    /// charged no hold or reservation.
     settlement: Option<Settlement>,
 }
 
-/// The settlement statement's arguments for one call.
+/// What settlement applies to one call's charges.
 #[derive(Debug)]
 struct Settlement {
-    /// Logical call.
-    call_id: GatewayCallId,
-    /// The call's admission window.
-    window_start: DateTime<Utc>,
-    /// Settlement time.
-    now: DateTime<Utc>,
-    /// Hold corrections.
-    holds: Vec<GatewayHoldDelta>,
+    /// Signed token corrections by limit key.
+    holds: Vec<(String, i64)>,
     /// Reservation settlements.
-    settlements: Vec<GatewaySettlementEntry>,
-    /// Whether the call's leases are released.
-    release: bool,
+    settlements: Vec<Settled>,
 }
 
 impl Accounted {
@@ -241,7 +245,7 @@ impl Accounted {
         entries.push(entry);
 
         let charged = !admission.holds.is_empty() || !admission.reservations.is_empty();
-        let settlement = (charged || admission.leased)
+        let settlement = charged
             .then(|| -> Result<Settlement, WyrdError> {
                 let mut settlements = Vec::with_capacity(admission.reservations.len());
                 for reservation in &admission.reservations {
@@ -255,20 +259,13 @@ impl Accounted {
                 let holds = admission
                     .holds
                     .iter()
-                    .map(|hold| GatewayHoldDelta {
-                        key: hold.key.clone(),
-                        delta: covered_tokens(&hold.target, &execution.attempts)
-                            .map_or(0, |tokens| tokens - hold.tokens),
+                    .map(|hold| {
+                        let delta = covered_tokens(&hold.target, &execution.attempts)
+                            .map_or(0, |tokens| tokens - hold.tokens);
+                        (hold.key.clone(), delta)
                     })
                     .collect();
-                Ok(Settlement {
-                    call_id: call.call_id,
-                    window_start: minute_start(call.admitted_at),
-                    now,
-                    holds,
-                    settlements,
-                    release: admission.leased,
-                })
+                Ok(Settlement { holds, settlements })
             })
             .transpose()?;
         Ok(Self {
@@ -278,16 +275,16 @@ impl Accounted {
     }
 }
 
-/// Admits and settles gateway calls against the tenant pool.
-pub(crate) struct GatewayLedger<'p> {
-    /// Tenant pool the admission and settlement statements run on.
-    postgres: &'p WyrdPostgres,
+/// Admits and settles gateway calls against this process's usage.
+pub(crate) struct GatewayLedger<'u> {
+    /// The process usage admissions charge.
+    usage: &'u Arc<GatewayUsage>,
 }
 
-impl<'p> GatewayLedger<'p> {
-    /// Borrows the tenant pool.
-    pub(crate) fn new(postgres: &'p WyrdPostgres) -> Self {
-        Self { postgres }
+impl<'u> GatewayLedger<'u> {
+    /// Borrows the process usage.
+    pub(crate) fn new(usage: &'u Arc<GatewayUsage>) -> Self {
+        Self { usage }
     }
 
     /// Admits `call`, narrowing `plan` to candidates its limits and budgets
@@ -304,21 +301,21 @@ impl<'p> GatewayLedger<'p> {
     ///    of each applicable budget.
     ///
     /// When no limit covers a remaining candidate and no budget applies, the
-    /// call is admitted with no IO. Otherwise one `wyrd.gateway_admit`
-    /// statement checks every covering limit's request, token, and
-    /// concurrency use and every budget's period spend under the tenant
-    /// admission lock, and charges all of them only when all have room. A
-    /// limit it reports exhausted removes the candidates it covers, and the
-    /// statement runs again for what remains, so each repetition removes at
-    /// least one candidate. Nothing is charged by a rejection.
+    /// call is admitted without touching usage. Otherwise
+    /// [`GatewayUsage::admit`] checks every covering limit's request, token,
+    /// and concurrency use and every budget's period spend against local and
+    /// last refreshed shared usage, and charges all of them only when all
+    /// have room. A limit it reports exhausted removes the candidates it
+    /// covers, and the check runs again for what remains, so each repetition
+    /// removes at least one candidate. Nothing is charged by a rejection.
     ///
     /// # Errors
     /// Returns `GatewayLimitExceeded` with `retry_after_seconds`,
     /// `GatewayCostUnbounded` (also for unbounded token exposure), or
     /// `GatewayBudgetExceeded` when no candidate survives,
-    /// `ServiceUnavailable` when storage fails, and `Internal` for an entry
-    /// that violates the ledger contract.
-    pub(crate) async fn admit(
+    /// `ServiceUnavailable` when the tenant's usage is not loaded, stale, or
+    /// full, and `Internal` for an entry that violates the ledger contract.
+    pub(crate) fn admit(
         &self,
         call: &LedgerCall<'_>,
         plan: &mut CallPlan,
@@ -383,9 +380,9 @@ impl<'p> GatewayLedger<'p> {
                         .any(|candidate| covers(&limit.target, &candidate.model))
                 })
                 .collect();
-            let charges: Vec<GatewayLimitCharge> = covering
+            let charges: Vec<LimitCharge> = covering
                 .iter()
-                .map(|(limit, key)| GatewayLimitCharge {
+                .map(|(limit, key)| LimitCharge {
                     key: key.clone(),
                     requests: limit.requests_per_minute.map(NonZeroU64::get),
                     tokens: limit.tokens_per_minute.map(NonZeroU64::get),
@@ -414,22 +411,19 @@ impl<'p> GatewayLedger<'p> {
                 return Ok(Admission::default());
             }
 
-            let mut conn = self.postgres.conn().await.map_err(unavailable)?;
-            let outcome = GatewayAdmissions::new(&mut conn, call.tenant)
-                .admit(&GatewayAdmissionWrite {
-                    call_id: call.call_id.as_uuid(),
-                    window_start: minute_start(now),
-                    now,
-                    expires_at: call.expires_at,
-                    limits: &charges,
-                    budgets: &budget_charges,
-                })
-                .await
-                .map_err(unavailable)?;
-            match outcome {
-                GatewayAdmissionOutcome::Admitted => {
+            let window = minute_start(now);
+            match self
+                .usage
+                .admit(call.tenant, window, &charges, budget_charges)?
+            {
+                Outcome::Admitted => {
                     return Ok(Admission {
-                        leased: charges.iter().any(|charge| charge.lease),
+                        leases: charges
+                            .iter()
+                            .filter(|charge| charge.lease)
+                            .map(|charge| charge.key.clone())
+                            .collect(),
+                        charged: Some((Arc::clone(self.usage), call.tenant, window)),
                         holds: covering
                             .iter()
                             .zip(charges)
@@ -442,8 +436,8 @@ impl<'p> GatewayLedger<'p> {
                         reservations,
                     });
                 }
-                GatewayAdmissionOutcome::BudgetExceeded => return Err(budget_exceeded()),
-                GatewayAdmissionOutcome::Exhausted(keys) => {
+                Outcome::BudgetExceeded => return Err(budget_exceeded()),
+                Outcome::Exhausted(keys) => {
                     let exhausted: Vec<&GatewayPolicyTarget> = covering
                         .iter()
                         .filter(|(_, key)| keys.contains(key))
@@ -462,44 +456,28 @@ impl<'p> GatewayLedger<'p> {
         }
     }
 
-    /// Persists what admission charged `accounted`'s call in one
-    /// `wyrd.gateway_settle` statement, and does nothing for a call that
-    /// charged nothing.
+    /// Applies `accounted`'s settlement to the usage `admission` charged
+    /// and ends the call's concurrency, exactly once: a second call, or the
+    /// admission's drop afterwards, changes nothing.
     ///
-    /// The statement replaces each hold by its actual tokens, appends each
-    /// reservation settlement (a replay appends nothing), releases the
-    /// call's leases, and prunes windows and leases no admission reads.
-    ///
-    /// # Errors
-    /// Returns `ServiceUnavailable` when storage fails. Nothing commits then:
-    /// leases lapse at their expiry and each reservation keeps counting at
-    /// its reserved cost.
-    pub(crate) async fn settle(
-        &self,
-        tenant: DataTenantId,
-        accounted: &Accounted,
-    ) -> Result<(), WyrdError> {
-        let Some(settlement) = &accounted.settlement else {
-            return Ok(());
+    /// Each hold is corrected to its actual tokens and each reservation
+    /// settled, in memory; background work persists them.
+    #[tracing::instrument(name = "gateway.account", level = "debug", skip_all)]
+    pub(crate) fn settle(admission: &mut Admission, accounted: &mut Accounted) {
+        let Some((usage, tenant, window)) = admission.charged.take() else {
+            return;
         };
-        let mut conn = self.postgres.conn().await.map_err(unavailable)?;
-        GatewayAdmissions::new(&mut conn, tenant)
-            .settle(&GatewaySettlementWrite {
-                call_id: settlement.call_id.as_uuid(),
-                window_start: settlement.window_start,
-                window_floor: minute_start(settlement.now) - chrono::TimeDelta::minutes(1),
-                now: settlement.now,
-                holds: &settlement.holds,
-                settlements: &settlement.settlements,
-                release: settlement.release,
-            })
-            .await
-            .map_err(unavailable)
+        let (holds, settlements) = accounted
+            .settlement
+            .take()
+            .map(|settlement| (settlement.holds, settlement.settlements))
+            .unwrap_or_default();
+        usage.settle(tenant, window, &holds, &admission.leases, settlements);
     }
 }
 
-/// The admission statement's check of `budget` against `reserve`, and the
-/// reservation it creates, which is `None` for a zero reserve.
+/// The admission check of `budget` against `reserve`, and the reservation it
+/// creates, which is `None` for a zero reserve.
 ///
 /// # Errors
 /// Returns `Internal` when the budget period is out of range or the
@@ -508,17 +486,14 @@ fn reservation(
     call: &LedgerCall<'_>,
     budget: &GatewayBudget,
     reserve: &GatewayCost,
-) -> Result<(GatewayBudgetCharge, Option<Reservation>), WyrdError> {
+) -> Result<(BudgetCharge, Option<Reservation>), WyrdError> {
     let (period_start, period_end) = period_bounds(budget.period, call.admitted_at)
         .ok_or_else(|| internal("budget period is out of range"))?;
-    let mut charge = GatewayBudgetCharge {
-        subject: encode(&budget.subject)?,
-        period_start: encode(&period_start)?,
-        period_end: encode(&period_end)?,
-        amount: budget.amount.as_str().to_owned(),
-        reserve: reserve.to_decimal().as_str().to_owned(),
-        entry_id: None,
-        entry: None,
+    let mut charge = BudgetCharge {
+        key: budget_key(&budget.subject, period_start, period_end),
+        amount: GatewayCost::from_decimal(&budget.amount),
+        reserve: reserve.clone(),
+        reservation: None,
     };
     if reserve.is_zero() {
         return Ok((charge, None));
@@ -543,8 +518,15 @@ fn reservation(
         expires_at: call.expires_at,
     };
     entry.validate().map_err(internal)?;
-    charge.entry_id = Some(entry_id.as_uuid());
-    charge.entry = Some(encode(&entry)?);
+    charge.reservation = Some((
+        reservation.id.as_uuid(),
+        GatewayUsageEntry {
+            entry_id: entry_id.as_uuid(),
+            call_id: call.call_id.as_uuid(),
+            kind: "budget_reservation_created",
+            entry: encode(&entry)?,
+        },
+    ));
     Ok((charge, Some(reservation)))
 }
 
@@ -557,7 +539,7 @@ fn settlement(
     reservation: &Reservation,
     actual: &GatewayCost,
     now: DateTime<Utc>,
-) -> Result<GatewaySettlementEntry, WyrdError> {
+) -> Result<Settled, WyrdError> {
     let entry_id = GatewayAccountingEntryId::new_v7();
     let entry = GatewayAccountingEntryV1::BudgetReservationSettled {
         entry_id,
@@ -570,9 +552,15 @@ fn settlement(
         settled_at: now,
     };
     entry.validate().map_err(internal)?;
-    Ok(GatewaySettlementEntry {
-        entry_id: entry_id.as_uuid(),
-        entry: encode(&entry)?,
+    Ok(Settled {
+        reservation: reservation.id.as_uuid(),
+        actual: actual.clone(),
+        entry: GatewayUsageEntry {
+            entry_id: entry_id.as_uuid(),
+            call_id: call.call_id.as_uuid(),
+            kind: "budget_reservation_settled",
+            entry: encode(&entry)?,
+        },
     })
 }
 

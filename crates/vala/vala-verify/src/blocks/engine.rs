@@ -22,6 +22,7 @@
 //! settled block instead of running it again and counts every attempt that
 //! never settled against the step's retries.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -42,13 +43,14 @@ use wyrd_spec::ids::SlotName;
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::VerificationVerdict;
 use wyrd_spec::verification::execution::{
-    CallProvenance, Citation, InputDeclaration, InvocationSettlement, Producer, ProducerInvocation,
-    RequirementDetail, RequirementOutcome, RequirementResult, Speculation, StepResult, StepStatus,
-    VerificationOutcome,
+    CallProvenance, Citation, ExecutedOutcome, ExecutedRequirement, InputDeclaration,
+    InvocationSettlement, Producer, ProducerInvocation, RequirementDetail, RequirementDetails,
+    RequirementOutcome, RequirementResult, Speculation, StepResult, StepStatus,
 };
 use wyrd_spec::verification::state::{ControlRecord, ExecutionState};
 use wyrd_spec::verification::{ComparisonOperator, ContextCapture};
 
+use super::BoundJson;
 use super::drift::DriftChecks;
 use super::scope::{
     Cause, Done, Frame, Iteration, Ledger, Missing, Scope, Settled, StepDone, attempt_records,
@@ -668,6 +670,11 @@ impl VerificationEngine {
     /// the engine's bound, and `max_agent_invocations` counts every Agent
     /// action and check attempt, those earlier runs recorded included.
     ///
+    /// The evidence has one owner for the whole run: the engine pins it,
+    /// with its synthetic attachment slots, behind one [`Arc`] that the host
+    /// reader is admitted with and every block resolves against, and moves
+    /// it back out into the outcome once every block has settled.
+    ///
     /// The deadline is checked before any work and again before the verdict
     /// is published, so work that completes without suspending, such as an
     /// empty Verifier, never reports a verdict outside its budget; pending
@@ -676,8 +683,7 @@ impl VerificationEngine {
     /// Before any block runs, every supplied declaration must conform to its
     /// declared slot (see [`conform`]) and the host's evidence reader, when
     /// set, must admit the whole set. A declared slot left unsupplied is not
-    /// refused here: a required one leaves its dependents without evidence
-    /// and an optional one reads as null.
+    /// refused here: it leaves the checks that need it inconclusive.
     ///
     /// # Errors
     /// Returns [`EngineError::InputInvalid`] or [`EngineError::InputTooLarge`]
@@ -701,7 +707,7 @@ impl VerificationEngine {
         spec: Arc<VerifierSpec>,
         evidence: BTreeMap<SlotName, InputDeclaration>,
         deadline: Instant,
-    ) -> Result<VerificationOutcome, EngineError> {
+    ) -> Result<ExecutedOutcome, EngineError> {
         let expired = || Instant::now() >= deadline;
         if expired() {
             return Err(EngineError::DeadlineExceeded);
@@ -711,6 +717,7 @@ impl VerificationEngine {
         let limits = spec.limits.as_ref();
         let (ledger, evidence) = timeout_at(deadline, async {
             let (evidence, attached) = self.attach(&spec, evidence).await?;
+            let evidence = Arc::new(evidence);
             if let Some(reader) = &self.evidence {
                 reader.admit(&spec.inputs, &evidence).await?;
             }
@@ -731,38 +738,54 @@ impl VerificationEngine {
                     .map(|bound| Arc::new(Semaphore::new(bound as usize))),
                 ..self.clone()
             };
-            let evidence = Arc::new(evidence);
             let ledger = attempt.drive(&spec, &evidence, deadline).await?;
-            let evidence = Arc::try_unwrap(evidence).unwrap_or_else(|shared| (*shared).clone());
             Ok::<_, EngineError>((ledger, evidence))
         })
         .await
         .map_err(|_| EngineError::DeadlineExceeded)??;
+        // Every block has settled, so each settlement has one owner left and
+        // moves into the outcome, its shared step output uncopied.
+        let mut settled: HashMap<TaskId, Done> = ledger
+            .into_iter()
+            .map(|(id, done)| (id, Arc::unwrap_or_clone(done)))
+            .collect();
         let (mut steps, mut requirements) = (Vec::new(), Vec::new());
         for id in plan.stages.iter().flat_map(|stage| &stage.tasks) {
-            if let Some(Done::Step(done)) = ledger.get(id).map(AsRef::as_ref) {
-                steps.push(done.result.clone());
-                requirements.extend(done.requirements.iter().cloned());
+            if let Some(Done::Step(done)) = settled.remove(id) {
+                let StepDone {
+                    mut result,
+                    state,
+                    requirements: instances,
+                    ..
+                } = *done;
+                if let Settled::Succeeded { output, .. } = state {
+                    result.output = Some(Arc::unwrap_or_clone(output));
+                }
+                steps.push(result);
+                requirements.extend(instances);
             }
         }
         for requirement in &spec.requirements {
-            if let Some(Done::Requirement(result)) = ledger.get(&requirement.id).map(AsRef::as_ref)
-            {
-                requirements.push((**result).clone());
+            if let Some(Done::Requirement(result)) = settled.remove(&requirement.id) {
+                requirements.push(*result);
             }
         }
         let verdict = decide(
             spec.decide,
-            requirements.iter().map(|result| result.outcome),
+            requirements
+                .iter()
+                .map(|requirement| requirement.result.outcome),
         );
         if expired() {
             return Err(EngineError::DeadlineExceeded);
         }
-        Ok(VerificationOutcome {
+        Ok(ExecutedOutcome {
             verdict,
             requirements,
             steps,
-            evidence,
+            // Every block has settled and readers keep only a weak view, so
+            // this is the last owner and the evidence moves out uncopied.
+            evidence: Arc::unwrap_or_clone(evidence),
         })
     }
 
@@ -895,7 +918,7 @@ impl VerificationEngine {
                     if !step.speculative || disposed.contains(&index) {
                         continue;
                     }
-                    let scope = Scope::new(spec, evidence, &ledger);
+                    let scope = Scope::new(evidence, &ledger);
                     let Some((speculation, reason)) = guard(&scope, &ledger, step) else {
                         continue;
                     };
@@ -913,14 +936,8 @@ impl VerificationEngine {
                         }
                         _ => continue,
                     };
-                    let decided = self.decide_speculation(
-                        spec,
-                        &scope,
-                        index,
-                        settled,
-                        speculation,
-                        &reason,
-                    )?;
+                    let decided =
+                        self.decide_speculation(spec, &scope, index, settled, speculation, &reason);
                     disposed.insert(index);
                     let engine = self.clone();
                     let control = ControlRecord::Disposition {
@@ -987,9 +1004,9 @@ impl VerificationEngine {
                 self.step(spec, evidence, ledger, index, deadline)
             }
             Node::Requirement(at) => {
-                let scope = Scope::new(spec, evidence, ledger);
+                let scope = Scope::new(evidence, ledger);
                 Ok(
-                    match self.requirement(spec, &scope, (None, at), (None, None), deadline)? {
+                    match self.requirement(spec, &scope, (None, at), (None, None), deadline) {
                         Prepared::Settled(result) => {
                             Prepared::Settled(Arc::new(Done::Requirement(Box::new(result))))
                         }
@@ -1006,10 +1023,6 @@ impl VerificationEngine {
     /// `speculation`: an admitted contribution is kept, any other is
     /// withheld, its output and requirement judgments replaced by the
     /// guard's gap while its invocations stay reported.
-    ///
-    /// # Errors
-    /// Returns [`EngineError::Capture`] when a requirement's actual value
-    /// cannot be captured.
     fn decide_speculation(
         &self,
         spec: &VerifierSpec,
@@ -1018,10 +1031,10 @@ impl VerificationEngine {
         mut done: StepDone,
         speculation: Speculation,
         reason: &str,
-    ) -> Result<StepDone, EngineError> {
+    ) -> StepDone {
         done.speculation = speculation;
         if speculation.admits() {
-            return Ok(done);
+            return done;
         }
         let (status, gap) = withheld(speculation, reason);
         done.result.status = status;
@@ -1030,8 +1043,8 @@ impl VerificationEngine {
         done.result.reason = Some(gap.reason.clone());
         done.state = Settled::NoOutput { status, gap };
         done.member = None;
-        done.requirements = missing_requirements(spec, scope, &self.attached, index, &done)?;
-        Ok(done)
+        done.requirements = missing_requirements(spec, scope, &self.attached, index, &done);
+        done
     }
 
     /// Prepare one step.
@@ -1062,7 +1075,7 @@ impl VerificationEngine {
         deadline: Instant,
     ) -> Result<Prepared<Arc<Done>, EngineError>, EngineError> {
         let step = &spec.steps[index];
-        let scope = Scope::new(spec, evidence, ledger);
+        let scope = Scope::new(evidence, ledger);
         let settle = |status: StepStatus, gap: Missing, speculation: Speculation| {
             let mut done = unrun(step, gap, speculation);
             done.result.status = status;
@@ -1072,7 +1085,7 @@ impl VerificationEngine {
             {
                 *settled = status;
             }
-            done.requirements = missing_requirements(spec, &scope, &self.attached, index, &done)?;
+            done.requirements = missing_requirements(spec, &scope, &self.attached, index, &done);
             Ok(Prepared::Settled(Arc::new(Done::Step(Box::new(done)))))
         };
         if let DependsOn::AnySucceeded { any_succeeded } = &step.depends_on
@@ -1112,7 +1125,7 @@ impl VerificationEngine {
                             *settled = status;
                         }
                         done.requirements =
-                            missing_requirements(spec, &scope, &self.attached, index, &done)?;
+                            missing_requirements(spec, &scope, &self.attached, index, &done);
                         return Ok(Prepared::Settled(Arc::new(Done::Step(Box::new(done)))));
                     }
                 }
@@ -1138,9 +1151,13 @@ impl VerificationEngine {
                         Ok(resolved) => resolved,
                         Err(gap) => return settle(gap.control_status(), gap, speculation),
                     };
-                    let (values, freeze) = match (self.frozen(&step.id), &resolved.value) {
+                    let selected = match &resolved.value {
+                        CallValue::Json(value) => value.as_array(),
+                        _ => None,
+                    };
+                    let (values, freeze) = match (self.frozen(&step.id), selected) {
                         (Some(frozen), _) => (frozen.clone(), None),
-                        (None, CallValue::Json(Value::Array(values))) => {
+                        (None, Some(values)) => {
                             let values = values.clone();
                             let freeze = ControlRecord::Items {
                                 step: step.id.clone(),
@@ -1167,7 +1184,7 @@ impl VerificationEngine {
                             Some((
                                 at,
                                 Some(CallInput {
-                                    value: CallValue::Json(value),
+                                    value: CallValue::Json(value.into()),
                                     sources: resolved.sources.clone(),
                                 }),
                             ))
@@ -1193,7 +1210,7 @@ impl VerificationEngine {
         let gaps: Vec<Missing> = members
             .iter()
             .filter_map(|item| {
-                let scope = Scope::new(spec, evidence, ledger).framed(first(item));
+                let scope = Scope::new(evidence, ledger).framed(first(item));
                 bindings(&scope, &self.attached, step).err()
             })
             .collect();
@@ -1322,7 +1339,7 @@ impl VerificationEngine {
             let mut own = if let Some(own) = self.restored_action(&step.id, instance) {
                 own
             } else {
-                let scope = Scope::new(spec, evidence, ledger).framed(frame.clone());
+                let scope = Scope::new(evidence, ledger).framed(frame.clone());
                 match bindings(&scope, &self.attached, step) {
                     Err(gap) => {
                         let mut own = unrun(step, gap, Speculation::None);
@@ -1333,10 +1350,12 @@ impl VerificationEngine {
                         let attempted = self.attempt(step, &bindings, deadline, instance).await?;
                         let attempts = attempted.attempts;
                         let own = attempted.settle(step, bindings.sources(), instance);
-                        if attempts > 0 {
+                        // Only a checkpointed run records the settlement, so only
+                        // it copies the output into one.
+                        if attempts > 0 && self.checkpoints.is_some() {
                             let producer = producer(&step.id, instance, attempts);
                             let settled = InvocationSettlement::Action {
-                                result: Box::new(own.result.clone()),
+                                result: Box::new(reported(&own)),
                                 sources: sources(&own.state),
                             };
                             self.commit(&producer, &settled).await?;
@@ -1353,7 +1372,10 @@ impl VerificationEngine {
             requirements.extend(own.requirements.iter().cloned());
             let output = match &own.state {
                 Settled::Succeeded { output, sources } => CallInput {
-                    value: CallValue::Json(output.clone()),
+                    value: CallValue::Json(
+                        BoundJson::output(output, &[])
+                            .expect("an empty path selects the whole output"),
+                    ),
                     sources: sources.clone(),
                 },
                 Settled::NoOutput { .. } => {
@@ -1369,7 +1391,7 @@ impl VerificationEngine {
             if let Some(current) = &mut frame.iteration {
                 current.output = Some(output.clone());
             }
-            let scope = Scope::new(spec, evidence, ledger).framed(frame);
+            let scope = Scope::new(evidence, ledger).framed(frame);
             let stop = condition(&scope, &repeat.until, "until");
             let fail = |own: &mut StepDone, reason: String| {
                 own.result.status = StepStatus::Failed;
@@ -1396,7 +1418,7 @@ impl VerificationEngine {
                     );
                     last = Some(own);
                 }
-                Ok(false) => previous = json(&output),
+                Ok(false) => previous = json(&output).into_owned(),
                 Err(gap) => {
                     fail(&mut own, gap.reason);
                     last = Some(own);
@@ -1434,18 +1456,18 @@ impl VerificationEngine {
     async fn instance_requirements(
         &self,
         spec: &Arc<VerifierSpec>,
-        evidence: &BTreeMap<SlotName, InputDeclaration>,
+        evidence: &Arc<BTreeMap<SlotName, InputDeclaration>>,
         ledger: &Ledger,
         index: usize,
         frame: &Frame,
         deadline: Instant,
-    ) -> Result<Vec<RequirementResult>, EngineError> {
+    ) -> Result<Vec<ExecutedRequirement>, EngineError> {
         let instance = frame.instance();
         let mut results = Vec::new();
-        let mut running: Tasks<usize, RequirementResult, EngineError> = Tasks::default();
+        let mut running: Tasks<usize, ExecutedRequirement, EngineError> = Tasks::default();
         for at in 0..spec.steps[index].requirements.len() {
-            let scope = Scope::new(spec, evidence, ledger).framed(frame.clone());
-            match self.requirement(spec, &scope, (Some(index), at), instance, deadline)? {
+            let scope = Scope::new(evidence, ledger).framed(frame.clone());
+            match self.requirement(spec, &scope, (Some(index), at), instance, deadline) {
                 Prepared::Settled(result) => results.push((at, result)),
                 Prepared::Run(task) => running.push(at, task),
             }
@@ -1470,11 +1492,10 @@ impl VerificationEngine {
     /// spends nothing; an Agent check finding the run's budget spent is
     /// inconclusive without a call.
     ///
-    /// # Errors
-    /// Returns [`EngineError::Capture`] when an actual value cannot be
-    /// hashed; the prepared check fails with [`EngineError::Busy`] when it is
-    /// refused process capacity and [`EngineError::DefinitionUnavailable`]
-    /// when its exact definition is unavailable.
+    /// The prepared check fails with [`EngineError::Busy`] when it is refused
+    /// process capacity, [`EngineError::DefinitionUnavailable`] when its
+    /// exact definition is unavailable, [`EngineError::Capture`] when its
+    /// actual value cannot be hashed, and the checkpoint store's failure.
     ///
     /// # Panics
     /// Panics when `key` does not name a requirement of `spec`.
@@ -1485,35 +1506,36 @@ impl VerificationEngine {
         key: Key,
         instance: Instance,
         deadline: Instant,
-    ) -> Result<Prepared<RequirementResult, EngineError>, EngineError> {
+    ) -> Prepared<ExecutedRequirement, EngineError> {
         let requirement = requirement_at(spec, key);
         if let Some(InvocationSettlement::Requirement { result }) =
             self.restored(&requirement.id, instance)
         {
-            return Ok(Prepared::Settled((**result).clone()));
+            return Prepared::Settled((**result).clone());
         }
         let inputs = match requirement_bindings(spec, scope, &self.attached, key) {
             Ok(inputs) => inputs,
             Err(gap) => {
-                return Judged::missing(gap)
-                    .report(spec, key, instance)
-                    .map(Prepared::Settled);
+                return Prepared::Settled(Judged::missing(gap).report(spec, key, instance));
             }
         };
         let engine = self.clone();
         let spec = Arc::clone(spec);
-        Ok(Prepared::Run(Box::pin(async move {
+        Prepared::Run(Box::pin(async move {
             let requirement = requirement_at(&spec, key);
             let _permits = engine.admit().await;
             if matches!(requirement.check, Check::Agent(_)) && !engine.spend() {
-                return Judged::inconclusive(BUDGET_SPENT.to_owned()).report(&spec, key, instance);
+                return Ok(
+                    Judged::inconclusive(BUDGET_SPENT.to_owned()).report(&spec, key, instance)
+                );
             }
             let attempt = engine.recorded(&requirement.id, instance) + 1;
             let producer = producer(&requirement.id, instance, attempt);
             engine.begin(&producer).await?;
             let step = key.0.map(|index| &spec.steps[index].id);
+            let capture = spec.context_capture.unwrap_or(ContextCapture::Full);
             let judged = match engine
-                .judge(requirement, step, inputs, deadline, &producer)
+                .judge(requirement, step, inputs, capture, deadline, &producer)
                 .await
             {
                 Err(error @ (EngineError::Busy(_) | EngineError::DefinitionUnavailable(_))) => {
@@ -1522,13 +1544,17 @@ impl VerificationEngine {
                 }
                 judged => judged?,
             };
-            let result = judged.report(&spec, key, instance)?;
-            let settled = InvocationSettlement::Requirement {
-                result: Box::new(result.clone()),
-            };
-            engine.commit(&producer, &settled).await?;
+            let result = judged.report(&spec, key, instance);
+            // Only a checkpointed run records the settlement, so only it
+            // copies the judged actual value into one.
+            if engine.checkpoints.is_some() {
+                let settled = InvocationSettlement::Requirement {
+                    result: Box::new(result.clone()),
+                };
+                engine.commit(&producer, &settled).await?;
+            }
             Ok(result)
-        })))
+        }))
     }
 
     /// Run one step's action, retrying retryable failures and per-attempt
@@ -1658,7 +1684,8 @@ impl VerificationEngine {
     /// process capacity and [`EngineError::DefinitionUnavailable`] when its
     /// exact definition is unavailable, neither of which is judged, and
     /// [`EngineError::EvidenceUnavailable`] when a deferring engine's trace
-    /// has not landed yet.
+    /// has not landed yet, and [`EngineError::Capture`] when the actual value
+    /// cannot be captured under `capture`.
     #[tracing::instrument(
         name = "verification.block",
         level = "debug",
@@ -1670,6 +1697,7 @@ impl VerificationEngine {
         requirement: &Requirement,
         step: Option<&TaskId>,
         bindings: Bindings,
+        capture: ContextCapture,
         deadline: Instant,
         producer: &Producer,
     ) -> Result<Judged, EngineError> {
@@ -1683,8 +1711,8 @@ impl VerificationEngine {
                 expected,
                 ..
             } => {
-                let observed = inputs.get("value").map_or(Value::Null, json);
-                let compared = match (each, &observed) {
+                let observed = inputs.get("value").map_or(Cow::Owned(Value::Null), json);
+                let compared = match (each, &*observed) {
                     (Some(_), Value::Array(items)) if items.is_empty() => {
                         timer.finish(true);
                         return Ok(Judged::inconclusive(EMPTY_SELECTION.to_owned()));
@@ -1695,11 +1723,14 @@ impl VerificationEngine {
                     (None, _) => evaluate_single(&requirement.id, operator, expected, &observed),
                 };
                 let ok = compared.is_ok();
-                (Judged::compared(compared), ok)
+                (Judged::compared(compared, capture), ok)
             }
             Check::Trace(trace) => {
-                match self.trace(&requirement.id, trace, &inputs, deadline).await {
-                    Ok(judged) => judged,
+                match self
+                    .trace(&requirement.id, trace, &inputs, capture, deadline)
+                    .await
+                {
+                    Ok((judged, ok)) => (Ok(judged), ok),
                     Err(error) => {
                         timer.finish(false);
                         return Err(error);
@@ -1720,7 +1751,7 @@ impl VerificationEngine {
                     iteration_index: producer.iteration_index,
                 };
                 match self.checks.execute(call).await {
-                    Ok(output) => (Judged::cited(output, &sources), true),
+                    Ok(output) => (Judged::cited(output, &sources, capture), true),
                     Err(BlockError::Busy { reason }) => {
                         timer.finish(false);
                         return Err(EngineError::Busy(reason));
@@ -1729,16 +1760,16 @@ impl VerificationEngine {
                         timer.finish(false);
                         return Err(EngineError::DefinitionUnavailable(reason));
                     }
-                    Err(error) => (Judged::inconclusive(reason(&error)), false),
+                    Err(error) => (Ok(Judged::inconclusive(reason(&error))), false),
                 }
             }
             Check::Drift(drift) => (
-                Judged::checked(self.drift.judge(&requirement.id, drift)),
+                Judged::checked(self.drift.judge(&requirement.id, drift), capture),
                 true,
             ),
         };
         timer.finish(ok);
-        Ok(judged)
+        Ok(judged?)
     }
 
     /// Compare the selected span value of the declared trace.
@@ -1756,6 +1787,7 @@ impl VerificationEngine {
         id: &TaskId,
         trace: &TraceCheck,
         inputs: &BTreeMap<String, CallInput>,
+        capture: ContextCapture,
         deadline: Instant,
     ) -> Result<(Judged, bool), EngineError> {
         let Some(CallValue::Evidence(InputDeclaration::Trace { trace_id })) =
@@ -1777,10 +1809,13 @@ impl VerificationEngine {
             }
         };
         let document = project_spans(*trace_id, &spans);
-        let compared = extract_jsonpath_from(&document, &trace.span_selector)
-            .and_then(|observed| evaluate_single(id, &trace.operator, &trace.expected, &observed));
+        let observed = match extract_jsonpath_from(&document, &trace.span_selector) {
+            Ok(observed) => observed,
+            Err(error) => return Ok((Judged::compared(Err(error), capture)?, false)),
+        };
+        let compared = evaluate_single(id, &trace.operator, &trace.expected, &observed);
         let ok = compared.is_ok();
-        Ok((Judged::compared(compared), ok))
+        Ok((Judged::compared(compared, capture)?, ok))
     }
 
     /// The run's one read of `trace_id`: the first check naming it fetches
@@ -1873,7 +1908,8 @@ fn bindings(scope: &Scope<'_>, attached: &Attached, step: &Step) -> Result<Bindi
 /// evaluated: a false condition is `Ok(false)`, never an error.
 fn condition(scope: &Scope<'_>, condition: &Condition, clause: &str) -> Result<bool, Missing> {
     let path = &condition.path;
-    let observed = json(&scope.resolve(path, None)?);
+    let resolved = scope.resolve(path, None)?;
+    let observed = json(&resolved);
     let compared = if matches!(
         condition.operator,
         ComparisonOperator::Equals | ComparisonOperator::NotEquals
@@ -2004,9 +2040,6 @@ fn requirement_bindings(
 /// `done` produced no output: each takes the strongest of that gap and its
 /// own binding gaps, without a call.
 ///
-/// # Errors
-/// Returns [`EngineError::Capture`] when an actual value cannot be captured.
-///
 /// # Panics
 /// Panics when `index` does not name a step of `spec`.
 fn missing_requirements(
@@ -2015,7 +2048,7 @@ fn missing_requirements(
     attached: &Attached,
     index: usize,
     done: &StepDone,
-) -> Result<Vec<RequirementResult>, EngineError> {
+) -> Vec<ExecutedRequirement> {
     let frame = Frame {
         own: Some(done.clone()),
         ..Frame::default()
@@ -2213,15 +2246,26 @@ fn sources(state: &Settled) -> BTreeSet<SlotName> {
     }
 }
 
-/// The settled invocation `instance` of a step from its reported `result`.
-fn own(result: StepResult, sources: BTreeSet<SlotName>, instance: Instance) -> StepDone {
-    let state = match (&result.status, &result.output) {
+/// The reported result of a settled invocation with its output, which
+/// [`StepDone::state`] alone holds while the run lasts.
+fn reported(done: &StepDone) -> StepResult {
+    let mut result = done.result.clone();
+    if let Settled::Succeeded { output, .. } = &done.state {
+        result.output = Some(Value::clone(output));
+    }
+    result
+}
+
+/// The settled invocation `instance` of a step from its reported `result`,
+/// whose output moves into the shared state that bindings select from.
+fn own(mut result: StepResult, sources: BTreeSet<SlotName>, instance: Instance) -> StepDone {
+    let state = match (result.status, result.output.take()) {
         (StepStatus::Succeeded, Some(output)) => Settled::Succeeded {
-            output: output.clone(),
+            output: Arc::new(output),
             sources,
         },
         (status, _) => Settled::NoOutput {
-            status: *status,
+            status,
             gap: Missing::failed(result.reason.clone().unwrap_or_default()),
         },
     };
@@ -2277,7 +2321,7 @@ struct Member {
     /// The final invocation: the last iteration, with its outcome.
     last: StepDone,
     /// Every requirement instance across its iterations.
-    requirements: Vec<RequirementResult>,
+    requirements: Vec<ExecutedRequirement>,
     /// Every invocation attempt across its iterations.
     invocations: Vec<ProducerInvocation>,
 }
@@ -2340,7 +2384,10 @@ fn aggregate(step: &Step, mut members: Vec<Member>, fanout: bool, elapsed: Durat
         let output = Value::Array(
             members
                 .iter()
-                .filter_map(|member| member.last.result.output.clone())
+                .filter_map(|member| match &member.last.state {
+                    Settled::Succeeded { output, .. } => Some(Value::clone(output)),
+                    Settled::NoOutput { .. } => None,
+                })
                 .collect(),
         );
         let sources = members
@@ -2349,8 +2396,11 @@ fn aggregate(step: &Step, mut members: Vec<Member>, fanout: bool, elapsed: Durat
             .collect();
         (
             StepStatus::Succeeded,
-            Some(output.clone()),
-            Settled::Succeeded { output, sources },
+            None,
+            Settled::Succeeded {
+                output: Arc::new(output),
+                sources,
+            },
         )
     };
     StepDone {
@@ -2418,7 +2468,8 @@ struct Judged {
     outcome: RequirementOutcome,
     /// Why it holds.
     reason: String,
-    /// The compared actual value.
+    /// The compared actual value, already captured under the Verifier's
+    /// context-capture mode.
     actual: Option<Value>,
     /// Citations of reachable original evidence.
     citations: Vec<Citation>,
@@ -2432,12 +2483,7 @@ struct Judged {
 
 impl Judged {
     /// The reported result of the requirement at `key` for its owner's
-    /// invocation `instance`, its actual value captured under the Verifier's
-    /// context-capture mode.
-    ///
-    /// # Errors
-    /// Returns [`EngineError::Capture`] when the actual value cannot be
-    /// hashed.
+    /// invocation `instance`.
     ///
     /// # Panics
     /// Panics when `key` does not name a requirement of `spec`.
@@ -2446,24 +2492,25 @@ impl Judged {
         spec: &VerifierSpec,
         key: Key,
         (item_index, iteration_index): Instance,
-    ) -> Result<RequirementResult, EngineError> {
+    ) -> ExecutedRequirement {
         let requirement = requirement_at(spec, key);
-        let capture = spec.context_capture.unwrap_or(ContextCapture::Full);
-        Ok(RequirementResult {
-            id: requirement.id.clone(),
-            step: key.0.map(|index| spec.steps[index].id.clone()),
-            statement: requirement.statement.clone(),
-            outcome: self.outcome,
-            reason: self.reason,
-            actual: capture_actual(self.actual, capture)?,
-            citations: self.citations,
-            data: self.data,
-            detail: self.detail,
+        RequirementDetails {
+            result: RequirementResult {
+                id: requirement.id.clone(),
+                step: key.0.map(|index| spec.steps[index].id.clone()),
+                item_index,
+                iteration_index,
+                statement: requirement.statement.clone(),
+                outcome: self.outcome,
+                reason: self.reason,
+                actual: self.actual,
+                citations: self.citations,
+                data: self.data,
+                detail: self.detail,
+            },
             check: requirement.check.clone(),
             provenance: self.provenance,
-            item_index,
-            iteration_index,
-        })
+        }
     }
 
     /// The outcome of evidence that could not be supplied.
@@ -2490,50 +2537,68 @@ impl Judged {
     }
 
     /// A deterministic comparison: passed or failed, or inconclusive when the
-    /// values cannot be compared.
-    fn compared(compared: Result<Compared, ExecError>) -> Self {
+    /// values cannot be compared. The borrowed actual value is captured
+    /// under `capture`, so only `full` copies it.
+    ///
+    /// # Errors
+    /// Returns the capture failure of an actual value that cannot be hashed.
+    fn compared(
+        compared: Result<Compared<'_>, ExecError>,
+        capture: ContextCapture,
+    ) -> Result<Self, ExecError> {
         match compared {
-            Ok((passed, actual, _, message)) => {
+            Ok((passed, actual, message)) => {
                 let outcome = if passed {
                     RequirementOutcome::Passed
                 } else {
                     RequirementOutcome::Failed
                 };
-                Self {
-                    actual,
+                Ok(Self {
+                    actual: capture_actual(actual, capture)?,
                     ..Self::bare(
                         outcome,
                         message.unwrap_or_else(|| "the comparison held".to_owned()),
                     )
-                }
+                })
             }
-            Err(error) => Self::inconclusive(error.to_string()),
+            Err(error) => Ok(Self::inconclusive(error.to_string())),
         }
     }
 
-    /// An executor's judgment, unchanged.
-    fn checked(output: CheckOutput) -> Self {
+    /// An executor's judgment, unchanged except that its actual value is
+    /// captured under `capture`.
+    ///
+    /// # Errors
+    /// Returns the capture failure of an actual value that cannot be hashed.
+    fn checked(output: CheckOutput, capture: ContextCapture) -> Result<Self, ExecError> {
         let outcome = match output.verdict.outcome {
             VerificationVerdict::Passed => RequirementOutcome::Passed,
             VerificationVerdict::Failed => RequirementOutcome::Failed,
             VerificationVerdict::Inconclusive => RequirementOutcome::Inconclusive,
         };
-        Self {
+        Ok(Self {
             outcome,
             reason: output.verdict.reason,
-            actual: output.actual,
+            actual: capture_actual(output.actual.map(Cow::Owned), capture)?,
             citations: output.verdict.citations,
             data: output.verdict.data,
             detail: output.detail,
             provenance: output.provenance,
-        }
+        })
     }
 
     /// An Agent or code judgment: citations outside the call's original
     /// `sources` are dropped, and a pass left without a citation is
     /// inconclusive.
-    fn cited(output: CheckOutput, sources: &BTreeSet<SlotName>) -> Self {
-        let mut judged = Self::checked(output);
+    ///
+    /// # Errors
+    /// Returns the capture failure of an actual value that cannot be hashed.
+    fn cited(
+        output: CheckOutput,
+        sources: &BTreeSet<SlotName>,
+        capture: ContextCapture,
+    ) -> Result<Self, ExecError> {
+        let mut judged = Self::checked(output, capture)?;
         judged
             .citations
             .retain(|citation| sources.contains(&citation.slot));
@@ -2544,7 +2609,7 @@ impl Judged {
                 judged.reason
             );
         }
-        judged
+        Ok(judged)
     }
 }
 
@@ -2560,16 +2625,16 @@ fn requirement_at(spec: &VerifierSpec, (step, at): Key) -> &Requirement {
     }
 }
 
-/// The JSON a comparison reads: evidence compares as its declaration.
-/// Publications never reach a comparison, since validation admits them only
-/// as workspace sources.
-fn json(input: &CallInput) -> Value {
+/// The JSON a comparison reads: a selected JSON value itself, borrowed, and
+/// evidence as its declaration's JSON form. Publications never reach a
+/// comparison, since validation admits them only as workspace sources.
+fn json(input: &CallInput) -> Cow<'_, Value> {
     match &input.value {
-        CallValue::Json(value) => value.clone(),
+        CallValue::Json(value) => Cow::Borrowed(&**value),
         CallValue::Evidence(declaration) => {
-            serde_json::to_value(declaration).unwrap_or(Value::Null)
+            Cow::Owned(serde_json::to_value(declaration).unwrap_or(Value::Null))
         }
-        CallValue::Publication { .. } | CallValue::Publications { .. } => Value::Null,
+        CallValue::Publication { .. } | CallValue::Publications { .. } => Cow::Owned(Value::Null),
     }
 }
 

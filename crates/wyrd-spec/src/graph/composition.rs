@@ -1,8 +1,8 @@
 //! Service-root composition rules for composite Card submissions.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
-use super::{GraphError, RootPick, identity_key, submission_card_ref};
+use super::{GraphError, GraphSubmission, RootPick, identity_key, submission_card_ref};
 use crate::card::agent::AgentSpec;
 use crate::card::operator::OperatorSpec;
 use crate::card::trigger::TriggerSpec;
@@ -10,7 +10,6 @@ use crate::card::verifier::{OWNER_OCCURRENCE_KEY, VerificationBinding};
 use crate::envelope::{CardKind, Spec};
 use crate::error::WyrdError;
 use crate::reference::InlineableRef;
-use crate::registry::CardSubmission;
 
 /// Validate peer ownership and verification binding links in a submission graph.
 ///
@@ -32,21 +31,13 @@ use crate::registry::CardSubmission;
 /// card, or [`GraphError::UnboundVerifierPeer`] when a Service-root bundle
 /// includes a Verifier no local subject binds.
 pub fn validate_composition(
-    submissions: &[CardSubmission],
+    submissions: &[GraphSubmission],
     root: &RootPick,
 ) -> Result<(), GraphError> {
-    let decoded = submissions
-        .iter()
-        .map(|submission| {
-            Spec::from_kind_and_value(&submission.kind, submission.spec.clone()).map_err(|error| {
-                GraphError::InvalidSpec {
-                    message: error.to_string(),
-                }
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    for (submission, spec) in submissions.iter().zip(&decoded) {
+    for GraphSubmission {
+        submission, spec, ..
+    } in submissions
+    {
         let Spec::Service(service) = spec else {
             continue;
         };
@@ -68,14 +59,14 @@ pub fn validate_composition(
                     ),
                 });
             }
-            let Some(component_ref) = component.card_ref.as_card_ref() else {
+            let Some(component_ref) = component.card_ref.target() else {
                 continue;
             };
             if is_peer_only_component(&component_ref.kind) {
                 return Err(GraphError::InvalidServiceComponentKind {
                     service: Box::new(service_ref),
                     alias: component.alias.clone(),
-                    component: Box::new(component_ref.clone()),
+                    component: Box::new(component_ref),
                     field: format!("spec.components[{index}].ref"),
                 });
             }
@@ -86,16 +77,16 @@ pub fn validate_composition(
         return Ok(());
     }
 
-    let bound = decoded
+    let bound = submissions
         .iter()
-        .flat_map(Spec::binding_sites)
+        .flat_map(|graph| graph.spec.binding_sites())
         .filter(|site| !site.nested)
         .flat_map(|site| site.bindings)
-        .filter_map(|binding| binding.verifier.as_card_ref())
-        .map(identity_key)
+        .filter_map(|binding| binding.verifier.target())
+        .filter_map(|verifier| verifier.identity_key())
         .collect::<BTreeSet<_>>();
 
-    for submission in submissions {
+    for GraphSubmission { submission, .. } in submissions {
         if submission.kind != CardKind::Verifier {
             continue;
         }
@@ -133,11 +124,11 @@ pub fn validate_composition(
 /// cannot repeat the same side effect by inlining it twice.
 #[must_use]
 pub fn binding_validation_errors(bindings: &[VerificationBinding], field: &str) -> Vec<WyrdError> {
-    let mut seen_verifiers = BTreeSet::new();
+    let mut seen_verifiers = HashSet::new();
     let mut errors = Vec::new();
     for (index, binding) in bindings.iter().enumerate() {
         let binding_field = format!("{field}[{index}]");
-        if let Some(verifier) = binding.verifier.as_card_ref() {
+        if let Some(verifier) = binding.verifier.target() {
             if verifier.kind != CardKind::Verifier {
                 errors.push(WyrdError::SpecInvalidVerifierRefKind {
                     message: format!(
@@ -152,7 +143,7 @@ pub fn binding_validation_errors(bindings: &[VerificationBinding], field: &str) 
                     }),
                 });
             }
-            if !seen_verifiers.insert(verifier.identity_key()) {
+            if !seen_verifiers.insert(verifier.clone()) {
                 errors.push(WyrdError::SpecDuplicateVerificationBinding {
                     message: format!("duplicate {field} Verifier {verifier}"),
                     details: serde_json::json!({ "field": binding_field, "verifier": verifier }),
@@ -175,7 +166,7 @@ fn check_runs_on(
     binding_field: &str,
     errors: &mut Vec<WyrdError>,
 ) {
-    let Some(trigger) = runs_on.as_card_ref() else {
+    let Some(trigger) = runs_on.target() else {
         return;
     };
     if trigger.kind != CardKind::Trigger {
@@ -201,7 +192,7 @@ fn check_operators(
     list_field: &str,
     errors: &mut Vec<WyrdError>,
 ) {
-    let mut seen_operators = BTreeSet::new();
+    let mut seen_operators = HashSet::new();
     // ponytail: inline specs have no total order, so equality is a linear scan
     // over one binding's Operator list. Key them if a list ever grows large.
     let mut seen_inline_operators: Vec<&OperatorSpec> = Vec::new();
@@ -226,7 +217,10 @@ fn check_operators(
                 }
                 seen_inline_operators.push(spec.as_ref());
             }
-            InlineableRef::Ref(card_ref) | InlineableRef::Sibling { sibling: card_ref } => {
+            InlineableRef::Ref(_) | InlineableRef::Sibling { .. } => {
+                let Some(card_ref) = operator.target() else {
+                    continue;
+                };
                 if card_ref.kind != CardKind::Operator {
                     errors.push(WyrdError::SpecInvalidBindingRefKind {
                         message: format!(
@@ -242,7 +236,7 @@ fn check_operators(
                     });
                     continue;
                 }
-                if !seen_operators.insert(card_ref.identity_key()) {
+                if !seen_operators.insert(card_ref.clone()) {
                     errors.push(WyrdError::SpecDuplicateBindingOperator {
                         message: format!("duplicate {list_field} Operator {card_ref}"),
                         details: serde_json::json!({
@@ -404,7 +398,7 @@ mod tests {
     use crate::card::verifier::{OWNER_OCCURRENCE_KEY, VerificationBinding};
     use crate::envelope::Spec;
     use crate::envelope::{CardKind, Metadata};
-    use crate::graph::{GraphError, RootPick};
+    use crate::graph::{GraphError, GraphSubmission, RootPick};
     use crate::reference::CardRef;
     use crate::registry::CardSubmission;
 
@@ -466,6 +460,17 @@ mod tests {
         })
     }
 
+    /// Decode submissions whose versions and siblings are already exact.
+    ///
+    /// # Panics
+    /// Panics when a spec does not decode.
+    fn graph<const N: usize>(submissions: [CardSubmission; N]) -> Vec<GraphSubmission> {
+        submissions
+            .into_iter()
+            .map(|submission| GraphSubmission::decode(submission).expect("test spec decodes"))
+            .collect()
+    }
+
     /// Build one `verified_by` entry binding `verifier` with an inline activation.
     fn binding(verifier: &CardRef) -> serde_json::Value {
         json!({ "verifier": verifier, "runs_on": { "kind": "schedule", "cron": "0 * * * *" } })
@@ -490,7 +495,7 @@ mod tests {
             root: card_ref(CardKind::Service, "app"),
         };
 
-        let error = validate_composition(&[service], &root)
+        let error = validate_composition(&graph([service]), &root)
             .expect_err("component aliases are unique within a Service");
 
         assert!(matches!(
@@ -515,7 +520,7 @@ mod tests {
             root: card_ref(CardKind::Service, "app"),
         };
 
-        let error = validate_composition(&[service], &root)
+        let error = validate_composition(&graph([service]), &root)
             .expect_err("the owner occurrence key is not a component alias");
 
         assert!(matches!(
@@ -546,7 +551,7 @@ mod tests {
             root: card_ref(CardKind::Service, "app"),
         };
 
-        let error = validate_composition(&[service], &root)
+        let error = validate_composition(&graph([service]), &root)
             .expect_err("Verifier cannot be a Service component");
 
         assert!(matches!(
@@ -575,7 +580,7 @@ mod tests {
             root: card_ref(CardKind::Service, "app"),
         };
 
-        let error = validate_composition(&[service, verifier], &root)
+        let error = validate_composition(&graph([service, verifier]), &root)
             .expect_err("Service-root Verifier requires a local binding");
 
         assert!(matches!(
@@ -602,7 +607,7 @@ mod tests {
             root: card_ref(CardKind::Service, "app"),
         };
 
-        validate_composition(&[service, verifier], &root)
+        validate_composition(&graph([service, verifier]), &root)
             .expect("bound Verifier is a valid Service peer");
     }
 
@@ -630,7 +635,7 @@ mod tests {
             root: card_ref(CardKind::Service, "app"),
         };
 
-        validate_composition(&[service, verifier], &root)
+        validate_composition(&graph([service, verifier]), &root)
             .expect("component-bound Verifier is a valid Service peer");
     }
 
@@ -645,7 +650,7 @@ mod tests {
             root: card_ref(CardKind::Verifier, "quality"),
         };
 
-        validate_composition(&[verifier], &root).expect("standalone Verifier remains valid");
+        validate_composition(&graph([verifier]), &root).expect("standalone Verifier remains valid");
     }
 
     /// Reject two bindings to the same exact Verifier version on one subject.

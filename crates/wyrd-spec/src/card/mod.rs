@@ -2754,6 +2754,44 @@ mod verifier_card_tests {
         assert!(error.contains("unknown field `required`"), "{error}");
     }
 
+    /// Refuse slot-level `required`, true or false, on every slot form at
+    /// the slot's path, while a JSON Schema's own nested `required` stays a
+    /// valid part of a `json` slot's schema.
+    ///
+    /// # Panics
+    /// Panics when a slot-level `required` decodes, its refusal does not
+    /// name the slot, or a nested schema `required` is refused or altered.
+    #[test]
+    fn slot_level_required_is_refused_and_schema_required_is_kept() {
+        for slot in [
+            serde_json::json!({"type": "json", "required": false}),
+            serde_json::json!({"type": "json", "schema": {"type": "string"}, "required": true}),
+            serde_json::json!({"type": "media", "formats": ["pdf"], "required": false}),
+            serde_json::json!({"type": "trace", "required": false}),
+            serde_json::json!({"type": "trace", "required": true}),
+        ] {
+            let error = Spec::from_kind_and_value(
+                &CardKind::Verifier,
+                serde_json::json!({"inputs": {"evidence": slot}}),
+            )
+            .expect_err("slot-level required is refused")
+            .message;
+            assert!(error.contains("inputs.evidence"), "{error}");
+            assert!(error.contains("unknown field `required`"), "{error}");
+        }
+        let spec = serde_json::json!({"inputs": {"report": {"type": "json", "schema": {
+            "type": "object",
+            "properties": {"text": {"type": "string"}, "note": {"type": ["string", "null"]}},
+            "required": ["text"],
+        }}}});
+        let Spec::Verifier(verifier) =
+            Spec::from_kind_and_value(&CardKind::Verifier, spec.clone()).expect("nested required")
+        else {
+            panic!("a Verifier spec decodes as a Verifier");
+        };
+        assert_eq!(serde_json::to_value(&verifier).expect("serialize"), spec);
+    }
+
     /// Reject `kind: Drift` and `kind: Eval` envelopes; neither is a Card kind.
     ///
     /// # Panics

@@ -180,6 +180,30 @@ def test_role_helpers_cover_system_user_assistant_and_tool_result() -> None:
     ]
 
 
+@pytest.mark.parametrize("role", ["user", "assistant"])
+def test_terminal_rich_text_part_requires_its_variable(role: str) -> None:
+    base = Prompt.anthropic("claude-sonnet-4", messages="hello")
+    prompt = getattr(base, role)([{"type": "text", "text": "Hi {{who}}"}])
+
+    with pytest.raises(WyrdError) as error:
+        prompt.render()
+
+    assert error.value.code == "WYRD_PROMPT_422_MISSING_VARIABLE"
+    expected = {"role": role, "content": [{"type": "text", "text": "Hi Ada"}]}
+    assert prompt.render(who="Ada").messages[1] == expected
+    assert prompt.bind(who="Ada").render().messages[1] == expected
+
+
+def test_bound_template_text_stays_data_after_appending_rich_content() -> None:
+    prompt = Prompt.anthropic("claude-sonnet-5", messages="Hello {{value}}")
+    prompt = prompt.bind("value", "literal {{other}}").user([{"type": "text", "text": "extra"}])
+
+    rendered = prompt.render()
+
+    assert rendered.messages[0]["content"] == [{"type": "text", "text": "Hello literal {{other}}"}]
+    assert rendered.messages[1]["content"] == [{"type": "text", "text": "extra"}]
+
+
 def test_message_string_becomes_one_anthropic_text_block() -> None:
     prompt = Prompt.anthropic("claude-sonnet-4", messages="hello")
 
@@ -265,3 +289,35 @@ def test_openai_responses_text_input_reads_as_one_user_message(fixtures_dir: Pat
 
     (item,) = prompt.request.openai_responses().input
     assert (item.kind, item.as_message_role()) == ("message", "user")
+
+
+def test_response_format_verdict_shares_the_class_and_inspects_expanded() -> None:
+    import wyrd.verify
+    from pydantic import BaseModel
+
+    class Score(BaseModel):
+        value: float
+
+    class Judged(BaseModel):
+        score: Score
+
+    plain = ResponseFormat.verdict()
+    assert type(plain) is ResponseFormat is wyrd.verify.ResponseFormat
+    assert plain.to_dict() == {"kind": "verdict"}
+    assert ResponseFormat.verdict(None).to_dict() == plain.to_dict()
+    schema = {**Judged.model_json_schema(), "additionalProperties": False}
+    custom = ResponseFormat.verdict(Judged)
+    assert custom.to_dict() == ResponseFormat.verdict(schema).to_dict(), (
+        "a model is its closed schema"
+    )
+    assert custom.to_dict()["kind"] == "verdict"
+    assert custom.to_dict()["data"]["properties"]["score"] == {"$ref": "#/$defs/Score"}
+    assert "Score" in custom.to_dict()["data"]["$defs"]
+    dict_only = ResponseFormat.verdict({"type": "object", "properties": {"n": {"type": "integer"}}})
+    assert dict_only.to_dict()["data"]["properties"] == {"n": {"type": "integer"}}
+
+    prompt = Prompt.openai_chat("gpt-4o", messages="Judge", response_format=plain)
+    assert json.loads(str(prompt))["response_format"] == "verdict", "Prompts keep the named form"
+    for refused in (1, "verdict", ["not", "a", "schema"]):
+        with pytest.raises(WyrdError):
+            ResponseFormat.verdict(refused)  # ty: ignore[invalid-argument-type]

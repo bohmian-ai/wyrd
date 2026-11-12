@@ -27,7 +27,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{ExecutionId, SlotName, VerificationResultId};
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::ids::RunId;
-use wyrd_spec::verification::execution::{InputDeclaration, VerificationOutcome};
+use wyrd_spec::verification::execution::InputDeclaration;
 use wyrd_spec::verification::{DriftWindow, GroupSnapshot, GroupSourceSnapshot, TaskId};
 
 use super::drift::ObservationWindow;
@@ -407,19 +407,21 @@ impl<'q> InputResolver<'q> {
         Ok(Some(resolved))
     }
 
-    /// One published result's application Run and full outcome: the verdict
-    /// from its summary, requirements and steps from its output record, and
-    /// evidence resolved from its execution's input record. `None` until all
-    /// three records and every group source are visible, including a tenant
-    /// whose tables no result has created.
+    /// One published result's application Run and outcome, decoded as `O`:
+    /// the verdict from its summary, requirements and steps from its output
+    /// record, and evidence resolved from its execution's input record. A
+    /// compact `O` skips the stored checks, steps, and evidence; a
+    /// descriptive one keeps them in their authored form. Neither compiles a
+    /// Prompt. `None` until all three records and every group source are
+    /// visible, including a tenant whose tables no result has created.
     ///
     /// # Errors
     /// Returns the query refusal or failure, and an internal error when a
     /// stored record does not decode.
-    pub async fn result(
+    pub async fn result<O: serde::de::DeserializeOwned>(
         &self,
         result_id: VerificationResultId,
-    ) -> Result<Option<(Option<RunId>, VerificationOutcome)>, WyrdError> {
+    ) -> Result<Option<(Option<RunId>, O)>, WyrdError> {
         let batches = self
             .rows(&format!(
                 "SELECT r.verdict, r.run_id, o.output, i.origin, i.inputs, i.activation \

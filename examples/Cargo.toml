@@ -27,8 +27,20 @@ name = "client_request"
 path = "rust/client_request.rs"
 
 [[bin]]
+name = "client_profile"
+path = "rust/client_profile.rs"
+
+[[bin]]
 name = "quickstart"
 path = "quickstart/quickstart.rs"
+
+[[bin]]
+name = "finance_release"
+path = "finance-release/finance_release.rs"
+
+[[bin]]
+name = "author_in_code"
+path = "author-in-code/author.rs"
 
 [[bin]]
 name = "support_desk"
@@ -49,6 +61,8 @@ wyrd-ai = { path = "../sdks/wyrd-sdk-rust", features = ["otel"] }
 workspace-hack.workspace = true
 # The journeys run each docs example binary against a real server.
 secrecy = { workspace = true }
+# The finance release journey answers the policy judge from a local model.
+wiremock = { workspace = true }
 wyrd-testing = { workspace = true }
 
 [lints]

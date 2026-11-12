@@ -282,6 +282,7 @@ mod pg_tests {
                 "verification.list_publications",
                 "verification.get_publication",
                 "verification.download_publication",
+                "verification.get_execution_details",
                 "operator_connections.list",
                 "operator_connections.get",
                 "github_connection.get",

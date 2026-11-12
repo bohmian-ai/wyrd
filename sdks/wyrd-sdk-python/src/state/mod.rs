@@ -46,8 +46,9 @@ use registry::PythonCardRegistry;
 /// Immutable Python projection of one complete Card envelope.
 #[pyclass(module = "wyrd.state", name = "CardEnvelope", frozen)]
 pub struct PyCardEnvelope {
-    /// Complete native Card retained as the projection source of truth.
-    card: Card,
+    /// Complete native Card retained as the projection source of truth,
+    /// shared with the hydrated state that loaded it.
+    card: Arc<Card>,
     /// Exact identity validated during bundle loading or by the registry read.
     card_ref: CardRef,
     /// Stable aliases resolving to this exact Card; nonempty for hydrated
@@ -146,11 +147,13 @@ impl PyWyrdState {
         Self::hydrated(py, inner, interfaces, load_kwargs, trusted_artifact_hashes)
     }
 
-    /// Declare a Card file and return its eagerly hydrated state, ready to run.
+    /// Declare a Card file or an authored Card graph and return its eagerly
+    /// hydrated state, ready to run.
     ///
     /// The online counterpart of `from_path`: the file and the files its
-    /// `./path` references name are declared under the registry's usual
-    /// version rules, the declared root's complete graph is pulled and
+    /// `./path` references name, or the authored Card and everything it
+    /// references, are declared as `Cards.declare` declares them, under the
+    /// registry's usual version rules, the declared root's complete graph is pulled and
     /// validated, and Python holders are hydrated exactly as `from_path`
     /// hydrates them. The declaration, the pull, and every later server call
     /// run as one client. Without `bundle_dir`, the bundle stays private:
@@ -165,7 +168,7 @@ impl PyWyrdState {
     /// ```
     ///
     /// # Arguments
-    /// * `path` - The root Service Card file.
+    /// * `path` - The root Service: its Card file, or an authored Card.
     /// * `client` - The `WyrdClient` every call runs as, or `None` for the
     ///   ambient chain.
     /// * `bundle_dir` - A caller-owned directory to publish the bundle to,
@@ -183,18 +186,21 @@ impl PyWyrdState {
     #[pyo3(signature = (path, client=None, *, bundle_dir=None, interfaces=None, load_kwargs=None, trusted_artifact_hashes=None))]
     fn declare(
         py: Python<'_>,
-        path: PathBuf,
+        path: &Bound<'_, PyAny>,
         client: Option<PyRef<'_, PyWyrdClient>>,
         bundle_dir: Option<PathBuf>,
         interfaces: Option<&Bound<'_, PyMapping>>,
         load_kwargs: Option<&Bound<'_, PyMapping>>,
         trusted_artifact_hashes: Option<&Bound<'_, PyMapping>>,
     ) -> CardPyResult<Self> {
+        let input = crate::verify::definitions::declarable(path).ok_or_else(|| {
+            invalid_argument("path", "expected a Card file path or an authored Card")
+        })?;
         let options = DeclareOptions {
             client: client.map(|client| client.inner().clone()),
             bundle_dir,
         };
-        let inner = crate::trace::block_on(py, WyrdState::declare_with(path, options))
+        let inner = crate::trace::block_on(py, WyrdState::declare_with(input, options))
             .map_err(WyrdPyError::from)?;
         Self::hydrated(py, inner, interfaces, load_kwargs, trusted_artifact_hashes)
     }
@@ -292,6 +298,18 @@ impl PyWyrdState {
             ),
         )
         .map_err(WyrdPyError::from)
+    }
+
+    /// Bind the registered `"<namespace>.<name>"` table as the active table
+    /// `run.bifrost.write(row)` writes, describing it first. The previous
+    /// table's producer keeps draining.
+    ///
+    /// # Errors
+    /// Raises `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup,
+    /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, and the server's describe
+    /// error for an unknown, unauthorized, or unavailable table.
+    fn use_table_by_name(&self, py: Python<'_>, table: &str) -> CardPyResult<()> {
+        crate::trace::block_on(py, self.inner.use_table_by_name(table)).map_err(WyrdPyError::from)
     }
 
     /// Fix this state's Service release and deployment environment before
@@ -776,7 +794,7 @@ impl PyCardEnvelope {
             uid: card.metadata.uid.clone(),
         };
         Ok(Self {
-            card,
+            card: Arc::new(card),
             card_ref,
             aliases: Vec::new(),
         })
@@ -1192,7 +1210,7 @@ impl PythonStateHydrator<'_> {
                 Py::new(
                     py,
                     PyCardEnvelope {
-                        card: card.clone(),
+                        card: Arc::clone(card),
                         card_ref,
                         aliases,
                     },
@@ -1226,7 +1244,7 @@ impl PythonStateHydrator<'_> {
         let state = self.state;
         let mut values = BTreeMap::new();
         for (key, envelope) in state.cards_of_kind(CardKind::Prompt) {
-            let mut card = PromptCard::from_card(envelope.clone()).map_err(|_| {
+            let mut card = PromptCard::from_card(Card::clone(envelope)).map_err(|_| {
                 runtime_hydration_error(state, key, "prompt", "prompt holder construction failed")
             })?;
             card.hydrate_prompt(py).map_err(|_| {
@@ -1269,7 +1287,7 @@ impl PythonStateHydrator<'_> {
         let state = self.state;
         let mut values = BTreeMap::new();
         for (key, envelope) in state.cards_of_kind(CardKind::Agent) {
-            let mut card = PyAgentCard::from_card(py, envelope.clone()).map_err(|_| {
+            let mut card = PyAgentCard::from_card(py, Card::clone(envelope)).map_err(|_| {
                 runtime_hydration_error(state, key, "prompt", "agent holder construction failed")
             })?;
             let prompt_key = state
@@ -1312,7 +1330,7 @@ impl PythonStateHydrator<'_> {
         let config = &self.config;
         let mut values = BTreeMap::new();
         for (key, envelope) in state.cards_of_kind(CardKind::Model) {
-            let mut card = ModelCard::from_card(envelope.clone()).map_err(|_| {
+            let mut card = ModelCard::from_card(Card::clone(envelope)).map_err(|_| {
                 runtime_hydration_error(state, key, "interface", "model holder construction failed")
             })?;
             let interface = config.interfaces.get(key).map(|value| value.bind(py));
@@ -1369,7 +1387,7 @@ impl PythonStateHydrator<'_> {
         let config = &self.config;
         let mut values = BTreeMap::new();
         for (key, envelope) in state.cards_of_kind(CardKind::Data) {
-            let mut card = DataCard::from_card(envelope.clone()).map_err(|_| {
+            let mut card = DataCard::from_card(Card::clone(envelope)).map_err(|_| {
                 runtime_hydration_error(state, key, "interface", "data holder construction failed")
             })?;
             let interface = config.interfaces.get(key).map(|value| value.bind(py));
@@ -1940,16 +1958,25 @@ impl PyCards {
         }
     }
 
-    /// Declare a caller-owned `DataCard`, `ModelCard`, or `PromptCard`.
+    /// Declare an authored Card graph, a Card file or bundle directory, or a
+    /// caller-owned `DataCard`, `ModelCard`, or `PromptCard`.
     ///
-    /// Declaration serializes the complete Card envelope, saves `DataCard` or
+    /// An authored Card from `wyrd.verify` is copied as it is now,
+    /// validated, and declared through the shared Rust declaration: each
+    /// local Artifact it references is published first as its own
+    /// submission, then the graph; a later graph failure leaves those
+    /// Artifacts registered. A path declares through the shared file loader.
+    /// Neither takes `version_bump` or `save_args`.
+    ///
+    /// For a holder, declaration serializes the complete Card envelope, saves `DataCard` or
     /// `ModelCard` artifacts through the attached interface, uploads the
     /// resulting manifest, and waits for server completion. On success, the
     /// same caller-owned card is updated with the server-assigned UID,
     /// resolved version, and normalized identity fields.
     ///
     /// # Arguments
-    /// * `card` - Native Wyrd card holder to declare.
+    /// * `card` - An authored Card, a Card file or bundle path, or a native
+    ///   Wyrd card holder to declare.
     /// * `version_bump` - Version intent. Defaults to server-compatible `VersionBump.Patch`.
     ///   Use `VersionBump.pre`, `build`, or `pre_build` for version metadata.
     /// * `save_args` - `DataSaveArgs` or `ModelSaveArgs` forwarded to the
@@ -1971,7 +1998,24 @@ impl PyCards {
         version_bump: Option<&Bound<'_, PyAny>>,
         save_args: Option<&Bound<'_, PyAny>>,
     ) -> CardPyResult<PyDeclarationReceipt> {
-        PythonCardRegistry::new(self.cards(py)?).declare(py, card, version_bump, save_args)
+        let Some(input) = crate::verify::definitions::declarable(card) else {
+            return PythonCardRegistry::new(self.cards(py)?).declare(
+                py,
+                card,
+                version_bump,
+                save_args,
+            );
+        };
+        if version_bump.is_some() || save_args.is_some() {
+            return Err(invalid_argument(
+                "card",
+                "an authored Card or path declares without version_bump or save_args",
+            )
+            .into());
+        }
+        crate::trace::block_on(py, self.cards(py)?.declare(input))
+            .map(PyDeclarationReceipt::from)
+            .map_err(WyrdPyError::from)
     }
 
     /// Declare a Card from a local Card file or bundle directory.
@@ -2113,7 +2157,7 @@ impl PyCards {
             ..requested
         };
         Ok(PyCardEnvelope {
-            card,
+            card: Arc::new(card),
             card_ref,
             aliases: Vec::new(),
         })

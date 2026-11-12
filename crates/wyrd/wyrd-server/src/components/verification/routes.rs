@@ -1,8 +1,8 @@
 //! HTTP projection of the Verification control plane.
 //!
 //! Evidence upload planning, direct execution, background submission,
-//! execution status, invocation and publication inspection, publication
-//! download planning, cancellation, and binding status. Evidence bytes travel
+//! execution status and details, invocation and publication inspection,
+//! publication download planning, cancellation, and binding status. Evidence bytes travel
 //! through the shared storage upload lifecycle. Each handler parses its
 //! path, header, and body, then delegates to [`VerificationControl`], which
 //! owns authorization, audit, tenancy, and error mapping.
@@ -19,7 +19,8 @@ use wyrd_spec::storage::DownloadInitResponse;
 use wyrd_spec::verification::execution::{
     CancelExecutionResponse, EnqueueVerificationResponse, EvidencePlanRequest,
     EvidencePlanResponse, ExecutionPageQuery, InvocationPage, Publication, PublicationPage,
-    PublicationSelector, VerificationExecutionState, VerificationRequest, VerificationResult,
+    PublicationSelector, VerificationDetails, VerificationExecutionState, VerificationRequest,
+    VerificationResult,
 };
 use wyrd_spec::verification::{
     MAX_EXECUTE_BODY_BYTES, PublicationName, TaskId, VerificationBindingStatus,
@@ -44,6 +45,7 @@ pub fn verification_router() -> OpenApiRouter<AppState> {
         .routes(routes!(execute))
         .routes(routes!(enqueue))
         .routes(routes!(get_execution))
+        .routes(routes!(get_execution_details))
         .routes(routes!(list_invocations))
         .routes(routes!(list_publications))
         .routes(routes!(get_publication))
@@ -217,7 +219,7 @@ async fn enqueue(
     Ok((StatusCode::ACCEPTED, Json(response?)))
 }
 
-/// Read one execution's status, dispatches, and result once visible.
+/// Read one execution's status, dispatches, and compact result once visible.
 ///
 /// # Errors
 /// Returns a stable Wyrd error when the path is malformed, the caller lacks
@@ -603,6 +605,53 @@ async fn cancel_execution(
     ))
 }
 
+/// Read what one completed execution ran: its exact authored checks,
+/// provenance, steps, and pinned evidence beside the same judgments.
+///
+/// # Errors
+/// Returns a stable Wyrd error when the path is malformed, the caller lacks
+/// `verifier:read` on the execution's Verifier, no complete details are
+/// visible in the caller's tenant, or a read fails.
+#[utoipa::path(
+    get,
+    path = "/verification/executions/{execution_id}/details",
+    params(("execution_id" = ExecutionId, Path, description = "Execution ID returned by \
+        POST /v1/verification/execute or POST /v1/verification/enqueue")),
+    responses(
+        (status = 200, description = "Execution details", body = VerificationDetails),
+        (status = 400, description = "The execution ID is not a valid UUID \
+          (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks verifier:read on the execution's \
+          Verifier (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 404, description = "No complete details of such an execution are visible \
+          in the caller's tenant: it is unknown, not yet recorded, or no longer readable \
+          (WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND)", body = WyrdProblem),
+        (status = 503, description = "The registry is unavailable, or no verifier is \
+          configured for the access token (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Verification"
+)]
+#[tracing::instrument(
+    skip(state, caller),
+    fields(operation = "verification.execution.details.read")
+)]
+async fn get_execution_details(
+    State(state): State<AppState>,
+    caller: Caller,
+    execution_id: Result<Path<ExecutionId>, PathRejection>,
+) -> Result<Json<VerificationDetails>, WyrdErrorResponse> {
+    let Path(execution_id) = execution_id.map_err(|rejection| path_rejection(&rejection))?;
+    Ok(Json(
+        VerificationControl::new(&state)
+            .get_execution_details(&caller, execution_id)
+            .await?,
+    ))
+}
+
 /// Execute one exact Verifier over supplied evidence and return its result.
 ///
 /// The body is read up to [`MAX_EXECUTE_BODY_BYTES`]; a larger body is
@@ -647,6 +696,7 @@ async fn cancel_execution(
 )]
 #[tracing::instrument(
     name = "verification.handle",
+    level = "debug",
     skip(state, caller, body),
     fields(operation = "verification.execute")
 )]
@@ -662,7 +712,7 @@ async fn execute(
         VerificationControl::new(&state)
             .execute(
                 &caller,
-                &request,
+                request,
                 edge_timer.map(|Extension(timer)| timer).as_ref(),
                 arrival.map(|Extension(arrival)| arrival),
             )

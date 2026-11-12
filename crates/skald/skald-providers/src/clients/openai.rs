@@ -9,8 +9,8 @@ use rand::Rng;
 use rand::distr::Alphanumeric;
 use reqwest::Method;
 use reqwest::header::HeaderValue;
-use serde_json::Value;
 use serde_json::value::RawValue;
+use serde_json::{Map, Value};
 use skald_spec::{ProviderRequest, ProviderResponse};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
@@ -217,8 +217,8 @@ impl Debug for UploadFile {
 pub struct MediaAnswer {
     /// The provider's `content-type`, or `application/octet-stream`.
     pub content_type: String,
-    /// Answer bytes, unchanged.
-    pub bytes: Vec<u8>,
+    /// Answer bytes, unchanged; a single-chunk answer shares its chunk.
+    pub bytes: bytes::Bytes,
 }
 
 impl Debug for MediaAnswer {
@@ -228,6 +228,162 @@ impl Debug for MediaAnswer {
             .field("content_type", &self.content_type)
             .field("size", &self.bytes.len())
             .finish()
+    }
+}
+
+/// A request body as the encoders take it: a JSON value, or a borrowed JSON
+/// object with an optional `model` set as it encodes.
+///
+/// Setting the model never copies the object: a present `model` member keeps
+/// its position with the new value, an absent one follows the other members,
+/// and every other member encodes exactly as stored. JSON and multipart
+/// encoding share this one member order.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RequestBody<'a> {
+    /// A JSON value encoded as is.
+    Json(&'a Value),
+    /// A JSON object's members, with the model to set.
+    Object {
+        /// The object's members, as submitted.
+        members: &'a Map<String, Value>,
+        /// The model to set, or `None` to encode the members unchanged.
+        model: Option<&'a str>,
+    },
+}
+
+impl<'a> From<&'a Value> for RequestBody<'a> {
+    /// Takes a JSON object as its members, any other value as is.
+    fn from(body: &'a Value) -> Self {
+        match body {
+            Value::Object(members) => Self::Object {
+                members,
+                model: None,
+            },
+            other => Self::Json(other),
+        }
+    }
+}
+
+/// One member value of a [`RequestBody`] object in encoding order.
+#[derive(Clone, Copy)]
+enum Member<'a> {
+    /// A stored member value.
+    Value(&'a Value),
+    /// The model set in place of the stored one.
+    Model(&'a str),
+}
+
+impl serde::Serialize for Member<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Value(value) => value.serialize(serializer),
+            Self::Model(model) => serializer.serialize_str(model),
+        }
+    }
+}
+
+impl RequestBody<'_> {
+    /// Serializes the body as compact JSON bytes.
+    ///
+    /// The bytes are written once into a buffer reserved from
+    /// [`Self::len_hint`], so a body without escapes never grows it, and the
+    /// buffer moves into the transport as is, spare capacity included.
+    ///
+    /// # Errors
+    ///
+    /// Returns the serialization error of a member serde cannot write.
+    pub fn to_json(self) -> serde_json::Result<Vec<u8>> {
+        let mut json = Vec::with_capacity(self.len_hint());
+        serde_json::to_writer(&mut json, &self)?;
+        Ok(json)
+    }
+
+    /// Compact JSON length of the body with its model applied, assuming no
+    /// string needs escapes and every float takes its longest form.
+    ///
+    /// Only a capacity hint: escapes make the output longer, and shorter
+    /// floats or a replaced model make it shorter.
+    #[must_use]
+    pub fn len_hint(self) -> usize {
+        match self {
+            Self::Json(value) => json_len_hint(value),
+            Self::Object { members, model } => {
+                let model = model.map_or(0, |model| model.len() + r#","model":"""#.len());
+                object_len_hint(members) + model
+            }
+        }
+    }
+}
+
+/// Unescaped compact JSON length of `value`; see [`RequestBody::len_hint`].
+fn json_len_hint(value: &Value) -> usize {
+    match value {
+        Value::Null | Value::Bool(true) => 4,
+        Value::Bool(false) => 5,
+        Value::Number(number) => match (number.as_u64(), number.as_i64()) {
+            (Some(natural), _) => natural
+                .checked_ilog10()
+                .map_or(1, |digits| digits as usize + 1),
+            (None, Some(negative)) => negative.unsigned_abs().ilog10() as usize + 2,
+            // The longest shortest-round-trip f64, such as -2.2250738585072014e-308.
+            (None, None) => 24,
+        },
+        Value::String(text) => text.len() + 2,
+        Value::Array(items) => {
+            2 + items
+                .iter()
+                .map(|item| json_len_hint(item) + 1)
+                .sum::<usize>()
+        }
+        Value::Object(members) => object_len_hint(members),
+    }
+}
+
+/// Unescaped compact JSON length of the object `members`; see [`json_len_hint`].
+fn object_len_hint(members: &Map<String, Value>) -> usize {
+    2 + members
+        .iter()
+        .map(|(key, value)| key.len() + 4 + json_len_hint(value))
+        .sum::<usize>()
+}
+
+/// The `members` of a [`RequestBody::Object`] in encoding order with `model`
+/// applied.
+fn entries<'a>(
+    members: &'a Map<String, Value>,
+    model: Option<&'a str>,
+) -> impl Iterator<Item = (&'a str, Member<'a>)> {
+    let absent = model.filter(|_| !members.contains_key("model"));
+    let stored = members.iter().map(move |(name, value)| match model {
+        Some(model) if name == "model" => (name.as_str(), Member::Model(model)),
+        _ => (name.as_str(), Member::Value(value)),
+    });
+    stored.chain(absent.map(|model| ("model", Member::Model(model))))
+}
+
+/// The multipart text fields of `members` in encoding order: each scalar
+/// member once and each array member once per item.
+fn fields<'a>(
+    members: &'a Map<String, Value>,
+    model: Option<&'a str>,
+) -> impl Iterator<Item = (&'a str, Member<'a>)> {
+    entries(members, model).flat_map(|(name, value)| {
+        let (scalar, items): (_, &[Value]) = match value {
+            Member::Value(Value::Array(items)) => (None, items),
+            value => (Some((name, value)), &[]),
+        };
+        scalar
+            .into_iter()
+            .chain(items.iter().map(move |item| (name, Member::Value(item))))
+    })
+}
+
+impl serde::Serialize for RequestBody<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match *self {
+            Self::Json(value) => value.serialize(serializer),
+            Self::Object { members, model } => serializer.collect_map(entries(members, model)),
+        }
     }
 }
 
@@ -290,9 +446,22 @@ impl OpenAiClient {
     pub async fn send_raw(
         &self,
         route: OpenAiRoute,
-        body: &RawValue,
+        body: Vec<u8>,
     ) -> ProviderResult<Box<RawValue>> {
-        raw::send_raw(
+        let answer = self.send_raw_text(route, body).await?;
+        raw::answer_json("openai", answer)
+    }
+
+    /// Posts a caller-built body exactly as [`Self::send_raw`] does and
+    /// returns the successful answer as text without validating it as JSON,
+    /// for a caller that validates it in its own single pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::send_raw`] other than the answer's JSON
+    /// [`ProviderError::Decode`].
+    pub async fn send_raw_text(&self, route: OpenAiRoute, body: Vec<u8>) -> ProviderResult<String> {
+        raw::send_raw_text(
             &self.transport,
             "openai",
             &self.url(route),
@@ -316,7 +485,7 @@ impl OpenAiClient {
     pub async fn stream_raw(
         &self,
         route: OpenAiRoute,
-        body: &RawValue,
+        body: Vec<u8>,
     ) -> ProviderResult<super::ProviderByteStream> {
         super::open_stream(
             &self.transport,
@@ -347,8 +516,34 @@ impl OpenAiClient {
     pub async fn send_media(
         &self,
         route: OpenAiMediaRoute,
-        body: &Value,
+        body: impl Into<RequestBody<'_>>,
         files: &[UploadFile],
+    ) -> ProviderResult<MediaAnswer> {
+        let payload = media_payload(route, body.into(), files).await?;
+        self.send_media_payload(route, payload).await
+    }
+
+    /// Sends one Images or Audio request on a JSON `route` with `json`, the
+    /// request already encoded as JSON bytes, like [`Self::send_media`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::BadRequest`] for a multipart `route`, and the
+    /// auth and exchange errors of [`Self::send_media`].
+    pub async fn send_media_json(
+        &self,
+        route: OpenAiMediaRoute,
+        json: Vec<u8>,
+    ) -> ProviderResult<MediaAnswer> {
+        self.send_media_payload(route, json_media_payload(route, json)?)
+            .await
+    }
+
+    /// Sends `payload` on the media `route` once.
+    async fn send_media_payload(
+        &self,
+        route: OpenAiMediaRoute,
+        payload: Payload,
     ) -> ProviderResult<MediaAnswer> {
         let (content_type, bytes) = self
             .transport
@@ -357,7 +552,7 @@ impl OpenAiClient {
                 Method::POST,
                 &format!("{}{}", self.auth.base_url(), route.path()),
                 self.auth.headers()?,
-                Some(media_payload(route, body, files).await?),
+                Some(payload),
             )
             .await?;
         Ok(MediaAnswer {
@@ -378,8 +573,34 @@ impl OpenAiClient {
     pub async fn stream_media(
         &self,
         route: OpenAiMediaRoute,
-        body: &Value,
+        body: impl Into<RequestBody<'_>>,
         files: &[UploadFile],
+    ) -> ProviderResult<ProviderByteStream> {
+        let payload = media_payload(route, body.into(), files).await?;
+        self.open_media_payload(route, payload).await
+    }
+
+    /// Opens one Images or Audio request on a JSON `route` with `json`, the
+    /// request already encoded as JSON bytes, like [`Self::stream_media`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::BadRequest`] for a multipart `route`, and the
+    /// auth, transport, and refusal errors of [`Self::stream_media`].
+    pub async fn stream_media_json(
+        &self,
+        route: OpenAiMediaRoute,
+        json: Vec<u8>,
+    ) -> ProviderResult<ProviderByteStream> {
+        self.open_media_payload(route, json_media_payload(route, json)?)
+            .await
+    }
+
+    /// Opens `payload` on the media `route` once for incremental reading.
+    async fn open_media_payload(
+        &self,
+        route: OpenAiMediaRoute,
+        payload: Payload,
     ) -> ProviderResult<ProviderByteStream> {
         let response = self
             .transport
@@ -388,7 +609,7 @@ impl OpenAiClient {
                 Method::POST,
                 &format!("{}{}", self.auth.base_url(), route.path()),
                 self.auth.headers()?,
-                Some(media_payload(route, body, files).await?),
+                Some(payload),
             )
             .await?;
         Ok(ProviderByteStream {
@@ -416,10 +637,11 @@ impl OpenAiClient {
     pub async fn send_batch(
         &self,
         route: &OpenAiBatchRoute,
-        body: &Value,
+        body: impl Into<RequestBody<'_>>,
         file: Option<&UploadFile>,
     ) -> ProviderResult<MediaAnswer> {
         let (method, path) = route.request()?;
+        let body = body.into();
         let payload = match route {
             OpenAiBatchRoute::UploadFile => {
                 let file = file.ok_or_else(|| {
@@ -429,7 +651,8 @@ impl OpenAiClient {
             }
             OpenAiBatchRoute::CreateBatch => Some(Payload::bytes(
                 HeaderValue::from_static("application/json"),
-                serde_json::to_vec(body).map_err(|error| ProviderError::decode("openai", error))?,
+                body.to_json()
+                    .map_err(|error| ProviderError::decode("openai", error))?,
             )),
             _ => None,
         };
@@ -450,7 +673,16 @@ impl OpenAiClient {
     }
 
     /// Sends a native OpenAI request.
-    pub async fn send_native(&self, request: ProviderRequest) -> ProviderResult<ProviderResponse> {
+    ///
+    /// # Errors
+    /// Returns [`ProviderError::VariantMismatch`] for a request this client
+    /// does not serve, [`ProviderError::Auth`] when its credentials cannot be
+    /// presented, [`ProviderError::Status`] for a non-success answer,
+    /// [`ProviderError::Connect`], [`ProviderError::Upstream`], or
+    /// [`ProviderError::Timeout`] when the exchange fails, and
+    /// [`ProviderError::Decode`] when the body cannot be encoded or the answer
+    /// decoded.
+    pub async fn send_native(&self, request: &ProviderRequest) -> ProviderResult<ProviderResponse> {
         match request {
             ProviderRequest::OpenAiChatCompletion(request) => {
                 let url = self.url(OpenAiRoute::ChatCompletions);
@@ -492,7 +724,7 @@ impl OpenAiClient {
                 Ok(ProviderResponse::OpenAiEmbeddings(response))
             }
             ProviderRequest::RawV1 { body, .. } => {
-                let body = serde_json::value::to_raw_value(&body)
+                let body = serde_json::to_vec(&body)
                     .map_err(|error| ProviderError::decode("openai", error))?;
                 let url = format!("{}/raw", self.auth.base_url());
                 let response = raw::send_raw(
@@ -500,7 +732,7 @@ impl OpenAiClient {
                     "openai",
                     &url,
                     self.auth.headers()?,
-                    &body,
+                    body,
                     &self.retry,
                 )
                 .await?;
@@ -508,7 +740,7 @@ impl OpenAiClient {
             }
             other => Err(ProviderError::variant_mismatch(
                 "openai",
-                super::request_variant_label(&other),
+                super::request_variant_label(other),
             )),
         }
     }
@@ -518,59 +750,62 @@ impl OpenAiClient {
 ///
 /// The boundary is 40 random alphanumerics, which a part collides with only
 /// by chance. Field names and file names escape `"`, CR, and LF as
-/// percent-encodings, as browsers do.
+/// percent-encodings, as browsers do. Framing and member text are written
+/// straight into the payload, so no member text is copied first.
 ///
 /// # Errors
 ///
 /// Returns [`ProviderError::BadRequest`] for a non-object body, a nested
 /// object or array member, or a file content type that is not a valid header
 /// value.
-async fn multipart(body: &Value, files: &[UploadFile]) -> ProviderResult<Payload> {
+async fn multipart(body: RequestBody<'_>, files: &[UploadFile]) -> ProviderResult<Payload> {
     let rejected = |detail: &str| ProviderError::bad_request("openai", detail);
-    let Value::Object(members) = body else {
+    let RequestBody::Object { members, model } = body else {
         return Err(rejected("a multipart body must be a JSON object"));
     };
     let boundary: String = rand::rng()
         .sample_iter(Alphanumeric)
-        .take(40)
+        .take(BOUNDARY_LEN)
         .map(char::from)
         .collect();
-    let escape = |text: &str| {
-        text.replace('"', "%22")
-            .replace('\r', "%0D")
-            .replace('\n', "%0A")
+    let disposition = |payload: &mut Vec<u8>, name: &str| {
+        payload.extend_from_slice(b"--");
+        payload.extend_from_slice(boundary.as_bytes());
+        payload.extend_from_slice(b"\r\nContent-Disposition: form-data; name=\"");
+        escape_into(payload, name);
+        payload.push(b'"');
     };
-    let mut payload = Vec::new();
-    let mut text = |name: &str, value: &Value| {
+    let mut payload = Vec::with_capacity(multipart_len_hint(members, model, files));
+    let mut text = |name: &str, value: Member<'_>| {
         let value = match value {
-            Value::String(text) => text.clone(),
-            Value::Number(number) => number.to_string(),
-            Value::Bool(flag) => flag.to_string(),
-            Value::Null => return Ok(()),
-            Value::Array(_) | Value::Object(_) => {
+            Member::Value(Value::Null) => return Ok(()),
+            Member::Value(Value::Array(_) | Value::Object(_)) => {
                 return Err(rejected(
                     "multipart fields must be scalars or scalar arrays",
                 ));
             }
+            value => value,
         };
-        payload.extend_from_slice(
-            format!(
-                "--{boundary}\r\nContent-Disposition: form-data; name=\"{}\"\r\n\r\n{value}\r\n",
-                escape(name)
-            )
-            .as_bytes(),
-        );
+        disposition(&mut payload, name);
+        payload.extend_from_slice(b"\r\n\r\n");
+        match value {
+            Member::Value(Value::String(text)) => payload.extend_from_slice(text.as_bytes()),
+            Member::Model(model) => payload.extend_from_slice(model.as_bytes()),
+            Member::Value(Value::Number(number)) => {
+                payload.extend_from_slice(number.to_string().as_bytes());
+            }
+            Member::Value(Value::Bool(flag)) => {
+                payload.extend_from_slice(if *flag { b"true" } else { b"false" });
+            }
+            Member::Value(Value::Null | Value::Array(_) | Value::Object(_)) => {
+                unreachable!("rejected above")
+            }
+        }
+        payload.extend_from_slice(b"\r\n");
         Ok(())
     };
-    for (name, value) in members {
-        match value {
-            Value::Array(items) => {
-                for item in items {
-                    text(name, item)?;
-                }
-            }
-            value => text(name, value)?,
-        }
+    for (name, value) in fields(members, model) {
+        text(name, value)?;
     }
     // In-memory parts accumulate in `payload`; each spooled file closes the
     // current segment so its content streams between in-memory segments.
@@ -579,15 +814,12 @@ async fn multipart(body: &Value, files: &[UploadFile]) -> ProviderResult<Payload
     for file in files {
         HeaderValue::from_str(&file.content_type)
             .map_err(|_| rejected("a file content type must be a valid header value"))?;
-        payload.extend_from_slice(
-            format!(
-                "--{boundary}\r\nContent-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\nContent-Type: {}\r\n\r\n",
-                escape(&file.field),
-                escape(&file.filename),
-                file.content_type
-            )
-            .as_bytes(),
-        );
+        disposition(&mut payload, &file.field);
+        payload.extend_from_slice(b"; filename=\"");
+        escape_into(&mut payload, &file.filename);
+        payload.extend_from_slice(b"\"\r\nContent-Type: ");
+        payload.extend_from_slice(file.content_type.as_bytes());
+        payload.extend_from_slice(b"\r\n\r\n");
         match &file.content {
             UploadContent::Bytes(bytes) => payload.extend_from_slice(bytes),
             spooled @ UploadContent::Spooled { .. } => {
@@ -617,6 +849,66 @@ async fn multipart(body: &Value, files: &[UploadFile]) -> ProviderResult<Payload
     ))
 }
 
+/// Number of random alphanumerics in a multipart boundary.
+const BOUNDARY_LEN: usize = 40;
+
+/// Framing bytes of one multipart part besides its name and content: the
+/// boundary line, the disposition, and the blank and closing lines.
+const PART_FRAMING: usize =
+    "--\r\nContent-Disposition: form-data; name=\"\"\r\n\r\n\r\n".len() + BOUNDARY_LEN;
+
+/// Length of the in-memory multipart payload of `members` and `files`,
+/// assuming no name needs escapes and every number takes its longest form.
+///
+/// Only a capacity hint, so the payload is written once without growing:
+/// escapes make the output longer, and spooled files stream outside it.
+fn multipart_len_hint(
+    members: &Map<String, Value>,
+    model: Option<&str>,
+    files: &[UploadFile],
+) -> usize {
+    let text = fields(members, model)
+        .map(|(name, value)| {
+            let value = match value {
+                Member::Value(Value::Null | Value::Array(_) | Value::Object(_)) => return 0,
+                Member::Value(Value::String(text)) => text.len(),
+                Member::Model(model) => model.len(),
+                Member::Value(Value::Number(_) | Value::Bool(_)) => 24,
+            };
+            PART_FRAMING + name.len() + value
+        })
+        .sum::<usize>();
+    let files = files
+        .iter()
+        .map(|file| {
+            let content = match &file.content {
+                UploadContent::Bytes(bytes) => bytes.len(),
+                UploadContent::Spooled { .. } => 0,
+            };
+            PART_FRAMING
+                + "; filename=\"\"\r\nContent-Type: ".len()
+                + file.field.len()
+                + file.filename.len()
+                + file.content_type.len()
+                + content
+        })
+        .sum::<usize>();
+    text + files + BOUNDARY_LEN + "----\r\n".len()
+}
+
+/// Writes `text` into `payload` with `"`, CR, and LF percent-encoded, as
+/// browsers encode form names; every other byte is written unchanged.
+fn escape_into(payload: &mut Vec<u8>, text: &str) {
+    for byte in text.bytes() {
+        match byte {
+            b'"' => payload.extend_from_slice(b"%22"),
+            b'\r' => payload.extend_from_slice(b"%0D"),
+            b'\n' => payload.extend_from_slice(b"%0A"),
+            byte => payload.push(byte),
+        }
+    }
+}
+
 /// Encodes a media request: multipart routes as a form, JSON routes as JSON.
 ///
 /// # Errors
@@ -625,33 +917,50 @@ async fn multipart(body: &Value, files: &[UploadFile]) -> ProviderResult<Payload
 /// JSON `body` cannot serialize.
 async fn media_payload(
     route: OpenAiMediaRoute,
-    body: &Value,
+    body: RequestBody<'_>,
     files: &[UploadFile],
 ) -> ProviderResult<Payload> {
     if route.multipart() {
         return multipart(body, files).await;
     }
-    let payload =
-        serde_json::to_vec(body).map_err(|error| ProviderError::decode("openai", error))?;
+    let payload = body
+        .to_json()
+        .map_err(|error| ProviderError::decode("openai", error))?;
+    json_media_payload(route, payload)
+}
+
+/// The JSON payload of an Images or Audio request on `route`, already encoded
+/// as `json`.
+///
+/// # Errors
+///
+/// Returns [`ProviderError::BadRequest`] for a multipart `route`.
+fn json_media_payload(route: OpenAiMediaRoute, json: Vec<u8>) -> ProviderResult<Payload> {
+    if route.multipart() {
+        return Err(ProviderError::bad_request(
+            "openai",
+            "a multipart media route takes form fields",
+        ));
+    }
     Ok(Payload::bytes(
         HeaderValue::from_static("application/json"),
-        payload,
+        json,
     ))
 }
 
 #[async_trait]
 impl ProviderClient for OpenAiClient {
-    async fn send(&self, request: ProviderRequest) -> ProviderResult<ProviderResponse> {
+    async fn send(&self, request: &ProviderRequest) -> ProviderResult<ProviderResponse> {
         self.send_native(request).await
     }
 
-    async fn stream(&self, request: ProviderRequest) -> ProviderResult<ProviderStream> {
+    async fn stream(&self, request: &ProviderRequest) -> ProviderResult<ProviderStream> {
         match request {
             ProviderRequest::OpenAiChatCompletion(request) => {
                 let url = self.url(OpenAiRoute::ChatCompletions);
                 let body = serde_json::to_vec(&request)
                     .map_err(|error| ProviderError::decode("openai", error))?;
-                let text = super::send_bytes_with_retry(
+                let answer = super::send_bytes_with_retry(
                     &self.transport,
                     "openai",
                     reqwest::Method::POST,
@@ -661,14 +970,15 @@ impl ProviderClient for OpenAiClient {
                     &self.retry,
                 )
                 .await?;
-                let chunks = decode_sse_events("openai", text.as_bytes())?;
+                let chunks =
+                    decode_sse_events("openai", String::from_utf8_lossy(&answer).as_bytes())?;
                 Ok(ProviderStream::OpenAiChat(chunks))
             }
             ProviderRequest::OpenAiResponses(request) => {
                 let url = self.url(OpenAiRoute::Responses);
                 let body = serde_json::to_vec(&request)
                     .map_err(|error| ProviderError::decode("openai", error))?;
-                let text = super::send_bytes_with_retry(
+                let answer = super::send_bytes_with_retry(
                     &self.transport,
                     "openai",
                     reqwest::Method::POST,
@@ -678,12 +988,13 @@ impl ProviderClient for OpenAiClient {
                     &self.retry,
                 )
                 .await?;
-                let events = decode_sse_events("openai", text.as_bytes())?;
+                let events =
+                    decode_sse_events("openai", String::from_utf8_lossy(&answer).as_bytes())?;
                 Ok(ProviderStream::OpenAiResponses(events))
             }
             other => Err(ProviderError::variant_mismatch(
                 "openai",
-                super::request_variant_label(&other),
+                super::request_variant_label(other),
             )),
         }
     }
@@ -711,7 +1022,7 @@ mod openai_chat {
         let request: OpenAiChatRequest =
             serde_json::from_str(&request_body).expect("fixture parses");
         let response = common::openai_client(&server.uri())
-            .send(ProviderRequest::OpenAiChatCompletion(request))
+            .send(&ProviderRequest::OpenAiChatCompletion(request))
             .await
             .expect("request succeeds");
 
@@ -736,7 +1047,7 @@ mod openai_chat {
         let request: OpenAiChatRequest =
             serde_json::from_str(&request_body).expect("fixture parses");
         let response = common::openai_client(&server.uri())
-            .send(ProviderRequest::OpenAiChatCompletion(request))
+            .send(&ProviderRequest::OpenAiChatCompletion(request))
             .await
             .expect("request succeeds");
 
@@ -763,7 +1074,7 @@ mod openai_chat {
         let request: OpenAiChatRequest =
             serde_json::from_str(&request_body).expect("fixture parses");
         let response = common::openai_client(&server.uri())
-            .send(ProviderRequest::OpenAiChatCompletion(request))
+            .send(&ProviderRequest::OpenAiChatCompletion(request))
             .await
             .expect("retry succeeds");
 
@@ -778,7 +1089,6 @@ mod openai_chat {
 mod openai_raw_route {
     use crate::OpenAiRoute;
     use crate::common;
-    use serde_json::value::RawValue;
     use wiremock::matchers::{body_string, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -797,9 +1107,8 @@ mod openai_raw_route {
             .mount(&server)
             .await;
 
-        let body = RawValue::from_string(request.to_owned()).expect("raw body");
         let response = common::openai_client(&server.uri())
-            .send_raw(OpenAiRoute::ChatCompletions, &body)
+            .send_raw(OpenAiRoute::ChatCompletions, request.as_bytes().to_vec())
             .await
             .expect("raw route succeeds");
 
@@ -897,7 +1206,7 @@ mod openai_media {
             )
             .await
             .expect("transcription succeeds");
-        assert_eq!(transcript.bytes, b"{\"text\":\"hi\"}");
+        assert_eq!(transcript.bytes, &b"{\"text\":\"hi\"}"[..]);
         let requests = server.received_requests().await.expect("recording");
         let sent = requests.last().expect("multipart request");
         let content_type = sent.headers["content-type"].to_str().expect("header");
@@ -1168,7 +1477,7 @@ mod openai_embed {
         let request: OpenAiEmbeddingsRequest =
             serde_json::from_str(&request_body).expect("fixture parses");
         let response = common::openai_client(&server.uri())
-            .send(ProviderRequest::OpenAiEmbeddings(request))
+            .send(&ProviderRequest::OpenAiEmbeddings(request))
             .await
             .expect("request succeeds");
 
@@ -1199,7 +1508,7 @@ mod openai_responses {
         let request: OpenAiResponsesRequest =
             serde_json::from_str(&request_body).expect("fixture parses");
         let response = common::openai_client(&server.uri())
-            .send(ProviderRequest::OpenAiResponses(request))
+            .send(&ProviderRequest::OpenAiResponses(request))
             .await
             .expect("request succeeds");
 
@@ -1221,7 +1530,7 @@ mod variant_mismatch {
             serde_json::from_str(&request_body).expect("fixture parses");
 
         let error = common::openai_client("http://localhost")
-            .send(ProviderRequest::AnthropicMessage(request))
+            .send(&ProviderRequest::AnthropicMessage(request))
             .await
             .expect_err("variant mismatch");
 

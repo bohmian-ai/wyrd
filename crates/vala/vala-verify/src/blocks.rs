@@ -18,18 +18,22 @@ pub(crate) mod agent;
 mod tools;
 
 pub use agent::{
-    AgentCardResolver, AgentExecutor, EvidenceReader, PromptCardResolver, block_error,
+    AGENT_PHASE_DURATION_SECONDS, AgentCardResolver, AgentExecutor, EvidenceReader,
+    PromptCardResolver, block_error,
 };
 pub use tools::{AgentToolset, ToolSession, provider_tool_name};
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Deref;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use skald_spec::{PreparedSchemas, SharedSchema};
 use thiserror::Error;
 use tokio::time::Instant;
 
-use wyrd_spec::card::verifier::{Action, Check};
+use wyrd_spec::card::verifier::{Action, Check, PathSegment};
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::verification::execution::{
     CallProvenance, InputDeclaration, InvocationSettlement, Producer, PublicationCollection,
@@ -63,7 +67,7 @@ pub enum Position<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum CallValue {
     /// JSON data: inline input, step output, status, or verdict field.
-    Json(Value),
+    Json(BoundJson),
     /// Pinned original evidence a media slot names; executors fetch bytes.
     Evidence(InputDeclaration),
     /// `steps.<id>.publications.<name>`: what `producer`, the step's
@@ -83,6 +87,111 @@ pub enum CallValue {
         /// Its status and attempts, with no entries yet.
         collection: PublicationCollection,
     },
+}
+
+/// The JSON one binding reads, dereferencing to the selected value.
+///
+/// A selection naming one value of the run's pinned evidence or of a settled
+/// step's output points at that value where it is held, so binding copies
+/// nothing however large it is. A wildcard selection, which builds a new
+/// array, and a constant or derived value, such as a step status, are owned.
+#[derive(Debug, Clone)]
+pub struct BoundJson(Bound);
+
+/// Where a [`BoundJson`] value is held.
+#[derive(Debug, Clone)]
+enum Bound {
+    /// A value the binding owns.
+    Owned(Value),
+    /// The value at `path` in the JSON evidence `slot`.
+    Evidence {
+        /// The run's pinned evidence.
+        evidence: Arc<BTreeMap<SlotName, InputDeclaration>>,
+        /// The JSON slot selected.
+        slot: SlotName,
+        /// Field and index selectors below the slot's value.
+        path: Vec<PathSegment>,
+    },
+    /// The value at `path` in a settled step's output.
+    Output {
+        /// The step's output, shared with the ledger.
+        output: Arc<Value>,
+        /// Field and index selectors below the output.
+        path: Vec<PathSegment>,
+    },
+}
+
+impl BoundJson {
+    /// The value at `path` in the JSON evidence `slot`, or `None` when the
+    /// slot is not JSON or `path` selects nothing.
+    pub(crate) fn evidence(
+        evidence: &Arc<BTreeMap<SlotName, InputDeclaration>>,
+        slot: &SlotName,
+        path: &[PathSegment],
+    ) -> Option<Self> {
+        let Some(InputDeclaration::Json { value }) = evidence.get(slot) else {
+            return None;
+        };
+        scope::find(value, path)?;
+        Some(Self(Bound::Evidence {
+            evidence: Arc::clone(evidence),
+            slot: slot.clone(),
+            path: path.to_vec(),
+        }))
+    }
+
+    /// The value at `path` in a step's `output`, or `None` when `path`
+    /// selects nothing.
+    pub(crate) fn output(output: &Arc<Value>, path: &[PathSegment]) -> Option<Self> {
+        scope::find(output, path)?;
+        Some(Self(Bound::Output {
+            output: Arc::clone(output),
+            path: path.to_vec(),
+        }))
+    }
+}
+
+impl From<Value> for BoundJson {
+    /// A binding that owns `value`.
+    fn from(value: Value) -> Self {
+        Self(Bound::Owned(value))
+    }
+}
+
+impl Deref for BoundJson {
+    type Target = Value;
+
+    /// The selected value, found again by its selectors over data no one
+    /// mutates.
+    ///
+    /// # Panics
+    /// Panics when the selected value is gone, which cannot happen: a shared
+    /// binding is built only once its selectors resolve, over immutable
+    /// shared data.
+    fn deref(&self) -> &Value {
+        match &self.0 {
+            Bound::Owned(value) => value,
+            Bound::Evidence {
+                evidence,
+                slot,
+                path,
+            } => match evidence.get(slot) {
+                Some(InputDeclaration::Json { value }) => scope::find(value, path),
+                _ => None,
+            }
+            .expect("a bound evidence value stays selectable"),
+            Bound::Output { output, path } => {
+                scope::find(output, path).expect("a bound step output stays selectable")
+            }
+        }
+    }
+}
+
+impl PartialEq for BoundJson {
+    /// Bindings are equal when their selected values are.
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
 }
 
 /// A resolved binding plus the original input slots it derives from, so
@@ -180,7 +289,8 @@ pub enum BlockError {
         reason: String,
     },
     /// The process refused the block a shared resource, such as a Python
-    /// worker or a workspace, at admission.
+    /// worker, a workspace, or a gateway call it cannot serve yet, at
+    /// admission.
     ///
     /// That is pressure on the host, not a failure of the block, so it spends
     /// no authored retry and is never judged: the engine stops the whole
@@ -286,16 +396,23 @@ pub trait Checkpoints: Send + Sync {
 /// [`Verdict`], and keep its custom `data` within the fixed bounds. Agent
 /// and code checks share this rule; a refusal names the failing schema
 /// location or limit, never the response contents or a path into them,
-/// since returned dictionary keys are response contents.
+/// since returned dictionary keys are response contents. `schemas` reuses
+/// the schema's compiled validator when an equal schema was prepared before;
+/// the response is validated either way.
 ///
 /// # Errors
 /// Returns [`BlockError::Terminal`], which makes the requirement
 /// inconclusive, for an invalid schema, a response the schema refuses, a
 /// response that is not a Verdict, or data beyond its bounds.
-pub fn verdict_from(schema: &Value, response: Value) -> Result<Verdict, BlockError> {
+pub fn verdict_from(
+    schemas: &PreparedSchemas,
+    schema: &SharedSchema,
+    response: Value,
+) -> Result<Verdict, BlockError> {
     let terminal = |reason: String| BlockError::Terminal { reason };
-    let validator = jsonschema::validator_for(schema)
-        .map_err(|_| terminal("the declared Verdict format is not a valid schema".to_owned()))?;
+    let validator = schemas
+        .validator(schema)
+        .ok_or_else(|| terminal("the declared Verdict format is not a valid schema".to_owned()))?;
     if let Some(error) = validator.iter_errors(&response).next() {
         return Err(terminal(format!(
             "the check response violates its declared Verdict format at schema `{}`",
@@ -333,7 +450,7 @@ mod tests {
         async fn execute(&self, call: BlockCall<'_, Action>) -> Result<ActionOutput, BlockError> {
             match call.inputs.get("from").map(|input| &input.value) {
                 Some(CallValue::Json(value)) => Ok(ActionOutput {
-                    output: value.clone(),
+                    output: Value::clone(value),
                     provenance: None,
                     tool_calls: Vec::new(),
                 }),
@@ -357,7 +474,7 @@ mod tests {
             serde_json::from_value(json!({"kind": "extract", "from": "inputs.deck"}))
                 .expect("action");
         let input = CallInput {
-            value: CallValue::Json(json!({"slides": []})),
+            value: CallValue::Json(json!({"slides": []}).into()),
             sources: BTreeSet::from([SlotName::new("deck").expect("slot")]),
         };
         let call = BlockCall {
@@ -462,20 +579,73 @@ mod tests {
         for (data, good, bad) in cases {
             let format: skald_spec::NamedResponseFormat =
                 serde_json::from_value(json!({"kind": "verdict", "data": data})).expect("format");
-            let schema = Value::Object(Verdict::response_format(&format).expect("resolves"));
-            let verdict = verdict_from(&schema, response(good.clone()))
-                .unwrap_or_else(|error| panic!("{good}: {error}"));
+            let schema = SharedSchema::new(Value::Object(
+                Verdict::response_format(&format).expect("resolves"),
+            ));
+            let verdict =
+                verdict_from(&PreparedSchemas::default(), &schema, response(good.clone()))
+                    .unwrap_or_else(|error| panic!("{good}: {error}"));
             assert_eq!(serde_json::to_value(verdict.data).expect("data"), good);
             for bad in bad {
                 assert!(
                     matches!(
-                        verdict_from(&schema, response(bad.clone())),
+                        verdict_from(&PreparedSchemas::default(), &schema, response(bad.clone())),
                         Err(BlockError::Terminal { .. })
                     ),
                     "{bad}"
                 );
             }
         }
+    }
+
+    /// A warm prepared Verdict format still refuses a response its schema
+    /// refuses, a non-Verdict, and custom data beyond the depth bound, and a
+    /// changed format is judged by its own schema rather than a stale one.
+    ///
+    /// # Panics
+    /// Panics when a warm format accepts what it refuses cold, or a changed
+    /// format reuses the previous validator.
+    #[test]
+    fn prepared_verdict_keeps_validation_and_data_bounds() {
+        let schemas = PreparedSchemas::default();
+        let format = |data: Value| {
+            let format: skald_spec::NamedResponseFormat =
+                serde_json::from_value(json!({"kind": "verdict", "data": data})).expect("format");
+            SharedSchema::new(Value::Object(
+                Verdict::response_format(&format).expect("resolves"),
+            ))
+        };
+        let integers = format(json!({"type": "object", "additionalProperties": true}));
+        let response = |data: Value| json!({"outcome": "passed", "reason": "judged", "citations": [], "data": data});
+        let mut deep = json!(1);
+        for _ in 0..=wyrd_spec::verification::execution::MAX_VERDICT_DATA_DEPTH {
+            deep = json!({"n": deep});
+        }
+        for _ in 0..2 {
+            let verdict =
+                verdict_from(&schemas, &integers, response(json!({"n": 1}))).expect("valid");
+            assert_eq!(
+                verdict.outcome,
+                wyrd_spec::verification::VerificationVerdict::Passed
+            );
+            for refused in [
+                json!({"outcome": "passed", "reason": "judged", "citations": [], "data": 1}),
+                json!({"outcome": "maybe", "reason": "judged", "citations": []}),
+                response(deep.clone()),
+            ] {
+                assert!(
+                    matches!(
+                        verdict_from(&schemas, &integers, refused.clone()),
+                        Err(BlockError::Terminal { .. })
+                    ),
+                    "{refused}"
+                );
+            }
+        }
+        let strings = format(json!({"type": "object", "additionalProperties": {"type": "string"}}));
+        assert!(verdict_from(&schemas, &strings, response(json!({"n": 1}))).is_err());
+        assert!(verdict_from(&schemas, &strings, response(json!({"n": "1"}))).is_ok());
+        assert!(verdict_from(&schemas, &integers, response(json!({"n": 1}))).is_ok());
     }
 
     /// A refusal names where the declared schema failed, never where the
@@ -491,11 +661,13 @@ mod tests {
             "data": {"type": "object", "additionalProperties": {"type": "integer"}}
         }))
         .expect("format");
-        let schema = Value::Object(Verdict::response_format(&format).expect("resolves"));
+        let schema = SharedSchema::new(Value::Object(
+            Verdict::response_format(&format).expect("resolves"),
+        ));
         let secret = "customer-secret@example.test";
         let response = json!({"outcome": "passed", "reason": "judged", "citations": [],
             "data": {"nested": 1, secret: "wrong"}});
-        match verdict_from(&schema, response) {
+        match verdict_from(&PreparedSchemas::default(), &schema, response) {
             Err(BlockError::Terminal { reason }) => {
                 assert!(!reason.contains("customer-secret"), "{reason}");
             }

@@ -358,6 +358,10 @@ impl GatewayModelPricing {
 
 /// The tenant's single gateway governance policy.
 ///
+/// Each server enforces limits and budgets against its own charges plus the
+/// other servers' usage it refreshes in the background, so enforcement
+/// across servers is approximate and can briefly overshoot.
+///
 /// The default is the empty policy: no limits or budgets, no active pricing,
 /// and `unknown_cost: allow_unpriced`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

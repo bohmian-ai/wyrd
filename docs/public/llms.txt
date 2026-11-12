@@ -24,8 +24,9 @@ Set up a local server, run one verification, then choose what to build, in this 
 
 ## Build and verify
 
-- [Services](/wyrd/build-and-verify/declare/define-a-service/): Declare a Service from YAML files, with each component at an exact version and a table for the rows it records, then read back what the server stored.
+- [Services](/wyrd/build-and-verify/declare/define-a-service/): Declare a Service from YAML files, with its components and a table for the rows it records, then read back the exact versions the server stored.
 - [Bindings](/wyrd/build-and-verify/declare/bind-a-verifier/): Attach a Verifier to a Service or one of its components with verified_by, and choose whether your code or a schedule runs it.
+- [Author in code](/wyrd/build-and-verify/declare/author-in-code/): Build a Service, its Agent and Prompt, and a Verifier in Python, Rust, or TypeScript, declare them without versions, verify two answers, and read back the rows each Run wrote.
 - [Repositories](/wyrd/build-and-verify/declare/declare-a-repository/): Declare a connected GitHub repository's review policy from wyrd.toml, check it offline, watch its pull requests run, and roll it back or empty it.
 - [Runs and observations](/wyrd/build-and-verify/observe/record-a-run-and-observations/): Wrap each request in a Run, call your model through the gateway, record what happened, verify it, and read the whole Run back.
 - [Write a Verifier](/wyrd/build-and-verify/verify/author-a-verifier/): Write a Verifier, bind it to your Service, call it from your code, and read its verdict, then add a Python check and a model judge.

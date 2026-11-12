@@ -180,13 +180,15 @@ pub use wyrd_spec::envelope::{Card, Spec};
 /// Where an Agent's model calls go, as declared on every Agent Card.
 pub use wyrd_spec::ExecutionRoute;
 
-/// The result `observe().verify` and `Execution::wait` return:
-/// the decided verdict, one result per requirement and step, and the
-/// evidence each input slot resolved to.
+/// The compact result `observe().verify` and `Execution::wait` return: the
+/// decided verdict and one judgment per requirement. `Execution::details`
+/// returns [`VerificationDetails`]: the same judgments with each exact
+/// authored check and provenance, every step, and the pinned evidence.
 pub use wyrd_spec::verification::VerificationVerdict;
 pub use wyrd_spec::verification::execution::{
-    CallProvenance, Citation, Locator, RequirementDetail, RequirementOutcome, RequirementResult,
-    StepResult, StepStatus, VerificationOutcome, VerificationResult,
+    CallProvenance, Citation, Locator, OutcomeDetails, RequirementDetail, RequirementDetails,
+    RequirementOutcome, RequirementResult, StepResult, StepStatus, VerificationDetails,
+    VerificationOutcome, VerificationResult,
 };
 
 /// The identity of one queued Verifier execution, as `submit` returns it and

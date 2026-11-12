@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 
-use arrow::array::{ArrayRef, RecordBatch, StringArray};
+use arrow::array::{ArrayRef, AsArray as _, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::json::ReaderBuilder;
 use base64::Engine;
@@ -53,6 +53,7 @@ use wyrd_tonic::otlp::trace::v1::status::StatusCode;
 use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
 
 use super::invocation::GatewayCallContext;
+use super::routes::SerializedLength;
 use crate::scribe_outbox::{Owner, ScribeTable, project_spans};
 use crate::state::AppState;
 
@@ -181,10 +182,12 @@ pub struct CallCapture {
     /// encoded.
     payload: GatewayCallPayloadV1,
     /// The selected request payload, redacted and encoded as a Variant on the
-    /// capturing task so the Scribe lane appends it without re-encoding.
-    request: Option<EncodedVariant>,
-    /// The selected response payload, encoded as [`Self::request`] is.
-    response: Option<EncodedVariant>,
+    /// capturing task and moved into a one-row storage column, so the Scribe
+    /// lane appends it without re-encoding and a lone capture's batch shares
+    /// its buffers.
+    request: Option<ArrayRef>,
+    /// The selected response payload, held as [`Self::request`] is.
+    response: Option<ArrayRef>,
     /// Bytes of every object the row references, persisted before delivery.
     objects: PayloadObjects,
     /// One span's admitted-adapter provider and fields per attempt, in
@@ -312,12 +315,44 @@ impl CallCapture {
     /// and every referenced object, which the Scribe outbox accounts against
     /// its byte limit.
     pub(crate) fn content_bytes(&self) -> usize {
+        self.payload_bytes() + self.objects.bytes()
+    }
+
+    /// Encoded bytes of both selected payloads.
+    fn payload_bytes(&self) -> usize {
         [&self.request, &self.response]
             .into_iter()
             .flatten()
-            .map(EncodedVariant::encoded_bytes)
+            .map(|column| {
+                let storage = column.as_struct();
+                (0..storage.num_columns())
+                    .map(|child| storage.column(child).as_binary::<i32>().values().len())
+                    .sum::<usize>()
+            })
             .sum::<usize>()
-            + self.objects.bytes()
+    }
+
+    /// Upper estimate of the sliced Arrow bytes this capture's call row
+    /// holds, known before any row is built: the encoded payloads, the
+    /// scalar fields' serialized JSON, whose quoting and field names outweigh
+    /// the columns' offsets and validity, and the correlation strings with
+    /// their offsets.
+    pub(crate) fn row_bytes(&self) -> usize {
+        let mut scalars = SerializedLength(0);
+        // Serializing to a counter fails only where the row decoder would.
+        let _ = serde_json::to_writer(&mut scalars, &self.payload);
+        let correlation = self.subject.as_ref().map_or(0, |context| {
+            [
+                context.workload_card_uid.as_ref().map(CardUid::as_str),
+                context.subject_card_uid.as_ref().map(CardUid::as_str),
+                context.run_id.as_ref().map(RunId::as_str),
+                context.deployment_environment.as_deref(),
+            ]
+            .into_iter()
+            .map(|value| value.map_or(0, str::len))
+            .sum()
+        });
+        self.payload_bytes() + scalars.0 + correlation + 4 * size_of::<i32>()
     }
 
     /// Builds one `bifrost.gateway.calls` batch holding one row per capture, in
@@ -332,12 +367,14 @@ impl CallCapture {
     ///
     /// The scalar columns decode from the serialized payloads in one decoder
     /// pass; the `request_payload` and `response_payload` Variant columns
-    /// append the payloads already encoded by [`Self::from_facts`]. Every
-    /// batch shares one schema `Arc`.
+    /// join the one-row columns [`Self::from_facts`] encoded: a lone capture's
+    /// batch shares them without a copy, and several are concatenated once
+    /// into exactly sized buffers. Every batch shares one schema `Arc`.
     ///
     /// # Errors
     ///
-    /// Returns [`CaptureDrop::Projection`] when Arrow cannot decode the rows.
+    /// Returns [`CaptureDrop::Projection`] when Arrow cannot decode the rows
+    /// or join the payload columns.
     pub(crate) fn calls_batch(captures: &[&Self]) -> Result<RecordBatch, CaptureDrop> {
         let (schema, scalars) = &*CALLS_SCHEMAS;
         let mut decoder = ReaderBuilder::new(Arc::clone(scalars))
@@ -363,32 +400,19 @@ impl CallCapture {
                     .map(|capture| capture.subject.as_ref().and_then(pick)),
             ))
         };
-        let payload = |pick: fn(&CallCapture) -> Option<&EncodedVariant>| -> ArrayRef {
-            let (metadata_bytes, value_bytes) = captures
+        let payload = |pick: fn(&CallCapture) -> Option<&ArrayRef>| {
+            let rows = captures
                 .iter()
-                .filter_map(|capture| pick(capture))
-                .fold((0, 0), |(metadata, value), encoded| {
-                    (
-                        metadata + encoded.metadata().len(),
-                        value + encoded.value().len(),
-                    )
-                });
-            let mut column = VariantColumnBuilder::with_byte_capacity(
-                captures.len(),
-                metadata_bytes,
-                value_bytes,
-            );
-            for capture in captures {
-                column.append_option(pick(capture));
-            }
-            column.finish()
+                .map(|capture| pick(capture).unwrap_or(&NULL_PAYLOAD).as_ref())
+                .collect::<Vec<_>>();
+            arrow::compute::concat(&rows).map_err(|_| CaptureDrop::Projection)
         };
         let columns = schema
             .fields()
             .iter()
             .map(|field| match field.name().as_str() {
-                REQUEST_PAYLOAD => Ok(payload(|capture| capture.request.as_ref())),
-                RESPONSE_PAYLOAD => Ok(payload(|capture| capture.response.as_ref())),
+                REQUEST_PAYLOAD => payload(|capture| capture.request.as_ref()),
+                RESPONSE_PAYLOAD => payload(|capture| capture.response.as_ref()),
                 WORKLOAD_CARD_UID => Ok(subject(|context| {
                     context.workload_card_uid.as_ref().map(CardUid::as_str)
                 })),
@@ -807,6 +831,14 @@ static CALLS_SCHEMAS: LazyLock<(Arc<Schema>, Arc<Schema>)> = LazyLock::new(|| {
     )
 });
 
+/// The canonical one-row null payload column: empty child bytes under an
+/// invalid row, as [`VariantColumnBuilder::append_null`] writes it.
+static NULL_PAYLOAD: LazyLock<ArrayRef> = LazyLock::new(|| {
+    let mut column = VariantColumnBuilder::with_capacity(1);
+    column.append_null();
+    column.finish()
+});
+
 /// Whether `name` is one of the two Variant payload columns of
 /// `bifrost.gateway.calls`, which the JSON row decoder cannot build.
 fn is_payload_column(name: &str) -> bool {
@@ -815,7 +847,7 @@ fn is_payload_column(name: &str) -> bool {
 
 /// Redacts `value` in place, collecting substituted binary content into
 /// `objects`, and encodes it as the stored Variant in one pass, with no JSON
-/// text in between.
+/// text in between, moving the encoding into its one-row storage column.
 ///
 /// # Errors
 ///
@@ -824,11 +856,12 @@ fn is_payload_column(name: &str) -> bool {
 fn redacted_payload(
     mut value: Value,
     objects: &mut PayloadObjects,
-) -> Result<EncodedVariant, CaptureDrop> {
+) -> Result<ArrayRef, CaptureDrop> {
     redact(&mut value, objects)?;
     EncodedVariant::from_serialize(&value)
         .ok()
         .filter(|encoded| encoded.encoded_bytes() <= GATEWAY_JSON_MAX_BYTES)
+        .map(EncodedVariant::into_column)
         .ok_or(CaptureDrop::Payload)
 }
 
@@ -876,37 +909,59 @@ fn redact_object(
     map: &mut Map<String, Value>,
     objects: &mut PayloadObjects,
 ) -> Result<(), CaptureDrop> {
-    let media_type = ["mime_type", "mimeType", "media_type", "format"]
+    // A `data` member beside a media type is referenced first, while the
+    // media type's original text can still be borrowed.
+    let media = ["mime_type", "mimeType", "media_type", "format"]
         .iter()
         .find_map(|key| map.get(*key).and_then(Value::as_str))
-        .map(str::to_owned);
+        .zip(map.get("data").and_then(Value::as_str))
+        .map(|(kind, encoded)| decode_base64(encoded).map(|bytes| objects.reference(kind, bytes)))
+        .transpose()?;
+    let referenced = media.is_some();
+    if let (Some(reference), Some(member)) = (media, map.get_mut("data")) {
+        *member = reference;
+    }
     for (key, member) in map.iter_mut() {
-        let normalized: String = key
-            .chars()
-            .filter(char::is_ascii_alphanumeric)
-            .map(|c| c.to_ascii_lowercase())
-            .collect();
-        if normalized == "token"
-            || SECRET_KEY_FRAGMENTS
-                .iter()
-                .any(|fragment| normalized.contains(fragment))
-        {
-            *member = Value::String(REDACTED.to_owned());
+        if referenced && key == "data" {
             continue;
         }
-        let inline = match (key.as_str(), member.as_str(), &media_type) {
-            ("b64_json", Some(encoded), _) => Some(("application/octet-stream", encoded)),
-            ("data", Some(encoded), Some(kind)) => Some((kind.as_str(), encoded)),
-            _ => None,
-        };
-        match inline {
-            Some((kind, encoded)) => {
-                *member = objects.reference(kind, decode_base64(encoded)?);
-            }
-            None => redact(member, objects)?,
+        if secret_key(key) {
+            *member = Value::String(REDACTED.to_owned());
+        } else if let ("b64_json", Some(encoded)) = (key.as_str(), member.as_str()) {
+            *member = objects.reference("application/octet-stream", decode_base64(encoded)?);
+        } else {
+            redact(member, objects)?;
         }
     }
     Ok(())
+}
+
+/// Whether `key` names a credential: lowercased and stripped to ASCII
+/// alphanumerics, it is exactly `token` or contains a
+/// [`SECRET_KEY_FRAGMENTS`] entry.
+///
+/// The normalized key is walked in place rather than collected, so checking
+/// every member of a payload allocates nothing.
+fn secret_key(key: &str) -> bool {
+    let mut rest = key
+        .bytes()
+        .filter(u8::is_ascii_alphanumeric)
+        .map(|byte| byte.to_ascii_lowercase());
+    if rest.clone().eq("token".bytes()) {
+        return true;
+    }
+    loop {
+        let starts = |fragment: &&str| {
+            let mut tail = rest.clone();
+            fragment.bytes().all(|byte| tail.next() == Some(byte))
+        };
+        if SECRET_KEY_FRAGMENTS.iter().any(starts) {
+            return true;
+        }
+        if rest.next().is_none() {
+            return false;
+        }
+    }
 }
 
 /// Reference for a `data:<type>;base64,<content>` URL, or `None` for any
@@ -1126,14 +1181,14 @@ pub(crate) mod tests {
     use std::collections::BTreeSet;
     use std::num::{NonZeroU32, NonZeroU64};
 
-    use arrow::array::Array;
+    use arrow::array::{Array, AsArray as _};
     use chrono::Utc;
     use serde_json::json;
     use wyrd_gateway::{
         AttemptRecord, AttemptUsage, IngressDialect, MediaRequest, OpenAiMediaRoute, UploadContent,
         UploadFile,
     };
-    use wyrd_queue::variant::variant_bytes_to_json;
+    use wyrd_queue::variant::variant_cell_to_json;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::{Attribution, PrincipalId};
     use wyrd_spec::gateway::{
@@ -1143,8 +1198,9 @@ pub(crate) mod tests {
     use wyrd_spec::ids::ProviderDeploymentName;
 
     use super::{
-        AnyValueKind, CallCapture, CallFacts, CaptureDrop, PayloadObjects, ScribeTable,
-        object_path, request_content,
+        AnyValueKind, ArrayRef, CallCapture, CallFacts, CaptureDrop, EncodedVariant,
+        PayloadObjects, REDACTED, REQUEST_PAYLOAD, RESPONSE_PAYLOAD, ScribeTable, object_path,
+        request_content,
     };
 
     /// Secret planted under credential-shaped keys; must never be persisted.
@@ -1374,6 +1430,99 @@ pub(crate) mod tests {
         }
     }
 
+    /// Proves redacted payloads reach the calls columns without an
+    /// intermediate copy.
+    ///
+    /// A lone capture's request and response columns are the very buffers
+    /// its redacted encoding produced; a group concatenates them once, in
+    /// order, with a metadata-only call's payloads null. The nested request
+    /// keeps its redaction and binary references, the response its redacted
+    /// token, and the outbox weight stays the encoded bytes.
+    ///
+    /// # Panics
+    /// Panics when a column copies a lone capture's payload or a row differs.
+    #[test]
+    fn capture_columns_avoid_intermediate_payload_copies() {
+        let both = [GatewayPayloadField::Request, GatewayPayloadField::Response];
+        let payload = CallCapture::from_facts(facts(policy(GatewayCaptureMode::Payload, &both)))
+            .expect("payload projects");
+        let metadata = CallCapture::from_facts(facts(policy(GatewayCaptureMode::Metadata, &[])))
+            .expect("metadata projects");
+        let value_buffer = |column: &ArrayRef| {
+            column
+                .as_struct()
+                .column(1)
+                .as_binary::<i32>()
+                .values()
+                .as_ptr()
+        };
+        let rendered = |column: &ArrayRef, row| {
+            variant_cell_to_json(column.as_ref(), row).expect("the payload renders")
+        };
+        let request = payload.request.as_ref().expect("request selected");
+        let response = payload.response.as_ref().expect("response selected");
+        let request_json = rendered(request, 0);
+        let response_json = rendered(response, 0);
+        assert!(!request_json.to_string().contains(CANARY), "{request_json}");
+        assert!(
+            !request_json.to_string().contains(IMAGE_B64),
+            "{request_json}"
+        );
+        assert_eq!(
+            request_json["messages"][0]["content"][1]["inline_data"]["data"]["content_type"],
+            "image/png"
+        );
+        assert_eq!(
+            response_json,
+            json!({"id": "chatcmpl-1", "token": REDACTED})
+        );
+        let encoded = [&request_json, &response_json]
+            .into_iter()
+            .map(|value| {
+                EncodedVariant::from_json(value)
+                    .expect("encodes")
+                    .encoded_bytes()
+            })
+            .sum::<usize>();
+        assert_eq!(payload.content_bytes(), encoded + payload.objects.bytes());
+
+        let lone = CallCapture::calls_batch(&[&payload]).expect("calls batch");
+        for (name, column) in [(REQUEST_PAYLOAD, request), (RESPONSE_PAYLOAD, response)] {
+            assert_eq!(
+                value_buffer(lone.column_by_name(name).expect(name)),
+                value_buffer(column),
+                "a lone capture's {name} shares its encoded buffer"
+            );
+        }
+
+        let group =
+            CallCapture::calls_batch(&[&metadata, &payload, &metadata]).expect("calls batch");
+        let column = group
+            .column_by_name(REQUEST_PAYLOAD)
+            .expect("request column");
+        assert_eq!(column.data_type(), request.data_type());
+        assert_eq!(column.null_count(), 2, "metadata calls keep null payloads");
+        assert_eq!(rendered(column, 1), request_json);
+        assert_eq!(
+            rendered(
+                group
+                    .column_by_name(RESPONSE_PAYLOAD)
+                    .expect("response column"),
+                1
+            ),
+            response_json
+        );
+        let storage = column.as_struct();
+        for child in 0..storage.num_columns() {
+            let bytes = storage.column(child).as_binary::<i32>();
+            assert_eq!(
+                bytes.value_length(0) + bytes.value_length(2),
+                0,
+                "a null payload keeps empty child bytes"
+            );
+        }
+    }
+
     /// Proves a selected payload is redacted, binary content becomes a
     /// digest reference with no base64, and the unselected field stays null.
     #[test]
@@ -1384,7 +1533,7 @@ pub(crate) mod tests {
         )))
         .expect("payload projects");
         let request = capture.request.as_ref().expect("request selected");
-        let request = variant_bytes_to_json(request.metadata(), request.value())
+        let request = variant_cell_to_json(request.as_ref(), 0)
             .expect("the encoded request renders")
             .to_string();
         assert!(!request.contains(CANARY), "{request}");
@@ -1525,6 +1674,78 @@ pub(crate) mod tests {
             CallCapture::from_facts(facts).err(),
             Some(CaptureDrop::Payload)
         );
+    }
+
+    /// Proves redaction and Variant encoding keep the selected content
+    /// exactly: secret keys match after lowercasing and stripping to ASCII
+    /// alphanumerics, so case and separators never matter and a non-ASCII
+    /// letter splits a fragment, and `token` matches only whole; a media `data` member is referenced by the first
+    /// media-type member's original text even when that member is itself a
+    /// data URL; nested objects and arrays, Unicode keys, explicit nulls, and
+    /// exact numbers survive the encoding unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any member is redacted, referenced, or encoded differently
+    /// from the expected payload.
+    #[test]
+    fn payload_materialization_preserves_redaction_and_variant_values() {
+        let reference = |kind: &str| {
+            let mut objects = PayloadObjects::default();
+            let bytes = super::decode_base64(IMAGE_B64).expect("the image is base64");
+            objects.reference(kind, bytes)
+        };
+        let url = format!("data:text/plain;base64,{IMAGE_B64}");
+        let value = json!({
+            "X-Goog-Api-Key": CANARY,
+            "Clé API-Key": CANARY,
+            "Ünïcode Sécret": "visible",
+            "my_ACCESS-token": CANARY,
+            "To-Ken": CANARY,
+            "tokens": 12,
+            "tokenizer": "bpe",
+            "clé": null,
+            "nested": [{"Authorization": CANARY, "keep": [1, -2, 18_446_744_073_709_551_615_u64, 0.1]}],
+            "source": {"format": url, "mime_type": "image/png", "data": IMAGE_B64},
+            "audio": {"mimeType": "audio/wav", "format": "wav", "data": IMAGE_B64},
+            "plain": {"data": IMAGE_B64},
+        });
+        let expected = json!({
+            "X-Goog-Api-Key": REDACTED,
+            "Clé API-Key": REDACTED,
+            "Ünïcode Sécret": "visible",
+            "my_ACCESS-token": REDACTED,
+            "To-Ken": REDACTED,
+            "tokens": 12,
+            "tokenizer": "bpe",
+            "clé": null,
+            "nested": [{"Authorization": REDACTED, "keep": [1, -2, 18_446_744_073_709_551_615_u64, 0.1]}],
+            "source": {"format": reference("text/plain"), "mime_type": "image/png", "data": reference("image/png")},
+            "audio": {"mimeType": "audio/wav", "format": "wav", "data": reference("audio/wav")},
+            "plain": {"data": IMAGE_B64},
+        });
+        let mut objects = PayloadObjects::default();
+        let column = super::redacted_payload(value, &mut objects).expect("the payload encodes");
+        assert_eq!(
+            variant_cell_to_json(column.as_ref(), 0).expect("the payload renders"),
+            expected
+        );
+        assert_eq!(objects.refs().len(), 3, "one object per content type");
+        for (key, secret) in [
+            ("", false),
+            ("token", true),
+            ("TOK_EN", true),
+            ("tokens", false),
+            ("xtoken", false),
+            ("ppassword", true),
+            ("passwor", false),
+            ("user-secret", true),
+            ("sécret", false),
+            ("Set-Cookie", true),
+            ("id", false),
+        ] {
+            assert_eq!(super::secret_key(key), secret, "{key}");
+        }
     }
 
     /// Proves malformed inline base64 — a `b64_json` member, a media `data`

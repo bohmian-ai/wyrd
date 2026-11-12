@@ -30,7 +30,7 @@ import {
 import { judgeReply, toolCall, toolTurn } from "../support/assistant.js";
 import type { ReceivedRequest, Reply } from "../support/http-receiver.js";
 import { configureGateway } from "../support/local-development.js";
-import { fixture, serverTest } from "../support/server.js";
+import { details, fixture, serverTest } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 300_000 });
 
@@ -238,9 +238,9 @@ function requirement<T>(result: VerificationResult<T>, id: string): RequirementR
   return found;
 }
 
-/** The step `id` of `result`. */
-function step(result: VerificationResult, id: string): CardTypes.StepResult {
-  const found = result.outcome.steps.find((each) => each.id === id);
+/** The step `id` of `result`, read from its execution's details. */
+async function step(result: VerificationResult, id: string): Promise<CardTypes.StepResult> {
+  const found = (await details(result.execution_id)).outcome.steps.find((each) => each.id === id);
   if (found === undefined) {
     throw new Error(`step ${id}: ${JSON.stringify(result)}`);
   }
@@ -386,10 +386,10 @@ test("conditions_and_collections_preserve_missing_evidence", async ({ provider, 
     const result = await state.run().observe.verify("specialist-review", question);
 
     expect(
-      ["plan", "security", "style", "quote"].map((id) => step(result, id).status),
+      await Promise.all(["plan", "security", "style", "quote"].map(async (id) => (await step(result, id)).status)),
       `${question}: ${JSON.stringify(result)}`,
     ).toEqual(statuses);
-    expect(step(result, "general").status, question).toBe("succeeded");
+    expect((await step(result, "general")).status, question).toBe("succeeded");
     expect(
       requirement(result, "consolidated").outcome,
       `${question}: consolidation reads failed and skipped collections`,
@@ -398,11 +398,11 @@ test("conditions_and_collections_preserve_missing_evidence", async ({ provider, 
       expect(asked(marker, question).length > 0, `${question}: ${marker}`).toBe(called.includes(marker));
     }
     if (securityReason !== undefined) {
-      const security = step(result, "security");
+      const security = await step(result, "security");
       expect(security.reason ?? "", `${question}: ${JSON.stringify(security)}`).toContain(securityReason);
     }
     if (quoteReason !== undefined) {
-      const quote = step(result, "quote");
+      const quote = await step(result, "quote");
       expect(quote.reason ?? "", `${question}: ${JSON.stringify(quote)}`).toContain(quoteReason);
     }
     const consolidator = asked("CONSOLIDATE:", question).at(-1);
@@ -424,7 +424,7 @@ test("conditions_and_collections_preserve_missing_evidence", async ({ provider, 
 
   const unjudged = await state.run().observe.verify("specialists-only", "NEITHER-ONLY");
   expect([
-    step(unjudged, "security").status,
+    (await step(unjudged, "security")).status,
     requirement(unjudged, "secured").outcome,
     unjudged.outcome.verdict,
   ]).toEqual(["skipped", "not_applicable", "inconclusive"]);
@@ -632,7 +632,7 @@ test("speculative_disposition_controls_consumer_admission", async ({ provider, s
     }
 
     expect(requirement(result, "consolidated").outcome, `${question}: ${JSON.stringify(result)}`).toBe("passed");
-    expect(step(result, "extra").status, `${question}: ${JSON.stringify(result)}`).toBe(status);
+    expect((await step(result, "extra")).status, `${question}: ${JSON.stringify(result)}`).toBe(status);
     expect(
       arrived.some((prompt) => prompt.includes("EXTRA:") && prompt.includes(question)),
       `${question}: a held extra review counts once it arrives`,
@@ -684,7 +684,7 @@ test("document_pipeline_uses_array_repeat_and_publications", async ({ provider, 
   const requests = (marker: string): string[] =>
     provider.received.map(text).filter((prompt) => prompt.includes(marker));
 
-  const sections = step(result, "sections");
+  const sections = await step(result, "sections");
   expect([sections.status, sections.output], JSON.stringify(result)).toEqual([
     "succeeded",
     [{ done: true }, { done: true }, { done: true }],
@@ -693,7 +693,7 @@ test("document_pipeline_uses_array_repeat_and_publications", async ({ provider, 
     [...new Set(requests("SECTION:").map((prompt) => prompt.split("SECTION: ")[1]?.split("\n")[0]))].sort(),
     "the duplicate keeps its own index and the empty appendix calls no reviewer",
   ).toEqual(["claims at=1", "claims at=2", "intro at=0"]);
-  const polish = step(result, "polish");
+  const polish = await step(result, "polish");
   expect(
     [polish.status, polish.output],
     "each section repeats independently and the final values keep input order",
@@ -717,10 +717,10 @@ test("document_pipeline_uses_array_repeat_and_publications", async ({ provider, 
     "1": ["0", "1"],
     "2": ["0", "1"],
   });
-  const appendix = step(result, "appendix");
+  const appendix = await step(result, "appendix");
   expect([appendix.status, appendix.output]).toEqual(["succeeded", []]);
-  expect(step(result, "escalate").status).toBe("failed");
-  const summarize = step(result, "summarize");
+  expect((await step(result, "escalate")).status).toBe("failed");
+  const summarize = await step(result, "summarize");
   expect([summarize.status, summarize.output]).toEqual(["succeeded", { score: 1, text: "summary v1" }]);
   const summaries = provider.received.filter((request) => text(request).includes("SUMMARIZE:"));
   expect(

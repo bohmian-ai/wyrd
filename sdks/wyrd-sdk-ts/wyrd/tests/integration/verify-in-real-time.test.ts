@@ -34,7 +34,16 @@ import {
   toolTurn,
 } from "../support/assistant.js";
 import { type ReceivedRequest, Receiver, type Reply } from "../support/http-receiver.js";
-import { ancestry, binding, fixture, groupExecution, declared, runtimeAccount, timeline } from "../support/server.js";
+import {
+  ancestry,
+  binding,
+  declared,
+  details,
+  fixture,
+  groupExecution,
+  runtimeAccount,
+  timeline,
+} from "../support/server.js";
 
 vi.setConfig({ testTimeout: 180_000 });
 
@@ -221,7 +230,8 @@ test("judged answer passes the agent check", async ({ provider, state }) => {
   const [requirement] = result.outcome.requirements;
   expect(requirement?.outcome).toBe("passed");
   expect(requirement?.citations).toEqual([{ slot: "answer", locator: { json_pointer: "" } }]);
-  expect(requirement?.provenance).toMatchObject({ kind: "agent", agent: { name: "judge-agent" } });
+  const [described] = (await details(result.execution_id)).outcome.requirements;
+  expect(described?.provenance).toMatchObject({ kind: "agent", agent: { name: "judge-agent" } });
   const judged = provider.received.filter((request) => request.path === "/v1/chat/completions");
   expect(judged).toHaveLength(1);
   expect(judged[0]?.body).toContain("Claim: The answer agrees with the customer");
@@ -600,7 +610,7 @@ test("grouped support resumes", async ({ server, assistant }) => {
   expect([judged.group_id, judged.owner_card_uid]).toEqual([group, declared(receipt).uid]);
   expect(judged.group?.sources.turns.execution_ids).toHaveLength(6);
   expect(judged.group?.sources.turns.execution_ids[5]).toBe(replayed);
-  expect(judged.result?.outcome.evidence.turns).toEqual({ kind: "json", value: turns });
+  expect((await details(judged.execution_id)).outcome.evidence.turns).toEqual({ kind: "json", value: turns });
   expect(judged.result?.outcome.verdict).toBe("passed");
   await expect(
     cards.declareFromPath(fixture("cards/verify_in_real_time/support-unsourced.yaml")),
@@ -743,9 +753,10 @@ test("grouped coding uses declared sources", async ({ server, provider, assistan
   const judged = await groupExecution(server, bindingId, WAIT_MS);
 
   const outcome = judged.result?.outcome;
-  expect(outcome?.evidence.calls).toEqual({ kind: "json", value: calls });
-  expect(outcome?.evidence.traces).toEqual({ kind: "json", value: [traceId, null, null] });
-  expect(outcome?.evidence.tests).toEqual({ kind: "json", value: ["passed", "failed", "passed"] });
+  const { evidence } = (await details(judged.execution_id)).outcome;
+  expect(evidence.calls).toEqual({ kind: "json", value: calls });
+  expect(evidence.traces).toEqual({ kind: "json", value: [traceId, null, null] });
+  expect(evidence.tests).toEqual({ kind: "json", value: ["passed", "failed", "passed"] });
   expect(
     outcome?.requirements.map((requirement) => [requirement.id, requirement.outcome]),
     JSON.stringify(outcome?.requirements),
@@ -846,7 +857,7 @@ test("grouped sampled frames use visible outcomes", async ({ server, provider, a
   let judged = await groupExecution(server, bindingId, WAIT_MS);
   expect(judged.group_id).toBe("door-44");
   expect(badged(judged)).toEqual(["inconclusive", "empty_selection"]);
-  expect(judged.result?.outcome.evidence.outcomes).toEqual({ kind: "json", value: [] });
+  expect((await details(judged.execution_id)).outcome.evidence.outcomes).toEqual({ kind: "json", value: [] });
 
   const failing = Array.from({ length: 19 }, (_, index) => frame(`fail-${String(index).padStart(4, "0")}`));
   failing.splice(7, 0, frame(UNBADGED));
@@ -871,7 +882,7 @@ test("grouped sampled frames use visible outcomes", async ({ server, provider, a
   expect(judged.group?.sources.event.execution_ids).toHaveLength(1);
   const unbadged = ids(executions)[7];
   const expected = listed.map((id) => (id === unbadged ? "failed" : "passed"));
-  expect(judged.result?.outcome.evidence.outcomes).toEqual({ kind: "json", value: expected });
+  expect((await details(judged.execution_id)).outcome.evidence.outcomes).toEqual({ kind: "json", value: expected });
   expect(judged.result?.outcome.verdict).toBe("failed");
 
   for (const [group, count] of [
@@ -888,7 +899,10 @@ test("grouped sampled frames use visible outcomes", async ({ server, provider, a
     judged = await reportedGroup(server, bindingId, judged.execution_id);
     expect(judged.group_id).toBe(group);
     expect([...(judged.group?.sources.outcomes.execution_ids ?? [])].sort()).toEqual(ids(door).sort());
-    expect(judged.result?.outcome.evidence.outcomes).toEqual({ kind: "json", value: Array(count).fill("passed") });
+    expect((await details(judged.execution_id)).outcome.evidence.outcomes).toEqual({
+      kind: "json",
+      value: Array(count).fill("passed"),
+    });
     expect(judged.result?.outcome.verdict).toBe("passed");
   }
   expect(
@@ -912,7 +926,7 @@ async function reportedGroup(
 ): Promise<Awaited<ReturnType<typeof groupExecution>>> {
   for (;;) {
     const judged = await groupExecution(server, bindingId, WAIT_MS, after);
-    const outcomes = judged.result?.outcome.evidence.outcomes;
+    const outcomes = (await details(judged.execution_id)).outcome.evidence.outcomes;
     if (judged.group?.sources.event.execution_ids.length === 1 && !JSON.stringify(outcomes).includes("null")) {
       return judged;
     }
@@ -989,7 +1003,7 @@ test("grouped conversations coexist with drift", async ({ server, state: drift }
     const execution = await (await verify.Execution.connect(id)).status();
     judged[execution.group_id ?? ""] = [
       execution.group?.sources.turns.execution_ids.length,
-      execution.result?.outcome.evidence.turns,
+      (await details(execution.execution_id)).outcome.evidence.turns,
       execution.result?.outcome.verdict,
     ];
   }
@@ -1116,7 +1130,7 @@ stagingTest("verification_staging_refuses_and_recovers", async ({ server, state 
     [group.group_id, group.group?.sources.turns.execution_ids],
     "the refused grouped turns staged nothing",
   ).toEqual(["pressured", [turn.execution.id]]);
-  expect(group.result?.outcome.evidence.turns).toEqual({ kind: "json", value: [pressured] });
+  expect((await details(group.execution_id)).outcome.evidence.turns).toEqual({ kind: "json", value: [pressured] });
 
   server.flushBifrost();
   const rows = await (await Bifrost.connect()).sql(

@@ -1236,6 +1236,450 @@ async fn referenced_binding_refusals_leave_no_writes() {
     server.shutdown().await.expect("test server shuts down");
 }
 
+/// One submission body; `version: None` leaves the version to the server.
+fn submission_body(kind: &str, name: &str, version: Option<&str>, spec: Value) -> Value {
+    let mut metadata = json!({ "name": name });
+    if let Some(version) = version {
+        metadata["version"] = json!(version);
+    }
+    json!({ "apiVersion": "wyrd/v1", "kind": kind, "metadata": metadata, "spec": spec, "artifacts": [] })
+}
+
+/// A versionless sibling reference to the submission `kind`/`name`.
+fn omitted_sibling(kind: &str, name: &str) -> Value {
+    json!({ "sibling": { "kind": kind, "name": name } })
+}
+
+/// An Agent spec over the seeded `binding-prompt`.
+fn seeded_agent_spec(verified_by: Value) -> Value {
+    json!({
+        "prompt": { "kind": "Prompt", "name": "binding-prompt", "version": "1.0.0" },
+        "execution_route": { "kind": "native" },
+        "verified_by": verified_by,
+    })
+}
+
+/// Post `submissions` to the declaration route under idempotency `key` as
+/// `jwt` and return the status and JSON body, so a journey can assert a
+/// refusal's code as readily as a receipt.
+///
+/// # Panics
+///
+/// Panics when the server does not respond or the body is not JSON.
+async fn declare_json(
+    server: &WyrdTestServer,
+    jwt: &str,
+    key: &str,
+    submissions: Value,
+) -> (StatusCode, Value) {
+    let response = server
+        .oneshot_authenticated(
+            jwt,
+            request_with_body(key, json!({ "submissions": submissions })),
+        )
+        .await
+        .expect("declaration responds");
+    let status = response.status();
+    (status, response_json(response).await)
+}
+
+/// Versionless declaration targets select, validate, and bind by the exact
+/// Cards they resolve to, and refuse every invalid graph before any write.
+///
+/// An explicit `@0.0.0` sibling never names an omitted submission. Binding
+/// uniqueness and grouped-source ambiguity hold for the targets an omitted
+/// and an explicit sibling spelling both match, and for the exact Card an
+/// omitted submission deduplicates to beside an external reference.
+/// Bindings and baselines are validated against versionless submitted
+/// bodies. Distinct selected versions still declare, and a same-key replay
+/// returns the identical exact references.
+///
+/// # Panics
+/// Panics when the server or bootstrap fails, a route call fails, or any
+/// status, stable code, persisted reference, replay, or no-write assertion
+/// does not hold.
+#[tokio::test(flavor = "current_thread")]
+async fn versionless_targets_bind_exactly_or_refuse_before_writes() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("versionless-writer", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    seed_dependency(&server, server.data_tenant_id(), "binding-prompt", "active").await;
+    let prompt = json!({ "provider": "openai", "model": "gpt-4o",
+                         "messages": [{ "role": "user", "content": "hello" }] });
+    let operator =
+        json!({ "kind": "http", "method": "post", "url": "https://hooks.example.com/alert" });
+
+    // An explicit `@0.0.0` sibling names no submission, even beside an
+    // omitted submission of the same kind and name.
+    let (status, problem) = declare_json(
+        &server,
+        &jwt,
+        "versionless-unmatched",
+        json!([
+            submission_body("Agent", "unmatched-agent", Some("1.0.0"), json!({
+                "prompt": { "sibling": { "kind": "Prompt", "name": "unmatched-prompt", "version": "0.0.0" } },
+                "execution_route": { "kind": "native" },
+            })),
+            submission_body("Prompt", "unmatched-prompt", None, prompt.clone()),
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{problem}");
+    assert_eq!(
+        problem["code"], "WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY",
+        "{problem}"
+    );
+    assert_no_declaration_writes(&server, "versionless-unmatched", "unmatched-agent").await;
+    assert_no_declaration_writes(&server, "versionless-unmatched", "unmatched-prompt").await;
+
+    // An omitted and an explicit sibling naming one submitted Verifier or
+    // Operator are one binding target.
+    let mixed = [
+        (
+            "verifier",
+            json!([
+                { "verifier": omitted_sibling("Verifier", "mixed-verifier") },
+                { "verifier": { "sibling": { "kind": "Verifier", "name": "mixed-verifier", "version": "1.0.0" } } },
+            ]),
+            "WYRD_SPEC_400_DUPLICATE_VERIFICATION_BINDING",
+        ),
+        (
+            "operator",
+            json!([{
+                "verifier": omitted_sibling("Verifier", "mixed-verifier"),
+                "on_failure": [
+                    omitted_sibling("Operator", "mixed-operator"),
+                    { "sibling": { "kind": "Operator", "name": "mixed-operator", "version": "1.0.0" } },
+                ],
+            }]),
+            "WYRD_SPEC_400_DUPLICATE_BINDING_OPERATOR",
+        ),
+    ];
+    for (shape, verified_by, code) in mixed {
+        let key = format!("versionless-mixed-{shape}");
+        let (status, problem) = declare_json(
+            &server,
+            &jwt,
+            &key,
+            json!([
+                submission_body(
+                    "Agent",
+                    "mixed-agent",
+                    Some("1.0.0"),
+                    seeded_agent_spec(verified_by)
+                ),
+                submission_body(
+                    "Verifier",
+                    "mixed-verifier",
+                    Some("1.0.0"),
+                    assertion_verifier_spec()
+                ),
+                submission_body(
+                    "Operator",
+                    "mixed-operator",
+                    Some("1.0.0"),
+                    operator.clone()
+                ),
+            ]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{shape}: {problem}");
+        assert_eq!(problem["code"], code, "{shape}: {problem}");
+        assert_no_declaration_writes(&server, &key, "mixed-agent").await;
+        assert_no_declaration_writes(&server, &key, "mixed-verifier").await;
+    }
+
+    // An omitted Verifier that deduplicates to the exact Card an external
+    // reference names is a duplicate binding.
+    let (status, body) = declare_json(
+        &server,
+        &jwt,
+        "versionless-dedup-seed",
+        json!([submission_body(
+            "Verifier",
+            "dedup-verifier",
+            Some("1.0.0"),
+            assertion_verifier_spec()
+        )]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let dedup_bindings = json!([
+        { "verifier": { "kind": "Verifier", "name": "dedup-verifier", "version": "1.0.0" } },
+        { "verifier": omitted_sibling("Verifier", "dedup-verifier") },
+    ]);
+    let (status, problem) = declare_json(
+        &server,
+        &jwt,
+        "versionless-dedup",
+        json!([
+            submission_body(
+                "Agent",
+                "dedup-agent",
+                Some("1.0.0"),
+                seeded_agent_spec(dedup_bindings.clone())
+            ),
+            submission_body(
+                "Verifier",
+                "dedup-verifier",
+                None,
+                assertion_verifier_spec()
+            ),
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{problem}");
+    assert_eq!(
+        problem["code"], "WYRD_SPEC_400_DUPLICATE_VERIFICATION_BINDING",
+        "{problem}"
+    );
+    assert_no_declaration_writes(&server, "versionless-dedup", "dedup-agent").await;
+
+    // Changed omitted content selects a distinct version, which declares,
+    // and a same-key replay returns the identical exact references.
+    let mut changed = assertion_verifier_spec();
+    changed["requirements"][0]["statement"] = json!("The answer is still one.");
+    let distinct = json!([
+        submission_body(
+            "Agent",
+            "dedup-agent",
+            Some("1.0.0"),
+            seeded_agent_spec(dedup_bindings)
+        ),
+        submission_body("Verifier", "dedup-verifier", None, changed),
+    ]);
+    let (status, declared) =
+        declare_json(&server, &jwt, "versionless-distinct", distinct.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{declared}");
+    let selected = outcomes_named(&declared, "Verifier", "dedup-verifier");
+    assert_eq!(selected.len(), 1, "{declared}");
+    assert_ne!(selected[0]["card_ref"]["version"], "1.0.0", "{declared}");
+    assert!(selected[0]["card_ref"]["uid"].is_string(), "{declared}");
+    let (status, replayed) = declare_json(&server, &jwt, "versionless-distinct", distinct).await;
+    assert_eq!(status, StatusCode::CREATED, "{replayed}");
+    let card_refs = |body: &Value| {
+        let mut refs = vec![body["root"].clone()];
+        refs.extend(
+            body["outcomes"]
+                .as_array()
+                .expect("outcomes are an array")
+                .iter()
+                .map(|outcome| outcome["card_ref"].clone()),
+        );
+        refs
+    };
+    assert_eq!(card_refs(&replayed), card_refs(&declared));
+
+    // Bindings and baselines are checked against versionless submitted
+    // bodies: a schedule Trigger cannot activate an assertion Verifier, and
+    // a baseline must declare every monitored feature.
+    let (status, problem) = declare_json(
+        &server,
+        &jwt,
+        "versionless-activation",
+        json!([
+            submission_body(
+                "Agent",
+                "activation-agent",
+                Some("1.0.0"),
+                seeded_agent_spec(json!([{
+                    "verifier": omitted_sibling("Verifier", "activation-verifier"),
+                    "runs_on": omitted_sibling("Trigger", "activation-trigger"),
+                }]))
+            ),
+            submission_body(
+                "Verifier",
+                "activation-verifier",
+                None,
+                assertion_verifier_spec()
+            ),
+            submission_body(
+                "Trigger",
+                "activation-trigger",
+                None,
+                json!({ "kind": "schedule", "cron": "0 * * * *" })
+            ),
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{problem}");
+    assert_eq!(
+        problem["code"], "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH",
+        "{problem}"
+    );
+    assert_no_declaration_writes(&server, "versionless-activation", "activation-agent").await;
+    assert_no_declaration_writes(&server, "versionless-activation", "activation-verifier").await;
+
+    let (status, problem) = declare_json(
+        &server,
+        &jwt,
+        "versionless-baseline",
+        json!([
+            submission_body(
+                "Verifier",
+                "baseline-verifier",
+                None,
+                json!({
+                    "inputs": { "samples": { "type": "samples", "features": ["score"] } },
+                    "requirements": [{
+                        "id": "drift",
+                        "statement": "The window does not drift.",
+                        "check": {
+                            "kind": "drift", "on": "inputs.samples", "method": "Psi",
+                            "signal": { "kind": "Distribution",
+                                        "baseline_ref": omitted_sibling("Data", "baseline-data"),
+                                        "features": ["score"] },
+                            "condition": { "kind": "Statistical" },
+                            "profile": { "kind": "Psi",
+                                         "binning_strategy": { "kind": "EqualWidth", "n_bins": 10 },
+                                         "threshold": { "kind": "Fixed", "value": 0.25 } }
+                        }
+                    }]
+                })
+            ),
+            submission_body(
+                "Data",
+                "baseline-data",
+                None,
+                json!({
+                    "interface": { "kind": "Parquet", "meta": { "compression": "Snappy" } },
+                    "schema": { "columns": [{ "name": "latency", "dtype": "float64" }] },
+                    "stats": { "row_count": 1, "col_count": 1, "byte_count": 1,
+                               "sha256": "c4f7700b380aff2662e88d034154d1890c33d3c12c8dda1a0ca9481f43bb9906" },
+                })
+            ),
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{problem}");
+    assert_eq!(problem["code"], "WYRD_DRIFT_400_VALIDATION", "{problem}");
+    assert_no_declaration_writes(&server, "versionless-baseline", "baseline-verifier").await;
+    assert_no_declaration_writes(&server, "versionless-baseline", "baseline-data").await;
+
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// A group source is ambiguous once an omitted Agent component deduplicates
+/// to the exact Agent another alias references externally, and distinct once
+/// changed content selects another version.
+///
+/// Preflight sees an external and a versionless sibling subject as different
+/// Cards; binding projection sees both bound to one Agent UID and refuses the
+/// Service before the declaration commits.
+///
+/// # Panics
+/// Panics when the server or bootstrap fails, a route call fails, or any
+/// status, stable code, or no-write assertion does not hold.
+#[tokio::test(flavor = "current_thread")]
+async fn deduplicated_component_subject_makes_group_source_ambiguous() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("group-source-writer", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    seed_dependency(&server, server.data_tenant_id(), "binding-prompt", "active").await;
+    let turn = json!({
+        "inputs": { "turn": { "type": "json" } },
+        "requirements": [{ "id": "answered", "statement": "The turn has an answer.",
+                           "check": { "kind": "assert", "path": "inputs.turn.answer",
+                                      "operator": "not_equals", "expected": "" } }]
+    });
+    let conversation = json!({
+        "inputs": { "turns": "verifiers.group-turn.inputs.turn",
+                    "answered": "verifiers.group-turn.requirements.answered.outcome" },
+        "requirements": [{ "id": "every-turn", "statement": "Every turn was answered.",
+                           "check": { "kind": "assert", "each": "inputs.answered[*]",
+                                      "operator": "equals", "expected": "passed" } }]
+    });
+    let seeds = [
+        submission_body(
+            "Agent",
+            "group-agent",
+            Some("1.0.0"),
+            seeded_agent_spec(json!([])),
+        ),
+        submission_body("Verifier", "group-turn", Some("1.0.0"), turn),
+        submission_body(
+            "Verifier",
+            "group-conversation",
+            Some("1.0.0"),
+            conversation,
+        ),
+    ];
+    for (index, seed) in seeds.into_iter().enumerate() {
+        let key = format!("group-source-seed-{index}");
+        let (status, body) = declare_json(&server, &jwt, &key, json!([seed])).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    let service = |authored_agent: Value, key: &str| {
+        let turn =
+            json!({ "verifier": { "kind": "Verifier", "name": "group-turn", "version": "1.0.0" } });
+        let service = submission_body(
+            "Service",
+            "group-service",
+            None,
+            json!({
+                "service_type": "agent",
+                "components": [
+                    {
+                        "alias": "external",
+                        "ref": { "kind": "Agent", "name": "group-agent", "version": "1.0.0" },
+                        "verified_by": [turn.clone(), {
+                            "verifier": { "kind": "Verifier", "name": "group-conversation", "version": "1.0.0" },
+                            "runs_on": { "kind": "group_end", "after": "3s" },
+                        }],
+                    },
+                    {
+                        "alias": "authored",
+                        "ref": omitted_sibling("Agent", "group-agent"),
+                        "verified_by": [turn],
+                    },
+                ],
+            }),
+        );
+        (
+            key.to_owned(),
+            json!([
+                service,
+                submission_body("Agent", "group-agent", None, authored_agent)
+            ]),
+        )
+    };
+
+    let (key, submissions) = service(seeded_agent_spec(json!([])), "group-source-ambiguous");
+    let (status, problem) = declare_json(&server, &jwt, &key, submissions).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{problem}");
+    assert_eq!(problem["code"], "WYRD_SPEC_400_VALIDATION", "{problem}");
+    assert_eq!(problem["details"]["rule"], "source", "{problem}");
+    assert_no_declaration_writes(&server, &key, "group-service").await;
+
+    let mut changed = seeded_agent_spec(json!([]));
+    changed["run_config"] = json!({ "max_iterations": 2 });
+    let (key, submissions) = service(changed, "group-source-distinct");
+    let (status, declared) = declare_json(&server, &jwt, &key, submissions).await;
+    assert_eq!(status, StatusCode::CREATED, "{declared}");
+    assert_eq!(
+        outcomes_named(&declared, "Service", "group-service").len(),
+        1,
+        "{declared}"
+    );
+
+    server.shutdown().await.expect("test server shuts down");
+}
+
 /// Build a one-Agent declaration whose `verified_by` list is posted verbatim.
 ///
 /// The Agent's prompt is the seeded `vc-prompt`. Taking the raw list lets a
@@ -1278,7 +1722,7 @@ fn standalone_card_request(kind: &str, name: &str, spec: Value, key: &str) -> Re
 ///
 /// Through the public HTTP route, with real declared targets behind every
 /// reference, this proves: the retired `kind: Drift` and `kind: Eval` Cards
-/// are refused; a `verifier`, `runs_on`, or `on_failure`
+/// and a slot-level `required`, true or false, are refused; a `verifier`, `runs_on`, or `on_failure`
 /// reference that resolves to a Card of the wrong kind is refused with its
 /// stable kind error; a repeated Verifier or Operator in one binding is
 /// refused as a duplicate; and an Operator carrying literal credential
@@ -1381,6 +1825,45 @@ async fn verifier_contract_refusals_leave_no_writes() {
             );
         }
     };
+
+    for (slot, name) in [
+        (
+            json!({ "type": "json", "required": false }),
+            "vc-optional-json",
+        ),
+        (
+            json!({ "type": "trace", "required": true }),
+            "vc-required-trace",
+        ),
+    ] {
+        let operation = format!("{name}-operation");
+        let response = server
+            .oneshot_authenticated(
+                &jwt,
+                standalone_card_request(
+                    "Verifier",
+                    name,
+                    json!({ "inputs": { "evidence": slot } }),
+                    &operation,
+                ),
+            )
+            .await
+            .expect("refused registration responds");
+        let status = response.status();
+        let problem = response_json(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{name}: {problem}");
+        assert_eq!(
+            problem["code"], "WYRD_REGISTRY_400_INVALID_CARD_SPEC",
+            "{name}: {problem}"
+        );
+        assert!(
+            problem["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("inputs.evidence: unknown field `required`")),
+            "{name}: {problem}"
+        );
+        assert_no_declaration_writes(&server, &operation, name).await;
+    }
 
     for kind in ["Drift", "Eval"] {
         let name = format!("vc-retired-{}", kind.to_lowercase());

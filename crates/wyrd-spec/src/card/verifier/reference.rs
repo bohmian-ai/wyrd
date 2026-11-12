@@ -137,6 +137,36 @@ impl Reference {
         self.path.contains(&PathSegment::Wildcard)
     }
 
+    /// `inputs.<slot>`: the whole value of one declared input slot.
+    ///
+    /// # Errors
+    /// Returns [`ReferenceError`] when `slot` is not a valid slot name.
+    pub fn input(slot: &str) -> Result<Self, ReferenceError> {
+        Self::parse(&format!("inputs.{slot}"))
+    }
+
+    /// `steps.<step>.output`: one step's whole action output.
+    ///
+    /// # Errors
+    /// Returns [`ReferenceError`] when `step` is not a valid block ID.
+    pub fn step_output(step: &str) -> Result<Self, ReferenceError> {
+        Self::parse(&format!("steps.{step}.output"))
+    }
+
+    /// This reference followed by the child selectors in `path`, such as
+    /// `text`, `items[0].id`, or `[*]`; an empty `path` is this reference.
+    ///
+    /// # Errors
+    /// Returns [`ReferenceError`] for a malformed `path` or a root that
+    /// accepts no child selectors.
+    pub fn at(&self, path: &str) -> Result<Self, ReferenceError> {
+        match path.chars().next() {
+            None => Ok(self.clone()),
+            Some('[') => Self::parse(&format!("{self}{path}")),
+            Some(_) => Self::parse(&format!("{self}.{path}")),
+        }
+    }
+
     /// Parses a reference.
     ///
     /// # Errors

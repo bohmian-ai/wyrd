@@ -93,10 +93,14 @@ const rootAllowed = new Set([
   "dist/card-types.js",
   "dist/cli.d.ts",
   "dist/cli.js",
+  "dist/definitions.d.ts",
+  "dist/definitions.js",
   "dist/error-codes.d.ts",
   "dist/error-codes.js",
   "dist/index.d.ts",
   "dist/index.js",
+  "dist/native.d.ts",
+  "dist/native.js",
   "dist/otel.d.ts",
   "dist/otel.js",
   "index.cjs",
@@ -144,9 +148,15 @@ try {
   const { stdout: importOutput } = await exec(
     process.execPath,
     ["--input-type=module", "-e", `
-      import { Bifrost, TableConfig, WyrdAgentsTraceProcessor } from "wyrd-ai";
+      import { Bifrost, TableConfig, WyrdAgentsTraceProcessor, verify } from "wyrd-ai";
       if (typeof Bifrost.connect !== "function") throw new Error("Bifrost facade missing");
       if (typeof TableConfig !== "function") throw new Error("TableConfig missing");
+      if (new verify.Service("app", { version: "1.0.0" }).cardRef()?.version !== "1.0.0") throw new Error("verify definitions missing");
+      if (new verify.Service("app").cardRef() !== undefined) throw new Error("an unversioned Card has a reference");
+      await import("wyrd-ai/authoring").then(
+        () => { throw new Error("wyrd-ai/authoring still resolves"); },
+        (error) => { if (error?.code !== "ERR_PACKAGE_PATH_NOT_EXPORTED") throw error; },
+      );
       // The clean project installs no optional peer, so this proves the Agents SDK is optional.
       await new WyrdAgentsTraceProcessor().onTraceStart({ traceId: "trace_1", name: "workflow" });
       const resolved = import.meta.resolve("wyrd-ai");
@@ -163,6 +173,9 @@ try {
     `import { Bifrost, TableConfig, WyrdAgentsTraceProcessor, WyrdClient, WyrdState } from "wyrd-ai";
 export const processor = new WyrdAgentsTraceProcessor();
 export type Root = [Bifrost, TableConfig, WyrdClient, WyrdState];
+import { verify } from "wyrd-ai";
+const { Component, Service, Verifier } = verify;
+export const service: verify.Service = new Service("app", { version: "1.0.0" }).addComponent(new Component("judge", new Verifier("v")));
 `,
   );
   const tsc = createRequire(join(sdkDir, "package.json")).resolve("typescript/bin/tsc");

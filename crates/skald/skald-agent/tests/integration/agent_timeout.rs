@@ -164,10 +164,15 @@ async fn agent_run_no_timeout_runs_to_completion() {
     assert!(!matches!(root.status, CapturedSpanStatus::Error(_)));
 }
 
-/// One tool-calling run emits `invoke_agent` with one `chat` span per model
-/// call and one `execute_tool` span per tool call as children, using GenAI
+/// One tool-calling run emits `invoke_agent` with one `chat` inference span
+/// per model call, which has no child span and records the answer's token
+/// usage, and one `execute_tool` span per tool call as children, using GenAI
 /// attribute names; a failing tool records its stable code; no span carries
 /// the prompt, input, tool arguments, or output.
+///
+/// # Panics
+/// Panics when the run fails, a span is missing or misparented, an attribute
+/// differs from the GenAI contract, or any span carries a payload.
 #[tokio::test]
 async fn agent_run_emits_genai_spans_without_payloads() {
     capture();
@@ -209,6 +214,15 @@ async fn agent_run_emits_genai_spans_without_payloads() {
     }
     let chats: Vec<_> = children.iter().filter(|span| span.name == "chat").collect();
     assert_eq!(chats.len(), 2);
+    let usage = |chat: &CapturedSpan| {
+        ["gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens"]
+            .map(|key| chat.attributes.get(key).cloned())
+    };
+    assert_eq!(
+        chats.iter().map(|chat| usage(chat)).collect::<Vec<_>>(),
+        [[None, None], [Some("3".to_owned()), Some("5".to_owned())]],
+        "the answering call records its token usage"
+    );
     for chat in &chats {
         assert_eq!(
             chat.attributes
@@ -232,6 +246,13 @@ async fn agent_run_emits_genai_spans_without_payloads() {
             !chat
                 .attributes
                 .contains_key("gen_ai.response.finish_reasons")
+        );
+        assert!(
+            capture()
+                .finished_since(0)
+                .iter()
+                .all(|span| span.parent_span_id != chat.span_id),
+            "the inference span is the only span of a model call"
         );
     }
     let mut tools: Vec<_> = children
@@ -318,8 +339,9 @@ async fn agent_run_chat_span_records_callback_replaced_model() {
 
 /// Gemini and Vertex runs name the semantic-convention providers
 /// `gcp.gemini` and `gcp.vertex_ai` and the Prompt's resolved model on both
-/// `invoke_agent` and `chat`, keep the `chat` operation, omit the scalar
-/// finish-reasons attribute, and carry no payload.
+/// `invoke_agent` and the inference span, name that span and its operation
+/// `generate_content`, omit the scalar finish-reasons attribute, and carry
+/// no payload.
 ///
 /// # Panics
 /// Panics when a Prompt does not build, a run fails, or a captured span
@@ -360,9 +382,11 @@ async fn agent_run_genai_google_provider_and_model() {
 
         assert_eq!(run.output, "final-output-pii-marker");
         let (root, children) = agent_spans(agent_id);
-        let chats: Vec<_> = children.iter().filter(|span| span.name == "chat").collect();
-        assert_eq!(chats.len(), 1);
-        for (span, operation) in [(&root, "invoke_agent"), (chats[0], "chat")] {
+        let [inference] = children.as_slice() else {
+            panic!("{agent_id}: one inference span, got {children:?}");
+        };
+        assert_eq!(inference.name, "generate_content");
+        for (span, operation) in [(&root, "invoke_agent"), (inference, "generate_content")] {
             for (key, value) in [
                 ("gen_ai.operation.name", operation),
                 ("gen_ai.provider.name", provider_name),
@@ -464,10 +488,10 @@ impl Provider for RecordingProvider {
     /// # Errors
     ///
     /// Returns [`ProviderError::BadRequest`] once the script is exhausted.
-    async fn send(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+    async fn send(&self, request: &ProviderRequest) -> Result<ProviderResponse, ProviderError> {
         match self.requests.lock() {
-            Ok(mut guard) => guard.push(request),
-            Err(poisoned) => poisoned.into_inner().push(request),
+            Ok(mut guard) => guard.push(request.clone()),
+            Err(poisoned) => poisoned.into_inner().push(request.clone()),
         }
         self.responses()
             .pop_front()
@@ -479,7 +503,7 @@ impl Provider for RecordingProvider {
     /// # Errors
     ///
     /// Always returns [`ProviderError::BadRequest`].
-    async fn stream(&self, _request: ProviderRequest) -> Result<ProviderStream, ProviderError> {
+    async fn stream(&self, _request: &ProviderRequest) -> Result<ProviderStream, ProviderError> {
         Err(ProviderError::bad_request(
             "recording",
             "recording provider does not stream",
@@ -757,7 +781,12 @@ fn openai_text_response(text: &str) -> ProviderResponse {
             finish_reason: Some("stop".to_owned()),
             logprobs: None,
         }],
-        usage: None,
+        usage: Some(
+            serde_json::from_value(
+                json!({"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8}),
+            )
+            .expect("usage decodes"),
+        ),
         system_fingerprint: None,
         service_tier: None,
     })

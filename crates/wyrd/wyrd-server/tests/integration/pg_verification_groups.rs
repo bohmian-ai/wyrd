@@ -9,6 +9,7 @@
 //! test brings pending groups due by moving their due time to PostgreSQL's
 //! statement time instead of waiting out the binding's `after`.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,9 +40,12 @@ use wyrd_server::verification::groups::GroupPoller;
 use wyrd_server::verification::inputs::InputResolver;
 use wyrd_server::verification::results::{ResultPayload, ResultPayloadBuilder, ResultRun};
 use wyrd_server::verification::scheduler::{GroupHandoff, VerificationScheduler};
+use wyrd_spec::card::verifier::Check;
 use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, GroupId, SlotName};
 use wyrd_spec::registry::DeclarationReceipt;
-use wyrd_spec::verification::execution::{InputDeclaration, VerificationResult};
+use wyrd_spec::verification::execution::{
+    ExecutedOutcome, ExecutedRequirement, InputDeclaration, VerificationResult,
+};
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::service_accounts::system_principal_id;
 use wyrd_sql::queries::verifier_executions::{
@@ -587,8 +591,35 @@ fn payload(
         chrono::DateTime::UNIX_EPOCH,
         chrono::DateTime::UNIX_EPOCH,
     )
-    .build(&outcome.outcome)
+    .build(&recorded(outcome))
     .expect("the result builds")
+}
+
+/// The recorded outcome of the compact `turn-check` result `result`: its
+/// judgments beside the fixture's one assertion check.
+///
+/// # Panics
+/// Panics when the fixture check does not decode.
+fn recorded(result: &VerificationResult) -> ExecutedOutcome {
+    let check: Check = serde_json::from_value(json!({
+        "kind": "assert", "path": "inputs.turn.answer", "operator": "not_equals", "expected": ""
+    }))
+    .expect("the fixture check decodes");
+    ExecutedOutcome {
+        verdict: result.outcome.verdict,
+        requirements: result
+            .outcome
+            .requirements
+            .iter()
+            .map(|requirement| ExecutedRequirement {
+                result: requirement.clone(),
+                check: check.clone(),
+                provenance: None,
+            })
+            .collect(),
+        steps: Vec::new(),
+        evidence: BTreeMap::new(),
+    }
 }
 
 /// Acknowledged evidence, not historical metadata, makes a group due: a
@@ -757,7 +788,7 @@ async fn incomplete_snapshots_retry_then_error() {
         chrono::DateTime::UNIX_EPOCH,
         chrono::DateTime::UNIX_EPOCH,
     )
-    .build(&judged.outcome)
+    .build(&recorded(&judged))
     .expect("the result builds");
     let state = support.server.state();
     state

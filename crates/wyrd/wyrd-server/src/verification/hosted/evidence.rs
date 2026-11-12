@@ -19,7 +19,7 @@
 //! through `steps.<id>.publications` references.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -60,9 +60,12 @@ pub struct TenantEvidence {
     /// The authority every Artifact read is authorized and audited under;
     /// its tenant is the evidence namespace.
     caller: Caller,
-    /// The execution's pinned input declarations, the only citable sources;
-    /// [`EvidenceReader::admit`] adds the engine's fixed attachment slots.
-    slots: Mutex<BTreeMap<SlotName, InputDeclaration>>,
+    /// The execution's pinned evidence, the only citable sources: the
+    /// caller's declarations and the engine's fixed attachment slots, as
+    /// [`EvidenceReader::admit`] receives them. The engine owns that one
+    /// backing; this reader keeps only a weak view, so the evidence returns
+    /// to the engine uncopied once the run settles. Empty before admission.
+    slots: Mutex<Weak<BTreeMap<SlotName, InputDeclaration>>>,
     /// Each File's recorded location by declared digest and size, resolved
     /// once for this execution.
     files: Mutex<HashMap<(Sha256Hex, u64), ValidatedPath>>,
@@ -79,19 +82,14 @@ pub struct TenantEvidence {
 type ArtifactKey = (CardRefIdentity, Option<CardUid>);
 
 impl TenantEvidence {
-    /// A reader of `caller`'s tenant evidence whose citable sources are the
-    /// execution's pinned `slots`, under `limits`.
+    /// A reader of `caller`'s tenant evidence under `limits`, whose citable
+    /// sources are the evidence [`EvidenceReader::admit`] pins.
     #[must_use]
-    pub fn new(
-        state: AppState,
-        caller: Caller,
-        slots: BTreeMap<SlotName, InputDeclaration>,
-        limits: HostedLimits,
-    ) -> Self {
+    pub fn new(state: AppState, caller: Caller, limits: HostedLimits) -> Self {
         Self {
             state,
             caller,
-            slots: Mutex::new(slots),
+            slots: Mutex::default(),
             files: Mutex::default(),
             artifacts: Mutex::default(),
             limits,
@@ -523,8 +521,9 @@ impl EvidenceReader for TenantEvidence {
     /// together. Each original input counts once, whatever later
     /// reads, workspaces, or retries do with it. Each uploaded file's
     /// recorded location is then resolved through [`Self::file_object`];
-    /// no bytes are read here. Admitted declarations the execution did not
-    /// pin, the engine's fixed attachments, become citable slots.
+    /// no bytes are read here. Every admitted declaration, the engine's fixed
+    /// attachments included, becomes a citable slot through a weak view of
+    /// the engine's evidence.
     ///
     /// # Errors
     /// Returns [`EngineError::InputTooLarge`] past a slot, individual, or
@@ -537,10 +536,10 @@ impl EvidenceReader for TenantEvidence {
     async fn admit(
         &self,
         slots: &BTreeMap<SlotName, InputSlot>,
-        evidence: &BTreeMap<SlotName, InputDeclaration>,
+        evidence: &Arc<BTreeMap<SlotName, InputDeclaration>>,
     ) -> Result<(), EngineError> {
         let mut total = 0_u64;
-        for (name, declaration) in evidence {
+        for (name, declaration) in evidence.iter() {
             let size = match declaration {
                 InputDeclaration::File { size_bytes, .. } => *size_bytes,
                 InputDeclaration::Artifact { artifact, path } => {
@@ -583,7 +582,7 @@ impl EvidenceReader for TenantEvidence {
                     ))
                 })?;
         }
-        for (name, declaration) in evidence {
+        for (name, declaration) in evidence.iter() {
             if let InputDeclaration::File {
                 sha256, size_bytes, ..
             } = declaration
@@ -593,12 +592,7 @@ impl EvidenceReader for TenantEvidence {
                     .map_err(|error| admission(name, error))?;
             }
         }
-        let mut pinned = lock(&self.slots);
-        for (name, declaration) in evidence {
-            pinned
-                .entry(name.clone())
-                .or_insert_with(|| declaration.clone());
-        }
+        *lock(&self.slots) = Arc::downgrade(evidence);
         Ok(())
     }
 
@@ -637,19 +631,18 @@ impl EvidenceReader for TenantEvidence {
     ) -> Result<Vec<Citation>, BlockError> {
         let mut located: BTreeMap<SlotName, Option<Vec<(Locator, String)>>> = BTreeMap::new();
         let mut valid = Vec::new();
+        let Some(pinned) = lock(&self.slots).upgrade() else {
+            return Ok(valid);
+        };
         for citation in citations {
-            let Some(declaration) = self
-                .slots
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
+            let Some(declaration) = pinned
                 .get(&citation.slot)
                 .filter(|_| reachable.contains(&citation.slot))
-                .cloned()
             else {
                 continue;
             };
             if !located.contains_key(&citation.slot) {
-                let units = self.located(&declaration).await?;
+                let units = self.located(declaration).await?;
                 located.insert(citation.slot.clone(), units);
             }
             if let Some(Some(units)) = located.get(&citation.slot)

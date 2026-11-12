@@ -57,7 +57,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardUid, ExecutionId, SlotName, VerificationResultId};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::ids::RunId;
-use wyrd_spec::verification::execution::{InputDeclaration, VerificationOutcome};
+use wyrd_spec::verification::execution::{ExecutedOutcome, InputDeclaration};
 use wyrd_spec::verification::state::{ExecutionIdentity, TerminalSelection};
 use wyrd_spec::verification::{DriftWindow, VerificationError, VerificationVerdict};
 use wyrd_spec::verification::{TaskId, VerificationExecutionStatus, VerifierReadiness};
@@ -245,7 +245,7 @@ enum Offer {
     /// The decision the recovered state already accepted.
     Accepted(Decision),
     /// A completed outcome, computed from its instant.
-    Selected(VerificationOutcome, DateTime<Utc>),
+    Selected(ExecutedOutcome, DateTime<Utc>),
     /// A failure without an outcome.
     Failed(TerminalStatus, VerificationError),
 }
@@ -799,30 +799,31 @@ impl VerifierRunner {
             }
         };
         let caller = Caller::accepted(&run.authority, system);
-        let engine = match self.blocks.engine(
-            &self.state,
-            Execution {
-                caller: &caller,
-                verifier: &run.verifier_card_uid,
-                evidence: &evidence,
-                routes: &routes,
-                subject: GatewayCallContext {
-                    workload_card_uid: run
-                        .owner_card_uid
-                        .as_ref()
-                        .or_else(|| run.authority.owning_root())
-                        .cloned(),
-                    subject_card_uid: Some(run.card_uid.clone()),
-                    run_id,
-                    deployment_environment: run.deployment_environment.clone(),
+        let engine = match telemetry.time(Phase::Setup, || {
+            self.blocks.engine(
+                &self.state,
+                Execution {
+                    caller: &caller,
+                    verifier: &run.verifier_card_uid,
+                    routes: &routes,
+                    subject: GatewayCallContext {
+                        workload_card_uid: run
+                            .owner_card_uid
+                            .as_ref()
+                            .or_else(|| run.authority.owning_root())
+                            .cloned(),
+                        subject_card_uid: Some(run.card_uid.clone()),
+                        run_id,
+                        deployment_environment: run.deployment_environment.clone(),
+                    },
+                    defer_unlanded_traces: run.attempt < run.max_attempts,
+                    drift,
+                    clock: telemetry.clock(),
+                    execution: Some(Arc::clone(state)),
+                    mode: ExecutionMode::Queued,
                 },
-                defer_unlanded_traces: run.attempt < run.max_attempts,
-                drift,
-                clock: telemetry.clock(),
-                execution: Some(Arc::clone(state)),
-                mode: ExecutionMode::Queued,
-            },
-        ) {
+            )
+        }) {
             Ok(engine) => engine,
             Err(error) => {
                 tracing::warn!(execution_id = %run.lease.execution_id, %error, "the execution engine cannot be built");

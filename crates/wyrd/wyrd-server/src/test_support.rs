@@ -285,3 +285,61 @@ pub(crate) fn test_caller(
         executed_by: None,
     }
 }
+
+/// The library test binary's allocator: the system allocator plus a count of
+/// the bytes each thread requests, so a test can observe whether a workflow
+/// allocates a payload-sized buffer.
+pub(crate) struct CountingAllocator;
+
+thread_local! {
+    /// Bytes this thread has requested from [`CountingAllocator`].
+    static ALLOCATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl CountingAllocator {
+    /// Runs `work` and returns its result with the bytes this thread
+    /// requested meanwhile, growth included and frees not subtracted.
+    pub(crate) fn measure<T>(work: impl FnOnce() -> T) -> (T, usize) {
+        let before = ALLOCATED.get();
+        let result = work();
+        (result, ALLOCATED.get() - before)
+    }
+
+    /// Adds `bytes` to this thread's count; a no-op once the thread's
+    /// storage is gone.
+    fn charge(bytes: usize) {
+        let _ = ALLOCATED.try_with(|count| count.set(count.get() + bytes));
+    }
+}
+
+// SAFETY: every method forwards its arguments unchanged to `System` and
+// returns what `System` returned; counting touches only a const-initialized
+// thread-local `Cell` with no destructor.
+#[expect(
+    unsafe_code,
+    reason = "a global allocator is unsafe; the counting it adds is safe"
+)]
+unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        Self::charge(layout.size());
+        // SAFETY: `layout` comes from the caller and is forwarded unchanged.
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        // SAFETY: `ptr` came from `System` with this same `layout`.
+        unsafe { std::alloc::System.dealloc(ptr, layout) };
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        Self::charge(layout.size());
+        // SAFETY: `layout` comes from the caller and is forwarded unchanged.
+        unsafe { std::alloc::System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        Self::charge(new_size);
+        // SAFETY: the caller's `ptr`, `layout` and `new_size` are forwarded unchanged.
+        unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+    }
+}

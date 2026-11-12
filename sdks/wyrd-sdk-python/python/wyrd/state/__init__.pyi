@@ -10,6 +10,7 @@ from ..data import DataCard
 from ..model import ModelCard
 from ..observe import Run
 from ..prompt import PromptCard
+from ..verify import AnyCard
 from ._hydrated import HydratedCard
 
 class CardEnvelope:
@@ -137,7 +138,7 @@ class WyrdState:
 
     @staticmethod
     def declare(
-        path: str | Path,
+        path: str | Path | AnyCard,
         client: WyrdClient | None = None,
         *,
         bundle_dir: str | Path | None = None,
@@ -146,10 +147,12 @@ class WyrdState:
         | None = None,
         trusted_artifact_hashes: Mapping[str, str] | None = None,
     ) -> WyrdState:
-        """Declare a Card file and return its eagerly hydrated state.
+        """Declare a Card file or an authored Card graph and return its eagerly hydrated state.
 
-        The file and the files its ``./path`` references name are declared
-        under the registry's usual version rules, so an unchanged rerun
+        The file and the files its ``./path`` references name, or the
+        authored Card and everything it references, are declared as
+        ``Cards.declare`` declares them, under the registry's usual version
+        rules, so an unchanged rerun
         declares nothing new. The declared graph is pulled, validated, and
         hydrated as ``from_path`` hydrates a bundle. Every call runs as one
         client. Without ``bundle_dir`` the graph is held in memory and no
@@ -157,7 +160,8 @@ class WyrdState:
         ``bundle_dir``.
 
         Args:
-            path: The root Service Card file.
+            path: The root Service: its Card file, or an authored Card from
+                ``wyrd.verify``, copied as it is now.
             client: the ``WyrdClient`` every call runs as. Omitted, the
                 ambient client resolves once.
             bundle_dir: A directory to publish the complete bundle to. It
@@ -190,11 +194,13 @@ class WyrdState:
         The writer acts as the state's client: the one given to ``from_path``,
         else the ambient client. Startup describes ``bifrost.drift.observations``
         before succeeding, so a run can never enqueue against a missing,
-        unauthorized, or incompatible system table.
+        unauthorized, or incompatible system table. When the root Service
+        declares exactly one table and ``table`` is omitted, that table becomes
+        the active table ``run.bifrost.write(row)`` writes.
 
         Args:
-            table: the Bifrost write binding, as for ``Bifrost()``. It does
-                not choose a run's destination.
+            table: the active table ``run.bifrost.write(row)`` writes, as for
+                ``Bifrost()``, in place of a sole declared table.
             client_byte_limit_bytes: the handle-wide ingestion byte budget.
                 256 MiB if omitted.
 
@@ -205,6 +211,25 @@ class WyrdState:
                 byte budget too small to seal one message, or the catalog code
                 for a missing credential, an undialable ingest channel, or a
                 fixed table that is absent, unauthorized, or incompatible.
+        """
+        ...
+
+    def use_table_by_name(self, table: str) -> None:
+        """Bind a registered table as the active table, describing it first.
+
+        ``run.bifrost.write(row)`` then writes it. Every run of this state
+        shares the active table, and the previous table's buffered rows still
+        drain. Runs writing different tables concurrently use
+        ``run.bifrost.write_to(table, row)`` instead.
+
+        Args:
+            table: the registered ``"<namespace>.<name>"`` table.
+
+        Raises:
+            WyrdError: ``WYRD_SDK_400_BIFROST_NOT_STARTED`` before
+                ``start_bifrost``, ``WYRD_SDK_409_BIFROST_CLOSED`` after
+                shutdown, and the server's error for a table that is unknown,
+                unauthorized, or unavailable.
         """
         ...
 

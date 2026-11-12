@@ -676,6 +676,47 @@ fn run_for_card_refuses_an_unknown_alias_without_network_io() {
     assert_eq!(error.code(), "WYRD_SDK_404_UNKNOWN_ALIAS");
 }
 
+/// A subject's bindings resolve in order: the root Service's own for the
+/// root, then each component occurrence naming the subject, then a standalone
+/// Agent's own. The first bound Verifier of the name wins, a Verifier bound
+/// elsewhere is unknown, and every result names the exact subject.
+///
+/// # Panics
+/// Panics if the fixture does not load, a binding resolves to the wrong
+/// Verifier or subject, or an unbound name resolves.
+#[test]
+fn verifier_resolution_preserves_subjects_and_binding_order() {
+    let (bundle, [judge, judge_next, solo]) = TestBundle::with_bound_verifiers();
+    let state = WyrdState::from_path(bundle.path()).expect("fixture bundle loads");
+    let root = state.root_ref().clone();
+    let model = state.card_ref("model").expect("model ref").clone();
+    let agent = state.card_ref("agent_triage").expect("agent ref").clone();
+    let quality = state
+        .card_ref("quality_check")
+        .expect("quality ref")
+        .clone();
+    let resolves = |subject: &wyrd_spec::reference::CardRef, name: &str| {
+        let bound = state
+            .bound_verifier(subject, name)
+            .unwrap_or_else(|error| panic!("{name} resolves for {subject}: {error}"));
+        (bound.verifier_card_uid, bound.card_uid)
+    };
+    let uid = |card: &wyrd_spec::reference::CardRef| card.uid.clone().expect("fixture UID");
+
+    assert_eq!(resolves(&root, "quality"), (uid(&quality), uid(&root)));
+    assert_eq!(resolves(&model, "judge"), (uid(&judge), uid(&model)));
+    assert_eq!(resolves(&model, "solo"), (uid(&solo), uid(&model)));
+    assert_eq!(resolves(&agent, "judge"), (uid(&judge_next), uid(&agent)));
+    assert_eq!(resolves(&agent, "solo"), (uid(&solo), uid(&agent)));
+    for (subject, name) in [(&root, "judge"), (&model, "quality"), (&agent, "quality")] {
+        let error = state
+            .bound_verifier(subject, name)
+            .err()
+            .unwrap_or_else(|| panic!("{name} is not bound to {subject}"));
+        assert_eq!(error.code(), "WYRD_SDK_404_UNKNOWN_VERIFIER");
+    }
+}
+
 // ── Scenario 2b: Verifier execution through named slots ────────────────────
 
 /// A client presenting a static bearer to `base_url` with `timeout_ms`, so no
@@ -714,9 +755,9 @@ fn run_verifier() -> wyrd_spec::card::verifier::VerifierSpec {
             "answer": { "type": "json" },
             "policy": { "type": "media", "formats": ["pdf"], "max_bytes": 64 },
             "deck": { "type": "media", "formats": ["pptx", "pdf"] },
-            "copy": { "type": "media", "formats": ["pdf"], "required": false },
-            "archive": { "type": "media", "formats": ["pdf"], "required": false },
-            "trace": { "type": "trace", "required": false },
+            "copy": { "type": "media", "formats": ["pdf"] },
+            "archive": { "type": "media", "formats": ["pdf"] },
+            "trace": { "type": "trace" },
         },
         "requirements": [{
             "id": "answered", "statement": "An answer is given",
@@ -960,7 +1001,12 @@ async fn execute_pins_files_and_completes_shared_uploads() {
     );
 
     let result = target(&spec)
-        .execute(&bearer_client(server.uri(), 5_000), run)
+        .execute(
+            &bearer_client(server.uri(), 5_000),
+            run,
+            &mut wyrd_benchmark::Observation::default(),
+            None,
+        )
         .await
         .expect("the execution succeeds");
     assert_eq!(result.execution_id, id);
@@ -1033,7 +1079,12 @@ async fn file_refusals_happen_locally_before_any_request() {
     ] {
         let run = run_evidence(&spec, crate::verify::Inputs::named([("policy", file)]));
         let error = target(&spec)
-            .execute(&client, run)
+            .execute(
+                &client,
+                run,
+                &mut wyrd_benchmark::Observation::default(),
+                None,
+            )
             .await
             .expect_err("the file is refused");
         assert_eq!(error.code(), code);
@@ -1043,7 +1094,12 @@ async fn file_refusals_happen_locally_before_any_request() {
         crate::verify::Inputs::named([("deck", crate::verify::File::bytes(vec![1]))]),
     );
     let error = target(&spec)
-        .execute(&client, run)
+        .execute(
+            &client,
+            run,
+            &mut wyrd_benchmark::Observation::default(),
+            None,
+        )
         .await
         .expect_err("a format must be declared when several are accepted");
     assert_eq!(error.code(), "WYRD_VERIFICATION_400_INPUT_INVALID");
@@ -1274,8 +1330,12 @@ async fn wait_deadline_bounds_slow_reads_and_starts_no_read_after_expiry() {
 /// A direct execution waits past a shorter configured `timeout_ms` so the
 /// server's own deadline answer reaches the caller, sent once.
 ///
+/// The longer execution deadline is the execute request's own: an ordinary
+/// request on the same client still times out at the configured deadline.
+///
 /// # Panics
-/// Panics when the delayed 504 is replaced by a client timeout or replayed.
+/// Panics when the delayed 504 is replaced by a client timeout or replayed,
+/// or the ordinary request outlives the configured deadline.
 #[tokio::test]
 async fn execute_outlives_the_configured_timeout() {
     use wiremock::matchers::{method, path};
@@ -1301,11 +1361,38 @@ async fn execute_outlives_the_configured_timeout() {
         crate::verify::Inputs::named([("answer", json!("yes"))]),
     );
 
+    Mock::given(method("POST"))
+        .and(path("/v1/ordinary"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(200))
+                .set_body_json(json!({})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = bearer_client(server.uri(), 20);
+
     let error = target(&spec)
-        .execute(&bearer_client(server.uri(), 20), run)
+        .execute(
+            &client,
+            run,
+            &mut wyrd_benchmark::Observation::default(),
+            None,
+        )
         .await
         .expect_err("the server's deadline answer is an error");
     assert_eq!(error.code(), "WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT");
+
+    let ordinary = client
+        .http
+        .request_json::<_, Value>(reqwest::Method::POST, "/v1/ordinary", Some(&json!({})))
+        .await
+        .expect_err("an ordinary request keeps the configured deadline");
+    assert!(
+        ordinary.to_string().contains("transport error"),
+        "{ordinary:?}"
+    );
 }
 
 // ── Scenario 3: the Drift projection ───────────────────────────────────────
@@ -1415,15 +1502,15 @@ fn drift_refuses_unsupported_inputs() {
     }
 }
 
-// ── Scenario 5: the generic record path ────────────────────────────────────
+// ── Scenario 5: the Run-scoped write path ─────────────────────────────────
 
 /// The first call describes the table once; later calls reuse its schema.
 ///
 /// # Panics
-/// Panics when startup or either record fails, or the server sees more
+/// Panics when startup or either write fails, or the server sees more
 /// than one describe for the table across the run and its sibling Card view.
 #[tokio::test]
-async fn record_describes_a_dataset_table_once() {
+async fn write_describes_a_dataset_table_once() {
     let server = DescribeServer::start(fixed_table_bodies());
     server.publish(
         "bifrost.datasets.app_events",
@@ -1436,14 +1523,14 @@ async fn record_describes_a_dataset_table_once() {
     start_over(&state, &server).await.expect("startup");
     let run = state.run();
 
-    run.observe()
-        .record("bifrost.datasets.app_events", &json!({ "event": "done" }))
+    run.bifrost()
+        .write_to("bifrost.datasets.app_events", &json!({ "event": "done" }))
         .await
-        .expect("first record describes then enqueues");
+        .expect("first write describes then enqueues");
     run.for_card("model")
         .expect("model view")
-        .observe()
-        .record("bifrost.datasets.app_events", &json!({ "event": "scored" }))
+        .bifrost()
+        .write_to("bifrost.datasets.app_events", &json!({ "event": "scored" }))
         .await
         .expect("a sibling view reuses the cached schema");
 
@@ -1458,11 +1545,11 @@ async fn record_describes_a_dataset_table_once() {
 /// producer, while two distinct tables keep their own destinations.
 ///
 /// # Panics
-/// Panics when startup or any raced record fails, either table is
+/// Panics when startup or any raced write fails, either table is
 /// described more than once, the pool holds other than two producers, or the
 /// two cached writer tables share a name.
 #[tokio::test]
-async fn concurrent_first_records_describe_each_table_once() {
+async fn concurrent_first_writes_describe_each_table_once() {
     let server = DescribeServer::start(fixed_table_bodies());
     for table in ["bifrost.datasets.first", "bifrost.datasets.second"] {
         server.publish(
@@ -1473,7 +1560,7 @@ async fn concurrent_first_records_describe_each_table_once() {
     let (_bundle, state) = state_fixture();
     start_over(&state, &server).await.expect("startup");
     let run = state.run();
-    let observe = run.observe();
+    let bifrost = run.bifrost();
     let row = json!({ "event": "raced" });
 
     let results = futures_util::future::join_all((0..8).map(|index| {
@@ -1482,7 +1569,7 @@ async fn concurrent_first_records_describe_each_table_once() {
         } else {
             "bifrost.datasets.second"
         };
-        observe.record(table, &row)
+        bifrost.write_to(table, &row)
     }))
     .await;
 
@@ -1512,11 +1599,11 @@ async fn concurrent_first_records_describe_each_table_once() {
 /// A reserved or system-managed table is refused before any describe.
 ///
 /// # Panics
-/// Panics when startup fails, a record to a reserved, system, or
+/// Panics when startup fails, a write to a reserved, system, or
 /// malformed table succeeds or refuses with a code other than
 /// `WYRD_SDK_400_INVALID_OBSERVATION`, or the refusal reached a describe.
 #[tokio::test]
-async fn record_refuses_reserved_and_system_tables() {
+async fn write_refuses_reserved_and_system_tables() {
     let server = DescribeServer::start(fixed_table_bodies());
     let (_bundle, state) = state_fixture();
     start_over(&state, &server).await.expect("startup");
@@ -1534,8 +1621,8 @@ async fn record_refuses_reserved_and_system_tables() {
     ] {
         let before = server.calls(table);
         let error = run
-            .observe()
-            .record(table, &json!({ "event": "done" }))
+            .bifrost()
+            .write_to(table, &json!({ "event": "done" }))
             .await
             .expect_err("only registered bifrost.datasets tables are caller-owned");
         assert_eq!(error.code(), "WYRD_SDK_400_INVALID_OBSERVATION", "{table}");
@@ -1550,21 +1637,125 @@ async fn record_refuses_reserved_and_system_tables() {
 /// An unknown dataset table fails at describe, before queue admission.
 ///
 /// # Panics
-/// Panics when startup fails, or recording to the unregistered table
+/// Panics when startup fails, or writing to the unregistered table
 /// succeeds or refuses with a status other than 404.
 #[tokio::test]
-async fn record_refuses_an_unknown_dataset_table() {
+async fn write_refuses_an_unknown_dataset_table() {
     let server = DescribeServer::start(fixed_table_bodies());
     let (_bundle, state) = state_fixture();
     start_over(&state, &server).await.expect("startup");
 
     let error = state
         .run()
-        .observe()
-        .record("bifrost.datasets.absent", &json!({ "event": "done" }))
+        .bifrost()
+        .write_to("bifrost.datasets.absent", &json!({ "event": "done" }))
         .await
         .expect_err("an unregistered table must refuse");
     assert_eq!(error.status(), 404);
+}
+
+/// A root Service's sole declared table becomes the active table at
+/// startup, so `write(row)` names no table and performs no further describe.
+///
+/// # Panics
+/// Panics when startup or the write fails, or the table is described other
+/// than once.
+#[tokio::test]
+async fn a_sole_declared_table_is_active_after_startup() {
+    let server = DescribeServer::start(fixed_table_bodies());
+    let table = "bifrost.datasets.replies";
+    server.publish(
+        table,
+        &description(table, vec![Field::new("event", DataType::Utf8, false)]),
+    );
+    let bundle = TestBundle::complete_service_with_tables(&["replies"]);
+    let state = WyrdState::from_path(bundle.path()).expect("fixture bundle loads");
+    start_over(&state, &server).await.expect("startup");
+
+    state
+        .run()
+        .bifrost()
+        .write(&json!({ "event": "done" }))
+        .await
+        .expect("the declared table is active");
+
+    assert_eq!(server.calls(table), 1, "described once, at startup");
+}
+
+/// With several declared tables none is active: `write(row)` refuses until
+/// the caller binds one, and switching tables changes where it writes.
+///
+/// # Panics
+/// Panics when startup fails, the unbound write succeeds or refuses with
+/// another code, or a write after binding fails.
+#[tokio::test]
+async fn several_declared_tables_need_an_explicit_active_table() {
+    let server = DescribeServer::start(fixed_table_bodies());
+    for table in ["bifrost.datasets.first", "bifrost.datasets.second"] {
+        server.publish(
+            table,
+            &description(table, vec![Field::new("event", DataType::Utf8, false)]),
+        );
+    }
+    let bundle = TestBundle::complete_service_with_tables(&["first", "second"]);
+    let state = WyrdState::from_path(bundle.path()).expect("fixture bundle loads");
+    start_over(&state, &server).await.expect("startup");
+    let run = state.run();
+    let row = json!({ "event": "done" });
+
+    let error = run
+        .bifrost()
+        .write(&row)
+        .await
+        .expect_err("no table is active");
+    assert_eq!(error.code(), "WYRD_VALA_412_NO_ACTIVE_TABLE");
+    assert_eq!(
+        server.calls("bifrost.datasets.first"),
+        0,
+        "nothing activated"
+    );
+
+    for table in ["bifrost.datasets.first", "bifrost.datasets.second"] {
+        state.use_table_by_name(table).await.expect("table binds");
+        run.bifrost()
+            .write(&row)
+            .await
+            .expect("writes the active table");
+        let started = state.started_bifrost().expect("started");
+        assert_eq!(
+            started.bifrost.active_writer_table().expect("active").fqn(),
+            table
+        );
+    }
+    let started = state.started_bifrost().expect("started");
+    assert_eq!(
+        started.bifrost.producer_count(),
+        2,
+        "one producer per table"
+    );
+}
+
+/// An active table outside `bifrost.datasets` is refused before admission.
+///
+/// # Panics
+/// Panics when startup or binding fails, or the write is admitted.
+#[tokio::test]
+async fn write_refuses_an_active_system_table() {
+    let server = DescribeServer::start(fixed_table_bodies());
+    let (_bundle, state) = state_fixture();
+    start_over(&state, &server).await.expect("startup");
+    state
+        .use_table_by_name(DRIFT_OBSERVATIONS_TABLE)
+        .await
+        .expect("a system table binds on the handle");
+
+    let error = state
+        .run()
+        .bifrost()
+        .write(&json!({ "event": "done" }))
+        .await
+        .expect_err("a run never writes a system table");
+    assert_eq!(error.code(), "WYRD_SDK_400_INVALID_OBSERVATION");
 }
 
 /// A state created with a client keeps it for every server call: its clones

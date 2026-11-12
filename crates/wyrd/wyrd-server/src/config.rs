@@ -17,6 +17,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use tokio::sync::Semaphore;
 use url::Url;
+use vala_bifrost_redux::resources::ScribeWorkerOverrides;
 use vala_bifrost_redux::scribe::geometry::{ScribeGeometry, ScribeGeometryError};
 use wyrd_auth_oidc::{AddressPolicy, ScreenedHttp};
 use wyrd_crypt::SealingKeyring;
@@ -313,15 +314,18 @@ pub struct ServeConfig {
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScribeRuntimeConfig {
-    /// Tokio coordination worker count.
-    #[serde(default = "default_scribe_coordination_threads")]
-    pub coordination_threads: usize,
-    /// Ingress CPU worker count.
-    #[serde(default = "default_scribe_ingress_cpu_threads")]
-    pub ingress_cpu_threads: usize,
-    /// Persistence CPU worker count for Parquet preparation and bounded replay work.
-    #[serde(default = "default_scribe_persistence_cpu_threads")]
-    pub persistence_cpu_threads: usize,
+    /// Tokio coordination worker count; unset derives it from effective CPU
+    /// through
+    /// [`vala_bifrost_redux::resources::ScribeWorkers::resolve`].
+    #[serde(default)]
+    pub coordination_threads: Option<usize>,
+    /// Ingress CPU worker count; unset derives it from effective CPU.
+    #[serde(default)]
+    pub ingress_cpu_threads: Option<usize>,
+    /// Persistence CPU worker count for Parquet preparation and bounded replay
+    /// work; unset derives it from effective CPU.
+    #[serde(default)]
+    pub persistence_cpu_threads: Option<usize>,
     /// WAL IO worker count. Boot runs at least one worker per shard; see
     /// [`Self::wal_io_workers`].
     #[serde(default = "default_scribe_wal_io_threads")]
@@ -1131,6 +1135,35 @@ pub struct BifrostRuntimeConfig {
 }
 
 impl BifrostRuntimeConfig {
+    /// Projects the resource and Scribe worker settings onto the checked
+    /// resource policy.
+    ///
+    /// This is the only translation from server configuration to Bifrost
+    /// resource planning, so boot and tests resolve the same shared cap and
+    /// worker counts from the same fields. Validation happens where the policy
+    /// meets an observation, never here.
+    #[must_use]
+    pub fn resource_policy(
+        &self,
+        roles: std::collections::BTreeSet<vala_bifrost_redux::resources::BifrostRole>,
+        scratch_root: Option<PathBuf>,
+        volume_roots: Option<vala_bifrost_redux::resources::BifrostVolumeRoots>,
+    ) -> vala_bifrost_redux::resources::BifrostResourcePolicy {
+        let resources = &self.resources;
+        vala_bifrost_redux::resources::BifrostResourcePolicy {
+            roles,
+            server_memory_min_bytes: resources.server_memory_min_bytes,
+            bifrost_memory_limit_bytes: resources.memory_limit_bytes,
+            scratch_limit_bytes: resources.scratch_limit_bytes,
+            effective_cpu: resources.effective_cpu,
+            scribe_workers: self.scribe.worker_overrides(),
+            oracle_query_slot_limit: resources.oracle_query_slot_limit,
+            oracle_partition_scan_bytes: resources.oracle_partition_scan_bytes,
+            scratch_root,
+            volume_roots,
+        }
+    }
+
     /// Resolved local Bifrost data root: the environment override, else `.wyrd/bifrost`.
     #[must_use]
     pub fn data_dir(&self) -> &Path {
@@ -1407,66 +1440,6 @@ pub struct BifrostResourceConfig {
     pub oracle_partition_scan_bytes: Option<u64>,
 }
 
-impl BifrostResourceConfig {
-    /// Projects these operator settings onto the checked resource policy.
-    ///
-    /// This is the only translation from server configuration to Bifrost
-    /// resource planning, so boot and tests resolve the same shared cap from
-    /// the same fields. Validation happens where the policy meets an
-    /// observation, never here.
-    #[must_use]
-    pub fn policy(
-        &self,
-        roles: std::collections::BTreeSet<vala_bifrost_redux::resources::BifrostRole>,
-        scratch_root: Option<PathBuf>,
-        volume_roots: Option<vala_bifrost_redux::resources::BifrostVolumeRoots>,
-    ) -> vala_bifrost_redux::resources::BifrostResourcePolicy {
-        vala_bifrost_redux::resources::BifrostResourcePolicy {
-            roles,
-            server_memory_min_bytes: self.server_memory_min_bytes,
-            bifrost_memory_limit_bytes: self.memory_limit_bytes,
-            scratch_limit_bytes: self.scratch_limit_bytes,
-            effective_cpu: self.effective_cpu,
-            oracle_query_slot_limit: self.oracle_query_slot_limit,
-            oracle_partition_scan_bytes: self.oracle_partition_scan_bytes,
-            scratch_root,
-            volume_roots,
-        }
-    }
-}
-
-/// Derives the dedicated Scribe coordination-runtime worker count.
-///
-/// The coordination runtime hosts one long-lived task per Scribe shard lane
-/// plus the reconciliation and persistence loops. Those shard owners are not
-/// pure channel-awaiters: each performs synchronous Arrow memtable insertion
-/// inline and awaits a Postgres `COMMIT`, so a thread count well below the
-/// lane count serializes independent lanes.
-///
-/// The derivation therefore starts from detected parallelism — matching the
-/// sibling ingress and persistence derivations, including their `map_or(4, ..)`
-/// fallback for platforms that cannot report it — floored at two so a
-/// single-core box still gets a second thread to make progress on while one
-/// lane blocks in `COMMIT`.
-fn default_scribe_coordination_threads() -> usize {
-    std::thread::available_parallelism()
-        .map_or(4, std::num::NonZeroUsize::get)
-        .max(2)
-}
-
-fn default_scribe_ingress_cpu_threads() -> usize {
-    let available = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
-    (available.saturating_sub(2).max(2) / 3).max(1)
-}
-
-fn default_scribe_persistence_cpu_threads() -> usize {
-    let available = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
-    let budget = available.saturating_sub(2).max(2);
-    budget
-        .saturating_sub(default_scribe_ingress_cpu_threads())
-        .max(1)
-}
-
 fn default_scribe_wal_io_threads() -> usize {
     4
 }
@@ -1522,9 +1495,9 @@ fn default_ingest_wal_workspace_bytes() -> usize {
 impl Default for ScribeRuntimeConfig {
     fn default() -> Self {
         Self {
-            coordination_threads: default_scribe_coordination_threads(),
-            ingress_cpu_threads: default_scribe_ingress_cpu_threads(),
-            persistence_cpu_threads: default_scribe_persistence_cpu_threads(),
+            coordination_threads: None,
+            ingress_cpu_threads: None,
+            persistence_cpu_threads: None,
             wal_io_threads: default_scribe_wal_io_threads(),
             ingest_request_bytes: default_ingest_request_bytes(),
             outbox_capacity: default_outbox_capacity(),
@@ -1552,6 +1525,17 @@ impl ScribeRuntimeConfig {
         self.wal_io_threads.max(self.shard_count)
     }
 
+    /// The worker counts set explicitly, which the resource plan applies over
+    /// its CPU-derived defaults.
+    #[must_use]
+    pub const fn worker_overrides(&self) -> ScribeWorkerOverrides {
+        ScribeWorkerOverrides {
+            coordination_threads: self.coordination_threads,
+            ingress_cpu_threads: self.ingress_cpu_threads,
+            persistence_cpu_threads: self.persistence_cpu_threads,
+        }
+    }
+
     /// Validate that every configured bound can provide bounded operation.
     ///
     /// # Errors
@@ -1566,9 +1550,12 @@ impl ScribeRuntimeConfig {
             ("coordination_threads", self.coordination_threads),
             ("ingress_cpu_threads", self.ingress_cpu_threads),
             ("persistence_cpu_threads", self.persistence_cpu_threads),
-            ("wal_io_threads", self.wal_io_threads),
+            ("wal_io_threads", Some(self.wal_io_threads)),
         ];
-        if let Some((name, _value)) = thread_values.into_iter().find(|(_, value)| *value == 0) {
+        if let Some((name, _value)) = thread_values
+            .into_iter()
+            .find(|(_, value)| *value == Some(0))
+        {
             return Err(format!("scribe.{name} must be at least 1"));
         }
         let rotation_values = [
@@ -1712,10 +1699,11 @@ pub struct MetricsConfig {
     /// stays on loopback rather than inheriting the (possibly public) HTTP IP.
     #[serde(default)]
     pub bind: Option<SocketAddr>,
-    /// Whether the metrics listener also serves the read-only benchmark
-    /// timing snapshot, `GET /benchmark/timings`, and the process records
-    /// benchmark timing histograms. Defaults to false; only a
-    /// benchmark-owned server enables it, and it requires a loopback bind.
+    /// Whether this process installs the benchmark recorder instead of the
+    /// Prometheus recorder: its metrics listener then serves the read-only
+    /// benchmark snapshot, `GET /benchmark/snapshot`, and no `/metrics`
+    /// exposition. Defaults to false; only a benchmark-owned server enables
+    /// it, and it requires a loopback bind and a `bench` build.
     #[serde(default)]
     pub benchmark_snapshot: bool,
 }
@@ -4052,8 +4040,16 @@ impl WyrdServerConfig {
             }
         }
 
-        // 1c. The benchmark snapshot is served only on an enabled loopback
-        // metrics listener: it is an unauthenticated local readout.
+        // 1c. The benchmark snapshot exists only in a `bench` build and is
+        // served only on an enabled loopback metrics listener: it is an
+        // unauthenticated local readout.
+        if self.metrics.benchmark_snapshot && !cfg!(feature = "bench") {
+            return Err(ConfigError::Invalid {
+                message: "metrics.benchmark_snapshot requires a wyrd-server built with the \
+                          `bench` feature"
+                    .to_owned(),
+            });
+        }
         if self.metrics.benchmark_snapshot
             && (!self.metrics.enabled || self.metrics.is_public_bind(self.http.bind))
         {
@@ -4535,7 +4531,7 @@ mod tests {
     use super::*;
     use crate::verification::hosted::LaneLimits;
     use vala_bifrost_redux::resources::{
-        ORACLE_PARTITION_WORKING_MEMORY_BYTES, ResourcePlan, oracle_worker_slots,
+        ORACLE_PARTITION_WORKING_MEMORY_BYTES, ResourcePlan, ScribeWorkers, oracle_worker_slots,
     };
 
     /// Serialize env-var tests so concurrent test threads cannot interfere.
@@ -4594,7 +4590,7 @@ mod tests {
             role: BifrostTarget::ForgeWorker,
             ..WyrdServerConfig::default()
         };
-        config.bifrost.scribe.coordination_threads = 0;
+        config.bifrost.scribe.coordination_threads = Some(0);
         config.bifrost.oracle.admission_waiters = 0;
         config.bifrost.oracle.calibration_profile = PathBuf::from("/\0malformed");
         config.http.bind = config.grpc.bind;
@@ -4620,7 +4616,7 @@ mod tests {
                 role,
                 ..WyrdServerConfig::default()
             };
-            config.bifrost.scribe.coordination_threads = 0;
+            config.bifrost.scribe.coordination_threads = Some(0);
             config.grpc.reflection_enabled = true;
             config.limits.body_bytes = 0;
             config.limits.timeout_ms = 0;
@@ -4733,7 +4729,7 @@ maintenance_interval_secs = 45
                     memory_source: ResourceSource::Injected,
                     cpu_source: ResourceSource::Injected,
                 },
-                config.bifrost.resources.policy(
+                config.bifrost.resource_policy(
                     [BifrostRole::Scribe, BifrostRole::Oracle, BifrostRole::Forge]
                         .into_iter()
                         .collect(),
@@ -5971,10 +5967,10 @@ minimum_slots = 2
     #[test]
     fn scribe_runtime_defaults_match_configured_ingest_contract() {
         let cfg = ScribeRuntimeConfig::default();
-        assert!(
-            cfg.coordination_threads >= 2,
-            "coordination threads {} must keep the two-thread floor",
-            cfg.coordination_threads
+        assert_eq!(
+            cfg.worker_overrides(),
+            ScribeWorkerOverrides::default(),
+            "omitted worker counts derive from the resource plan"
         );
         assert_eq!(
             cfg.ingest_request_bytes,
@@ -6043,6 +6039,74 @@ minimum_slots = 2
         assert!(error.contains("seal_key_early_seal_bytes"), "{error}");
     }
 
+    /// Omitted Scribe worker counts derive from the plan's capped effective
+    /// CPU while explicit ones, even one equal to the derived default, keep
+    /// their value, and invalid explicit counts keep their errors.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an omitted count ignores the CPU cap, an explicit count is
+    /// replaced, or an invalid count is accepted.
+    #[test]
+    fn scribe_worker_resolution_preserves_explicit_settings() {
+        use vala_bifrost_redux::resources::{
+            BifrostRole, BifrostRuntimeResources, ResourceSource, SystemResourceSnapshot,
+        };
+        const GIB: usize = 1024 * 1024 * 1024;
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        let resolve = |toml: &str| {
+            let config = from_toml_str_with_dev_oracle_opt_in(toml).expect("config parses");
+            config.bifrost.scribe.validate().expect("valid workers");
+            BifrostRuntimeResources::from_snapshot(
+                SystemResourceSnapshot {
+                    memory_limit_bytes: 8 * GIB,
+                    effective_cpu: 32,
+                    scratch_capacity_bytes: 64 * GIB as u64,
+                    scratch_available_bytes: 64 * GIB as u64,
+                    memory_source: ResourceSource::Injected,
+                    cpu_source: ResourceSource::Injected,
+                },
+                config.bifrost.resource_policy(
+                    [BifrostRole::Scribe].into_iter().collect(),
+                    None,
+                    None,
+                ),
+            )
+            .expect("plan resolves")
+            .plan()
+        };
+        let workers =
+            |coordination_threads, ingress_cpu_threads, persistence_cpu_threads| ScribeWorkers {
+                coordination_threads,
+                ingress_cpu_threads,
+                persistence_cpu_threads,
+            };
+        let cap = "[bifrost.resources]\neffective_cpu = 8\n";
+        // C = 8: coordination max(8, 2), budget 6, ingress 2, persistence 4.
+        let omitted = resolve(cap);
+        assert_eq!(omitted.effective_cpu, 8);
+        assert_eq!(omitted.scribe_workers, workers(8, 2, 4));
+        // Uncapped, the same omission follows the observed 32 CPUs.
+        assert_eq!(resolve("").scribe_workers, workers(32, 10, 20));
+        // Explicit ingress leaves the persistence default's formula alone.
+        let partial = resolve(&format!("{cap}[bifrost.scribe]\ningress_cpu_threads = 5\n"));
+        assert_eq!(partial.scribe_workers, workers(8, 5, 4));
+        // Explicit values equal to the derived defaults are still explicit and
+        // survive a different CPU.
+        let explicit = "[bifrost.scribe]\ncoordination_threads = 8\ningress_cpu_threads = 2\n\
+                        persistence_cpu_threads = 4\n";
+        assert_eq!(resolve(explicit).scribe_workers, workers(8, 2, 4));
+        let config =
+            from_toml_str_with_dev_oracle_opt_in("[bifrost.scribe]\npersistence_cpu_threads = 0\n")
+                .expect("a zero count parses");
+        let error = config
+            .bifrost
+            .scribe
+            .validate()
+            .expect_err("a zero explicit count is refused");
+        assert!(error.contains("persistence_cpu_threads"), "{error}");
+    }
+
     /// Boot runs one WAL IO worker per shard when the configured count is lower.
     #[test]
     fn wal_io_workers_cover_every_shard() {
@@ -6074,9 +6138,9 @@ minimum_slots = 2
                 assert!(error.contains(stringify!($field)), "{error}");
             }};
         }
-        assert_rejected!(coordination_threads, 0);
-        assert_rejected!(ingress_cpu_threads, 0);
-        assert_rejected!(persistence_cpu_threads, 0);
+        assert_rejected!(coordination_threads, Some(0));
+        assert_rejected!(ingress_cpu_threads, Some(0));
+        assert_rejected!(persistence_cpu_threads, Some(0));
         assert_rejected!(wal_io_threads, 0);
         assert_rejected!(shard_count, 0);
         assert_rejected!(max_file_size_on_disk, 0);
@@ -6967,6 +7031,7 @@ minimum_slots = 2
             oracle_enabled: true,
             forge_enabled: false,
             scratch_limit_bytes: 0,
+            scribe_workers: ScribeWorkers::resolve(effective_cpu, ScribeWorkerOverrides::default()),
         };
         // Memory is generous, so CPU is what bounds concurrency; the ratio is
         // two units per effective core.

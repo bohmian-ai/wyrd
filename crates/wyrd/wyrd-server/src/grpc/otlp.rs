@@ -216,14 +216,14 @@ where
 
 /// Boxes one export's service future and records its server time, from the
 /// service call through the built response, through
-/// [`wyrd_telemetry::record_timing`] at `boundary`: `success` when the
+/// [`wyrd_benchmark::record_timing`] at `boundary`: `success` when the
 /// response carries no error `grpc-status`, else `failed`. Without benchmark
 /// timing it only boxes the future: no clock, span or status is read.
 fn timed(
     boundary: &'static str,
     export: impl Future<Output = Result<HttpResponse<TonicBody>, Infallible>> + Send + 'static,
 ) -> Pin<Box<dyn Future<Output = Result<HttpResponse<TonicBody>, Infallible>> + Send>> {
-    if !wyrd_telemetry::timing::enabled() {
+    if !wyrd_benchmark::enabled() {
         return Box::pin(export);
     }
     let started = std::time::Instant::now();
@@ -237,13 +237,13 @@ fn timed(
             },
             Err(never) => match *never {},
         };
-        wyrd_telemetry::record_timing(&parent, boundary, outcome, started.elapsed(), None);
+        wyrd_benchmark::record_timing(&parent, boundary, outcome, started.elapsed(), None);
         response
     })
 }
 
 /// Runs one export's protobuf `decode` and, on success, records its time
-/// through [`wyrd_telemetry::record_timing`] at `boundary` under the current
+/// through [`wyrd_benchmark::record_timing`] at `boundary` under the current
 /// request's benchmark classification. Without benchmark timing it only
 /// runs `decode`: no clock or span is read.
 ///
@@ -254,12 +254,12 @@ fn timed_decode<T>(
     boundary: &'static str,
     decode: impl FnOnce() -> Result<T, Status>,
 ) -> Result<T, Status> {
-    if !wyrd_telemetry::timing::enabled() {
+    if !wyrd_benchmark::enabled() {
         return decode();
     }
     let started = std::time::Instant::now();
     let decoded = decode()?;
-    wyrd_telemetry::record_timing(
+    wyrd_benchmark::record_timing(
         &tracing::Span::current(),
         boundary,
         "success",
@@ -840,7 +840,7 @@ mod tests {
     //! Proof of the OTLP export boundary's benchmark histogram observations.
 
     use super::*;
-    use wyrd_telemetry::timing;
+    use wyrd_benchmark as timing;
 
     /// An export's observation runs from the service call until its
     /// response is built, so a 30 ms acknowledgement is inside it; an error
@@ -850,7 +850,7 @@ mod tests {
     /// Panics when an outcome, count, or elapsed bound is wrong.
     #[tokio::test]
     async fn histograms_cover_service_call_through_acknowledgement() {
-        timing::enable();
+        timing::install().expect("the benchmark recorder installs");
         let before = timing::snapshot();
         let export = |status: Option<&'static str>| async move {
             tokio::time::sleep(std::time::Duration::from_millis(30)).await;
@@ -895,7 +895,7 @@ mod tests {
     /// Panics when the decoded value, error, or observation count is wrong.
     #[test]
     fn decode_timing_records_only_successful_decodes() {
-        timing::enable();
+        timing::install().expect("the benchmark recorder installs");
         let before = timing::snapshot();
         let boundary = "bifrost.otlp.traces.decode";
         assert_eq!(timed_decode(boundary, || Ok(7)).expect("decoded"), 7);

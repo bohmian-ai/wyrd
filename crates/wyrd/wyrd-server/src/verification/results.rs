@@ -1,6 +1,6 @@
 //! Arrow payloads for one Verifier execution: pure mapping, no transport.
 //!
-//! [`ResultPayloadBuilder`] maps one engine [`VerificationOutcome`] onto the
+//! [`ResultPayloadBuilder`] maps one engine [`ExecutedOutcome`] onto the
 //! authored schemas of `bifrost.verification.execution_outputs` (its
 //! requirements and steps) and `bifrost.verification.results` (its
 //! payload-free summary), and the execution's [`InputRecord`] onto
@@ -42,7 +42,7 @@ use wyrd_spec::vala::managed_columns::{
 };
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
-    InputDeclaration, PullRequestActivation, RequirementResult, StepResult, VerificationOutcome,
+    ExecutedOutcome, ExecutedRequirement, InputDeclaration, PullRequestActivation, StepResult,
 };
 use wyrd_spec::verification::{DriftWindow, FrozenTarget, VerificationVerdict};
 use wyrd_sql::queries::verifier_executions::Submission;
@@ -178,13 +178,13 @@ impl ResultPayload {
     }
 }
 
-/// The stored `output` Variant: a [`VerificationOutcome`]'s requirements and
+/// The stored `output` Variant: an [`ExecutedOutcome`]'s requirements and
 /// steps, without the verdict the summary records or the `evidence` only the
 /// execution's input record stores.
 #[derive(Serialize)]
 struct StoredOutput<'a> {
     /// Every requirement, step requirements included.
-    requirements: &'a [RequirementResult],
+    requirements: &'a [ExecutedRequirement],
     /// Every step in plan order.
     steps: &'a [StepResult],
 }
@@ -304,10 +304,7 @@ impl<'a> ResultPayloadBuilder<'a> {
     /// do not name each table field exactly once,
     /// [`ResultPayloadError::Variant`] when the outcome exceeds a Variant
     /// limit, and a JSON or Arrow error when encoding fails.
-    pub fn build(
-        &self,
-        outcome: &VerificationOutcome,
-    ) -> Result<ResultPayload, ResultPayloadError> {
+    pub fn build(&self, outcome: &ExecutedOutcome) -> Result<ResultPayload, ResultPayloadError> {
         self.build_as(VerificationResultId::new_v7(), outcome)
     }
 
@@ -320,7 +317,7 @@ impl<'a> ResultPayloadBuilder<'a> {
     pub fn build_as(
         &self,
         result_id: VerificationResultId,
-        outcome: &VerificationOutcome,
+        outcome: &ExecutedOutcome,
     ) -> Result<ResultPayload, ResultPayloadError> {
         let output = StoredOutput {
             requirements: &outcome.requirements,
@@ -354,7 +351,7 @@ impl<'a> ResultPayloadBuilder<'a> {
     fn summary(
         &self,
         result_id: VerificationResultId,
-        outcome: &VerificationOutcome,
+        outcome: &ExecutedOutcome,
     ) -> Result<Vec<NamedColumn>, ResultPayloadError> {
         let trigger = self.run.trigger.map(canonical_json).transpose()?;
         let verdict: &'static str = outcome.verdict.into();
@@ -645,7 +642,9 @@ mod tests {
     use wyrd_spec::card::drift::DriftMethod;
     use wyrd_spec::card::verifier::Check;
     use wyrd_spec::ids::FeatureName;
-    use wyrd_spec::verification::execution::{RequirementDetail, RequirementOutcome};
+    use wyrd_spec::verification::execution::{
+        RequirementDetail, RequirementOutcome, RequirementResult,
+    };
     use wyrd_spec::verification::{DriftReport, DriftVerdict, FeatureDriftReport};
 
     use super::*;
@@ -725,7 +724,7 @@ mod tests {
 
     /// A failed outcome with one two-feature drift requirement, one with a
     /// non-finite score, and one assertion requirement with no detail.
-    fn outcome() -> VerificationOutcome {
+    fn outcome() -> ExecutedOutcome {
         let feature = |name: &str, score: f64, verdict| {
             let name = FeatureName::new(name).expect("valid feature name");
             (
@@ -739,25 +738,27 @@ mod tests {
                 },
             )
         };
-        let requirement = |id: &str, detail| RequirementResult {
-            id: TaskId::new(id).expect("valid task id"),
-            step: None,
-            item_index: None,
-            iteration_index: None,
-            statement: id.to_owned(),
-            outcome: RequirementOutcome::Failed,
-            reason: "drifted".to_owned(),
-            actual: None,
-            citations: Vec::new(),
-            data: None,
-            detail,
+        let requirement = |id: &str, detail| ExecutedRequirement {
+            result: RequirementResult {
+                id: TaskId::new(id).expect("valid task id"),
+                step: None,
+                item_index: None,
+                iteration_index: None,
+                statement: id.to_owned(),
+                outcome: RequirementOutcome::Failed,
+                reason: "drifted".to_owned(),
+                actual: None,
+                citations: Vec::new(),
+                data: None,
+                detail,
+            },
             check: serde_json::from_value::<Check>(serde_json::json!({
                 "kind": "assert", "path": "inputs.x", "operator": "equals", "expected": true
             }))
             .expect("assert check decodes"),
             provenance: None,
         };
-        VerificationOutcome {
+        ExecutedOutcome {
             verdict: VerificationVerdict::Failed,
             requirements: vec![
                 requirement(

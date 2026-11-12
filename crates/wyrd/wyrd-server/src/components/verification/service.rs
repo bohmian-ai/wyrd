@@ -27,7 +27,8 @@ use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::vala::ids::{SpanId, TraceId};
 use wyrd_spec::verification::execution::{
     EnqueueVerificationResponse, EvidencePlanRequest, EvidencePlanResponse, EvidenceUpload,
-    VerificationExecutionState, VerificationRequest, VerificationResult,
+    OutcomeDetails, VerificationDetails, VerificationExecutionState, VerificationRequest,
+    VerificationResult,
 };
 use wyrd_spec::verification::state::ExecutionState;
 use wyrd_spec::verification::state::{ExecutionIdentity, TerminalSelection};
@@ -69,6 +70,9 @@ const GET_BINDING: &str = "verification.binding.read";
 
 /// Audit operation of an execution status read.
 const GET_EXECUTION: &str = "verification.execution.read";
+
+/// Audit operation of an execution details read.
+const GET_EXECUTION_DETAILS: &str = "verification.execution.details.read";
 
 /// Audit operation of an evidence upload plan.
 const EVIDENCE: &str = "verification.evidence";
@@ -123,6 +127,15 @@ fn state_unavailable(error: &dyn std::fmt::Display) -> WyrdError {
     WyrdError::ServiceUnavailable {
         message: "the verification execution state cannot be recorded now".to_owned(),
         details: serde_json::json!({ "retry_after_seconds": STAGING_RETRY_AFTER_SECONDS }),
+    }
+}
+
+/// The not-found refusal of an execution the caller's tenant does not
+/// show: unknown, or, for details, without complete visible records.
+fn execution_not_found(execution_id: ExecutionId) -> WyrdError {
+    WyrdError::VerificationExecutionNotFound {
+        message: "no verification execution with this ID in the caller's tenant".to_owned(),
+        details: serde_json::json!({ "execution_id": execution_id }),
     }
 }
 
@@ -238,7 +251,8 @@ impl<'a> VerificationControl<'a> {
         })
     }
 
-    /// Read one execution's status, dispatches, and result once visible.
+    /// Read one execution's status, dispatches, and compact result once
+    /// visible.
     ///
     /// Reads the execution as [`Self::retained`](VerificationControl::retained)
     /// does, for direct and queued work alike and whether or not its queue
@@ -251,7 +265,8 @@ impl<'a> VerificationControl<'a> {
     /// answers the queue's status. Dispatches and a group execution's source
     /// selection are read from the queue row and the input record. A result
     /// Scribe has not yet published leaves `result` absent, so the caller
-    /// polls again.
+    /// polls again. The result is the compact decision: its stored checks
+    /// are skipped, never decoded or compiled.
     ///
     /// # Errors
     /// The errors of [`Self::retained`](VerificationControl::retained), and
@@ -303,6 +318,47 @@ impl<'a> VerificationControl<'a> {
                 deployment_environment: identity.deployment_environment.clone(),
             });
         Ok(state)
+    }
+
+    /// Read what one completed execution ran and how it judged.
+    ///
+    /// The same authority, tenancy, and selected result as
+    /// [`get_execution`](Self::get_execution), audited as its own read: the
+    /// retained records decode in their authored form, so no Prompt is
+    /// compiled, rendered, or executed and nothing is rejudged.
+    ///
+    /// # Errors
+    /// The errors of [`Self::retained`](VerificationControl::retained), the
+    /// query error when a record read fails, and
+    /// [`WyrdError::VerificationExecutionNotFound`] unless complete details
+    /// are visible: an execution without a selected result, or one whose
+    /// records are not yet or no longer readable.
+    pub(crate) async fn get_execution_details(
+        &self,
+        caller: &Caller,
+        execution_id: ExecutionId,
+    ) -> Result<VerificationDetails, WyrdError> {
+        let retained = self
+            .retained(caller, execution_id, GET_EXECUTION_DETAILS)
+            .await?;
+        let records = InputResolver::new(&retained.query, None);
+        let (Some(selected), Some(identity)) =
+            (&retained.state.terminal, retained.state.identity.as_ref())
+        else {
+            return Err(execution_not_found(execution_id));
+        };
+        let (run_id, outcome) = records
+            .result::<OutcomeDetails>(selected.result_id)
+            .await?
+            .ok_or_else(|| execution_not_found(execution_id))?;
+        Ok(VerificationDetails {
+            execution_id,
+            run_id,
+            verifier: identity.verifier.clone(),
+            subject: identity.subject.clone(),
+            deployment_environment: identity.deployment_environment.clone(),
+            outcome,
+        })
     }
 
     /// Plan uploads of the caller's evidence files that are not completed
@@ -433,7 +489,7 @@ impl<'a> VerificationControl<'a> {
     pub(crate) async fn execute(
         &self,
         caller: &Caller,
-        request: &VerificationRequest,
+        request: VerificationRequest,
         edge_timer: Option<&EdgeTimer>,
         arrival: Option<RequestArrival>,
     ) -> Result<VerificationResult, WyrdError> {
@@ -461,7 +517,7 @@ impl<'a> VerificationControl<'a> {
     async fn run_direct(
         &self,
         caller: &Caller,
-        request: &VerificationRequest,
+        mut request: VerificationRequest,
         edge_timer: Option<&EdgeTimer>,
         telemetry: &ExecutionTelemetry,
     ) -> (&'static str, Result<VerificationResult, WyrdError>) {
@@ -476,7 +532,7 @@ impl<'a> VerificationControl<'a> {
             request.verifier_card_uid, request.card_uid
         );
         let admitted = telemetry.time(Phase::Admit, || {
-            environment_tag(request)?;
+            environment_tag(&request)?;
             self.authorize_run(
                 caller,
                 &request.verifier_card_uid,
@@ -498,8 +554,8 @@ impl<'a> VerificationControl<'a> {
         let target = match telemetry
             .phase(
                 Phase::Load,
-                self.resolve(caller, request)
-                    .instrument(tracing::info_span!("verification.load")),
+                self.resolve(caller, &request)
+                    .instrument(tracing::debug_span!("verification.load")),
             )
             .await
         {
@@ -563,26 +619,28 @@ impl<'a> VerificationControl<'a> {
             deadline,
         ));
         let finished = async {
-            let engine = match blocks.engine(
-                self.state,
-                Execution {
-                    caller: &executor,
-                    verifier: &request.verifier_card_uid,
-                    evidence: &request.inputs,
-                    routes: &request.execution_route_overrides,
-                    subject: GatewayCallContext {
-                        workload_card_uid: owner.cloned(),
-                        subject_card_uid: Some(request.card_uid.clone()),
-                        run_id: request.run_id.clone(),
-                        deployment_environment: request.deployment_environment.clone(),
+            let built = telemetry.time(Phase::Setup, || {
+                blocks.engine(
+                    self.state,
+                    Execution {
+                        caller: &executor,
+                        verifier: &request.verifier_card_uid,
+                        routes: &request.execution_route_overrides,
+                        subject: GatewayCallContext {
+                            workload_card_uid: owner.cloned(),
+                            subject_card_uid: Some(request.card_uid.clone()),
+                            run_id: request.run_id.clone(),
+                            deployment_environment: request.deployment_environment.clone(),
+                        },
+                        defer_unlanded_traces: false,
+                        drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
+                        clock: telemetry.clock(),
+                        execution: Some(Arc::clone(&state)),
+                        mode: ExecutionMode::Direct,
                     },
-                    defer_unlanded_traces: false,
-                    drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
-                    clock: telemetry.clock(),
-                    execution: Some(Arc::clone(&state)),
-                    mode: ExecutionMode::Direct,
-                },
-            ) {
+                )
+            });
+            let engine = match built {
                 Ok(engine) => engine.with_checkpoints(
                     Arc::clone(&state) as Arc<dyn Checkpoints>,
                     &ExecutionState::default(),
@@ -592,11 +650,15 @@ impl<'a> VerificationControl<'a> {
             let ran = telemetry
                 .phase(
                     Phase::Engine,
-                    engine.run(Arc::clone(&target.spec), request.inputs.clone(), deadline),
+                    engine.run(
+                        Arc::clone(&target.spec),
+                        std::mem::take(&mut request.inputs),
+                        deadline,
+                    ),
                 )
-                .instrument(tracing::info_span!("verification.engine"))
+                .instrument(tracing::debug_span!("verification.engine"))
                 .await;
-            let outcome = match ran {
+            let mut outcome = match ran {
                 Ok(outcome) => outcome,
                 Err(EngineError::DeadlineExceeded) => {
                     return (
@@ -662,8 +724,16 @@ impl<'a> VerificationControl<'a> {
                 }
                 Err(error) => return ("unavailable", Err(state_unavailable(&error))),
             };
+            // The engine returned the one evidence copy it ran on; stage the
+            // caller's declarations from it, apart from the engine's
+            // synthetic attachment slots, which no Verifier declares. The
+            // compact result carries no evidence.
+            outcome
+                .evidence
+                .retain(|slot, _| target.spec.inputs.contains_key(slot));
+            request.inputs = std::mem::take(&mut outcome.evidence);
             telemetry.time(Phase::Stage, || {
-                Self::stage_direct(&staged, caller, execution_id, request, &target, &selected);
+                Self::stage_direct(&staged, caller, execution_id, &request, &target, &selected);
             });
             (
                 "completed",
@@ -672,7 +742,7 @@ impl<'a> VerificationControl<'a> {
                     run_id: request.run_id.clone(),
                     verifier: target.verifier.clone(),
                     subject: target.subject.clone(),
-                    outcome,
+                    outcome: outcome.compact(),
                     deployment_environment: request.deployment_environment.clone(),
                 }),
             )

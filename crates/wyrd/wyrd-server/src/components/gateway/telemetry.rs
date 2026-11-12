@@ -26,7 +26,7 @@ use wyrd_spec::gateway::{GatewayCallOutcome, GatewayOperation};
 use super::capture::operation_name;
 use crate::app::metrics::{
     GATEWAY_DURATION_SECONDS, GATEWAY_OVERHEAD_SECONDS, GATEWAY_PHASE_DURATION_SECONDS,
-    GATEWAY_UPSTREAM_SECONDS,
+    GATEWAY_UPSTREAM_SECONDS, GATEWAY_WAIT_SECONDS,
 };
 use crate::http::middleware::metrics::RequestArrival;
 
@@ -73,6 +73,40 @@ impl Phase {
             Self::Account => "account",
             Self::Relay => "relay",
             Self::Capture => "capture",
+        }
+    }
+}
+
+/// One controlled wait of a governed call, as its `wait` label names it.
+///
+/// Waits are diagnostics beside the phases, never part of them: dispatch
+/// and resumption are handoffs between the caller's task and the call's
+/// execution task, and the provider waits split the exchanges the `answer`
+/// point already subtracts. They overlap phases and are never summed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Wait {
+    /// The spawn of an admitted call's execution task until it starts;
+    /// admission is not part of it, unlike the queue delay.
+    Dispatch,
+    /// The execution task's answer send until the caller's task resumes on
+    /// it.
+    Resume,
+    /// Ended provider exchanges' send to headers, or to failure when none
+    /// arrived, plus an opened stream's send to headers; it includes local
+    /// pool, connect, and runtime work.
+    ProviderHeaders,
+    /// Ended provider exchanges' body receipt outside every header wait.
+    ProviderBody,
+}
+
+impl Wait {
+    /// The closed `wait` label.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Dispatch => "dispatch",
+            Self::Resume => "resume",
+            Self::ProviderHeaders => "provider_headers",
+            Self::ProviderBody => "provider_body",
         }
     }
 }
@@ -156,6 +190,20 @@ impl CallTelemetry {
         self.phase(phase, started.elapsed());
     }
 
+    /// Records `elapsed` as one observation of `wait`, only while
+    /// benchmarking; an ordinary server records no wait.
+    pub(crate) fn wait(&self, wait: Wait, elapsed: Duration) {
+        if !wyrd_benchmark::enabled() {
+            return;
+        }
+        metrics::histogram!(
+            GATEWAY_WAIT_SECONDS,
+            "operation" => self.operation,
+            "wait" => wait.name()
+        )
+        .record(elapsed.as_secs_f64());
+    }
+
     /// Records the `answer` point now: a buffered answer, a refusal, or a
     /// stream's head handed to the response body with `outcome`, after
     /// waiting `upstream` on provider exchanges (until the stream's headers,
@@ -176,11 +224,11 @@ impl CallTelemetry {
     /// time under `upstream_point`, and their difference at handoff `point`;
     /// nothing without an arrival.
     ///
-    /// The same duration and provider wait are also recorded through
-    /// [`wyrd_telemetry::record_timing`] under the current span's benchmark
-    /// classification, at boundary `gateway.buffered`,
-    /// `gateway.stream.head`, or `gateway.stream.end`; the benchmark
-    /// histograms keep each call's residual beside both.
+    /// While benchmarking, the duration and provider wait are recorded
+    /// instead through [`wyrd_benchmark::record_timing`] under the current
+    /// span's benchmark classification, at boundary `gateway.buffered`,
+    /// `gateway.stream.head`, or `gateway.stream.end`, so each is counted
+    /// once; the benchmark histograms keep each call's residual beside both.
     fn point(
         &self,
         point: &'static str,
@@ -195,7 +243,7 @@ impl CallTelemetry {
         let duration = at.saturating_duration_since(arrival);
         let stream = if self.stream { "true" } else { "false" };
         let outcome = outcome_name(outcome);
-        wyrd_telemetry::record_timing(
+        wyrd_benchmark::record_timing(
             &tracing::Span::current(),
             match (self.stream, point) {
                 (false, _) => "gateway.buffered",
@@ -206,6 +254,9 @@ impl CallTelemetry {
             duration,
             Some(upstream),
         );
+        if wyrd_benchmark::enabled() {
+            return;
+        }
         metrics::histogram!(
             GATEWAY_DURATION_SECONDS,
             "operation" => self.operation,
@@ -237,18 +288,20 @@ mod tests {
     //! Proof of the handoff boundaries' benchmark histogram observations.
 
     use super::*;
-    use wyrd_telemetry::timing;
+    use wyrd_benchmark as timing;
 
     /// A stream records its head and its final frame as separate
     /// observations, each with its own provider wait and residual; a
     /// buffered call whose wait exceeds its time is a negative residual,
-    /// never a clamped zero; a call without an arrival records nothing.
+    /// never a clamped zero; a call without an arrival records nothing; no
+    /// production duration histogram counts a timed handoff again.
     ///
     /// # Panics
-    /// Panics when a boundary, count, wait, or residual is wrong.
+    /// Panics when a boundary, count, wait, or residual is wrong, or a
+    /// production histogram repeats a handoff.
     #[test]
     fn histograms_preserve_head_and_final_overhead() {
-        timing::enable();
+        timing::install().expect("the benchmark recorder installs");
         let before = timing::snapshot();
         let arrival = Instant::now()
             .checked_sub(Duration::from_millis(300))
@@ -299,6 +352,86 @@ mod tests {
             interval.series.len(),
             3,
             "an unarrived call records nothing"
+        );
+        for family in [
+            GATEWAY_DURATION_SECONDS,
+            GATEWAY_OVERHEAD_SECONDS,
+            GATEWAY_UPSTREAM_SECONDS,
+        ] {
+            assert!(
+                interval.histogram(family, &[]).is_err(),
+                "{family} would count a timed handoff twice"
+            );
+        }
+    }
+
+    /// Controlled waits are diagnostics under their own closed labels: each
+    /// is one observation of its wait, none is a phase, and recording them
+    /// beside a call's handoff leaves its single boundary observation,
+    /// provider wait, and residual unchanged.
+    ///
+    /// # Panics
+    /// Panics when a wait is missing, miscounted, or recorded as a phase or a
+    /// boundary.
+    #[test]
+    fn handoff_diagnostics_preserve_request_boundaries() {
+        timing::install().expect("the benchmark recorder installs");
+        let before = timing::snapshot();
+        let arrival = Instant::now()
+            .checked_sub(Duration::from_millis(300))
+            .expect("invariant: the monotonic clock is past 300 ms");
+        let call = CallTelemetry::new(GatewayOperation::ChatCompletions, false, Some(arrival));
+        for (wait, ms) in [
+            (Wait::Dispatch, 1),
+            (Wait::ProviderHeaders, 80),
+            (Wait::ProviderBody, 20),
+            (Wait::Resume, 2),
+        ] {
+            call.wait(wait, Duration::from_millis(ms));
+        }
+        call.answered(GatewayCallOutcome::Succeeded, Duration::from_millis(100));
+        let interval = timing::snapshot().since(&before).expect("one process");
+        for (wait, ms) in [
+            ("dispatch", 1),
+            ("provider_headers", 80),
+            ("provider_body", 20),
+            ("resume", 2),
+        ] {
+            let recorded = interval
+                .histogram(
+                    GATEWAY_WAIT_SECONDS,
+                    &[("operation", "chat_completions"), ("wait", wait)],
+                )
+                .unwrap_or_else(|error| panic!("no {wait} wait: {error}"));
+            assert_eq!(recorded.len(), 1, "{wait}");
+            assert!(
+                recorded
+                    .maximum()
+                    .is_some_and(|bucket| bucket.lowest <= ms * 1_000_000
+                        && ms * 1_000_000 <= bucket.highest),
+                "{wait}"
+            );
+        }
+        assert!(
+            interval
+                .histogram(GATEWAY_PHASE_DURATION_SECONDS, &[])
+                .is_err(),
+            "a wait is not a phase"
+        );
+        assert_eq!(interval.series.len(), 1, "one boundary observation");
+        let buffered = &interval.series[0];
+        assert_eq!(
+            (buffered.boundary.as_str(), buffered.count),
+            ("gateway.buffered", 1)
+        );
+        assert!(buffered.problems().is_empty(), "{:?}", buffered.problems());
+        assert!(
+            buffered
+                .residual
+                .as_ref()
+                .and_then(timing::Distribution::maximum)
+                .is_some_and(|bucket| bucket.highest >= 200_000_000 && bucket.lowest < 290_000_000),
+            "the residual still subtracts only the provider wait"
         );
     }
 }

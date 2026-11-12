@@ -30,7 +30,7 @@ import {
 import { judgeReply, toolCall, toolTurn } from "../support/assistant.js";
 import type { ReceivedRequest, Reply } from "../support/http-receiver.js";
 import { configureGateway } from "../support/local-development.js";
-import { fixture, serverTest } from "../support/server.js";
+import { details, fixture, serverTest } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 180_000 });
 
@@ -208,9 +208,9 @@ function requirement<T>(result: VerificationResult<T>, id: string): RequirementR
   return found;
 }
 
-/** The step `id` of `result`. */
-function step(result: VerificationResult, id: string): CardTypes.StepResult {
-  const found = result.outcome.steps.find((each) => each.id === id);
+/** The step `id` of `result`, read from its execution's details. */
+async function step(result: VerificationResult, id: string): Promise<CardTypes.StepResult> {
+  const found = (await details(result.execution_id)).outcome.steps.find((each) => each.id === id);
   if (found === undefined) {
     throw new Error(`step ${id}: ${JSON.stringify(result)}`);
   }
@@ -381,7 +381,7 @@ test("agent_publishes_file_directory_and_json", async ({ server, provider, bundl
 
   const question = "FULL-RUN narrowed";
   const narrowed = await verifyAs("writes_only", { tool: "fs.write" }, question);
-  const calls = step(narrowed, "draft").tool_calls ?? [];
+  const calls = (await step(narrowed, "draft")).tool_calls ?? [];
   expect(calls.length, question).toBeGreaterThan(0);
   for (const call of calls) {
     const denied = (call.error ?? "").includes(DENIED);
@@ -399,7 +399,7 @@ test("agent_publishes_file_directory_and_json", async ({ server, provider, bundl
     `${question}: a denied publish echoes no content`,
   ).not.toContain("low");
   expect(await publications(narrowed.execution_id), question).toEqual([]);
-  expect(step(narrowed, "consume").status, question).toBe("failed");
+  expect((await step(narrowed, "consume")).status, question).toBe("failed");
   expect(
     asked.every((request) => !text(request).includes("CONSUME:")),
     `${question}: the consumer never reached the model`,

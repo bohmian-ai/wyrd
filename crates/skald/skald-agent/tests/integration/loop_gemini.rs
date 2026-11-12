@@ -125,7 +125,7 @@ impl WyrdGatewayCaller for RecordingGoogleGateway {
     /// answer is not a Google `GenerateContent` response.
     async fn call(
         &self,
-        call: WyrdGatewayCall,
+        call: WyrdGatewayCall<'_>,
         _cancellation: &CancellationToken,
     ) -> Result<ProviderResponse, ProviderError> {
         let ProviderRequest::GeminiGenerateContent(request) = call.request else {
@@ -134,7 +134,7 @@ impl WyrdGatewayCaller for RecordingGoogleGateway {
         self.requests
             .lock()
             .expect("requests lock")
-            .push(serde_json::to_value(&request).expect("request serializes"));
+            .push(serde_json::to_value(request).expect("request serializes"));
         let raw = self
             .replies
             .lock()

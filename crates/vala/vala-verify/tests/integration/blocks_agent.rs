@@ -17,9 +17,11 @@ use skald_spec::{MediaRef, ProviderName, ProviderRequest, ProviderResponse};
 use skald_tool::{AgentTool, ToolError, ToolRegistry};
 use tokio::time::Instant;
 use vala_verify::blocks::{
-    ActionExecutor, AgentCardResolver, AgentExecutor, AgentToolset, BlockCall, BlockError,
-    CallInput, CallValue, CheckExecutor, EvidenceReader, Position, PromptCardResolver, ToolSession,
+    AGENT_PHASE_DURATION_SECONDS, ActionExecutor, AgentCardResolver, AgentExecutor, AgentToolset,
+    BlockCall, BlockError, CallInput, CallValue, CheckExecutor, EvidenceReader, Position,
+    PromptCardResolver, ToolSession,
 };
+use wyrd_benchmark::MetricValue;
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::card::agent::{AgentRunConfigSpec, AgentSpec, BuiltinTool, ExecutionRoute};
 use wyrd_spec::card::verifier::{Action, AgentCall, Check};
@@ -263,7 +265,7 @@ fn input(name: &str, value: Value) -> BTreeMap<String, CallInput> {
     BTreeMap::from([(
         name.to_owned(),
         CallInput {
-            value: CallValue::Json(value),
+            value: CallValue::Json(value.into()),
             sources: BTreeSet::new(),
         },
     )])
@@ -526,7 +528,7 @@ fn from_deck(value: Value) -> BTreeMap<String, CallInput> {
     BTreeMap::from([(
         "response".to_owned(),
         CallInput {
-            value: CallValue::Json(value),
+            value: CallValue::Json(value.into()),
             sources: BTreeSet::from([SlotName::new("deck").expect("slot")]),
         },
     )])
@@ -589,6 +591,39 @@ async fn check_agent_keeps_only_valid_citations() {
         .await
         .expect("the check runs");
     assert_eq!(output.verdict.outcome, VerificationVerdict::Inconclusive);
+}
+
+/// A benchmark-recorded Agent check times each of its phases once into
+/// [`AGENT_PHASE_DURATION_SECONDS`].
+///
+/// # Panics
+/// Panics when the check fails or a phase is missing or counted twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn benchmark_check_agent_times_each_phase() {
+    wyrd_benchmark::install().expect("the only recorder");
+    let pinned = executor(vec![openai_text_response(
+        &json!({"outcome": "passed", "reason": "grounded", "citations": [{"slot": "deck", "locator": {"page": 3}}]})
+            .to_string(),
+    )])
+    .with_evidence(Arc::new(PinnedDeck));
+    check(
+        &pinned,
+        &agent(verdict_prompt(), &[]),
+        from_deck(json!("deck text")),
+    )
+    .await
+    .expect("the check runs");
+    let metrics = wyrd_benchmark::snapshot().metrics;
+    for phase in ["resolve", "bind", "run", "verdict", "cite"] {
+        let series = metrics
+            .iter()
+            .find(|metric| metric.matches(AGENT_PHASE_DURATION_SECONDS, &[("phase", phase)]))
+            .unwrap_or_else(|| panic!("no {phase} phase: {metrics:?}"));
+        assert!(
+            matches!(series.value, MetricValue::Histogram { count: 1, .. }),
+            "{phase}: {series:?}"
+        );
+    }
 }
 
 /// An Agent Card whose inline portable Prompt over `{{response}}` declares
@@ -867,7 +902,7 @@ impl Provider for Recording {
     ///
     /// # Panics
     /// Panics when the request log's lock is poisoned.
-    async fn send(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+    async fn send(&self, request: &ProviderRequest) -> Result<ProviderResponse, ProviderError> {
         self.requests
             .lock()
             .expect("unpoisoned")
@@ -879,7 +914,7 @@ impl Provider for Recording {
     ///
     /// # Errors
     /// Always the mock's empty-stream error.
-    async fn stream(&self, request: ProviderRequest) -> Result<ProviderStream, ProviderError> {
+    async fn stream(&self, request: &ProviderRequest) -> Result<ProviderStream, ProviderError> {
         self.mock.stream(request).await
     }
 
@@ -927,7 +962,7 @@ fn sourced(value: &str, slots: &[&str]) -> BTreeMap<String, CallInput> {
     BTreeMap::from([(
         "response".to_owned(),
         CallInput {
-            value: CallValue::Json(json!(value)),
+            value: CallValue::Json(json!(value).into()),
             sources: slots
                 .iter()
                 .map(|&slot| SlotName::new(slot).expect("slot"))
@@ -1023,7 +1058,7 @@ async fn check_agent_reads_its_workspace_through_declared_tools() {
             workspace: BTreeMap::from([(
                 "/inputs/report.txt".to_owned(),
                 CallInput {
-                    value: CallValue::Json(json!("report")),
+                    value: CallValue::Json(json!("report").into()),
                     sources: BTreeSet::from([SlotName::new("deck").expect("slot")]),
                 },
             )]),

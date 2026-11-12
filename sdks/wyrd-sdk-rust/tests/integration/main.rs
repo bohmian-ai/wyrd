@@ -7,6 +7,8 @@
 
 /// One Service action read back as one connected trace timeline.
 mod action_timeline;
+/// Cards authored in code: two components, each verified by its own Verifier.
+mod authoring;
 mod declare_and_pull;
 /// Queued work, acknowledged only once durably admitted.
 mod durable_verifier_work;

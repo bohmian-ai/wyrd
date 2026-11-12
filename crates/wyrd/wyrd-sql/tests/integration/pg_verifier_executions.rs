@@ -4454,6 +4454,9 @@ async fn repository_with_bindings(
 }
 
 /// The pins of PR 7 of repository 42 at head `head`.
+///
+/// # Panics
+/// Panics when the fixed repository id is rejected.
 fn pins(head: &str) -> PullRequestActivation {
     PullRequestActivation {
         host: "github.com".to_owned(),
@@ -4483,6 +4486,9 @@ fn pr_key(repository: &RepositoryId) -> PullRequestKey<'_> {
 }
 
 /// Every binding admitted under `owner`'s background authority.
+///
+/// # Panics
+/// Panics when the tenant's SYSTEM principal cannot be provisioned.
 async fn pr_targets(
     conn: &mut TenantConn<'_>,
     owner: PrincipalId,

@@ -210,6 +210,11 @@ mod pg_tests {
     ///
     /// Returns server startup, bootstrap, connection, declaration, MCP
     /// transport, or tool-call failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an admitted execution's pins, binding, or supersession
+    /// differ from what GitHub showed.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn an_agent_reads_the_selected_repository_policy() -> Result<(), McpJourneyError> {

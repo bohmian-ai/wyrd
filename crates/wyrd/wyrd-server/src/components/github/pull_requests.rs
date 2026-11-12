@@ -293,7 +293,12 @@ impl GithubConnections<'_> {
         if !replay {
             let Some(targets) = self.targets(&mut conn, &repository_id).await? else {
                 let superseded = queue
-                    .deactivate_pull_request(&mut conn, key, observed_at, PullRequestEnd::Superseded)
+                    .deactivate_pull_request(
+                        &mut conn,
+                        key,
+                        observed_at,
+                        PullRequestEnd::Superseded,
+                    )
                     .await
                     .map_err(registry_db_error)?;
                 conn.commit().await.map_err(registry_db_error)?;
@@ -584,6 +589,9 @@ mod tests {
     use super::*;
 
     /// The event `action` with `changes`.
+    ///
+    /// # Panics
+    /// Panics when `changes` does not decode as an event's changes.
     fn event(action: &str, changes: serde_json::Value) -> PullRequestEvent {
         serde_json::from_value(serde_json::json!({
             "action": action,

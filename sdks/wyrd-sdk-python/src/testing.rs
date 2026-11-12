@@ -1049,6 +1049,9 @@ impl GithubAppMock {
     ///
     /// # Errors
     /// Raises the harness error when the payload cannot convert.
+    ///
+    /// # Panics
+    /// Panics when the mock holds no such pull request.
     fn pull_request_event(
         &self,
         py: Python<'_>,

@@ -96,6 +96,10 @@ impl NativeGithubAppMock {
     /// # Errors
     ///
     /// Returns a napi error when the request cannot be sent.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the mock holds no such pull request.
     #[napi]
     pub fn deliver_pull_request(
         &self,

@@ -1147,7 +1147,12 @@ async fn hook_deliveries(
 
 /// One page of `state`'s delivery log, `per_page` attempts from `cursor`,
 /// newest first, with a `Link: rel="next"` header while more remain.
-fn delivery_page(mock: &GithubAppMock, state: &MockState, per_page: usize, cursor: usize) -> Response {
+fn delivery_page(
+    mock: &GithubAppMock,
+    state: &MockState,
+    per_page: usize,
+    cursor: usize,
+) -> Response {
     let attempts: Vec<Value> = state
         .deliveries
         .iter()

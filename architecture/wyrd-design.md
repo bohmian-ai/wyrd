@@ -2229,16 +2229,25 @@ and can admit; converted-to-draft and closed are observed and deactivate;
 other edits, and every admitting event while the pull request is a draft, are
 not. A binding activates on pull requests through an inline or a referenced
 `pull_request` Trigger alike. The
-server takes a PostgreSQL observation time, then reads the pull request's
-current state from GitHub; the delivered payload never decides the source.
-Under a per-pull-request lock, an observation older than the newest accepted
-one or the last deactivation is obsolete and owes no work. Otherwise the
+server mints a narrowed installation token for the installation that routed
+the delivery, takes a per-pull-request lock, then takes a PostgreSQL
+observation time and reads the pull request's current state from GitHub
+while holding it; the delivered payload never decides the source. A later
+delivery of the same pull request waits on that lock, so its read is always
+newer, including when the earlier decision writes nothing. The decision
+commits only while the tenant's connection slot, locked after the read, is
+still at the revision the token was minted under; access lost or replaced
+meanwhile leaves the delivery retryable and admits nothing. An observation
+older than the newest accepted one or the last deactivation is obsolete and
+owes no work. Otherwise the
 current base ref, head commit and head repository identify a generation, and
 the selected Repository version's `pull_request` bindings, its declaring
 principal and the Verifier and Trigger versions are frozen into one reserved
 execution per binding before any hand-off. A newer generation cancels every
 unfinished execution of the older one with `pull_request_superseded` and
-fences its running leases; close, draft conversion and loss of repository
+fences its running leases, and a newer source the selected policy binds no
+Verifier to does the same and deactivates the older generation, so it is
+never replayed as current; close, draft conversion and loss of repository
 access (repository removal, suspension, uninstall or disconnect) cancel with
 `pull_request_closed`, `pull_request_draft` and `repository_access_lost`. Settled history keeps its pins, and a policy
 re-declaration affects only later generations.
@@ -2252,10 +2261,15 @@ refusal settlement establishes that no work is owed; a refusal settles as an
 redelivery of an accepted generation that is still current and not
 deactivated re-stages the stored pins, never a newer policy; a newer source
 is admitted under the selected policy instead, and a closed or draft pull
-request admits nothing. GitHub does not redeliver failed deliveries on its own, so the GitHub
+request admits nothing. A pull request read GitHub refuses or rate-limits is
+unavailable, not absent. GitHub does not redeliver failed deliveries on its own, so the GitHub
 owner scans the App's delivery log and asks GitHub to redeliver each delivery
 without a 2xx attempt until a bounded number of redeliveries is logged;
-replicas scanning at once may each ask.
+replicas scanning at once may each ask, and shutdown abandons a scan still
+waiting on GitHub. Reading a pull request's execution, or its progress and
+publications, needs `cards:read` in addition to `verifier:read` on its exact
+Verifier, decided from the queue row or, once that is gone, the accepted
+input record's origin.
 
 Other external pushes are deliberately not an activation.
 

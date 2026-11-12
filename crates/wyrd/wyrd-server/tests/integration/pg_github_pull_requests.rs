@@ -175,6 +175,9 @@ impl Deployment {
     }
 
     /// The server's base URL.
+    ///
+    /// # Panics
+    /// Panics when the server was started without a bound listener.
     fn base(&self) -> &str {
         self.server.base_url().expect("bound")
     }
@@ -270,6 +273,10 @@ impl Deployment {
 impl Deployment {
     /// Deliver `action` on PR `number` from GitHub's current state on its
     /// own task; joins to the status and delivery id.
+    ///
+    /// # Panics
+    /// Panics when the PR does not exist on GitHub; the task panics when
+    /// the request cannot be sent.
     fn spawn_send(
         &self,
         number: u64,
@@ -1100,7 +1107,9 @@ async fn a_new_head_supersedes_work_when_the_policy_binds_nothing() {
     );
     let running = deployment.claim(1).await.pop().expect("one of A runs");
 
-    deployment.declare(POLICY_EMPTY, "pull-request-policy-empty").await;
+    deployment
+        .declare(POLICY_EMPTY, "pull-request-policy-empty")
+        .await;
     let before = deployment.rows(29).await;
     assert_eq!(
         summary(&before),
@@ -1158,9 +1167,9 @@ async fn a_new_head_supersedes_work_when_the_policy_binds_nothing() {
         "returning to A admits a new generation instead of replaying the cancelled one"
     );
     assert!(
-        rows[4..]
+        rows[4..].iter().all(|row| before
             .iter()
-            .all(|row| before.iter().all(|old| old.execution_id != row.execution_id)),
+            .all(|old| old.execution_id != row.execution_id)),
         "the new generation has new executions"
     );
 }
@@ -1438,7 +1447,11 @@ async fn close_fences_running_work_and_failed_reads_stay_retryable() {
     assert_eq!(late, Settlement::StaleLease, "the running worker is fenced");
 
     for (number, failure) in [(18, StatusCode::BAD_GATEWAY), (26, StatusCode::FORBIDDEN)] {
-        mock.set_pull_request(REPOSITORY, number, PullRequest::open(REPOSITORY, "b1", "f1"));
+        mock.set_pull_request(
+            REPOSITORY,
+            number,
+            PullRequest::open(REPOSITORY, "b1", "f1"),
+        );
         mock.fail_next_pull_request_read(failure);
         let (status, failed) = deployment.send(number, "opened").await;
         assert!(
@@ -1477,7 +1490,14 @@ async fn deliveries_admit_only_into_the_connected_tenant() {
     mock.add_installation(202, &[(REPOSITORY, "acme/policy")]);
     mock.add_user("octo", &[INSTALLATION, 202]);
     mock.install_target(202);
-    install(&deployment.server, mock, other, "other-tenant", "github_admin").await;
+    install(
+        &deployment.server,
+        mock,
+        other,
+        "other-tenant",
+        "github_admin",
+    )
+    .await;
     mock.set_pull_request(REPOSITORY, 19, PullRequest::open(REPOSITORY, "b1", "t1"));
 
     let payload = mock.pull_request_event(202, REPOSITORY, 19, "opened");
@@ -1528,8 +1548,8 @@ async fn delivery_recovery_yields_to_shutdown_mid_scan() {
 
     let shutdown = tokio_util::sync::CancellationToken::new();
     let held = mock.hold_next_delivery_log_read();
-    let worker = GithubConnections::new(deployment.server.state())
-        .run_delivery_recovery(shutdown.clone());
+    let worker =
+        GithubConnections::new(deployment.server.state()).run_delivery_recovery(shutdown.clone());
     let stop = async {
         held.arrived().await;
         shutdown.cancel();
@@ -1658,6 +1678,9 @@ async fn a_repeated_draft_waits_for_an_earlier_ready_read() {
 
 /// Hold GitHub's answer to the open read of PR `number` at `head` and
 /// deliver it on its own task.
+///
+/// # Panics
+/// Panics as [`Deployment::spawn_send`] does.
 fn read_held(
     deployment: &Deployment,
     number: u64,
@@ -1667,7 +1690,11 @@ fn read_held(
     tokio::task::JoinHandle<(StatusCode, String)>,
 ) {
     let mock = &deployment.mock;
-    mock.set_pull_request(REPOSITORY, number, PullRequest::open(REPOSITORY, "b1", head));
+    mock.set_pull_request(
+        REPOSITORY,
+        number,
+        PullRequest::open(REPOSITORY, "b1", head),
+    );
     let held = mock.hold_next_pull_request_read();
     (held, deployment.spawn_send(number, "opened"))
 }
@@ -1690,7 +1717,11 @@ async fn a_suspension_during_a_pull_request_read_admits_nothing() {
     held.arrived().await;
     mock.set_suspended(INSTALLATION, true);
     let status = mock
-        .deliver(deployment.base(), "installation", &installation_event("suspend"))
+        .deliver(
+            deployment.base(),
+            "installation",
+            &installation_event("suspend"),
+        )
         .await
         .expect("delivery sends");
     assert_eq!(status, StatusCode::ACCEPTED);
@@ -1715,7 +1746,11 @@ async fn a_reconnect_during_a_pull_request_read_admits_nothing_for_the_old_conne
     let (held, delayed) = read_held(&deployment, 24, "u1");
     held.arrived().await;
     let status = mock
-        .deliver(deployment.base(), "installation", &installation_event("deleted"))
+        .deliver(
+            deployment.base(),
+            "installation",
+            &installation_event("deleted"),
+        )
         .await
         .expect("delivery sends");
     assert_eq!(status, StatusCode::ACCEPTED);
@@ -1788,7 +1823,10 @@ async fn read_as(deployment: &Deployment, jwt: &str, uri: &str) -> (StatusCode, 
     let bytes = to_bytes(response.into_body(), 1 << 20)
         .await
         .expect("body reads");
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 /// Inspecting a PR execution, and its sibling progress read, needs
@@ -1852,7 +1890,11 @@ async fn pull_request_inspection_requires_repository_read() {
         let (code, body) = read_as(&deployment, &verifier_only, uri).await;
         assert_eq!(code, StatusCode::FORBIDDEN, "{uri}: {body}");
         assert_eq!(body["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
-        assert_eq!(read_as(&deployment, &both, uri).await.0, StatusCode::OK, "{uri}");
+        assert_eq!(
+            read_as(&deployment, &both, uri).await.0,
+            StatusCode::OK,
+            "{uri}"
+        );
     }
 
     let mut conn = deployment.conn().await;

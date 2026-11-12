@@ -664,6 +664,9 @@ mod tests {
 
     /// The next page is the `rel="next"` target among several links, and a
     /// last page has none.
+    ///
+    /// # Panics
+    /// Panics when a header fails to parse or the next page differs.
     #[test]
     fn next_page_follows_only_the_next_link() {
         let mut headers = reqwest::header::HeaderMap::new();
@@ -688,6 +691,9 @@ mod tests {
 
     /// A page link is followed only under the configured API base, so the
     /// App JWT never reaches another origin or path.
+    ///
+    /// # Panics
+    /// Panics when a URL fails to parse or a link is classified otherwise.
     #[test]
     fn page_links_stay_under_the_api_base() {
         let base = Url::parse("https://ghe.example.com/api/v3/").expect("base");

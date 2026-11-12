@@ -297,7 +297,12 @@ closed or draft pull request admits nothing. After the
 bound is exhausted, an operator redelivers from the App's delivery log, or the
 next pull-request event admits the current source. Disconnect, uninstall,
 suspension and repository removal cancel the affected unfinished executions with
-`repository_access_lost` in the access change's own transaction.
+`repository_access_lost` in the access change's own transaction; a delivery
+whose GitHub read was outstanding meanwhile commits nothing and is answered
+non-2xx. A pull request read GitHub refuses or rate-limits is answered non-2xx
+as well, so recovery redelivers it. Shutdown abandons a delivery-log scan
+still waiting on GitHub rather than spending the shared drain budget; the log
+still shows what was not redelivered.
 
 Existing File completion, session recovery, integrity, inventory acknowledgement
 and evidence retention retain their owners. Accepted descriptors stay with run

@@ -204,9 +204,7 @@ pub(crate) fn request_span(
     let span = tracing::info_span!(
         "request",
         otel.kind = "server",
-        method = %request.method(),
         path = request.uri().path(),
-        version = ?request.version(),
         http.request.method = %request.method(),
         http.route = request
             .extensions()

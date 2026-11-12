@@ -613,7 +613,7 @@ impl<'a> VerificationControl<'a> {
             .phase(
                 Phase::Load,
                 self.resolve(caller, &request)
-                    .instrument(tracing::info_span!("verification.load")),
+                    .instrument(tracing::debug_span!("verification.load")),
             )
             .await
         {
@@ -668,7 +668,7 @@ impl<'a> VerificationControl<'a> {
                     tokio::time::Instant::now() + timeout,
                 ),
             )
-            .instrument(tracing::info_span!("verification.engine"))
+            .instrument(tracing::debug_span!("verification.engine"))
             .await;
         let mut outcome = match ran {
             Ok(outcome) => outcome,

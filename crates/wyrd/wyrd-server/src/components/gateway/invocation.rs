@@ -698,7 +698,7 @@ impl<'a> GatewayInvocation<'a> {
     /// candidate remains. An authorization decision returns no error of its
     /// own: its audit is staged off the request path, so a failed append is
     /// logged and counted rather than surfaced here.
-    #[tracing::instrument(name = "gateway.route", skip_all)]
+    #[tracing::instrument(name = "gateway.route", level = "debug", skip_all)]
     async fn route(
         &self,
         caller: &Caller,
@@ -864,7 +864,12 @@ impl<'a> GatewayInvocation<'a> {
     ///
     /// # Errors
     /// Returns the deny reason when `caller` may not invoke `model`.
-    #[tracing::instrument(name = "gateway.authorize", skip_all, fields(operation))]
+    #[tracing::instrument(
+        name = "gateway.authorize",
+        level = "debug",
+        skip_all,
+        fields(operation)
+    )]
     pub(crate) fn decide(
         &self,
         caller: &Caller,
@@ -989,7 +994,7 @@ impl<'a> GatewayInvocation<'a> {
     /// # Errors
     /// Returns the admission rejections of [`GatewayLedger::admit`]; a
     /// rejection charges nothing.
-    #[tracing::instrument(name = "gateway.admit", skip_all)]
+    #[tracing::instrument(name = "gateway.admit", level = "debug", skip_all)]
     fn admit(&self, call: &AdmittedCall, plan: &mut CallPlan) -> Result<Admission, WyrdError> {
         GatewayLedger::new(self.state.gateway.usage()).admit(&call.ledger(), plan)
     }
@@ -1104,7 +1109,7 @@ impl<'a> GatewayInvocation<'a> {
             capture.persist(state).await?;
             Ok(capture)
         }
-        .instrument(tracing::info_span!("gateway.capture"));
+        .instrument(tracing::debug_span!("gateway.capture"));
         let result = match tokio::time::timeout_at(call.deadline, work).await {
             Ok(Ok(capture)) => {
                 match &call.capture_slot {

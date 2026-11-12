@@ -462,7 +462,7 @@ impl<'u> GatewayLedger<'u> {
     ///
     /// Each hold is corrected to its actual tokens and each reservation
     /// settled, in memory; background work persists them.
-    #[tracing::instrument(name = "gateway.account", skip_all)]
+    #[tracing::instrument(name = "gateway.account", level = "debug", skip_all)]
     pub(crate) fn settle(admission: &mut Admission, accounted: &mut Accounted) {
         let Some((usage, tenant, window)) = admission.charged.take() else {
             return;

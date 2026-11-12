@@ -333,6 +333,7 @@ async fn get_execution_details(
 )]
 #[tracing::instrument(
     name = "verification.handle",
+    level = "debug",
     skip(state, caller, body),
     fields(operation = "verification.execute")
 )]

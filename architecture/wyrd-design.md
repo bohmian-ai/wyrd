@@ -1052,7 +1052,13 @@ Server spans export twice from one tracer provider:
   filter `WYRD_LOG`/`RUST_LOG`; neither filter nor the ratio can remove a
   tenant copy, because catalog spans and events at `info` or above always
   record. Logs are written whatever the sampling decision, so an error in
-  an unsampled request is still logged inside its request span.
+  an unsampled request is still logged inside its request span. At `info`
+  a direct verification opens only the request span,
+  `verification.execute`, the GenAI spans, `gateway.call`,
+  `gateway.execute`, and `gateway.attempt`; its in-process phases
+  (`verification.handle`, `verification.load`, `verification.engine`, and
+  the gateway's authorize, route, admit, translate, account, and capture
+  spans) are `debug` spans, whose timing the phase metrics already carry.
 - A server span whose parent or one of whose links is a sampled client span
   also writes, with its catalog descendants, to the requesting tenant's
   `bifrost.traces.spans` on the process Scribe outbox, with the same trace,

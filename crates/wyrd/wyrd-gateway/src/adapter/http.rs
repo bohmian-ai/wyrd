@@ -682,7 +682,7 @@ impl ProviderDispatch for HttpProviderDispatch {
             class,
             usage: AttemptUsage::default(),
         };
-        let prepared = match tracing::info_span!("gateway.translate", direction = "request")
+        let prepared = match tracing::debug_span!("gateway.translate", direction = "request")
             .in_scope(|| {
                 prepare(
                     attempt.ingress,
@@ -760,7 +760,7 @@ impl ProviderDispatch for HttpProviderDispatch {
                 return failure(error, translated, attempt.credential);
             }
         };
-        let mapped = tracing::info_span!("gateway.translate", direction = "response")
+        let mapped = tracing::debug_span!("gateway.translate", direction = "response")
             .in_scope(|| complete(response, wire, translated, attempt.capture, &id, model));
         match mapped {
             Ok((body, usage, decoded))

@@ -14,6 +14,22 @@ export declare class NativeGithubAppMock {
   signIn(login: string): void
   /** Make the install page select installation `id`. */
   installTarget(id: number): void
+  /**
+   * Make pull request `number` of `repository` open on `main` at
+   * `base_sha` with head `head_sha` from the same repository, or a draft
+   * or closed one, replacing any earlier state.
+   */
+  setPullRequest(repository: number, number: number, baseSha: string, headSha: string, draft?: boolean | undefined | null, open?: boolean | undefined | null): void
+  /**
+   * Deliver GitHub's signed `pull_request` webhook for `action` on pull
+   * request `number` of `repository` under `installation`, from its
+   * current state, to `server_base`; returns the HTTP status.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the request cannot be sent.
+   */
+  deliverPullRequest(serverBase: string, installation: number, repository: number, number: number, action: string): number
   /** Every code, token and secret the mock issued, for leak assertions. */
   secrets(): Array<string>
 }

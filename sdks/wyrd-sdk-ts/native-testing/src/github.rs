@@ -4,7 +4,7 @@
 use napi::Result;
 use napi_derive::napi;
 use serde_json::Value;
-use wyrd_testing::github::{BrowserAnswer, GithubAppMock, GithubBrowser};
+use wyrd_testing::github::{BrowserAnswer, GithubAppMock, GithubBrowser, PullRequest};
 
 use crate::reason;
 
@@ -66,6 +66,55 @@ impl NativeGithubAppMock {
     #[napi]
     pub fn install_target(&self, id: u32) {
         self.mock.install_target(u64::from(id));
+    }
+
+    /// Make pull request `number` of `repository` open on `main` at
+    /// `base_sha` with head `head_sha` from the same repository, or a draft
+    /// or closed one, replacing any earlier state.
+    #[napi]
+    pub fn set_pull_request(
+        &self,
+        repository: u32,
+        number: u32,
+        base_sha: String,
+        head_sha: String,
+        draft: Option<bool>,
+        open: Option<bool>,
+    ) {
+        let repository = u64::from(repository);
+        let mut pull_request = PullRequest::open(repository, &base_sha, &head_sha);
+        pull_request.draft = draft.unwrap_or(false);
+        pull_request.open = open.unwrap_or(true);
+        self.mock
+            .set_pull_request(repository, u64::from(number), pull_request);
+    }
+
+    /// Deliver GitHub's signed `pull_request` webhook for `action` on pull
+    /// request `number` of `repository` under `installation`, from its
+    /// current state, to `server_base`; returns the HTTP status.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the request cannot be sent.
+    #[napi]
+    pub fn deliver_pull_request(
+        &self,
+        server_base: String,
+        installation: u32,
+        repository: u32,
+        number: u32,
+        action: String,
+    ) -> Result<u32> {
+        let payload = self.mock.pull_request_event(
+            u64::from(installation),
+            u64::from(repository),
+            u64::from(number),
+            &action,
+        );
+        wyrd_runtime::runtime()
+            .block_on(self.mock.deliver(&server_base, "pull_request", &payload))
+            .map(|status| u32::from(status.as_u16()))
+            .map_err(reason)
     }
 
     /// Every code, token and secret the mock issued, for leak assertions.

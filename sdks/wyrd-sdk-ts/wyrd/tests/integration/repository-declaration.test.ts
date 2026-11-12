@@ -8,7 +8,7 @@ import { join } from "node:path";
 
 import { expect, vi } from "vitest";
 
-import { type CardRef, Cards, GithubConnection, type RepositoryStatus, WyrdClient } from "wyrd-ai";
+import { type CardRef, Cards, GithubConnection, type RepositoryStatus, WyrdClient, verify } from "wyrd-ai";
 import { cli, signInGithubBrowser } from "@wyrd/testing";
 
 import { fixture, serverTest } from "../support/server.js";
@@ -147,4 +147,45 @@ test("cli checks offline and declares the policy", async ({ server, cards, admin
   const receipt = await cli.declare(policy(root, "minimal"), { client: admin });
   expect(receipt.root.kind).toBe("Repository");
   expect((await repository(cards, receipt.root))[0]?.selected).toBe(true);
+});
+
+test("pull requests admit pinned executions and supersede them", async ({ server, cards }) => {
+  const github = server.githubApp;
+  const receipt = await cards.declareFromPath(policy(checkout(github.host, "acme/api"), "minimal"));
+  const [binding] = (await cards.get(receipt.root)).status?.verification?.binding_ids ?? [];
+  const token = await WyrdClient.connect().accessToken();
+  const deliver = async (action: string) => {
+    expect(github.deliverPullRequest(server.baseUrl, 101, 1, 7, action)).toBe(202);
+    const response = await fetch(`${server.baseUrl}/v1/verification/bindings/${binding}`, {
+      headers: { "x-wyrd-access-token": `Bearer ${token}` },
+    });
+    const { last_execution_id: latest } = (await response.json()) as { last_execution_id: string };
+    return (await verify.Execution.connect(latest)).status();
+  };
+  const inspect = async (id: string) => (await verify.Execution.connect(id)).status();
+
+  github.setPullRequest(1, 7, "b1", "a1");
+  const opened = await deliver("opened");
+  expect(opened.status).toBe("pending");
+  expect(opened.pull_request).toMatchObject({
+    number: 7,
+    repository_id: "1",
+    base: { ref: "main", sha: "b1" },
+    head: { sha: "a1" },
+  });
+
+  github.setPullRequest(1, 7, "b1", "b2");
+  const pushed = await deliver("synchronize");
+  expect(pushed.execution_id).not.toBe(opened.execution_id);
+  const superseded = await inspect(opened.execution_id);
+  expect([superseded.status, superseded.error?.code, superseded.pull_request?.head.sha]).toEqual([
+    "cancelled",
+    "pull_request_superseded",
+    "a1",
+  ]);
+
+  github.setPullRequest(1, 7, "b1", "b2", false, false);
+  expect(github.deliverPullRequest(server.baseUrl, 101, 1, 7, "closed")).toBe(202);
+  const closed = await inspect(pushed.execution_id);
+  expect([closed.status, closed.error?.code]).toEqual(["cancelled", "pull_request_closed"]);
 });

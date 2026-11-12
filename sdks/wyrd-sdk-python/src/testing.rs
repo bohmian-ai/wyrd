@@ -1040,7 +1040,8 @@ impl GithubAppMock {
         let mut pull_request = PullRequest::open(repository, base_sha, head_sha);
         pull_request.draft = draft;
         pull_request.open = open;
-        self.inner.set_pull_request(repository, number, pull_request);
+        self.inner
+            .set_pull_request(repository, number, pull_request);
     }
 
     /// GitHub's `pull_request` webhook payload for `action` on pull request

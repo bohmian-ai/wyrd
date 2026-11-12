@@ -1220,8 +1220,9 @@ async fn uninstalling_the_app_cancels_unfinished_pull_request_work() {
 }
 
 /// Close fences a running execution as well as queued ones; an observation
-/// taken before the close cannot admit afterwards; a failed GitHub read is
-/// not acknowledged and its redelivery admits.
+/// taken before the close cannot admit afterwards; a failed GitHub read,
+/// whether GitHub is unavailable or rate-limits the read with a 403, is not
+/// acknowledged and its redelivery admits exactly once.
 ///
 /// # Panics
 /// Panics when deactivated work can still settle, an outdated observation
@@ -1271,23 +1272,25 @@ async fn close_fences_running_work_and_failed_reads_stay_retryable() {
     conn.commit().await.expect("commits");
     assert_eq!(late, Settlement::StaleLease, "the running worker is fenced");
 
-    mock.set_pull_request(REPOSITORY, 18, PullRequest::open(REPOSITORY, "b1", "f1"));
-    mock.fail_next_pull_request_read();
-    let (status, failed) = deployment.send(18, "opened").await;
-    assert!(
-        !status.is_success(),
-        "an unread source is not acknowledged: {status}"
-    );
-    assert!(deployment.rows(18).await.is_empty());
-    assert_eq!(
-        mock.redeliver(&failed).await.expect("redelivers"),
-        StatusCode::ACCEPTED
-    );
-    assert_eq!(
-        summary(&deployment.rows(18).await),
-        [("pending", None, "f1"), ("pending", None, "f1")],
-        "the redelivery admits once GitHub answers"
-    );
+    for (number, failure) in [(18, StatusCode::BAD_GATEWAY), (26, StatusCode::FORBIDDEN)] {
+        mock.set_pull_request(REPOSITORY, number, PullRequest::open(REPOSITORY, "b1", "f1"));
+        mock.fail_next_pull_request_read(failure);
+        let (status, failed) = deployment.send(number, "opened").await;
+        assert!(
+            !status.is_success(),
+            "a source GitHub answered {failure} for is not acknowledged: {status}"
+        );
+        assert!(deployment.rows(number).await.is_empty());
+        assert_eq!(
+            mock.redeliver(&failed).await.expect("redelivers"),
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(
+            summary(&deployment.rows(number).await),
+            [("pending", None, "f1"), ("pending", None, "f1")],
+            "the redelivery after {failure} admits once GitHub answers"
+        );
+    }
 }
 
 /// A delivery admits only into the tenant connected to its installation:
@@ -1338,4 +1341,43 @@ async fn deliveries_admit_only_into_the_connected_tenant() {
     .expect("count reads");
     conn.commit().await.expect("read commits");
     assert_eq!(foreign, 0, "nothing is admitted into the other tenant");
+}
+
+/// Failed-delivery recovery stops at shutdown even while GitHub has not
+/// answered its delivery log read, and asks for no redelivery afterwards.
+///
+/// The worker must join well inside GitHub's ten-second request deadline,
+/// which would otherwise end the held read and let a stalled scan look
+/// like a prompt stop.
+///
+/// # Panics
+/// Panics when the worker outlives its shutdown or redelivers after it.
+#[tokio::test(flavor = "multi_thread")]
+async fn delivery_recovery_yields_to_shutdown_mid_scan() {
+    let deployment = Deployment::start().await;
+    let mock = &deployment.mock;
+    mock.set_pull_request(REPOSITORY, 27, PullRequest::open(REPOSITORY, "b1", "s1"));
+    let (status, failed) = deployment.send(27, "opened").await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    mock.lose_answer(&failed);
+
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let held = mock.hold_next_delivery_log_read();
+    let worker = GithubConnections::new(deployment.server.state())
+        .run_delivery_recovery(shutdown.clone());
+    let stop = async {
+        held.arrived().await;
+        shutdown.cancel();
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(worker, stop)
+    })
+    .await
+    .expect("the worker stops while GitHub still holds its read");
+    held.release();
+    assert_eq!(
+        mock.delivery_attempts(&failed),
+        [(0, false)],
+        "no redelivery is asked for after shutdown"
+    );
 }

@@ -524,6 +524,11 @@ impl GithubConnections<'_> {
 
     /// Scan for failed deliveries every [`RECOVERY_INTERVAL`] until
     /// `shutdown`.
+    ///
+    /// Shutdown also abandons a scan still waiting on GitHub, so recovery
+    /// never spends the process's shared drain budget; GitHub's delivery log
+    /// still shows whatever was not redelivered, and the next process's scan
+    /// asks again.
     pub async fn run_delivery_recovery(self, shutdown: CancellationToken) {
         // ponytail: every replica scans the App-wide log, so a failed delivery
         // may be redelivered once per replica per scan, up to MAX_REDELIVERIES
@@ -534,7 +539,11 @@ impl GithubConnections<'_> {
         loop {
             tokio::select! {
                 () = shutdown.cancelled() => break,
-                _ = ticks.tick() => match self.recover_deliveries().await {
+                _ = ticks.tick() => {}
+            }
+            tokio::select! {
+                () = shutdown.cancelled() => break,
+                scanned = self.recover_deliveries() => match scanned {
                     Ok(0) => {}
                     Ok(asked) => tracing::info!(asked, "failed GitHub deliveries redelivered"),
                     Err(error) => tracing::warn!(%error, "GitHub delivery log unavailable; next scan retries"),

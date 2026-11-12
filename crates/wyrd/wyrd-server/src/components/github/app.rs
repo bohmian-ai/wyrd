@@ -432,11 +432,12 @@ impl GithubApp {
 
     /// GitHub's current state of pull request `number` of repository
     /// `repository_id`, read with installation `token`; `None` when GitHub
-    /// no longer shows it to the installation.
+    /// answers 404 because it no longer shows it to the installation.
     ///
     /// # Errors
     /// Returns [`WyrdError::GithubUnavailable`] when GitHub cannot be reached
-    /// or answers unexpectedly.
+    /// or answers anything else unsuccessfully, including the 403 it answers
+    /// a rate-limited token, so the delivery stays retryable.
     pub(crate) async fn pull_request(
         &self,
         token: &SecretString,
@@ -451,10 +452,7 @@ impl GithubApp {
             .send()
             .await
             .map_err(|_| unavailable("the pull request read"))?;
-        if matches!(
-            response.status(),
-            StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
-        ) {
+        if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
         }
         Self::decode(response, "the pull request read")

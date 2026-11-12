@@ -222,8 +222,10 @@ struct MockState {
     pulls: BTreeMap<(u64, u64), PullRequest>,
     /// Held next answer of the pull request read.
     pull_hold: Option<HeldAnswer>,
-    /// Whether the next pull request read fails with a server error.
-    pull_failure: bool,
+    /// The status the next pull request read fails with, if any.
+    pull_failure: Option<StatusCode>,
+    /// Held next answer of the delivery log read.
+    deliveries_hold: Option<HeldAnswer>,
     /// The App's webhook delivery log, oldest first.
     deliveries: Vec<DeliveryAttempt>,
     /// Wyrd's public base URL, where redeliveries are sent.
@@ -522,10 +524,11 @@ impl GithubAppMock {
         })
     }
 
-    /// Fail the next pull request read with `502 Bad Gateway`, as an
-    /// unavailable GitHub would.
-    pub fn fail_next_pull_request_read(&self) {
-        self.state().pull_failure = true;
+    /// Fail the next pull request read with `status`: `502 Bad Gateway` as
+    /// an unavailable GitHub answers, or `403 Forbidden` as GitHub answers a
+    /// rate-limited token.
+    pub fn fail_next_pull_request_read(&self, status: StatusCode) {
+        self.state().pull_failure = Some(status);
     }
 
     /// Hold GitHub's answer to the next pull request read.
@@ -533,6 +536,14 @@ impl GithubAppMock {
     pub fn hold_next_pull_request_read(&self) -> HeldAnswer {
         let hold = HeldAnswer::default();
         self.state().pull_hold = Some(hold.clone());
+        hold
+    }
+
+    /// Hold GitHub's answer to the next delivery log read.
+    #[must_use]
+    pub fn hold_next_delivery_log_read(&self) -> HeldAnswer {
+        let hold = HeldAnswer::default();
+        self.state().deliveries_hold = Some(hold.clone());
         hold
     }
 
@@ -1082,11 +1093,11 @@ async fn pull_request(
                 && !installation.suspended
                 && installation.repositories.contains_key(&repository)
         });
-        let failed = std::mem::take(&mut state.pull_failure);
-        let answer = match state.pulls.get(&(repository, number)) {
+        let failed = state.pull_failure.take();
+        let answer = match (state.pulls.get(&(repository, number)), failed) {
             _ if !issued => StatusCode::UNAUTHORIZED.into_response(),
-            _ if failed => StatusCode::BAD_GATEWAY.into_response(),
-            Some(pull_request) if reachable => {
+            (_, Some(status)) => status.into_response(),
+            (Some(pull_request), None) if reachable => {
                 axum::Json(pull_request.json(repository, number)).into_response()
             }
             _ => StatusCode::NOT_FOUND.into_response(),
@@ -1123,7 +1134,20 @@ async fn hook_deliveries(
     }
     let per_page = query.per_page.unwrap_or(30).max(1);
     let cursor = query.cursor.unwrap_or(0);
-    let state = mock.state();
+    let (response, hold) = {
+        let mut state = mock.state();
+        let hold = state.deliveries_hold.take();
+        (delivery_page(&mock, &state, per_page, cursor), hold)
+    };
+    if let Some(hold) = hold {
+        hold.hold().await;
+    }
+    response
+}
+
+/// One page of `state`'s delivery log, `per_page` attempts from `cursor`,
+/// newest first, with a `Link: rel="next"` header while more remain.
+fn delivery_page(mock: &GithubAppMock, state: &MockState, per_page: usize, cursor: usize) -> Response {
     let attempts: Vec<Value> = state
         .deliveries
         .iter()

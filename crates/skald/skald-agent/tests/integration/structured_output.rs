@@ -659,7 +659,7 @@ async fn structured_output_validates_a_replaced_schema() {
             if let Some(OpenAiResponseFormat::JsonSchema { json_schema }) =
                 &mut chat.response_format
             {
-                json_schema.schema = swapped.as_object().cloned();
+                json_schema.schema = swapped.as_object().cloned().map(Into::into);
             }
             CallbackOutcome::ReplaceWith(request)
         }));

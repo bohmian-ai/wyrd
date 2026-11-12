@@ -24,7 +24,7 @@ use monty_pool::{
 };
 use monty_types::{MontyObject, ResourceLimits};
 use serde_json::{Map, Value};
-use skald_spec::PreparedSchemas;
+use skald_spec::{PreparedSchemas, SharedSchema};
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 use vala_verify::blocks::{
@@ -374,7 +374,8 @@ impl CheckExecutor for CodeExecutor {
             .response_schema()
             .map_err(|error| terminal(format!("the code check format is invalid: {error}")))?;
         let (value, provenance) = self.run(&code.call, &call.inputs, call.deadline).await?;
-        let mut verdict = verdict_from(&PreparedSchemas::default(), &Value::Object(schema), value)?;
+        let schema = SharedSchema::new(Value::Object(schema));
+        let mut verdict = verdict_from(&PreparedSchemas::default(), &schema, value)?;
         let reachable: BTreeSet<SlotName> = call
             .inputs
             .values()

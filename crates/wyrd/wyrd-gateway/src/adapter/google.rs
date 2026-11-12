@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
+use skald_spec::SharedSchema;
 use skald_spec::wire::google_generate::{
     GoogleContent, GoogleFinishReason, GoogleFunctionCall, GoogleFunctionCallingConfig,
     GoogleFunctionDeclaration, GoogleFunctionResponse, GoogleGenerateContentRequest,
@@ -385,13 +386,13 @@ fn choice(choice: Option<OpenAiChatToolChoice>) -> Option<GoogleToolConfig> {
 
 /// Translates a checked response format into a response MIME type and
 /// schema.
-fn output(format: Option<OpenAiResponseFormat>) -> (Option<String>, Option<Value>) {
+fn output(format: Option<OpenAiResponseFormat>) -> (Option<String>, Option<SharedSchema>) {
     let json = || Some("application/json".to_owned());
     match format {
         None | Some(OpenAiResponseFormat::Text) => (None, None),
         Some(OpenAiResponseFormat::JsonObject) => (json(), None),
         Some(OpenAiResponseFormat::JsonSchema { json_schema }) => {
-            (json(), json_schema.schema.map(Value::Object))
+            (json(), json_schema.schema.map(Into::into))
         }
     }
 }

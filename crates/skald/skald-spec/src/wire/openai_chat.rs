@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::wire::common::TokenUsage;
+use crate::wire::common::{SharedObjectSchema, TokenUsage};
 
 crate::borrowed_as_self!(
     OpenAiReasoningEffort,
@@ -276,7 +276,7 @@ crate::wire_contract! {
         #[serde(skip_serializing_if = "Option::is_none")]
         pub description: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        pub schema: Option<Map<String, Value>>,
+        pub schema: Option<SharedObjectSchema>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub strict: Option<bool>,
     }

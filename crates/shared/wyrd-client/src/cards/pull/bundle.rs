@@ -364,7 +364,7 @@ mod tests {
         let path = dir.path().join("card.yaml");
         let value = skald_spec::ResponseType::JsonSchema {
             name: "judge".to_owned(),
-            schema: serde_json::json!({ "type": "object" }),
+            schema: serde_json::json!({ "type": "object" }).into(),
         };
         write_yaml(&path, &value).expect("the document writes");
         let read: serde_json::Value =

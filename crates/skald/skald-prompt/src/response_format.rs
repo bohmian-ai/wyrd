@@ -98,7 +98,7 @@ impl ResponseFormat {
             | ResponseFormatKind::Named(_) => ResponseType::Text,
             ResponseFormatKind::JsonSchema { name, schema } => ResponseType::JsonSchema {
                 name: name.clone(),
-                schema: schema.clone(),
+                schema: schema.clone().into(),
             },
         }
     }

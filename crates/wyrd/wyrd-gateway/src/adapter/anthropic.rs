@@ -406,7 +406,7 @@ fn output(format: Option<OpenAiResponseFormat>) -> Option<AnthropicOutputConfig>
                 },
         }) => Some(AnthropicOutputConfig {
             format: AnthropicOutputFormat::JsonSchema {
-                schema: Value::Object(schema),
+                schema: schema.into(),
             },
         }),
         _ => None,

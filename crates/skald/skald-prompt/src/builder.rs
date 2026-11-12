@@ -387,7 +387,7 @@ fn openai_chat_response_format(
             json_schema: skald_spec::wire::openai_chat::OpenAiJsonSchema {
                 name: name.clone(),
                 description: None,
-                schema: Some(schema_object(schema)?),
+                schema: Some(schema_object(schema)?.into()),
                 strict: Some(true),
             },
         },
@@ -413,7 +413,7 @@ fn openai_responses_text(
                 OpenAiTextResponseFormat::JsonSchema {
                     name: name.clone(),
                     description: None,
-                    schema: Some(schema_object(schema)?),
+                    schema: Some(schema_object(schema)?.into()),
                     strict: Some(true),
                 }
             }
@@ -442,7 +442,7 @@ fn anthropic_output_config(
             schema_object(schema)?;
             Some(AnthropicOutputConfig {
                 format: AnthropicOutputFormat::JsonSchema {
-                    schema: schema.clone(),
+                    schema: schema.clone().into(),
                 },
             })
         }
@@ -478,7 +478,7 @@ fn google_settings(
                 config.response_mime_type = Some("application/json".to_owned());
                 // Google refuses a config carrying both schema fields.
                 config.response_schema = None;
-                config.response_json_schema = Some(schema.clone());
+                config.response_json_schema = Some(schema.clone().into());
             }
         }
     }
@@ -604,7 +604,7 @@ mod builder_tests {
             prompt.native().response_type,
             ResponseType::JsonSchema {
                 name: "answer".to_owned(),
-                schema
+                schema: schema.into()
             }
         );
         let ProviderRequest::OpenAiChatCompletion(request) = &prompt.native().request else {
@@ -766,7 +766,7 @@ mod builder_tests {
             prompt.native().response_type,
             ResponseType::JsonSchema {
                 name: "summary".to_owned(),
-                schema: output_schema
+                schema: output_schema.into()
             }
         );
         let ProviderRequest::OpenAiChatCompletion(request) = &prompt.native().request else {
@@ -880,7 +880,7 @@ mod builder_tests {
                 generation_config: Some(
                     skald_spec::wire::google_generate::GoogleGenerationConfig {
                         temperature: Some(0.5),
-                        response_schema: Some(json!({"type": "STRING"})),
+                        response_schema: Some(json!({"type": "STRING"}).into()),
                         ..Default::default()
                     },
                 ),

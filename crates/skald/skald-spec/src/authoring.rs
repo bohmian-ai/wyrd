@@ -798,7 +798,7 @@ fn named_output(
                 json_schema: OpenAiJsonSchema {
                     name: RESPONSE_SCHEMA_NAME.to_owned(),
                     description: None,
-                    schema: Some(schema),
+                    schema: Some(schema.into()),
                     strict: Some(false),
                 },
             });
@@ -818,7 +818,7 @@ fn named_output(
                     .format = Some(OpenAiTextResponseFormat::JsonSchema {
                     name: RESPONSE_SCHEMA_NAME.to_owned(),
                     description: None,
-                    schema: Some(schema),
+                    schema: Some(schema.into()),
                     strict: Some(false),
                 });
             }
@@ -829,7 +829,7 @@ fn named_output(
             }
             request.output_config = schema.map(|schema| AnthropicOutputConfig {
                 format: AnthropicOutputFormat::JsonSchema {
-                    schema: Value::Object(schema),
+                    schema: Value::Object(schema).into(),
                 },
             });
         }
@@ -851,7 +851,7 @@ fn named_output(
             if let Some(schema) = schema {
                 let config = request.settings.generation_config.get_or_insert_default();
                 config.response_mime_type = Some("application/json".to_owned());
-                config.response_json_schema = Some(Value::Object(schema));
+                config.response_json_schema = Some(Value::Object(schema).into());
             }
         }
         _ => {
@@ -954,7 +954,7 @@ fn openai_chat(
             json_schema: OpenAiJsonSchema {
                 name: RESPONSE_SCHEMA_NAME.to_owned(),
                 description: None,
-                schema: Some(schema),
+                schema: Some(schema.into()),
                 strict: Some(strict),
             },
         }),
@@ -1057,7 +1057,7 @@ fn anthropic(
         tool_choice: None,
         output_config: schema.map(|schema| AnthropicOutputConfig {
             format: AnthropicOutputFormat::JsonSchema {
-                schema: Value::Object(schema),
+                schema: Value::Object(schema).into(),
             },
         }),
         settings: AnthropicMessagesSettings {
@@ -1130,7 +1130,7 @@ fn google(
             2.0,
         )?,
         response_mime_type: schema.as_ref().map(|_| "application/json".to_owned()),
-        response_json_schema: schema.map(Value::Object),
+        response_json_schema: schema.map(|schema| Value::Object(schema).into()),
         ..Default::default()
     };
     Ok(GoogleGenerateContentRequest {
@@ -1366,7 +1366,7 @@ mod tests {
             openai.response_type,
             ResponseType::JsonSchema {
                 name: "response".to_owned(),
-                schema: schema.clone()
+                schema: schema.clone().into()
             }
         );
         assert!(matches!(

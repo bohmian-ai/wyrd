@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use skald_spec::PreparedSchemas;
+use skald_spec::{PreparedSchemas, SharedSchema};
 use thiserror::Error;
 use tokio::time::Instant;
 
@@ -309,7 +309,7 @@ pub trait CheckExecutor: Send + Sync {
 /// response that is not a Verdict, or data beyond its bounds.
 pub fn verdict_from(
     schemas: &PreparedSchemas,
-    schema: &Value,
+    schema: &SharedSchema,
     response: Value,
 ) -> Result<Verdict, BlockError> {
     let terminal = |reason: String| BlockError::Terminal { reason };
@@ -479,7 +479,9 @@ mod tests {
         for (data, good, bad) in cases {
             let format: skald_spec::NamedResponseFormat =
                 serde_json::from_value(json!({"kind": "verdict", "data": data})).expect("format");
-            let schema = Value::Object(Verdict::response_format(&format).expect("resolves"));
+            let schema = SharedSchema::new(Value::Object(
+                Verdict::response_format(&format).expect("resolves"),
+            ));
             let verdict =
                 verdict_from(&PreparedSchemas::default(), &schema, response(good.clone()))
                     .unwrap_or_else(|error| panic!("{good}: {error}"));
@@ -509,7 +511,9 @@ mod tests {
         let format = |data: Value| {
             let format: skald_spec::NamedResponseFormat =
                 serde_json::from_value(json!({"kind": "verdict", "data": data})).expect("format");
-            Value::Object(Verdict::response_format(&format).expect("resolves"))
+            SharedSchema::new(Value::Object(
+                Verdict::response_format(&format).expect("resolves"),
+            ))
         };
         let integers = format(json!({"type": "object", "additionalProperties": true}));
         let response = |data: Value| json!({"outcome": "passed", "reason": "judged", "citations": [], "data": data});
@@ -557,7 +561,9 @@ mod tests {
             "data": {"type": "object", "additionalProperties": {"type": "integer"}}
         }))
         .expect("format");
-        let schema = Value::Object(Verdict::response_format(&format).expect("resolves"));
+        let schema = SharedSchema::new(Value::Object(
+            Verdict::response_format(&format).expect("resolves"),
+        ));
         let secret = "customer-secret@example.test";
         let response = json!({"outcome": "passed", "reason": "judged", "citations": [],
             "data": {"nested": 1, secret: "wrong"}});

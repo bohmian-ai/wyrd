@@ -531,10 +531,12 @@ impl GithubApp {
     /// Whether `url` is under the configured API origin, so a followed page
     /// link never sends the App JWT elsewhere.
     fn same_api(&self, url: &Url) -> bool {
-        url.origin() == self.settings.api_origin.origin()
-            && url
-                .path()
-                .starts_with(self.settings.api_origin.path().trim_end_matches('/'))
+        Self::under(&self.settings.api_origin, url)
+    }
+
+    /// Whether `url` has `base`'s origin and lies under its path.
+    fn under(base: &Url, url: &Url) -> bool {
+        url.origin() == base.origin() && url.path().starts_with(base.path().trim_end_matches('/'))
     }
 
     /// `path` under the web origin.
@@ -655,5 +657,53 @@ impl GithubApp {
         )
         .map(SecretString::from)
         .map_err(|_| unavailable("App authentication"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The next page is the `rel="next"` target among several links, and a
+    /// last page has none.
+    #[test]
+    fn next_page_follows_only_the_next_link() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::LINK,
+            r#"<https://api.github.com/app/hook/deliveries?cursor=a>; rel="prev", <https://api.github.com/app/hook/deliveries?cursor=b>; rel="next""#
+                .parse()
+                .expect("header value"),
+        );
+        assert_eq!(
+            GithubApp::next_page(&headers).map(String::from),
+            Some("https://api.github.com/app/hook/deliveries?cursor=b".to_owned())
+        );
+        headers.insert(
+            reqwest::header::LINK,
+            r#"<https://api.github.com/app/hook/deliveries?cursor=a>; rel="prev""#
+                .parse()
+                .expect("header value"),
+        );
+        assert_eq!(GithubApp::next_page(&headers), None);
+    }
+
+    /// A page link is followed only under the configured API base, so the
+    /// App JWT never reaches another origin or path.
+    #[test]
+    fn page_links_stay_under_the_api_base() {
+        let base = Url::parse("https://ghe.example.com/api/v3/").expect("base");
+        let url = |link: &str| Url::parse(link).expect("link");
+        assert!(GithubApp::under(
+            &base,
+            &url("https://ghe.example.com/api/v3/app/hook/deliveries?cursor=b")
+        ));
+        for foreign in [
+            "https://evil.example.com/api/v3/app/hook/deliveries",
+            "http://ghe.example.com/api/v3/app/hook/deliveries",
+            "https://ghe.example.com/other/app/hook/deliveries",
+        ] {
+            assert!(!GithubApp::under(&base, &url(foreign)), "{foreign}");
+        }
     }
 }

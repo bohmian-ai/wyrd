@@ -94,9 +94,9 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
     /// A lane-bound caller first waits, until `cancellation` or the call's
     /// timeout, for one of its lane's model-call permits and holds it until
     /// the call returns. Its deadline is fixed before the wait and bounds the
-    /// gateway's snapshot, authorization, routing, and capture-slot wait as
-    /// well, so no admission step restarts it and a call admitted to its lane
-    /// reaches the provider with that same deadline. The
+    /// gateway's snapshot, authorization, and routing as well, so no
+    /// admission step restarts it and a call admitted to its lane reaches the
+    /// provider with that same deadline; it never waits for a capture slot. The
     /// request is projected before admission, so an unservable dialect
     /// reaches no gateway decision. The gateway evaluates and audits the captured caller's invoke permission
     /// for the requested model and every fallback candidate. Its cancellation

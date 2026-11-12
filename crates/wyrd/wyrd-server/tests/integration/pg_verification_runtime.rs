@@ -473,7 +473,7 @@ impl Harness {
     }
 
     /// Record every committed update of a queue row from now on, as its
-    /// `(status, delivery owed)` pair, through a test-only trigger. A
+    /// status, through a test-only trigger. A
     /// rolled-back update records nothing, so [`Self::commits`] reads the
     /// transactions that actually committed.
     ///
@@ -482,11 +482,10 @@ impl Harness {
     async fn log_commits(&self) {
         for statement in [
             "CREATE TABLE public.queue_commits (seq bigserial PRIMARY KEY, \
-             execution_id uuid NOT NULL, status text NOT NULL, owed boolean NOT NULL)",
+             execution_id uuid NOT NULL, status text NOT NULL)",
             "CREATE FUNCTION public.log_queue_commit() RETURNS trigger LANGUAGE plpgsql \
              SECURITY DEFINER AS $$ BEGIN INSERT INTO public.queue_commits \
-             (execution_id, status, owed) VALUES \
-             (NEW.execution_id, NEW.status, NEW.delivery_due_at IS NOT NULL); \
+             (execution_id, status) VALUES (NEW.execution_id, NEW.status); \
              RETURN NEW; END $$",
             "CREATE TRIGGER log_queue_commit AFTER UPDATE ON wyrd.verifier_executions \
              FOR EACH ROW EXECUTE FUNCTION public.log_queue_commit()",
@@ -503,9 +502,9 @@ impl Harness {
     ///
     /// # Panics
     /// Panics when the log cannot be read.
-    async fn commits(&self, execution: ExecutionId) -> Vec<(String, bool)> {
-        sqlx::query_as(
-            "SELECT status, owed FROM public.queue_commits WHERE execution_id = $1 ORDER BY seq",
+    async fn commits(&self, execution: ExecutionId) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT status FROM public.queue_commits WHERE execution_id = $1 ORDER BY seq",
         )
         .bind(execution.as_uuid())
         .fetch_all(&self.assertion)
@@ -1431,7 +1430,8 @@ async fn completion_waits_for_the_durable_result() {
     let deadline = tokio::time::Instant::now() + WAIT;
     loop {
         let passed: bool = sqlx::query_scalar(
-            "SELECT deadline_at < statement_timestamp() FROM wyrd.verifier_executions \
+            "SELECT created_at + INTERVAL '5 seconds' < statement_timestamp() \
+             FROM wyrd.verifier_executions \
              WHERE execution_id = $1",
         )
         .bind(run.as_uuid())
@@ -2358,9 +2358,7 @@ async fn exhausted_reconciliation_survives_source_and_capacity_outage() {
     );
     let commits = harness.commits(run).await;
     assert!(
-        commits[before..]
-            .iter()
-            .all(|commit| *commit == ("running".to_owned(), false)),
+        commits[before..].iter().all(|commit| commit == "running"),
         "the blocked reclaim commits only its claim: {commits:?}"
     );
     drop(share);
@@ -2444,16 +2442,9 @@ async fn stage_unsettled_result(
 /// # Panics
 /// Panics when a commit owes a delivery or `terminal` committed other than
 /// once.
-fn assert_one_settlement(commits: &[(String, bool)], terminal: &str) {
-    assert!(
-        commits.iter().all(|(_, owed)| !owed),
-        "no commit owes a delivery: {commits:?}"
-    );
+fn assert_one_settlement(commits: &[String], terminal: &str) {
     assert_eq!(
-        commits
-            .iter()
-            .filter(|(status, _)| status == terminal)
-            .count(),
+        commits.iter().filter(|status| *status == terminal).count(),
         1,
         "the attempt settles {terminal} in one commit: {commits:?}"
     );
@@ -2463,15 +2454,15 @@ fn assert_one_settlement(commits: &[(String, bool)], terminal: &str) {
 /// each settle once their failure is acknowledged: while the failure's state
 /// frame is held before Scribe the execution stays `running` with no failure
 /// accepted, and once released the attempt terminates with the canonical
-/// failure and identity in one commit that owes no further delivery. A
-/// retryable failure with attempts left still retries.
+/// failure and identity in one commit. A retryable failure with attempts
+/// left still retries.
 ///
 /// Every committed update of the queue row is logged by a test-only trigger,
-/// so a delivery owed at any commit, or a later delivery claim, shows.
+/// so a second settlement commit shows.
 ///
 /// # Panics
-/// Panics when an execution settles before its failure is acknowledged, any
-/// commit owes a delivery, the state records another decision or identity,
+/// Panics when an execution settles before its failure is acknowledged,
+/// settles in more than one commit, the state records another decision or identity,
 /// or a retryable failure with attempts left does not retry.
 #[tokio::test]
 async fn terminal_failures_use_one_acknowledged_settlement() {
@@ -2558,8 +2549,6 @@ async fn terminal_failures_use_one_acknowledged_settlement() {
         (row.attempts, row.error_code.as_deref()),
         (1, Some("engine_unavailable"))
     );
-    let commits = harness.commits(run).await;
-    assert!(commits.iter().all(|(_, owed)| !owed), "{commits:?}");
     runtime.stop().await;
     assert!(harness.writes().await.is_empty(), "no result is written");
 }
@@ -2567,18 +2556,18 @@ async fn terminal_failures_use_one_acknowledged_settlement() {
 /// A terminal failure accepted in the execution's state is never recomputed:
 /// the failure is canonical in the state before its termination commit fails,
 /// and the reclaim runs no engine and terminates with the recorded error in
-/// one commit that owes no further delivery.
+/// one commit.
 ///
 /// A test-only deferred constraint trigger fails every `errored` commit made
 /// under the first attempt's lease token, so the failure reaches the state
 /// while its termination rolls back; the lease is then expired and a fresh
 /// runner, scripted to complete, reclaims the execution. Every committed
-/// update of the queue row is logged, so a delivery owed at any commit shows.
+/// update of the queue row is logged, so a second settlement commit shows.
 ///
 /// # Panics
 /// Panics when the fault cannot be installed, the failure is not accepted
 /// before the reclaim, the reclaim runs its engine, settles another status or
-/// error, writes a result, or any commit owes a delivery.
+/// error, writes a result, or settles in more than one commit.
 #[tokio::test]
 async fn terminal_failure_reclaims_without_reentering_the_engine() {
     let harness = Harness::start().await;
@@ -4115,8 +4104,11 @@ async fn claim_first_round(tenants: usize, slots: usize) {
     for _ in 0..tenants {
         script.push(EngineOutcome::Completed(unscored_report()));
     }
+    // The deadline counts from admission, and seeding many tenants can
+    // outlast the harness timeout before the runner starts.
     let limits = RuntimeLimits {
         execution_slots: slots,
+        execution_timeout: Duration::from_mins(5),
         ..Harness::limits()
     };
     let runtime = harness.spawn(&limits, &script);

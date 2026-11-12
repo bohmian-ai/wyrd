@@ -261,8 +261,9 @@ struct AdmittedCall {
     /// caller's trace; its captured attempt spans are children of that span.
     trace: Option<TraceContext>,
     /// The Scribe outbox slot admission reserved for the call's capture;
-    /// `None` when the admitted policy captures nothing. Dropping it unused
-    /// returns the slot.
+    /// `None` when the admitted policy captures nothing or a bound call found
+    /// no free slot, whose capture is then staged unreserved. Dropping it
+    /// unused returns the slot.
     capture_slot: Option<Reservation<ScribeSink>>,
 }
 
@@ -296,8 +297,8 @@ impl<'a> GatewayInvocation<'a> {
     /// Bounds the call this handle runs by `deadline`, an instant its caller
     /// fixed before waiting for its own admission, such as a verification
     /// lane's model-call permit. Snapshot, authorization, and routing that
-    /// outlive it refuse the call, as does a capture-slot wait that ends past
-    /// it, before the ledger is charged; an admitted call's provider deadline
+    /// outlive it refuse the call before the ledger is charged, and a bound
+    /// call never waits for a capture slot; an admitted call's provider deadline
     /// is `deadline` itself. A ledger write already started when it passes
     /// still hands off to settlement, and the engine then refuses to start an
     /// attempt.
@@ -551,9 +552,11 @@ impl<'a> GatewayInvocation<'a> {
     ///
     /// Latency: on the request path, with no Postgres wait. The tenant
     /// snapshot is served from the process cache, and [`Self::admit`]
-    /// charges process memory. A capturing call first waits
+    /// charges process memory. A standalone capturing call first waits
     /// for a Scribe outbox capture slot ([`Self::capture_slot`]), which is
-    /// immediate unless the outbox is full. Every invoke-decision audit, here and per fallback
+    /// immediate unless the outbox is full; a [bound](Self::bounded) call
+    /// takes a free slot without waiting, else its capture is staged
+    /// unreserved and may be shed, so capture capacity never delays it. Every invoke-decision audit, here and per fallback
     /// model in [`Self::route`], is staged on the process audit outbox and is
     /// not a request-path round trip.
     ///
@@ -647,13 +650,17 @@ impl<'a> GatewayInvocation<'a> {
             None => prepared.await?,
         };
 
-        // Admission is the capture-slot wait and the ledger statement.
+        // Admission is the capture-slot wait and the ledger statement. A
+        // bound call, a verification lane's, never waits for capture
+        // capacity: it takes a free slot or stages its capture unreserved.
         let deadline = self
             .bound
             .unwrap_or_else(|| Instant::now() + request.timeout);
         let started = std::time::Instant::now();
         let capture_slot = if snapshot.capture.mode == GatewayCaptureMode::Disabled {
             None
+        } else if self.bound.is_some() {
+            self.state.bifrost.scribe_outbox().reserve(1).ok()
         } else {
             Some(self.capture_slot(deadline).await?)
         };
@@ -1122,7 +1129,8 @@ impl<'a> GatewayInvocation<'a> {
     /// hung dependency cannot hold facts, object bytes, or this task past the
     /// call; work still running when it passes is dropped, releasing what it
     /// held, and one [`CaptureDrop::Unavailable`] is recorded. Staging never
-    /// waits and is never shed: it spends the slot admission reserved, and
+    /// waits: it spends the slot admission reserved, which is never shed, or
+    /// for a bound call that found none stages unreserved, and
     /// the outbox owns encoding and delivery. `body` is the call's request
     /// body, moved in so capture redacts and encodes it without a copy.
     async fn capture(

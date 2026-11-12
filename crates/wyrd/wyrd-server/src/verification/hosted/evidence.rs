@@ -107,19 +107,12 @@ impl TenantEvidence {
     /// Every publication `step` accepted in the bound execution's state,
     /// grouped by item, iteration, and attempt and in acceptance order within
     /// an attempt, each with its completed File descriptors; none without a
-    /// bound execution.
-    ///
-    /// # Errors
-    /// Never fails: the accepted state is held in memory. The result keeps
-    /// the workspace's fallible read shape.
-    pub async fn publications(
-        &self,
-        step: &TaskId,
-    ) -> Result<Vec<AcceptedPublication>, BlockError> {
-        Ok(match &self.execution {
+    /// bound execution. Read from the live state held in memory.
+    pub fn publications(&self, step: &TaskId) -> Vec<AcceptedPublication> {
+        match &self.execution {
             Some(state) => state.publications(step),
             None => Vec::new(),
-        })
+        }
     }
 
     /// The verified bytes of one file a publication retains, read from the

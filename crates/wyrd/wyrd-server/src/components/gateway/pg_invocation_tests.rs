@@ -3789,15 +3789,17 @@ async fn gateway_capture_follows_policy_and_never_affects_the_call() {
     drain_gateway(&unavailable).await;
 }
 
-/// Proves a capturing call waits for a Scribe outbox capture slot during
-/// admission instead of having its capture shed.
+/// Proves a standalone capturing call waits for a Scribe outbox capture slot
+/// during admission instead of having its capture shed, while a bound
+/// verification call never waits for one.
 ///
 /// While every reservable slot is held, a call with a short deadline is
 /// refused with `WYRD_GATEWAY_429_CAPTURE_STAGING_FULL` after waiting out
-/// that deadline, before any provider sees it and with nothing captured; a
-/// call bound to an earlier instant than its relative timeout is refused the
-/// same way at that bound. A call admitted while the slots are held waits, is
-/// admitted once they are released, answers, and its capture row is written.
+/// that deadline, before any provider sees it and with nothing captured. A
+/// call bound to its own deadline, as a verification lane's call is, is
+/// dispatched at once and answers well before that bound. A standalone call
+/// admitted while the slots are held waits, is admitted once they are
+/// released, answers, and its capture row is written.
 ///
 /// # Panics
 /// Panics when the Postgres fixture, a seed or call, or an assertion fails.
@@ -3848,31 +3850,29 @@ async fn capturing_call_waits_for_a_capture_slot_and_refuses_at_its_deadline() {
         "a refused call reaches no provider"
     );
 
-    // A bound call waits for its slot until its bound, not its far longer
-    // relative timeout, and is refused the same way.
+    // A bound call never waits for a capture slot: it is dispatched while
+    // every slot is held and answers before its bound.
+    dispatch.push(Step::Return(completed(100, 50)));
     let started = tokio::time::Instant::now();
-    let refused = GatewayInvocation::new(&state)
-        .bounded(started + Duration::from_millis(200))
+    let bound = GatewayInvocation::new(&state)
+        .bounded(started + Duration::from_secs(5))
         .run(
             &caller,
             request("dep-a/a", Some((1000, 500)), Duration::from_secs(10)),
             &CancellationToken::new(),
         )
         .await
-        .expect_err("no capture slot frees before the bound");
-    let waited = started.elapsed();
+        .expect("a bound call is dispatched without a capture slot");
+    assert_eq!(bound.status, 200);
     assert!(
-        matches!(refused.error, WyrdError::GatewayCaptureStagingFull { .. }) && !refused.dispatched,
-        "{:?}",
-        refused.error
+        started.elapsed() < Duration::from_secs(2),
+        "a bound call waited {:?} for capture capacity",
+        started.elapsed()
     );
-    assert!(
-        (Duration::from_millis(200)..Duration::from_secs(2)).contains(&waited),
-        "the bound ended the capture-slot wait after {waited:?}"
-    );
-    assert!(
-        dispatch.seen().is_empty(),
-        "a refused bound call reaches no provider"
+    assert_eq!(
+        dispatch.seen().len(),
+        1,
+        "the bound call reached its provider"
     );
 
     let release = tokio::spawn(async move {
@@ -3890,11 +3890,6 @@ async fn capturing_call_waits_for_a_capture_slot_and_refuses_at_its_deadline() {
     release.await.expect("release task");
     assert_eq!(answered.status, 200);
     drain_gateway(&state).await;
-    assert_eq!(
-        scribe.calls().len(),
-        1,
-        "only the admitted call is captured"
-    );
     captured(&scribe, answered.call_id);
 }
 

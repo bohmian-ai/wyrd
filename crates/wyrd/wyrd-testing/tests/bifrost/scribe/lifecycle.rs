@@ -684,7 +684,8 @@ async fn execution_recovery_requires_exact_accepted_state() {
             .await
             .expect("the revision is accepted");
     }
-    let accepted = first.snapshot().await;
+    first.persisted().await.expect("the revisions are accepted");
+    let accepted = first.snapshot();
     drop(first);
 
     let pool = server
@@ -717,7 +718,7 @@ async fn execution_recovery_requires_exact_accepted_state() {
     let recovered = take_over(&fixture, &server, execution)
         .await
         .expect("the accepted revision recovers");
-    assert_eq!(recovered.snapshot().await, accepted);
+    assert_eq!(recovered.snapshot(), accepted);
     assert_eq!(
         invocations(&accepted),
         [("review".to_owned(), 1), ("judge".to_owned(), 1)]
@@ -768,25 +769,34 @@ async fn execution_takeover_rejects_late_writes_after_replay() {
     replaced
         .begin(&Producer::plain(&TaskId::new("review").expect("task"), 1))
         .await
+        .expect("A's first revision is recorded");
+    replaced
+        .persisted()
+        .await
         .expect("A's first revision is accepted");
 
     let current = take_over(&fixture, &server, execution)
         .await
         .expect("B takes the state over");
     assert_eq!(
-        invocations(&current.snapshot().await),
+        invocations(&current.snapshot()),
         [("review".to_owned(), 1)],
         "B inherits the progress accepted before its takeover"
     );
     current
         .begin(&Producer::plain(&TaskId::new("judge").expect("task"), 1))
         .await
-        .expect("B's revision is accepted");
+        .expect("B's revision is recorded");
+    current.persisted().await.expect("B's revision is accepted");
     replaced
         .begin(&Producer::plain(&TaskId::new("late").expect("task"), 1))
         .await
+        .expect("the replaced writer records its revision in memory");
+    replaced
+        .persisted()
+        .await
         .expect_err("the replaced writer cannot take B's revision");
-    let accepted = current.snapshot().await;
+    let accepted = current.snapshot();
     drop((replaced, current));
 
     let server = Box::pin(server.restart_bound(
@@ -811,7 +821,7 @@ async fn execution_takeover_rejects_late_writes_after_replay() {
     let recovered = take_over(&fixture, &server, execution)
         .await
         .expect("the accepted revision recovers after replay");
-    assert_eq!(recovered.snapshot().await, accepted);
+    assert_eq!(recovered.snapshot(), accepted);
     assert_eq!(
         invocations(&accepted),
         [("review".to_owned(), 1), ("judge".to_owned(), 1)]

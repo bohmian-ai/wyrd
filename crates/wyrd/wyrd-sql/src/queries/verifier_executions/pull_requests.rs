@@ -89,8 +89,6 @@ const DEACTIVATE_SQL: &str = concat!(
                                    THEN NULL ELSE next_attempt_at END,
             settled_at = CASE WHEN status IN ('pending', 'retrying', 'running')
                               THEN statement_timestamp() ELSE settled_at END,
-            delivery_due_at = CASE WHEN status IN ('pending', 'retrying', 'running')
-                                   THEN statement_timestamp() ELSE delivery_due_at END,
             pr_deactivated_at = COALESCE(pr_deactivated_at, $5, statement_timestamp()),
             updated_at = statement_timestamp()
       WHERE ",
@@ -104,8 +102,7 @@ const DEACTIVATE_SQL: &str = concat!(
 const SUPERSEDE_SQL: &str = concat!(
     "UPDATE wyrd.verifier_executions
         SET status = 'cancelled', error = $4, lease_expires_at = NULL, next_attempt_at = NULL,
-            settled_at = statement_timestamp(), delivery_due_at = statement_timestamp(),
-            updated_at = statement_timestamp()
+            settled_at = statement_timestamp(), updated_at = statement_timestamp()
       WHERE ",
     this_pull_request!(),
     " AND status IN ('pending', 'retrying', 'running')
@@ -126,8 +123,6 @@ const CANCEL_REPOSITORIES_SQL: &str = "
                                   THEN NULL ELSE next_attempt_at END,
            settled_at = CASE WHEN status IN ('pending', 'retrying', 'running')
                              THEN statement_timestamp() ELSE settled_at END,
-           delivery_due_at = CASE WHEN status IN ('pending', 'retrying', 'running')
-                                  THEN statement_timestamp() ELSE delivery_due_at END,
            pr_deactivated_at = COALESCE(pr_deactivated_at, statement_timestamp()),
            updated_at = statement_timestamp()
      WHERE origin = 'pull_request' AND pull_request->>'host' = $1
@@ -162,20 +157,19 @@ const RESERVE_SQL: &str = "
 
 /// Record binding `$2` refused at admission of PR pins `$7` observed at `$8`
 /// as one terminal errored execution `$1` with error `$5`, serving `$3` and
-/// recorded by `$4`, its delivery due at once. A missing binding or Verifier
+/// recorded by `$4`. A missing binding or Verifier
 /// Card inserts nothing.
 const REFUSE_SQL: &str = "
     INSERT INTO wyrd.verifier_executions (
         execution_id, data_tenant_id, verifier_card_uid, verifier_version, card_uid,
         origin, owner_card_uid, binding_id, trigger_uid, trigger_digest, operators,
         sub_principal_id, act_principal_id, status, error, max_attempts,
-        created_at, updated_at, settled_at, delivery_due_at, pull_request, pr_observed_at
+        created_at, updated_at, settled_at, pull_request, pr_observed_at
     )
     SELECT $1, wyrd.current_tenant(), b.verifier_card_uid, v.version, b.card_uid,
            'pull_request', b.owner_card_uid, b.binding_id, b.trigger_uid, b.trigger_digest,
            b.operators, $3, $4, 'errored', $5, $6,
-           statement_timestamp(), statement_timestamp(), statement_timestamp(),
-           statement_timestamp(), $7, $8
+           statement_timestamp(), statement_timestamp(), statement_timestamp(), $7, $8
       FROM wyrd.verification_bindings b
       JOIN wyrd.cards v ON v.card_uid = b.verifier_card_uid
      WHERE b.binding_id = $2

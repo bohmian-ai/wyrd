@@ -122,7 +122,6 @@ impl Workspaces {
                 CallValue::Publication { producer, name } => {
                     let publication = evidence
                         .publications(&producer.step_id)
-                        .await?
                         .into_iter()
                         .find(|stored| {
                             &stored.publication.producer == producer
@@ -144,7 +143,7 @@ impl Workspaces {
                     // A withheld speculative contribution mounts no content:
                     // only its status, disposition, and attempts.
                     let admitted = if collection.speculation.admits() {
-                        evidence.publications(step).await?
+                        evidence.publications(step)
                     } else {
                         Vec::new()
                     };

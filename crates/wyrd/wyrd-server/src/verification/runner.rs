@@ -62,8 +62,8 @@ use wyrd_spec::verification::{TaskId, VerificationExecutionStatus, VerifierReadi
 use wyrd_sql::queries::auth::service_accounts::system_principal_id;
 use wyrd_sql::queries::cards::get_card_for_reconciliation;
 use wyrd_sql::queries::verifier_executions::{
-    ClaimedExecution, Completion, EnqueueRefusal, ExecutionInput, RetryOutcome, TerminalDelivery,
-    TerminalStatus, VerifierExecutionQueue,
+    ClaimedExecution, Completion, EnqueueRefusal, ExecutionInput, RetryOutcome, TerminalStatus,
+    VerifierExecutionQueue,
 };
 use wyrd_sql::{OperatorPool, SqlError, TenantConn, WyrdPostgres};
 
@@ -1005,13 +1005,7 @@ impl VerifierRunner {
             }
             Transition::Terminate(status, error) => settled(
                 self.queue
-                    .terminate(
-                        &mut conn,
-                        lease,
-                        status,
-                        &error,
-                        TerminalDelivery::Acknowledged,
-                    )
+                    .terminate(&mut conn, lease, status, &error)
                     .await?,
                 terminal_label(status),
             ),

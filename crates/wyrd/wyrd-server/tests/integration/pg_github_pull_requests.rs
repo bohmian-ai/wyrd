@@ -16,9 +16,7 @@ use wyrd_loader::{build_declaration_input, load};
 use wyrd_server::components::github::service::GithubConnections;
 use wyrd_spec::ids::VerificationResultId;
 use wyrd_spec::verification::VerificationVerdict;
-use wyrd_sql::queries::verifier_executions::{
-    Settlement, TerminalDelivery, TerminalStatus, VerifierExecutionQueue,
-};
+use wyrd_sql::queries::verifier_executions::{Settlement, TerminalStatus, VerifierExecutionQueue};
 use wyrd_testing::github::{GithubAppMock, GithubBrowser, PullRequest};
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
@@ -602,7 +600,6 @@ async fn pull_request_lifecycle_admits_supersedes_and_ends_through_the_webhook()
                 code: "late".to_owned(),
                 message: "the superseded worker finished late".to_owned(),
             },
-            TerminalDelivery::Owed,
         )
         .await
         .expect("settlement runs");

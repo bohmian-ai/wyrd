@@ -98,8 +98,6 @@ pub struct ExecutionRow {
     pub result_id: Option<Uuid>,
     /// Stored error code of a retried or failed attempt.
     pub error_code: Option<String>,
-    /// Deadline the first claim fixed, which no reclaim moves.
-    pub deadline_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Seeds and reads verification state in one tenant.
@@ -742,7 +740,6 @@ impl VerificationFixture {
                 Published::Json(value) => {
                     backend
                         .json(&call, value.clone())
-                        .await
                         .map_err(|e| refused(&e))?;
                     continue;
                 }
@@ -774,8 +771,8 @@ impl VerificationFixture {
         execution: ExecutionId,
     ) -> Result<ExecutionRow, VerificationFixtureError> {
         let mut conn = self.postgres.tenant_conn(self.tenant).await?;
-        let (status, attempts, result_id, error_code, deadline_at) = sqlx::query_as(
-            "SELECT status, attempts, result_id, error->>'code', deadline_at \
+        let (status, attempts, result_id, error_code) = sqlx::query_as(
+            "SELECT status, attempts, result_id, error->>'code' \
              FROM wyrd.verifier_executions WHERE execution_id = $1",
         )
         .bind(execution.as_uuid())
@@ -786,7 +783,6 @@ impl VerificationFixture {
             attempts,
             result_id,
             error_code,
-            deadline_at,
         })
     }
 

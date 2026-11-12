@@ -353,7 +353,7 @@ impl Invocation {
         let publications = Publications::new(&self.state, &self.caller, run, self.limits);
         let kind = match (args.path, args.value) {
             (Some(path), None) => publications.path(&call, self.workspace()?, &path).await?,
-            (None, Some(value)) => publications.json(&call, value).await?,
+            (None, Some(value)) => publications.json(&call, value)?,
             _ => {
                 return Err(structured(&WyrdError::Validation {
                     message: "publish needs exactly one source: a /work `path` or a JSON `value`"

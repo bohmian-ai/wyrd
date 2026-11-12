@@ -92,11 +92,7 @@ impl<'a> Publications<'a> {
     /// # Errors
     /// Returns a `publication_size` refusal for a value whose serialization
     /// exceeds the tool result limit, and [`Self::accept`]'s refusals.
-    pub async fn json(
-        &self,
-        call: &PublishCall,
-        value: Value,
-    ) -> Result<PublicationKind, ToolError> {
+    pub fn json(&self, call: &PublishCall, value: Value) -> Result<PublicationKind, ToolError> {
         // ponytail: JSON publications share the tool result bound, since an
         // Agent supplies them as tool arguments; larger JSON publishes as a file.
         let limit = self.limits.tool_result_max_bytes;
@@ -117,7 +113,6 @@ impl<'a> Publications<'a> {
         }
         let arguments = serde_json::json!({ "name": call.name, "value": value });
         self.accept(call, &arguments, PublicationContent::Json { value }, &[])
-            .await
     }
 
     /// Publish the `/work` file or directory at `path` under `call`'s name:
@@ -153,7 +148,7 @@ impl<'a> Publications<'a> {
                 directories: Vec::new(),
             },
         };
-        if let Some(receipt) = self.receipt(call, &arguments, probe).await? {
+        if let Some(receipt) = self.receipt(call, &arguments, probe)? {
             return receipt;
         }
         let (files, directories, directory) = match workspace.freeze(path).await? {
@@ -197,7 +192,7 @@ impl<'a> Publications<'a> {
         } else {
             PublicationContent::File { manifest }
         };
-        self.accept(call, &arguments, content, &objects).await
+        self.accept(call, &arguments, content, &objects)
     }
 
     /// Complete `bytes`, whose digest is `sha256`, as one verification File
@@ -255,7 +250,7 @@ impl<'a> Publications<'a> {
     ///
     /// # Errors
     /// Returns an invocation failure when the arguments cannot serialize.
-    async fn receipt(
+    fn receipt(
         &self,
         call: &PublishCall,
         arguments: &Value,
@@ -284,7 +279,7 @@ impl<'a> Publications<'a> {
     /// the name in this attempt, a `publication_count` or `publication_bytes`
     /// refusal when the execution's budget cannot hold it, and an invocation
     /// failure when the writer lost the state, its lease, or its deadline.
-    async fn accept(
+    fn accept(
         &self,
         call: &PublishCall,
         arguments: &Value,

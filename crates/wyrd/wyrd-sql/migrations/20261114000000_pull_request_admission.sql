@@ -61,3 +61,16 @@ CREATE INDEX verifier_executions_pull_request
         ((pull_request->>'number')::bigint), pr_observed_at
     )
     WHERE origin = 'pull_request';
+
+-- Execution status and publications of queued Verifier executions are read
+-- under the `verifier:read` permission rather than `cards:read`. Every
+-- built-in Role carries its unscoped grant, so the built-in Roles a tenant
+-- was seeded with before it existed gain it here; tenant-defined Roles are
+-- left to their administrators. The migrator connects as operator, so the
+-- update spans every tenant.
+UPDATE wyrd.auth_roles
+   SET permissions = permissions
+       || '[{"resource": "verifier", "action": "read", "scope": "all"}]'::jsonb
+ WHERE builtin
+   AND name IN ('viewer', 'workload', 'editor')
+   AND NOT permissions @> '[{"resource": "verifier", "action": "read", "scope": "all"}]'::jsonb;

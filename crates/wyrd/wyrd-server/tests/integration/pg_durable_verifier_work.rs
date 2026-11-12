@@ -60,8 +60,7 @@ use wyrd_spec::verification::{
 };
 use wyrd_sql::queries::auth::service_accounts::system_principal_id;
 use wyrd_sql::queries::verifier_executions::{
-    ClaimedExecution, ExecutionLease, Settlement, TerminalDelivery, TerminalStatus,
-    VerifierExecutionQueue,
+    ClaimedExecution, ExecutionLease, Settlement, TerminalStatus, VerifierExecutionQueue,
 };
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::verification::VerificationFixture;
@@ -378,25 +377,6 @@ impl Leased {
             .expect("the lease owner hears the loss");
     }
 
-    /// The execution's deadline on the database clock.
-    ///
-    /// # Panics
-    /// Panics when the read fails.
-    async fn deadline(&self) -> chrono::DateTime<chrono::Utc> {
-        let mut conn = self
-            .server
-            .tenant_conn_for(self.server.data_tenant_id())
-            .await
-            .expect("tenant connection opens");
-        sqlx::query_scalar(
-            "SELECT deadline_at FROM wyrd.verifier_executions WHERE execution_id = $1",
-        )
-        .bind(self.lease.execution_id.as_uuid())
-        .fetch_one(&mut **conn.transaction())
-        .await
-        .expect("the deadline reads")
-    }
-
     /// Every accepted publication of the execution as (task, attempt, name),
     /// in acceptance order.
     ///
@@ -480,15 +460,11 @@ async fn file_and_json_publications_are_immutable() {
                 "/work/notes/report one.md",
             )
             .await,
-        publications
-            .json(
-                &call("c2", &producer, "assessment"),
-                json!({"agrees": true}),
-            )
-            .await,
-        publications
-            .json(&call("c3", &producer, "nothing"), Value::Null)
-            .await,
+        publications.json(
+            &call("c2", &producer, "assessment"),
+            json!({"agrees": true}),
+        ),
+        publications.json(&call("c3", &producer, "nothing"), Value::Null),
     ]
     .map(|kind| kind.expect("the publication is accepted"));
     assert_eq!(
@@ -556,7 +532,6 @@ async fn file_and_json_publications_are_immutable() {
     assert_eq!(rule(&file), "work_budget");
     let value = publications
         .json(&call("c5", &producer, "huge"), json!("x".repeat(64)))
-        .await
         .expect_err("an oversized value is refused");
     assert_eq!(rule(&value), "publication_size");
     for refused in ["big", "huge"] {
@@ -817,7 +792,6 @@ async fn publication_replay_preserves_attempt_identity() {
         assert_eq!(
             publications
                 .json(&call("c1", &first, "report"), json!({"v": 1}))
-                .await
                 .expect("the call and its replay answer one receipt"),
             PublicationKind::Json
         );
@@ -865,13 +839,11 @@ async fn publication_replay_preserves_attempt_identity() {
     for (id, value) in [("c1", json!({"v": 2})), ("c2", json!({"v": 1}))] {
         let error = publications
             .json(&call(id, &first, "report"), value)
-            .await
             .expect_err("another call or argument set conflicts");
         assert_eq!(rule(&error), "publication_name");
     }
     publications
         .json(&call("c3", &second, "report"), json!({"v": 3}))
-        .await
         .expect("a fresh attempt publishes the name again");
     leased.settled().await;
     assert_eq!(
@@ -907,7 +879,6 @@ async fn publication_replay_preserves_attempt_identity() {
     leased.lost().await;
     let stale = publications
         .json(&call("c1", &first, "report"), json!({"v": 1}))
-        .await
         .expect_err("a JSON replay as the stale writer's first operation is refused");
     assert!(
         stale
@@ -921,11 +892,9 @@ async fn publication_replay_preserves_attempt_identity() {
         .expect_err("a file replay under the stale lease is refused");
     publications
         .json(&call("c4", &second, "late"), json!(null))
-        .await
         .expect_err("a reclaimed lease publishes nothing");
     Publications::new(leased.server.state(), &caller, &current, limits)
         .json(&call("c5", &second, "late"), json!(null))
-        .await
         .expect("the current lease publishes");
     leased.settled().await;
     assert_eq!(
@@ -1000,7 +969,6 @@ async fn publication_limits_survive_reclaim() {
     assert_eq!(rule(&over), "publication_size");
     publications
         .json(&call("j", &producer, "j"), json!("ab"))
-        .await
         .expect("a 4-byte value fits the 16-byte total");
     let tail = publications
         .path(
@@ -1025,11 +993,9 @@ async fn publication_limits_survive_reclaim() {
     let resumed = Publications::new(leased.server.state(), &caller, &current, limits);
     resumed
         .json(&call("k", &producer, "k"), json!(1))
-        .await
         .expect("the third publication fits");
     let count = resumed
         .json(&call("l", &producer, "l"), json!(1))
-        .await
         .expect_err("a reclaim inherits the accepted count");
     assert_eq!(rule(&count), "publication_count");
     for refused in ["over", "tail", "l"] {
@@ -1126,7 +1092,6 @@ async fn publication_mounts_preserve_status_and_lineage() {
         .expect("the successful attempt publishes its report");
     publications
         .json(&call("a", &second, "assessment"), json!({"agrees": true}))
-        .await
         .expect("the successful attempt publishes JSON");
     publications
         .path(&call("p", &broken, "partial"), &scratch, "/work/partial.md")
@@ -1369,7 +1334,6 @@ async fn cancelled_work_keeps_checkpoints_and_fences_stale_writes() {
         .expect("the checkpoint is accepted");
     publications
         .json(&call("c1", &producer, "report"), json!({"v": 1}))
-        .await
         .expect("the live lease publishes");
     leased.settled().await;
 
@@ -1397,7 +1361,6 @@ async fn cancelled_work_keeps_checkpoints_and_fences_stale_writes() {
                     code: "late".to_owned(),
                     message: "a late settlement".to_owned(),
                 },
-                TerminalDelivery::Acknowledged,
             )
             .await
             .expect("terminate runs"),
@@ -1427,7 +1390,6 @@ async fn cancelled_work_keeps_checkpoints_and_fences_stale_writes() {
     tx.commit().await.expect("the reads commit");
     publications
         .json(&call("c2", &producer, "late"), json!(null))
-        .await
         .expect_err("a cancelled lease publishes nothing");
     let accepted = leased.accepted().await;
     assert_eq!(
@@ -2213,19 +2175,16 @@ fn outcome(verdict: VerificationVerdict) -> ExecutedOutcome {
     }
 }
 
-/// A reclaim resumes invocation attempts from the accepted Bifrost state
-/// under the execution's original deadline.
+/// A reclaim resumes invocation attempts from the accepted Bifrost state.
 ///
 /// The first claim begins two attempts and abandons a third before it ran.
 /// The reclaim recovers exactly the two begun attempts, both still spent, so
-/// a retry of one starts its next attempt; the abandoned attempt is gone, the
-/// database deadline is unchanged, and PostgreSQL holds no invocation copy.
+/// a retry of one starts its next attempt, and the abandoned attempt is gone.
 ///
 /// # Panics
-/// Panics when a revision is refused, the reclaim recovers other attempts,
-/// the deadline moves, or a PostgreSQL invocation table exists.
+/// Panics when a revision is refused or the reclaim recovers other attempts.
 #[tokio::test(flavor = "multi_thread")]
-async fn invocations_resume_from_bifrost_with_original_bounds() {
+async fn invocations_resume_from_bifrost() {
     let leased = Leased::start().await;
     let task = |id: &str| TaskId::new(id).expect("task");
     for step in ["review", "judge", "refused"] {
@@ -2240,7 +2199,6 @@ async fn invocations_resume_from_bifrost_with_original_bounds() {
         .forget(&Producer::plain(&task("refused"), 1))
         .await
         .expect("the attempt refused capacity is forgotten");
-    let deadline = leased.deadline().await;
     leased.settled().await;
 
     let current = leased.reclaim().await;
@@ -2261,23 +2219,6 @@ async fn invocations_resume_from_bifrost_with_original_bounds() {
             ("judge".to_owned(), 2)
         ]
     );
-    assert_eq!(
-        leased.deadline().await,
-        deadline,
-        "a reclaim keeps the deadline"
-    );
-    let mut conn = leased
-        .server
-        .tenant_conn_for(leased.server.data_tenant_id())
-        .await
-        .expect("tenant connection opens");
-    let legacy: Option<String> =
-        sqlx::query_scalar("SELECT to_regclass('wyrd.verifier_execution_invocations')::text")
-            .fetch_one(&mut **conn.transaction())
-            .await
-            .expect("the catalog reads");
-    assert_eq!(legacy, None, "no PostgreSQL invocation copy exists");
-    drop(conn);
     leased
         .server
         .shutdown()
@@ -2328,7 +2269,6 @@ async fn publications_recover_exact_descriptors_from_run_state() {
         .expect("the file publishes");
     first
         .json(&call("p2", &producer, "verdict"), json!({"ok": true}))
-        .await
         .expect("the value publishes");
     let accepted = leased.run.publications(&task);
     leased.settled().await;
@@ -2351,7 +2291,6 @@ async fn publications_recover_exact_descriptors_from_run_state() {
         .expect("the same call replays its receipt without scratch");
     first
         .json(&call("p3", &producer, "late"), json!(null))
-        .await
         .expect_err("the replaced writer publishes nothing");
     leased.settled().await;
     assert_eq!(
@@ -2363,10 +2302,7 @@ async fn publications_recover_exact_descriptors_from_run_state() {
     );
     let evidence = TenantEvidence::new(leased.server.state().clone(), caller, limits)
         .with_execution(Arc::clone(&current));
-    let recovered = evidence
-        .publications(&task)
-        .await
-        .expect("publications read");
+    let recovered = evidence.publications(&task);
     assert_eq!(recovered, accepted);
     leased
         .server
@@ -2406,7 +2342,6 @@ async fn terminal_selection_and_inspection_use_run_state() {
     };
     Publications::new(leased.server.state(), &caller, &leased.run, limits)
         .json(&call("p1", &producer, "report"), json!({"v": 1}))
-        .await
         .expect("the value publishes");
     let selected = leased
         .run
@@ -2629,7 +2564,6 @@ async fn failures_read_back_from_state_instead_of_the_queue_payload() {
                 code: "queue_only".to_owned(),
                 message: "the queue's copy".to_owned(),
             },
-            TerminalDelivery::Acknowledged,
         )
         .await
         .expect("terminate runs");

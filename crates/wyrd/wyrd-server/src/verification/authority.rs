@@ -257,11 +257,11 @@ impl BackgroundAuthority {
         let Some((issuer, system)) = self.system(conn, owner).await? else {
             return Ok(Err(AuthorityRefusal::Unavailable));
         };
-        Ok(Self::accepted(
+        Self::accepted(
             owner,
             system,
             issuer.scheduled(conn, owner.as_uuid(), root).await,
-        )?)
+        )
     }
 
     /// The accountable/SYSTEM authority a run serving `principal`, the
@@ -281,11 +281,11 @@ impl BackgroundAuthority {
         let Some((issuer, system)) = self.system(conn, principal).await? else {
             return Ok(Err(AuthorityRefusal::Unavailable));
         };
-        Ok(Self::accepted(
+        Self::accepted(
             principal,
             system,
             issuer.accountable(conn, principal.as_uuid()).await,
-        )?)
+        )
     }
 
     /// The configured issuer and the tenant SYSTEM principal, or `None`,

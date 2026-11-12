@@ -605,8 +605,7 @@ mod pg_tests {
             .status
             .and_then(|status| status.verification)
             .expect("the Repository serves its bindings")
-            .binding_ids[0]
-            .clone();
+            .binding_ids[0];
 
         mock.set_pull_request(1, 7, PullRequest::open(1, "b1", "a1"));
         deliver(&mock, &deployment, "opened").await;
@@ -630,7 +629,7 @@ mod pg_tests {
         deliver(&mock, &deployment, "synchronize").await;
         let pushed = newest(&deployment, &binding).await;
         assert_ne!(pushed.execution_id, opened.execution_id);
-        let superseded = inspect(&deployment, opened.execution_id.clone()).await;
+        let superseded = inspect(&deployment, opened.execution_id).await;
         assert_eq!(superseded.status, VerificationExecutionStatus::Cancelled);
         assert_eq!(
             superseded.error.map(|error| error.code).as_deref(),

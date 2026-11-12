@@ -18,6 +18,7 @@
 //! every later settlement exactly as [`VerifierExecutionQueue::cancel`] does,
 //! so supersession, closure and access loss stop queued, running and later
 //! parked work alike, while settled history keeps its pins.
+// raw-query grep allowlist: verifier execution tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use chrono::{DateTime, Utc};
 use sqlx::Error as SqlxError;
@@ -35,7 +36,7 @@ use crate::TenantConn;
 
 /// Advisory lock class of [`LOCK_PULL_REQUEST_SQL`], apart from every other
 /// advisory lock in the database.
-const PULL_REQUEST_LOCK_CLASS: i32 = 0x0C_A2_D0_32;
+const PULL_REQUEST_LOCK_CLASS: i32 = 0x0CA2_D032;
 
 /// Serialize every decision about one tenant's PR until the transaction ends.
 const LOCK_PULL_REQUEST_SQL: &str = "SELECT pg_advisory_xact_lock($1, hashtext($2))";

@@ -631,11 +631,13 @@ async fn interrupted_handoff_completes_the_same_fanout_after_restart() {
         2,
         "the generation is frozen before the handoff"
     );
-    let restarted = deployment
-        .server
-        .restart_bound(WyrdTestServer::builder().with_github_app_for_test(&mock))
-        .await
-        .expect("server restarts");
+    let restarted = Box::pin(
+        deployment
+            .server
+            .restart_bound(WyrdTestServer::builder().with_github_app_for_test(&mock)),
+    )
+    .await
+    .expect("server restarts");
     held.release();
     let answered = delivery.await.expect("joins");
     assert!(

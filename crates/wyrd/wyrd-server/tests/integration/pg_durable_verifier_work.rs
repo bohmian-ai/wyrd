@@ -2859,7 +2859,10 @@ async fn only_queued_verification_keeps_run_state() {
         results[0].execution_id, results[1].execution_id,
         "fresh direct calls are distinct executions"
     );
-    server.flush_bifrost().await.expect("the direct records drain");
+    server
+        .flush_bifrost()
+        .await
+        .expect("the direct records drain");
     for result in &results {
         assert!(
             fixture

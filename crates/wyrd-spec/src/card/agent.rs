@@ -195,6 +195,17 @@ pub struct AgentSpec<F: PromptForm = Compiled> {
     pub verified_by: Vec<VerificationBinding>,
 }
 
+impl<F: PromptForm> AgentSpec<F> {
+    /// Whether this Agent declares the built-in `publish` tool, whose
+    /// publications only queued execution keeps. Pure: no IO.
+    #[must_use]
+    pub fn publishes(&self) -> bool {
+        self.tool_names
+            .iter()
+            .any(|name| name == BuiltinTool::Publish.as_str())
+    }
+}
+
 /// The form an inline Agent Prompt takes once decoded from its authored
 /// wire form.
 pub trait PromptForm:

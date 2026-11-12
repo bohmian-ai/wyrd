@@ -150,12 +150,22 @@ fn environment_tag(request: &VerificationRequest) -> Result<(), WyrdError> {
 /// This is the single direct-eligibility rule `verify` applies once its
 /// target resolves and before the engine is built: a direct request is
 /// never converted to a queued one and never runs part of its graph. A
-/// Verifier judging a scheduled window is queued-only. Pure: no IO.
+/// Verifier judging a scheduled window is queued-only, and so is one
+/// registration marked [`VerifierSpec::queue_only`]. That flag is read from
+/// the resolved spec, so a cached target answers it with no scan of steps,
+/// tools or referenced Agents. Pure: no IO.
 ///
 /// # Errors
 /// Returns [`WyrdError::VerificationInputUnsupported`] for a queued-only
 /// Verifier.
 fn direct_eligibility(verifier: &CardUid, spec: &VerifierSpec) -> Result<(), WyrdError> {
+    if spec.queue_only {
+        return Err(WyrdError::VerificationInputUnsupported {
+            message: "this Verifier runs only as queued work; submit it instead of verifying now"
+                .to_owned(),
+            details: serde_json::json!({ "verifier_card_uid": verifier }),
+        });
+    }
     if spec
         .all_requirements()
         .any(|requirement| requirement.check.evidence() == CheckEvidence::Window)
@@ -1149,8 +1159,8 @@ mod tests {
 
     use super::direct_eligibility;
 
-    /// A Verifier judging a scheduled window is refused as queued-only; an
-    /// ordinary assert-only Verifier is eligible.
+    /// A Verifier judging a scheduled window or marked `queue_only` is
+    /// refused as queued-only; an ordinary assert-only Verifier is eligible.
     ///
     /// # Panics
     /// Panics when a spec does not parse or the rule decides either wrongly.
@@ -1180,10 +1190,17 @@ mod tests {
             json!({ "kind": "assert", "path": "inputs.question", "operator": "is_not_null" }),
         );
 
-        assert!(matches!(
-            direct_eligibility(&verifier, &window),
-            Err(WyrdError::VerificationInputUnsupported { .. })
-        ));
+        let marked = VerifierSpec {
+            queue_only: true,
+            ..ordinary.clone()
+        };
+
+        for queued_only in [&window, &marked] {
+            assert!(matches!(
+                direct_eligibility(&verifier, queued_only),
+                Err(WyrdError::VerificationInputUnsupported { .. })
+            ));
+        }
         assert!(direct_eligibility(&verifier, &ordinary).is_ok());
     }
 }

@@ -19,7 +19,7 @@ use wyrd_spec::card::drift::DriftSignal;
 use wyrd_spec::card::repository::infer_card_name;
 use wyrd_spec::card::trigger::TriggerActivation;
 use wyrd_spec::card::verifier::{
-    InputSlot, OWNER_OCCURRENCE_KEY, OrderBy, VerificationBinding, VerificationStatus,
+    InputSlot, OWNER_OCCURRENCE_KEY, OrderBy, VerificationBinding, VerificationStatus, VerifierSpec,
 };
 use wyrd_spec::envelope::{
     Card, CardKind, Metadata, Relationships, RepositoryStatus, Spec, Status,
@@ -1512,6 +1512,9 @@ impl DeclarationWriter<'_> {
             if let Some(error) = spec_binding_errors(&spec).into_iter().next() {
                 return Err(error);
             }
+            if let Spec::Verifier(verifier) = &mut spec {
+                verifier.queue_only = queue_only(&mut conn, verifier).await?;
+            }
             if let Spec::Agent(agent) = &mut spec
                 && let InlineableRef::Inline(prompt) = &agent.prompt
             {
@@ -1910,6 +1913,37 @@ fn pinned_uid(card_ref: Option<&CardRef>) -> Result<CardUid, WyrdError> {
     card_ref
         .and_then(|card_ref| card_ref.uid.clone())
         .ok_or_else(|| WyrdError::internal("verification binding ref is not pinned to a UID"))
+}
+
+/// Whether `verifier` runs only as queued work, derived at registration.
+///
+/// Called once per declared Verifier after its references are pinned and
+/// before its spec is hashed, so the stored value replaces any the author
+/// sent and never depends on a later read. A Verifier is queue-only when an
+/// inline or registered Agent it calls declares `publish`; a registered
+/// Agent is read by UID inside the declaration transaction, which already
+/// holds a sibling Agent persisted earlier in it. Later queued-only forms
+/// extend this one derivation.
+///
+/// # Errors
+/// Returns `WYRD_INTERNAL` when an Agent reference is unpinned or names
+/// another kind, and the registry error from reading a referenced Agent.
+async fn queue_only(conn: &mut TenantConn<'_>, verifier: &VerifierSpec) -> Result<bool, WyrdError> {
+    for (_, call) in verifier.agent_calls() {
+        let publishes = if let Some(agent) = call.agent.as_inline() {
+            agent.publishes()
+        } else {
+            let uid = pinned_uid(call.agent.as_card_ref())?;
+            let Spec::Agent(agent) = sql_get_card_by_uid(conn, &uid).await?.spec else {
+                return Err(WyrdError::internal("an Agent reference names another kind"));
+            };
+            agent.publishes()
+        };
+        if publishes {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Freeze an inline Trigger or Operator body as its canonical spec digest.

@@ -1718,6 +1718,145 @@ fn standalone_card_request(kind: &str, name: &str, spec: Value, key: &str) -> Re
     )
 }
 
+/// Registration derives `queue_only` from the Agents a Verifier calls and
+/// ignores the value an author sends.
+///
+/// A step calling an inline Agent declaring `publish`, or a registered
+/// Agent declaring it, makes its Verifier queue-only even when the author
+/// sent `false`; an assert-only Verifier sent with `true` is stored as
+/// not queue-only, and its stored spec omits the field.
+///
+/// # Panics
+/// Panics when the server fails to start, a declaration is refused, or a
+/// stored spec carries another `queue_only`.
+#[tokio::test(flavor = "current_thread")]
+async fn registration_derives_queue_only_from_publishing_agents() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("queue-only-writer", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    seed_dependency(&server, server.data_tenant_id(), "qo-prompt", "active").await;
+    let agent = |tools: Value| {
+        json!({
+            "prompt": { "kind": "Prompt", "name": "qo-prompt", "version": "1.0.0" },
+            "execution_route": { "kind": "native" },
+            "tool_names": tools,
+        })
+    };
+    let calling = |called: Value, sent: bool| {
+        json!({
+            "steps": [{ "id": "draft", "action": { "kind": "agent", "agent": called } }],
+            "requirements": [{ "id": "drafted", "statement": "The draft ran.",
+                               "check": { "kind": "assert", "path": "steps.draft.status",
+                                          "operator": "is_not_null" } }],
+            "queue_only": sent,
+        })
+    };
+    let (status, body) = declare_json(
+        &server,
+        &jwt,
+        "qo-publisher",
+        json!([submission_body(
+            "Agent",
+            "qo-publisher",
+            Some("1.0.0"),
+            agent(json!(["publish"])),
+        )]),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "the publishing Agent registers: {body}"
+    );
+    let mut ordinary = assertion_verifier_spec();
+    ordinary["queue_only"] = json!(true);
+    let cases = [
+        (
+            "qo-inline",
+            vec![submission_body(
+                "Verifier",
+                "qo-inline",
+                Some("1.0.0"),
+                calling(agent(json!(["fs.write", "publish"])), false),
+            )],
+            true,
+        ),
+        (
+            "qo-registered",
+            vec![submission_body(
+                "Verifier",
+                "qo-registered",
+                Some("1.0.0"),
+                calling(
+                    json!({ "kind": "Agent", "name": "qo-publisher", "version": "1.0.0" }),
+                    false,
+                ),
+            )],
+            true,
+        ),
+        (
+            "qo-files",
+            vec![submission_body(
+                "Verifier",
+                "qo-files",
+                Some("1.0.0"),
+                calling(agent(json!(["fs.write", "fs.read"])), true),
+            )],
+            false,
+        ),
+        (
+            "qo-ordinary",
+            vec![submission_body(
+                "Verifier",
+                "qo-ordinary",
+                Some("1.0.0"),
+                ordinary,
+            )],
+            false,
+        ),
+    ];
+    for (name, submissions, expected) in cases {
+        let (status, body) = declare_json(&server, &jwt, name, json!(submissions)).await;
+        assert_eq!(status, StatusCode::CREATED, "{name}: {body}");
+        let outcome = body["outcomes"]
+            .as_array()
+            .and_then(|outcomes| {
+                outcomes
+                    .iter()
+                    .find(|outcome| outcome["card_ref"]["name"] == name)
+            })
+            .unwrap_or_else(|| panic!("{name}: no outcome in {body}"));
+        let uid: CardUid = serde_json::from_value(outcome["card_ref"]["uid"].clone())
+            .expect("the outcome carries a uid");
+        let mut conn = server
+            .tenant_conn_for(server.data_tenant_id())
+            .await
+            .expect("tenant connection opens");
+        let stored = get_card_by_uid(&mut conn, &uid)
+            .await
+            .expect("the Verifier loads");
+        let Spec::Verifier(verifier) = stored.spec else {
+            panic!("{name}: the stored Card is not a Verifier");
+        };
+        assert_eq!(verifier.queue_only, expected, "{name}");
+        if !expected {
+            assert!(
+                serde_json::to_value(&verifier).expect("the spec serializes")["queue_only"]
+                    .is_null(),
+                "{name}: a Verifier that may run directly stores no flag"
+            );
+        }
+    }
+    server.shutdown().await.expect("test server shuts down");
+}
+
 /// The authenticated declaration route enforces the shared Verifier contract.
 ///
 /// Through the public HTTP route, with real declared targets behind every

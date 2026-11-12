@@ -806,14 +806,22 @@ async fn agent_writes_private_workspace_files() {
         "every call is recorded under its dotted built-in name"
     );
 
-    let refused = desk
-        .state
-        .run()
-        .observe()
-        .verify("report-pipeline", json!("DIRECT-PUBLISH"))
-        .await
-        .expect_err("a publishing graph does not verify directly");
-    assert_eq!(refused.code(), "WYRD_VERIFICATION_422_INPUT_UNSUPPORTED");
+    // The first call loads the target cold; the second is served from the
+    // cache and is refused by the same registration-derived flag.
+    for attempt in ["cold", "cached"] {
+        let refused = desk
+            .state
+            .run()
+            .observe()
+            .verify("report-pipeline", json!("DIRECT-PUBLISH"))
+            .await
+            .expect_err("a publishing graph does not verify directly");
+        assert_eq!(
+            refused.code(),
+            "WYRD_VERIFICATION_422_INPUT_UNSUPPORTED",
+            "{attempt}"
+        );
+    }
     assert!(
         desk.requests("DIRECT-PUBLISH").await.is_empty(),
         "the refusal comes before any step calls the model"

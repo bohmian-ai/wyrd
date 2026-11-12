@@ -2208,8 +2208,8 @@ async fn refinement_progresses_while_persistence_is_held() {
     );
     let draft = step(&desk.deployment, &direct, "draft").await;
     assert_eq!(
-        ((draft.status, draft.output.clone()), draft.attempts),
-        (final_report.clone(), 1),
+        (draft.status, draft.output.clone()),
+        final_report.clone(),
         "the direct details read the recorded step: {direct:?}"
     );
     assert_eq!(

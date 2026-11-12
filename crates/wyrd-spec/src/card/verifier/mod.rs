@@ -80,6 +80,15 @@ pub struct VerifierSpec {
     /// Ceilings that only lower the server's effective execution limits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<VerifierLimits>,
+    /// Whether this Verifier runs only as queued work, so a direct `verify`
+    /// is refused before any step.
+    ///
+    /// Server-derived: registration replaces whatever the author sent with
+    /// the value the Verifier's steps and their Agents imply, before the
+    /// spec is hashed and stored. Omitted when `false`, so a Verifier that
+    /// can run directly stores and hashes as if the field did not exist.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub queue_only: bool,
 }
 
 /// Authored execution ceilings. Each one only lowers the server's effective

@@ -309,6 +309,7 @@ impl Deployment {
             let waiting: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM pg_locks
                   WHERE locktype = 'advisory' AND NOT granted
+                    AND classid = x'0CA2D032'::int::oid AND objsubid = 2
                     AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
             )
             .fetch_one(&mut **conn.transaction())
@@ -1730,6 +1731,43 @@ async fn a_suspension_during_a_pull_request_read_admits_nothing() {
     assert!(
         deployment.rows(23).await.is_empty(),
         "a read begun before the suspension admits nothing"
+    );
+}
+
+/// Disconnecting the GitHub integration in Wyrd while GitHub answers a PR
+/// read leaves the delayed delivery nothing to admit.
+///
+/// # Panics
+/// Panics when the delayed read admits work.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_disconnect_during_a_pull_request_read_admits_nothing() {
+    let deployment = Deployment::start().await;
+    let (held, delayed) = read_held(&deployment, 28, "d1");
+    held.arrived().await;
+    let Bootstrap::User { jwt, .. } = deployment
+        .server
+        .bootstrap_user("pull-request-admin", &["admin"])
+        .await
+        .expect("admin bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let disconnected = deployment
+        .server
+        .oneshot_authenticated(
+            &jwt,
+            Request::delete("/v1/integrations/github")
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("disconnect responds");
+    assert_eq!(disconnected.status(), StatusCode::OK);
+    held.release();
+    delayed.await.expect("joins");
+    assert!(
+        deployment.rows(28).await.is_empty(),
+        "a read begun before the disconnect admits nothing"
     );
 }
 

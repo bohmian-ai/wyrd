@@ -19,6 +19,7 @@ mod pg_durable_verifier_work;
 // forwards it.
 /// The GitHub installation token facility against the GitHub App mock.
 mod pg_github_connection;
+mod pg_github_pull_requests;
 #[cfg(feature = "test-support")]
 mod pg_grpc_ingest_smoke;
 mod pg_grpc_smoke;

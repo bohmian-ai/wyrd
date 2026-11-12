@@ -3,8 +3,9 @@
 //! [`GithubApp`] holds the validated operator configuration and performs
 //! every GitHub request Wyrd makes: the user OAuth code exchange, the user's
 //! installation and repository access, the App's own installation record
-//! (authenticated with an RS256 App JWT), and narrowed installation access
-//! tokens. Each request goes through the deployment's [`ScreenedHttp`] with
+//! (authenticated with an RS256 App JWT), narrowed installation access
+//! tokens, an installation's current pull request state, and the App's
+//! webhook delivery log and redelivery. Each request goes through the deployment's [`ScreenedHttp`] with
 //! a bounded body, and no token or key is logged or returned in an error.
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -91,6 +92,40 @@ struct TokenBody {
 struct InstallationTokenBody {
     /// The token.
     token: String,
+}
+
+/// One side of a pull request as GitHub reports it.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct PullRequestSide {
+    /// Branch name.
+    #[serde(rename = "ref")]
+    pub(crate) ref_name: String,
+    /// Commit SHA.
+    pub(crate) sha: String,
+    /// The side's repository; `None` once a fork is deleted.
+    pub(crate) repo: Option<PullRequestRepository>,
+}
+
+/// A pull request side's repository.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct PullRequestRepository {
+    /// Stable repository id.
+    pub(crate) id: u64,
+}
+
+/// `GET /repositories/{id}/pulls/{number}` body, as far as Wyrd reads it:
+/// GitHub's current state of the pull request.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct PullRequestBody {
+    /// `open` or `closed`.
+    pub(crate) state: String,
+    /// Whether it is a draft.
+    #[serde(default)]
+    pub(crate) draft: bool,
+    /// The target branch and its current commit.
+    pub(crate) base: PullRequestSide,
+    /// The source branch and its current commit.
+    pub(crate) head: PullRequestSide,
 }
 
 /// App JWT claims (GitHub: `iat`, `exp` at most ten minutes later, `iss`).
@@ -393,6 +428,113 @@ impl GithubApp {
         let body: InstallationTokenBody =
             Self::decode(response, "the installation token request").await?;
         Ok(SecretString::from(body.token))
+    }
+
+    /// GitHub's current state of pull request `number` of repository
+    /// `repository_id`, read with installation `token`; `None` when GitHub
+    /// no longer shows it to the installation.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::GithubUnavailable`] when GitHub cannot be reached
+    /// or answers unexpectedly.
+    pub(crate) async fn pull_request(
+        &self,
+        token: &SecretString,
+        repository_id: u64,
+        number: u64,
+    ) -> Result<Option<PullRequestBody>, WyrdError> {
+        let url = self.api(&format!("/repositories/{repository_id}/pulls/{number}"));
+        let response = self
+            .request(Method::GET, &url)
+            .await?
+            .bearer_auth(token.expose_secret())
+            .send()
+            .await
+            .map_err(|_| unavailable("the pull request read"))?;
+        if matches!(
+            response.status(),
+            StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+        ) {
+            return Ok(None);
+        }
+        Self::decode(response, "the pull request read")
+            .await
+            .map(Some)
+    }
+
+    /// The App's recent webhook delivery log, newest first, read page by
+    /// page with GitHub's cursor up to [`MAX_PAGES`] pages.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::GithubUnavailable`] when GitHub cannot be reached
+    /// or answers unexpectedly.
+    pub(crate) async fn deliveries<T: DeserializeOwned>(&self) -> Result<Vec<T>, WyrdError> {
+        let mut deliveries = Vec::new();
+        let mut url = self.api("/app/hook/deliveries");
+        url.query_pairs_mut()
+            .append_pair("per_page", &PAGE_SIZE.to_string());
+        for _ in 0..MAX_PAGES {
+            let response = self
+                .request(Method::GET, &url)
+                .await?
+                .bearer_auth(self.app_jwt()?.expose_secret())
+                .send()
+                .await
+                .map_err(|_| unavailable("the delivery log read"))?;
+            let next = Self::next_page(response.headers());
+            let page: Vec<T> = Self::decode(response, "the delivery log read").await?;
+            deliveries.extend(page);
+            let Some(next) = next.filter(|next| self.same_api(next)) else {
+                break;
+            };
+            url = next;
+        }
+        Ok(deliveries)
+    }
+
+    /// Ask GitHub to redeliver webhook delivery attempt `id`.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::GithubUnavailable`] when GitHub cannot be reached
+    /// or refuses.
+    pub(crate) async fn redeliver(&self, id: u64) -> Result<(), WyrdError> {
+        let url = self.api(&format!("/app/hook/deliveries/{id}/attempts"));
+        let response = self
+            .request(Method::POST, &url)
+            .await?
+            .bearer_auth(self.app_jwt()?.expose_secret())
+            .send()
+            .await
+            .map_err(|_| unavailable("the redelivery request"))?;
+        if !response.status().is_success() {
+            tracing::warn!(status = %response.status(), "GitHub refused a redelivery");
+            return Err(unavailable("the redelivery request"));
+        }
+        Ok(())
+    }
+
+    /// The `rel="next"` target of a response's `Link` header.
+    fn next_page(headers: &reqwest::header::HeaderMap) -> Option<Url> {
+        let link = headers.get(reqwest::header::LINK)?.to_str().ok()?;
+        link.split(',').find_map(|part| {
+            let (target, params) = part.split_once(';')?;
+            params
+                .split(';')
+                .any(|param| param.trim() == r#"rel="next""#)
+                .then(|| {
+                    Url::parse(target.trim().trim_start_matches('<').trim_end_matches('>')).ok()
+                })
+                .flatten()
+        })
+    }
+
+    /// Whether `url` is under the configured API origin, so a followed page
+    /// link never sends the App JWT elsewhere.
+    fn same_api(&self, url: &Url) -> bool {
+        url.origin() == self.settings.api_origin.origin()
+            && url
+                .path()
+                .starts_with(self.settings.api_origin.path().trim_end_matches('/'))
     }
 
     /// `path` under the web origin.

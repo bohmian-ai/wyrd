@@ -311,6 +311,7 @@ async fn webhook(
     GithubConnections::new(&state)
         .webhook(
             header_str("x-github-event"),
+            header_str("x-github-delivery"),
             header_str("x-hub-signature-256"),
             &body,
         )

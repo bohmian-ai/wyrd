@@ -7,7 +7,10 @@
 //! the REST API under `/api/v3`. Tests script GitHub's side: installations,
 //! users, the browser's signed-in GitHub user, suspension and repository
 //! access, and can hold GitHub's next answer to interleave Wyrd work with
-//! it. [`GithubBrowser`] is a
+//! it. Pull requests are scripted with [`PullRequest`] and read back by
+//! installation tokens; every webhook delivery is logged with its
+//! `X-GitHub-Delivery` id so Wyrd can list and redeliver failed ones, as
+//! GitHub's App delivery API allows. [`GithubBrowser`] is a
 //! browser signed in to Wyrd that follows the redirect chain across Wyrd and
 //! the mock, keeping Wyrd's cookies. Webhooks are delivered signed with the
 //! configured secret, or deliberately missigned.
@@ -103,6 +106,78 @@ impl HeldAnswer {
     }
 }
 
+/// One pull request as GitHub holds it, which the test edits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequest {
+    /// Target branch.
+    pub base_ref: String,
+    /// Target branch commit.
+    pub base_sha: String,
+    /// Source branch.
+    pub head_ref: String,
+    /// Source branch commit.
+    pub head_sha: String,
+    /// Source repository; `None` once a fork is deleted.
+    pub head_repository: Option<u64>,
+    /// Whether it is a draft.
+    pub draft: bool,
+    /// Whether it is open.
+    pub open: bool,
+}
+
+impl PullRequest {
+    /// An open, ready pull request from `head_sha` on `feature` of
+    /// `repository` into `main` at `base_sha`.
+    #[must_use]
+    pub fn open(repository: u64, base_sha: &str, head_sha: &str) -> Self {
+        Self {
+            base_ref: "main".to_owned(),
+            base_sha: base_sha.to_owned(),
+            head_ref: "feature".to_owned(),
+            head_sha: head_sha.to_owned(),
+            head_repository: Some(repository),
+            draft: false,
+            open: true,
+        }
+    }
+
+    /// GitHub's JSON shape of the pull request numbered `number`.
+    fn json(&self, repository: u64, number: u64) -> Value {
+        json!({
+            "number": number,
+            "state": if self.open { "open" } else { "closed" },
+            "draft": self.draft,
+            "base": {"ref": self.base_ref, "sha": self.base_sha, "repo": {"id": repository}},
+            "head": {
+                "ref": self.head_ref,
+                "sha": self.head_sha,
+                "repo": self.head_repository.map(|id| json!({"id": id})),
+            },
+        })
+    }
+}
+
+/// One attempt in the App's webhook delivery log.
+#[derive(Debug, Clone)]
+struct DeliveryAttempt {
+    /// Attempt id.
+    id: u64,
+    /// Delivery id, shared by its redeliveries.
+    guid: String,
+    /// Event name.
+    event: String,
+    /// The signed body.
+    body: String,
+    /// The Wyrd base URL it was sent to.
+    server_base: String,
+    /// The answer's status; 0 when no answer arrived.
+    status_code: u16,
+    /// Whether it was a redelivery.
+    redelivery: bool,
+    /// When it was sent.
+    delivered_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// An issued, unexchanged authorization code.
 #[derive(Debug, Clone)]
 struct Code {
@@ -143,6 +218,14 @@ struct MockState {
     installation_failure: bool,
     /// Token exchanges answered with a user token.
     exchanges: usize,
+    /// Pull requests by (repository id, number).
+    pulls: BTreeMap<(u64, u64), PullRequest>,
+    /// Held next answer of the pull request read.
+    pull_hold: Option<HeldAnswer>,
+    /// The App's webhook delivery log, oldest first.
+    deliveries: Vec<DeliveryAttempt>,
+    /// Wyrd's public base URL, where redeliveries are sent.
+    public_url: Option<String>,
     /// Counter for unique codes and tokens.
     serial: u64,
 }
@@ -262,7 +345,9 @@ impl GithubAppMock {
             public_url.trim_end_matches('/')
         ))
         .expect("the test server's public URL is a URL");
-        self.state().setup_url = Some(setup);
+        let mut state = self.state();
+        state.setup_url = Some(setup);
+        state.public_url = Some(public_url.trim_end_matches('/').to_owned());
     }
 
     /// Install this App as `id` with `repositories` (id, `owner/name`)
@@ -382,6 +467,186 @@ impl GithubAppMock {
         secrets
     }
 
+    /// Create or replace pull request `number` of `repository`.
+    pub fn set_pull_request(&self, repository: u64, number: u64, pull_request: PullRequest) {
+        self.state()
+            .pulls
+            .insert((repository, number), pull_request);
+    }
+
+    /// Edit pull request `number` of `repository` in place.
+    ///
+    /// # Panics
+    /// Panics when the pull request does not exist.
+    pub fn edit_pull_request(
+        &self,
+        repository: u64,
+        number: u64,
+        edit: impl FnOnce(&mut PullRequest),
+    ) {
+        edit(
+            self.state()
+                .pulls
+                .get_mut(&(repository, number))
+                .expect("the pull request exists"),
+        );
+    }
+
+    /// The `pull_request` webhook body GitHub sends for `action` on pull
+    /// request `number` of `repository` under `installation`, from its
+    /// current state.
+    ///
+    /// # Panics
+    /// Panics when the pull request does not exist.
+    #[must_use]
+    pub fn pull_request_event(
+        &self,
+        installation: u64,
+        repository: u64,
+        number: u64,
+        action: &str,
+    ) -> Value {
+        let state = self.state();
+        let pull_request = state
+            .pulls
+            .get(&(repository, number))
+            .expect("the pull request exists");
+        json!({
+            "action": action,
+            "number": number,
+            "pull_request": pull_request.json(repository, number),
+            "repository": {"id": repository},
+            "installation": {"id": installation},
+        })
+    }
+
+    /// Hold GitHub's answer to the next pull request read.
+    #[must_use]
+    pub fn hold_next_pull_request_read(&self) -> HeldAnswer {
+        let hold = HeldAnswer::default();
+        self.state().pull_hold = Some(hold.clone());
+        hold
+    }
+
+    /// Record that Wyrd's answer to the latest attempt of delivery `guid`
+    /// never reached GitHub, as when Wyrd stopped before answering: GitHub
+    /// then shows the delivery failed.
+    pub fn lose_answer(&self, guid: &str) {
+        if let Some(attempt) = self
+            .state()
+            .deliveries
+            .iter_mut()
+            .rev()
+            .find(|attempt| attempt.guid == guid)
+        {
+            attempt.status_code = 0;
+        }
+    }
+
+    /// Every attempt of delivery `guid`, oldest first, as (status,
+    /// redelivery).
+    #[must_use]
+    pub fn delivery_attempts(&self, guid: &str) -> Vec<(u16, bool)> {
+        self.state()
+            .deliveries
+            .iter()
+            .filter(|attempt| attempt.guid == guid)
+            .map(|attempt| (attempt.status_code, attempt.redelivery))
+            .collect()
+    }
+
+    /// Redeliver delivery `guid` as GitHub's Redeliver does: the same body
+    /// and delivery id; returns the status.
+    ///
+    /// # Errors
+    /// Returns [`WyrdTestServerError::Io`] when the delivery is unknown or
+    /// the request cannot be sent.
+    pub async fn redeliver(&self, guid: &str) -> Result<StatusCode, WyrdTestServerError> {
+        let attempt = self
+            .state()
+            .deliveries
+            .iter()
+            .rev()
+            .find(|attempt| attempt.guid == guid)
+            .cloned()
+            .ok_or_else(|| WyrdTestServerError::Io(format!("no delivery {guid}")))?;
+        let base = self.redelivery_base(&attempt);
+        self.attempt(&base, &attempt.event, guid, attempt.body, true)
+            .await
+    }
+
+    /// Deliver `body` as an attempt of delivery `guid`, signed, and record
+    /// it in the delivery log.
+    ///
+    /// # Errors
+    /// Returns [`WyrdTestServerError::Io`] when the request cannot be sent.
+    async fn attempt(
+        &self,
+        server_base: &str,
+        event: &str,
+        guid: &str,
+        body: String,
+        redelivery: bool,
+    ) -> Result<StatusCode, WyrdTestServerError> {
+        let signature = format!(
+            "sha256={}",
+            hex::encode(wyrd_crypt::hmac_sha256(
+                WEBHOOK_SECRET.as_bytes(),
+                body.as_bytes()
+            ))
+        );
+        let answered = deliver(
+            server_base,
+            event,
+            Some(guid),
+            Some(&signature),
+            body.clone(),
+        )
+        .await;
+        let mut state = self.state();
+        state.serial += 1;
+        let id = state.serial;
+        state.deliveries.push(DeliveryAttempt {
+            id,
+            guid: guid.to_owned(),
+            event: event.to_owned(),
+            body,
+            server_base: server_base.to_owned(),
+            status_code: answered.as_ref().map_or(0, StatusCode::as_u16),
+            redelivery,
+            delivered_at: chrono::Utc::now(),
+        });
+        answered
+    }
+
+    /// Where a redelivery of `attempt` is sent: Wyrd's current public URL,
+    /// as GitHub sends to the App's configured webhook, else where it was
+    /// first sent.
+    fn redelivery_base(&self, attempt: &DeliveryAttempt) -> String {
+        self.state()
+            .public_url
+            .clone()
+            .unwrap_or_else(|| attempt.server_base.clone())
+    }
+
+    /// Deliver webhook `event` with `payload` to `server_base` as a new
+    /// delivery, signed and logged; returns the status and its delivery id.
+    ///
+    /// # Errors
+    /// Returns [`WyrdTestServerError::Io`] when the request cannot be sent.
+    pub async fn deliver_new(
+        &self,
+        server_base: &str,
+        event: &str,
+        payload: &Value,
+    ) -> Result<(StatusCode, String), WyrdTestServerError> {
+        let guid = uuid::Uuid::new_v4().to_string();
+        let status = self
+            .attempt(server_base, event, &guid, payload.to_string(), false)
+            .await?;
+        Ok((status, guid))
+    }
+
     /// Deliver webhook `event` with `payload` to `server_base`, signed with
     /// the configured secret; returns the status.
     ///
@@ -393,15 +658,9 @@ impl GithubAppMock {
         event: &str,
         payload: &Value,
     ) -> Result<StatusCode, WyrdTestServerError> {
-        let body = payload.to_string();
-        let signature = format!(
-            "sha256={}",
-            hex::encode(wyrd_crypt::hmac_sha256(
-                WEBHOOK_SECRET.as_bytes(),
-                body.as_bytes()
-            ))
-        );
-        deliver(server_base, event, Some(&signature), body).await
+        self.deliver_new(server_base, event, payload)
+            .await
+            .map(|(status, _)| status)
     }
 
     /// Deliver webhook `event` with `payload` carrying `signature` instead
@@ -416,7 +675,7 @@ impl GithubAppMock {
         payload: &Value,
         signature: Option<&str>,
     ) -> Result<StatusCode, WyrdTestServerError> {
-        deliver(server_base, event, signature, payload.to_string()).await
+        deliver(server_base, event, None, signature, payload.to_string()).await
     }
 }
 
@@ -427,6 +686,7 @@ impl GithubAppMock {
 async fn deliver(
     server_base: &str,
     event: &str,
+    guid: Option<&str>,
     signature: Option<&str>,
     body: String,
 ) -> Result<StatusCode, WyrdTestServerError> {
@@ -438,6 +698,9 @@ async fn deliver(
         .header("x-github-event", event)
         .header(header::CONTENT_TYPE, "application/json")
         .body(body);
+    if let Some(guid) = guid {
+        request = request.header("x-github-delivery", guid);
+    }
     if let Some(signature) = signature {
         request = request.header("x-hub-signature-256", signature);
     }
@@ -458,6 +721,15 @@ fn router(inner: std::sync::Weak<Inner>) -> Router {
         .route(
             "/api/v3/app/installations/{id}/access_tokens",
             post(installation_token),
+        )
+        .route(
+            "/api/v3/repositories/{id}/pulls/{number}",
+            get(pull_request),
+        )
+        .route("/api/v3/app/hook/deliveries", get(hook_deliveries))
+        .route(
+            "/api/v3/app/hook/deliveries/{id}/attempts",
+            post(hook_redeliver),
         )
         .route("/api/v3/user/installations", get(user_installations))
         .route(
@@ -780,6 +1052,129 @@ async fn user_repositories(
         .collect();
     axum::Json(json!({ "total_count": repositories.len(), "repositories": repositories }))
         .into_response()
+}
+
+/// `GET /api/v3/repositories/{id}/pulls/{number}`: an installation reads
+/// a pull request of a repository its token reaches.
+async fn pull_request(
+    State(weak): State<Weak>,
+    Path((repository, number)): Path<(u64, u64)>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(mock) = weak.mock() else {
+        return gone();
+    };
+    let (answer, hold) = {
+        let mut state = mock.state();
+        let issued = bearer(&headers).is_some_and(|token| {
+            token.starts_with(INSTALLATION_TOKEN_PREFIX) && state.issued.iter().any(|t| t == token)
+        });
+        let reachable = state.installations.values().any(|installation| {
+            installation.app_id == APP_ID
+                && !installation.suspended
+                && installation.repositories.contains_key(&repository)
+        });
+        let answer = match state.pulls.get(&(repository, number)) {
+            _ if !issued => StatusCode::UNAUTHORIZED.into_response(),
+            Some(pull_request) if reachable => {
+                axum::Json(pull_request.json(repository, number)).into_response()
+            }
+            _ => StatusCode::NOT_FOUND.into_response(),
+        };
+        (answer, state.pull_hold.take())
+    };
+    if let Some(hold) = hold {
+        hold.hold().await;
+    }
+    answer
+}
+
+/// Delivery log page query.
+#[derive(Deserialize)]
+struct DeliveriesQuery {
+    /// Page size.
+    per_page: Option<usize>,
+    /// Attempts already listed.
+    cursor: Option<usize>,
+}
+
+/// `GET /api/v3/app/hook/deliveries`: the App's delivery log, newest first,
+/// paged by cursor with a `Link: rel="next"` header.
+async fn hook_deliveries(
+    State(weak): State<Weak>,
+    Query(query): Query<DeliveriesQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(mock) = weak.mock() else {
+        return gone();
+    };
+    if !app_authenticated(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let per_page = query.per_page.unwrap_or(30).max(1);
+    let cursor = query.cursor.unwrap_or(0);
+    let state = mock.state();
+    let attempts: Vec<Value> = state
+        .deliveries
+        .iter()
+        .rev()
+        .skip(cursor)
+        .take(per_page)
+        .map(|attempt| {
+            json!({
+                "id": attempt.id,
+                "guid": attempt.guid,
+                "status_code": attempt.status_code,
+                "redelivery": attempt.redelivery,
+                "delivered_at": attempt.delivered_at,
+                "event": attempt.event,
+            })
+        })
+        .collect();
+    let mut response = axum::Json(attempts).into_response();
+    if cursor + per_page < state.deliveries.len() {
+        let next = format!(
+            "<{}api/v3/app/hook/deliveries?per_page={per_page}&cursor={}>; rel=\"next\"",
+            mock.origin(),
+            cursor + per_page
+        );
+        if let Ok(value) = next.parse() {
+            response.headers_mut().insert(header::LINK, value);
+        }
+    }
+    response
+}
+
+/// `POST /api/v3/app/hook/deliveries/{id}/attempts`: the App asks GitHub
+/// to redeliver attempt `id`; the mock redelivers before answering.
+async fn hook_redeliver(
+    State(weak): State<Weak>,
+    Path(id): Path<u64>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(mock) = weak.mock() else {
+        return gone();
+    };
+    if !app_authenticated(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let attempt = mock
+        .state()
+        .deliveries
+        .iter()
+        .find(|attempt| attempt.id == id)
+        .cloned();
+    let Some(attempt) = attempt else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let base = mock.redelivery_base(&attempt);
+    match mock
+        .attempt(&base, &attempt.event, &attempt.guid, attempt.body, true)
+        .await
+    {
+        Ok(_) => StatusCode::ACCEPTED.into_response(),
+        Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+    }
 }
 
 /// Installation token request body.

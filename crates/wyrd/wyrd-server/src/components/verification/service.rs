@@ -101,7 +101,7 @@ const STAGING_RETRY_AFTER_SECONDS: u64 = 1;
 /// Map a refused outbox reservation to the caller's retryable pressure.
 ///
 /// The refusal admitted nothing, so the identical call may be retried whole.
-fn staging_full(full: OutboxFull) -> WyrdError {
+pub(crate) fn staging_full(full: OutboxFull) -> WyrdError {
     tracing::warn!(
         outbox = full.outbox,
         admitted = full.admitted,

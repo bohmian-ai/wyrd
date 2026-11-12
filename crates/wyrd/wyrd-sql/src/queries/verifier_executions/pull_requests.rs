@@ -372,6 +372,22 @@ struct GenerationRow {
 }
 
 impl VerifierExecutionQueue {
+    /// The database time a PR observation is ordered by, read before the
+    /// provider's current PR state is: a later observation always reads
+    /// later provider state, so [`PullRequestHistory::obsolete`] refuses an
+    /// earlier one that commits after it.
+    ///
+    /// # Errors
+    /// Returns the database error when the read fails.
+    pub async fn observe_pull_request(
+        &self,
+        conn: &mut TenantConn<'_>,
+    ) -> Result<DateTime<Utc>, SqlxError> {
+        sqlx::query_scalar("SELECT statement_timestamp()")
+            .fetch_one(&mut **conn.transaction())
+            .await
+    }
+
     /// Lock `key`'s PR for the rest of the caller's transaction and read its
     /// latest observation and newest generation.
     ///

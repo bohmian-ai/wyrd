@@ -1263,7 +1263,10 @@ impl ScribeSink {
     /// delivery of a selected result, in any slice, resubmits the same two
     /// batch ids and Scribe's batch-id fence keeps each row once. Result
     /// summary frames are moved after every detail frame, so a visible
-    /// summary's details were acknowledged first. Positions of writes that cannot be projected
+    /// summary's details were acknowledged first. A pull-request execution's
+    /// input record is likewise its own frame keyed by its `execution_id`,
+    /// so a redelivered webhook restaging a reserved execution resubmits
+    /// the batch id its first staging used. Positions of writes that cannot be projected
     /// are added to `lost`.
     fn frames(items: &[ScribeWrite], lost: &mut BTreeSet<usize>) -> Vec<Frame> {
         let mut frames: Vec<Frame> = Vec::new();
@@ -1297,6 +1300,13 @@ impl ScribeSink {
             };
             let key = match item {
                 ScribeWrite::Result { payload, .. } => Some(payload.result_id().as_uuid()),
+                ScribeWrite::ExecutionInputs { row, .. }
+                    if row.row.text("origin") == Some("pull_request") =>
+                {
+                    row.row
+                        .text("execution_id")
+                        .and_then(|id| Uuid::parse_str(id).ok())
+                }
                 _ => None,
             };
             for rows in rows {

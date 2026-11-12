@@ -647,6 +647,18 @@ impl BoundServer {
             set.spawn(worker);
         }
 
+        if self.state.github.is_some() {
+            let state = self.state.clone();
+            let shutdown = shutdown.clone();
+            set.spawn(worker_task(
+                TaskId::Worker("github_delivery_recovery"),
+                async move {
+                    crate::components::github::service::GithubConnections::new(&state)
+                        .run_delivery_recovery(shutdown)
+                        .await;
+                },
+            ));
+        }
         if let Some(operator) = self.state.postgres.operator_pool() {
             set.spawn(worker_task(
                 TaskId::Worker("card_reconciler"),

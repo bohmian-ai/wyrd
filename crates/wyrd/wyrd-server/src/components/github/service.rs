@@ -41,8 +41,10 @@ use wyrd_sql::queries::github_installations::{
     associate_github_installation, github_installation, lock_github_installation,
     release_github_installation, remove_github_repositories, set_github_installation_suspended,
 };
+use wyrd_sql::queries::verifier_executions::VerifierExecutionQueue;
 
 use super::app::{GithubApp, refused, unavailable};
+use super::pull_requests::PullRequestEvent;
 use crate::audit;
 use crate::components::auth::Caller;
 use crate::state::{AppState, registry_db_error};
@@ -145,7 +147,7 @@ pub(crate) struct SetupRedirect {
 /// Owner of the tenant GitHub connection for one request.
 pub struct GithubConnections<'a> {
     /// Server state providing tenant connections, authorization and audit.
-    state: &'a AppState,
+    pub(super) state: &'a AppState,
 }
 
 impl<'a> GithubConnections<'a> {
@@ -158,7 +160,7 @@ impl<'a> GithubConnections<'a> {
     ///
     /// # Errors
     /// Returns [`WyrdError::GithubNotConfigured`] without one.
-    fn app(&self) -> Result<&'a GithubApp, WyrdError> {
+    pub(super) fn app(&self) -> Result<&'a GithubApp, WyrdError> {
         self.state.github.as_deref().ok_or_else(not_configured)
     }
 
@@ -181,7 +183,7 @@ impl<'a> GithubConnections<'a> {
     ///
     /// # Errors
     /// Returns the registry unavailability error.
-    async fn conn(&self, tenant: DataTenantId) -> Result<TenantConn<'a>, WyrdError> {
+    pub(super) async fn conn(&self, tenant: DataTenantId) -> Result<TenantConn<'a>, WyrdError> {
         self.state.registry_tenant_conn(tenant).await
     }
 
@@ -354,8 +356,9 @@ impl<'a> GithubConnections<'a> {
     ///
     /// The slot stays locked until the caller's transaction ends, so no
     /// association or webhook change interleaves. The release advances the
-    /// slot revision; queued verification is not bound to a GitHub
-    /// repository, so that is the whole fence. Once it commits,
+    /// slot revision and, in the same transaction, cancels the unfinished
+    /// pull-request executions of every repository it reached with
+    /// `repository_access_lost`, keeping their history. Once it commits,
     /// [`Self::installation_token`] refuses every repository of the
     /// installation and discards any token GitHub was still minting under
     /// the released revision.
@@ -369,9 +372,37 @@ impl<'a> GithubConnections<'a> {
         lock_github_installation(conn)
             .await
             .map_err(registry_db_error)?;
-        release_github_installation(conn, only)
+        let released = release_github_installation(conn, only)
             .await
-            .map_err(registry_db_error)
+            .map_err(registry_db_error)?;
+        if let Some(host) = released.as_ref().and_then(|row| row.host.as_deref()) {
+            Self::access_lost(conn, host, None).await?;
+        }
+        Ok(released)
+    }
+
+    /// Cancel the unfinished pull-request executions of `host`'s
+    /// `repositories`, or of every repository when `None`, with
+    /// `repository_access_lost`, in the caller's transaction.
+    ///
+    /// # Errors
+    /// Returns a registry error.
+    async fn access_lost(
+        conn: &mut TenantConn<'_>,
+        host: &str,
+        repositories: Option<&[String]>,
+    ) -> Result<(), WyrdError> {
+        let cancelled = VerifierExecutionQueue::default()
+            .cancel_pull_request_repositories(conn, host, repositories)
+            .await
+            .map_err(registry_db_error)?;
+        if cancelled > 0 {
+            tracing::info!(
+                cancelled,
+                "pull-request work cancelled on repository access loss"
+            );
+        }
+        Ok(())
     }
 
     /// GitHub's setup redirect reached the caller's signed-in browser: bind
@@ -590,6 +621,7 @@ impl<'a> GithubConnections<'a> {
     pub(crate) async fn webhook(
         &self,
         event: Option<&str>,
+        delivery: Option<&str>,
         signature: Option<&str>,
         body: &[u8],
     ) -> Result<(), WyrdError> {
@@ -620,6 +652,19 @@ impl<'a> GithubConnections<'a> {
         else {
             return Ok(());
         };
+        if event == "pull_request" {
+            let event: PullRequestEvent =
+                serde_json::from_slice(body).map_err(|_| WyrdError::GithubRequestInvalid {
+                    message: "the webhook body is not a pull_request event".to_owned(),
+                    details: serde_json::json!({ "field": "body" }),
+                })?;
+            let delivery = delivery.ok_or_else(|| WyrdError::GithubRequestInvalid {
+                message: "the pull_request delivery carries no X-GitHub-Delivery id".to_owned(),
+                details: serde_json::json!({ "field": "x-github-delivery" }),
+            })?;
+            self.pull_request(app, tenant, delivery, &event).await?;
+            return Ok(());
+        }
         if let ("installation", Some("suspend" | "unsuspend")) = (event, payload.action.as_deref())
         {
             return self
@@ -637,9 +682,14 @@ impl<'a> GithubConnections<'a> {
                     .iter()
                     .map(|repository| repository.id.to_string())
                     .collect();
-                remove_github_repositories(&mut conn, &host, installation_id, &removed)
-                    .await
-                    .map_err(registry_db_error)?
+                let changed =
+                    remove_github_repositories(&mut conn, &host, installation_id, &removed)
+                        .await
+                        .map_err(registry_db_error)?;
+                if changed.is_some() {
+                    Self::access_lost(&mut conn, &host, Some(&removed)).await?;
+                }
+                changed
             }
             _ => None,
         };
@@ -692,6 +742,9 @@ impl<'a> GithubConnections<'a> {
             .await
             .map_err(registry_db_error)?
             .ok_or_else(connection_changed)?;
+        if current.suspended {
+            Self::access_lost(&mut conn, &app.settings().host(), None).await?;
+        }
         conn.commit().await.map_err(registry_db_error)?;
         tracing::info!(
             suspended = current.suspended,

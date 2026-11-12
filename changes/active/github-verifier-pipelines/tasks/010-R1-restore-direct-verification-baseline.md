@@ -16,6 +16,27 @@ blocks: [TASK-010-acceptance, TASK-006-acceptance, TASK-005, TASK-007, TASK-008,
 
 # Restore direct verification and batching without benchmark regressions
 
+## Revision — registration-derived `queue_only`
+
+This maintainer-directed revision supersedes conflicting eligibility criteria
+and guard placement below, including R4 and the linked design's guard wording.
+
+- Add `queue_only: bool` to the Verifier struct. It is server-derived at
+  registration and cannot be set or overridden by users.
+- At registration, set it to `true` if the Verifier contains a `pull_request`
+  extraction step, a `publish` step, deferred inputs, or a referenced registered
+  Agent declaring `publish`; otherwise set it to `false`. Inspect the referenced
+  Agent during registration, not during warm-cache direct execution.
+- During direct verification, check `queue_only` only on the first registry
+  load, before cache insertion, and refuse a queue-only Verifier before execution.
+  Cache hits reuse the admitted cached entry without repeating the check or
+  scanning steps, tools or mounts. Do not add other inferred guard criteria.
+- Verify these registration conditions, including a referenced registered Agent
+  with `publish`, the ordinary `false` case, and inability to set or override
+  `queue_only` through user input. Also verify
+  cold-load refusal before any step, and warm-cache direct execution without
+  repeating eligibility work. Queue-only Verifiers must never execute directly.
+
 ## Outcome and agreement
 
 Direct verification again runs through the shared engine without resumable

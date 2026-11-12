@@ -288,9 +288,11 @@ A crash after reservation, an ambiguous Scribe ACK or a failed queue commit
 leaves the reserved rows not yet due and the delivery unanswered or non-2xx.
 GitHub never redelivers on its own, so every replica scans the App delivery
 log each minute and requests a redelivery for each delivery without a 2xx
-attempt, at most three per delivery. The redelivery re-stages the reserved
-rows with their stored pins and identical Scribe batch identity and makes
-them due; it never resamples policy, so no binding runs twice. After the
+attempt until three redeliveries are logged; replicas scanning at once may
+each ask. While the source is unchanged and not deactivated, the redelivery
+re-stages the reserved rows with their stored pins and identical Scribe batch
+identity and makes them due without resampling policy, so no binding runs
+twice; otherwise it admits the current source under the selected policy. After the
 bound is exhausted, an operator redelivers from the App's delivery log, or the
 next pull-request event admits the current source. Disconnect, suspension and
 repository removal cancel the affected unfinished executions with

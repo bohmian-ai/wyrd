@@ -2224,8 +2224,11 @@ logged.
 
 For `pull_request`, the server admits from a signature-verified GitHub
 `pull_request` delivery for a connected, selected repository. Opened,
-reopened, ready-for-review, synchronize and base-changing edits are observed;
-other edits, and every event while the pull request is a draft, are not. The
+reopened, ready-for-review, synchronize and base-changing edits are observed
+and can admit; converted-to-draft and closed are observed and deactivate;
+other edits, and every admitting event while the pull request is a draft, are
+not. A binding activates on pull requests through an inline or a referenced
+`pull_request` Trigger alike. The
 server takes a PostgreSQL observation time, then reads the pull request's
 current state from GitHub; the delivered payload never decides the source.
 Under a per-pull-request lock, an observation older than the newest accepted
@@ -2246,10 +2249,12 @@ due only when the outbox commits them. A delivery is answered 2xx only after
 every execution of its generation is due, or after durable obsolete or
 refusal settlement establishes that no work is owed; a refusal settles as an
 `errored` execution, and an unavailable authority store answers non-2xx. A
-redelivery of an accepted generation re-stages the stored pins, never a newer
-policy. GitHub does not redeliver failed deliveries on its own, so the GitHub
+redelivery of an accepted generation that is still current and not
+deactivated re-stages the stored pins, never a newer policy; otherwise it
+admits the current source under the selected policy. GitHub does not redeliver failed deliveries on its own, so the GitHub
 owner scans the App's delivery log and asks GitHub to redeliver each delivery
-without a 2xx attempt, a bounded number of times.
+without a 2xx attempt until a bounded number of redeliveries is logged;
+replicas scanning at once may each ask.
 
 Other external pushes are deliberately not an activation.
 

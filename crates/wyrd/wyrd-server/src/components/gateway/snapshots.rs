@@ -25,7 +25,8 @@
 //!
 //! At most [`CACHE_TENANTS`] tenants' snapshots are retained, evicting the
 //! least recently used, and at most as many tenants wait for a reload,
-//! because every Wyrd-owned buffer is bounded.
+//! because every Wyrd-owned buffer is bounded. A tenant whose reload the full
+//! queue cannot hold stops serving until a later cache miss queues it.
 
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
@@ -75,10 +76,14 @@ impl Default for Entries {
 }
 
 impl Entries {
-    /// Queues `tenant` for reload unless the queue is full.
+    /// Queues `tenant` for reload, or forgets its snapshot when the full
+    /// queue cannot hold it, so a cached policy never outlives its owed
+    /// reload; a forgotten tenant is queued again by its next cache miss.
     fn queue(&mut self, tenant: DataTenantId) {
-        if self.reloads.len() < CACHE_TENANTS.get() {
+        if self.reloads.len() < CACHE_TENANTS.get() || self.reloads.contains(&tenant) {
             self.reloads.insert(tenant);
+        } else {
+            self.snapshots.pop(&tenant);
         }
     }
 }
@@ -442,6 +447,48 @@ mod tests {
         let recovered = cache.fill_generation().expect("listening");
         assert_eq!(cache.install(a, recovered, Ok(snapshot())).ok(), Some(true));
         assert!(cache.cached(a).is_some(), "recovery serves again");
+    }
+
+    /// A reload the full queue cannot hold stops its tenant serving, whether
+    /// a fenced install or an invalidation owes it, so no obsolete policy
+    /// outlives its lost reload; the tenant recovers through an ordinary
+    /// cache miss once the queue drains, and a healthy tenant keeps serving.
+    ///
+    /// # Panics
+    /// Panics when a tenant keeps serving with no queued reload, the queue
+    /// exceeds its bound, the healthy tenant stops serving, or the tenant
+    /// does not recover without another edit.
+    #[tokio::test]
+    async fn reloads_the_full_queue_cannot_hold_stop_serving() {
+        let cache = GatewaySnapshots::default();
+        cache.reset(true);
+        let (a, b, healthy) = (
+            DataTenantId::new_v7(),
+            DataTenantId::new_v7(),
+            DataTenantId::new_v7(),
+        );
+        for tenant in [a, b, healthy] {
+            cache.insert(tenant, cache.fill_generation(), snapshot());
+        }
+        cache.invalidate(&a.as_uuid().to_string());
+        assert_eq!(cache.reloads().await, vec![a], "a's load is in flight");
+        let started = cache.fill_generation().expect("listening");
+        for _ in 0..CACHE_TENANTS.get() {
+            cache.invalidate(&DataTenantId::new_v7().as_uuid().to_string());
+        }
+
+        assert_eq!(cache.install(a, started, Ok(snapshot())).ok(), Some(false));
+        assert!(cache.cached(a).is_none(), "a fenced reload is not lost");
+        cache.invalidate(&b.as_uuid().to_string());
+        assert!(cache.cached(b).is_none(), "an invalidation is not lost");
+        assert!(cache.cached(healthy).is_some(), "healthy keeps serving");
+        assert_eq!(cache.reloads().await.len(), CACHE_TENANTS.get());
+
+        assert!(cache.admitted(a).is_none(), "a miss queues a again");
+        assert_eq!(cache.reloads().await, vec![a]);
+        let retry = cache.fill_generation().expect("listening");
+        assert_eq!(cache.install(a, retry, Ok(snapshot())).ok(), Some(true));
+        assert!(cache.cached(a).is_some(), "a recovers to current policy");
     }
 
     /// The cache retains at most [`CACHE_TENANTS`] tenants, evicting the

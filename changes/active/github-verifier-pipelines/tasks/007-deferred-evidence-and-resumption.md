@@ -5,7 +5,7 @@ approved_spec_revision: 5
 requirements: [REQ-008, REQ-009, REQ-011, REQ-016]
 acceptance: [AC-005, AC-006, AC-007, AC-011]
 invariants: [INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007]
-depends_on: [TASK-001, TASK-003, TASK-006]
+depends_on: [TASK-001, TASK-003, TASK-006, TASK-010]
 ---
 
 # Accept deferred evidence and resume the same execution
@@ -15,6 +15,8 @@ subscription lifecycle / No new PostgreSQL tables** and
 **approved-runtime-and-github.md → Durable waits and resumption**. Use
 **contracts.md → Deferred input publication / Errors, inspection and delivery**.
 This is ordinary typed input dependency, not a Trigger, wait action or broker.
+It requires task 010's memory execution runtime (spec revision 7 REQ-017), which
+supersedes any engine ACK-before-progress wording in the design supplements.
 
 ## Input and subscription source
 
@@ -70,9 +72,11 @@ source evidence matches another eligible policy subscriber.
 Extend `vala-verify`'s existing logical execution state and `server/verification/
 state.rs::RunState` with nonterminal blocked dependencies and accepted facts.
 The sole execution state owner consumes them; do not introduce a second writer
-racing running branches. When no branch is active/runnable, ACK the canonical
-pending checkpoint **before** retiring current queue delivery and releasing
-runner capacity, renewable lease, workspace/Python/model invocation resources.
+racing running branches. When no branch is active/runnable, release execution,
+workspace, Python and model resources immediately. Bounded background custody
+keeps the claim permit and renewing lease, persists the parked state and waits
+for its ACK **before** retiring current queue delivery; no compute permit is held
+over that ACK. A crash before the ACK can repeat unpersisted work under REQ-017.
 Use existing runner/SQL waiting/readiness coordination, not a sleeping block or
 continuous polling execution. Every true continuation has stable internal delivery
 identity so retry reacquires queued capacity for the same execution and does not
@@ -109,7 +113,8 @@ type and different exact policy pins for the same source. Assert typed receipts,
 explicit unmatched/no retained replay, exact content and no terminal reopening.
 
 **AC-006 (deferred portion):** With an independent branch, park only consumers;
-when all block observe released task 001 resources/lease, publish and resume the
+when all block observe released task 001 compute resources while the parked ACK
+is held, then the retired delivery/lease after ACK; publish and resume the
 same ExecutionId with settled work/spend/retries/deadline unchanged. Supersede
 through task 006 or revoke while parked; old acceptance cannot release work.
 

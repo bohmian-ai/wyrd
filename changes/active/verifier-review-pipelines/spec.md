@@ -8,6 +8,15 @@ approved_github_amendment_revision: 24
 
 > **Deprecated for future work — 2026-11-09.** The user requested a fresh design of the remaining capabilities. Continue in [GitHub Verifier pipelines design](../github-verifier-pipelines/design/notes.md). This packet is retained as history; its prior approvals and evidence do not approve the replacement.
 
+> **Superseded by github-verifier-pipelines TASK-010.** Per-step SQL lease confirmation, outbox
+> reservation and Scribe ACK gates on engine progress, PostgreSQL pending terminal
+> delivery and unconditional preservation of unpersisted progress are superseded by
+> the [nonblocking execution correction](../github-verifier-pipelines/design/approved-nonblocking-execution.md)
+> (github-verifier-pipelines spec revision 7). Engine progress completes in live
+> memory; persistence is background work; a crash can lose unaccepted progress.
+> Exact accepted recovery and queued terminal ACK before queue settlement remain.
+> Marked claims below are historical and not newly verified.
+
 
 # Build review pipelines with Verifier primitives
 
@@ -35,7 +44,7 @@ Revision 21 records the explicitly approved terminal-settlement amendment in
 Every queued terminal path records canonical state, receives the existing
 Bifrost WAL/batch-commit ACK, then settles queue delivery. Cancellation stops
 computation immediately and preserves durable delivery responsibility in the
-existing queue. The active correction handoff is
+existing queue (queue-retained delivery: Superseded by github-verifier-pipelines TASK-010). The active correction handoff is
 [TASK-001-R5](review/task-001-r4-0d317ecdf-working/TASK-001-R5-single-terminal-settlement.md):
 revert the rejected R4 implementation and rebuild its single terminal workflow.
 [TASK-001-R4](review/task-001-r3-d89356985/TASK-001-R4-uniform-terminal-settlement.md)
@@ -125,7 +134,7 @@ the existing verification binding/result contracts without introducing a
 Repository Card. Every selected Verifier still executes through the same engine.
 
 Durable acknowledgement adds storage/database work to execution acceptance and
-step completion. GitHub App connections require credential rotation, repository
+step completion (Superseded by github-verifier-pipelines TASK-010; persistence is background work). GitHub App connections require credential rotation, repository
 reconciliation and an independently retryable publication lifecycle. These costs are required to make the execution promise real.
 
 Repository subjects extend public and persisted subject contracts. Git-backed
@@ -164,7 +173,8 @@ scheduling. It does not hold a competing recovery copy of invocation results,
 accepted publications or final-result selection.
 
 The existing Bifrost shared writer persists complete logical checkpoints at
-consequential boundaries and returns Scribe WAL acknowledgements. Bifrost's
+consequential boundaries and returns Scribe WAL acknowledgements (Superseded by github-verifier-pipelines TASK-010:
+revisions are coalesced in background and no boundary waits for them). Bifrost's
 existing read and acceptance owners must be extended for authoritative exact
 checkpoint loading, current-writer acceptance and rejection that survives WAL
 replay. Recovery waits/fails when required state is unavailable; it never
@@ -175,7 +185,7 @@ Concurrent steps retain their existing execution concurrency. Checkpoint IO
 must not hold an execution's memory lock: independent steps can record progress
 while an earlier checkpoint awaits acceptance. Independent changes may share
 one complete checkpoint, with each consequential boundary waiting until an
-accepted snapshot covers its own change. A checkpoint revision identifies that
+accepted snapshot covers its own change (wait Superseded by github-verifier-pipelines TASK-010). A checkpoint revision identifies that
 snapshot, not each memory mutation. This clarifies revision 18's existing
 batching and engine-ownership contract; it changes neither durability barriers
 nor the persisted state format.
@@ -386,7 +396,8 @@ producer provenance. Metadata grants no file access; generated opinions are not
 original-source citations. Agents can read attached workspaces without any
 Prompt input bindings. No live subscription or follow/read tool is introduced.
 
-**REQ-012 — Commit before release.** Commit each action output independently,
+**REQ-012 — Commit before release.** (Superseded by github-verifier-pipelines TASK-010: consumers
+are released from live state; only persisted settlements are recoverable.) Commit each action output independently,
 including fanout siblings and sequential iterations, before releasing its consumers. Persist bytes and
 completed inventory before the fenced checkpoint references them. Action and
 requirement settlements are individually recoverable; recovery after an action
@@ -401,7 +412,8 @@ with matching-key replay and conflicting-key refusal. Execution checkpoints and
 selected terminal outcomes are durably accepted by Bifrost through the existing
 shared writer under the approved state contract. Direct and queued runs share
 that execution path. Final success requires selected state and referenced result
-records; process-memory staging is insufficient. Preserve cancellation-fence
+records; process-memory staging is insufficient (for engine progress, Superseded by github-verifier-pipelines TASK-010; queued
+settlement still follows the terminal ACK). Preserve cancellation-fence
 acknowledgement and non-blocking audit; no active-to-retained transfer or new
 cleanup mechanism is introduced.
 
@@ -983,7 +995,7 @@ visible. A later workspace edit cannot alter an accepted snapshot.
 **REQ-047 — Recoverable publication acknowledgements.** `publish` accepts a logical
 `name` and exactly one of workspace `path` or JSON `value`. Acknowledge only
 completed immutable bytes plus a fenced durable manifest/checkpoint and
-replayable Bifrost projection intent. Same-call retries return the same receipt;
+replayable Bifrost projection intent (checkpoint ACK Superseded by github-verifier-pipelines TASK-010; receipts follow live acceptance). Same-call retries return the same receipt;
 a different call reusing a committed name in the same invocation attempt refuses.
 The uniqueness scope includes execution, step, item, iteration, attempt and name.
 A fresh Agent retry can publish the same name in its separate attempt; earlier

@@ -7,6 +7,11 @@ recommendations. Waiting must not consume active
 worker capacity. Exact authoring/wire and durable-transition contracts remain
 to specify; implementation is not implied by this approval.
 
+Precedence: the later [nonblocking execution correction](approved-nonblocking-execution.md)
+(spec revision 7, task 010) supersedes every engine ACK-before-progress or
+checkpoint-before-compute-release prerequisite below. Engine transitions complete
+in live memory; persistence, ACK waits and queue retirement are background custody.
+
 ## Direct and queued capacity
 
 - Direct and queued verification have separate execution/admission capacity.
@@ -136,9 +141,12 @@ No new PostgreSQL tables are allowed.
   parking. Resume the same execution, not a replacement; do not replay settled
   predecessors or replenish spent budgets/retries.
 - A blocked branch holds no active block capacity. Independent ready branches
-  continue. Once none are active/runnable, persist and ACK the parked checkpoint,
-  retire the current queue delivery and release its runner permit and renewing
-  execution lease. Release invocation-owned workspace/Python/provider resources.
+  continue. Once none are active/runnable, release invocation-owned execution,
+  workspace, Python and provider resources immediately. Bounded background custody
+  then persists the parked state, waits for its ACK, retires the current queue
+  delivery and releases the claim permit and renewing lease. A crash before that
+  ACK can repeat unpersisted work. (Superseded wording: "persist and ACK the parked
+  checkpoint" before releasing resources.)
 - Ordinary in-flight tool/model IO remains bounded active work. Resource release
   is not a rule to drop permits on every language-level await.
 - Accepted deferred evidence or human decision stages continuation through

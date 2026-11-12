@@ -35,16 +35,17 @@ acquisition/comparison/index/context and remains standalone.
 | [002](002-github-app-connection.md) | Verified tenant installation/selected repository access, installation-token capability and revocation fence for 003/004/006/009 |
 | [003](003-repository-declaration.md) | **Complete.** Ready exact Repository receipt, selected policy/bindings and activation lifecycle for 006/007 |
 | [004](004-pinned-pr-preparation.md) | **Complete.** Reviewed pinned/baseline-aware ReviewPipeline revision, ObjectStorage adapter and PostgreSQL SnapshotStore/ContextStore metadata tables/adapters for 005 |
-| [005](005-pull-request-extraction.md) | Accepted typed extraction and retained exact source/context for ordinary reviewers and 009 rendering |
+| [005](005-pull-request-extraction.md) | **Requires 010.** Validated live typed extraction for ordinary reviewers; accepted revisions retain exact source/context for recovery and 009 rendering |
 | [006](006-pr-admission-and-supersession.md) | **Historical PASS; acceptance reopened pending 010.** Durable queued ExecutionIds with frozen policy/source/generation and cancellation fences for 005/007/008/009 |
-| [007](007-deferred-evidence-and-resumption.md) | Durable source-matched evidence, waiting inspection and same-execution park/continuation lifecycle for 008/009 |
-| [008](008-approval-steps.md) | Exact pending approval identities, accepted decisions and continuation/progress for 009 |
-| [009](009-reports-and-github-delivery.md) | Optional standard report/helper authoring and recoverable Checks/comments with independent delivery inspection |
+| [007](007-deferred-evidence-and-resumption.md) | **Requires 010.** Durable source-matched evidence, waiting inspection and same-execution park/continuation lifecycle (compute released at park; background ACK before retirement) for 008/009 |
+| [008](008-approval-steps.md) | **Requires 010.** Exact pending approval identities, accepted decisions and continuation/progress for 009 |
+| [009](009-reports-and-github-delivery.md) | **Requires 010.** Optional standard report/helper authoring and recoverable Checks/comments with independent provider retry that never recomputes verification; no new SQL delivery fields |
 | [010](010-nonblocking-verification-execution.md) | **Proposed; blocks renewed 006 acceptance and 005/007–009.** Approved runtime spec revision 7; shared memory-owned engine, preserved preparation, bounded background terminal retention/lease/group-commit settlement, claim backpressure and resource-scaling proof; keeps Bifrost unchanged and PR/GitHub/Task 004 metadata |
 
 Task 010 targets approved runtime spec revision 7 and must be completed before
-renewed 006 acceptance or 005/007–009 execution. Their older runtime assumptions need
-alignment as listed in 010; existing task metadata does not waive this prerequisite.
+renewed 006 acceptance or 005/007–009 execution. Tasks 005 and 007–009 list 010 in
+`depends_on` and carry the corrected runtime handoffs: live extraction, background
+park/ACK custody and independent provider retry.
 
 Numbering preserves the original nine behavioral pieces, not a linear execution
 order. The original sequence was 001/002, then 003/004, then 006, then 005/007,
@@ -73,13 +74,13 @@ listed in task metadata; their strongest crash/authority proof is identified her
 | REQ-006–007; AC-004 | 004 public pipeline full/active pinned comparisons→005 actual admitted extraction→same Prompt/workspace values and retained source after recovery/cache expiry |
 | REQ-008–009; AC-005 | 007: active binding subscription→real upload/publication→existing/new subscriber scenarios, source/type/auth matching and exact replay/conflict |
 | REQ-010–011; AC-006 | 007 independent work/all blocked→resource-free park→evidence continuation; 008 actual pending occurrence→authorized/rejected/expired decision→same execution |
-| REQ-009–011; AC-007 | 007 evidence/checkpoint/queue ACK crash boundaries; 008 decision ACK boundaries, exact recovery/unavailability and no settled computation replay |
+| REQ-009–011; AC-007 | 007 evidence ACK and background parked-checkpoint/queue ACK crash boundaries; 008 decision ACK boundaries, exact recovery/unavailability and no settled computation replay |
 | REQ-012–013; AC-008 | 009: retained successful outputs→zero/one/multiple/invalid report→pinned Check/comment/suggestion independent of authored verdict |
 | REQ-005,014; AC-009 | 009: provider remote success/timeout/batching/restart/new head/access loss→readback/reconciled independent delivery without recomputation |
 | REQ-015; AC-010 | 001 queued saturation→reserved direct execution; 005/007/008 direct queued-only refusal before any step; 006 supplies burst ingress |
 | REQ-016; AC-011 | 002/003/005/006/007/008/009 ship their own typed operations, scopes/errors/inspection/docs and journeys; 009 connects the complete reader journey |
 | INV-001 | 002 association, 003 identity, 006 accepted authority, 007 source/type/tenant evidence matching, 008 exact approval permission and 009 per-write access |
-| INV-002–004 | 003 readiness selection; 006 canonical input ACK→queue commit; 007/008 evidence/decision/pending ACK→continuation recovery; 009 retained progress→owed provider delivery |
+| INV-002–004 | 003 readiness selection; 006 canonical input ACK→queue commit; 007/008 evidence/decision/pending ACK→continuation recovery; 009 retained progress→independent provider delivery |
 | INV-005 | 005 frozen source/baseline/context and 007/008 same-execution accepted state/budget/deadline recovery |
 | INV-006 | 006 source generation and cancellation fence→007/008 no stale release→009 no obsolete current delivery |
 | INV-007 | All nine reuse the specified owners; only 002 adds wyrd.github_installations and preserves OIDC trust; 002 redacts secrets, 003 keeps keys out of Cards/TOML, 004 preserves library independence |

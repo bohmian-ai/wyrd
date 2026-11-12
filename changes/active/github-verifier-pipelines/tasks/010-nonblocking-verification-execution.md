@@ -78,10 +78,15 @@ notification and locking mechanics are implementation-owned, with contention
 and memory proof required below.
 
 `components/verification/service.rs` returns the live direct result without
-result-slot gating or terminal durability waits. Preserve RS ordinary enqueue's
-bounded staging response rather than the added admission waiter. Preserve PR
-webhook durable acceptance/deduplication/generation checks; it is a control flow,
-not engine progress. Full request staging may refuse work before execution starts.
+result-slot gating or terminal durability waits. Preserve ordinary enqueue's
+existing durable admission contract and `AdmissionReply`: answer 202 only after
+the execution row commits, replay the original execution for an identical
+Idempotency-Key/request, return 409 for conflicting content and 503 when admission
+is lost. This request waits for job acceptance, not verification computation;
+do not remove it to eliminate engine persistence waits. Preserve the corresponding
+docs, SDK contracts and admission journeys. PR webhook durable acceptance,
+deduplication and generation checks also remain. Both are admission control flows;
+bounded staging may refuse requests before execution starts.
 
 ### Background lease and bounded queued completion
 
@@ -284,7 +289,7 @@ before RED. No new benchmark framework, SQL-call production hook or test binary.
 
 | Proof | Trigger → required observation |
 |---|---|
-| O1 — direct result/details (REQ-017, AC-012; REQ-016, INV-002,004) | Existing HTTP WAL-full/missing-details test remains unchanged: compact passing result returns despite unavailable retained details; existing after-drain comparison still holds. Preserve user-visible result/detail split and ordinary cold preparation behavior. |
+| O1 — direct result/details (REQ-017, AC-012; REQ-016, INV-002,004) | Existing HTTP WAL-full/missing-details test remains unchanged: compact passing result returns despite unavailable retained details; existing after-drain comparison still holds. Preserve user-visible result/detail split and ordinary cold preparation behavior. Keep existing enqueue admission journeys proving committed 202, original-ID replay, conflicting-key 409 and lost-admission 503; no staged-only 202. |
 | O2 — shared memory engine (REQ-017, AC-012; REQ-015–016, INV-005–006) | Unit tests hold persistence ACKs across begin/settle/control/publication replay/terminal selection: operations complete from memory. Real direct and queued SDK journeys hold model transport, fill outbox, release provider response: dependent executes and result is selected with computation-owned workspace/Python/model resources released before drain; queued claim permits remain held for background persistence/settlement, while direct execution admission is released with its response. Inspect/measure that no outbox staging or whole-state encoding occurs on engine transitions. |
 | O3 — background lease/group commit (REQ-017, AC-012; REQ-004,015, INV-001,005–006) | Hold background renewal/completion replies while prepared executions run: no engine SQL attempts, local-token cancellation still stops further dispatch. Use existing tracing/instrumentation or a narrowly scoped test-only counter to distinguish preparation/background SQL from execution; do not require zero SQL across the entire cold direct request or across Agent Bifrost tool internals. Concurrent completions/renewals use tenant batches, promptly release connections, and do not fall back to one transaction per row under group failure. |
 | O4 — bounded terminal custody (REQ-017, AC-012; REQ-015, INV-002,004–005, AC-010) | With real SQL/Scribe seams, block persistence, complete queued work, and fill tracking including already-running claims: finished results remain retained, computation-owned resources are free and existing ClaimLoop permits remain held, bounding running plus completing claims without another tracker; per-run/outbox byte limits hold, exhausting claim permits pauses new claims, and direct work still succeeds. Restore persistence: the same results are retained, then token-fenced queue completion commits in batches. No engine recomputation and no terminal-on-shed completion. Exercise the existing recording-error path and verify permanent rejection does not create endless retries or leak tracking. |

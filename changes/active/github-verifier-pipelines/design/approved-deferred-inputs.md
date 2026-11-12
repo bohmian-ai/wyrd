@@ -44,8 +44,14 @@ inputs:
   wait actions. Approval and deferred inputs reuse park/resume behavior.
 
 This supersedes the initial scope of three generic durable wait modes. Previously
-approved budget/deadline preservation, checkpoint-before-release, queue-based
-resumption, independent branches and human approval security still apply.
+approved budget/deadline preservation, queue-based resumption, independent
+branches and human approval security still apply. The earlier
+checkpoint-before-release rule is superseded by the
+[nonblocking execution correction](approved-nonblocking-execution.md) (spec
+revision 7, task 010): a fully blocked execution releases compute immediately and
+bounded background custody persists the parked checkpoint before retiring its
+queue delivery. Positive evidence and approval receipts still follow durable
+acceptance.
 The earlier rule rejecting early external wait signals does not prohibit supplying
 a declared deferred slot before its consumer starts.
 
@@ -140,8 +146,9 @@ This is an explicit user constraint, not merely a preference.
 
 Extend these owners for deferred-input acceptance, approval, park/resume and
 GitHub delivery tracking. No additional outbox, event bus or payload store.
-Existing terminal delivery records outcomes in Bifrost; GitHub publishing needs
-provider integration and recoverable progress, not a replacement result path.
+Accepted terminal evidence records outcomes in Bifrost; GitHub publishing needs
+provider integration and recoverable progress, not a replacement result path or
+new SQL delivery fields.
 Exact extensions and restart-safe handoffs remain to specify and verify.
 
 ## Approval and deadlines

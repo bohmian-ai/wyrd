@@ -5,7 +5,7 @@ approved_spec_revision: 5
 requirements: [REQ-010, REQ-011, REQ-016]
 acceptance: [AC-006, AC-007, AC-011]
 invariants: [INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007]
-depends_on: [TASK-007]
+depends_on: [TASK-007, TASK-010]
 ---
 
 # Accept approval decisions for exact pending occurrences
@@ -14,6 +14,7 @@ Carry **approved-deferred-inputs.md → Approval and deadlines** and
 **approved-runtime-and-github.md → Durable waits and resumption** through task
 007's canonical state/park/continuation owners. **contracts.md → Human approval**
 is approved; the earlier recent-login/five-minute proof restriction is superseded.
+It requires task 010's memory execution runtime (spec revision 7 REQ-017).
 
 ## Input → pending occurrence
 
@@ -27,10 +28,11 @@ When the action becomes pending, the sole state owner creates a server-issued
 approval_id for its logical step/item/iteration occurrence, distinct across
 repeat/fanout. Attempts do not silently mint another occurrence. Set expiry once
 using database coordination time, capped by the original execution deadline.
-Persist pending identity/message/expiry in canonical Bifrost checkpoint state
-before returning it in inspection or parking. Independent branches continue;
-when all block, use task 007's checkpoint-ACK-before-retirement/resource-release
-path, not another wait service or deadline loop.
+The pending identity/message/expiry enters live state; inspection and decision
+acceptance resolve it only from accepted Bifrost state. Independent branches
+continue; when all block, use task 007's background park handoff (compute
+released immediately, parked state ACKed before delivery retirement), not another
+wait service or deadline loop.
 
 ## Decision acceptance and same-execution continuation
 

@@ -35,6 +35,24 @@ content, reference selection, permissions, and resource limits remain in scope
 under their existing contracts. This supplement changes where execution state
 is owned and recovered, not those contracts.
 
+## Superseded by github-verifier-pipelines TASK-010
+
+The [nonblocking execution correction](../github-verifier-pipelines/design/approved-nonblocking-execution.md),
+approved as github-verifier-pipelines spec revision 7, governs where it conflicts
+with this supplement. The claims below are historical; they are not newly verified.
+
+| Historical claim | Current rule |
+| --- | --- |
+| Per-boundary ACK before invocation start, dependent release, publication receipt and terminal return (DUR-004, *How an update is recorded*) | Engine transitions validate and mutate live `RunState` and return at once. A background flush coalesces dirty state into the next revision through the existing Scribe outbox. |
+| Queued writes reserve capacity; no checkpoint is shed | Queued revisions wait for a reserved slot in background and retry until accepted or the lease is lost. Direct revisions are best effort and shed with existing loss accounting; a failed direct revision stops further direct persistence. |
+| Lease confirmation precedes freezing each revision (*Implemented ordering*) | No inline lease confirmation. The background lease owner sets a local lost/cancel token through renewal and the `wyrd_verification_cancelled` listener; the engine checks that token and its deadline. Revision batch identity and first-fenced-wins are unchanged. |
+| PostgreSQL retains pending terminal delivery (revision 3) | No owed-delivery fields or queue operations. The runner keeps its claim permit and lease renewal until Scribe acknowledges the terminal revision and result rows, then completes through token-fenced batched completion. |
+| Settled progress is never lost | A crash loses live and unaccepted progress, including terminal state. Queued redelivery recovers the exact accepted revision with the original deadline and may repeat later work; direct never resumes. |
+
+Still in force: exact accepted recovery, authoritative versus unavailable loading,
+revision identities and conflicts, publication naming and receipt replay, and
+queued terminal ACK before queue settlement.
+
 ## Scope and limits
 
 The principal subject is everything inside **execute verification**. Entry
@@ -170,6 +188,9 @@ checkpoints are required at the boundaries below, not for every memory
 mutation. Physical encoding remains implementation-owned within that contract;
 no separate checkpoint table is selected.
 
+The boundary table below is superseded by github-verifier-pipelines TASK-010; none of these
+boundaries waits for an ACK.
+
 | Boundary | Progress that must be acknowledged before continuing |
 | --- | --- |
 | Starting an external invocation | Its identity and started attempt, so an ambiguous call consumes the correct budget. |
@@ -239,6 +260,10 @@ output and result without waiting for their acknowledgement, while its
 progress and publication boundaries keep theirs.
 
 ### Approved terminal settlement — revision 3
+
+ACK before queue settlement still holds. PostgreSQL pending-delivery custody,
+cancellation-retained delivery and the TASK-007 checkpoint-before-release order
+are superseded by github-verifier-pipelines TASK-010.
 
 Every queued terminal path uses this order: select the terminal decision and
 stop computation; record the complete canonical terminal state and required
@@ -371,7 +396,7 @@ is accepted first, A's checkpoint is rejected. Cancellation, lease validity
 and the original execution deadline remain enforced; a stale or expired
 worker cannot gain acceptance merely because a replacement has not yet run.
 
-Implemented ordering: B's takeover is its PostgreSQL claim, and A's writes stop
+Implemented ordering (lease confirmation superseded by github-verifier-pipelines TASK-010): B's takeover is its PostgreSQL claim, and A's writes stop
 at their next lease confirmation, which precedes freezing each revision. A
 revision is accepted by its Scribe batch fence, whose identity derives from the
 execution and revision, so of A's and B's writes of one revision only the first
@@ -413,6 +438,9 @@ stateless Agent calls existing publish tool
   -> existing shared writer persists the acceptance
   -> after acknowledgement the Agent receives the existing receipt
 ```
+
+The receipt ACK wait is superseded by github-verifier-pipelines TASK-010: the receipt returns once
+accepted in live state; only persisted publications are recoverable.
 
 The Agent holds no verification state. The publication tool does not become a
 state owner or recovery service. File bytes use the same non-Card File
@@ -555,3 +583,4 @@ not implementation. Historical review reports retain their original verdicts.
 | 2 | approved | Records explicit user approval of decisions 1–5, including complete logical checkpoints, existing WAL acknowledgement, authoritative recovery reads, Bifrost stale-writer protection, unchanged publication semantics, and scheduled/group reuse. Implementation validation and packet reconciliation remain required. |
 
 | 3 | approved | User explicitly approves uniform queued terminal settlement: canonical Bifrost record and batch-commit ACK before queue delivery retirement; immediate cancellation/revocation retains durable pending delivery in the existing queue. Direct fast return remains. TASK-007 applies the ordering to suspended queue deliveries when implemented. |
+| 3 (note) | approved | Per-step ACK gates, PostgreSQL pending-delivery custody and inline lease confirmation marked superseded by github-verifier-pipelines TASK-010; no new approval or verification is claimed. |

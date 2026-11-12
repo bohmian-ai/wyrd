@@ -12,6 +12,8 @@ depends_on: [TASK-001, TASK-002, TASK-003]
 
 Completed following the [PASS verdict](../review/006-pr-admission-r2/verdict.md) for `fb8da5ad7e87f784cde39513cb8605dba8bbf1a2`. FIND-006-1 through FIND-006-7 are closed.
 
+That PASS is historical. Maintainer acceptance is reopened until task 010's runtime correction is verified; the evidence below is retained unchanged.
+
 Implement **approved-runtime-and-github.md → Webhook ingress** and
 **approved-code-review-support.md → Successive commits and pipeline ownership**.
 Use **bursts-and-successive-commits.md** for the fair-queue/burst rationale,

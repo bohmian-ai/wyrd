@@ -293,3 +293,12 @@ listener rather than deleting and rebuilding them. Claim permits bound running
 plus completing work; per-run/outbox byte limits remain. No second tracker,
 semaphore, completion manager or public behavior change is selected. Task 010 and
 the runtime supplement now use this interpretation; spec revision 7 is unchanged.
+
+### Enqueue admission clarification
+
+Keep the existing durable enqueue acceptance contract: 202 after queue commit,
+original-ID replay for the same key/request, 409 for conflicting content and 503
+for lost admission. AdmissionReply waits for job acceptance, not engine execution.
+The previous task instruction to restore staged-only enqueue was an incorrect
+extension of the execution optimization and is removed. Preserve the existing
+admission documentation and SDK journeys. No production behavior is changed here.

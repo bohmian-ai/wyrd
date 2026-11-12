@@ -265,7 +265,7 @@ credential.
   validate its tenant, producer, path, digest and length through existing storage
   owners. Do not rediscover by global digest or accept a caller storage path.
   Local publication bytes remain under verifier authorization, never the
-  cards:read blob route. Preserve File completion/inventory acknowledgement,
+  cards:read blob route. Preserve external File completion/inventory acknowledgement,
   original evidence retention and independent delivery/replay authority. There
   is no active-Postgres descriptor custody or later reference transfer. Required
   unavailable state is not absence and cannot authorize duplicate execution.
@@ -278,11 +278,10 @@ credential.
   plane instead revalidates current state on every request. Revoking a
   principal also cancels, in the same commit, every unfinished Verifier
   execution it submitted or accepted, so queued work never outlives the
-  authority it was accepted under. That control commit preserves durable pending
-  terminal delivery in the existing queue. Server-owned delivery can record the
-  cancellation under existing internal permissions after revocation, without
-  restoring the principal's execution authority. Only Bifrost WAL/batch-commit
-  ACK permits retiring that delivery; revocation itself never waits for Bifrost.
+  authority it was accepted under. A running claim observes that cancellation
+  through its lease-renewal listener, stops further engine work and settles
+  nothing after losing its claim; previously issued IO can still finish.
+  Revocation itself never waits for Bifrost.
 - Bearer access tokens remain replayable until expiry. TLS, short lifetime,
   token-family replay detection, least privilege, and audit are the required
   replay controls. Logs and traces never record bearer material.

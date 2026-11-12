@@ -470,15 +470,14 @@ typed columns:
   - Verification execution checkpoints extend the existing canonical verification
     data with complete versioned logical state. The engine owns the live object;
     PostgreSQL queue rows coordinate work, not a duplicate checkpoint/result
-    payload store or general event projection backlog. The existing queue also
-    retains durable pending terminal delivery: the minimal sanitized terminal
-    decision and stable delivery identity remain retryable until canonical
-    Bifrost records receive WAL/batch-commit ACK. Only then may the queue retire
-    delivery. This narrow responsibility covers every queued terminal producer;
-    it introduces no execution-head table, separate finalizer or second writer.
-    Existing inputs/results/outputs retain their meanings.
-  - The existing shared Scribe outbox provides bounded batching, stable retry
-    identities and WAL acknowledgement at consequential execution boundaries.
+    payload store, owed-delivery record or general event projection backlog. A
+    queued claim settles only after Scribe acknowledges the revision holding its
+    terminal decision and its result rows; the runner retains that terminal state
+    in memory until then. There is no execution-head table, separate finalizer or
+    second writer. Existing inputs/results/outputs retain their meanings.
+  - The existing shared Scribe outbox provides bounded batching and stable retry
+    identities for revisions flushed in background; engine transitions never wait
+    for its acknowledgement.
     Exact completed File descriptors stay with accepted publications from the
     start; no terminal archive handoff or PostgreSQL descriptor transfer exists.
   - Internal execution recovery reads obtain the accepted checkpoint position
@@ -496,10 +495,12 @@ typed columns:
     Each revision's batch identity derives from its execution and revision, so
     its Scribe batch fence accepts exactly one write of it; recovery reads the
     fenced prefix. No PostgreSQL execution-head table exists. A revision the old
-    writer froze under its confirmed lease just before takeover may still be
-    accepted first and is then inherited; that rare interval is accepted.
-  - File completion, exact path/digest/length validation, inventory acknowledgement
-    and existing storage/session retention remain unchanged. No inventory
+    owner froze just before takeover may still be accepted first and is then
+    inherited; that rare interval is accepted.
+  - External File completion, exact path/digest/length validation, inventory
+    acknowledgement and existing storage/session retention remain unchanged.
+    Server-produced publication files keep validation and exact descriptors; their
+    inventory records persist in background without an engine wait. No inventory
     rediscovery, remote-publication/Iceberg wait, extra writer or new collector.
   - Execution APIs keep recorded identity, current feature permissions, exact
     producer selection, page membership and complete errors without legacy

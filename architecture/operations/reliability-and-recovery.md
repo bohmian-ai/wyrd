@@ -248,37 +248,48 @@ direct-Iceberg relay is not a recovery mechanism.
 
 ## Verification execution state and recovery
 
-The verification engine owns one in-memory logical state and persists complete
-versioned checkpoints through the existing Bifrost shared writer and Scribe WAL
-acknowledgement. PostgreSQL owns queue admission, claims, lease renewal and retry
-scheduling, not a second invocation/publication recovery payload. Direct verify
-remains queue-free and uses the same engine state lifecycle; disconnect does not
-schedule background Agent work. Scheduled/group activation retains its existing
-queue path and retries preserve original windows and pinned inputs.
+Direct and queued verification run one engine on a live in-memory `RunState`.
+Engine transitions never wait for SQL, lease confirmation, outbox capacity or
+Scribe acknowledgement. A background flush per execution coalesces dirty state
+into the next revision, written as a `bifrost.verification.execution_events` row
+whose batch id derives from execution and revision; the first fenced write of a
+revision wins. Queued revisions wait in background for reserved outbox capacity
+and retry until accepted or the lease is lost. Direct revisions are best effort
+and shed with counted loss when the outbox is full. PostgreSQL owns queue
+admission, claims, lease renewal and retry scheduling, not a second
+invocation/publication recovery payload. Direct verify is queue-free and never
+resumes; disconnect does not schedule background Agent work. Scheduled/group
+activation retains its existing queue path and retries preserve original windows
+and pinned inputs.
 
-Recovery obtains the accepted checkpoint position and loads its exact compatible
-state. Authoritative absence permits fresh execution; required unavailable or
-incomplete state causes bounded wait/retry, never older/empty fallback. Ordinary
-analytical query success is not proof of complete recovery. A replacement worker
-shuts out the old writer before continuing; late or rejected checkpoints cannot
-advance accepted state, including after WAL replay, except a revision the old
-writer froze under its confirmed lease just before takeover, which may be
-accepted first and is then inherited. Lease renewal does not extend
-the original execution deadline. Checkpoint rejection is an operation failure,
-not a reason to crash healthy sibling capabilities.
+A crash loses live and unaccepted progress, including an unaccepted terminal
+decision. Queued redelivery loads the exact accepted revision (the fenced prefix)
+with the same execution ID, input, source, policy and original deadline, and may
+repeat later work, effects and spend. Authoritative absence permits fresh
+execution; unavailable or incomplete state defers preparation, never older/empty
+fallback, and an unsupported `ExecutionState` format defers with
+`execution_state_incompatible`. Ordinary analytical query success is not proof
+of complete recovery. A revision the old owner froze just before takeover may be
+accepted first and is then inherited. A refused revision breaks its writer; the
+engine's next transition fails into ordinary retry, not a crash of healthy
+sibling capabilities.
 
-Settled results, decisions, original budgets/deadlines, exact publication
-descriptors and final-result selection survive recovery. Interrupted external
-calls may repeat within remaining policy. A terminal retry resends required
-records with stable identities and returns the selected outcome without model
-reruns. Every queued terminal path retires queue delivery only after canonical
-Bifrost state and required result records receive WAL/batch-commit ACK. Immediate
-cancellation/revocation preserves durable pending delivery in the existing queue.
-A crash before staging, an ambiguous ACK or failed queue settlement leaves
-record-only recovery eligible; unavailable sources never justify dropping that
-responsibility. Computation deadlines and budgets are not replenished, and their
-expiry does not erase required terminal delivery. Existing writer batching and backpressure remain bounded; no separate
-writer, archive handoff, replica protocol or object-publication/Iceberg wait.
+The original deadline is admission time plus the runtime execution timeout,
+computed by PostgreSQL at claim; reclaim and lease renewal never extend it.
+Cancellation reaches a running claim through the lease-renewal `LISTEN` on
+`wyrd_verification_cancelled` and renewal ticks, which set its local token.
+
+When queued computation ends, its workspace, Python, model and block permits are
+released. The runner keeps its claim permit and lease renewal until Scribe
+acknowledges the revision holding the terminal decision and then the result rows,
+then completes through token-fenced batched completion; there is no
+acknowledgement timeout. While Scribe is unavailable, full claim capacity pauses
+new claims and the direct lane stays available. A recovered accepted terminal
+decision is delivered without recomputation. A dropped result acknowledgement
+retries with `result_undelivered` within the attempt budget. Lease loss or
+cancellation ends the old owner's waits and releases its claim permit. Existing
+writer batching and backpressure remain bounded; no separate writer, owed-delivery
+queue, archive handoff, replica protocol or object-publication/Iceberg wait.
 The WAL guarantee requires retained Scribe storage; permanent loss of unpublished
 WAL remains outside automatic recovery. Recovery may wait for its owner/volume.
 

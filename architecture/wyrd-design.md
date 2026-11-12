@@ -644,11 +644,14 @@ is a server-internal write holding no token, role, or grant; Scribe stamps
 each captured row with the verified pair the call ran under. Each `wyrd-server` process stages captures on its one
 Scribe outbox, which submits in-process when Scribe runs in the pod
 (`WYRD_TARGET`) and otherwise over the peer plane to a live, ready Scribe,
-retrying Scribe backpressure. A capturing call reserves its outbox slot during
+retrying Scribe backpressure. A standalone capturing call reserves its outbox slot during
 admission, before it is charged or dispatched; while the outbox is full,
 admission backs off and retries until the call's deadline, and then refuses the
 call with the retryable `WYRD_GATEWAY_429_CAPTURE_STAGING_FULL`. A reserved
-capture is never shed. Payload, storage, or deadline failures while the
+capture is never shed. A verification-originated call does not wait for a
+capture slot: its capture is staged unreserved and, when the outbox is full,
+shed and counted lost. Provider/model admission, quota accounting and per-call
+deadlines, including model response time, apply to both. Payload, storage, or deadline failures while the
 capture is projected drop it with a counted reason without changing the
 answered call. The same outbox submits Verifier results to the
 three result tables, attributed to the pair the result was produced under —
@@ -658,9 +661,8 @@ stamps as `sub_principal_id` and `act_principal_id`; each row names the verified
 exact Verifier Card as `verifier_card_uid`; a result batch is never dropped for time and is retried under its
 own batch id until Scribe acknowledges it. A queued run commits `completed`
 only after Scribe acknowledges every row of its selected result; a result
-Scribe drops retries the run from its committed checkpoints with
-`result_undelivered`, and one not acknowledged before the execution deadline
-times the run out. Gate refuses every public write to
+Scribe drops retries the run from its accepted state with
+`result_undelivered` within the attempt budget. Gate refuses every public write to
 `bifrost.gateway.calls` and the three result tables.
 Tenant principal kinds are `TenantAdmin`, `User`, and `Service`, plus the
 internal credentialless `System` actor. Agent is a Card kind, not a principal
@@ -1592,7 +1594,7 @@ and attempt) plus `content/<opaque invocation segment>/<name>`, so failed
 attempts' accepted partial work stays readable and distinct. Mounted content
 cites only its producer's original slots; a failed step's partial work and
 the manifest cite none. Direct and queued verification retain Agent publications
-and engine extraction through the same accepted run state and Bifrost checkpoint
+and engine extraction through the same live run state and background revision
 path; standalone code actions receive no publication tool.
 
 Requirement outcomes are `passed`, `failed`, `inconclusive`, or
@@ -1850,12 +1852,17 @@ bounds, the last ending `errored`. Per-file and aggregate limits
 (`WYRD_VERIFICATION_FILE_MAX_MIB`, `WYRD_VERIFICATION_FILES_MAX_MIB`) are
 enforced at planning. `ArtifactRef` selects a declared Artifact under its own
 authorization.
-Accepted publications additionally carry the exact descriptor returned by verified File
-completion: its exact association is retained in the accepted run state and its
-Bifrost checkpoint from acceptance onward. Hosted publication mounts and inspection/download/content
+Accepted publications additionally carry the exact descriptor of their stored
+object: its exact association is retained in the run state and its persisted
+revisions from acceptance onward. Hosted publication mounts and inspection/download/content
 use that association, not a new digest/size inventory lookup. Match descriptor tenant,
 digest and length to the selected manifest and preserve shared
-download/integrity/cleanup ownership and inventory ACK. This does not change ordinary
+download/integrity/cleanup ownership. A server-produced publication file is put
+through the storage owner's validated server-side object path (tenant path,
+digest and length checks, exact `StoredObjectRef`) without an external
+upload-session round trip; the engine does not wait for its inventory record,
+which the storage owner persists in background. External client uploads keep the
+completion contract above. This does not change ordinary
 input-File discovery or authorize caller-supplied storage paths.
 
 
@@ -1879,7 +1886,7 @@ The engine loads the executing Verifier's exact Agent and Prompt Cards under
 the same audited `verifier:run`, never `cards:read`; a referenced definition
 that is deleted, mismatched, or otherwise unreadable when its work starts ends
 the execution errored with `capability_unavailable` instead of judging the
-work, and its committed checkpoints stay readable.
+work, and its accepted state stays readable.
 Planning and every follow-up operation on a File upload (part URL, local
 transfer, completion, abort) stage bytes and select no Verifier, so they
 require only operation-level `verifier:run` admission: any `verifier:run`
@@ -1945,52 +1952,84 @@ baselines. Parsed Verifiers are cached per process by tenant and Card UID in
 a fixed 64 MiB least-recently-used cache that is never shared across tenants.
 A deleted Verifier terminates the execution `errored`.
 
-One shared verification engine executes the declarative graph. Both synchronous
-verify and queued execution load or initialize one in-memory logical run state.
-Bifrost is its durable recovery source; PostgreSQL coordinates queue admission,
-claims, lease renewal, cancellation and retry scheduling, not invocation results
-or publication acceptance. For every queued terminal path, the existing queue
-retains pending terminal delivery until Bifrost accepts the canonical decision
-and required result records through WAL/batch commit. Queue settlement follows
-that ACK. Cancellation/revocation immediately stops computation and retains
-minimal durable delivery coordination; restart retries only record delivery,
-never cancelled or already-terminal computation. No separate finalizer is added. Scheduled/group activation retains the same queue path.
+One shared verification engine executes the declarative graph. Direct verify
+and queued execution prepare one live in-memory `RunState` and run the same
+engine on it. Preparation (input validation, authorization, exact target
+resolution including cold loads, and for queued work the batched claim, pinned
+input/source/policy, accepted authority, original deadline and exact accepted
+recovery) completes before the engine starts. Engine transitions (begin, forget,
+settle, control, publication acceptance and replay, terminal selection and
+failure) validate and mutate live memory and return at once; they never wait for
+SQL, lease confirmation, outbox reservation or staging, or Scribe acknowledgement.
+Model, tool, Python and validated file IO remain actual work under their limits.
+Bifrost is the durable recovery source; PostgreSQL coordinates admission, claims,
+lease renewal, cancellation and retry scheduling, not invocation results or
+publication acceptance.
 
-Complete versioned logical checkpoints preserve pinned declarations/evidence,
-settlements, attempts, original deadline/budgets, control decisions, accepted
-publications/exact File descriptors and selected final outcome. The engine reads
-dependencies from memory. Existing shared Scribe outbox batching and WAL ACK apply
-at external dispatch, dependent release, publication receipt and final success.
-No separate writer, recovery store, engine serialization, conversation replay,
-remote-publication wait or archive handoff is introduced.
+Each state change marks the run dirty. One background flush per execution
+freezes at most one coalesced snapshot at a time as the next revision and writes
+it as a `bifrost.verification.execution_events` row through the process Scribe
+outbox. The batch id derives from execution and revision, so of competing writes
+of one revision the first fenced is accepted and the other refused; a refused or
+conflicting revision breaks the writer, the engine's next transition fails, and
+existing retry handling applies. Queued revisions wait in background for a
+reserved outbox slot and retry until accepted or the lease is lost. Direct
+revisions are best effort: staged unreserved, shed and counted lost when the
+outbox is full, and a failed direct revision stops further persistence for that
+execution. Complete versioned logical snapshots preserve pinned
+declarations/evidence, settlements, attempts, original deadline/budgets, control
+decisions, accepted publications/exact File descriptors and the selected final
+outcome. No separate writer, recovery store, engine serialization, conversation
+replay or archive handoff is introduced.
 
-Bifrost recovery must return the exact accepted compatible state, authoritative
-absence, or explicit unavailability. Its current analytical source discovery is
-not proof of complete recovery. A replacement writer shuts out the old writer
-before loading/continuing; acceptance checks current authority and accepted
-revision, and WAL replay must not resurrect rejected progress. These are required
-extensions of existing Bifrost read/acceptance owners, not a second queue lease.
-A delayed accepted checkpoint causes wait/retry rather than older/fresh state.
-A revision the old writer froze under its confirmed lease just before takeover
-may still be accepted ahead of the replacement's and is then inherited; this
-rare interval is accepted and no PostgreSQL ownership table closes it. Direct
-verify returns its final input, output and result without waiting for their
-acknowledgement. Execution failures and cancellations are recorded in the
-checkpoint with the execution's exact identity, so retained reads need neither
-the queue row nor the source Cards.
+Direct verify returns its selected result and releases its resources
+independently of persistence; the response does not certify that retained
+details exist. When queued computation ends, the engine and its workspace,
+Python, model and block permits are dropped. The runner keeps the claim: its
+claim-loop capacity permit, acquired before claiming, and its lease-renewal
+registration stay held while it waits in background for Scribe to acknowledge the
+revision holding the terminal decision and then the result rows, then completes
+the claim through the token-fenced batched completion group commit. There is no
+acknowledgement timeout and no pre-claim outbox reservation; full claim capacity
+pauses new claims while running work finishes, and the direct lane stays
+available. A cancelled, timed-out or errored decision is recorded the same way
+before the fenced terminate. A result whose acknowledgement is dropped follows
+the ordinary retry transition with `result_undelivered` within the attempt budget.
+Lease loss or cancellation ends the old owner's waits and settlement and releases
+its claim permit; previously submitted IO can still finish. A tenant without an
+active SYSTEM principal terminates `errored` without a state record. No separate
+finalizer or owed-delivery queue exists. Scheduled/group activation retains the
+same queue path.
+
+A crash loses live and unaccepted progress, including an unaccepted terminal
+decision. Direct work never resumes. Queued redelivery recovers the exact
+accepted revision (the fenced prefix) with the same execution ID, input, source,
+policy and original deadline, and may repeat later work, effects and spend; lost
+spend is not reconstructed. A recovered accepted terminal decision is delivered
+without recomputation. Recovery returns the exact accepted compatible state,
+authoritative absence, or explicit unavailability; unavailability defers
+preparation and is never treated as absence. A snapshot that does not decode
+as a supported `ExecutionState` format defers with `execution_state_incompatible`.
+A revision the old owner froze just before takeover may still be accepted ahead
+of the replacement's and is then inherited; this rare interval is accepted and no
+PostgreSQL ownership table closes it. Execution failures and cancellations are
+recorded in the state with the execution's exact identity, so retained reads need
+neither the queue row nor the source Cards.
 
 Queue leases renew on the PostgreSQL clock; expiry never revives an old lease.
-Renewal loss cancels the runner, but external calls or buffered writes may still
-return late. Acceptance must preserve cancellation, expiry and deadline fences.
-Current defaults remain a ten-minute queue lease and five-minute queued execution
-timeout; renewal does not extend the original execution deadline.
+The background lease-renewal owner sets each claim's local lost/cancelled token
+from renewal ticks and from its `LISTEN` on `wyrd_verification_cancelled`, fed by
+the cancellation trigger on `wyrd.verifier_executions`; the engine checks that
+token and its deadline. External calls or buffered writes may still return late.
+A queued execution's original deadline is its admission time (`created_at`) plus
+the runtime execution timeout, computed by PostgreSQL in the claim statement; a
+reclaim never replenishes it. The Verifier's `limits.timeout_seconds` also counts
+from admission. Current defaults remain a ten-minute queue lease and five-minute
+queued execution timeout.
 
 Direct verify remains queue-free and fresh requests have distinct identities.
-It uses the common state lifecycle, including accepted publications; disconnect
-stops new request work without creating background Agent execution or a new resume
-API. Terminal recovery returns the saved outcome and finishes existing delivery
-without reexecuting settled work. Interrupted external effects may repeat within
-remaining bounds; settled failures remain settled.
+Disconnect stops new request work without creating background Agent execution or
+a new resume API. Settled failures in accepted state remain settled.
 
 Dedicated reads preserve existing wire/permission/cursor contracts using accepted
 execution identities and exact File references. They do not switch from a PostgreSQL
@@ -1998,9 +2037,6 @@ payload owner to an archive. Group comparisons/dedup, binding summaries and
 independent Operator/provider delivery retain their behavior while old execution-row
 dependencies are removed. Existing storage/session and evidence retention owners
 remain; no new cleanup protocol, tombstones or whole-group serialization is added.
-
-Implementation must prove these execution-state guarantees; architectural
-requirements do not assert the current Bifrost extensions are already implemented.
 
 A `VerificationResult` is the compact decision that direct execution, status,
 wait, and typed reads return. It carries `execution_id`, optional `run_id`,

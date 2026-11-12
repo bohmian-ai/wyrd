@@ -5,7 +5,7 @@ approved_spec_revision: 5
 requirements: [REQ-005, REQ-012, REQ-013, REQ-014, REQ-016]
 acceptance: [AC-008, AC-009, AC-011]
 invariants: [INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007]
-depends_on: [TASK-002, TASK-005, TASK-006, TASK-007, TASK-008]
+depends_on: [TASK-002, TASK-005, TASK-006, TASK-007, TASK-008, TASK-010]
 ---
 
 # Render retained reports and recover GitHub delivery
@@ -66,13 +66,15 @@ merge decision, source change or autofix is authorized.
 
 ## Existing delivery workflow and consequential handoffs
 
-Current `runner.rs::DeliveryClaim` and SQL `VerifierExecutionQueue` coordinate
-owed terminal **Bifrost** result delivery; they are not GitHub publishing. Extend
-that existing runner/queue delivery phase to claim provider progress independently
-of computation, preserving canonical result delivery. Keep report/source/progress
-in canonical Bifrost verification state and provider IDs/attempt/readiness/
-sanitized failure coordination in existing queue/control owners without storing
-report payloads in SQL. No finalizer service, second payload store or table.
+Task 010 removes owed terminal-delivery queue operations (`delivery_due_at`,
+claim/redeliver/delivered, `Owe`); queued settlement follows the terminal Bifrost
+ACK in the runner. GitHub delivery is a separate provider lifecycle with its own
+independent retry: it consumes retained accepted reports and validates current
+authority, and a provider retry never recomputes verification. Keep report/
+source/progress in canonical Bifrost verification state and coordination in
+existing queue/control owners, without new SQL delivery fields, report payloads in
+SQL or a revived terminal-delivery mechanism. No finalizer service, second payload
+store or table.
 
 Retain enough accepted progress for every consequential Check/review/comment/
 annotation batch effect to be reconciled after timeout/restart. Stable IDs and
@@ -87,8 +89,8 @@ Superseded work never claims current-result delivery or starts a continuation.
 
 Provider retry reads retained outputs/progress and consumes no new verification
 attempt, approval or model computation. Record acknowledged provider progress
-before retiring its owed queue delivery; recovery rediscovers the remaining
-obligation. Execution inspection exposes delivery status/error separately from
+before retiring a provider delivery obligation; recovery rediscovers the remaining
+obligation from retained state. Execution inspection exposes delivery status/error separately from
 verdict, through existing read authorization, even after computation completes.
 Amend **wyrd-design.md → Prompt / Verifier / queued delivery** and appropriate
 **bifrost-design.md → canonical evidence / Durability and visibility**; delivery
@@ -128,7 +130,7 @@ receipts/accepted states at every seam, not seeded report/activation fixtures.
 
 Tier 1: matched Rust/Python/TypeScript stories and `wyrd-mcp` journeys with real
 WyrdTestServer/Postgres and local protocol/model transports, using README runners;
-server verification runtime journeys cover restart. Tier 2: queue claims/owed
+server verification runtime journeys cover restart. Tier 2: provider delivery
 progress and canonical reads against real dependencies; tier 3: schema, selection,
 anchor/rendering and helper branches. Record actual new focused commands when
 tests exist. Apply README surface/contract/type/boundary checks; integrated change

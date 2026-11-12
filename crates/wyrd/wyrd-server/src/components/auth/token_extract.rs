@@ -97,10 +97,16 @@ pub(crate) fn tenant_from_unverified_access_token(
 ) -> Result<DataTenantId, WyrdErrorResponse> {
     AccessTokenClaims::unverified_tenant(token).map_err(|error| match error {
         AuthError::BadTokenFormat => bad_token_format(),
-        _ => WyrdErrorResponse::from(WyrdError::Unauthenticated {
-            message: "token is not a tenant access token".to_owned(),
-            details: serde_json::json!({ "plane": "tenant" }),
-        }),
+        _ => not_tenant_access_token(),
+    })
+}
+
+/// The refusal of a well-formed JWT whose claims are not tenant access-token
+/// claims; see [`tenant_from_unverified_access_token`].
+fn not_tenant_access_token() -> WyrdErrorResponse {
+    WyrdErrorResponse::from(WyrdError::Unauthenticated {
+        message: "token is not a tenant access token".to_owned(),
+        details: serde_json::json!({ "plane": "tenant" }),
     })
 }
 
@@ -151,22 +157,31 @@ pub(crate) fn verify_authenticated_principal(
 /// authenticated principal.
 ///
 /// The token's unverified tenant claim selects the verification tenant; the
-/// verifier then checks signature, expiry, and claims against it.
+/// verifier then checks signature, expiry, and claims against it. Only a
+/// refusal decodes every unverified claim, so a token whose claims are not
+/// tenant access-token claims is refused as unauthenticated however
+/// verification would have failed.
 ///
 /// # Errors
 /// Returns `BadTokenFormat` for a token that is not a compact Wyrd JWT,
-/// `AuthVerifyUnavailable` when no verifier is configured, and the mapped
-/// verification error.
+/// `Unauthenticated` for one whose claims are not tenant access-token
+/// claims, `AuthVerifyUnavailable` when no verifier is configured, and the
+/// mapped verification error.
 pub(crate) fn verify_access_token(
     verifier: Option<&wyrd_auth_verify::TokenVerifier>,
     token: SecretString,
     surface: wyrd_auth_verify::TokenAudience,
 ) -> Result<AuthenticatedPrincipal, WyrdErrorResponse> {
     let expected_tenant = tenant_from_unverified_access_token(token.expose_secret())?;
-    let verifier = verifier.ok_or_else(auth_not_configured)?;
+    let refused =
+        |error: WyrdErrorResponse| match AccessTokenClaims::unverified(token.expose_secret()) {
+            Ok(_) => error,
+            Err(_) => not_tenant_access_token(),
+        };
+    let verifier = verifier.ok_or_else(|| refused(auth_not_configured()))?;
     let verified = verifier
         .verify_on(&token, &expected_tenant, surface)
-        .map_err(WyrdErrorResponse::from)?;
+        .map_err(|error| refused(WyrdErrorResponse::from(error)))?;
     Ok(AuthenticatedPrincipal::from_verified(Arc::new(verified)))
 }
 
@@ -291,7 +306,7 @@ mod tests {
     use secrecy::ExposeSecret;
     use wyrd_spec::error::WyrdError;
 
-    use super::{ANTHROPIC_API_KEY_HEADER, extract_gateway_access_token};
+    use super::{ANTHROPIC_API_KEY_HEADER, extract_gateway_access_token, verify_access_token};
 
     /// Extracts from `headers` on an Anthropic route whose only accepted query
     /// parameter is `alt`.
@@ -349,5 +364,121 @@ mod tests {
                 "{headers:?} {query:?}"
             );
         }
+    }
+
+    const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
+    const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
+
+    /// Access-token claims for a fresh User of a fresh tenant, as JSON.
+    ///
+    /// # Panics
+    /// Panics when the claims fail to serialize.
+    fn claims() -> serde_json::Value {
+        let principal = wyrd_runtime::PrincipalId::new(uuid::Uuid::now_v7());
+        serde_json::to_value(wyrd_auth_verify::AccessTokenClaims {
+            sub: principal.to_string(),
+            principal: wyrd_auth_verify::TokenPrincipalRef {
+                id: principal,
+                kind: wyrd_spec::auth::PrincipalKindTag::User,
+                tenant_id: wyrd_spec::DataTenantId::new_v7(),
+            },
+            roles: vec![],
+            permissions: wyrd_runtime::PermissionSet::default(),
+            workload_uid: None,
+            card_access: wyrd_spec::auth::CardAccess::AnyRegistered,
+            act: None,
+            aud: "wyrd".to_owned(),
+            exp: 9_999_999_999,
+            iat: 0,
+            iss: "wyrd".to_owned(),
+            jti: "01K00000000000000000000000".to_owned(),
+            cid: None,
+        })
+        .expect("claims serialize")
+    }
+
+    /// `claims` signed by the test key `k1`.
+    ///
+    /// # Panics
+    /// Panics when the test key does not parse or the token fails to sign.
+    fn sign(claims: &serde_json::Value) -> secrecy::SecretString {
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA);
+        header.kid = Some("k1".to_owned());
+        let key = jsonwebtoken::EncodingKey::from_ed_pem(PRIVATE_KEY_PEM.as_bytes())
+            .expect("test key parses");
+        jsonwebtoken::encode(&header, claims, &key)
+            .expect("token signs")
+            .into()
+    }
+
+    /// The error code `token` is refused with, with or without a
+    /// `configured` verifier, or `None` when it verifies.
+    ///
+    /// # Panics
+    /// Panics when the test key does not load.
+    fn refusal(configured: bool, token: secrecy::SecretString) -> Option<String> {
+        let keys = std::collections::HashMap::from([(
+            wyrd_auth_verify::Kid::new("k1").expect("kid is valid"),
+            std::sync::Arc::new(
+                wyrd_auth_verify::public_key_from_pem(PUBLIC_KEY_PEM).expect("public key loads"),
+            ),
+        )]);
+        let verifier = wyrd_auth_verify::TokenVerifier::new(
+            keys,
+            "wyrd",
+            wyrd_auth_verify::WyrdAuthVerifySettings::default(),
+        );
+        verify_access_token(
+            configured.then_some(&verifier),
+            token,
+            wyrd_auth_verify::TokenAudience::Wyrd,
+        )
+        .err()
+        .map(|error| error.0.code().to_owned())
+    }
+
+    /// A signed token whose tenant parses but whose other claims are not
+    /// access-token claims is refused as unauthenticated, as before
+    /// verification read only the tenant, whether or not a verifier is
+    /// configured; valid, badly signed, and malformed tokens keep their own
+    /// classification.
+    ///
+    /// # Panics
+    /// Panics when any token is classified differently.
+    #[test]
+    fn malformed_claims_are_refused_as_unauthenticated() {
+        let mut malformed = claims();
+        malformed["permissions"] = serde_json::json!(42);
+        for verifier in [true, false] {
+            assert_eq!(
+                refusal(verifier, sign(&malformed)).as_deref(),
+                Some("WYRD_AUTH_401_UNAUTHENTICATED"),
+                "verifier configured: {verifier}"
+            );
+        }
+
+        assert_eq!(refusal(true, sign(&claims())), None, "valid claims verify");
+        let (token, other) = (sign(&claims()), sign(&claims()));
+        let (token, other) = (token.expose_secret(), other.expose_secret());
+        let signature = |token: &str| token.rfind('.').expect("compact JWT");
+        let forged = format!(
+            "{}{}",
+            &token[..signature(token)],
+            &other[signature(other)..]
+        );
+        assert_eq!(
+            refusal(true, forged.into()).as_deref(),
+            Some("WYRD_AUTH_401_INVALID_TOKEN"),
+            "a bad signature stays an invalid token"
+        );
+        assert_eq!(
+            refusal(true, "not-a-jwt".to_owned().into()).as_deref(),
+            Some("WYRD_AUTH_400_BAD_TOKEN_FORMAT")
+        );
+        assert_eq!(
+            refusal(false, sign(&claims())).as_deref(),
+            Some("WYRD_AUTH_503_VERIFY_UNAVAILABLE"),
+            "valid claims without a verifier stay unavailable"
+        );
     }
 }

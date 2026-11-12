@@ -535,11 +535,16 @@ pub(crate) fn store_unavailable(error: wyrd_sql::SqlError) -> WyrdError {
 /// The tenant an access token's unverified claims name, which routes a
 /// delegation to the tenant both tokens are then verified against.
 ///
+/// Every claim is decoded, so a subject token whose claims are not
+/// access-token claims is refused before tenant storage is reached.
+///
 /// # Errors
 /// Returns [`WyrdError::BadTokenFormat`] when `token` is not a compact JWT
-/// with decodable claims.
+/// with decodable access-token claims.
 fn tenant_from_unverified_access_token(token: &str) -> Result<wyrd_spec::DataTenantId, WyrdError> {
-    AccessTokenClaims::unverified_tenant(token).map_err(|_| bad_subject_token_format())
+    AccessTokenClaims::unverified(token)
+        .map(|claims| claims.principal.tenant_id)
+        .map_err(|_| bad_subject_token_format())
 }
 
 /// The refusal of a subject token that is not a compact JWT.
@@ -608,6 +613,26 @@ mod tests {
 
         let result = tenant_from_unverified_access_token(&fake_jwt).expect("extracts tenant");
         assert_eq!(result, tenant_id);
+    }
+
+    /// A subject token whose tenant parses but whose other claims are not
+    /// access-token claims is refused as a format error.
+    ///
+    /// # Panics
+    /// Panics when the malformed claims are accepted.
+    #[test]
+    fn rejects_malformed_claims_beside_a_valid_tenant() {
+        let claims = serde_json::json!({
+            "principal": { "tenant_id": DataTenantId::new_v7() },
+            "permissions": 42,
+        });
+        let payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes());
+        let result = tenant_from_unverified_access_token(&format!("header.{payload}.sig"));
+        assert!(matches!(
+            result,
+            Err(wyrd_spec::error::WyrdError::BadTokenFormat { .. })
+        ));
     }
 
     #[test]

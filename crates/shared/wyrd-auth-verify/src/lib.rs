@@ -801,8 +801,6 @@ impl AccessTokenClaims {
     /// JWT with a base64url payload, and [`AuthError::InvalidToken`] when
     /// the payload names no tenant.
     pub fn unverified_tenant(token: &str) -> Result<DataTenantId, AuthError> {
-        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-
         /// The one claim read before verification.
         #[derive(Deserialize)]
         struct Claims {
@@ -817,13 +815,35 @@ impl AccessTokenClaims {
             tenant_id: DataTenantId,
         }
 
+        Self::unverified_payload::<Claims>(token).map(|claims| claims.principal.tenant_id)
+    }
+
+    /// Every unverified claim of compact access `token`, decoded without
+    /// checking its signature, so a refusal can still classify a token
+    /// whose claims are not access-token claims as one.
+    ///
+    /// # Errors
+    /// Returns [`AuthError::BadTokenFormat`] when `token` is not a compact
+    /// JWT with a base64url payload, and [`AuthError::InvalidToken`] when
+    /// the payload is not access-token claims.
+    pub fn unverified(token: &str) -> Result<Self, AuthError> {
+        Self::unverified_payload(token)
+    }
+
+    /// Decodes the unverified payload segment of compact `token` as `T`.
+    ///
+    /// # Errors
+    /// Returns [`AuthError::BadTokenFormat`] when `token` is not a compact
+    /// JWT with a base64url payload, and [`AuthError::InvalidToken`] when
+    /// the payload is not a `T`.
+    fn unverified_payload<T: DeserializeOwned>(token: &str) -> Result<T, AuthError> {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
         let payload = token.split('.').nth(1).ok_or(AuthError::BadTokenFormat)?;
         let bytes = URL_SAFE_NO_PAD
             .decode(payload)
             .map_err(|_| AuthError::BadTokenFormat)?;
-        serde_json::from_slice::<Claims>(&bytes)
-            .map(|claims| claims.principal.tenant_id)
-            .map_err(|_| AuthError::InvalidToken)
+        serde_json::from_slice(&bytes).map_err(|_| AuthError::InvalidToken)
     }
 
     /// Convert verified claims into a runtime verified-token envelope.

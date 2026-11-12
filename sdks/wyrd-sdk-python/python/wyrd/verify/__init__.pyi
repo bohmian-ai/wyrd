@@ -486,7 +486,10 @@ class CancelledExecution(TypedDict):
     execution_id: str
     status: ExecutionStatus
 
-PullRequestRef = TypedDict("PullRequestRef", {"ref": str, "sha": str})
+class PullRequestRef(TypedDict):
+    ref: str
+    sha: str
+
 """One side of a pull request as an admission pinned it: the branch name then and the exact commit."""
 
 class PullRequestActivation(TypedDict):

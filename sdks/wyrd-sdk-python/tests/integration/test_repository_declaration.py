@@ -10,13 +10,13 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from wyrd import WyrdError
+from wyrd import WyrdError, verify
 from wyrd.cards import CardKind, CardRef, Cards
 from wyrd.client import WyrdClient
 from wyrd.github import GithubConnection
 from wyrd.testing import GithubAppMock, GithubBrowser, WyrdTestServer, cli
 
-from .support import FIXTURES
+from .support import FIXTURES, binding_ids, binding_status
 
 pytestmark = pytest.mark.integration
 
@@ -174,3 +174,41 @@ def test_cli_checks_offline_and_declares_the_policy(
     receipt = cli.declare(policy(root, "minimal"), client=admin)
     assert receipt.root.kind == CardKind.Repository
     assert repository(Cards(admin), receipt.root)[0]["selected"] is True
+
+
+def test_pull_requests_admit_pinned_executions_and_supersede_them(
+    admin: WyrdClient, mock: GithubAppMock, server: WyrdTestServer, tmp_path: Path
+) -> None:
+    cards = Cards(admin)
+    receipt = cards.declare_from_path(
+        policy(checkout(mock, "acme/api", tmp_path / "api"), "minimal")
+    )
+    [binding] = binding_ids(cards, receipt.root)
+
+    def deliver(action: str) -> "verify.ExecutionState":
+        payload = mock.pull_request_event(101, 1, 7, action)
+        assert mock.deliver(server.base_url, "pull_request", payload) == 202
+        newest = binding_status(server, binding)["last_execution_id"]
+        return verify.Execution(newest, admin).status()
+
+    mock.set_pull_request(1, 7, "b1", "a1")
+    opened = deliver("opened")
+    assert opened["status"] == "pending"
+    pins = opened["pull_request"]
+    assert (pins["number"], pins["repository_id"]) == (7, "1")
+    assert pins["base"] == {"ref": "main", "sha": "b1"}
+    assert pins["head"]["sha"] == "a1"
+
+    mock.set_pull_request(1, 7, "b1", "b2")
+    pushed = deliver("synchronize")
+    assert pushed["execution_id"] != opened["execution_id"]
+    superseded = verify.Execution(opened["execution_id"], admin).status()
+    assert superseded["status"] == "cancelled"
+    assert superseded["error"]["code"] == "pull_request_superseded"
+    assert superseded["pull_request"]["head"]["sha"] == "a1"
+
+    mock.set_pull_request(1, 7, "b1", "b2", open=False)
+    payload = mock.pull_request_event(101, 1, 7, "closed")
+    assert mock.deliver(server.base_url, "pull_request", payload) == 202
+    closed = verify.Execution(pushed["execution_id"], admin).status()
+    assert (closed["status"], closed["error"]["code"]) == ("cancelled", "pull_request_closed")

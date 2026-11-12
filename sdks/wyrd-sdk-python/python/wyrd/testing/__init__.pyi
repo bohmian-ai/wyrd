@@ -562,6 +562,41 @@ class GithubAppMock:
         """
         ...
 
+    def set_pull_request(
+        self,
+        repository: int,
+        number: int,
+        base_sha: str,
+        head_sha: str,
+        *,
+        draft: bool = False,
+        open: bool = True,
+    ) -> None:
+        """Set a pull request's current state, replacing any earlier one.
+
+        Args:
+            repository: the base repository id.
+            number: the pull request number.
+            base_sha: the ``main`` base commit.
+            head_sha: the head commit, from the same repository.
+            draft: whether the pull request is a draft.
+            open: whether the pull request is open.
+        """
+        ...
+
+    def pull_request_event(
+        self, installation: int, repository: int, number: int, action: str
+    ) -> dict[str, Any]:
+        """GitHub's ``pull_request`` webhook payload from the pull request's current state.
+
+        Args:
+            installation: the installation id.
+            repository: the base repository id.
+            number: the pull request number.
+            action: the webhook action, such as ``"opened"`` or ``"synchronize"``.
+        """
+        ...
+
     def deliver(self, server_base: str, event: str, payload: Any) -> int:
         """Deliver one webhook signed with the configured secret.
 

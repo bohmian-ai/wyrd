@@ -21,7 +21,7 @@ use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_testing::github::{
-    GithubAppMock as NativeGithubAppMock, GithubBrowser as NativeGithubBrowser,
+    GithubAppMock as NativeGithubAppMock, GithubBrowser as NativeGithubBrowser, PullRequest,
 };
 use wyrd_testing::human_login::HumanSso;
 use wyrd_testing::{
@@ -1022,6 +1022,46 @@ impl GithubAppMock {
     /// Every code and token the mock issued plus the App's secrets.
     fn secrets(&self) -> Vec<String> {
         self.inner.secrets()
+    }
+
+    /// Make pull request `number` of `repository` open on `main` at
+    /// `base_sha` with head `head_sha` from the same repository, or a draft
+    /// or closed one, replacing any earlier state.
+    #[pyo3(signature = (repository, number, base_sha, head_sha, *, draft = false, open = true))]
+    fn set_pull_request(
+        &self,
+        repository: u64,
+        number: u64,
+        base_sha: &str,
+        head_sha: &str,
+        draft: bool,
+        open: bool,
+    ) {
+        let mut pull_request = PullRequest::open(repository, base_sha, head_sha);
+        pull_request.draft = draft;
+        pull_request.open = open;
+        self.inner.set_pull_request(repository, number, pull_request);
+    }
+
+    /// GitHub's `pull_request` webhook payload for `action` on pull request
+    /// `number` of `repository` under `installation`, from its current state.
+    ///
+    /// # Errors
+    /// Raises the harness error when the payload cannot convert.
+    fn pull_request_event(
+        &self,
+        py: Python<'_>,
+        installation: u64,
+        repository: u64,
+        number: u64,
+        action: &str,
+    ) -> WyrdPyResult<Py<PyAny>> {
+        Ok(json_to_pyobject(
+            py,
+            &self
+                .inner
+                .pull_request_event(installation, repository, number, action),
+        )?)
     }
 
     /// Deliver webhook `event` with `payload` to `server_base`, signed with

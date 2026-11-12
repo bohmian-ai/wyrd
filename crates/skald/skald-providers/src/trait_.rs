@@ -25,8 +25,18 @@ pub enum ProviderStream {
 #[async_trait]
 pub trait ProviderClient: Send + Sync {
     /// Sends one native provider request and returns the native response.
+    ///
+    /// # Errors
+    /// Returns the [`ProviderError`](crate::ProviderError) for a request
+    /// variant the client does not serve, unusable credentials, a
+    /// non-success answer, a failed exchange, or an undecodable answer.
     async fn send(&self, request: &ProviderRequest) -> ProviderResult<ProviderResponse>;
 
     /// Sends one streaming request and decodes provider-native stream chunks.
+    ///
+    /// # Errors
+    /// Returns the [`ProviderError`](crate::ProviderError) for a request
+    /// variant the client does not serve, unusable credentials, a
+    /// non-success answer, a failed exchange, or an undecodable answer.
     async fn stream(&self, request: &ProviderRequest) -> ProviderResult<ProviderStream>;
 }

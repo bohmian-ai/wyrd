@@ -236,6 +236,12 @@ impl RequestJson {
 /// # Errors
 ///
 /// Returns the serialization error of `model`.
+///
+/// # Panics
+///
+/// Panics if a member's ranges are not within `text` or its name range does
+/// not follow the name's opening quote; every caller passes members scanned
+/// from `text` itself, so this cannot happen.
 fn write_members(
     text: &[u8],
     members: &[Member],
@@ -657,13 +663,6 @@ mod tests {
         );
     }
 
-    /// `with_model` replaces a present `model` in place and appends an
-    /// absent one, keeping text kept with members that match a fresh scan,
-    /// and sets the member of a decoded body.
-    ///
-    /// # Panics
-    /// Panics when a body is not rewritten as described or its members
-    /// differ from a scan of the written text.
     /// Member ranges as comparable tuples.
     fn ranges(members: &[Member]) -> Vec<(Range<usize>, Range<usize>)> {
         members
@@ -675,8 +674,11 @@ mod tests {
     /// A typed body whose flattened map can repeat a named member.
     #[derive(serde::Serialize)]
     struct Flattened {
+        /// Serialized first, as a named member.
         model: &'static str,
+        /// A float member the scan must find through its digits.
         temperature: f32,
+        /// Flattened members, which may repeat `model`.
         #[serde(flatten)]
         extra: serde_json::Map<String, Value>,
     }
@@ -685,6 +687,10 @@ mod tests {
     /// check finds, through escapes, structure inside strings, nesting, and
     /// floats, and refuses what it refuses: a repeated name at any depth and
     /// an oversized object. A refused body is decoded instead of kept.
+    ///
+    /// # Panics
+    /// Panics when a case fails to serialize, the scans disagree, a
+    /// canonical body is not kept, or a refused body is not decoded.
     #[test]
     fn written_text_scan_matches_the_canonical_check() {
         let many = (0..=MAX_CANONICAL_MEMBERS)
@@ -740,6 +746,13 @@ mod tests {
         assert_eq!(body.member("model").as_deref(), Some(&Value::from("other")));
     }
 
+    /// `with_model` replaces a present `model` in place and appends an
+    /// absent one, keeping text kept with members that match a fresh scan,
+    /// and sets the member of a decoded body.
+    ///
+    /// # Panics
+    /// Panics when a body is not rewritten as described or its members
+    /// differ from a scan of the written text.
     #[test]
     fn with_model_rewrites_kept_text_without_decoding() {
         let cases = [
@@ -761,12 +774,6 @@ mod tests {
             assert!(body.tree.get().is_none(), "{text}: never decoded");
             let (kept, members) = body.text.as_ref().expect("kept");
             let scanned = canonical(kept).expect("written text is canonical");
-            let ranges = |members: &[Member]| {
-                members
-                    .iter()
-                    .map(|member| (member.name.clone(), member.value.clone()))
-                    .collect::<Vec<_>>()
-            };
             assert_eq!(ranges(members), ranges(&scanned), "{text}");
         }
 

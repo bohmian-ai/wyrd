@@ -117,6 +117,15 @@ impl VertexClient {
 
     /// Sends a native Vertex request: a Google GenerateContent body to the
     /// project/location `generateContent` endpoint, or a Predict body.
+    ///
+    /// # Errors
+    /// Returns [`ProviderError::VariantMismatch`] for a request this client
+    /// does not serve, [`ProviderError::Auth`] when its credentials cannot be
+    /// presented, [`ProviderError::Status`] for a non-success answer,
+    /// [`ProviderError::Connect`], [`ProviderError::Upstream`], or
+    /// [`ProviderError::Timeout`] when the exchange fails, and
+    /// [`ProviderError::Decode`] when the body cannot be encoded or the answer
+    /// decoded.
     pub async fn send_native(&self, request: &ProviderRequest) -> ProviderResult<ProviderResponse> {
         match request {
             ProviderRequest::GeminiGenerateContent(request) => {

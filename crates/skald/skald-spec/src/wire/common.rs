@@ -106,6 +106,9 @@ impl PartialEq<Value> for SharedSchema {
 
 impl Serialize for SharedSchema {
     /// Serializes as the schema's JSON value.
+    ///
+    /// # Errors
+    /// Returns `serializer`'s error when it refuses the value.
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.0.serialize(serializer)
     }
@@ -113,6 +116,9 @@ impl Serialize for SharedSchema {
 
 impl<'de> Deserialize<'de> for SharedSchema {
     /// Decodes any JSON value.
+    ///
+    /// # Errors
+    /// Returns `deserializer`'s error when its input is not JSON.
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         Value::deserialize(deserializer).map(Self::new)
     }
@@ -191,7 +197,10 @@ impl From<SharedObjectSchema> for SharedSchema {
 impl TryFrom<SharedSchema> for SharedObjectSchema {
     type Error = SharedSchema;
 
-    /// Keeps `schema` shared when it is an object, and returns it otherwise.
+    /// Keeps `schema` shared when it is an object.
+    ///
+    /// # Errors
+    /// Returns `schema` itself, still shared, when it is not an object.
     fn try_from(schema: SharedSchema) -> Result<Self, SharedSchema> {
         if schema.is_object() {
             Ok(Self(schema))
@@ -202,7 +211,10 @@ impl TryFrom<SharedSchema> for SharedObjectSchema {
 }
 
 impl<'de> Deserialize<'de> for SharedObjectSchema {
-    /// Decodes a JSON object, refusing any other value.
+    /// Decodes a JSON object.
+    ///
+    /// # Errors
+    /// Returns `deserializer`'s error when its input is not a JSON object.
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         Map::deserialize(deserializer).map(Self::new)
     }

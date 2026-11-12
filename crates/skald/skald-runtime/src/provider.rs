@@ -24,9 +24,19 @@ static DEFAULT_REGISTRY: OnceLock<RwLock<Arc<ProviderRegistry>>> = OnceLock::new
 #[async_trait]
 pub trait Provider: Send + Sync + 'static {
     /// Sends one native provider request.
+    ///
+    /// # Errors
+    /// Returns the [`ProviderError`] for a request variant the client does
+    /// not serve, unusable credentials, a non-success answer, a failed
+    /// exchange, or an undecodable answer.
     async fn send(&self, request: &ProviderRequest) -> Result<ProviderResponse, ProviderError>;
 
     /// Sends one streaming native provider request.
+    ///
+    /// # Errors
+    /// Returns the [`ProviderError`] for a request variant the client does
+    /// not serve, unusable credentials, a non-success answer, a failed
+    /// exchange, or an undecodable answer.
     async fn stream(&self, request: &ProviderRequest) -> Result<ProviderStream, ProviderError>;
 
     /// Returns the provider this client handles.

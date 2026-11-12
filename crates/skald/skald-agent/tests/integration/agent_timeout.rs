@@ -169,6 +169,10 @@ async fn agent_run_no_timeout_runs_to_completion() {
 /// usage, and one `execute_tool` span per tool call as children, using GenAI
 /// attribute names; a failing tool records its stable code; no span carries
 /// the prompt, input, tool arguments, or output.
+///
+/// # Panics
+/// Panics when the run fails, a span is missing or misparented, an attribute
+/// differs from the GenAI contract, or any span carries a payload.
 #[tokio::test]
 async fn agent_run_emits_genai_spans_without_payloads() {
     capture();

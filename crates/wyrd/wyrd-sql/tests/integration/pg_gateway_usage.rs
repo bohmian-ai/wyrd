@@ -20,6 +20,9 @@ use wyrd_sql::queries::gateway_admission::{
 const KEY: &str = "k";
 
 /// Start of the minute containing now.
+///
+/// # Panics
+/// Never panics: a whole minute of the current time is a valid timestamp.
 fn this_minute() -> DateTime<Utc> {
     let now = Utc::now().timestamp();
     DateTime::from_timestamp(now - now.rem_euclid(60), 0).expect("minute start is valid")

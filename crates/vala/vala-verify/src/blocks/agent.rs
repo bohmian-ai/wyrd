@@ -722,6 +722,10 @@ mod tests {
     /// A gateway that cannot serve the call yet makes the block busy, so the
     /// execution runs again instead of judging it; a capacity refusal keeps
     /// the shared retry classification.
+    ///
+    /// # Panics
+    /// Panics when an unavailable gateway is not busy, a capacity refusal is
+    /// not retryable, or a permission refusal is not terminal.
     #[test]
     fn unavailable_gateway_is_busy_and_other_problems_are_classified() {
         assert_eq!(

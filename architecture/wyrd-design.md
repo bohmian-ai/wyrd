@@ -1593,9 +1593,12 @@ publication, its kind, its mounted `path`, and its producer item, iteration,
 and attempt) plus `content/<opaque invocation segment>/<name>`, so failed
 attempts' accepted partial work stays readable and distinct. Mounted content
 cites only its producer's original slots; a failed step's partial work and
-the manifest cite none. Direct and queued verification retain Agent publications
-and engine extraction through the same live run state and background revision
-path; standalone code actions receive no publication tool.
+the manifest cite none. Publications are queued-only: queued verification
+retains Agent publications and engine extraction through its live run state and
+background revision path, and a direct request whose step Agent declares
+`publish` or whose workspace mounts `steps.<id>.publications` is refused
+`WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` before any step runs. Standalone code
+actions receive no publication tool.
 
 Requirement outcomes are `passed`, `failed`, `inconclusive`, or
 `not_applicable`. An intentional skip (false `when`) makes dependent
@@ -1818,7 +1821,7 @@ execution; scheduled executions have no `run_id`.
 | `POST /v1/verification/execute` | Exact Verifier and subject, optional Run and `group_id`, named input declarations, optional route overrides → `200 VerificationResult` |
 | `POST /v1/verification/enqueue` | The same Run evidence with `Idempotency-Key` → `202 { execution_id }` after durable admission |
 | `GET /v1/verification/executions/{execution_id}` | Status, terminal error, result when visible, and a group execution's `group_id`, owner, and source selection once its input record is visible; a direct execution's completed status once its records are visible |
-| `GET /v1/verification/executions/{execution_id}/invocations` | One page of a queued execution's invocation attempts in insertion order — producer, progress, reason, speculation — with its status and history projection counts |
+| `GET /v1/verification/executions/{execution_id}/invocations` | One page of a queued execution's invocation attempts; a direct execution has no history and is not found in insertion order — producer, progress, reason, speculation — with its status and history projection counts |
 | `GET /v1/verification/executions/{execution_id}/publications` | One page of its publications' names, kinds, and producers, without content |
 | `GET /v1/verification/executions/{execution_id}/publications/{step_id}/{name}` | One publication of the exact producer attempt with its JSON value or manifest |
 | `POST /v1/verification/executions/{execution_id}/publications/{step_id}/{name}/download` | The shared download plan of a file publication's file or a directory publication's listed `path`. A cloud backend's plan is presigned; the local backend's points at `.../content` |
@@ -1966,25 +1969,31 @@ Bifrost is the durable recovery source; PostgreSQL coordinates admission, claims
 lease renewal, cancellation and retry scheduling, not invocation results or
 publication acceptance.
 
-Each state change marks the run dirty. One background flush per execution
+Only queued execution has recoverable state. Direct execution runs the same
+engine without the checkpoint adapter: it creates no run state, checkpoint,
+execution history or publication receipt, and stages exactly its
+`execution_inputs` (`origin=direct`) and compact result (`execution_outputs`
+then `results`) rows on two outbox slots reserved at admission. Those rows join
+their destination's shared frames, so many direct results deliver as one batch
+per table.
+
+Each state change of a queued run marks it dirty. One background flush per execution
 freezes at most one coalesced snapshot at a time as the next revision and writes
 it as a `bifrost.verification.execution_events` row through the process Scribe
 outbox. The batch id derives from execution and revision, so of competing writes
 of one revision the first fenced is accepted and the other refused; a refused or
 conflicting revision breaks the writer, the engine's next transition fails, and
-existing retry handling applies. Queued revisions wait in background for a
-reserved outbox slot and retry until accepted or the lease is lost. Direct
-revisions are best effort: staged unreserved, shed and counted lost when the
-outbox is full, and a failed direct revision stops further persistence for that
-execution. Complete versioned logical snapshots preserve pinned
+existing retry handling applies. Revisions wait in background for a
+reserved outbox slot and retry until accepted or the lease is lost. Complete versioned logical snapshots preserve pinned
 declarations/evidence, settlements, attempts, original deadline/budgets, control
 decisions, accepted publications/exact File descriptors and the selected final
 outcome. No separate writer, recovery store, engine serialization, conversation
 replay or archive handoff is introduced.
 
-Direct verify returns its selected result and releases its resources
-independently of persistence; the response does not certify that retained
-details exist. When queued computation ends, the engine and its workspace,
+Direct verify returns its result and releases its resources independently of
+persistence; the response does not certify that retained details exist. Its
+status and details reads resolve through its published `direct` input record and
+result, never through execution state. When queued computation ends, the engine and its workspace,
 Python, model and block permits are dropped. The runner keeps the claim: its
 claim-loop capacity permit, acquired before claiming, and its lease-renewal
 registration stay held while it waits in background for Scribe to acknowledge the

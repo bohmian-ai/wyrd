@@ -122,6 +122,17 @@ feature or tuning knob. Buffer inflation or weaker loss accounting is not repair
 | R4 — REQ-015/016, AC-010/011; approved consumer boundary; INV-001/007 | Direct result/details reads consume the actual baseline records; queued inspection consumes accepted state. Foreign/unauthorized access stays refused. Direct graphs declaring a queued-only `publish` tool or publication-dependent mount refuse before an earlier observable step can run, not at tool-session creation midway through execution. Existing extraction/deferred/approval exclusions remain. Ordinary direct tools/file graphs still work. Exercise affected shipped surfaces at their owning journey tier. |
 | R5 — REQ-018, AC-013 as explicitly amended to all three engines and L1 only | Full clean L1 verification, gateway and Bifrost on an immutable candidate → every experiment VALID, every existing target met and no latency, throughput, CPU-efficiency, memory or correctness regression against comparable clean resource-scaling records. Every repetition meets existing integrity criteria; evidence is retained with no lost writes or unexpected refusals. |
 
+## Obligations
+
+| ID | Promise (source) | Planned proof |
+|---|---|---|
+| R0 | Authority reconciled before production edits: spec/contracts amendment, task 010 banner, `wyrd-design.md` verification sections, `bifrost-design.md` checkpoint scope (Outcome and agreement) | Content review of the diff |
+| R1 | Direct runs the shared engine without checkpoint adapter or `RunState`; result selected and compute released with persistence held; no checkpoint/history row or SQL execution row; after drain the input/output/result records serve result/details with caller attribution (R1; REQ-015/017, AC-010/012) | Server integration journey with held Scribe and post-drain reads; source inspection of `run_direct` |
+| R2 | Direct output/summary rows absorb into destination frames; detail-before-summary; stable slice retry identity; tenant isolation; queued result keys/acks unchanged (R2; REQ-018, AC-013) | `scribe_outbox.rs` unit tests over many direct results and a queued result |
+| R3 | Queued keeps resumable state, recovery, bounded custody, claim backpressure, batched fenced settlement; direct completes while queued acks are held and claim tracking is full (R3; INV-002/004–006) | Existing `pg_durable_verifier_work` and runner tests plus a direct-under-held-queued-custody regression |
+| R4 | Direct status/details read baseline records; queued inspection reads accepted state; foreign/unauthorized refused; invocations/publications of direct are not found; `publish` step Agents (inline or registered) and `steps.<id>.publications` mounts refuse before any step; ordinary direct tools/files keep working (R4; REQ-015/016, AC-010/011; INV-001/007) | `pg_verification_routes` details tests, eligibility unit and integration tests, Rust SDK journey |
+| R5 | Full L1 verification, gateway and Bifrost on one immutable candidate: all VALID, targets met, no regression vs newest comparable clean resource-scaling records (R5; REQ-018, AC-013 as amended; L2 excluded) | `bench:l1:*` records compared with `benchmarks/history/` baselines |
+
 ## Verification and handoff
 
 Use existing unit owners in `scribe_outbox.rs`, the shared outbox and engine for

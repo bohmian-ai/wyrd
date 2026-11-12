@@ -11,6 +11,10 @@ JSON objects are closed unless an existing referenced type says otherwise.
 ## Execution and receipt semantics — revision 7
 
 Direct and queued work use the same memory-owned engine under spec REQ-017.
+Under the TASK-010-R1 amendment only queued work carries resumable execution
+state; direct work records its input, output and compact result records, and
+its status/details reads use them. Invocation and publication inspection is
+queued-only and answers execution-not-found for a direct execution.
 Necessary preparation/cold loads remain supported. Live step/publication success
 and direct results do not certify retained evidence. Validated extraction values
 feed Prompt/workspace consumers without a persistence ACK; recovery uses exact

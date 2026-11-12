@@ -270,7 +270,9 @@ execution verdict. No new result mirror or finalizer service.
 **REQ-015 — Resource isolation.** Direct and queued execution, workspace, Python
 and model-call admission use separate capacity without borrowing. PR extraction,
 deferred inputs and approval are queued-only, including manual calls; refuse a
-direct request before any step. Ordinary direct-eligible Verifiers retain their
+direct request before any step. Under the TASK-010-R1 amendment, step Agents
+declaring the `publish` tool and workspace mounts of `steps.<id>.publications`
+are also queued-only and refused before any step. Ordinary direct-eligible Verifiers retain their
 path. Same engine and tenant/evidence rules apply. A burst of 41 PRs is durably
 accepted under bounded ingress and progresses through the existing fair queue;
 there is no completion-time SLA for arbitrary DAGs.
@@ -283,7 +285,10 @@ execution ceiling through normal operator configuration. Documentation teaches
 App setup, declaration, publication, approval and diagnosis without a UI.
 
 **REQ-017 — Memory execution and bounded background completion.** Direct and
-queued execution use the same stateful engine. Preserve existing request/claim
+queued execution use the same stateful engine. Under the TASK-010-R1 amendment
+only queued execution attaches resumable execution state (checkpoints,
+publication receipts, execution history); direct execution records exactly its
+input, output and compact result records, as resource-scaling did. Preserve existing request/claim
 preparation, authorization and necessary cold loads; do not add a cold-cache
 refusal/retry contract. Once prepared, engine transitions validate and mutate
 live state, release dependents and select one terminal result without SQL lease
@@ -339,7 +344,9 @@ SQL or invent instantaneous cross-replica revocation.
 latency, throughput, server CPU efficiency and memory behavior using matched full
 verification benchmarks and existing targets, including direct p99 overhead below
 500 microseconds at 64 clients and L2 backlog at most one second of offered work,
-drain at most 60 seconds and recovery within 30 seconds. No new 5% regression
+drain at most 60 seconds and recovery within 30 seconds. The TASK-010-R1
+amendment qualifies on full L1 verification, gateway and Bifrost benchmarks with
+no regression in any of them, and excludes L2 measurement. No new 5% regression
 allowance is selected. Correct verdicts and healthy-load evidence reconciliation
 remain necessary; benchmark validity or exit zero alone is insufficient.
 
@@ -456,3 +463,17 @@ The maintainer reaffirmed revision 7 approval after task 010 was clarified to
 reuse the existing ClaimLoop permit through background persistence/settlement
 and retain the existing cancellation-notification migration, trigger and listener.
 These reuse clarifications preserve this revision's behavior and add no subsystem.
+
+**TASK-010-R1 amendment (maintainer-agreed).** After the `b709eaa21` candidate
+regressed the verification L1 benchmark, the maintainer agreed the
+[benchmark remediation](design/task-010-benchmark-remediation.md) and requested
+TASK-010-R1. It amends revision 7 without a new revision number or any other
+approval: direct execution carries no `RunState`, checkpoint, execution history
+or publication receipt and records the resource-scaling `execution_inputs`
+(`origin=direct`), `execution_outputs` and `results` rows, delivered in
+destination-batched frames; direct status/details reads use those records;
+queued execution keeps resumable state, recovery and bounded custody on the
+same engine; `publish` tools and publication mounts are queued-only; and
+qualification is L1 verification, gateway and Bifrost with no regression, with
+no L2 measurement. Conflicting direct-state, direct-inspection and L2 text in
+this revision, the contracts and task 010 is superseded by this amendment.

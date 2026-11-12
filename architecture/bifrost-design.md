@@ -468,7 +468,8 @@ typed columns:
   existing immutable File references, never SQL payload custody or a new archive table
   family.
   - Verification execution checkpoints extend the existing canonical verification
-    data with complete versioned logical state. The engine owns the live object;
+    data with complete versioned logical state of queued executions only; direct
+    executions write no checkpoint or history. The engine owns the live object;
     PostgreSQL queue rows coordinate work, not a duplicate checkpoint/result
     payload store, owed-delivery record or general event projection backlog. A
     queued claim settles only after Scribe acknowledges the revision holding its

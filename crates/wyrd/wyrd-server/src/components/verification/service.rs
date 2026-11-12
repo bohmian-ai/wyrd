@@ -14,14 +14,16 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_verify::blocks::{DriftChecks, EngineError};
+use vala_verify::blocks::{AgentCardResolver, DriftChecks, EngineError};
 use wyrd_runtime::outbox::{OutboxFull, Reservation};
 use wyrd_runtime::permission::{Action, Resource};
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_runtime::{AcceptedAuthority, CardAttribution, Permission};
-use wyrd_spec::card::verifier::{CheckEvidence, VerifierSpec};
+use wyrd_spec::card::agent::{AgentSpec, BuiltinTool};
+use wyrd_spec::card::verifier::{CheckEvidence, ReferenceRoot, VerifierSpec, WorkspaceSource};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, IdempotencyKey};
+use wyrd_spec::reference::InlineableRef;
 use wyrd_spec::vala::api::AuditOutcome;
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::vala::ids::{SpanId, TraceId};
@@ -53,6 +55,7 @@ use crate::state::{AppState, registry_db_error};
 use crate::verification::authority::SystemReadAuthority;
 use crate::verification::cache::{Db, Target};
 use crate::verification::hosted::blocks::{Execution, HostedBlocks};
+use crate::verification::hosted::registry::TenantRegistry;
 use crate::verification::inputs::InputResolver;
 use crate::verification::results::{
     InputRecord, ResultPayloadBuilder, ResultPayloadError, ResultRun,
@@ -147,10 +150,14 @@ fn environment_tag(request: &VerificationRequest) -> Result<(), WyrdError> {
 
 /// Refuse a Verifier that only queued execution may run, before any step.
 ///
-/// This is the single direct-eligibility rule `verify` applies once its
-/// target resolves and before the engine is built: a direct request is
-/// never converted to a queued one and never runs part of its graph. A
-/// Verifier judging a scheduled window is queued-only. Pure: no IO.
+/// This is the direct-eligibility rule `verify` applies once its target
+/// resolves and before the engine is built: a direct request is never
+/// converted to a queued one and never runs part of its graph. A Verifier
+/// judging a scheduled window is queued-only, and so is one whose Agent
+/// mounts `steps.<id>.publications` or whose inline Agent declares the
+/// `publish` tool, since publications live in execution state only queued
+/// work has. A registered Agent's tools are checked by
+/// [`VerificationControl::registered_publishers`]. Pure: no IO.
 ///
 /// # Errors
 /// Returns [`WyrdError::VerificationInputUnsupported`] for a queued-only
@@ -162,7 +169,37 @@ fn direct_eligibility(verifier: &CardUid, spec: &VerifierSpec) -> Result<(), Wyr
     {
         return Err(window_refusal(verifier));
     }
+    for (path, call) in spec.agent_calls() {
+        let mounts_publications = call
+            .workspace
+            .values()
+            .filter_map(WorkspaceSource::reference)
+            .any(|reference| matches!(reference.root, ReferenceRoot::StepPublications { .. }));
+        if mounts_publications || call.agent.as_inline().is_some_and(publishes) {
+            return Err(publication_refusal(verifier, &path));
+        }
+    }
     Ok(())
+}
+
+/// Whether `agent` declares the `publish` tool.
+fn publishes(agent: &AgentSpec) -> bool {
+    agent
+        .tool_names
+        .iter()
+        .any(|name| BuiltinTool::from_name(name) == Some(BuiltinTool::Publish))
+}
+
+/// The refusal of a direct request for a Verifier whose Agent call at
+/// `path` publishes or mounts publications.
+fn publication_refusal(verifier: &CardUid, path: &str) -> WyrdError {
+    WyrdError::VerificationInputUnsupported {
+        message: format!(
+            "{path}: publications exist only in queued execution; enqueue this Verifier \
+             instead of verifying now"
+        ),
+        details: serde_json::json!({ "verifier_card_uid": verifier, "path": path }),
+    }
 }
 
 /// The refusal of a direct request for a Verifier that judges a scheduled
@@ -570,6 +607,12 @@ impl<'a> VerificationControl<'a> {
             );
         };
         let executor = caller.clone().executed_by_system(system);
+        if let Err(error) = self
+            .registered_publishers(&executor, &request.verifier_card_uid, &target.spec)
+            .await
+        {
+            return ("refused", Err(error));
+        }
         let started_at = Utc::now();
         // The Verifier's own `limits.timeout_seconds` only lowers the
         // server's direct deadline.
@@ -972,6 +1015,42 @@ impl<'a> VerificationControl<'a> {
         Ok(target)
     }
 
+    /// Refuse, before any step, a direct execution of `verifier` whose
+    /// registered Agent declares the `publish` tool, the part of
+    /// [`direct_eligibility`] that needs each exact Agent Card.
+    ///
+    /// Each registered Agent resolves as the engine resolves it, through
+    /// [`TenantRegistry`] as `executor`. An Agent that cannot be resolved
+    /// now is left to the engine, which refuses it as unavailable when its
+    /// step runs; a Verifier with only inline Agents reads nothing.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::VerificationInputUnsupported`] for an Agent that
+    /// publishes.
+    async fn registered_publishers(
+        &self,
+        executor: &Caller,
+        verifier: &CardUid,
+        spec: &VerifierSpec,
+    ) -> Result<(), WyrdError> {
+        let mut registry = None;
+        for (path, call) in spec.agent_calls() {
+            let InlineableRef::Ref(agent) = &call.agent else {
+                continue;
+            };
+            let registry = registry.get_or_insert_with(|| {
+                TenantRegistry::new(self.state.clone(), Some(executor.clone()), verifier.clone())
+            });
+            if AgentCardResolver::resolve(registry, agent)
+                .await
+                .is_ok_and(|spec| publishes(&spec))
+            {
+                return Err(publication_refusal(verifier, &path));
+            }
+        }
+        Ok(())
+    }
+
     /// The process's hosted Verifier blocks.
     ///
     /// # Errors
@@ -1149,11 +1228,13 @@ mod tests {
 
     use super::direct_eligibility;
 
-    /// A Verifier judging a scheduled window is refused as queued-only; an
-    /// ordinary assert-only Verifier is eligible.
+    /// A Verifier judging a scheduled window, a step Agent declaring
+    /// `publish`, and an Agent mounting a step's publications are refused as
+    /// queued-only; an ordinary assert-only Verifier and an Agent step with
+    /// filesystem tools over a declared input mount are eligible.
     ///
     /// # Panics
-    /// Panics when a spec does not parse or the rule decides either wrongly.
+    /// Panics when a spec does not parse or the rule decides any case wrongly.
     #[test]
     fn direct_eligibility_refuses_only_queued_only_verifiers() {
         let verifier = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("a v7 UUID is a Card UID");
@@ -1180,10 +1261,50 @@ mod tests {
             json!({ "kind": "assert", "path": "inputs.question", "operator": "is_not_null" }),
         );
 
-        assert!(matches!(
-            direct_eligibility(&verifier, &window),
-            Err(WyrdError::VerificationInputUnsupported { .. })
-        ));
+        let agent_step = |tools: &[&str], workspace: serde_json::Value| -> VerifierSpec {
+            serde_json::from_value(json!({
+                "inputs": { "policy": { "type": "json" } },
+                "steps": [{
+                    "id": "review",
+                    "action": {
+                        "kind": "agent",
+                        "agent": {
+                            "prompt": {
+                                "provider": "openai",
+                                "model": "gpt-4o",
+                                "messages": [{ "role": "user", "content": "Review" }],
+                            },
+                            "execution_route": {
+                                "kind": "wyrd_gateway", "deployment": "openai-primary",
+                            },
+                            "tool_names": tools,
+                        },
+                        "workspace": workspace,
+                    },
+                }],
+                "requirements": [{ "id": "r", "statement": "s", "check": {
+                    "kind": "assert", "path": "steps.review.status", "operator": "is_not_null",
+                } }],
+            }))
+            .expect("the spec parses")
+        };
+        let publisher = agent_step(&["fs.write", "publish"], json!({}));
+        let mounted = agent_step(
+            &["fs.read"],
+            json!({ "/inputs/earlier": "steps.review.publications" }),
+        );
+        let files = agent_step(
+            &["fs.read", "fs.search"],
+            json!({ "/inputs/policy": "inputs.policy" }),
+        );
+
+        for queued_only in [&window, &publisher, &mounted] {
+            assert!(matches!(
+                direct_eligibility(&verifier, queued_only),
+                Err(WyrdError::VerificationInputUnsupported { .. })
+            ));
+        }
         assert!(direct_eligibility(&verifier, &ordinary).is_ok());
+        assert!(direct_eligibility(&verifier, &files).is_ok());
     }
 }

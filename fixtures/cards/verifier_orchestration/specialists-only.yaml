@@ -21,6 +21,8 @@ spec:
         kind: agent
         agent: ./security.yaml
         inputs: {question: inputs.question}
+        workspace:
+          /inputs/question.json: inputs.question
       requirements:
         - id: secured
           statement: The security specialist finished

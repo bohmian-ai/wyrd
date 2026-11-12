@@ -82,6 +82,30 @@ impl RequestJson {
         serde_json::from_slice::<Value>(&text).map(Self::from)
     }
 
+    /// Takes the body `serde_json` writes for `body`.
+    ///
+    /// `serde_json` writes every value compactly and as its decode would
+    /// serialize, so the text is kept after one pass that finds the top-level
+    /// members and checks that no object repeats a member name, which a
+    /// flattened map can do. Text that repeats a name, holds an object with
+    /// more than [`MAX_CANONICAL_MEMBERS`] members, or is not an object is
+    /// taken as [`Self::parse`] takes it. `body` must not serialize a
+    /// [`serde_json::value::RawValue`], whose text is written as it arrived.
+    ///
+    /// # Errors
+    ///
+    /// Returns the serialization error of `body`.
+    pub fn serialize(body: &impl serde::Serialize) -> serde_json::Result<Self> {
+        let text = Bytes::from(serde_json::to_vec(body)?);
+        match written_members(&text) {
+            Some(members) => Ok(Self {
+                text: Some((text, members)),
+                tree: OnceLock::new(),
+            }),
+            None => Self::parse(text),
+        }
+    }
+
     /// The kept compact text, when the body arrived as it.
     #[must_use]
     pub fn text(&self) -> Option<&[u8]> {
@@ -259,6 +283,85 @@ fn write_members(
     }
     json.push(b'}');
     Ok(json)
+}
+
+/// The top-level members of `text`, compact JSON `serde_json` wrote, when it
+/// is an object whose objects each hold at most [`MAX_CANONICAL_MEMBERS`]
+/// members with distinct names, or `None`.
+///
+/// Only strings and structure are read: the writer already wrote every
+/// scalar as its decode serializes. Names are compared as written, which is
+/// exact because `serde_json` escapes equal strings equally.
+fn written_members(text: &[u8]) -> Option<Vec<Member>> {
+    if text.first() != Some(&b'{') {
+        return None;
+    }
+    // The names of each open object, or `None` for an open array.
+    let mut open: Vec<Option<usize>> = Vec::new();
+    let mut names: Vec<Range<usize>> = Vec::new();
+    let mut members = Vec::new();
+    let mut name = None;
+    let mut key = false;
+    let mut at = 0;
+    while at < text.len() {
+        match text[at] {
+            b'"' => {
+                let mut end = at + 1;
+                loop {
+                    match *text.get(end)? {
+                        b'"' => break,
+                        b'\\' => end += 2,
+                        _ => end += 1,
+                    }
+                }
+                if key {
+                    let earlier = open.last().copied().flatten()?;
+                    let written = at + 1..end;
+                    if names.len() - earlier >= MAX_CANONICAL_MEMBERS
+                        || names[earlier..]
+                            .iter()
+                            .any(|known| text[known.clone()] == text[written.clone()])
+                    {
+                        return None;
+                    }
+                    if open.len() == 1 {
+                        name = Some(written.clone());
+                    }
+                    names.push(written);
+                    key = false;
+                    // The name's closing quote and its `:`.
+                    end += 1;
+                }
+                at = end;
+            }
+            b'{' => {
+                open.push(Some(names.len()));
+                key = true;
+            }
+            b'[' => open.push(None),
+            close @ (b'}' | b']' | b',') => {
+                if open.len() == 1
+                    && let Some(name) = name.take()
+                {
+                    members.push(Member {
+                        value: name.end + 2..at,
+                        name,
+                    });
+                }
+                match close {
+                    b',' => key = open.last().copied().flatten().is_some(),
+                    _ => {
+                        if let Some(Some(earlier)) = open.pop() {
+                            names.truncate(earlier);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    open.is_empty().then_some(members)
 }
 
 /// The top-level members of `text` when it is a JSON object written exactly
@@ -561,6 +664,82 @@ mod tests {
     /// # Panics
     /// Panics when a body is not rewritten as described or its members
     /// differ from a scan of the written text.
+    /// Member ranges as comparable tuples.
+    fn ranges(members: &[Member]) -> Vec<(Range<usize>, Range<usize>)> {
+        members
+            .iter()
+            .map(|member| (member.name.clone(), member.value.clone()))
+            .collect()
+    }
+
+    /// A typed body whose flattened map can repeat a named member.
+    #[derive(serde::Serialize)]
+    struct Flattened {
+        model: &'static str,
+        temperature: f32,
+        #[serde(flatten)]
+        extra: serde_json::Map<String, Value>,
+    }
+
+    /// The scan of written text finds exactly the members the full canonical
+    /// check finds, through escapes, structure inside strings, nesting, and
+    /// floats, and refuses what it refuses: a repeated name at any depth and
+    /// an oversized object. A refused body is decoded instead of kept.
+    #[test]
+    fn written_text_scan_matches_the_canonical_check() {
+        let many = (0..=MAX_CANONICAL_MEMBERS)
+            .map(|index| (format!("m{index}"), Value::from(index)))
+            .collect::<serde_json::Map<_, _>>();
+        let cases = [
+            serde_json::to_vec(&serde_json::json!({
+                "model": "gpt",
+                "messages": [{"role": "user", "content": "a\"b\\c\u{1}é{}[],:"}],
+                "n\"ame": {"nested": [1, -0.0, 0.1, 1e300, null, true, {"x": []}]},
+                "empty": {},
+            }))
+            .expect("serializes"),
+            serde_json::to_vec(&Flattened {
+                model: "gpt",
+                temperature: 0.7,
+                extra: serde_json::Map::from_iter([("top_p".to_owned(), Value::from(0.9))]),
+            })
+            .expect("serializes"),
+            serde_json::to_vec(&Flattened {
+                model: "gpt",
+                temperature: 0.7,
+                extra: serde_json::Map::from_iter([("model".to_owned(), Value::from("other"))]),
+            })
+            .expect("serializes"),
+            serde_json::to_vec(&serde_json::json!({
+                "messages": [{"content": Flattened {
+                    model: "a",
+                    temperature: 1.0,
+                    extra: serde_json::Map::from_iter([("model".to_owned(), Value::from("b"))]),
+                }}],
+            }))
+            .expect("serializes"),
+            serde_json::to_vec(&Value::Object(many)).expect("serializes"),
+            serde_json::to_vec(&serde_json::json!([1, 2])).expect("serializes"),
+        ];
+        for text in &cases {
+            assert_eq!(
+                written_members(text).as_deref().map(ranges),
+                canonical(text).as_deref().map(ranges),
+                "{}",
+                String::from_utf8_lossy(text)
+            );
+        }
+        assert!(written_members(&cases[0]).is_some() && written_members(&cases[1]).is_some());
+        let repeated = Flattened {
+            model: "gpt",
+            temperature: 0.7,
+            extra: serde_json::Map::from_iter([("model".to_owned(), Value::from("other"))]),
+        };
+        let body = RequestJson::serialize(&repeated).expect("serializes");
+        assert!(body.text().is_none(), "a repeated name is decoded");
+        assert_eq!(body.member("model").as_deref(), Some(&Value::from("other")));
+    }
+
     #[test]
     fn with_model_rewrites_kept_text_without_decoding() {
         let cases = [

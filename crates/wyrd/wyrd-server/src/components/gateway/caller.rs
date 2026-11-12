@@ -11,7 +11,6 @@
 
 use async_trait::async_trait;
 use axum::http::StatusCode;
-use bytes::Bytes;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -269,13 +268,13 @@ impl NativeCall {
     }
 }
 
-/// Serialize a native request body to compact text the gateway keeps.
+/// Serialize a native request body to compact text the gateway keeps; see
+/// [`RequestJson::serialize`].
 ///
 /// # Errors
 /// Returns [`ProviderError::BadRequest`] when the body does not serialize.
 fn encode(body: &impl Serialize) -> Result<RequestJson, ProviderError> {
-    let text = serde_json::to_vec(body).map_err(|_| unserializable())?;
-    RequestJson::parse(Bytes::from(text)).map_err(|_| unserializable())
+    RequestJson::serialize(body).map_err(|_| unserializable())
 }
 
 /// The refusal of a request body that does not serialize.

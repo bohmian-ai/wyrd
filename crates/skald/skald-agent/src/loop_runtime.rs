@@ -341,12 +341,12 @@ impl Agent {
         request: &ProviderRequest,
         current: Option<StructuredOutput>,
     ) -> AgentResult<Option<StructuredOutput>> {
-        match ResponseType::of(request) {
-            ResponseType::Text => Ok(None),
-            ResponseType::JsonSchema { schema, .. } => match current {
-                Some(current) if current.schema() == &schema => Ok(Some(current)),
-                _ => StructuredOutput::new(&self.id, &self.schemas, Arc::new(schema)).map(Some),
-            },
+        let Some((_, schema)) = ResponseType::schema(request) else {
+            return Ok(None);
+        };
+        match current {
+            Some(current) if current.sends(schema) => Ok(Some(current)),
+            _ => StructuredOutput::new(&self.id, &self.schemas, schema).map(Some),
         }
     }
 

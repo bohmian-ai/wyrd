@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::authoring::{AuthoredPrompt, invalid};
 use crate::error::{SkaldError, SkaldResult};
@@ -315,70 +315,127 @@ const PREPARED_SCHEMAS: usize = 256;
 /// schemas are prepared again.
 #[derive(Debug, Default)]
 pub struct PreparedSchemas {
-    /// Schemas with their compiled validators, by [`schema_hash`].
+    /// Schemas with their compiled validators, by [`SchemaView::hash`].
     validators: Mutex<HashMap<u64, Vec<PreparedValidator>>>,
     /// Schemas that passed [`check_output_schema`], by whether their
-    /// destination required an object root and [`schema_hash`].
+    /// destination required an object root and [`SchemaView::hash`].
     checked: Mutex<HashMap<(bool, u64), Vec<Value>>>,
 }
 
 /// One schema and its compiled validator.
-type PreparedValidator = (Value, Arc<jsonschema::Validator>);
+type PreparedValidator = (Arc<Value>, Arc<jsonschema::Validator>);
 
-/// Structural hash of `schema`, computed without serializing it; equal
-/// schemas with the same key order hash equally.
-fn schema_hash(schema: &Value) -> u64 {
-    /// Feeds `value` to `state`, tagging each node so shapes cannot collide.
-    fn feed(value: &Value, state: &mut impl Hasher) {
-        match value {
-            Value::Null => 0u8.hash(state),
-            Value::Bool(flag) => (1u8, flag).hash(state),
-            Value::Number(number) => (2u8, number).hash(state),
-            Value::String(text) => (3u8, text).hash(state),
-            Value::Array(values) => {
-                (4u8, values.len()).hash(state);
-                for value in values {
-                    feed(value, state);
-                }
-            }
-            Value::Object(fields) => {
-                (5u8, fields.len()).hash(state);
-                for (key, value) in fields {
-                    key.hash(state);
-                    feed(value, state);
-                }
-            }
+/// A response schema borrowed where a request holds it: a whole JSON value,
+/// or the members of an object schema a request stores without its
+/// [`Value`] wrapper. Both forms of one schema hash and compare equal, so a
+/// lookup never copies the schema.
+#[derive(Debug, Clone, Copy)]
+pub enum SchemaView<'a> {
+    /// A schema held as a JSON value.
+    Value(&'a Value),
+    /// An object schema held as its members.
+    Object(&'a Map<String, Value>),
+}
+
+impl<'a> From<&'a Value> for SchemaView<'a> {
+    /// Views a schema held as a JSON value.
+    fn from(schema: &'a Value) -> Self {
+        Self::Value(schema)
+    }
+}
+
+impl SchemaView<'_> {
+    /// The schema as an owned JSON value.
+    #[must_use]
+    pub fn to_value(self) -> Value {
+        match self {
+            Self::Value(schema) => schema.clone(),
+            Self::Object(members) => Value::Object(members.clone()),
         }
     }
-    let mut state = DefaultHasher::new();
-    feed(schema, &mut state);
-    state.finish()
+
+    /// Whether `known` is this schema.
+    #[must_use]
+    pub fn is(self, known: &Value) -> bool {
+        match self {
+            Self::Value(schema) => known == schema,
+            Self::Object(members) => known.as_object() == Some(members),
+        }
+    }
+
+    /// Structural hash of the schema, computed without serializing it; equal
+    /// schemas with the same key order hash equally, in either form.
+    fn hash(self) -> u64 {
+        /// Feeds `value` to `state`, tagging each node so shapes cannot collide.
+        fn feed(value: &Value, state: &mut impl Hasher) {
+            match value {
+                Value::Null => 0u8.hash(state),
+                Value::Bool(flag) => (1u8, flag).hash(state),
+                Value::Number(number) => (2u8, number).hash(state),
+                Value::String(text) => (3u8, text).hash(state),
+                Value::Array(values) => {
+                    (4u8, values.len()).hash(state);
+                    for value in values {
+                        feed(value, state);
+                    }
+                }
+                Value::Object(fields) => object(fields, state),
+            }
+        }
+        /// Feeds the object `fields` to `state` as [`feed`] feeds an object.
+        fn object(fields: &Map<String, Value>, state: &mut impl Hasher) {
+            (5u8, fields.len()).hash(state);
+            for (key, value) in fields {
+                key.hash(state);
+                feed(value, state);
+            }
+        }
+        let mut state = DefaultHasher::new();
+        match self {
+            Self::Value(schema) => feed(schema, &mut state),
+            Self::Object(members) => object(members, &mut state),
+        }
+        state.finish()
+    }
 }
 
 impl PreparedSchemas {
     /// The compiled validator of `schema`, compiled now unless an equal
     /// schema was compiled before; `None` when it does not compile,
     /// which is never kept.
+    #[must_use]
+    pub fn validator(&self, schema: &Value) -> Option<Arc<jsonschema::Validator>> {
+        self.prepared(schema.into()).map(|(_, validator)| validator)
+    }
+
+    /// The kept copy of `schema` and its compiled validator, compiled and
+    /// kept now unless an equal schema was before; `None` when it does not
+    /// compile, which is never kept. A schema found here is not copied, and
+    /// every caller of one schema shares the kept copy.
     ///
     /// # Panics
     /// Never panics: a poisoned lock is recovered, since every entry is
     /// complete once inserted.
     #[must_use]
-    pub fn validator(&self, schema: &Value) -> Option<Arc<jsonschema::Validator>> {
-        let key = schema_hash(schema);
+    pub fn prepared(
+        &self,
+        schema: SchemaView<'_>,
+    ) -> Option<(Arc<Value>, Arc<jsonschema::Validator>)> {
+        let key = schema.hash();
         let lock = || {
             self.validators
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
         };
-        if let Some((_, validator)) = lock()
+        if let Some((known, validator)) = lock()
             .get(&key)
-            .and_then(|entries| entries.iter().find(|(known, _)| known == schema))
+            .and_then(|entries| entries.iter().find(|(known, _)| schema.is(known)))
         {
-            return Some(Arc::clone(validator));
+            return Some((Arc::clone(known), Arc::clone(validator)));
         }
+        let schema = Arc::new(schema.to_value());
         // Compiled unlocked: concurrent first calls may each compile once.
-        let validator = Arc::new(jsonschema::validator_for(schema).ok()?);
+        let validator = Arc::new(jsonschema::validator_for(&schema).ok()?);
         let mut validators = lock();
         // ponytail: forget-all eviction; an LRU if many distinct live schemas thrash it.
         if validators.len() >= PREPARED_SCHEMAS {
@@ -387,8 +444,8 @@ impl PreparedSchemas {
         validators
             .entry(key)
             .or_default()
-            .push((schema.clone(), Arc::clone(&validator)));
-        Some(validator)
+            .push((Arc::clone(&schema), Arc::clone(&validator)));
+        Some((schema, validator))
     }
 
     /// [`check_output_schema`] of `schema`, skipped when an equal schema
@@ -397,7 +454,7 @@ impl PreparedSchemas {
     /// # Errors
     /// Returns [`check_output_schema`]'s refusal at `field`.
     pub fn check(&self, schema: &Value, field: &str, object_root: bool) -> SkaldResult<()> {
-        let key = (object_root, schema_hash(schema));
+        let key = (object_root, SchemaView::Value(schema).hash());
         let lock = || self.checked.lock().unwrap_or_else(PoisonError::into_inner);
         if lock().get(&key).is_some_and(|known| known.contains(schema)) {
             return Ok(());
@@ -1155,23 +1212,28 @@ impl ResponseType {
     /// Portable schemas carry the name `response`; Anthropic and
     /// GenerateContent declare no schema name, so they use the same one.
     pub fn of(request: &ProviderRequest) -> Self {
+        Self::schema(request).map_or(Self::Text, |(name, schema)| Self::JsonSchema {
+            name: name.to_owned(),
+            schema: schema.to_value(),
+        })
+    }
+
+    /// The schema name and response schema `request` sends, borrowed from its
+    /// structured-output field as [`Self::of`] reads it, or `None` for a text
+    /// response.
+    #[must_use]
+    pub fn schema(request: &ProviderRequest) -> Option<(&str, SchemaView<'_>)> {
         use crate::wire::anthropic_messages::AnthropicOutputFormat;
         use crate::wire::openai_chat::OpenAiResponseFormat;
         use crate::wire::openai_responses::OpenAiTextResponseFormat;
 
-        let named = |name: &str, schema: Value| ResponseType::JsonSchema {
-            name: name.to_owned(),
-            schema,
-        };
         match request {
             ProviderRequest::OpenAiChatCompletion(request) => match &request.response_format {
                 Some(OpenAiResponseFormat::JsonSchema { json_schema }) => json_schema
                     .schema
-                    .clone()
-                    .map_or(ResponseType::Text, |schema| {
-                        named(&json_schema.name, Value::Object(schema))
-                    }),
-                _ => ResponseType::Text,
+                    .as_ref()
+                    .map(|schema| (json_schema.name.as_str(), SchemaView::Object(schema))),
+                _ => None,
             },
             ProviderRequest::OpenAiResponses(request) => {
                 match request.text.as_ref().and_then(|text| text.format.as_ref()) {
@@ -1179,18 +1241,20 @@ impl ResponseType {
                         name,
                         schema: Some(schema),
                         ..
-                    }) => named(name, Value::Object(schema.clone())),
-                    _ => ResponseType::Text,
+                    }) => Some((name.as_str(), SchemaView::Object(schema))),
+                    _ => None,
                 }
             }
-            ProviderRequest::AnthropicMessage(request) => match &request.output_config {
-                Some(config) => match &config.format {
-                    AnthropicOutputFormat::JsonSchema { schema } => {
-                        named("response", schema.clone())
-                    }
-                },
-                None => ResponseType::Text,
-            },
+            ProviderRequest::AnthropicMessage(request) => {
+                request
+                    .output_config
+                    .as_ref()
+                    .map(|config| match &config.format {
+                        AnthropicOutputFormat::JsonSchema { schema } => {
+                            ("response", SchemaView::Value(schema))
+                        }
+                    })
+            }
             ProviderRequest::GeminiGenerateContent(request) => request
                 .settings
                 .generation_config
@@ -1198,11 +1262,11 @@ impl ResponseType {
                 .and_then(|config| {
                     config
                         .response_json_schema
-                        .clone()
-                        .or_else(|| config.response_schema.clone())
+                        .as_ref()
+                        .or(config.response_schema.as_ref())
                 })
-                .map_or(ResponseType::Text, |schema| named("response", schema)),
-            _ => ResponseType::Text,
+                .map(|schema| ("response", SchemaView::Value(schema))),
+            _ => None,
         }
     }
 }

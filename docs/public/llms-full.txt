@@ -1088,7 +1088,7 @@ Pass the remote with `wyrd declare wyrd.toml --repository https://github.com/acm
 
 ## 5. Watch a pull request run
 
-Open a pull request on the repository. When GitHub delivers the event, Wyrd queues one execution per binding of the selected policy. Find the newest one from the binding the Repository lists under `status.verification.binding_ids`:
+Open a pull request on the repository. When GitHub delivers the event, Wyrd queues one execution per binding of the selected policy. The Repository lists its bindings under `status.verification.binding_ids`. Read one with `verification.get_binding` (`GET /v1/verification/bindings/{binding_id}`): its `last_execution_id` is the newest execution. Then inspect it:
 
 ```bash
 wyrd execution status --execution-id <execution_id>
@@ -1103,13 +1103,13 @@ Opening, reopening, marking ready for review, pushing commits and changing the b
 | `pull_request_superseded` | A newer head commit was pushed, or the base branch changed |
 | `pull_request_closed` | The pull request was closed or merged |
 | `pull_request_draft` | The pull request was converted to a draft |
-| `repository_access_lost` | The repository was removed from the installation, the installation was suspended, or the tenant disconnected GitHub |
+| `repository_access_lost` | The repository was removed from the installation, the installation was suspended or uninstalled, or the tenant disconnected GitHub |
 
 Declaring a new policy changes only runs queued afterwards; runs already queued keep the policy they started with. Runs act as the principal that declared the selected policy: if it can no longer run Verifiers, each run ends `errored` with the permission refusal and nothing executes.
 
 **When GitHub reports a failed delivery:**
 
-Wyrd answers GitHub only after the run is durably queued, so an interrupted delivery shows as failed in the App's delivery log. The server checks that log every minute and asks GitHub to redeliver each failed delivery until three redeliveries are logged; replicas checking at the same moment may each ask once. While GitHub still shows the same source, a redelivery reuses the run queued for the original delivery, so nothing runs twice; if the source changed or the pull request was closed meanwhile, the current source is admitted under the currently selected policy. You can also select **Redeliver** on the delivery in the App's settings.
+Wyrd answers GitHub only after the run is durably queued, so an interrupted delivery shows as failed in the App's delivery log. The server checks that log every minute and asks GitHub to redeliver each failed delivery until three redeliveries are logged; replicas checking at the same moment may each ask once. While GitHub still shows the same source, a redelivery reuses the run queued for the original delivery, so nothing runs twice; if a newer commit or base branch arrived meanwhile, the current source is admitted under the currently selected policy, and if the pull request was closed or converted to a draft, nothing is admitted. You can also select **Redeliver** on the delivery in the App's settings.
 
 ## If it fails
 

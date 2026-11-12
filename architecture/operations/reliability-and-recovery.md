@@ -292,10 +292,11 @@ attempt until three redeliveries are logged; replicas scanning at once may
 each ask. While the source is unchanged and not deactivated, the redelivery
 re-stages the reserved rows with their stored pins and identical Scribe batch
 identity and makes them due without resampling policy, so no binding runs
-twice; otherwise it admits the current source under the selected policy. After the
+twice. A newer source is admitted under the selected policy instead, and a
+closed or draft pull request admits nothing. After the
 bound is exhausted, an operator redelivers from the App's delivery log, or the
-next pull-request event admits the current source. Disconnect, suspension and
-repository removal cancel the affected unfinished executions with
+next pull-request event admits the current source. Disconnect, uninstall,
+suspension and repository removal cancel the affected unfinished executions with
 `repository_access_lost` in the access change's own transaction.
 
 Existing File completion, session recovery, integrity, inventory acknowledgement

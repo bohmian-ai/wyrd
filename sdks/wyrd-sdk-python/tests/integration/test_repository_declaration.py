@@ -197,7 +197,7 @@ def test_pull_requests_admit_pinned_executions_and_supersede_them(
     pins = opened["pull_request"]
     assert (pins["number"], pins["repository_id"]) == (7, "1")
     assert pins["base"] == {"ref": "main", "sha": "b1"}
-    assert pins["head"]["sha"] == "a1"
+    assert pins["head"] == {"ref": "feature", "sha": "a1"}
     assert pins["head_repository_id"] == "1"
     assert pins["delivery_id"]
 

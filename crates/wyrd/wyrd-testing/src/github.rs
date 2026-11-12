@@ -222,6 +222,8 @@ struct MockState {
     pulls: BTreeMap<(u64, u64), PullRequest>,
     /// Held next answer of the pull request read.
     pull_hold: Option<HeldAnswer>,
+    /// Whether the next pull request read fails with a server error.
+    pull_failure: bool,
     /// The App's webhook delivery log, oldest first.
     deliveries: Vec<DeliveryAttempt>,
     /// Wyrd's public base URL, where redeliveries are sent.
@@ -518,6 +520,12 @@ impl GithubAppMock {
             "repository": {"id": repository},
             "installation": {"id": installation},
         })
+    }
+
+    /// Fail the next pull request read with `502 Bad Gateway`, as an
+    /// unavailable GitHub would.
+    pub fn fail_next_pull_request_read(&self) {
+        self.state().pull_failure = true;
     }
 
     /// Hold GitHub's answer to the next pull request read.
@@ -1074,8 +1082,10 @@ async fn pull_request(
                 && !installation.suspended
                 && installation.repositories.contains_key(&repository)
         });
+        let failed = std::mem::take(&mut state.pull_failure);
         let answer = match state.pulls.get(&(repository, number)) {
             _ if !issued => StatusCode::UNAUTHORIZED.into_response(),
+            _ if failed => StatusCode::BAD_GATEWAY.into_response(),
             Some(pull_request) if reachable => {
                 axum::Json(pull_request.json(repository, number)).into_response()
             }

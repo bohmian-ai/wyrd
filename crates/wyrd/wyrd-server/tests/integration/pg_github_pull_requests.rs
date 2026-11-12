@@ -121,26 +121,13 @@ impl Deployment {
     /// # Panics
     /// Panics when the connection fails.
     async fn connect(server: &WyrdTestServer, mock: &GithubAppMock) {
-        let admin = server
-            .bootstrap_service_in_tenant(server.data_tenant_id(), "github_admin", &["admin"])
-            .await
-            .expect("administrator bootstraps");
-        let api_key = admin.api_key().expect("a machine principal").clone();
-        let mut browser = GithubBrowser::sign_in(
-            server.base_url().expect("bound"),
+        install(
+            server,
+            mock,
+            server.data_tenant_id(),
             server.pg_fixture().tenant_slug(),
-            api_key.expose_secret(),
         )
-        .await
-        .expect("browser signs in");
-        let answer = browser
-            .open(&format!(
-                "{}apps/wyrd-test-app/installations/new",
-                mock.origin()
-            ))
-            .await
-            .expect("browser navigates");
-        assert_eq!(answer.status, 200, "{:?}", answer.body);
+        .await;
         mock.add_installation(
             INSTALLATION,
             &[(REPOSITORY, "acme/policy"), (UNSELECTED, "acme/other")],
@@ -329,6 +316,39 @@ impl Deployment {
     }
 }
 
+/// Install the App for tenant `tenant` (slug `slug`) through GitHub's
+/// install page as its administrator, selecting the mock's install target.
+///
+/// # Panics
+/// Panics when the installation is not connected.
+async fn install(
+    server: &WyrdTestServer,
+    mock: &GithubAppMock,
+    tenant: wyrd_spec::ids::DataTenantId,
+    slug: &str,
+) {
+    let admin = server
+        .bootstrap_service_in_tenant(tenant, "github_admin", &["admin"])
+        .await
+        .expect("administrator bootstraps");
+    let api_key = admin.api_key().expect("a machine principal").clone();
+    let mut browser = GithubBrowser::sign_in(
+        server.base_url().expect("bound"),
+        slug,
+        api_key.expose_secret(),
+    )
+    .await
+    .expect("browser signs in");
+    let answer = browser
+        .open(&format!(
+            "{}apps/wyrd-test-app/installations/new",
+            mock.origin()
+        ))
+        .await
+        .expect("browser navigates");
+    assert_eq!(answer.status, 200, "{:?}", answer.body);
+}
+
 /// The status, code and head of `rows`.
 fn summary(rows: &[Row]) -> Vec<(&str, Option<&str>, &str)> {
     rows.iter()
@@ -391,6 +411,23 @@ async fn pull_request_lifecycle_admits_supersedes_and_ends_through_the_webhook()
             ("z-review".into(), "1.0.0".into(), "1.0.0".into(), true),
         ],
         "inline and referenced pull_request Triggers each bind one Verifier"
+    );
+    let mut conn = deployment.conn().await;
+    let unaccountable: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM wyrd.verifier_executions e
+           JOIN wyrd.cards c ON c.card_uid = e.owner_card_uid
+           JOIN wyrd.card_declaration_operations o
+             ON o.operation_id = c.selection_occurrence
+          WHERE e.origin = 'pull_request'
+            AND e.sub_principal_id IS DISTINCT FROM o.sub_principal_id",
+    )
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("authority reads");
+    conn.commit().await.expect("read commits");
+    assert_eq!(
+        unaccountable, 0,
+        "each execution acts as the principal that declared the selected policy"
     );
 
     let title = json!({
@@ -675,34 +712,36 @@ async fn burst_of_forty_one_pull_requests_admits_each_binding_once() {
         rows.iter().all(|row| row.status == "completed"),
         "every admitted execution progresses to completion: {rows:?}"
     );
-    let served = deployment.status(rows[0].execution_id).await;
-    assert_eq!(served["status"], "completed");
-    assert_eq!(served["pull_request"]["repository_id"], "4242");
+    for row in &rows {
+        let served = deployment.status(row.execution_id).await;
+        assert_eq!(served["status"], "completed");
+        assert_eq!(served["pull_request"]["head"]["sha"], row.head);
+    }
 }
 
-/// A delivery interrupted after its generation was reserved, with one
-/// binding already due and the rest of its handoff unacknowledged, is
-/// answered with no 2xx; after a restart, failed-delivery recovery
-/// redelivers it and completes the same frozen fanout under the same
-/// execution IDs, never a second generation or a second run of the due
-/// binding.
+/// Open PR `number` and interrupt its delivery after the generation was
+/// reserved and one binding activated, with the rest of the handoff
+/// unacknowledged; restart the server and return it with the reserved rows.
 ///
 /// # Panics
-/// Panics when the interrupted delivery is acknowledged, or recovery admits
-/// other or duplicate executions.
-#[tokio::test(flavor = "multi_thread")]
-async fn interrupted_handoff_completes_the_same_fanout_after_restart() {
+/// Panics when the generation is not reserved first or the interrupted
+/// delivery is acknowledged.
+async fn interrupted(number: u64) -> (Deployment, Vec<Row>) {
     let Deployment {
         mock,
         server,
         jwt: _,
     } = Deployment::start().await;
-    mock.set_pull_request(REPOSITORY, 9, PullRequest::open(REPOSITORY, "b1", "a1"));
+    mock.set_pull_request(
+        REPOSITORY,
+        number,
+        PullRequest::open(REPOSITORY, "b1", "a1"),
+    );
     server.flush_bifrost().await.expect("setup settles");
     let held = server
         .stall_next_bifrost_write_into("bifrost.verification.execution_inputs")
         .expect("Scribe stalls");
-    let payload = mock.pull_request_event(INSTALLATION, REPOSITORY, 9, "opened");
+    let payload = mock.pull_request_event(INSTALLATION, REPOSITORY, number, "opened");
     let delivery = {
         let mock = mock.clone();
         let base = server.base_url().expect("bound").to_owned();
@@ -714,7 +753,7 @@ async fn interrupted_handoff_completes_the_same_fanout_after_restart() {
         server,
         jwt: String::new(),
     };
-    let reserved = deployment.rows(9).await;
+    let reserved = deployment.rows(number).await;
     assert_eq!(
         reserved.len(),
         2,
@@ -755,6 +794,22 @@ async fn interrupted_handoff_completes_the_same_fanout_after_restart() {
         server: restarted,
         jwt,
     };
+    (deployment, reserved)
+}
+
+/// A delivery interrupted after its generation was reserved, with one
+/// binding already due and the rest of its handoff unacknowledged, is
+/// answered with no 2xx; after a restart, failed-delivery recovery
+/// redelivers it and completes the same frozen fanout under the same
+/// execution IDs, never a second generation or a second run of the due
+/// binding.
+///
+/// # Panics
+/// Panics when the interrupted delivery is acknowledged, or recovery admits
+/// other or duplicate executions.
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupted_handoff_completes_the_same_fanout_after_restart() {
+    let (deployment, reserved) = interrupted(9).await;
     let asked = GithubConnections::new(deployment.server.state())
         .recover_deliveries()
         .await
@@ -778,6 +833,47 @@ async fn interrupted_handoff_completes_the_same_fanout_after_restart() {
         let served = deployment.status(row.execution_id).await;
         assert_eq!(served["execution_id"], row.execution_id.to_string());
     }
+}
+
+/// An interrupted delivery whose PR moved to a new head before recovery
+/// admits the current source under the selected policy and cancels the
+/// interrupted generation, the binding already due included.
+///
+/// # Panics
+/// Panics when recovery completes the stale generation.
+#[tokio::test(flavor = "multi_thread")]
+async fn recovery_after_a_new_head_admits_the_current_source() {
+    let (deployment, reserved) = interrupted(10).await;
+    deployment
+        .mock
+        .edit_pull_request(REPOSITORY, 10, |pr| pr.head_sha = "a2".to_owned());
+    assert_eq!(
+        GithubConnections::new(deployment.server.state())
+            .recover_deliveries()
+            .await
+            .expect("the delivery log reads"),
+        1
+    );
+    let rows = deployment.rows(10).await;
+    assert_eq!(
+        rows[..2]
+            .iter()
+            .map(|row| row.execution_id)
+            .collect::<Vec<_>>(),
+        reserved
+            .iter()
+            .map(|row| row.execution_id)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        summary(&rows),
+        [
+            ("cancelled", Some("pull_request_superseded"), "a1"),
+            ("cancelled", Some("pull_request_superseded"), "a1"),
+            ("pending", None, "a2"),
+            ("pending", None, "a2"),
+        ]
+    );
 }
 
 /// When the declaring principal can no longer act, an open PR settles one
@@ -1121,4 +1217,125 @@ async fn uninstalling_the_app_cancels_unfinished_pull_request_work() {
             ("cancelled", Some("repository_access_lost"), "a1"),
         ]
     );
+}
+
+/// Close fences a running execution as well as queued ones; an observation
+/// taken before the close cannot admit afterwards; a failed GitHub read is
+/// not acknowledged and its redelivery admits.
+///
+/// # Panics
+/// Panics when deactivated work can still settle, an outdated observation
+/// admits, or a failed read is acknowledged or lost.
+#[tokio::test(flavor = "multi_thread")]
+async fn close_fences_running_work_and_failed_reads_stay_retryable() {
+    let deployment = Deployment::start().await;
+    let mock = &deployment.mock;
+    mock.set_pull_request(REPOSITORY, 17, PullRequest::open(REPOSITORY, "b1", "a1"));
+    assert_eq!(deployment.send(17, "opened").await.0, StatusCode::ACCEPTED);
+    let running = deployment.claim(1).await.pop().expect("one runs");
+
+    let held = mock.hold_next_pull_request_read();
+    let delayed = {
+        let payload = mock.pull_request_event(INSTALLATION, REPOSITORY, 17, "synchronize");
+        let mock = mock.clone();
+        let base = deployment.base().to_owned();
+        tokio::spawn(async move { mock.deliver_new(&base, "pull_request", &payload).await })
+    };
+    held.arrived().await;
+    mock.edit_pull_request(REPOSITORY, 17, |pr| pr.open = false);
+    assert_eq!(deployment.send(17, "closed").await.0, StatusCode::ACCEPTED);
+    held.release();
+    let (status, _) = delayed.await.expect("joins").expect("delivery sends");
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(
+        summary(&deployment.rows(17).await),
+        [
+            ("cancelled", Some("pull_request_closed"), "a1"),
+            ("cancelled", Some("pull_request_closed"), "a1"),
+        ],
+        "the running and the queued execution end, and the open state read \
+         before the close admits nothing"
+    );
+    let mut conn = deployment.conn().await;
+    let late = VerifierExecutionQueue::default()
+        .complete(
+            &mut conn,
+            running.lease,
+            VerificationResultId::new_v7(),
+            VerificationVerdict::Passed,
+            "finished after the close",
+            None,
+        )
+        .await
+        .expect("settlement runs");
+    conn.commit().await.expect("commits");
+    assert_eq!(late, Settlement::StaleLease, "the running worker is fenced");
+
+    mock.set_pull_request(REPOSITORY, 18, PullRequest::open(REPOSITORY, "b1", "f1"));
+    mock.fail_next_pull_request_read();
+    let (status, failed) = deployment.send(18, "opened").await;
+    assert!(
+        !status.is_success(),
+        "an unread source is not acknowledged: {status}"
+    );
+    assert!(deployment.rows(18).await.is_empty());
+    assert_eq!(
+        mock.redeliver(&failed).await.expect("redelivers"),
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        summary(&deployment.rows(18).await),
+        [("pending", None, "f1"), ("pending", None, "f1")],
+        "the redelivery admits once GitHub answers"
+    );
+}
+
+/// A delivery admits only into the tenant connected to its installation:
+/// another tenant's installation reaching the same repository owes the
+/// first tenant nothing, and the first tenant's delivery writes nothing in
+/// the other.
+///
+/// # Panics
+/// Panics when a delivery admits work into a tenant not connected to it.
+#[tokio::test(flavor = "multi_thread")]
+async fn deliveries_admit_only_into_the_connected_tenant() {
+    let deployment = Deployment::start().await;
+    let mock = &deployment.mock;
+    let other = deployment
+        .server
+        .seed_tenant("other-tenant")
+        .await
+        .expect("second tenant seeds");
+    mock.add_installation(202, &[(REPOSITORY, "acme/policy")]);
+    mock.add_user("octo", &[INSTALLATION, 202]);
+    mock.install_target(202);
+    install(&deployment.server, mock, other, "other-tenant").await;
+    mock.set_pull_request(REPOSITORY, 19, PullRequest::open(REPOSITORY, "b1", "t1"));
+
+    let payload = mock.pull_request_event(202, REPOSITORY, 19, "opened");
+    let (status, _) = mock
+        .deliver_new(deployment.base(), "pull_request", &payload)
+        .await
+        .expect("delivery sends");
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert!(
+        deployment.rows(19).await.is_empty(),
+        "the other tenant's installation admits nothing here"
+    );
+
+    assert_eq!(deployment.send(19, "opened").await.0, StatusCode::ACCEPTED);
+    assert_eq!(deployment.rows(19).await.len(), 2);
+    let mut conn = deployment
+        .server
+        .tenant_conn_for(other)
+        .await
+        .expect("tenant connection opens");
+    let foreign: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM wyrd.verifier_executions WHERE origin = 'pull_request'",
+    )
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("count reads");
+    conn.commit().await.expect("read commits");
+    assert_eq!(foreign, 0, "nothing is admitted into the other tenant");
 }

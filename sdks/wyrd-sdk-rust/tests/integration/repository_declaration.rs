@@ -625,6 +625,7 @@ mod pg_tests {
             (pins.base.sha.as_str(), pins.head.sha.as_str()),
             ("b1", "a1")
         );
+        assert_eq!(pins.head.ref_name.as_str(), "feature");
         assert_eq!(
             pins.head_repository_id.as_ref().map(RepositoryId::as_str),
             Some("1")

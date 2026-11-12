@@ -338,6 +338,7 @@ mod pg_tests {
             json!({ "ref": "main", "sha": "b1" })
         );
         assert_eq!(admitted["pull_request"]["head"]["sha"], "a1");
+        assert_eq!(admitted["pull_request"]["head"]["ref"], "feature");
         assert_eq!(admitted["pull_request"]["head_repository_id"], "2");
         assert!(
             admitted["pull_request"]["delivery_id"]

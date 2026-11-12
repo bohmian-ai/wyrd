@@ -171,7 +171,7 @@ test("pull requests admit pinned executions and supersede them", async ({ server
     number: 7,
     repository_id: "1",
     base: { ref: "main", sha: "b1" },
-    head: { sha: "a1" },
+    head: { ref: "feature", sha: "a1" },
     head_repository_id: "1",
   });
   expect(opened.pull_request?.delivery_id).toBeTruthy();

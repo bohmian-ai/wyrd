@@ -2239,8 +2239,8 @@ principal and the Verifier and Trigger versions are frozen into one reserved
 execution per binding before any hand-off. A newer generation cancels every
 unfinished execution of the older one with `pull_request_superseded` and
 fences its running leases; close, draft conversion and loss of repository
-access cancel with `pull_request_closed`, `pull_request_draft` and
-`repository_access_lost`. Settled history keeps its pins, and a policy
+access (repository removal, suspension, uninstall or disconnect) cancel with
+`pull_request_closed`, `pull_request_draft` and `repository_access_lost`. Settled history keeps its pins, and a policy
 re-declaration affects only later generations.
 
 The reserved executions then follow the same Scribe hand-off and outbox as
@@ -2250,8 +2250,9 @@ every execution of its generation is due, or after durable obsolete or
 refusal settlement establishes that no work is owed; a refusal settles as an
 `errored` execution, and an unavailable authority store answers non-2xx. A
 redelivery of an accepted generation that is still current and not
-deactivated re-stages the stored pins, never a newer policy; otherwise it
-admits the current source under the selected policy. GitHub does not redeliver failed deliveries on its own, so the GitHub
+deactivated re-stages the stored pins, never a newer policy; a newer source
+is admitted under the selected policy instead, and a closed or draft pull
+request admits nothing. GitHub does not redeliver failed deliveries on its own, so the GitHub
 owner scans the App's delivery log and asks GitHub to redeliver each delivery
 without a 2xx attempt until a bounded number of redeliveries is logged;
 replicas scanning at once may each ask.

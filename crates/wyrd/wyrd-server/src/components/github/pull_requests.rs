@@ -4,18 +4,22 @@
 //! A signature-verified `pull_request` delivery for a tenant's connected,
 //! selected repository is admitted in three steps, each owned elsewhere:
 //!
-//! 1. [`GithubConnections::pull_request`] reads the database observation
-//!    time, then GitHub's current state of the PR with a narrowed
-//!    installation token, outside any transaction. The delivered payload
-//!    only says which PR to look at: an old delivery never makes old source
-//!    current.
-//! 2. Under the PR's lock it decides on that state: an observation older
-//!    than the PR's newest is obsolete; a closed or draft PR cancels its
-//!    unfinished work; a source the newest generation already reviews
-//!    replays it; any other open source becomes a new generation, frozen per
-//!    `pull_request` binding of the selected Repository with the selecting
-//!    declaration's accountable principal, and supersedes the older one.
-//!    Every outcome commits before anything else happens.
+//! 1. [`GithubConnections::pull_request`] mints a narrowed installation
+//!    token for the installation the delivery was routed by, then takes the
+//!    PR's lock, reads the database observation time and GitHub's current
+//!    state of the PR while holding it. The delivered payload only says
+//!    which PR to look at: an old delivery never makes old source current,
+//!    and a later delivery of the same PR waits until this one decided.
+//! 2. Still under the PR's lock, and only while the tenant's connection is
+//!    at the revision the token was minted under, it decides on that state:
+//!    an observation older than the PR's newest is obsolete; a closed or
+//!    draft PR cancels its unfinished work; a source the newest generation
+//!    already reviews replays it; any other open source becomes a new
+//!    generation, frozen per `pull_request` binding of the selected
+//!    Repository with the selecting declaration's accountable principal,
+//!    and supersedes the older one, which is deactivated outright when the
+//!    selected policy binds nothing. Every outcome commits before anything
+//!    else happens.
 //! 3. Each reserved execution's input record is staged on the Scribe outbox
 //!    under a batch identity derived from its execution ID, and the queue
 //!    writer activates it only after Scribe acknowledges the record. The
@@ -168,8 +172,9 @@ struct Delivery {
 }
 
 impl GithubConnections<'_> {
-    /// Admit `event`, delivery `delivery_id` for `tenant`, into the Verifier
-    /// queue, returning once every execution it owes was durably admitted.
+    /// Admit `event`, delivery `delivery_id` for `tenant` routed by its
+    /// `installation`, into the Verifier queue, returning once every
+    /// execution it owes was durably admitted.
     ///
     /// See the [module](self) for the steps. An event that cannot change the
     /// PR's source, a repository the connection no longer reaches, one
@@ -178,17 +183,25 @@ impl GithubConnections<'_> {
     /// not run its Verifier settles `errored` with the refusal and runs
     /// nothing.
     ///
+    /// One tenant connection and the PR's lock are held across GitHub's one
+    /// deadline-bounded PR read; other PRs take other locks, and no
+    /// connection-slot or execution row is locked while GitHub answers.
+    ///
     /// # Errors
     /// Returns [`WyrdError::GithubUnavailable`] when GitHub cannot report
-    /// the PR, [`WyrdError::ServiceUnavailable`] when the accountable
-    /// authority cannot be decided now, this process queues no Verifier work,
-    /// or an admission was lost before it committed, the staging refusal,
-    /// or a registry error. Each leaves the delivery retryable.
+    /// the PR, [`WyrdError::GithubConnectionConflict`]
+    /// (`connection_changed`) when the tenant's connection changed while
+    /// GitHub answered, [`WyrdError::ServiceUnavailable`] when the
+    /// accountable authority cannot be decided now, this process queues no
+    /// Verifier work, or an admission was lost before it committed, the
+    /// staging refusal, or a registry error. Each leaves the delivery
+    /// retryable.
     #[tracing::instrument(skip(self, app, event), fields(operation = "github_connection.pull_request", %tenant, number = event.number))]
     pub(crate) async fn pull_request(
         &self,
         app: &GithubApp,
         tenant: DataTenantId,
+        installation: i64,
         delivery_id: &str,
         event: &PullRequestEvent,
     ) -> Result<Vec<ExecutionId>, WyrdError> {
@@ -203,15 +216,11 @@ impl GithubConnections<'_> {
             repository_id: &repository_id,
             number: event.number,
         };
-        let queue = VerifierExecutionQueue::default();
-        let mut conn = self.conn(tenant).await?;
-        let observed_at = queue
-            .observe_pull_request(&mut conn)
+        let (token, binding) = match self
+            .installation_access(tenant, Some(installation), event.repository.id)
             .await
-            .map_err(registry_db_error)?;
-        conn.commit().await.map_err(registry_db_error)?;
-        let token = match self.installation_token(tenant, event.repository.id).await {
-            Ok(token) => token,
+        {
+            Ok(access) => access,
             Err(
                 WyrdError::GithubRepositoryInaccessible { .. }
                 | WyrdError::GithubNotConnected { .. },
@@ -221,17 +230,27 @@ impl GithubConnections<'_> {
             }
             Err(error) => return Err(error),
         };
-        let Some(current) = app
+        let queue = VerifierExecutionQueue::default();
+        let mut conn = self.conn(tenant).await?;
+        queue
+            .lock_pull_request(&mut conn, key)
+            .await
+            .map_err(registry_db_error)?;
+        let observed_at = queue
+            .observe_pull_request(&mut conn)
+            .await
+            .map_err(registry_db_error)?;
+        let current = app
             .pull_request(&token, event.repository.id, event.number)
-            .await?
-        else {
+            .await?;
+        drop(token);
+        let Some(current) = current else {
+            conn.commit().await.map_err(registry_db_error)?;
             tracing::info!("GitHub no longer shows the pull request; nothing admitted");
             return Ok(Vec::new());
         };
-        drop(token);
         let observed = Observed::of(current)?;
-
-        let mut conn = self.conn(tenant).await?;
+        Self::hold_binding(&mut conn, binding).await?;
         let history = queue
             .lock_pull_request(&mut conn, key)
             .await
@@ -273,8 +292,15 @@ impl GithubConnections<'_> {
             .is_some_and(|generation| !generation.deactivated && generation.reviews(&source));
         if !replay {
             let Some(targets) = self.targets(&mut conn, &repository_id).await? else {
+                let superseded = queue
+                    .deactivate_pull_request(&mut conn, key, observed_at, PullRequestEnd::Superseded)
+                    .await
+                    .map_err(registry_db_error)?;
                 conn.commit().await.map_err(registry_db_error)?;
-                tracing::info!("no selected Repository binds this repository's pull requests");
+                tracing::info!(
+                    superseded = superseded.len(),
+                    "no selected Repository binds this repository's pull requests"
+                );
                 return Ok(Vec::new());
             };
             let (reserved, superseded) = queue

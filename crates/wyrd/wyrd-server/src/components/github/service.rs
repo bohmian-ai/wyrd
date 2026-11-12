@@ -664,7 +664,8 @@ impl<'a> GithubConnections<'a> {
                 message: "the pull_request delivery carries no X-GitHub-Delivery id".to_owned(),
                 details: serde_json::json!({ "field": "x-github-delivery" }),
             })?;
-            self.pull_request(app, tenant, delivery, &event).await?;
+            self.pull_request(app, tenant, installation_id, delivery, &event)
+                .await?;
             return Ok(());
         }
         if let ("installation", Some("suspend" | "unsuspend")) = (event, payload.action.as_deref())
@@ -878,6 +879,29 @@ impl<'a> GithubConnections<'a> {
         tenant: DataTenantId,
         repository_id: u64,
     ) -> Result<SecretString, WyrdError> {
+        self.installation_access(tenant, None, repository_id)
+            .await
+            .map(|(token, _)| token)
+    }
+
+    /// An installation token as [`Self::installation_token`] mints it, and
+    /// the slot binding it was minted under; when `installation` is given,
+    /// the slot must still be associated with that installation.
+    ///
+    /// A webhook passes the installation it was routed by, so a delivery
+    /// for an installation the tenant no longer holds is never served by
+    /// the one that replaced it.
+    ///
+    /// # Errors
+    /// The errors of [`Self::installation_token`], and
+    /// [`WyrdError::GithubRepositoryInaccessible`] when the slot holds
+    /// another installation.
+    pub(super) async fn installation_access(
+        &self,
+        tenant: DataTenantId,
+        installation: Option<i64>,
+        repository_id: u64,
+    ) -> Result<(SecretString, GithubSlotBinding), WyrdError> {
         let app = self.app()?;
         let mut conn = self.conn(tenant).await?;
         let slot = github_installation(&mut conn)
@@ -896,10 +920,11 @@ impl<'a> GithubConnections<'a> {
             .0
             .iter()
             .any(|entry| entry.repository_id == repository);
+        let routed = installation.is_none_or(|routed| slot.installation_id == Some(routed));
         let installation = slot
             .installation_id
             .and_then(|id| u64::try_from(id).ok())
-            .filter(|_| selected && slot.suspended_at.is_none());
+            .filter(|_| routed && selected && slot.suspended_at.is_none());
         let Some(installation) = installation else {
             return Err(WyrdError::GithubRepositoryInaccessible {
                 message: "this repository is not selected for an active installation".to_owned(),
@@ -916,6 +941,31 @@ impl<'a> GithubConnections<'a> {
             drop(token);
             return Err(connection_changed());
         }
-        Ok(token)
+        Ok((token, slot.binding()))
+    }
+
+    /// Lock `conn`'s tenant connection slot for the rest of its transaction
+    /// and refuse unless it is still at `binding`.
+    ///
+    /// Every change to the association or its access advances the slot
+    /// revision under this lock, so work written after this check commits
+    /// only under the access it was decided with, and an access change that
+    /// commits first makes this refuse.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::GithubConnectionConflict`]
+    /// (`connection_changed`) when the slot moved past `binding`, or a
+    /// registry error.
+    pub(super) async fn hold_binding(
+        conn: &mut TenantConn<'_>,
+        binding: GithubSlotBinding,
+    ) -> Result<(), WyrdError> {
+        let slot = lock_github_installation(conn)
+            .await
+            .map_err(registry_db_error)?;
+        if slot.map(|row| row.binding()) != Some(binding) {
+            return Err(connection_changed());
+        }
+        Ok(())
     }
 }

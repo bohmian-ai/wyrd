@@ -7,7 +7,9 @@
 //! closed or draft PR deactivates it ([`VerifierExecutionQueue::deactivate_pull_request`]),
 //! an unchanged source replays it, and a new source reserves a new
 //! generation ([`VerifierExecutionQueue::reserve_pull_request`]) that cancels
-//! every older unfinished execution of the PR in the same transaction.
+//! every older unfinished execution of the PR in the same transaction, or,
+//! when the selected policy binds nothing, deactivates the older ones as
+//! superseded.
 //!
 //! A reservation freezes each binding's Verifier, subject, Trigger,
 //! Operators and accepted authority with the PR pins before any input record
@@ -220,14 +222,17 @@ impl PullRequestKey<'_> {
     }
 }
 
-/// Why a PR stopped being reviewable, recorded as the cancellation code of
-/// its unfinished executions.
+/// Why a PR's generations stopped being reviewable, recorded as the
+/// cancellation code of their unfinished executions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PullRequestEnd {
     /// The PR was closed or merged.
     Closed,
     /// The PR was converted to a draft.
     Draft,
+    /// A new source replaced them that the selected policy binds no
+    /// Verifier to, so no newer generation was stored.
+    Superseded,
 }
 
 impl PullRequestEnd {
@@ -243,6 +248,7 @@ impl PullRequestEnd {
                 code: "pull_request_draft".to_owned(),
                 message: "the pull request was converted to a draft".to_owned(),
             },
+            Self::Superseded => superseded(),
         }
     }
 }
@@ -480,9 +486,10 @@ impl VerifierExecutionQueue {
             .collect()
     }
 
-    /// Cancel the locked PR's unfinished executions because it ended, and
-    /// deactivate its generations as of `observed_at`. Returns the
-    /// executions this call cancelled. History keeps its pins and status.
+    /// Cancel the locked PR's unfinished executions because of `end`, and
+    /// deactivate its generations as of `observed_at`, so none of them is
+    /// replayed as current again. Returns the executions this call
+    /// cancelled. History keeps its pins and status.
     ///
     /// # Errors
     /// Returns the database error when the update fails.

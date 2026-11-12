@@ -126,6 +126,7 @@ impl Deployment {
             mock,
             server.data_tenant_id(),
             server.pg_fixture().tenant_slug(),
+            "github_admin",
         )
         .await;
         mock.add_installation(
@@ -261,6 +262,62 @@ impl Deployment {
 }
 
 impl Deployment {
+    /// Deliver `action` on PR `number` from GitHub's current state on its
+    /// own task; joins to the status and delivery id.
+    fn spawn_send(
+        &self,
+        number: u64,
+        action: &str,
+    ) -> tokio::task::JoinHandle<(StatusCode, String)> {
+        let payload = self
+            .mock
+            .pull_request_event(INSTALLATION, REPOSITORY, number, action);
+        let mock = self.mock.clone();
+        let base = self.base().to_owned();
+        tokio::spawn(async move {
+            mock.deliver_new(&base, "pull_request", &payload)
+                .await
+                .expect("delivery sends")
+        })
+    }
+
+    /// Wait until `delivery` either finished or waits on a pull request's
+    /// lock, and return whether it waits.
+    ///
+    /// # Panics
+    /// Panics when it does neither within a minute.
+    async fn waits_on_the_pull_request(
+        &self,
+        delivery: &tokio::task::JoinHandle<(StatusCode, String)>,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_mins(1);
+        loop {
+            let mut conn = self.conn().await;
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_locks
+                  WHERE locktype = 'advisory' AND NOT granted
+                    AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+            )
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("locks read");
+            conn.commit().await.expect("read commits");
+            if waiting > 0 {
+                return true;
+            }
+            if delivery.is_finished() {
+                return false;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the delivery neither finished nor waits"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+}
+
+impl Deployment {
     /// A tenant connection.
     ///
     /// # Panics
@@ -317,7 +374,8 @@ impl Deployment {
 }
 
 /// Install the App for tenant `tenant` (slug `slug`) through GitHub's
-/// install page as its administrator, selecting the mock's install target.
+/// install page as its new administrator `admin`, selecting the mock's
+/// install target.
 ///
 /// # Panics
 /// Panics when the installation is not connected.
@@ -326,9 +384,10 @@ async fn install(
     mock: &GithubAppMock,
     tenant: wyrd_spec::ids::DataTenantId,
     slug: &str,
+    admin: &str,
 ) {
     let admin = server
-        .bootstrap_service_in_tenant(tenant, "github_admin", &["admin"])
+        .bootstrap_service_in_tenant(tenant, admin, &["admin"])
         .await
         .expect("administrator bootstraps");
     let api_key = admin.api_key().expect("a machine principal").clone();
@@ -363,9 +422,9 @@ fn summary(rows: &[Row]) -> Vec<(&str, Option<&str>, &str)> {
 /// whose answer was lost and is recovered from GitHub's delivery log,
 /// admit nothing twice. A new head supersedes the queued and the running
 /// generation, fencing the running worker and keeping its history. A
-/// metadata-only edit admits nothing. A delivery whose provider read
-/// observed the PR before a newer head committed cannot make its older
-/// source current. Draft conversion, close and access loss cancel unfinished
+/// metadata-only edit admits nothing. A newer head's delivery waits while
+/// an earlier provider read is outstanding, so that read cannot make its
+/// older source current. Draft conversion, close and access loss cancel unfinished
 /// work with their codes; ready and reopen admit a new generation.
 ///
 /// # Panics
@@ -566,25 +625,22 @@ async fn pull_request_lifecycle_admits_supersedes_and_ends_through_the_webhook()
     );
 
     let held = mock.hold_next_pull_request_read();
-    let delayed = {
-        let payload = mock.pull_request_event(INSTALLATION, REPOSITORY, 7, "synchronize");
-        let mock = mock.clone();
-        let base = deployment.base().to_owned();
-        tokio::spawn(async move { mock.deliver_new(&base, "pull_request", &payload).await })
-    };
+    let delayed = deployment.spawn_send(7, "synchronize");
     held.arrived().await;
     mock.edit_pull_request(REPOSITORY, 7, |pr| pr.head_sha = "c3".to_owned());
-    assert_eq!(
-        deployment.send(7, "synchronize").await.0,
-        StatusCode::ACCEPTED
+    let newer = deployment.spawn_send(7, "synchronize");
+    assert!(
+        deployment.waits_on_the_pull_request(&newer).await,
+        "the newer delivery waits for the delayed read"
     );
     held.release();
-    let (status, _) = delayed.await.expect("joins").expect("delivery sends");
+    let (status, _) = delayed.await.expect("joins");
     assert_eq!(
         status,
         StatusCode::ACCEPTED,
-        "an obsolete observation owes no work"
+        "the delayed read of the current source owes no new work"
     );
+    assert_eq!(newer.await.expect("joins").0, StatusCode::ACCEPTED);
     let rows = deployment.rows(7).await;
     assert_eq!(
         summary(&rows[2..]),
@@ -1219,8 +1275,8 @@ async fn uninstalling_the_app_cancels_unfinished_pull_request_work() {
     );
 }
 
-/// Close fences a running execution as well as queued ones; an observation
-/// taken before the close cannot admit afterwards; a failed GitHub read,
+/// Close fences a running execution as well as queued ones; the close waits
+/// for an observation taken before it, which cannot admit afterwards; a failed GitHub read,
 /// whether GitHub is unavailable or rate-limits the read with a 403, is not
 /// acknowledged and its redelivery admits exactly once.
 ///
@@ -1236,18 +1292,17 @@ async fn close_fences_running_work_and_failed_reads_stay_retryable() {
     let running = deployment.claim(1).await.pop().expect("one runs");
 
     let held = mock.hold_next_pull_request_read();
-    let delayed = {
-        let payload = mock.pull_request_event(INSTALLATION, REPOSITORY, 17, "synchronize");
-        let mock = mock.clone();
-        let base = deployment.base().to_owned();
-        tokio::spawn(async move { mock.deliver_new(&base, "pull_request", &payload).await })
-    };
+    let delayed = deployment.spawn_send(17, "synchronize");
     held.arrived().await;
     mock.edit_pull_request(REPOSITORY, 17, |pr| pr.open = false);
-    assert_eq!(deployment.send(17, "closed").await.0, StatusCode::ACCEPTED);
+    let close = deployment.spawn_send(17, "closed");
+    assert!(
+        deployment.waits_on_the_pull_request(&close).await,
+        "the close waits for the delayed read"
+    );
     held.release();
-    let (status, _) = delayed.await.expect("joins").expect("delivery sends");
-    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(delayed.await.expect("joins").0, StatusCode::ACCEPTED);
+    assert_eq!(close.await.expect("joins").0, StatusCode::ACCEPTED);
     assert_eq!(
         summary(&deployment.rows(17).await),
         [
@@ -1312,7 +1367,7 @@ async fn deliveries_admit_only_into_the_connected_tenant() {
     mock.add_installation(202, &[(REPOSITORY, "acme/policy")]);
     mock.add_user("octo", &[INSTALLATION, 202]);
     mock.install_target(202);
-    install(&deployment.server, mock, other, "other-tenant").await;
+    install(&deployment.server, mock, other, "other-tenant", "github_admin").await;
     mock.set_pull_request(REPOSITORY, 19, PullRequest::open(REPOSITORY, "b1", "t1"));
 
     let payload = mock.pull_request_event(202, REPOSITORY, 19, "opened");
@@ -1379,5 +1434,228 @@ async fn delivery_recovery_yields_to_shutdown_mid_scan() {
         mock.delivery_attempts(&failed),
         [(0, false)],
         "no redelivery is asked for after shutdown"
+    );
+}
+
+/// A close of a PR with no work yet is never undone by an open read begun
+/// before it: the close waits while that read is outstanding, then cancels
+/// what it admitted.
+///
+/// # Panics
+/// Panics when the earlier read leaves work due or the close does not wait.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_close_waits_for_an_earlier_open_read() {
+    let deployment = Deployment::start().await;
+    let mock = &deployment.mock;
+    mock.set_pull_request(REPOSITORY, 20, PullRequest::open(REPOSITORY, "b1", "o1"));
+    let held = mock.hold_next_pull_request_read();
+    let open = deployment.spawn_send(20, "opened");
+    held.arrived().await;
+    mock.edit_pull_request(REPOSITORY, 20, |pr| pr.open = false);
+    let close = deployment.spawn_send(20, "closed");
+    let waited = deployment.waits_on_the_pull_request(&close).await;
+    held.release();
+    assert_eq!(open.await.expect("joins").0, StatusCode::ACCEPTED);
+    assert_eq!(close.await.expect("joins").0, StatusCode::ACCEPTED);
+    assert_eq!(
+        summary(&deployment.rows(20).await),
+        [
+            ("cancelled", Some("pull_request_closed"), "o1"),
+            ("cancelled", Some("pull_request_closed"), "o1"),
+        ],
+        "the open read before the close cannot admit after it"
+    );
+    assert!(waited, "the close waits for the outstanding read");
+}
+
+/// A replay of the current source is never undone by a read of an
+/// intermediate source begun before it: the source GitHub shows last stays
+/// under review.
+///
+/// # Panics
+/// Panics when the intermediate source ends up under review or the replay
+/// does not wait.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replay_waits_for_an_earlier_intermediate_read() {
+    let deployment = Deployment::start().await;
+    let mock = &deployment.mock;
+    mock.set_pull_request(REPOSITORY, 21, PullRequest::open(REPOSITORY, "b1", "a1"));
+    assert_eq!(deployment.send(21, "opened").await.0, StatusCode::ACCEPTED);
+    mock.edit_pull_request(REPOSITORY, 21, |pr| pr.head_sha = "b1".to_owned());
+    let held = mock.hold_next_pull_request_read();
+    let intermediate = deployment.spawn_send(21, "synchronize");
+    held.arrived().await;
+    mock.edit_pull_request(REPOSITORY, 21, |pr| pr.head_sha = "a1".to_owned());
+    let replay = deployment.spawn_send(21, "synchronize");
+    let waited = deployment.waits_on_the_pull_request(&replay).await;
+    held.release();
+    assert_eq!(intermediate.await.expect("joins").0, StatusCode::ACCEPTED);
+    assert_eq!(replay.await.expect("joins").0, StatusCode::ACCEPTED);
+    let rows = deployment.rows(21).await;
+    let due: Vec<_> = summary(&rows)
+        .into_iter()
+        .filter(|(status, _, _)| *status == "pending")
+        .collect();
+    assert_eq!(
+        due,
+        [("pending", None, "a1"), ("pending", None, "a1")],
+        "the source GitHub shows last is the one under review"
+    );
+    assert!(waited, "the replay waits for the outstanding read");
+}
+
+/// A repeated draft conversion is never undone by a ready read begun before
+/// it, although the draft finds nothing left to cancel when it is decided.
+///
+/// # Panics
+/// Panics when the ready read leaves work due or the draft does not wait.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeated_draft_waits_for_an_earlier_ready_read() {
+    let deployment = Deployment::start().await;
+    let mock = &deployment.mock;
+    mock.set_pull_request(REPOSITORY, 22, PullRequest::open(REPOSITORY, "b1", "a1"));
+    assert_eq!(deployment.send(22, "opened").await.0, StatusCode::ACCEPTED);
+    mock.edit_pull_request(REPOSITORY, 22, |pr| pr.draft = true);
+    assert_eq!(
+        deployment.send(22, "converted_to_draft").await.0,
+        StatusCode::ACCEPTED
+    );
+    mock.edit_pull_request(REPOSITORY, 22, |pr| {
+        pr.draft = false;
+        pr.head_sha = "c1".to_owned();
+    });
+    let held = mock.hold_next_pull_request_read();
+    let ready = deployment.spawn_send(22, "ready_for_review");
+    held.arrived().await;
+    mock.edit_pull_request(REPOSITORY, 22, |pr| pr.draft = true);
+    let draft = deployment.spawn_send(22, "converted_to_draft");
+    let waited = deployment.waits_on_the_pull_request(&draft).await;
+    held.release();
+    assert_eq!(ready.await.expect("joins").0, StatusCode::ACCEPTED);
+    assert_eq!(draft.await.expect("joins").0, StatusCode::ACCEPTED);
+    assert_eq!(
+        summary(&deployment.rows(22).await),
+        [
+            ("cancelled", Some("pull_request_draft"), "a1"),
+            ("cancelled", Some("pull_request_draft"), "a1"),
+            ("cancelled", Some("pull_request_draft"), "c1"),
+            ("cancelled", Some("pull_request_draft"), "c1"),
+        ],
+        "the ready read before the second draft leaves nothing due"
+    );
+    assert!(waited, "the second draft waits for the outstanding read");
+}
+
+/// Hold GitHub's answer to the open read of PR `number` at `head` and
+/// deliver it on its own task.
+fn read_held(
+    deployment: &Deployment,
+    number: u64,
+    head: &str,
+) -> (
+    wyrd_testing::github::HeldAnswer,
+    tokio::task::JoinHandle<(StatusCode, String)>,
+) {
+    let mock = &deployment.mock;
+    mock.set_pull_request(REPOSITORY, number, PullRequest::open(REPOSITORY, "b1", head));
+    let held = mock.hold_next_pull_request_read();
+    (held, deployment.spawn_send(number, "opened"))
+}
+
+/// `action` on installation 101 as GitHub delivers it.
+fn installation_event(action: &str) -> Value {
+    json!({"action": action, "installation": {"id": INSTALLATION}})
+}
+
+/// A suspension committed while GitHub answers a PR read leaves the delayed
+/// delivery nothing to admit.
+///
+/// # Panics
+/// Panics when the delayed read admits work.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_suspension_during_a_pull_request_read_admits_nothing() {
+    let deployment = Deployment::start().await;
+    let mock = &deployment.mock;
+    let (held, delayed) = read_held(&deployment, 23, "s1");
+    held.arrived().await;
+    mock.set_suspended(INSTALLATION, true);
+    let status = mock
+        .deliver(deployment.base(), "installation", &installation_event("suspend"))
+        .await
+        .expect("delivery sends");
+    assert_eq!(status, StatusCode::ACCEPTED);
+    held.release();
+    delayed.await.expect("joins");
+    assert!(
+        deployment.rows(23).await.is_empty(),
+        "a read begun before the suspension admits nothing"
+    );
+}
+
+/// Uninstalling and reconnecting the App while GitHub answers a PR read
+/// leaves the delayed delivery nothing to admit under the new connection,
+/// while a delivery after the reconnect admits as usual.
+///
+/// # Panics
+/// Panics when the delayed read admits work, or a later delivery does not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reconnect_during_a_pull_request_read_admits_nothing_for_the_old_connection() {
+    let deployment = Deployment::start().await;
+    let mock = &deployment.mock;
+    let (held, delayed) = read_held(&deployment, 24, "u1");
+    held.arrived().await;
+    let status = mock
+        .deliver(deployment.base(), "installation", &installation_event("deleted"))
+        .await
+        .expect("delivery sends");
+    assert_eq!(status, StatusCode::ACCEPTED);
+    install(
+        &deployment.server,
+        mock,
+        deployment.server.data_tenant_id(),
+        deployment.server.pg_fixture().tenant_slug(),
+        "github_reconnecting_admin",
+    )
+    .await;
+    held.release();
+    delayed.await.expect("joins");
+    assert!(
+        deployment.rows(24).await.is_empty(),
+        "a read begun under the uninstalled connection admits nothing under the new one"
+    );
+    assert_eq!(deployment.send(24, "opened").await.0, StatusCode::ACCEPTED);
+    assert_eq!(
+        summary(&deployment.rows(24).await),
+        [("pending", None, "u1"), ("pending", None, "u1")],
+        "a delivery after the reconnect admits"
+    );
+}
+
+/// Removing the repository from the installation while GitHub answers a PR
+/// read leaves the delayed delivery nothing to admit.
+///
+/// # Panics
+/// Panics when the delayed read admits work.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repository_removal_during_a_pull_request_read_admits_nothing() {
+    let deployment = Deployment::start().await;
+    let mock = &deployment.mock;
+    let (held, delayed) = read_held(&deployment, 25, "r1");
+    held.arrived().await;
+    let removed = json!({
+        "action": "removed",
+        "installation": {"id": INSTALLATION},
+        "repositories_removed": [{"id": REPOSITORY}],
+    });
+    let status = mock
+        .deliver(deployment.base(), "installation_repositories", &removed)
+        .await
+        .expect("delivery sends");
+    assert_eq!(status, StatusCode::ACCEPTED);
+    held.release();
+    delayed.await.expect("joins");
+    assert!(
+        deployment.rows(25).await.is_empty(),
+        "a read begun before the repository was removed admits nothing"
     );
 }

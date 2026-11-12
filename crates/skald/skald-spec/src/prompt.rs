@@ -1,7 +1,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -15,7 +15,7 @@ use crate::wire::anthropic_messages::{
     AnthropicContentBlock, AnthropicDocumentSource, AnthropicImageSource, AnthropicMessagesRequest,
     AnthropicMessagesSettings, AnthropicSystem, AnthropicSystemBlock,
 };
-use crate::wire::common::{SharedObjectSchema, SharedSchema};
+use crate::wire::common::SharedSchema;
 use crate::wire::google_generate::{
     GoogleContent, GoogleFileData, GoogleGenerateContentRequest, GoogleGenerateSettings,
     GoogleInlineData, GooglePart,
@@ -296,48 +296,134 @@ pub fn check_output_schema(schema: &Value, field: &str, object_root: bool) -> Sk
     Ok(())
 }
 
-/// Most distinct schemas one [`PreparedSchemas`] keeps before it forgets
-/// them all.
+/// Most distinct schemas one [`PreparedSchemas`] map keeps, and most edits
+/// it keeps of one schema, before it forgets them all.
 const PREPARED_SCHEMAS: usize = 256;
 
 /// Immutable preparation of exact JSON Schemas reused across calls: the
-/// compiled validator of each schema text and which schemas already passed
-/// [`check_output_schema`] for an object-root or any-root destination.
+/// compiled validator of each schema, which schemas already passed
+/// [`check_output_schema`] for an object-root or any-root destination, and
+/// what each named edit of a schema produced.
 ///
 /// A host whose lifetime spans many calls owns one and lends it to each call
 /// that sends or checks a schema, so repeated calls with an unchanged schema
-/// skip meta-validation and compilation. A [`SharedSchema`] already prepared
-/// is found by identity; any other is found by a structural hash and matched
-/// by exact equality, so a lookup never serializes or copies the schema: a
-/// changed, narrowed, or hook-replaced schema is a different entry and is
-/// prepared again, never validated by a stale entry.
-/// It holds only schemas and their validators, never request contents,
-/// media, tools, or caller authority. It is bounded at [`PREPARED_SCHEMAS`]
-/// entries per map; reaching the bound forgets every entry, after which
-/// schemas are prepared again.
+/// skip meta-validation, compilation, and re-editing. A schema seen before
+/// is found by the identity of its [`SharedSchema`]; any other is found by a
+/// structural hash and matched by exact equality, so a lookup never
+/// serializes or copies the schema: a changed, narrowed, or hook-replaced
+/// schema is a different entry and is prepared again, never validated by a
+/// stale entry.
+/// It holds only schemas, their validators, and edit names, never request
+/// contents, media, tools, or caller authority. Each map is bounded at
+/// [`PREPARED_SCHEMAS`] schemas; reaching the bound forgets every entry,
+/// after which schemas are prepared again.
 #[derive(Debug, Default)]
 pub struct PreparedSchemas {
     /// Schemas with their compiled validators.
-    validators: Mutex<Validators>,
-    /// Schemas that passed [`check_output_schema`], by whether their
-    /// destination required an object root and [`schema_hash`].
-    checked: Mutex<HashMap<(bool, u64), Vec<Value>>>,
+    validators: Mutex<SchemaMap<Arc<jsonschema::Validator>>>,
+    /// Schemas that passed [`check_output_schema`] for an any-root (index 0)
+    /// or object-root (index 1) destination.
+    checked: [Mutex<SchemaMap<()>>; 2],
+    /// Schemas with the schema each named edit produced from them.
+    edited: Mutex<SchemaMap<Vec<(String, SharedSchema)>>>,
 }
 
-/// The compiled validators of [`PreparedSchemas`], reachable by content and
-/// by the identity of each shared schema they were looked up with.
-#[derive(Debug, Default)]
-struct Validators {
-    /// Schemas with their validators, by [`schema_hash`].
-    by_content: HashMap<u64, Vec<PreparedValidator>>,
-    /// Shared schemas with their validators, by [`SharedSchema::address`].
-    /// Each entry holds its schema, so no other schema can take its address
-    /// while the entry lives.
-    by_identity: HashMap<usize, PreparedValidator>,
+/// Where a [`SchemaMap`] keeps one schema: its [`schema_hash`] and its
+/// position among the schemas of that hash.
+type Slot = (u64, usize);
+
+/// Values kept per schema, found by the identity of a [`SharedSchema`] seen
+/// before and by content otherwise.
+///
+/// Every schema it holds, kept or merely seen, is held by a clone, so no
+/// other schema can take its address and a shared schema cannot change
+/// while held: [`SharedSchema::make_mut`] copies a held schema first.
+#[derive(Debug)]
+struct SchemaMap<T> {
+    /// Kept schemas with their values, by [`schema_hash`].
+    entries: HashMap<u64, Vec<(SharedSchema, T)>>,
+    /// Each schema seen, by [`SharedSchema::address`], with where its equal
+    /// kept schema is.
+    seen: HashMap<usize, (SharedSchema, Slot)>,
 }
 
-/// One schema and its compiled validator.
-type PreparedValidator = (SharedSchema, Arc<jsonschema::Validator>);
+impl<T> Default for SchemaMap<T> {
+    /// An empty map.
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            seen: HashMap::new(),
+        }
+    }
+}
+
+impl<T> SchemaMap<T> {
+    /// Where `schema` is kept, found in `map` by identity or else by
+    /// content, with the map still locked; `Err` carries its hash when it is
+    /// not kept. The hash is computed unlocked.
+    fn locate<'a>(
+        map: &'a Mutex<Self>,
+        schema: &SharedSchema,
+    ) -> (MutexGuard<'a, Self>, Result<Slot, u64>) {
+        let lock = || map.lock().unwrap_or_else(PoisonError::into_inner);
+        let held = lock();
+        if let Some((_, slot)) = held.seen.get(&schema.address()) {
+            let slot = *slot;
+            return (held, Ok(slot));
+        }
+        drop(held);
+        let hash = schema_hash(schema);
+        let mut held = lock();
+        let index = held
+            .entries
+            .get(&hash)
+            .and_then(|entries| entries.iter().position(|(known, _)| known == schema));
+        match index {
+            Some(index) => {
+                held.see(schema, (hash, index));
+                (held, Ok((hash, index)))
+            }
+            None => (held, Err(hash)),
+        }
+    }
+
+    /// Records that `schema` is the schema kept at `slot`, forgetting
+    /// everything first at the bound.
+    fn see(&mut self, schema: &SharedSchema, slot: Slot) {
+        if self.seen.len() >= PREPARED_SCHEMAS {
+            self.seen.clear();
+        }
+        self.seen.insert(schema.address(), (schema.clone(), slot));
+    }
+
+    /// Keeps `schema`, whose hash is `hash`, with `value`, forgetting every
+    /// entry first at the bound, and returns its slot.
+    fn keep(&mut self, schema: &SharedSchema, hash: u64, value: T) -> Slot {
+        if self.entries.len() >= PREPARED_SCHEMAS {
+            self.entries.clear();
+            self.seen.clear();
+        }
+        let entries = self.entries.entry(hash).or_default();
+        entries.push((schema.clone(), value));
+        let slot = (hash, entries.len() - 1);
+        self.see(schema, slot);
+        slot
+    }
+
+    /// The value kept at `slot`.
+    ///
+    /// # Panics
+    /// Never panics for a slot this map returned under the same lock: slots
+    /// are forgotten together with the entries they point to.
+    fn value(&mut self, (hash, index): Slot) -> &mut T {
+        &mut self
+            .entries
+            .get_mut(&hash)
+            .and_then(|entries| entries.get_mut(index))
+            .expect("a located slot is kept")
+            .1
+    }
+}
 
 /// Structural hash of `schema`, computed without serializing it; equal
 /// schemas with the same key order hash equally.
@@ -372,53 +458,24 @@ fn schema_hash(schema: &Value) -> u64 {
 impl PreparedSchemas {
     /// The compiled validator of `schema`, compiled now unless an equal
     /// schema was compiled before; `None` when it does not compile, which is
-    /// never kept. A schema this lookup or an earlier one shared is found by
-    /// identity, without hashing or comparing it.
+    /// never kept.
     ///
     /// # Panics
     /// Never panics: a poisoned lock is recovered, since every entry is
     /// complete once inserted.
     #[must_use]
     pub fn validator(&self, schema: &SharedSchema) -> Option<Arc<jsonschema::Validator>> {
-        let lock = || {
-            self.validators
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
+        let hash = match SchemaMap::locate(&self.validators, schema) {
+            (mut held, Ok(slot)) => return Some(Arc::clone(held.value(slot))),
+            (_, Err(hash)) => hash,
         };
-        let address = schema.address();
-        if let Some((_, validator)) = lock().by_identity.get(&address) {
-            return Some(Arc::clone(validator));
-        }
-        let key = schema_hash(schema);
-        let known = lock().by_content.get(&key).and_then(|entries| {
-            entries
-                .iter()
-                .find(|(known, _)| known == schema)
-                .map(|(_, validator)| Arc::clone(validator))
-        });
         // Compiled unlocked: concurrent first calls may each compile once.
-        let (validator, compiled) = match known {
-            Some(validator) => (validator, false),
-            None => (Arc::new(jsonschema::validator_for(schema).ok()?), true),
-        };
-        let mut validators = lock();
-        // ponytail: forget-all eviction; an LRU if many distinct live schemas thrash it.
-        if validators.by_identity.len() >= PREPARED_SCHEMAS {
-            validators.by_identity.clear();
-        }
-        if compiled {
-            if validators.by_content.len() >= PREPARED_SCHEMAS {
-                validators.by_content.clear();
-            }
-            validators
-                .by_content
-                .entry(key)
-                .or_default()
-                .push((schema.clone(), Arc::clone(&validator)));
-        }
-        validators
-            .by_identity
-            .insert(address, (schema.clone(), Arc::clone(&validator)));
+        let validator = Arc::new(jsonschema::validator_for(schema).ok()?);
+        let mut held = self
+            .validators
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        held.keep(schema, hash, Arc::clone(&validator));
         Some(validator)
     }
 
@@ -427,19 +484,41 @@ impl PreparedSchemas {
     ///
     /// # Errors
     /// Returns [`check_output_schema`]'s refusal at `field`.
-    pub fn check(&self, schema: &Value, field: &str, object_root: bool) -> SkaldResult<()> {
-        let key = (object_root, schema_hash(schema));
-        let lock = || self.checked.lock().unwrap_or_else(PoisonError::into_inner);
-        if lock().get(&key).is_some_and(|known| known.contains(schema)) {
-            return Ok(());
-        }
+    pub fn check(&self, schema: &SharedSchema, field: &str, object_root: bool) -> SkaldResult<()> {
+        let checked = &self.checked[usize::from(object_root)];
+        let hash = match SchemaMap::locate(checked, schema) {
+            (_, Ok(_)) => return Ok(()),
+            (_, Err(hash)) => hash,
+        };
         check_output_schema(schema, field, object_root)?;
-        let mut checked = lock();
-        if checked.len() >= PREPARED_SCHEMAS {
-            checked.clear();
-        }
-        checked.entry(key).or_default().push(schema.clone());
+        let mut held = checked.lock().unwrap_or_else(PoisonError::into_inner);
+        held.keep(schema, hash, ());
         Ok(())
+    }
+
+    /// The schema the edit named `edit` produced from `schema` before.
+    #[must_use]
+    fn edited(&self, schema: &SharedSchema, edit: &str) -> Option<SharedSchema> {
+        let (mut held, slot) = SchemaMap::locate(&self.edited, schema);
+        let edits = held.value(slot.ok()?);
+        edits
+            .iter()
+            .find(|(name, _)| name == edit)
+            .map(|(_, edited)| edited.clone())
+    }
+
+    /// Keeps `edited` as what the edit named `edit` produces from `schema`.
+    fn keep_edited(&self, schema: &SharedSchema, edit: &str, edited: SharedSchema) {
+        let (mut held, slot) = SchemaMap::locate(&self.edited, schema);
+        let slot = match slot {
+            Ok(slot) => slot,
+            Err(hash) => held.keep(schema, hash, Vec::new()),
+        };
+        let edits = held.value(slot);
+        if edits.len() >= PREPARED_SCHEMAS {
+            edits.clear();
+        }
+        edits.push((edit.to_owned(), edited));
     }
 }
 
@@ -938,75 +1017,43 @@ impl Prompt {
     ///
     /// A host uses it on a per-call copy, for example to narrow a schema to
     /// what one invocation may answer; the edit is the host's, and Skald
-    /// never interprets it. A Prompt without a response schema is unchanged.
+    /// never interprets it. `name` names the edit: the same name applied to
+    /// an equal schema must produce an equal schema, so `schemas` reuses the
+    /// schema an earlier edit of that name produced, shared rather than
+    /// edited again. A Prompt without a response schema is unchanged.
     ///
     /// # Errors
     ///
     /// Returns [`SkaldError::PromptInvalid`] at the schema's native body path
     /// when the edited schema is invalid for its destination (see
-    /// [`check_output_schema`]); `schemas` skips that check for an edited
-    /// schema it already passed.
+    /// [`check_output_schema`]), leaving the Prompt unchanged; `schemas`
+    /// skips that check for an edited schema it already passed.
     pub fn edit_response_schema_mut(
         &mut self,
         schemas: &PreparedSchemas,
+        name: &str,
         edit: impl FnOnce(&mut Value),
     ) -> SkaldResult<()> {
-        use crate::wire::anthropic_messages::AnthropicOutputFormat;
-        use crate::wire::openai_chat::OpenAiResponseFormat;
-        use crate::wire::openai_responses::OpenAiTextResponseFormat;
-
-        /// Applies `edit` to an object-typed schema field.
-        fn object(schema: &mut SharedObjectSchema, edit: impl FnOnce(&mut Value)) {
-            let members = schema.make_mut();
-            let mut value = Value::Object(std::mem::take(members));
-            edit(&mut value);
-            if let Value::Object(edited) = value {
-                *members = edited;
-            }
+        let Some((_, schema)) = ResponseType::schema(&self.request) else {
+            return Ok(());
+        };
+        let schema = schema.clone();
+        let (field, object_root) = output_schema_field(&self.request);
+        let (edited, kept) = if let Some(edited) = schemas.edited(&schema, name) {
+            (edited, true)
+        } else {
+            let mut edited = schema.clone();
+            edit(edited.make_mut());
+            (edited, false)
+        };
+        schemas.check(&edited, field, object_root)?;
+        if !kept {
+            schemas.keep_edited(&schema, name, edited.clone());
         }
-        match &mut self.request {
-            ProviderRequest::OpenAiChatCompletion(request) => {
-                if let Some(OpenAiResponseFormat::JsonSchema { json_schema }) =
-                    &mut request.response_format
-                    && let Some(schema) = &mut json_schema.schema
-                {
-                    object(schema, edit);
-                }
-            }
-            ProviderRequest::OpenAiResponses(request) => {
-                if let Some(OpenAiTextResponseFormat::JsonSchema {
-                    schema: Some(schema),
-                    ..
-                }) = request.text.as_mut().and_then(|text| text.format.as_mut())
-                {
-                    object(schema, edit);
-                }
-            }
-            ProviderRequest::AnthropicMessage(request) => {
-                if let Some(config) = &mut request.output_config {
-                    let AnthropicOutputFormat::JsonSchema { schema } = &mut config.format;
-                    edit(schema.make_mut());
-                }
-            }
-            ProviderRequest::GeminiGenerateContent(request) => {
-                if let Some(config) = &mut request.settings.generation_config {
-                    let schema = if config.response_json_schema.is_some() {
-                        &mut config.response_json_schema
-                    } else {
-                        &mut config.response_schema
-                    };
-                    if let Some(schema) = schema {
-                        edit(schema.make_mut());
-                    }
-                }
-            }
-            _ => {}
+        if let Some((_, field)) = self.request.take_response_schema() {
+            self.request.set_response_schema(field, edited);
         }
         self.response_type = ResponseType::of(&self.request);
-        if let ResponseType::JsonSchema { schema, .. } = &self.response_type {
-            let (field, object_root) = output_schema_field(&self.request);
-            schemas.check(schema, field, object_root)?;
-        }
         Ok(())
     }
 }
@@ -2837,9 +2884,13 @@ mod response_schema_edit {
 
         let mut narrowed = prompt.clone();
         narrowed
-            .edit_response_schema_mut(&crate::prompt::PreparedSchemas::default(), |schema| {
-                schema["properties"]["slot"]["enum"] = json!(["order"]);
-            })
+            .edit_response_schema_mut(
+                &crate::prompt::PreparedSchemas::default(),
+                "order",
+                |schema| {
+                    schema["properties"]["slot"]["enum"] = json!(["order"]);
+                },
+            )
             .expect("narrowed schema is valid");
         assert!(!sent(&narrowed.request).ptr_eq(&sent(&prompt.request)));
         assert_eq!(
@@ -2849,10 +2900,14 @@ mod response_schema_edit {
     }
 
     /// An edit reaches both the sent request and the derived response type,
-    /// and an edit the destination rejects fails construction-time checks.
+    /// the same named edit of an equal schema reuses the schema it produced
+    /// without editing again, another name edits anew, and an edit the
+    /// destination rejects fails construction-time checks and changes
+    /// nothing.
     ///
     /// # Panics
-    /// Panics when the edit is lost on either side or an invalid edit passes.
+    /// Panics when the edit is lost on either side, a named edit runs again,
+    /// or an invalid edit passes or changes the Prompt.
     #[test]
     fn edit_response_schema_reaches_request_and_type() {
         let mut request = common::openai_chat_request();
@@ -2868,11 +2923,12 @@ mod response_schema_edit {
             },
         });
         let model = request.model.clone();
-        let mut prompt =
+        let declared =
             Prompt::new(ProviderRequest::OpenAiChatCompletion(request), &model).expect("builds");
+        let mut prompt = declared.clone();
         let schemas = crate::prompt::PreparedSchemas::default();
         prompt
-            .edit_response_schema_mut(&schemas, |schema| {
+            .edit_response_schema_mut(&schemas, "order", |schema| {
                 schema["properties"]["slot"]["enum"] = json!(["order"]);
             })
             .expect("narrowed schema is valid");
@@ -2886,10 +2942,44 @@ mod response_schema_edit {
                 .contains("order")
         );
 
+        let sent = |prompt: &Prompt| {
+            ResponseType::schema(&prompt.request)
+                .expect("structured request")
+                .1
+                .clone()
+        };
+
+        let mut again = declared.clone();
+        again
+            .edit_response_schema_mut(&schemas, "order", |_| panic!("edited again"))
+            .expect("reuses the earlier edit");
+        assert!(sent(&again).ptr_eq(&sent(&prompt)));
+        let ResponseType::JsonSchema { schema, .. } = &again.response_type else {
+            panic!("structured Prompt");
+        };
+        assert!(schema.ptr_eq(&sent(&prompt)));
+
+        let mut other = declared.clone();
+        other
+            .edit_response_schema_mut(&schemas, "refund", |schema| {
+                schema["properties"]["slot"]["enum"] = json!(["refund"]);
+            })
+            .expect("narrowed schema is valid");
+        assert_eq!(
+            sent(&other)["properties"]["slot"]["enum"],
+            json!(["refund"])
+        );
+
+        let before = sent(&prompt);
         assert!(
             prompt
-                .edit_response_schema_mut(&schemas, |schema| *schema = json!({"type": 5}))
+                .edit_response_schema_mut(&schemas, "invalid", |schema| *schema =
+                    json!({"type": 5}))
                 .is_err()
+        );
+        assert!(
+            sent(&prompt).ptr_eq(&before),
+            "a refused edit changed the Prompt"
         );
     }
 }

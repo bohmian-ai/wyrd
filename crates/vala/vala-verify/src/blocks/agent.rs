@@ -303,7 +303,8 @@ impl AgentExecutor {
     /// strings render raw and other JSON as JSON text; evidence binds as
     /// provider-native media, which Skald checks against the placeholder kind.
     /// Non-empty `slots` narrow the copy's Verdict citation slots, so the
-    /// provider and the Agent's validation admit only the reachable ones.
+    /// provider and the Agent's validation admit only the reachable ones;
+    /// the prepared schemas reuse an earlier narrowing to the same slots.
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for a placeholder mismatch, evidence
@@ -356,8 +357,11 @@ impl AgentExecutor {
             }
         }
         if !slots.is_empty() {
+            // Slot names are identifiers, so the joined set names it exactly.
+            let names: Vec<&str> = slots.iter().map(SlotName::as_str).collect();
+            let edit = format!("verdict-slots:{}", names.join(","));
             bound
-                .edit_response_schema_mut(&self.schemas, |schema| {
+                .edit_response_schema_mut(&self.schemas, &edit, |schema| {
                     Verdict::restrict_slots(schema, slots);
                 })
                 .map_err(|error| BlockError::Terminal {

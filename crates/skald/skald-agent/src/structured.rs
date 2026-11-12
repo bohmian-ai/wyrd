@@ -289,7 +289,11 @@ mod tests {
         schemas.check(&sent, "schema", true).expect("still valid");
         assert!(
             schemas
-                .check(&json!({"type": "string"}), "schema", true)
+                .check(
+                    &SharedSchema::new(json!({"type": "string"})),
+                    "schema",
+                    true
+                )
                 .is_err()
         );
         for bound in 0..256 {

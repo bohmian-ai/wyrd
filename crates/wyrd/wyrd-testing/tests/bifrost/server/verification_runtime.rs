@@ -4509,9 +4509,11 @@ async fn subscribed(proxy: &ListenerStallProxy, channel: &str) -> Result<(), Ser
 /// report reach the server; request connections keep flowing. A's next
 /// move commits normally, and calls reach the new route within
 /// [`STALL_DETECTION`] plus [`STALL_TOLERANCE`] while every subscription
-/// is still stalled, so they read Postgres. Tenant B keeps its own route
-/// throughout. After the path is restored and a listener subscribes again, a
-/// further move is still seen.
+/// is still stalled. Tenant B keeps its own route throughout. After the path
+/// is restored and a listener subscribes again, the reconnect clears the
+/// cache, so calls may be refused with the retryable miss until each
+/// tenant's snapshot reloads; both routes then return, and a further move is
+/// still seen.
 ///
 /// # Errors
 /// Returns server, proxy, request, or Postgres errors, or a description of
@@ -4573,7 +4575,11 @@ async fn silent_listener_stall_falls_back_and_recovers() -> Result<(), ServerJou
 
     proxy.restore(SNAPSHOT_CHANNEL);
     subscribed(&proxy, SNAPSHOT_CHANNEL).await?;
-    expect_eq("A after recovery", &journey.call(&a).await?, &two)?;
+    expect_eq(
+        "A after recovery",
+        &journey.route_after_write(&a, two.as_deref()).await?,
+        &two,
+    )?;
     journey.deploy(&a, "three").await?;
     let three = reaches("three");
     expect_eq(
@@ -4581,7 +4587,11 @@ async fn silent_listener_stall_falls_back_and_recovers() -> Result<(), ServerJou
         &journey.route_after_write(&a, three.as_deref()).await?,
         &three,
     )?;
-    expect_eq("B after recovery", &journey.call(&b).await?, &bee)?;
+    expect_eq(
+        "B after recovery",
+        &journey.route_after_write(&b, bee.as_deref()).await?,
+        &bee,
+    )?;
     journey.server.shutdown().await?;
     Ok(())
 }
@@ -7392,10 +7402,11 @@ async fn settle_all(
 /// each status carries no result and costs no Oracle read. The runtime then
 /// reads each execution's input record and collects its trace once. After
 /// publication each status, read through the Rust SDK, returns its own
-/// verdict and execution with one Oracle statement joining the summary,
-/// output, and input records that scans one file per table, so the older
-/// day-partitioned results are pruned; another execution's result never
-/// substitutes.
+/// verdict and execution with two Oracle statements: one exact read of the
+/// accepted state revision that selects the result, then one joining the
+/// summary, output, and input records that scans one file per table, so the
+/// older day-partitioned results are pruned; another execution's result
+/// never substitutes.
 /// Another tenant's caller and an unknown execution are refused as not found.
 ///
 /// # Errors
@@ -7499,9 +7510,9 @@ async fn completed_result_lookup_preserves_evidence() -> Result<(), ServerJourne
         if result.execution_id != *execution || read["verdict"] != verdict {
             return Err(format!("{execution} read another result: {read}").into());
         }
-        if !ScanEvidence::is(work.queries, 1) || work.files > 3.0 {
+        if !ScanEvidence::is(work.queries, 2) || work.files > 4.0 {
             return Err(format!(
-                "one exact result read scans one file per verification table: {work:?}"
+                "one state read and one exact result read scan one file per table: {work:?}"
             )
             .into());
         }

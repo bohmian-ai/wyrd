@@ -32,7 +32,7 @@ use wyrd_ai::{
 };
 use wyrd_spec::verification::state::{ControlRecord, ExecutionState};
 use wyrd_testing::gateway_capture::HeldUpstream;
-use wyrd_testing::server::WyrdTestServerBuilder;
+use wyrd_testing::server::{ScribeReservation, WyrdTestServerBuilder};
 use wyrd_testing::verification::VerificationFixture;
 
 use crate::hosted_agent_tools::{
@@ -2032,6 +2032,166 @@ async fn repeat_stops_or_exhausts_without_overlapping() {
             "{question}: iteration 1 runs once more and nothing overlaps"
         );
     }
+    desk.deployment.shutdown().await;
+}
+
+/// Hold all but `leave` slots of `desk`'s reserved Scribe share, counting
+/// the `already` slots the caller holds, and return the new reservations with
+/// the total now held.
+///
+/// Staged work is flushed between attempts, so slots that in-flight writes
+/// free are taken as they return; it finishes only when the caller holds
+/// exactly the share less `leave`, so no other reservation remains beyond
+/// those `leave` slots.
+///
+/// # Panics
+/// Panics when Bifrost cannot flush, a free slot cannot be reserved, or the
+/// share is not held within 30 seconds.
+async fn hold_reserved_share(
+    desk: &Desk,
+    already: usize,
+    leave: usize,
+) -> (Vec<ScribeReservation>, usize) {
+    let server = desk.deployment.server();
+    let outbox = server.state().bifrost.scribe_outbox();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let (mut share, mut held) = (Vec::new(), already);
+    loop {
+        server.flush_bifrost().await.expect("staged work drains");
+        let full = outbox
+            .reserve(usize::MAX)
+            .expect_err("no reservation holds every slot");
+        let target = full.limit - leave;
+        let take = (full.limit - full.admitted).min(target - held);
+        if take > 0 {
+            share.push(
+                outbox
+                    .reserve(take)
+                    .expect("the free reservable share is held"),
+            );
+            held += take;
+        }
+        if held == target {
+            return (share, held);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} reserved slots stay held elsewhere",
+            full.limit - leave - held
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Refinement runs from memory while background persistence is held.
+///
+/// A direct verify, admitted with its own reserved slots, stalls inside
+/// iteration 0's first model call; the server's remaining reserved Scribe
+/// share is then held and the model released. Every dependent iteration
+/// runs and the caller receives its selected report.
+///
+/// A queued execution is then submitted while all but the one slot its
+/// admission stages through is held; once it stalls in its first model call
+/// that slot is held too, so none of its later revisions or its result can
+/// be staged. Its stalled model call is released and every iteration runs from memory while the
+/// execution stays `running`, its claim kept for the result it cannot yet
+/// persist. Once the share is released the execution settles with the same
+/// final report and no further model request.
+///
+/// # Panics
+/// Panics when a verification is refused, an iteration does not run while
+/// persistence is held, the queued execution settles before persistence
+/// returns, or settling calls the model again.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn refinement_progresses_while_persistence_is_held() {
+    const DIRECT: &str = "REFINE-HELD-DIRECT";
+    const QUEUED: &str = "REFINE-HELD-QUEUED";
+    let final_report = (
+        StepStatus::Succeeded,
+        Some(json!({ "score": 2, "text": "v2" })),
+    );
+    let upstream = upstream().await;
+    let held = HeldUpstream::start(&upstream)
+        .await
+        .expect("the held upstream binds");
+    let builder = builder(&upstream).with_gateway_provider_root_for_test(
+        held.uri().parse().expect("the held upstream's URL parses"),
+    );
+    let desk = Desk::start_with(upstream, builder).await;
+
+    held.hold(&[DIRECT]);
+    let direct = {
+        let state = desk.state.clone();
+        tokio::spawn(async move {
+            state
+                .run()
+                .observe()
+                .verify("refine-report", json!(DIRECT))
+                .await
+        })
+    };
+    desk.stalled_in("REFINE:", DIRECT).await;
+    let (share, _) = hold_reserved_share(&desk, 0, 2).await;
+    held.release(&[DIRECT]);
+    let direct = direct
+        .await
+        .expect("the direct verify joins")
+        .expect("the direct verify completes while persistence is held");
+    let draft = step(&desk.deployment, &direct, "draft").await;
+    assert_eq!(
+        (draft.status, draft.output.clone()),
+        final_report,
+        "{direct:?}"
+    );
+    assert_eq!(
+        iterations(&desk.asked("REFINE:", DIRECT).await),
+        [0, 0, 1, 1, 2, 2],
+        "every direct iteration ran while persistence was held"
+    );
+    drop(share);
+
+    held.hold(&[QUEUED]);
+    let (admitting, already) = hold_reserved_share(&desk, 0, 1).await;
+    let queued = desk.submit("repeat-takeover", json!(QUEUED)).await;
+    desk.stalled_in("REFINE:", QUEUED).await;
+    let (share, _) = hold_reserved_share(&desk, already, 0).await;
+    held.release(&[QUEUED]);
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    while iterations(&desk.asked("REFINE:", QUEUED).await).len() < 6 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the queued refinement stopped while persistence was held"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let execution = Execution::connect_with(queued, &desk.deployment.admin())
+        .await
+        .expect("the execution handle connects");
+    assert_eq!(
+        execution.status().await.expect("the status reads").status,
+        VerificationExecutionStatus::Running,
+        "the queued execution waits for its result to be accepted"
+    );
+    assert_eq!(
+        iterations(&desk.asked("REFINE:", QUEUED).await),
+        [0, 0, 1, 1, 2, 2],
+        "every queued iteration ran from memory while persistence was held"
+    );
+
+    drop((admitting, share));
+    let result = desk.settled(queued).await;
+    let draft = step(&desk.deployment, &result, "draft").await;
+    assert_eq!(
+        (draft.status, draft.output.clone()),
+        final_report,
+        "{result:?}"
+    );
+    assert_eq!(
+        iterations(&desk.asked("REFINE:", QUEUED).await),
+        [0, 0, 1, 1, 2, 2],
+        "settling once persistence returns calls the model no more"
+    );
     desk.deployment.shutdown().await;
 }
 

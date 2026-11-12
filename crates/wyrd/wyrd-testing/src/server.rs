@@ -77,6 +77,10 @@ pub use wyrd_server::verification::hosted::blocks::LaneAdmission;
 pub use wyrd_server::verification::hosted::{HostedLimits, LaneLimits};
 /// The execution lane a journey selects hosted capacity by.
 pub use wyrd_server::verification::telemetry::ExecutionMode;
+/// Reserved Scribe outbox slots a journey holds to fill the server's
+/// reserved share; dropping it releases them.
+pub type ScribeReservation =
+    wyrd_runtime::outbox::Reservation<wyrd_server::scribe_outbox::ScribeSink>;
 use wyrd_server::{AppState, WyrdServer, WyrdServerConfig, build_router};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::NodeId;

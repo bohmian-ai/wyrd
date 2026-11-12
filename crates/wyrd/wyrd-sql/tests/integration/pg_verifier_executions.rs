@@ -4499,7 +4499,8 @@ async fn pr_targets(
 }
 
 /// A reserved generation is frozen but unclaimable until its handoff
-/// activates it; activation is idempotent; a new source cancels the queued
+/// activates it; activation is idempotent and a replay completes a partial
+/// fanout; a new source cancels the queued
 /// and the running executions of the old one, fencing the running worker,
 /// and keeps their pins; an observation older than the newest generation is
 /// obsolete.
@@ -4565,10 +4566,19 @@ async fn pull_request_generations_reserve_activate_and_supersede() {
 
     assert_eq!(
         queue
-            .activate_pull_requests(&mut conn, &a)
+            .activate_pull_requests(&mut conn, &a[..1])
             .await
             .expect("activates"),
-        a
+        a[..1],
+        "a partial handoff activates only what reached the queue"
+    );
+    assert_eq!(
+        queue
+            .activate_pull_requests(&mut conn, &a)
+            .await
+            .expect("replay activates"),
+        a[1..],
+        "a replay completes the fanout without activating a binding twice"
     );
     assert!(
         queue

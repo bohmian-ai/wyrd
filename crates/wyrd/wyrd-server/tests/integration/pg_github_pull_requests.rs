@@ -851,8 +851,8 @@ async fn policy_reselection_affects_only_later_admissions() {
 }
 
 /// Installation suspension and disconnect cancel unfinished PR work with
-/// `repository_access_lost`; draft PRs and unselected repositories admit
-/// nothing.
+/// `repository_access_lost`; unsigned and mis-signed deliveries, draft PRs
+/// and unselected repositories admit nothing.
 ///
 /// # Panics
 /// Panics when ineligible work is admitted or access loss leaves it due.
@@ -878,6 +878,20 @@ async fn suspension_disconnect_and_ineligible_pull_requests_owe_no_work() {
     assert!(
         deployment.rows(13).await.is_empty(),
         "an unselected repository admits nothing"
+    );
+
+    mock.set_pull_request(REPOSITORY, 14, PullRequest::open(REPOSITORY, "b1", "s1"));
+    let payload = mock.pull_request_event(INSTALLATION, REPOSITORY, 14, "opened");
+    for signature in [None, Some("sha256=00")] {
+        let status = mock
+            .deliver_with_signature(deployment.base(), "pull_request", &payload, signature)
+            .await
+            .expect("delivery sends");
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{signature:?}");
+    }
+    assert!(
+        deployment.rows(14).await.is_empty(),
+        "an unsigned or mis-signed delivery admits nothing"
     );
 
     mock.set_pull_request(REPOSITORY, 11, PullRequest::open(REPOSITORY, "b1", "a1"));

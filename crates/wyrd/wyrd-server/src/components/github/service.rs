@@ -369,13 +369,15 @@ impl<'a> GithubConnections<'a> {
         conn: &mut TenantConn<'_>,
         only: Option<(&str, i64)>,
     ) -> Result<Option<GithubInstallationRow>, WyrdError> {
-        lock_github_installation(conn)
+        let held = lock_github_installation(conn)
             .await
             .map_err(registry_db_error)?;
         let released = release_github_installation(conn, only)
             .await
             .map_err(registry_db_error)?;
-        if let Some(host) = released.as_ref().and_then(|row| row.host.as_deref()) {
+        if released.is_some()
+            && let Some(host) = held.as_ref().and_then(|row| row.host.as_deref())
+        {
             Self::access_lost(conn, host, None).await?;
         }
         Ok(released)

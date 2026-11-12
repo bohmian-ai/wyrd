@@ -13,6 +13,8 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 use wyrd_loader::{build_declaration_input, load};
 use wyrd_server::components::github::service::GithubConnections;
+use wyrd_spec::ids::VerificationResultId;
+use wyrd_spec::verification::VerificationVerdict;
 use wyrd_sql::queries::verifier_executions::{
     Settlement, TerminalDelivery, TerminalStatus, VerifierExecutionQueue,
 };
@@ -21,10 +23,15 @@ use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 /// The connected repository.
 const REPOSITORY: u64 = 4242;
+/// A repository the installation reaches that the tenant did not select.
+const UNSELECTED: u64 = 4343;
 /// The connected installation.
 const INSTALLATION: u64 = 101;
 /// The Repository binding two queued review Verifiers to pull requests.
 const POLICY: &str = "apiVersion: wyrd/v1\nkind: Repository\nmetadata:\n  name: policy\n  version: 1.0.0\nspec:\n  repository_id: \"4242\"\n  verified_by:\n    - verifier: ./a-review.yaml\n      runs_on: {kind: pull_request}\n    - verifier: ./z-review.yaml\n      runs_on: {kind: pull_request}\n";
+
+/// [`POLICY`] re-declared binding only `a-review`.
+const POLICY_V2: &str = "apiVersion: wyrd/v1\nkind: Repository\nmetadata:\n  name: policy\n  version: 1.0.1\nspec:\n  repository_id: \"4242\"\n  verified_by:\n    - verifier: ./a-review.yaml\n      runs_on: {kind: pull_request}\n";
 
 /// An exact queued Verifier named `name`.
 fn review_verifier(name: &str) -> String {
@@ -65,10 +72,25 @@ impl Deployment {
     /// # Panics
     /// Panics when a step fails.
     async fn start() -> Self {
+        Self::start_with(false).await
+    }
+
+    /// Start the deployment as [`Self::start`] does, running queued work
+    /// when `runtime` is set.
+    ///
+    /// # Panics
+    /// Panics when a step fails.
+    async fn start_with(runtime: bool) -> Self {
         let mock = GithubAppMock::start().expect("the GitHub mock starts");
-        mock.add_installation(INSTALLATION, &[(REPOSITORY, "acme/policy")]);
-        let server = WyrdTestServer::builder()
-            .with_github_app_for_test(&mock)
+        mock.add_installation(
+            INSTALLATION,
+            &[(REPOSITORY, "acme/policy"), (UNSELECTED, "acme/other")],
+        );
+        let mut builder = WyrdTestServer::builder().with_github_app_for_test(&mock);
+        if runtime {
+            builder = builder.with_verification_runtime_for_test();
+        }
+        let server = builder
             .start_bound()
             .await
             .expect("bound test server starts");
@@ -81,7 +103,7 @@ impl Deployment {
             panic!("user bootstrap returned a non-user principal");
         };
         let deployment = Self { mock, server, jwt };
-        deployment.declare().await;
+        deployment.declare(POLICY, "pull-request-policy").await;
         deployment
     }
 
@@ -112,16 +134,17 @@ impl Deployment {
         conn.commit().await.expect("slot commits");
     }
 
-    /// Declare [`POLICY`] with both review Verifiers.
+    /// Declare the Repository `policy` with both review Verifiers under
+    /// idempotency `key`.
     ///
     /// # Panics
     /// Panics when the declaration is refused.
-    async fn declare(&self) {
+    async fn declare(&self, policy: &str, key: &str) {
         let dir = tempfile::tempdir().expect("checkout creates");
         for (name, contents) in [
             ("a-review.yaml", review_verifier("a-review")),
             ("z-review.yaml", review_verifier("z-review")),
-            ("policy.yaml", POLICY.to_owned()),
+            ("policy.yaml", policy.to_owned()),
         ] {
             std::fs::write(dir.path().join(name), contents).expect("card file writes");
         }
@@ -132,7 +155,7 @@ impl Deployment {
             .method(Method::POST)
             .uri("/v1/cards")
             .header(header::CONTENT_TYPE, "application/json")
-            .header("Idempotency-Key", "pull-request-policy")
+            .header("Idempotency-Key", key)
             .body(Body::from(body.to_string()))
             .expect("request builds");
         let response = self
@@ -208,6 +231,62 @@ impl Deployment {
             .await
             .expect("body reads");
         serde_json::from_slice(&bytes).expect("status is JSON")
+    }
+}
+
+impl Deployment {
+    /// A tenant connection.
+    ///
+    /// # Panics
+    /// Panics when the connection cannot open.
+    async fn conn(&self) -> wyrd_sql::TenantConn<'_> {
+        self.server
+            .tenant_conn_for(self.server.data_tenant_id())
+            .await
+            .expect("tenant connection opens")
+    }
+
+    /// Claim up to `limit` due executions as a worker would.
+    ///
+    /// # Panics
+    /// Panics when the claim fails.
+    async fn claim(
+        &self,
+        limit: u32,
+    ) -> Vec<wyrd_sql::queries::verifier_executions::ClaimedExecution> {
+        let mut conn = self.conn().await;
+        let claimed = VerifierExecutionQueue::default()
+            .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), limit)
+            .await
+            .expect("claim runs");
+        conn.commit().await.expect("claim commits");
+        claimed
+    }
+
+    /// Wait until no execution of PRs `numbers` is unfinished and return
+    /// their rows.
+    ///
+    /// # Panics
+    /// Panics when work is still unfinished after a minute.
+    async fn settled(&self, numbers: std::ops::RangeInclusive<u64>) -> Vec<Row> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_mins(1);
+        loop {
+            let mut rows = Vec::new();
+            for number in numbers.clone() {
+                rows.extend(self.rows(number).await);
+            }
+            if rows
+                .iter()
+                .all(|row| !matches!(row.status.as_str(), "pending" | "running" | "retrying"))
+            {
+                return rows;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "unfinished: {rows:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 }
 
@@ -465,14 +544,15 @@ async fn pull_request_lifecycle_admits_supersedes_and_ends_through_the_webhook()
     );
 }
 
-/// Forty-one PRs opened at once each admit exactly one due execution per
-/// binding, every delivery answered only after its admission committed.
+/// Forty-one PRs opened at once each admit exactly one execution per
+/// binding, every delivery answered only after its admission committed, and
+/// the fair queue runs every one to completion with typed status.
 ///
 /// # Panics
 /// Panics when a delivery is refused or any PR's fanout differs.
 #[tokio::test(flavor = "multi_thread")]
 async fn burst_of_forty_one_pull_requests_admits_each_binding_once() {
-    let deployment = Deployment::start().await;
+    let deployment = Deployment::start_with(true).await;
     for number in 1..=41 {
         deployment.mock.set_pull_request(
             REPOSITORY,
@@ -494,18 +574,23 @@ async fn burst_of_forty_one_pull_requests_admits_each_binding_once() {
         let (status, _) = answer.expect("joins").expect("delivery sends");
         assert_eq!(status, StatusCode::ACCEPTED);
     }
+    let rows = deployment.settled(1..=41).await;
+    assert_eq!(rows.len(), 82, "one execution per binding per PR: {rows:?}");
     for number in 1..=41 {
-        let rows = deployment.rows(number).await;
         let head = format!("h{number}");
         assert_eq!(
-            summary(&rows),
-            [
-                ("pending", None, head.as_str()),
-                ("pending", None, head.as_str())
-            ],
+            rows.iter().filter(|row| row.head == head).count(),
+            2,
             "PR {number}"
         );
     }
+    assert!(
+        rows.iter().all(|row| row.status == "completed"),
+        "every admitted execution progresses to completion: {rows:?}"
+    );
+    let served = deployment.status(rows[0].execution_id).await;
+    assert_eq!(served["status"], "completed");
+    assert_eq!(served["pull_request"]["repository_id"], "4242");
 }
 
 /// A delivery interrupted after its generation was reserved, with its input
@@ -643,5 +728,207 @@ async fn revoked_accountable_principal_settles_a_durable_refusal() {
             .expect("claim runs")
             .is_empty(),
         "a refusal is not runnable work"
+    );
+}
+
+/// P completed, A running, B pushed: B cancels A and fences its worker, and
+/// P's completed results stay as B's usable baseline.
+///
+/// # Panics
+/// Panics when P changes, A survives or its worker can still settle.
+#[tokio::test(flavor = "multi_thread")]
+async fn completed_baseline_survives_when_a_new_head_supersedes_running_work() {
+    let deployment = Deployment::start().await;
+    let mock = &deployment.mock;
+    mock.set_pull_request(REPOSITORY, 8, PullRequest::open(REPOSITORY, "b1", "p0"));
+    assert_eq!(deployment.send(8, "opened").await.0, StatusCode::ACCEPTED);
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = deployment.conn().await;
+    for claimed in deployment.claim(2).await {
+        let settled = queue
+            .complete(
+                &mut conn,
+                claimed.lease,
+                VerificationResultId::new_v7(),
+                VerificationVerdict::Passed,
+                "P passes",
+                None,
+            )
+            .await
+            .expect("P completes");
+        assert_eq!(settled, Settlement::Applied);
+    }
+    conn.commit().await.expect("P commits");
+
+    mock.edit_pull_request(REPOSITORY, 8, |pr| pr.head_sha = "a1".to_owned());
+    assert_eq!(
+        deployment.send(8, "synchronize").await.0,
+        StatusCode::ACCEPTED
+    );
+    let running = deployment.claim(2).await;
+    assert_eq!(running.len(), 2, "A runs");
+    mock.edit_pull_request(REPOSITORY, 8, |pr| pr.head_sha = "b2".to_owned());
+    assert_eq!(
+        deployment.send(8, "synchronize").await.0,
+        StatusCode::ACCEPTED
+    );
+
+    assert_eq!(
+        summary(&deployment.rows(8).await),
+        [
+            ("completed", None, "p0"),
+            ("completed", None, "p0"),
+            ("cancelled", Some("pull_request_superseded"), "a1"),
+            ("cancelled", Some("pull_request_superseded"), "a1"),
+            ("pending", None, "b2"),
+            ("pending", None, "b2"),
+        ]
+    );
+    let mut conn = deployment.conn().await;
+    for claimed in running {
+        let late = queue
+            .complete(
+                &mut conn,
+                claimed.lease,
+                VerificationResultId::new_v7(),
+                VerificationVerdict::Passed,
+                "A finished late",
+                None,
+            )
+            .await
+            .expect("settlement runs");
+        assert_eq!(late, Settlement::StaleLease, "A's worker is fenced");
+    }
+    conn.commit().await.expect("commits");
+}
+
+/// Re-declaring the Repository changes only later admissions: an open PR's
+/// accepted executions stay, a redelivery of its delivery keeps the first
+/// policy and IDs, and only a new source generation uses the new policy.
+///
+/// # Panics
+/// Panics when the re-declaration sweeps or resamples accepted work.
+#[tokio::test(flavor = "multi_thread")]
+async fn policy_reselection_affects_only_later_admissions() {
+    let deployment = Deployment::start().await;
+    let mock = &deployment.mock;
+    mock.set_pull_request(REPOSITORY, 5, PullRequest::open(REPOSITORY, "b1", "a1"));
+    let (_, opened) = deployment.send(5, "opened").await;
+    let first = deployment.rows(5).await;
+    assert_eq!(first.len(), 2);
+
+    deployment
+        .declare(POLICY_V2, "pull-request-policy-v2")
+        .await;
+    assert_eq!(
+        deployment.rows(5).await,
+        first,
+        "selection sweeps no open PR"
+    );
+    assert_eq!(
+        mock.redeliver(&opened).await.expect("redelivers"),
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        deployment.rows(5).await,
+        first,
+        "a redelivery keeps the first policy and IDs"
+    );
+
+    mock.edit_pull_request(REPOSITORY, 5, |pr| pr.head_sha = "b2".to_owned());
+    assert_eq!(
+        deployment.send(5, "synchronize").await.0,
+        StatusCode::ACCEPTED
+    );
+    let rows = deployment.rows(5).await;
+    assert_eq!(
+        summary(&rows[2..]),
+        [("pending", None, "b2")],
+        "the new generation uses the new policy's one binding"
+    );
+}
+
+/// Installation suspension and disconnect cancel unfinished PR work with
+/// `repository_access_lost`; draft PRs and unselected repositories admit
+/// nothing.
+///
+/// # Panics
+/// Panics when ineligible work is admitted or access loss leaves it due.
+#[tokio::test(flavor = "multi_thread")]
+async fn suspension_disconnect_and_ineligible_pull_requests_owe_no_work() {
+    let deployment = Deployment::start().await;
+    let mock = &deployment.mock;
+    let mut draft = PullRequest::open(REPOSITORY, "b1", "d1");
+    draft.draft = true;
+    mock.set_pull_request(REPOSITORY, 12, draft);
+    assert_eq!(deployment.send(12, "opened").await.0, StatusCode::ACCEPTED);
+    assert!(
+        deployment.rows(12).await.is_empty(),
+        "a draft admits nothing"
+    );
+    mock.set_pull_request(UNSELECTED, 13, PullRequest::open(UNSELECTED, "b1", "u1"));
+    let payload = mock.pull_request_event(INSTALLATION, UNSELECTED, 13, "opened");
+    let (status, _) = mock
+        .deliver_new(deployment.base(), "pull_request", &payload)
+        .await
+        .expect("delivery sends");
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert!(
+        deployment.rows(13).await.is_empty(),
+        "an unselected repository admits nothing"
+    );
+
+    mock.set_pull_request(REPOSITORY, 11, PullRequest::open(REPOSITORY, "b1", "a1"));
+    assert_eq!(deployment.send(11, "opened").await.0, StatusCode::ACCEPTED);
+    let event = |action: &str| json!({"action": action, "installation": {"id": INSTALLATION}});
+    mock.set_suspended(INSTALLATION, true);
+    let status = mock
+        .deliver(deployment.base(), "installation", &event("suspend"))
+        .await
+        .expect("delivery sends");
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(
+        summary(&deployment.rows(11).await),
+        [
+            ("cancelled", Some("repository_access_lost"), "a1"),
+            ("cancelled", Some("repository_access_lost"), "a1"),
+        ]
+    );
+    mock.set_suspended(INSTALLATION, false);
+    mock.deliver(deployment.base(), "installation", &event("unsuspend"))
+        .await
+        .expect("delivery sends");
+    mock.edit_pull_request(REPOSITORY, 11, |pr| pr.head_sha = "b2".to_owned());
+    assert_eq!(
+        deployment.send(11, "synchronize").await.0,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(deployment.rows(11).await.len(), 4, "unsuspend admits again");
+
+    let Bootstrap::User { jwt, .. } = deployment
+        .server
+        .bootstrap_user("pull-request-admin", &["admin"])
+        .await
+        .expect("admin bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let disconnected = deployment
+        .server
+        .oneshot_authenticated(
+            &jwt,
+            Request::delete("/v1/integrations/github")
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("disconnect responds");
+    assert_eq!(disconnected.status(), StatusCode::OK);
+    assert_eq!(
+        summary(&deployment.rows(11).await[2..]),
+        [
+            ("cancelled", Some("repository_access_lost"), "b2"),
+            ("cancelled", Some("repository_access_lost"), "b2"),
+        ]
     );
 }

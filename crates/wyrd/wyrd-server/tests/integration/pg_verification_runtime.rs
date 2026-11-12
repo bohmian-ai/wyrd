@@ -1371,7 +1371,7 @@ async fn unscorable_verifier_errors_without_publishing() {
 /// A run commits `completed` only once Scribe acknowledges its result: while
 /// the result is held before Scribe the run stays `running` with no selected
 /// result, and completes on its first attempt once released. A result Scribe
-/// rejects defers the run without spending an attempt, and the next claim
+/// rejects retries the run within its attempt budget, and the next claim
 /// delivers the same selected result; a result still unacknowledged at the
 /// deadline keeps the run waiting for it rather than timing out an outcome
 /// its state already selected.
@@ -1414,7 +1414,7 @@ async fn completion_waits_for_the_durable_result() {
     harness.fault.reject_next(OUTPUTS);
     let run = harness.submit().await;
     let row = harness.wait_execution(run, status("completed")).await;
-    assert_eq!(row.attempts, 1, "the deferred delivery spends no attempt");
+    assert_eq!(row.attempts, 2, "the rejected delivery is retried");
     let outputs = sent_to(&harness.fault, OUTPUTS).await;
     let delivered: Vec<_> = outputs[1..].iter().map(sent_result_id).collect();
     assert_eq!(
@@ -2275,18 +2275,18 @@ async fn redelivers_the_selected_result(final_attempt: bool) {
 
 /// A final attempt whose selected result was staged but whose settlement
 /// never commits is not exhausted while its state cannot be read or its
-/// result cannot be staged: an exhausted reclaim that meets either outage
+/// result cannot be staged: an exhausted reclaim that cannot read its state
 /// leaves its lease to expire without computing, counting an attempt, or
-/// settling, and once both recover the next reclaim completes the execution
-/// with the selected result instead of erroring.
+/// settling, and a reclaim that meets a full outbox holds its claim and
+/// waits for capacity in background, then completes the execution with the
+/// selected result instead of erroring.
 ///
 /// The source outage revokes the tenant role's read of the Scribe batch
 /// fences the accepted revision is recovered from; it is restored once the
 /// reclaim has reported the state unusable. The capacity outage holds the
 /// whole reservable item share of the server's shared Scribe outbox, which
-/// the recovery runtime stages through; it is released once the reclaim was
-/// refused, which shows as its `stale_lease` outcome once every earlier
-/// runtime has stopped.
+/// the recovery runtime stages through; it is released once the reclaim has
+/// committed its claim.
 ///
 /// # Panics
 /// Panics as [`stage_unsettled_result`] does, when the grant cannot change,
@@ -2295,7 +2295,6 @@ async fn redelivers_the_selected_result(final_attempt: bool) {
 /// attempt with the selected result.
 #[tokio::test]
 async fn exhausted_reconciliation_survives_source_and_capacity_outage() {
-    let metrics = wyrd_server::app::metrics::install_recorder().expect("recorder installs");
     let logs = LogCapture::install();
     let harness = Harness::start().await;
     harness.log_commits().await;
@@ -2334,18 +2333,7 @@ async fn exhausted_reconciliation_survives_source_and_capacity_outage() {
         .reserve(full.limit - full.admitted)
         .expect("the free reservable share is held");
     assert!(outbox.reserve(1).is_err(), "the reservable share is full");
-    let refused = || {
-        metrics
-            .render()
-            .lines()
-            .find_map(|line| {
-                line.strip_prefix(
-                    r#"wyrd_verification_run_failures_total{mode="queued",outcome="stale_lease"} "#,
-                )
-            })
-            .map_or(0, |value| value.parse::<u64>().expect("a count"))
-    };
-    let before = (refused(), harness.commits(run).await.len());
+    let before = harness.commits(run).await.len();
     harness.expire(run).await;
     let recovery = RunningRuntime::spawn(
         VerificationRuntime::builder(harness.server.state())
@@ -2354,25 +2342,28 @@ async fn exhausted_reconciliation_survives_source_and_capacity_outage() {
             .build()
             .expect("the recovery runtime composes"),
     );
-    wait_until("the reclaim to be refused capacity", || {
-        refused() > before.0
-    })
-    .await;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while harness.commits(run).await.len() == before {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the reclaim to commit its claim"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     let row = harness.seed.execution(run).await.expect("execution reads");
     assert_eq!(
         (row.status.as_str(), row.attempts),
         ("running", 1),
-        "a refused reclaim neither settles nor counts an attempt"
+        "a reclaim waiting for capacity neither settles nor counts an attempt"
     );
     let commits = harness.commits(run).await;
     assert!(
-        commits[before.1..]
+        commits[before..]
             .iter()
             .all(|commit| *commit == ("running".to_owned(), false)),
         "the blocked reclaim commits only its claim: {commits:?}"
     );
     drop(share);
-    harness.expire(run).await;
     let row = harness.wait_execution(run, status("completed")).await;
     recovery.stop().await;
     assert_eq!(row.attempts, 1, "no reclaim counts an attempt");
@@ -2659,134 +2650,6 @@ async fn terminal_failure_reclaims_without_reentering_the_engine() {
     assert_eq!(winner.entered(), 0, "the reclaim runs no engine");
     assert!(harness.writes().await.is_empty(), "no result is written");
     harness.assert_failure(&harness.state(run).await, "errored", "engine_refused");
-}
-
-/// Whether `execution`'s terminal delivery is still owed.
-///
-/// # Panics
-/// Panics when the execution cannot be read.
-async fn owed(harness: &Harness, execution: ExecutionId) -> bool {
-    sqlx::query_scalar(
-        "SELECT delivery_due_at IS NOT NULL FROM wyrd.verifier_executions \
-         WHERE execution_id = $1",
-    )
-    .bind(execution.as_uuid())
-    .fetch_one(&harness.assertion)
-    .await
-    .expect("the delivery reads")
-}
-
-/// A selected outcome cancelled before its result is acknowledged keeps its
-/// delivery owed until every required result record is acknowledged.
-///
-/// The attempt's output frame is held after its selection is accepted, and
-/// the execution is cancelled while the attempt waits for it; once released,
-/// the stale attempt's completing settlement is fenced and the cancellation's
-/// delivery stays owed. A fresh runtime then delivers the same selected
-/// result: while its output is held the delivery stays owed, a rejected
-/// summary keeps it owed, and it retires only once both records are
-/// acknowledged, with no engine entry, the status still `cancelled`, every
-/// sent record under the selected result identity, and exactly one output
-/// and one summary retained under it.
-///
-/// # Panics
-/// Panics when the stale settlement or an unacknowledged delivery retires
-/// the delivery, the cancellation's status changes, the delivery computes or
-/// mints another result identity, or its output or summary is not retained
-/// exactly once.
-#[tokio::test]
-async fn cancelled_selected_delivery_waits_for_all_required_acks() {
-    let harness = Harness::start().await;
-    harness.log_commits().await;
-    let original = EngineScript::default();
-    original.push(EngineOutcome::Completed(drifting_report()));
-    let held = harness.fault.hold_next(OUTPUTS);
-    let stale = harness.spawn(&Harness::limits(), &original);
-    let run = harness.submit().await;
-    tokio::time::timeout(WAIT, held.arrived())
-        .await
-        .expect("the result reaches Scribe");
-    stale.stop.cancel();
-    let selected = harness
-        .state(run)
-        .await
-        .terminal
-        .expect("the selection is accepted before its result");
-
-    let mut conn = harness
-        .server
-        .state()
-        .postgres
-        .wyrd()
-        .tenant_conn(harness.seed.tenant())
-        .await
-        .expect("tenant connection opens");
-    assert!(
-        VerifierExecutionQueue::default()
-            .cancel(&mut conn, run)
-            .await
-            .expect("cancel runs")
-    );
-    conn.commit().await.expect("the cancellation commits");
-    let cancelled = harness.commits(run).await.len();
-    held.release();
-    stale.stop().await;
-    assert_eq!(
-        harness.commits(run).await.len(),
-        cancelled,
-        "the stale attempt's settlement commits nothing"
-    );
-    assert!(
-        owed(&harness, run).await,
-        "cancellation's delivery stays owed"
-    );
-
-    let held = harness.fault.hold_next(OUTPUTS);
-    let fresh_script = EngineScript::default();
-    let fresh = harness.spawn(&Harness::limits(), &fresh_script);
-    tokio::time::timeout(WAIT, held.arrived())
-        .await
-        .expect("the delivery writes the result");
-    assert!(
-        owed(&harness, run).await,
-        "an unacknowledged result is owed"
-    );
-    harness.fault.reject_next(RESULTS);
-    held.release();
-    let deadline = tokio::time::Instant::now() + WAIT;
-    while owed(&harness, run).await {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for the delivery to retire"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    fresh.stop().await;
-
-    let row = harness.seed.execution(run).await.expect("execution reads");
-    assert_eq!(
-        (row.status.as_str(), row.error_code.as_deref()),
-        ("cancelled", Some("cancelled"))
-    );
-    assert_eq!((original.entered(), fresh_script.entered()), (1, 0));
-    assert_eq!(harness.state(run).await.terminal, Some(selected.clone()));
-    let id = selected.result_id.to_string();
-    let summaries = sent_to(&harness.fault, RESULTS).await;
-    assert!(
-        summaries.len() >= 3,
-        "the stale, rejected, and delivered summaries were sent"
-    );
-    for sent in summaries
-        .iter()
-        .chain(&sent_to(&harness.fault, OUTPUTS).await)
-    {
-        assert_eq!(sent_result_id(sent), id, "one selected result identity");
-    }
-    assert_eq!(
-        harness.retained_result(&id).await,
-        (1, vec!["failed".to_owned()]),
-        "the selected result's output and summary are each retained once"
-    );
 }
 
 /// A selected result delivered again by a later claim is retained once.

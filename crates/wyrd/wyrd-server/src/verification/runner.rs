@@ -550,8 +550,18 @@ impl VerifierRunner {
                 EngineOutcome::Retry(error) if run.attempt >= run.max_attempts => {
                     Offer::Failed(TerminalStatus::Errored, error)
                 }
-                EngineOutcome::Retry(error) => return Transition::Retry(error),
-                EngineOutcome::Deferred(error) => return Transition::Defer(error),
+                EngineOutcome::Retry(error) => {
+                    return persisted(&state, lease, frozen.run.execution_id)
+                        .await
+                        .err()
+                        .unwrap_or(Transition::Retry(error));
+                }
+                EngineOutcome::Deferred(error) => {
+                    return persisted(&state, lease, frozen.run.execution_id)
+                        .await
+                        .err()
+                        .unwrap_or(Transition::Defer(error));
+                }
             }
         };
         conclude(tenant, frozen, system, &state, offer, lease, &self.outbox).await
@@ -663,7 +673,7 @@ impl VerifierRunner {
     }
 
     /// Prepare the claimed execution's frozen input, then run the engine
-    /// over it in its `engine` phase. Under `test-support` a scripted
+    /// over it, both in its `engine` phase. Under `test-support` a scripted
     /// outcome, when queued, replaces both.
     async fn compute(
         &self,
@@ -674,21 +684,25 @@ impl VerifierRunner {
         state: &Arc<RunState>,
         telemetry: &ExecutionTelemetry,
     ) -> EngineOutcome {
-        #[cfg(feature = "test-support")]
-        if let Some(script) = &self.script
-            && let Some(outcome) = script.next().await
-        {
-            return outcome;
-        }
-        let prepared = match self.prepare(tenant, run, spec, system, telemetry).await {
-            Ok(prepared) => prepared,
-            Err(outcome) => return outcome,
+        let engine = async {
+            #[cfg(feature = "test-support")]
+            if let Some(script) = &self.script
+                && let Some(outcome) = script.next().await
+            {
+                return outcome;
+            }
+            match self.prepare(tenant, run, spec, system, telemetry).await {
+                Ok(prepared) => {
+                    self.dispatch(run, spec, system, state, telemetry, prepared)
+                        .await
+                }
+                Err(outcome) => outcome,
+            }
         };
         telemetry
             .phase(
                 Phase::Engine,
-                self.dispatch(run, spec, system, state, telemetry, prepared)
-                    .instrument(tracing::info_span!("verification.engine")),
+                engine.instrument(tracing::info_span!("verification.engine")),
             )
             .await
     }
@@ -1325,14 +1339,8 @@ async fn conclude(
         Err(_) if lease.lost().is_cancelled() => return Transition::LeaseLost,
         Err(error) => return state_failure(execution_id, &error),
     };
-    tokio::select! {
-        biased;
-        () = lease.lost().cancelled() => return Transition::LeaseLost,
-        persisted = state.persisted() => match persisted {
-            Ok(()) => {}
-            Err(_) if lease.lost().is_cancelled() => return Transition::LeaseLost,
-            Err(error) => return state_failure(execution_id, &error),
-        },
+    if let Err(transition) = persisted(state, lease, execution_id).await {
+        return transition;
     }
     match decided {
         Decision::Failed(failure) => {
@@ -1341,6 +1349,29 @@ async fn conclude(
         Decision::Selected(selected) => match result(frozen, &selected, system) {
             Ok((transition, write)) => deliver(tenant, transition, write, lease, outbox).await,
             Err(transition) => transition,
+        },
+    }
+}
+
+/// Wait until every change `state` holds is persisted, off the claim's
+/// computation and under its renewed `lease`, so the next claim recovers
+/// what this attempt recorded instead of an older revision.
+///
+/// # Errors
+/// Returns [`Transition::LeaseLost`] when the lease is lost first, and the
+/// [`state_failure`] of `execution_id` when persistence fails.
+async fn persisted(
+    state: &RunState,
+    lease: &HeldLease,
+    execution_id: ExecutionId,
+) -> Result<(), Transition> {
+    tokio::select! {
+        biased;
+        () = lease.lost().cancelled() => Err(Transition::LeaseLost),
+        persisted = state.persisted() => match persisted {
+            Ok(()) => Ok(()),
+            Err(_) if lease.lost().is_cancelled() => Err(Transition::LeaseLost),
+            Err(error) => Err(state_failure(execution_id, &error)),
         },
     }
 }

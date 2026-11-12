@@ -321,7 +321,23 @@ pub struct PyRunBifrost {
 
 #[pymethods]
 impl PyRunBifrost {
-    /// Buffer one row for a registered caller-owned table.
+    /// Buffer one row for the state's active table: the root Service's sole
+    /// declared table, else the one bound by `start_bifrost(table=...)` or
+    /// `WyrdState.use_table_by_name`. Performs no IO; `WyrdState.shutdown()`
+    /// drains it.
+    ///
+    /// # Errors
+    /// Raises `WYRD_VALA_412_NO_ACTIVE_TABLE` when no table is active,
+    /// `WYRD_SDK_400_INVALID_OBSERVATION` when it is outside
+    /// `bifrost.datasets`, and otherwise as `write_to`.
+    fn write(&self, py: Python<'_>, row: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
+        let json = json_text(py, "row", row)?;
+        crate::trace::block_on(py, self.run.bifrost().write_json(None, &json))
+            .map_err(WyrdPyError::from)
+    }
+
+    /// Buffer one row for a named registered caller-owned table, leaving the
+    /// active table unchanged.
     ///
     /// Blocking: the first call for a table describes it. Later calls reuse the
     /// writer's cached schema and producer and perform no schema lookup.
@@ -333,9 +349,9 @@ impl PyRunBifrost {
     /// `bifrost.datasets`, `WYRD_SDK_400_BIFROST_NOT_STARTED`,
     /// `WYRD_SDK_409_BIFROST_CLOSED`, `WYRD_CLIENT_429_QUEUE_FULL`, and the
     /// server's error for an unknown, unauthorized, or unavailable table.
-    fn write(&self, py: Python<'_>, table: &str, row: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
+    fn write_to(&self, py: Python<'_>, table: &str, row: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
         let json = json_text(py, "row", row)?;
-        crate::trace::block_on(py, self.run.bifrost().write_json(table, &json))
+        crate::trace::block_on(py, self.run.bifrost().write_json(Some(table), &json))
             .map_err(WyrdPyError::from)
     }
 }

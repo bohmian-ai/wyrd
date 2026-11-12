@@ -300,6 +300,18 @@ impl PyWyrdState {
         .map_err(WyrdPyError::from)
     }
 
+    /// Bind the registered `"<namespace>.<name>"` table as the active table
+    /// `run.bifrost.write(row)` writes, describing it first. The previous
+    /// table's producer keeps draining.
+    ///
+    /// # Errors
+    /// Raises `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup,
+    /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, and the server's describe
+    /// error for an unknown, unauthorized, or unavailable table.
+    fn use_table_by_name(&self, py: Python<'_>, table: &str) -> CardPyResult<()> {
+        crate::trace::block_on(py, self.inner.use_table_by_name(table)).map_err(WyrdPyError::from)
+    }
+
     /// Fix this state's Service release and deployment environment before
     /// its first use; local, with no network IO.
     ///

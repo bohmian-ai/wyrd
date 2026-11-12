@@ -13,7 +13,7 @@ use crate::cards::{CardSelector, Cards, Declarable};
 use crate::environment::Environment;
 use crate::error::WyrdClientError;
 use crate::observe::Run;
-use crate::observe::lifecycle::{BifrostLifecycle, StartedBifrost};
+use crate::observe::lifecycle::{BifrostLifecycle, StartClaim, StartedBifrost};
 use base64::Engine;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -739,9 +739,9 @@ impl WyrdState {
 
     /// Connect this state's one Bifrost writer with an active write table.
     ///
-    /// `table` retains its existing Bifrost meaning as the handle's active
-    /// write binding; it does not choose a run's destination and does not
-    /// replace a fixed system table. The queue keeps its default configuration;
+    /// `table` is the handle's active write binding, the table
+    /// `run.bifrost().write(row)` writes, in place of a sole declared table;
+    /// it never replaces a fixed system table. The queue keeps its default configuration;
     /// [`WyrdState::start_bifrost_with_config`] is the configured form.
     ///
     /// # Arguments
@@ -782,9 +782,68 @@ impl WyrdState {
     ) -> Result<(), WyrdError> {
         let claim = self.bifrost.claim()?;
         let client = self.client()?;
-        claim
-            .complete(Bifrost::connect_with(client, BifrostOptions { table, queue }).await?)
-            .await
+        let chosen = table.is_some();
+        let bifrost = Bifrost::connect_with(client, BifrostOptions { table, queue }).await?;
+        self.complete_start(claim, bifrost, chosen).await
+    }
+
+    /// Activate the sole declared table unless the caller chose one, then
+    /// publish the started writer.
+    ///
+    /// A root Service that declares exactly one table makes it the active
+    /// table, so `run.bifrost().write(row)` needs no table name. With none,
+    /// or several, nothing is activated: the caller binds one with
+    /// [`WyrdState::start_bifrost_with`] or [`WyrdState::use_table_by_name`].
+    ///
+    /// # Errors
+    /// The server's describe error for the declared table, then as
+    /// [`StartClaim::complete`].
+    async fn complete_start(
+        &self,
+        claim: StartClaim<'_>,
+        bifrost: Bifrost,
+        chosen: bool,
+    ) -> Result<(), WyrdError> {
+        if !chosen && let Some(table) = self.sole_declared_table() {
+            bifrost.use_table_by_name(&table).await?;
+        }
+        claim.complete(bifrost).await
+    }
+
+    /// The fully-qualified name of the root Service's only declared table.
+    fn sole_declared_table(&self) -> Option<String> {
+        match &self.service().spec {
+            Spec::Service(service) => match service.tables.as_slice() {
+                [table] => Some(format!("bifrost.datasets.{}", table.name)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Bind the registered `<namespace>.<name>` table as the active table
+    /// that `run.bifrost().write(row)` writes, describing it first.
+    ///
+    /// This is [`Bifrost::use_table_by_name`] on the state's one writer: the
+    /// previous table's producer keeps draining, so switching strands no
+    /// buffered row. Every run of this state shares the active table; a
+    /// caller writing several tables concurrently names each one with
+    /// `run.bifrost().write_to(table, row)` instead.
+    ///
+    /// # Arguments
+    /// * `fqn` - The registered table's `<namespace>.<name>`.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup,
+    /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, and the server's describe
+    /// error for an unknown, unauthorized, or unavailable table.
+    ///
+    /// # Cancellation
+    /// Abandoning the future during the describe leaves the active table
+    /// unchanged.
+    pub async fn use_table_by_name(&self, fqn: &str) -> Result<(), WyrdError> {
+        let started = self.started_bifrost()?;
+        Ok(started.bifrost.use_table_by_name(fqn).await?)
     }
 
     /// The client this state's server calls go through.
@@ -1045,7 +1104,9 @@ impl WyrdState {
         &self,
         bifrost: Bifrost,
     ) -> Result<(), WyrdError> {
-        self.bifrost.claim()?.complete(bifrost).await
+        let chosen = bifrost.table().is_some();
+        self.complete_start(self.bifrost.claim()?, bifrost, chosen)
+            .await
     }
 
     /// The started writer and its described fixed Drift table.
@@ -2411,7 +2472,7 @@ pub(crate) mod tests {
     use wyrd_spec::card::field::FieldSpec;
     use wyrd_spec::card::model::{CustomMeta, ModelInterface, ModelSignature, ModelSpec, TaskType};
     use wyrd_spec::card::prompt::PromptSpec;
-    use wyrd_spec::card::service::{ServiceComponent, ServiceSpec};
+    use wyrd_spec::card::service::{ServiceComponent, ServiceSpec, ServiceTable};
     use wyrd_spec::card::trigger::{TriggerActivation, TriggerSpec};
     use wyrd_spec::card::verifier::{
         AgentCall, Check, Requirement, VerificationBinding, VerifierSpec,
@@ -2460,6 +2521,11 @@ pub(crate) mod tests {
         /// Panics if the temporary directory cannot be created or fixture
         /// values cannot be serialized and written.
         pub(crate) fn complete_service() -> Self {
+            Self::complete_service_with_tables(&[])
+        }
+
+        /// [`Self::complete_service`] whose root Service declares `tables`.
+        pub(crate) fn complete_service_with_tables(tables: &[&str]) -> Self {
             let root_ref = test_ref(CardKind::Service, "service", 1);
             let model_ref = test_ref(CardKind::Model, "model", 2);
             let backup_ref = test_ref(CardKind::Model, "backup", 3);
@@ -2482,6 +2548,13 @@ pub(crate) mod tests {
                         credential_refs: Vec::new(),
                     },
                 ],
+                tables: tables
+                    .iter()
+                    .map(|name| ServiceTable {
+                        name: (*name).to_owned(),
+                        schema: serde_json::json!({ "type": "object" }),
+                    })
+                    .collect(),
                 ..ServiceSpec::default()
             };
             let mut bundle = Self {

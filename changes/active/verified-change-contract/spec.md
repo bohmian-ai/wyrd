@@ -427,8 +427,9 @@ flows are listed in its "Input and queue boundary" section.
   per-observation describe requests or client-authored table schemas.
   `observe.drift` and `observe.eval` MUST stay synchronous projection-and-
   enqueue calls in Rust, Python, and TypeScript. The constructor's optional
-  active `table` argument retains its existing Bifrost meaning; it MUST NOT
-  select a run's destination or change either fixed system table. Repeated
+  active `table` argument retains its existing Bifrost meaning and, per
+  `sdk-authoring-ergonomics` REQ-016, is the destination of a run's default
+  write; it MUST NOT change either fixed system table. Repeated
   `use_table_by_name` calls are not a schema cache: they describe remotely and
   mutate the shared active table, so the run observation path MUST NOT use them.
   The existing WriterPool already reuses its producer for each table; no
@@ -447,7 +448,9 @@ flows are listed in its "Input and queue boundary" section.
   restarted; a new `WyrdState` is required for a new writer lifetime.
 - **REQ-128**: `observe.record(table, value)` MUST require the destination
   table name on the call, not on `state.run()`, and infer no table from the
-  CardRef or run ID. It MUST accept a language-native serializable row and
+  CardRef or run ID. (Amended by `sdk-authoring-ergonomics` REQ-016: the
+  destination is the call's table or the state's active table, never one
+  inferred from the CardRef or run ID.) It MUST accept a language-native serializable row and
   supply the scoped CardRef/run ID correlation without requiring a caller
   schema, `TableConfig`, or Bifrost handle. The row and destination schema
   MUST be representable by the existing JSON-to-Arrow queue, including the

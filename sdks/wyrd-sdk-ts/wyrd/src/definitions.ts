@@ -79,11 +79,13 @@ type AuthorableMember<T> = T extends Wire.CardRef
             ? Shape<T> | Requirement
             : T extends Wire.ServiceComponent
               ? Shape<T> | Component
-              : T extends Wire.VerificationBinding
-                ? Shape<T> | Binding
-                : T extends Wire.TypedInputSlot
-                  ? Shape<T> | InputSlot
-                  : Shape<T>;
+              : T extends Wire.ServiceTable
+                ? Shape<T> | Table
+                : T extends Wire.VerificationBinding
+                  ? Shape<T> | Binding
+                  : T extends Wire.TypedInputSlot
+                    ? Shape<T> | InputSlot
+                    : Shape<T>;
 
 /** The members of `T`, each {@link Authorable}. */
 type Shape<T> = T extends readonly (infer U)[]
@@ -1669,6 +1671,26 @@ export class Artifact extends AuthoredCard {
    */
   addMetadata(key: string, value: Entry<ArtifactFields, "metadata">): this {
     return insert(this, "metadata", key, value);
+  }
+}
+
+/**
+ * One Bifrost dataset table a Service declares: its name inside
+ * `bifrost.datasets` and the JSON Schema whose `properties` order is its
+ * column order.
+ */
+export class Table {
+  /** Type-only identity: no other value is a Table, whatever its shape. */
+  declare private readonly family: "Table";
+
+  /**
+   * The table `name` with the JSON Schema object `schema`.
+   *
+   * @param name - The table name.
+   * @param schema - The JSON Schema of the table's fields, in column order.
+   */
+  constructor(name: string, schema: Wire.ServiceTable["schema"]) {
+    holdAuthored(this, NativeAuthored.table(name, snapshot("schema", schema)));
   }
 }
 

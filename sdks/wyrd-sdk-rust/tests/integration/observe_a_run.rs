@@ -180,7 +180,7 @@ async fn writes_land_under_the_view_that_wrote_them() {
         run.for_card(alias)
             .expect("view resolves")
             .bifrost()
-            .write(table, &json!({ "value": value }))
+            .write_to(table, &json!({ "value": value }))
             .await
             .expect("the row buffers");
     }

@@ -21,8 +21,8 @@ use wyrd_client::verify::{
     Action, Agent, AnthropicOptions, Artifact, ArtifactFile, Audit, Binding, CardDefinition,
     CardRef, Check, CodeSource, Component, Data, Experiment, FieldValue, GeminiOptions, InputSlot,
     Mcp, Model, OpenAiChatOptions, OpenAiResponsesOptions, Operator, Prompt, PromptBuilderError,
-    Requirement, ResponseFormat, Service, Step, Trigger, Verifier, anthropic, gemini, openai_chat,
-    openai_responses, vertex,
+    Requirement, ResponseFormat, Service, Step, Table, Trigger, Verifier, anthropic, gemini,
+    openai_chat, openai_responses, vertex,
 };
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
@@ -75,6 +75,8 @@ enum Authored {
     Operator(Operator),
     /// A Service component.
     Component(Component),
+    /// A Service table.
+    Table(Table),
     /// A verification binding.
     Binding(Binding),
     /// A Verifier step.
@@ -176,8 +178,8 @@ macro_rules! families {
 families!(
     cards { Service, Agent, Verifier, Artifact, Model, Data, Experiment, Mcp, Audit, Trigger, Operator }
     values {
-        Component, Binding, Step, Requirement, InputSlot, Action, Check, CardRef, ArtifactFile,
-        CodeSource
+        Component, Table, Binding, Step, Requirement, InputSlot, Action, Check, CardRef,
+        ArtifactFile, CodeSource
     }
     boxed { Prompt }
 );
@@ -494,6 +496,7 @@ macro_rules! canonical {
 
 canonical!(
     component => Component,
+    table => Table,
     step => Step,
     requirement => Requirement,
     action => Action,
@@ -614,7 +617,7 @@ fields! {
         }
         list {
             components, add_component: component, verified_by, add_verified_by: binding,
-            tables, add_table: json, credential_refs, add_credential_ref: json,
+            tables, add_table: table, credential_refs, add_credential_ref: json,
         }
         map {
             deployment, add_deployment: json, service_config, add_service_config: json,
@@ -692,6 +695,7 @@ fields! {
         list { verified_by, add_verified_by: binding, credential_refs, add_credential_ref: json }
         map { config, add_config: json }
     }
+    Table { one {} list {} map {} }
     Binding {
         one { runs_on: field }
         list { on_failure, add_on_failure: field, on_verdict_change, add_on_verdict_change: field }
@@ -1024,6 +1028,13 @@ impl NativeAuthored {
             alias,
             reference.clone().field()?,
         ))))
+    }
+
+    /// The Service table `name` in `bifrost.datasets` with the JSON Schema
+    /// object `schema`, whose `properties` order is the column order.
+    #[napi(factory)]
+    pub fn table(name: String, schema: Value) -> Self {
+        Self::of(Authored::Table(Table::new(name, schema)))
     }
 
     /// Bind `verifier`: a Verifier, an exact `CardRef`, or a reference path.

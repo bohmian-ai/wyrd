@@ -247,15 +247,12 @@ pub async fn serve(desk: &Desk) -> Result<Vec<Served>, Error> {
         let request = async {
             let answer = answer(state, &run, &question).await?;
             run.bifrost()
-                .write(
-                    "bifrost.datasets.tickets",
-                    &TicketRow {
-                        ticket_id: format!("T-{index}"),
-                        question: &question,
-                        answer: &answer,
-                        refund: question.contains("refund"),
-                    },
-                )
+                .write(&TicketRow {
+                    ticket_id: format!("T-{index}"),
+                    question: &question,
+                    answer: &answer,
+                    refund: question.contains("refund"),
+                })
                 .await?;
             match run
                 .observe()

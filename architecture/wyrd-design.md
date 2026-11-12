@@ -2338,7 +2338,7 @@ version: `new(name, None)` in Rust, `Kind(name)` in Python, and
 An omitted version is never invented by the client: the server selects it at
 registration, exactly as for a YAML file that omits `metadata.version`. Each
 sub-value (`Component`, `Binding`, `InputSlot`, `Step`, `Requirement`,
-`Action`, `Check`) takes the fields that identify it. Constructor arguments
+`Table`, `Action`, `Check`) takes the fields that identify it. Constructor arguments
 are fixed: no later method edits them, so a different name, version, alias,
 reference, id, action, check, or check operand means constructing another
 value. Every `Action` constructor returns an `Action` and every `Check`
@@ -2350,7 +2350,9 @@ values to executable arguments (`addInput`/`bindInput` in TypeScript). Their
 canonical `inputs` maps and whole-map setters retain their names. Rust accepts
 bare JSON Schemas and Python accepts schema dictionaries or supported model
 classes without a mandatory JSON-slot wrapper; a Python Verifier's `inputs`
-may also be one Pydantic model class whose fields are its named slots.
+may also be one Pydantic model class whose fields are its named slots,
+and a Python Service `Table`'s `schema` may be a model class whose field
+order is the column order. Pydantic is the optional `wyrd-ai[pydantic]` extra.
 Explicit canonical slot forms and distinct non-JSON slot constructors remain
 available. Execution references stay strings such as `inputs.report.text`.
 Fields accept their canonical typed values as well as canonical JSON: the

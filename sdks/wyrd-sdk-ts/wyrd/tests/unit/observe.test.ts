@@ -32,7 +32,7 @@ function everyCall(
   value: () => unknown,
 ): (() => Promise<unknown>)[] {
   return [
-    () => bifrost.write("bifrost.datasets.events", value()),
+    () => bifrost.writeTo("bifrost.datasets.events", value()),
     () => observe.verify("policy-check", { answer: value() as never }),
     () => observe.submit("policy-check", { answer: value() as never }),
   ];
@@ -198,6 +198,7 @@ describe("internal native run wrapper", () => {
       "Requirement",
       "Service",
       "Step",
+      "Table",
       "Trigger",
       "Verifier",
     ]);

@@ -38,6 +38,11 @@ export declare class NativeAuthored {
    */
   static component(alias: string, reference: NativeValue): NativeAuthored
   /**
+   * The Service table `name` in `bifrost.datasets` with the JSON Schema
+   * object `schema`, whose `properties` order is the column order.
+   */
+  static table(name: string, schema: any): NativeAuthored
+  /**
    * Bind `verifier`: a Verifier, an exact `CardRef`, or a reference path.
    *
    * # Errors
@@ -1130,7 +1135,8 @@ export declare class NativeRun {
    * discarding the returned promise does not cancel it: the row may still
    * be admitted. A successful outcome admitted exactly one row, so repeating
    * it writes another; a refused outcome admitted none and may be retried.
-   * Admission and queue retries follow `RunBifrost::write`.
+   * Admission and queue retries follow `RunBifrost::write_to`. `table`
+   * names the destination; `None` writes the state's active table.
    *
    * # Errors
    *
@@ -1138,7 +1144,7 @@ export declare class NativeRun {
    * reserved, unknown, or unauthorized table and the lifecycle refusals are
    * returned in [`NativeLifecycleResult`].
    */
-  write(table: string, rowJson: string): Promise<NativeLifecycleResult>
+  write(table: string | undefined | null, rowJson: string): Promise<NativeLifecycleResult>
 }
 
 /**
@@ -1505,6 +1511,17 @@ export declare class NativeWyrdState {
    * fixed-table failures are returned in [`NativeLifecycleResult`].
    */
   startBifrost(table?: NativeTableConfig | undefined | null, clientByteLimitBytes?: number | undefined | null): Promise<NativeLifecycleResult>
+  /**
+   * Binds the registered `<namespace>.<name>` table as the active table a
+   * run's default write targets, describing it first.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the outcome cannot be projected; the
+   * lifecycle refusals and the describe error are returned in
+   * [`NativeLifecycleResult`].
+   */
+  useTableByName(table: string): Promise<NativeLifecycleResult>
   /**
    * Opens one invocation over this state, targeting `alias` or the root Service.
    *

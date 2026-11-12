@@ -184,7 +184,7 @@ export async function serve(desk: Desk): Promise<Served[]> {
         try {
           const reply = await answer(client, state, run, asked);
           // Buffered: state.shutdown() below drains the ticket rows.
-          await run.bifrost.write("bifrost.datasets.tickets", {
+          await run.bifrost.write({
             ticket_id: `T-${index}`,
             question: asked,
             answer: reply,

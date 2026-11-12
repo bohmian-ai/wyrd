@@ -51,7 +51,7 @@ def test_run_exposes_bifrost_write_and_observe_verification(state: WyrdState) ->
     assert callable(run.observe.verify)
     assert callable(run.observe.submit)
     with pytest.raises(wyrd.WyrdError) as raised:
-        run.for_card("model").bifrost.write("bifrost.datasets.latency", {"latency_ms": 1.0})
+        run.for_card("model").bifrost.write_to("bifrost.datasets.latency", {"latency_ms": 1.0})
     assert raised.value.code == "WYRD_SDK_400_BIFROST_NOT_STARTED"
 
 
@@ -79,7 +79,7 @@ def test_unknown_alias_is_refused(state: WyrdState) -> None:
 def test_write_refuses_a_table_outside_bifrost_datasets(state: WyrdState) -> None:
     """``write`` targets registered caller-owned tables only."""
     with pytest.raises(wyrd.WyrdError) as raised:
-        state.run().bifrost.write("bifrost.drift.observations", {"value": 1})
+        state.run().bifrost.write_to("bifrost.drift.observations", {"value": 1})
     assert raised.value.code == "WYRD_SDK_400_INVALID_OBSERVATION"
 
 
@@ -100,7 +100,7 @@ def test_shutdown_without_startup_succeeds(state: WyrdState) -> None:
 def test_write_refuses_a_non_string_mapping_key(state: WyrdState, key: object) -> None:
     """``json.dumps`` would stringify the key, so it is refused before the writer."""
     with pytest.raises(wyrd.WyrdError) as raised:
-        state.run().bifrost.write("bifrost.datasets.latency", {key: 1.0})
+        state.run().bifrost.write_to("bifrost.datasets.latency", {key: 1.0})
     assert raised.value.code == "WYRD_SPEC_400_VALIDATION"
 
 
@@ -624,7 +624,7 @@ def test_otel_imports_without_the_agents_sdk() -> None:
 def _write_reaches_the_ordinary_boundary(run: Run) -> None:
     """Write one explicit row and assert its ordinary offline error."""
     with pytest.raises(wyrd.WyrdError) as raised:
-        run.bifrost.write("bifrost.datasets.latency", {"latency_ms": 1.0})
+        run.bifrost.write_to("bifrost.datasets.latency", {"latency_ms": 1.0})
     assert raised.value.code == "WYRD_SDK_400_BIFROST_NOT_STARTED"
 
 

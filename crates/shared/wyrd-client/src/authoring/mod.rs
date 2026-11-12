@@ -51,7 +51,7 @@ use wyrd_spec::registry::CardSubmission;
 
 pub use kinds::{
     Agent, Artifact, Audit, Binding, Component, Data, Experiment, Mcp, Model, Operator, Service,
-    Trigger,
+    Table, Trigger,
 };
 pub use verifier::{Action, Check, InputSlot, Requirement, Step, Verifier};
 pub use wyrd_spec::verification::ExecutionPlan;

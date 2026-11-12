@@ -759,6 +759,30 @@ impl NativeWyrdState {
         })
     }
 
+    /// Binds the registered `<namespace>.<name>` table as the active table a
+    /// run's default write targets, describing it first.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the outcome cannot be projected; the
+    /// lifecycle refusals and the describe error are returned in
+    /// [`NativeLifecycleResult`].
+    #[napi]
+    pub fn use_table_by_name<'env>(
+        &self,
+        env: &'env Env,
+        table: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let state = self.state.clone();
+        crate::trace::spawn(env, async move {
+            let state = match &state {
+                Ok(state) => state,
+                Err(error) => return Ok(NativeLifecycleResult::from_wyrd(error)),
+            };
+            NativeLifecycleResult::outcome(Box::pin(state.use_table_by_name(&table)).await)
+        })
+    }
+
     /// Opens one invocation over this state, targeting `alias` or the root Service.
     ///
     /// Local only: no network IO, no server-side Run resource, and no Verifier
@@ -1072,7 +1096,8 @@ impl NativeRun {
     /// discarding the returned promise does not cancel it: the row may still
     /// be admitted. A successful outcome admitted exactly one row, so repeating
     /// it writes another; a refused outcome admitted none and may be retried.
-    /// Admission and queue retries follow `RunBifrost::write`.
+    /// Admission and queue retries follow `RunBifrost::write_to`. `table`
+    /// names the destination; `None` writes the state's active table.
     ///
     /// # Errors
     ///
@@ -1083,13 +1108,13 @@ impl NativeRun {
     pub fn write<'env>(
         &self,
         env: &'env Env,
-        table: String,
+        table: Option<String>,
         row_json: String,
     ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
         let run = self.run.clone();
         crate::trace::spawn(env, async move {
             NativeLifecycleResult::outcome(
-                Box::pin(run.bifrost().write_json(&table, &row_json)).await,
+                Box::pin(run.bifrost().write_json(table.as_deref(), &row_json)).await,
             )
         })
     }

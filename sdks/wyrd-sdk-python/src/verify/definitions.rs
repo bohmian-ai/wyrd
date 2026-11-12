@@ -13,9 +13,9 @@
 //! Python adapts only arguments: plain JSON values, the native authoring
 //! values, `wyrd.cards.CardRef`, the original `wyrd.prompt.Prompt`, the
 //! canonical `ComparisonOperator`, `ExecutionRoute` and `AgentRunConfig`
-//! projections, and, for an input slot or a Verifier's whole `inputs`, a
-//! supported scalar class or a class with `model_json_schema()` such as a
-//! Pydantic model. This module never imports Pydantic.
+//! projections, and, for an input slot, a Verifier's whole `inputs`, or a
+//! Service table's `schema`, a supported scalar class or a class with
+//! `model_json_schema()` such as a Pydantic model. This module never imports Pydantic.
 
 use std::path::PathBuf;
 
@@ -30,7 +30,7 @@ use wyrd_client::cards::Declarable;
 use wyrd_client::verify::{
     Action, Agent, AgentRunConfigSpec, Artifact, ArtifactFile, Audit, Binding, CardDefinition,
     CardRef, Check, CodeSource, ComparisonOperator, Component, Data, Experiment, FieldValue,
-    InputSlot, Mcp, Model, Operator, Requirement, Service, Step, Trigger, Verifier,
+    InputSlot, Mcp, Model, Operator, Requirement, Service, Step, Table, Trigger, Verifier,
 };
 use wyrd_spec::ExecutionRoute;
 use wyrd_spec::envelope::CardKind;
@@ -96,6 +96,31 @@ fn schema(field: &str, value: &Bound<'_, PyAny>) -> PyResult<Value> {
         Ok(class) => class_schema(field, class),
         Err(_) => json(field, value),
     }
+}
+
+/// A Service `tables` entry: a `Table`, or its canonical mapping, whose
+/// `schema` may be a class standing for a JSON Schema, as in `Table`.
+///
+/// # Errors
+/// As [`class_schema`] for a class `schema`, and [`json`] for the rest.
+fn table(field: &str, value: &Bound<'_, PyAny>) -> PyResult<Table> {
+    if let Ok(table) = value.cast::<PyTable>() {
+        return Ok(table.borrow().inner.clone());
+    }
+    let class = value
+        .cast::<PyMapping>()
+        .ok()
+        .and_then(|entry| entry.get_item("schema").ok())
+        .and_then(|schema| schema.cast_into::<PyType>().ok());
+    let Some(class) = class else {
+        return json(field, value).map(Table::from);
+    };
+    let rest = PyDict::new(value.py());
+    rest.update(value.cast::<PyMapping>()?)?;
+    rest.del_item("schema")?;
+    let mut table = json(field, rest.as_any())?;
+    table["schema"] = class_schema(&format!("{field}.schema"), &class)?;
+    Ok(Table::from(table))
 }
 
 /// An input slot: an `InputSlot`, or else a source slot's reference string,
@@ -208,6 +233,7 @@ fn nested(field: &str, value: &Bound<'_, PyAny>, depth: usize) -> PyResult<Field
         PyArtifactFile,
         PyCodeSource,
         PyComponent,
+        PyTable,
         PyBinding,
         PyStep,
         PyRequirement,
@@ -691,7 +717,7 @@ card_class! {
         }
         list {
             components, add_component: component, verified_by, add_verified_by: binding,
-            tables, add_table: json, credential_refs, add_credential_ref: json,
+            tables, add_table: table, credential_refs, add_credential_ref: json,
         }
         map {
             deployment, add_deployment: json, service_config, add_service_config: json,
@@ -891,6 +917,31 @@ definition_class! {
     ) -> PyResult<Self> {
         Ok(Self {
             inner: Self::with_fields(Component::new(alias, field("ref", r#ref)?), fields)?,
+        })
+    }
+}
+
+/// One Bifrost dataset table a Service declares: its name and the JSON
+/// Schema of its columns.
+#[pyclass(module = "wyrd.verify", name = "Table")]
+pub(crate) struct PyTable {
+    /// The shared native table.
+    inner: Table,
+}
+
+#[pymethods]
+impl PyTable {
+    /// The table `name` in `bifrost.datasets` with `schema`: a JSON Schema
+    /// object, or a class with `model_json_schema()` such as a Pydantic
+    /// model, whose fields become the columns in order.
+    ///
+    /// # Errors
+    /// As [`schema`].
+    #[new]
+    #[pyo3(signature = (name, schema))]
+    fn __new__(name: String, schema: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self {
+            inner: Table::new(name, self::schema("schema", schema)?),
         })
     }
 }
@@ -1582,6 +1633,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyTrigger>()?;
     module.add_class::<PyOperator>()?;
     module.add_class::<PyComponent>()?;
+    module.add_class::<PyTable>()?;
     module.add_class::<PyBinding>()?;
     module.add_class::<PyStep>()?;
     module.add_class::<PyRequirement>()?;

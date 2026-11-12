@@ -40,6 +40,7 @@ from wyrd.verify import (
     ResponseFormat,
     Service,
     Step,
+    Table,
     Trigger,
     Verifier,
 )
@@ -247,6 +248,25 @@ def test_pydantic_models_supply_input_schemas() -> None:
     assert "text" in inputs["report"]["schema"]["required"]
     assert "notes" not in inputs["report"]["schema"]["required"], "omission follows the model"
     assert {"type": "null"} in inputs["report"]["schema"]["properties"]["notes"]["anyOf"]
+
+
+class Reply(BaseModel):
+    answer: str
+    verdict: str
+
+
+def test_pydantic_models_supply_table_schemas() -> None:
+    plain = {"name": "plain", "schema": {"type": "object"}}
+    service = Service("tabled", tables=[Table("replies", Reply)])
+    service.add_table({"name": "mapped", "schema": Reply}).add_table(plain)
+    [modelled, mapped, kept] = service.spec()["tables"]
+    assert modelled == {"name": "replies", "schema": Reply.model_json_schema()}
+    assert list(modelled["schema"]["properties"]) == ["answer", "verdict"], "columns in field order"
+    assert mapped == {"name": "mapped", "schema": Reply.model_json_schema()}
+    assert kept == plain
+    assert Service("dict", tables=[Table("plain", {"type": "object"})]).spec()["tables"] == [plain]
+    with pytest.raises(TypeError, match="has no JSON Schema"):
+        Table("t", object)
 
 
 def test_schema_callback_may_edit_its_receiver() -> None:

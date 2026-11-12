@@ -194,11 +194,13 @@ class WyrdState:
         The writer acts as the state's client: the one given to ``from_path``,
         else the ambient client. Startup describes ``bifrost.drift.observations``
         before succeeding, so a run can never enqueue against a missing,
-        unauthorized, or incompatible system table.
+        unauthorized, or incompatible system table. When the root Service
+        declares exactly one table and ``table`` is omitted, that table becomes
+        the active table ``run.bifrost.write(row)`` writes.
 
         Args:
-            table: the Bifrost write binding, as for ``Bifrost()``. It does
-                not choose a run's destination.
+            table: the active table ``run.bifrost.write(row)`` writes, as for
+                ``Bifrost()``, in place of a sole declared table.
             client_byte_limit_bytes: the handle-wide ingestion byte budget.
                 256 MiB if omitted.
 
@@ -209,6 +211,25 @@ class WyrdState:
                 byte budget too small to seal one message, or the catalog code
                 for a missing credential, an undialable ingest channel, or a
                 fixed table that is absent, unauthorized, or incompatible.
+        """
+        ...
+
+    def use_table_by_name(self, table: str) -> None:
+        """Bind a registered table as the active table, describing it first.
+
+        ``run.bifrost.write(row)`` then writes it. Every run of this state
+        shares the active table, and the previous table's buffered rows still
+        drain. Runs writing different tables concurrently use
+        ``run.bifrost.write_to(table, row)`` instead.
+
+        Args:
+            table: the registered ``"<namespace>.<name>"`` table.
+
+        Raises:
+            WyrdError: ``WYRD_SDK_400_BIFROST_NOT_STARTED`` before
+                ``start_bifrost``, ``WYRD_SDK_409_BIFROST_CLOSED`` after
+                shutdown, and the server's error for a table that is unknown,
+                unauthorized, or unavailable.
         """
         ...
 

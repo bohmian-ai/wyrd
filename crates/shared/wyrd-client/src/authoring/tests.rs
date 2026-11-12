@@ -1911,3 +1911,30 @@ fn shared_children_join_once_and_plain_graphs_keep_no_targets() {
         "no local Artifact needs sibling targets"
     );
 }
+
+/// A [`Table`] authors the same Service `tables` entry as its canonical
+/// object, and a JSON entry stays accepted beside it.
+#[test]
+fn tables_match_their_canonical_entries() {
+    let schema = json!({
+        "type": "object",
+        "properties": { "answer": { "type": "string" } },
+        "required": ["answer"],
+    });
+    let mut service = Service::new("tabled", None).tables([Table::new("replies", schema)]);
+    service.add_table(Table::from(
+        json!({ "name": "plain", "schema": { "type": "object" } }),
+    ));
+    let canonical: ServiceSpec = yaml(
+        r"
+tables:
+  - name: replies
+    schema: {type: object, properties: {answer: {type: string}}, required: [answer]}
+  - name: plain
+    schema: {type: object}
+",
+    );
+    let authored: ServiceSpec =
+        serde_json::from_value(service.spec()).expect("authored tables decode as a Service spec");
+    assert_eq!(authored, canonical);
+}

@@ -661,6 +661,21 @@ impl Bifrost {
             .map_err(Into::into)
     }
 
+    /// The active table's write destination, when one is bound with a table
+    /// version; the run-scoped default write reads it without cloning the
+    /// whole binding.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the active-table lock is poisoned.
+    pub(crate) fn active_writer_table(&self) -> Option<WriterTable> {
+        self.active
+            .lock()
+            .expect("active table lock poisoned")
+            .as_ref()
+            .and_then(TableConfig::writer_table)
+    }
+
     /// The active write binding, if any.
     ///
     /// # Panics
@@ -699,11 +714,7 @@ impl Bifrost {
     /// Panics if the active-table lock is poisoned.
     pub fn insert(&self, row: Vec<u8>, correlation: Correlation) -> Result<(), BifrostClientError> {
         let table = self
-            .active
-            .lock()
-            .expect("active table lock poisoned")
-            .as_ref()
-            .and_then(TableConfig::writer_table)
+            .active_writer_table()
             .ok_or(BifrostClientError::NoActiveTable)?;
         self.writer
             .insert(

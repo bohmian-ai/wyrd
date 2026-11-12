@@ -25,7 +25,6 @@ from wyrd.state import WyrdState
 ROOT = Path(__file__).resolve().parents[1]
 SERVICE = ROOT / "service"
 BUNDLE = ROOT / ".wyrd-bundle"
-TICKETS = "bifrost.datasets.tickets"
 
 tracer = trace.get_tracer("support-desk")
 
@@ -70,7 +69,7 @@ class Desk:
             agent = Agent(name="support-agent", model=model)
             result = await Runner.run(agent, self.template.replace("{{question}}", question))
             answer = str(result.final_output)
-            run.bifrost.write(TICKETS, {"question": question, "answer": answer})
+            run.bifrost.write({"question": question, "answer": answer})
         # ANCHOR_END: answer
         return run, answer
 

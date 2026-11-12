@@ -43,7 +43,7 @@ pub use execution::Execution;
 pub use crate::authoring::{
     Action, Agent, Artifact, ArtifactFile, Audit, Binding, CardDefinition, CardRef, Check,
     CodeSource, Component, Data, Declaration, ExecutionPlan, Experiment, FieldValue, InputSlot,
-    LocalArtifact, Mcp, Model, Operator, Requirement, Service, Step, Trigger, Verifier,
+    LocalArtifact, Mcp, Model, Operator, Requirement, Service, Step, Table, Trigger, Verifier,
 };
 pub use skald_prompt::{
     AnthropicOptions, GeminiOptions, OpenAiChatOptions, OpenAiResponsesOptions, Prompt,

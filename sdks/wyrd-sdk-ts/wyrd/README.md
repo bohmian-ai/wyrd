@@ -22,7 +22,7 @@ await state.startBifrost();
 const run = state.run();
 
 // Buffer a row; shutdown drains it
-await run.bifrost.write("bifrost.datasets.answers", { question, answer });
+await run.bifrost.writeTo("bifrost.datasets.answers", { question, answer });
 
 // Run a Verifier now and wait for the verdict
 const result = await run.observe.verify("my-check", { answer });

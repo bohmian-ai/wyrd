@@ -196,8 +196,31 @@ class RunBifrost:
     acknowledgement: a successful ``WyrdState.shutdown()`` drains the queue.
     """
 
-    def write(self, table: str, row: Mapping[str, Any] | Any) -> None:
-        """Buffer one row for a registered ``bifrost.datasets.<name>`` table.
+    def write(self, row: Mapping[str, Any] | Any) -> None:
+        """Buffer one row for the state's active table.
+
+        The active table is the root Service's sole declared table, else the
+        one bound by ``start_bifrost(table=...)`` or
+        ``WyrdState.use_table_by_name``. It was described when bound, so this
+        performs no IO; the row is durable only once ``WyrdState.shutdown()``
+        succeeds.
+
+        Args:
+            row: a mapping with ``str`` keys, a dataclass instance, or a
+                Pydantic model instance, with any JSON values.
+
+        Raises:
+            WyrdError: ``WYRD_VALA_412_NO_ACTIVE_TABLE`` when no table is
+                active, ``WYRD_SDK_400_INVALID_OBSERVATION`` when it is outside
+                ``bifrost.datasets``, and otherwise as ``write_to``.
+        """
+        ...
+
+    def write_to(self, table: str, row: Mapping[str, Any] | Any) -> None:
+        """Buffer one row for a named ``bifrost.datasets.<name>`` table.
+
+        The active table is unchanged, so concurrent runs may each write their
+        own table this way.
 
         The first call for a table blocks to describe it; later calls reuse
         the cached schema and producer. Row values are checked against that

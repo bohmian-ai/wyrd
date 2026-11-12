@@ -81,7 +81,7 @@ fields!(Service [card.spec] {
     one service_type: Value = "service_type";
     list components, add_component: Component = "components";
     list verified_by, add_verified_by: Binding = "verified_by";
-    list tables, add_table: Value = "tables";
+    list tables, add_table: Table = "tables";
     one entry_point: Value = "entry_point";
     map deployment, add_deployment: Value = "deployment";
     one runtime: Value = "runtime";
@@ -302,6 +302,38 @@ impl From<Component> for FieldValue {
     /// The canonical component object.
     fn from(component: Component) -> Self {
         component.body.into_field()
+    }
+}
+
+/// One Bifrost dataset table a Service declares: its name inside
+/// `bifrost.datasets` and the JSON Schema whose `properties` order is the
+/// table's column order. Declaration creates the table, or refuses one that
+/// exists with different columns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Table {
+    /// The table's fields.
+    body: Body,
+}
+
+impl Table {
+    /// The table `name` with the JSON Schema object `schema`; nothing is
+    /// validated until its graph is.
+    pub fn new(name: impl Into<String>, schema: Value) -> Self {
+        Self {
+            body: Body::new([
+                ("name", FieldValue::from(name.into())),
+                ("schema", FieldValue::from(schema)),
+            ]),
+        }
+    }
+}
+
+canonical_object!(Table);
+
+impl From<Table> for FieldValue {
+    /// The canonical table object.
+    fn from(table: Table) -> Self {
+        table.body.into_field()
     }
 }
 

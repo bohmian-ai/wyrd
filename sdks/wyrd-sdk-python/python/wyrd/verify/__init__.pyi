@@ -748,6 +748,10 @@ canonical slot; any other mapping is the JSON Schema of a ``json`` slot, never a
 example value to infer one from.
 """
 
+TableInput: TypeAlias = Table | Mapping[str, JsonInput | type]
+"""A Service ``tables`` entry: a ``Table``, or its mapping of ``name`` and ``schema``,
+where ``schema`` is a JSON Schema object or a class standing for one."""
+
 class CardRef:
     """An exact Card reference, kept as authored until validation.
 
@@ -922,7 +926,7 @@ class ServiceFields(TypedDict, total=False):
     service_type: JsonInput
     components: Sequence[Component | Mapping[str, FieldInput]]
     verified_by: Sequence[BindingInput]
-    tables: Sequence[JsonInput]
+    tables: Sequence[TableInput]
     entry_point: JsonInput
     deployment: Mapping[str, JsonInput]
     runtime: JsonInput
@@ -1053,7 +1057,7 @@ class Service:
         """
         ...
 
-    def tables(self, items: Iterable[JsonInput]) -> Self:
+    def tables(self, items: Iterable[TableInput]) -> Self:
         """Set the whole ``tables`` list, replacing every earlier entry; returns this value.
 
         Args:
@@ -1061,7 +1065,7 @@ class Service:
         """
         ...
 
-    def add_table(self, item: JsonInput) -> Self:
+    def add_table(self, item: TableInput) -> Self:
         """Append one entry to ``tables``; returns this value.
 
         Args:
@@ -2834,6 +2838,23 @@ class CodeSource:
         """
         ...
 
+class Table:
+    """One Bifrost dataset table a Service declares: its name and the JSON Schema of its columns."""
+
+    def __init__(self, name: str, schema: type | Mapping[str, JsonInput]) -> None:
+        """The table ``name`` in ``bifrost.datasets``; nothing is validated until its graph is.
+
+        Args:
+            name: The table name, such as ``refund_replies``.
+            schema: A JSON Schema object, or a class with ``model_json_schema()``, such
+                as a Pydantic model, whose fields become the columns in order.
+
+        Raises:
+            TypeError: ``schema`` is a class with no JSON Schema.
+            WyrdError: ``WYRD_SPEC_400_VALIDATION`` when JSON cannot represent ``schema``.
+        """
+        ...
+
 class Component:
     """One Service component: an alias for a referenced Card and the Verifiers that check it.
 
@@ -3591,6 +3612,7 @@ __all__ = [
     "ResponseFormat",
     "Service",
     "Step",
+    "Table",
     "Trigger",
     "VerificationResult",
     "Verifier",

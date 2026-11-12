@@ -1914,6 +1914,10 @@ fn shared_children_join_once_and_plain_graphs_keep_no_targets() {
 
 /// A [`Table`] authors the same Service `tables` entry as its canonical
 /// object, and a JSON entry stays accepted beside it.
+///
+/// # Panics
+/// Panics when the canonical YAML or the authored tables do not decode as a
+/// Service spec, or when the two differ.
 #[test]
 fn tables_match_their_canonical_entries() {
     let schema = json!({

@@ -202,6 +202,17 @@ def test_plain_schemas_do_not_require_pydantic() -> None:
         assert inputs["report"]["schema"]["properties"]["text"] == {"type": "string"}
         assert inputs["notes"] == {"type": "json", "schema": {"type": ["string", "null"]}}
         assert inputs["canonical"] == {"type": "json", "schema": {"type": "string"}}
+        answer = Verifier("answer", "1.0.0", inputs={"answer": {"type": "string"}}).spec()["inputs"]
+        assert answer == {"answer": {"type": "json", "schema": {"type": "string"}}}, answer
+        from wyrd.verify import Service, Table
+
+        reply = {
+            "type": "object",
+            "properties": {"answer": {"type": "string"}, "verdict": {"type": "string"}},
+            "required": ["answer", "verdict"],
+        }
+        tables = Service("plain", tables=[Table("refund_replies", reply)]).spec()["tables"]
+        assert tables == [{"name": "refund_replies", "schema": reply}], tables
         from wyrd.prompt import ResponseFormat
 
         verdict = ResponseFormat.verdict({"type": "object", "properties": {"n": {"type": "integer"}}})

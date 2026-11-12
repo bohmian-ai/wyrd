@@ -2524,7 +2524,12 @@ pub(crate) mod tests {
             Self::complete_service_with_tables(&[])
         }
 
-        /// [`Self::complete_service`] whose root Service declares `tables`.
+        /// [`Self::complete_service`] whose root Service declares `tables`,
+        /// each with an empty object schema.
+        ///
+        /// # Panics
+        /// Panics if the temporary directory cannot be created or a Card,
+        /// the manifest, or a fixture file cannot be serialized and written.
         pub(crate) fn complete_service_with_tables(tables: &[&str]) -> Self {
             let root_ref = test_ref(CardKind::Service, "service", 1);
             let model_ref = test_ref(CardKind::Model, "model", 2);

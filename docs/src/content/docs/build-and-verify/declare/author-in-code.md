@@ -22,7 +22,7 @@ The Python program uses Pydantic models. Add them with the `pydantic` extra:
 uv add "wyrd-ai[pydantic]==0.4.1"
 ```
 
-Without Pydantic, pass a JSON Schema dictionary wherever the program passes a model, and a dictionary as the row.
+Without Pydantic, map each input slot to its own schema, `inputs={"answer": {"type": "string"}}`. `Table` takes the row's whole object schema, and `write` takes a dictionary row.
 
 <CodeFromFile file="examples/author-in-code/author.py" lang="python" title="author.py" />
 
@@ -123,12 +123,24 @@ Pass a version to a constructor to set it, as `metadata.version` does in YAML. [
 
 ## 5. Use Pydantic models (Python)
 
-In Python, a Pydantic model class can be a slot's schema, and an instance of it is that slot's evidence. These files split a two-component Service into modules, each component with its own Agent and Verifier. The complete directory, with each component's `agent.py`, is `examples/finance-release/service/`. Its Agent checks call a model, so running it needs an `openai` deployment in the [LLM gateway](/connect/set-up-the-llm-gateway/).
+In Python, a Pydantic model class can be a slot's schema, and an instance of it is that slot's evidence. This Service has two components, each with its own Agent and Verifier, in separate modules. Its Agent checks call a model, so running it needs an `openai` deployment in the [LLM gateway](/connect/set-up-the-llm-gateway/).
+
+In `quickstart`, create a `service` directory and save these five files in it, at the paths their tabs show:
 
 <Tabs>
+<Tab label="components/report_writer/agent.py">
+
+<CodeFromFile file="examples/finance-release/service/components/report_writer/agent.py" lang="python" title="components/report_writer/agent.py" />
+
+</Tab>
 <Tab label="components/report_writer/verifier.py">
 
 <CodeFromFile file="examples/finance-release/service/components/report_writer/verifier.py" lang="python" title="components/report_writer/verifier.py" />
+
+</Tab>
+<Tab label="components/release_reviewer/agent.py">
+
+<CodeFromFile file="examples/finance-release/service/components/release_reviewer/agent.py" lang="python" title="components/release_reviewer/agent.py" />
 
 </Tab>
 <Tab label="components/release_reviewer/verifier.py">
@@ -145,10 +157,9 @@ In Python, a Pydantic model class can be a slot's schema, and an instance of it 
 
 - `inputs={"report": Report}` maps a slot to its model. `inputs=Inputs` passes one model whose fields are the slots.
 - `ResponseFormat.verdict()` asks the judge for the standard verdict. `verdict(data=JudgeData)` adds a typed `data` field to it; `data` also takes a JSON Schema object, so Pydantic is optional.
-- `ComparisonOperator`, `ExecutionRoute`, and `AgentRunConfig` are typed forms of the YAML values. The [Verifier reference](/reference/verifier-card/) lists every operator and field.
 - Importing a module only builds definitions. Nothing registers or runs until `main.py` calls `WyrdState.declare`.
 
-From that directory, run:
+From `service`, run:
 
 ```bash
 uv run main.py
@@ -158,6 +169,12 @@ uv run main.py
 Report quality: passed
 Release controls: passed
 ```
+
+`ComparisonOperator` and `ExecutionRoute` are typed forms of the YAML values, and `AgentRunConfig`, also from `wyrd.verify`, sets an Agent's run limits through `run_config`:
+
+<CodeFromFile file="examples/finance-release/finance_release.py" region="run-config" lang="python" title="finance_release.py" />
+
+The [Verifier reference](/reference/verifier-card/) lists every operator and field.
 
 ## If it fails
 

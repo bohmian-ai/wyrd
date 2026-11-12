@@ -487,10 +487,10 @@ class CancelledExecution(TypedDict):
     status: ExecutionStatus
 
 class PullRequestRef(TypedDict):
+    """One side of a pull request as an admission pinned it: the branch and exact commit."""
+
     ref: str
     sha: str
-
-"""One side of a pull request as an admission pinned it: the branch name then and the exact commit."""
 
 class PullRequestActivation(TypedDict):
     """The pull request source a queued execution was admitted for.

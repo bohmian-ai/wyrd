@@ -1,14 +1,15 @@
 //! Pull-request deliveries admitted into the Verifier queue through the real
 //! webhook route, against the GitHub App mock and repository Postgres.
 //!
-//! The tenant is connected to installation 101 with `acme/policy` (4242)
-//! selected and declares the `policy` Repository binding two queued review
+//! The tenant connects to installation 101 through GitHub's install page
+//! with `acme/policy` (4242) selected and declares the `policy` Repository binding two queued review
 //! Verifiers to its pull requests. The default test server holds the
 //! Verifier runner, so admitted work stays queued until a test claims it.
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode, header};
 use chrono::Duration;
+use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 use uuid::Uuid;
 use wyrd_loader::{build_declaration_input, load};
@@ -18,7 +19,7 @@ use wyrd_spec::verification::VerificationVerdict;
 use wyrd_sql::queries::verifier_executions::{
     Settlement, TerminalDelivery, TerminalStatus, VerifierExecutionQueue,
 };
-use wyrd_testing::github::{GithubAppMock, PullRequest};
+use wyrd_testing::github::{GithubAppMock, GithubBrowser, PullRequest};
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 /// The connected repository.
@@ -87,10 +88,10 @@ impl Deployment {
     /// Panics when a step fails.
     async fn start_with(runtime: bool) -> Self {
         let mock = GithubAppMock::start().expect("the GitHub mock starts");
-        mock.add_installation(
-            INSTALLATION,
-            &[(REPOSITORY, "acme/policy"), (UNSELECTED, "acme/other")],
-        );
+        mock.add_installation(INSTALLATION, &[(REPOSITORY, "acme/policy")]);
+        mock.add_user("octo", &[INSTALLATION]);
+        mock.sign_in("octo");
+        mock.install_target(INSTALLATION);
         let mut builder = WyrdTestServer::builder().with_github_app_for_test(&mock);
         if runtime {
             builder = builder.with_verification_runtime_for_test();
@@ -112,31 +113,38 @@ impl Deployment {
         deployment
     }
 
-    /// Associate the tenant's slot with installation 101 selecting
-    /// `acme/policy`.
+    /// Connect the tenant to installation 101 the way an administrator
+    /// does, through GitHub's install page, selecting `acme/policy`; then
+    /// let the installation reach `acme/other` without Wyrd being told, so
+    /// it stays unselected for the tenant.
     ///
     /// # Panics
-    /// Panics when the slot cannot be written.
+    /// Panics when the connection fails.
     async fn connect(server: &WyrdTestServer, mock: &GithubAppMock) {
-        let mut conn = server
-            .tenant_conn_for(server.data_tenant_id())
+        let admin = server
+            .bootstrap_service_in_tenant(server.data_tenant_id(), "github_admin", &["admin"])
             .await
-            .expect("tenant connection opens");
-        sqlx::query(
-            "INSERT INTO wyrd.github_installations
-                 (data_tenant_id, connection_id, revision, host, installation_id, repositories,
-                  connected_at)
-             VALUES ($1, $2, 1, $3, 101,
-                     '[{\"repository_id\":\"4242\",\"full_name\":\"acme/policy\"}]'::jsonb,
-                     statement_timestamp())",
+            .expect("administrator bootstraps");
+        let api_key = admin.api_key().expect("a machine principal").clone();
+        let mut browser = GithubBrowser::sign_in(
+            server.base_url().expect("bound"),
+            server.pg_fixture().tenant_slug(),
+            api_key.expose_secret(),
         )
-        .bind(server.data_tenant_id().as_uuid())
-        .bind(Uuid::now_v7())
-        .bind(mock.host())
-        .execute(&mut **conn.transaction())
         .await
-        .expect("slot associates");
-        conn.commit().await.expect("slot commits");
+        .expect("browser signs in");
+        let answer = browser
+            .open(&format!(
+                "{}apps/wyrd-test-app/installations/new",
+                mock.origin()
+            ))
+            .await
+            .expect("browser navigates");
+        assert_eq!(answer.status, 200, "{:?}", answer.body);
+        mock.add_installation(
+            INSTALLATION,
+            &[(REPOSITORY, "acme/policy"), (UNSELECTED, "acme/other")],
+        );
     }
 
     /// Declare the Repository `policy` with both review Verifiers under
@@ -218,15 +226,17 @@ impl Deployment {
         rows
     }
 
-    /// The frozen Verifier name and version and the admitting Repository
-    /// version of every execution of PR `number`, in [`Self::rows`] order.
+    /// The frozen Verifier name and version, the admitting Repository
+    /// version, and whether the Trigger is a referenced Card (else an
+    /// inline digest) of every execution of PR `number`, in [`Self::rows`]
+    /// order.
     ///
     /// # Panics
     /// Panics when the read fails.
-    async fn frozen(&self, number: u64) -> Vec<(String, String, String)> {
+    async fn frozen(&self, number: u64) -> Vec<(String, String, String, bool)> {
         let mut conn = self.conn().await;
         let rows = sqlx::query_as(
-            "SELECT v.name, v.version, o.version
+            "SELECT v.name, v.version, o.version, e.trigger_uid IS NOT NULL
                FROM wyrd.verifier_executions e
                JOIN wyrd.cards v ON v.card_uid = e.verifier_card_uid
                JOIN wyrd.cards o ON o.card_uid = e.owner_card_uid
@@ -377,8 +387,8 @@ async fn pull_request_lifecycle_admits_supersedes_and_ends_through_the_webhook()
     assert_eq!(
         deployment.frozen(7).await,
         [
-            ("a-review".into(), "1.0.0".into(), "1.0.0".into()),
-            ("z-review".into(), "1.0.0".into(), "1.0.0".into()),
+            ("a-review".into(), "1.0.0".into(), "1.0.0".into(), false),
+            ("z-review".into(), "1.0.0".into(), "1.0.0".into(), true),
         ],
         "inline and referenced pull_request Triggers each bind one Verifier"
     );
@@ -940,9 +950,9 @@ async fn policy_reselection_affects_only_later_admissions() {
     assert_eq!(
         deployment.frozen(5).await,
         [
-            ("a-review".into(), "1.0.0".into(), "1.0.0".into()),
-            ("z-review".into(), "1.0.0".into(), "1.0.0".into()),
-            ("a-review".into(), "1.0.0".into(), "1.0.1".into()),
+            ("a-review".into(), "1.0.0".into(), "1.0.0".into(), false),
+            ("z-review".into(), "1.0.0".into(), "1.0.0".into(), true),
+            ("a-review".into(), "1.0.0".into(), "1.0.1".into(), false),
         ],
         "each generation freezes the policy selected when it was admitted"
     );

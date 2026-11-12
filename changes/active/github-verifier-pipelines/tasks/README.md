@@ -9,7 +9,9 @@ and proof. Task 003 is complete following its PASS verdict; FIND-003-1 through
 FIND-003-8 are closed. Task 004 targets approved spec revision 6 for the user-directed
 storage amendment and is complete following the
 [final PASS verdict](../review/004-pinned-pr-preparation-r3/verdict.md);
-FIND-004-1 and FIND-004-2 are closed. Other tasks retain their existing statuses
+FIND-004-1 and FIND-004-2 are closed. Task 006 and its remediation are complete following the
+[PASS verdict](../review/006-pr-admission-r2/verdict.md); FIND-006-1 through
+FIND-006-7 are closed. Other tasks retain their existing statuses
 and revision 5 basis. Verification evidence lives in the owning tasks and reviews.
 
 The selected path is existing connect/authorization→Card declaration saga→Scribe
@@ -33,7 +35,7 @@ acquisition/comparison/index/context and remains standalone.
 | [003](003-repository-declaration.md) | **Complete.** Ready exact Repository receipt, selected policy/bindings and activation lifecycle for 006/007 |
 | [004](004-pinned-pr-preparation.md) | **Complete.** Reviewed pinned/baseline-aware ReviewPipeline revision, ObjectStorage adapter and PostgreSQL SnapshotStore/ContextStore metadata tables/adapters for 005 |
 | [005](005-pull-request-extraction.md) | Accepted typed extraction and retained exact source/context for ordinary reviewers and 009 rendering |
-| [006](006-pr-admission-and-supersession.md) | Durable queued ExecutionIds with frozen policy/source/generation and cancellation fences for 005/007/008/009 |
+| [006](006-pr-admission-and-supersession.md) | **Complete.** Durable queued ExecutionIds with frozen policy/source/generation and cancellation fences for 005/007/008/009 |
 | [007](007-deferred-evidence-and-resumption.md) | Durable source-matched evidence, waiting inspection and same-execution park/continuation lifecycle for 008/009 |
 | [008](008-approval-steps.md) | Exact pending approval identities, accepted decisions and continuation/progress for 009 |
 | [009](009-reports-and-github-delivery.md) | Optional standard report/helper authoring and recoverable Checks/comments with independent delivery inspection |

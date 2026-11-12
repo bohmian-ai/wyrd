@@ -1,7 +1,7 @@
 ---
 id: TASK-006-R1
 kind: remediation
-status: ready
+status: complete
 spec: SPEC-github-verifier-pipelines
 spec_revision: 5
 parent_task: TASK-006
@@ -9,6 +9,8 @@ remediates: [FIND-006-1, FIND-006-2, FIND-006-3, FIND-006-4, FIND-006-5, FIND-00
 ---
 
 # Close PR admission lifecycle and authority gaps
+
+Completed following the [PASS verdict](../006-pr-admission-r2/verdict.md) for `fb8da5ad7e87f784cde39513cb8605dba8bbf1a2`. FIND-006-1 through FIND-006-7 are closed.
 
 Route directly to `$wyrd-implement`. Implement the seven independently validated findings without changing approved behavior or adding a new subsystem.
 

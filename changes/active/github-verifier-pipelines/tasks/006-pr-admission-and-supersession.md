@@ -1,6 +1,6 @@
 ---
 id: TASK-006
-status: proposed
+status: complete
 approved_spec_revision: 5
 requirements: [REQ-004, REQ-005, REQ-015, REQ-016]
 acceptance: [AC-003, AC-011]
@@ -9,6 +9,8 @@ depends_on: [TASK-001, TASK-002, TASK-003]
 ---
 
 # Admit PR generations through the verification queue
+
+Completed following the [PASS verdict](../review/006-pr-admission-r2/verdict.md) for `fb8da5ad7e87f784cde39513cb8605dba8bbf1a2`. FIND-006-1 through FIND-006-7 are closed.
 
 Implement **approved-runtime-and-github.md → Webhook ingress** and
 **approved-code-review-support.md → Successive commits and pipeline ownership**.

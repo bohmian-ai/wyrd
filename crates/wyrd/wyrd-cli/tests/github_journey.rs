@@ -14,7 +14,7 @@ mod pg_tests {
     use secrecy::ExposeSecret as _;
     use serde_json::Value;
     use wyrd_testing::WyrdTestServer;
-    use wyrd_testing::github::{GithubAppMock, GithubBrowser};
+    use wyrd_testing::github::{GithubAppMock, GithubBrowser, PullRequest};
 
     use crate::principal_journey::{run_cli_with_env, run_scrubbed};
 
@@ -28,6 +28,25 @@ mod pg_tests {
         tokio::task::spawn_blocking(move || {
             run_cli_with_env(
                 &["github", &verb],
+                &[("WYRD_SERVER_URL", &base), ("WYRD_API_KEY", &key)],
+            )
+        })
+        .await
+        .expect("CLI subprocess joins")
+    }
+
+    /// Run `wyrd <arguments>` with the server from `WYRD_SERVER_URL` and `key`
+    /// from `WYRD_API_KEY`.
+    ///
+    /// # Panics
+    /// Panics when the CLI cannot run or its subprocess cannot join.
+    async fn wyrd(arguments: &[&str], base: &str, key: &str) -> Output {
+        let arguments: Vec<String> = arguments.iter().map(ToString::to_string).collect();
+        let (base, key) = (base.to_owned(), key.to_owned());
+        tokio::task::spawn_blocking(move || {
+            let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+            run_cli_with_env(
+                &arguments,
                 &[("WYRD_SERVER_URL", &base), ("WYRD_API_KEY", &key)],
             )
         })
@@ -149,7 +168,10 @@ mod pg_tests {
     }
 
     /// A tenant administrator connects, inspects and releases GitHub through the
-    /// shipped binary; a viewer is refused every verb.
+    /// shipped binary; a viewer is refused every verb. A pull request on a
+    /// declared repository admits an execution `wyrd execution status` shows
+    /// pinned to its base and head, and disconnecting cancels it with
+    /// `repository_access_lost`, pins kept.
     ///
     /// # Panics
     /// Panics when a command fails, prints an unexpected view, leaks a secret,
@@ -227,9 +249,100 @@ mod pg_tests {
             );
         }
 
+        let declared = json(
+            "declare",
+            &wyrd(
+                &[
+                    "declare",
+                    concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../../fixtures/cards/repository_declaration/repository.yaml"
+                    ),
+                    "--format",
+                    "json",
+                ],
+                &base,
+                &admin,
+            )
+            .await,
+        );
+        let uid = declared["root"]["uid"]
+            .as_str()
+            .expect("the root has a uid")
+            .to_owned();
+        let card = json(
+            "get",
+            &wyrd(
+                &[
+                    "get",
+                    "--kind",
+                    "Repository",
+                    "--uid",
+                    &uid,
+                    "--format",
+                    "json",
+                ],
+                &base,
+                &admin,
+            )
+            .await,
+        );
+        let binding = card["status"]["verification"]["binding_ids"][0]
+            .as_str()
+            .expect("the Repository serves its binding")
+            .to_owned();
+        mock.set_pull_request(2, 7, PullRequest::open(2, "b1", "a1"));
+        let opened = mock.pull_request_event(101, 2, 7, "opened");
+        assert_eq!(
+            mock.deliver(&base, "pull_request", &opened)
+                .await
+                .expect("delivery sends"),
+            202
+        );
+        let token = server
+            .exchange_api_key(&admin.clone().into())
+            .await
+            .expect("the key exchanges");
+        let status: Value = reqwest::Client::new()
+            .get(format!("{base}/v1/verification/bindings/{binding}"))
+            .header("x-wyrd-access-token", format!("Bearer {token}"))
+            .send()
+            .await
+            .expect("binding reads")
+            .json()
+            .await
+            .expect("binding is JSON");
+        let execution = status["last_execution_id"]
+            .as_str()
+            .expect("the pull request admitted an execution")
+            .to_owned();
+        let inspect = async || {
+            json(
+                "execution status",
+                &wyrd(
+                    &["execution", "status", "--execution-id", &execution],
+                    &base,
+                    &admin,
+                )
+                .await,
+            )
+        };
+        let admitted = inspect().await;
+        assert_eq!(admitted["status"], "pending");
+        assert_eq!(admitted["pull_request"]["number"], 7);
+        assert_eq!(admitted["pull_request"]["repository_id"], "2");
+        assert_eq!(
+            admitted["pull_request"]["base"],
+            serde_json::json!({ "ref": "main", "sha": "b1" })
+        );
+        assert_eq!(admitted["pull_request"]["head"]["sha"], "a1");
         let released = json("disconnect", &github("disconnect", &base, &admin).await);
         assert_eq!(released["state"], "not_connected");
         assert_eq!(released["installation_id"], Value::Null);
+        let cancelled = inspect().await;
+        assert_eq!(cancelled["status"], "cancelled");
+        assert_eq!(cancelled["error"]["code"], "repository_access_lost");
+        assert_eq!(cancelled["pull_request"]["head"]["sha"], "a1");
         failed_with(
             "second disconnect",
             &github("disconnect", &base, &admin).await,

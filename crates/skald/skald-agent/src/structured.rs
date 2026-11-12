@@ -75,7 +75,8 @@ impl StructuredOutput {
         schema.is(&self.schema)
     }
 
-    /// Accepts `output` when it is a JSON object satisfying the schema.
+    /// Accepts `output` when it is a JSON object satisfying the schema,
+    /// collecting violations only for a refused answer.
     ///
     /// # Errors
     ///
@@ -97,13 +98,15 @@ impl StructuredOutput {
                 "reply is not a JSON object",
             ));
         }
-        let errors: Vec<ValidationError<'_>> = self.validator.iter_errors(&value).collect();
-        if errors.is_empty() {
+        // Valid answers are the common case; only a refusal needs the
+        // collected violations.
+        if self.validator.is_valid(&value) {
             let Value::Object(map) = value else {
                 unreachable!("checked to be an object");
             };
             return Ok(map);
         }
+        let errors: Vec<ValidationError<'_>> = self.validator.iter_errors(&value).collect();
         Err(self.violations(&errors))
     }
 

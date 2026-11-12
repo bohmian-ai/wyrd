@@ -1076,9 +1076,12 @@ Server spans export twice from one tracer provider:
   inference span per model call named after its `gen_ai.operation.name`
   (`chat`, `generate_content`, or `embeddings`), `gateway.*` except
   `gateway.attempt`, `bifrost.gate.*`, `bifrost.oracle.query`, and OTLP
-  ingest — and only spans
+  ingest — at `info` or above, and only spans
   whose ancestors up to the span that opened the copy are all catalog
-  spans. It keeps only safe
+  spans. A catalog span below `info`, recorded only at higher operator
+  verbosity, is not copied: its copied children name its nearest copied
+  ancestor as their parent, so the tenant copy is the same at every
+  operator verbosity. It keeps only safe
   attributes (`wyrd.*`, `gen_ai.*`, and HTTP, RPC, and error semantic
   conventions); the tenant id is never a span attribute. The copy is
   non-blocking and never fails the request, and it works with or without an

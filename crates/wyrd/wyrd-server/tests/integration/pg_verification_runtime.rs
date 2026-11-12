@@ -3997,13 +3997,15 @@ async fn tenant_spans(
 }
 
 /// Asserts that `tenant` holds exactly the behavior spans of the request the
-/// caller span `caller` parents, each with the operator's ids and parents,
-/// stamped with `principal`, and keeping only safe attributes.
+/// caller span `caller` parents, each with the operator's ids and, as its
+/// parent, its nearest operator ancestor the tenant also holds, stamped with
+/// `principal`, and keeping only safe attributes.
 ///
 /// # Panics
 /// Panics when the tenant copy is missing a behavior span, holds a span the
-/// operator did not export or another request's span, names another
-/// principal, or keeps an attribute outside the allowlist.
+/// operator did not export or another request's span, names a parent other
+/// than its nearest held ancestor, names another principal, or keeps an
+/// attribute outside the allowlist.
 fn assert_tenant_copy(
     tenant: &[TenantSpan],
     operator: &[wyrd_telemetry::CapturedSpan],
@@ -4033,13 +4035,23 @@ fn assert_tenant_copy(
         );
     }
     for span in tenant {
-        assert!(
-            operator
+        let exported = operator
+            .iter()
+            .find(|exported| exported.span_id == span.span_id && exported.name == span.name)
+            .unwrap_or_else(|| panic!("the operator exported the tenant span: {span:#?}"));
+        let mut parent = exported.parent_span_id.as_str();
+        while parent != caller && !tenant.iter().any(|held| held.span_id == parent) {
+            parent = operator
                 .iter()
-                .any(|exported| exported.span_id == span.span_id
-                    && exported.parent_span_id == span.parent_span_id
-                    && exported.name == span.name),
-            "the tenant copy keeps the operator's ids and parent: {span:#?}"
+                .find(|ancestor| ancestor.span_id == parent)
+                .map_or_else(
+                    || panic!("{parent} is an operator span: {span:#?}"),
+                    |ancestor| ancestor.parent_span_id.as_str(),
+                );
+        }
+        assert_eq!(
+            span.parent_span_id, parent,
+            "the tenant copy names its nearest held ancestor: {span:#?}"
         );
         assert_eq!(span.sub_principal_id, principal.to_string(), "{span:#?}");
         assert_eq!(span.act_principal_id, principal.to_string(), "{span:#?}");

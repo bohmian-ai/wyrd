@@ -360,13 +360,27 @@ pub(crate) struct RequestSink(pub(crate) Arc<dyn TenantSpanSink>);
 /// A request's route as every live span of the request holds it.
 type RouteSlot = Arc<Route>;
 
+/// One live span on a route.
+struct Live {
+    /// The route the span's copy, or its descendants' copies, stage on.
+    route: RouteSlot,
+    /// Whether the span is copied; a catalog span below `info` is not, and
+    /// passes its place in the tree to its children.
+    copied: bool,
+    /// The parent the span's copy names: its own parent, or the nearest
+    /// copied ancestor past spans that are not copied.
+    parent: SpanId,
+    /// Whether `parent` is the remote span the route continued.
+    parent_is_remote: bool,
+}
+
 /// The process routing registry of live request routes.
 struct TenantRoutes {
-    /// The route of every live catalog span whose ancestors up to a sampled
-    /// remote parent are all catalog spans, keyed by the span's own ids,
-    /// which the server generated.
+    /// Every live catalog span whose ancestors up to a sampled remote
+    /// parent are all catalog spans, keyed by the span's own ids, which the
+    /// server generated.
     // ponytail: one process lock per routed span start and end; shard by span id if it contends.
-    live: Mutex<HashMap<(TraceId, SpanId), RouteSlot>>,
+    live: Mutex<HashMap<(TraceId, SpanId), Live>>,
 }
 
 impl TenantRoutes {
@@ -377,8 +391,12 @@ impl TenantRoutes {
     /// new route on the serving server's `sink`, when the request edge
     /// carried one. Either way the span joins only if the catalog names it,
     /// so a span outside the catalog takes its whole subtree out of the
-    /// tenant copy. Any other span has no route. `data` reads the span's name
-    /// and links, only when it could join.
+    /// tenant copy. A catalog span below `info`, which only operator
+    /// verbosity records, joins without being copied, and its children's
+    /// copies name its nearest copied ancestor, so the tenant copy is the
+    /// same at every operator verbosity. Any other span has no route.
+    /// `data` reads the span's name, level, and links, only when it could
+    /// join.
     fn start(
         &self,
         parent: &SpanContext,
@@ -388,11 +406,16 @@ impl TenantRoutes {
     ) {
         let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
         let joined = (!parent.is_remote())
-            .then(|| {
-                live.get(&(parent.trace_id(), parent.span_id()))
-                    .map(Arc::clone)
-            })
-            .flatten();
+            .then(|| live.get(&(parent.trace_id(), parent.span_id())))
+            .flatten()
+            .map(|joined| {
+                let (place, remote) = if joined.copied {
+                    (parent.span_id(), false)
+                } else {
+                    (joined.parent, joined.parent_is_remote)
+                };
+                (Arc::clone(&joined.route), place, remote)
+            });
         if joined.is_none() && sink.is_none() {
             return;
         }
@@ -401,27 +424,45 @@ impl TenantRoutes {
         let Some(data) = data().filter(|data| in_catalog(&data.name)) else {
             return;
         };
-        let route = match (joined, sink) {
-            (Some(route), _) => route,
+        let (route, place, remote) = match (joined, sink) {
+            (Some(joined), _) => joined,
             (None, Some(RequestSink(sink)))
                 if (parent.is_remote() && parent.is_sampled()) || links_sampled(&data.links) =>
             {
-                Route::new(Arc::clone(sink))
+                (
+                    Route::new(Arc::clone(sink)),
+                    parent.span_id(),
+                    parent.is_remote(),
+                )
             }
             _ => return,
         };
-        live.insert((span.trace_id(), span.span_id()), route);
+        live.insert(
+            (span.trace_id(), span.span_id()),
+            Live {
+                route,
+                copied: !below_info(&data),
+                parent: place,
+                parent_is_remote: remote,
+            },
+        );
     }
 
-    /// Forget the ended `span` and return its route and bound identity when
-    /// the route is bound.
-    fn end(&self, span: &SpanContext) -> Option<(TenantSpanRoute, RouteSlot)> {
-        let route = self
+    /// Forget the ended `span` and return its copy's route, bound identity,
+    /// and parent when the span is copied and the route is bound.
+    fn end(&self, span: &SpanContext) -> Option<(TenantSpanRoute, RouteSlot, SpanId, bool)> {
+        let live = self
             .live
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(&(span.trace_id(), span.span_id()))?;
-        Some((*route.identity.get()?, route))
+            .remove(&(span.trace_id(), span.span_id()))
+            .filter(|live| live.copied)?;
+        Some((
+            *live.route.identity.get()?,
+            live.route,
+            live.parent,
+            live.parent_is_remote,
+        ))
     }
 
     /// Bind `route` to the request `span` belongs to.
@@ -443,14 +484,13 @@ impl TenantRoutes {
     fn rebind(&self, span: &SpanContext, route: TenantSpanRoute) {
         let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
         let key = (span.trace_id(), span.span_id());
-        let Some(slot) = live.get(&key) else {
+        let Some(slot) = live.get_mut(&key) else {
             return;
         };
-        let own = Arc::new(Route {
+        slot.route = Arc::new(Route {
             identity: OnceLock::from(route),
-            sink: Arc::clone(&slot.sink),
+            sink: Arc::clone(&slot.route.sink),
         });
-        live.insert(key, own);
     }
 
     /// The route of the live `span`, if it has one.
@@ -459,8 +499,17 @@ impl TenantRoutes {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&(span.trace_id(), span.span_id()))
-            .map(Arc::clone)
+            .map(|live| Arc::clone(&live.route))
     }
+}
+
+/// Whether `data` is a span below `info`, by the `level` attribute the
+/// tracing layer records on every span.
+fn below_info(data: &SpanData) -> bool {
+    data.attributes.iter().any(|attribute| {
+        attribute.key.as_str() == "level"
+            && matches!(attribute.value.as_str().as_ref(), "DEBUG" | "TRACE")
+    })
 }
 
 /// The one process routing registry.
@@ -519,13 +568,15 @@ impl SpanProcessor for TenantExport {
         );
     }
 
-    /// Stage the tenant copy of an ended span on its route's sink if the
-    /// route's identity is bound.
+    /// Stage the tenant copy of an ended copied span on its route's sink,
+    /// under its copy's parent, if the route's identity is bound.
     ///
     /// The span leaves the registry first, so the registry holds only live
     /// spans.
-    fn on_end(&self, span: SpanData) {
-        if let Some((identity, route)) = ROUTES.end(&span.span_context) {
+    fn on_end(&self, mut span: SpanData) {
+        if let Some((identity, route, parent, parent_is_remote)) = ROUTES.end(&span.span_context) {
+            span.parent_span_id = parent;
+            span.parent_span_is_remote = parent_is_remote;
             route.sink.stage(
                 identity,
                 ResourceSpans::new(tenant_copy(span), &self.resource),
@@ -1049,6 +1100,69 @@ mod tests {
                 assert_eq!(names, expected, "{row}");
             }
         }
+    }
+
+    /// A catalog span below `info` is not copied, and its catalog child's
+    /// copy names the nearest copied ancestor as its parent, so the copy's
+    /// tree has no missing parent.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the debug span is copied or its child's copy keeps the
+    /// uncopied parent.
+    #[test]
+    fn debug_catalog_span_passes_its_place_to_its_children() {
+        let staged = staged();
+        let provider = tracer_provider(
+            Sampler::AlwaysOff,
+            Resource::builder_empty().build(),
+            None::<OperatorExport<Recorder>>,
+        );
+        let tracer = provider.tracer("wyrd");
+        let parent = remote(true);
+        let trace_id = parent.trace_id();
+        let caller = Context::new()
+            .with_remote_span_context(parent)
+            .with_value(RequestSink(Arc::clone(&staged) as Arc<dyn TenantSpanSink>));
+        let root = tracer
+            .span_builder("request")
+            .with_attributes([KeyValue::new("level", "INFO")])
+            .start_with_context(&tracer, &caller);
+        ROUTES.bind(
+            root.span_context(),
+            TenantSpanRoute {
+                tenant: DataTenantId::new_v7(),
+                attribution: Attribution::direct(
+                    "01900000-0000-7000-8000-000000000007"
+                        .parse::<PrincipalId>()
+                        .expect("a principal id"),
+                ),
+            },
+        );
+        let request = caller.with_span(root);
+        let detail = request.with_span(
+            tracer
+                .span_builder("verification.engine")
+                .with_attributes([KeyValue::new("level", "DEBUG")])
+                .start_with_context(&tracer, &request),
+        );
+        tracer
+            .span_builder("invoke_agent")
+            .with_attributes([KeyValue::new("level", "INFO")])
+            .start_with_context(&tracer, &detail)
+            .end();
+        detail.span().end();
+        request.span().end();
+        let copies = staged.of(trace_id);
+        let names = copies
+            .iter()
+            .map(|(_, name, ..)| name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["invoke_agent", "request"]);
+        let (_, _, request_id, ..) = &copies[1];
+        let (_, _, _, agent_parent, keys) = &copies[0];
+        assert_eq!(agent_parent, request_id, "the child joins the request");
+        assert!(!keys.iter().any(|key| key == "level"), "{keys:?}");
     }
 
     /// A tenant copy keeps the operator's ids and parent, carries only safe

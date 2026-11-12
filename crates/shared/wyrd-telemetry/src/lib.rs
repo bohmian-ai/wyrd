@@ -457,7 +457,6 @@ pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard, WyrdError> {
         resolve_filter(&config),
         resolve_trace_filter(&config),
         provider.tracer("wyrd"),
-        false,
         writer,
     )
     .try_init()
@@ -517,7 +516,6 @@ pub fn init_test_capture(
         resolve_filter(&config),
         EnvFilter::new("trace"),
         provider.tracer("wyrd"),
-        true,
         std::io::stdout,
     )
     .try_init()
@@ -542,15 +540,16 @@ pub fn init_test_capture(
 /// diagnostic verbosity, and, whatever either filter says, every span and
 /// event the tenant copy needs: catalog spans and events at `INFO` or above,
 /// the verbosity the tenant catalog is defined at. Neither filter can
-/// therefore remove a tenant copy. With `level` set, each exported span also
-/// carries its `tracing` level. Spans carry no busy/idle times, thread, or
+/// therefore remove a tenant copy. Each span carries its `tracing` level,
+/// which the tenant copy reads to pass over catalog spans below `INFO` that
+/// operator verbosity records, so neither filter can add to a tenant copy
+/// either; the copy drops the attribute. Spans carry no busy/idle times, thread, or
 /// code location: each costs work on every span or every poll of an
 /// instrumented future, and no tenant copy keeps them.
 fn subscriber<W>(
     logs: EnvFilter,
     traces: EnvFilter,
     tracer: opentelemetry_sdk::trace::Tracer,
-    level: bool,
     writer: W,
 ) -> impl tracing::Subscriber + Send + Sync
 where
@@ -573,7 +572,7 @@ where
         .with(
             tracing_opentelemetry::layer()
                 .with_tracer(tracer)
-                .with_level(level)
+                .with_level(true)
                 .with_tracked_inactivity(false)
                 .with_threads(false)
                 .with_location(false)
@@ -691,8 +690,8 @@ mod tests {
     /// operator sampling `ratio`, and return the tenant copies and the
     /// operator's spans by name, and the log output.
     ///
-    /// The request runs a catalog child, a debug diagnostic span, an info
-    /// event, and an error event.
+    /// The request runs a catalog child holding a debug diagnostic span
+    /// with its own catalog child, an info event, and an error event.
     ///
     /// # Panics
     ///
@@ -723,7 +722,6 @@ mod tests {
             EnvFilter::new(logs),
             EnvFilter::new(traces),
             provider.tracer("wyrd"),
-            false,
             move || writer.clone(),
         );
         tracing::subscriber::with_default(subscriber, || {
@@ -739,7 +737,9 @@ mod tests {
                     ),
                 });
                 tracing::info_span!("verification.run").in_scope(|| {
-                    tracing::debug_span!("verification.detail").in_scope(|| {});
+                    tracing::debug_span!("verification.detail").in_scope(|| {
+                        tracing::info_span!("verification.step").in_scope(|| {});
+                    });
                     tracing::info!("verification step");
                     tracing::error!(error.type = "timeout", "verification failed");
                 });
@@ -768,7 +768,7 @@ mod tests {
     #[test]
     fn production_filters_preserve_tenant_traces() {
         let (tenant, operator, logs) = serve("info", "info", 0.0);
-        assert_eq!(tenant, ["verification.run", "request"]);
+        assert_eq!(tenant, ["verification.step", "verification.run", "request"]);
         assert!(
             operator.is_empty(),
             "ratio zero exports nothing: {operator:?}"
@@ -782,17 +782,31 @@ mod tests {
             "the error carries its request's span context: {failure}"
         );
         assert!(!serve("off", "info", 0.0).2.contains("verification failed"));
-        for (logs, traces) in [("off", "info"), ("error", "error"), ("info", "off")] {
+        for (logs, traces) in [
+            ("off", "info"),
+            ("error", "error"),
+            ("info", "off"),
+            ("off", "debug"),
+            ("debug", "trace"),
+        ] {
             assert_eq!(
                 serve(logs, traces, 0.0).0,
                 tenant,
                 "logs {logs:?}, traces {traces:?}"
             );
         }
-        assert_eq!(serve("off", "info", 1.0).1, ["verification.run", "request"]);
+        assert_eq!(
+            serve("off", "info", 1.0).1,
+            ["verification.step", "verification.run", "request"]
+        );
         assert_eq!(
             serve("off", "debug", 1.0).1,
-            ["verification.detail", "verification.run", "request"]
+            [
+                "verification.step",
+                "verification.detail",
+                "verification.run",
+                "request"
+            ]
         );
     }
 

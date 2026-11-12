@@ -1,10 +1,13 @@
 //! Inspection and cancellation of executions.
 //!
-//! Inspection reads any execution, direct or queued, from its accepted
-//! state, with or without a queue row: the Verifier is the queue row's while
-//! one exists, else the one the state recorded, and `verifier:read` is
-//! authorized on exactly that Verifier before anything is returned, so a
-//! grant scoped to one Verifier inspects only its executions. Cancellation
+//! Inspection reads a queued execution from its accepted state, with or
+//! without a queue row, and a direct execution, which has no state, from its
+//! published `direct` input record and result. The Verifier is the queue
+//! row's while one exists, else the one the state or the direct result
+//! recorded, and `verifier:read` is authorized on exactly that Verifier
+//! before anything is returned, so a grant scoped to one Verifier inspects
+//! only its executions. Invocation and publication history is queued-only: a
+//! direct execution has none and those reads answer not found. Cancellation
 //! needs the queue row and authorizes `verifier:run` on its Verifier. An
 //! absent or other-tenant execution is the same not-found.
 //! Invocation and publication pages read the execution's accepted state at a
@@ -20,7 +23,7 @@ use uuid::Uuid;
 use wyrd_runtime::Permission;
 use wyrd_runtime::permission::{Action, PermissionScope, Resource};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::ExecutionId;
+use wyrd_spec::ids::{ExecutionId, VerificationResultId};
 use wyrd_spec::storage::{DownloadInitResponse, StorageBackendKind};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::verification::execution::{
@@ -29,9 +32,12 @@ use wyrd_spec::verification::execution::{
     InvocationSettlement, Publication, PublicationContent, PublicationFile, PublicationPage,
     PublicationSelector, PublicationSummary,
 };
-use wyrd_spec::verification::state::{AcceptedPublication, ExecutionState, InvocationRecord};
+use wyrd_spec::verification::state::{
+    AcceptedPublication, ExecutionIdentity, ExecutionState, InvocationRecord,
+};
 use wyrd_spec::verification::{PublicationName, TaskId, VerificationExecutionStatus};
 use wyrd_sql::TenantConn;
+use wyrd_sql::queries::cards::get_card_by_uid;
 use wyrd_sql::queries::verifier_executions::ExecutionStatus;
 use wyrd_storage::error::StorageError;
 use wyrd_storage::tenant_path::ValidatedPath;
@@ -40,8 +46,9 @@ use super::VerificationControl;
 use crate::audit;
 use crate::components::auth::Caller;
 use crate::state::registry_db_error;
+use crate::verification::cache::exact_ref;
 use crate::verification::hosted::publications::published_object;
-use crate::verification::inputs::{InputOrigin, InputResolver};
+use crate::verification::inputs::{DirectResult, InputOrigin, InputResolver};
 use crate::verification::state::RunState;
 
 /// Audit operation of an invocation page read.
@@ -218,6 +225,9 @@ pub(super) struct Retained {
     pub(super) state: ExecutionState,
     /// The record reader it was read through.
     pub(super) query: crate::query::scheduled::ScheduledQueryCaller,
+    /// A direct execution's published result and exact identity; `None` for
+    /// a queued execution, whose `state` holds both.
+    pub(super) direct: Option<(VerificationResultId, ExecutionIdentity)>,
 }
 
 impl Retained {
@@ -225,7 +235,7 @@ impl Retained {
     /// else its queue status, else `running`, since a state with neither and
     /// no queue row belongs to direct work still in flight.
     pub(super) fn status(&self) -> VerificationExecutionStatus {
-        if self.state.terminal.is_some() {
+        if self.state.terminal.is_some() || self.direct.is_some() {
             return VerificationExecutionStatus::Completed;
         }
         if let Some(failure) = &self.state.failure {
@@ -236,6 +246,23 @@ impl Retained {
             .map_or(VerificationExecutionStatus::Running, |queued| {
                 queued.state.status
             })
+    }
+
+    /// The execution's exact identity, from its state or direct result.
+    pub(super) fn identity(&self) -> Option<&ExecutionIdentity> {
+        self.state
+            .identity
+            .as_ref()
+            .or(self.direct.as_ref().map(|(_, identity)| identity))
+    }
+
+    /// The execution's selected result, from its state or direct result.
+    pub(super) fn result_id(&self) -> Option<VerificationResultId> {
+        self.state
+            .terminal
+            .as_ref()
+            .map(|selected| selected.result_id)
+            .or(self.direct.as_ref().map(|(result_id, _)| *result_id))
     }
 }
 
@@ -326,6 +353,10 @@ impl<'a> VerificationControl<'a> {
     /// accepted input record's origin; an input record not yet visible
     /// decides nothing and the read is unavailable.
     ///
+    /// An execution with neither a queue row nor accepted state is read as
+    /// direct work through its published `direct` result and both exact
+    /// Cards; until they are visible, or once a Card is gone, it is not found.
+    ///
     /// # Errors
     /// Returns [`WyrdError::PermissionDeniedRbac`] without a grant,
     /// [`WyrdError::VerificationExecutionNotFound`] when the tenant has
@@ -359,6 +390,7 @@ impl<'a> VerificationControl<'a> {
             &InputResolver::new(&query, None),
         )
         .await?;
+        let mut direct = None;
         let verifier = match (&queued, &state.identity) {
             (Some(queued), _) => queued.verifier_card_uid.clone(),
             (None, Some(identity)) => identity
@@ -366,7 +398,15 @@ impl<'a> VerificationControl<'a> {
                 .uid
                 .clone()
                 .ok_or_else(|| execution_not_found(execution_id))?,
-            (None, None) => return Err(execution_not_found(execution_id)),
+            (None, None) => {
+                let found = InputResolver::new(&query, None)
+                    .direct(execution_id)
+                    .await?
+                    .ok_or_else(|| execution_not_found(execution_id))?;
+                let verifier = found.verifier_card_uid.clone();
+                direct = Some(found);
+                verifier
+            }
         };
         let required = Permission {
             resource: Resource::Verifier,
@@ -376,6 +416,7 @@ impl<'a> VerificationControl<'a> {
         audit::authorize(self.state, caller, &required, operation, &resource)?;
         let pull_request = match &queued {
             Some(queued) => queued.state.pull_request.is_some(),
+            None if direct.is_some() => false,
             None => {
                 InputResolver::new(&query, None)
                     .record(execution_id)
@@ -394,12 +435,54 @@ impl<'a> VerificationControl<'a> {
                 &resource,
             )?;
         }
+        let direct = match direct {
+            Some(found) => Some(self.direct_identity(caller, execution_id, found).await?),
+            None => None,
+        };
         Ok(Retained {
             queued,
             revision,
             state,
             query,
+            direct,
         })
+    }
+
+    /// The result and exact identity of direct execution `execution_id`
+    /// from its published `found` summary, reading both Cards, deleted ones
+    /// included, in the caller's tenant.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::VerificationExecutionNotFound`] when either Card
+    /// is gone, and a registry error when a read fails.
+    async fn direct_identity(
+        &self,
+        caller: &Caller,
+        execution_id: ExecutionId,
+        found: DirectResult,
+    ) -> Result<(VerificationResultId, ExecutionIdentity), WyrdError> {
+        let mut conn = self
+            .state
+            .registry_tenant_conn(caller.data_tenant_id)
+            .await?;
+        let mut card = async |uid| match get_card_by_uid(&mut conn, uid).await {
+            Ok(row) => Ok(exact_ref(&row)),
+            Err(WyrdError::RegistryCardNotFound { .. }) => Err(execution_not_found(execution_id)),
+            Err(error) => Err(error),
+        };
+        let verifier = card(&found.verifier_card_uid).await?;
+        let subject = card(&found.card_uid).await?;
+        drop(conn);
+        Ok((
+            found.result_id,
+            ExecutionIdentity {
+                verifier,
+                subject,
+                deployment_environment: found.deployment_environment,
+                group_id: found.group_id,
+                owner_card_uid: None,
+            },
+        ))
     }
 
     /// Read and authorize `execution_id` as [`Self::retained`] does.
@@ -413,6 +496,9 @@ impl<'a> VerificationControl<'a> {
         operation: &str,
     ) -> Result<(VerificationExecutionStatus, i64, ExecutionState), WyrdError> {
         let retained = self.retained(caller, execution_id, operation).await?;
+        if retained.direct.is_some() {
+            return Err(execution_not_found(execution_id));
+        }
         Ok((retained.status(), retained.revision, retained.state))
     }
 

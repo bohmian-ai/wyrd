@@ -24,7 +24,7 @@ use serde_json::Value;
 use wyrd_spec::card::agent::ExecutionRoute;
 use wyrd_spec::card::verifier::{SourceField, SourceText};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{ExecutionId, SlotName, VerificationResultId};
+use wyrd_spec::ids::{CardUid, ExecutionId, GroupId, SlotName, VerificationResultId};
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::ids::RunId;
 use wyrd_spec::verification::execution::InputDeclaration;
@@ -213,6 +213,21 @@ impl InputRow {
             _ => Ok(None),
         }
     }
+}
+
+/// The published summary identities of one direct execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectResult {
+    /// Its one result.
+    pub result_id: VerificationResultId,
+    /// The exact Verifier.
+    pub verifier_card_uid: CardUid,
+    /// The Card verified.
+    pub card_uid: CardUid,
+    /// The caller group, when the request named one.
+    pub group_id: Option<GroupId>,
+    /// The deployment environment tag the request carried.
+    pub deployment_environment: Option<String>,
 }
 
 /// The boxed future of a recursive resolution.
@@ -461,6 +476,49 @@ impl<'q> InputResolver<'q> {
             .then(|| text(batch, "run_id", 0).map(RunId::from_string))
             .transpose()?;
         Ok(Some((run_id, decode(outcome)?)))
+    }
+
+    /// The published summary of a direct execution, which has no queue row
+    /// or execution state: only a result whose input record has the `direct`
+    /// origin, so a queued execution is never read this way. `None` until
+    /// both are visible.
+    ///
+    /// # Errors
+    /// Returns the query refusal or failure, and an internal error when a
+    /// stored identity is malformed.
+    pub async fn direct(&self, execution: ExecutionId) -> Result<Option<DirectResult>, WyrdError> {
+        let batches = self
+            .rows(&format!(
+                "SELECT r.result_id, r.verifier_card_uid, r.subject_card_uid, r.group_id, \
+                 r.deployment_environment FROM bifrost.verification.results r \
+                 JOIN bifrost.verification.execution_inputs i \
+                 ON i.execution_id = r.execution_id \
+                 WHERE r.execution_id = {} AND i.origin = 'direct' LIMIT 1",
+                quote(&execution.to_string())
+            ))
+            .await?;
+        let Some(batch) = batches.iter().find(|batch| batch.num_rows() > 0) else {
+            return Ok(None);
+        };
+        let optional = |name: &str| {
+            (!column(batch, name)?.is_null(0))
+                .then(|| text(batch, name, 0))
+                .transpose()
+        };
+        let card = |name: &str| {
+            CardUid::new(text(batch, name, 0)?).map_err(|error| invalid(error.to_string()))
+        };
+        Ok(Some(DirectResult {
+            result_id: text(batch, "result_id", 0)?
+                .parse()
+                .map_err(|error: wyrd_spec::ids::IdError| invalid(error.to_string()))?,
+            verifier_card_uid: card("verifier_card_uid")?,
+            card_uid: card("subject_card_uid")?,
+            group_id: optional("group_id")?
+                .map(|group| GroupId::new(group).map_err(|error| invalid(error.to_string())))
+                .transpose()?,
+            deployment_environment: optional("deployment_environment")?,
+        }))
     }
 
     /// The input records matching `filter`, first visible row per execution.

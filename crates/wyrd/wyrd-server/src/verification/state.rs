@@ -1,7 +1,7 @@
 //! The recoverable state of one running Verifier execution.
 //!
-//! [`RunState`] is the one owner of an execution's [`ExecutionState`] while
-//! it runs, for direct and queued executions alike. Steps validate and change
+//! [`RunState`] is the one owner of a queued execution's [`ExecutionState`]
+//! while it runs; direct executions have no recoverable state. Steps validate and change
 //! the live state in memory under a short lock and return at once: no step
 //! waits for SQL, a lease confirmation, outbox capacity, or a Scribe
 //! acknowledgement. A background flush persists the state: it freezes every
@@ -18,14 +18,11 @@
 //! [`StateError::Unavailable`], never older or empty state. Live progress not
 //! yet accepted is lost with its process.
 //!
-//! A queued writer stages each revision on a reserved outbox slot, waiting
-//! for capacity in background, and retries until it is accepted or its lease
-//! is lost; a refused revision, an unknown acceptance, or a lost lease breaks
+//! A writer stages each revision on a reserved outbox slot, waiting for
+//! capacity in background, and retries until it is accepted or its lease is
+//! lost; a refused revision, an unknown acceptance, or a lost lease breaks
 //! the writer, whose next step then fails. Its terminal custody awaits
-//! [`RunState::persisted`] off its computation. A direct execution's identity
-//! is new, so it starts fresh with no read, and its revisions are best
-//! effort: staged unreserved, shed and counted lost when the outbox is full,
-//! after which it persists nothing more and keeps running. A delayed old
+//! [`RunState::persisted`] off its computation. A delayed old
 //! worker can race a replacement for one revision; whichever batch is fenced
 //! first keeps it, and the other writer breaks.
 
@@ -250,12 +247,9 @@ struct Held {
     /// Whether the background flush is running; at most one per writer, so
     /// at most one frozen revision of the execution exists at a time.
     writing: bool,
-    /// Set once a queued revision was refused, its acceptance is unknown, or
-    /// the writer's lease was lost; this writer records nothing more.
+    /// Set once a revision was refused, its acceptance is unknown, or the
+    /// writer's lease was lost; this writer records nothing more.
     broken: bool,
-    /// Set once a direct revision was not accepted; the direct execution
-    /// keeps running and persists nothing more.
-    abandoned: bool,
 }
 
 impl Held {
@@ -268,7 +262,6 @@ impl Held {
             covered: 0,
             writing: false,
             broken: false,
-            abandoned: false,
         }
     }
 }
@@ -282,10 +275,9 @@ struct Writer {
     tenant: DataTenantId,
     /// The identities every revision's row records.
     row: Arc<StateRow>,
-    /// The queued execution's lease-loss token, which ends its writes and
-    /// fails its later changes; `None` for a direct execution, whose
-    /// revisions are best effort.
-    lost: Option<CancellationToken>,
+    /// The execution's lease-loss token, which ends its writes and fails its
+    /// later changes.
+    lost: CancellationToken,
     /// The live state and its acceptance, locked only to read or change
     /// memory, never across encoding or IO.
     held: Mutex<Held>,
@@ -300,27 +292,23 @@ impl Writer {
     }
 
     /// Whether this writer may change the state: nothing broke it and its
-    /// lease, when it has one, has not been lost.
+    /// lease has not been lost.
     fn current(&self, held: &Held) -> bool {
-        !held.broken
-            && !self
-                .lost
-                .as_ref()
-                .is_some_and(CancellationToken::is_cancelled)
+        !held.broken && !self.lost.is_cancelled()
     }
 
     /// Record one change applied to `held`'s state and start the background
-    /// flush unless one is running or persistence was abandoned.
+    /// flush unless one is running.
     fn changed(self: &Arc<Self>, held: &mut Held) {
         held.changes += 1;
-        if !held.writing && !held.abandoned {
+        if !held.writing {
             held.writing = true;
             tokio::spawn(Arc::clone(self).flush());
         }
     }
 
     /// Persist every change in background until an accepted revision holds
-    /// the latest one, the writer breaks, or persistence is abandoned.
+    /// the latest one or the writer breaks.
     ///
     /// Each turn freezes the live state, every change so far, into the next
     /// revision under the short lock, then writes it outside the lock, so
@@ -330,7 +318,7 @@ impl Writer {
         loop {
             let (revision, covers, state) = {
                 let mut held = self.lock();
-                if held.broken || held.abandoned || held.covered >= held.changes {
+                if held.broken || held.covered >= held.changes {
                     held.writing = false;
                     drop(held);
                     self.flushed.notify_waiters();
@@ -344,12 +332,9 @@ impl Writer {
                 if accepted {
                     held.revision = revision;
                     held.covered = covers;
-                } else if self.lost.is_some() {
+                } else {
                     tracing::warn!(execution_id = %self.row.execution_id, revision, "an execution state revision was not accepted; its writer stops");
                     held.broken = true;
-                } else {
-                    tracing::warn!(execution_id = %self.row.execution_id, revision, "a direct execution state revision was not accepted; its state is not persisted further");
-                    held.abandoned = true;
                 }
             }
             self.flushed.notify_waiters();
@@ -359,11 +344,10 @@ impl Writer {
     /// Stage `state` as `revision` under the revision's batch identity and
     /// wait for Scribe to accept it, returning whether it did.
     ///
-    /// A queued revision takes a reserved outbox slot, waiting for capacity
-    /// while the outbox is full, so it is never shed; its lease's loss ends
-    /// the wait. A direct revision is staged unreserved: a full outbox sheds
-    /// and counts it lost. The outbox writer prepares the row, so this does
-    /// no encoding, and nothing here holds the state's lock.
+    /// The revision takes a reserved outbox slot, waiting for capacity while
+    /// the outbox is full, so it is never shed; its lease's loss ends the
+    /// wait. The outbox writer prepares the row, so this does no encoding,
+    /// and nothing here holds the state's lock.
     async fn write(&self, revision: i64, state: ExecutionState) -> bool {
         let (sender, acked) = oneshot::channel();
         let write = ScribeWrite::ExecutionState {
@@ -372,10 +356,7 @@ impl Writer {
             attribution: self.row.attribution,
             acked: Mutex::new(Some(sender)),
         };
-        let Some(lost) = &self.lost else {
-            self.outbox.stage(self.tenant, write);
-            return acked.await.is_ok();
-        };
+        let lost = &self.lost;
         let slot = loop {
             tokio::select! {
                 biased;
@@ -563,8 +544,8 @@ pub struct RunState {
 impl RunState {
     /// Recover `tenant`'s execution state for a new writer whose attempt
     /// ends at `deadline`, through `records`, whose read authority must cover
-    /// `bifrost.verification.execution_events`. `lost`, when the execution
-    /// is queued, is its lease-loss token.
+    /// `bifrost.verification.execution_events`. `lost` is its lease-loss
+    /// token.
     ///
     /// # Errors
     /// Returns [`StateError::Unavailable`] when the accepted revision cannot
@@ -576,7 +557,7 @@ impl RunState {
         tenant: DataTenantId,
         row: StateRow,
         deadline: tokio::time::Instant,
-        lost: Option<CancellationToken>,
+        lost: CancellationToken,
         records: &InputResolver<'_>,
     ) -> Result<Self, StateError> {
         let (revision, state) = Self::accepted(app, tenant, row.execution_id, records).await?;
@@ -585,39 +566,15 @@ impl RunState {
         ))
     }
 
-    /// The state of an execution identity no writer ever advanced, such as
-    /// a direct execution's, for a new writer with no lease whose revisions
-    /// are best effort.
-    ///
-    /// A direct execution's identity is new to its request and never
-    /// resumed, so its state starts fresh and nothing is read.
-    #[must_use]
-    pub fn fresh(
-        outbox: Arc<ScribeOutbox>,
-        tenant: DataTenantId,
-        row: StateRow,
-        deadline: tokio::time::Instant,
-    ) -> Self {
-        Self::at(
-            outbox,
-            tenant,
-            row,
-            deadline,
-            None,
-            ExecutionState::fresh(),
-            0,
-        )
-    }
-
     /// A writer of `state`, accepted at `revision`, which records `row`'s
-    /// identity unless the state already holds one. `lost` is a queued
-    /// execution's lease-loss token; `None` makes revisions best effort.
+    /// identity unless the state already holds one. `lost` is the
+    /// execution's lease-loss token.
     pub(crate) fn at(
         outbox: Arc<ScribeOutbox>,
         tenant: DataTenantId,
         row: StateRow,
         deadline: tokio::time::Instant,
-        lost: Option<CancellationToken>,
+        lost: CancellationToken,
         mut state: ExecutionState,
         revision: i64,
     ) -> Self {
@@ -722,8 +679,7 @@ impl RunState {
     ///
     /// # Errors
     /// Returns [`StateError::Stale`] once the writer broke or lost its
-    /// lease, and [`StateError::Unavailable`] once a direct execution
-    /// abandoned persistence.
+    /// lease.
     pub async fn persisted(&self) -> Result<(), StateError> {
         loop {
             let notified = self.writer.flushed.notified();
@@ -736,11 +692,6 @@ impl RunState {
                 }
                 if held.covered >= held.changes {
                     return Ok(());
-                }
-                if held.abandoned {
-                    return Err(StateError::Unavailable(
-                        "the direct execution's state was not accepted".to_owned(),
-                    ));
                 }
             }
             notified.await;
@@ -1082,26 +1033,26 @@ mod tests {
         CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid")
     }
 
-    /// A fresh direct execution's state, written through a Scribe that holds
-    /// every revision until released.
+    /// A fresh execution's state, written through a Scribe that holds every
+    /// revision until released.
     ///
     /// # Panics
     /// Panics when a fresh UUID is not a Card UID, or when called outside a
     /// Tokio runtime, where the outbox cannot spawn its writer.
     fn held_state() -> (RunState, Arc<TableGate>) {
-        held_at(ExecutionState::fresh(), 0, None)
+        held_at(ExecutionState::fresh(), 0, CancellationToken::new())
     }
 
     /// A writer of `state`, accepted at `revision`, written through a Scribe
-    /// that holds every revision until released; queued under the lease-loss
-    /// token `lost`, direct when `None`.
+    /// that holds every revision until released, under the lease-loss token
+    /// `lost`.
     ///
     /// # Panics
     /// Panics as [`held_state`] does.
     fn held_at(
         state: ExecutionState,
         revision: i64,
-        lost: Option<CancellationToken>,
+        lost: CancellationToken,
     ) -> (RunState, Arc<TableGate>) {
         let scribe = Arc::new(TableGate::new(ScribeTable::ExecutionEvents));
         let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _, None);
@@ -1314,7 +1265,7 @@ mod tests {
     /// Panics when the writer keeps accepting changes or reports persistence.
     #[tokio::test]
     async fn a_refused_revision_breaks_a_queued_writer() {
-        let (state, scribe) = held_at(ExecutionState::fresh(), 0, Some(CancellationToken::new()));
+        let (state, scribe) = held_at(ExecutionState::fresh(), 0, CancellationToken::new());
         scribe
             .inner
             .refuse_next(vala_bifrost_redux::contracts::ScribeError::BatchConflict);
@@ -1343,7 +1294,7 @@ mod tests {
     #[tokio::test]
     async fn a_lost_lease_stops_a_queued_writer() {
         let lost = CancellationToken::new();
-        let (state, scribe) = held_at(ExecutionState::fresh(), 0, Some(lost.clone()));
+        let (state, scribe) = held_at(ExecutionState::fresh(), 0, lost.clone());
         state
             .begin(&Producer::plain(&task("factual-check"), 1))
             .await
@@ -1373,40 +1324,6 @@ mod tests {
             PublicationAcceptance::StaleLease
         );
         assert_eq!(state.snapshot().invocations.len(), 1);
-    }
-
-    /// Proves a direct writer whose revision is not accepted keeps running
-    /// from memory and persists nothing more.
-    ///
-    /// # Panics
-    /// Panics when the direct execution stops progressing or writes again.
-    #[tokio::test]
-    async fn a_direct_writer_keeps_running_after_its_revision_is_lost() {
-        let (state, scribe) = held_state();
-        scribe
-            .inner
-            .refuse_next(vala_bifrost_redux::contracts::ScribeError::BatchConflict);
-        scribe
-            .release
-            .add_permits(tokio::sync::Semaphore::MAX_PERMITS);
-        state
-            .begin(&Producer::plain(&task("factual-check"), 1))
-            .await
-            .expect("recorded");
-        assert!(matches!(
-            settled(&state).await,
-            Err(StateError::Unavailable(_))
-        ));
-        state
-            .begin(&Producer::plain(&task("sensitive-check"), 1))
-            .await
-            .expect("the direct execution keeps progressing");
-        assert_eq!(state.snapshot().invocations.len(), 2);
-        assert!(matches!(
-            settled(&state).await,
-            Err(StateError::Unavailable(_))
-        ));
-        assert!(revisions(&scribe).is_empty());
     }
 
     /// Accept JSON `value` under `name` for provider call `call` of `task`'s
@@ -1474,7 +1391,7 @@ mod tests {
             PublicationAcceptance::Conflict,
             "a live call cannot take a second name"
         );
-        let (restored, scribe) = held_at(live.snapshot(), 1, None);
+        let (restored, scribe) = held_at(live.snapshot(), 1, CancellationToken::new());
         scribe
             .release
             .add_permits(tokio::sync::Semaphore::MAX_PERMITS);

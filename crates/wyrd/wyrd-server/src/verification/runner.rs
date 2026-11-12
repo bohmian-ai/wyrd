@@ -624,7 +624,7 @@ impl VerifierRunner {
             tenant,
             frozen.row(system, identity),
             deadline,
-            Some(lease.lost().clone()),
+            lease.lost().clone(),
             accepted,
             revision,
         );
@@ -665,7 +665,7 @@ impl VerifierRunner {
                 frozen.identity((verifier.verifier.clone(), verifier.subject.clone())),
             ),
             deadline,
-            Some(lease.lost().clone()),
+            lease.lost().clone(),
             &InputResolver::new(&query, None),
         )
         .await

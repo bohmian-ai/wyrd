@@ -222,7 +222,7 @@ impl Leased {
                 attribution: Attribution::new(claimed.attribution.sub_principal_id, system),
             },
             tokio::time::Instant::now() + std::time::Duration::from_secs(300),
-            Some(lease.lost().clone()),
+            lease.lost().clone(),
             &InputResolver::new(&query, None),
         )
         .await?;

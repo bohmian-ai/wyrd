@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_verify::blocks::{Checkpoints, DriftChecks, EngineError};
+use vala_verify::blocks::{DriftChecks, EngineError};
 use wyrd_runtime::outbox::{OutboxFull, Reservation};
 use wyrd_runtime::permission::{Action, Resource};
 use wyrd_runtime::principal::PrincipalId;
@@ -27,13 +27,11 @@ use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::vala::ids::{SpanId, TraceId};
 use wyrd_spec::verification::execution::{
     EnqueueVerificationResponse, EvidencePlanRequest, EvidencePlanResponse, EvidenceUpload,
-    OutcomeDetails, VerificationDetails, VerificationExecutionState, VerificationRequest,
-    VerificationResult,
+    ExecutedOutcome, OutcomeDetails, VerificationDetails, VerificationExecutionState,
+    VerificationRequest, VerificationResult,
 };
-use wyrd_spec::verification::state::ExecutionState;
-use wyrd_spec::verification::state::{ExecutionIdentity, TerminalSelection};
 use wyrd_spec::verification::{
-    VerificationBindingStatus, VerificationError, VerificationExecutionStatus, VerifierReadiness,
+    VerificationBindingStatus, VerificationExecutionStatus, VerifierReadiness,
 };
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::service_accounts::system_principal_id;
@@ -59,7 +57,6 @@ use crate::verification::inputs::InputResolver;
 use crate::verification::results::{
     InputRecord, ResultPayloadBuilder, ResultPayloadError, ResultRun,
 };
-use crate::verification::state::{Decision, RunState, StateRow};
 use crate::verification::submissions::{AdmissionReply, Queued};
 use crate::verification::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
 
@@ -115,17 +112,6 @@ pub(crate) fn staging_full(full: OutboxFull) -> WyrdError {
     metrics::counter!("verification_staging_refused_total", "outbox" => full.outbox).increment(1);
     WyrdError::VerificationStagingFull {
         message: "this server has no verification staging capacity now".to_owned(),
-        details: serde_json::json!({ "retry_after_seconds": STAGING_RETRY_AFTER_SECONDS }),
-    }
-}
-
-/// The retryable refusal of a direct execution whose state could not be
-/// claimed or changed, such as while Scribe is unreachable; the identical
-/// call may be retried whole as a new execution.
-fn state_unavailable(error: &dyn std::fmt::Display) -> WyrdError {
-    tracing::warn!(%error, "the direct execution state is unavailable");
-    WyrdError::ServiceUnavailable {
-        message: "the verification execution state cannot be recorded now".to_owned(),
         details: serde_json::json!({ "retry_after_seconds": STAGING_RETRY_AFTER_SECONDS }),
     }
 }
@@ -256,8 +242,10 @@ impl<'a> VerificationControl<'a> {
     ///
     /// Reads the execution as [`Self::retained`](VerificationControl::retained)
     /// does, for direct and queued work alike and whether or not its queue
-    /// row remains, authorizing `verifier:read` on its exact Verifier. The
-    /// status, error, and result come from the accepted state: a selected
+    /// row remains, authorizing `verifier:read` on its exact Verifier. A
+    /// direct execution reads as completed once its published result is
+    /// visible, with that result. A queued execution's status, error, and
+    /// result come from the accepted state: a selected
     /// outcome is read back from its result records under the result
     /// identity the state selected, with the Verifier and subject the state
     /// recorded, so a deleted Card or a removed queue row changes nothing; a
@@ -278,7 +266,7 @@ impl<'a> VerificationControl<'a> {
     ) -> Result<VerificationExecutionState, WyrdError> {
         let retained = self.retained(caller, execution_id, GET_EXECUTION).await?;
         let records = InputResolver::new(&retained.query, None);
-        let identity = retained.state.identity.as_ref();
+        let identity = retained.identity();
         let mut state = match &retained.queued {
             Some(queued) => queued.state.clone(),
             None => VerificationExecutionState {
@@ -303,20 +291,21 @@ impl<'a> VerificationControl<'a> {
                 None => None,
             };
         }
-        let (Some(selected), Some(identity)) = (&retained.state.terminal, identity) else {
+        let (Some(result_id), Some(identity)) = (retained.result_id(), identity) else {
             return Ok(state);
         };
-        state.result = records
-            .result(selected.result_id)
-            .await?
-            .map(|(run_id, outcome)| VerificationResult {
-                execution_id,
-                run_id,
-                verifier: identity.verifier.clone(),
-                subject: identity.subject.clone(),
-                outcome,
-                deployment_environment: identity.deployment_environment.clone(),
-            });
+        state.result =
+            records
+                .result(result_id)
+                .await?
+                .map(|(run_id, outcome)| VerificationResult {
+                    execution_id,
+                    run_id,
+                    verifier: identity.verifier.clone(),
+                    subject: identity.subject.clone(),
+                    outcome,
+                    deployment_environment: identity.deployment_environment.clone(),
+                });
         Ok(state)
     }
 
@@ -342,13 +331,11 @@ impl<'a> VerificationControl<'a> {
             .retained(caller, execution_id, GET_EXECUTION_DETAILS)
             .await?;
         let records = InputResolver::new(&retained.query, None);
-        let (Some(selected), Some(identity)) =
-            (&retained.state.terminal, retained.state.identity.as_ref())
-        else {
+        let (Some(result_id), Some(identity)) = (retained.result_id(), retained.identity()) else {
             return Err(execution_not_found(execution_id));
         };
         let (run_id, outcome) = records
-            .result::<OutcomeDetails>(selected.result_id)
+            .result::<OutcomeDetails>(result_id)
             .await?
             .ok_or_else(|| execution_not_found(execution_id))?;
         Ok(VerificationDetails {
@@ -597,172 +584,126 @@ impl<'a> VerificationControl<'a> {
             });
         let deadline = tokio::time::Instant::now() + timeout;
         let owner = wyrd_runtime::owning_root(&caller.principal, &caller.delegation_chain);
-        let state = Arc::new(RunState::fresh(
-            Arc::clone(self.state.bifrost.scribe_outbox()),
-            caller.data_tenant_id,
-            StateRow {
-                execution_id,
-                verifier_uid: request.verifier_card_uid.clone(),
-                card_uid: request.card_uid.clone(),
-                owner_card_uid: owner.cloned(),
-                run_id: request.run_id.clone(),
-                deployment_environment: request.deployment_environment.clone(),
-                attribution: caller.attribution(),
-                identity: ExecutionIdentity {
-                    verifier: target.verifier.clone(),
-                    subject: target.subject.clone(),
-                    deployment_environment: request.deployment_environment.clone(),
-                    group_id: request.group_id.clone(),
-                    owner_card_uid: None,
-                },
-            },
-            deadline,
-        ));
-        let finished = async {
-            let built = telemetry.time(Phase::Setup, || {
-                blocks.engine(
-                    self.state,
-                    Execution {
-                        caller: &executor,
-                        verifier: &request.verifier_card_uid,
-                        routes: &request.execution_route_overrides,
-                        subject: GatewayCallContext {
-                            workload_card_uid: owner.cloned(),
-                            subject_card_uid: Some(request.card_uid.clone()),
-                            run_id: request.run_id.clone(),
-                            deployment_environment: request.deployment_environment.clone(),
-                        },
-                        defer_unlanded_traces: false,
-                        drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
-                        clock: telemetry.clock(),
-                        execution: Some(Arc::clone(&state)),
-                        mode: ExecutionMode::Direct,
+        let built = telemetry.time(Phase::Setup, || {
+            blocks.engine(
+                self.state,
+                Execution {
+                    caller: &executor,
+                    verifier: &request.verifier_card_uid,
+                    routes: &request.execution_route_overrides,
+                    subject: GatewayCallContext {
+                        workload_card_uid: owner.cloned(),
+                        subject_card_uid: Some(request.card_uid.clone()),
+                        run_id: request.run_id.clone(),
+                        deployment_environment: request.deployment_environment.clone(),
                     },
-                )
-            });
-            let engine = match built {
-                Ok(engine) => engine.with_checkpoints(
-                    Arc::clone(&state) as Arc<dyn Checkpoints>,
-                    &ExecutionState::default(),
-                ),
-                Err(error) => return ("errored", Err(error)),
-            };
-            let ran = telemetry
-                .phase(
-                    Phase::Engine,
-                    engine.run(
-                        Arc::clone(&target.spec),
-                        std::mem::take(&mut request.inputs),
-                        deadline,
-                    ),
-                )
-                .instrument(tracing::debug_span!("verification.engine"))
-                .await;
-            let mut outcome = match ran {
-                Ok(outcome) => outcome,
-                Err(EngineError::DeadlineExceeded) => {
-                    return (
-                        "timed_out",
-                        Err(WyrdError::VerificationExecutionTimedOut {
-                            message: "the Verifier exceeded the direct execution deadline"
-                                .to_owned(),
-                            details: serde_json::json!({ "deadline_seconds": timeout.as_secs() }),
-                        }),
-                    );
-                }
-                Err(EngineError::Plan(error)) => return ("errored", Err(error)),
-                Err(EngineError::Busy(reason)) => {
-                    return (
-                        "unavailable",
-                        Err(WyrdError::ServiceUnavailable {
-                            message:
-                                "the verification runtime has no capacity for this Verifier now"
-                                    .to_owned(),
-                            details: serde_json::json!({ "reason": reason }),
-                        }),
-                    );
-                }
-                Err(EngineError::InputInvalid(reason)) => {
-                    return (
-                        "refused",
-                        Err(WyrdError::VerificationInputInvalid {
-                            message: reason.clone(),
-                            details: serde_json::json!({ "reason": reason }),
-                        }),
-                    );
-                }
-                Err(EngineError::InputTooLarge(reason)) => {
-                    return (
-                        "refused",
-                        Err(WyrdError::VerificationInputTooLarge {
-                            message: reason.clone(),
-                            details: serde_json::json!({ "reason": reason }),
-                        }),
-                    );
-                }
-                Err(EngineError::DefinitionUnavailable(reason)) => {
-                    return ("errored", Err(WyrdError::registry_card_not_found(reason)));
-                }
-                Err(EngineError::EvidenceUnavailable(reason)) => {
-                    return (
-                        "unavailable",
-                        Err(WyrdError::ServiceUnavailable {
-                            message: "the verification evidence cannot be admitted now".to_owned(),
-                            details: serde_json::json!({ "reason": reason }),
-                        }),
-                    );
-                }
-                Err(EngineError::Checkpoint(reason)) => {
-                    return ("unavailable", Err(state_unavailable(&reason)));
-                }
-                Err(error) => return ("errored", Err(WyrdError::internal(error.to_string()))),
-            };
-            let selected = match state.select(&outcome, started_at) {
-                Ok(Decision::Selected(selected)) => selected,
-                Ok(Decision::Failed(failure)) => {
-                    return ("errored", Err(WyrdError::internal(failure.error.message)));
-                }
-                Err(error) => return ("unavailable", Err(state_unavailable(&error))),
-            };
-            // The engine returned the one evidence copy it ran on; stage the
-            // caller's declarations from it, apart from the engine's
-            // synthetic attachment slots, which no Verifier declares. The
-            // compact result carries no evidence.
-            outcome
-                .evidence
-                .retain(|slot, _| target.spec.inputs.contains_key(slot));
-            request.inputs = std::mem::take(&mut outcome.evidence);
-            telemetry.time(Phase::Stage, || {
-                Self::stage_direct(&staged, caller, execution_id, &request, &target, &selected);
-            });
-            (
-                "completed",
-                Ok(VerificationResult {
-                    execution_id,
-                    run_id: request.run_id.clone(),
-                    verifier: target.verifier.clone(),
-                    subject: target.subject.clone(),
-                    outcome: outcome.compact(),
-                    deployment_environment: request.deployment_environment.clone(),
-                }),
+                    defer_unlanded_traces: false,
+                    drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
+                    clock: telemetry.clock(),
+                    execution: None,
+                    mode: ExecutionMode::Direct,
+                },
             )
-        }
-        .await;
-        if let (label, Err(error)) = &finished {
-            let status = if *label == "timed_out" {
-                VerificationExecutionStatus::TimedOut
-            } else {
-                VerificationExecutionStatus::Errored
-            };
-            let failure = VerificationError {
-                code: error.code().to_owned(),
-                message: error.to_string(),
-            };
-            if let Err(unrecorded) = state.fail(status, &failure) {
-                tracing::warn!(%execution_id, error = %unrecorded, "a direct execution's failure was not retained");
+        });
+        let engine = match built {
+            Ok(engine) => engine,
+            Err(error) => return ("errored", Err(error)),
+        };
+        let ran = telemetry
+            .phase(
+                Phase::Engine,
+                engine.run(
+                    Arc::clone(&target.spec),
+                    std::mem::take(&mut request.inputs),
+                    deadline,
+                ),
+            )
+            .instrument(tracing::debug_span!("verification.engine"))
+            .await;
+        let mut outcome = match ran {
+            Ok(outcome) => outcome,
+            Err(EngineError::DeadlineExceeded) => {
+                return (
+                    "timed_out",
+                    Err(WyrdError::VerificationExecutionTimedOut {
+                        message: "the Verifier exceeded the direct execution deadline".to_owned(),
+                        details: serde_json::json!({ "deadline_seconds": timeout.as_secs() }),
+                    }),
+                );
             }
-        }
-        finished
+            Err(EngineError::Plan(error)) => return ("errored", Err(error)),
+            Err(EngineError::Busy(reason)) => {
+                return (
+                    "unavailable",
+                    Err(WyrdError::ServiceUnavailable {
+                        message: "the verification runtime has no capacity for this Verifier now"
+                            .to_owned(),
+                        details: serde_json::json!({ "reason": reason }),
+                    }),
+                );
+            }
+            Err(EngineError::InputInvalid(reason)) => {
+                return (
+                    "refused",
+                    Err(WyrdError::VerificationInputInvalid {
+                        message: reason.clone(),
+                        details: serde_json::json!({ "reason": reason }),
+                    }),
+                );
+            }
+            Err(EngineError::InputTooLarge(reason)) => {
+                return (
+                    "refused",
+                    Err(WyrdError::VerificationInputTooLarge {
+                        message: reason.clone(),
+                        details: serde_json::json!({ "reason": reason }),
+                    }),
+                );
+            }
+            Err(EngineError::DefinitionUnavailable(reason)) => {
+                return ("errored", Err(WyrdError::registry_card_not_found(reason)));
+            }
+            Err(EngineError::EvidenceUnavailable(reason)) => {
+                return (
+                    "unavailable",
+                    Err(WyrdError::ServiceUnavailable {
+                        message: "the verification evidence cannot be admitted now".to_owned(),
+                        details: serde_json::json!({ "reason": reason }),
+                    }),
+                );
+            }
+            Err(error) => return ("errored", Err(WyrdError::internal(error.to_string()))),
+        };
+        // The engine returned the one evidence copy it ran on; stage the
+        // caller's declarations from it, apart from the engine's
+        // synthetic attachment slots, which no Verifier declares. The
+        // compact result carries no evidence.
+        outcome
+            .evidence
+            .retain(|slot, _| target.spec.inputs.contains_key(slot));
+        request.inputs = std::mem::take(&mut outcome.evidence);
+        telemetry.time(Phase::Stage, || {
+            Self::stage_direct(
+                &staged,
+                caller,
+                execution_id,
+                &request,
+                &target,
+                &outcome,
+                started_at,
+            );
+        });
+        (
+            "completed",
+            Ok(VerificationResult {
+                execution_id,
+                run_id: request.run_id.clone(),
+                verifier: target.verifier.clone(),
+                subject: target.subject.clone(),
+                outcome: outcome.compact(),
+                deployment_environment: request.deployment_environment.clone(),
+            }),
+        )
     }
 
     /// Stage one background execution and return its identity.
@@ -909,12 +850,13 @@ impl<'a> VerificationControl<'a> {
         }
     }
 
-    /// Stage a completed direct execution's inputs and the result its state
-    /// `selected` on the Scribe outbox.
+    /// Stage a completed direct execution's inputs and result on the Scribe
+    /// outbox.
     ///
     /// Both rows are staged on the slots `staged` reserved before the
-    /// execution ran. The payload carries the selected result identity and
-    /// interval and correlates with the execution through `execution_id`. Its rows name the subject
+    /// execution ran. The payload mints its own result identity, spans
+    /// `started_at` to now, and correlates with the execution through
+    /// `execution_id`. Its rows name the subject
     /// as `subject_card_uid` and the exact Verifier as `verifier_card_uid`, are
     /// attributed to the caller, carry the caller's application Run, group,
     /// and authenticated owner Service, and have no binding or Trigger. The inputs row never queues work. The
@@ -926,7 +868,8 @@ impl<'a> VerificationControl<'a> {
         execution_id: ExecutionId,
         request: &VerificationRequest,
         target: &Target,
-        selected: &TerminalSelection,
+        outcome: &ExecutedOutcome,
+        started_at: chrono::DateTime<Utc>,
     ) {
         let verifier_version = target.verifier.version.to_string();
         let builder = ResultPayloadBuilder::new(
@@ -946,17 +889,12 @@ impl<'a> VerificationControl<'a> {
                 window: None,
             },
             &request.verifier_card_uid,
-            selected.started_at,
-            selected.ended_at,
+            started_at,
+            Utc::now(),
         );
         let built = builder
             .inputs(InputRecord::Direct(&request.inputs))
-            .and_then(|row| {
-                Ok((
-                    row,
-                    builder.build_as(selected.result_id, &selected.outcome)?,
-                ))
-            });
+            .and_then(|row| Ok((row, builder.build(outcome)?)));
         match built {
             Ok((row, payload)) => {
                 staged.stage(

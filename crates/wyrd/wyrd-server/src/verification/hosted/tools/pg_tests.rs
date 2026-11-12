@@ -295,14 +295,14 @@ fn retries_keep_their_actions_spent_time() {
     });
 }
 
-/// A fresh direct execution state of Verifier `verifier` for `caller`,
-/// staging its revisions on `state`'s outbox.
+/// A fresh queued execution state of Verifier `verifier` for `caller`,
+/// staging its revisions on `state`'s outbox under a lease never lost.
 ///
 /// # Panics
 /// Panics when a `UUIDv7` is not a Card UID.
 fn execution(state: &AppState, caller: &Caller, verifier: &CardUid) -> Arc<RunState> {
     let subject = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid");
-    Arc::new(RunState::fresh(
+    Arc::new(RunState::at(
         Arc::clone(state.bifrost.scribe_outbox()),
         test_tenant(),
         StateRow {
@@ -319,6 +319,9 @@ fn execution(state: &AppState, caller: &Caller, verifier: &CardUid) -> Arc<RunSt
             ),
         },
         Instant::now() + Duration::from_secs(30),
+        tokio_util::sync::CancellationToken::new(),
+        wyrd_spec::verification::state::ExecutionState::fresh(),
+        0,
     ))
 }
 

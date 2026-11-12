@@ -816,7 +816,8 @@ impl VerificationFixture {
 
     /// Claim the tenant's next due execution as a worker would, then
     /// recover its accepted Bifrost state as the tenant's SYSTEM principal.
-    /// The returned state confirms no lease before its revisions.
+    /// The returned state's lease is never lost, so its revisions retry
+    /// until Scribe accepts them.
     ///
     /// # Errors
     /// Returns [`VerificationFixtureError`] when nothing is claimable or the
@@ -875,7 +876,7 @@ impl VerificationFixture {
                 },
             },
             tokio::time::Instant::now() + std::time::Duration::from_secs(60),
-            None,
+            CancellationToken::new(),
             &InputResolver::new(&query, None),
         )
         .await;

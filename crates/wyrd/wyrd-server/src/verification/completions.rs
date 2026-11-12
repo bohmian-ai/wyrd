@@ -36,6 +36,20 @@ const FLUSHERS: usize = 4;
 /// Most queued runs one flush task takes at once, bounding one turn's work.
 const BATCH: usize = 512;
 
+/// Why one run's completion did not settle.
+///
+/// The runner logs it and retries the settlement while its lease holds.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum SettleError {
+    /// The run's own transaction failed.
+    #[error(transparent)]
+    Sql(#[from] SqlError),
+    /// The batch that held the run failed; every run in it shares the one
+    /// failure, and nothing was applied.
+    #[error("the batched settlement failed: {0}")]
+    Batch(#[source] Arc<SqlError>),
+}
+
 /// One run waiting for a flush to complete it.
 struct Waiting {
     /// The run's tenant, whose transaction completes it.
@@ -44,7 +58,7 @@ struct Waiting {
     completion: Completion,
     /// Receives the settlement once the flush commits, or the failure of
     /// the flush that held the run.
-    reply: oneshot::Sender<Result<Settled, String>>,
+    reply: oneshot::Sender<Result<Settled, Arc<SqlError>>>,
 }
 
 /// A committed flush's answer to one of its runs.
@@ -108,14 +122,14 @@ impl Completions {
     /// remains to take the run, so the caller settles it alone.
     ///
     /// # Errors
-    /// Returns [`SqlError::TxFailed`] carrying the failure of the batch that
+    /// Returns [`SettleError::Batch`] carrying the failure of the batch that
     /// held this run; nothing was applied, and the caller retries it through
     /// a later batch.
     pub(super) async fn complete(
         &self,
         tenant: DataTenantId,
         completion: Completion,
-    ) -> Result<Option<Settlement>, SqlError> {
+    ) -> Result<Option<Settlement>, SettleError> {
         let (reply, settled) = oneshot::channel();
         if self
             .queue
@@ -131,11 +145,7 @@ impl Completions {
         let Ok(settled) = settled.await else {
             return Ok(None);
         };
-        let settled = settled.map_err(|failure| {
-            SqlError::TxFailed(sqlx::Error::Protocol(format!(
-                "the batched settlement failed: {failure}"
-            )))
-        })?;
+        let settled = settled.map_err(SettleError::Batch)?;
         drop(tracing::info_span!(
             "complete_many",
             operation = "verification.executions.complete_many",
@@ -190,7 +200,7 @@ impl Flusher {
             }
             Err(error) => {
                 tracing::warn!(tenant_id = %tenant, runs = batch, %error, "a batched verification settlement failed; its runs retry in a later batch");
-                let failure = error.to_string();
+                let failure = Arc::new(error);
                 for reply in replies {
                     let _ = reply.send(Err(failure.clone()));
                 }

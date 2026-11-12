@@ -73,7 +73,7 @@ use super::RuntimeLimits;
 use super::authority::{SystemReadAuthority, SystemReadAuthorityError};
 use super::cache::{Db, Target, exact_ref};
 use super::claims::{ClaimLoop, LeasedWork, settled};
-use super::completions::Completions;
+use super::completions::{Completions, SettleError};
 use super::drift::DriftEngine;
 use super::engines::{self, EngineOutcome};
 use super::health::RuntimeCapability;
@@ -948,13 +948,14 @@ impl VerifierRunner {
     /// `stale_lease`.
     ///
     /// # Errors
-    /// Returns [`SqlError`] when the transaction fails; nothing is applied.
+    /// Returns [`SettleError`] when the transaction or the batch holding the
+    /// run fails; nothing is applied.
     async fn settle(
         &self,
         tenant: DataTenantId,
         run: &ClaimedExecution,
         transition: Transition,
-    ) -> Result<&'static str, SqlError> {
+    ) -> Result<&'static str, SettleError> {
         if transition == Transition::LeaseLost {
             return Ok("stale_lease");
         }
@@ -977,6 +978,23 @@ impl VerifierRunner {
                 return Ok(settled(settlement, "completed"));
             }
         }
+        Ok(self.settle_alone(tenant, run, transition).await?)
+    }
+
+    /// Apply `transition` to claimed `run` in its own tenant transaction,
+    /// outside the group commit.
+    ///
+    /// Returns the same outcome labels as [`Self::settle`].
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when the transaction fails; nothing is applied.
+    async fn settle_alone(
+        &self,
+        tenant: DataTenantId,
+        run: &ClaimedExecution,
+        transition: Transition,
+    ) -> Result<&'static str, SqlError> {
+        let lease = run.lease;
         let mut conn = self.postgres.tenant_conn(tenant).await?;
         let outcome = match transition {
             Transition::Complete {
@@ -1623,10 +1641,11 @@ fn system_missing() -> Transition {
 ///
 /// # Errors
 /// Returns the latest failure once `lost` is cancelled.
-async fn persist<T, F, Fut>(lost: &CancellationToken, mut operation: F) -> Result<T, SqlError>
+async fn persist<T, E, F, Fut>(lost: &CancellationToken, mut operation: F) -> Result<T, E>
 where
+    E: std::fmt::Display,
     F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, SqlError>>,
+    Fut: Future<Output = Result<T, E>>,
 {
     let mut pause = PERSIST_INITIAL;
     loop {

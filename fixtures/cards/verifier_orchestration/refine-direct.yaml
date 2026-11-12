@@ -1,0 +1,23 @@
+# A sequential refinement that publishes nothing, so it may run directly.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: refine-direct
+  version: 1.0.0
+spec:
+  description: Sequential refinement without publications.
+  inputs:
+    question: {type: json, schema: {type: string}}
+  steps:
+    - id: draft
+      repeat:
+        max_iterations: 4
+        until: {path: iteration.output.score, operator: greater_than_or_equals, expected: 2}
+      action:
+        kind: agent
+        agent: ./scorer.yaml
+        inputs: {question: inputs.question, index: iteration.index, previous: iteration.previous}
+  requirements:
+    - id: final
+      statement: The refined report reached its score
+      check: {kind: assert, path: steps.draft.output.score, operator: greater_than_or_equals, expected: 2}

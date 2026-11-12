@@ -876,18 +876,18 @@ async fn submitted_answer_is_judged_in_the_background_and_resumes_by_id() {
     assistant.deployment.shutdown().await;
 }
 
-/// `verify` and `submit` run the same request through one durable execution
-/// path: the direct call returns its result synchronously under its own
-/// identity, while the submission completes in the background with the same
-/// verdict, and a handle rebuilt from either ID reads back exactly the result
-/// that execution returned.
+/// `verify` and `submit` judge the same request alike: the direct call
+/// returns its result synchronously under its own identity, while the
+/// submission completes in the background with the same verdict, and a
+/// handle rebuilt from either ID reads back exactly the result that
+/// execution returned.
 ///
 /// # Panics
 /// Panics when a call fails, the verdicts differ, the executions share an
 /// identity, or a result read back by its ID differs.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn verify_and_submit_share_durable_execution_state() {
+async fn verify_and_submit_judge_one_request_alike() {
     let assistant = Assistant::start().await;
     let state = assistant.state().await;
     let run = state.run_for_card("agent").expect("agent run opens");

@@ -2772,20 +2772,24 @@ async fn state_format_changes_preserve_existing_custody() {
         .expect("test server shuts down");
 }
 
-/// Direct and queued verification both select their outcome through the
-/// same Bifrost execution state.
+/// Only queued verification keeps Bifrost execution state; direct
+/// verification records its input, output and result alone.
 ///
-/// Two direct executions of one assertion Verifier get distinct identities,
-/// admit no queue record, and each returns before its state persists in
-/// background, which then selects the outcome returned. A queued submission of the same request run
-/// by the runtime completes with the result its accepted state selected.
+/// Two direct executions of one assertion Verifier get distinct identities
+/// and admit no queue record. Once their records drain, neither has an
+/// execution state revision, and the status read, which resolves through
+/// the execution's `direct` input record and its result, returns the
+/// outcome the call returned. A queued
+/// submission of the same request run by the runtime completes with the
+/// result its accepted state selected.
 ///
 /// # Panics
 /// Panics when provisioning or a request fails, a direct execution shares an
-/// identity, admits a queue record, or returns an outcome its state did not
-/// select, or the queued result differs from its selected one.
+/// identity, admits a queue record, keeps execution state or reads back
+/// another outcome, or the queued result
+/// differs from its selected one.
 #[tokio::test(flavor = "multi_thread")]
-async fn direct_and_queued_use_bifrost_run_state() {
+async fn only_queued_verification_keeps_run_state() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -2855,27 +2859,39 @@ async fn direct_and_queued_use_bifrost_run_state() {
         results[0].execution_id, results[1].execution_id,
         "fresh direct calls are distinct executions"
     );
+    server.flush_bifrost().await.expect("the direct records drain");
     for result in &results {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        let state = loop {
-            if let Some(state) = fixture
+        assert!(
+            fixture
                 .execution_state(server.state(), result.execution_id)
                 .await
                 .expect("the state reads")
-                && state.terminal.is_some()
-            {
-                break state;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "a direct execution's state persists in background"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        };
+                .is_none(),
+            "a direct execution keeps no execution state"
+        );
+        let id = result.execution_id.to_string();
+        let response = server
+            .oneshot_authenticated(
+                &jwt,
+                axum::http::Request::builder()
+                    .uri(format!("/v1/verification/executions/{id}"))
+                    .body(axum::body::Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("the status responds");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body reads");
+        let status: serde_json::Value = serde_json::from_slice(&body).expect("a status");
         assert_eq!(
-            state.terminal.map(|selected| selected.outcome.compact()),
-            Some(result.outcome.clone()),
-            "the direct result is the outcome its state selected"
+            (&status["status"], &status["result"]["outcome"]),
+            (
+                &json!("completed"),
+                &serde_json::to_value(&result.outcome).expect("the outcome serializes")
+            ),
+            "the status reads the recorded outcome"
         );
     }
     assert!(

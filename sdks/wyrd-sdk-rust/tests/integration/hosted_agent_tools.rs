@@ -548,30 +548,41 @@ impl PublishDesk {
             .expect("bundle loads offline")
     }
 
-    /// Verify `question` with `verifier` now, as the every-tool principal.
+    /// Queue `question` for `verifier` as the every-tool principal and wait
+    /// for its result.
     ///
     /// # Panics
-    /// Panics when the verify is refused.
+    /// Panics when the submission is refused or does not settle.
     async fn verify(&self, verifier: &str, question: &str) -> VerificationResult {
         self.verify_as(&self.state, verifier, question).await
     }
 
-    /// Verify `question` with `verifier` now through `state`.
+    /// Queue `question` for `verifier` through `state` and wait for its
+    /// result. Publishing Agents run only as queued work.
     ///
     /// # Panics
-    /// Panics when the verify is refused.
+    /// Panics when the submission is refused or does not settle.
     async fn verify_as(
         &self,
         state: &WyrdState,
         verifier: &str,
         question: &str,
     ) -> VerificationResult {
-        state
+        let Submission::Queued(queued) = state
             .run()
             .observe()
-            .verify(verifier, json!(question))
+            .submit(verifier, json!(question))
             .await
-            .expect("the verification runs")
+            .expect("the verification is submitted")
+        else {
+            panic!("Run evidence queues an execution");
+        };
+        Execution::connect_with(*queued.id(), &self.deployment.admin())
+            .await
+            .expect("the execution handle connects")
+            .wait(Duration::from_secs(90))
+            .await
+            .expect("the queued execution settles")
     }
 
     /// Every Chat Completions request the upstream received whose messages
@@ -706,17 +717,25 @@ fn selector(attempt: u32, path: Option<&str>) -> PublicationSelector {
 /// private scratch without any declared input; writes to `/inputs`, through
 /// traversal, at `/work` itself, or below a file are refused with their
 /// typed rule and change nothing; the peeker, a later step, sees none of the
-/// scribe's files and writes its own.
+/// scribe's files and writes its own. These ordinary tools run directly,
+/// while a direct verify of the publishing report pipeline is refused as
+/// queued-only before any step calls the model.
 ///
 /// # Panics
-/// Panics when the verification is refused or a write, read, refusal, or
-/// listing differs.
+/// Panics when the verification is refused, a write, read, refusal, or
+/// listing differs, or the publishing pipeline runs directly.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn agent_writes_private_workspace_files() {
     let desk = PublishDesk::start().await;
 
-    let result = desk.verify("scratch-writes", "SCRATCH-RUN").await;
+    let result = desk
+        .state
+        .run()
+        .observe()
+        .verify("scratch-writes", json!("SCRATCH-RUN"))
+        .await
+        .expect("an ordinary tool graph verifies directly");
 
     assert_eq!(
         requirement(&result, "written").outcome,
@@ -785,6 +804,19 @@ async fn agent_writes_private_workspace_files() {
             (json!("fs.write"), true),
         ],
         "every call is recorded under its dotted built-in name"
+    );
+
+    let refused = desk
+        .state
+        .run()
+        .observe()
+        .verify("report-pipeline", json!("DIRECT-PUBLISH"))
+        .await
+        .expect_err("a publishing graph does not verify directly");
+    assert_eq!(refused.code(), "WYRD_VERIFICATION_422_INPUT_UNSUPPORTED");
+    assert!(
+        desk.requests("DIRECT-PUBLISH").await.is_empty(),
+        "the refusal comes before any step calls the model"
     );
     desk.deployment.shutdown().await;
 }

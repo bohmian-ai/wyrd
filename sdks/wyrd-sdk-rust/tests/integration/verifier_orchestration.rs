@@ -22,7 +22,7 @@ use wyrd_ai::cards::Cards;
 use wyrd_ai::cli::{ExecutionArg, ExecutionVerb, PageArgs};
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::{
-    Execution, ExecutionInvocation, ExecutionPageQuery, File, InvocationProgress,
+    Execution, ExecutionInvocation, ExecutionPageQuery, File, Inputs, InvocationProgress,
     PublicationContent, PublicationName, PublicationSelector, PublicationSummary, Speculation,
     Submission, TaskId, VerificationExecutionStatus,
 };
@@ -255,6 +255,13 @@ fn reply(request: &Request, script: &Script) -> ResponseTemplate {
             _ => done(),
         };
     }
+    if prompt.contains("SCORE:") {
+        let index = prompt
+            .split_once("index=")
+            .and_then(|(_, rest)| rest.split_whitespace().next()?.parse::<u64>().ok())
+            .unwrap_or(u64::MAX);
+        return answer(&json!({ "score": index, "text": format!("v{index}") }));
+    }
     if prompt.contains("REFINE:") {
         let index: u64 = prompt
             .split_once("index=")
@@ -467,30 +474,25 @@ impl Desk {
         hydrate(&admin, &admin).await
     }
 
-    /// Verify `question` with `verifier` now.
+    /// Queue `question` for `verifier` and wait for its result. The desk's
+    /// Agents publish, which only queued execution accepts.
     ///
     /// # Panics
-    /// Panics when the verify is refused.
+    /// Panics when the submission is refused or does not settle.
     async fn verify(&self, verifier: &str, question: &str) -> VerificationResult {
-        self.state
-            .run()
-            .observe()
-            .verify(verifier, json!(question))
+        self.settled(self.submit(verifier, json!(question)).await)
             .await
-            .expect("the verification runs")
     }
 
-    /// Verify the fixture document at `relative` with `verifier` now.
+    /// Queue the fixture document at `relative` for `verifier` and wait for
+    /// its result.
     ///
     /// # Panics
-    /// Panics when the upload or the verify is refused.
+    /// Panics when the upload or the submission is refused or the execution
+    /// does not settle.
     async fn verify_document(&self, verifier: &str, relative: &str) -> VerificationResult {
-        self.state
-            .run()
-            .observe()
-            .verify(verifier, File::path(fixture(relative)))
+        self.settled(self.submit(verifier, File::path(fixture(relative))).await)
             .await
-            .expect("the document is uploaded and verified")
     }
 
     /// The messages of every request whose messages carry `marker`, in
@@ -526,7 +528,7 @@ impl Desk {
     ///
     /// # Panics
     /// Panics when the submission is refused or runs at once.
-    async fn submit(&self, verifier: &str, input: Value) -> ExecutionId {
+    async fn submit(&self, verifier: &str, input: impl Into<Inputs>) -> ExecutionId {
         let Submission::Queued(queued) = self
             .state
             .run()
@@ -805,7 +807,9 @@ struct Case {
 /// status. The quoter, requiring the security account by name, runs only
 /// when that account was produced: a security review that succeeds without
 /// publishing it fails the quoter before its model is called. With no specialist selected and only the
-/// specialist judged, the verdict is inconclusive. The CLI and the HTTP
+/// specialist judged, the verdict is inconclusive, and a direct verify of
+/// that graph is refused as queued-only before its tool-free planner runs.
+/// The CLI and the HTTP
 /// routes report the same branch statuses and publications as the SDK. A
 /// held execution cancelled through the SDK makes its wait raise
 /// `WYRD_SDK_409_VERIFICATION_CANCELLED` with its identity, while its status
@@ -990,6 +994,18 @@ async fn conditions_and_collections_preserve_missing_evidence() {
             RequirementOutcome::NotApplicable,
             wyrd_ai::VerificationVerdict::Inconclusive
         )
+    );
+    let refused = desk
+        .state
+        .run()
+        .observe()
+        .verify("specialists-only", json!("DIRECT-PLAN"))
+        .await
+        .expect_err("a graph with a publishing step does not verify directly");
+    assert_eq!(refused.code(), "WYRD_VERIFICATION_422_INPUT_UNSUPPORTED");
+    assert!(
+        desk.requests("DIRECT-PLAN").await.is_empty(),
+        "the refusal comes before the planner, which publishes nothing, runs"
     );
 
     Mock::given(method("POST"))
@@ -2085,10 +2101,13 @@ async fn hold_reserved_share(
 
 /// Refinement runs from memory while background persistence is held.
 ///
-/// A direct verify, admitted with its own reserved slots, stalls inside
-/// iteration 0's first model call; the server's remaining reserved Scribe
-/// share is then held and the model released. Every dependent iteration
-/// runs and the caller receives its selected report.
+/// A direct verify of a refinement that publishes nothing, admitted with
+/// its own reserved slots, stalls inside iteration 0's model call; the
+/// server's remaining reserved Scribe share is then held and the model
+/// released. Every dependent iteration runs and the caller receives its
+/// selected report. The direct execution keeps no execution state and no
+/// queue record; once its records drain, its status and details read
+/// back from them.
 ///
 /// A queued execution is then submitted while all but the one slot its
 /// admission stages through is held; once it stalls in its first model call
@@ -2127,29 +2146,80 @@ async fn refinement_progresses_while_persistence_is_held() {
             state
                 .run()
                 .observe()
-                .verify("refine-report", json!(DIRECT))
+                .verify("refine-direct", json!(DIRECT))
                 .await
         })
     };
-    desk.stalled_in("REFINE:", DIRECT).await;
+    desk.stalled_in("SCORE:", DIRECT).await;
     let (share, _) = hold_reserved_share(&desk, 0, 2).await;
     held.release(&[DIRECT]);
     let direct = direct
         .await
         .expect("the direct verify joins")
         .expect("the direct verify completes while persistence is held");
-    let draft = step(&desk.deployment, &direct, "draft").await;
     assert_eq!(
-        (draft.status, draft.output.clone()),
-        final_report,
+        requirement(&direct, "final").outcome,
+        RequirementOutcome::Passed,
         "{direct:?}"
     );
     assert_eq!(
-        iterations(&desk.asked("REFINE:", DIRECT).await),
-        [0, 0, 1, 1, 2, 2],
+        iterations(&desk.asked("SCORE:", DIRECT).await),
+        [0, 1, 2],
         "every direct iteration ran while persistence was held"
     );
     drop(share);
+    desk.deployment
+        .server()
+        .flush_bifrost()
+        .await
+        .expect("the direct records drain");
+    let fixture = desk.fixture().await;
+    assert!(
+        fixture
+            .execution_state(desk.deployment.server().state(), direct.execution_id)
+            .await
+            .expect("the state reads")
+            .is_none(),
+        "a direct execution keeps no execution state"
+    );
+    assert!(
+        fixture.executions().await.expect("executions read").is_empty(),
+        "a direct execution admits no queue record"
+    );
+    let execution = Execution::connect_with(direct.execution_id, &desk.deployment.admin())
+        .await
+        .expect("the execution handle connects");
+    let status = execution.status().await.expect("the direct status reads");
+    let recorded = status.result.expect("the direct status carries its result");
+    assert_eq!(
+        (
+            status.status,
+            &recorded.verifier,
+            &recorded.subject,
+            recorded.outcome.verdict
+        ),
+        (
+            VerificationExecutionStatus::Completed,
+            &direct.verifier,
+            &direct.subject,
+            direct.outcome.verdict
+        ),
+        "the direct status reads its recorded result"
+    );
+    let draft = step(&desk.deployment, &direct, "draft").await;
+    assert_eq!(
+        ((draft.status, draft.output.clone()), draft.attempts),
+        (final_report.clone(), 1),
+        "the direct details read the recorded step: {direct:?}"
+    );
+    assert_eq!(
+        execution
+            .invocations(&ExecutionPageQuery::default())
+            .await
+            .expect_err("a direct execution has no invocation history")
+            .code(),
+        "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND"
+    );
 
     held.hold(&[QUEUED]);
     let (admitting, already) = hold_reserved_share(&desk, 0, 1).await;

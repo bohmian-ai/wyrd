@@ -7962,6 +7962,16 @@ export interface VerifierSpec {
    */
   readonly order_by?: OrderBy | null;
   /**
+   * Whether this Verifier runs only as queued work, so a direct `verify`
+   * is refused before any step.
+   *
+   * Server-derived: registration replaces whatever the author sent with
+   * the value the Verifier's steps and their Agents imply, before the
+   * spec is hashed and stored. Omitted when `false`, so a Verifier that
+   * can run directly stores and hashes as if the field did not exist.
+   */
+  readonly queue_only?: boolean;
+  /**
    * Whole-Verifier requirements, judged after every step finishes.
    */
   readonly requirements?: readonly Requirement[];

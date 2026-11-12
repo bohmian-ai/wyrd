@@ -1085,6 +1085,25 @@ ID, and the request's root Card cannot say which card a correlated record
 belongs to — the subject Card must be carried on that row. Generic telemetry
 may omit a subject Card.
 
+Run-scoped caller-table writes use `run.bifrost.write(row)` for the state's
+shared active table, or `write_to(table, row)` (`writeTo` in TypeScript) for a
+named `bifrost.datasets.<name>` destination without changing that binding.
+Rust uses its normal method accessor. With no chosen startup table, a root
+Service's sole declared table becomes active; no or multiple declarations
+infer none. Describing the inferred table is a startup precondition: failure
+prevents that state's entire Bifrost writer from starting, including fixed-table
+observations, while ordinary verification and the server remain available.
+The existing failed-start retry and closed-state rules apply. Missing active
+selection returns `WYRD_VALA_412_NO_ACTIVE_TABLE`; scoped writes outside
+`bifrost.datasets` return `WYRD_SDK_400_INVALID_OBSERVATION`.
+The state projects Bifrost's existing table-switch operation. Every Run shares
+the binding; callers needing distinct concurrent destinations use named writes.
+Each admitted row retains its destination, exact subject Card UID and Run ID.
+Switching retains prior table producers in the same shutdown drain. Write
+return means buffered submission, not durable admission or complete row-schema
+validation; successful state shutdown is the existing drain barrier. Fixed
+system destinations, direct Bifrost operations and authorization are unchanged.
+
 Python `Run` values are synchronous context managers for optional ambient span
 correlation. Entering a scope best-effort attaches the selected Card UID and
 run ID to Python OpenTelemetry context, annotates an active recording span,

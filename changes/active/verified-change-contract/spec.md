@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 71
+revision: 72
 status: approved
 ---
 
@@ -281,8 +281,12 @@ changes. They are not variants of this change's public `VerifierSpec`.
 The agreed Rust, Python, and TypeScript user interfaces and examples are
 locked in [run_api.md](architecture/logic/run_api.md). This section fixes
 their shared behavior without creating another Run registry or ingest path.
-The three exact `observe.eval`, `observe.drift`, and `observe.record` insertion
-flows are listed in its "Input and queue boundary" section.
+The three original insertion flows are listed in its "Input and queue
+boundary" section. For caller-table writes, approved SDK-authoring revisions
+6–8 supersede the old `observe.record(table, value)` spelling in that reference
+and REQ-123: use `run.bifrost.write(row)` for the shared active table or
+`write_to(table, row)` (`writeTo` in TypeScript) for an explicit destination,
+with language-idiomatic access. This adds no scoped query or Run registry.
 
 - **REQ-123**: All three SDKs MUST expose the run API shown in `run_api.md`:
   Python `state.start_bifrost(...)`, `state.run(card=None)`,
@@ -429,9 +433,16 @@ flows are listed in its "Input and queue boundary" section.
   enqueue calls in Rust, Python, and TypeScript. The constructor's optional
   active `table` argument retains its existing Bifrost meaning and, per
   `sdk-authoring-ergonomics` REQ-016, is the destination of a run's default
-  write; it MUST NOT change either fixed system table. Repeated
+  write; it MUST NOT change either fixed system table. Without a chosen
+  table, the root Service's sole declared table MUST become active; no or
+  multiple declarations infer none. Describing an inferred table is a startup
+  precondition: a missing, unauthorized or unavailable table MUST fail that
+  state's Bifrost startup, including fixed-table observations, under the
+  existing startup retry/closed-state rules. Ordinary verification and the
+  shared server remain available. Repeated
   `use_table_by_name` calls are not a schema cache: they describe remotely and
-  mutate the shared active table, so the run observation path MUST NOT use them.
+  mutate the shared active table, so fixed-system observation emission MUST
+  NOT use them.
   The existing WriterPool already reuses its producer for each table; no
   second queue, transport, or per-table producer cache is created. Shared
   `wyrd-client` and `wyrd-queue` MUST remain Verifier-kind agnostic. Explicit
@@ -446,11 +457,15 @@ flows are listed in its "Input and queue boundary" section.
   NOT create a replacement writer that could strand pending rows. After a
   successful shutdown, that state is closed to Bifrost writes and cannot be
   restarted; a new `WyrdState` is required for a new writer lifetime.
-- **REQ-128**: `observe.record(table, value)` MUST require the destination
-  table name on the call, not on `state.run()`, and infer no table from the
-  CardRef or run ID. (Amended by `sdk-authoring-ergonomics` REQ-016: the
-  destination is the call's table or the state's active table, never one
-  inferred from the CardRef or run ID.) It MUST accept a language-native serializable row and
+- **REQ-128**: `run.bifrost.write(value)` MUST use the state's active table;
+  `write_to(table, value)` (`writeTo` in TypeScript) MUST name a destination per
+  call without changing that binding. No table is selected on `state.run()`
+  or inferred from its CardRef/run ID. The active binding is shared by every
+  run of the state; concurrent callers needing distinct destinations use
+  explicit per-call writes. A default write with no active table MUST return
+  `WYRD_VALA_412_NO_ACTIVE_TABLE`; either write form MUST refuse destinations
+  outside `bifrost.datasets` with `WYRD_SDK_400_INVALID_OBSERVATION`.
+  Each write MUST accept a language-native serializable row and
   supply the scoped CardRef/run ID correlation without requiring a caller
   schema, `TableConfig`, or Bifrost handle. The row and destination schema
   MUST be representable by the existing JSON-to-Arrow queue, including the
@@ -461,14 +476,17 @@ flows are listed in its "Input and queue boundary" section.
   schema before enqueue; later writes reuse that schema and the existing
   pooled producer. Concurrent first uses of the same table MUST converge on
   one schema/producer. Unknown, unauthorized, or unavailable tables MUST fail
-  before queue admission. Python's synchronous `record` MAY block on first
-  describe; TypeScript and Rust `record` MUST be async for that first IO.
-  Inserts MUST route by explicit table and cached schema without mutating
-  Bifrost's shared active table. One schema per table name MUST remain
+  before queue admission. Python's synchronous `write_to` MAY block on first
+  describe; TypeScript and Rust explicit writes MUST be async for that first IO.
+  Default writes reuse the already described active destination. Each insert
+  MUST retain its selected table and schema without mutating the active binding.
+  Explicit state-level switching uses the existing Bifrost binding operation
+  and MUST keep switched-away producers in the same shutdown drain. One schema
+  per table name MUST remain
   authoritative for the writer's lifetime; a conflicting schema MUST NOT
   silently replace an existing producer's schema. A server-side schema
   change requires a new writer after shutdown or receives a schema-fingerprint
-  refusal. Generic `record` MUST obey ordinary user-table permissions and
+  refusal. Both write forms MUST obey ordinary user-table permissions and
   MUST NOT write reserved/system-managed tables or select a Verifier binding.
   All table producers share one Bifrost transport and bounded client budget;
   no per-Card, per-Agent, per-run, or per-table Bifrost client is created.
@@ -2557,7 +2575,8 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
 - **AC-025**: Rust, Python, and TypeScript SDK journeys MUST start Bifrost
   through their specified pass-through options, fail startup when either
   fixed system table cannot be described, and emit Drift and Eval without
-  per-observation schema IO. Each MUST write `observe.record` to two distinct
+  per-observation schema IO. Each MUST use explicit
+  `run.bifrost.write_to` (`writeTo` in TypeScript) to write to two distinct
   already registered user tables from one state and run, including a scoped
   Card view, without changing an active table or supplying schemas. Evidence
   MUST show one first-use describe per dynamic table, cached reuse, concurrent
@@ -2947,6 +2966,11 @@ published image pinned by an immutable registry digest before release.
 
 ## Open material decisions
 
+Revision 72:
+
+- None added. The maintainer explicitly approved the Table/active-table
+  amendment on 2026-11-11; SDK-authoring revision 8 owns its complete contract.
+
 Revision 71:
 
 - None. The user approved on 2026-10-26 extending `flush_bifrost` with
@@ -3021,6 +3045,15 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
 - [PagerDuty Global Integrations and Service Routes](https://support.pagerduty.com/main/docs/event-orchestration)
 
 ## Revision history
+
+- **Revision 72 SDK-authoring active-table alignment (2026-11-11, approved by
+  the user):** The maintainer instructed “approve the spec revision and write
+  the remediation task” after the public Table, optional Pydantic extra,
+  row-only default write, explicit per-call write, shared switching and
+  inferred-table startup failure were explained. REQ-127/128 and the connected
+  Run spelling/AC-025 now align with approved SDK-authoring revision 8.
+  Fixed-system destinations, authorization, tenant/Card/Run attribution,
+  one writer lifecycle, admission, retries and draining are preserved.
 
 - **Revision 71 Hot-state flush targets (2026-10-26, approved by the user):**
   - **Trigger.** The configured-context journey must prove each context

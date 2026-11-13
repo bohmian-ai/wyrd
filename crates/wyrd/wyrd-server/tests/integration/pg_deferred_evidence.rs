@@ -810,36 +810,34 @@ async fn artifact_evidence_is_admitted_before_it_is_accepted() {
         json!({"kind": "artifact", "artifact": card, "path": path})
     };
 
-    for (value, status, reason) in [
+    let invalid = "WYRD_VERIFICATION_400_INPUT_INVALID";
+    for (value, status, code) in [
         (
             artifact("1.0.0", "report.pdf"),
             StatusCode::BAD_REQUEST,
-            "format",
+            invalid,
         ),
         (
             artifact("1.0.0", "missing.csv"),
             StatusCode::BAD_REQUEST,
-            "no such file",
+            invalid,
         ),
         (
             artifact("9.9.9", "report.csv"),
             StatusCode::BAD_REQUEST,
-            "reports",
+            invalid,
         ),
         (
             artifact("1.0.0", "big.csv"),
             StatusCode::PAYLOAD_TOO_LARGE,
-            "64-byte",
+            "WYRD_VERIFICATION_413_INPUT_TOO_LARGE",
         ),
     ] {
         let (answer, refused) = deployment
             .publish(&publication(SLUG, C0, "report", value.clone()))
             .await;
         assert_eq!(answer, status, "{value}: {refused}");
-        assert!(
-            refused.to_string().contains(reason),
-            "{value} names {reason}: {refused}"
-        );
+        assert_eq!(refused["code"], code, "{value}: {refused}");
     }
     let (status, receipt) = deployment
         .publish(&publication(

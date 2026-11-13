@@ -3430,7 +3430,11 @@ async fn speculative_steps_withhold_content_until_admitted() {
     assert_eq!(disposition("late"), Some(Speculation::Admitted));
     assert_eq!(disposition("dropped"), Some(Speculation::Discarded));
     assert_eq!(disposition("blocked"), Some(Speculation::Blocked));
-    assert_eq!(disposition("early"), None);
+    assert_eq!(
+        disposition("early"),
+        Some(Speculation::Discarded),
+        "a guard known at dispatch is recorded too"
+    );
 
     let recovered = script();
     let controls_only = ExecutionState {
@@ -3515,6 +3519,112 @@ async fn speculative_steps_withhold_content_until_admitted() {
             undecided.calls()
         );
     }
+}
+
+/// A speculative step whose guard is already decided when it is dispatched
+/// records that decision before its contribution is visible: admitted,
+/// discarded, and blocked alike, including one withheld without a call. A
+/// rerun from the recorded decisions reproduces each without recording it
+/// again or calling a withheld action.
+///
+/// # Panics
+/// Panics when a known decision is not recorded, is recorded again on
+/// recovery, or recovery changes an admission.
+#[tokio::test(start_paused = true)]
+async fn speculative_guards_known_at_dispatch_are_recorded() {
+    let guard = |path: &str, expected: Value| json!({"path": path, "operator": "equals", "expected": expected});
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "steps": [
+            {"id": "compare", "action": code_action(json!({"x": "inputs.answer"}))},
+            {"id": "admitted", "speculative": true, "depends_on": ["compare"],
+             "when": guard("steps.compare.output.x", json!(1)),
+             "action": code_action(json!({"y": "inputs.answer"}))},
+            {"id": "discarded", "speculative": true, "depends_on": ["compare"],
+             "when": guard("steps.compare.output.x", json!(2)),
+             "action": code_action(json!({"y": "inputs.answer"}))},
+            {"id": "blocked", "speculative": true, "depends_on": ["compare"],
+             "when": guard("steps.compare.output.missing", json!(1)),
+             "action": code_action(json!({"y": "inputs.answer"}))},
+            {"id": "consumer", "action": code_action(json!({"e": "steps.admitted.output"}))}
+        ]
+    }));
+    let script = || {
+        Arc::new(Script {
+            actions: HashMap::from([
+                ("compare", echo(&[1])),
+                ("admitted", echo(&[1])),
+                ("consumer", echo(&[])),
+            ]),
+            ..Script::default()
+        })
+    };
+    let dispositions = |ledger: &Ledger| -> Vec<(String, Speculation)> {
+        ledger
+            .recorded()
+            .controls
+            .iter()
+            .filter_map(|control| match control {
+                ControlRecord::Disposition {
+                    step, speculation, ..
+                } => Some((step.as_str().to_owned(), *speculation)),
+                _ => None,
+            })
+            .collect()
+    };
+    let first = script();
+    let ledger = Arc::new(Ledger::default());
+    let outcome = run(
+        &engine(&first, InMemoryTraceSource::new(), 8).with_checkpoints(
+            Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+            &ExecutionState::default(),
+        ),
+        &spec,
+        json!({"answer": 1}),
+    )
+    .await
+    .expect("outcome");
+    let mut recorded = dispositions(&ledger);
+    recorded.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        recorded,
+        vec![
+            ("admitted".to_owned(), Speculation::Admitted),
+            ("blocked".to_owned(), Speculation::Blocked),
+            ("discarded".to_owned(), Speculation::Discarded),
+        ]
+    );
+    assert_eq!(
+        step(&outcome, "consumer").output,
+        Some(json!({"e": {"y": 1}}))
+    );
+    for (id, status) in [
+        ("discarded", StepStatus::Skipped),
+        ("blocked", StepStatus::Failed),
+    ] {
+        let withheld = step(&outcome, id);
+        assert_eq!((withheld.status, withheld.attempts), (status, 0), "{id}");
+        assert!(!first.calls().contains(&format!("action:{id}")), "{id}");
+    }
+
+    let recovered = script();
+    let rerun = Arc::new(Ledger::default());
+    let outcome = run(
+        &engine(&recovered, InMemoryTraceSource::new(), 8).with_checkpoints(
+            Arc::clone(&rerun) as Arc<dyn Checkpoints>,
+            &ledger.recorded(),
+        ),
+        &spec,
+        json!({"answer": 1}),
+    )
+    .await
+    .expect("recovered outcome");
+    assert_eq!(step(&outcome, "admitted").status, StepStatus::Succeeded);
+    assert!(
+        dispositions(&rerun).is_empty(),
+        "a restored decision is not recorded again: {:?}",
+        dispositions(&rerun)
+    );
 }
 
 /// A step graph whose only cycle runs through a speculative guard and a

@@ -961,6 +961,7 @@ impl VerificationEngine {
                     }
                     let node = pending.remove(at);
                     released = true;
+                    self.dispatching(spec, evidence, &ledger, node, &mut disposed);
                     match self.prepare(spec, evidence, &ledger, node, deadline)? {
                         Prepared::Settled(done) => ledger.insert(node.id(spec).clone(), done),
                         Prepared::Run(task) => tasks.push(node, task),
@@ -975,6 +976,7 @@ impl VerificationEngine {
                     return Ok(ledger);
                 }
                 let node = pending.remove(0);
+                self.dispatching(spec, evidence, &ledger, node, &mut disposed);
                 match self.prepare(spec, evidence, &ledger, node, deadline)? {
                     Prepared::Settled(done) => ledger.insert(node.id(spec).clone(), done),
                     Prepared::Run(task) => tasks.push(node, task),
@@ -984,6 +986,40 @@ impl VerificationEngine {
             let (node, done) = tasks.next(EngineError::Join).await;
             ledger.insert(node.id(spec).clone(), settled(done, &mut tasks).await?);
         }
+    }
+
+    /// Mark speculative step `node` disposed in `disposed` when its
+    /// disposition is already known as it is dispatched: [`Self::step`] then
+    /// decides and records it, so `drive` must neither decide it again nor
+    /// cancel the task that records it.
+    fn dispatching(
+        &self,
+        spec: &VerifierSpec,
+        evidence: &Arc<BTreeMap<SlotName, InputDeclaration>>,
+        ledger: &Ledger,
+        node: Node,
+        disposed: &mut BTreeSet<usize>,
+    ) {
+        if let Node::Step(index) = node
+            && spec.steps[index].speculative
+            && self
+                .known_disposition(&Scope::new(evidence, ledger), ledger, &spec.steps[index])
+                .is_some()
+        {
+            disposed.insert(index);
+        }
+    }
+
+    /// The disposition of speculative `step` known now: the one an earlier
+    /// run recorded, else its guard's once every guard step is complete.
+    fn known_disposition(
+        &self,
+        scope: &Scope<'_>,
+        ledger: &Ledger,
+        step: &Step,
+    ) -> Option<(Speculation, String)> {
+        self.disposition(&step.id)
+            .or_else(|| guard(scope, ledger, step))
     }
 
     /// Prepare one ready `node` against the blocks already in `ledger`.
@@ -1055,7 +1091,9 @@ impl VerificationEngine {
     /// or unevaluable one skipping it with that cause; a speculative `when`
     /// whose guard steps are complete, or whose recorded disposition exists,
     /// decides the disposition, and withholds the step without a call unless
-    /// it admits. Then `foreach.items` is frozen: the recorded items, else the
+    /// it admits. A disposition decided here rather than restored is recorded
+    /// through [`Self::control`] before the step's contribution is visible,
+    /// on every path, so recovery reproduces it. Then `foreach.items` is frozen: the recorded items, else the
     /// resolved array, refused without a call when it is not an array or
     /// exceeds `max_items`. Every member's first bindings must resolve, or the
     /// step is skipped with the strongest gap. Otherwise every member runs.
@@ -1076,6 +1114,37 @@ impl VerificationEngine {
     ) -> Result<Prepared<Arc<Done>, EngineError>, EngineError> {
         let step = &spec.steps[index];
         let scope = Scope::new(evidence, ledger);
+        let known = step
+            .speculative
+            .then(|| self.known_disposition(&scope, ledger, step))
+            .flatten();
+        // A disposition decided now, not restored, is recorded before the
+        // step's contribution is exposed; without checkpoints nothing records.
+        let record = match &known {
+            Some((speculation, reason))
+                if self.checkpoints.is_some() && self.disposition(&step.id).is_none() =>
+            {
+                Some(ControlRecord::Disposition {
+                    step: step.id.clone(),
+                    speculation: *speculation,
+                    reason: reason.clone(),
+                })
+            }
+            _ => None,
+        };
+        let expose = |done: StepDone| {
+            let done = Arc::new(Done::Step(Box::new(done)));
+            match record.clone() {
+                None => Ok(Prepared::Settled(done)),
+                Some(control) => {
+                    let engine = self.clone();
+                    Ok(Prepared::Run(Box::pin(async move {
+                        engine.control(&control).await?;
+                        Ok(done)
+                    })))
+                }
+            }
+        };
         let settle = |status: StepStatus, gap: Missing, speculation: Speculation| {
             let mut done = unrun(step, gap, speculation);
             done.result.status = status;
@@ -1086,7 +1155,7 @@ impl VerificationEngine {
                 *settled = status;
             }
             done.requirements = missing_requirements(spec, &scope, &self.attached, index, &done);
-            Ok(Prepared::Settled(Arc::new(Done::Step(Box::new(done)))))
+            expose(done)
         };
         if let DependsOn::AnySucceeded { any_succeeded } = &step.depends_on
             && !any_succeeded
@@ -1105,10 +1174,7 @@ impl VerificationEngine {
         let mut speculation = Speculation::None;
         if let Some(when) = &step.when {
             if step.speculative {
-                match self
-                    .disposition(&step.id)
-                    .or_else(|| guard(&scope, ledger, step))
-                {
+                match known {
                     None => speculation = Speculation::Pending,
                     Some((Speculation::Admitted, _)) => speculation = Speculation::Admitted,
                     Some((decided, reason)) => {
@@ -1126,7 +1192,7 @@ impl VerificationEngine {
                         }
                         done.requirements =
                             missing_requirements(spec, &scope, &self.attached, index, &done);
-                        return Ok(Prepared::Settled(Arc::new(Done::Step(Box::new(done)))));
+                        return expose(done);
                     }
                 }
             } else {
@@ -1222,8 +1288,8 @@ impl VerificationEngine {
         let evidence = Arc::clone(evidence);
         let ledger = Arc::new(ledger.clone());
         Ok(Prepared::Run(Box::pin(async move {
-            if let Some(freeze) = &freeze {
-                engine.control(freeze).await?;
+            for control in record.iter().chain(&freeze) {
+                engine.control(control).await?;
             }
             let started = Instant::now();
             let fanout = spec.steps[index].foreach.is_some();

@@ -2049,7 +2049,7 @@ export class Action {
    * @param from - The media slot reference.
    * @returns The action.
    */
-  static extract(from: Wire.ActionExtract["from"]): Action {
+  static extract(from: string): Action {
     return adopt(Action.prototype, NativeAuthored.actionExtract(from));
   }
 

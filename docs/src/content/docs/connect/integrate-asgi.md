@@ -16,7 +16,7 @@ Add `WyrdMiddleware` to any ASGI app, such as FastAPI, Starlette, Django, or Lit
 ## Before you start
 
 - The server from [Set up Wyrd](/get-started/setup/), running.
-- The `support-reply` Service from [Run your first verification](/get-started/quickstart/), declared.
+- The `support-reply` Service from the [setup check](/get-started/setup/#3-check-it-end-to-end), declared.
 
 ## Install
 

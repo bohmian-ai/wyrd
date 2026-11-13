@@ -26,6 +26,7 @@ const { load: landingData } = await import('./+page.server');
 const { default: Layout } = await import('./+layout.svelte');
 const { default: ErrorPage } = await import('./+error.svelte');
 const { allSlugs } = await import('$lib/content');
+const { default: FinanceFlow } = await import('$lib/components/FinanceFlow.svelte');
 
 const routes = new Set(['/', ...allSlugs().map((slug) => `/${slug}/`)]);
 const publicFile = (path: string) =>
@@ -65,6 +66,43 @@ describe('landing and shell actions reach real destinations', () => {
 
   it('always offers a way home from the error page', () => {
     expect(internalLinks(ErrorPage)).toContain('/');
+  });
+});
+
+// The landing's server HTML carries the finance figure's whole meaning: the
+// finance API's tested source, the three requirements, the API's decision, and
+// the asynchronous capture, resting on the finished state until motion starts.
+describe('landing finance figure', () => {
+  const api = readFileSync(new URL('../../../examples/finance-release/api.py', import.meta.url), 'utf8');
+  const text = (html: string) => html.replace(/<[^>]+>/g, '').replace(/&quot;/g, '"').replace(/&gt;/g, '>');
+
+  it('homepage shows embedded finance verification', () => {
+    const { body } = render(Landing, { props: { data: landingData() } });
+    expect(body).toContain('The only real-time verification system built for your applications.');
+    expect(body).toMatch(/You built the system\. How do you know it(&#39;|')s behaving correctly\?/);
+    expect(body.indexOf('id="flow-h"')).toBeLessThan(body.indexOf('id="layers-h"'));
+    expect(body.indexOf('id="workflows-h"')).toBeGreaterThan(body.indexOf('id="platform-h"'));
+    // Every displayed code line is a line of the journey-tested API, numbered 1 to 12.
+    const lines = [...body.matchAll(/<text x="44" y="\d+"[^>]*>([\s\S]*?)<\/text>/g)].map(([, line]) => text(line));
+    expect(lines).toHaveLength(12);
+    expect(lines[0]).toBe('from wyrd import WyrdState');
+    expect(lines.slice(5, 7)).toEqual(['@api.post("/reports/send")', 'def send_report(release: Release) -> dict[str, str]:']);
+    for (const line of lines.filter(Boolean)) expect(api).toContain(line);
+    for (const name of ['Recipient authorized', 'Sharing policy · PDF', 'Destination restricted', 'GATEWAY', 'BIFROST'])
+      expect(body).toContain(name);
+    expect(body).toMatch(/flow asynchronously to Bifrost\. The handler's response does not wait/);
+    expect(body).toContain('→ Release');
+    expect(body).toMatch(/<button[^>]*>Play<\/button>/);
+    for (const story of ['Real-time verification', 'Agent evaluation', 'Code review', 'Session evaluation'])
+      expect(body).toMatch(new RegExp(`<h3[^>]*>${story}</h3>`));
+  });
+
+  it('holds the report when the policy check fails', () => {
+    const { body } = render(FinanceFlow, { props: { code: landingData().flow, failing: true } });
+    expect(body).toContain('‖ Hold');
+    expect(body).not.toContain('→ Release');
+    expect(body).toContain('✕ FAILED');
+    expect(body).toContain('the handler holds the report');
   });
 });
 

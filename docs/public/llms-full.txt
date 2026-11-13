@@ -2446,7 +2446,7 @@ Page: /wyrd/build-and-verify/verify/verifier-recipes/
 
 > Copyable Verifiers for common checks, each with its YAML and the Python that calls it - assertions, traces, Python checks, model judges, multi-step, uploaded files, grouped sessions, and drift.
 
-Pick the check you need, bind its Verifier under `verified_by` to what it checks (a Service, one of its Agents, Models, or Data, or a standalone Agent), and call it from your code. Each recipe's Python declares `support-reply.yaml`, a Service that binds the recipe's Verifier, as in [Run your first verification](/wyrd/get-started/quickstart/).
+Pick the check you need, bind its Verifier under `verified_by` to what it checks (a Service, one of its Agents, Models, or Data, or a standalone Agent), and call it from your code. Each recipe's Python declares `support-reply.yaml`, a Service that binds the recipe's Verifier, as in the [setup check](/wyrd/get-started/setup/#3-check-it-end-to-end).
 
 | To check | Use | Kind |
 | --- | --- | --- |
@@ -3155,7 +3155,7 @@ Add `WyrdMiddleware` to any ASGI app, such as FastAPI, Starlette, Django, or Lit
 ## Before you start
 
 - The server from [Set up Wyrd](/wyrd/get-started/setup/), running.
-- The `support-reply` Service from [Run your first verification](/wyrd/get-started/quickstart/), declared.
+- The `support-reply` Service from the [setup check](/wyrd/get-started/setup/#3-check-it-end-to-end), declared.
 
 ## Install
 
@@ -3178,7 +3178,7 @@ Each app loads the pulled Service, adds the middleware, and reads the request's 
 ```python title="app.py"
 """A FastAPI app that verifies each support answer it receives under its own Run.
 
-It serves the Quickstart's ``support-reply`` Service, pulled once at deploy time:
+It serves the setup check's ``support-reply`` Service, pulled once at deploy time:
 
     wyrd pull --kind Service --name support-reply --version 1.0.0 \
       --output-dir .wyrd-bundle
@@ -4103,7 +4103,7 @@ A Verifier checks declared requirements against evidence and returns a verdict: 
 
 ## The parts of a Verifier
 
-This is the Verifier from [Run your first verification](/wyrd/get-started/quickstart/):
+This is the Verifier from the [setup check](/wyrd/get-started/setup/#3-check-it-end-to-end):
 
 ```yaml title="no-refund-promise.yaml"
 # The Verifier: a support answer never promises a guaranteed refund.
@@ -4308,7 +4308,7 @@ A Card is a versioned declaration of one AI system component, or of one Verifier
 
 ## The shape of a Card
 
-These are the two Cards from [Run your first verification](/wyrd/get-started/quickstart/):
+These are the two Cards from the [setup check](/wyrd/get-started/setup/#3-check-it-end-to-end):
 
 **support-reply.yaml**
 

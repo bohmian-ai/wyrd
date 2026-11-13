@@ -1,54 +1,34 @@
-import { highlight } from '$lib/mdsvex/highlight.js';
+import { highlight, sliceRegion, tokenLines } from '$lib/mdsvex/highlight.js';
 
-// The landing page's Declare → Observe → Verify example is the Quickstart:
-// its Cards and programs come from examples/setup-check, which the SDK journeys
-// run. Vite inlines them at build time, so the built server reads no files.
-const sources: Record<string, string> = import.meta.glob('../../../examples/setup-check/*', {
+// The landing page shows the Quickstart's finance release example, which the
+// SDK journeys run: its programs and API come from examples/finance-release.
+// Vite inlines them at build time, so the built server reads no files.
+const sources: Record<string, string> = import.meta.glob('../../../examples/finance-release/*.{py,rs,ts}', {
   query: '?raw',
   import: 'default',
   eager: true
 });
 
-const quickstart = (file: string) => sources[`../../../examples/setup-check/${file}`];
+const finance = (file: string) => sources[`../../../examples/finance-release/${file}`];
+const region = (file: string, name: string) => sliceRegion(finance(file), name, `examples/finance-release/${file}`);
 
-// The `VerificationResult` that `verify` returns for the Quickstart's failing
-// answer. The wire shape is in crates/wyrd-spec/src/verification/execution.rs;
-// the reason and actual value are what the journeys assert. IDs are illustrative.
-const RESULT = JSON.stringify(
-  {
-    execution_id: '019a3c2e-7b41-7d2a-9c1e-4f6b8a2d0e13',
-    run_id: '019a3c2e-7a90-7f11-8b3d-2e5c9d1a6f47',
-    verifier: { kind: 'Verifier', name: 'no-refund-promise', version: '1.0.0', space: 'default', uid: '019a3c2e-6f12-7c4d-8e31-5a9b0c7d2e64' },
-    subject: { kind: 'Service', name: 'support-reply', version: '1.0.0', space: 'default', uid: '019a3c2e-6f0a-7b22-9d4e-1c8f3a5b6d70' },
-    outcome: {
-      verdict: 'failed',
-      requirements: [
-        {
-          id: 'no-refund-promise',
-          statement: 'The answer never promises a guaranteed refund',
-          outcome: 'failed',
-          reason: 'operator NotContains returned false',
-          actual: 'You have a guaranteed refund.'
-        }
-      ]
-    }
-  },
-  null,
-  2
-);
+// What the Quickstart program prints, as the journeys assert it.
+const OUTPUT = `quarterly-report: passed (release-check@0.1.0) -> released
+report-with-bank-account: failed (release-check@0.1.0) -> held for review
+  follows-policy failed: the report names a bank account identifier`;
 
 export function load() {
   const programs = [
-    { lang: 'python', file: 'check.py', title: 'check.py' },
-    { lang: 'rust', file: 'check.rs', title: 'src/main.rs' },
-    { lang: 'typescript', file: 'check.ts', title: 'check.ts' }
+    { lang: 'python', file: 'finance_release.py', title: 'finance_release.py' },
+    { lang: 'rust', file: 'finance_release.rs', title: 'src/main.rs' },
+    { lang: 'typescript', file: 'finance_release.ts', title: 'finance_release.ts' }
   ] as const;
+  // The finance API's import and handler, with the blank line Python puts between them.
+  const api = `${region('api.py', 'import')}\n\n${region('api.py', 'handler')}`;
   return {
-    declare: {
-      service: { title: 'support-reply.yaml', html: highlight(quickstart('support-reply.yaml'), 'yaml') },
-      verifier: { title: 'no-refund-promise.yaml', html: highlight(quickstart('no-refund-promise.yaml'), 'yaml') }
-    },
-    observe: programs.map((p) => ({ lang: p.lang, title: p.title, html: highlight(quickstart(p.file), p.lang) })),
-    verify: { title: 'verify → result', html: highlight(RESULT, 'json') }
+    flow: tokenLines(api, 'python'),
+    declare: { title: 'finance_release.py', html: highlight(region('finance_release.py', 'requirements'), 'python') },
+    verify: programs.map((p) => ({ lang: p.lang, title: p.title, html: highlight(finance(p.file), p.lang) })),
+    decide: { title: 'output', html: highlight(OUTPUT, 'text') }
   };
 }

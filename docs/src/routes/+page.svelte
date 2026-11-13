@@ -8,11 +8,14 @@
   import LangTab from '$lib/components/LangTab.svelte';
   import Tabs from '$lib/components/Tabs.svelte';
   import Tab from '$lib/components/Tab.svelte';
+  import FinanceFlow from '$lib/components/FinanceFlow.svelte';
+  import WorkflowStrip from '$lib/components/WorkflowStrip.svelte';
 
   let { data } = $props();
 
-  // Landing: the painted cover and value statement, the Declare → Observe →
-  // Verify strip, the platform summary, then one door per published section.
+  // Landing: the painted cover and value statement, the finance verification
+  // figure, the Declare → Observe → Verify strip, the Quickstart, the platform
+  // summary, the workflow strip, then one door per published section.
   // Every internal action resolves through published content, so a section or
   // a start page appears here only once its page exists.
   const GITHUB_URL = 'https://github.com/bohmian-ai/wyrd';
@@ -26,17 +29,20 @@
   };
   const doors = navGroups().map((group) => ({ label: group.label, path: group.items[0].path, ...DOORS[group.label] }));
   const startPages = navGroups().find((group) => group.label === 'Get started')?.items ?? [];
-  // The CTA opens setup, the first step a reader can complete, else the first Get started page.
+  // "Get started" opens setup, the first step a reader can complete, else the
+  // first Get started page; "Verify in real time" opens the Quickstart.
   const start = startPages.find((item) => item.path === '/get-started/setup/') ?? firstPage('Get started');
-  const agent = startPages.find((item) => item.path === '/get-started/use-with-your-coding-agent/');
-  const build = startPages.find((item) => item.path === '/get-started/what-can-i-build/');
+  const quickstart = startPages.find((item) => item.path === '/get-started/quickstart/');
+  const foundation = navGroups()
+    .flatMap((group) => group.items)
+    .find((item) => item.path === '/understand/how-verification-works/');
 </script>
 
 <svelte:head>
   <title>Wyrd docs</title>
   <meta
     name="description"
-    content="Wyrd is open-source infrastructure for building your own verification system for AI systems, with verdicts kept beside the exact versions they judged."
+    content="The only real-time verification system built for your applications. Your application asks Wyrd whether an action meets your requirements, and acts on the verdict."
   />
 </svelte:head>
 
@@ -45,18 +51,25 @@
   <div class="wrap hero">
     <p class="eyebrow">Open-source verification infrastructure for AI systems · v{__WYRD_VERSION__}</p>
     <h1><span class="d">Declare.</span><br /><span class="o">Observe.</span><br />Verify.</h1>
-    <p class="tagline">Know whether your AI system does what you said it would, before release and in production.</p>
-    <p class="lede">Build the verification your system needs from primitives you compose: an assertion on one API response, a model judge that cites your policy document, or a check on every step of a multi-hour agent session.</p>
+    <p class="tagline">The only real-time verification system built for your applications.</p>
+    <p class="lede">You built the system. How do you know it's behaving correctly?</p>
     <div class="cta">
       {#if start}
-        <a class="button primary" href={`${base}${start.path}`}>Get started →</a>
-        {#if build}<a class="button" href={`${base}${build.path}`}>What can I build?</a>{/if}
-        {#if agent}<a class="button" href={`${base}${agent.path}`}>Use with your coding agent</a>{/if}
+        {#if quickstart}<a class="button primary" href={`${base}${quickstart.path}`}>Verify in real time →</a>{/if}
+        <a class={quickstart ? 'button' : 'button primary'} href={`${base}${start.path}`}>Get started</a>
         <a class="button" href={GITHUB_URL} rel="noreferrer" target="_blank">GitHub</a>
       {:else}
         <a class="button primary" href={GITHUB_URL} rel="noreferrer" target="_blank">Wyrd on GitHub →</a>
       {/if}
     </div>
+  </div>
+</section>
+
+<section class="flow dark-field" aria-labelledby="flow-h">
+  <div class="wrap">
+    <h2 id="flow-h">Verification in the flow.</h2>
+    <p class="sub">Your finance API calls Wyrd to verify each report before releasing it. Wyrd returns the verdict; your API decides.</p>
+    <FinanceFlow code={data.flow} />
   </div>
 </section>
 
@@ -75,34 +88,32 @@
     <section class="qs" aria-labelledby="qs-h">
       <div>
         <p class="eyebrow">Get started</p>
-        <h2 id="qs-h">From intent to evidence.</h2>
-        <p class="sub">One support agent and one Verifier, one step per tab: declare what an answer must never say, verify two answers, and read the verdict.</p>
+        <h2 id="qs-h">Release only what passes.</h2>
+        <p class="sub">One finance Service and one Verifier with three requirements, one step per tab: declare them, verify each release, and act on the verdict.</p>
         <nav class="links" aria-label="Get started">
           {#each startPages as item (item.path)}
             <a href={`${base}${item.path}`}>{item.label}</a>
           {/each}
+          {#if foundation}<a href={`${base}${foundation.path}`}>{foundation.label}</a>{/if}
         </nav>
       </div>
       <div class="loop">
         <Tabs>
           <Tab label="01 Declare">
-            <p class="step">The Service binds one Verifier. The Verifier declares the evidence it takes and the requirement it checks. Declare both with <code>wyrd declare support-reply.yaml</code>, or from your code with <code>WyrdState.declare</code>.</p>
-            <Tabs>
-              <Tab label="Service"><CodeBlock lang="yaml" {...data.declare.service} /></Tab>
-              <Tab label="Verifier"><CodeBlock lang="yaml" {...data.declare.verifier} /></Tab>
-            </Tabs>
+            <p class="step">The <code>release-check</code> Verifier states three requirements: two assertions on records your application supplies, and an Agent that reads the company sharing policy PDF.</p>
+            <CodeBlock lang="python" {...data.declare} />
           </Tab>
-          <Tab label="02 Observe">
-            <p class="step">Declare, start a Run, and verify two answers. <code>verify</code> waits for the verdict; <code>submit</code> queues the check and returns at once.</p>
+          <Tab label="02 Verify">
+            <p class="step">Declare the Service, then verify each proposed release with one call. Only a <code>passed</code> verdict releases the report.</p>
             <LangTabs langs={['python', 'rust', 'typescript']}>
-              {#each data.observe as o (o.lang)}
+              {#each data.verify as o (o.lang)}
                 <LangTab lang={o.lang}><CodeBlock lang={o.lang} title={o.title} html={o.html} /></LangTab>
               {/each}
             </LangTabs>
           </Tab>
-          <Tab label="03 Verify">
-            <p class="step">The failing answer's verdict names the requirement, the reason, and the value it judged. A failed check is a result, not an exception.</p>
-            <CodeBlock lang="json" {...data.verify} />
+          <Tab label="03 Decide">
+            <p class="step">The second report names a bank account, which the policy forbids, so the API holds it. A failed verdict is a result, not an exception.</p>
+            <CodeBlock lang="text" {...data.decide} />
           </Tab>
         </Tabs>
       </div>
@@ -117,6 +128,12 @@
       <div><b>Gateway</b><p>Route LLM calls through the Wyrd AI Gateway. Each call is authorized for the calling agent, attributed to it, and recorded for end-to-end verification.</p></div>
       <div><b>Interfaces</b><p>Python, TypeScript, and Rust SDKs, OpenTelemetry (OTLP) ingest, HTTP, CLI, and MCP. You run the server yourself, on Postgres and object storage.</p></div>
     </div>
+  </section>
+
+  <section class="workflows" aria-labelledby="workflows-h">
+    <h2 id="workflows-h">One verification engine. Build your workflow.</h2>
+    <p class="sub">The same engine checks one request, an agent run, a review pipeline, or a whole session.</p>
+    <WorkflowStrip />
   </section>
 
   {#if doors.length > 0}
@@ -209,6 +226,17 @@
   .layers,
   .platform {
     padding: 56px 0 0;
+  }
+  .flow {
+    padding: 56px 0 48px;
+    border-top: 1px solid var(--border);
+  }
+  .flow .sub,
+  .workflows .sub {
+    max-width: 60ch;
+  }
+  .workflows {
+    padding: 0 0 56px;
   }
   .layers .strip {
     margin-top: 24px;

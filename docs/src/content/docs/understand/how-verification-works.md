@@ -10,7 +10,7 @@ A Verifier checks declared requirements against evidence and returns a verdict: 
 
 ## The parts of a Verifier
 
-This is the Verifier from [Run your first verification](/get-started/quickstart/):
+This is the Verifier from the [setup check](/get-started/setup/#3-check-it-end-to-end):
 
 <CodeFromFile file="examples/setup-check/no-refund-promise.yaml" lang="yaml" title="no-refund-promise.yaml" />
 

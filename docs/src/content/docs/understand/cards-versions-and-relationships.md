@@ -10,7 +10,7 @@ A Card is a versioned declaration of one AI system component, or of one Verifier
 
 ## The shape of a Card
 
-These are the two Cards from [Run your first verification](/get-started/quickstart/):
+These are the two Cards from the [setup check](/get-started/setup/#3-check-it-end-to-end):
 
 <Tabs>
 <Tab label="support-reply.yaml">

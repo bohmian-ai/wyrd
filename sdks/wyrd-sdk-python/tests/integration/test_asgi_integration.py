@@ -48,7 +48,7 @@ pytestmark = pytest.mark.integration
 SDK_ROOT = Path(__file__).resolve().parents[2]
 """The Python SDK root, from which the worker application imports."""
 
-QUICKSTART = SDK_ROOT.parents[1] / "examples/setup-check"
+SETUP_CHECK = SDK_ROOT.parents[1] / "examples/setup-check"
 FASTAPI_EXAMPLE = SDK_ROOT.parents[1] / "examples/integrate-fastapi"
 
 
@@ -480,8 +480,8 @@ def test_asgi_telemetry_ownership(
 def test_fastapi_example(
     wyrd_server: WyrdTestServer, bifrost: Bifrost, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The FastAPI guide's app, beside the Quickstart Service pulled as `.wyrd-bundle`.
-    WyrdState.declare(str(QUICKSTART / "support-reply.yaml"), bundle_dir=tmp_path / ".wyrd-bundle")
+    # The FastAPI guide's app, beside the setup check's Service pulled as `.wyrd-bundle`.
+    WyrdState.declare(str(SETUP_CHECK / "support-reply.yaml"), bundle_dir=tmp_path / ".wyrd-bundle")
     monkeypatch.chdir(tmp_path)
     example = runpy.run_path(str(FASTAPI_EXAMPLE / "app.py"))
     served = {}

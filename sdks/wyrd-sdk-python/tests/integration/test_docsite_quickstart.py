@@ -19,6 +19,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
 from wyrd import WyrdError
 from wyrd.client import WyrdClient
 from wyrd.state import WyrdState
@@ -192,3 +193,25 @@ def test_docsite_quickstart_refuses_changed_content_and_broken_references(
 
     assert drifted.value.code == "WYRD_REGISTRY_409_SPEC_DRIFT"
     assert missing.value.code == "WYRD_LOADER_400_INVALID_ENVELOPE"
+
+
+def test_finance_api_releases_only_passed_reports(
+    reader: Path, server: WyrdTestServer, model: Receiver
+) -> None:
+    # The homepage's finance API, beside the Quickstart Service pulled as `.wyrd-bundle`.
+    script, _ = run_quickstart(reader)
+    WyrdState.declare(script["service"], bundle_dir=reader / ".wyrd-bundle")
+    shutil.copy(EXAMPLE / "api.py", reader)
+    example = runpy.run_path(str(reader / "api.py"))
+    releases = json.loads((EXAMPLE / "releases.json").read_text())
+    with TestClient(example["api"]) as client:
+        decisions = [
+            client.post("/reports/send", json={key: release[key] for key in PERMITTED}).json()
+            for release in releases
+        ]
+        uncertain = client.post(
+            "/reports/send",
+            json={**PERMITTED, "report": {"text": "Synthetic report flagged PROVIDER-UNCERTAIN."}},
+        ).json()
+    assert decisions == [{"decision": "released"}, {"decision": "held for review"}]
+    assert uncertain == {"decision": "held for review"}, "inconclusive holds"

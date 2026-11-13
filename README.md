@@ -16,9 +16,72 @@
   <a href="https://discord.gg/K5bf23yPNb">Discord</a>
 </p>
 
-Wyrd is open-source infrastructure for building your own verification system for AI/ML in production. Register what you ship at exact versions, record what it does, and judge that behavior with checks you compose: a one-line assertion, a model judge that cites your policy document, or a check across a six-hour agent run.
+## The only real-time verification system built for your applications.
 
-Your app sends Wyrd what it did. Wyrd returns a verdict for each requirement, with a reason, and keeps it beside the exact versions it judged. Start from a use case:
+**You built the system. How do you know it's behaving correctly?**
+
+Wyrd tells you while it runs. Before your application acts, it sends Wyrd what it is about to do. Wyrd judges that against the requirements you declare and returns a verdict for each one, with a reason. Your code decides what happens next, and Wyrd keeps the evidence beside the exact versions it judged.
+
+Wyrd is open source. You build the verification your system needs from three steps: **Declare** what you ship and what it must do, **Observe** what it does, and **Verify** it.
+
+## Example
+
+An application shares synthetic customer reports with outside auditors. Before it sends one, it checks three requirements: the recipient is authorized, the company sharing policy PDF permits the release, and the destination restricts access. A model judges the policy; the other two are assertions on records the application supplies.
+
+<!-- example: examples/finance-release/finance_release.py region=requirements -->
+```python
+requirements=[
+    Requirement(
+        "recipient-authorized",
+        "The recipient is authorized to receive the report.",
+        Check.assert_("inputs.recipient.authorized", ComparisonOperator.Equals, True),
+    ),
+    Requirement(
+        "follows-policy",
+        "The company sharing policy permits this release.",
+        follows_policy,
+    ),
+    Requirement(
+        "destination-restricted",
+        "The destination restricts access to the report.",
+        Check.assert_("inputs.destination.restricted", ComparisonOperator.Equals, True),
+    ),
+],
+```
+
+The application verifies each release with one call and sends only a passed one:
+
+<!-- example: examples/finance-release/finance_release.py region=release -->
+```python
+for release in releases:
+    name = release.pop("name")
+    try:
+        with state.run() as run:
+            # One synchronous call judges all three requirements.
+            result = run.observe.verify("release-check", **release)
+    except WyrdError as error:
+        print(f"{name}: {error.code} -> held for review")
+        continue
+    verifier = result.verifier
+    # Only a passed verdict releases the report.
+    decision = "released" if result.verdict == "passed" else "held for review"
+    print(f"{name}: {result.verdict} ({verifier.name}@{verifier.version}) -> {decision}")
+    for requirement in result.requirements:
+        if requirement["outcome"] != "passed":
+            print(f"  {requirement['id']} {requirement['outcome']}: {requirement['reason']}")
+```
+
+```text
+quarterly-report: passed (release-check@0.1.0) -> released
+report-with-bank-account: failed (release-check@0.1.0) -> held for review
+  follows-policy failed: the report names a bank account identifier
+```
+
+The full program is in [Python](https://github.com/bohmian-ai/wyrd/blob/main/examples/finance-release/finance_release.py), [Rust](https://github.com/bohmian-ai/wyrd/blob/main/examples/finance-release/finance_release.rs), and [TypeScript](https://github.com/bohmian-ai/wyrd/blob/main/examples/finance-release/finance_release.ts). [Run your first verification](https://docs.bohmian.ai/wyrd/get-started/quickstart/) runs it against your own server and model.
+
+## What you can build
+
+The same primitives build other verification. Start from a use case:
 
 <p align="center">
   <a href="https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/#policy-verification"><img src="https://img.shields.io/badge/Policy%20verification-555555" alt="Use case: Policy verification"></a>
@@ -29,7 +92,7 @@ Your app sends Wyrd what it did. Wyrd returns a verdict for each requirement, wi
   <a href="https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/#drift-monitoring"><img src="https://img.shields.io/badge/Drift%20monitoring-555555" alt="Use case: Drift monitoring"></a>
 </p>
 
-[What can I build?](https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/) walks through each one. They are examples: the same primitives build any verification you need.
+[What can I build?](https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/) walks through each one.
 
 ## How Wyrd fits your stack
 
@@ -76,147 +139,6 @@ pnpm add wyrd-ai@0.4.1
 ```
 
 Start a local server with `wyrd init` (`uv run wyrd init` or `pnpm wyrd init`), or let your coding agent do it with `wyrd init guided`. [Set up Wyrd](https://docs.bohmian.ai/wyrd/get-started/setup/) has the details.
-
-## Example
-
-Declare one requirement: a support answer never promises a guaranteed refund.
-
-<!-- example: examples/quickstart/no-refund-promise.yaml -->
-```yaml
-# The Verifier: a support answer never promises a guaranteed refund.
-apiVersion: wyrd/v1
-kind: Verifier
-metadata:
-  name: no-refund-promise
-  version: 1.0.0
-spec:
-  inputs:
-    answer: { type: json }
-  requirements:
-    - id: no-refund-promise
-      statement: The answer never promises a guaranteed refund
-      check:
-        kind: assert
-        path: inputs.answer
-        operator: not_contains
-        expected: guaranteed refund
-```
-
-Bind it to the Service it checks:
-
-<!-- example: examples/quickstart/support-reply.yaml -->
-```yaml
-# The subject: your support agent's Service, verified by no-refund-promise.
-apiVersion: wyrd/v1
-kind: Service
-metadata:
-  name: support-reply
-  version: 1.0.0
-spec:
-  verified_by:
-    - verifier: ./no-refund-promise.yaml
-```
-
-Then verify two answers:
-
-<details open>
-<summary><b>Python</b></summary>
-
-<!-- example: examples/quickstart/quickstart.py -->
-```python
-from wyrd import WyrdState
-
-# Declare the Service and the Verifier it references, and get a ready state.
-state = WyrdState.declare("support-reply.yaml")
-run = state.run()
-
-for answer in ("Your refund request is approved.", "You have a guaranteed refund."):
-    result = run.observe.verify("no-refund-promise", answer=answer)
-    print(f"{result.verdict}: {result.requirements[0]['reason']}")
-    print(f"  subject:  {result.subject}")
-    print(f"  verifier: {result.verifier}")
-```
-
-</details>
-
-<details>
-<summary><b>Rust</b></summary>
-
-<!-- example: examples/quickstart/quickstart.rs -->
-```rust
-//! The docsite Quickstart in Rust: declare a Service and the Verifier it
-//! references, then judge a passing and a failing answer.
-
-use wyrd_ai::WyrdError;
-use wyrd_ai::serde_json::json;
-use wyrd_ai::state::WyrdState;
-
-/// Declares `support-reply.yaml` from the working directory, verifies two
-/// answers against `no-refund-promise`, and prints each verdict with its reason
-/// and the exact subject and Verifier identities.
-///
-/// # Errors
-///
-/// Returns the [`WyrdError`] of a refused declaration or verification.
-#[tokio::main]
-async fn main() -> Result<(), WyrdError> {
-    // Declare the Service and the Verifier it references, and get a ready state.
-    let state = WyrdState::declare("support-reply.yaml").await?;
-    let run = state.run();
-
-    for answer in [
-        "Your refund request is approved.",
-        "You have a guaranteed refund.",
-    ] {
-        let result = run
-            .observe()
-            .verify("no-refund-promise", json!(answer))
-            .await?;
-        let reason = &result.outcome.requirements[0].reason;
-        println!("{}: {reason}", result.outcome.verdict);
-        println!("  subject:  {}", result.subject);
-        println!("  verifier: {}", result.verifier);
-    }
-    Ok(())
-}
-```
-
-</details>
-
-<details>
-<summary><b>TypeScript</b></summary>
-
-<!-- example: examples/quickstart/quickstart.ts -->
-```typescript
-import { type CardRef, WyrdState } from "wyrd-ai";
-
-// Declare the Service and the Verifier it references, and get a ready state.
-const state = await WyrdState.declare("support-reply.yaml");
-const run = state.run();
-
-const id = (ref: CardRef) => `${ref.kind}/${ref.name}@${ref.version}#${ref.uid}`;
-for (const answer of ["Your refund request is approved.", "You have a guaranteed refund."]) {
-  const result = await run.observe.verify("no-refund-promise", { answer });
-  console.log(`${result.outcome.verdict}: ${result.outcome.requirements[0].reason}`);
-  console.log(`  subject:  ${id(result.subject)}`);
-  console.log(`  verifier: ${id(result.verifier)}`);
-}
-```
-
-</details>
-
-Every language prints one passing and one failing verdict, each naming the exact versions it checked:
-
-```text
-passed: the comparison held
-  subject:  Service/support-reply@1.0.0#<uid>
-  verifier: default/Verifier/no-refund-promise@1.0.0#<uid>
-failed: operator NotContains returned false
-  subject:  Service/support-reply@1.0.0#<uid>
-  verifier: default/Verifier/no-refund-promise@1.0.0#<uid>
-```
-
-[Run your first verification](https://docs.bohmian.ai/wyrd/get-started/quickstart/) walks through it. This assertion is the simplest check. A Verifier can also run Python, judge with an Agent that reads your uploaded policy files and cites them, judge a whole session, or watch for drift on a schedule; see [What can I build?](https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/) and [Recipes](https://docs.bohmian.ai/wyrd/build-and-verify/verify/verifier-recipes/).
 
 ## Already have tools?
 

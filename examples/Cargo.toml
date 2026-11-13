@@ -31,8 +31,8 @@ name = "client_profile"
 path = "rust/client_profile.rs"
 
 [[bin]]
-name = "quickstart"
-path = "quickstart/quickstart.rs"
+name = "setup_check"
+path = "setup-check/check.rs"
 
 [[bin]]
 name = "finance_release"

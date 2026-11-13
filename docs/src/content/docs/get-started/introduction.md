@@ -25,12 +25,12 @@ A support agent must never promise a guaranteed refund. The Service describes th
 <Tabs>
 <Tab label="support-reply.yaml">
 
-<CodeFromFile file="examples/quickstart/support-reply.yaml" lang="yaml" title="support-reply.yaml" />
+<CodeFromFile file="examples/setup-check/support-reply.yaml" lang="yaml" title="support-reply.yaml" />
 
 </Tab>
 <Tab label="no-refund-promise.yaml">
 
-<CodeFromFile file="examples/quickstart/no-refund-promise.yaml" lang="yaml" title="no-refund-promise.yaml" />
+<CodeFromFile file="examples/setup-check/no-refund-promise.yaml" lang="yaml" title="no-refund-promise.yaml" />
 
 </Tab>
 </Tabs>
@@ -40,17 +40,17 @@ This program declares both and verifies two answers:
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
 
-<CodeFromFile file="examples/quickstart/quickstart.py" lang="python" title="quickstart.py" />
+<CodeFromFile file="examples/setup-check/check.py" lang="python" title="check.py" />
 
 </LangTab>
 <LangTab lang="rust">
 
-<CodeFromFile file="examples/quickstart/quickstart.rs" lang="rust" title="src/main.rs" />
+<CodeFromFile file="examples/setup-check/check.rs" lang="rust" title="src/main.rs" />
 
 </LangTab>
 <LangTab lang="typescript">
 
-<CodeFromFile file="examples/quickstart/quickstart.ts" lang="typescript" title="quickstart.ts" />
+<CodeFromFile file="examples/setup-check/check.ts" lang="typescript" title="check.ts" />
 
 </LangTab>
 </LangTabs>

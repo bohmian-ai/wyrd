@@ -54,12 +54,6 @@ AGREES = (
 )
 """The judge's Verdict for ``answer-judged``: passed, citing the whole answer."""
 
-RELEASE_APPROVED = (
-    '{"outcome":"passed","reason":"an external audit may receive this report",'
-    '"citations":[{"slot":"report","locator":{"json_pointer":"/text"}}]}'
-)
-"""The finance release example judge's Verdict: every release follows the policy, citing the report."""
-
 REPORT_SUPPORTED = (
     '{"outcome":"passed","reason":"the report matches its source",'
     '"citations":[{"slot":"report","locator":{"json_pointer":"/text"}}]}'
@@ -271,6 +265,10 @@ READ_SHARING_POLICY = {
 """The sharing-policy judge's first turn: read its mounted policy as ``fs_read``."""
 
 
+FINANCE_POLICY_JUDGE = "Decide whether the company sharing policy permits sharing this report"
+"""The finance release example judge's prompt, which the local model answers as the sharing-policy judge."""
+
+
 def sharing_verdict(messages: list[dict]) -> str:
     """The sharing-policy judge's Verdict once ``messages`` carry its ``fs.read`` result.
 
@@ -371,22 +369,20 @@ def completion(body: dict) -> tuple[int, dict]:
     otherwise passes citing the answer text. The scored judge (its prompt carries
     ``SCORE:``) answers ``scored``. The handbook judge reads its mount and
     answers ``handbook_verdict``, and the sharing-policy judge (its prompt
-    carries ``POLICY JUDGE``) reads its mount and answers ``sharing_verdict``;
-    the finance release example's judge answers ``RELEASE_APPROVED``, and the
+    carries ``POLICY JUDGE``), like the finance release example's judge, reads
+    its mount and answers ``sharing_verdict``; the
     modular finance Service's judges answer ``REPORT_SUPPORTED`` and
     ``AUDIT_PURPOSE``; the file probe plays ``probe_turn``. Every
     other judge agrees.
     """
     text = json.dumps(body)
     returned = any(message.get("role") == "tool" for message in body.get("messages", []))
-    if "POLICY JUDGE" in text:
+    if "POLICY JUDGE" in text or FINANCE_POLICY_JUDGE in text:
         message = (
             {"role": "assistant", "content": sharing_verdict(body["messages"])}
             if returned
             else READ_SHARING_POLICY
         )
-    elif "follows the company sharing policy" in text:
-        message = {"role": "assistant", "content": RELEASE_APPROVED}
     elif "accurately summarizes the source" in text:
         message = {"role": "assistant", "content": REPORT_SUPPORTED}
     elif "specific financial-audit need" in text:

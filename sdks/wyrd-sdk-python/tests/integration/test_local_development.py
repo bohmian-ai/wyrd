@@ -1237,20 +1237,20 @@ def test_guided_setup_prompt_surfaces() -> None:
             assert read_setup_prompt(cli_path, home, env) == printed.stdout
 
 
-QUICKSTART_RUNNERS = {
-    "python": lambda root: [sys.executable, "quickstart.py"],
+SETUP_CHECK_RUNNERS = {
+    "python": lambda root: [sys.executable, "check.py"],
     "rust": lambda root: [
         *("mise", "exec", "--", "cargo", "run", "--locked", "-q"),
         *("--manifest-path", str(root / "Cargo.toml"), "-p", "wyrd-rust-examples"),
-        *("--bin", "quickstart"),
+        *("--bin", "setup_check"),
     ],
-    "typescript": lambda root: ["node", str(root / "examples/quickstart/quickstart.ts")],
+    "typescript": lambda root: ["node", str(root / "examples/setup-check/check.ts")],
 }
-"""Language → the command a reader runs in a directory holding the Quickstart files."""
+"""Language → the command a reader runs in a directory holding the setup check's files."""
 
 
 GET_SERVICE = "wyrd get --kind Service --name support-reply --version 1.0.0"
-"""The Quickstart's published command that reads the Service, whose ``metadata.uid`` the query needs."""
+"""The command that reads the setup check's Service, whose ``metadata.uid`` the query needs."""
 
 QUERY_VERDICTS = "wyrd query --server http://127.0.0.1:8080 --file stored-verdicts.sql"
 """The Quickstart's published query command, naming the default address ``wyrd init`` prints."""
@@ -1286,37 +1286,35 @@ def stored_verdicts(cli_path: str, reader: Path, env: dict[str, str], sql: str) 
 
 
 @pytest.mark.local_dev
-@pytest.mark.parametrize("language", QUICKSTART_RUNNERS)
+@pytest.mark.parametrize("language", SETUP_CHECK_RUNNERS)
 def test_guided_manual_setup(language: str, tmp_path: Path) -> None:
     """The manual path the setup prompt also follows stores one Run's two verdicts.
 
-    After ``wyrd init``, the Quickstart program runs from a directory holding
-    only its Card files with the saved local setup and no model key, prints a
-    passed and a failed verdict for the Service, and the prompt's ``cards.get``
-    and the published ``wyrd get`` and ``wyrd query`` readback finds both
-    verdicts under one stored Run. The Quickstart page publishes that readback,
-    Setup's Manual tab links to it, and its query is the setup prompt's.
+    After ``wyrd init``, the setup check runs from a directory holding only
+    its Card files with the saved local setup and no model key, prints a
+    passed and a failed verdict for the Service, and the ``wyrd get`` and
+    ``wyrd query`` readback finds both verdicts under one stored Run. Setup
+    publishes the check, the Quickstart publishes the readback, and its query
+    is the setup prompt's.
     """
     root = Path(__file__).resolve().parents[4]
     cli_path = str(root / "target/debug/wyrd")
-    example = root / "examples/quickstart"
+    example = root / "examples/setup-check"
     reader = tmp_path / "project"
     reader.mkdir()
-    for name in ("no-refund-promise.yaml", "support-reply.yaml", "quickstart.py"):
+    for name in ("no-refund-promise.yaml", "support-reply.yaml", "check.py"):
         shutil.copy(example / name, reader)
     prompt = subprocess.check_output([cli_path, "init", "--print-prompt"], text=True)
-    sql = (example / "stored-verdicts.sql").read_text()
+    sql = (root / "examples/finance-release/stored-verdicts.sql").read_text()
     assert sql.splitlines()[-1] == prompt.split("```sql\n", 1)[1].split("```", 1)[0].strip()
     docs = root / "docs/src/content/docs/get-started"
     quickstart = (docs / "quickstart.md").read_text()
-    assert GET_SERVICE in quickstart and QUERY_VERDICTS in quickstart
-    assert 'file="examples/quickstart/stored-verdicts.sql"' in quickstart
-    assert (
-        "/get-started/quickstart/#3-confirm-the-stored-verdicts" in (docs / "setup.md").read_text()
-    )
+    assert QUERY_VERDICTS in quickstart
+    assert 'file="examples/finance-release/stored-verdicts.sql"' in quickstart
+    assert 'file="examples/setup-check/check.py"' in (docs / "setup.md").read_text()
     with local_deployment() as (home, env), installed_local_cli(cli_path, home, env, ""):
         ran = subprocess.run(
-            QUICKSTART_RUNNERS[language](root), cwd=reader, env=env, capture_output=True, text=True
+            SETUP_CHECK_RUNNERS[language](root), cwd=reader, env=env, capture_output=True, text=True
         )
         assert ran.returncode == 0, ran.stdout + ran.stderr
         verdicts = [line.split(":")[0] for line in ran.stdout.splitlines() if not line[0].isspace()]

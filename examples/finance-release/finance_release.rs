@@ -1,99 +1,100 @@
-//! The finance release, authored in Rust.
+//! Verify each proposed report release before the application sends it.
 //!
-//! A finance team's `report-writer` Agent prepares customer reports for
-//! outside auditors. Before a report is sent, the `release-check` Verifier
-//! judges three requirements, all at once:
+//! The `finance-release` Service shares synthetic customer reports with
+//! outside auditors. Before it releases one, it calls the `release-check`
+//! Verifier once, and the Verifier judges three requirements together:
 //!
-//! - `no-bank-account`: the report names no bank account (an assertion).
-//! - `recipient-authorized`: the recipient is authorized (an assertion).
-//! - `follows-policy`: `policy-judge` reads the company sharing policy and
-//!   approves the release (an Agent check).
+//! - `recipient-authorized`: the supplied recipient record says the
+//!   recipient is authorized (an assertion).
+//! - `follows-policy`: `policy-judge` reads the company sharing policy PDF
+//!   and judges the report against it (an Agent check, through the Wyrd
+//!   gateway).
+//! - `destination-restricted`: the supplied destination record says access
+//!   is restricted (an assertion).
 //!
-//! The program builds every Card in code, declares them in one call, and
-//! verifies a permitted release and one that names a bank account. No Card
-//! names a version: the server selects each one at declaration.
+//! Wyrd returns the verdict; the application decides. Only `passed` releases
+//! the report; anything else holds it for review. Nothing is sent anywhere.
 
-use wyrd_ai::serde_json::json;
+use std::error::Error;
+
+use wyrd_ai::serde_json::{self, Map, Value, json};
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::{
-    Agent, AgentRunConfigSpec, Artifact, Check, ComparisonOperator, Component, Inputs,
-    OpenAiChatOptions, Requirement, ResponseFormat, Service, Verifier, openai_chat,
+    Agent, AgentRunConfigSpec, Artifact, Check, ComparisonOperator, Inputs, OpenAiChatOptions,
+    Requirement, ResponseFormat, Service, Verifier, openai_chat,
 };
-use wyrd_ai::{ExecutionRoute, RequirementOutcome, VerificationResult};
+use wyrd_ai::{ExecutionRoute, RequirementOutcome, VerificationVerdict};
 
-/// Build the finance release in code, declare it with
-/// [`WyrdState::declare`], which uploads the policy first, and print the
-/// verdict of a permitted release and of one naming a bank account.
+/// Declare the finance release, then verify each proposed release in
+/// `releases.json` and print the application's decision.
 ///
 /// # Errors
 /// Returns the ambient client's configuration or credential error, the
 /// declaration's refusal (an invalid graph, an unreadable policy file, or
-/// the registry's refusal), and a verification run's error.
+/// the registry's refusal), and an unreadable `releases.json`. A refused
+/// verification holds its release instead.
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // The company sharing policy, uploaded from this directory, with the
-    // PDF's text extracted so the judge can read it.
+async fn main() -> Result<(), Box<dyn Error>> {
+    // The company sharing policy, uploaded once from this directory with its
+    // text extracted so the judge can read it.
     let policy = Artifact::from_path("company-sharing-policy", None, "company-sharing-policy.pdf")
         .extract(true);
-
-    // The Service: the Agent that writes the reports, verified by
-    // `release-check`.
-    let writer = Agent::new("report-writer", None)
-        .prompt(openai_chat(
-            "gpt-4o",
-            OpenAiChatOptions {
-                messages: vec!["Write the customer report for {{customer}}.".into()],
-                ..Default::default()
-            },
-        )?)
-        .execution_route(gateway()?);
-    let service = Service::new("finance-release", None)
-        .components([Component::new("report-writer", writer)])
-        .verified_by([release_check(&policy)?]);
+    let service = Service::new("finance-release", None).verified_by([release_check(&policy)?]);
 
     // Upload the policy, declare every Card, and get a ready state.
     let state = WyrdState::declare(&service).await?;
 
-    for report in [
-        "Quarterly total $120.",
-        "Quarterly total $120. Paid from BANK-ACCOUNT-DEMO-001.",
-    ] {
-        let result = state
+    let releases: Vec<Map<String, Value>> =
+        serde_json::from_str(&std::fs::read_to_string("releases.json")?)?;
+    for mut release in releases {
+        let name = release.remove("name").unwrap_or_default();
+        let name = name.as_str().unwrap_or_default();
+        // One synchronous call judges all three requirements.
+        let result = match state
             .run()
             .observe()
-            .verify(
-                "release-check",
-                Inputs::named([
-                    ("report", json!({ "text": report })),
-                    (
-                        "recipient",
-                        json!({ "email": "auditor@example.test", "authorized": true }),
-                    ),
-                ]),
-            )
-            .await?;
-        print_result(report, &result);
+            .verify("release-check", Inputs::named(release))
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                println!("{name}: {} -> held for review", error.code());
+                continue;
+            }
+        };
+        let verdict = result.outcome.verdict;
+        // Only a passed verdict releases the report.
+        let decision = if verdict == VerificationVerdict::Passed {
+            "released"
+        } else {
+            "held for review"
+        };
+        let verifier = &result.verifier;
+        println!(
+            "{name}: {verdict} ({}@{}) -> {decision}",
+            verifier.name, verifier.version
+        );
+        for requirement in &result.outcome.requirements {
+            if requirement.outcome != RequirementOutcome::Passed {
+                let outcome = json!(requirement.outcome);
+                let outcome = outcome.as_str().unwrap_or_default();
+                println!(
+                    "  {} {outcome}: {}",
+                    requirement.id.as_str(),
+                    requirement.reason
+                );
+            }
+        }
     }
     Ok(())
 }
 
-/// The `openai` gateway deployment every Agent's model calls go through.
-///
-/// # Errors
-/// Returns the refusal of an invalid deployment name.
-fn gateway() -> anyhow::Result<ExecutionRoute> {
-    Ok(ExecutionRoute::WyrdGateway {
-        deployment: "openai".parse()?,
-    })
-}
-
-/// `release-check`: two assertions and one Agent check, which reads `policy`.
+/// `release-check`: the recipient and destination assertions, and the
+/// policy judgment, which reads `policy`.
 ///
 /// # Errors
 /// Returns the policy judge's Prompt or route refusal.
-fn release_check(policy: &Artifact) -> anyhow::Result<Verifier> {
-    // An Agent check: `policy-judge` sees the report and the recipient, and
-    // reads the policy from `/inputs/policy.json`.
+fn release_check(policy: &Artifact) -> Result<Verifier, Box<dyn Error>> {
     let mut follows_policy = Check::agent(policy_judge()?).inputs([
         ("report", "inputs.report"),
         ("recipient", "inputs.recipient"),
@@ -104,7 +105,8 @@ fn release_check(policy: &Artifact) -> anyhow::Result<Verifier> {
     );
 
     Ok(Verifier::new("release-check", None)
-        // The evidence the app sends, and the JSON Schema each must match.
+        // The evidence the application sends, and the JSON Schema each must
+        // match.
         .inputs([
             (
                 "report",
@@ -125,21 +127,22 @@ fn release_check(policy: &Artifact) -> anyhow::Result<Verifier> {
                     },
                 }),
             ),
+            (
+                "destination",
+                json!({
+                    "type": "object",
+                    "required": ["url", "restricted"],
+                    "properties": {
+                        "url": { "type": "string" },
+                        "restricted": { "type": "boolean" },
+                    },
+                }),
+            ),
         ])
         .requirements([
-            // Assertions: compare a value, no model runs.
-            Requirement::new(
-                "no-bank-account",
-                "The report names no bank account.",
-                Check::assert(
-                    "inputs.report.text",
-                    ComparisonOperator::NotContains,
-                    "BANK-ACCOUNT",
-                ),
-            ),
             Requirement::new(
                 "recipient-authorized",
-                "The recipient is authorized.",
+                "The recipient is authorized to receive the report.",
                 Check::assert(
                     "inputs.recipient.authorized",
                     ComparisonOperator::Equals,
@@ -148,25 +151,35 @@ fn release_check(policy: &Artifact) -> anyhow::Result<Verifier> {
             ),
             Requirement::new(
                 "follows-policy",
-                "The release follows the company sharing policy.",
+                "The company sharing policy permits this release.",
                 follows_policy,
+            ),
+            Requirement::new(
+                "destination-restricted",
+                "The destination restricts access to the report.",
+                Check::assert(
+                    "inputs.destination.restricted",
+                    ComparisonOperator::Equals,
+                    true,
+                ),
             ),
         ]))
 }
 
 /// `policy-judge`: a model that reads the policy with `fs.read` and returns
-/// a verdict on the release.
+/// a verdict on the report. Its model calls go through the `openai` gateway
+/// deployment.
 ///
 /// # Errors
 /// Returns the Prompt builder's or the route's refusal.
-fn policy_judge() -> anyhow::Result<Agent> {
+fn policy_judge() -> Result<Agent, Box<dyn Error>> {
     let prompt = openai_chat(
         "gpt-4o",
         OpenAiChatOptions {
             messages: vec![
-                "Read /inputs/policy.json with fs.read. Decide whether this release follows the \
-                 company sharing policy, citing the report and the policy. \
-                 Report: {{report}} Recipient: {{recipient}}"
+                "Read /inputs/policy.json with fs.read. Decide whether the company sharing \
+                 policy permits sharing this report with this recipient, citing the report \
+                 and the policy line you apply. Report: {{report}} Recipient: {{recipient}}"
                     .into(),
             ],
             response_format: Some(ResponseFormat::verdict(None)),
@@ -175,21 +188,12 @@ fn policy_judge() -> anyhow::Result<Agent> {
     )?;
     Ok(Agent::new("policy-judge", None)
         .prompt(prompt)
-        .execution_route(gateway()?)
+        .execution_route(ExecutionRoute::WyrdGateway {
+            deployment: "openai".parse()?,
+        })
         .tool_names(["fs.read"])
         .run_config(AgentRunConfigSpec {
             max_iterations: Some(3),
             ..Default::default()
         }))
-}
-
-/// Print the verdict on `report`, then each requirement that did not pass.
-fn print_result(report: &str, result: &VerificationResult) {
-    println!("{report}");
-    println!("  {}: {}", result.verifier.name, result.outcome.verdict);
-    for requirement in &result.outcome.requirements {
-        if requirement.outcome != RequirementOutcome::Passed {
-            println!("    not passed: {}", requirement.statement);
-        }
-    }
 }

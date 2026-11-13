@@ -15,12 +15,12 @@ These are the two Cards from [Run your first verification](/get-started/quicksta
 <Tabs>
 <Tab label="support-reply.yaml">
 
-<CodeFromFile file="examples/quickstart/support-reply.yaml" lang="yaml" title="support-reply.yaml" />
+<CodeFromFile file="examples/setup-check/support-reply.yaml" lang="yaml" title="support-reply.yaml" />
 
 </Tab>
 <Tab label="no-refund-promise.yaml">
 
-<CodeFromFile file="examples/quickstart/no-refund-promise.yaml" lang="yaml" title="no-refund-promise.yaml" />
+<CodeFromFile file="examples/setup-check/no-refund-promise.yaml" lang="yaml" title="no-refund-promise.yaml" />
 
 </Tab>
 </Tabs>

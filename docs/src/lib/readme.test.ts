@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { render } from 'svelte/server';
 import { expect, it } from 'vitest';
 import WyrdDiagram from '$lib/components/WyrdDiagram.svelte';
+import { embedCodeFromFile } from './mdsvex/highlight.js';
 
 // The repository README shows the Introduction's stack diagram as a static SVG
 // per GitHub theme. Each file is the server-rendered drawing with the docs'
@@ -40,13 +41,17 @@ for (const theme of ['light', 'dark'] as const) {
   });
 }
 
-// Each README code block marked `<!-- example: <path> -->` is a verbatim copy of
-// that tested example file, since GitHub cannot embed files.
+// Each README code block marked `<!-- example: <path> [region=<name>] -->` is a
+// verbatim copy of that tested example file, or of its named region as
+// `<CodeFromFile>` embeds it, since GitHub cannot embed files.
 it('README examples match their tested files', () => {
   const readme = readFileSync(new URL('../../../README.md', import.meta.url), 'utf8');
-  const blocks = [...readme.matchAll(/<!-- example: (\S+) -->\s*```\w*\n([\s\S]*?)```/g)];
+  const blocks = [...readme.matchAll(/<!-- example: (\S+)(?: region=([\w-]+))? -->\s*```\w*\n([\s\S]*?)```/g)];
   expect(blocks.length).toBeGreaterThan(0);
-  for (const [, path, code] of blocks) {
-    expect(code, path).toBe(readFileSync(new URL(`../../../${path}`, import.meta.url), 'utf8'));
+  for (const [, path, region, code] of blocks) {
+    const expected = region
+      ? embedCodeFromFile(`<CodeFromFile file="${path}" region="${region}" lang="text" />`, (body) => `${body}\n`).code
+      : readFileSync(new URL(`../../../${path}`, import.meta.url), 'utf8');
+    expect(code, path).toBe(expected);
   }
 });

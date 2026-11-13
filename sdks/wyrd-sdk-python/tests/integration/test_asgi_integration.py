@@ -48,7 +48,7 @@ pytestmark = pytest.mark.integration
 SDK_ROOT = Path(__file__).resolve().parents[2]
 """The Python SDK root, from which the worker application imports."""
 
-QUICKSTART = SDK_ROOT.parents[1] / "examples/quickstart"
+QUICKSTART = SDK_ROOT.parents[1] / "examples/setup-check"
 FASTAPI_EXAMPLE = SDK_ROOT.parents[1] / "examples/integrate-fastapi"
 
 

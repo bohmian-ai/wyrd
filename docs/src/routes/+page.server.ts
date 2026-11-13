@@ -1,15 +1,15 @@
 import { highlight } from '$lib/mdsvex/highlight.js';
 
 // The landing page's Declare → Observe → Verify example is the Quickstart:
-// its Cards and programs come from examples/quickstart, which the SDK journeys
+// its Cards and programs come from examples/setup-check, which the SDK journeys
 // run. Vite inlines them at build time, so the built server reads no files.
-const sources: Record<string, string> = import.meta.glob('../../../examples/quickstart/*', {
+const sources: Record<string, string> = import.meta.glob('../../../examples/setup-check/*', {
   query: '?raw',
   import: 'default',
   eager: true
 });
 
-const quickstart = (file: string) => sources[`../../../examples/quickstart/${file}`];
+const quickstart = (file: string) => sources[`../../../examples/setup-check/${file}`];
 
 // The `VerificationResult` that `verify` returns for the Quickstart's failing
 // answer. The wire shape is in crates/wyrd-spec/src/verification/execution.rs;
@@ -39,9 +39,9 @@ const RESULT = JSON.stringify(
 
 export function load() {
   const programs = [
-    { lang: 'python', file: 'quickstart.py', title: 'quickstart.py' },
-    { lang: 'rust', file: 'quickstart.rs', title: 'src/main.rs' },
-    { lang: 'typescript', file: 'quickstart.ts', title: 'quickstart.ts' }
+    { lang: 'python', file: 'check.py', title: 'check.py' },
+    { lang: 'rust', file: 'check.rs', title: 'src/main.rs' },
+    { lang: 'typescript', file: 'check.ts', title: 'check.ts' }
   ] as const;
   return {
     declare: {

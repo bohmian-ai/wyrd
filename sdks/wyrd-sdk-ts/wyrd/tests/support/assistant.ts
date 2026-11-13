@@ -44,6 +44,51 @@ export function toolTurn(calls: readonly unknown[]): Reply {
   };
 }
 
+/** The sharing-policy judge's first turn: read its mounted policy. */
+const READ_POLICY = [toolCall("call-policy", "fs.read", { path: "/inputs/policy.json" })];
+
+/** The sharing-policy judge's Verdict once `body` carries its `fs.read` result; no Verdict when the read has no `external-audit` line. */
+function sharingVerdict(body: string): string {
+  const messages = (JSON.parse(body) as { messages: { role: string; content: string | null }[] }).messages;
+  const release = JSON.stringify(messages.filter(({ role }) => role === "user").map(({ content }) => content));
+  let output: { sources?: string[]; units?: { text: string; locator: unknown }[] };
+  try {
+    output = JSON.parse(messages.find(({ role }) => role === "tool")?.content ?? "") as typeof output;
+  } catch {
+    return "the policy did not read";
+  }
+  const line = (output.units ?? []).find(({ text }) => text.includes("external-audit"));
+  if (line === undefined) {
+    return "the policy did not read";
+  }
+  const citations = [
+    { slot: "report", locator: { json_pointer: "/text" } },
+    { slot: output.sources?.[0], locator: line.locator },
+  ];
+  if (release.includes("PROVIDER-UNCERTAIN")) {
+    return JSON.stringify({
+      outcome: "inconclusive",
+      reason: "the policy does not settle this release",
+      citations: [],
+    });
+  }
+  if (release.includes("BANK-ACCOUNT-DEMO-001")) {
+    return JSON.stringify({ outcome: "failed", reason: "the report names a bank account identifier", citations });
+  }
+  return JSON.stringify({ outcome: "passed", reason: "an external audit may receive this report", citations });
+}
+
+/**
+ * The sharing-policy judge's reply: it reads `/inputs/policy.json` with
+ * `fs.read` first, then is inconclusive for a release naming
+ * `PROVIDER-UNCERTAIN`, fails one naming `BANK-ACCOUNT-DEMO-001`, and
+ * otherwise passes, citing the report text and the policy line permitting
+ * `external-audit`.
+ */
+export function sharingPolicyJudge(request: ReceivedRequest): Reply {
+  return /"role"\s*:\s*"tool"/.test(request.body) ? judgeReply(sharingVerdict(request.body)) : toolTurn(READ_POLICY);
+}
+
 /** One judge call's `bifrost.gateway.calls` identity and attribution. */
 export const JudgeCall = z.object({
   call_id: z.string(),

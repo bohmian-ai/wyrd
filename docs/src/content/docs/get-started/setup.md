@@ -1,6 +1,6 @@
 ---
 title: Set up Wyrd
-description: Install the Wyrd 0.4.1 CLI and SDK for Python, Rust, or TypeScript, then let your coding agent start a local server and run a first verification, or do it by hand.
+description: Install the Wyrd 0.4.1 CLI and SDK for Python, Rust, or TypeScript, start a local server with your coding agent or by hand, and check it with a verification that needs no model.
 pillar: wyrd
 section: Get started
 order: 2
@@ -67,9 +67,9 @@ It asks for:
 - your database URL, `postgresql://USER:PASSWORD@HOST:5432/DATABASE`
 - a tenant name, such as `acme`
 
-If a model provider key such as `OPENAI_API_KEY` is set, it also offers to add that provider to the gateway. Press Enter to skip; the quickstart calls no model.
+If a model provider key such as `OPENAI_API_KEY` is set, it also offers to add that provider to the gateway. Accept it to skip the provider step of the [quickstart](/get-started/quickstart/).
 
-It then starts a local server and hands over to the agent, which runs [Run your first verification](/get-started/quickstart/) and reports one `passed` and one `failed` verdict. Leave the terminal open; the server runs until you press Ctrl-C.
+It then starts a local server and hands over to the agent, which runs the [check](#3-check-it-end-to-end) below and reports one `passed` and one `failed` verdict. Leave the terminal open; the server runs until you press Ctrl-C.
 
 <Aside type="note" title="Another agent, or your own">
 
@@ -118,9 +118,67 @@ wyrd list
 
 An empty list means you're connected. Your code finds the server the same way, with no configuration.
 
-### 3. Run your first verification
+### 3. Check it end to end
 
-Follow [Run your first verification](/get-started/quickstart/), through [Confirm the stored verdicts](/get-started/quickstart/#3-confirm-the-stored-verdicts).
+This check declares a requirement and verifies two support answers against it. It calls no model.
+
+Save the Verifier in `quickstart` as `no-refund-promise.yaml`, and the Service it verifies as `support-reply.yaml`:
+
+<Tabs>
+<Tab label="no-refund-promise.yaml">
+
+<CodeFromFile file="examples/setup-check/no-refund-promise.yaml" lang="yaml" title="no-refund-promise.yaml" />
+
+</Tab>
+<Tab label="support-reply.yaml">
+
+<CodeFromFile file="examples/setup-check/support-reply.yaml" lang="yaml" title="support-reply.yaml" />
+
+</Tab>
+</Tabs>
+
+Save the program beside them and run it:
+
+<LangTabs langs={['python', 'rust', 'typescript']}>
+<LangTab lang="python">
+
+<CodeFromFile file="examples/setup-check/check.py" lang="python" title="check.py" />
+
+```bash
+uv run check.py
+```
+
+</LangTab>
+<LangTab lang="rust">
+
+<CodeFromFile file="examples/setup-check/check.rs" lang="rust" title="src/main.rs" />
+
+```bash
+cargo run
+```
+
+</LangTab>
+<LangTab lang="typescript">
+
+<CodeFromFile file="examples/setup-check/check.ts" lang="typescript" title="check.ts" />
+
+```bash
+node check.ts
+```
+
+</LangTab>
+</LangTabs>
+
+```text
+passed: the comparison held
+  subject:  Service/support-reply@1.0.0#<uid>
+  verifier: default/Verifier/no-refund-promise@1.0.0#<uid>
+failed: operator NotContains returned false
+  subject:  Service/support-reply@1.0.0#<uid>
+  verifier: default/Verifier/no-refund-promise@1.0.0#<uid>
+```
+
+A `failed` verdict is a result, not an error: the second answer promises a guaranteed refund. Your `uid` values differ; the server assigns them.
 
 ## If it fails
 
@@ -133,4 +191,4 @@ Follow [Run your first verification](/get-started/quickstart/), through [Confirm
 
 ## Next
 
-[Run your first verification](/get-started/quickstart/).
+[Run your first verification](/get-started/quickstart/) verifies a finance report against a policy PDF and decides whether to release it.

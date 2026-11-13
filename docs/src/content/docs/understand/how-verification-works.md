@@ -12,7 +12,7 @@ A Verifier checks declared requirements against evidence and returns a verdict: 
 
 This is the Verifier from [Run your first verification](/get-started/quickstart/):
 
-<CodeFromFile file="examples/quickstart/no-refund-promise.yaml" lang="yaml" title="no-refund-promise.yaml" />
+<CodeFromFile file="examples/setup-check/no-refund-promise.yaml" lang="yaml" title="no-refund-promise.yaml" />
 
 | Part | Holds |
 | --- | --- |

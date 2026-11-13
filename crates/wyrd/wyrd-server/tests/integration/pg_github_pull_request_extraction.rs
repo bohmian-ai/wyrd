@@ -1872,6 +1872,44 @@ async fn missing_changed_source_fails_the_extraction_and_never_passes() {
     assert_eq!(details["outcome"]["verdict"], "inconclusive", "{details}");
 }
 
+/// A text change whose patch GitHub truncated away fails the extraction
+/// rather than reviewing a partial diff, so the review is inconclusive and
+/// never passes.
+///
+/// # Panics
+/// Panics when the extraction succeeds or the review passes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_truncated_patch_fails_the_extraction_and_never_passes() {
+    let deployment =
+        Deployment::start(&[("pr-review.yaml", REVIEW), ("policy.yaml", POLICY)]).await;
+    deployment.head(&sha('a'), &sha('8'), HANDLER_A);
+    deployment.json(
+        &format!("/compare/{}...{}", sha('c'), sha('a')),
+        &json!({"status": "ahead", "base_commit": {"sha": sha('c')},
+                "merge_base_commit": {"sha": sha('c')},
+                "commits": [{"sha": sha('a')}],
+                "files": [{"filename": "src/handler.ts", "status": "modified",
+                           "sha": blob(HANDLER_A)}]}),
+    );
+
+    let execution = deployment.review(&sha('a'), "opened").await;
+
+    let details = deployment
+        .get(&format!("/v1/verification/executions/{execution}/details"))
+        .await;
+    let step = &details["outcome"]["steps"][0];
+    assert_eq!(
+        (&step["status"], &step["reason"]),
+        (
+            &json!("failed"),
+            &json!("pull request source acquisition failed: patch unavailable for src/handler.ts")
+        ),
+        "{details}"
+    );
+    assert!(step["output"].is_null(), "{details}");
+    assert_eq!(details["outcome"]["verdict"], "inconclusive", "{details}");
+}
+
 /// Related declarations the library's context leaves out are recorded as
 /// omissions, never hidden: a change calling twenty helpers in twenty files
 /// selects fifteen and omits five at the file limit, so a Verifier requiring

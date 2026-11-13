@@ -106,4 +106,4 @@ Wyrd answers GitHub only after the run is durably queued, so an interrupted deli
 
 ## Next
 
-[Write a Verifier](/build-and-verify/verify/author-a-verifier/) for the checks your pull requests need.
+[Write a Verifier](/build-and-verify/verify/author-a-verifier/) for the checks your pull requests need. To have an Agent review the changed source, give the Verifier an [`extract` step with `extractor: pull_request`](/reference/verifier-card/#actions).

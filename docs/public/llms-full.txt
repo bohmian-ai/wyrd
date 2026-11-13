@@ -1741,7 +1741,7 @@ Wyrd answers GitHub only after the run is durably queued, so an interrupted deli
 
 ## Next
 
-[Write a Verifier](/wyrd/build-and-verify/verify/author-a-verifier/) for the checks your pull requests need.
+[Write a Verifier](/wyrd/build-and-verify/verify/author-a-verifier/) for the checks your pull requests need. To have an Agent review the changed source, give the Verifier an [`extract` step with `extractor: pull_request`](/wyrd/reference/verifier-card/#actions).
 
 # Runs and observations
 
@@ -4355,11 +4355,13 @@ When to use each kind is in [Steps and checks](/wyrd/understand/how-verification
 | `kind` | Fields | Output |
 | --- | --- | --- |
 | `extract` | `from`: a `media` slot | The file's text and structure, in the shape [Extraction output](/wyrd/reference/extraction-output/) gives for its format |
+| `extract` | `extractor: pull_request` | The pinned source of the pull request the execution was queued for, described below |
 | `agent` | `agent`, `inputs`, `workspace` | The Agent's response, shaped by its Prompt `response_format` |
 | `code` | `runtime` (`python`, default), `entrypoint`, `source`, `inputs` | The function's return value, as JSON |
 
 - `extract` reads `pdf`, `text`, `markdown`, `csv`, `json`, `html`, `docx`, `xlsx`, and `pptx`, choosing the extractor by format.
 - `agent` is a path such as `./reader.yaml` or a CardRef. `inputs` maps each Prompt placeholder to a reference; a placeholder takes text, so a `media` slot goes through `extract` first. `workspace` maps paths under `/inputs/` to a reference such as `inputs.policy`, or to `{artifact: {card: {kind: Artifact, name, version}, path}}`, which mounts one file, a directory, or (without `path`) every file of an uploaded Artifact version, unchanged and pinned with the Verifier. Tools are in [Agent tools and authorization](/wyrd/reference/agent-tools-and-authorization/).
+- `extract` with `extractor: pull_request` takes no `from`. It runs only in an execution queued by a [Repository's](/wyrd/build-and-verify/declare/declare-a-repository/) `pull_request` Trigger, so a Verifier holding it is queued-only: verifying it directly is refused with `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` before any step runs. Its output is JSON with `format`, `pr` (number, title, body, `base`, `head`, `merge_base`), `review` (`mode`, `comparison_base`, `previous` execution, `fallback_reason`, and the whole pull request as `full_pr`), `changes` (each file's `path`, `status`, `before` and `after` source, and `hunks`), and `context` (related code with its `omissions`). The first review, or one after a policy change or a rewritten history, is `full`; later ones review only the commits since the last execution that extracted source. Pass it to an Agent through `inputs` or `workspace`, for example `workspace: {/inputs/pr.json: steps.pr.output}`. Wyrd never checks out the repository; a file whose source cannot be read fails the step, and an empty change is never a pass. Read the output in the execution's step results.
 - `code` calls the function `entrypoint` with `inputs` as keyword arguments. `source` is `{inline: "<python>"}` or `{artifact: {card, path?}}`, where `card` names an Artifact Card.
 
 ## Requirements
@@ -4497,6 +4499,7 @@ Common `rule` values in `WYRD_SPEC_400_VALIDATION`:
 | `duplicate_id` | Two steps or requirements share an `id` |
 | `graph` | `depends_on` forms a cycle |
 | `media_as_text` | A `media` slot is bound to an Agent text placeholder |
+| `extract_source` | An `extract` step names both or neither of `from` and `extractor`, or `from` is not a whole `media` slot |
 | `extract_format` | An `extract` step reads a slot with a format it cannot extract |
 | `operator` | An operator's parameters are invalid, such as a bad regex |
 | `step_budget` | `timeout_seconds` is 0 or `retries` is above 5 |

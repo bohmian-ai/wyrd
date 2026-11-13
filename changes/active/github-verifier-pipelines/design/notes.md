@@ -1,6 +1,32 @@
 # GitHub Verifier pipelines
 
-Status: finalized (remediation agreed; L1-only measurement)
+Status: exploring (direct-cache eligibility refinement; agreed remediation retained)
+
+## Direct cache eligibility
+
+The maintainer requires direct eligibility to be checked only on a registry
+load, before cache insertion, with no eligibility check on a direct cache hit.
+The current `VerifierCardCache` is shared by direct verification, queued
+submission and the runner, keyed by tenant, Verifier and subject. A queued
+caller can therefore populate an entry that has not passed direct eligibility.
+
+Recommendation: add direct/queued execution mode to the existing cache key.
+Keep one cache owner, its existing total byte limit and notification listener.
+A direct miss loads the registry, applies direct eligibility once, and caches
+only an eligible target under the direct key; refusal inserts no direct entry.
+Queued callers use the queued key. A direct hit returns its already-admitted
+target without a `queue_only` read or eligibility branch. Preserve existing
+direct refusal behavior, including scheduled-window eligibility, on the cold
+path rather than introducing another per-request guard.
+
+Invalidate both modes on the existing Card/tenant notifications, and preserve
+the existing generation-race and disconnected-listener behavior. With no valid
+cache entry each registry load still requires validation. Targets used by both
+modes may occupy two entries within the same existing byte budget; measure that
+memory and hit-rate trade-off in the required L1 comparison. Queued-first then
+direct invocation of a queue-only target must refuse; queued cache population
+must never establish direct eligibility. This is a proposal, not an approved
+cache implementation change or a task revision.
 
 ## Benchmark regression remediation
 
@@ -61,6 +87,15 @@ delivery is available; all five L1 experiments measure the same final candidate
 revision. L2 remains excluded. No further material design decision was found.
 
 ## Problem
+
+The [remaining-task hot-path review](remaining-task-hot-path-review.md) checked
+005 and 007–009 after the remediation work was separated. The maintainer then
+directed two task revisions: 005 extends `CodeReviewMetadata` with immediate-drain
+batching/group commit; 008 removes separate approval expiration. Pending approvals
+and deferred waits share the execution's one original expiration timestamp,
+preserved through checkpoint/recovery and continuation. No approval-specific
+timeout, clock anchor or per-step timestamp query is selected. 007/009 retain
+background/control-operation persistence rather than per-step engine waits.
 
 Users need one declared repository review policy that starts Verifier executions
 on eligible PRs, accepts later evidence and approval without occupying workers,

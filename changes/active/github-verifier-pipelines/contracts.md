@@ -15,6 +15,11 @@ Under the TASK-010-R1 amendment only queued work carries resumable execution
 state; direct work records its input, output and compact result records, and
 its status/details reads use them. Invocation and publication inspection is
 queued-only and answers execution-not-found for a direct execution.
+The Verifier spec carries server-derived `queue_only: bool`, set at
+registration when a step or check Agent (inline or a referenced registered
+Agent) declares `publish` and `false` otherwise; an authored value is replaced.
+Direct verify refuses a `queue_only` Verifier with
+`WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` before any step.
 Necessary preparation/cold loads remain supported. Live step/publication success
 and direct results do not certify retained evidence. Validated extraction values
 feed Prompt/workspace consumers without a persistence ACK; recovery uses exact
@@ -280,18 +285,19 @@ PostgreSQL tables or payload mirrors.
 action:
   kind: approval
   message: Approve the assessment before continuing.
-  expires_after_seconds: 3600
 ```
 
-Expiry is selected once with database coordination time, bounded by the original
-execution deadline. Inspection adds pending approval occurrences with approval_id,
-step/item/iteration identity, message, expiry and pending/approved/rejected/expired
-state. Approval IDs identify logical occurrences, not computation attempts.
+The execution's original expiration timestamp governs all pending approvals and
+deferred waits. There is no approval-specific duration or deadline. Inspection
+adds pending approval occurrences with approval_id, step/item/iteration identity,
+message and pending/approved/rejected/expired state; use the existing execution
+expiration. Approval IDs identify logical occurrences, not computation attempts.
 
 POST /v1/verification/executions/{execution_id}/approvals/{approval_id}
 accepts `{decision: approved | rejected, reason: string | null}`.
 A retry of the same actor/decision/reason returns the same receipt; a conflicting
-or non-pending occurrence returns 409. Expiry is server-selected, not a request.
+or non-pending occurrence returns 409. The execution expiration is server-owned
+and cannot be overridden by an approval request.
 Result is `{approval_id,status,actor_id,decided_at,reason}`; expired has null actor.
 No payload can expand the execution's accepted authority.
 

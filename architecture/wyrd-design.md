@@ -21,6 +21,7 @@ drift, not permission for code and documentation to diverge.
 ## Table of contents
 
 - [Doctrine](#doctrine) — 21 design principles
+- [Recording and eventual consistency](#recording-and-eventual-consistency) — asynchronous recording and explicit durability boundaries
 - [Client model](#client-model) — language-agnostic protocol and first-class SDKs
 - [Kind catalog](#kind-catalog) — 12 registrable kinds + External discriminator
 - [Per-kind specs](#per-kind-specs) — field shapes per kind
@@ -300,6 +301,30 @@ services.
     changes the containing Card spec. There is no separate publication or
     monitor-routing field, and clients never select a Verifier per
     observation.
+
+## Recording and eventual consistency
+
+Recording is asynchronous and eventually consistent by default. Execution does
+not wait for recorded results, evidence, or audit events to become durable or
+queryable. Verification and gateway calls stage their records on the process
+Scribe outbox and continue; background writers batch and persist those records
+in Bifrost. A successful execution response does not certify that its records
+are already retained or visible to readers.
+
+Background PostgreSQL writers and Scribe use batching and group commit.
+Recording must not introduce a database write or a wait for downstream
+acknowledgements into the execution path. Any operation that must wait for
+durability must explicitly document that boundary in its owning architecture
+contract. Existing boundaries include recoverable queued submission acceptance
+and the Bifrost append acknowledgement. Queued execution also retains its claim
+in background until terminal state and results are acknowledged; computation
+does not retain its engine resources while waiting.
+
+Eventual consistency does not excuse lost records. Recording paths retain their
+bounded buffering, retry, overload handling, and loss accounting contracts.
+Staging in process memory is not a durability acknowledgement; crash and
+shutdown guarantees remain explicit in the owning recording contract. Audit
+recording never blocks or fails the operation being audited.
 
 ## Client model
 
@@ -1535,7 +1560,14 @@ spec:
   steps?: [Step]                             # id, action, when?, depends_on?, retries?, timeout_seconds?, requirements?
   requirements?: [Requirement]               # id, statement, check — whole-Verifier
   decide?: all | { pass_rate: { threshold } } # default all
+  queue_only: bool                           # server-derived at registration; never authored
 ```
+
+`queue_only` is derived when the Verifier registers and is stored with its
+spec: `true` when a step or check Agent, inline or a referenced registered
+Agent, declares the `publish` tool, else `false`. A value an author sends is
+replaced, never honored. Later queued-only forms extend this derivation at
+registration; execution never re-infers it.
 
 | Slot | Evidence |
 |---|---|
@@ -1595,9 +1627,8 @@ attempts' accepted partial work stays readable and distinct. Mounted content
 cites only its producer's original slots; a failed step's partial work and
 the manifest cite none. Publications are queued-only: queued verification
 retains Agent publications and engine extraction through its live run state and
-background revision path, and a direct request whose step Agent declares
-`publish` or whose workspace mounts `steps.<id>.publications` is refused
-`WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` before any step runs. Standalone code
+background revision path, and a direct request for a `queue_only` Verifier is
+refused `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` before any step runs. Standalone code
 actions receive no publication tool.
 
 Requirement outcomes are `passed`, `failed`, `inconclusive`, or
@@ -1951,13 +1982,19 @@ Postgres pool, Oracle admission and memory, the Bifrost memory budget, and
 verification-runtime capacity. Work refused by one of them returns to the
 queue without consuming an attempt. The claim transaction also returns the
 Verifier Card's status, its spec on a cache miss, and any fitted drift
-baselines. Parsed Verifiers are cached per process by tenant and Card UID in
-a fixed 64 MiB least-recently-used cache that is never shared across tenants.
+baselines. Resolved targets are cached per process by tenant, Verifier,
+subject, and mode (direct or queued) in one fixed 64 MiB least-recently-used
+cache that is never shared across tenants. Direct verify checks direct
+eligibility (`queue_only` or a scheduled window) only on a direct miss and
+caches only an admitted target under direct; a direct hit runs with no further
+check, and a queued entry never answers a direct lookup. A Card or tenant
+invalidation removes both modes.
 A deleted Verifier terminates the execution `errored`.
 
-One shared verification engine executes the declarative graph. Direct verify
-and queued execution prepare one live in-memory `RunState` and run the same
-engine on it. Preparation (input validation, authorization, exact target
+One shared verification engine executes the declarative graph. Queued execution
+prepares a live in-memory `RunState` for recovery checkpoints; direct verify
+runs the same engine without that state or the checkpoint adapter.
+Preparation (input validation, authorization, exact target
 resolution including cold loads, and for queued work the batched claim, pinned
 input/source/policy, accepted authority, original deadline and exact accepted
 recovery) completes before the engine starts. Engine transitions (begin, forget,
@@ -2181,7 +2218,8 @@ tenant and subject limits, budgets, and accounting still apply. Both sides
 run the one engine with the same authority, evidence, billing, cancellation,
 and platform behavior. The reservation covers these admissions only; CPU,
 Postgres, gateway, and provider capacity remain shared. A Verifier using a
-queued-only form (a scheduled-window check today) is refused by `verify`
+queued-only form (a scheduled-window check, or registration-derived
+`queue_only`) is refused by `verify`
 before any step runs, never converted to a queued request. The queued
 execution deadline is the original ceiling of everything a queued execution
 waits for, including approval periods; waiting never resets it.

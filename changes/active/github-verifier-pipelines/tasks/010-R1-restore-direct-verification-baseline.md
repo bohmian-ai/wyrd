@@ -23,19 +23,35 @@ and guard placement below, including R4 and the linked design's guard wording.
 
 - Add `queue_only: bool` to the Verifier struct. It is server-derived at
   registration and cannot be set or overridden by users.
-- At registration, set it to `true` if the Verifier contains a `pull_request`
-  extraction step, a `publish` step, deferred inputs, or a referenced registered
-  Agent declaring `publish`; otherwise set it to `false`. Inspect the referenced
-  Agent during registration, not during warm-cache direct execution.
+- This remediation implements registration-time detection of `publish` only:
+  a Verifier containing a `publish` step or a referenced registered Agent
+  declaring `publish` gets `queue_only=true`; otherwise `false` for the forms
+  currently supported. Resolve referenced Agents during registration, not during
+  warm-cache direct execution.
+- Task 005 extends the same derivation when it introduces `pull_request`
+  extraction; task 007 extends it when it introduces deferred inputs. Do not
+  implement those future forms or placeholder predicates in this remediation.
 - During direct verification, check `queue_only` only on the first registry
   load, before cache insertion, and refuse a queue-only Verifier before execution.
   Cache hits reuse the admitted cached entry without repeating the check or
   scanning steps, tools or mounts. Do not add other inferred guard criteria.
-- Verify these registration conditions, including a referenced registered Agent
-  with `publish`, the ordinary `false` case, and inability to set or override
+- Use the existing cache with key `(tenant_id, verifier_uid, subject_uid, mode)`.
+  Tenant separation is unchanged; `mode` distinguishes `Direct` from `Queued`.
+  Direct calls look up only `Direct`; submission and runner calls look up only
+  `Queued`. A direct hit continues without an eligibility check. A direct miss
+  uses the existing registry query, checks eligibility, and inserts only an
+  eligible target under `Direct`; refusal inserts no direct entry. Queued loads
+  insert under `Queued` and cannot populate or satisfy a direct lookup. Mode is
+  an in-memory cache-key field, not another registry-query predicate. Keep one
+  cache owner and its existing total byte limit. Existing Card/tenant invalidation
+  must remove both modes, with generation/listener safeguards unchanged.
+- Verify publish detection, including a referenced registered Agent with
+  `publish`, the ordinary `false` case, and inability to set or override
   `queue_only` through user input. Also verify
   cold-load refusal before any step, and warm-cache direct execution without
-  repeating eligibility work. Queue-only Verifiers must never execute directly.
+  repeating eligibility work. Also prove queued-first cache population cannot
+  bypass direct refusal, tenant separation and invalidation of both modes.
+  Queue-only Verifiers must never execute directly.
 
 ## Outcome and agreement
 
@@ -151,7 +167,9 @@ feature or tuning knob. Buffer inflation or weaker loss accounting is not repair
 | R1 | Direct runs the shared engine without checkpoint adapter or `RunState`; result selected and compute released with persistence held; no checkpoint/history row or SQL execution row; after drain the input/output/result records serve result/details with caller attribution (R1; REQ-015/017, AC-010/012) | Server integration journey with held Scribe and post-drain reads; source inspection of `run_direct` |
 | R2 | Direct output/summary rows absorb into destination frames; detail-before-summary; stable slice retry identity; tenant isolation; queued result keys/acks unchanged (R2; REQ-018, AC-013) | `scribe_outbox.rs` unit tests over many direct results and a queued result |
 | R3 | Queued keeps resumable state, recovery, bounded custody, claim backpressure, batched fenced settlement; direct completes while queued acks are held and claim tracking is full (R3; INV-002/004–006) | Existing `pg_durable_verifier_work` and runner tests plus a direct-under-held-queued-custody regression |
-| R4 | Direct status/details read baseline records; queued inspection reads accepted state; foreign/unauthorized refused; invocations/publications of direct are not found; `publish` step Agents (inline or registered) and `steps.<id>.publications` mounts refuse before any step; ordinary direct tools/files keep working (R4; REQ-015/016, AC-010/011; INV-001/007) | `pg_verification_routes` details tests, eligibility unit and integration tests, Rust SDK journey |
+| R4 | Direct status/details read baseline records; queued inspection reads accepted state; foreign/unauthorized refused; invocations/publications of direct are not found; ordinary direct tools/files keep working (R4; REQ-015/016, AC-010/011; INV-001/007) | `pg_verification_routes` details tests, Rust SDK journey |
+| Q1 | Registration derives `queue_only` from a `publish` step or a referenced registered Agent declaring `publish`, `false` otherwise; users cannot set or override it (Revision) | Declaration route integration test |
+| Q2 | Direct verification checks `queue_only` only on a direct cache miss, before direct cache insertion, and refuses before any step; a direct hit continues with no eligibility work; cache key `(tenant, verifier, subject, mode)`; queued loads cannot populate or satisfy a direct lookup; tenant separation; Card/tenant invalidation removes both modes (Revision) | Cache unit tests, eligibility unit test, Rust SDK journey with queued-first population, source inspection of the hit path |
 | R5 | Full L1 verification, gateway and Bifrost on one immutable candidate: all VALID, targets met, no regression vs newest comparable clean resource-scaling records (R5; REQ-018, AC-013 as amended; L2 excluded) | `bench:l1:*` records compared with `benchmarks/history/` baselines |
 
 ## Verification and handoff

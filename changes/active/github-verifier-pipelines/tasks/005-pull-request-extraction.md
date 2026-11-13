@@ -30,8 +30,50 @@ credentials. Missing accepted source identity refuses before acquisition.
 support media `extract/from`; the server's hosted evidence/blocks bind tenant
 reads and Agent execution. Extend the existing extract action with exactly one
 of `from` or `extractor: pull_request`. Preserve existing formats and failure
-semantics. Attach the new form to task 001's pre-execution queued-only check,
-including manual direct invocation; never execute a prefix then refuse.
+semantics.
+
+### Revision — registration-derived `queue_only`
+
+When introducing `extractor: pull_request`, extend the server-owned registration
+derivation introduced by [010-R1](010-R1-restore-direct-verification-baseline.md)
+to set the Verifier's `queue_only=true` for this form. Preserve other supported
+queue-only conditions; users cannot set or override the flag. This replaces the
+former instruction to add a pre-execution graph guard. Direct verification
+reuses the existing flag check on cold registry load before cache insertion;
+do not add request-time extraction scans or repeat eligibility work on cache hits.
+Verify registration classification, direct cold-load refusal before any step,
+and that ordinary media extraction remains direct-eligible in the absence of
+other queue-only features. Task 010-R1 implements publish detection only;
+this task owns the extraction extension and its proof.
+
+### Revision — metadata batching and group commit
+
+Extend the existing `CodeReviewMetadata` owner to collect pending metadata writes
+and group-commit independent operations in short tenant-scoped transactions.
+Use verification `Completions` as the model for collection, flush and per-call
+replies; metadata remains owned by `CodeReviewMetadata`.
+
+Workers take available operations up to a bounded batch size as soon as they are
+free. Do not wait for the batch to fill or add a collection timer: a lone write
+commits immediately when a worker is available. Bound pending work and worker
+concurrency. Return each operation's result only after its transaction commits;
+dependent pipeline work still waits for that result. Preserve conditional pointer
+publication, conflict handling, context timestamps, tenant isolation and retry
+semantics. Failed batches report failure without falling back to a transaction
+per operation. Reads remain available when the pipeline needs them.
+
+Release the transaction before GitHub or object-storage IO. Do not hold a state
+lock while waiting for admission, SQL or commit, or reuse the execution-completion
+queue for metadata. No new database, generic batching service or configuration
+surface is selected.
+
+Verify concurrent independent writes share commits, low-traffic writes complete
+without waiting for another arrival, replies follow commit, failures retain the
+existing operation semantics, and tenant batches remain isolated. Exercise the
+actual pipeline with real Postgres/object-store adapters; preserve pointer races,
+context lifetime and cleanup coverage. Record batch sizes and transaction
+boundaries through existing tracing/test seams; no benchmark or production hook
+is added by this revision.
 
 ## Agreed transformation and custody
 

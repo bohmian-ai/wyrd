@@ -2123,7 +2123,7 @@ async fn hold_reserved_share(
 /// released. Every dependent iteration runs and the caller receives its
 /// selected report. The direct execution keeps no execution state and no
 /// queue record; once its records drain, its status and details read
-/// back from them.
+/// back from them, and its invocations and publications are not found.
 ///
 /// A queued execution is then submitted while all but the one slot its
 /// admission stages through is held; once it stalls in its first model call
@@ -2237,6 +2237,14 @@ async fn refinement_progresses_while_persistence_is_held() {
             .invocations(&ExecutionPageQuery::default())
             .await
             .expect_err("a direct execution has no invocation history")
+            .code(),
+        "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND"
+    );
+    assert_eq!(
+        execution
+            .publications(&ExecutionPageQuery::default())
+            .await
+            .expect_err("a direct execution has no publication history")
             .code(),
         "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND"
     );

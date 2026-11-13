@@ -153,15 +153,19 @@ Exact extensions and restart-safe handoffs remain to specify and verify.
 
 ## Approval and deadlines
 
-The user approved a dedicated approval action with message and expiry, returning
-approved/rejected/expired with server-derived actor and time. Reuse existing
+The user approved a dedicated approval action with a message, returning
+approved/rejected/expired with server-derived actor and time. The user's later
+simplification removes any approval-specific expiration setting: all pending
+approvals and deferred waits share the execution's one original expiration
+timestamp, preserved across checkpoints, recovery and continuation. Reuse existing
 authentication plus a separate approval permission; no quorum, approval-links
 service or generic signal API. The user's later correction removes the earlier
 recent-interactive-login restriction: normal authentication and authorization
 are sufficient. No authentication-age threshold or special approval proof.
 
-Use the original execution deadline for missing evidence and approval; neither
-extends it. Expose the execution ceiling through normal operator configuration
+Use that original execution deadline for missing evidence and approval; neither
+extends it. Do not add an approval timer, clock anchor or per-step timestamp query.
+Expose the execution ceiling through normal operator configuration
 so intended human approval periods are usable. Exact nested authoring/API schemas
 remain to specify, not another decision about adding generic waits.
 

@@ -18,17 +18,36 @@ It requires task 010's memory execution runtime (spec revision 7 REQ-017).
 
 ## Input → pending occurrence
 
-An exact registered Verifier declares `action: {kind: approval, message: ...,
-expires_after_seconds: ...}`. Add that closed action/schema/validation at the
-existing spec/engine action owner and attach it to task 001's pre-step queued-only
-check. Task 006's accepted source/authority and task 007's restored logical
-execution provide its context; no request can expand that accepted authority.
+An exact registered Verifier declares `action: {kind: approval, message: ...}`.
+There is no approval-specific expiration setting. Add that closed action/schema/
+validation at the existing spec/engine action owner. Task 006's accepted source/authority and task
+007's restored logical execution provide its context; no request can expand that
+accepted authority.
+
+### Revision — reconcile approval-only eligibility
+
+Do not implement the former instruction to add a separate pre-step approval
+guard. [010-R1](010-R1-restore-direct-verification-baseline.md) introduces a
+server-derived `queue_only` flag checked on cold registry load; task 005 adds
+pull-request extraction detection and task 007 adds deferred-input detection.
+Approval is a separate action and does not automatically declare a deferred
+input. The existing approval-is-queued-only requirement therefore is not fully
+expressed by the maintainer's three specified registration conditions.
+Resolve this approval-only eligibility conflict with the maintainer before
+implementing that behavior. Do not infer a fourth classification condition,
+invent deferred inputs, add per-request guards or silently allow direct approval.
+This issue belongs to task 008 and does not block publish-only remediation or
+the extraction/deferred-input registration extensions. Other approval behavior
+below remains unchanged.
 
 When the action becomes pending, the sole state owner creates a server-issued
 approval_id for its logical step/item/iteration occurrence, distinct across
-repeat/fanout. Attempts do not silently mint another occurrence. Set expiry once
-using database coordination time, capped by the original execution deadline.
-The pending identity/message/expiry enters live state; inspection and decision
+repeat/fanout. Attempts do not silently mint another occurrence. Every pending
+approval uses the execution's one original expiration timestamp. Do not calculate
+or store another approval deadline, add `expires_after_seconds`, introduce a clock
+anchor, or query PostgreSQL when an approval step is reached. Checkpoint/recovery
+and continuation preserve the same execution expiration; they never restart it.
+The pending identity/message enters live state; inspection and decision
 acceptance resolve it only from accepted Bifrost state. Independent branches
 continue; when all block, use task 007's background park handoff (compute
 released immediately, parked state ACKed before delivery retirement), not another
@@ -45,8 +64,9 @@ audit owners. No login-age cutoff, interactive proof, special approval token,
 quorum or credential-type shortcut is authorized.
 
 Extend the existing canonical execution control-fact acceptance owner used by
-007 to conditionally accept actor/decision/reason for this pending, unexpired,
-current occurrence. Record approved/rejected/expired with server actor/time/reason
+007 to conditionally accept actor/decision/reason for this pending, current
+occurrence while its execution has not expired. Record approved/rejected/expired
+with server actor/time/reason
 (expiry has null actor). Same actor/decision/reason retry replays receipt;
 conflicting, expired, stale, terminal or superseded occurrence refuses as approved.
 Accept durable decision ACK before positive receipt; a process-local notification
@@ -65,8 +85,9 @@ authorize current work. Revocation/cancellation/deadline apply while parked.
 
 ## Output and shipped projection
 
-Inspection returns pending/status occurrences with ID, step/item/iteration,
-message and expiry. Decision receipt is exactly approval_id/status/actor_id/
+Inspection returns pending/status occurrences with ID, step/item/iteration and
+message; expiration is the existing execution expiration, not another per-approval
+field. Decision receipt is exactly approval_id/status/actor_id/
 decided_at/reason from the contracts. Task 009 reads pending reason and accepted
 progress for GitHub status without changing verdict. Shared client and thin
 Rust/Python/TypeScript, CLI, HTTP/MCP approve/read operations, scopes, typed errors,
@@ -80,8 +101,10 @@ canonical decision/ACK contract at its owner. No UI or alternate login flow.
 **AC-006 (approval):** Drive task 002 connect→003 declare→006 admit and task 007's
 actual park lifecycle, with independent work and a pending approval. Read its ID
 through SDK/CLI/MCP and approve/reject as an authorized second principal. Observe
-exact receipt, same execution continuation and authored require-approved behavior;
-expiry records expired rather than passing/crashing. Unauthorized, foreign tenant,
+exact receipt, same execution continuation and authored require-approved behavior.
+The execution's expiration expires pending approvals rather than passing/crashing;
+decisions after it are refused. Assert no approval-specific duration/deadline and
+no new SQL call when an approval becomes pending. Unauthorized, foreign tenant,
 wrong Verifier scope, conflicting retry, stale occurrence and old-head decision
 fail safely. Repeat/fanout have distinct occurrence IDs; discarded speculation
 cannot authorize retained work. Observe independent progress and capacity release
@@ -90,7 +113,8 @@ through the same resource path already proved by 007.
 **AC-007 (decisions):** Crash before/after decision ACK and continuation commit,
 then recover actual pending occurrence and accepted fact through 007. A positive
 receipt survives without another decision or replay of settled computation;
-unknown/unavailable canonical state is not a newly generated approval. Race
+unknown/unavailable canonical state is not a newly generated approval. Verify
+recovery and continuation preserve the same execution expiration. Race
 expiry, current authority loss and task 006 supersession with acceptance and
 observe no stale release. This extends 007's recovery journey with real accepted
 decisions, rather than a synthetic checkpoint claiming approval.

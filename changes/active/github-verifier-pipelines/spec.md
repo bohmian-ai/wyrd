@@ -211,8 +211,10 @@ Execution initialization checks accepted matching evidence as well as processing
 new notifications. Publication acknowledgement confirms durable evidence
 acceptance, not review completion. Partial uploaded bytes are not publication.
 
-**REQ-010 — Human approval.** A dedicated approval action declares message and
-expiry. Pending occurrences have exact server-issued identities. An authorized
+**REQ-010 — Human approval.** A dedicated approval action declares a message.
+Pending approvals share the execution's original expiration timestamp; there is
+no separate approval duration or deadline. Pending occurrences have exact
+server-issued identities. An authorized
 user may approve/reject through the shared execution surfaces using normal
 authentication and authorization. Require the approval permission and current
 subject authority. Do not require recent interactive proof, a special login
@@ -230,7 +232,7 @@ No execution permit remains attached to that ACK. Continuation restores the same
 execution and accepted state without replaying durably settled predecessors or
 replenishing accepted spend/retries or the original deadline. A crash before
 checkpoint acceptance can repeat unpersisted work under REQ-017. Missing evidence
-and approval expiry remain bounded by the original execution deadline; operator
+and pending approvals use the same original execution expiration; operator
 execution ceilings must support intended approval periods. Cancellation,
 revocation and supersession apply while parked.
 
@@ -270,9 +272,10 @@ execution verdict. No new result mirror or finalizer service.
 **REQ-015 — Resource isolation.** Direct and queued execution, workspace, Python
 and model-call admission use separate capacity without borrowing. PR extraction,
 deferred inputs and approval are queued-only, including manual calls; refuse a
-direct request before any step. Under the TASK-010-R1 amendment, step Agents
-declaring the `publish` tool and workspace mounts of `steps.<id>.publications`
-are also queued-only and refused before any step. Ordinary direct-eligible Verifiers retain their
+direct request before any step. Under the TASK-010-R1 amendment, a Verifier
+whose step or check Agent, inline or a referenced registered Agent, declares
+the `publish` tool is marked `queue_only` at registration (server-derived, never
+user-settable) and refused before any step. Ordinary direct-eligible Verifiers retain their
 path. Same engine and tenant/evidence rules apply. A burst of 41 PRs is durably
 accepted under bounded ingress and progresses through the existing fair queue;
 there is no completion-time SLA for arbitrary DAGs.
@@ -444,6 +447,11 @@ readiness. Implementation tasks derive from this approved revision.
 | 6 | approved storage direction | Task 004 ObjectStorage over existing object storage and PostgreSQL SnapshotStore/ContextStore with their required metadata-table exception; reconcile the previously stale draft frontmatter. |
 | 7 | approved in current conversation | Shared memory execution, preserved preparation/Bifrost, bounded background queued completion and leases/group commit, explicit crash loss, compute-free park handoffs, resource-scaling proof and unreleased execution-schema cleanup. |
 
+Subsequent explicit maintainer amendment: approval authoring has no separate
+expiration setting. Pending approvals and deferred waits share the execution's
+one original expiration timestamp; checkpoints, recovery and continuation never
+reset it. REQ-010–011 and the approval contract reflect that instruction.
+
 Authority: [Wyrd doctrine/Verifier](../../../architecture/wyrd-design.md),
 [Bifrost](../../../architecture/bifrost-design.md),
 [security](../../../architecture/wyrd-security-posture.md),
@@ -473,7 +481,9 @@ or publication receipt and records the resource-scaling `execution_inputs`
 (`origin=direct`), `execution_outputs` and `results` rows, delivered in
 destination-batched frames; direct status/details reads use those records;
 queued execution keeps resumable state, recovery and bounded custody on the
-same engine; `publish` tools and publication mounts are queued-only; and
+same engine; a Verifier declaring a `publish` Agent is registration-derived
+`queue_only` and refused by direct verify on a direct cache miss before any
+step; and
 qualification is L1 verification, gateway and Bifrost with no regression, with
 no L2 measurement. Conflicting direct-state, direct-inspection and L2 text in
 this revision, the contracts and task 010 is superseded by this amendment.

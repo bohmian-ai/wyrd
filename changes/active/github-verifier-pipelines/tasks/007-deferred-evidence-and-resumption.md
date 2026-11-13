@@ -26,7 +26,20 @@ consumers from ordinary input refs; no extra subscription authoring/depends_on.
 Task 003's active selected binding establishes subscription to each named
 input even without a running execution. Task 006 supplies accepted PR repository/
 head/policy/authority for consumers. Publication alone never starts a run.
-New slot forms join task 001's queued-only validation before any direct step.
+
+### Revision — registration-derived `queue_only`
+
+When introducing deferred inputs, extend the server-owned registration derivation
+introduced by [010-R1](010-R1-restore-direct-verification-baseline.md) to set
+`queue_only=true` when a Verifier declares `deferred: true`. Preserve other
+supported queue-only conditions; users cannot set or override the flag. Omitted
+or false `deferred` does not itself make a Verifier queue-only. This replaces the
+former instruction to add pre-step slot validation for direct eligibility.
+Reuse the cold registry-load flag check before cache insertion; do not scan
+inputs on each direct request or repeat eligibility work on cache hits. Verify
+registration classification for true/false/omitted, refusal before any direct
+step, and unchanged ordinary-input eligibility. Task 010-R1 implements publish
+detection only; this task owns the deferred-input extension and its proof.
 
 Publishers use `wyrd evidence publish ci_results --file results.json` or
 `client.evidence.publish(name, value, repository=None, commit=None)`. CLI/SDK infer

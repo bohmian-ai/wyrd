@@ -648,6 +648,14 @@ binding rather than restating them.
 
 ## Durability and visibility
 
+Bifrost implements Wyrd's
+[asynchronous, eventually consistent recording contract](wyrd-design.md#recording-and-eventual-consistency).
+Verification, gateway, and query-audit producers stage records without waiting
+for Scribe; background writers batch their delivery. The append acknowledgement
+below is the explicit durability boundary for an append, not a reason to make
+those producers wait. Later storage publication and maintenance also proceed
+asynchronously; an append does not wait for every downstream stage.
+
 Bifrost uses explicit authority transitions:
 
 ```text

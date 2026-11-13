@@ -1557,7 +1557,7 @@ impl Verdict {
 /// Keys of `properties` and `$defs` are names, never keywords. It runs on
 /// the generated envelope only, before any authored `data` schema is
 /// embedded.
-fn portable(schema: &mut Value) {
+pub(crate) fn portable(schema: &mut Value) {
     let Value::Object(node) = schema else {
         return;
     };

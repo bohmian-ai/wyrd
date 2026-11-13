@@ -391,7 +391,7 @@ impl Deployment {
 ///
 /// # Panics
 /// Panics when the installation is not connected.
-async fn install(
+pub(super) async fn install(
     server: &WyrdTestServer,
     mock: &GithubAppMock,
     tenant: wyrd_spec::ids::DataTenantId,

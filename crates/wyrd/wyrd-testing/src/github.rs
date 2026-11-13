@@ -8,7 +8,8 @@
 //! users, the browser's signed-in GitHub user, suspension and repository
 //! access, and can hold GitHub's next answer to interleave Wyrd work with
 //! it. Pull requests are scripted with [`PullRequest`] and read back by
-//! installation tokens; every webhook delivery is logged with its
+//! installation tokens, as is repository content the test serves verbatim
+//! with every read recorded; every webhook delivery is logged with its
 //! `X-GitHub-Delivery` id so Wyrd can list and redeliver failed ones, as
 //! GitHub's App delivery API allows. [`GithubBrowser`] is a
 //! browser signed in to Wyrd that follows the redirect chain across Wyrd and
@@ -109,6 +110,8 @@ impl HeldAnswer {
 /// One pull request as GitHub holds it, which the test edits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullRequest {
+    /// Title.
+    pub title: String,
     /// Target branch.
     pub base_ref: String,
     /// Target branch commit.
@@ -131,6 +134,7 @@ impl PullRequest {
     #[must_use]
     pub fn open(repository: u64, base_sha: &str, head_sha: &str) -> Self {
         Self {
+            title: "Change".to_owned(),
             base_ref: "main".to_owned(),
             base_sha: base_sha.to_owned(),
             head_ref: "feature".to_owned(),
@@ -145,8 +149,10 @@ impl PullRequest {
     fn json(&self, repository: u64, number: u64) -> Value {
         json!({
             "number": number,
+            "title": self.title,
             "state": if self.open { "open" } else { "closed" },
             "draft": self.draft,
+            "merged": false,
             "base": {"ref": self.base_ref, "sha": self.base_sha, "repo": {"id": repository}},
             "head": {
                 "ref": self.head_ref,
@@ -224,6 +230,12 @@ struct MockState {
     pull_hold: Option<HeldAnswer>,
     /// The status the next pull request read fails with, if any.
     pull_failure: Option<StatusCode>,
+    /// Scripted repository content by (repository id, path and query
+    /// below the repository), answered with (status, body).
+    content: HashMap<(u64, String), (StatusCode, Vec<u8>)>,
+    /// Every installation read below a repository, as (repository id,
+    /// path and query), in arrival order.
+    repository_reads: Vec<(u64, String)>,
     /// Held next answer of the delivery log read.
     deliveries_hold: Option<HeldAnswer>,
     /// The App's webhook delivery log, oldest first.
@@ -531,6 +543,28 @@ impl GithubAppMock {
         self.state().pull_failure = Some(status);
     }
 
+    /// Answer an installation's `GET /repositories/{repository}{path}`
+    /// with `status` and `body`; `path` is empty for the repository itself
+    /// and includes any query exactly as the client sends it. Unscripted
+    /// paths answer `404 Not Found`.
+    pub fn serve_repository(&self, repository: u64, path: &str, status: StatusCode, body: Vec<u8>) {
+        self.state()
+            .content
+            .insert((repository, path.to_owned()), (status, body));
+    }
+
+    /// Every installation read below `repository`, pull request reads
+    /// included, as its path and query, in arrival order.
+    #[must_use]
+    pub fn repository_reads(&self, repository: u64) -> Vec<String> {
+        self.state()
+            .repository_reads
+            .iter()
+            .filter(|(id, _)| *id == repository)
+            .map(|(_, path)| path.clone())
+            .collect()
+    }
+
     /// Hold GitHub's answer to the next pull request read.
     #[must_use]
     pub fn hold_next_pull_request_read(&self) -> HeldAnswer {
@@ -755,6 +789,7 @@ fn router(inner: std::sync::Weak<Inner>) -> Router {
             "/api/v3/user/installations/{id}/repositories",
             get(user_repositories),
         )
+        .fallback(repository_content)
         .with_state(Weak(inner))
 }
 
@@ -1085,14 +1120,12 @@ async fn pull_request(
     };
     let (answer, hold) = {
         let mut state = mock.state();
-        let issued = bearer(&headers).is_some_and(|token| {
-            token.starts_with(INSTALLATION_TOKEN_PREFIX) && state.issued.iter().any(|t| t == token)
-        });
-        let reachable = state.installations.values().any(|installation| {
-            installation.app_id == APP_ID
-                && !installation.suspended
-                && installation.repositories.contains_key(&repository)
-        });
+        let (issued, reachable) = installation_read(
+            &mut state,
+            &headers,
+            repository,
+            &format!("/pulls/{number}"),
+        );
         let failed = state.pull_failure.take();
         let answer = match (state.pulls.get(&(repository, number)), failed) {
             _ if !issued => StatusCode::UNAUTHORIZED.into_response(),
@@ -1108,6 +1141,57 @@ async fn pull_request(
         hold.hold().await;
     }
     answer
+}
+
+/// Record an installation read of `path` below `repository` and report
+/// whether the bearer is an issued installation token and whether a live
+/// installation of this App reaches the repository.
+fn installation_read(
+    state: &mut MockState,
+    headers: &HeaderMap,
+    repository: u64,
+    path: &str,
+) -> (bool, bool) {
+    state.repository_reads.push((repository, path.to_owned()));
+    let issued = bearer(headers).is_some_and(|token| {
+        token.starts_with(INSTALLATION_TOKEN_PREFIX) && state.issued.iter().any(|t| t == token)
+    });
+    let reachable = state.installations.values().any(|installation| {
+        installation.app_id == APP_ID
+            && !installation.suspended
+            && installation.repositories.contains_key(&repository)
+    });
+    (issued, reachable)
+}
+
+/// `GET /api/v3/repositories/{id}/...` beyond the named routes: an
+/// installation reads scripted repository content of a repository its
+/// token reaches. Every other unrouted request is `404 Not Found`.
+async fn repository_content(
+    State(weak): State<Weak>,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+) -> Response {
+    let Some(mock) = weak.mock() else {
+        return gone();
+    };
+    let target = uri
+        .path_and_query()
+        .map_or(uri.path(), |target| target.as_str());
+    let Some((repository, path)) = target
+        .strip_prefix("/api/v3/repositories/")
+        .map(|rest| rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len())))
+        .and_then(|(id, path)| Some((id.parse::<u64>().ok()?, path.to_owned())))
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let mut state = mock.state();
+    let (issued, reachable) = installation_read(&mut state, &headers, repository, &path);
+    match state.content.get(&(repository, path)) {
+        _ if !issued => StatusCode::UNAUTHORIZED.into_response(),
+        Some((status, body)) if reachable => (*status, body.clone()).into_response(),
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// Delivery log page query.

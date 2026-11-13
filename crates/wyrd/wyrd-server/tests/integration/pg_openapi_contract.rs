@@ -1590,13 +1590,13 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
     server.shutdown().await.expect("server shuts down");
 }
 
-/// The Verification surface is exactly thirteen typed operations.
+/// The Verification surface is exactly fourteen typed operations.
 ///
 /// Binding status, evidence planning, deferred evidence publication, direct
 /// execution, enqueue, execution
 /// status, invocation and publication pages, publication read, download, and
-/// local content, and cancellation publish their typed request and response
-/// schemas; local content answers `application/octet-stream` bytes,
+/// local content, cancellation, and an approval decision publish their typed
+/// request and response schemas; local content answers `application/octet-stream` bytes,
 /// enqueue answers `202 Accepted`, direct execution answers `200` with its
 /// compact result and documents its stable refusals, execution details are
 /// their own read whose requirements add the check and provenance the
@@ -1622,7 +1622,7 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
 /// disposition, or producer field is unpublished, or when the document names
 /// a retired evaluation identifier.
 #[tokio::test]
-async fn verification_contract_publishes_thirteen_typed_operations_and_the_local_upload() {
+async fn verification_contract_publishes_fourteen_typed_operations_and_the_local_upload() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -1649,6 +1649,10 @@ async fn verification_contract_publishes_thirteen_typed_operations_and_the_local
             ("/v1/verification/evidence/publish", "post"),
             ("/v1/verification/execute", "post"),
             ("/v1/verification/executions/{execution_id}", "get"),
+            (
+                "/v1/verification/executions/{execution_id}/approvals/{approval_id}",
+                "post"
+            ),
             ("/v1/verification/executions/{execution_id}/cancel", "post"),
             ("/v1/verification/executions/{execution_id}/details", "get"),
             (
@@ -1687,6 +1691,16 @@ async fn verification_contract_publishes_thirteen_typed_operations_and_the_local
     assert_eq!(
         schema_ref(enqueue, "202").as_deref(),
         Some("#/components/schemas/EnqueueVerificationResponse")
+    );
+    let decide =
+        &paths["/v1/verification/executions/{execution_id}/approvals/{approval_id}"]["post"];
+    assert_eq!(
+        decide["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/DecideApprovalRequest"
+    );
+    assert_eq!(
+        schema_ref(decide, "200").as_deref(),
+        Some("#/components/schemas/ApprovalReceipt")
     );
     let evidence = &paths["/v1/verification/evidence"]["post"];
     assert_eq!(

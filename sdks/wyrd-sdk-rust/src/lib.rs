@@ -259,6 +259,8 @@ mod tests {
         let _ = super::WyrdClient::with_config;
         let _ = super::verify::Execution::connect;
         let _ = super::verify::Execution::connect_with;
+        let _ = super::verify::Evidence::connect;
+        let _ = super::verify::Evidence::connect_with;
         let _ =
             |bytes: Vec<u8>| super::verify::File::bytes(bytes).with_format(super::MediaFormat::Pdf);
         let _ = super::WyrdError::code;

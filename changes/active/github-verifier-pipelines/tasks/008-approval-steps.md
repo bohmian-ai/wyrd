@@ -129,3 +129,22 @@ existing server and SQL integration owners via
 permission coverage and standard helper behavior at their owners. Record new
 focused commands when tests exist. Apply README codegen/typing/OpenAPI/MCP,
 format/lint, dependency and tenant checks. No authentication-age tests are added.
+
+## Obligations
+
+Maintainer clarification (2026-11-13): approval-only eligibility is settled by
+spec REQ-015 ("PR extraction, deferred inputs and approval are queued-only") and
+the registration-derived `queue_only` owner, whose contract already says later
+queued-only forms extend that one derivation. A Verifier with an approval step
+is therefore marked `queue_only` at registration; the §Revision caution is
+resolved, not a fourth inferred rule.
+
+| ID | Promise (source) | Planned proof |
+|---|---|---|
+| REQ-010a | `action: {kind: approval, message}` is a closed action with validation; no approval expiration setting; registration derives `queue_only`; direct verify refuses before any step (§Input, §Revision, REQ-015) | spec validation unit tests; declaration route test; direct refusal test |
+| REQ-010b | A reached approval occurrence becomes pending with a server-issued approval_id per logical step/item/iteration, stable across attempts and distinct across fanout/repeat; no per-approval deadline, clock anchor or SQL call when pending; independent branches continue; all-blocked parks through 007's park handoff (§Input → pending) | engine unit tests (pending, independent progress, fanout/repeat distinct occurrences); runtime park test |
+| REQ-010c | `POST /v1/verification/executions/{execution_id}/approvals/{approval_id}` with approved/rejected + optional reason: normal auth, exact `verifier:approve` at Verifier scope plus subject scope, audited; resolves only from accepted state; durable decision ACK before receipt `{approval_id,status,actor_id,decided_at,reason}`; identical retry replays; conflicting/expired/stale/terminal/superseded/unknown refuse (§Decision acceptance, contracts → Human approval) | server pg journey: authorized second principal, unauthorized, foreign tenant, wrong Verifier scope, conflict, replay, terminal/expired, old head |
+| REQ-011 | The accepted decision continues the same ExecutionId through 007's queue continuation; completed predecessors, deadline, attempts/spend and authority are restored; rejection is step data; standard helper passes only approved; ACK→queue gap recovers by park recheck; supersession/revocation/deadline fence parked work (§Decision acceptance) | pg journey (approve → pass, reject → fail via helper), deadline expiry, restart while waiting (AC-007) |
+| REQ-016 | Inspection lists approval occurrences (id, step/item/iteration, message, status) using the execution's expiration; shared client, Rust/Python/TS SDKs, CLI, MCP read/decide, scope, typed errors, docs; architecture amended (§Output) | SDK journeys (Rust/Python/TS), MCP journey, CLI test, codegen/docs checks |
+| INV-003/004 | Positive receipt follows durable acceptance; unavailable canonical state is never a new or absent approval (AC-007) | restart/unavailable tests |
+| INV-006 | Superseded/old-head and discarded-speculation occurrences never authorize current work (AC-006) | old-head decision refused; occurrence IDs bind the execution |

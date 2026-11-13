@@ -6,8 +6,9 @@
 //! mock, and the agent reads and releases it; no answer carries a token, code
 //! or key. A writer sees the read tool but not the write tools, and is
 //! refused all three when it names them. An agent reads a declared
-//! Repository's served selection and lists the Repository family, and
-//! publishes the deferred evidence a waiting pull request execution needs.
+//! Repository's served selection and lists the Repository family,
+//! publishes the deferred evidence a waiting pull request execution needs,
+//! and has another agent approve its pending signoff.
 
 /// The Postgres-backed half of the GitHub connection journey.
 mod pg_tests {
@@ -15,6 +16,7 @@ mod pg_tests {
 
     use rmcp::ClientServiceExt as _;
     use rmcp::model::{CallToolRequestParams, CallToolResult};
+    use rmcp::service::{RoleClient, RunningService};
     use secrecy::ExposeSecret as _;
     use serde_json::json;
     use wyrd_client::cards::Cards;
@@ -364,6 +366,205 @@ mod pg_tests {
         Ok(())
     }
 
+    /// The head commit every waiting pull request opens at.
+    const HEAD: &str = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
+
+    /// A connected deployment whose administrator agent declared a
+    /// Repository and opened pull request 9 of `acme/web` at [`HEAD`].
+    struct Opened {
+        /// The GitHub App mock, kept alive with the server.
+        mock: GithubAppMock,
+        /// The running server.
+        server: WyrdTestServer,
+        /// The administrator's agent.
+        agent: RunningService<RoleClient, ()>,
+        /// The pull request's execution ID.
+        execution: serde_json::Value,
+    }
+
+    impl Opened {
+        /// Connect GitHub as an administrator agent, declare the Repository
+        /// fixture at `repository`, and open the pull request.
+        ///
+        /// # Errors
+        ///
+        /// Returns server startup, bootstrap, connection, declaration, MCP
+        /// transport, or tool-call failures.
+        async fn start(repository: &str) -> Result<Self, McpJourneyError> {
+            let mock = GithubAppMock::start()?;
+            mock.add_installation(101, &[(2, "acme/web")]);
+            mock.add_user("octo", &[101]);
+            mock.sign_in("octo");
+            mock.install_target(101);
+            let server = WyrdTestServer::builder()
+                .with_github_app_for_test(&mock)
+                .with_verification_runtime_for_test()
+                .start_bound()
+                .await?;
+            let key = Self::key(&server, "mcp-github-admin", "admin").await?;
+            let credential = || ResolvedCredential::ApiKey(key.clone().into());
+            let agent =
+                ().serve_with_lifecycle(transport(&server, credential(), None)?, discover())
+                    .await?;
+            let receipt = structured(agent.call_tool(call("github_connection.connect")).await?)?;
+            let mut browser = GithubBrowser::sign_in(
+                server.base_url().ok_or("bound")?,
+                server.pg_fixture().tenant_slug(),
+                &key,
+            )
+            .await?;
+            let url = receipt["authorization_url"]
+                .as_str()
+                .ok_or("connect returns the install URL")?;
+            assert_eq!(browser.open(url).await?.status, 200);
+            let cards = Cards::connect_with(&client(&server, credential())?).await?;
+            let declared = Box::pin(cards.declare_from_path(format!(
+                "{}/../../../fixtures/cards/{repository}",
+                env!("CARGO_MANIFEST_DIR")
+            )))
+            .await?;
+            let card = structured(
+                agent
+                    .call_tool(call_with(
+                        "cards.get",
+                        &json!({ "card_ref": declared.root }),
+                    )?)
+                    .await?,
+            )?;
+            let binding = card["card"]["status"]["verification"]["binding_ids"][0].clone();
+
+            mock.set_pull_request(2, 9, PullRequest::open(2, "b1", HEAD));
+            let opened = mock.pull_request_event(101, 2, 9, "opened");
+            let base = server.base_url().ok_or("bound")?;
+            assert_eq!(mock.deliver(base, "pull_request", &opened).await?, 202);
+            let read = structured(
+                agent
+                    .call_tool(call_with(
+                        "verification.get_binding",
+                        &json!({ "binding_id": binding }),
+                    )?)
+                    .await?,
+            )?;
+            let execution = read["last_execution_id"].clone();
+            Ok(Self {
+                mock,
+                server,
+                agent,
+                execution,
+            })
+        }
+
+        /// The API key of a new service principal `name` holding `role`.
+        ///
+        /// # Errors
+        ///
+        /// Returns bootstrap failures.
+        async fn key(
+            server: &WyrdTestServer,
+            name: &str,
+            role: &str,
+        ) -> Result<String, McpJourneyError> {
+            Ok(server
+                .bootstrap_service(name, &[role])
+                .await?
+                .api_key()
+                .ok_or("a service bootstraps with a machine key")?
+                .expose_secret()
+                .to_owned())
+        }
+
+        /// A new agent of a service principal `name` holding `role`.
+        ///
+        /// # Errors
+        ///
+        /// Returns bootstrap or MCP transport failures.
+        async fn agent(
+            &self,
+            name: &str,
+            role: &str,
+        ) -> Result<RunningService<RoleClient, ()>, McpJourneyError> {
+            let key = Self::key(&self.server, name, role).await?;
+            Ok(()
+                .serve_with_lifecycle(
+                    transport(&self.server, ResolvedCredential::ApiKey(key.into()), None)?,
+                    discover(),
+                )
+                .await?)
+        }
+
+        /// Read the execution until `done` holds, within one minute.
+        ///
+        /// # Errors
+        ///
+        /// Returns MCP failures or an error naming the last state when it
+        /// never holds.
+        async fn until(
+            &self,
+            done: impl Fn(&serde_json::Value) -> bool,
+        ) -> Result<serde_json::Value, McpJourneyError> {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_mins(1);
+            loop {
+                let state = structured(
+                    self.agent
+                        .call_tool(call_with(
+                            "verification.get_execution",
+                            &json!({ "execution_id": self.execution }),
+                        )?)
+                        .await?,
+                )?;
+                if done(&state) {
+                    return Ok(state);
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!("execution never settled as expected: {state}").into());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+
+        /// The `verification.publish_evidence` call supplying `ci` as `value`.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error when the arguments are not an object.
+        fn publish(value: serde_json::Value) -> Result<CallToolRequestParams, McpJourneyError> {
+            call_with(
+                "verification.publish_evidence",
+                &json!({
+                    "repository": "acme/web",
+                    "tags": { "commit": HEAD },
+                    "input": "ci",
+                    "value": { "kind": "json", "value": value },
+                }),
+            )
+        }
+
+        /// Close the agent and stop the server.
+        ///
+        /// # Errors
+        ///
+        /// Returns MCP or shutdown failures.
+        async fn stop(self) -> Result<(), McpJourneyError> {
+            self.agent.cancel().await?;
+            self.server.shutdown().await?;
+            Ok(())
+        }
+    }
+
+    /// The names of the tools `agent` is offered.
+    ///
+    /// # Errors
+    ///
+    /// Returns MCP failures.
+    async fn tools(agent: &RunningService<RoleClient, ()>) -> Result<Vec<String>, McpJourneyError> {
+        Ok(agent
+            .list_all_tools()
+            .await?
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect())
+    }
+
     /// An agent finds a pull request execution waiting for its deferred
     /// `ci` input, publishes the evidence for the repository slug and head
     /// commit, and the same execution completes; publishing again replays
@@ -382,143 +583,144 @@ mod pg_tests {
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn an_agent_publishes_deferred_evidence_for_a_waiting_execution()
     -> Result<(), McpJourneyError> {
-        const HEAD: &str = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
-        let mock = GithubAppMock::start()?;
-        mock.add_installation(101, &[(2, "acme/web")]);
-        mock.add_user("octo", &[101]);
-        mock.sign_in("octo");
-        mock.install_target(101);
-        let server = WyrdTestServer::builder()
-            .with_github_app_for_test(&mock)
-            .with_verification_runtime_for_test()
-            .start_bound()
-            .await?;
-        let admin = server
-            .bootstrap_service("mcp-evidence-admin", &["admin"])
-            .await?;
-        let key = admin
-            .api_key()
-            .ok_or("a service bootstraps with a machine key")?
-            .expose_secret()
-            .to_owned();
-        let credential = || ResolvedCredential::ApiKey(key.clone().into());
-        let agent =
-            ().serve_with_lifecycle(transport(&server, credential(), None)?, discover())
-                .await?;
-        let names: Vec<String> = agent
-            .list_all_tools()
-            .await?
-            .into_iter()
-            .map(|tool| tool.name.into_owned())
-            .collect();
+        let opened = Opened::start("deferred_evidence/repository.yaml").await?;
+        let agent = &opened.agent;
         assert!(
-            names
+            tools(agent)
+                .await?
                 .iter()
                 .any(|name| name == "verification.publish_evidence")
         );
-        let receipt = structured(agent.call_tool(call("github_connection.connect")).await?)?;
-        let mut browser = GithubBrowser::sign_in(
-            server.base_url().ok_or("bound")?,
-            server.pg_fixture().tenant_slug(),
-            &key,
-        )
-        .await?;
-        let url = receipt["authorization_url"]
-            .as_str()
-            .ok_or("connect returns the install URL")?;
-        assert_eq!(browser.open(url).await?.status, 200);
-        let cards = Cards::connect_with(&client(&server, credential())?).await?;
-        let declared = Box::pin(cards.declare_from_path(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../../fixtures/cards/deferred_evidence/repository.yaml"
-        )))
-        .await?;
-        let card = structured(
-            agent
-                .call_tool(call_with(
-                    "cards.get",
-                    &json!({ "card_ref": declared.root }),
-                )?)
-                .await?,
-        )?;
-        let binding = card["card"]["status"]["verification"]["binding_ids"][0].clone();
-
-        mock.set_pull_request(2, 9, PullRequest::open(2, "b1", HEAD));
-        let opened = mock.pull_request_event(101, 2, 9, "opened");
-        let base = server.base_url().ok_or("bound")?;
-        assert_eq!(mock.deliver(base, "pull_request", &opened).await?, 202);
-        let read = structured(
-            agent
-                .call_tool(call_with(
-                    "verification.get_binding",
-                    &json!({ "binding_id": binding }),
-                )?)
-                .await?,
-        )?;
-        let execution = read["last_execution_id"].clone();
-        let until = async |done: &dyn Fn(&serde_json::Value) -> bool|
-               -> Result<serde_json::Value, McpJourneyError> {
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_mins(1);
-            loop {
-                let state = structured(
-                    agent
-                        .call_tool(call_with(
-                            "verification.get_execution",
-                            &json!({ "execution_id": execution }),
-                        )?)
-                        .await?,
-                )?;
-                if done(&state) {
-                    return Ok(state);
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(format!("execution never settled as expected: {state}").into());
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        };
-        let waiting = until(&|state| state["status"] == "waiting").await?;
+        let waiting = opened.until(|state| state["status"] == "waiting").await?;
         assert_eq!(waiting["waiting"], json!(["ci"]));
 
-        let publish = |value: serde_json::Value| {
-            call_with(
-                "verification.publish_evidence",
-                &json!({
-                    "repository": "acme/web",
-                    "tags": { "commit": HEAD },
-                    "input": "ci",
-                    "value": { "kind": "json", "value": value },
-                }),
-            )
-        };
         let accepted = structured(
             agent
-                .call_tool(publish(json!({"status": "green"}))?)
+                .call_tool(Opened::publish(json!({"status": "green"}))?)
                 .await?,
         )?;
         assert_eq!(accepted["status"], "accepted");
         assert_eq!(accepted["matched_subscriptions"], 1);
         assert_eq!(
             accepted["repository"],
-            json!({ "host": mock.host(), "repository_id": "2" })
+            json!({ "host": opened.mock.host(), "repository_id": "2" })
         );
-        let completed =
-            until(&|state| state["status"] == "completed" && !state["result"].is_null()).await?;
+        let completed = opened
+            .until(|state| state["status"] == "completed" && !state["result"].is_null())
+            .await?;
         assert_eq!(completed["result"]["outcome"]["verdict"], "passed");
         let replayed = structured(
             agent
-                .call_tool(publish(json!({"status": "green"}))?)
+                .call_tool(Opened::publish(json!({"status": "green"}))?)
                 .await?,
         )?;
         assert_eq!(replayed["status"], "replayed");
         assert_eq!(replayed["evidence_id"], accepted["evidence_id"]);
-        let conflict = refused(agent.call_tool(publish(json!({"status": "red"}))?).await)?;
+        let conflict = refused(
+            agent
+                .call_tool(Opened::publish(json!({"status": "red"}))?)
+                .await,
+        )?;
         assert!(
             conflict.contains("WYRD_VERIFICATION_409_EVIDENCE_CONFLICT"),
             "{conflict}"
         );
-        agent.cancel().await?;
-        server.shutdown().await?;
-        Ok(())
+        opened.stop().await
+    }
+
+    /// Another agent approves a pull request's pending signoff over MCP and
+    /// the same execution passes.
+    ///
+    /// The execution lists one pending `signoff` occurrence while it waits
+    /// for `ci`; once CI is published it waits for the approval alone. A
+    /// viewer agent is not offered `verification.decide_approval` and is
+    /// refused when it names it; an editor agent approves with a reason,
+    /// receives the durable receipt, replays it, and the execution passes
+    /// listing who approved.
+    ///
+    /// # Errors
+    ///
+    /// Returns server startup, bootstrap, connection, declaration, MCP
+    /// transport, or tool-call failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the occurrence is not pending, a decision or refusal
+    /// differs, or the execution does not pass.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn an_agent_approves_a_pending_signoff() -> Result<(), McpJourneyError> {
+        let opened = Opened::start("approvals/repository.yaml").await?;
+        let waiting = opened.until(|state| state["status"] == "waiting").await?;
+        assert_eq!(waiting["waiting"], json!(["ci"]));
+        let pending = &waiting["approvals"][0];
+        assert_eq!(pending["step_id"], "signoff");
+        assert_eq!(pending["message"], "Ship this change?");
+        assert_eq!(pending["status"], "pending");
+        let approval = pending["approval_id"].clone();
+        structured(
+            opened
+                .agent
+                .call_tool(Opened::publish(json!({"status": "green"}))?)
+                .await?,
+        )?;
+        opened
+            .until(|state| state["status"] == "waiting" && state["waiting"].is_null())
+            .await?;
+
+        let decide = |reason: Option<&str>| {
+            call_with(
+                "verification.decide_approval",
+                &json!({
+                    "execution_id": opened.execution,
+                    "approval_id": approval,
+                    "decision": "approved",
+                    "reason": reason,
+                }),
+            )
+        };
+        let viewer = opened.agent("mcp-signoff-viewer", "viewer").await?;
+        assert!(
+            !tools(&viewer)
+                .await?
+                .iter()
+                .any(|name| name == "verification.decide_approval"),
+            "a viewer is not offered the decision"
+        );
+        let denied = refused(viewer.call_tool(decide(Some("looks fine"))?).await)?;
+        assert!(
+            denied.contains("WYRD_PERMISSION_403_DENIED_RBAC"),
+            "{denied}"
+        );
+        viewer.cancel().await?;
+
+        let editor = opened.agent("mcp-signoff-editor", "editor").await?;
+        assert!(
+            tools(&editor)
+                .await?
+                .iter()
+                .any(|name| name == "verification.decide_approval")
+        );
+        let receipt = structured(editor.call_tool(decide(Some("reviewed the diff"))?).await?)?;
+        assert_eq!(receipt["approval_id"], approval);
+        assert_eq!(receipt["status"], "approved");
+        assert_eq!(receipt["reason"], "reviewed the diff");
+        assert!(receipt["actor_id"].is_string() && receipt["decided_at"].is_string());
+        let replayed = structured(editor.call_tool(decide(Some("reviewed the diff"))?).await?)?;
+        assert_eq!(replayed, receipt);
+        let conflict = refused(editor.call_tool(decide(None)?).await)?;
+        assert!(
+            conflict.contains("WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING"),
+            "{conflict}"
+        );
+        editor.cancel().await?;
+
+        let completed = opened
+            .until(|state| state["status"] == "completed" && !state["result"].is_null())
+            .await?;
+        assert_eq!(completed["result"]["outcome"]["verdict"], "passed");
+        assert_eq!(completed["approvals"][0]["status"], "approved");
+        assert_eq!(completed["approvals"][0]["actor_id"], receipt["actor_id"]);
+        opened.stop().await
     }
 }

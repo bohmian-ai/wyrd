@@ -225,3 +225,45 @@ JSON fixture alone cannot prove any predecessor handoff in this journey.
 | X11 | Output, consumers and surfaces; AC-011; Revision — no client projection | Action schema with `extractor` in the regenerated wire types, stable errors; the extraction and `review.previous` are inspectable as ordinary step-output JSON through the existing execution details on HTTP and MCP (no CLI details read exists; see the revision); no SDK typed read or authoring helper; focused input/workspace guide | `codegen:check`; inspection journey over existing details surfaces; docs review |
 | X12 | Agreed transformation ¶4 | `wyrd-design.md` Verifier / Agents, tools and workspaces and `bifrost-design.md` Durability/Ingest state typed extraction and source custody | content review |
 | X13 | Connected proof ¶3; INV-002 | New tests sit in existing targets; contract, dependency and tenant checks pass | `codegen:check`, `check:deps`, `check:tenant-isolation` |
+
+## Evidence
+
+`J` = `crates/wyrd/wyrd-server/tests/integration/pg_github_pull_request_extraction.rs`;
+`Q` = `crates/wyrd/wyrd-sql/tests/integration/pg_verifier_executions.rs`;
+`C` = `crates/wyrd/wyrd-server/tests/integration/pg_code_review_cache.rs`.
+
+| Obligation and required cases | Implementation evidence | Proof location | Verification evidence | Result |
+|---|---|---|---|---|
+| X1: exactly one of `from`/`extractor`; neither or both refused; media extract unchanged | `wyrd-spec/src/card/verifier/validate.rs:492` (`extract_source`); `vala-verify/src/blocks/engine.rs:1951` binds `from` only when present | `validate.rs:1680` `verifier_spec_refuses_invalid_graphs_and_references` (`extractor` beside `from`, `from: null`); `pg_hosted_files.rs:199` `extract_action_returns_locked_shape`; vala `extract` unit tests | spec verifier lane 24 passed; vala `extract` 2 passed; server integration 51 passed | PASS |
+| X2: registration derives `queue_only`, ignores an authored value, keeps the publish condition, media-only stays direct; direct verify refuses before any step | `components/cards/service.rs` registration derivation | `pg_card_declaration_route.rs:1734` `registration_derives_queue_only_from_publishing_agents_and_pull_request_extraction`; `J:846` `direct_verification_of_a_pull_request_verifier_refuses_before_any_step` (422 `INPUT_UNSUPPORTED`, no repository read) | server integration 51 passed | PASS |
+| X3: reads only the queued activation's pins and tenant connection; no accepted source refuses before acquisition; no caller credentials | `verification/hosted/blocks.rs` `ExecutionBinding::pull_request` (terminal without `PullRequestSource`); `extraction.rs:73` takes the tenant and source only; the action has no credential field (`wyrd-spec/src/card/verifier/pull_request.rs`) | `J:914` `queued_work_without_an_admitted_pull_request_extracts_nothing` (enqueued, not admitted: `pr` failed with the refusal reason, verdict inconclusive, no repository read) | server integration 51 passed | PASS |
+| X4: baseline = last completed same-PR same-policy execution with extracted source; failed extraction never advances; failed judgment after extraction does; P/A/B; four fallbacks; unreadable history retryable; PR base/merge base distinct from `comparison_base` | migration `20261115000000_pull_request_source_extracted.sql`; `pull_requests.rs:203`; `engines.rs:99` `pr_source_extracted`; `runner.rs` `Transition::Complete`; `extraction.rs:133` `history` | `Q:4628`, `Q:4715`, `Q:4787`, `Q:4834`, `Q:4881`; `J:482` (full then incremental, bases), `J:679`/`J:701`/`J:717` (rewritten, unavailable, policy changed), `J:778` (unextracted never baseline), `J:811` (failed judgment is baseline), `J:1280` (P/A/B) | SQL 39 passed; server integration 51 passed. **Unreadable execution state is retryable has only source proof** (`extraction.rs:137` maps every history read failure to `BlockError::Retryable`); no test drives a failing history read | FAIL |
+| X5: one `ReviewPipeline::pinned` call per extraction via the installation token; no clone/index/rerank; second consumer no second acquisition | `extraction.rs:73-122` (one `review()` call, `installation_access` token, no filesystem) | `J:589` (one `/compare/` read for Agent and requirement); `J:1026` (settling acquires nothing again) | server integration 51 passed; source review | PASS |
+| X6: closed typed output incl. empty active diff never a pass | `components/github/extraction/output.rs` (`deny_unknown_fields`) | `output.rs:299` `pull_request_extraction_round_trips_every_field`; `J:482`, `J:744` `an_empty_incremental_change_is_evidence_and_never_a_pass` | server lib 2 passed; server integration 51 passed | PASS |
+| X7: Prompt inputs and workspace JSON carry the same extraction; no checkout or implicit input; dependents consume live value under held ACK | engine bindings; `blocks.rs` extractor route | `J:589` (exact source in Prompt and `/inputs/pr.json` equal to the extraction); `J:1026` `an_agent_consumes_the_live_extraction_while_persistence_is_held` | server integration 51 passed | PASS |
+| X8: recovery reuses the accepted extraction after library context expiry | ordinary step output in accepted revisions | `J:1123` `recovery_reuses_the_accepted_extraction_after_library_contexts_expire` (no new repository reads, Prompt and mount equal the retained extraction, `pr_source_extracted` true) | server integration 51 passed | PASS |
+| X9: missing source, omissions, model-input limit never pass | existing step, requirement and model limits | `J:1317`, `J:1349`, `J:1433` | server integration 51 passed | PASS |
+| X10: per-tenant group commit; lone write immediate; replies after commit; failed batch fails callers; bounded; no IO in transactions; batch size traced | `review_cache.rs:145-152` (`WORKERS`, `BATCH`, `PENDING`), `:346` span field `batch` | `C:820`, `C:847`, `C:913`, `C:543` | server integration 51 passed | PASS |
+| X11: `extractor` in regenerated wire types; stable errors; extraction inspectable via existing HTTP and MCP details; no SDK typed read or helper; focused guide | `sdks/wyrd-sdk-ts/wyrd/src/card-types.ts`; `validate.rs` `output_schema` returns `None`; docs `reference/verifier-card.md` (`extract` row, extractor bullet, `extract_source` rule), `declare-a-repository.md` Next | HTTP: `J:437` `extraction()` reads `/details`; MCP `verification.get_execution_details` calls the same `VerificationService::get_execution_details` (`mcp/verification.rs:367`) proven generically by `wyrd-mcp/tests/bifrost/mcp/verification.rs:946` | `codegen:check` exit 0; `docs:check` exit 0; content review | PASS |
+| X12: design authorities state typed extraction and custody | `architecture/wyrd-design.md` action table, references paragraph, Agents/tools/workspaces paragraph; `architecture/bifrost-design.md` checkpoint custody bullet | commit 9d875a178 | content review | PASS |
+| X13: tests in existing targets; contract, dependency and tenant checks | new tests only in existing `integration` targets and inline modules | — | `codegen:check`, `check:deps`, `check:tenant-isolation` exit 0 | PASS |
+
+Commands: `mise exec -- cargo nextest run --locked -p wyrd-spec --lib -E 'test(/verifier::/)'`;
+`-p vala-verify --lib -E 'test(/extract/)'`; `-p wyrd-server --lib -E 'test(/extraction|engines/)'`;
+under `scripts/postgres/with-test-postgres.sh`: `-p wyrd-server --test integration -E "test(/pg_github_pull_request_extraction|pg_code_review_cache|pg_github_pull_requests|pg_hosted_files|registration_derives_queue_only/)"`
+and `-p wyrd-sql --test integration -E "test(/pg_verifier_executions/)"`; `cargo clippy -p wyrd-server -p wyrd-sql --tests -D warnings`; `git diff --check`.
+
+Process exceptions: spec types and metadata batching were written before their
+tests; the server extractor (e4e6c3f79) was committed without RED; the direct
+refusal, held-ACK, P/A/B, X3 non-admitted and X9 journeys passed on first run
+because the behavior already existed. RED proven for the extracted-source
+baseline (removing the predicate made `J:778` fall back with
+`history_unavailable`). Tier 2 journeys live in the `wyrd-server` integration
+target rather than `test:bifrost:journey:server` (mechanical deviation).
+
+Limits: recovered step output serializes object keys sorted while the live
+value keeps struct order; values are equal and `J:1123` compares by value.
+Outside this task's write set.
+
+Non-goals: no SDK typed read, builder or CLI command; no `wyrd-spec` feature
+gating (separate design change).

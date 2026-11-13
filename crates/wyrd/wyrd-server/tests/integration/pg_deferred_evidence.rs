@@ -50,7 +50,7 @@ const C3: &str = "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3";
 /// it; it only accepts media publications.
 fn ci_gate(version: &str) -> String {
     format!(
-        "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: ci-gate\n  version: {version}\nspec:\n  description: CI is green.\n  inputs:\n    ci: {{type: json, deferred: true, schema: {{type: object, required: [status]}}}}\n    report: {{type: media, formats: [csv], max_bytes: 64, deferred: true}}\n  requirements:\n    - id: green\n      statement: CI is green\n      check: {{kind: assert, path: inputs.ci.status, operator: equals, expected: green}}\n"
+        "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: ci-gate\n  version: {version}\nspec:\n  description: CI is green.\n  inputs:\n    ci: {{type: json, deferred: true, schema: {{type: object, required: [status]}}}}\n    report: {{type: media, formats: [csv], deferred: true}}\n  requirements:\n    - id: green\n      statement: CI is green\n      check: {{kind: assert, path: inputs.ci.status, operator: equals, expected: green}}\n"
     )
 }
 
@@ -767,16 +767,34 @@ async fn unacknowledged_publication_is_unavailable_and_its_retry_resumes() {
 }
 
 /// A registered Artifact is admitted against the subscriber's slot before
-/// it is accepted: a file of the wrong format, a path or version the
-/// registry does not hold, or a file past the slot's limit is refused with
-/// nothing retained, so the right file then publishes for the same commit.
+/// it is accepted, and the waiting consumer then reads it.
+///
+/// `report-gate` reads its deferred CSV `report` and passes when it parses
+/// as CSV; the pull request's execution waits for it. A publisher holding
+/// `verifier:run` but not Artifact read, a file of the wrong format, a path
+/// or version the registry does not hold, or a file past the slot's limit
+/// is refused with nothing retained, so the right file then publishes as
+/// `accepted` for the same commit and the same execution resumes and
+/// passes.
 ///
 /// # Panics
-/// Panics when a refusal differs or the valid file is not accepted.
+/// Panics when a refusal differs, the valid file is not accepted, or the
+/// execution does not wait and then pass.
 #[tokio::test(flavor = "multi_thread")]
 async fn artifact_evidence_is_admitted_before_it_is_accepted() {
-    let deployment = Deployment::start_with(false).await;
-    deployment.gate("1.1.0", "1.0.0").await;
+    use wyrd_runtime::Permission;
+
+    let deployment = Deployment::start_limited(limits(Duration::from_mins(5))).await;
+    deployment
+        .declare_files(
+            &[(
+                "report-gate.yaml",
+                "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: report-gate\n  version: 1.0.0\nspec:\n  description: The report reads as CSV.\n  inputs:\n    report: {type: media, formats: [csv], max_bytes: 64, deferred: true}\n  steps:\n    - id: read\n      action: {kind: extract, from: inputs.report}\n  requirements:\n    - id: readable\n      statement: The report reads as CSV\n      check: {kind: assert, path: steps.read.output.format, operator: equals, expected: csv}\n".to_owned(),
+            )],
+            "apiVersion: wyrd/v1\nkind: Repository\nmetadata:\n  name: policy\n  version: 1.1.0\nspec:\n  repository_id: \"4242\"\n  verified_by:\n    - verifier: ./report-gate.yaml\n      runs_on: {kind: pull_request}\n",
+            "report-gate",
+        )
+        .await;
     let dir = tempfile::tempdir().expect("checkout creates");
     for (name, bytes) in [
         ("report.csv", "a,b\n1,2\n".to_owned()),
@@ -810,7 +828,35 @@ async fn artifact_evidence_is_admitted_before_it_is_accepted() {
         json!({"kind": "artifact", "artifact": card, "path": path})
     };
 
+    let waiting = deployment.open(6, C0).await;
+    assert_eq!(
+        deployment.until(waiting, "waiting").await["waiting"],
+        json!(["report"])
+    );
+
+    deployment
+        .server
+        .seed_role("evidence_runner", &[Permission::verifier_run_any()])
+        .await
+        .expect("role seeds");
+    let Bootstrap::User { jwt: runner, .. } = deployment
+        .server
+        .bootstrap_user("evidence-runner", &["evidence_runner"])
+        .await
+        .expect("runner bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let (status, denied) = deployment
+        .publish_as(
+            &runner,
+            &publication(SLUG, C0, "report", artifact("1.0.0", "report.csv")),
+        )
+        .await;
     let invalid = "WYRD_VERIFICATION_400_INPUT_INVALID";
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{denied}");
+    assert_eq!(denied["code"], invalid, "{denied}");
+
     for (value, status, code) in [
         (
             artifact("1.0.0", "report.pdf"),
@@ -852,6 +898,8 @@ async fn artifact_evidence_is_admitted_before_it_is_accepted() {
         receipt["status"], "accepted",
         "nothing was retained before: {receipt}"
     );
+    let served = deployment.until(waiting, "completed").await;
+    assert_eq!(served["result"]["outcome"]["verdict"], "passed", "{served}");
 }
 
 /// Losing repository access cancels a parked execution, and evidence

@@ -1862,9 +1862,11 @@ async fn registration_derives_queue_only_from_publishing_agents() {
 ///
 /// A `json` or `media` slot declaring `deferred: true` makes its Verifier
 /// queue-only even when the author sent `false`; `deferred: false` or an
-/// omitted flag does not, and its stored spec omits both fields. A direct
-/// verify of the deferred Verifier answers `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED`,
-/// while the ordinary one with the same inputs still judges directly.
+/// omitted flag does not, nor does an author's own `queue_only: true`, and
+/// its stored spec omits both fields. A direct verify of the deferred
+/// Verifier answers `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` because it is
+/// queue-only, while the ordinary one with the same inputs still judges
+/// directly.
 ///
 /// # Panics
 /// Panics when the server fails to start, a declaration is refused, a stored
@@ -1888,7 +1890,7 @@ async fn registration_derives_queue_only_from_deferred_inputs() {
         "active",
     )
     .await;
-    let verifier = |slot: Value| {
+    let verifier = |slot: Value, claimed: bool| {
         json!({
             "inputs": { "answer": slot },
             "requirements": [{
@@ -1896,29 +1898,33 @@ async fn registration_derives_queue_only_from_deferred_inputs() {
                 "statement": "The answer is one.",
                 "check": { "kind": "assert", "path": "inputs.answer", "operator": "equals", "expected": 1 }
             }],
-            "queue_only": false,
+            "queue_only": claimed,
         })
     };
     let cases = [
         (
             "deferred-json",
             json!({ "type": "json", "deferred": true }),
+            false,
             true,
         ),
         (
             "deferred-media",
             json!({ "type": "media", "formats": ["json"], "deferred": true }),
+            false,
             true,
         ),
         (
             "deferred-false",
             json!({ "type": "json", "deferred": false }),
             false,
+            false,
         ),
-        ("deferred-omitted", json!({ "type": "json" }), false),
+        ("deferred-omitted", json!({ "type": "json" }), false, false),
+        ("claimed-queue-only", json!({ "type": "json" }), true, false),
     ];
     let mut registered = Vec::new();
-    for (name, slot, expected) in cases {
+    for (name, slot, claimed, expected) in cases {
         let (status, body) = declare_json(
             &server,
             &jwt,
@@ -1927,7 +1933,7 @@ async fn registration_derives_queue_only_from_deferred_inputs() {
                 "Verifier",
                 name,
                 Some("1.0.0"),
-                verifier(slot)
+                verifier(slot, claimed)
             )]),
         )
         .await;
@@ -1985,6 +1991,12 @@ async fn registration_derives_queue_only_from_deferred_inputs() {
                     Some("WYRD_VERIFICATION_422_INPUT_UNSUPPORTED")
                 ),
                 "{name}: {body}"
+            );
+            assert!(
+                body["detail"]
+                    .as_str()
+                    .is_some_and(|detail| detail.contains("runs only as queued work")),
+                "{name}: refused as queue-only, not for its value: {body}"
             );
             assert!(body.get("outcome").is_none(), "{name}: no step ran: {body}");
         } else {

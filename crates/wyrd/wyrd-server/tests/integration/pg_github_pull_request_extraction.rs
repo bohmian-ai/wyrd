@@ -582,16 +582,18 @@ async fn an_agent_reads_the_extraction_as_prompt_values_and_workspace_json() {
     );
 }
 
-/// The full review of head `b…` after a completed review at `a…`, with the
-/// reason no incremental review was possible and no previous review.
-fn full_review(extraction: &Value) -> (&Value, &Value, &Value, &Value) {
+/// Assert `extraction` reviews the whole pull request from its merge base
+/// `c…` for `reason`, with no previous review.
+///
+/// # Panics
+/// Panics when the review is incremental, names another reason, or names a
+/// previous review.
+fn assert_full_review(extraction: &Value, reason: &str) {
     let review = &extraction["review"];
-    (
-        &review["mode"],
-        &review["fallback_reason"],
-        &review["previous"],
-        &review["comparison_base"],
-    )
+    assert_eq!(review["mode"], "full", "{extraction}");
+    assert_eq!(review["fallback_reason"], reason, "{extraction}");
+    assert_eq!(review["previous"], Value::Null, "{extraction}");
+    assert_eq!(review["comparison_base"], sha('c'), "{extraction}");
 }
 
 /// A force-pushed head that no longer descends from the reviewed head is
@@ -612,16 +614,7 @@ async fn a_rewritten_history_reviews_the_whole_pull_request() {
     let second = deployment.review(&sha('b'), "synchronize").await;
 
     let extraction = deployment.extraction(second).await;
-    assert_eq!(
-        full_review(&extraction),
-        (
-            &json!("full"),
-            &json!("history_rewritten"),
-            &Value::Null,
-            &json!(sha('c'))
-        ),
-        "{extraction}"
-    );
+    assert_full_review(&extraction, "history_rewritten");
     assert_eq!(extraction["changes"], extraction["review"]["full_pr"]);
 }
 
@@ -638,16 +631,7 @@ async fn an_unavailable_baseline_reviews_the_whole_pull_request() {
     let second = deployment.review(&sha('b'), "synchronize").await;
 
     let extraction = deployment.extraction(second).await;
-    assert_eq!(
-        full_review(&extraction),
-        (
-            &json!("full"),
-            &json!("history_unavailable"),
-            &Value::Null,
-            &json!(sha('c'))
-        ),
-        "{extraction}"
-    );
+    assert_full_review(&extraction, "history_unavailable");
 }
 
 /// After the Repository rebinds a new version of the Verifier, the next
@@ -673,16 +657,7 @@ async fn a_changed_policy_reviews_the_whole_pull_request() {
     let second = deployment.review(&sha('b'), "synchronize").await;
 
     let extraction = deployment.extraction(second).await;
-    assert_eq!(
-        full_review(&extraction),
-        (
-            &json!("full"),
-            &json!("policy_changed"),
-            &Value::Null,
-            &json!(sha('c'))
-        ),
-        "{extraction}"
-    );
+    assert_full_review(&extraction, "policy_changed");
 }
 
 /// A new head that changes nothing since the reviewed head is still

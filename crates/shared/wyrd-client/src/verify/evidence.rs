@@ -264,10 +264,31 @@ mod tests {
             Some(("acme/from-env".to_owned(), pinned)),
             "no checkout is needed"
         );
-        let missing = resolved(Some("acme/explicit"), None, &none, elsewhere.path())
-            .expect_err("no commit source");
-        assert_eq!(missing.code(), "WYRD_VERIFICATION_400_INPUT_INVALID");
-        assert!(missing.to_string().contains("WYRD_COMMIT"), "{missing}");
+        let explicit = "c".repeat(40);
+        assert_eq!(
+            resolved(
+                Some("acme/explicit"),
+                Some(&explicit),
+                &env,
+                checkout.path()
+            )
+            .ok(),
+            Some(("acme/explicit".to_owned(), explicit.clone())),
+            "arguments win over variables and the checkout"
+        );
+        for (repository, flag, variable) in [
+            (Some("acme/explicit"), "--commit", "WYRD_COMMIT"),
+            (None, "--repository", "WYRD_REPOSITORY"),
+        ] {
+            let missing = resolved(repository, None, &none, elsewhere.path())
+                .expect_err("no source supplies the value");
+            assert_eq!(missing.code(), "WYRD_VERIFICATION_400_INPUT_INVALID");
+            let message = missing.to_string();
+            assert!(
+                message.contains(flag) && message.contains(variable),
+                "{message}"
+            );
+        }
         let invalid = resolved(
             Some("acme/explicit"),
             Some("not-a-sha"),

@@ -537,10 +537,18 @@ where
         }
         let action_path = format!("{path}.action");
         match &step.action {
+            Action::Approval { message } if message.trim().is_empty() => {
+                return Err(invalid(
+                    "approval_message",
+                    &format!("{action_path}.message"),
+                    "an approval states a non-empty message",
+                ));
+            }
             Action::Extract {
                 from: None,
                 extractor: Some(_),
-            } => {}
+            }
+            | Action::Approval { .. } => {}
             Action::Extract {
                 from: None,
                 extractor: None,
@@ -578,14 +586,6 @@ where
             }
             Action::Agent(call) => self.validate_agent(call, position, &action_path)?,
             Action::Code(call) => self.validate_code(call, position, &action_path)?,
-            Action::Approval { message } if message.trim().is_empty() => {
-                return Err(invalid(
-                    "approval_message",
-                    &format!("{action_path}.message"),
-                    "an approval states a non-empty message",
-                ));
-            }
-            Action::Approval { .. } => {}
         }
         Ok(())
     }

@@ -19,18 +19,20 @@ use base64::Engine as _;
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use uuid::Uuid;
 use wyrd_runtime::Permission;
 use wyrd_runtime::permission::{Action, PermissionScope, Resource};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{ExecutionId, VerificationResultId};
+
+use wyrd_spec::ids::{ApprovalId, ExecutionId, VerificationResultId};
 use wyrd_spec::storage::{DownloadInitResponse, StorageBackendKind};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::verification::execution::{
-    CancelExecutionResponse, EXECUTION_PAGE_DEFAULT, EXECUTION_PAGE_MAX, ExecutionInvocation,
-    ExecutionPageQuery, HistoryProjection, InvocationPage, InvocationProgress,
-    InvocationSettlement, Publication, PublicationContent, PublicationFile, PublicationPage,
-    PublicationSelector, PublicationSummary,
+    ApprovalOccurrenceState, ApprovalReceipt, ApprovalStatus, CancelExecutionResponse,
+    EXECUTION_PAGE_DEFAULT, EXECUTION_PAGE_MAX, ExecutionInvocation, ExecutionPageQuery,
+    HistoryProjection, InvocationPage, InvocationProgress, InvocationSettlement, Publication,
+    PublicationContent, PublicationFile, PublicationPage, PublicationSelector, PublicationSummary,
 };
 use wyrd_spec::verification::state::{
     AcceptedPublication, ExecutionIdentity, ExecutionState, InvocationRecord,
@@ -46,6 +48,7 @@ use super::VerificationControl;
 use crate::audit;
 use crate::components::auth::Caller;
 use crate::state::registry_db_error;
+use crate::verification::approvals::ApprovalDecisions;
 use crate::verification::cache::exact_ref;
 use crate::verification::hosted::publications::published_object;
 use crate::verification::inputs::{DirectResult, InputOrigin, InputResolver};
@@ -228,13 +231,17 @@ pub(super) struct Retained {
     /// A direct execution's published result and exact identity; `None` for
     /// a queued execution, whose `state` holds both.
     pub(super) direct: Option<(VerificationResultId, ExecutionIdentity)>,
+    /// The accepted decision of each approval occurrence `state` recorded
+    /// that has one.
+    pub(super) decisions: BTreeMap<ApprovalId, ApprovalReceipt>,
 }
 
 impl Retained {
     /// The execution's status: the outcome or failure its state retained,
-    /// else `waiting` for a queued execution parked on deferred inputs, else
-    /// its queue status, else `running`, since a state with neither and no
-    /// queue row belongs to direct work still in flight.
+    /// else `waiting` for a queued execution parked on deferred inputs or an
+    /// undecided approval, else its queue status, else `running`, since a
+    /// state with neither and no queue row belongs to direct work still in
+    /// flight.
     pub(super) fn status(&self) -> VerificationExecutionStatus {
         if self.state.terminal.is_some() || self.direct.is_some() {
             return VerificationExecutionStatus::Completed;
@@ -249,7 +256,7 @@ impl Retained {
                 |queued| match queued.state.status {
                     VerificationExecutionStatus::Pending
                     | VerificationExecutionStatus::Retrying
-                        if !self.state.waiting.is_empty() =>
+                        if !self.state.waiting.is_empty() || self.undecided() =>
                     {
                         VerificationExecutionStatus::Waiting
                     }
@@ -266,6 +273,52 @@ impl Retained {
         } else {
             std::collections::BTreeSet::new()
         }
+    }
+
+    /// Whether an approval occurrence the execution recorded has no
+    /// accepted decision.
+    fn undecided(&self) -> bool {
+        self.state
+            .approvals
+            .iter()
+            .any(|recorded| !self.decisions.contains_key(&recorded.approval_id))
+    }
+
+    /// Every approval occurrence the execution recorded, in the order it
+    /// reached them, with its accepted decision; an undecided occurrence is
+    /// `pending` while the execution is unfinished and `expired`, with no
+    /// actor, once it ended.
+    pub(super) fn approvals(&self) -> Vec<ApprovalOccurrenceState> {
+        let open = matches!(
+            self.status(),
+            VerificationExecutionStatus::Pending
+                | VerificationExecutionStatus::Retrying
+                | VerificationExecutionStatus::Running
+                | VerificationExecutionStatus::Waiting
+        );
+        self.state
+            .approvals
+            .iter()
+            .map(|recorded| {
+                let decided = self.decisions.get(&recorded.approval_id);
+                let occurrence = &recorded.occurrence;
+                ApprovalOccurrenceState {
+                    approval_id: recorded.approval_id,
+                    step_id: occurrence.step.clone(),
+                    item: occurrence.item,
+                    iteration: occurrence.iteration,
+                    message: occurrence.message.clone(),
+                    status: match decided {
+                        Some(receipt) => receipt.status,
+                        None if open => ApprovalStatus::Pending,
+                        None => ApprovalStatus::Expired,
+                    },
+                    actor_id: decided.and_then(|receipt| receipt.actor_id),
+                    decided_at: decided.and_then(|receipt| receipt.decided_at),
+                    reason: decided.and_then(|receipt| receipt.reason.clone()),
+                }
+            })
+            .collect()
     }
 
     /// The execution's exact identity, from its state or direct result.
@@ -459,12 +512,21 @@ impl<'a> VerificationControl<'a> {
             Some(found) => Some(self.direct_identity(caller, execution_id, found).await?),
             None => None,
         };
+        let approvals: Vec<ApprovalId> = state
+            .approvals
+            .iter()
+            .map(|recorded| recorded.approval_id)
+            .collect();
+        let decisions = ApprovalDecisions::new(self.state, caller.data_tenant_id)
+            .decided(&InputResolver::new(&query, None), execution_id, &approvals)
+            .await?;
         Ok(Retained {
             queued,
             revision,
             state,
             query,
             direct,
+            decisions,
         })
     }
 

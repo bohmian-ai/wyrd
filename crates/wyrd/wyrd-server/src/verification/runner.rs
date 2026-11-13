@@ -44,7 +44,7 @@ use tracing::Instrument as _;
 use tracing::field::Empty;
 use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_verify::blocks::{Checkpoints, DriftChecks, EngineError};
+use vala_verify::blocks::{Checkpoints, Decisions, DriftChecks, EngineError};
 use wyrd_runtime::AcceptedAuthority;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, PrincipalId};
@@ -52,11 +52,11 @@ use wyrd_spec::card::agent::ExecutionRoute;
 use wyrd_spec::card::operator::DriftCounts;
 use wyrd_spec::card::verifier::VerifierSpec;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{CardUid, ExecutionId, SlotName, VerificationResultId};
+use wyrd_spec::ids::{ApprovalId, CardUid, ExecutionId, SlotName, VerificationResultId};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::ids::RunId;
 use wyrd_spec::verification::execution::{ExecutedOutcome, InputDeclaration};
-use wyrd_spec::verification::state::{ExecutionIdentity, TerminalSelection};
+use wyrd_spec::verification::state::{ExecutionIdentity, ExecutionState, TerminalSelection};
 use wyrd_spec::verification::{DriftWindow, VerificationError, VerificationVerdict};
 use wyrd_spec::verification::{TaskId, VerificationExecutionStatus, VerifierReadiness};
 use wyrd_sql::queries::auth::service_accounts::system_principal_id;
@@ -70,6 +70,7 @@ use wyrd_sql::{OperatorPool, SqlError, TenantConn, WyrdPostgres};
 #[cfg(feature = "test-support")]
 use super::CapabilityCrash;
 use super::RuntimeLimits;
+use super::approvals::ApprovalDecisions;
 use super::authority::{SystemReadAuthority, SystemReadAuthorityError};
 use super::cache::{Db, Target, exact_ref};
 use super::claims::{ClaimLoop, LeasedWork, settled};
@@ -726,7 +727,7 @@ impl VerifierRunner {
             };
             match prepared {
                 Ok(prepared) => {
-                    self.dispatch(run, spec, system, state, telemetry, prepared)
+                    self.dispatch(tenant, run, spec, system, state, telemetry, prepared)
                         .await
                 }
                 Err(outcome) => outcome,
@@ -877,9 +878,16 @@ impl VerifierRunner {
     /// defers a not-yet-landed trace, so the queue retries the same execution
     /// under its backoff; the last attempt judges it inconclusive and
     /// completes under the Verifier's decision rule. The engine records its
-    /// progress in `state` and runs until its writer's deadline.
+    /// progress in `state` and runs until its writer's deadline, with every
+    /// approval occurrence `state` recorded that has an accepted decision
+    /// decided, read again on every claim so a lost wake loses nothing.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one claimed attempt's tenant, claim, Verifier, principal, state, telemetry, and input"
+    )]
     async fn dispatch(
         &self,
+        tenant: DataTenantId,
         run: &ClaimedExecution,
         spec: &Arc<VerifierSpec>,
         system: PrincipalId,
@@ -922,7 +930,13 @@ impl VerifierRunner {
             )
         });
         let recorded = state.snapshot();
-        let engine = engine.with_checkpoints(Arc::clone(state) as Arc<dyn Checkpoints>, &recorded);
+        let decisions = match self.decisions(tenant, run, system, &recorded).await {
+            Ok(decisions) => decisions,
+            Err(outcome) => return outcome,
+        };
+        let engine = engine
+            .with_checkpoints(Arc::clone(state) as Arc<dyn Checkpoints>, &recorded)
+            .with_approvals(decisions);
         match engine
             .run(Arc::clone(spec), evidence, state.deadline())
             .await
@@ -930,6 +944,65 @@ impl VerifierRunner {
             Ok(outcome) => EngineOutcome::Completed(outcome),
             Err(error) => engine_failure(run, &error),
         }
+    }
+
+    /// The accepted decision of each approval occurrence `recorded` holds,
+    /// keyed by its step, fanout item, and repeat iteration.
+    ///
+    /// # Errors
+    /// Returns [`EngineOutcome::Deferred`] when a decision cannot be read
+    /// now or is not visible yet, so it is never mistaken for absence.
+    async fn decisions(
+        &self,
+        tenant: DataTenantId,
+        run: &ClaimedExecution,
+        system: PrincipalId,
+        recorded: &ExecutionState,
+    ) -> Result<Decisions, EngineOutcome> {
+        if recorded.approvals.is_empty() {
+            return Ok(Decisions::new());
+        }
+        let unavailable = |error: &dyn std::fmt::Display| {
+            tracing::info!(execution_id = %run.lease.execution_id, %error, "approval decisions cannot be read now");
+            EngineOutcome::Deferred(failure(
+                EVIDENCE_UNAVAILABLE,
+                "the execution's approval decisions cannot be read now",
+            ))
+        };
+        let query = self
+            .reader(tenant, system, Some(&run.authority))
+            .await
+            .map_err(|error| unavailable(&error))?;
+        let ids: Vec<ApprovalId> = recorded
+            .approvals
+            .iter()
+            .map(|recorded| recorded.approval_id)
+            .collect();
+        let mut decided = ApprovalDecisions::new(&self.state, tenant)
+            .decided(
+                &InputResolver::new(&query, None),
+                run.lease.execution_id,
+                &ids,
+            )
+            .await
+            .map_err(|error| unavailable(&error))?;
+        Ok(recorded
+            .approvals
+            .iter()
+            .filter_map(|recorded| {
+                let occurrence = &recorded.occurrence;
+                decided.remove(&recorded.approval_id).map(|receipt| {
+                    (
+                        (
+                            occurrence.step.clone(),
+                            occurrence.item,
+                            occurrence.iteration,
+                        ),
+                        receipt,
+                    )
+                })
+            })
+            .collect())
     }
 
     /// Resolve a submitted or group execution's evidence and accepted routes
@@ -1014,8 +1087,8 @@ impl VerifierRunner {
     }
 
     /// A query caller reading as the tenant's `system` principal, granted only
-    /// the verification input, output, execution state, and deferred evidence
-    /// tables, and
+    /// the verification input, output, execution state, deferred evidence,
+    /// and approval decision tables, and
     /// serving `served`, a run's accepted authority, when given.
     ///
     /// # Errors
@@ -1032,6 +1105,7 @@ impl VerifierRunner {
             "execution_outputs",
             "execution_events",
             "evidence",
+            "approvals",
         ]
         .map(|name| TableRef::new(BifrostNamespace::Verification, name));
         let mut read =

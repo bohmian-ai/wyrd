@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use chrono::{DateTime, SubsecRound, Utc};
 use vala_verify::blocks::{EngineError, EvidenceReader as _, conform};
+use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::repository::RepositoryRemote;
 use wyrd_spec::error::WyrdError;
@@ -256,9 +257,9 @@ impl VerificationControl<'_> {
             {
                 continue;
             }
-            if let Err(error) = self.authorize_run(
+            if let Err(error) = self.authorize_subject(
                 caller,
-                &verifier,
+                Permission::verifier_run(verifier.clone()),
                 &subject,
                 PUBLISH_EVIDENCE,
                 "verification.evidence.publish",

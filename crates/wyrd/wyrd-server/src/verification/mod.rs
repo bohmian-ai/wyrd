@@ -9,6 +9,7 @@
 //! runtime holds no process-local registry, so any process may crash and
 //! another reclaims its leases.
 
+pub(crate) mod approvals;
 pub mod authority;
 pub(crate) mod cache;
 mod claims;
@@ -77,11 +78,15 @@ pub struct Verification {
     submissions: Arc<SubmissionOutbox>,
     /// Operator connection key owner.
     operator_keys: Arc<OperatorKeys>,
+    /// The configured queued execution deadline, measured from admission,
+    /// which also closes the execution's approval occurrences.
+    execution_timeout: Duration,
 }
 
 impl Verification {
-    /// Capabilities over `postgres`, hosting `blocks` and sealing Operator
-    /// connections with `operator_keys`.
+    /// Capabilities over `postgres`, hosting `blocks`, sealing Operator
+    /// connections with `operator_keys`, and closing queued executions
+    /// `execution_timeout` after admission.
     ///
     /// # Panics
     /// Panics when called outside a Tokio runtime, because the submission
@@ -91,12 +96,14 @@ impl Verification {
         postgres: wyrd_sql::WyrdPostgres,
         blocks: Option<HostedBlocks>,
         operator_keys: OperatorKeys,
+        execution_timeout: Duration,
     ) -> Self {
         Self {
             health: Arc::default(),
             blocks: blocks.map(Arc::new),
             submissions: SubmissionSink::outbox(postgres),
             operator_keys: Arc::new(operator_keys),
+            execution_timeout,
         }
     }
 
@@ -122,6 +129,12 @@ impl Verification {
     #[must_use]
     pub const fn operator_keys(&self) -> &Arc<OperatorKeys> {
         &self.operator_keys
+    }
+
+    /// The configured queued execution deadline, measured from admission.
+    #[must_use]
+    pub const fn execution_timeout(&self) -> Duration {
+        self.execution_timeout
     }
 
     /// The target invalidation listener over `postgres`, which runs until

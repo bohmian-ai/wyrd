@@ -34,7 +34,7 @@ use wyrd_spec::vala::managed_columns::{RUN_ID, SUBJECT_CARD_UID, WORKLOAD_CARD_U
 use wyrd_spec::verification::execution::InputDeclaration;
 
 use super::inputs::InputResolver;
-use crate::scribe_outbox::{ScribeWrite, evidence_batch_id};
+use crate::scribe_outbox::{ScribeTable, ScribeWrite, fenced_batch_id};
 use crate::state::AppState;
 
 /// The table every acceptance is a row of, and the logical table of every
@@ -223,7 +223,8 @@ impl<'a> DeferredEvidence<'a> {
             let (sender, ack) = oneshot::channel();
             slot.stage(
                 self.tenant,
-                ScribeWrite::Evidence {
+                ScribeWrite::Fenced {
+                    table: ScribeTable::Evidence,
                     batch: key(source, input, verifier),
                     row,
                     attribution,
@@ -248,7 +249,11 @@ impl<'a> DeferredEvidence<'a> {
 
     /// The batch fence of `verifier`'s acceptance of `input` for `source`.
     fn fence(&self, source: EvidenceSource<'_>, input: &SlotName, verifier: &CardUid) -> Uuid {
-        evidence_batch_id(self.tenant, key(source, input, verifier))
+        fenced_batch_id(
+            self.tenant,
+            ScribeTable::Evidence,
+            key(source, input, verifier),
+        )
     }
 }
 

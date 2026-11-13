@@ -2270,6 +2270,35 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: Value,
     },
+    /// The execution records no approval occurrence with this id.
+    #[error("[WYRD_VERIFICATION_404_APPROVAL_NOT_FOUND] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_404_APPROVAL_NOT_FOUND",
+        status = 404,
+        title = "Verification approval not found",
+        remediation = "Read the execution and decide an approval_id its approvals list as pending."
+    )]
+    VerificationApprovalNotFound {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// The approval occurrence is no longer pending: another decision was
+    /// accepted, or its execution ended, expired, or was superseded.
+    #[error("[WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING",
+        status = 409,
+        title = "Verification approval not pending",
+        remediation = "An accepted decision is final and an ended execution takes none: read the execution for the occurrence's status, and decide a pending occurrence of a current execution instead."
+    )]
+    VerificationApprovalNotPending {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload naming the occurrence's status.
+        details: Value,
+    },
     /// An agent check's provider failed after the check's own retry budget.
     #[error("[WYRD_VERIFICATION_502_DEPENDENCY_FAILED] {message}")]
     #[wyrd_error(
@@ -4239,6 +4268,8 @@ impl WyrdError {
             | Self::VerificationInputUnsupported { message, details }
             | Self::VerificationEvidenceUnmatched { message, details }
             | Self::VerificationEvidenceConflict { message, details }
+            | Self::VerificationApprovalNotFound { message, details }
+            | Self::VerificationApprovalNotPending { message, details }
             | Self::VerificationDependencyFailed { message, details }
             | Self::VerificationExecutionTimedOut { message, details }
             | Self::VerificationStagingFull { message, details }

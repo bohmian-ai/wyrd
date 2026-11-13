@@ -156,7 +156,12 @@ pub fn shell_owners(
     storage: Arc<StorageHandle>,
     bifrost: Arc<Bifrost>,
 ) -> AppStateInner {
-    let verification = Verification::new(postgres.wyrd().clone(), None, OperatorKeys::default());
+    let verification = Verification::new(
+        postgres.wyrd().clone(),
+        None,
+        OperatorKeys::default(),
+        crate::verification::RuntimeLimits::default().execution_timeout,
+    );
     AppStateInner {
         settings: ServerSettings {
             deployment_profile: DeploymentProfile::Development,

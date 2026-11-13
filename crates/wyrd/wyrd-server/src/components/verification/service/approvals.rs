@@ -1,0 +1,221 @@
+//! Approval decisions: accepting a person's decision of one pending approval
+//! occurrence of a queued execution and making the execution due.
+
+use std::time::Instant;
+
+use chrono::{SubsecRound, Utc};
+use wyrd_runtime::Permission;
+use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::{ApprovalId, ExecutionId};
+use wyrd_spec::verification::execution::{
+    ApprovalDecision, ApprovalReceipt, ApprovalStatus, DecideApprovalRequest,
+};
+use wyrd_sql::queries::verifier_executions::VerifierExecutionQueue;
+
+use super::inspection::execution_not_found;
+use super::{DECIDE_APPROVAL, VerificationControl};
+use crate::components::auth::Caller;
+use crate::state::registry_db_error;
+use crate::verification::approvals::ApprovalDecisions;
+use crate::verification::inputs::InputResolver;
+
+/// The longest reason, in characters, a decision may record.
+const REASON_MAX_CHARS: usize = 4096;
+
+impl VerificationControl<'_> {
+    /// Accept `request` as the caller's decision of pending approval
+    /// occurrence `approval_id` of queued execution `execution_id`, and
+    /// return its receipt once the decision is durable.
+    ///
+    /// The execution is read and `verifier:read` authorized as an
+    /// inspection is; the occurrence must be one its accepted state
+    /// recorded. The caller then needs `verifier:approve` on the execution's
+    /// exact Verifier and current authority over its subject. A decision
+    /// already accepted for the occurrence replays its receipt when the same
+    /// actor sends the same decision and reason, and refuses otherwise. A new
+    /// decision is accepted only while the execution is unfinished and before
+    /// its original deadline, written through Scribe, and returned once
+    /// acknowledged; the execution is then made due so it continues under
+    /// the same id. A lost wake loses nothing: the parked execution rechecks
+    /// its decisions when its bounded park ends.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::VerificationInputInvalid`] for an oversized
+    /// reason; the read and authorization errors of an inspection;
+    /// [`WyrdError::VerificationApprovalNotFound`] when the execution
+    /// recorded no such occurrence; [`WyrdError::PermissionDeniedRbac`]
+    /// without `verifier:approve` on the Verifier or authority over the
+    /// subject; [`WyrdError::VerificationApprovalNotPending`] when another
+    /// decision was accepted or the execution ended, expired, or was
+    /// superseded; and [`WyrdError::ServiceUnavailable`] or
+    /// `WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE` when the decision cannot be
+    /// read or acknowledged now, so the caller decides again.
+    #[tracing::instrument(
+        name = "verification.approval.decide",
+        skip_all,
+        fields(%execution_id, %approval_id, decision = ?request.decision)
+    )]
+    pub(crate) async fn decide_approval(
+        &self,
+        caller: &Caller,
+        execution_id: ExecutionId,
+        approval_id: ApprovalId,
+        request: DecideApprovalRequest,
+    ) -> Result<ApprovalReceipt, WyrdError> {
+        if request
+            .reason
+            .as_ref()
+            .is_some_and(|reason| reason.chars().count() > REASON_MAX_CHARS)
+        {
+            return Err(WyrdError::VerificationInputInvalid {
+                message: format!("reason exceeds {REASON_MAX_CHARS} characters"),
+                details: serde_json::json!({ "field": "reason", "max_chars": REASON_MAX_CHARS }),
+            });
+        }
+        let retained = self.retained(caller, execution_id, DECIDE_APPROVAL).await?;
+        if !retained
+            .state
+            .approvals
+            .iter()
+            .any(|recorded| recorded.approval_id == approval_id)
+        {
+            return Err(WyrdError::VerificationApprovalNotFound {
+                message: "the execution records no approval occurrence with this ID".to_owned(),
+                details: serde_json::json!({
+                    "execution_id": execution_id,
+                    "approval_id": approval_id,
+                }),
+            });
+        }
+        let identity = retained
+            .identity()
+            .ok_or_else(|| execution_not_found(execution_id))?;
+        let verifier = identity
+            .verifier
+            .uid
+            .clone()
+            .ok_or_else(|| execution_not_found(execution_id))?;
+        let subject = identity
+            .subject
+            .uid
+            .clone()
+            .ok_or_else(|| execution_not_found(execution_id))?;
+        let resource = format!("verification.execution:{execution_id}/approval:{approval_id}");
+        self.authorize_subject(
+            caller,
+            Permission::verifier_approve(verifier.clone()),
+            &subject,
+            DECIDE_APPROVAL,
+            &resource,
+        )?;
+        let tenant = caller.data_tenant_id;
+        let custody = ApprovalDecisions::new(self.state, tenant);
+        if let Some(held) = retained.decisions.get(&approval_id) {
+            return replay(held, caller, &request);
+        }
+        let mut conn = self
+            .state
+            .postgres
+            .wyrd()
+            .tenant_conn(tenant)
+            .await
+            .map_err(registry_db_error)?;
+        let timeout = chrono::Duration::from_std(self.state.verification.execution_timeout())
+            .map_err(|error| WyrdError::internal(format!("execution timeout: {error}")))?;
+        let open = self
+            .queue
+            .open_for_decision(&mut conn, execution_id, timeout)
+            .await
+            .map_err(registry_db_error)?;
+        conn.commit().await.map_err(registry_db_error)?;
+        if open != Some(true) {
+            return Err(not_pending(approval_id, ApprovalStatus::Expired));
+        }
+        let receipt = ApprovalReceipt {
+            approval_id,
+            status: match request.decision {
+                ApprovalDecision::Approved => ApprovalStatus::Approved,
+                ApprovalDecision::Rejected => ApprovalStatus::Rejected,
+            },
+            actor_id: Some(caller.principal.id),
+            // Bifrost keeps microseconds; a fresh receipt states what a replay reads.
+            decided_at: Some(Utc::now().trunc_subsecs(6)),
+            reason: request.reason.clone(),
+        };
+        let deadline = Instant::now() + self.state.settings.limits.timeout / 2;
+        let accepted = custody
+            .accept(
+                caller.attribution(),
+                (execution_id, &verifier),
+                &receipt,
+                deadline,
+            )
+            .await;
+        if let Err(error) = accepted {
+            // A concurrent decider may have won the fence first; its
+            // decision is the receipt this request replays or conflicts with.
+            let records = InputResolver::new(&retained.query, None);
+            let raced = custody
+                .decided(&records, execution_id, &[approval_id])
+                .await?;
+            return match raced.get(&approval_id) {
+                Some(held) => replay(held, caller, &request),
+                None => Err(error),
+            };
+        }
+        self.wake_decided(tenant, execution_id).await;
+        Ok(receipt)
+    }
+
+    /// Make `execution_id` due now. A failure is logged: the parked
+    /// execution rechecks its decisions when its bounded park ends.
+    async fn wake_decided(&self, tenant: wyrd_spec::DataTenantId, execution_id: ExecutionId) {
+        let woken = async {
+            let mut conn = self.state.postgres.wyrd().tenant_conn(tenant).await?;
+            let woken = VerifierExecutionQueue::default()
+                .wake_decided(&mut conn, execution_id)
+                .await?;
+            conn.commit().await?;
+            Ok::<_, wyrd_sql::SqlError>(woken)
+        };
+        match woken.await {
+            Ok(woken) => tracing::info!(woken, "the decided execution was made due"),
+            Err(error) => {
+                tracing::warn!(%error, "waking the decided execution failed; its park recheck repairs it");
+            }
+        }
+    }
+}
+
+/// The receipt of `held`, an accepted decision, when `caller` sends the same
+/// decision and reason again.
+///
+/// # Errors
+/// Returns [`WyrdError::VerificationApprovalNotPending`] for any other actor,
+/// decision, or reason.
+fn replay(
+    held: &ApprovalReceipt,
+    caller: &Caller,
+    request: &DecideApprovalRequest,
+) -> Result<ApprovalReceipt, WyrdError> {
+    let decision = match request.decision {
+        ApprovalDecision::Approved => ApprovalStatus::Approved,
+        ApprovalDecision::Rejected => ApprovalStatus::Rejected,
+    };
+    if held.actor_id == Some(caller.principal.id)
+        && held.status == decision
+        && held.reason == request.reason
+    {
+        Ok(held.clone())
+    } else {
+        Err(not_pending(held.approval_id, held.status))
+    }
+}
+
+/// The refusal of a decision of `approval_id`, which is `status`, not pending.
+fn not_pending(approval_id: ApprovalId, status: ApprovalStatus) -> WyrdError {
+    WyrdError::VerificationApprovalNotPending {
+        message: format!("approval {approval_id} is no longer pending"),
+        details: serde_json::json!({ "approval_id": approval_id, "status": status }),
+    }
+}

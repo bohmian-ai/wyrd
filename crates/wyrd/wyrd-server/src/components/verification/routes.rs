@@ -2,7 +2,7 @@
 //!
 //! Evidence upload planning, deferred evidence publication, direct execution, background submission,
 //! execution status and details, invocation and publication inspection,
-//! publication download planning, cancellation, and binding status. Evidence bytes travel
+//! publication download planning, cancellation, approval decisions, and binding status. Evidence bytes travel
 //! through the shared storage upload lifecycle. Each handler parses its
 //! path, header, and body, then delegates to [`VerificationControl`], which
 //! owns authorization, audit, tenancy, and error mapping.
@@ -14,13 +14,13 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use wyrd_spec::error::{WyrdError, WyrdProblem};
-use wyrd_spec::ids::{BindingId, ExecutionId};
+use wyrd_spec::ids::{ApprovalId, BindingId, ExecutionId};
 use wyrd_spec::storage::DownloadInitResponse;
 use wyrd_spec::verification::execution::{
-    CancelExecutionResponse, EnqueueVerificationResponse, EvidencePlanRequest,
-    EvidencePlanResponse, ExecutionPageQuery, InvocationPage, Publication, PublicationPage,
-    PublicationSelector, PublishEvidenceRequest, PublishEvidenceResponse, VerificationDetails,
-    VerificationExecutionState, VerificationRequest, VerificationResult,
+    ApprovalReceipt, CancelExecutionResponse, DecideApprovalRequest, EnqueueVerificationResponse,
+    EvidencePlanRequest, EvidencePlanResponse, ExecutionPageQuery, InvocationPage, Publication,
+    PublicationPage, PublicationSelector, PublishEvidenceRequest, PublishEvidenceResponse,
+    VerificationDetails, VerificationExecutionState, VerificationRequest, VerificationResult,
 };
 use wyrd_spec::verification::{
     MAX_EXECUTE_BODY_BYTES, PublicationName, TaskId, VerificationBindingStatus,
@@ -53,6 +53,7 @@ pub fn verification_router() -> OpenApiRouter<AppState> {
         .routes(routes!(download_publication))
         .routes(routes!(publication_content))
         .routes(routes!(cancel_execution))
+        .routes(routes!(decide_approval))
 }
 
 /// Read a bounded JSON body and decode it as `T`.
@@ -664,6 +665,73 @@ async fn cancel_execution(
     Ok(Json(
         VerificationControl::new(&state)
             .cancel(&caller, execution_id)
+            .await?,
+    ))
+}
+
+/// Decide one pending approval occurrence of a queued execution and return
+/// its receipt once the decision is durable.
+///
+/// The same actor, decision, and reason replays the receipt; the execution
+/// then continues under the same ID.
+///
+/// # Errors
+/// Returns a stable Wyrd error when the path or body is malformed, the
+/// caller lacks `verifier:read` or `verifier:approve` on the execution's
+/// Verifier or authority over its subject, the execution or occurrence is
+/// not in the caller's tenant, the occurrence is no longer pending, or the
+/// decision cannot be accepted now.
+#[utoipa::path(
+    post,
+    path = "/verification/executions/{execution_id}/approvals/{approval_id}",
+    params(
+        ("execution_id" = ExecutionId, Path, description = "Execution ID returned by \
+            POST /v1/verification/enqueue"),
+        ("approval_id" = ApprovalId, Path, description = "A pending approval_id from the \
+            execution's approvals list")
+    ),
+    request_body = DecideApprovalRequest,
+    responses(
+        (status = 200, description = "The decision is durably accepted, or was already by the \
+          same actor with the same decision and reason", body = ApprovalReceipt),
+        (status = 400, description = "A path ID or the body is invalid, or the reason is too \
+          long (WYRD_SPEC_400_VALIDATION, WYRD_VERIFICATION_400_INPUT_INVALID)",
+          body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks verifier:read or verifier:approve on \
+          the execution's Verifier, or authority over its subject \
+          (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_WORKLOAD_CONTEXT_REQUIRED)",
+          body = WyrdProblem),
+        (status = 404, description = "No such execution or approval occurrence in the caller's \
+          tenant (WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND, \
+          WYRD_VERIFICATION_404_APPROVAL_NOT_FOUND)", body = WyrdProblem),
+        (status = 409, description = "The occurrence was already decided differently, or its \
+          execution ended, expired, or was superseded \
+          (WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING)", body = WyrdProblem),
+        (status = 503, description = "The decision cannot be read or acknowledged now; decide \
+          again (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE, \
+          WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE, WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE)",
+          body = WyrdProblem)
+    ),
+    tag = "Verification"
+)]
+#[tracing::instrument(
+    skip(state, caller, body),
+    fields(operation = "verification.approval.decide")
+)]
+async fn decide_approval(
+    State(state): State<AppState>,
+    caller: Caller,
+    ids: Result<Path<(ExecutionId, ApprovalId)>, PathRejection>,
+    body: Body,
+) -> Result<Json<ApprovalReceipt>, WyrdErrorResponse> {
+    let Path((execution_id, approval_id)) = ids.map_err(|rejection| path_rejection(&rejection))?;
+    let request: DecideApprovalRequest = decode_body(body).await?;
+    Ok(Json(
+        VerificationControl::new(&state)
+            .decide_approval(&caller, execution_id, approval_id, request)
             .await?,
     ))
 }

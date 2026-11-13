@@ -21,13 +21,16 @@ use arrow::util::display::array_value_to_string;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::card::agent::ExecutionRoute;
 use wyrd_spec::card::verifier::{SourceField, SourceText};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{CardUid, EvidenceId, ExecutionId, GroupId, SlotName, VerificationResultId};
+use wyrd_spec::ids::{
+    ApprovalId, CardUid, EvidenceId, ExecutionId, GroupId, SlotName, VerificationResultId,
+};
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::ids::RunId;
-use wyrd_spec::verification::execution::InputDeclaration;
+use wyrd_spec::verification::execution::{ApprovalReceipt, ApprovalStatus, InputDeclaration};
 use wyrd_spec::verification::{DriftWindow, GroupSnapshot, GroupSourceSnapshot, TaskId};
 
 use super::drift::ObservationWindow;
@@ -322,12 +325,7 @@ impl<'q> InputResolver<'q> {
                         .map_err(|error| invalid(error.to_string()))?,
                 )
                 .map_err(|error| invalid(error.to_string()))?;
-                let recorded_at = column(batch, "recorded_at")?
-                    .as_any()
-                    .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
-                    .filter(|times| !times.is_null(row))
-                    .and_then(|times| DateTime::from_timestamp_micros(times.value(row)))
-                    .ok_or_else(|| invalid("recorded_at is not a timestamp".to_owned()))?;
+                let recorded_at = timestamp(batch, "recorded_at", row)?;
                 let accepted = super::evidence::Accepted {
                     published: super::evidence::Published {
                         evidence_id,
@@ -337,6 +335,56 @@ impl<'q> InputResolver<'q> {
                     recorded_at,
                 };
                 found.insert(verifier, accepted);
+            }
+        }
+        Ok(found)
+    }
+
+    /// Every visible decision of an approval occurrence of `execution_id`,
+    /// by approval id.
+    ///
+    /// # Errors
+    /// Returns the query refusal or failure, and an internal error when a
+    /// stored row is malformed.
+    pub(crate) async fn decisions(
+        &self,
+        execution_id: ExecutionId,
+    ) -> Result<BTreeMap<ApprovalId, ApprovalReceipt>, WyrdError> {
+        let batches = self
+            .rows(&format!(
+                "SELECT approval_id, decision, actor_id, reason, decided_at \
+                 FROM bifrost.verification.approvals WHERE execution_id = {}",
+                quote(&execution_id.to_string()),
+            ))
+            .await?;
+        let mut found = BTreeMap::new();
+        for batch in &batches {
+            for row in 0..batch.num_rows() {
+                let parsed = |name: &str| {
+                    text(batch, name, row).and_then(|value| {
+                        uuid::Uuid::parse_str(&value).map_err(|error| invalid(error.to_string()))
+                    })
+                };
+                let approval_id = ApprovalId::new(parsed("approval_id")?)
+                    .map_err(|error| invalid(error.to_string()))?;
+                let status = match text(batch, "decision", row)?.as_str() {
+                    "approved" => ApprovalStatus::Approved,
+                    "rejected" => ApprovalStatus::Rejected,
+                    other => return Err(invalid(format!("unknown approval decision {other}"))),
+                };
+                let reason = (!column(batch, "reason")?.is_null(row))
+                    .then(|| text(batch, "reason", row))
+                    .transpose()?;
+                found.insert(
+                    approval_id,
+                    ApprovalReceipt {
+                        approval_id,
+                        status,
+                        actor_id: Some(PrincipalId::new(parsed("actor_id")?)),
+                        decided_at: Some(timestamp(batch, "decided_at", row)?),
+                        reason,
+                    },
+                );
             }
         }
         Ok(found)
@@ -732,6 +780,20 @@ fn text(batch: &RecordBatch, name: &str, row: usize) -> Result<String, WyrdError
         return Err(invalid(format!("null {name}")));
     }
     array_value_to_string(column, row).map_err(|error| invalid(error.to_string()))
+}
+
+/// Timestamp cell `row` of microsecond column `name`.
+///
+/// # Errors
+/// Returns an internal error when the column is absent, not a microsecond
+/// timestamp, or the cell is null or out of range.
+fn timestamp(batch: &RecordBatch, name: &str, row: usize) -> Result<DateTime<Utc>, WyrdError> {
+    column(batch, name)?
+        .as_any()
+        .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+        .filter(|times| !times.is_null(row))
+        .and_then(|times| DateTime::from_timestamp_micros(times.value(row)))
+        .ok_or_else(|| invalid(format!("{name} is not a timestamp")))
 }
 
 /// Variant cell `row` of column `name` as JSON.

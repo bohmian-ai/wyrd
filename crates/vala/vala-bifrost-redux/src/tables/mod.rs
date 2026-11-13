@@ -47,7 +47,8 @@ pub use metrics::{PointsTable, SeriesTable};
 pub use storage::ObjectsTable;
 pub use traces::SpansTable;
 pub use verification::{
-    EvidenceTable, ExecutionEventsTable, ExecutionInputsTable, ExecutionOutputsTable, ResultsTable,
+    ApprovalsTable, EvidenceTable, ExecutionEventsTable, ExecutionInputsTable,
+    ExecutionOutputsTable, ResultsTable,
 };
 
 /// Errors from pure table schema and projection operations.
@@ -1282,8 +1283,8 @@ const fn definition<T: DomainTable>() -> BuiltinTableDefinition {
     }
 }
 
-/// The single canonical list of thirteen server-owned built-in tables.
-pub static BUILTIN_TABLES: [BuiltinTableDefinition; 13] = [
+/// The single canonical list of fourteen server-owned built-in tables.
+pub static BUILTIN_TABLES: [BuiltinTableDefinition; 14] = [
     definition::<SpansTable>(),
     definition::<PointsTable>(),
     definition::<SeriesTable>(),
@@ -1294,6 +1295,7 @@ pub static BUILTIN_TABLES: [BuiltinTableDefinition; 13] = [
     definition::<ExecutionOutputsTable>(),
     definition::<ExecutionEventsTable>(),
     definition::<EvidenceTable>(),
+    definition::<ApprovalsTable>(),
     definition::<AuditLogTable>(),
     definition::<CallsTable>(),
     definition::<ObjectsTable>(),
@@ -1301,7 +1303,7 @@ pub static BUILTIN_TABLES: [BuiltinTableDefinition; 13] = [
 
 /// Return all immutable built-in definitions.
 #[must_use]
-pub const fn builtin_tables() -> &'static [BuiltinTableDefinition; 13] {
+pub const fn builtin_tables() -> &'static [BuiltinTableDefinition; 14] {
     &BUILTIN_TABLES
 }
 
@@ -1313,7 +1315,7 @@ pub fn builtin_table(namespace: &str, name: &str) -> Option<&'static BuiltinTabl
         .find(|definition| definition.namespace == namespace && definition.name == name)
 }
 
-/// Return the thirteen built-in logical FQNs in canonical order.
+/// Return the fourteen built-in logical FQNs in canonical order.
 #[must_use]
 pub fn builtin_fqns() -> Vec<String> {
     BUILTIN_TABLES
@@ -1526,6 +1528,11 @@ mod tests {
                         PartitionTransformWire::Day,
                         &["evidence_id", "commit", "verifier_card_uid"],
                     ),
+                    ("verification", "approvals") => (
+                        "decided_at",
+                        PartitionTransformWire::Day,
+                        &["approval_id", "execution_id"],
+                    ),
                     ("storage", "objects") => (
                         "recorded_at",
                         PartitionTransformWire::Day,
@@ -1612,7 +1619,7 @@ mod tests {
         blooms: &'static [&'static str],
     }
 
-    /// The approved contract for all seven verification tables.
+    /// The approved contract for all eight verification tables.
     fn verification_contracts() -> Vec<VerificationContract> {
         vec![
             VerificationContract {
@@ -1768,6 +1775,34 @@ mod tests {
                     "evidence_id",
                     "commit",
                     "verifier_card_uid",
+                ],
+            },
+            VerificationContract {
+                namespace: "verification",
+                name: "approvals",
+                columns: vec![
+                    utf8("approval_id", false),
+                    utf8("execution_id", false),
+                    utf8("verifier_card_uid", false),
+                    utf8("decision", false),
+                    utf8("actor_id", false),
+                    utf8("reason", true),
+                    ts_us_utc("decided_at", false),
+                    utf8("service_name", true),
+                    utf8("service_version", true),
+                    utf8("deployment_environment", true),
+                    utf8("subject_kind", true),
+                    utf8("subject_name", true),
+                    utf8("subject_version", true),
+                ],
+                blooms: &[
+                    "service_name",
+                    "subject_name",
+                    WORKLOAD_CARD_UID,
+                    SUBJECT_CARD_UID,
+                    RUN_ID,
+                    "approval_id",
+                    "execution_id",
                 ],
             },
         ]

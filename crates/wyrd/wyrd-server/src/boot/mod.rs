@@ -1347,6 +1347,7 @@ impl AppState {
                 dependencies.postgres.wyrd().clone(),
                 blocks,
                 OperatorKeys::for_role(config.role, &config.verification.operator_keys)?,
+                config.verification.runtime.execution_timeout,
             );
             let github = config
                 .github

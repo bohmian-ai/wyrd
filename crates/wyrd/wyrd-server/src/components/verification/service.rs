@@ -60,6 +60,7 @@ use crate::verification::results::{
 use crate::verification::submissions::{AdmissionReply, Queued};
 use crate::verification::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
 
+mod approvals;
 mod evidence;
 mod inspection;
 
@@ -77,6 +78,9 @@ const EVIDENCE: &str = "verification.evidence";
 
 /// Audit operation of a deferred evidence publication.
 const PUBLISH_EVIDENCE: &str = "verification.evidence.publish";
+
+/// Audit operation of an approval decision.
+const DECIDE_APPROVAL: &str = "verification.approval.decide";
 
 /// Audit operation of a direct execution.
 const EXECUTE: &str = "verification.execute";
@@ -286,6 +290,7 @@ impl<'a> VerificationControl<'a> {
         };
         state.status = retained.status();
         state.waiting = retained.waiting();
+        state.approvals = retained.approvals();
         if let Some(failure) = &retained.state.failure {
             state.error = Some(failure.error.clone());
         }
@@ -524,9 +529,9 @@ impl<'a> VerificationControl<'a> {
         );
         let admitted = telemetry.time(Phase::Admit, || {
             environment_tag(&request)?;
-            self.authorize_run(
+            self.authorize_subject(
                 caller,
-                &request.verifier_card_uid,
+                Permission::verifier_run(request.verifier_card_uid.clone()),
                 &request.card_uid,
                 EXECUTE,
                 &resource,
@@ -751,9 +756,9 @@ impl<'a> VerificationControl<'a> {
             "verifier:{}/subject:{}",
             request.verifier_card_uid, request.card_uid
         );
-        self.authorize_run(
+        self.authorize_subject(
             caller,
-            &request.verifier_card_uid,
+            Permission::verifier_run(request.verifier_card_uid.clone()),
             &request.card_uid,
             ENQUEUE,
             &resource,
@@ -991,11 +996,13 @@ impl<'a> VerificationControl<'a> {
         }
     }
 
-    /// Evaluate `verifier:run` on `verifier` for `operation` and stage the
-    /// single allow or deny decision without waiting for its commit.
+    /// Evaluate `required`, a Verifier action at one exact Verifier scope
+    /// such as `verifier:run` or `verifier:approve`, for `operation` on
+    /// work verifying `subject`, and stage the single allow or deny decision
+    /// without waiting for its commit.
     ///
-    /// Direct and queued work both admit through here, before anything is
-    /// reserved or staged. A Card-scoped caller must carry the verified
+    /// Direct and queued work admit, and approval decisions are accepted,
+    /// through here, before anything is reserved or staged. A Card-scoped caller must carry the verified
     /// `subject` in its signed Card scope, and a family-restricted caller
     /// must have selected a root; this is the same in-memory rule the
     /// gateway applies to attribution, so no registry read is needed. A
@@ -1007,15 +1014,14 @@ impl<'a> VerificationControl<'a> {
     /// Verifier or the signed scope does not carry `subject`, and
     /// [`WyrdError::WorkloadContextRequired`] when a family-restricted
     /// caller selected no root.
-    fn authorize_run(
+    fn authorize_subject(
         &self,
         caller: &Caller,
-        verifier: &CardUid,
+        required: Permission,
         subject: &CardUid,
         operation: &str,
         resource: &str,
     ) -> Result<(), WyrdError> {
-        let required = Permission::verifier_run(verifier.clone());
         let decision = self
             .state
             .auth
@@ -1055,7 +1061,7 @@ impl<'a> VerificationControl<'a> {
     /// `verifier:run` grant admits it, including one scoped to a single
     /// Verifier UID. Planning and every shared storage operation on a File
     /// upload session are admitted this way. The exact Verifier is
-    /// authorized later by [`Self::authorize_run`] when execute or enqueue
+    /// authorized later by [`Self::authorize_subject`] when execute or enqueue
     /// names it.
     ///
     /// # Errors
@@ -1096,7 +1102,8 @@ impl<'a> VerificationControl<'a> {
 
     /// The record reader of an execution read: the tenant's SYSTEM
     /// principal granted only `bifrost.verification.execution_inputs`,
-    /// `results`, `execution_outputs`, `execution_events`, and `evidence`,
+    /// `results`, `execution_outputs`, `execution_events`, `evidence`, and
+    /// `approvals`,
     /// serving `caller`.
     ///
     /// # Errors
@@ -1118,6 +1125,7 @@ impl<'a> VerificationControl<'a> {
             "execution_outputs",
             "execution_events",
             "evidence",
+            "approvals",
         ]
         .map(|name| TableRef::new(BifrostNamespace::Verification, name));
         let read = SystemReadAuthority::resolve(self.state, caller.data_tenant_id, system, &tables)

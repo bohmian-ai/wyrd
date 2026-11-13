@@ -259,7 +259,9 @@ Process exceptions: spec types and metadata batching were written before their
 tests; the server extractor (e4e6c3f79) was committed without RED. These
 journeys passed on first run because the behavior already existed: the direct
 refusal, held ACK, P/A/B, non-admitted, MCP, workspace listing, bystander and
-X9 journeys, and the SQL `policy_changed` and replay additions. RED was proven
+X9 journeys, the SQL `policy_changed` and replay additions, the
+unreviewable-file journey `J:1541`, and the cross-tenant baseline `Q:4731`;
+the last two were proven to bite by mutation. RED was proven
 for the extracted-source baseline (removing the predicate made `J:907` fall
 back with `history_unavailable`) and, by mutation, for the unreadable-history
 journey.

@@ -389,6 +389,18 @@ uuid7_id_type!(
 );
 
 uuid7_id_type!(
+    /// Server-issued identity of one approval occurrence.
+    ///
+    /// Derived from the execution and the approval step's logical
+    /// occurrence (step, fanout item, repeat iteration), so every attempt
+    /// and recovery of the same execution reaching the same occurrence names
+    /// the same approval, a fanout item or repeat iteration names another,
+    /// and another execution, such as a newer pull request head, never
+    /// shares one.
+    ApprovalId
+);
+
+uuid7_id_type!(
     /// Durable identity of one Operator dispatch in `wyrd.operator_dispatches`.
     ///
     /// Settlement of a failed binding-created run mints one per distinct

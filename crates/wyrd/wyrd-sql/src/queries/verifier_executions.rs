@@ -47,6 +47,7 @@ use wyrd_spec::verification::{
 use crate::queries::verification::{BindingSchedule, InactivityTimeout, binding_activity};
 use crate::{OperatorPool, TenantConn};
 
+mod approvals;
 mod pull_requests;
 
 pub use pull_requests::{
@@ -3270,6 +3271,7 @@ impl VerifierExecutionQueue {
                     group: None,
                     pull_request: row.pull_request.map(|Json(pull_request)| pull_request),
                     waiting: std::collections::BTreeSet::new(),
+                    approvals: Vec::new(),
                 },
                 attribution: Attribution::new(
                     PrincipalId::new(row.sub_principal_id),

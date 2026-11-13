@@ -1925,8 +1925,9 @@ fn pinned_uid(card_ref: Option<&CardRef>) -> Result<CardUid, WyrdError> {
 /// requirement judges a scheduled window, which only its binding schedule
 /// supplies; when a step extracts a pull request, whose source only a queued
 /// `pull_request` activation supplies; when it declares a deferred input,
-/// whose evidence only a parked queued execution can wait for; or when an
-/// inline or registered Agent it calls declares `publish`. A registered Agent
+/// whose evidence only a parked queued execution can wait for; when a step
+/// asks for an approval, which only a parked queued execution can wait for;
+/// or when an inline or registered Agent it calls declares `publish`. A registered Agent
 /// is read by UID inside the declaration transaction, which already holds a
 /// sibling Agent persisted earlier in it. Later queued-only forms extend this
 /// one derivation.
@@ -1947,8 +1948,13 @@ async fn queue_only(conn: &mut TenantConn<'_>, verifier: &VerifierSpec) -> Resul
     let judges_window = verifier
         .all_requirements()
         .any(|requirement| requirement.check.evidence() == CheckEvidence::Window);
+    let approves = verifier
+        .steps
+        .iter()
+        .any(|step| matches!(step.action, Action::Approval { .. }));
     if judges_window
         || extracts_pull_request
+        || approves
         || verifier.inputs.values().any(InputSlot::is_deferred)
     {
         return Ok(true);

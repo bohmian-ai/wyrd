@@ -4189,6 +4189,7 @@ async fn a_parked_attempt_keeps_its_claim_until_acknowledged() {
     let run = harness.submit().await;
     script.push(EngineOutcome::Parked(
         [SlotName::new("ci").expect("slot name")].into(),
+        Vec::new(),
     ));
     let stall = harness
         .server

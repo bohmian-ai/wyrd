@@ -38,7 +38,9 @@ use vala_bifrost_redux::tables::staged::StagedRow;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, Sha256Hex};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{CardUid, EvidenceId, ExecutionId, SlotName, VerificationResultId};
+use wyrd_spec::ids::{
+    ApprovalId, CardUid, EvidenceId, ExecutionId, SlotName, VerificationResultId,
+};
 use wyrd_spec::storage::StoredObjectRef;
 use wyrd_spec::vala::ids::RunId;
 use wyrd_spec::verification::TaskId;
@@ -46,8 +48,8 @@ use wyrd_spec::verification::execution::{
     ExecutedOutcome, InvocationSettlement, Producer, Publication, PublicationKind,
 };
 use wyrd_spec::verification::state::{
-    AcceptedPublication, ControlRecord, ExecutionIdentity, ExecutionState, ExecutionStateError,
-    InvocationRecord, TerminalFailure, TerminalSelection,
+    AcceptedPublication, ApprovalOccurrence, ControlRecord, ExecutionIdentity, ExecutionState,
+    ExecutionStateError, InvocationRecord, RecordedApproval, TerminalFailure, TerminalSelection,
 };
 use wyrd_spec::verification::{VerificationError, VerificationExecutionStatus};
 
@@ -79,6 +81,37 @@ pub fn revision_batch(execution: ExecutionId, revision: i64) -> uuid::Uuid {
     let mut bytes = [0; 16];
     bytes.copy_from_slice(&digest[..16]);
     uuid::Builder::from_custom_bytes(bytes).into_uuid()
+}
+
+/// The server-issued id of `execution`'s approval `occurrence`: derived from
+/// the step, fanout item, and repeat iteration, so distinct occurrences never
+/// share an id and the same occurrence keeps its id across attempts.
+///
+/// # Panics
+/// Never: the digest is stamped as a version 7 UUID before it is wrapped.
+#[must_use]
+pub fn approval_id(execution: ExecutionId, occurrence: &ApprovalOccurrence) -> ApprovalId {
+    let index = |part: Option<u32>| {
+        part.map_or([0; 5], |at| {
+            let [a, b, c, d] = at.to_be_bytes();
+            [1, a, b, c, d]
+        })
+    };
+    let step = occurrence.step.as_str().as_bytes();
+    let digest = Sha256::new()
+        .chain_update(b"wyrd.verification.approval.v1")
+        .chain_update(execution.as_uuid().as_bytes())
+        .chain_update((step.len() as u64).to_be_bytes())
+        .chain_update(step)
+        .chain_update(index(occurrence.item))
+        .chain_update(index(occurrence.iteration))
+        .finalize();
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    ApprovalId::new(uuid::Uuid::from_bytes(bytes))
+        .expect("a version 7 shaped UUID is a valid approval id")
 }
 
 /// The Scribe batch id `tenant`'s `revision` of `execution` is written
@@ -767,19 +800,44 @@ impl RunState {
     }
 
     /// Record that the execution parks waiting for the deferred inputs
-    /// `waiting`, because no runnable step remains; [`Self::persisted`]
-    /// awaits the parked revision before the queue delivery is retired.
+    /// `waiting` and the undecided approval occurrences `approvals`, because
+    /// no runnable step remains; [`Self::persisted`] awaits the parked
+    /// revision before the queue delivery is retired.
+    ///
+    /// Each occurrence not yet recorded is issued its [`approval_id`], so
+    /// the same occurrence keeps one id across attempts and a decision can
+    /// only address an occurrence this execution recorded.
     ///
     /// # Errors
     /// Returns [`StateError::Stale`] once the writer broke or lost its
     /// lease.
-    pub fn wait(&self, waiting: BTreeSet<SlotName>) -> Result<(), StateError> {
+    pub fn wait(
+        &self,
+        waiting: BTreeSet<SlotName>,
+        approvals: Vec<ApprovalOccurrence>,
+    ) -> Result<(), StateError> {
         let mut held = self.writer.lock();
         if !self.writer.current(&held) {
             return Err(StateError::Stale);
         }
-        if held.state.waiting != waiting {
-            held.state.waiting = waiting;
+        let mut changed = held.state.waiting != waiting;
+        held.state.waiting = waiting;
+        for occurrence in approvals {
+            if held
+                .state
+                .approvals
+                .iter()
+                .all(|recorded| recorded.occurrence != occurrence)
+            {
+                let approval_id = approval_id(self.writer.row.execution_id, &occurrence);
+                held.state.approvals.push(RecordedApproval {
+                    approval_id,
+                    occurrence,
+                });
+                changed = true;
+            }
+        }
+        if changed {
             self.writer.changed(&mut held);
         }
         Ok(())

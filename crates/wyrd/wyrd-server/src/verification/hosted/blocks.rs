@@ -484,6 +484,9 @@ impl ActionExecutor for Blocks {
             Action::Extract { .. } => self.binding.evidence.execute(call).await,
             Action::Agent(_) => ActionExecutor::execute(self.agent(), call).await,
             Action::Code(_) => ActionExecutor::execute(&self.code, call).await,
+            Action::Approval { .. } => Err(BlockError::Terminal {
+                reason: "an approval is decided by a person, never executed".to_owned(),
+            }),
         }
     }
 }

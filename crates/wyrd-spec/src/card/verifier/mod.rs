@@ -584,6 +584,14 @@ pub enum Action {
     Agent(AgentCall),
     /// Run sandboxed code returning JSON data.
     Code(CodeCall),
+    /// Wait for a person to approve or reject this occurrence. The step's
+    /// output is the decision receipt; a rejection is data, not a failure.
+    /// Pending approvals share the execution's own expiration. A Verifier
+    /// declaring one runs only as queued work.
+    Approval {
+        /// What the approver is asked, shown with the pending occurrence.
+        message: String,
+    },
 }
 
 /// One Agent invocation in a step or check position.

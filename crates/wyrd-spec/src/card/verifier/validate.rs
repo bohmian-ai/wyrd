@@ -25,7 +25,7 @@ use crate::envelope::CardKind;
 use crate::error::WyrdError;
 use crate::ids::{FeatureName, SlotName};
 use crate::reference::InlineableRef;
-use crate::verification::execution::Verdict;
+use crate::verification::execution::{ApprovalReceipt, Verdict};
 use crate::verification::{ExecutionPlan, TaskId, plan_stages};
 
 /// An Agent and its Prompt, resolved by the caller for validation.
@@ -284,6 +284,7 @@ fn action_references(step: &Step) -> std::vec::IntoIter<&Reference> {
             )
             .collect(),
         Action::Code(call) => call.inputs.values().collect(),
+        Action::Approval { .. } => Vec::new(),
     };
     action.into_iter()
 }
@@ -577,6 +578,14 @@ where
             }
             Action::Agent(call) => self.validate_agent(call, position, &action_path)?,
             Action::Code(call) => self.validate_code(call, position, &action_path)?,
+            Action::Approval { message } if message.trim().is_empty() => {
+                return Err(invalid(
+                    "approval_message",
+                    &format!("{action_path}.message"),
+                    "an approval states a non-empty message",
+                ));
+            }
+            Action::Approval { .. } => {}
         }
         Ok(())
     }
@@ -1088,14 +1097,36 @@ where
         }
     }
 
-    /// Returns the known output schema of a step, when it has one.
+    /// Returns the known output schema of a step, when it has one: its
+    /// action's output, or for a fanout step the array of its members'
+    /// outputs, with the member's definitions kept at the root its
+    /// references resolve against.
     fn output_schema(&self, step: &'a Step) -> Option<Value> {
+        let mut member = self.action_output_schema(step)?;
+        if step.foreach.is_none() {
+            return Some(member);
+        }
+        let definitions = member
+            .as_object_mut()
+            .and_then(|member| member.remove("$defs"));
+        let mut array = json!({ "type": "array", "items": member });
+        if let Some(definitions) = definitions {
+            array["$defs"] = definitions;
+        }
+        Some(array)
+    }
+
+    /// Returns the known output schema of one invocation of a step's action.
+    fn action_output_schema(&self, step: &'a Step) -> Option<Value> {
         match &step.action {
             Action::Extract {
                 extractor: Some(Extractor::PullRequest),
                 ..
             }
             | Action::Code(_) => None,
+            Action::Approval { .. } => {
+                serde_json::to_value(schemars::schema_for!(ApprovalReceipt)).ok()
+            }
             Action::Extract { from, .. } => match self.whole_slot(from.as_ref()?)? {
                 InputSlot::Media { formats, .. } => Some(ExtractOutput::schema_for(formats)),
                 _ => None,
@@ -1550,6 +1581,53 @@ mod tests {
             serde_json::to_value(parse(&explicit)).expect("serialize"),
             json!({"inputs": {"a": {"type": "json"}}})
         );
+    }
+
+    /// An approval step states a non-empty message and outputs its decision
+    /// receipt, so a requirement may read `status` but not an undeclared
+    /// field; it takes no expiration of its own.
+    ///
+    /// # Panics
+    /// Panics when a valid approval is refused or an invalid one accepted.
+    #[test]
+    fn approval_states_a_message_and_outputs_its_receipt() {
+        let body = |message: &str, path: &str| {
+            json!({
+                "steps": [{"id": "gate", "action": {"kind": "approval", "message": message}}],
+                "requirements": [{
+                    "id": "approved",
+                    "statement": "A person approved.",
+                    "check": {"kind": "assert", "path": path, "operator": "equals", "expected": "approved"},
+                }],
+            })
+        };
+        let valid = body("Approve the assessment.", "steps.gate.output.status");
+        let spec = parse(&valid);
+        spec.validate()
+            .expect("an approval reading its status validates");
+        assert_eq!(serde_json::to_value(&spec).expect("serialize"), valid);
+        assert_eq!(
+            rule(&body("  ", "steps.gate.output.status")),
+            "approval_message"
+        );
+        assert!(
+            parse(&body("Approve.", "steps.gate.output.verdict"))
+                .validate()
+                .is_err(),
+            "an undeclared receipt field is refused"
+        );
+        let mut fanout = body("Approve each region.", "steps.gate.output[1].status");
+        fanout["steps"][0]["foreach"] = json!({"count": 2});
+        parse(&fanout)
+            .validate()
+            .expect("a fanout step's output is the array of its members' receipts");
+        fanout["requirements"][0]["check"]["path"] = json!("steps.gate.output.status");
+        assert!(
+            parse(&fanout).validate().is_err(),
+            "a fanout output is an array"
+        );
+        let expiring = json!({"steps": [{"id": "gate", "action": {"kind": "approval", "message": "Approve.", "expires_after_seconds": 60}}]});
+        assert!(serde_json::from_value::<VerifierSpec>(expiring).is_err());
     }
 
     /// Pass-rate thresholds must be finite and in `(0, 1]`.

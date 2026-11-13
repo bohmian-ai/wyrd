@@ -16,7 +16,8 @@ use wyrd_spec::vala::trace::{InstrumentationScope, Resource, SpanKind, SpanRecor
 use wyrd_spec::verification::DriftWindow;
 use wyrd_spec::verification::PublicationName;
 use wyrd_spec::verification::execution::{
-    ExecutedRequirement, Producer, ProducerInvocation, PublicationCollection, Speculation, Verdict,
+    ApprovalStatus, ExecutedRequirement, Producer, ProducerInvocation, PublicationCollection,
+    Speculation, Verdict,
 };
 
 use super::*;
@@ -4045,7 +4046,7 @@ async fn a_resumed_execution_keeps_its_spent_agent_budget() {
     )
     .await;
     assert!(
-        matches!(waiting, Err(EngineError::Waiting(_))),
+        matches!(waiting, Err(EngineError::Waiting { .. })),
         "{waiting:?}"
     );
     assert_eq!(parked.calls(), ["action:first"]);
@@ -4330,7 +4331,7 @@ async fn deferred_inputs_hold_only_their_consumers_until_supplied() {
         &ExecutionState::default(),
     );
     let waiting = run(&first, &spec, json!({"answer": 1})).await;
-    let Err(EngineError::Waiting(slots)) = waiting else {
+    let Err(EngineError::Waiting { inputs: slots, .. }) = waiting else {
         panic!("the execution waits: {waiting:?}");
     };
     assert_eq!(
@@ -4364,4 +4365,113 @@ async fn deferred_inputs_hold_only_their_consumers_until_supplied() {
             ("later", RequirementOutcome::Passed),
         ])
     );
+}
+
+/// An approval occurrence without a decision holds only its step and that
+/// step's dependents: an independent step runs, and once nothing else can
+/// run the engine reports each undecided occurrence, one per fanout item.
+/// Run again with decisions, the settled step is restored, each decided
+/// occurrence outputs its receipt, a rejection is data rather than a
+/// failure, and the standard `status equals approved` requirement passes
+/// only the approved occurrence. A third run restores every decision.
+///
+/// # Panics
+/// Panics when a waiting block runs, the occurrences differ, a settled
+/// block replays, or a requirement judges the wrong decision.
+#[tokio::test(start_paused = true)]
+async fn approvals_hold_only_their_dependents_until_decided() {
+    let approved = |id: &str, path: &str| json!({"id": id, "statement": id, "check": {"kind": "assert", "path": path, "operator": "equals", "expected": "approved"}});
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "steps": [
+            {"id": "independent", "action": code_action(json!({"x": "inputs.answer"}))},
+            {"id": "sign-off", "action": {"kind": "approval", "message": "Approve the release."}},
+            {"id": "per-region", "foreach": {"count": 2},
+             "action": {"kind": "approval", "message": "Approve this region."}},
+            {"id": "after", "action": code_action(json!({"r": "steps.sign-off.output"}))}
+        ],
+        "requirements": [
+            approved("signed", "steps.sign-off.output.status"),
+            approved("first-region", "steps.per-region.output[0].status"),
+            approved("second-region", "steps.per-region.output[1].status")
+        ]
+    }));
+    let ledger = Arc::new(Ledger::default());
+    let parked = Arc::new(Script::default());
+    let first = engine(&parked, InMemoryTraceSource::new(), 4).with_checkpoints(
+        Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+        &ExecutionState::default(),
+    );
+    let waiting = run(&first, &spec, json!({"answer": 1})).await;
+    let Err(EngineError::Waiting { inputs, approvals }) = waiting else {
+        panic!("the execution waits: {waiting:?}");
+    };
+    assert!(inputs.is_empty());
+    let occurrence = |step: &str, item: Option<u32>, message: &str| ApprovalOccurrence {
+        step: TaskId::new(step).expect("task id"),
+        item,
+        iteration: None,
+        message: message.to_owned(),
+    };
+    assert_eq!(
+        approvals.into_iter().collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            occurrence("sign-off", None, "Approve the release."),
+            occurrence("per-region", Some(0), "Approve this region."),
+            occurrence("per-region", Some(1), "Approve this region."),
+        ])
+    );
+    assert_eq!(parked.calls(), vec!["action:independent"]);
+
+    let receipt = |status: ApprovalStatus| ApprovalReceipt {
+        approval_id: wyrd_spec::ids::ApprovalId::new_v7(),
+        status,
+        actor_id: Some(wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7())),
+        decided_at: Some(chrono::Utc::now()),
+        reason: None,
+    };
+    let key = |step: &str, item: Option<u32>| (TaskId::new(step).expect("task id"), item, None);
+    let decisions = Decisions::from([
+        (key("sign-off", None), receipt(ApprovalStatus::Approved)),
+        (
+            key("per-region", Some(0)),
+            receipt(ApprovalStatus::Approved),
+        ),
+        (
+            key("per-region", Some(1)),
+            receipt(ApprovalStatus::Rejected),
+        ),
+    ]);
+    let resumed = Arc::new(Script::default());
+    let second = engine(&resumed, InMemoryTraceSource::new(), 4)
+        .with_checkpoints(
+            Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+            &ledger.recorded(),
+        )
+        .with_approvals(decisions);
+    let outcome = run(&second, &spec, json!({"answer": 1}))
+        .await
+        .expect("the decided execution completes");
+    assert_eq!(resumed.calls(), vec!["action:after"]);
+    assert_eq!(step(&outcome, "independent").attempts, 1);
+    assert_eq!(step(&outcome, "per-region").status, StepStatus::Succeeded);
+    assert_eq!(
+        outcomes(&outcome),
+        BTreeMap::from([
+            ("signed", RequirementOutcome::Passed),
+            ("first-region", RequirementOutcome::Passed),
+            ("second-region", RequirementOutcome::Failed),
+        ])
+    );
+
+    let replayed = Arc::new(Script::default());
+    let third = engine(&replayed, InMemoryTraceSource::new(), 4).with_checkpoints(
+        Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+        &ledger.recorded(),
+    );
+    let again = run(&third, &spec, json!({"answer": 1}))
+        .await
+        .expect("a recovered run restores every decision");
+    assert!(replayed.calls().is_empty(), "{:?}", replayed.calls());
+    assert_eq!(outcomes(&again), outcomes(&outcome));
 }

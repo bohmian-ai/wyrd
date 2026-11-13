@@ -13,6 +13,7 @@ use wyrd_spec::ids::SlotName;
 use wyrd_spec::verification::execution::{
     CallProvenance, ExecutedOutcome, RequirementDetail, RequirementOutcome, StepStatus,
 };
+use wyrd_spec::verification::state::ApprovalOccurrence;
 use wyrd_spec::verification::{DriftVerdict, VerificationError};
 use wyrd_sql::queries::verifier_executions::TerminalStatus;
 
@@ -39,9 +40,10 @@ pub enum EngineOutcome {
     /// interval and tries again without spending an attempt.
     Deferred(VerificationError),
     /// Every runnable step settled and the rest read deferred inputs not yet
-    /// published, named here. The execution releases its compute and waits
-    /// for the publication, or its deadline.
-    Parked(BTreeSet<SlotName>),
+    /// published or wait on undecided approval occurrences, both named here.
+    /// The execution releases its compute and waits for the publication or
+    /// decision, or its deadline.
+    Parked(BTreeSet<SlotName>, Vec<ApprovalOccurrence>),
     /// A terminal failure that carries no verdict.
     Terminal(TerminalStatus, VerificationError),
 }

@@ -1719,12 +1719,13 @@ fn standalone_card_request(kind: &str, name: &str, spec: Value, key: &str) -> Re
 }
 
 /// Registration derives `queue_only` from a scheduled-window check, the
-/// Agents a Verifier calls and its pull-request extraction, and ignores the
-/// value an author sends.
+/// Agents a Verifier calls, its pull-request extraction, and an approval
+/// step, and ignores the value an author sends.
 ///
 /// A drift requirement judging a scheduled window, a step calling an inline
-/// Agent declaring `publish`, a registered Agent declaring it, or a
-/// pull-request `extract` makes its Verifier queue-only even when the author
+/// Agent declaring `publish`, a registered Agent declaring it, a
+/// pull-request `extract`, or an `approval` step makes its Verifier
+/// queue-only even when the author
 /// sent `false`; an assert-only Verifier sent with
 /// `true` and a media `extract` alone are stored as not queue-only, and
 /// their stored specs omit the field.
@@ -1733,8 +1734,7 @@ fn standalone_card_request(kind: &str, name: &str, spec: Value, key: &str) -> Re
 /// Panics when the server fails to start, a declaration is refused, or a
 /// stored spec carries another `queue_only`.
 #[tokio::test(flavor = "current_thread")]
-async fn registration_derives_queue_only_from_windows_publishing_agents_and_pull_request_extraction()
- {
+async fn registration_derives_queue_only_from_each_queued_only_form() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -1937,6 +1937,22 @@ async fn registration_derives_queue_only_from_windows_publishing_agents_and_pull
                 "qo-pull-request-disclaimed",
                 Some("1.0.0"),
                 disclaimed,
+            )],
+            true,
+        ),
+        (
+            "qo-approval",
+            vec![submission_body(
+                "Verifier",
+                "qo-approval",
+                Some("1.0.0"),
+                json!({
+                    "steps": [{ "id": "gate", "action": { "kind": "approval", "message": "Approve." } }],
+                    "requirements": [{ "id": "approved", "statement": "A person approved.",
+                                       "check": { "kind": "assert", "path": "steps.gate.output.status",
+                                                  "operator": "equals", "expected": "approved" } }],
+                    "queue_only": false,
+                }),
             )],
             true,
         ),

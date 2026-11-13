@@ -281,6 +281,7 @@ impl<'a> VerificationControl<'a> {
                 group: None,
                 pull_request: None,
                 waiting: std::collections::BTreeSet::new(),
+                approvals: Vec::new(),
             },
         };
         state.status = retained.status();

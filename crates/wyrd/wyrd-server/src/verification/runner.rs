@@ -575,9 +575,9 @@ impl VerifierRunner {
                         .err()
                         .unwrap_or(Transition::Defer(error));
                 }
-                EngineOutcome::Parked(waiting) => {
+                EngineOutcome::Parked(waiting, approvals) => {
                     let execution_id = frozen.run.execution_id;
-                    if let Err(error) = state.wait(waiting) {
+                    if let Err(error) = state.wait(waiting, approvals) {
                         return state_failure(execution_id, &error);
                     }
                     let recheck = deadline
@@ -1696,11 +1696,11 @@ fn state_failure(execution_id: ExecutionId, error: &StateError) -> Transition {
 /// block task, unreadable evidence metadata, or a deferred not-yet-landed
 /// trace retries, a block refused
 /// process capacity defers without spending an attempt, and steps waiting
-/// for unpublished deferred inputs park.
+/// for unpublished deferred inputs or undecided approvals park.
 fn engine_failure(run: &ClaimedExecution, error: &EngineError) -> EngineOutcome {
-    if let EngineError::Waiting(waiting) = error {
-        tracing::info!(execution_id = %run.lease.execution_id, ?waiting, "the verification waits for deferred inputs");
-        return EngineOutcome::Parked(waiting.clone());
+    if let EngineError::Waiting { inputs, approvals } = error {
+        tracing::info!(execution_id = %run.lease.execution_id, ?inputs, approvals = approvals.len(), "the verification waits for deferred inputs or approvals");
+        return EngineOutcome::Parked(inputs.clone(), approvals.clone());
     }
     tracing::warn!(execution_id = %run.lease.execution_id, %error, "the verification engine failed");
     match error {
@@ -1739,7 +1739,9 @@ fn engine_failure(run: &ClaimedExecution, error: &EngineError) -> EngineOutcome 
             EXECUTION_INTERRUPTED,
             "a verification checkpoint cannot commit",
         )),
-        EngineError::Waiting(waiting) => EngineOutcome::Parked(waiting.clone()),
+        EngineError::Waiting { inputs, approvals } => {
+            EngineOutcome::Parked(inputs.clone(), approvals.clone())
+        }
     }
 }
 

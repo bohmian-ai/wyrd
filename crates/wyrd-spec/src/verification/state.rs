@@ -20,7 +20,7 @@ use super::TaskId;
 use super::execution::{ExecutedOutcome, InvocationSettlement, Producer, Publication, Speculation};
 use super::{VerificationError, VerificationExecutionStatus};
 use crate::auth::Sha256Hex;
-use crate::ids::{CardUid, EvidenceId, GroupId, SlotName, VerificationResultId};
+use crate::ids::{ApprovalId, CardUid, EvidenceId, GroupId, SlotName, VerificationResultId};
 use crate::reference::CardRef;
 use crate::storage::StoredObjectRef;
 
@@ -33,8 +33,10 @@ use crate::storage::StoredObjectRef;
 /// worker that cannot honour them refuses the state; format 1 never left
 /// development and is refused. Format 4 added the deferred inputs a parked
 /// execution waits for and the deferred evidence it accepted; a format 3
-/// state is a format 4 state holding neither, so it still decodes.
-pub const EXECUTION_STATE_FORMAT: u32 = 4;
+/// state is a format 4 state holding neither, so it still decodes. Format 5
+/// added the approval occurrences an execution reached; a format 3 or 4
+/// state holds none.
+pub const EXECUTION_STATE_FORMAT: u32 = 5;
 
 /// The oldest stored format that decodes as [`EXECUTION_STATE_FORMAT`].
 const OLDEST_READABLE_FORMAT: u32 = 3;
@@ -77,6 +79,39 @@ pub struct ExecutionState {
     /// from, once accepted; a resumption reads exactly this evidence.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub evidence: BTreeMap<SlotName, EvidenceId>,
+    /// Every approval occurrence the execution reached, with the identity
+    /// a decision names, in the order first reached. An occurrence stays
+    /// once recorded; its decision is accepted beside the state, never in it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approvals: Vec<RecordedApproval>,
+}
+
+/// One logical approval occurrence: an approval step, with its fanout item
+/// and repeat iteration when the step fans out or repeats.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalOccurrence {
+    /// The approval step.
+    pub step: TaskId,
+    /// Zero-based fanout item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<u32>,
+    /// Zero-based repeat iteration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iteration: Option<u32>,
+    /// What the approver is asked.
+    pub message: String,
+}
+
+/// An approval occurrence an execution reached and the server-issued
+/// identity a decision names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordedApproval {
+    /// Derived from the execution and the occurrence.
+    pub approval_id: ApprovalId,
+    /// The occurrence.
+    pub occurrence: ApprovalOccurrence,
 }
 
 /// The exact identities an execution was accepted for.

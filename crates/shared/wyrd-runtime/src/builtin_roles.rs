@@ -54,8 +54,9 @@ const WORKLOAD: &[Permission] = &[
 ];
 
 /// [`WORKLOAD`] plus authoring: Card and artifact writes, Card deletion, policy
-/// lock, and Service installation. Changing what a workload is verified
-/// against belongs to people, not to the workload itself.
+/// lock, Service installation, and Verifier approval decisions. Changing what
+/// a workload is verified against, and approving its verification, belong to
+/// people, not to the workload itself.
 const EDITOR: &[Permission] = &[
     Permission::card_read(),
     Permission::verifier_read_any(),
@@ -77,6 +78,7 @@ const EDITOR: &[Permission] = &[
     Permission::artifact_write(),
     Permission::policy_lock(),
     Permission::service_install(),
+    Permission::verifier_approve_any(),
 ];
 
 /// Source of truth for Wyrd's per-tenant builtin roles.
@@ -239,7 +241,14 @@ mod tests {
             Permission::artifact_write(),
             Permission::policy_lock(),
             Permission::service_install(),
+            Permission::verifier_approve_any(),
         ]);
+        assert!(
+            !permissions("workload")
+                .iter()
+                .any(|held| held.covers(&Permission::verifier_approve_any())),
+            "a workload never approves its own verification"
+        );
         assert_eq!(permissions("viewer"), viewer.as_slice());
         assert_eq!(permissions("workload"), workload.as_slice());
         assert_eq!(permissions("editor"), editor.as_slice());

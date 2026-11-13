@@ -346,7 +346,7 @@ impl Visit for VerifierSpec {
         for (i, step) in self.steps.iter_mut().enumerate() {
             let prefix = format!("spec.steps[{i}].action");
             match &mut step.action {
-                Action::Extract { .. } => {}
+                Action::Extract { .. } | Action::Approval { .. } => {}
                 Action::Agent(call) => visit_agent_call(call, &prefix, f),
                 Action::Code(call) => visit_code_call(call, &prefix, f),
             }

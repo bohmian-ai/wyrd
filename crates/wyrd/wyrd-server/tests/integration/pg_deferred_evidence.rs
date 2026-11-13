@@ -504,9 +504,10 @@ async fn evidence_published_while_its_consumer_runs_reaches_it() {
     deployment.gate("1.1.0", "1.0.0").await;
     let script = EngineScript::default();
     script.hold();
-    script.push(EngineOutcome::Parked(BTreeSet::from([
-        SlotName::new("ci").expect("slot name")
-    ])));
+    script.push(EngineOutcome::Parked(
+        BTreeSet::from([SlotName::new("ci").expect("slot name")]),
+        Vec::new(),
+    ));
     let runtime = VerificationRuntime::builder(deployment.server.state())
         .limits(limits(Duration::from_mins(5)))
         .engine_script(script.clone())

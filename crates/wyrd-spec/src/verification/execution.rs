@@ -25,11 +25,12 @@ use super::{
     DriftReport, DriftWindow, GroupSnapshot, OperatorDispatchState, VerificationError,
     VerificationExecutionStatus, VerificationVerdict,
 };
+use crate::auth::PrincipalId;
 use crate::auth::Sha256Hex;
 use crate::card::agent::{Authored, BuiltinTool, Compiled, ExecutionRoute, PromptForm};
 use crate::card::verifier::{Check, CodeRuntime};
 use crate::error::WyrdError;
-use crate::ids::{CardUid, EvidenceId, ExecutionId, GroupId, RepositoryId, SlotName};
+use crate::ids::{ApprovalId, CardUid, EvidenceId, ExecutionId, GroupId, RepositoryId, SlotName};
 use crate::origin::CommitSha;
 use crate::reference::CardRef;
 use crate::storage::ids::UploadId;
@@ -225,6 +226,106 @@ pub struct PublishEvidenceResponse {
     pub recorded_at: DateTime<Utc>,
 }
 
+/// A person's decision on one pending approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDecision {
+    /// Continue as approved.
+    Approved,
+    /// Continue as rejected; the Verifier decides what a rejection means.
+    Rejected,
+}
+
+/// Where one approval occurrence stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalStatus {
+    /// Waiting for a decision before the execution expires.
+    Pending,
+    /// Approved by `actor_id`.
+    Approved,
+    /// Rejected by `actor_id`.
+    Rejected,
+    /// The execution ended before anyone decided; no actor.
+    Expired,
+}
+
+/// `POST /v1/verification/executions/{execution_id}/approvals/{approval_id}`
+/// request body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct DecideApprovalRequest {
+    /// `approved` or `rejected`.
+    pub decision: ApprovalDecision,
+    /// Why, recorded with the decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// The decision receipt of one approval occurrence, and an approval step's
+/// output.
+///
+/// Returned only once the decision is durably accepted. `actor_id` and
+/// `decided_at` are absent while pending and for an expired occurrence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalReceipt {
+    /// The occurrence decided.
+    #[cfg_attr(feature = "server", schema(value_type = String))]
+    pub approval_id: ApprovalId,
+    /// `approved` or `rejected` once decided.
+    pub status: ApprovalStatus,
+    /// The principal who decided.
+    #[serde(default)]
+    #[cfg_attr(feature = "server", schema(value_type = Option<String>))]
+    pub actor_id: Option<PrincipalId>,
+    /// When the decision was accepted.
+    #[serde(default)]
+    pub decided_at: Option<DateTime<Utc>>,
+    /// The decider's stated reason.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// One approval occurrence of an execution, as inspection reports it.
+///
+/// It expires with the execution itself; there is no per-approval deadline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalOccurrenceState {
+    /// The identity a decision names.
+    #[cfg_attr(feature = "server", schema(value_type = String))]
+    pub approval_id: ApprovalId,
+    /// The approval step.
+    #[cfg_attr(feature = "server", schema(value_type = String))]
+    pub step_id: TaskId,
+    /// Zero-based fanout item, for a fanout step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<u32>,
+    /// Zero-based repeat iteration, for a repeating step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iteration: Option<u32>,
+    /// What the approver is asked.
+    pub message: String,
+    /// Where the occurrence stands.
+    pub status: ApprovalStatus,
+    /// The principal who decided, once decided.
+    #[serde(default)]
+    #[cfg_attr(feature = "server", schema(value_type = Option<String>))]
+    pub actor_id: Option<PrincipalId>,
+    /// When the decision was accepted, once decided.
+    #[serde(default)]
+    pub decided_at: Option<DateTime<Utc>>,
+    /// The decider's stated reason.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 /// How to upload one missing file through the shared storage lifecycle.
 ///
 /// Transfer the bytes by `plan`, then finish with
@@ -299,6 +400,10 @@ pub struct VerificationExecutionState<T = Map<String, Value>> {
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     #[cfg_attr(feature = "server", schema(value_type = Vec<String>))]
     pub waiting: BTreeSet<SlotName>,
+    /// Every approval occurrence the execution reached, pending or
+    /// decided, in step order; empty when it reached none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approvals: Vec<ApprovalOccurrenceState>,
 }
 
 /// One side of a pull request as an admission pinned it: the branch name
@@ -1103,6 +1208,7 @@ impl VerificationExecutionState {
             group,
             pull_request,
             waiting,
+            approvals,
         } = self;
         Ok(VerificationExecutionState {
             execution_id,
@@ -1115,6 +1221,7 @@ impl VerificationExecutionState {
             group,
             pull_request,
             waiting,
+            approvals,
         })
     }
 }

@@ -150,6 +150,9 @@ pub(super) enum Done {
     Step(Box<StepDone>),
     /// A judged whole-Verifier requirement, as reported.
     Requirement(Box<ExecutedRequirement>),
+    /// A step whose approval occurrences wait for a decision. Never entered
+    /// in the ledger: the step and its dependents stay unsettled.
+    Awaiting(Vec<wyrd_spec::verification::state::ApprovalOccurrence>),
 }
 
 /// The ledger the engine shares with the blocks it starts, which each take a

@@ -42,12 +42,13 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::VerificationVerdict;
+use wyrd_spec::verification::execution::ApprovalReceipt;
 use wyrd_spec::verification::execution::{
     CallProvenance, Citation, ExecutedOutcome, ExecutedRequirement, InputDeclaration,
     InvocationSettlement, Producer, ProducerInvocation, RequirementDetail, RequirementDetails,
     RequirementOutcome, RequirementResult, Speculation, StepResult, StepStatus,
 };
-use wyrd_spec::verification::state::{ControlRecord, ExecutionState};
+use wyrd_spec::verification::state::{ApprovalOccurrence, ControlRecord, ExecutionState};
 use wyrd_spec::verification::{ComparisonOperator, ContextCapture};
 
 use super::BoundJson;
@@ -170,6 +171,7 @@ const fn action_kind(action: &Action) -> &'static str {
         Action::Extract { .. } => "extract",
         Action::Agent(_) => "agent",
         Action::Code(_) => "code",
+        Action::Approval { .. } => "approval",
     }
 }
 
@@ -232,12 +234,18 @@ pub enum EngineError {
     #[error("the verification evidence cannot be admitted now: {0}")]
     EvidenceUnavailable(String),
     /// Every block that can run has settled and the rest read deferred
-    /// input slots whose evidence has not arrived: the named slots. No
-    /// verdict exists; the settled blocks are already recorded through
-    /// [`Checkpoints`], so the host parks the execution and runs it again
-    /// once evidence for a named slot is supplied.
-    #[error("the verification waits for deferred inputs: {0:?}")]
-    Waiting(BTreeSet<SlotName>),
+    /// input slots whose evidence has not arrived, or follow an approval
+    /// occurrence nobody decided yet. No verdict exists; the settled blocks
+    /// are already recorded through [`Checkpoints`], so the host parks the
+    /// execution and runs it again once evidence for a named slot is
+    /// supplied or a named approval is decided.
+    #[error("the verification waits for deferred inputs {inputs:?} and approvals {approvals:?}")]
+    Waiting {
+        /// The deferred inputs still missing.
+        inputs: BTreeSet<SlotName>,
+        /// The approval occurrences reached and still undecided.
+        approvals: Vec<ApprovalOccurrence>,
+    },
 }
 
 /// The engine of one Verifier execution, composed from injected capabilities.
@@ -279,10 +287,17 @@ pub struct VerificationEngine {
     /// The current run's own concurrency bound beneath the engine's;
     /// `None` without `limits.concurrency`.
     run_permits: Option<Arc<Semaphore>>,
+    /// The accepted decision of each approval occurrence decided so far,
+    /// keyed by step, item, and iteration; an occurrence absent here waits.
+    decisions: Arc<Decisions>,
     /// The highest attempt the current run began per block and instance;
     /// [`Self::run`] starts each run with none.
     begun: Begun,
 }
+
+/// The accepted decision of each decided approval occurrence, keyed by its
+/// step, fanout item, and repeat iteration.
+pub type Decisions = HashMap<(TaskId, Option<u32>, Option<u32>), ApprovalReceipt>;
 
 /// One run's highest begun attempt per step and instance.
 type Begun = Arc<std::sync::Mutex<HashMap<(TaskId, Instance), u32>>>;
@@ -367,7 +382,16 @@ impl VerificationEngine {
             budget: None,
             run_permits: None,
             begun: Begun::default(),
+            decisions: Arc::default(),
         }
+    }
+
+    /// Settle each approval occurrence in `decisions` with its accepted
+    /// decision; every other approval occurrence the run reaches waits.
+    #[must_use]
+    pub fn with_approvals(mut self, decisions: Decisions) -> Self {
+        self.decisions = Arc::new(decisions);
+        self
     }
 
     /// Record every block invocation of this queued execution in `store`,
@@ -406,6 +430,30 @@ impl VerificationEngine {
             .as_ref()?
             .settled
             .get(&(task.clone(), instance))
+    }
+
+    /// The accepted decision of approval `step`'s `instance` as the step's
+    /// output: its receipt.
+    ///
+    /// # Errors
+    /// Returns [`BlockError::Terminal`] when the occurrence has no accepted
+    /// decision or its receipt does not serialize; the caller only asks for
+    /// a decided occurrence.
+    fn decided(&self, step: &TaskId, instance: Instance) -> Result<ActionOutput, BlockError> {
+        let receipt = self
+            .decisions
+            .get(&(step.clone(), instance.0, instance.1))
+            .ok_or_else(|| BlockError::Terminal {
+                reason: "the approval has no accepted decision".to_owned(),
+            })?;
+        let output = serde_json::to_value(receipt).map_err(|error| BlockError::Terminal {
+            reason: format!("the approval receipt cannot be read: {error}"),
+        })?;
+        Ok(ActionOutput {
+            output,
+            provenance: None,
+            tool_calls: Vec::new(),
+        })
     }
 
     /// The restored action settlement of `step`'s `instance`.
@@ -952,6 +1000,9 @@ impl VerificationEngine {
             .collect();
         let mut tasks: Tasks<'_, Node, Arc<Done>, EngineError> = Tasks::default();
         let mut disposed = BTreeSet::new();
+        // Steps holding an undecided approval occurrence, by step index:
+        // never settled, so nothing downstream of them is released.
+        let mut awaiting: BTreeMap<usize, Vec<ApprovalOccurrence>> = BTreeMap::new();
         loop {
             let mut released = true;
             while released {
@@ -968,8 +1019,13 @@ impl VerificationEngine {
                         Some(Done::Step(done)) if done.speculation == Speculation::Pending => {
                             (**done).clone()
                         }
-                        None if tasks.contains(&Node::Step(index)) && !speculation.admits() => {
-                            tasks.cancel(&Node::Step(index));
+                        None if (tasks.contains(&Node::Step(index))
+                            || awaiting.contains_key(&index))
+                            && !speculation.admits() =>
+                        {
+                            if awaiting.remove(&index).is_none() {
+                                tasks.cancel(&Node::Step(index));
+                            }
                             let status = withheld(speculation, &reason).0;
                             let mut cancelled =
                                 unrun(step, Missing::failed(reason.clone()), Speculation::Pending);
@@ -1014,13 +1070,16 @@ impl VerificationEngine {
                 // Validation keeps the graph acyclic, so nothing stays
                 // pending once nothing runs; bind the first anyway rather
                 // than wait forever, so its gaps settle it.
-                if pending.is_empty() {
+                if pending.is_empty() && awaiting.is_empty() {
                     return Ok(ledger);
                 }
                 let blocked: BTreeSet<SlotName> =
                     pending.iter().flat_map(|node| waited(*node)).collect();
-                if !blocked.is_empty() {
-                    return Err(EngineError::Waiting(blocked));
+                if !blocked.is_empty() || !awaiting.is_empty() {
+                    return Err(EngineError::Waiting {
+                        inputs: blocked,
+                        approvals: awaiting.into_values().flatten().collect(),
+                    });
                 }
                 let node = pending.remove(0);
                 self.dispatching(spec, evidence, &ledger, node, &mut disposed);
@@ -1031,7 +1090,13 @@ impl VerificationEngine {
                 continue;
             }
             let (node, done) = tasks.next(EngineError::Join).await;
-            ledger.insert(node.id(spec).clone(), settled(done, &mut tasks).await?);
+            let done = settled(done, &mut tasks).await?;
+            match (node, done.as_ref()) {
+                (Node::Step(index), Done::Awaiting(occurrences)) => {
+                    awaiting.insert(index, occurrences.clone());
+                }
+                _ => ledger.insert(node.id(spec).clone(), done),
+            }
         }
     }
 
@@ -1340,10 +1405,20 @@ impl VerificationEngine {
             }
             let started = Instant::now();
             let fanout = spec.steps[index].foreach.is_some();
-            let members = engine
+            let (mut settled, mut awaiting) = (Vec::new(), Vec::new());
+            for member in engine
                 .members(&spec, &evidence, &ledger, index, members, deadline)
-                .await?;
-            let mut done = aggregate(&spec.steps[index], members, fanout, started.elapsed());
+                .await?
+            {
+                match member {
+                    Ok(member) => settled.push(member),
+                    Err(occurrence) => awaiting.push(occurrence),
+                }
+            }
+            if !awaiting.is_empty() {
+                return Ok(Arc::new(Done::Awaiting(awaiting)));
+            }
+            let mut done = aggregate(&spec.steps[index], settled, fanout, started.elapsed());
             done.speculation = speculation;
             Ok(Arc::new(Done::Step(Box::new(done))))
         })))
@@ -1367,13 +1442,14 @@ impl VerificationEngine {
         index: usize,
         items: Vec<Option<(u32, Option<CallInput>)>>,
         deadline: Instant,
-    ) -> Result<Vec<Member>, EngineError> {
+    ) -> Result<Vec<Result<Member, ApprovalOccurrence>>, EngineError> {
         let bound = spec.steps[index]
             .foreach
             .as_ref()
             .and_then(|foreach| foreach.concurrency)
             .map(|bound| Arc::new(Semaphore::new(bound as usize)));
-        let mut running: Tasks<'_, usize, Member, EngineError> = Tasks::default();
+        let mut running: Tasks<'_, usize, Result<Member, ApprovalOccurrence>, EngineError> =
+            Tasks::default();
         let total = items.len();
         for (at, item) in items.into_iter().enumerate() {
             let (engine, spec, evidence, ledger, bound) = (
@@ -1396,7 +1472,8 @@ impl VerificationEngine {
                 }),
             );
         }
-        let mut members: Vec<(usize, Member)> = Vec::with_capacity(total);
+        let mut members: Vec<(usize, Result<Member, ApprovalOccurrence>)> =
+            Vec::with_capacity(total);
         while !running.is_empty() {
             let (at, member) = running.next(EngineError::Join).await;
             members.push((at, settled(member, &mut running).await?));
@@ -1407,6 +1484,9 @@ impl VerificationEngine {
 
     /// Run one member of step `index`: its iterations one at a time, each
     /// action then its requirement instances, then `repeat.until`.
+    ///
+    /// An approval iteration without an accepted decision stops the member
+    /// as that waiting occurrence, its earlier iterations already recorded.
     ///
     /// A restored iteration settlement is reused rather than run again. An
     /// action failure ends the member; `until` true stops it successfully,
@@ -1428,7 +1508,7 @@ impl VerificationEngine {
         index: usize,
         item: Option<(u32, Option<CallInput>)>,
         deadline: Instant,
-    ) -> Result<Member, EngineError> {
+    ) -> Result<Result<Member, ApprovalOccurrence>, EngineError> {
         let step = &spec.steps[index];
         let item_index = item.as_ref().map(|(at, _)| *at);
         let iterations = step
@@ -1460,6 +1540,20 @@ impl VerificationEngine {
                         own
                     }
                     Ok(bindings) => {
+                        if let Action::Approval { message } = &step.action
+                            && !self.decisions.contains_key(&(
+                                step.id.clone(),
+                                instance.0,
+                                instance.1,
+                            ))
+                        {
+                            return Ok(Err(ApprovalOccurrence {
+                                step: step.id.clone(),
+                                item: instance.0,
+                                iteration: instance.1,
+                                message: message.clone(),
+                            }));
+                        }
                         let attempted = self.attempt(step, &bindings, deadline, instance).await?;
                         let attempts = attempted.attempts;
                         let own = attempted.settle(step, bindings.sources(), instance);
@@ -1546,12 +1640,12 @@ impl VerificationEngine {
                 Speculation::None,
             )
         });
-        Ok(Member {
+        Ok(Ok(Member {
             item: item_index,
             last,
             requirements,
             invocations,
-        })
+        }))
     }
 
     /// Judge every requirement of step `index` for the invocation `frame`,
@@ -1746,15 +1840,19 @@ impl VerificationEngine {
                 iteration_index: instance.1,
             };
             let timer = BlockTimer::start(&self.clock, "action", action_kind(&step.action));
-            let result = match timeout {
-                Some(at) => timeout_at(at, self.actions.execute(call))
-                    .await
-                    .unwrap_or_else(|_| {
-                        Err(BlockError::Retryable {
-                            reason: "timed out".to_owned(),
-                        })
-                    }),
-                None => self.actions.execute(call).await,
+            let result = if matches!(step.action, Action::Approval { .. }) {
+                self.decided(&step.id, instance)
+            } else {
+                match timeout {
+                    Some(at) => timeout_at(at, self.actions.execute(call))
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(BlockError::Retryable {
+                                reason: "timed out".to_owned(),
+                            })
+                        }),
+                    None => self.actions.execute(call).await,
+                }
             };
             timer.finish(result.is_ok());
             match result {
@@ -1997,6 +2095,7 @@ fn bindings(scope: &Scope<'_>, attached: &Attached, step: &Step) -> Result<Bindi
             mount(scope, attached, &call.workspace, None),
         ),
         Action::Code(call) => (scope.resolve_all(&call.inputs, None), empty()),
+        Action::Approval { .. } => (empty(), empty()),
     };
     let (inputs, workspace) = match (inputs, workspace) {
         (Ok(inputs), Ok(workspace)) => (inputs, workspace),
@@ -2094,7 +2193,7 @@ fn complete(ledger: &Ledger, task: &TaskId) -> bool {
     match ledger.get(task).map(AsRef::as_ref) {
         Some(Done::Step(done)) => done.speculation != Speculation::Pending,
         Some(Done::Requirement(_)) => true,
-        None => false,
+        Some(Done::Awaiting(_)) | None => false,
     }
 }
 

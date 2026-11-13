@@ -89,4 +89,4 @@ The SDKs publish the same way: `verify.Evidence().publish("ci", value)` in Pytho
 
 ## Next
 
-[Respond to a failed verification](/build-and-verify/verify/respond-to-a-failed-verification/) when the results are not green.
+[Bind more Verifiers](/build-and-verify/declare/bind-a-verifier/) to the repository's pull requests.

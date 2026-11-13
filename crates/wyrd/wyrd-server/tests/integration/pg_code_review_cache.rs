@@ -15,9 +15,9 @@ use std::time::Duration;
 use bohmian_code_review_pipeline::persistence::ContextLookup;
 use bohmian_code_review_pipeline::testing::RoutedTransport;
 use bohmian_code_review_pipeline::{
-    BoxFuture, ContextStore, Contexts, GitHubClient, GitHubHost, HttpRequest, HttpResponse,
-    HttpTransport, Identity, InstallationId, InstallationToken, ObjectKey, ObjectSha,
-    ObjectStorage, Operation, PersistenceError, PipelineLimits, PullRequestPins,
+    BoxFuture, ColdBuildError, ContextStore, Contexts, GitHubClient, GitHubHost, HttpRequest,
+    HttpResponse, HttpTransport, Identity, InstallationId, InstallationToken, ObjectKey, ObjectSha,
+    ObjectStorage, Operation, PersistenceError, PipelineError, PipelineLimits, PullRequestPins,
     RepositoryIdentity, RequestLimits, ReviewPipeline, SNAPSHOT_FORMAT_VERSION, SnapshotPointer,
     SnapshotScope, SnapshotStore, Snapshots, StorageError, TenantId, TransportError,
 };
@@ -649,11 +649,13 @@ async fn contexts_expire_without_extension_and_stay_in_their_tenant() {
 }
 
 /// Two cold pinned reviews of one repository racing over Wyrd custody
-/// both succeed with the same comparison, converge on one snapshot, and a
-/// later review reuses it without another archive.
+/// converge on one snapshot: the review whose pointer publication loses
+/// reports the documented `PointerConflict` retry state, and its one retry
+/// reuses the winner's snapshot. Both then return the same comparison, and
+/// a later review reuses the snapshot without another archive.
 ///
 /// # Panics
-/// Panics when either racing review fails, they disagree, more than one
+/// Panics when either racing review fails after that retry, they disagree, more than one
 /// snapshot object is kept, or the later review rebuilds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn competing_cold_reviews_converge_on_one_snapshot() {
@@ -668,10 +670,13 @@ async fn competing_cold_reviews_converge_on_one_snapshot() {
     let (first_client, second_client) = (github.client(), github.client());
     let pins = pins();
 
-    let (first, second) = tokio::join!(
-        pipeline.pinned(&first_client, &identity, &pins, None),
-        pipeline.pinned(&second_client, &identity, &pins, None),
-    );
+    let review = async |client| match pipeline.pinned(client, &identity, &pins, None).await {
+        Err(PipelineError::Snapshot(ColdBuildError::PointerConflict)) => {
+            pipeline.pinned(client, &identity, &pins, None).await
+        }
+        reviewed => reviewed,
+    };
+    let (first, second) = tokio::join!(review(&first_client), review(&second_client));
     let (first, second) = (
         first.expect("first racing review"),
         second.expect("second racing review"),

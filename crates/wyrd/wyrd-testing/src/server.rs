@@ -6343,15 +6343,25 @@ mod tests {
         "/../../../sdks/wyrd-sdk-ts/testing/native.d.cts"
     ));
 
-    /// The three Python controls REQ-195 sanctions.
-    const PYTHON_CONTROLS: [&str; 3] = ["flush_bifrost", "wait_for_baseline", "make_binding_due"];
+    /// The four Python controls the published stub sanctions.
+    const PYTHON_CONTROLS: [&str; 4] = [
+        "flush_bifrost",
+        "wait_for_baseline",
+        "make_binding_due",
+        "hold_publications",
+    ];
 
-    /// The same three controls in TypeScript's camelCase projection.
-    const TYPESCRIPT_CONTROLS: [&str; 3] = ["flushBifrost", "waitForBaseline", "makeBindingDue"];
+    /// The same four controls in TypeScript's camelCase projection.
+    const TYPESCRIPT_CONTROLS: [&str; 4] = [
+        "flushBifrost",
+        "waitForBaseline",
+        "makeBindingDue",
+        "holdPublications",
+    ];
 
     /// Python members that start, address, or credential the server and so
     /// neither steer nor inspect its state.
-    const PYTHON_SETUP: [&str; 23] = [
+    const PYTHON_SETUP: [&str; 24] = [
         "__init__",
         "__enter__",
         "__exit__",
@@ -6359,6 +6369,7 @@ mod tests {
         "grpc_url",
         "api_key",
         "tenant_id",
+        "tenant_slug",
         "access_token",
         "bootstrap_service",
         "bootstrap_user",
@@ -6378,11 +6389,13 @@ mod tests {
     ];
 
     /// TypeScript members that start, address, or credential the server.
-    const TYPESCRIPT_SETUP: [&str; 21] = [
+    const TYPESCRIPT_SETUP: [&str; 23] = [
         "baseUrl",
         "grpcUrl",
         "token",
         "tableFqn",
+        "tenantSlug",
+        "githubApp",
         "apiKey",
         "cardRef",
         "bootstrapService",
@@ -6457,20 +6470,22 @@ mod tests {
             .collect();
         assert!(
             hooks.is_empty(),
-            "{language} WyrdTestServer exposes test hooks outside the three sanctioned controls: {hooks:?}"
+            "{language} WyrdTestServer exposes test hooks outside the four sanctioned controls: {hooks:?}"
         );
     }
 
     /// Rust, Python, and TypeScript test servers expose `flush_bifrost`,
-    /// `wait_for_baseline`, and `make_binding_due`, and the Python and
+    /// `wait_for_baseline`, `make_binding_due`, and `hold_publications`, and
+    /// the Python and
     /// TypeScript projections expose no other hook that steers or inspects
     /// server state.
     #[test]
-    fn public_controls_are_the_three_sanctioned_operations() {
+    fn public_controls_are_the_four_sanctioned_operations() {
         let rust_controls = [
             std::any::type_name_of_val(&WyrdTestServer::flush_bifrost),
             std::any::type_name_of_val(&WyrdTestServer::wait_for_baseline),
             std::any::type_name_of_val(&WyrdTestServer::make_binding_due),
+            std::any::type_name_of_val(&WyrdTestServer::hold_publications),
         ];
         for (path, control) in rust_controls.iter().zip(PYTHON_CONTROLS) {
             assert!(

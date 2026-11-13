@@ -120,6 +120,7 @@ To read once without waiting, call `status()`:
 | --- | --- | --- |
 | not found | Not queued yet, lost before it was, or not visible to you | Read again; after a few minutes, treat it as lost |
 | `pending`, `running`, `retrying` | Not finished | Read again |
+| `waiting` | Parked until the deferred inputs named in `waiting` are published | Publish them, or read again |
 | `completed` | A verdict exists; `result` holds it once stored | Read `result.outcome` |
 | `errored`, `timed_out`, `cancelled` | The Verifier did not reach a verdict | Read `error.code` and `error.message`. No Operator runs |
 

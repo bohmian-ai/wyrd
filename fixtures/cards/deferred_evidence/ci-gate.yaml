@@ -1,0 +1,13 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: ci-gate
+  version: 1.0.0
+spec:
+  description: The pull request's CI results, published after review starts, are green.
+  inputs:
+    ci: {type: json, deferred: true}
+  requirements:
+    - id: green
+      statement: CI is green
+      check: {kind: assert, path: inputs.ci.status, operator: equals, expected: green}

@@ -6,7 +6,8 @@
 //! mock, and the agent reads and releases it; no answer carries a token, code
 //! or key. A writer sees the read tool but not the write tools, and is
 //! refused all three when it names them. An agent reads a declared
-//! Repository's served selection and lists the Repository family.
+//! Repository's served selection and lists the Repository family, and
+//! publishes the deferred evidence a waiting pull request execution needs.
 
 /// The Postgres-backed half of the GitHub connection journey.
 mod pg_tests {
@@ -358,6 +359,164 @@ mod pg_tests {
         assert_eq!(superseded["status"], "cancelled");
         assert_eq!(superseded["error"]["code"], "pull_request_superseded");
         assert_eq!(superseded["pull_request"]["head"]["sha"], "a1");
+        agent.cancel().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// An agent finds a pull request execution waiting for its deferred
+    /// `ci` input, publishes the evidence for the repository slug and head
+    /// commit, and the same execution completes; publishing again replays
+    /// the receipt, and different content is refused as a conflict.
+    ///
+    /// # Errors
+    ///
+    /// Returns server startup, bootstrap, connection, declaration, MCP
+    /// transport, or tool-call failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the execution does not wait, the receipt differs, or the
+    /// resumed execution does not pass.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn an_agent_publishes_deferred_evidence_for_a_waiting_execution()
+    -> Result<(), McpJourneyError> {
+        const HEAD: &str = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
+        let mock = GithubAppMock::start()?;
+        mock.add_installation(101, &[(2, "acme/web")]);
+        mock.add_user("octo", &[101]);
+        mock.sign_in("octo");
+        mock.install_target(101);
+        let server = WyrdTestServer::builder()
+            .with_github_app_for_test(&mock)
+            .with_verification_runtime_for_test()
+            .start_bound()
+            .await?;
+        let admin = server
+            .bootstrap_service("mcp-evidence-admin", &["admin"])
+            .await?;
+        let key = admin
+            .api_key()
+            .ok_or("a service bootstraps with a machine key")?
+            .expose_secret()
+            .to_owned();
+        let credential = || ResolvedCredential::ApiKey(key.clone().into());
+        let agent =
+            ().serve_with_lifecycle(transport(&server, credential(), None)?, discover())
+                .await?;
+        let names: Vec<String> = agent
+            .list_all_tools()
+            .await?
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect();
+        assert!(
+            names
+                .iter()
+                .any(|name| name == "verification.publish_evidence")
+        );
+        let receipt = structured(agent.call_tool(call("github_connection.connect")).await?)?;
+        let mut browser = GithubBrowser::sign_in(
+            server.base_url().ok_or("bound")?,
+            server.pg_fixture().tenant_slug(),
+            &key,
+        )
+        .await?;
+        let url = receipt["authorization_url"]
+            .as_str()
+            .ok_or("connect returns the install URL")?;
+        assert_eq!(browser.open(url).await?.status, 200);
+        let cards = Cards::connect_with(&client(&server, credential())?).await?;
+        let declared = Box::pin(cards.declare_from_path(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../fixtures/cards/deferred_evidence/repository.yaml"
+        )))
+        .await?;
+        let card = structured(
+            agent
+                .call_tool(call_with(
+                    "cards.get",
+                    &json!({ "card_ref": declared.root }),
+                )?)
+                .await?,
+        )?;
+        let binding = card["card"]["status"]["verification"]["binding_ids"][0].clone();
+
+        mock.set_pull_request(2, 9, PullRequest::open(2, "b1", HEAD));
+        let opened = mock.pull_request_event(101, 2, 9, "opened");
+        let base = server.base_url().ok_or("bound")?;
+        assert_eq!(mock.deliver(base, "pull_request", &opened).await?, 202);
+        let read = structured(
+            agent
+                .call_tool(call_with(
+                    "verification.get_binding",
+                    &json!({ "binding_id": binding }),
+                )?)
+                .await?,
+        )?;
+        let execution = read["last_execution_id"].clone();
+        let until = async |done: &dyn Fn(&serde_json::Value) -> bool|
+               -> Result<serde_json::Value, McpJourneyError> {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_mins(1);
+            loop {
+                let state = structured(
+                    agent
+                        .call_tool(call_with(
+                            "verification.get_execution",
+                            &json!({ "execution_id": execution }),
+                        )?)
+                        .await?,
+                )?;
+                if done(&state) {
+                    return Ok(state);
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!("execution never settled as expected: {state}").into());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        };
+        let waiting = until(&|state| state["status"] == "waiting").await?;
+        assert_eq!(waiting["waiting"], json!(["ci"]));
+
+        let publish = |value: serde_json::Value| {
+            call_with(
+                "verification.publish_evidence",
+                &json!({
+                    "repository": "acme/web",
+                    "tags": { "commit": HEAD },
+                    "input": "ci",
+                    "value": { "kind": "json", "value": value },
+                }),
+            )
+        };
+        let accepted = structured(
+            agent
+                .call_tool(publish(json!({"status": "green"}))?)
+                .await?,
+        )?;
+        assert_eq!(accepted["status"], "accepted");
+        assert_eq!(accepted["matched_subscriptions"], 1);
+        assert_eq!(
+            accepted["repository"],
+            json!({ "host": mock.host(), "repository_id": "2" })
+        );
+        let completed =
+            until(&|state| state["status"] == "completed" && !state["result"].is_null()).await?;
+        assert_eq!(completed["result"]["outcome"]["verdict"], "passed");
+        let replayed = structured(
+            agent
+                .call_tool(publish(json!({"status": "green"}))?)
+                .await?,
+        )?;
+        assert_eq!(replayed["status"], "replayed");
+        assert_eq!(replayed["evidence_id"], accepted["evidence_id"]);
+        let conflict = refused(agent.call_tool(publish(json!({"status": "red"}))?).await)?;
+        assert!(
+            conflict.contains("WYRD_VERIFICATION_409_EVIDENCE_CONFLICT"),
+            "{conflict}"
+        );
         agent.cancel().await?;
         server.shutdown().await?;
         Ok(())

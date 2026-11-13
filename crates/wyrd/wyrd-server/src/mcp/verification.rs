@@ -3,8 +3,9 @@
 //! Typed projections of the same server operations HTTP serves: the
 //! `verification.*` tools read binding and execution status and execution
 //! details, page an execution's invocations and publications, read a
-//! publication or plan its file download, plan evidence uploads, verify now,
-//! enqueue a background execution, and cancel one. Authorization,
+//! publication or plan its file download, plan evidence uploads, publish
+//! deferred evidence, verify now, enqueue a background execution, and cancel
+//! one. Authorization,
 //! audit, tenancy, idempotency, and error mapping stay with
 //! [`VerificationControl`], so this module only parses arguments and
 //! projects answers.
@@ -20,8 +21,8 @@ use wyrd_spec::storage::DownloadInitResponse;
 use wyrd_spec::verification::execution::{
     CancelExecutionResponse, EnqueueVerificationResponse, EvidencePlanRequest,
     EvidencePlanResponse, ExecutionPageQuery, InvocationPage, Publication, PublicationPage,
-    PublicationSelector, VerificationDetails, VerificationExecutionState, VerificationRequest,
-    VerificationResult,
+    PublicationSelector, PublishEvidenceRequest, PublishEvidenceResponse, VerificationDetails,
+    VerificationExecutionState, VerificationRequest, VerificationResult,
 };
 use wyrd_spec::verification::{PublicationName, TaskId, VerificationBindingStatus};
 
@@ -56,6 +57,9 @@ pub(super) const GET_EXECUTION_DETAILS: &str = "verification.get_execution_detai
 
 /// Wire name of the evidence upload plan.
 pub(super) const EVIDENCE: &str = "verification.evidence";
+
+/// Wire name of the deferred evidence publication.
+pub(super) const PUBLISH_EVIDENCE: &str = "verification.publish_evidence";
 
 /// Wire name of the direct execution.
 pub(super) const EXECUTE: &str = "verification.execute";
@@ -209,6 +213,19 @@ pub(super) fn write_descriptors() -> Vec<Tool> {
              and upload plan per file the server does not already hold; send the bytes as the \
              plan says, then complete with POST /v1/cards/upload/{upload_id}/complete. \
              Requires verifier:run.",
+            false,
+        ),
+        tool::<PublishEvidenceRequest, PublishEvidenceResponse>(
+            PUBLISH_EVIDENCE,
+            "Publish deferred evidence",
+            "Supply the deferred input named input for one connected repository (owner/name) \
+             at one full commit SHA (tags.commit), as inline JSON or a completed upload from \
+             verification.evidence. Every Verifier bound to the repository, or already \
+             executing for the commit, that declares the input deferred receives it, and its \
+             waiting executions resume; publication never starts one. The receipt reports \
+             accepted or replayed and matched_subscriptions. Different content for the same \
+             source is refused (409 evidence conflict); no subscriber is refused as unmatched \
+             (409) and nothing is kept. Requires verifier:run on a subscribed Verifier.",
             false,
         ),
         tool::<VerificationRequest, VerificationResult>(
@@ -369,8 +386,8 @@ impl WyrdMcpHandler {
         )
     }
 
-    /// Run one verification write tool: `evidence`, `execute`, `enqueue`,
-    /// or `cancel`.
+    /// Run one verification write tool: `evidence`, `publish_evidence`,
+    /// `execute`, `enqueue`, or `cancel`.
     ///
     /// Decodes the arguments exactly as the HTTP body; `enqueue` also takes
     /// the optional `idempotency_key`, validated with the shared key
@@ -409,6 +426,11 @@ impl WyrdMcpHandler {
                         None,
                         None,
                     )
+                    .await?,
+            ),
+            PUBLISH_EVIDENCE => structured(
+                &control
+                    .publish_evidence(&caller, serde_json::from_value(arguments).map_err(invalid)?)
                     .await?,
             ),
             CANCEL => {

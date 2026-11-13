@@ -1,7 +1,7 @@
 {
   "name": "wyrd-ai",
   "version": "0.4.1",
-  "description": "TypeScript SDK for Wyrd: verification and assurance for AI systems.",
+  "description": "TypeScript SDK for Wyrd, the real-time verification system built for your applications.",
   "keywords": [
     "wyrd",
     "ai",

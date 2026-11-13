@@ -157,8 +157,8 @@ No new PostgreSQL tables are allowed.
 - Identical idempotent replay returns the accepted receipt. Conflicting decisions
   or input replacements are refused. Cancelled/superseded/terminal executions
   reject new input; old approval cannot authorize a new PR head.
-- Approval requires normal authentication, current subject authority and the
-  approval permission. The user subsequently rejected recent interactive login
+- Approval requires normal authentication and the approval permission on the
+  execution's exact Verifier; Card scope attributes and never authorizes it. The user subsequently rejected recent interactive login
   and the proposed five-minute cutoff. No special approval-proof flow is needed.
   The decision never expands execution authority.
 - Rejection is a recorded decision, not an engine crash or automatic cancellation.

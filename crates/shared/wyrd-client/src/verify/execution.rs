@@ -248,7 +248,7 @@ impl Execution {
     ///
     /// # Errors
     /// Returns the server's permission error without `verifier:approve` on
-    /// the execution's Verifier or read authority over its subject,
+    /// the execution's Verifier,
     /// `WYRD_VERIFICATION_404_APPROVAL_NOT_FOUND` for an occurrence the
     /// execution never reached, `WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING`
     /// once another decision was accepted or the execution ended or expired,

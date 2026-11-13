@@ -828,7 +828,7 @@ pub enum WyrdError {
         code = "WYRD_AUTH_403_WORKLOAD_CONTEXT_REQUIRED",
         status = 403,
         title = "Workload context required",
-        remediation = "This account is restricted to one workload family, so Card-attributed emission and verification need the exact release root. Exchange the key with `workload_uid`, send `x-wyrd-workload-uid`, or use the WyrdState loaded for that release. Generic authorized calls do not need a root."
+        remediation = "This account is restricted to one workload family, so Card-attributed emission needs the exact release root. Exchange the key with `workload_uid`, send `x-wyrd-workload-uid`, or use the WyrdState loaded for that release. Generic authorized calls do not need a root."
     )]
     WorkloadContextRequired {
         /// Human-readable error message.

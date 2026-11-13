@@ -18,7 +18,7 @@ use vala_verify::blocks::{DriftChecks, EngineError};
 use wyrd_runtime::outbox::{OutboxFull, Reservation};
 use wyrd_runtime::permission::{Action, Resource};
 use wyrd_runtime::principal::PrincipalId;
-use wyrd_runtime::{AcceptedAuthority, CardAttribution, Permission};
+use wyrd_runtime::{AcceptedAuthority, Permission};
 use wyrd_spec::card::verifier::VerifierSpec;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, IdempotencyKey};
@@ -269,7 +269,9 @@ impl<'a> VerificationControl<'a> {
         caller: &Caller,
         execution_id: ExecutionId,
     ) -> Result<VerificationExecutionState, WyrdError> {
-        let retained = self.retained(caller, execution_id, GET_EXECUTION).await?;
+        let retained = self
+            .retained(caller, execution_id, GET_EXECUTION, Action::Read)
+            .await?;
         let records = InputResolver::new(&retained.query, None);
         let identity = retained.identity();
         let mut state = match &retained.queued {
@@ -337,7 +339,7 @@ impl<'a> VerificationControl<'a> {
         execution_id: ExecutionId,
     ) -> Result<VerificationDetails, WyrdError> {
         let retained = self
-            .retained(caller, execution_id, GET_EXECUTION_DETAILS)
+            .retained(caller, execution_id, GET_EXECUTION_DETAILS, Action::Read)
             .await?;
         let records = InputResolver::new(&retained.query, None);
         let (Some(result_id), Some(identity)) = (retained.result_id(), retained.identity()) else {
@@ -459,9 +461,7 @@ impl<'a> VerificationControl<'a> {
     ///
     /// # Errors
     /// Returns [`WyrdError::PermissionDeniedRbac`] without `verifier:run` on
-    /// the Verifier or when a Card-scoped caller's signed scope does not
-    /// carry the subject, [`WyrdError::WorkloadContextRequired`] when a
-    /// family-restricted caller selected no root,
+    /// the Verifier,
     /// [`WyrdError::VerificationTargetNotFound`] for an
     /// unknown, inactive, or non-Verifier target,
     /// [`WyrdError::VerificationInputUnsupported`] for a Window Verifier,
@@ -529,10 +529,9 @@ impl<'a> VerificationControl<'a> {
         );
         let admitted = telemetry.time(Phase::Admit, || {
             environment_tag(&request)?;
-            self.authorize_subject(
+            self.authorize_verifier(
                 caller,
                 Permission::verifier_run(request.verifier_card_uid.clone()),
-                &request.card_uid,
                 EXECUTE,
                 &resource,
             )?;
@@ -729,8 +728,7 @@ impl<'a> VerificationControl<'a> {
     ///
     /// # Errors
     /// Returns [`WyrdError::PermissionDeniedRbac`] without `verifier:run` on
-    /// the Verifier or when a Card-bound caller's signed scope does not carry
-    /// the subject's UID, [`WyrdError::VerificationInputTooLarge`] for inputs
+    /// the Verifier, [`WyrdError::VerificationInputTooLarge`] for inputs
     /// past a Variant limit, `WYRD_SPEC_400_VALIDATION` for an empty
     /// `deployment_environment`, [`WyrdError::ServiceUnavailable`] when this
     /// process hosts no Verifier queue or the submission was lost before its
@@ -756,10 +754,9 @@ impl<'a> VerificationControl<'a> {
             "verifier:{}/subject:{}",
             request.verifier_card_uid, request.card_uid
         );
-        self.authorize_subject(
+        self.authorize_verifier(
             caller,
             Permission::verifier_run(request.verifier_card_uid.clone()),
-            &request.card_uid,
             ENQUEUE,
             &resource,
         )?;
@@ -996,29 +993,22 @@ impl<'a> VerificationControl<'a> {
         }
     }
 
-    /// Evaluate `required`, a Verifier action at one exact Verifier scope
-    /// such as `verifier:run` or `verifier:approve`, for `operation` on
-    /// work verifying `subject`, and stage the single allow or deny decision
-    /// without waiting for its commit.
+    /// Evaluate `required`, `verifier:run` at one exact Verifier scope, for
+    /// `operation` and stage the single allow or deny decision without
+    /// waiting for its commit.
     ///
-    /// Direct and queued work admit, and approval decisions are accepted,
-    /// through here, before anything is reserved or staged. A Card-scoped caller must carry the verified
-    /// `subject` in its signed Card scope, and a family-restricted caller
-    /// must have selected a root; this is the same in-memory rule the
-    /// gateway applies to attribution, so no registry read is needed. A
-    /// caller that may attribute to any registered Card is decided by RBAC
-    /// alone.
+    /// Direct and queued work admit, and deferred evidence publishes, through
+    /// here, before anything is reserved or staged. The decision is RBAC
+    /// alone: a request's Card scope attributes what it writes and never
+    /// authorizes it.
     ///
     /// # Errors
     /// Returns [`WyrdError::PermissionDeniedRbac`] when RBAC refuses the
-    /// Verifier or the signed scope does not carry `subject`, and
-    /// [`WyrdError::WorkloadContextRequired`] when a family-restricted
-    /// caller selected no root.
-    fn authorize_subject(
+    /// Verifier.
+    fn authorize_verifier(
         &self,
         caller: &Caller,
         required: Permission,
-        subject: &CardUid,
         operation: &str,
         resource: &str,
     ) -> Result<(), WyrdError> {
@@ -1028,20 +1018,7 @@ impl<'a> VerificationControl<'a> {
             .permission_check
             .check(&caller.principal, &required)
             .into_result()
-            .map_err(permission_deny_reason_to_wyrd)
-            .and_then(|()| match caller.principal.card_attribution() {
-                CardAttribution::RootRequired(_) => Err(WyrdError::workload_context_required(
-                    "the caller is restricted to one workload family and selected no root",
-                )),
-                CardAttribution::Scoped(scope) if !scope.contains(subject) => {
-                    Err(WyrdError::PermissionDeniedRbac {
-                        message: "the caller's Card scope does not cover the verified subject"
-                            .to_owned(),
-                        details: serde_json::json!({ "resource": resource }),
-                    })
-                }
-                _ => Ok(()),
-            });
+            .map_err(permission_deny_reason_to_wyrd);
         let outcome = if decision.is_ok() {
             AuditOutcome::Allowed
         } else {
@@ -1061,7 +1038,7 @@ impl<'a> VerificationControl<'a> {
     /// `verifier:run` grant admits it, including one scoped to a single
     /// Verifier UID. Planning and every shared storage operation on a File
     /// upload session are admitted this way. The exact Verifier is
-    /// authorized later by [`Self::authorize_subject`] when execute or enqueue
+    /// authorized later by [`Self::authorize_verifier`] when execute or enqueue
     /// names it.
     ///
     /// # Errors

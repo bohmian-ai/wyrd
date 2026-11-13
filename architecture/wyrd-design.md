@@ -701,7 +701,7 @@ account identity.
 A Service account carries one `workload_restriction`, a closed union:
 `{"mode":"unrestricted"}` (the default) or
 `{"mode":"family","kind":"Service","name":<card name>}`. A family
-restriction limits Card-attributed emission and verification to roots of that
+restriction limits Card-attributed emission to roots of that
 family, and makes the account that family's unique scheduled runtime account
 in the tenant; a second live account for the same family conflicts. Setting a
 family restriction, at creation or later, additionally requires
@@ -1648,8 +1648,8 @@ cancellation expires it. `POST
 status, actor_id, decided_at, reason}` only after the decision is durable. The
 first decision is final: the same actor, decision, and reason replay the
 receipt, and anything else refuses
-`WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING`. Deciding needs `verifier:approve`
-on the exact Verifier plus authority over the subject. The same `ExecutionId`
+`WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING`. Deciding needs only
+`verifier:approve` on the exact Verifier. The same `ExecutionId`
 continues after the decision. A rejection is data: the step succeeds with the receipt (`status:
 rejected`) as `steps.<id>.output`, and a requirement over it fails the verdict.
 

@@ -1113,8 +1113,7 @@ class Execution:
         Raises:
             WyrdError: ``WYRD_SPEC_400_VALIDATION`` for a malformed ID or
                 decision; ``WYRD_PERMISSION_403_DENIED_RBAC`` without
-                ``verifier:approve`` on the execution's Verifier or read
-                authority over its subject;
+                ``verifier:approve`` on the execution's Verifier;
                 ``WYRD_VERIFICATION_404_APPROVAL_NOT_FOUND`` for an occurrence
                 the execution never reached;
                 ``WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING`` once another

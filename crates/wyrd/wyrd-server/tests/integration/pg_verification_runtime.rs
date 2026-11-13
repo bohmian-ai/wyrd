@@ -5653,7 +5653,7 @@ fn service_ref(name: &str, version: &str) -> wyrd_spec::reference::CardRef {
 /// subject is also a component of another owner's binding. The accepted
 /// snapshot is the subject/actor intersection: the actor's root and
 /// credential provenance, a Card scope that carries the subject but not an
-/// unrelated Service (whose enqueue is refused), and none of the User's
+/// unrelated Service, and none of the User's
 /// excess admin wildcard. The first attempt retries; the runtime stops; the
 /// actor loses its role, its family restriction, and its key; a fresh
 /// runtime reclaims and completes the run. The stored authority and pair are
@@ -5733,16 +5733,6 @@ async fn accepted_authority_survives_account_and_context_changes() {
         })
     };
     let post = axum::http::Method::POST;
-    let (code, problem) = send(
-        server,
-        &delegated,
-        post.clone(),
-        "/v1/verification/enqueue",
-        Some(enqueue(&other)),
-    )
-    .await;
-    assert_eq!(code, axum::http::StatusCode::FORBIDDEN, "{problem}");
-    assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
 
     let script = EngineScript::default();
     script.push(EngineOutcome::Retry(VerificationError {

@@ -12,6 +12,7 @@ use uuid::Uuid;
 use wyrd_runtime::Permission;
 use wyrd_server::state::LimitsConfig;
 use wyrd_server::verification::VerificationRuntime;
+use wyrd_spec::auth::TokenAudience;
 use wyrd_spec::ids::CardUid;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
@@ -229,8 +230,8 @@ fn occurrence_status<'a>(served: &'a Value, step: &str) -> &'a Value {
 /// the same request replays it, while a different decision or decider is
 /// refused as not pending. The execution passes under its original id and
 /// inspection shows who approved. A second pull request is rejected by a
-/// person granted `verifier:approve` on exactly this Verifier and read
-/// authority over its subject, and fails.
+/// person granted only `verifier:approve` on exactly this Verifier, and
+/// fails.
 /// Every decide check is audited.
 ///
 /// # Panics
@@ -374,11 +375,7 @@ async fn a_pending_approval_is_decided_once_and_resumes_the_same_execution() {
         .server
         .seed_role(
             "signoff_approver",
-            &[
-                Permission::card_read(),
-                Permission::verifier_read_any(),
-                Permission::verifier_approve(verifier),
-            ],
+            &[Permission::verifier_approve(verifier)],
         )
         .await
         .expect("role seeds");
@@ -899,4 +896,74 @@ async fn a_cold_decision_needs_only_its_own_connection() {
     drop(held);
     assert_eq!(status, StatusCode::OK, "{receipt}");
     assert_eq!(receipt["status"], "approved", "{receipt}");
+}
+
+/// A service account deciding on a user's behalf is the decision's actor.
+///
+/// A user delegates to an `editor` Service rooted at its own Card, whose Card
+/// scope does not carry the Repository subject; the delegated token approves,
+/// and the receipt and inspection name the Service as the actor. The same
+/// delegated request replays the receipt, while the user directly and a second
+/// Service acting for the same user are refused as not pending.
+///
+/// # Panics
+/// Panics when a decision, refusal, receipt or inspection differs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_service_account_decides_on_a_users_behalf() {
+    let deployment = Deployment::start_limited(limits(Duration::from_mins(5))).await;
+    deployment.signoff().await;
+    let execution = deployment.open(1, H1).await;
+    let served = deployment.until(execution, "waiting").await;
+    let approval = occurrence(&served)["approval_id"]
+        .as_str()
+        .expect("approval id")
+        .to_owned();
+
+    let (_, user_jwt) = deployment.user("approval-delegator", &["editor"]).await;
+    let on_behalf = async |name: &str| {
+        let actor = deployment
+            .server
+            .bootstrap_service(name, &["editor"])
+            .await
+            .expect("actor Service bootstraps");
+        let actor_jwt = deployment
+            .server
+            .exchange_rooted(&actor)
+            .await
+            .expect("actor exchanges at its own Card");
+        let delegated = deployment
+            .server
+            .delegate(&user_jwt, &actor_jwt, TokenAudience::Wyrd)
+            .await
+            .expect("the Service acts for the user");
+        (actor.id().as_uuid(), delegated)
+    };
+    let (actor, delegated) = on_behalf("approval-actor").await;
+    let approve = json!({"decision": "approved", "reason": "bot verified"});
+    let (status, receipt) = deployment
+        .decide(&delegated, execution, &approval, &approve)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["actor_id"], actor.to_string(), "{receipt}");
+    let (status, replayed) = deployment
+        .decide(&delegated, execution, &approval, &approve)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{replayed}");
+    assert_eq!(replayed, receipt, "the actor's retry replays");
+
+    let (_, other) = on_behalf("approval-other-actor").await;
+    for jwt in [&user_jwt, &other] {
+        let (status, refused) = deployment.decide(jwt, execution, &approval, &approve).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(
+            refused["code"],
+            "WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING"
+        );
+    }
+    let served = deployment.status(execution).await;
+    assert_eq!(
+        occurrence(&served)["actor_id"],
+        actor.to_string(),
+        "{served}"
+    );
 }

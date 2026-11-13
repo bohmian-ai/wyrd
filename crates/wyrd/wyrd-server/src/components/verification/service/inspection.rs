@@ -424,12 +424,14 @@ impl<'a> VerificationControl<'a> {
 
     /// Read `execution_id`'s queue row, when it still has one, and its
     /// accepted state and revision as the tenant's SYSTEM principal serving
-    /// `caller`, then authorize `verifier:read` for `operation` on the queue
+    /// `caller`, then authorize Verifier `action` for `operation` on the queue
     /// row's Verifier, or the Verifier the state recorded, before returning
     /// either. An execution with no accepted revision yet has fresh state at
     /// revision 0. `query` is the record reader.
     ///
-    /// A pull-request execution also needs repository read, `cards:read`,
+    /// Inspection passes `read`; an approval decision passes `approve`, which
+    /// needs nothing else. A pull-request execution read also needs
+    /// repository read, `cards:read`,
     /// decided and audited after `verifier:read`. Whether it is one is read
     /// from the queue row's PR pins, or, once the row is gone, from the
     /// accepted input record's origin; an input record not yet visible
@@ -451,9 +453,11 @@ impl<'a> VerificationControl<'a> {
         caller: &Caller,
         execution_id: ExecutionId,
         operation: &str,
+        action: Action,
     ) -> Result<Retained, WyrdError> {
         let resource = format!("verification.execution:{execution_id}");
-        self.require_verifier(caller, Action::Read, operation, &resource)?;
+        let reading = action == Action::Read;
+        self.require_verifier(caller, action.clone(), operation, &resource)?;
         let mut conn = self
             .state
             .registry_tenant_conn(caller.data_tenant_id)
@@ -492,11 +496,12 @@ impl<'a> VerificationControl<'a> {
         };
         let required = Permission {
             resource: Resource::Verifier,
-            action: Action::Read,
+            action,
             scope: PermissionScope::Verifier(verifier),
         };
         audit::authorize(self.state, caller, &required, operation, &resource)?;
         let pull_request = match &queued {
+            _ if !reading => false,
             Some(queued) => queued.state.pull_request.is_some(),
             None if direct.is_some() => false,
             None => {
@@ -586,7 +591,9 @@ impl<'a> VerificationControl<'a> {
         execution_id: ExecutionId,
         operation: &str,
     ) -> Result<(VerificationExecutionStatus, i64, ExecutionState), WyrdError> {
-        let retained = self.retained(caller, execution_id, operation).await?;
+        let retained = self
+            .retained(caller, execution_id, operation, Action::Read)
+            .await?;
         if retained.direct.is_some() {
             return Err(execution_not_found(execution_id));
         }

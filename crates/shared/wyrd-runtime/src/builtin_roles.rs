@@ -247,7 +247,7 @@ mod tests {
             !permissions("workload")
                 .iter()
                 .any(|held| held.covers(&Permission::verifier_approve_any())),
-            "a workload never approves its own verification"
+            "the workload Role holds no approval"
         );
         assert_eq!(permissions("viewer"), viewer.as_slice());
         assert_eq!(permissions("workload"), workload.as_slice());

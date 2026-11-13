@@ -1685,12 +1685,11 @@ mod pg_tests {
         Ok(())
     }
 
-    /// `verification.execute` admits the subject through the caller's signed
-    /// Card limit before it judges anything: the subject's runtime account
-    /// at its root judges it, the same account without a root is refused as
-    /// needing workload context, and an unrelated Service rooted at its own
-    /// Card is refused as out of scope, while that Service without a root,
-    /// which may attribute to any registered Card, still judges it.
+    /// `verification.execute` is decided by RBAC alone; a caller's Card scope
+    /// attributes and never authorizes. With `editor`, the subject's runtime
+    /// account rooted or rootless and an unrelated Service rooted at its own
+    /// Card or rootless each judge the subject, while a `viewer` Service,
+    /// which holds no `verifier:run`, is refused.
     ///
     /// # Errors
     ///
@@ -1703,7 +1702,7 @@ mod pg_tests {
     /// verdict or refusal code differs from the expectation.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
-    async fn direct_execution_enforces_card_access() -> Result<(), McpJourneyError> {
+    async fn direct_execution_is_authorized_by_rbac_alone() -> Result<(), McpJourneyError> {
         let server = Box::pin(WyrdTestServer::start_bound()).await?;
         let admin = server
             .bootstrap_service("mcp-access-admin", &["admin"])
@@ -1718,28 +1717,26 @@ mod pg_tests {
         let foreign = server
             .bootstrap_service("mcp-access-foreign", &["editor"])
             .await?;
+        let viewer = server
+            .bootstrap_service("mcp-access-viewer", &["viewer"])
+            .await?;
 
-        for (agent, code) in [
-            (
-                connect(&server, &owner).await?,
-                "WYRD_AUTH_403_WORKLOAD_CONTEXT_REQUIRED",
-            ),
-            (
-                connect_rooted(&server, &foreign).await?,
-                "WYRD_PERMISSION_403_DENIED_RBAC",
-            ),
-        ] {
-            let refused = refusal(
-                agent
-                    .call_tool(call(EXECUTE, fixture.assert_request(PASSING_ANSWER))?)
-                    .await,
-            )?;
-            assert!(refused.contains(code), "{code}: {refused}");
-            agent.cancel().await?;
-        }
+        let agent = connect(&server, &viewer).await?;
+        let refused = refusal(
+            agent
+                .call_tool(call(EXECUTE, fixture.assert_request(PASSING_ANSWER))?)
+                .await,
+        )?;
+        assert!(
+            refused.contains("WYRD_PERMISSION_403_DENIED_RBAC"),
+            "{refused}"
+        );
+        agent.cancel().await?;
         for agent in [
+            connect(&server, &owner).await?,
             connect_rooted(&server, &owner).await?,
             connect(&server, &foreign).await?,
+            connect_rooted(&server, &foreign).await?,
         ] {
             let judged = structured(
                 agent

@@ -677,10 +677,9 @@ async fn cancel_execution(
 ///
 /// # Errors
 /// Returns a stable Wyrd error when the path or body is malformed, the
-/// caller lacks `verifier:read` or `verifier:approve` on the execution's
-/// Verifier or authority over its subject, the execution or occurrence is
-/// not in the caller's tenant, the occurrence is no longer pending, or the
-/// decision cannot be accepted now.
+/// caller lacks `verifier:approve` on the execution's Verifier, the
+/// execution or occurrence is not in the caller's tenant, the occurrence is
+/// no longer pending, or the decision cannot be accepted now.
 #[utoipa::path(
     post,
     path = "/verification/executions/{execution_id}/approvals/{approval_id}",
@@ -700,9 +699,8 @@ async fn cancel_execution(
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
-        (status = 403, description = "The principal lacks verifier:read or verifier:approve on \
-          the execution's Verifier, or authority over its subject \
-          (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_WORKLOAD_CONTEXT_REQUIRED)",
+        (status = 403, description = "The principal lacks verifier:approve on the execution's \
+          Verifier (WYRD_PERMISSION_403_DENIED_RBAC)",
           body = WyrdProblem),
         (status = 404, description = "No such execution or approval occurrence in the caller's \
           tenant (WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND, \

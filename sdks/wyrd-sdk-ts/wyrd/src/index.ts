@@ -2785,8 +2785,8 @@ export namespace verify {
      * @param reason - Why, recorded with the decision.
      * @returns The receipt: `approval_id`, `status`, `actor_id`, `decided_at`, `reason`.
      * @throws {@link WyrdError} `WYRD_PERMISSION_403_DENIED_RBAC` without
-     * `verifier:approve` on the execution's Verifier or read authority over its
-     * subject; `WYRD_VERIFICATION_404_APPROVAL_NOT_FOUND` for an occurrence the
+     * `verifier:approve` on the execution's Verifier;
+     * `WYRD_VERIFICATION_404_APPROVAL_NOT_FOUND` for an occurrence the
      * execution never reached; `WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING` once
      * another decision was accepted or the execution ended or expired.
      */

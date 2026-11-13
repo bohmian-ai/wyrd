@@ -700,18 +700,19 @@ async fn enqueue_refusals_fail_before_staging() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// A rooted caller may enqueue only a subject its signed Card scope carries:
-/// holding `verifier:run` and `verifier:read` on exactly the selected Verifier, the subject
-/// family's runtime account rooted at the subject is accepted, while an
-/// unrelated Service rooted at its own Card, and an editor Service acting on
-/// its behalf, are refused with one audited denial each before anything is
-/// staged. A rootless caller is decided by RBAC alone.
+/// Enqueue is decided by RBAC alone; a caller's Card scope attributes and
+/// never authorizes. Holding `verifier:run` on exactly the selected Verifier,
+/// the subject family's runtime account rooted at the subject, an unrelated
+/// Service rooted at its own Card, an editor Service acting on that Service's
+/// behalf, and an editor user are each accepted. A Service granted
+/// `verifier:run` only on another Verifier is refused with one audited denial
+/// before anything is staged.
 ///
 /// # Panics
 /// Panics when the server fails to start, a fixture write fails, a route fails
 /// to respond, or any status, code, queue, or audit expectation fails.
 #[tokio::test(flavor = "current_thread")]
-async fn enqueue_admits_only_signed_scope_subjects() {
+async fn enqueue_is_authorized_by_rbac_alone() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -728,29 +729,28 @@ async fn enqueue_admits_only_signed_scope_subjects() {
         )
         .await
         .expect("role seeds");
+    server
+        .seed_role(
+            "vq_other_verifier",
+            &[
+                Permission::card_read(),
+                Permission::verifier_run(fixture.drift.clone()),
+                Permission::verifier_read(fixture.drift.clone()),
+            ],
+        )
+        .await
+        .expect("role seeds");
 
     let owner = server
         .credential_registered_service(&fixture.subject_ref(), &["vq_exact_verifier"])
         .await
         .expect("subject Service is credentialed");
     let owner_jwt = machine_jwt(&server, &owner).await;
-    let (status, accepted) = enqueue(&server, &owner_jwt, &body, None).await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
-    visible_execution(&server, &owner_jwt, execution_id(&accepted)).await;
-    assert_eq!(
-        decisions(&server, "verification.enqueue", owner.id().as_uuid()).await,
-        vec![run_decision("allowed")]
-    );
-
     let foreign = server
         .bootstrap_service("vq-foreign-service", &["vq_exact_verifier"])
         .await
         .expect("unrelated Card-bound Service bootstraps");
     let foreign_jwt = machine_jwt(&server, &foreign).await;
-    let (status, problem) = enqueue(&server, &foreign_jwt, &body, None).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
-    assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
-
     let actor = server
         .bootstrap_service("vq-editor-actor", &["editor"])
         .await
@@ -763,20 +763,39 @@ async fn enqueue_admits_only_signed_scope_subjects() {
         )
         .await
         .expect("editor acts on the unrelated Service's behalf");
-    let (status, problem) = enqueue(&server, &delegated, &body, None).await;
+    let (_, editor_jwt) = user(&server, "vq-editor", &["editor"]).await;
+    for jwt in [&owner_jwt, &foreign_jwt, &delegated, &editor_jwt] {
+        let (status, accepted) = enqueue(&server, jwt, &body, None).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+        visible_execution(&server, jwt, execution_id(&accepted)).await;
+    }
+    assert_eq!(
+        decisions(&server, "verification.enqueue", owner.id().as_uuid()).await,
+        vec![run_decision("allowed")]
+    );
+    assert_eq!(
+        decisions(&server, "verification.enqueue", foreign.id().as_uuid()).await,
+        vec![run_decision("allowed"); 2],
+        "the direct and the delegated admission"
+    );
+
+    let other = server
+        .bootstrap_service("vq-other-verifier", &["vq_other_verifier"])
+        .await
+        .expect("other-Verifier Service bootstraps");
+    let (status, problem) =
+        enqueue(&server, &machine_jwt(&server, &other).await, &body, None).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
     assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
     assert_eq!(
-        decisions(&server, "verification.enqueue", foreign.id().as_uuid()).await,
-        vec![run_decision("denied"); 2],
-        "the direct and the delegated refusal"
+        decisions(&server, "verification.enqueue", other.id().as_uuid()).await,
+        vec![run_decision("denied")]
     );
-
-    let (_, editor_jwt) = user(&server, "vq-editor", &["editor"]).await;
-    let (status, accepted) = enqueue(&server, &editor_jwt, &body, None).await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
-    visible_execution(&server, &editor_jwt, execution_id(&accepted)).await;
-    assert_eq!(fixture.queued().await, 2, "no refusal staged a submission");
+    assert_eq!(
+        fixture.queued().await,
+        4,
+        "the refusal staged no submission"
+    );
     server.shutdown().await.expect("test server shuts down");
 }
 
@@ -1863,21 +1882,19 @@ async fn direct_execution_refusals_are_stable() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Direct execution admits the verified subject through the caller's signed
-/// Card limit before any input is staged or the engine runs, exactly as
-/// enqueue does: the subject's runtime account rooted at the subject judges
-/// it, while the same account without a root is refused as needing workload
-/// context, and an unrelated Service rooted at its own Card is refused as out
-/// of scope, each with one audited denial. Rootless callers that may attribute
-/// to any registered Card, an editor user and an unrestricted Service, still
-/// judge it.
+/// Direct execution is decided by RBAC alone, exactly as enqueue is; a
+/// caller's Card scope attributes and never authorizes. With `editor`, the
+/// subject's runtime account rooted at the subject or rootless, an unrelated
+/// Service rooted at its own Card or rootless, and an editor user each judge
+/// the subject. A `viewer` Service, which holds no `verifier:run`, is refused
+/// with one audited denial before any input is staged or the engine runs.
 ///
 /// # Panics
 /// Panics when the server fails to start, a fixture write fails, a route fails
 /// to respond, or any status, code, verdict, input, queue, or audit
 /// expectation fails.
 #[tokio::test(flavor = "current_thread")]
-async fn direct_execution_enforces_card_access() {
+async fn direct_execution_is_authorized_by_rbac_alone() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -1900,35 +1917,43 @@ async fn direct_execution_enforces_card_access() {
         .await
         .expect("rootless exchange succeeds");
     let (_, editor) = user(&server, "vx-scope-editor", &["editor"]).await;
+    let viewer = server
+        .bootstrap_service("vx-scope-viewer", &["viewer"])
+        .await
+        .expect("viewer Service bootstraps");
 
-    let refusals = [
-        (&rootless_owner, "WYRD_AUTH_403_WORKLOAD_CONTEXT_REQUIRED"),
-        (
-            &machine_jwt(&server, &foreign).await,
-            "WYRD_PERMISSION_403_DENIED_RBAC",
-        ),
-    ];
-    for (jwt, code) in refusals {
-        let (status, problem) = execute(&server, jwt, body.clone()).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
-        assert_eq!(problem["code"], code, "{problem}");
-    }
+    let (status, problem) =
+        execute(&server, &machine_jwt(&server, &viewer).await, body.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
+    assert_eq!(
+        problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC",
+        "{problem}"
+    );
     let (staged, _) = input_rows(&server, ExecutionId::new_v7()).await;
     assert_eq!(staged, 0, "a refused execution stages no inputs");
 
-    for jwt in [machine_jwt(&server, &owner).await, unrestricted, editor] {
+    for jwt in [
+        machine_jwt(&server, &owner).await,
+        rootless_owner,
+        machine_jwt(&server, &foreign).await,
+        unrestricted,
+        editor,
+    ] {
         let (status, judged) = execute(&server, &jwt, body.clone()).await;
         assert_eq!(status, StatusCode::OK, "{judged}");
         assert_eq!(judged["outcome"]["verdict"], "passed", "{judged}");
     }
     assert_eq!(
         decisions(&server, "verification.execute", owner.id().as_uuid()).await,
-        vec![run_decision("allowed"), run_decision("denied")]
+        vec![run_decision("allowed"); 2]
     );
     assert_eq!(
         decisions(&server, "verification.execute", foreign.id().as_uuid()).await,
-        vec![run_decision("allowed"), run_decision("denied")],
-        "the rooted refusal and the rootless judgment"
+        vec![run_decision("allowed"); 2]
+    );
+    assert_eq!(
+        decisions(&server, "verification.execute", viewer.id().as_uuid()).await,
+        vec![run_decision("denied")]
     );
     assert_eq!(fixture.queued().await, 0, "direct execution never enqueues");
     server.shutdown().await.expect("test server shuts down");

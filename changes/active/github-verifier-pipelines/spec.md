@@ -216,8 +216,9 @@ Pending approvals share the execution's original expiration timestamp; there is
 no separate approval duration or deadline. Pending occurrences have exact
 server-issued identities. An authorized
 user may approve/reject through the shared execution surfaces using normal
-authentication and authorization. Require the approval permission and current
-subject authority. Do not require recent interactive proof, a special login
+authentication and authorization. Require the approval permission on the
+execution's exact Verifier; the caller's Card scope attributes and never
+authorizes the decision. Do not require recent interactive proof, a special login
 flow or an authentication-age threshold. Record approved/rejected/expired with actor,
 time and reason. An identical authenticated retry replays; a conflicting or stale
 occurrence refuses. No authority expansion, quorum or silent approval of a new

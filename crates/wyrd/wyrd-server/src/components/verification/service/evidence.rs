@@ -257,10 +257,9 @@ impl VerificationControl<'_> {
             {
                 continue;
             }
-            if let Err(error) = self.authorize_subject(
+            if let Err(error) = self.authorize_verifier(
                 caller,
                 Permission::verifier_run(verifier.clone()),
-                &subject,
                 PUBLISH_EVIDENCE,
                 "verification.evidence.publish",
             ) {

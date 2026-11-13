@@ -95,7 +95,7 @@ account atomically with its roles, optional `workload_restriction`, and first
 credential, returned once; failure creates nothing. A restriction is
 `{"mode":"unrestricted"}` (the default) or
 `{"mode":"family","kind":"Service","name":...}`. A family restriction
-limits Card-attributed emission and verification to that family's roots and
+limits Card-attributed emission to that family's roots and
 makes the account the family's unique scheduled runtime account; a second live
 account for the family conflicts with `WYRD_AUTH_409_WORKLOAD_BINDING_CONFLICT`.
 Creating or replacing a family restriction
@@ -167,13 +167,13 @@ metadata grant nothing. A parked execution resumes under its own accepted
 authority, never the publisher's, and losing repository access cancels it
 `repository_access_lost`.
 
-Deciding a pending approval needs `verifier:approve` on the execution's exact
-Verifier, granted by that Verifier's UID or by every Verifier in the tenant,
-plus current authority over its subject. `verifier:run` and `verifier:read`
-never cover it. The built-in `editor` and `admin` Roles hold it for every
-Verifier; `workload` and `viewer` do not, so a workload never approves its own
-verification. Each check is audited under `verification.approval.decide` with
-the occurrence as the resource. The decision adds no authority to the
+Deciding a pending approval needs only `verifier:approve` on the execution's
+exact Verifier, granted by that Verifier's UID or by every Verifier in the
+tenant; the caller's Card scope attributes and never authorizes it.
+`verifier:run` and `verifier:read` never cover it. The built-in `editor` and
+`admin` Roles hold it for every Verifier; `workload` and `viewer` do not. Each
+check is audited under `verification.approval.decide` with the execution as
+the resource. The decision adds no authority to the
 execution: it resumes under its own accepted authority, and the decider's
 identity is recorded only as the decision's actor.
 

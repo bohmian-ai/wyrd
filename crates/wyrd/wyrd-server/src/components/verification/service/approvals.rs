@@ -4,7 +4,7 @@
 use std::time::Instant;
 
 use chrono::{SubsecRound, Utc};
-use wyrd_runtime::Permission;
+use wyrd_runtime::permission::Action;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{ApprovalId, ExecutionId};
 use wyrd_spec::verification::execution::{ApprovalReceipt, ApprovalStatus, DecideApprovalRequest};
@@ -26,10 +26,9 @@ impl VerificationControl<'_> {
     /// occurrence `approval_id` of queued execution `execution_id`, and
     /// return its receipt once the decision is durable.
     ///
-    /// The execution is read and `verifier:read` authorized as an
-    /// inspection is; the occurrence must be one its accepted state
-    /// recorded. The caller then needs `verifier:approve` on the execution's
-    /// exact Verifier and current authority over its subject. A decision
+    /// The execution is read as an inspection reads it, but authorized only
+    /// by `verifier:approve` on its exact Verifier, audited; the occurrence
+    /// must be one its accepted state recorded. A decision
     /// already accepted for the occurrence replays its receipt when the same
     /// actor sends the same decision and reason, and refuses otherwise; a
     /// replay makes the execution due again, as a decision does. An
@@ -44,11 +43,10 @@ impl VerificationControl<'_> {
     ///
     /// # Errors
     /// Returns [`WyrdError::VerificationInputInvalid`] for an oversized
-    /// reason; the read and authorization errors of an inspection;
+    /// reason; [`WyrdError::PermissionDeniedRbac`] without `verifier:approve`
+    /// on the execution's exact Verifier; the read errors of an inspection;
     /// [`WyrdError::VerificationApprovalNotFound`] when the execution
-    /// recorded no such occurrence; [`WyrdError::PermissionDeniedRbac`]
-    /// without `verifier:approve` on the Verifier or authority over the
-    /// subject; [`WyrdError::VerificationTargetNotFound`] when the
+    /// recorded no such occurrence; [`WyrdError::VerificationTargetNotFound`] when the
     /// execution's exact Verifier and subject no longer resolve for a new
     /// decision; [`WyrdError::VerificationApprovalNotPending`] when another
     /// decision was accepted or the execution ended, expired, or was
@@ -77,7 +75,9 @@ impl VerificationControl<'_> {
                 details: serde_json::json!({ "field": "reason", "max_chars": REASON_MAX_CHARS }),
             });
         }
-        let retained = self.retained(caller, execution_id, DECIDE_APPROVAL).await?;
+        let retained = self
+            .retained(caller, execution_id, DECIDE_APPROVAL, Action::Approve)
+            .await?;
         let Some(recorded) = retained
             .state
             .approvals
@@ -105,14 +105,6 @@ impl VerificationControl<'_> {
             .uid
             .clone()
             .ok_or_else(|| execution_not_found(execution_id))?;
-        let resource = format!("verification.execution:{execution_id}/approval:{approval_id}");
-        self.authorize_subject(
-            caller,
-            Permission::verifier_approve(verifier.clone()),
-            &subject,
-            DECIDE_APPROVAL,
-            &resource,
-        )?;
         let tenant = caller.data_tenant_id;
         let custody = ApprovalDecisions::new(self.state, tenant);
         if let Some(held) = retained.decisions.get(&approval_id) {

@@ -282,8 +282,8 @@ pub(super) fn write_descriptors() -> Vec<Tool> {
 /// grant.
 ///
 /// A planning convenience, not the boundary: [`VerificationControl`]
-/// authorizes `verifier:approve` on the execution's exact Verifier and its
-/// subject, and audits that decision, when the tool is named directly.
+/// authorizes `verifier:approve` on the execution's exact Verifier, and
+/// audits that decision, when the tool is named directly.
 #[must_use]
 pub(super) fn approve_descriptors() -> Vec<Tool> {
     vec![tool::<DecideApprovalArgs, ApprovalReceipt>(
@@ -295,8 +295,7 @@ pub(super) fn approve_descriptors() -> Vec<Tool> {
          only once the decision is durable, and the same execution continues. Repeating \
          the same decision and reason replays the receipt; any other decision, a decision \
          by someone else, or one after the execution ended or expired is refused (409 \
-         approval not pending). Requires verifier:approve on the execution's Verifier and \
-         read authority over its subject.",
+         approval not pending). Requires verifier:approve on the execution's Verifier.",
         false,
     )]
 }

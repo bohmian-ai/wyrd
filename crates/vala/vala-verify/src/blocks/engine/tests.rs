@@ -3568,7 +3568,7 @@ async fn speculative_guards_known_at_dispatch_are_recorded() {
                 ControlRecord::Disposition {
                     step, speculation, ..
                 } => Some((step.as_str().to_owned(), *speculation)),
-                _ => None,
+                ControlRecord::Items { .. } => None,
             })
             .collect()
     };

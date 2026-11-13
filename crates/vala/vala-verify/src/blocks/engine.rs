@@ -686,6 +686,22 @@ impl VerificationEngine {
         }
     }
 
+    /// Record that the approval `occurrence` was reached, so a queued host
+    /// offers it for a decision while independent work continues.
+    ///
+    /// # Errors
+    /// Returns [`EngineError::Checkpoint`] when the host cannot record it.
+    async fn reached(&self, occurrence: &ApprovalOccurrence) -> Result<(), EngineError> {
+        match &self.checkpoints {
+            Some(checkpointed) => checkpointed
+                .store
+                .reached(occurrence)
+                .await
+                .map_err(EngineError::Checkpoint),
+            None => Ok(()),
+        }
+    }
+
     /// Stop a run whose declared trace has not landed yet with
     /// [`EngineError::EvidenceUnavailable`], so a queued host can retry the
     /// same execution once the evidence lands. Without it, such a trace check
@@ -1093,6 +1109,9 @@ impl VerificationEngine {
             let done = settled(done, &mut tasks).await?;
             match (node, done.as_ref()) {
                 (Node::Step(index), Done::Awaiting(occurrences)) => {
+                    for occurrence in occurrences {
+                        self.reached(occurrence).await?;
+                    }
                     awaiting.insert(index, occurrences.clone());
                 }
                 _ => ledger.insert(node.id(spec).clone(), done),

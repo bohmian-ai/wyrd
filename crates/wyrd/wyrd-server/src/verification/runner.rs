@@ -578,12 +578,36 @@ impl VerifierRunner {
                 }
                 EngineOutcome::Parked(waiting, approvals) => {
                     let execution_id = frozen.run.execution_id;
+                    let parked: Vec<_> = approvals
+                        .iter()
+                        .map(|occurrence| {
+                            (
+                                occurrence.step.clone(),
+                                occurrence.item,
+                                occurrence.iteration,
+                            )
+                        })
+                        .collect();
                     if let Err(error) = state.wait(waiting, approvals) {
                         return state_failure(execution_id, &error);
                     }
-                    let recheck = deadline
-                        .saturating_duration_since(tokio::time::Instant::now())
-                        .min(PARK_RECHECK);
+                    // A decision accepted while independent work still ran
+                    // found the execution running, so its wake changed
+                    // nothing; such an execution continues at once.
+                    let decided = !parked.is_empty()
+                        && self
+                            .decisions(tenant, run, system, &state.snapshot())
+                            .await
+                            .is_ok_and(|decided| {
+                                parked.iter().any(|key| decided.contains_key(key))
+                            });
+                    let recheck = if decided {
+                        Duration::ZERO
+                    } else {
+                        deadline
+                            .saturating_duration_since(tokio::time::Instant::now())
+                            .min(PARK_RECHECK)
+                    };
                     return persisted(&state, lease, execution_id)
                         .await
                         .err()

@@ -39,7 +39,7 @@ use wyrd_spec::verification::execution::{
     CallProvenance, InputDeclaration, InvocationSettlement, Producer, PublicationCollection,
     RequirementDetail, ToolCallRecord, Verdict,
 };
-use wyrd_spec::verification::state::ControlRecord;
+use wyrd_spec::verification::state::{ApprovalOccurrence, ControlRecord};
 use wyrd_spec::verification::{PublicationName, TaskId};
 
 mod drift;
@@ -389,6 +389,16 @@ pub trait Checkpoints: Send + Sync {
     /// Returns a bounded reason when the decision cannot commit; nothing that
     /// depends on it then runs.
     async fn control(&self, control: &ControlRecord) -> Result<(), String>;
+
+    /// Record that the engine reached the undecided approval `occurrence`
+    /// while other work may still run, so the host can offer it for a
+    /// decision at once rather than only when the execution parks.
+    /// Recording the same occurrence again changes nothing.
+    ///
+    /// # Errors
+    /// Returns a bounded reason when the occurrence cannot be recorded, such
+    /// as a lost lease; nothing downstream of it then runs.
+    async fn reached(&self, occurrence: &ApprovalOccurrence) -> Result<(), String>;
 }
 
 /// Decodes a check's raw `response` as the Verdict its declared `schema`

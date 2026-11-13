@@ -1376,6 +1376,114 @@ async fn an_agent_consumes_the_live_extraction_while_persistence_is_held() {
     );
 }
 
+/// `pr-review` with a sign-off beside the extraction: neither step depends
+/// on the other, and the review passes once the change touches a file and a
+/// person approves it.
+const SIGNED_REVIEW: &str = "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: pr-review\n  version: 1.0.0\nspec:\n  description: The pull request changes source and a person signs off.\n  steps:\n    - id: pr\n      action: {kind: extract, extractor: pull_request}\n    - id: signoff\n      action: {kind: approval, message: Ship this change?}\n  requirements:\n    - id: changes\n      statement: The reviewed change touches a file\n      check: {kind: assert, path: steps.pr.output.changes.files, operator: is_non_empty}\n    - id: approved\n      statement: A person approved the change\n      check: {kind: assert, path: steps.signoff.output.status, operator: equals, expected: approved}\n";
+
+/// An approval reached beside a running extraction is offered and decided
+/// before the extraction finishes, and the same execution consumes that
+/// decision as soon as the extraction lets it park.
+///
+/// GitHub holds the extraction's pull request read, so the execution stays
+/// `running`. Meanwhile it lists the `signoff` occurrence as pending and an
+/// editor approves it. Once GitHub answers, the execution passes within
+/// seconds, well before a parked execution's one-minute recheck, under its
+/// original id and without reading the pull request again.
+///
+/// # Panics
+/// Panics when the occurrence is not offered while the extraction runs, the
+/// decision is refused, or the execution does not pass promptly with one
+/// extraction read.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_approval_beside_running_work_is_decided_before_it_parks() {
+    let deployment =
+        Deployment::start(&[("pr-review.yaml", SIGNED_REVIEW), ("policy.yaml", POLICY)]).await;
+    deployment.head(&sha('a'), &sha('8'), HANDLER_A);
+    deployment.compare(&sha('c'), &sha('a'), &sha('c'), HANDLER_A, PATCH_A);
+    let head = sha('a');
+    let admission_read = deployment.mock.hold_next_pull_request_read();
+    let (execution, extraction_read) = tokio::join!(deployment.admit(&head, "opened"), async {
+        admission_read.arrived().await;
+        let extraction_read = deployment.mock.hold_next_pull_request_read();
+        admission_read.release();
+        extraction_read
+    });
+    extraction_read.arrived().await;
+
+    let uri = format!("/v1/verification/executions/{execution}");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let served = loop {
+        let served = deployment.get(&uri).await;
+        if served["approvals"]
+            .as_array()
+            .is_some_and(|approvals| !approvals.is_empty())
+        {
+            break served;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the reached approval is not offered while the extraction runs: {served}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(served["status"], "running", "{served}");
+    let approval = &served["approvals"][0];
+    assert_eq!(approval["step_id"], "signoff", "{served}");
+    assert_eq!(approval["status"], "pending", "{served}");
+    assert_eq!(approval["message"], "Ship this change?", "{served}");
+    let approval_id = approval["approval_id"].as_str().expect("approval id");
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("{uri}/approvals/{approval_id}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"decision": "approved"}).to_string()))
+        .expect("request builds");
+    let response = deployment
+        .server
+        .oneshot_authenticated(&deployment.jwt, request)
+        .await
+        .expect("decide responds");
+    let status = response.status();
+    let receipt: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("body reads"),
+    )
+    .expect("receipt JSON");
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["status"], "approved", "{receipt}");
+    assert_eq!(deployment.get(&uri).await["status"], "running");
+
+    extraction_read.release();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let served = deployment.get(&uri).await;
+        if served["status"] == "completed" {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the decided execution waits for its park recheck: {served}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    deployment.settled(execution).await;
+    let served = deployment.get(&uri).await;
+    assert_eq!(served["result"]["outcome"]["verdict"], "passed", "{served}");
+    assert_eq!(served["approvals"][0]["status"], "approved", "{served}");
+    assert_eq!(
+        deployment
+            .mock
+            .repository_reads(REPOSITORY)
+            .iter()
+            .filter(|read| read.starts_with("/compare/"))
+            .count(),
+        1,
+        "the extraction is not replayed"
+    );
+}
+
 /// Recovery reuses the accepted extraction exactly, even once the review
 /// library's context records have expired: the Agent, allowed one retry,
 /// stalls on its first

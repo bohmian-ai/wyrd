@@ -2576,6 +2576,8 @@ struct Ledger {
     attempts: Mutex<BTreeMap<Producer, Option<InvocationSettlement>>>,
     /// Every recorded scheduling decision, in order.
     controls: Mutex<Vec<ControlRecord>>,
+    /// Every reached approval occurrence, in order.
+    reached: Mutex<Vec<ApprovalOccurrence>>,
 }
 
 impl Ledger {
@@ -2675,6 +2677,21 @@ impl Checkpoints for Ledger {
     /// Panics when another call panicked while holding the lock.
     async fn control(&self, control: &ControlRecord) -> Result<(), String> {
         self.controls.lock().expect("ledger").push(control.clone());
+        Ok(())
+    }
+
+    /// Record the reached occurrence.
+    ///
+    /// # Errors
+    /// Never returns an error.
+    ///
+    /// # Panics
+    /// Panics when another call panicked while holding the lock.
+    async fn reached(&self, occurrence: &ApprovalOccurrence) -> Result<(), String> {
+        self.reached
+            .lock()
+            .expect("ledger")
+            .push(occurrence.clone());
         Ok(())
     }
 }
@@ -4365,6 +4382,56 @@ async fn deferred_inputs_hold_only_their_consumers_until_supplied() {
             ("later", RequirementOutcome::Passed),
         ])
     );
+}
+
+/// A reached approval is recorded at once, while an independent step is
+/// still running, so it can be decided before the execution parks.
+///
+/// # Panics
+/// Panics when the hanging step finishes, or the occurrence is not
+/// recorded while it runs.
+#[tokio::test(start_paused = true)]
+async fn a_reached_approval_is_recorded_while_independent_work_runs() {
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "steps": [
+            {"id": "independent", "action": code_action(json!({"x": "inputs.answer"}))},
+            {"id": "sign-off", "action": {"kind": "approval", "message": "Approve the release."}}
+        ]
+    }));
+    let script = Arc::new(Script {
+        actions: HashMap::from([("independent", Behavior::Hang(Arc::new(Notify::new())))]),
+        ..Script::default()
+    });
+    let ledger = Arc::new(Ledger::default());
+    let engine = engine(&script, InMemoryTraceSource::new(), 4).with_checkpoints(
+        Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+        &ExecutionState::default(),
+    );
+    let recorded = async {
+        while ledger.reached.lock().expect("ledger").is_empty() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    tokio::select! {
+        outcome = run(&engine, &spec, json!({"answer": 1})) => {
+            panic!("the hanging step never lets the run end: {outcome:?}");
+        }
+        () = recorded => {}
+        () = tokio::time::sleep(Duration::from_secs(60)) => {
+            panic!("the reached approval was not recorded while the step ran");
+        }
+    }
+    assert_eq!(
+        *ledger.reached.lock().expect("ledger"),
+        vec![ApprovalOccurrence {
+            step: TaskId::new("sign-off").expect("task id"),
+            item: None,
+            iteration: None,
+            message: "Approve the release.".to_owned(),
+        }]
+    );
+    assert_eq!(script.calls(), vec!["action:independent"]);
 }
 
 /// An approval occurrence without a decision holds only its step and that

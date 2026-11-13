@@ -205,6 +205,19 @@ fn occurrence(served: &Value) -> &Value {
     &approvals[0]
 }
 
+/// The status `served` lists for its `step` approval occurrence.
+///
+/// # Panics
+/// Panics when it lists no occurrence of `step`.
+fn occurrence_status<'a>(served: &'a Value, step: &str) -> &'a Value {
+    &served["approvals"]
+        .as_array()
+        .expect("approvals listed")
+        .iter()
+        .find(|approval| approval["step_id"] == step)
+        .unwrap_or_else(|| panic!("{step} is listed: {served}"))["status"]
+}
+
 /// A pending approval is decided once, by an authorized person, and the
 /// same execution continues to the verdict that decision implies.
 ///
@@ -744,10 +757,11 @@ async fn a_discarded_speculative_approval_refuses_a_decision() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{receipt}");
-    let served = deployment
+    deployment
         .until_approval(waiting, "signoff", "expired")
         .await;
-    assert_eq!(served["status"], "waiting", "{served}");
+    let served = deployment.until(waiting, "waiting").await;
+    assert_eq!(occurrence_status(&served, "signoff"), "expired", "{served}");
     assert_eq!(served["waiting"], json!(["ci"]), "{served}");
 
     let (status, refused) = deployment

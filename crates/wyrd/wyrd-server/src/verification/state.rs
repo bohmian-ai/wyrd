@@ -823,19 +823,7 @@ impl RunState {
         let mut changed = held.state.waiting != waiting;
         held.state.waiting = waiting;
         for occurrence in approvals {
-            if held
-                .state
-                .approvals
-                .iter()
-                .all(|recorded| recorded.occurrence != occurrence)
-            {
-                let approval_id = approval_id(self.writer.row.execution_id, &occurrence);
-                held.state.approvals.push(RecordedApproval {
-                    approval_id,
-                    occurrence,
-                });
-                changed = true;
-            }
+            changed |= record_approval(&mut held.state, self.writer.row.execution_id, occurrence);
         }
         if changed {
             self.writer.changed(&mut held);
@@ -966,6 +954,28 @@ impl RunState {
         Ok(())
     }
 }
+
+/// Record `occurrence` in `state` under its [`approval_id`] for `execution`
+/// unless it is already recorded, and report whether `state` changed.
+fn record_approval(
+    state: &mut ExecutionState,
+    execution: ExecutionId,
+    occurrence: ApprovalOccurrence,
+) -> bool {
+    if state
+        .approvals
+        .iter()
+        .any(|recorded| recorded.occurrence == occurrence)
+    {
+        return false;
+    }
+    state.approvals.push(RecordedApproval {
+        approval_id: approval_id(execution, &occurrence),
+        occurrence,
+    });
+    true
+}
+
 /// The receipt `call` holds in `state`: replayed with the accepted kind for
 /// the same call, name, and arguments, a conflict for any other holder of
 /// the name in the producer attempt or for the same call under another name
@@ -1082,6 +1092,17 @@ impl vala_verify::blocks::Checkpoints for RunState {
                 }
             }
         })
+    }
+
+    /// Record the reached approval `occurrence` in the live state under its
+    /// stable [`approval_id`], so it can be decided before the execution
+    /// parks; recording it again changes nothing.
+    ///
+    /// # Errors
+    /// Returns a bounded reason when the writer broke or lost its lease.
+    async fn reached(&self, occurrence: &ApprovalOccurrence) -> Result<(), String> {
+        let execution = self.writer.row.execution_id;
+        self.change(|state| Ok(record_approval(state, execution, occurrence.clone())))
     }
 }
 

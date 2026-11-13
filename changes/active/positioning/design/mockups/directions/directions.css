@@ -1,0 +1,77 @@
+/* Loaded after ../simple/hero.css; only what the direction variants change. */
+:root {
+  /* Amber is the third diagram series here (the Gateway / model route), not a warning. */
+  --gateway: #f0a13c;
+}
+
+.sr {
+  position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+  overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0;
+}
+
+/* The section uses the full content width; every diagram is a shallow band
+ * drawn on a 960-unit-wide viewBox (about 1.3x at the 1240px desktop width). */
+.flow > * { max-width: none; }
+.fig { margin-block: 20px 0; }
+
+/* Only the selected variant is rendered, so only its pulses run. */
+.fig[data-dir="a"] svg:not([data-dir="a"]),
+.fig[data-dir="b"] svg:not([data-dir="b"]),
+.fig[data-dir="c"] svg:not([data-dir="c"]) { display: none; }
+
+/* Below 960px the diagram keeps its drawn size and scrolls inside the figure,
+ * so labels stay readable and the page itself never scrolls sideways. */
+.scroll { overflow-x: auto; }
+.fig svg { min-width: 960px; }
+.hint { display: none; margin: 0 0 8px; color: var(--muted); font: 12px var(--font-mono); }
+@media (max-width: 1000px) { .hint { display: block; } }
+
+.dirs { margin: 28px 0 0; padding: 0 0 12px; border: 0; border-bottom: 1px solid color-mix(in srgb, var(--text) 16%, transparent); }
+.dirs .tag { margin-right: 0; }
+
+/* One step up from ../simple/, so labels hold up at the 1:1 scrolling size. */
+.cap, .ln { font-size: 10px; }
+/* Nine code lines fit the handler at 9.5 units. Token colours follow the docs
+ * site's code theme: keyword periwinkle (from hero.css), string lime,
+ * function amber, punctuation muted; plain names stay the text colour. */
+.code { font-size: 9.5px; }
+.code .s { fill: var(--evidence); }
+.code .f { fill: var(--gateway); }
+.code .p { fill: var(--muted); }
+.mark { font-size: 11px; }
+.handler .mark { font-size: 9.5px; }
+.name { font-size: 12px; }
+
+/* ── hierarchy: verification first ───────────────────────────── */
+.frame.wyrd { fill: #1a2040; fill-opacity: 0.4; stroke-width: 1.5; stroke-dasharray: none; }
+.rule.w { stroke: var(--declare); stroke-opacity: 0.6; }
+.dot.call, .stripe, .code .w { fill: var(--declare); }
+
+/* ── Gateway: amber, small, attached to the Agent check only ─── */
+.frame.gw, .link.gw { stroke: var(--gateway); }
+.cap.gw, .dot.gw { fill: var(--gateway); }
+
+/* ── Bifrost: lime, quiet, downstream ────────────────────────── */
+.tap { stroke: var(--evidence); stroke-opacity: 0.6; }
+.tap-port { fill: var(--evidence); }
+
+/* ── pulses: shared keyframes, endpoints supplied per dot ────── */
+.dot.on { animation-name: move; }
+.dot.via.on { animation-name: move-via; }
+.dot.ev.on { animation-name: move-fade; animation-duration: 0.35s; animation-delay: var(--delay, 0.35s); }
+@keyframes move {
+  from { transform: translate(var(--x0), var(--y0)); }
+  to { transform: translate(var(--x1), var(--y1)); }
+}
+/* A's call turns a corner: across, then down (and back the same way). */
+@keyframes move-via {
+  0% { transform: translate(var(--x0), var(--y0)); }
+  55% { transform: translate(var(--xm), var(--ym)); }
+  100% { transform: translate(var(--x1), var(--y1)); }
+}
+/* Capture pulses stay invisible through their delay and fade out on arrival. */
+@keyframes move-fade {
+  0% { transform: translate(var(--x0), var(--y0)); opacity: 0; }
+  15%, 80% { opacity: 1; }
+  100% { transform: translate(var(--x1), var(--y1)); opacity: 0; }
+}

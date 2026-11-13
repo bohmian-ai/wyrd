@@ -1,0 +1,181 @@
+@font-face { font-family: "Familjen Grotesk"; font-weight: 400; font-display: swap; src: url("../fonts/familjen-grotesk-latin-400-normal.woff2") format("woff2"); }
+@font-face { font-family: "Familjen Grotesk"; font-weight: 500; font-display: swap; src: url("../fonts/familjen-grotesk-latin-500-normal.woff2") format("woff2"); }
+@font-face { font-family: "Familjen Grotesk"; font-weight: 600; font-display: swap; src: url("../fonts/familjen-grotesk-latin-600-normal.woff2") format("woff2"); }
+@font-face { font-family: "Familjen Grotesk"; font-weight: 700; font-display: swap; src: url("../fonts/familjen-grotesk-latin-700-normal.woff2") format("woff2"); }
+@font-face { font-family: "Fragment Mono"; font-weight: 400; font-display: swap; src: url("../fonts/fragment-mono-latin-400-normal.woff2") format("woff2"); }
+
+/* The cover is the dark field in both themes: values from .dark-field in
+ * docs/src/styles/docs.css and docs/src/styles/wyrd-tokens.css. */
+:root {
+  --font-sans: "Familjen Grotesk", system-ui, sans-serif;
+  --font-mono: "Fragment Mono", ui-monospace, monospace;
+  --bg: #0b0c12;
+  --text: #e6e4da;
+  --muted: #8f92a5;
+  --border: #252838;
+  --declare: #7a8cff;
+  --declare-ink: #0b0c12;
+  --evidence: #c5f23b;
+  --ok: #3dbe5a;
+  --warn: #f0a13c;
+  --danger: #e2484d;
+  --r: 2px;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.45 var(--font-sans); }
+a { color: inherit; }
+:focus-visible { outline: 2px solid var(--declare); outline-offset: 2px; }
+.wrap { width: min(1240px, calc(100% - 40px)); margin: 0 auto; }
+
+/* ── cover and its existing painted background ───────────────── */
+.cover { position: relative; min-height: 720px; overflow: hidden; }
+#cover-scene { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+
+.site { position: relative; display: flex; align-items: center; justify-content: space-between; padding: 18px 0 0; }
+.brand { display: inline-flex; align-items: center; gap: 10px; font-size: 20px; font-weight: 600; text-decoration: none; }
+.mk-w { fill: var(--declare); stroke: var(--bg); stroke-width: 2; }
+.mk-s { fill: var(--evidence); stroke: var(--bg); stroke-width: 2; }
+.site nav { display: flex; gap: 22px; font: 14px var(--font-mono); }
+.site nav a { text-decoration: none; }
+.site nav a:hover { text-decoration: underline; }
+
+.hero { position: relative; padding: 64px 0 72px; }
+.hero > * { max-width: 560px; }
+.eyebrow { margin: 0 0 12px; color: var(--evidence); font: 13px/1.4 var(--font-mono); letter-spacing: 0.18em; text-transform: uppercase; }
+h1 { margin: 0; font-size: clamp(56px, 7.5vw, 104px); font-weight: 700; line-height: 0.92; letter-spacing: -0.04em; }
+h1 .d { color: var(--declare); }
+h1 .o { box-shadow: inset 0 -0.08em 0 0 var(--evidence); }
+.tagline { margin: 22px 0 0; font-size: clamp(24px, 2.6vw, 32px); font-weight: 500; line-height: 1.15; letter-spacing: -0.02em; }
+.question { margin: 14px 0 0; font-size: 19px; line-height: 1.35; }
+.lede { max-width: 40ch; margin: 8px 0 0; color: var(--muted); font-size: 18px; }
+.cta { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 30px; }
+.button {
+  display: inline-flex; align-items: center; min-height: 46px; padding: 0 22px;
+  border: 1px solid var(--text); border-radius: var(--r);
+  background: var(--bg); color: var(--text);
+  font: 15px var(--font-mono); text-decoration: none;
+}
+.button.primary { border-color: var(--declare); background: var(--declare); color: var(--declare-ink); }
+
+/* ── its own section below the cover: heading, one sentence, the graph ── */
+.flow { padding: 64px 0 56px; }
+.flow > * { max-width: 680px; margin-inline: auto; }
+h2 { margin-block: 0; font-size: clamp(36px, 4vw, 52px); font-weight: 700; line-height: 1; letter-spacing: -0.03em; }
+.sub { margin-block: 10px 0; color: var(--muted); font-size: 18px; }
+.fig { margin-block: 32px 0; }
+.fig svg { display: block; width: 100%; height: auto; overflow: visible; }
+
+/* Fine dashed contours: the API handler above, the Wyrd checks below. */
+.frame { fill: none; stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 3; }
+.frame.wyrd, .link { stroke: var(--declare); }
+.rule { stroke: var(--muted); stroke-opacity: 0.5; stroke-width: 1; }
+.link { fill: none; stroke-width: 1; stroke-dasharray: 2 3; }
+.port { fill: var(--declare); }
+.band { fill: #1a2040; } /* --declare-soft, dark */
+.slot { fill: none; stroke: var(--muted); stroke-width: 1; }
+
+text { fill: var(--text); font-family: var(--font-sans); }
+.code { font: 10.5px var(--font-mono); }
+.code text { font-family: var(--font-mono); }
+.code .k { fill: var(--declare); }
+.ln { fill: var(--muted); font: 9px var(--font-mono); text-anchor: end; }
+.cap { fill: var(--muted); font: 9px var(--font-mono); letter-spacing: 0.12em; }
+.cap.w { fill: var(--declare); }
+.name { font-size: 11.5px; }
+.mark { font: 10.5px var(--font-mono); }
+.mid { text-anchor: middle; }
+.end { text-anchor: end; }
+.cap.out { fill: var(--text); }
+
+/* Anything with data-on is shown only during its beats. */
+.fig [data-on] { opacity: 0; transition: opacity 0.12s; }
+.fig [data-on].on { opacity: 1; }
+.fig[data-case="fail"] [data-case="pass"],
+.fig[data-case="pass"] [data-case="fail"] { display: none; }
+
+/* Progress fills grow from the left. Assertions settle within their beat;
+ * the Agent's fill spans two beats; the call's fill spans the whole round trip. */
+.fig .fill {
+  fill: var(--ok); transform: scaleX(0); transform-box: fill-box; transform-origin: left center;
+  transition: transform 0.15s linear, opacity 0.05s;
+}
+.fig .fill.on { transform: none; }
+.fig .fill.agent { transition-duration: 0.42s, 0.05s; }
+.fig .fill.call { fill: var(--declare); transition-duration: 0.85s, 0.05s; }
+.fig .fill.bad { fill: var(--danger); }
+
+/* Each pulse lasts slightly less than its beat in data-beats, so none spills into the next. */
+.dot { fill: var(--text); }
+.fig .dot { transition: none; }
+.dot.ok { fill: var(--ok); }
+.dot.bad { fill: var(--danger); }
+.dot.on { animation: 0.19s linear both; }
+.d-down.on { animation-name: d-down; }
+.d-up.on { animation-name: d-up; }
+@keyframes d-down { from { transform: translate(200px, 150px); } to { transform: translate(200px, 186px); } }
+@keyframes d-up { from { transform: translate(200px, 186px); } to { transform: translate(200px, 150px); } }
+
+/* Gateway: the Agent's model call out and back. */
+.g-out.on { animation-name: g-out; }
+.g-back.on { animation-name: g-back; }
+@keyframes g-out { from { transform: translate(200px, 258px); } to { transform: translate(200px, 274px); } }
+@keyframes g-back { from { transform: translate(200px, 274px); } to { transform: translate(200px, 258px); } }
+
+/* Bifrost: quiet dotted taps and a rail. Capture pulses wait until the handler
+ * has continued, stay invisible through their delay, and fade out on arrival. */
+.tap { fill: none; stroke: var(--muted); stroke-width: 1; stroke-dasharray: 1 3; }
+.tap-port { fill: var(--muted); }
+.frame.bif { stroke: var(--evidence); stroke-opacity: 0.6; }
+.cap.bif { fill: var(--evidence); }
+.dot.ev { fill: var(--evidence); }
+.c-app.on { animation-name: c-app; animation-duration: 0.55s; animation-delay: 0.35s; }
+.c-wy.on { animation-name: c-wy; animation-duration: 0.35s; animation-delay: 0.5s; }
+.c-app.late.on { animation-delay: 0.8s; }
+.c-wy.late.on { animation-delay: 0.95s; }
+@keyframes c-app {
+  0% { transform: translate(20px, 150px); opacity: 0; }
+  10%, 85% { opacity: 1; }
+  100% { transform: translate(20px, 316px); opacity: 0; }
+}
+@keyframes c-wy {
+  0% { transform: translate(350px, 258px); opacity: 0; }
+  15%, 80% { opacity: 1; }
+  100% { transform: translate(350px, 316px); opacity: 0; }
+}
+
+figcaption { margin-top: 12px; }
+.status { margin: 0; font-size: 15px; }
+.review {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px;
+  margin-top: 10px; padding-top: 8px;
+  border-top: 1px solid color-mix(in srgb, var(--text) 16%, transparent);
+  color: var(--muted); font: 12px var(--font-mono);
+}
+.review .tag { margin-right: auto; }
+.review label { display: inline-flex; align-items: center; gap: 5px; min-height: 26px; cursor: pointer; }
+.review input { margin: 0; accent-color: var(--declare); }
+.review input:checked + span { color: var(--text); }
+.review button {
+  min-height: 26px; padding: 0 9px;
+  border: 1px solid var(--muted); border-radius: var(--r);
+  background: transparent; color: var(--text); font: inherit; cursor: pointer;
+}
+.review button:hover { border-color: var(--text); }
+
+.continue { margin: 0 auto; padding: 16px 0 28px; border-top: 1px solid var(--declare); color: var(--muted); font: 13px var(--font-mono); }
+
+.halt .dot { animation-play-state: paused; }
+@media (prefers-reduced-motion: reduce) {
+  .dot { display: none; }
+  .fig [data-on], .fig .fill { transition: none; }
+}
+
+/* Narrow: the background becomes a band under the copy, as on the live page. */
+@media (max-width: 900px) {
+  .cover { min-height: 0; }
+  #cover-scene { top: auto; height: 400px; }
+  .hero { padding: 36px 0 420px; }
+  .flow { padding: 44px 0 40px; }
+}

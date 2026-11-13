@@ -550,6 +550,34 @@ async fn successive_heads_extract_the_full_then_the_incremental_change() {
     assert_eq!(extraction["pr"]["number"], PR);
     assert_eq!(extraction["pr"]["repository"]["repository_id"], "4242");
     assert_eq!(extraction["pr"]["repository"]["card"]["name"], "policy");
+    assert_eq!(extraction["pr"]["repository"]["card"]["version"], "1.0.0");
+    assert!(
+        extraction["pr"]["repository"]["host"]
+            .as_str()
+            .is_some_and(|host| !host.is_empty()),
+        "{extraction}"
+    );
+    assert_eq!(
+        (
+            &extraction["changes"]["base"],
+            &extraction["changes"]["head"]
+        ),
+        (&json!(sha('c')), &json!(sha('a'))),
+        "{extraction}"
+    );
+    let details = deployment
+        .get(&format!("/v1/verification/executions/{first}/details"))
+        .await;
+    assert!(
+        !deployment.mock.token_requests().is_empty(),
+        "the extraction used an installation token"
+    );
+    assert!(
+        !details
+            .to_string()
+            .contains(wyrd_testing::github::INSTALLATION_TOKEN_PREFIX),
+        "no installation token reaches the evidence: {details}"
+    );
     assert_eq!(extraction["pr"]["base"]["sha"], sha('c'));
     assert_eq!(extraction["pr"]["head"]["sha"], sha('a'));
     assert_eq!(extraction["pr"]["merge_base"], sha('c'));

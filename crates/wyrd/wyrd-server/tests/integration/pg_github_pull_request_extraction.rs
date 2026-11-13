@@ -2015,10 +2015,12 @@ async fn omitted_context_is_recorded_and_fails_a_completeness_requirement() {
 
 /// An extraction larger than the model accepts fails the Agent honestly:
 /// the provider refuses the input as over its context length, the review
-/// step fails, and the review is never passed.
+/// step fails, and the review is never passed. Its source was extracted, so
+/// the next head is reviewed incrementally from it.
 ///
 /// # Panics
-/// Panics when the Agent step succeeds or the review passes.
+/// Panics when the Agent step succeeds, the review passes, or the next head
+/// is not reviewed from it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_model_refusing_the_input_size_never_passes_the_review() {
     let deployment = Deployment::start(&[
@@ -2056,5 +2058,15 @@ async fn a_model_refusing_the_input_size_never_passes_the_review() {
             .expect("requests are recorded")
             .is_empty(),
         "the model was asked and refused"
+    );
+
+    deployment.head(&sha('b'), &sha('9'), HANDLER_B);
+    deployment.compare(&sha('a'), &sha('b'), &sha('a'), HANDLER_B, PATCH_AB);
+    deployment.compare(&sha('c'), &sha('b'), &sha('c'), HANDLER_B, PATCH_B);
+    let next = deployment.review(&sha('b'), "synchronize").await;
+    assert_eq!(
+        deployment.extraction(next).await["review"]["previous"],
+        json!({"execution_id": execution, "head": sha('a')}),
+        "a review that extracted its source but was not passed is still the baseline"
     );
 }

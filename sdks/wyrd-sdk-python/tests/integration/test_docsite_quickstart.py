@@ -17,6 +17,7 @@ import runpy
 import shutil
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -34,7 +35,7 @@ pytestmark = pytest.mark.integration
 
 EXAMPLE = Path(__file__).resolve().parents[4] / "examples/finance-release"
 
-PERMITTED = {
+PERMITTED: dict[str, Any] = {
     "report": {"text": "Synthetic customer report: quarterly total $120."},
     "recipient": {"email": "auditor@example.test", "authorized": True},
     "destination": {"url": "https://auditor.example.test/reports", "restricted": True},

@@ -68,13 +68,20 @@ export interface ActionCode {
 }
 
 /**
- * Extract text and structure from one media slot.
+ * Extract one document: text and structure from the media slot
+ * `from`, or the pinned source of a queued pull request with
+ * `extractor: pull_request`. Exactly one of the two is set; validation
+ * refuses neither and both.
  */
 export interface ActionExtract {
   /**
+   * The extractor to run instead of reading a media slot.
+   */
+  readonly extractor?: Extractor | null;
+  /**
    * The media slot, as `inputs.<slot>`.
    */
-  readonly from: Reference;
+  readonly from?: Reference | null;
   readonly kind: "extract";
 }
 
@@ -2294,6 +2301,11 @@ export interface ExperimentSpec {
  * whole reference is at most 1024 bytes without control characters.
  */
 export type ExternalSecretReference = string;
+
+/**
+ * The extractor an `extract` action runs instead of reading a media slot.
+ */
+export type Extractor = "pull_request";
 
 /**
  * Ordered fallback candidates for one scope.

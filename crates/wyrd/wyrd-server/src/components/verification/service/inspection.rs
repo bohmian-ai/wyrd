@@ -33,9 +33,10 @@ use wyrd_spec::verification::execution::{
     EXECUTION_PAGE_DEFAULT, EXECUTION_PAGE_MAX, ExecutionInvocation, ExecutionPageQuery,
     HistoryProjection, InvocationPage, InvocationProgress, InvocationSettlement, Publication,
     PublicationContent, PublicationFile, PublicationPage, PublicationSelector, PublicationSummary,
+    Speculation,
 };
 use wyrd_spec::verification::state::{
-    AcceptedPublication, ExecutionIdentity, ExecutionState, InvocationRecord,
+    AcceptedPublication, ExecutionIdentity, ExecutionState, InvocationRecord, RecordedApproval,
 };
 use wyrd_spec::verification::{PublicationName, TaskId, VerificationExecutionStatus};
 use wyrd_sql::TenantConn;
@@ -276,18 +277,26 @@ impl Retained {
     }
 
     /// Whether an approval occurrence the execution recorded has no
-    /// accepted decision.
+    /// accepted decision and may still get one.
     fn undecided(&self) -> bool {
-        self.state
-            .approvals
-            .iter()
-            .any(|recorded| !self.decisions.contains_key(&recorded.approval_id))
+        self.state.approvals.iter().any(|recorded| {
+            !self.decisions.contains_key(&recorded.approval_id) && !self.withdrawn(recorded)
+        })
+    }
+
+    /// Whether `recorded` was reached speculatively and its guard then
+    /// discarded or blocked the step, so no decision of it is ever used.
+    pub(super) fn withdrawn(&self, recorded: &RecordedApproval) -> bool {
+        matches!(
+            self.state.speculation(&recorded.occurrence.step),
+            Speculation::Discarded | Speculation::Blocked
+        )
     }
 
     /// Every approval occurrence the execution recorded, in the order it
     /// reached them, with its accepted decision; an undecided occurrence is
-    /// `pending` while the execution is unfinished and `expired`, with no
-    /// actor, once it ended.
+    /// `pending` while the execution is unfinished and its step was not
+    /// withdrawn, and otherwise `expired`, with no actor.
     pub(super) fn approvals(&self) -> Vec<ApprovalOccurrenceState> {
         let open = matches!(
             self.status(),
@@ -310,7 +319,7 @@ impl Retained {
                     message: occurrence.message.clone(),
                     status: match decided {
                         Some(receipt) => receipt.status,
-                        None if open => ApprovalStatus::Pending,
+                        None if open && !self.withdrawn(recorded) => ApprovalStatus::Pending,
                         None => ApprovalStatus::Expired,
                     },
                     actor_id: decided.and_then(|receipt| receipt.actor_id),

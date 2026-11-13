@@ -140,6 +140,32 @@ impl Deployment {
         (id.as_uuid(), jwt)
     }
 
+    /// Wait until `execution` serves its `step` approval occurrence as
+    /// `status`, and return the execution.
+    ///
+    /// # Panics
+    /// Panics when it is not within two minutes, longer than a parked
+    /// execution's one-minute recheck.
+    async fn until_approval(&self, execution: Uuid, step: &str, status: &str) -> Value {
+        let deadline = tokio::time::Instant::now() + Duration::from_mins(2);
+        loop {
+            let served = self.status(execution).await;
+            let listed = served["approvals"].as_array().is_some_and(|approvals| {
+                approvals
+                    .iter()
+                    .any(|approval| approval["step_id"] == step && approval["status"] == status)
+            });
+            if listed {
+                return served;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{execution} does not serve {step} as {status}: {served}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     /// The audited outcomes of `principal`'s `verifier:approve` checks.
     ///
     /// # Panics
@@ -665,4 +691,79 @@ async fn a_decision_after_the_authored_timeout_is_refused() {
     assert!(occurrence(&served)["actor_id"].is_null(), "{served}");
     stop.cancel();
     task.await.expect("the runtime task does not panic");
+}
+
+/// The `gated` Verifier: a person first says whether the change is needed,
+/// and the `signoff` approval runs speculatively before that answer, kept
+/// only when it is approved. Deferred `ci` keeps the execution open.
+const GATED: &str = "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: signoff\n  version: 1.0.0\nspec:\n  description: A needed change is signed off once CI is green.\n  inputs:\n    ci: {type: json, deferred: true, schema: {type: object, required: [status]}}\n  steps:\n    - id: gate\n      action: {kind: approval, message: Is this change needed?}\n    - id: signoff\n      speculative: true\n      when: {path: steps.gate.output.status, operator: equals, expected: approved}\n      action: {kind: approval, message: Ship this change?}\n  requirements:\n    - id: green\n      statement: CI is green\n      check: {kind: assert, path: inputs.ci.status, operator: equals, expected: green}\n";
+
+/// An approval its speculative guard discarded stops being pending and
+/// refuses a first decision, while the execution keeps waiting for its
+/// other input.
+///
+/// Both approvals are pending at first. Rejecting `gate` discards the
+/// speculative `signoff`: it stays listed, now expired with no actor, and
+/// approving it is refused as not pending. The execution still waits for
+/// `ci` under the same id.
+///
+/// # Panics
+/// Panics when the discarded approval stays pending or accepts a decision,
+/// or the execution stops waiting.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_discarded_speculative_approval_refuses_a_decision() {
+    let deployment = Deployment::start_limited(limits(Duration::from_mins(5))).await;
+    deployment
+        .declare_files(
+            &[("signoff.yaml", GATED.to_owned())],
+            POLICY,
+            "gated-policy",
+        )
+        .await;
+    let waiting = deployment.open(12, H1).await;
+    let served = deployment.until(waiting, "waiting").await;
+    let id = |served: &Value, step: &str| {
+        served["approvals"]
+            .as_array()
+            .expect("approvals listed")
+            .iter()
+            .find(|approval| approval["step_id"] == step)
+            .unwrap_or_else(|| panic!("{step} is listed: {served}"))["approval_id"]
+            .as_str()
+            .expect("approval id")
+            .to_owned()
+    };
+    let (gate, signoff) = (id(&served, "gate"), id(&served, "signoff"));
+
+    let (status, receipt) = deployment
+        .decide(
+            &deployment.jwt,
+            waiting,
+            &gate,
+            &json!({"decision": "rejected"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    let served = deployment
+        .until_approval(waiting, "signoff", "expired")
+        .await;
+    assert_eq!(served["status"], "waiting", "{served}");
+    assert_eq!(served["waiting"], json!(["ci"]), "{served}");
+
+    let (status, refused) = deployment
+        .decide(
+            &deployment.jwt,
+            waiting,
+            &signoff,
+            &json!({"decision": "approved"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(
+        refused["code"],
+        "WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING"
+    );
+    assert_eq!(refused["details"]["status"], "expired");
+    let served = deployment.status(waiting).await;
+    assert_eq!(served["status"], "waiting", "{served}");
 }

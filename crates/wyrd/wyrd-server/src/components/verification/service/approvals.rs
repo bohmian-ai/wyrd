@@ -32,7 +32,9 @@ impl VerificationControl<'_> {
     /// exact Verifier and current authority over its subject. A decision
     /// already accepted for the occurrence replays its receipt when the same
     /// actor sends the same decision and reason, and refuses otherwise; a
-    /// replay makes the execution due again, as a decision does. A new
+    /// replay makes the execution due again, as a decision does. An
+    /// undecided occurrence whose step a speculative guard discarded or
+    /// blocked is refused as expired, since no decision of it is used. A new
     /// decision is accepted only while the execution is unfinished and before
     /// its original deadline, the runtime timeout capped by the Verifier's
     /// authored timeout, both from admission, written through Scribe, and returned once
@@ -74,12 +76,12 @@ impl VerificationControl<'_> {
             });
         }
         let retained = self.retained(caller, execution_id, DECIDE_APPROVAL).await?;
-        if !retained
+        let Some(recorded) = retained
             .state
             .approvals
             .iter()
-            .any(|recorded| recorded.approval_id == approval_id)
-        {
+            .find(|recorded| recorded.approval_id == approval_id)
+        else {
             return Err(WyrdError::VerificationApprovalNotFound {
                 message: "the execution records no approval occurrence with this ID".to_owned(),
                 details: serde_json::json!({
@@ -87,7 +89,7 @@ impl VerificationControl<'_> {
                     "approval_id": approval_id,
                 }),
             });
-        }
+        };
         let identity = retained
             .identity()
             .ok_or_else(|| execution_not_found(execution_id))?;
@@ -115,6 +117,9 @@ impl VerificationControl<'_> {
             let receipt = replay(held, caller, &request)?;
             self.wake_decided(tenant, execution_id).await;
             return Ok(receipt);
+        }
+        if retained.withdrawn(recorded) {
+            return Err(not_pending(approval_id, ApprovalStatus::Expired));
         }
         let mut conn = self
             .state

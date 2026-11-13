@@ -337,6 +337,25 @@ impl Deployment {
         execution
     }
 
+    /// Start with [`REVIEW`] bound and complete the first review of PR
+    /// [`PR`] at head `a…`; returns the deployment and that execution.
+    ///
+    /// # Panics
+    /// Panics when a step fails.
+    async fn reviewed_at_a() -> (Self, Uuid) {
+        let deployment = Self::start(&[("pr-review.yaml", REVIEW), ("policy.yaml", POLICY)]).await;
+        deployment.head(&sha('a'), &sha('8'), HANDLER_A);
+        deployment.compare(&sha('c'), &sha('a'), &sha('c'), HANDLER_A, PATCH_A);
+        let first = deployment.review(&sha('a'), "opened").await;
+        (deployment, first)
+    }
+
+    /// Serve head `b…` and the full comparison `c…...b…`.
+    fn serve_b(&self) {
+        self.head(&sha('b'), &sha('9'), HANDLER_B);
+        self.compare(&sha('c'), &sha('b'), &sha('c'), HANDLER_B, PATCH_B);
+    }
+
     /// The extraction step of `execution`'s retained details.
     ///
     /// # Panics
@@ -561,4 +580,140 @@ async fn an_agent_reads_the_extraction_as_prompt_values_and_workspace_json() {
         1,
         "both consumers share one acquisition"
     );
+}
+
+/// The full review of head `b…` after a completed review at `a…`, with the
+/// reason no incremental review was possible and no previous review.
+fn full_review(extraction: &Value) -> (&Value, &Value, &Value, &Value) {
+    let review = &extraction["review"];
+    (
+        &review["mode"],
+        &review["fallback_reason"],
+        &review["previous"],
+        &review["comparison_base"],
+    )
+}
+
+/// A force-pushed head that no longer descends from the reviewed head is
+/// reviewed in full with `history_rewritten`.
+///
+/// # Panics
+/// Panics when the review is not full.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rewritten_history_reviews_the_whole_pull_request() {
+    let (deployment, _) = Deployment::reviewed_at_a().await;
+    deployment.serve_b();
+    deployment.json(
+        &format!("/compare/{}...{}", sha('a'), sha('b')),
+        &json!({"status": "diverged", "base_commit": {"sha": sha('a')},
+                "merge_base_commit": {"sha": sha('c')}, "commits": [], "files": []}),
+    );
+
+    let second = deployment.review(&sha('b'), "synchronize").await;
+
+    let extraction = deployment.extraction(second).await;
+    assert_eq!(
+        full_review(&extraction),
+        (
+            &json!("full"),
+            &json!("history_rewritten"),
+            &Value::Null,
+            &json!(sha('c'))
+        ),
+        "{extraction}"
+    );
+    assert_eq!(extraction["changes"], extraction["review"]["full_pr"]);
+}
+
+/// A reviewed head GitHub can no longer find is reviewed in full with
+/// `history_unavailable`.
+///
+/// # Panics
+/// Panics when the review is not full.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unavailable_baseline_reviews_the_whole_pull_request() {
+    let (deployment, _) = Deployment::reviewed_at_a().await;
+    deployment.serve_b();
+
+    let second = deployment.review(&sha('b'), "synchronize").await;
+
+    let extraction = deployment.extraction(second).await;
+    assert_eq!(
+        full_review(&extraction),
+        (
+            &json!("full"),
+            &json!("history_unavailable"),
+            &Value::Null,
+            &json!(sha('c'))
+        ),
+        "{extraction}"
+    );
+}
+
+/// After the Repository rebinds a new version of the Verifier, the next
+/// head is reviewed in full with `policy_changed`.
+///
+/// # Panics
+/// Panics when the review is not full.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_changed_policy_reviews_the_whole_pull_request() {
+    let (deployment, _) = Deployment::reviewed_at_a().await;
+    deployment.serve_b();
+    deployment.compare(&sha('a'), &sha('b'), &sha('a'), HANDLER_B, PATCH_AB);
+    deployment
+        .declare(
+            &[
+                ("pr-review.yaml", &REVIEW.replace("1.0.0", "1.0.1")),
+                ("policy.yaml", &POLICY.replace("1.0.0", "1.0.1")),
+            ],
+            "pull-request-extraction-policy-v2",
+        )
+        .await;
+
+    let second = deployment.review(&sha('b'), "synchronize").await;
+
+    let extraction = deployment.extraction(second).await;
+    assert_eq!(
+        full_review(&extraction),
+        (
+            &json!("full"),
+            &json!("policy_changed"),
+            &Value::Null,
+            &json!(sha('c'))
+        ),
+        "{extraction}"
+    );
+}
+
+/// A new head that changes nothing since the reviewed head is still
+/// evidence: the extraction succeeds with no active change, and the
+/// requirement that a file changed fails rather than passing.
+///
+/// # Panics
+/// Panics when the empty change passes or is not extracted.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_incremental_change_is_evidence_and_never_a_pass() {
+    let (deployment, _) = Deployment::reviewed_at_a().await;
+    deployment.head(&sha('b'), &sha('8'), HANDLER_A);
+    deployment.compare(&sha('c'), &sha('b'), &sha('c'), HANDLER_A, PATCH_A);
+    deployment.json(
+        &format!("/compare/{}...{}", sha('a'), sha('b')),
+        &json!({"status": "ahead", "base_commit": {"sha": sha('a')},
+                "merge_base_commit": {"sha": sha('a')},
+                "commits": [{"sha": sha('b')}], "files": []}),
+    );
+
+    let second = deployment.review(&sha('b'), "synchronize").await;
+
+    let extraction = deployment.extraction(second).await;
+    assert_eq!(extraction["review"]["mode"], "incremental", "{extraction}");
+    assert_eq!(extraction["changes"]["files"], json!([]));
+    assert_eq!(
+        extraction["review"]["full_pr"]["files"][0]["path"],
+        "src/handler.ts"
+    );
+    let details = deployment
+        .get(&format!("/v1/verification/executions/{second}/details"))
+        .await;
+    assert_eq!(details["outcome"]["verdict"], "failed", "{details}");
 }

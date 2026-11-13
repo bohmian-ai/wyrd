@@ -17,7 +17,7 @@ use flate2::write::GzEncoder;
 use serde_json::{Value, json};
 use sha1::{Digest as _, Sha1};
 use uuid::Uuid;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_loader::{build_declaration_input, load};
 use wyrd_runtime::Permission;
@@ -50,7 +50,13 @@ const AGENT_POLICY: &str = "apiVersion: wyrd/v1\nkind: Repository\nmetadata:\n  
 /// as `/inputs/pr.json`.
 const AGENT_REVIEW: &str = "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: agent-review\n  version: 1.0.0\nspec:\n  description: An Agent reviews the pull request.\n  steps:\n    - id: pr\n      action: {kind: extract, extractor: pull_request}\n    - id: review\n      depends_on: [pr]\n      action:\n        kind: agent\n        agent: ./reviewer.yaml\n        inputs: {pr: steps.pr.output.pr, changes: steps.pr.output.changes, context: steps.pr.output.context}\n        workspace: {/inputs/pr.json: steps.pr.output}\n  requirements:\n    - id: reviewed\n      statement: The Agent answered\n      check: {kind: assert, path: steps.review.output, operator: is_non_empty}\n";
 /// The reviewing Agent.
-const REVIEWER: &str = "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: reviewer\n  version: 1.0.0\nspec:\n  execution_route: {kind: wyrd_gateway, deployment: openai}\n  tool_names: [fs.read]\n  run_config: {max_iterations: 3}\n  prompt:\n    provider: openai\n    model: gpt-test\n    messages:\n      - role: user\n        content: \"Review pull request {{pr}} changing {{changes}} in {{context}}; the whole extraction is /inputs/pr.json.\"\n";
+const REVIEWER: &str = "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: reviewer\n  version: 1.0.0\nspec:\n  execution_route: {kind: wyrd_gateway, deployment: openai}\n  tool_names: [fs.read, fs.list]\n  run_config: {max_iterations: 3}\n  prompt:\n    provider: openai\n    model: gpt-test\n    messages:\n      - role: user\n        content: \"Review pull request {{pr}} changing {{changes}} in {{context}}; the whole extraction is /inputs/pr.json.\"\n";
+
+/// [`AGENT_REVIEW`] with a bystander Agent that follows the extraction but
+/// binds none of it.
+const BYSTANDER_REVIEW: &str = "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: agent-review\n  version: 1.0.0\nspec:\n  description: An Agent reviews the pull request beside a bystander.\n  steps:\n    - id: pr\n      action: {kind: extract, extractor: pull_request}\n    - id: review\n      depends_on: [pr]\n      action:\n        kind: agent\n        agent: ./reviewer.yaml\n        inputs: {pr: steps.pr.output.pr, changes: steps.pr.output.changes, context: steps.pr.output.context}\n        workspace: {/inputs/pr.json: steps.pr.output}\n    - id: aside\n      depends_on: [pr]\n      action: {kind: agent, agent: ./bystander.yaml}\n  requirements:\n    - id: reviewed\n      statement: The Agent answered\n      check: {kind: assert, path: steps.review.output, operator: is_non_empty}\n";
+/// An Agent binding no extraction; without a declared workspace it has none.
+const BYSTANDER: &str = "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: bystander\n  version: 1.0.0\nspec:\n  execution_route: {kind: wyrd_gateway, deployment: openai}\n  run_config: {max_iterations: 1}\n  prompt:\n    provider: openai\n    model: gpt-test\n    messages:\n      - role: user\n        content: \"Bystander: say what you were given.\"\n";
 
 /// Declares `lookupUser`.
 const USER: &[u8] = b"export function lookupUser(id: string): string {\n  return id;\n}\n";
@@ -603,8 +609,8 @@ async fn successive_heads_extract_the_full_then_the_incremental_change() {
     );
 }
 
-/// A model answer calling `fs.read` on `/inputs/pr.json`, then a final
-/// answer.
+/// The reviewer's model: it reads `/inputs/pr.json` and lists `/inputs`,
+/// then answers.
 async fn reads_the_workspace(model: &MockServer) {
     let answer = |message: Value, finish: &str| {
         ResponseTemplate::new(200).set_body_json(json!({
@@ -615,10 +621,13 @@ async fn reads_the_workspace(model: &MockServer) {
     };
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
+        .and(body_string_contains("Review pull request"))
         .respond_with(answer(
             json!({"role": "assistant", "content": null, "tool_calls": [{
                 "id": "call_read", "type": "function",
-                "function": {"name": "fs_read", "arguments": "{\"path\":\"/inputs/pr.json\"}"}}]}),
+                "function": {"name": "fs_read", "arguments": "{\"path\":\"/inputs/pr.json\"}"}}, {
+                "id": "call_list", "type": "function",
+                "function": {"name": "fs_list", "arguments": "{\"path\":\"/inputs\"}"}}]}),
             "tool_calls",
         ))
         .up_to_n_times(1)
@@ -627,6 +636,7 @@ async fn reads_the_workspace(model: &MockServer) {
         .await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
+        .and(body_string_contains("Review pull request"))
         .respond_with(answer(
             json!({"role": "assistant", "content": "The handler trims the id."}),
             "stop",
@@ -635,23 +645,58 @@ async fn reads_the_workspace(model: &MockServer) {
         .await;
 }
 
-/// A normal Agent consumes one extraction twice: its Prompt receives the
-/// pinned `pr`, active `changes` with the exact head source, and `context`,
-/// and its workspace mounts the whole same output as JSON. GitHub is
-/// compared once for both consumers.
+/// The bystander's model: it answers at once.
+async fn answers_the_bystander(model: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("Bystander"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-aside", "object": "chat.completion", "created": 1, "model": "gpt-test",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "Nothing."}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        })))
+        .mount(model)
+        .await;
+}
+
+/// The content of the tool result answering call `id` in model request
+/// `body`.
 ///
 /// # Panics
-/// Panics when the Agent does not see the exact source in both, or the
-/// pull request is acquired again.
+/// Panics when the request returns no result for `id`.
+fn tool_result<'a>(body: &'a Value, id: &str) -> &'a str {
+    body["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == id)
+        .and_then(|message| message["content"].as_str())
+        .unwrap_or_else(|| panic!("no result for {id}: {body}"))
+}
+
+/// A normal Agent consumes one extraction twice: its Prompt receives the
+/// pinned `pr`, active `changes` with the exact head source, and `context`,
+/// and its workspace mounts the whole same output as JSON and nothing else,
+/// no source checkout. Another Agent following the extraction without
+/// binding it receives none of it in its Prompt and has no workspace. GitHub is compared once for every
+/// consumer.
+///
+/// # Panics
+/// Panics when the Agent does not see the exact source in both, its
+/// workspace holds more, the bystander sees the extraction, or the pull
+/// request is acquired again.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_agent_reads_the_extraction_as_prompt_values_and_workspace_json() {
     let deployment = Deployment::start(&[
-        ("agent-review.yaml", AGENT_REVIEW),
+        ("agent-review.yaml", BYSTANDER_REVIEW),
         ("reviewer.yaml", REVIEWER),
+        ("bystander.yaml", BYSTANDER),
         ("policy.yaml", AGENT_POLICY),
     ])
     .await;
     reads_the_workspace(&deployment.model).await;
+    answers_the_bystander(&deployment.model).await;
     deployment.head(&sha('a'), &sha('8'), HANDLER_A);
     deployment.compare(&sha('c'), &sha('a'), &sha('c'), HANDLER_A, PATCH_A);
 
@@ -663,13 +708,25 @@ async fn an_agent_reads_the_extraction_as_prompt_values_and_workspace_json() {
     assert_eq!(details["outcome"]["verdict"], "passed", "{details}");
 
     let changed_line = "lookupUser(id.trim());";
-    let requests = deployment
+    let requests: Vec<Value> = deployment
         .model
         .received_requests()
         .await
-        .expect("requests are recorded");
-    assert_eq!(requests.len(), 2, "one tool call, then the answer");
-    let first: Value = serde_json::from_slice(&requests[0].body).expect("JSON");
+        .expect("requests are recorded")
+        .iter()
+        .map(|request| serde_json::from_slice(&request.body).expect("JSON"))
+        .collect();
+    let (reviewer, aside): (Vec<&Value>, Vec<&Value>) = requests
+        .iter()
+        .partition(|body| body.to_string().contains("Review pull request"));
+    assert_eq!(reviewer.len(), 2, "one tool turn, then the answer");
+    assert_eq!(aside.len(), 1, "the bystander answered once: {details}");
+    let aside_step = details["outcome"]["steps"]
+        .as_array()
+        .and_then(|steps| steps.iter().find(|step| step["id"] == "aside"))
+        .unwrap_or_else(|| panic!("the bystander ran: {details}"));
+    assert_eq!(aside_step["status"], "succeeded", "{details}");
+    let first = reviewer[0];
     let prompt = first["messages"][0]["content"]
         .as_str()
         .expect("the Prompt renders to text");
@@ -680,15 +737,9 @@ async fn an_agent_reads_the_extraction_as_prompt_values_and_workspace_json() {
         !prompt.contains("first_review"),
         "the unbound review section stays out of the Prompt: {prompt}"
     );
-    let second: Value = serde_json::from_slice(&requests[1].body).expect("JSON");
-    let read = second["messages"]
-        .as_array()
-        .expect("messages")
-        .iter()
-        .find(|message| message["role"] == "tool")
-        .and_then(|message| message["content"].as_str())
-        .expect("the tool result is returned to the model");
-    let read: Value = serde_json::from_str(read).expect("fs.read answers JSON");
+    let second = reviewer[1];
+    let read: Value =
+        serde_json::from_str(tool_result(second, "call_read")).expect("fs.read answers JSON");
     assert!(read.get("next").is_none_or(Value::is_null), "{read}");
     let mounted: Vec<&str> = read["units"]
         .as_array()
@@ -701,6 +752,26 @@ async fn an_agent_reads_the_extraction_as_prompt_values_and_workspace_json() {
         extraction,
         "/inputs/pr.json is the whole extraction"
     );
+    let listed: Value =
+        serde_json::from_str(tool_result(second, "call_list")).expect("fs.list answers JSON");
+    let files: Vec<&str> = listed["files"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a listing: {listed}"))
+        .iter()
+        .filter_map(|file| file["path"].as_str())
+        .collect();
+    assert_eq!(files, ["/inputs/pr.json"], "no source checkout: {listed}");
+    let aside = aside
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    for withheld in [changed_line, "pr.json", &sha('a'), "src/handler.ts"] {
+        assert!(
+            !aside.contains(withheld),
+            "{withheld} reaches the bystander: {aside}"
+        );
+    }
     assert_eq!(extraction["review"]["fallback_reason"], "first_review");
     assert_eq!(
         deployment

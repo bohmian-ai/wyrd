@@ -75,6 +75,36 @@ context lifetime and cleanup coverage. Record batch sizes and transaction
 boundaries through existing tracing/test seams; no benchmark or production hook
 is added by this revision.
 
+### Revision — extracted-source baseline eligibility
+
+A completed execution is not proof that its source was extracted: a failed
+pull_request extraction still settles `completed` with an `inconclusive`
+verdict. Baseline eligibility is a source fact, never a judgment; the verdict
+does not decide it.
+
+Record `pr_source_extracted` on the execution row through a new immutable
+migration (`BOOLEAN NOT NULL DEFAULT false`, true only for completed
+`pull_request` executions). The runner derives it from the successful
+pull_request extraction settlement of the admitted source (its server-assigned
+extraction provenance), not from output JSON or the verdict, and carries it
+through the completion transition. Write it atomically with `status`,
+`result_id` and settlement timestamps in the existing lease-fenced completion
+transaction, in both single and batched completion, preserving it on identical
+replay and on recovery that reuses accepted extraction. Do not write it when
+extraction finishes: cancelled or unfinished work must never become eligible.
+
+Baseline selection, including the candidates that identify `policy_changed`,
+requires the fact. A successful extraction remains eligible when later judgment
+is failed or inconclusive; the complete PR remains in `review.full_pr` for the
+Verifier to use. Existing rows default to false, giving full reviews until
+eligible history accumulates.
+
+Verify at Tier 2: a → unreadable d → b keeps a as `previous`; successful
+extraction with a failed or inconclusive judgment advances; recovery keeps the
+fact without reacquisition; cancelled work does not advance; policy change
+falls back. Verify at the SQL owner: single/batched parity, rollback, stale
+lease and replay.
+
 ## Agreed transformation and custody
 
 Select the last completed usable same-PR/same-policy review from retained
@@ -157,7 +187,7 @@ JSON fixture alone cannot prove any predecessor handoff in this journey.
 | X1 | REQ-006; contracts → Pull request extraction ¶1; AC-004 | `extract` takes exactly one of `from` or `extractor: pull_request`; neither or both is refused at validation; media `extract/from` keeps its formats, output and failures | spec validation unit tests; existing media extract tests; legacy media step in the journey |
 | X2 | Revision — registration-derived `queue_only` | Registration sets `queue_only=true` for a PR extractor step, preserves the publish condition, ignores an authored value; direct verify refuses it on cold load before any step; media extraction alone stays direct-eligible | server registration test; direct-verify refusal in the journey; media-only Verifier stays `queue_only=false` |
 | X3 | Input and existing owner ¶1; INV-001 | The extractor reads only the queued activation's pins and tenant connection; a missing accepted source identity refuses before any acquisition; a caller supplies no credentials | engine/server unit test of a non-PR execution; source review: no credential field in the action |
-| X4 | Agreed transformation ¶1; REQ-006 baseline | Baseline is the last completed usable same-PR, same-policy review: P completed, A running, B admitted reviews P→B; first review, unavailable or rewritten history and changed policy run full with `first_review`, `history_unavailable`, `history_rewritten`, `policy_changed`; unreadable execution state is a retryable failure; PR base and merge base stay distinct from `comparison_base` | SQL history test; Tier 2 P/A/B and fallback cases |
+| X4 | Agreed transformation ¶1; REQ-006 baseline; Revision — extracted-source baseline eligibility | Baseline is the last completed same-PR, same-policy execution whose pull_request source was extracted (`pr_source_extracted`, written with completion); a failed extraction never advances it, a failed or inconclusive judgment after a successful extraction does: P completed, A running, B admitted reviews P→B; first review, unavailable or rewritten history and changed policy run full with `first_review`, `history_unavailable`, `history_rewritten`, `policy_changed`; unreadable execution state is a retryable failure; PR base and merge base stay distinct from `comparison_base` | SQL history and single/batched completion tests; Tier 2 P/A/B, failed-extraction and fallback cases |
 | X5 | Agreed transformation ¶1, ¶3; AC-004 | One call to task 004's public `ReviewPipeline::pinned` per extraction, through the connection's installation token; no Wyrd clone, index, rerank or filesystem discovery; a second consumer causes no second acquisition | Tier 2 provider call counts; source review |
 | X6 | contracts table; Agreed transformation ¶2 | Closed typed output: `format`, `pr` metadata and identities, `review` mode, `comparison_base`, `previous`, `fallback_reason`, `full_pr`, active `changes` with paths, status, blob ids, hunks and before/after source or binary/unavailable/excluded identity, and the unchanged library `context`; an empty active diff is valid evidence, never a pass | spec schema test; Tier 2 output assertions incl. empty incremental diff |
 | X7 | REQ-007; Agreed transformation ¶3 | Prompt inputs bind `pr`, active `changes` and `context`, with placeholders matching; the workspace mounts the same whole output as JSON; no source checkout and no implicit input to other Agents; with the persistence ACK held, dependents consume the live extraction | journey Agent sees exact source text in Prompt and workspace; held-ACK Tier 2 |

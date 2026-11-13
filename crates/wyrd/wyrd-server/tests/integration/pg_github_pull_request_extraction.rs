@@ -1178,3 +1178,42 @@ async fn recovery_reuses_the_accepted_extraction_after_library_contexts_expire()
         "the recovered completion records the extracted source"
     );
 }
+
+/// Cancelled work never becomes the baseline: P is the completed review at
+/// `a…`; A, at head `d…`, stalls mid-extraction on GitHub when head `b…` is
+/// pushed, which cancels A. B is reviewed incrementally from P, and A,
+/// released afterwards, stays cancelled.
+///
+/// # Panics
+/// Panics when A survives or B is not reviewed from P.
+#[tokio::test(flavor = "multi_thread")]
+async fn superseded_running_work_never_becomes_the_baseline() {
+    let (deployment, first) = Deployment::reviewed_at_a().await;
+    deployment.head(&sha('d'), &sha('9'), HANDLER_B);
+    deployment.compare(&sha('a'), &sha('d'), &sha('a'), HANDLER_B, PATCH_AB);
+    let head = sha('d');
+    let admission_read = deployment.mock.hold_next_pull_request_read();
+    let (running, extraction_read) = tokio::join!(deployment.admit(&head, "synchronize"), async {
+        admission_read.arrived().await;
+        let extraction_read = deployment.mock.hold_next_pull_request_read();
+        admission_read.release();
+        extraction_read
+    });
+    extraction_read.arrived().await;
+
+    deployment.serve_b();
+    deployment.compare(&sha('a'), &sha('b'), &sha('a'), HANDLER_B, PATCH_AB);
+    let second = deployment.review(&sha('b'), "synchronize").await;
+    extraction_read.release();
+
+    let extraction = deployment.extraction(second).await;
+    assert_eq!(extraction["review"]["mode"], "incremental", "{extraction}");
+    assert_eq!(
+        extraction["review"]["previous"],
+        json!({"execution_id": first, "head": sha('a')})
+    );
+    let status = deployment
+        .get(&format!("/v1/verification/executions/{running}"))
+        .await;
+    assert_eq!(status["status"], "cancelled", "{status}");
+}

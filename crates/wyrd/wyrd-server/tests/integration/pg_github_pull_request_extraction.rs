@@ -762,3 +762,69 @@ async fn an_extracted_review_that_fails_is_the_next_baseline() {
         json!({"execution_id": failed, "head": sha('b')})
     );
 }
+
+/// Verifying the pull request Verifier now refuses before any step: it runs
+/// only as queued work for an admitted pull request, so no source is read.
+///
+/// # Panics
+/// Panics when the direct request is accepted or reads GitHub.
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_verification_of_a_pull_request_verifier_refuses_before_any_step() {
+    let deployment =
+        Deployment::start(&[("pr-review.yaml", REVIEW), ("policy.yaml", POLICY)]).await;
+    let mut conn = deployment
+        .server
+        .tenant_conn_for(deployment.server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let mut uid = async |kind: &str, name: &str| -> Uuid {
+        sqlx::query_scalar("SELECT card_uid FROM wyrd.cards WHERE kind = $1 AND name = $2")
+            .bind(kind)
+            .bind(name)
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("the Card is declared")
+    };
+    let verifier = uid("Verifier", "pr-review").await;
+    let repository = uid("Repository", "policy").await;
+    conn.commit().await.expect("read commits");
+    let reads_before = deployment.mock.repository_reads(REPOSITORY).len();
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/verification/execute")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({"verifier_card_uid": verifier, "card_uid": repository, "inputs": {}})
+                .to_string(),
+        ))
+        .expect("request builds");
+    let response = deployment
+        .server
+        .oneshot_authenticated(&deployment.jwt, request)
+        .await
+        .expect("execute responds");
+    let status = response.status();
+    let problem: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("body reads"),
+    )
+    .expect("problem JSON");
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{problem}");
+    assert_eq!(problem["code"], "WYRD_VERIFICATION_422_INPUT_UNSUPPORTED");
+    assert_eq!(
+        problem["detail"],
+        "this Verifier runs only as queued work; submit it instead of verifying now"
+    );
+    assert_eq!(
+        problem["details"]["verifier_card_uid"],
+        verifier.to_string()
+    );
+    assert_eq!(
+        deployment.mock.repository_reads(REPOSITORY).len(),
+        reads_before,
+        "no source is read"
+    );
+}

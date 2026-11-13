@@ -1677,6 +1677,10 @@ fn state_failure(execution_id: ExecutionId, error: &StateError) -> Transition {
 /// process capacity defers without spending an attempt, and steps waiting
 /// for unpublished deferred inputs park.
 fn engine_failure(run: &ClaimedExecution, error: &EngineError) -> EngineOutcome {
+    if let EngineError::Waiting(waiting) = error {
+        tracing::info!(execution_id = %run.lease.execution_id, ?waiting, "the verification waits for deferred inputs");
+        return EngineOutcome::Parked(waiting.clone());
+    }
     tracing::warn!(execution_id = %run.lease.execution_id, %error, "the verification engine failed");
     match error {
         EngineError::DeadlineExceeded => timed_out(),

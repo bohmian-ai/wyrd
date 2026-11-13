@@ -14,6 +14,8 @@ use axum::http::{Method, Request, StatusCode, header};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use wyrd_client::cards::Cards;
+use wyrd_loader::{build_declaration_input, load};
 use wyrd_server::state::LimitsConfig;
 use wyrd_server::verification::engines::EngineOutcome;
 use wyrd_server::verification::hosted::blocks::LaneAdmission;
@@ -26,6 +28,7 @@ use wyrd_testing::Bootstrap;
 use wyrd_testing::github::PullRequest;
 
 use super::pg_github_pull_requests::{Deployment, INSTALLATION, REPOSITORY};
+use super::pg_hosted_artifacts::client;
 
 /// The connected repository's slug.
 const SLUG: &str = "acme/policy";
@@ -47,7 +50,7 @@ const C3: &str = "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3";
 /// it; it only accepts media publications.
 fn ci_gate(version: &str) -> String {
     format!(
-        "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: ci-gate\n  version: {version}\nspec:\n  description: CI is green.\n  inputs:\n    ci: {{type: json, deferred: true, schema: {{type: object, required: [status]}}}}\n    report: {{type: media, formats: [csv], deferred: true}}\n  requirements:\n    - id: green\n      statement: CI is green\n      check: {{kind: assert, path: inputs.ci.status, operator: equals, expected: green}}\n"
+        "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: ci-gate\n  version: {version}\nspec:\n  description: CI is green.\n  inputs:\n    ci: {{type: json, deferred: true, schema: {{type: object, required: [status]}}}}\n    report: {{type: media, formats: [csv], max_bytes: 64, deferred: true}}\n  requirements:\n    - id: green\n      statement: CI is green\n      check: {{kind: assert, path: inputs.ci.status, operator: equals, expected: green}}\n"
     )
 }
 
@@ -761,6 +764,96 @@ async fn unacknowledged_publication_is_unavailable_and_its_retry_resumes() {
     );
     let served = deployment.until(waiting, "completed").await;
     assert_eq!(served["result"]["outcome"]["verdict"], "passed", "{served}");
+}
+
+/// A registered Artifact is admitted against the subscriber's slot before
+/// it is accepted: a file of the wrong format, a path or version the
+/// registry does not hold, or a file past the slot's limit is refused with
+/// nothing retained, so the right file then publishes for the same commit.
+///
+/// # Panics
+/// Panics when a refusal differs or the valid file is not accepted.
+#[tokio::test(flavor = "multi_thread")]
+async fn artifact_evidence_is_admitted_before_it_is_accepted() {
+    let deployment = Deployment::start_with(false).await;
+    deployment.gate("1.1.0", "1.0.0").await;
+    let dir = tempfile::tempdir().expect("checkout creates");
+    for (name, bytes) in [
+        ("report.csv", "a,b\n1,2\n".to_owned()),
+        ("big.csv", "a,b\n".repeat(32)),
+        ("report.pdf", "%PDF-1.4\n".to_owned()),
+    ] {
+        std::fs::write(dir.path().join(name), bytes).expect("file writes");
+    }
+    std::fs::write(
+        dir.path().join("reports.yaml"),
+        "apiVersion: wyrd/v1\nkind: Artifact\nmetadata:\n  name: reports\n  version: 1.0.0\nartifacts:\n  - relative_path: report.csv\n    content_type: text/csv\n  - relative_path: big.csv\n    content_type: text/csv\n  - relative_path: report.pdf\n    content_type: application/pdf\nspec:\n  artifact_kind: dataset\n",
+    )
+    .expect("card writes");
+    let input = build_declaration_input(load(&dir.path().join("reports.yaml")).expect("loads"))
+        .expect("registration input builds");
+    let reports = Cards::connect_with(&client(deployment.base(), &deployment.jwt))
+        .await
+        .expect("handle connects")
+        .declare(&input)
+        .await
+        .expect("the Artifact registers")
+        .root;
+    let artifact = |version: &str, path: &str| {
+        let mut card = serde_json::to_value(&reports).expect("reference serializes");
+        card["version"] = json!(version);
+        if version != "1.0.0" {
+            card.as_object_mut()
+                .expect("reference is an object")
+                .remove("uid");
+        }
+        json!({"kind": "artifact", "artifact": card, "path": path})
+    };
+
+    for (value, status, reason) in [
+        (
+            artifact("1.0.0", "report.pdf"),
+            StatusCode::BAD_REQUEST,
+            "format",
+        ),
+        (
+            artifact("1.0.0", "missing.csv"),
+            StatusCode::BAD_REQUEST,
+            "no such file",
+        ),
+        (
+            artifact("9.9.9", "report.csv"),
+            StatusCode::BAD_REQUEST,
+            "reports",
+        ),
+        (
+            artifact("1.0.0", "big.csv"),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "64-byte",
+        ),
+    ] {
+        let (answer, refused) = deployment
+            .publish(&publication(SLUG, C0, "report", value.clone()))
+            .await;
+        assert_eq!(answer, status, "{value}: {refused}");
+        assert!(
+            refused.to_string().contains(reason),
+            "{value} names {reason}: {refused}"
+        );
+    }
+    let (status, receipt) = deployment
+        .publish(&publication(
+            SLUG,
+            C0,
+            "report",
+            artifact("1.0.0", "report.csv"),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(
+        receipt["status"], "accepted",
+        "nothing was retained before: {receipt}"
+    );
 }
 
 /// Losing repository access cancels a parked execution, and evidence

@@ -2,10 +2,11 @@
 //! Verifiers subscribed to it and accepting it durably for each.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::{SubsecRound, Utc};
-use vala_verify::blocks::{EngineError, conform};
+use vala_verify::blocks::{EngineError, EvidenceReader as _, conform};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::repository::RepositoryRemote;
 use wyrd_spec::error::WyrdError;
@@ -24,6 +25,7 @@ use crate::components::storage::inventory::ObjectInventory;
 use crate::state::registry_db_error;
 use crate::verification::cache::Db;
 use crate::verification::evidence::{Accepted, DeferredEvidence, EvidenceSource, full_commit};
+use crate::verification::hosted::evidence::TenantEvidence;
 use crate::verification::inputs::InputResolver;
 
 impl VerificationControl<'_> {
@@ -37,7 +39,9 @@ impl VerificationControl<'_> {
     /// and every unfinished execution admitted for the commit, each kept only
     /// when its Verifier declares `input` with `deferred: true` and the caller
     /// may run it on its subject. The value must conform to every kept
-    /// subscriber's slot; a File must be a completed upload. A subscriber
+    /// subscriber's slot; a File must be a completed upload, and an Artifact
+    /// file must resolve under the caller's authority with a format and size
+    /// its slot accepts. A subscriber
     /// that already accepted the same content replays; different content is
     /// refused. New acceptances are written through Scribe, and the receipt
     /// is returned only once each is acknowledged; consumers parked on the
@@ -222,7 +226,20 @@ impl VerificationControl<'_> {
             .await
             .map_err(registry_db_error)?;
         conn.commit().await.map_err(registry_db_error)?;
-        let evidence = BTreeMap::from([(request.input.clone(), request.value.clone())]);
+        let evidence = Arc::new(BTreeMap::from([(
+            request.input.clone(),
+            request.value.clone(),
+        )]));
+        // An Artifact is resolved under the publisher's authority and
+        // admitted against each slot here, before anything is accepted.
+        let artifacts = match &request.value {
+            InputDeclaration::Artifact { .. } => Some(TenantEvidence::new(
+                self.state.clone(),
+                caller.clone(),
+                *self.blocks()?.limits(),
+            )),
+            _ => None,
+        };
         let (mut kept, mut refused) = (BTreeSet::new(), None);
         for (verifier, subject) in candidates {
             if kept.contains(&verifier) {
@@ -260,6 +277,12 @@ impl VerificationControl<'_> {
                 continue;
             }
             conform(&target.spec, &evidence).map_err(nonconforming)?;
+            if let Some(artifacts) = &artifacts {
+                artifacts
+                    .admit(&target.spec.inputs, &evidence)
+                    .await
+                    .map_err(nonconforming)?;
+            }
             kept.insert(verifier);
         }
         if kept.is_empty() {
@@ -329,12 +352,18 @@ fn conflicts(
     }
 }
 
-/// A subscriber slot's refusal of the published value as its public error.
+/// A subscriber slot's refusal of the published value as its public error;
+/// evidence that cannot be admitted now is unavailable, so the caller
+/// publishes again.
 fn nonconforming(error: EngineError) -> WyrdError {
     match error {
         EngineError::InputTooLarge(reason) => WyrdError::VerificationInputTooLarge {
             message: reason.clone(),
             details: serde_json::json!({ "reason": reason }),
+        },
+        EngineError::EvidenceUnavailable(reason) => WyrdError::ServiceUnavailable {
+            message: reason,
+            details: serde_json::json!({}),
         },
         error => {
             let reason = error.to_string();

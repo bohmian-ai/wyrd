@@ -193,7 +193,7 @@ pub(crate) fn user(
 ///
 /// # Panics
 /// Panics when the client cannot be assembled.
-fn client(base_url: &str, jwt: &str) -> WyrdClient {
+pub(crate) fn client(base_url: &str, jwt: &str) -> WyrdClient {
     let config = ClientConfig {
         http: HttpConfig {
             base_url: base_url.to_owned(),

@@ -46,3 +46,21 @@ Preserve every executable statement, assertion, signature, test name, fixture, q
 - AC-R1-3 / FIND-005-1: the remediation diff changes comments only in those two test files; runtime behavior and existing proof remain identical.
 
 Inspect the actual documentation against the unchanged complete helper bodies and callers, then run `mise run fmt:check` and `git diff --check`. No new runtime proof is needed for comments. Do not require full user journeys, broad aggregates, codegen, benchmarks or full Clippy for this write set. The original reviewed candidate already passed 198 focused behavioral tests, recorded in verification.md; this remediation's proof concerns the missing documentation gate only.
+
+## Obligations
+
+| ID | Promise | Source | Planned proof |
+|---|---|---|---|
+| R1-1 | `HeldBatch.lock` and `HeldBatch.write` carry rustdoc naming their distinct roles | FIND-005-1, AC-R1-1 | content review against `HeldBatch::start`/`release` |
+| R1-2 | `source_extracted` documents its panic under `# Panics` | FIND-005-1, AC-R1-2 | content review against its `expect` |
+| R1-3 | Only comments change, in the two named test files | AC-R1-3 | `git diff` |
+
+## Evidence
+
+| Obligation | Implementation evidence | Proof location | Verification evidence | Result |
+|---|---|---|---|---|
+| R1-1 | field docs: `lock` is the open row-lock transaction whose commit releases the blocked batch; `write` is the second write pending in that batch | `pg_code_review_cache.rs` `HeldBatch` | content review against `start` (returns `HeldBatch { lock, write }` once a batch blocks) and `release` | PASS |
+| R1-2 | `# Panics` when the read fails or no row is visible | `pg_verifier_executions.rs` `source_extracted` | content review against `fetch_one(...).expect("execution reads")` | PASS |
+| R1-3 | 6 added comment lines, 2 files | `git diff --stat` | `mise run fmt:check` 0; `git diff --check` clean | PASS |
+
+No RED: documentation only. No executable line, test, fixture or other file changed.

@@ -4605,6 +4605,9 @@ fn completion(
 }
 
 /// Whether `execution`'s row records its pull request source as extracted.
+///
+/// # Panics
+/// Panics when the read fails or `execution` has no row visible to `conn`.
 async fn source_extracted(conn: &mut TenantConn<'_>, execution: ExecutionId) -> bool {
     sqlx::query_scalar(
         "SELECT pr_source_extracted FROM wyrd.verifier_executions WHERE execution_id = $1",

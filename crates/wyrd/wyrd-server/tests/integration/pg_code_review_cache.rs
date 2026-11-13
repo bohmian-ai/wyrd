@@ -753,7 +753,10 @@ async fn queued_write<'a>(
 /// A tenant's metadata batch held open on a row lock, so that tenant's
 /// later writes queue behind it.
 struct HeldBatch<'a> {
+    /// Open transaction holding the record's row lock; committing it lets
+    /// the blocked batch proceed.
     lock: sqlx::Transaction<'static, sqlx::Postgres>,
+    /// The tenant's second write, pending inside the batch blocked on `lock`.
     write: InFlight<'a>,
 }
 

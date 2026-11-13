@@ -4703,6 +4703,22 @@ async fn pull_request_baseline_is_the_latest_extracted_review_under_the_same_pol
             .expect("baseline reads"),
         PullRequestBaseline::PolicyChanged
     );
+
+    sqlx::query(
+        "UPDATE wyrd.verifier_executions SET pr_source_extracted = false WHERE execution_id = $1",
+    )
+    .bind(p.lease.execution_id.as_uuid())
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("P extracted nothing");
+    assert_eq!(
+        queue
+            .pull_request_baseline(&mut conn, b.lease.execution_id)
+            .await
+            .expect("baseline reads"),
+        PullRequestBaseline::FirstReview,
+        "an unextracted review under another version is no policy change"
+    );
 }
 
 /// A completed review whose extraction failed is never a baseline, while a
@@ -4822,7 +4838,19 @@ async fn batched_and_single_completion_record_extracted_source_alike() {
         .await
         .expect("replay completes");
     assert_eq!(replayed, [Settlement::Applied, Settlement::Applied]);
-    assert!(source_extracted(&mut conn, claims[0].lease.execution_id).await);
+    assert_eq!(
+        queue
+            .complete(&mut conn, &single)
+            .await
+            .expect("single replay completes"),
+        Settlement::Applied
+    );
+    let replayed = [
+        source_extracted(&mut conn, claims[0].lease.execution_id).await,
+        source_extracted(&mut conn, claims[1].lease.execution_id).await,
+        source_extracted(&mut conn, claims[2].lease.execution_id).await,
+    ];
+    assert_eq!(replayed, recorded, "identical replay preserves each fact");
 }
 
 /// A completion under a lost lease, and one whose transaction rolls back,

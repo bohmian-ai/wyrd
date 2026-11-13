@@ -52,7 +52,21 @@ export WYRD_COMMIT=<head_commit_sha>
 wyrd evidence publish ci --json results.json
 ```
 
-Set `WYRD_REPOSITORY` and `WYRD_COMMIT` from whatever your CI system provides, or pass `--repository` and `--commit`. In a checkout of the repository you can omit both: `wyrd` reads `origin` and the checked-out commit from `.git`. For a `media` input, pass `--file report.pdf` instead of `--json`; the file is uploaded first.
+Set `WYRD_REPOSITORY` and `WYRD_COMMIT` from whatever your CI system provides, or pass `--repository` and `--commit`. In a checkout of the repository you can omit both: `wyrd` reads `origin` and the checked-out commit from `.git`.
+
+<Aside type="note" title="Publish a file">
+
+A `media` input takes a file, such as a test report:
+
+<CodeFromFile file="fixtures/cards/deferred_evidence/report-gate.yaml" lang="yaml" title="report-gate.yaml" />
+
+Pass `--file` instead of `--json`; the file is uploaded first:
+
+```bash
+wyrd evidence publish report --file report.csv
+```
+
+</Aside>
 
 It prints the receipt:
 

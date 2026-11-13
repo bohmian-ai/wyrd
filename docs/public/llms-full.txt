@@ -2778,7 +2778,37 @@ export WYRD_COMMIT=<head_commit_sha>
 wyrd evidence publish ci --json results.json
 ```
 
-Set `WYRD_REPOSITORY` and `WYRD_COMMIT` from whatever your CI system provides, or pass `--repository` and `--commit`. In a checkout of the repository you can omit both: `wyrd` reads `origin` and the checked-out commit from `.git`. For a `media` input, pass `--file report.pdf` instead of `--json`; the file is uploaded first.
+Set `WYRD_REPOSITORY` and `WYRD_COMMIT` from whatever your CI system provides, or pass `--repository` and `--commit`. In a checkout of the repository you can omit both: `wyrd` reads `origin` and the checked-out commit from `.git`.
+
+**Publish a file:**
+
+A `media` input takes a file, such as a test report:
+
+```yaml title="report-gate.yaml"
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: report-gate
+  version: 1.0.0
+spec:
+  description: The pull request's CI test report, uploaded after review starts, is a readable CSV.
+  inputs:
+    report: {type: media, formats: [csv], deferred: true}
+  steps:
+    - id: read
+      action: {kind: extract, from: inputs.report}
+  requirements:
+    - id: readable
+      statement: The test report reads as CSV
+      check: {kind: assert, path: steps.read.output.format, operator: equals, expected: csv}
+
+```
+
+Pass `--file` instead of `--json`; the file is uploaded first:
+
+```bash
+wyrd evidence publish report --file report.csv
+```
 
 It prints the receipt:
 

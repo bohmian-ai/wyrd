@@ -1,0 +1,16 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: report-gate
+  version: 1.0.0
+spec:
+  description: The pull request's CI test report, uploaded after review starts, is a readable CSV.
+  inputs:
+    report: {type: media, formats: [csv], deferred: true}
+  steps:
+    - id: read
+      action: {kind: extract, from: inputs.report}
+  requirements:
+    - id: readable
+      statement: The test report reads as CSV
+      check: {kind: assert, path: steps.read.output.format, operator: equals, expected: csv}

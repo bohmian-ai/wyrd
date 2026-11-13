@@ -2701,6 +2701,152 @@ A drift Verifier refuses `verify`; only the schedule judges it.
 
 [How verification works](/wyrd/understand/how-verification-works/) explains steps, verdicts, and where each check runs.
 
+# Publish CI results to a pull request
+
+Page: /wyrd/build-and-verify/verify/publish-deferred-evidence/
+
+> Declare a Verifier input that arrives after review starts, watch the pull request's execution wait for it, and publish it from any CI system with wyrd evidence publish.
+
+Have a pull request's Verifier wait for results your CI produces, then publish them from the CI job so the same execution resumes and judges them.
+
+## Before you start
+
+- A repository connected and declared as in [Repositories](/wyrd/build-and-verify/declare/declare-a-repository/).
+- A credential your CI job can use that holds `verifier:run` on the Verifier.
+
+## 1. Declare a deferred input
+
+Mark the input `deferred: true`. Its value is not passed when the pull request's execution starts; it is published later for the pull request's head commit:
+
+```yaml title="ci-gate.yaml"
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: ci-gate
+  version: 1.0.0
+spec:
+  description: The pull request's CI results, published after review starts, are green.
+  inputs:
+    ci: {type: json, deferred: true}
+  requirements:
+    - id: green
+      statement: CI is green
+      check: {kind: assert, path: inputs.ci.status, operator: equals, expected: green}
+
+```
+
+Bind it to the repository's pull requests:
+
+```yaml title="repository.yaml"
+apiVersion: wyrd/v1
+kind: Repository
+metadata:
+  name: web
+spec:
+  repository_id: "2"
+  verified_by:
+    - verifier: ./ci-gate.yaml
+      runs_on: {kind: pull_request}
+
+```
+
+```bash
+wyrd declare repository.yaml
+```
+
+A deferred input may be `json` or `media`.
+
+## 2. Watch the execution wait
+
+Open a pull request. Find its execution as in [Watch a pull request run](/wyrd/build-and-verify/declare/declare-a-repository/#5-watch-a-pull-request-run), then inspect it:
+
+```bash
+wyrd execution status --execution-id <execution_id>
+```
+
+It shows `"status": "waiting"` and `"waiting": ["ci"]`. Checks that do not read `ci` run without it.
+
+## 3. Publish from CI
+
+When the CI job has its results, publish them for the commit it tested:
+
+```bash
+export WYRD_SERVER_URL=https://wyrd.example.com
+export WYRD_API_KEY=<ci_credential>
+export WYRD_REPOSITORY=acme/web
+export WYRD_COMMIT=<head_commit_sha>
+wyrd evidence publish ci --file results.json
+```
+
+Set `WYRD_REPOSITORY` and `WYRD_COMMIT` from whatever your CI system provides, or pass `--repository` and `--commit`. In a checkout of the repository you can omit both: `wyrd` reads `origin` and the checked-out commit from `.git`.
+
+**Publish a file:**
+
+A `media` input takes a file, such as a test report:
+
+```yaml title="report-gate.yaml"
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: report-gate
+  version: 1.0.0
+spec:
+  description: The pull request's CI test report, uploaded after review starts, is a readable CSV.
+  inputs:
+    report: {type: media, formats: [csv], deferred: true}
+  steps:
+    - id: read
+      action: {kind: extract, from: inputs.report}
+  requirements:
+    - id: readable
+      statement: The test report reads as CSV
+      check: {kind: assert, path: steps.read.output.format, operator: equals, expected: csv}
+
+```
+
+A `.json` file is sent as JSON; any other file is uploaded first:
+
+```bash title="publish.sh"
+# In the CI job, after the tests write report.csv:
+wyrd evidence publish report --file report.csv
+
+```
+
+It prints the receipt:
+
+```json
+{
+  "evidence_id": "…",
+  "repository": { "host": "github.com", "repository_id": "2" },
+  "tags": { "commit": "<head_commit_sha>" },
+  "input": "ci",
+  "status": "accepted",
+  "matched_subscriptions": 1,
+  "recorded_at": "…"
+}
+```
+
+A receipt means Wyrd stored the evidence durably for every Verifier that declares `ci` on this repository. Inspect the execution again: it resumes and ends `completed` with a verdict. Publishing the same results again answers `"status": "replayed"` with the same `evidence_id`, so a retried CI step is safe.
+
+Evidence published before the pull request's execution exists is kept and used when it starts. Publishing never starts an execution and never reopens a finished one. An execution whose evidence never arrives ends `timed_out`, never passed.
+
+**From code or an agent:**
+
+The SDKs publish the same way: `verify.Evidence().publish("ci", value)` in Python, `verify::Evidence::publish` in Rust, and `verify.Evidence.connect()` then `publish` in TypeScript. Agents use the `verification.publish_evidence` [MCP tool](/wyrd/reference/mcp-tools/).
+
+## If it fails
+
+| You see | Fix |
+| --- | --- |
+| `WYRD_VERIFICATION_400_INPUT_INVALID` naming `WYRD_COMMIT` or `WYRD_REPOSITORY` | Set the variable, pass the flag, or run in a checkout of the repository |
+| `WYRD_VERIFICATION_409_EVIDENCE_UNMATCHED` | No Verifier bound to the repository declares that input as deferred: check the input name and the selected policy |
+| `WYRD_VERIFICATION_409_EVIDENCE_CONFLICT` | Different results were already published for this commit; push a new commit to publish new results |
+| `WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE` | The outcome is unknown: publish again; a stored publication replays |
+
+## Next
+
+[Bind more Verifiers](/wyrd/build-and-verify/declare/bind-a-verifier/) to the repository's pull requests.
+
 # LLM gateway
 
 Page: /wyrd/connect/set-up-the-llm-gateway/
@@ -4330,6 +4476,8 @@ A caller fills a slot by name; steps and checks read it as `inputs.<slot>`. A sl
 | `trace` | none | The run's trace spans |
 | `samples` | `features` (required) | Feature values over a window, for drift checks |
 
+A `json` or `media` slot may set `deferred: true`: its value is not passed when the execution starts but published later for a pull request's head commit, as in [Publish CI results to a pull request](/wyrd/build-and-verify/verify/publish-deferred-evidence/). Checks and steps that read a deferred slot wait for it while the rest run; the execution reports `waiting` with the slot names, resumes when the evidence is published, and ends `timed_out` if it never is. A Verifier with a deferred slot is queued only: `verify` refuses it.
+
 A group Verifier slot is a source string instead of an object: `verifiers.<name>.inputs.<slot>` or `verifiers.<name>.requirements.<rid>.outcome`. It holds one value per source execution, in order.
 
 Media formats: `png`, `jpeg`, `gif`, `webp`, `pdf`, `text`, `markdown`, `csv`, `json`, `html`, `docx`, `xlsx`, `pptx`, `doc`, `xls`, `ppt`, `tar_gz`, `zip`.
@@ -4887,6 +5035,7 @@ Tool names contain dots, which many model providers refuse, so each framework fo
 | `verification.get_publication` | `verifier:read` on the execution's Verifier | `{execution_id, step_id, name, attempt, item_index?, iteration_index?}` → publication | Read one publication's JSON value or manifest |
 | `verification.download_publication` | `verifier:read` on the execution's Verifier | The `verification.get_publication` arguments plus `path` for a directory → `{plan, size_bytes, sha256}` | Plan one publication file's download |
 | `verification.evidence` | `verifier:run` | `{files: [{sha256, size_bytes}]}` → `{uploads: [{sha256, upload_id, plan}]}` | Plan uploads for files the tenant lacks; complete each with `POST /v1/cards/upload/{upload_id}/complete` |
+| `verification.publish_evidence` | `verifier:run` on each subscribed Verifier | `{repository: "owner/name", tags: {commit}, input, value}` → `{evidence_id, repository, tags, input, status, matched_subscriptions, recorded_at}` | Publish a deferred input for one commit; waiting executions resume; `status` is `accepted` or `replayed` |
 | `verification.execute` | `verifier:run` on exact Verifier | Verifier, subject, optional `run_id`, and named input declarations → `VerificationResult` | Verify now and store the result; no Operator dispatch |
 | `verification.enqueue` | `verifier:run` on exact Verifier | The `verification.execute` arguments plus optional `idempotency_key` → `{execution_id}` | Queue a verification; poll `verification.get_execution` |
 | `verification.cancel` | `verifier:run` on the execution's Verifier | `{execution_id}` → `{execution_id, status}` | Cancel unfinished queued work; settled work keeps its status |
@@ -5529,6 +5678,8 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_VERIFICATION_404_TARGET_NOT_FOUND` | 404 | Verification target not found | Use an active Verifier Card UID and an active subject Card UID declared in the caller's tenant. |
 | `WYRD_VERIFICATION_409_BASELINE_LEGACY` | 409 | Verification baseline legacy | Register a new Verifier version so its baseline is refitted under the current format. |
 | `WYRD_VERIFICATION_409_BASELINE_NOT_READY` | 409 | Verification baseline not ready | Poll the Verifier Card's card.status.verification.baseline until it is ready, then retry. |
+| `WYRD_VERIFICATION_409_EVIDENCE_CONFLICT` | 409 | Verification evidence conflict | Accepted evidence is never replaced: republish the original content to replay its receipt, or publish the new content for a new commit. |
+| `WYRD_VERIFICATION_409_EVIDENCE_UNMATCHED` | 409 | Verification evidence unmatched | Check the input name and repository: publish only an input a Verifier bound to the connected repository declares with deferred: true. Nothing was retained, so publish again once a binding subscribes. |
 | `WYRD_VERIFICATION_409_SNAPSHOT_INCOMPLETE` | 409 | Verification snapshot incomplete | Check Bifrost publication for the named source executions, then submit a new turn to the group. |
 | `WYRD_VERIFICATION_409_VERIFIER_NOT_READY` | 409 | Verifier not ready | Poll the Verifier Card's card.status.verification.baseline until it is ready, then retry. |
 | `WYRD_VERIFICATION_413_INPUT_TOO_LARGE` | 413 | Verification input too large | Keep the request body and each evidence file within the Deployment's verification limits, or upload large files through verification.evidence and pass them by digest. |

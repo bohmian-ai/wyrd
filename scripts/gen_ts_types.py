@@ -100,6 +100,7 @@ WIRE_ROOTS = [
     "VerificationDetails",
     "VerificationExecutionState",
     "VerificationResult",
+    "PublishEvidenceResponse",
 ]
 
 # Wire roots the SDK sends. Every definition reachable from one of these or

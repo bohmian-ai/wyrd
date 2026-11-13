@@ -4141,6 +4141,57 @@ async fn the_runner_claims_no_more_than_its_execution_slots() {
     claim_first_round(3, 2).await;
 }
 
+/// A parked attempt keeps its claim until Scribe acknowledges the parked
+/// revision, and only then returns its row to the queue.
+///
+/// While the revision is held the row stays leased to the claim; once it is
+/// acknowledged the row is pending again with its lease cleared and its
+/// attempt refunded.
+///
+/// # Panics
+/// Panics when the row returns to the queue before the acknowledgement or
+/// stays leased after it.
+#[tokio::test]
+async fn a_parked_attempt_keeps_its_claim_until_acknowledged() {
+    let harness = Harness::start().await;
+    let script = EngineScript::default();
+    let run = harness.submit().await;
+    script.push(EngineOutcome::Parked(
+        [SlotName::new("ci").expect("slot name")].into(),
+    ));
+    let stall = harness
+        .server
+        .stall_next_bifrost_write_into("bifrost.verification.execution_events")
+        .expect("Scribe stalls");
+    let runtime = harness.spawn(&Harness::limits(), &script);
+    stall.wait_entered().await;
+    let pool = harness.assertion.clone();
+    let leased = || {
+        sqlx::query_as::<_, (String, bool)>(
+            "SELECT status, lease_expires_at IS NOT NULL
+               FROM wyrd.verifier_executions WHERE execution_id = $1",
+        )
+        .bind(run.as_uuid())
+        .fetch_one(&pool)
+    };
+    assert_eq!(
+        leased().await.expect("lease reads"),
+        ("running".to_owned(), true),
+        "the held park keeps its claim"
+    );
+
+    stall.release();
+    stall.wait_completed().await;
+    let parked = wait_execution_in(&harness.seed, run, status("pending")).await;
+    assert_eq!(parked.attempts, 0, "parking refunds its attempt");
+    assert_eq!(
+        leased().await.expect("lease reads"),
+        ("pending".to_owned(), false),
+        "the acknowledged park returns its row"
+    );
+    runtime.stop().await;
+}
+
 /// A burst of queued runs in one tenant is claimed in the runner's first
 /// round up to its free slots, through repeated passes over the single due
 /// tenant, not one run per round.

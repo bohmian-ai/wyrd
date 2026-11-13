@@ -4015,6 +4015,60 @@ async fn capacity_refusal_lets_dispatched_checks_settle() {
     }
 }
 
+/// A resumed execution keeps the Agent invocations it spent before waiting:
+/// with one invocation, the step run before the park spends it, and once
+/// the deferred input arrives the Agent step reading it is refused for a
+/// spent budget instead of called.
+///
+/// # Panics
+/// Panics when the execution does not wait, or the resume replenishes the
+/// budget and calls the second Agent step.
+#[tokio::test(start_paused = true)]
+async fn a_resumed_execution_keeps_its_spent_agent_budget() {
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}, "ci": {"type": "json", "deferred": true}},
+        "limits": {"max_agent_invocations": 1},
+        "steps": [
+            {"id": "first", "action": answer_agent()},
+            {"id": "read-ci", "action": reader_agent(json!({"/inputs/ci.json": "inputs.ci"}))}
+        ]
+    }));
+    let ledger = Arc::new(Ledger::default());
+    let parked = Arc::new(Script::default());
+    let waiting = run(
+        &engine(&parked, InMemoryTraceSource::new(), 4).with_checkpoints(
+            Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+            &ExecutionState::default(),
+        ),
+        &spec,
+        json!({"answer": 1}),
+    )
+    .await;
+    assert!(
+        matches!(waiting, Err(EngineError::Waiting(_))),
+        "{waiting:?}"
+    );
+    assert_eq!(parked.calls(), ["action:first"]);
+
+    let resumed = Arc::new(Script::default());
+    let outcome = run(
+        &engine(&resumed, InMemoryTraceSource::new(), 4).with_checkpoints(
+            Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+            &ledger.recorded(),
+        ),
+        &spec,
+        json!({"answer": 1, "ci": {"ok": true}}),
+    )
+    .await
+    .expect("the resumed execution completes");
+    assert!(resumed.calls().is_empty(), "{:?}", resumed.calls());
+    let read = step(&outcome, "read-ci");
+    assert_eq!(
+        (read.status, read.reason.as_deref()),
+        (StepStatus::Failed, Some(BUDGET_SPENT))
+    );
+}
+
 /// An inline Agent action or check reading the `answer` input.
 fn answer_agent() -> Value {
     reader_agent(json!({"/inputs/answer.json": "inputs.answer"}))
@@ -4241,4 +4295,73 @@ async fn condition_errors_and_admitted_failures_stay_failures() {
     );
     assert_ne!(step(&outcome, "consumer").status, StepStatus::Succeeded);
     assert!(!calls.contains(&"action:consumer".to_owned()), "{calls:?}");
+}
+
+/// A step reading a deferred slot whose evidence has not arrived waits with
+/// its dependents and the whole-Verifier requirements, while an independent
+/// step runs and settles; once nothing else can run, the engine reports the
+/// slot it waits for. Run again with the evidence, it restores the settled
+/// step without calling it again and judges the rest.
+///
+/// # Panics
+/// Panics when a waiting block runs, the independent step does not, the
+/// waiting slots differ, or the resumed run replays a settled block.
+#[tokio::test(start_paused = true)]
+async fn deferred_inputs_hold_only_their_consumers_until_supplied() {
+    let assert = |id: &str, path: &str| json!({"id": id, "statement": id, "check": {"kind": "assert", "path": path, "operator": "is_not_null"}});
+    let spec = verifier(json!({
+        "inputs": {
+            "answer": {"type": "json"},
+            "ci": {"type": "json", "deferred": true},
+            "later": {"type": "json", "deferred": true}
+        },
+        "steps": [
+            {"id": "independent", "action": code_action(json!({"x": "inputs.answer"})),
+             "requirements": [assert("independent-ran", "steps.independent.output")]},
+            {"id": "read-ci", "action": code_action(json!({"ci": "inputs.ci"}))},
+            {"id": "after-ci", "action": code_action(json!({"r": "steps.read-ci.output"}))}
+        ],
+        "requirements": [assert("ci-read", "steps.after-ci.output"), assert("later", "inputs.later")]
+    }));
+    let ledger = Arc::new(Ledger::default());
+    let parked = Arc::new(Script::default());
+    let first = engine(&parked, InMemoryTraceSource::new(), 4).with_checkpoints(
+        Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+        &ExecutionState::default(),
+    );
+    let waiting = run(&first, &spec, json!({"answer": 1})).await;
+    let Err(EngineError::Waiting(slots)) = waiting else {
+        panic!("the execution waits: {waiting:?}");
+    };
+    assert_eq!(
+        slots,
+        BTreeSet::from([
+            SlotName::new("ci").expect("slot"),
+            SlotName::new("later").expect("slot")
+        ])
+    );
+    assert_eq!(parked.calls(), vec!["action:independent"]);
+
+    let resumed = Arc::new(Script::default());
+    let second = engine(&resumed, InMemoryTraceSource::new(), 4).with_checkpoints(
+        Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+        &ledger.recorded(),
+    );
+    let outcome = run(
+        &second,
+        &spec,
+        json!({"answer": 1, "ci": {"ok": true}, "later": 2}),
+    )
+    .await
+    .expect("the supplied execution completes");
+    assert_eq!(resumed.calls(), vec!["action:read-ci", "action:after-ci"]);
+    assert_eq!(step(&outcome, "independent").attempts, 1);
+    assert_eq!(
+        outcomes(&outcome),
+        BTreeMap::from([
+            ("independent-ran", RequirementOutcome::Passed),
+            ("ci-read", RequirementOutcome::Passed),
+            ("later", RequirementOutcome::Passed),
+        ])
+    );
 }

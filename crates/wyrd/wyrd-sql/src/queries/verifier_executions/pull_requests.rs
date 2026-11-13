@@ -23,8 +23,8 @@
 // raw-query grep allowlist: verifier execution tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use chrono::{DateTime, Utc};
-use sqlx::Error as SqlxError;
 use sqlx::types::{Json, Uuid};
+use sqlx::{Error as SqlxError, Row as _};
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_spec::auth::Attribution;
 use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, RepositoryId};
@@ -137,6 +137,39 @@ const BINDINGS_SQL: &str = "
       FROM wyrd.verification_bindings
      WHERE owner_card_uid = $1 AND activation = 'pull_request'
      ORDER BY binding_id
+";
+
+/// Every subscriber of deferred evidence for commit `$4` of repository `$3`
+/// on host `$2`: each `pull_request` binding of selected Repository Card
+/// `$1`, when one is selected, and each unfinished execution admitted for
+/// that head commit, which keeps the exact Verifier it was admitted with.
+/// One row per Verifier version and subject, in that order.
+const SUBSCRIBERS_SQL: &str = "
+    SELECT verifier_card_uid, card_uid
+      FROM wyrd.verification_bindings
+     WHERE owner_card_uid = $1 AND activation = 'pull_request'
+    UNION
+    SELECT verifier_card_uid, card_uid
+      FROM wyrd.verifier_executions
+     WHERE origin = 'pull_request' AND pull_request->>'host' = $2
+       AND pull_request->>'repository_id' = $3 AND pull_request->'head'->>'sha' = $4
+       AND status IN ('pending', 'retrying', 'running')
+     ORDER BY verifier_card_uid, card_uid
+";
+
+/// Make the queued executions of Verifiers `$4` admitted for commit `$3` of
+/// repository `$2` on host `$1` due now, so a parked consumer of newly
+/// accepted evidence is claimed again at once. A reserved, running, settled,
+/// or already due execution is left as it is.
+// ponytail: also wakes a consumer in retry backoff; a parked flag if early retries ever matter.
+const WAKE_SQL: &str = "
+    UPDATE wyrd.verifier_executions
+       SET next_attempt_at = statement_timestamp(), updated_at = statement_timestamp()
+     WHERE origin = 'pull_request' AND pull_request->>'host' = $1
+       AND pull_request->>'repository_id' = $2 AND pull_request->'head'->>'sha' = $3
+       AND verifier_card_uid = ANY($4) AND status IN ('pending', 'retrying')
+       AND next_attempt_at > statement_timestamp() AND next_attempt_at <> 'infinity'
+    RETURNING execution_id
 ";
 
 /// Reserve one runnable execution of binding `$6` for PR pins `$15` observed
@@ -523,6 +556,74 @@ impl VerifierExecutionQueue {
                 })
             })
             .collect()
+    }
+
+    /// Every Verifier version, with its subject, subscribed to deferred
+    /// evidence for `commit` of `repository_id` on `host`: the
+    /// `pull_request` bindings of `selected`, the Repository Card version
+    /// selected for the repository when there is one, and every unfinished
+    /// execution admitted for that head commit.
+    ///
+    /// # Errors
+    /// Returns the database error when the read fails, or a decode error when
+    /// a stored identity is malformed.
+    pub async fn evidence_subscribers(
+        &self,
+        conn: &mut TenantConn<'_>,
+        selected: Option<&CardUid>,
+        (host, repository_id, commit): (&str, &RepositoryId, &str),
+    ) -> Result<Vec<(CardUid, CardUid)>, SqlxError> {
+        timed("evidence_subscribers", async {
+            let rows = sqlx::query(SUBSCRIBERS_SQL)
+                .bind(selected.map(CardUid::as_uuid))
+                .bind(host)
+                .bind(repository_id.as_str())
+                .bind(commit)
+                .fetch_all(&mut **conn.transaction())
+                .await?;
+            rows.iter()
+                .map(|row| {
+                    Ok((
+                        stored(CardUid::from_uuid(row.try_get("verifier_card_uid")?))?,
+                        stored(CardUid::from_uuid(row.try_get("card_uid")?))?,
+                    ))
+                })
+                .collect()
+        })
+        .await
+    }
+
+    /// Make every queued execution of `verifiers` admitted for `commit` of
+    /// `repository_id` on `host` due now, so a consumer parked on evidence
+    /// those Verifiers just accepted is claimed again at once; returns the
+    /// executions woken. The caller commits.
+    ///
+    /// # Errors
+    /// Returns the database error when the update fails.
+    #[tracing::instrument(
+        skip(self, conn, verifiers),
+        fields(operation = "verification.evidence.wake")
+    )]
+    pub async fn wake_evidence_consumers(
+        &self,
+        conn: &mut TenantConn<'_>,
+        (host, repository_id, commit): (&str, &RepositoryId, &str),
+        verifiers: &[CardUid],
+    ) -> Result<Vec<ExecutionId>, SqlxError> {
+        timed("evidence_wake", async {
+            let verifiers: Vec<Uuid> = verifiers.iter().map(CardUid::as_uuid).collect();
+            let rows = sqlx::query(WAKE_SQL)
+                .bind(host)
+                .bind(repository_id.as_str())
+                .bind(commit)
+                .bind(&verifiers)
+                .fetch_all(&mut **conn.transaction())
+                .await?;
+            rows.iter()
+                .map(|row| stored(ExecutionId::new(row.try_get("execution_id")?)))
+                .collect()
+        })
+        .await
     }
 
     /// Cancel the locked PR's unfinished executions because of `end`, and

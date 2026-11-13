@@ -60,6 +60,7 @@ use crate::verification::results::{
 use crate::verification::submissions::{AdmissionReply, Queued};
 use crate::verification::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
 
+mod evidence;
 mod inspection;
 
 /// Audit operation of a binding status read.
@@ -73,6 +74,9 @@ const GET_EXECUTION_DETAILS: &str = "verification.execution.details.read";
 
 /// Audit operation of an evidence upload plan.
 const EVIDENCE: &str = "verification.evidence";
+
+/// Audit operation of a deferred evidence publication.
+const PUBLISH_EVIDENCE: &str = "verification.evidence.publish";
 
 /// Audit operation of a direct execution.
 const EXECUTE: &str = "verification.execute";
@@ -289,9 +293,11 @@ impl<'a> VerificationControl<'a> {
                 owner_card_uid: identity.and_then(|identity| identity.owner_card_uid.clone()),
                 group: None,
                 pull_request: None,
+                waiting: std::collections::BTreeSet::new(),
             },
         };
         state.status = retained.status();
+        state.waiting = retained.waiting();
         if let Some(failure) = &retained.state.failure {
             state.error = Some(failure.error.clone());
         }
@@ -1102,8 +1108,8 @@ impl<'a> VerificationControl<'a> {
 
     /// The record reader of an execution read: the tenant's SYSTEM
     /// principal granted only `bifrost.verification.execution_inputs`,
-    /// `results`, `execution_outputs`, and `execution_events`, serving
-    /// `caller`.
+    /// `results`, `execution_outputs`, `execution_events`, and `evidence`,
+    /// serving `caller`.
     ///
     /// # Errors
     /// Returns a registry error when the SYSTEM principal cannot be read, and
@@ -1123,6 +1129,7 @@ impl<'a> VerificationControl<'a> {
             "results",
             "execution_outputs",
             "execution_events",
+            "evidence",
         ]
         .map(|name| TableRef::new(BifrostNamespace::Verification, name));
         let read = SystemReadAuthority::resolve(self.state, caller.data_tenant_id, system, &tables)

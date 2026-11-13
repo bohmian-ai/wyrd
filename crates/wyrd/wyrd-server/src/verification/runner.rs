@@ -76,6 +76,7 @@ use super::claims::{ClaimLoop, LeasedWork, settled};
 use super::completions::{Completions, SettleError};
 use super::drift::DriftEngine;
 use super::engines::{self, EngineOutcome};
+use super::evidence::{DeferredEvidence, EvidenceSource};
 use super::health::RuntimeCapability;
 use super::hosted::blocks::{Execution, HostedBlocks};
 use super::inputs::{InputResolver, InputRow};
@@ -138,6 +139,10 @@ const PERSIST_INITIAL: Duration = Duration::from_millis(50);
 const CAPACITY_WAIT: Duration = Duration::from_secs(60);
 /// Longest wait between settlement attempts.
 const PERSIST_MAX: Duration = Duration::from_secs(5);
+/// How long a parked execution stays queued before its claim rechecks the
+/// accepted evidence itself, which repairs a publication whose wake was
+/// lost; a publication wakes it at once, and the deadline bounds it.
+const PARK_RECHECK: Duration = Duration::from_mins(1);
 
 /// The single transition one claimed execution ends in.
 #[derive(Debug, Clone, PartialEq)]
@@ -168,6 +173,10 @@ pub enum Transition {
     /// poll interval, because an input read or a hosted block met admission
     /// backpressure.
     Defer(VerificationError),
+    /// Return the run to its queue with its attempt refunded, due after the
+    /// given delay, because it is parked waiting for deferred inputs whose
+    /// state is persisted.
+    Park(Duration),
     /// The lease is no longer held; another claimant owns the run, so nothing
     /// is settled.
     LeaseLost,
@@ -566,6 +575,19 @@ impl VerifierRunner {
                         .err()
                         .unwrap_or(Transition::Defer(error));
                 }
+                EngineOutcome::Parked(waiting) => {
+                    let execution_id = frozen.run.execution_id;
+                    if let Err(error) = state.wait(waiting) {
+                        return state_failure(execution_id, &error);
+                    }
+                    let recheck = deadline
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        .min(PARK_RECHECK);
+                    return persisted(&state, lease, execution_id)
+                        .await
+                        .err()
+                        .unwrap_or(Transition::Park(recheck));
+                }
             }
         };
         conclude(tenant, frozen, system, &state, offer, lease, &self.outbox).await
@@ -695,7 +717,14 @@ impl VerifierRunner {
             {
                 return outcome;
             }
-            match self.prepare(tenant, run, spec, system, telemetry).await {
+            let prepared = match self.prepare(tenant, run, spec, system, telemetry).await {
+                Ok(mut prepared) => self
+                    .deferred(tenant, run, spec, system, state, &mut prepared.1)
+                    .await
+                    .map(|()| prepared),
+                Err(outcome) => Err(outcome),
+            };
+            match prepared {
                 Ok(prepared) => {
                     self.dispatch(run, spec, system, state, telemetry, prepared)
                         .await
@@ -760,6 +789,84 @@ impl VerifierRunner {
                 )
             }
         })
+    }
+
+    /// Supply each deferred input `spec` declares and `evidence` lacks from
+    /// the evidence the execution's exact Verifier accepted for its pull
+    /// request's head commit, recording each acceptance in `state`.
+    ///
+    /// Only a pull request execution has a source to match. An input whose
+    /// acceptance is not fenced stays missing, and the engine parks its
+    /// consumers; accepted evidence is read on every claim, so a lost wake
+    /// loses nothing.
+    ///
+    /// # Errors
+    /// Returns [`EngineOutcome::Deferred`] when an acceptance cannot be read
+    /// now or is not visible yet, so it is never mistaken for absence, and
+    /// [`EngineOutcome::Retry`] when the state writer is stale.
+    async fn deferred(
+        &self,
+        tenant: DataTenantId,
+        run: &ClaimedExecution,
+        spec: &VerifierSpec,
+        system: PrincipalId,
+        state: &RunState,
+        evidence: &mut BTreeMap<SlotName, InputDeclaration>,
+    ) -> Result<(), EngineOutcome> {
+        let ExecutionInput::PullRequest { pull_request } = &run.input else {
+            return Ok(());
+        };
+        let missing: Vec<&SlotName> = spec
+            .inputs
+            .iter()
+            .filter(|(name, slot)| slot.is_deferred() && !evidence.contains_key(*name))
+            .map(|(name, _)| name)
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let unavailable = |error: &dyn std::fmt::Display| {
+            tracing::info!(execution_id = %run.lease.execution_id, %error, "deferred evidence cannot be read now");
+            EngineOutcome::Deferred(failure(
+                EVIDENCE_UNAVAILABLE,
+                "the execution's deferred evidence cannot be read now",
+            ))
+        };
+        let query = self
+            .reader(tenant, system, Some(&run.authority))
+            .await
+            .map_err(|error| unavailable(&error))?;
+        let records = InputResolver::new(&query, None);
+        let source = EvidenceSource {
+            host: &pull_request.host,
+            repository_id: &pull_request.repository_id,
+            commit: &pull_request.head.sha,
+        };
+        let custody = DeferredEvidence::new(&self.state, tenant);
+        for slot in missing {
+            let accepted = custody
+                .accepted(
+                    &records,
+                    source,
+                    slot,
+                    std::slice::from_ref(&run.verifier_card_uid),
+                )
+                .await
+                .map_err(|error| unavailable(&error))?;
+            let Some(accepted) = accepted.into_values().next() else {
+                continue;
+            };
+            state
+                .accept_evidence(slot, accepted.published.evidence_id)
+                .map_err(|_| {
+                    EngineOutcome::Retry(failure(
+                        EXECUTION_INTERRUPTED,
+                        "the execution state writer stopped",
+                    ))
+                })?;
+            evidence.insert(slot.clone(), accepted.published.value);
+        }
+        Ok(())
     }
 
     /// Run `spec` over the claimed execution's `prepared` input.
@@ -907,7 +1014,8 @@ impl VerifierRunner {
     }
 
     /// A query caller reading as the tenant's `system` principal, granted only
-    /// the verification input, output, and execution state tables, and
+    /// the verification input, output, execution state, and deferred evidence
+    /// tables, and
     /// serving `served`, a run's accepted authority, when given.
     ///
     /// # Errors
@@ -919,8 +1027,13 @@ impl VerifierRunner {
         system: PrincipalId,
         served: Option<&AcceptedAuthority>,
     ) -> Result<ScheduledQueryCaller, SystemReadAuthorityError> {
-        let tables = ["execution_inputs", "execution_outputs", "execution_events"]
-            .map(|name| TableRef::new(BifrostNamespace::Verification, name));
+        let tables = [
+            "execution_inputs",
+            "execution_outputs",
+            "execution_events",
+            "evidence",
+        ]
+        .map(|name| TableRef::new(BifrostNamespace::Verification, name));
         let mut read =
             SystemReadAuthority::resolve(&self.state, tenant, Some(system), &tables).await?;
         if let Some(served) = served {
@@ -1055,6 +1168,14 @@ impl VerifierRunner {
                 settled(
                     self.queue.release(&mut conn, lease, self.poll()).await?,
                     "deferred",
+                )
+            }
+            Transition::Park(recheck) => {
+                let recheck = chrono::Duration::from_std(recheck)
+                    .unwrap_or_else(|_| chrono::Duration::zero());
+                settled(
+                    self.queue.release(&mut conn, lease, recheck).await?,
+                    "parked",
                 )
             }
             Transition::LeaseLost => "stale_lease",
@@ -1304,11 +1425,11 @@ impl VerifierRunner {
         };
         let span = tracing::Span::current();
         span.record("outcome", outcome);
-        let failed = !matches!(outcome, "completed" | "released" | "deferred");
+        let failed = !matches!(outcome, "completed" | "released" | "deferred" | "parked");
         if failed {
             span.record("otel.status_code", "ERROR");
         }
-        if outcome == "deferred" {
+        if matches!(outcome, "deferred" | "parked") {
             return refused;
         }
         metrics::histogram!(
@@ -1573,9 +1694,14 @@ fn state_failure(execution_id: ExecutionId, error: &StateError) -> Transition {
 /// An expired deadline times out, an unplannable Verifier, an uncapturable
 /// actual value, or nonconforming evidence terminates `errored`, a stopped
 /// block task, unreadable evidence metadata, or a deferred not-yet-landed
-/// trace retries, and a block refused
-/// process capacity defers without spending an attempt.
+/// trace retries, a block refused
+/// process capacity defers without spending an attempt, and steps waiting
+/// for unpublished deferred inputs park.
 fn engine_failure(run: &ClaimedExecution, error: &EngineError) -> EngineOutcome {
+    if let EngineError::Waiting(waiting) = error {
+        tracing::info!(execution_id = %run.lease.execution_id, ?waiting, "the verification waits for deferred inputs");
+        return EngineOutcome::Parked(waiting.clone());
+    }
     tracing::warn!(execution_id = %run.lease.execution_id, %error, "the verification engine failed");
     match error {
         EngineError::DeadlineExceeded => timed_out(),
@@ -1613,6 +1739,7 @@ fn engine_failure(run: &ClaimedExecution, error: &EngineError) -> EngineOutcome 
             EXECUTION_INTERRUPTED,
             "a verification checkpoint cannot commit",
         )),
+        EngineError::Waiting(waiting) => EngineOutcome::Parked(waiting.clone()),
     }
 }
 
@@ -1679,7 +1806,7 @@ impl Transition {
     fn error(&self) -> Option<&VerificationError> {
         match self {
             Self::Retry(error) | Self::Terminate(_, error) | Self::Defer(error) => Some(error),
-            Self::Complete { .. } | Self::Release | Self::LeaseLost => None,
+            Self::Complete { .. } | Self::Release | Self::Park(_) | Self::LeaseLost => None,
         }
     }
 }

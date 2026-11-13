@@ -24,7 +24,7 @@ use serde_json::Value;
 use wyrd_spec::card::agent::ExecutionRoute;
 use wyrd_spec::card::verifier::{SourceField, SourceText};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{CardUid, ExecutionId, GroupId, SlotName, VerificationResultId};
+use wyrd_spec::ids::{CardUid, EvidenceId, ExecutionId, GroupId, SlotName, VerificationResultId};
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::ids::RunId;
 use wyrd_spec::verification::execution::InputDeclaration;
@@ -288,6 +288,58 @@ impl<'q> InputResolver<'q> {
             .find(|batch| batch.num_rows() > 0)
             .map(|batch| variant(batch, "value", 0))
             .transpose()
+    }
+
+    /// Every visible acceptance of deferred evidence for `input` of `source`,
+    /// by subscribing Verifier version.
+    ///
+    /// # Errors
+    /// Returns the query refusal or failure, and an internal error when a
+    /// stored row is malformed.
+    pub(crate) async fn published(
+        &self,
+        source: super::evidence::EvidenceSource<'_>,
+        input: &SlotName,
+    ) -> Result<BTreeMap<CardUid, super::evidence::Accepted>, WyrdError> {
+        let batches = self
+            .rows(&format!(
+                "SELECT evidence_id, verifier_card_uid, sha256, value, recorded_at \
+                 FROM bifrost.verification.evidence \
+                 WHERE host = {} AND repository_id = {} AND \"commit\" = {} AND input = {}",
+                quote(source.host),
+                quote(source.repository_id.as_str()),
+                quote(source.commit),
+                quote(input.as_str()),
+            ))
+            .await?;
+        let mut found = BTreeMap::new();
+        for batch in &batches {
+            for row in 0..batch.num_rows() {
+                let verifier = CardUid::new(text(batch, "verifier_card_uid", row)?)
+                    .map_err(|error| invalid(error.to_string()))?;
+                let evidence_id = EvidenceId::new(
+                    uuid::Uuid::parse_str(&text(batch, "evidence_id", row)?)
+                        .map_err(|error| invalid(error.to_string()))?,
+                )
+                .map_err(|error| invalid(error.to_string()))?;
+                let recorded_at = column(batch, "recorded_at")?
+                    .as_any()
+                    .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+                    .filter(|times| !times.is_null(row))
+                    .and_then(|times| DateTime::from_timestamp_micros(times.value(row)))
+                    .ok_or_else(|| invalid("recorded_at is not a timestamp".to_owned()))?;
+                let accepted = super::evidence::Accepted {
+                    published: super::evidence::Published {
+                        evidence_id,
+                        sha256: text(batch, "sha256", row)?,
+                        value: decode(variant(batch, "value", row)?)?,
+                    },
+                    recorded_at,
+                };
+                found.insert(verifier, accepted);
+            }
+        }
+        Ok(found)
     }
 
     /// The evidence `row` judges: a supplied record's declarations, a

@@ -1,5 +1,5 @@
-//! Thin napi projection of Verifier inputs, submissions, and execution
-//! handles.
+//! Thin napi projection of Verifier inputs, submissions, execution
+//! handles, and deferred evidence publication.
 //!
 //! Slot projection, file pinning, routing, retry keys, and polling stay in
 //! `wyrd_client::verify`; this module only converts Node values into the
@@ -12,7 +12,7 @@ use napi::bindgen_prelude::{Buffer, PromiseRaw};
 use napi_derive::napi;
 use serde_json::{Value, json};
 use wyrd_client::verify::{
-    ArtifactRef, Execution, ExecutionPageQuery, File, Input, Inputs, PublicationName,
+    ArtifactRef, Evidence, Execution, ExecutionPageQuery, File, Input, Inputs, PublicationName,
     PublicationSelector, Submission, TaskId,
 };
 use wyrd_spec::error::WyrdError;
@@ -401,6 +401,88 @@ impl NativeWyrdClient {
             Ok(match connected {
                 Ok(execution) => NativeSubmission::queued(execution),
                 Err(error) => NativeSubmission::outcome(Err(error)),
+            })
+        })
+    }
+}
+
+/// Node-facing deferred evidence publisher over the shared
+/// [`Evidence`] handle; source resolution and upload stay in Rust.
+#[napi]
+pub struct NativeEvidence {
+    /// Shared handle owning transport and authentication.
+    evidence: Evidence,
+}
+
+/// Closed result of connecting one evidence publisher: the handle or a
+/// catalog error.
+#[napi(object, object_from_js = false)]
+pub struct NativeEvidenceConnection {
+    /// Connected handle when the connection succeeded.
+    pub handle: Option<NativeEvidence>,
+    /// Catalog failure otherwise.
+    pub error: Option<NativeWyrdError>,
+}
+
+#[napi]
+impl NativeWyrdClient {
+    /// Connects one evidence publisher that calls the server as this client,
+    /// as `Evidence::connect_with` does.
+    ///
+    /// # Errors
+    /// Never returns a napi error; a refused or unreachable exchange is
+    /// carried in the result.
+    #[napi]
+    pub fn evidence<'env>(
+        &self,
+        env: &'env Env,
+    ) -> napi::Result<PromiseRaw<'env, NativeEvidenceConnection>> {
+        let client = self.client.clone();
+        crate::trace::spawn(env, async move {
+            Ok(match Evidence::connect_with(&client).await {
+                Ok(evidence) => NativeEvidenceConnection {
+                    handle: Some(NativeEvidence { evidence }),
+                    error: None,
+                },
+                Err(error) => NativeEvidenceConnection {
+                    handle: None,
+                    error: Some(NativeWyrdError::from_wyrd(&error)),
+                },
+            })
+        })
+    }
+}
+
+#[napi]
+impl NativeEvidence {
+    /// Publishes `value` as the deferred input `name`; an omitted
+    /// `repository` or `commit` resolves as `wyrd_client::verify::source`
+    /// does, from `WYRD_REPOSITORY` / `WYRD_COMMIT`, then the working
+    /// directory's Git checkout.
+    ///
+    /// # Errors
+    /// Returns a napi error only when the receipt cannot be projected; a
+    /// malformed value, an unresolvable source, and a server refusal are
+    /// carried in the result.
+    #[napi]
+    pub fn publish<'env>(
+        &self,
+        env: &'env Env,
+        name: String,
+        value: NativeVerifierInput,
+        repository: Option<String>,
+        commit: Option<String>,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let evidence = self.evidence.clone();
+        let value = input(&name, value);
+        crate::trace::spawn(env, async move {
+            NativeLifecycleResult::outcome(match value {
+                Ok(value) => {
+                    evidence
+                        .publish(&name, value, repository.as_deref(), commit.as_deref())
+                        .await
+                }
+                Err(error) => Err(error),
             })
         })
     }

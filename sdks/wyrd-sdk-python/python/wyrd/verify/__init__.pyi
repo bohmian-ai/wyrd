@@ -448,8 +448,16 @@ class VerificationError(TypedDict):
     message: str
 
 ExecutionStatus: TypeAlias = Literal[
-    "pending", "running", "retrying", "completed", "cancelled", "timed_out", "errored"
+    "pending",
+    "running",
+    "retrying",
+    "waiting",
+    "completed",
+    "cancelled",
+    "timed_out",
+    "errored",
 ]
+"""``waiting``: parked until the deferred inputs in ``waiting`` are published."""
 
 class FrozenUid(TypedDict):
     """A dispatch's frozen Operator Card UID."""
@@ -616,6 +624,99 @@ class ExecutionState(TypedDict, Generic[DataT]):
     owner_card_uid: NotRequired[str]
     group: NotRequired[GroupSnapshot]
     pull_request: NotRequired[PullRequestActivation]
+    waiting: NotRequired[list[str]]
+    """The deferred inputs a ``waiting`` execution is parked for."""
+
+class EvidenceRepository(TypedDict):
+    """The connected repository a publication's slug resolved to."""
+
+    host: str
+    repository_id: str
+
+class EvidenceTags(TypedDict):
+    """The source a publication matches on: only the commit."""
+
+    commit: str
+
+class EvidenceReceipt(TypedDict):
+    """``Evidence.publish``: the durable receipt.
+
+    ``status`` is ``accepted`` when a subscribed Verifier received the
+    evidence for the first time and ``replayed`` when every one already held
+    it; ``recorded_at`` is the RFC 3339 UTC time it was first accepted.
+    """
+
+    evidence_id: str
+    repository: EvidenceRepository
+    tags: EvidenceTags
+    input: str
+    status: Literal["accepted", "replayed"]
+    matched_subscriptions: int
+    recorded_at: str
+
+class Evidence:
+    """Publish evidence for a Verifier input declared ``deferred: true``.
+
+    Every Verifier bound to the repository, or already executing for the
+    commit, that declares the input receives the evidence, and its waiting
+    executions resume; publishing never starts an execution::
+
+        Evidence().publish("ci", {"status": "green"})
+        Evidence().publish("report", File("report.pdf"), repository="acme/web", commit=sha)
+    """
+
+    def __init__(self, client: WyrdClient | None = None) -> None:
+        """Build a publisher; no IO or credential resolution happens here.
+
+        Args:
+            client: the ``WyrdClient`` to act as. Omitted, the ambient client
+                resolves from ``config.toml``, then the environment, then the
+                saved ``wyrd auth login``.
+        """
+        ...
+
+    @staticmethod
+    def connect(client: WyrdClient | None = None) -> Evidence:
+        """Build a publisher and connect it now.
+
+        Args:
+            client: the ``WyrdClient`` to act as; omitted, the ambient client.
+
+        Raises:
+            WyrdError: the client's configuration or credential error.
+        """
+        ...
+
+    def publish(
+        self,
+        name: str,
+        value: object,
+        repository: str | None = None,
+        commit: str | None = None,
+    ) -> EvidenceReceipt:
+        """Publish ``value`` as the deferred input ``name`` and return the receipt.
+
+        Args:
+            name: the deferred input name.
+            value: JSON for a ``json`` input; a ``File`` or ``ArtifactRef``
+                for a ``media`` input. A ``File`` is uploaded first unless the
+                tenant already holds it.
+            repository: the repository as ``owner/name``. Omitted, it is
+                ``WYRD_REPOSITORY``, else the working directory's Git
+                ``origin``.
+            commit: the full commit SHA the evidence is about. Omitted, it is
+                ``WYRD_COMMIT``, else the checkout's ``HEAD``.
+
+        Raises:
+            WyrdError: ``WYRD_VERIFICATION_400_INPUT_INVALID`` when no source
+                names the repository or commit, or the value does not fit its
+                subscribers; ``WYRD_GITHUB_403_REPOSITORY_INACCESSIBLE`` for a
+                repository the tenant has not connected;
+                ``WYRD_VERIFICATION_409_EVIDENCE_UNMATCHED`` when no Verifier
+                subscribes; ``WYRD_VERIFICATION_409_EVIDENCE_CONFLICT`` when
+                different evidence was already accepted.
+        """
+        ...
 
 class File:
     """A local file to verify, read only when ``verify`` or ``submit`` uses it.
@@ -3865,6 +3966,7 @@ __all__ = [
     "ComparisonOperator",
     "Component",
     "Data",
+    "Evidence",
     "Execution",
     "ExecutionRoute",
     "Experiment",

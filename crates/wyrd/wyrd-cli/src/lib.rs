@@ -14,6 +14,7 @@ mod cli;
 mod client;
 pub mod declaration;
 pub mod error;
+mod evidence;
 mod execution;
 pub mod gateway;
 /// `wyrd github`: connect, check and release the tenant's GitHub App connection.

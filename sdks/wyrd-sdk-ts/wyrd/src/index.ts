@@ -51,6 +51,9 @@ import type {
   GatewayPolicySubject,
   GatewayPolicyTarget,
   GatewayPriceRate,
+  EvidenceRepository,
+  EvidenceStatus,
+  EvidenceTags,
   GithubAppIdentity,
   GithubConnectResponse,
   GithubConnectionState,
@@ -116,6 +119,7 @@ import type {
   Publication,
   PublicationPage,
   PublicationSelector,
+  PublishEvidenceResponse,
 } from "./card-types.js";
 
 import type {
@@ -145,6 +149,7 @@ const {
 type NativeBifrost = import("../index.cjs").NativeBifrost;
 type NativeCards = import("../index.cjs").NativeCards;
 type NativeOperatorConnections = import("../index.cjs").NativeOperatorConnections;
+type NativeEvidence = import("../index.cjs").NativeEvidence;
 type NativeGithubConnection = import("../index.cjs").NativeGithubConnection;
 type NativePrincipals = import("../index.cjs").NativePrincipals;
 type NativeGateway = import("../index.cjs").NativeGateway;
@@ -210,6 +215,9 @@ export type {
   GatewayPolicySubject,
   GatewayPolicyTarget,
   GatewayPriceRate,
+  EvidenceRepository,
+  EvidenceStatus,
+  EvidenceTags,
   GithubAppIdentity,
   GithubConnectResponse,
   GithubConnectionState,
@@ -253,6 +261,7 @@ export type {
   Publication,
   PublicationPage,
   PublicationSelector,
+  PublishEvidenceResponse,
   TokenAudience,
   UpdateOperatorConnectionRequest,
 };
@@ -2553,6 +2562,61 @@ export namespace verify {
       /** The file inside the Artifact, when it holds several. */
       readonly path?: string,
     ) {}
+  }
+
+  /**
+   * Publishes evidence for a Verifier input declared `deferred: true`.
+   *
+   * Every Verifier bound to the repository, or already executing for the
+   * commit, that declares the input receives the evidence, and its waiting
+   * executions resume; publishing never starts an execution.
+   */
+  export class Evidence {
+    readonly #native: NativeEvidence;
+
+    private constructor(native: NativeEvidence) {
+      this.#native = native;
+    }
+
+    /**
+     * Connect a publisher, completing any credential exchange the client requires.
+     *
+     * @param options - `client` to publish as; omitted, the ambient client is resolved.
+     * @throws {@link WyrdError} when the client cannot be resolved or its
+     * credential exchange is refused.
+     */
+    static async connect(options: ClientOptions = {}): Promise<Evidence> {
+      const connection = await wyrdClientNative(clientOf(options)).evidence();
+      return new Evidence(nativeHandle(connection.handle, connection.error));
+    }
+
+    /**
+     * Publish `value` as the deferred input `name` and return the durable receipt.
+     *
+     * @param name - The deferred input name.
+     * @param value - JSON for a `json` input; a {@link File} (uploaded unless
+     * the tenant already holds it) or {@link ArtifactRef} for a `media` input.
+     * @param source - `repository` as `owner/name`, else `WYRD_REPOSITORY`,
+     * else the working directory's Git `origin`; `commit`, the full SHA the
+     * evidence is about, else `WYRD_COMMIT`, else the checkout's `HEAD`.
+     * @returns `accepted` on first acceptance, `replayed` when every
+     * subscriber already held the same evidence.
+     * @throws {@link WyrdError} `WYRD_VERIFICATION_400_INPUT_INVALID` when no
+     * source names the repository or commit, or the value does not fit;
+     * `WYRD_GITHUB_403_REPOSITORY_INACCESSIBLE` for a repository the tenant has
+     * not connected; `WYRD_VERIFICATION_409_EVIDENCE_UNMATCHED` when no Verifier
+     * subscribes; `WYRD_VERIFICATION_409_EVIDENCE_CONFLICT` when different
+     * evidence was already accepted.
+     */
+    async publish(
+      name: string,
+      value: VerifierInput,
+      source: { readonly repository?: string; readonly commit?: string } = {},
+    ): Promise<PublishEvidenceResponse> {
+      return lifecycleValue(
+        await this.#native.publish(name, nativeInput(name, value), source.repository, source.commit),
+      );
+    }
   }
 
   /**

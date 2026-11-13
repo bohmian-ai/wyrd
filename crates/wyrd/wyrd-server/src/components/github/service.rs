@@ -176,6 +176,15 @@ impl<'a> GithubConnections<'a> {
         self.state.github.as_deref().ok_or_else(not_configured)
     }
 
+    /// The configured GitHub web host, such as `github.com`, against which
+    /// an `owner/name` slug is resolved.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::GithubNotConfigured`] without a configured App.
+    pub(crate) fn host(&self) -> Result<String, WyrdError> {
+        Ok(self.app()?.settings().host())
+    }
+
     /// Evaluate `identity_connections:write` for `operation` and stage the
     /// decision on the process audit outbox.
     ///

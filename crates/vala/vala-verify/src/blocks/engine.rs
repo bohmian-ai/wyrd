@@ -231,6 +231,13 @@ pub enum EngineError {
     /// execution may run again later.
     #[error("the verification evidence cannot be admitted now: {0}")]
     EvidenceUnavailable(String),
+    /// Every block that can run has settled and the rest read deferred
+    /// input slots whose evidence has not arrived: the named slots. No
+    /// verdict exists; the settled blocks are already recorded through
+    /// [`Checkpoints`], so the host parks the execution and runs it again
+    /// once evidence for a named slot is supplied.
+    #[error("the verification waits for deferred inputs: {0:?}")]
+    Waiting(BTreeSet<SlotName>),
 }
 
 /// The engine of one Verifier execution, composed from injected capabilities.
@@ -719,6 +726,12 @@ impl VerificationEngine {
         }
         conform(&spec, &evidence)?;
         let plan = spec.plan().map_err(EngineError::Plan)?;
+        let waiting: BTreeSet<SlotName> = spec
+            .inputs
+            .iter()
+            .filter(|(name, slot)| slot.is_deferred() && !evidence.contains_key(*name))
+            .map(|(name, _)| name.clone())
+            .collect();
         let limits = spec.limits.as_ref();
         let (ledger, evidence) = timeout_at(deadline, async {
             let (evidence, attached) = self.attach(&spec, evidence).await?;
@@ -743,7 +756,7 @@ impl VerificationEngine {
                     .map(|bound| Arc::new(Semaphore::new(bound as usize))),
                 ..self.clone()
             };
-            let ledger = attempt.drive(&spec, &evidence, deadline).await?;
+            let ledger = attempt.drive(&spec, &evidence, &waiting, deadline).await?;
             Ok::<_, EngineError>((ledger, evidence))
         })
         .await
@@ -898,18 +911,40 @@ impl VerificationEngine {
     /// does not admit is cancelled, and a settled one's disposition is
     /// recorded before anything reads it.
     ///
+    /// A block reading a `waiting` deferred slot is never released, so it and
+    /// everything downstream of it stay pending while independent blocks
+    /// run; once nothing runs and such a block is still pending, the drive
+    /// returns [`EngineError::Waiting`] naming the slots it waits for.
+    ///
     /// # Errors
     /// Returns [`EngineError::Capture`], [`EngineError::Join`],
-    /// [`EngineError::Busy`], [`EngineError::DefinitionUnavailable`], or
-    /// [`EngineError::Checkpoint`]; every running block is then dropped,
-    /// except that a capacity refusal ([`EngineError::Busy`]) first lets every
-    /// running block settle and dispatches nothing more.
+    /// [`EngineError::Busy`], [`EngineError::DefinitionUnavailable`],
+    /// [`EngineError::Checkpoint`], or [`EngineError::Waiting`]; every
+    /// running block is then dropped, except that a capacity refusal
+    /// ([`EngineError::Busy`]) first lets every running block settle and
+    /// dispatches nothing more.
     async fn drive(
         &self,
         spec: &Arc<VerifierSpec>,
         evidence: &Arc<BTreeMap<SlotName, InputDeclaration>>,
+        waiting: &BTreeSet<SlotName>,
         deadline: Instant,
     ) -> Result<Ledger, EngineError> {
+        let waited = |node: Node| -> BTreeSet<SlotName> {
+            if waiting.is_empty() {
+                return BTreeSet::new();
+            }
+            let reads = match node {
+                Node::Step(index) => spec.steps[index].input_slots(),
+                Node::Requirement(index) => spec.requirements[index].input_slots(),
+                Node::Disposition(_) => BTreeSet::new(),
+            };
+            reads
+                .into_iter()
+                .filter(|slot| waiting.contains(*slot))
+                .cloned()
+                .collect()
+        };
         let mut ledger = Ledger::default();
         let mut pending: Vec<Node> = (0..spec.steps.len())
             .map(Node::Step)
@@ -962,7 +997,7 @@ impl VerificationEngine {
                 }
                 let mut at = 0;
                 while at < pending.len() {
-                    if !ready(spec, &ledger, pending[at]) {
+                    if !ready(spec, &ledger, pending[at]) || !waited(pending[at]).is_empty() {
                         at += 1;
                         continue;
                     }
@@ -981,6 +1016,11 @@ impl VerificationEngine {
                 // than wait forever, so its gaps settle it.
                 if pending.is_empty() {
                     return Ok(ledger);
+                }
+                let blocked: BTreeSet<SlotName> =
+                    pending.iter().flat_map(|node| waited(*node)).collect();
+                if !blocked.is_empty() {
+                    return Err(EngineError::Waiting(blocked));
                 }
                 let node = pending.remove(0);
                 self.dispatching(spec, evidence, &ledger, node, &mut disposed);
@@ -2777,7 +2817,7 @@ fn decide(rule: Decide, outcomes: impl Iterator<Item = RequirementOutcome>) -> V
 /// Returns [`EngineError::InputTooLarge`] for a file above its slot's
 /// `max_bytes` and [`EngineError::InputInvalid`] for every other
 /// nonconformity, naming the slot.
-fn conform(
+pub fn conform(
     spec: &VerifierSpec,
     evidence: &BTreeMap<SlotName, InputDeclaration>,
 ) -> Result<(), EngineError> {

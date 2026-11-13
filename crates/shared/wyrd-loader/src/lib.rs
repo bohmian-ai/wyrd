@@ -28,6 +28,7 @@ pub use extract::{
 };
 pub use manifest::{ArtifactManifest, build_artifact_manifest};
 pub use parse::AuthoredCard;
+pub use repository::{head_commit, origin_remote};
 pub use upload::ArtifactUpload;
 pub use wyrd_spec::registry::{CardSubmission, RelativeArtifactPath};
 

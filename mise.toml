@@ -105,6 +105,7 @@ cargo nextest run --locked -p wyrd-server --test integration --test-threads=1 -E
 cargo nextest run --locked -p wyrd-server --test integration --test-threads=1 -E 'test(/^pg_verification_routes::/)'
 cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^declare_and_pull::/)'
 cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^repository_declaration::/)'
+cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^deferred_evidence::/)'
 """
 
 [tasks."test:principals:unit"]

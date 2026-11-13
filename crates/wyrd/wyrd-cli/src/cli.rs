@@ -6,6 +6,7 @@ use crate::auth::AuthCommand;
 use crate::card::{
     ArtifactCommand, DeclareArgs, DeleteArgs, GetArgs, LatestArgs, ListArgs, PullArgs,
 };
+use crate::evidence::EvidenceCommand;
 use crate::execution::ExecutionCommand;
 use crate::gateway::GatewayCommand;
 use crate::github::GithubCommand;
@@ -66,6 +67,9 @@ impl Cli {
                 .map_err(Into::into),
             Command::Query(command) => crate::query::dispatch(command).await,
             Command::Execution(command) => command.dispatch().await.map_err(Into::into),
+            Command::Evidence(command) => {
+                crate::evidence::dispatch(command).await.map_err(Into::into)
+            }
             Command::Gateway(command) => command.dispatch().await,
             Command::Init(args) => args.run().await.map_err(Into::into),
             Command::Server(command) => command.dispatch().await.map_err(Into::into),
@@ -115,6 +119,10 @@ pub enum Command {
     /// Inspect and cancel one queued Verifier execution: status, invocation
     /// and publication pages, publication reads, and download plans.
     Execution(ExecutionCommand),
+    /// Publish evidence for a deferred Verifier input at one repository
+    /// commit.
+    #[command(subcommand)]
+    Evidence(EvidenceCommand),
     /// Administer tenant gateway credentials, deployments, and policies.
     Gateway(GatewayCommand),
     /// Migrate, start, and configure a local Wyrd server, then hand off the

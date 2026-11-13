@@ -2096,6 +2096,48 @@ export interface DriftWindow {
 }
 
 /**
+ * Identity of one piece of published deferred evidence.
+ *
+ * Named by its source repository, commit, input name, and content, so
+ * publishing the same content again for the same source answers the
+ * same id, and every subscriber that accepted it holds the same id.
+ */
+export type EvidenceId = string;
+
+/**
+ * The connected provider repository a deferred publication is about.
+ *
+ * The stable identity a Repository Card names, not a Card reference: the
+ * provider web host and the provider's repository id.
+ */
+export interface EvidenceRepository {
+  /**
+   * Provider web host, such as `github.com`.
+   */
+  readonly host: string;
+  /**
+   * Stable provider id of the repository.
+   */
+  readonly repository_id: RepositoryId;
+}
+
+/**
+ * Whether a publication was newly accepted or an earlier acceptance
+ * replayed.
+ */
+export type EvidenceStatus = "accepted" | "replayed";
+
+/**
+ * The source tags a deferred publication matches on: only the commit.
+ */
+export interface EvidenceTags {
+  /**
+   * The exact full 40-character commit the evidence was produced from.
+   */
+  readonly commit: CommitSha;
+}
+
+/**
  * Server-issued identity of one exact Verifier execution.
  *
  * The server mints it for every real-time or queued execution. One
@@ -5403,6 +5445,44 @@ export interface PublicationSummary {
 }
 
 /**
+ * `POST /v1/verification/evidence/publish` response: the durable receipt.
+ *
+ * Returned only once every matched subscriber's acceptance is durable; it
+ * does not mean any execution ran.
+ */
+export interface PublishEvidenceResponse {
+  /**
+   * The evidence identity; the same for the same source and content.
+   */
+  readonly evidence_id: EvidenceId;
+  /**
+   * The deferred input supplied.
+   */
+  readonly input: SlotName;
+  /**
+   * How many subscribed Verifier versions hold the evidence.
+   */
+  readonly matched_subscriptions: number;
+  /**
+   * When the evidence was first accepted.
+   */
+  readonly recorded_at: string;
+  /**
+   * The connected repository the slug resolved to.
+   */
+  readonly repository: EvidenceRepository;
+  /**
+   * Whether this call accepted the evidence or replayed an earlier
+   * acceptance.
+   */
+  readonly status: EvidenceStatus;
+  /**
+   * The matched source tags.
+   */
+  readonly tags: EvidenceTags;
+}
+
+/**
  * The pull request source one queued execution was admitted for.
  *
  * Every execution of one admission shares its `generation`. A newer
@@ -7579,6 +7659,11 @@ export type TypedInputSlot = TypedInputSlotJson | TypedInputSlotMedia | TypedInp
  */
 export interface TypedInputSlotJson {
   /**
+   * Whether the value arrives later as published evidence instead of
+   * with the request. See [`InputSlot::is_deferred`].
+   */
+  readonly deferred?: boolean;
+  /**
    * JSON Schema the value must satisfy.
    */
   readonly schema?: JsonValue;
@@ -7589,6 +7674,11 @@ export interface TypedInputSlotJson {
  * A pinned file in one of the accepted formats.
  */
 export interface TypedInputSlotMedia {
+  /**
+   * Whether the file arrives later as published evidence instead of
+   * with the request. See [`InputSlot::is_deferred`].
+   */
+  readonly deferred?: boolean;
   /**
    * Accepted formats.
    */
@@ -7828,6 +7918,11 @@ export interface VerificationExecutionState {
    * Lifecycle status, independent of the verdict.
    */
   readonly status: VerificationExecutionStatus;
+  /**
+   * The deferred inputs a `waiting` execution is parked for; empty
+   * otherwise.
+   */
+  readonly waiting?: readonly SlotName[];
 }
 
 /**
@@ -7837,7 +7932,7 @@ export interface VerificationExecutionState {
  * result. `cancelled`, `timed_out`, and `errored` never carry a verdict or
  * dispatch an Operator.
  */
-export type VerificationExecutionStatus = "pending" | "running" | "retrying" | "completed" | "cancelled" | "timed_out" | "errored";
+export type VerificationExecutionStatus = "pending" | "running" | "retrying" | "waiting" | "completed" | "cancelled" | "timed_out" | "errored";
 
 /**
  * Overall verdict with its requirement judgments.

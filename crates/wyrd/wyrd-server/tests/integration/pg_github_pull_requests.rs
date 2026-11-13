@@ -14,20 +14,21 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 use wyrd_loader::{build_declaration_input, load};
 use wyrd_server::components::github::service::GithubConnections;
+use wyrd_server::verification::RuntimeLimits;
 use wyrd_spec::ids::VerificationResultId;
 use wyrd_spec::verification::VerificationVerdict;
 use wyrd_sql::queries::verifier_executions::{
     Completion, Settlement, TerminalStatus, VerifierExecutionQueue,
 };
 use wyrd_testing::github::{GithubAppMock, GithubBrowser, PullRequest};
-use wyrd_testing::{Bootstrap, WyrdTestServer};
+use wyrd_testing::{Bootstrap, WyrdTestServer, WyrdTestServerBuilder};
 
 /// The connected repository.
-const REPOSITORY: u64 = 4242;
+pub(crate) const REPOSITORY: u64 = 4242;
 /// A repository the installation reaches that the tenant did not select.
-const UNSELECTED: u64 = 4343;
+pub(crate) const UNSELECTED: u64 = 4343;
 /// The connected installation.
-const INSTALLATION: u64 = 101;
+pub(crate) const INSTALLATION: u64 = 101;
 /// The Repository binding two queued review Verifiers to pull requests:
 /// `a-review` through an inline Trigger, `z-review` through the referenced
 /// [`ON_PULL_REQUEST`] Trigger Card.
@@ -54,28 +55,28 @@ fn review_verifier(name: &str) -> String {
 
 /// One pull-request execution as the queue holds it.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
-struct Row {
+pub(crate) struct Row {
     /// The execution.
-    execution_id: Uuid,
+    pub(crate) execution_id: Uuid,
     /// Its status.
-    status: String,
+    pub(crate) status: String,
     /// Its settled error code.
-    code: Option<String>,
+    pub(crate) code: Option<String>,
     /// The frozen head commit.
-    head: String,
+    pub(crate) head: String,
     /// Whether it is reserved, not yet due.
-    reserved: bool,
+    pub(crate) reserved: bool,
 }
 
 /// A connected, declared deployment: the mock, the server, and the
 /// declaring editor's id and JWT.
-struct Deployment {
+pub(crate) struct Deployment {
     /// GitHub.
-    mock: GithubAppMock,
+    pub(crate) mock: GithubAppMock,
     /// Wyrd.
-    server: WyrdTestServer,
+    pub(crate) server: WyrdTestServer,
     /// The declaring editor's JWT.
-    jwt: String,
+    pub(crate) jwt: String,
 }
 
 impl Deployment {
@@ -92,16 +93,45 @@ impl Deployment {
     ///
     /// # Panics
     /// Panics when a step fails.
-    async fn start_with(runtime: bool) -> Self {
+    pub(crate) async fn start_with(runtime: bool) -> Self {
+        Self::launch(|builder| {
+            if runtime {
+                builder.with_verification_runtime_for_test()
+            } else {
+                builder
+            }
+        })
+        .await
+    }
+
+    /// Start the deployment as [`Self::start`] does, running queued work
+    /// under `limits`.
+    ///
+    /// # Panics
+    /// Panics when a step fails.
+    pub(crate) async fn start_limited(limits: RuntimeLimits) -> Self {
+        Self::launch(|builder| {
+            builder
+                .with_verification_runtime_for_test()
+                .with_verification_runtime_limits_for_test(limits)
+        })
+        .await
+    }
+
+    /// Start the deployment as [`Self::start`] does, its server further
+    /// configured by `configure`.
+    ///
+    /// # Panics
+    /// Panics when a step fails.
+    pub(crate) async fn launch(
+        configure: impl FnOnce(WyrdTestServerBuilder) -> WyrdTestServerBuilder,
+    ) -> Self {
         let mock = GithubAppMock::start().expect("the GitHub mock starts");
         mock.add_installation(INSTALLATION, &[(REPOSITORY, "acme/policy")]);
         mock.add_user("octo", &[INSTALLATION]);
         mock.sign_in("octo");
         mock.install_target(INSTALLATION);
-        let mut builder = WyrdTestServer::builder().with_github_app_for_test(&mock);
-        if runtime {
-            builder = builder.with_verification_runtime_for_test();
-        }
+        let builder = configure(WyrdTestServer::builder().with_github_app_for_test(&mock));
         let server = builder
             .start_bound()
             .await
@@ -147,15 +177,29 @@ impl Deployment {
     /// # Panics
     /// Panics when the declaration is refused.
     async fn declare(&self, policy: &str, key: &str) {
+        self.declare_files(
+            &[
+                ("a-review.yaml", review_verifier("a-review")),
+                ("z-review.yaml", review_verifier("z-review")),
+                ("on-pull-request.yaml", ON_PULL_REQUEST.to_owned()),
+            ],
+            policy,
+            key,
+        )
+        .await;
+    }
+
+    /// Declare the Repository `policy` from the checkout holding `files`
+    /// beside it under idempotency `key`.
+    ///
+    /// # Panics
+    /// Panics when the declaration is refused.
+    pub(crate) async fn declare_files(&self, files: &[(&str, String)], policy: &str, key: &str) {
         let dir = tempfile::tempdir().expect("checkout creates");
-        for (name, contents) in [
-            ("a-review.yaml", review_verifier("a-review")),
-            ("z-review.yaml", review_verifier("z-review")),
-            ("on-pull-request.yaml", ON_PULL_REQUEST.to_owned()),
-            ("policy.yaml", policy.to_owned()),
-        ] {
+        for (name, contents) in files {
             std::fs::write(dir.path().join(name), contents).expect("card file writes");
         }
+        std::fs::write(dir.path().join("policy.yaml"), policy).expect("policy file writes");
         let input = build_declaration_input(load(&dir.path().join("policy.yaml")).expect("loads"))
             .expect("declaration input builds");
         let body = serde_json::to_value(input.to_declare_card_request()).expect("serializes");
@@ -178,7 +222,7 @@ impl Deployment {
     ///
     /// # Panics
     /// Panics when the server was started without a bound listener.
-    fn base(&self) -> &str {
+    pub(crate) fn base(&self) -> &str {
         self.server.base_url().expect("bound")
     }
 
@@ -187,7 +231,7 @@ impl Deployment {
     ///
     /// # Panics
     /// Panics when the request cannot be sent.
-    async fn send(&self, number: u64, action: &str) -> (StatusCode, String) {
+    pub(crate) async fn send(&self, number: u64, action: &str) -> (StatusCode, String) {
         let payload = self
             .mock
             .pull_request_event(INSTALLATION, REPOSITORY, number, action);
@@ -201,7 +245,7 @@ impl Deployment {
     ///
     /// # Panics
     /// Panics when the read fails.
-    async fn rows(&self, number: u64) -> Vec<Row> {
+    pub(crate) async fn rows(&self, number: u64) -> Vec<Row> {
         let mut conn = self
             .server
             .tenant_conn_for(self.server.data_tenant_id())
@@ -252,7 +296,7 @@ impl Deployment {
     ///
     /// # Panics
     /// Panics when the read fails.
-    async fn status(&self, execution: Uuid) -> Value {
+    pub(crate) async fn status(&self, execution: Uuid) -> Value {
         let request = Request::builder()
             .uri(format!("/v1/verification/executions/{execution}"))
             .body(Body::empty())
@@ -336,7 +380,7 @@ impl Deployment {
     ///
     /// # Panics
     /// Panics when the connection cannot open.
-    async fn conn(&self) -> wyrd_sql::TenantConn<'_> {
+    pub(crate) async fn conn(&self) -> wyrd_sql::TenantConn<'_> {
         self.server
             .tenant_conn_for(self.server.data_tenant_id())
             .await
@@ -365,7 +409,7 @@ impl Deployment {
     ///
     /// # Panics
     /// Panics when work is still unfinished after a minute.
-    async fn settled(&self, numbers: std::ops::RangeInclusive<u64>) -> Vec<Row> {
+    pub(crate) async fn settled(&self, numbers: std::ops::RangeInclusive<u64>) -> Vec<Row> {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_mins(1);
         loop {
             let mut rows = Vec::new();

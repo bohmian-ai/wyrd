@@ -451,6 +451,7 @@ impl WyrdMcpHandler {
                     .map_err(wyrd_error_to_mcp)
             }
             name @ (verification::EVIDENCE
+            | verification::PUBLISH_EVIDENCE
             | verification::EXECUTE
             | verification::ENQUEUE
             | verification::CANCEL) => {

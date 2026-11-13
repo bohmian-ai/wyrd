@@ -737,6 +737,25 @@ export declare class NativeCards {
   delete(cardRef: string): Promise<NativeLifecycleResult>
 }
 
+/**
+ * Node-facing deferred evidence publisher over the shared
+ * [`Evidence`] handle; source resolution and upload stay in Rust.
+ */
+export declare class NativeEvidence {
+  /**
+   * Publishes `value` as the deferred input `name`; an omitted
+   * `repository` or `commit` resolves as `wyrd_client::verify::source`
+   * does, from `WYRD_REPOSITORY` / `WYRD_COMMIT`, then the working
+   * directory's Git checkout.
+   *
+   * # Errors
+   * Returns a napi error only when the receipt cannot be projected; a
+   * malformed value, an unresolvable source, and a server refusal are
+   * carried in the result.
+   */
+  publish(name: string, value: NativeVerifierInput, repository?: string | undefined | null, commit?: string | undefined | null): Promise<NativeLifecycleResult>
+}
+
 /** Node-facing handle of one queued Verifier execution. */
 export declare class NativeExecution {
   /** The server-issued execution ID. */
@@ -1467,6 +1486,15 @@ export declare class NativeWyrdClient {
    * exchange are carried in the result.
    */
   connectExecution(id: string): Promise<NativeSubmission>
+  /**
+   * Connects one evidence publisher that calls the server as this client,
+   * as `Evidence::connect_with` does.
+   *
+   * # Errors
+   * Never returns a napi error; a refused or unreachable exchange is
+   * carried in the result.
+   */
+  evidence(): Promise<NativeEvidenceConnection>
 }
 
 /**
@@ -1736,6 +1764,17 @@ export interface NativeConfigureOptions {
    * selects or refuses execution.
    */
   deploymentEnvironment?: string
+}
+
+/**
+ * Closed result of connecting one evidence publisher: the handle or a
+ * catalog error.
+ */
+export interface NativeEvidenceConnection {
+  /** Connected handle when the connection succeeded. */
+  handle?: NativeEvidence
+  /** Catalog failure otherwise. */
+  error?: NativeWyrdError
 }
 
 /** A local file for a `media` slot, read only when the call pins it. */

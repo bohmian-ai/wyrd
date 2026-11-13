@@ -10,6 +10,8 @@ mod action_timeline;
 /// Cards authored in code: two components, each verified by its own Verifier.
 mod authoring;
 mod declare_and_pull;
+/// CI publishes a deferred input; the waiting pull request execution resumes.
+mod deferred_evidence;
 /// Queued work, acknowledged only once durably admitted.
 mod durable_verifier_work;
 mod gateway_admin;

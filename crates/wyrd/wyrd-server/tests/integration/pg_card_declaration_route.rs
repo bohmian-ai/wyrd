@@ -1935,6 +1935,156 @@ async fn registration_derives_queue_only_from_publishing_agents_and_pull_request
     server.shutdown().await.expect("test server shuts down");
 }
 
+/// Registration derives `queue_only` from a deferred input, and direct
+/// verification refuses such a Verifier before any step.
+///
+/// A `json` or `media` slot declaring `deferred: true` makes its Verifier
+/// queue-only even when the author sent `false`; `deferred: false` or an
+/// omitted flag does not, nor does an author's own `queue_only: true`, and
+/// its stored spec omits both fields. A direct verify of the deferred
+/// Verifier answers `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` because it is
+/// queue-only, while the ordinary one with the same inputs still judges
+/// directly.
+///
+/// # Panics
+/// Panics when the server fails to start, a declaration is refused, a stored
+/// spec carries another `queue_only`, or a direct verify answers otherwise.
+#[tokio::test(flavor = "current_thread")]
+async fn registration_derives_queue_only_from_deferred_inputs() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("deferred-writer", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let subject = seed_dependency(
+        &server,
+        server.data_tenant_id(),
+        "deferred-subject",
+        "active",
+    )
+    .await;
+    let verifier = |slot: Value, claimed: bool| {
+        json!({
+            "inputs": { "answer": slot },
+            "requirements": [{
+                "id": "answer-is-one",
+                "statement": "The answer is one.",
+                "check": { "kind": "assert", "path": "inputs.answer", "operator": "equals", "expected": 1 }
+            }],
+            "queue_only": claimed,
+        })
+    };
+    let cases = [
+        (
+            "deferred-json",
+            json!({ "type": "json", "deferred": true }),
+            false,
+            true,
+        ),
+        (
+            "deferred-media",
+            json!({ "type": "media", "formats": ["json"], "deferred": true }),
+            false,
+            true,
+        ),
+        (
+            "deferred-false",
+            json!({ "type": "json", "deferred": false }),
+            false,
+            false,
+        ),
+        ("deferred-omitted", json!({ "type": "json" }), false, false),
+        ("claimed-queue-only", json!({ "type": "json" }), true, false),
+    ];
+    let mut registered = Vec::new();
+    for (name, slot, claimed, expected) in cases {
+        let (status, body) = declare_json(
+            &server,
+            &jwt,
+            name,
+            json!([submission_body(
+                "Verifier",
+                name,
+                Some("1.0.0"),
+                verifier(slot, claimed)
+            )]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{name}: {body}");
+        let uid: CardUid = serde_json::from_value(body["outcomes"][0]["card_ref"]["uid"].clone())
+            .unwrap_or_else(|error| panic!("{name}: no registered uid ({error}) in {body}"));
+        let mut conn = server
+            .tenant_conn_for(server.data_tenant_id())
+            .await
+            .expect("tenant connection opens");
+        let Spec::Verifier(stored) = get_card_by_uid(&mut conn, &uid)
+            .await
+            .expect("the Verifier loads")
+            .spec
+        else {
+            panic!("{name}: the stored Card is not a Verifier");
+        };
+        assert_eq!(stored.queue_only, expected, "{name}");
+        if !expected {
+            let stored = serde_json::to_value(&stored).expect("the spec serializes");
+            assert!(stored["queue_only"].is_null(), "{name}: {stored}");
+            assert!(
+                stored["inputs"]["answer"]["deferred"].is_null(),
+                "{name}: {stored}"
+            );
+        }
+        registered.push((name, uid, expected));
+    }
+
+    for (name, uid, queue_only) in registered {
+        let request = json!({
+            "verifier_card_uid": uid,
+            "card_uid": subject,
+            "inputs": { "answer": { "kind": "json", "value": 1 } },
+        });
+        let response = server
+            .oneshot_authenticated(
+                &jwt,
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/verification/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request.to_string()))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("direct verify responds");
+        let status = response.status();
+        let body = response_json(response).await;
+        if queue_only {
+            assert_eq!(
+                (status, body["code"].as_str()),
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Some("WYRD_VERIFICATION_422_INPUT_UNSUPPORTED")
+                ),
+                "{name}: {body}"
+            );
+            assert!(
+                body["detail"]
+                    .as_str()
+                    .is_some_and(|detail| detail.contains("runs only as queued work")),
+                "{name}: refused as queue-only, not for its value: {body}"
+            );
+            assert!(body.get("outcome").is_none(), "{name}: no step ran: {body}");
+        } else {
+            assert_eq!(status, StatusCode::OK, "{name}: {body}");
+            assert_eq!(body["outcome"]["verdict"], "passed", "{name}: {body}");
+        }
+    }
+    server.shutdown().await.expect("test server shuts down");
+}
+
 /// The authenticated declaration route enforces the shared Verifier contract.
 ///
 /// Through the public HTTP route, with real declared targets behind every

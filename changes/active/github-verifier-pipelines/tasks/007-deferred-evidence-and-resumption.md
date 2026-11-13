@@ -42,15 +42,40 @@ step, and unchanged ordinary-input eligibility. Task 010-R1 implements publish
 detection only; this task owns the deferred-input extension and its proof.
 
 Publishers use `wyrd evidence publish ci_results --file results.json` or
-`client.evidence.publish(name, value, repository=None, commit=None)`. CLI/SDK infer
-remote and commit from Git; explicit source overrides support absent checkout or
-CI merge revision. Resolve remote through server verification of stable connected
-host/repository_id. Raw HTTP is the approved
-`POST /v1/verification/evidence/publish` request, matching tenant + repository +
-commit + input. The publisher does not supply a Repository policy version,
-Verifier ID, execution ID, group_id or retry key; tags are limited to commit.
-Internal consumer matching still uses accepted execution context. Git metadata
-grants no permission.
+`client.evidence.publish(name, value, repository=None, commit=None)` from any
+environment: a developer machine, a script, or any CI system. Wyrd is
+CI-agnostic: no client or server code detects, names or reads the variables of
+a particular CI provider, and nothing requires a Git checkout or a `git`
+binary. Raw HTTP is `POST /v1/verification/evidence/publish`, matching tenant +
+repository + commit + input. The publisher does not supply a Repository policy
+version, Verifier ID, execution ID, group_id or retry key; tags are limited to
+commit. Internal consumer matching still uses accepted execution context.
+Client-supplied source identity grants no permission.
+
+### Revision — repository slug and CI-agnostic source resolution
+
+Decided with the maintainer during implementation, following the conventional
+uploader shape (the client names the repository by slug, the server resolves
+it). This replaces the request's `repository: {host, repository_id}`; the
+receipt still returns the resolved `{host, repository_id}`.
+
+- Wire: the request takes `repository: "owner/name"`. The server resolves the
+  slug, ignoring case, among the tenant's selected repositories on the
+  configured host through the existing `GithubConnections::verify_repository`
+  remote path; an unselected or unknown slug is
+  `WYRD_GITHUB_403_REPOSITORY_INACCESSIBLE`. Matching and custody use only the
+  resolved stable id, so a later rename does not affect accepted evidence.
+  Publishers need no connection-read permission.
+- CLI/SDK resolve `repository` and `commit` independently; the first source
+  that supplies a value wins:
+  1. explicit `--repository`/`--commit` (SDK `repository=`/`commit=`);
+  2. `WYRD_REPOSITORY`/`WYRD_COMMIT`, which the caller sets however its
+     environment provides the values;
+  3. a Git checkout when one is present: `origin`'s `owner/name` and the
+     `HEAD` commit, read from `.git` without running `git`.
+  A value none of these supplies is a local input error naming the flag and
+  the variable. The caller decides which commit the evidence is about; Wyrd
+  never guesses a different one.
 
 ## Selected custody and dependency flow
 
@@ -131,12 +156,12 @@ is held, then the retired delivery/lease after ACK; publish and resume the
 same ExecutionId with settled work/spend/retries/deadline unchanged. Supersede
 through task 006 or revoke while parked; old acceptance cannot release work.
 
-**AC-007 (evidence/park):** Controlled crash before/after upload completion,
-publication ACK, pending checkpoint ACK, retirement, continuation commit and
-recovery read. After positive receipt observe exact accepted evidence and owed
-continuation without producer replay; lost notifications are repaired. Unavailable
-canonical state never becomes empty/fresh state. Assert through public journey
-where observable, and real-dependency integration for the exact crash fences.
+**AC-007 (evidence/park):** Restart while an execution waits for evidence. After
+a positive receipt, the accepted evidence survives and the same execution
+finishes without producer replay; a publication whose outcome is unknown is
+retried; evidence published while its consumer runs still reaches it.
+Unavailable canonical state never becomes empty/fresh state. Prove with ordinary
+restart, retry and refusal journeys; no test-only crash hooks.
 
 **AC-011 (evidence/wait):** Follow source-inference/override and publication docs,
 inspect waiting state and durable receipt using shipped surfaces.
@@ -148,3 +173,48 @@ owners via `mise run test:bifrost:journey:server`, `mise run test:sql` and the
 affected `test:vala` lane; tier 3: reference/slot/schema/matching branches. Add
 new focused commands only after tests exist. Run README contract/type/boundary
 checks. Task 008 owns the decision-specific half of AC-006/007.
+
+## Obligations
+
+| ID | Promise (source) | Open cases |
+|---|---|---|
+| REQ-008 | `deferred: true` only on json/media slots; registration derives `queue_only`, users cannot set it, direct verify refuses; only consumers of a missing input wait (§Input, §Revision — queue_only) | none |
+| REQ-009 | Publish by tenant + repository slug + commit + input with `verifier:run`; validated against subscribers; matched, retained, replayed or refused; receipt only after the Bifrost ACK; publication alone starts nothing (§Input, §Selected custody, AC-005) | none |
+| REQ-011 | A parked execution releases compute, keeps its claim until the park ACK, resumes the same ExecutionId with work, attempts, Agent budget and deadline kept; supersession, revocation and deadline fence it (§Selected custody, AC-006) | none; maintainer decision: a park refunds its attempt (waiting is not failure), and a resume spends one |
+| REQ-016 | CI-agnostic source resolution; HTTP, client, three SDKs, CLI (`--file`), MCP, waiting inspection, docs, upload-based example, architecture (§Revision — slug, §Outputs, AC-011) | none; maintainer decision: one `--file` flag, a `.json` file or stdin sent inline and any other file uploaded (a media slot accepting `json` cannot be fed from the CLI) |
+| INV-004 | Unavailable custody is never read as absent or fresh (spec INV-004) | none; maintainer decision: the evidence read path rests on source inspection plus the publish-path journey, no test-only hook |
+| AC-007 | Restart while an execution waits for evidence: accepted evidence survives and the same execution finishes; unknown publication outcomes retry; evidence published while its consumer runs reaches it (spec AC-007, revised by the maintainer to drop crash-point enumeration) | none |
+
+## Evidence
+
+| Obligation | Implementation | Proof | Verification | Result |
+|---|---|---|---|---|
+| REQ-008 | `wyrd-spec` `InputSlot::is_deferred`; registry derivation; `vala-verify` engine wait | `card/verifier/mod.rs` `only_json_and_media_slots_can_be_deferred`; `pg_card_declaration_route.rs:1873`; `engine/tests.rs:4256` | PASS | PASS |
+| REQ-009 | `wyrd-server/src/verification/evidence.rs`; `bifrost.verification.evidence` (no migration) | `pg_deferred_evidence.rs` `publication_is_matched_retained_and_resumes_the_waiting_execution` (other tenant 404, planned-but-incomplete upload 400, zero executions after publication, pin 1.0.1 consumes), `unacknowledged_publication_is_unavailable_and_its_retry_resumes`; Rust SDK `deferred_evidence.rs:224` | PASS | PASS |
+| REQ-011 | `runner.rs` park branch; evidence wake; queue fences | `pg_deferred_evidence.rs` main test, `parked_executions_end_by_supersession_and_deadline`, `a_resumed_execution_keeps_its_admission_deadline`, `evidence_published_while_its_consumer_runs_reaches_it`, `a_parked_execution_releases_compute_before_its_park_is_acknowledged`, `lost_repository_access_fences_a_parked_execution`; `pg_verification_runtime.rs:4155`; `engine/tests.rs` `deferred_inputs_hold_only_their_consumers_until_supplied` (settled work not replayed), `a_resumed_execution_keeps_its_spent_agent_budget` (fails when the reseed is set to 0) | PASS | PASS |
+| REQ-016 | `wyrd_client::verify::Evidence`; SDKs; `wyrd evidence publish`; `verification.publish_evidence`; docs guide; architecture | `wyrd-client/src/verify/evidence.rs:227` (explicit precedence; each missing value names flag and variable); Rust/Python/TS journeys; `github_journey.rs` `ci_publishes_deferred_evidence_through_the_cli` (`--file results.json`), `ci_uploads_a_report_file_through_the_guide_script` (`examples/publish-deferred-evidence/publish.sh`); `wyrd-cli/src/evidence.rs` `publish_takes_one_file`, `json_files_are_sent_inline`; `wyrd-mcp/tests/bifrost/mcp/github.rs:383` | PASS; `codegen:check`, `docs:check`, `check:examples` PASS | PASS |
+| INV-004 | `evidence.rs:180` fenced-but-invisible → unavailable; `runner.rs:827,973,979,1714` an unreadable evidence read defers or retries as `evidence_unavailable`, never absent (source inspection) | `pg_deferred_evidence.rs` `unacknowledged_publication_is_unavailable_and_its_retry_resumes` | PASS | PASS |
+| AC-007 | — | `pg_deferred_evidence.rs` `a_waiting_execution_finishes_after_a_restart` (runtime stopped while waiting, evidence accepted with no runtime, fresh runtime passes the same execution, one attempt spent), `unacknowledged_publication_is_unavailable_and_its_retry_resumes`, `evidence_published_while_its_consumer_runs_reaches_it` | PASS | PASS |
+
+**Commands:** `mise run fmt`, `lints`, `py:lints`, `py:typecheck`, `ts:lints`,
+`ts:typecheck`, `ts:napi:check`, `codegen:check`, `check:deps`, `docs:check`,
+`git diff --check`; Postgres tests through
+`scripts/postgres/with-test-postgres.sh` after `db:migrate:all:inner`, using
+`cargo nextest run --locked` with exact selectors for every test named above. `test:sql` and `test:bifrost:journey:server` pass; `vala-verify` + `vala-bifrost-redux` lib under test Postgres: 1010/1010 pass.
+
+**Process exceptions (written after code, no RED):** REQ-008a spec/registration,
+REQ-008b engine test, publish route/client/CLI/MCP tests, the three SDK
+journeys, wake on replay, REQ-009b refusal cases, the media journey and the
+REQ-011a claim test. These tests pin existing behavior.
+
+**Diagnoses:**
+- `recorded_at` replay mismatch. Cause: the receipt carried nanoseconds while Bifrost stores microseconds. Fix site: truncate at receipt creation.
+- Completed status was read before its `result` landed. Cause: the status and the Bifrost result become visible separately. Fix site: the test helper waits for both.
+- REQ-011a, reverted. I read "no execution permit remains attached to that ACK" as requiring the claim slot to be freed, and freed it early (c71be4283). That conflicts with task 010: the claim permit bounds the whole claim lifetime and is not compute. This task's text also says custody "keeps the claim permit". Reverted in 798df3e1d and replaced by the claim-kept test (0ba344d30).
+- The webhook-based claim test returned 504. Cause: the second PR's admission write queued behind the stalled events write in Scribe. Fix site: a direct submit in the test.
+- A lease-check false negative. Cause: `lease_token` stays set after release by design. Fix site: assert `lease_expires_at`.
+
+- Running-consumer journey answered 503 (first attempt). Symptom: holding the park's `execution_events` write to keep the consumer `running` made the publish answer `WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE`. Cause: Scribe queues the `bifrost.verification.evidence` write behind the held write, so a Scribe stall cannot hold a consumer running while evidence lands. Fix site: none in product; the test now holds the consumer running with the existing `EngineScript` hold instead of a Scribe stall, then lets the real engine resume.
+- Wrong-tenant expectation. A tenant with no GitHub connection is refused with the existing `WYRD_GITHUB_404_NOT_CONNECTED`, not 403; the test expectation was corrected.
+
+**Non-goals confirmed:** no Trigger, wait action, broker, new permission category, new PostgreSQL table, subscription API, or CI-provider detection; decision waits are left to task 008.

@@ -1,6 +1,6 @@
 //! HTTP projection of the Verification control plane.
 //!
-//! Evidence upload planning, direct execution, background submission,
+//! Evidence upload planning, deferred evidence publication, direct execution, background submission,
 //! execution status and details, invocation and publication inspection,
 //! publication download planning, cancellation, and binding status. Evidence bytes travel
 //! through the shared storage upload lifecycle. Each handler parses its
@@ -19,8 +19,8 @@ use wyrd_spec::storage::DownloadInitResponse;
 use wyrd_spec::verification::execution::{
     CancelExecutionResponse, EnqueueVerificationResponse, EvidencePlanRequest,
     EvidencePlanResponse, ExecutionPageQuery, InvocationPage, Publication, PublicationPage,
-    PublicationSelector, VerificationDetails, VerificationExecutionState, VerificationRequest,
-    VerificationResult,
+    PublicationSelector, PublishEvidenceRequest, PublishEvidenceResponse, VerificationDetails,
+    VerificationExecutionState, VerificationRequest, VerificationResult,
 };
 use wyrd_spec::verification::{
     MAX_EXECUTE_BODY_BYTES, PublicationName, TaskId, VerificationBindingStatus,
@@ -42,6 +42,7 @@ pub fn verification_router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(get_binding))
         .routes(routes!(evidence))
+        .routes(routes!(publish_evidence))
         .routes(routes!(execute))
         .routes(routes!(enqueue))
         .routes(routes!(get_execution))
@@ -157,6 +158,68 @@ async fn evidence(
     Ok(Json(
         VerificationControl::new(&state)
             .evidence(&caller, &request)
+            .await?,
+    ))
+}
+
+/// Publish deferred evidence for one connected repository commit and return
+/// its durable receipt.
+///
+/// Every Verifier bound to the repository, or admitted for the commit, that
+/// declares `input` with `deferred: true` accepts the value; a waiting
+/// execution resumes. Upload a File through `POST /v1/verification/evidence`
+/// first. Publishing never starts an execution.
+///
+/// # Errors
+/// Returns a stable Wyrd error when the body is malformed or the value does
+/// not conform, the caller lacks `verifier:run`, the repository is not
+/// connected, no Verifier subscribes, different evidence was already
+/// accepted, or acceptance cannot be acknowledged now.
+#[utoipa::path(
+    post,
+    path = "/verification/evidence/publish",
+    request_body = PublishEvidenceRequest,
+    responses(
+        (status = 200, description = "The evidence is durably accepted (`accepted`) or was \
+          already (`replayed`)", body = PublishEvidenceResponse),
+        (status = 400, description = "The body is malformed, the commit is abbreviated, the \
+          File is not a completed upload, or the value does not conform to a subscriber's slot \
+          (WYRD_VERIFICATION_400_INPUT_INVALID)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks verifier:run on every subscriber, or \
+          the repository is not selected for the tenant's GitHub installation \
+          (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_GITHUB_403_REPOSITORY_INACCESSIBLE)",
+          body = WyrdProblem),
+        (status = 404, description = "The tenant has no GitHub connection \
+          (WYRD_GITHUB_404_NOT_CONNECTED)", body = WyrdProblem),
+        (status = 409, description = "No Verifier subscribes to the input, so nothing was \
+          retained, or different evidence was already accepted \
+          (WYRD_VERIFICATION_409_EVIDENCE_UNMATCHED, WYRD_VERIFICATION_409_EVIDENCE_CONFLICT)",
+          body = WyrdProblem),
+        (status = 413, description = "The body or value exceeds a bound \
+          (WYRD_VERIFICATION_413_INPUT_TOO_LARGE)", body = WyrdProblem),
+        (status = 503, description = "Acceptance cannot be decided or acknowledged now; publish \
+          again (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE, \
+          WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, WYRD_GITHUB_503_NOT_CONFIGURED)",
+          body = WyrdProblem)
+    ),
+    tag = "Verification"
+)]
+#[tracing::instrument(
+    skip(state, caller, body),
+    fields(operation = "verification.evidence.publish")
+)]
+async fn publish_evidence(
+    State(state): State<AppState>,
+    caller: Caller,
+    body: Body,
+) -> Result<Json<PublishEvidenceResponse>, WyrdErrorResponse> {
+    let request: PublishEvidenceRequest = decode_body(body).await?;
+    Ok(Json(
+        VerificationControl::new(&state)
+            .publish_evidence(&caller, request)
             .await?,
     ))
 }

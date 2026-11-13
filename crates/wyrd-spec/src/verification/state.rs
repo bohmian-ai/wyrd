@@ -10,6 +10,8 @@
 //! credentials, and model conversations are never part of it, and file bytes
 //! stay in verification File storage.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -18,7 +20,7 @@ use super::TaskId;
 use super::execution::{ExecutedOutcome, InvocationSettlement, Producer, Publication, Speculation};
 use super::{VerificationError, VerificationExecutionStatus};
 use crate::auth::Sha256Hex;
-use crate::ids::{CardUid, GroupId, VerificationResultId};
+use crate::ids::{CardUid, EvidenceId, GroupId, SlotName, VerificationResultId};
 use crate::reference::CardRef;
 use crate::storage::StoredObjectRef;
 
@@ -29,8 +31,13 @@ use crate::storage::StoredObjectRef;
 /// Format 2 added the recorded identity and the terminal failure; format 3
 /// added the control records of fanout, repetition, and speculation, so a
 /// worker that cannot honour them refuses the state; format 1 never left
-/// development and is refused.
-pub const EXECUTION_STATE_FORMAT: u32 = 3;
+/// development and is refused. Format 4 added the deferred inputs a parked
+/// execution waits for and the deferred evidence it accepted; a format 3
+/// state is a format 4 state holding neither, so it still decodes.
+pub const EXECUTION_STATE_FORMAT: u32 = 4;
+
+/// The oldest stored format that decodes as [`EXECUTION_STATE_FORMAT`].
+const OLDEST_READABLE_FORMAT: u32 = 3;
 
 /// The complete recoverable state of one execution at one accepted revision.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -62,6 +69,14 @@ pub struct ExecutionState {
     /// recorded beside a [`Self::terminal`] outcome.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<TerminalFailure>,
+    /// The deferred inputs the execution was parked waiting for when no
+    /// runnable step remained; empty while it runs or once it decided.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub waiting: BTreeSet<SlotName>,
+    /// The published deferred evidence each deferred input was supplied
+    /// from, once accepted; a resumption reads exactly this evidence.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub evidence: BTreeMap<SlotName, EvidenceId>,
 }
 
 /// The exact identities an execution was accepted for.
@@ -208,7 +223,7 @@ pub struct TerminalSelection {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ExecutionStateError {
     /// The state names a format this release does not read.
-    #[error("execution state format {found} is not format {EXECUTION_STATE_FORMAT}")]
+    #[error("execution state format {found} is not a format this release reads")]
     Incompatible {
         /// The stored format.
         found: u64,
@@ -229,7 +244,8 @@ impl ExecutionState {
     }
 
     /// Decode a stored state, refusing any format other than
-    /// [`EXECUTION_STATE_FORMAT`] before reading the rest.
+    /// [`EXECUTION_STATE_FORMAT`] or the format 3 it extends before reading
+    /// the rest; a format 3 state decodes as the current format.
     ///
     /// # Errors
     /// Returns [`ExecutionStateError::Incompatible`] for another or missing
@@ -237,11 +253,14 @@ impl ExecutionState {
     /// not decode.
     pub fn decode(value: Value) -> Result<Self, ExecutionStateError> {
         let found = value.get("format").and_then(Value::as_u64).unwrap_or(0);
-        if found != u64::from(EXECUTION_STATE_FORMAT) {
+        if !(u64::from(OLDEST_READABLE_FORMAT)..=u64::from(EXECUTION_STATE_FORMAT)).contains(&found)
+        {
             return Err(ExecutionStateError::Incompatible { found });
         }
-        serde_json::from_value(value)
-            .map_err(|error| ExecutionStateError::Malformed(error.to_string()))
+        let mut state: Self = serde_json::from_value(value)
+            .map_err(|error| ExecutionStateError::Malformed(error.to_string()))?;
+        state.format = EXECUTION_STATE_FORMAT;
+        Ok(state)
     }
 }
 
@@ -274,8 +293,8 @@ mod tests {
         assert_eq!(state.speculation(&reader), Speculation::None);
     }
 
-    /// Only [`EXECUTION_STATE_FORMAT`] decodes: a newer, missing, or
-    /// earlier format is incompatible and a state that does not decode is
+    /// Only [`EXECUTION_STATE_FORMAT`] and format 3 decode, format 3 as the
+    /// current format: a newer, missing, or earlier format is incompatible and a state that does not decode is
     /// malformed, never fresh.
     ///
     /// # Panics
@@ -296,7 +315,12 @@ mod tests {
             ExecutionState::decode(serde_json::json!({})),
             Err(ExecutionStateError::Incompatible { found: 0 })
         ));
-        for earlier in 1..EXECUTION_STATE_FORMAT {
+        let previous = serde_json::json!({ "format": 3, "sequence": 0, "invocations": [], "publications": [] });
+        assert_eq!(
+            ExecutionState::decode(previous),
+            Ok(ExecutionState::fresh())
+        );
+        for earlier in 1..super::OLDEST_READABLE_FORMAT {
             assert_eq!(
                 ExecutionState::decode(serde_json::json!({ "format": earlier, "sequence": 0 })),
                 Err(ExecutionStateError::Incompatible {

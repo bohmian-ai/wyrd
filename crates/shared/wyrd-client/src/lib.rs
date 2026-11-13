@@ -41,3 +41,4 @@ pub use global_config::GlobalConfig;
 pub use operator_connections::OperatorConnections;
 pub use platform::Platform;
 pub use principals::Principals;
+pub use verify::Evidence;

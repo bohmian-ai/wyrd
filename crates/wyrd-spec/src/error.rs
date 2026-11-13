@@ -2240,6 +2240,36 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: Value,
     },
+    /// No Verifier subscribes to the published deferred input for the
+    /// repository; nothing was retained.
+    #[error("[WYRD_VERIFICATION_409_EVIDENCE_UNMATCHED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_409_EVIDENCE_UNMATCHED",
+        status = 409,
+        title = "Verification evidence unmatched",
+        remediation = "Check the input name and repository: publish only an input a Verifier bound to the connected repository declares with deferred: true. Nothing was retained, so publish again once a binding subscribes."
+    )]
+    VerificationEvidenceUnmatched {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// Different evidence was already accepted for the same repository,
+    /// commit, and input.
+    #[error("[WYRD_VERIFICATION_409_EVIDENCE_CONFLICT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_409_EVIDENCE_CONFLICT",
+        status = 409,
+        title = "Verification evidence conflict",
+        remediation = "Accepted evidence is never replaced: republish the original content to replay its receipt, or publish the new content for a new commit."
+    )]
+    VerificationEvidenceConflict {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
     /// An agent check's provider failed after the check's own retry budget.
     #[error("[WYRD_VERIFICATION_502_DEPENDENCY_FAILED] {message}")]
     #[wyrd_error(
@@ -4207,6 +4237,8 @@ impl WyrdError {
             | Self::VerificationSnapshotIncomplete { message, details }
             | Self::VerificationInputIncompatible { message, details }
             | Self::VerificationInputUnsupported { message, details }
+            | Self::VerificationEvidenceUnmatched { message, details }
+            | Self::VerificationEvidenceConflict { message, details }
             | Self::VerificationDependencyFailed { message, details }
             | Self::VerificationExecutionTimedOut { message, details }
             | Self::VerificationStagingFull { message, details }

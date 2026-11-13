@@ -157,6 +157,16 @@ survives claim, retry, and restart, and is not refreshed by later grant
 changes; every protected downstream action still checks its own permission
 against it.
 
+Publishing deferred evidence adds no permission and no authority to the
+execution that consumes it. The publisher needs current `verifier:run` on
+each subscribing Verifier and its subject; a subscriber it may not run is
+skipped, and none refuses the publish before anything is retained. The
+repository must be one the tenant's connected installation reaches, resolved
+by the server from `owner/name`; the commit, branch, and any other Git
+metadata grant nothing. A parked execution resumes under its own accepted
+authority, never the publisher's, and losing repository access cancels it
+`repository_access_lost`.
+
 A tenant administrator is created once, during tenant provisioning, and is the
 tenant's headless root of trust: it holds credentials and roles, federates no
 identity by itself, and coexists with any human administrator the tenant later

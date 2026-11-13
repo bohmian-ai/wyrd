@@ -1565,7 +1565,8 @@ spec:
 
 `queue_only` is derived when the Verifier registers and is stored with its
 spec: `true` when a step or check Agent, inline or a referenced registered
-Agent, declares the `publish` tool, else `false`. A value an author sends is
+Agent, declares the `publish` tool, or a slot declares `deferred: true`, else
+`false`. A value an author sends is
 replaced, never honored. Later queued-only forms extend this derivation at
 registration; execution never re-infers it.
 
@@ -1575,6 +1576,39 @@ registration; execution never re-infers it.
 | `media` | One file pinned by SHA-256, with accepted `formats` and optional lower `max_bytes` |
 | `trace` | A trace ID resolved through tenant-scoped trace reads |
 | `samples` | Named `features` (or metric names) recorded for a scheduled window |
+
+A `json` or `media` slot may declare `deferred: true` (default `false`; other
+kinds refuse it): its value is not supplied when the execution starts but
+published later for one connected repository's commit with
+`POST /v1/verification/evidence/publish` (`repository` as `owner/name`,
+`tags.commit`, `input`, `value`). References alone make a step or check a
+consumer of the slot, so a consumer and its dependents wait while independent
+steps run; there is no wait action, Trigger, or `depends_on` for it. When no
+runnable work remains the execution reports `waiting` with the slot names,
+releases its workspace, Python, and model capacity, keeps its claim and lease
+until Scribe acknowledges the parked revision, and only then releases its
+queue row with the attempt refunded and
+the original deadline kept. Publication is matched by tenant, repository,
+commit, and input to every active binding of that repository and every
+nonterminal execution of that commit whose Verifier declares the input as
+deferred; each subscribed exact Verifier version accepts the evidence once,
+and the publish answers only after every acceptance is durable. No subscriber
+refuses `WYRD_VERIFICATION_409_EVIDENCE_UNMATCHED` and retains nothing;
+identical content replays its receipt (`status: replayed`) and different
+content for the same source refuses `WYRD_VERIFICATION_409_EVIDENCE_CONFLICT`.
+Each publication makes its waiting consumers due through the existing queue,
+replays included, and a parked claim rechecks accepted evidence at most a
+minute later, so a lost wake is repaired. Evidence accepted before an
+execution exists is read when it starts. Publishing never starts an execution
+or reopens a settled one; supersession, revoked repository access
+(`repository_access_lost`), and the deadline fence a parked execution, and
+evidence that never arrives ends it `timed_out`, never passed. Publishing needs
+`verifier:run` on a subscribing Verifier and its subject, the permission
+`submit` checks; a subscriber the caller may not run is skipped, none refuses
+the publish, and Git metadata grants nothing. The repository and commit come from the caller:
+SDKs and `wyrd evidence publish` take an explicit argument, else
+`WYRD_REPOSITORY` / `WYRD_COMMIT`, else the working directory's `.git`, and
+detect no CI system.
 
 Every declared slot uses the same omission rule: missing evidence makes checks
 that need it inconclusive, never a passing absence assertion or an intentional

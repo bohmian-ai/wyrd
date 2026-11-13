@@ -127,6 +127,10 @@ pub enum VerificationExecutionStatus {
     Running,
     /// A retryable failure is waiting for its next attempt.
     Retrying,
+    /// Parked: every runnable step settled and the rest wait for published
+    /// deferred inputs. Nonterminal; reported by inspection only, never
+    /// stored as a queue status.
+    Waiting,
     /// Executed and produced an acknowledged result.
     Completed,
     /// Stopped before producing a result.

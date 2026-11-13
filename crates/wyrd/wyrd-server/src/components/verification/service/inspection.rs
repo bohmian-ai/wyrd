@@ -232,8 +232,9 @@ pub(super) struct Retained {
 
 impl Retained {
     /// The execution's status: the outcome or failure its state retained,
-    /// else its queue status, else `running`, since a state with neither and
-    /// no queue row belongs to direct work still in flight.
+    /// else `waiting` for a queued execution parked on deferred inputs, else
+    /// its queue status, else `running`, since a state with neither and no
+    /// queue row belongs to direct work still in flight.
     pub(super) fn status(&self) -> VerificationExecutionStatus {
         if self.state.terminal.is_some() || self.direct.is_some() {
             return VerificationExecutionStatus::Completed;
@@ -243,9 +244,28 @@ impl Retained {
         }
         self.queued
             .as_ref()
-            .map_or(VerificationExecutionStatus::Running, |queued| {
-                queued.state.status
-            })
+            .map_or(
+                VerificationExecutionStatus::Running,
+                |queued| match queued.state.status {
+                    VerificationExecutionStatus::Pending
+                    | VerificationExecutionStatus::Retrying
+                        if !self.state.waiting.is_empty() =>
+                    {
+                        VerificationExecutionStatus::Waiting
+                    }
+                    status => status,
+                },
+            )
+    }
+
+    /// The deferred inputs a `waiting` execution is parked for; empty in
+    /// every other status.
+    pub(super) fn waiting(&self) -> std::collections::BTreeSet<wyrd_spec::ids::SlotName> {
+        if self.status() == VerificationExecutionStatus::Waiting {
+            self.state.waiting.clone()
+        } else {
+            std::collections::BTreeSet::new()
+        }
     }
 
     /// The execution's exact identity, from its state or direct result.

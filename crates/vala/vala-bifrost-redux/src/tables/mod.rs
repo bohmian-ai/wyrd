@@ -47,7 +47,7 @@ pub use metrics::{PointsTable, SeriesTable};
 pub use storage::ObjectsTable;
 pub use traces::SpansTable;
 pub use verification::{
-    ExecutionEventsTable, ExecutionInputsTable, ExecutionOutputsTable, ResultsTable,
+    EvidenceTable, ExecutionEventsTable, ExecutionInputsTable, ExecutionOutputsTable, ResultsTable,
 };
 
 /// Errors from pure table schema and projection operations.
@@ -1282,8 +1282,8 @@ const fn definition<T: DomainTable>() -> BuiltinTableDefinition {
     }
 }
 
-/// The single canonical list of twelve server-owned built-in tables.
-pub static BUILTIN_TABLES: [BuiltinTableDefinition; 12] = [
+/// The single canonical list of thirteen server-owned built-in tables.
+pub static BUILTIN_TABLES: [BuiltinTableDefinition; 13] = [
     definition::<SpansTable>(),
     definition::<PointsTable>(),
     definition::<SeriesTable>(),
@@ -1293,6 +1293,7 @@ pub static BUILTIN_TABLES: [BuiltinTableDefinition; 12] = [
     definition::<ExecutionInputsTable>(),
     definition::<ExecutionOutputsTable>(),
     definition::<ExecutionEventsTable>(),
+    definition::<EvidenceTable>(),
     definition::<AuditLogTable>(),
     definition::<CallsTable>(),
     definition::<ObjectsTable>(),
@@ -1300,7 +1301,7 @@ pub static BUILTIN_TABLES: [BuiltinTableDefinition; 12] = [
 
 /// Return all immutable built-in definitions.
 #[must_use]
-pub const fn builtin_tables() -> &'static [BuiltinTableDefinition; 12] {
+pub const fn builtin_tables() -> &'static [BuiltinTableDefinition; 13] {
     &BUILTIN_TABLES
 }
 
@@ -1312,7 +1313,7 @@ pub fn builtin_table(namespace: &str, name: &str) -> Option<&'static BuiltinTabl
         .find(|definition| definition.namespace == namespace && definition.name == name)
 }
 
-/// Return the twelve built-in logical FQNs in canonical order.
+/// Return the thirteen built-in logical FQNs in canonical order.
 #[must_use]
 pub fn builtin_fqns() -> Vec<String> {
     BUILTIN_TABLES
@@ -1520,6 +1521,11 @@ mod tests {
                         PartitionTransformWire::Day,
                         &["event_id", "execution_id", "verifier_card_uid"],
                     ),
+                    ("verification", "evidence") => (
+                        "recorded_at",
+                        PartitionTransformWire::Day,
+                        &["evidence_id", "commit", "verifier_card_uid"],
+                    ),
                     ("storage", "objects") => (
                         "recorded_at",
                         PartitionTransformWire::Day,
@@ -1606,7 +1612,7 @@ mod tests {
         blooms: &'static [&'static str],
     }
 
-    /// The approved contract for all six verification tables.
+    /// The approved contract for all seven verification tables.
     fn verification_contracts() -> Vec<VerificationContract> {
         vec![
             VerificationContract {
@@ -1730,6 +1736,37 @@ mod tests {
                     RUN_ID,
                     "event_id",
                     "execution_id",
+                    "verifier_card_uid",
+                ],
+            },
+            VerificationContract {
+                namespace: "verification",
+                name: "evidence",
+                columns: vec![
+                    utf8("evidence_id", false),
+                    utf8("host", false),
+                    utf8("repository_id", false),
+                    utf8("commit", false),
+                    utf8("input", false),
+                    utf8("verifier_card_uid", false),
+                    utf8("sha256", false),
+                    variant_field("value", false),
+                    ts_us_utc("recorded_at", false),
+                    utf8("service_name", true),
+                    utf8("service_version", true),
+                    utf8("deployment_environment", true),
+                    utf8("subject_kind", true),
+                    utf8("subject_name", true),
+                    utf8("subject_version", true),
+                ],
+                blooms: &[
+                    "service_name",
+                    "subject_name",
+                    WORKLOAD_CARD_UID,
+                    SUBJECT_CARD_UID,
+                    RUN_ID,
+                    "evidence_id",
+                    "commit",
                     "verifier_card_uid",
                 ],
             },
@@ -3456,6 +3493,7 @@ mod tests {
             ),
             ("verification", "execution_outputs", &["output"][..]),
             ("verification", "execution_events", &["value"][..]),
+            ("verification", "evidence", &["value"][..]),
             (
                 "verification",
                 "execution_inputs",

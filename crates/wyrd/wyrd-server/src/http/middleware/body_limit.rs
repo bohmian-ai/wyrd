@@ -96,7 +96,8 @@ where
     /// Apply the global request-body limit, or pass the request through
     /// unbounded to a route that owns its own bound.
     ///
-    /// Audio, verification request and evidence-planning routes, and the
+    /// Audio, verification request, evidence-planning, and evidence
+    /// publication routes, and the
     /// local upload route (`/v1/cards/upload/local/{id}`) bound their bodies
     /// in their handlers — the local upload against its upload's declared
     /// size — so this layer never caps them below the storage object limit.
@@ -111,6 +112,7 @@ where
                 | "/v1/verification/execute"
                 | "/v1/verification/enqueue"
                 | "/v1/verification/evidence"
+                | "/v1/verification/evidence/publish"
         ) || path.starts_with("/v1/cards/upload/local/")
         {
             let mut inner = self.inner.clone();
@@ -470,6 +472,10 @@ mod tests {
             ("/v1/verification/execute", axum::http::StatusCode::OK),
             ("/v1/verification/enqueue", axum::http::StatusCode::OK),
             ("/v1/verification/evidence", axum::http::StatusCode::OK),
+            (
+                "/v1/verification/evidence/publish",
+                axum::http::StatusCode::OK,
+            ),
             ("/v1/cards/upload/local/00", axum::http::StatusCode::OK),
             (
                 "/v1/audio/speech",

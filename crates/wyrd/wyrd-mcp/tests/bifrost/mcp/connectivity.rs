@@ -297,6 +297,7 @@ mod pg_tests {
                 "principals.revoke_credential",
                 "principals.set_workload_restriction",
                 "verification.evidence",
+                "verification.publish_evidence",
                 "verification.execute",
                 "verification.enqueue",
                 "verification.cancel",

@@ -44,6 +44,8 @@ A caller fills a slot by name; steps and checks read it as `inputs.<slot>`. A sl
 | `trace` | none | The run's trace spans |
 | `samples` | `features` (required) | Feature values over a window, for drift checks |
 
+A `json` or `media` slot may set `deferred: true`: its value is not passed when the execution starts but published later for a pull request's head commit, as in [Publish CI results to a pull request](/build-and-verify/verify/publish-deferred-evidence/). Checks and steps that read a deferred slot wait for it while the rest run; the execution reports `waiting` with the slot names, resumes when the evidence is published, and ends `timed_out` if it never is. A Verifier with a deferred slot is queued only: `verify` refuses it.
+
 A group Verifier slot is a source string instead of an object: `verifiers.<name>.inputs.<slot>` or `verifiers.<name>.requirements.<rid>.outcome`. It holds one value per source execution, in order.
 
 Media formats: `png`, `jpeg`, `gif`, `webp`, `pdf`, `text`, `markdown`, `csv`, `json`, `html`, `docx`, `xlsx`, `pptx`, `doc`, `xls`, `ppt`, `tar_gz`, `zip`.

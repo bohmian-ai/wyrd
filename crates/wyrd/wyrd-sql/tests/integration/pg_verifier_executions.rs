@@ -4853,8 +4853,9 @@ async fn batched_and_single_completion_record_extracted_source_alike() {
     assert_eq!(replayed, recorded, "identical replay preserves each fact");
 }
 
-/// A completion under a lost lease, and one whose transaction rolls back,
-/// record no extracted source.
+/// A completion under a lost lease, one whose transaction rolls back, and
+/// one arriving after cancellation record no extracted source, single and
+/// batched alike.
 ///
 /// # Panics
 /// Panics when a stale or rolled-back completion leaves the fact behind.
@@ -4898,6 +4899,60 @@ async fn stale_or_rolled_back_completion_records_no_extracted_source() {
 
     let mut conn = fixture.tenant_conn().await.expect("tenant connection");
     assert!(!source_extracted(&mut conn, current.lease.execution_id).await);
+
+    assert_eq!(
+        queue
+            .complete_many(
+                &mut conn,
+                &[completion(&stale, VerificationVerdict::Passed, true)],
+            )
+            .await
+            .expect("stale batched completion answers"),
+        [Settlement::StaleLease]
+    );
+    assert_eq!(
+        queue
+            .complete_many(
+                &mut conn,
+                &[completion(&current, VerificationVerdict::Passed, true)],
+            )
+            .await
+            .expect("batched completion applies"),
+        [Settlement::Applied]
+    );
+    conn.rollback()
+        .await
+        .expect("batched completion rolls back");
+    let mut conn = fixture.tenant_conn().await.expect("tenant connection");
+    assert!(!source_extracted(&mut conn, current.lease.execution_id).await);
+
+    assert!(
+        queue
+            .cancel(&mut conn, current.lease.execution_id)
+            .await
+            .expect("cancel applies")
+    );
+    let late = completion(&current, VerificationVerdict::Passed, true);
+    assert_eq!(
+        queue
+            .complete(&mut conn, &late)
+            .await
+            .expect("late completion answers"),
+        Settlement::StaleLease
+    );
+    assert_eq!(
+        queue
+            .complete_many(&mut conn, std::slice::from_ref(&late))
+            .await
+            .expect("late batched completion answers"),
+        [Settlement::StaleLease]
+    );
+    conn.commit().await.expect("cancellation commits");
+    let mut conn = fixture.tenant_conn().await.expect("tenant connection");
+    assert!(
+        !source_extracted(&mut conn, current.lease.execution_id).await,
+        "cancelled work never becomes eligible"
+    );
 }
 
 /// Only a completed `pull_request` execution can record extracted source:

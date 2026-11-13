@@ -249,6 +249,10 @@ pub enum InputSlot {
         /// JSON Schema the value must satisfy.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         schema: Option<Value>,
+        /// Whether the value arrives later as published evidence instead of
+        /// with the request. See [`InputSlot::is_deferred`].
+        #[serde(default, skip_serializing_if = "is_false")]
+        deferred: bool,
     },
     /// A pinned file in one of the accepted formats.
     Media {
@@ -258,6 +262,10 @@ pub enum InputSlot {
         /// Lower size bound than the deployment limit.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_bytes: Option<u64>,
+        /// Whether the file arrives later as published evidence instead of
+        /// with the request. See [`InputSlot::is_deferred`].
+        #[serde(default, skip_serializing_if = "is_false")]
+        deferred: bool,
     },
     /// A trace resolved through tenant-scoped trace reads.
     Trace {},
@@ -278,6 +286,24 @@ pub enum InputSlot {
     Source(SourceText),
 }
 
+impl InputSlot {
+    /// Whether this slot is supplied later by published evidence rather than
+    /// with the request.
+    ///
+    /// A deferred slot subscribes its active binding to evidence published
+    /// under the slot's name for the execution's repository and commit; the
+    /// steps that reference it wait for that evidence while independent
+    /// steps run, and a Verifier declaring one runs only as queued work.
+    /// Only `json` and `media` slots can be deferred. Pure: no IO.
+    #[must_use]
+    pub fn is_deferred(&self) -> bool {
+        matches!(
+            self,
+            Self::Json { deferred: true, .. } | Self::Media { deferred: true, .. }
+        )
+    }
+}
+
 /// The tagged forms of [`InputSlot`], decoded without its untagged source
 /// fallback so a malformed typed slot reports its own error, such as an
 /// unknown field, instead of "did not match any variant". The remote derive
@@ -296,6 +322,9 @@ enum TypedInputSlot {
         /// JSON Schema the value must satisfy.
         #[serde(default)]
         schema: Option<Value>,
+        /// Whether the value arrives later as published evidence.
+        #[serde(default)]
+        deferred: bool,
     },
     /// [`InputSlot::Media`].
     Media {
@@ -304,6 +333,9 @@ enum TypedInputSlot {
         /// Lower size bound than the deployment limit.
         #[serde(default)]
         max_bytes: Option<u64>,
+        /// Whether the file arrives later as published evidence.
+        #[serde(default)]
+        deferred: bool,
     },
     /// [`InputSlot::Trace`].
     Trace {},

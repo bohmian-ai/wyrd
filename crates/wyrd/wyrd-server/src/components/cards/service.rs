@@ -1919,16 +1919,20 @@ fn pinned_uid(card_ref: Option<&CardRef>) -> Result<CardUid, WyrdError> {
 ///
 /// Called once per declared Verifier after its references are pinned and
 /// before its spec is hashed, so the stored value replaces any the author
-/// sent and never depends on a later read. A Verifier is queue-only when an
-/// inline or registered Agent it calls declares `publish`; a registered
-/// Agent is read by UID inside the declaration transaction, which already
-/// holds a sibling Agent persisted earlier in it. Later queued-only forms
-/// extend this one derivation.
+/// sent and never depends on a later read. A Verifier is queue-only when it
+/// declares a deferred input, whose evidence only a parked queued execution
+/// can wait for, or when an inline or registered Agent it calls declares
+/// `publish`; a registered Agent is read by UID inside the declaration
+/// transaction, which already holds a sibling Agent persisted earlier in it.
+/// Later queued-only forms extend this one derivation.
 ///
 /// # Errors
 /// Returns `WYRD_INTERNAL` when an Agent reference is unpinned or names
 /// another kind, and the registry error from reading a referenced Agent.
 async fn queue_only(conn: &mut TenantConn<'_>, verifier: &VerifierSpec) -> Result<bool, WyrdError> {
+    if verifier.inputs.values().any(InputSlot::is_deferred) {
+        return Ok(true);
+    }
     for (_, call) in verifier.agent_calls() {
         let publishes = if let Some(agent) = call.agent.as_inline() {
             agent.publishes()

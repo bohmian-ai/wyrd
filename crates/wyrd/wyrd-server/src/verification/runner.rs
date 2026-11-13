@@ -36,9 +36,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
+use tokio::sync::Semaphore;
 #[cfg(feature = "test-support")]
 use tokio::sync::watch::Sender;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 use tracing::field::Empty;
@@ -142,16 +142,6 @@ const PERSIST_MAX: Duration = Duration::from_secs(5);
 /// accepted evidence itself, which repairs a publication whose wake was
 /// lost; a publication wakes it at once, and the deadline bounds it.
 const PARK_RECHECK: Duration = Duration::from_mins(1);
-
-/// What one claimed attempt holds while it runs: its renewed lease and its
-/// execution capacity permit, which a park gives up before it awaits
-/// Scribe while the lease stays held.
-struct Holding<'a> {
-    /// The claim's renewed lease, held until the attempt settles.
-    lease: &'a HeldLease,
-    /// The claim's execution capacity permit; `None` once given up.
-    slot: Option<OwnedSemaphorePermit>,
-}
 
 /// The single transition one claimed execution ends in.
 #[derive(Debug, Clone, PartialEq)]
@@ -503,21 +493,17 @@ impl VerifierRunner {
     /// invocations, both until `deadline`; a completed outcome, a terminal
     /// failure, or a retryable failure of the final attempt is
     /// [concluded](conclude), and an earlier retryable failure or a deferral
-    /// settles as it is. A park gives up the `holding` slot, the claim's
-    /// execution capacity, before it awaits the parked revision's
-    /// acknowledgement, so waiting on Scribe holds only the claim and its
-    /// lease. Never fails: every failure becomes the [`Transition`] it maps
-    /// to.
+    /// settles as it is. Never fails: every failure becomes the
+    /// [`Transition`] it maps to.
     async fn execute(
         &self,
         tenant: DataTenantId,
         run: &ClaimedExecution,
         verifier: Result<Arc<Target>, Refused>,
         deadline: tokio::time::Instant,
-        holding: &mut Holding<'_>,
+        lease: &HeldLease,
         telemetry: &ExecutionTelemetry,
     ) -> Transition {
-        let lease = holding.lease;
         let frozen = Frozen::attempt(run);
         let verifier = match verifier {
             Ok(verifier) => verifier,
@@ -593,7 +579,6 @@ impl VerifierRunner {
                     let recheck = deadline
                         .saturating_duration_since(tokio::time::Instant::now())
                         .min(PARK_RECHECK);
-                    drop(holding.slot.take());
                     return persisted(&state, lease, execution_id)
                         .await
                         .err()
@@ -1299,17 +1284,21 @@ impl LeasedWork for VerifierRunner {
         self: Arc<Self>,
         tenant: DataTenantId,
         claim: AttemptClaim,
-        slot: OwnedSemaphorePermit,
         stop: CancellationToken,
         abandon: CancellationToken,
         spawned_at: Instant,
     ) -> bool {
-        let span = claim.span.clone();
+        let AttemptClaim {
+            run,
+            verifier,
+            loaded,
+            span,
+        } = claim;
         span.record(
             "task_start_delay_us",
             u64::try_from(spawned_at.elapsed().as_micros()).unwrap_or(u64::MAX),
         );
-        self.attempt(tenant, claim, slot, &stop, &abandon)
+        self.attempt(tenant, &run, verifier, loaded, &stop, &abandon)
             .instrument(span)
             .await
     }
@@ -1351,24 +1340,16 @@ impl VerifierRunner {
     /// attempt to refund or spend, leaves its lease to expire into another
     /// exhausted claim instead of releasing, retrying, or deferring, so a
     /// dependency that is unavailable now never exhausts it falsely.
-    /// `slot` is the claim's execution capacity permit, held until the
-    /// attempt settles unless a park gives it up first.
     /// Returns whether admission backpressure deferred the run.
     async fn attempt(
         &self,
         tenant: DataTenantId,
-        claim: AttemptClaim,
-        slot: OwnedSemaphorePermit,
+        run: &ClaimedExecution,
+        verifier: Result<Arc<Target>, Refused>,
+        loaded: (Instant, Instant),
         stop: &CancellationToken,
         abandon: &CancellationToken,
     ) -> bool {
-        let AttemptClaim {
-            run,
-            verifier,
-            loaded,
-            ..
-        } = claim;
-        let run = &run;
         let started = Instant::now();
         // `remaining` and `age` were read by the claim statement, which
         // began after `loaded.0`; target loading and handoff spend them. The
@@ -1389,15 +1370,11 @@ impl VerifierRunner {
         let origin = run.origin.as_str();
         let held = Arc::new(self.renewal.hold(tenant, run.lease.token, abandon));
         let lost = held.lost();
-        let mut holding = Holding {
-            lease: &held,
-            slot: Some(slot),
-        };
         let transition = tokio::select! {
             biased;
             () = abandon.cancelled() => Transition::Release,
             () = lost.cancelled() => Transition::LeaseLost,
-            executed = self.execute(tenant, run, verifier, deadline, &mut holding, &telemetry) => executed,
+            executed = self.execute(tenant, run, verifier, deadline, &held, &telemetry) => executed,
         };
         let transition = match transition {
             Transition::Release | Transition::Retry(_) | Transition::Defer(_) if run.exhausted => {

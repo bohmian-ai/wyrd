@@ -14,9 +14,8 @@
 //! loop pays for the cross-tenant read at most once per poll interval and
 //! discovers a newly due tenant within one.
 //! Every claim takes one permit of the loop's capacity before claiming and
-//! hands it to the item, which holds it until it finishes unless it has
-//! stopped computing first, so a loop claims nothing while its capacity is
-//! spent; the Verifier runner shares its capacity with group
+//! holds it until the item finishes, so a loop claims nothing while its
+//! capacity is spent; the Verifier runner shares its capacity with group
 //! snapshot handoff. Operator delivery also takes delivery permits before
 //! claiming. A loop that claimed something claims again at once; an idle loop
 //! wakes on its optional local wake signal (the Verifier runner's is notified
@@ -33,7 +32,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, Semaphore};
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 use wyrd_spec::DataTenantId;
@@ -80,9 +79,7 @@ pub(super) trait LeasedWork: Send + Sync + 'static {
 
     /// Execute a claimed item and apply its single fenced settlement.
     ///
-    /// `slot` is the item's capacity permit; the item holds it while it
-    /// computes and may drop it earlier only once nothing it still awaits
-    /// uses process capacity. `abandon` cancels the item past the drain grace; a retryable failure
+    /// `abandon` cancels the item past the drain grace; a retryable failure
     /// observed after `stop` should be released rather than charged.
     /// `spawned_at` is the process-monotonic instant the loop spawned the
     /// item, so its first poll can measure task-start delay. Resolves to
@@ -92,7 +89,6 @@ pub(super) trait LeasedWork: Send + Sync + 'static {
         self: Arc<Self>,
         tenant: DataTenantId,
         claim: Self::Claim,
-        slot: OwnedSemaphorePermit,
         stop: CancellationToken,
         abandon: CancellationToken,
         spawned_at: Instant,
@@ -375,13 +371,12 @@ impl ClaimLoop {
                     let process = Arc::clone(work).process(
                         tenant,
                         claim,
-                        slot,
                         stop.clone(),
                         abandon.clone(),
                         Instant::now(),
                     );
                     spawned.spawn(async move {
-                        let _held = permit;
+                        let _held = (slot, permit);
                         process.await
                     });
                 }

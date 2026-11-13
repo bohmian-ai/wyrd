@@ -167,6 +167,16 @@ metadata grant nothing. A parked execution resumes under its own accepted
 authority, never the publisher's, and losing repository access cancels it
 `repository_access_lost`.
 
+Deciding a pending approval needs `verifier:approve` on the execution's exact
+Verifier, granted by that Verifier's UID or by every Verifier in the tenant,
+plus current authority over its subject. `verifier:run` and `verifier:read`
+never cover it. The built-in `editor` and `admin` Roles hold it for every
+Verifier; `workload` and `viewer` do not, so a workload never approves its own
+verification. Each check is audited under `verification.approval.decide` with
+the occurrence as the resource. The decision adds no authority to the
+execution: it resumes under its own accepted authority, and the decider's
+identity is recorded only as the decision's actor.
+
 A tenant administrator is created once, during tenant provisioning, and is the
 tenant's headless root of trust: it holds credentials and roles, federates no
 identity by itself, and coexists with any human administrator the tenant later
@@ -611,6 +621,11 @@ change; there are no custom runtime permission strings and no
   dropped-and-recreated table; catalog and schema ride with the UID so the
   synchronous check needs no catalog lookup. Catalog and schema are the logical
   SQL names (catalog `bifrost`, schema `logs`), validated as identifier segments.
+
+- `Verifier(CardUid)` is valid only on `verifier` `run`, `read`, and
+  `approve`, and covers exactly that Verifier Card UID. `All` on the same
+  operation covers every Verifier; no Verifier scope covers `All`, and each
+  action is granted separately.
 
 A future domain that needs object scope adds its own typed variant rather than
 reusing another domain's identity spelling.

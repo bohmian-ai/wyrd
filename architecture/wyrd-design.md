@@ -1566,7 +1566,8 @@ spec:
 `queue_only` is derived when the Verifier registers and is stored with its
 spec: `true` when a requirement judges a scheduled window, a step extracts a
 pull request, a step or check Agent, inline or a referenced registered Agent,
-declares the `publish` tool, or a slot declares `deferred: true`, else
+declares the `publish` tool, a step is an `approval`, or a slot declares
+`deferred: true`, else
 `false`. A value an author sends is replaced, never honored. Every queued-only
 form is derived here at registration; execution never re-infers it.
 
@@ -1625,6 +1626,7 @@ aggregation are unchanged.
 | `extract` | Exactly one of `from` or `extractor`. `from` reads one `media` slot into the format-discriminated extraction JSON (PDF, PPTX, DOCX, XLSX, CSV, JSON, text/Markdown/HTML); text and structure only, no OCR or rendering. `extractor: pull_request` reads the accepted source of the pull request a queued `pull_request` execution was admitted for (see below) |
 | `agent` | Calls an inline, file-authored, or declared Agent with `inputs` matching its Prompt placeholders, optionally over a bounded `workspace` with built-in tools |
 | `code` | Runs sandboxed Python (`runtime: python`) from inline source or an exact Artifact, with a named `entrypoint` and bound `inputs`; returns JSON |
+| `approval` | Asks a person to approve or reject, showing `message`; outputs the decision receipt (see below) |
 
 | Check | Judges |
 |---|---|
@@ -1633,6 +1635,23 @@ aggregation are unchanged.
 | `agent` | An Agent, with its declared tools and optional `workspace` as in a step, returning the closed Verdict schema `{outcome, reason, citations}` its Prompt declares, plus `data` when that format declares it |
 | `code` | Sandboxed Python returning the same Verdict schema; an optional `response_format` on the check declares its `data` |
 | `drift` | The existing PSI, SPC, or Custom decision over one `samples` slot, with full statistical detail |
+
+An `approval` step (`action: {kind: approval, message}`) makes its Verifier
+queued-only. Each time the step is reached, including each fanout item and
+repeat iteration, the server records one pending occurrence with its own
+`approval_id`; inspection lists every occurrence with its status. There is no
+per-approval deadline: the occurrence parks the execution the way a deferred
+slot does, and the execution's original deadline, supersession, or
+cancellation expires it. `POST
+/v1/verification/executions/{execution_id}/approvals/{approval_id}` with
+`{decision: approve | reject, reason?}` returns the receipt `{approval_id,
+status, actor_id, decided_at, reason}` only after the decision is durable. The
+first decision is final: the same actor, decision, and reason replay the
+receipt, and anything else refuses
+`WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING`. Deciding needs `verifier:approve`
+on the exact Verifier plus authority over the subject. The same `ExecutionId`
+continues after the decision. A rejection is data: the step succeeds with the receipt (`status:
+rejected`) as `steps.<id>.output`, and a requirement over it fails the verdict.
 
 Actions read and compute; they never mutate external systems, declare Cards,
 or dispatch Operators. References use `inputs.<slot>`, `steps.<id>.output`,

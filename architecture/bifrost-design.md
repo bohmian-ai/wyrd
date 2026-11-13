@@ -528,6 +528,12 @@ typed columns:
   its time column. No PostgreSQL table or payload mirror holds it; a parked
   execution's revision records only which slots it waits for, and its
   consumers read the accepted rows when they resume.
+- `bifrost.verification.approvals` is the custody of approval decisions: one
+  row per decided approval occurrence, naming `approval_id`, `execution_id`,
+  the execution's `verifier_card_uid`, the `decision`, the deciding
+  `actor_id`, the optional `reason`, and `decided_at`, its time column. The
+  first accepted decision is final. No PostgreSQL table or payload mirror
+  holds it; the queue only learns that the execution is due.
 
 - Every nullable built-in Struct — the `bifrost.metrics.points` bucket sets and
   `bifrost.gateway.calls` `resolved_model` — has nullable children, because a
@@ -692,16 +698,20 @@ An append acknowledgement means the WAL append and batch fence are durable and
 the exact rows and their recorded table version are authoritative in Scribe.
 It does not wait for local Parquet, object publication, Iceberg promotion, or compaction.
 
-Deferred evidence publication is the one verification producer whose caller
-waits: its positive receipt is returned only after Scribe acknowledges every
-subscriber's acceptance, within half the request timeout; without that
+Deferred evidence publication and approval decisions are the verification
+producers whose caller waits. A publication's positive receipt is returned
+only after Scribe acknowledges every subscriber's acceptance, within half the request timeout; without that
 acknowledgement the publish answers `WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE`
 and a republish of the same content replays. `bifrost.verification.evidence` is
 fenced-only: the committed batch fence is the acceptance, so an unfenced batch
 is absent and a fenced acceptance whose row no query can see yet is
 unavailable, never absent, both for publish deduplication and for a consumer's
-recovery read. A parked execution's revision is acknowledged before its queue
-row is released, so a crash before then repeats unpersisted work, never loses
+recovery read. An approval decision follows the same contract: its receipt is
+returned only after Scribe acknowledges the decision within half the request
+timeout, `bifrost.verification.approvals` is fenced-only, and without the
+acknowledgement the decide answers `WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE`
+so the caller decides again. A parked execution's revision is acknowledged
+before its queue row is released, so a crash before then repeats unpersisted work, never loses
 the park.
 
 Bifrost durability is the only evidence durability. The
@@ -877,6 +887,10 @@ Each deferred evidence acceptance is its own batch whose id derives from its
 source, input, and subscriber, so the first fenced batch keeps the evidence,
 an identical retry replays it, and different content for the same id is the
 batch conflict the publish reports as `WYRD_VERIFICATION_409_EVIDENCE_CONFLICT`.
+Each approval decision is its own batch whose id derives from its approval id,
+so the first fenced decision is final, an identical retry by the same actor
+replays its receipt, and any other decision of the same occurrence is refused
+as `WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING`.
 
 An honest retry of a batch that is already fenced and visible can avoid the
 shard queue. The existing bounded committed-batch mirror returns its original
@@ -1541,12 +1555,13 @@ to: one row per authorized request rather than continuous high-rate ingest,
 date-range rather than recent-window queries, and retention measured in years
 rather than days.
 
-The six verification tables — `bifrost.drift.observations`,
+The seven verification tables — `bifrost.drift.observations`,
 `bifrost.verification.execution_inputs`, `bifrost.verification.execution_outputs`,
-`bifrost.verification.execution_events`, `bifrost.verification.evidence`, and
-`bifrost.verification.results` — also partition by UTC day on each table's
+`bifrost.verification.execution_events`, `bifrost.verification.evidence`,
+`bifrost.verification.approvals`, and `bifrost.verification.results` — also partition by UTC day on each table's
 time column — `created_at` for observations, `recorded_at` for execution
-inputs and evidence, `occurred_at` for execution events, and `ended_at` for
+inputs and evidence, `occurred_at` for execution events, `decided_at` for
+approvals, and `ended_at` for
 execution outputs and results —
 never by Verifier, subject, binding, or tenant ID. A Drift schedule window does
 not determine partition size. `bifrost.storage.objects` partitions by UTC day
@@ -2020,11 +2035,11 @@ the namespace does not create another storage or authorization model.
 
 Permissions are scoped through `BifrostTable`, `BifrostRecord`, and
 `BifrostQuery`. Generic writes cannot target reserved or system-managed tables;
-`bifrost.gateway.calls`, the five verification tables
+`bifrost.gateway.calls`, the six verification tables
 (`bifrost.verification.results`, `bifrost.verification.execution_inputs`,
 `bifrost.verification.execution_outputs`,
-`bifrost.verification.execution_events`, and
-`bifrost.verification.evidence`), the `bifrost.storage.objects`
+`bifrost.verification.execution_events`,
+`bifrost.verification.evidence`, and `bifrost.verification.approvals`), the `bifrost.storage.objects`
 inventory, and the `bifrost.metrics.series` index, which Scribe derives from
 admitted points, accept no public write at all: Gate refuses every principal. Only
 the server-internal capture writer writes them, together with

@@ -116,11 +116,11 @@ impl VerificationControl<'_> {
         let query = self.records(&mut conn, caller).await?;
         conn.commit().await.map_err(registry_db_error)?;
         let records = InputResolver::new(&query, None);
-        let held = custody
+        let mut held = custody
             .accepted(&records, source, &request.input, &subscribers)
             .await?;
         conflicts(&held, &published.sha256, &request.input)?;
-        let fresh: Vec<CardUid> = subscribers
+        let mut fresh: Vec<CardUid> = subscribers
             .iter()
             .filter(|verifier| !held.contains_key(*verifier))
             .cloned()
@@ -139,7 +139,8 @@ impl VerificationControl<'_> {
                 )
                 .await;
             if let Err(error) = accepted {
-                // A concurrent publisher may have won the fence first.
+                // A concurrent publisher may have won the fence first; its
+                // acceptance is the receipt this publication replays.
                 let raced = custody
                     .accepted(&records, source, &request.input, &fresh)
                     .await?;
@@ -147,6 +148,8 @@ impl VerificationControl<'_> {
                 if raced.len() < fresh.len() {
                     return Err(error);
                 }
+                held.extend(raced);
+                fresh.clear();
             }
         }
         // A replay wakes too: a publisher retrying an unacknowledged

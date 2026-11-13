@@ -34,10 +34,12 @@ const C2: &str = "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2";
 const C3: &str = "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3";
 
 /// The `ci-gate` Verifier at `version`: it passes when the deferred `ci`
-/// evidence reports `status: green`.
+/// evidence, an object with a `status`, reports `status: green`. Its
+/// deferred CSV `report` slot is read by nothing, so no execution waits for
+/// it; it only accepts media publications.
 fn ci_gate(version: &str) -> String {
     format!(
-        "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: ci-gate\n  version: {version}\nspec:\n  description: CI is green.\n  inputs:\n    ci: {{type: json, deferred: true}}\n  requirements:\n    - id: green\n      statement: CI is green\n      check: {{kind: assert, path: inputs.ci.status, operator: equals, expected: green}}\n"
+        "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: ci-gate\n  version: {version}\nspec:\n  description: CI is green.\n  inputs:\n    ci: {{type: json, deferred: true, schema: {{type: object, required: [status]}}}}\n    report: {{type: media, formats: [csv], deferred: true}}\n  requirements:\n    - id: green\n      statement: CI is green\n      check: {{kind: assert, path: inputs.ci.status, operator: equals, expected: green}}\n"
     )
 }
 
@@ -230,18 +232,35 @@ async fn publication_is_matched_retained_and_resumes_the_waiting_execution() {
             publication(UNSELECTED_SLUG, C0, "ci", json_value.clone()),
             StatusCode::FORBIDDEN,
         ),
-        (
-            publication(
-                SLUG,
-                C0,
-                "ci",
-                json!({"kind": "file", "sha256": "ab".repeat(32), "size_bytes": 3, "format": "csv"}),
-            ),
-            StatusCode::BAD_REQUEST,
-        ),
     ] {
         let (status, answer) = deployment.publish(&body).await;
         assert_eq!(status, expected, "{body}: {answer}");
+    }
+    let file = |format: &str| json!({"kind": "file", "sha256": "ab".repeat(32), "size_bytes": 3, "format": format});
+    for (input, value, reason) in [
+        (
+            "ci",
+            json!({"kind": "json", "value": {"result": "green"}}),
+            "schema",
+        ),
+        ("ci", file("csv"), "json"),
+        ("report", json_value.clone(), "media"),
+        ("report", file("pdf"), "does not accept pdf"),
+        ("report", file("csv"), "completed"),
+    ] {
+        let (status, refused) = deployment
+            .publish(&publication(SLUG, C0, input, value))
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{input} {reason}: {refused}"
+        );
+        assert_eq!(refused["code"], "WYRD_VERIFICATION_400_INPUT_INVALID");
+        assert!(
+            refused.to_string().contains(reason),
+            "{input} is refused naming {reason}: {refused}"
+        );
     }
 
     let Bootstrap::User { jwt: viewer, .. } = deployment

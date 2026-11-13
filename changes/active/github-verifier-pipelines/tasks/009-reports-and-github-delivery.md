@@ -1,7 +1,7 @@
 ---
 id: TASK-009
 status: proposed
-approved_spec_revision: 5
+approved_spec_revision: 7
 requirements: [REQ-005, REQ-012, REQ-013, REQ-014, REQ-016]
 acceptance: [AC-008, AC-009, AC-011]
 invariants: [INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007]
@@ -130,6 +130,10 @@ receipts/accepted states at every seam, not seeded report/activation fixtures.
 
 Tier 1: matched Rust/Python/TypeScript stories and `wyrd-mcp` journeys with real
 WyrdTestServer/Postgres and local protocol/model transports, using README runners;
+the local GitHub is the existing `wyrd-testing` `GithubAppMock`, extended with
+Check run, pull-request review and review-comment endpoints with readback, and
+scripted faults: commit a write then lose its answer, rate-limit cooldown and
+permanent refusal;
 server verification runtime journeys cover restart. Tier 2: provider delivery
 progress and canonical reads against real dependencies; tier 3: schema, selection,
 anchor/rendering and helper branches. Record actual new focused commands when

@@ -186,6 +186,48 @@ const ACTIVATE_SQL: &str = "
     RETURNING execution_id
 ";
 
+/// The newest completed review of execution `$1`'s PR observed before it
+/// under the same Verifier name, preferring the exact same Verifier
+/// version: its id, its reviewed head, and whether it ran that version.
+const BASELINE_SQL: &str = "
+    WITH current AS (
+        SELECT e.pull_request, e.pr_observed_at, e.verifier_card_uid, v.kind, v.name
+          FROM wyrd.verifier_executions e
+          JOIN wyrd.cards v ON v.card_uid = e.verifier_card_uid
+         WHERE e.execution_id = $1 AND e.origin = 'pull_request'
+    )
+    SELECT e.execution_id, e.pull_request->'head'->>'sha' AS head,
+           e.verifier_card_uid = c.verifier_card_uid AS same_policy
+      FROM current c
+      JOIN wyrd.verifier_executions e
+        ON e.origin = 'pull_request' AND e.status = 'completed'
+       AND e.pull_request->>'host' = c.pull_request->>'host'
+       AND e.pull_request->>'repository_id' = c.pull_request->>'repository_id'
+       AND (e.pull_request->>'number')::bigint = (c.pull_request->>'number')::bigint
+       AND e.pr_observed_at < c.pr_observed_at
+      JOIN wyrd.cards v ON v.card_uid = e.verifier_card_uid
+     WHERE v.kind = c.kind AND v.name = c.name
+     ORDER BY same_policy DESC, e.pr_observed_at DESC
+     LIMIT 1
+";
+
+/// The review a PR execution compares its source against, chosen from the
+/// PR's completed execution history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PullRequestBaseline {
+    /// No earlier execution of the PR under this Verifier name completed.
+    FirstReview,
+    /// Only another version of the Verifier completed a review of the PR.
+    PolicyChanged,
+    /// The newest earlier completed review under the exact same Verifier.
+    Previous {
+        /// The completed execution.
+        execution_id: ExecutionId,
+        /// The head commit it reviewed.
+        head: String,
+    },
+}
+
 /// The error a superseded execution is cancelled with.
 #[must_use]
 pub fn superseded() -> VerificationError {
@@ -641,6 +683,44 @@ impl VerifierExecutionQueue {
                 .map(|id| stored(ExecutionId::new(id)))
                 .collect::<Result<_, _>>()?;
             Ok((reserved, superseded_ids))
+        })
+        .await
+    }
+
+    /// The baseline of PR execution `execution`: the newest completed
+    /// execution of the same PR observed before it under the exact same
+    /// Verifier, else whether another version of that Verifier completed
+    /// one. Cancelled, failed and unfinished executions never count, so a
+    /// generation admitted while an earlier one still runs reviews from the
+    /// last completed review.
+    ///
+    /// # Errors
+    /// Returns the database error when the read fails, or a decode error
+    /// when a stored identity or pin is malformed.
+    #[tracing::instrument(
+        skip(self, conn),
+        fields(operation = "verification.pull_request.baseline")
+    )]
+    pub async fn pull_request_baseline(
+        &self,
+        conn: &mut TenantConn<'_>,
+        execution: ExecutionId,
+    ) -> Result<PullRequestBaseline, SqlxError> {
+        timed("pull_request_baseline", async {
+            let row: Option<(Uuid, Option<String>, bool)> = sqlx::query_as(BASELINE_SQL)
+                .bind(execution.as_uuid())
+                .fetch_optional(&mut **conn.transaction())
+                .await?;
+            Ok(match row {
+                None => PullRequestBaseline::FirstReview,
+                Some((_, _, false)) => PullRequestBaseline::PolicyChanged,
+                Some((id, head, true)) => PullRequestBaseline::Previous {
+                    execution_id: stored(ExecutionId::new(id))?,
+                    head: head.ok_or_else(|| {
+                        SqlxError::Decode("a completed PR review has no head pin".into())
+                    })?,
+                },
+            })
         })
         .await
     }

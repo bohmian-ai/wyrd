@@ -50,8 +50,9 @@ use crate::{OperatorPool, TenantConn};
 mod pull_requests;
 
 pub use pull_requests::{
-    PullRequestBinding, PullRequestEnd, PullRequestExecution, PullRequestGeneration,
-    PullRequestHistory, PullRequestKey, PullRequestTarget, access_lost, superseded,
+    PullRequestBaseline, PullRequestBinding, PullRequestEnd, PullRequestExecution,
+    PullRequestGeneration, PullRequestHistory, PullRequestKey, PullRequestTarget, access_lost,
+    superseded,
 };
 
 /// Resolve a binding target's frozen identities and readiness.

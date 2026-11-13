@@ -48,10 +48,10 @@ use wyrd_sql::queries::verification_target::VerificationTargets;
 use wyrd_sql::queries::verifier_executions::{
     Cause, ClaimedExecution, Completion, DueSettlement, EnqueueOutcome, EnqueueRefusal,
     ExecutionAuthority, ExecutionInput, ExecutionLease, ExecutionOrigin, ExecutionStatus,
-    GroupActivity, GroupSelection, PinnedGroup, Prepared, PullRequestEnd, PullRequestHistory,
-    PullRequestKey, PullRequestTarget, QueueCounts, RetryOutcome, ScheduleOutcome, ScheduleSkip,
-    ScheduleTick, ScheduledAdmission, Settlement, Submission, SubmissionOutcome, TerminalStatus,
-    VerifierExecutionQueue,
+    GroupActivity, GroupSelection, PinnedGroup, Prepared, PullRequestBaseline, PullRequestEnd,
+    PullRequestHistory, PullRequestKey, PullRequestTarget, QueueCounts, RetryOutcome,
+    ScheduleOutcome, ScheduleSkip, ScheduleTick, ScheduledAdmission, Settlement, Submission,
+    SubmissionOutcome, TerminalStatus, VerifierExecutionQueue,
 };
 use wyrd_sql::row_types::cards::CardStatus;
 
@@ -4520,5 +4520,130 @@ async fn pull_request_ends_access_loss_and_refusals_settle_durably() {
             .expect("activation runs")
             .is_empty(),
         "a reservation cancelled by access loss is never activated"
+    );
+}
+
+/// Reserve and activate a generation of the test PR at `head` for
+/// `targets`, claim each execution, and return the claims in binding order.
+///
+/// # Panics
+/// Panics when the generation cannot be reserved, activated or claimed.
+async fn running_generation(
+    queue: &VerifierExecutionQueue,
+    conn: &mut TenantConn<'_>,
+    head: &str,
+    targets: &[PullRequestTarget],
+) -> Vec<ClaimedExecution> {
+    let observed = database_now(conn).await;
+    let (reserved, _) = queue
+        .reserve_pull_request(conn, &pins(head), observed, targets)
+        .await
+        .expect("generation reserves");
+    queue
+        .activate_pull_requests(conn, &reserved)
+        .await
+        .expect("generation activates");
+    let mut claims = Vec::new();
+    for _ in &reserved {
+        claims.push(claim(queue, conn).await);
+    }
+    claims.sort_by_key(|claim| {
+        reserved
+            .iter()
+            .position(|id| *id == claim.lease.execution_id)
+    });
+    claims
+}
+
+/// A PR execution's baseline is the latest completed execution of the same
+/// PR under the exact same Verifier: with none it is the first review, and
+/// when only another version of the Verifier completed, the policy changed.
+/// Work that never completed is never a baseline, and a later generation
+/// reviews against the newest completed one, not the one it superseded.
+///
+/// # Panics
+/// Panics when a selected baseline differs.
+#[tokio::test]
+async fn pull_request_baseline_is_the_latest_completed_review_under_the_same_policy() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture.tenant_conn().await.expect("tenant connection");
+    let (_, bindings) = repository_with_bindings(&mut conn, &actor, 1).await;
+    let targets = pr_targets(&mut conn, actor.id, &bindings).await;
+    let complete = async |conn: &mut TenantConn<'_>, claimed: &ClaimedExecution| {
+        queue
+            .complete(
+                conn,
+                claimed.lease,
+                VerificationResultId::new_v7(),
+                VerificationVerdict::Passed,
+                "verification",
+                None,
+            )
+            .await
+            .expect("execution settles");
+    };
+
+    let p = running_generation(&queue, &mut conn, "a", &targets)
+        .await
+        .remove(0);
+    assert_eq!(
+        queue
+            .pull_request_baseline(&mut conn, p.lease.execution_id)
+            .await
+            .expect("baseline reads"),
+        PullRequestBaseline::FirstReview
+    );
+    complete(&mut conn, &p).await;
+
+    let a = running_generation(&queue, &mut conn, "c", &targets)
+        .await
+        .remove(0);
+    let b = running_generation(&queue, &mut conn, "d", &targets)
+        .await
+        .remove(0);
+    let previous = PullRequestBaseline::Previous {
+        execution_id: p.lease.execution_id,
+        head: "a".repeat(40),
+    };
+    assert_eq!(
+        queue
+            .pull_request_baseline(&mut conn, b.lease.execution_id)
+            .await
+            .expect("baseline reads"),
+        previous,
+        "B, admitted while A ran, reviews from P"
+    );
+    assert_eq!(
+        queue
+            .pull_request_baseline(&mut conn, a.lease.execution_id)
+            .await
+            .expect("baseline reads"),
+        previous
+    );
+
+    let mut next = service_card("review-0");
+    next.metadata.version = Some("2.0.0".parse().expect("version"));
+    let other_version = insert_card(&mut conn, &actor, &next).await;
+    sqlx::query("UPDATE wyrd.cards SET kind = 'Verifier', status = 'active' WHERE card_uid = $1")
+        .bind(other_version.as_uuid())
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("another version of the Verifier registers");
+    sqlx::query(
+        "UPDATE wyrd.verifier_executions SET verifier_card_uid = $1 WHERE execution_id = $2",
+    )
+    .bind(other_version.as_uuid())
+    .bind(p.lease.execution_id.as_uuid())
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("P ran another version of the Verifier");
+    assert_eq!(
+        queue
+            .pull_request_baseline(&mut conn, b.lease.execution_id)
+            .await
+            .expect("baseline reads"),
+        PullRequestBaseline::PolicyChanged
     );
 }

@@ -90,8 +90,8 @@ use vala_bifrost_redux::tables::staged::StagedRow;
 use vala_bifrost_redux::tables::storage::ObjectsTable;
 use vala_bifrost_redux::tables::traces::project_resource_spans;
 use vala_bifrost_redux::tables::{
-    AuditLogTable, DomainTable, ExecutionEventsTable, ExecutionInputsTable, ExecutionOutputsTable,
-    ResultsTable, SpansTable,
+    AuditLogTable, DomainTable, EvidenceTable, ExecutionEventsTable, ExecutionInputsTable,
+    ExecutionOutputsTable, ResultsTable, SpansTable,
 };
 use wyrd_runtime::outbox::{LossReason, Outbox, OutboxLimits, OutboxSink, Reservation, count_lost};
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
@@ -309,6 +309,26 @@ pub enum ScribeWrite {
         /// unprojectable, or dropped write drops the sender instead.
         acked: Mutex<Option<oneshot::Sender<()>>>,
     },
+    /// One subscriber's acceptance of published deferred evidence, staged
+    /// as its `bifrost.verification.evidence` row.
+    ///
+    /// The acceptance is its own frame and its own Scribe batch, identified
+    /// by `batch`, which its source and subscriber derive, so a republication
+    /// resubmits the same identity and Scribe's batch-id dedup absorbs it;
+    /// different evidence under the same identity is refused as a batch
+    /// conflict.
+    Evidence {
+        /// The acceptance's batch identity.
+        batch: Uuid,
+        /// The `bifrost.verification.evidence` row.
+        row: StagedRow,
+        /// The publishing caller, which Scribe stamps on the row.
+        attribution: Attribution,
+        /// Fired once Scribe acknowledges the acceptance's own frame, and
+        /// only then; a refused, unprojectable, or dropped write drops the
+        /// sender instead.
+        acked: Mutex<Option<oneshot::Sender<()>>>,
+    },
 }
 
 /// One queued execution whose input record Scribe acknowledged. Only the
@@ -516,6 +536,13 @@ impl ScribeWrite {
                 attribution: *attribution,
                 part: Part::Checkpoint(Arc::clone(checkpoint)),
             }]),
+            Self::Evidence {
+                row, attribution, ..
+            } => Ok(vec![Rows {
+                table: ScribeTable::Evidence,
+                attribution: *attribution,
+                part: Part::Row(row.clone()),
+            }]),
         }
     }
 
@@ -541,7 +568,8 @@ impl ScribeWrite {
             | Self::Capture(_)
             | Self::ServerSpans { .. }
             | Self::Object { .. }
-            | Self::ExecutionState { .. } => {
+            | Self::ExecutionState { .. }
+            | Self::Evidence { .. } => {
                 return None;
             }
         };
@@ -579,11 +607,14 @@ pub enum ScribeTable {
     /// `bifrost.verification.execution_events`, one row per accepted
     /// revision of an execution's recoverable state.
     ExecutionEvents,
+    /// `bifrost.verification.evidence`, one row per subscriber acceptance of
+    /// published deferred evidence.
+    Evidence,
 }
 
 impl ScribeTable {
     /// Every destination, in a fixed order.
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::AuditLog,
         Self::Calls,
         Self::Spans,
@@ -592,6 +623,7 @@ impl ScribeTable {
         Self::ExecutionInputs,
         Self::Objects,
         Self::ExecutionEvents,
+        Self::Evidence,
     ];
 
     /// Fully qualified table name, which the peer RPC carries.
@@ -606,6 +638,7 @@ impl ScribeTable {
             Self::ExecutionInputs => "bifrost.verification.execution_inputs",
             Self::Objects => "bifrost.storage.objects",
             Self::ExecutionEvents => "bifrost.verification.execution_events",
+            Self::Evidence => "bifrost.verification.evidence",
         }
     }
 
@@ -637,6 +670,7 @@ impl ScribeTable {
             Self::ExecutionEvents => {
                 TableRef::new(BifrostNamespace::Verification, ExecutionEventsTable::NAME)
             }
+            Self::Evidence => TableRef::new(BifrostNamespace::Verification, EvidenceTable::NAME),
         }
     }
 }
@@ -1415,6 +1449,7 @@ impl ScribeSink {
                 {
                     Some(payload.result_id().as_uuid())
                 }
+                ScribeWrite::Evidence { batch, .. } => Some(*batch),
                 ScribeWrite::ExecutionInputs { row, .. }
                     if row.row.text("origin") == Some("pull_request") =>
                 {
@@ -1765,6 +1800,13 @@ pub(crate) fn revision_batch_id(tenant: DataTenantId, key: Uuid) -> Uuid {
     batch_id(tenant, ScribeTable::ExecutionEvents, (key, 0, 0), 0)
 }
 
+/// The Scribe batch id, and so the batch fence, under which `tenant`'s
+/// deferred evidence acceptance staged with batch identity `key` is
+/// written: an acceptance is its own one-row frame and chunk.
+pub(crate) fn evidence_batch_id(tenant: DataTenantId, key: Uuid) -> Uuid {
+    batch_id(tenant, ScribeTable::Evidence, (key, 0, 0), 0)
+}
+
 impl ScribeSink {
     /// Submits every frame of `frames`, the frames of outbox slice `slice`
     /// from index `first` on, along `route` for write `attempt`, keeping up
@@ -1924,7 +1966,8 @@ impl ScribeSink {
                     for position in owners {
                         if let Some(
                             ScribeWrite::Object { acked, .. }
-                            | ScribeWrite::ExecutionState { acked, .. },
+                            | ScribeWrite::ExecutionState { acked, .. }
+                            | ScribeWrite::Evidence { acked, .. },
                         ) = items.get(position)
                             && let Some(sender) = acked
                                 .lock()
@@ -1991,6 +2034,7 @@ impl OutboxSink for ScribeSink {
             } => return SubmissionSink::admission_lane(&queued.admission),
             ScribeWrite::ExecutionInputs { row, .. } => row.row.text("execution_id"),
             ScribeWrite::Object { row, .. } => row.text("storage_path"),
+            ScribeWrite::Evidence { row, .. } => row.text("commit"),
             ScribeWrite::ExecutionState { checkpoint, .. } => {
                 execution = checkpoint.execution_id().to_string();
                 Some(execution.as_str())
@@ -2016,7 +2060,9 @@ impl OutboxSink for ScribeSink {
                 payload.rows().iter().map(ResultRow::owned_bytes).sum()
             }
             ScribeWrite::ExecutionInputs { row, .. } => row.owned_bytes(),
-            ScribeWrite::Object { row, .. } => row.owned_bytes(),
+            ScribeWrite::Object { row, .. } | ScribeWrite::Evidence { row, .. } => {
+                row.owned_bytes()
+            }
             ScribeWrite::ExecutionState { checkpoint, .. } => checkpoint.weight(),
             ScribeWrite::ServerSpans { spans, .. } => spans.encoded_len(),
         }

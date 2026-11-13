@@ -2812,7 +2812,7 @@ fn decide(rule: Decide, outcomes: impl Iterator<Item = RequirementOutcome>) -> V
 /// Returns [`EngineError::InputTooLarge`] for a file above its slot's
 /// `max_bytes` and [`EngineError::InputInvalid`] for every other
 /// nonconformity, naming the slot.
-fn conform(
+pub fn conform(
     spec: &VerifierSpec,
     evidence: &BTreeMap<SlotName, InputDeclaration>,
 ) -> Result<(), EngineError> {

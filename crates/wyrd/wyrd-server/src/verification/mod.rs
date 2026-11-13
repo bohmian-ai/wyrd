@@ -15,6 +15,7 @@ mod claims;
 mod completions;
 pub mod drift;
 pub mod engines;
+pub(crate) mod evidence;
 #[cfg(feature = "test-support")]
 pub mod fault;
 pub mod fitter;

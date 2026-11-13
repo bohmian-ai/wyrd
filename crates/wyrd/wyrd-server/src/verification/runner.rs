@@ -76,6 +76,7 @@ use super::claims::{ClaimLoop, LeasedWork, settled};
 use super::completions::{Completions, SettleError};
 use super::drift::DriftEngine;
 use super::engines::{self, EngineOutcome};
+use super::evidence::{DeferredEvidence, EvidenceSource};
 use super::health::RuntimeCapability;
 use super::hosted::blocks::{Execution, HostedBlocks};
 use super::inputs::{InputResolver, InputRow};
@@ -712,7 +713,14 @@ impl VerifierRunner {
             {
                 return outcome;
             }
-            match self.prepare(tenant, run, spec, system, telemetry).await {
+            let prepared = match self.prepare(tenant, run, spec, system, telemetry).await {
+                Ok(mut prepared) => self
+                    .deferred(tenant, run, spec, system, state, &mut prepared.1)
+                    .await
+                    .map(|()| prepared),
+                Err(outcome) => Err(outcome),
+            };
+            match prepared {
                 Ok(prepared) => {
                     self.dispatch(run, spec, system, state, telemetry, prepared)
                         .await
@@ -777,6 +785,84 @@ impl VerifierRunner {
                 )
             }
         })
+    }
+
+    /// Supply each deferred input `spec` declares and `evidence` lacks from
+    /// the evidence the execution's exact Verifier accepted for its pull
+    /// request's head commit, recording each acceptance in `state`.
+    ///
+    /// Only a pull request execution has a source to match. An input whose
+    /// acceptance is not fenced stays missing, and the engine parks its
+    /// consumers; accepted evidence is read on every claim, so a lost wake
+    /// loses nothing.
+    ///
+    /// # Errors
+    /// Returns [`EngineOutcome::Deferred`] when an acceptance cannot be read
+    /// now or is not visible yet, so it is never mistaken for absence, and
+    /// [`EngineOutcome::Retry`] when the state writer is stale.
+    async fn deferred(
+        &self,
+        tenant: DataTenantId,
+        run: &ClaimedExecution,
+        spec: &VerifierSpec,
+        system: PrincipalId,
+        state: &RunState,
+        evidence: &mut BTreeMap<SlotName, InputDeclaration>,
+    ) -> Result<(), EngineOutcome> {
+        let ExecutionInput::PullRequest { pull_request } = &run.input else {
+            return Ok(());
+        };
+        let missing: Vec<&SlotName> = spec
+            .inputs
+            .iter()
+            .filter(|(name, slot)| slot.is_deferred() && !evidence.contains_key(*name))
+            .map(|(name, _)| name)
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let unavailable = |error: &dyn std::fmt::Display| {
+            tracing::info!(execution_id = %run.lease.execution_id, %error, "deferred evidence cannot be read now");
+            EngineOutcome::Deferred(failure(
+                EVIDENCE_UNAVAILABLE,
+                "the execution's deferred evidence cannot be read now",
+            ))
+        };
+        let query = self
+            .reader(tenant, system, Some(&run.authority))
+            .await
+            .map_err(|error| unavailable(&error))?;
+        let records = InputResolver::new(&query, None);
+        let source = EvidenceSource {
+            host: &pull_request.host,
+            repository_id: &pull_request.repository_id,
+            commit: &pull_request.head.sha,
+        };
+        let custody = DeferredEvidence::new(&self.state, tenant);
+        for slot in missing {
+            let accepted = custody
+                .accepted(
+                    &records,
+                    source,
+                    slot,
+                    std::slice::from_ref(&run.verifier_card_uid),
+                )
+                .await
+                .map_err(|error| unavailable(&error))?;
+            let Some(accepted) = accepted.into_values().next() else {
+                continue;
+            };
+            state
+                .accept_evidence(slot, accepted.published.evidence_id)
+                .map_err(|_| {
+                    EngineOutcome::Retry(failure(
+                        EXECUTION_INTERRUPTED,
+                        "the execution state writer stopped",
+                    ))
+                })?;
+            evidence.insert(slot.clone(), accepted.published.value);
+        }
+        Ok(())
     }
 
     /// Run `spec` over the claimed execution's `prepared` input.
@@ -916,7 +1002,8 @@ impl VerifierRunner {
     }
 
     /// A query caller reading as the tenant's `system` principal, granted only
-    /// the verification input, output, and execution state tables, and
+    /// the verification input, output, execution state, and deferred evidence
+    /// tables, and
     /// serving `served`, a run's accepted authority, when given.
     ///
     /// # Errors
@@ -928,8 +1015,13 @@ impl VerifierRunner {
         system: PrincipalId,
         served: Option<&AcceptedAuthority>,
     ) -> Result<ScheduledQueryCaller, SystemReadAuthorityError> {
-        let tables = ["execution_inputs", "execution_outputs", "execution_events"]
-            .map(|name| TableRef::new(BifrostNamespace::Verification, name));
+        let tables = [
+            "execution_inputs",
+            "execution_outputs",
+            "execution_events",
+            "evidence",
+        ]
+        .map(|name| TableRef::new(BifrostNamespace::Verification, name));
         let mut read =
             SystemReadAuthority::resolve(&self.state, tenant, Some(system), &tables).await?;
         if let Some(served) = served {

@@ -16,7 +16,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use wyrd_server::state::LimitsConfig;
 use wyrd_server::verification::engines::EngineOutcome;
+use wyrd_server::verification::hosted::blocks::LaneAdmission;
+use wyrd_server::verification::hosted::{HostedLimits, LaneLimits};
 use wyrd_server::verification::runner::EngineScript;
+use wyrd_server::verification::telemetry::ExecutionMode;
 use wyrd_server::verification::{RuntimeLimits, VerificationRuntime};
 use wyrd_spec::ids::SlotName;
 use wyrd_testing::Bootstrap;
@@ -529,6 +532,86 @@ async fn evidence_published_while_its_consumer_runs_reaches_it() {
     assert_eq!(served["result"]["outcome"]["verdict"], "passed", "{served}");
     stop.cancel();
     task.await.expect("the runtime task does not panic");
+}
+
+/// A parked execution gives back its compute before its park is
+/// acknowledged.
+///
+/// `ci-gate` here also runs an independent Python step. With one of each
+/// queued admission, the step runs in Python and a workspace, then the
+/// execution parks waiting for `ci`. While the park's write is held
+/// unacknowledged the execution is still `running`, yet every queued
+/// workspace, Python and model admission is free; once the park lands it
+/// waits, and publishing `ci` resumes it.
+///
+/// # Panics
+/// Panics when an admission is still held while the park is unacknowledged,
+/// or the execution does not wait and then pass.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn a_parked_execution_releases_compute_before_its_park_is_acknowledged() {
+    const ONE: LaneLimits = LaneLimits {
+        workspaces: 1,
+        python_workers: 1,
+        python_waiters: 0,
+        model_calls: 1,
+    };
+    let deployment = Deployment::launch(|builder| {
+        builder
+            .with_verification_runtime_for_test()
+            .with_verification_runtime_limits_for_test(limits(Duration::from_mins(5)))
+            .with_verification_limits_for_test(HostedLimits {
+                monty_min_workers: 0,
+                queued: ONE,
+                ..HostedLimits::default()
+            })
+    })
+    .await;
+    let measured = ci_gate("1.0.0").replace(
+        "  requirements:\n",
+        "  steps:\n    - id: measure\n      action:\n        kind: code\n        entrypoint: measure\n        source:\n          inline: |\n            def measure():\n                return {\"measured\": True}\n  requirements:\n    - id: measured\n      statement: Python ran\n      check: {kind: assert, path: steps.measure.output.measured, operator: equals, expected: true}\n",
+    );
+    deployment
+        .declare_files(
+            &[("ci-gate.yaml", measured)],
+            &gated("1.1.0"),
+            "gate-measured",
+        )
+        .await;
+    let stall = deployment
+        .server
+        .stall_next_bifrost_write_into("bifrost.verification.execution_events")
+        .expect("Scribe stalls");
+    let parked = deployment.open(7, C1).await;
+    stall.wait_entered().await;
+    assert_eq!(deployment.status(parked).await["status"], "running");
+    let blocks = deployment
+        .server
+        .state()
+        .verification
+        .blocks()
+        .expect("blocks are hosted");
+    for admission in [
+        LaneAdmission::Workspaces,
+        LaneAdmission::Python,
+        LaneAdmission::ModelCalls,
+    ] {
+        let free = blocks.hold_for_test(ExecutionMode::Queued, admission);
+        assert_eq!(
+            free.num_permits(),
+            1,
+            "{admission:?} is released while the park is unacknowledged"
+        );
+    }
+
+    stall.release();
+    stall.wait_completed().await;
+    let served = deployment.until(parked, "waiting").await;
+    assert_eq!(served["waiting"], json!(["ci"]));
+    let (status, receipt) = deployment.publish_ci(C1, json!({"status": "green"})).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    let served = deployment.until(parked, "completed").await;
+    assert_eq!(served["result"]["outcome"]["verdict"], "passed", "{served}");
 }
 
 /// A resumed execution keeps its admission deadline.

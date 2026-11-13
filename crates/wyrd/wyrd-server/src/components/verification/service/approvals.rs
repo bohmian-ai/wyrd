@@ -48,7 +48,9 @@ impl VerificationControl<'_> {
     /// [`WyrdError::VerificationApprovalNotFound`] when the execution
     /// recorded no such occurrence; [`WyrdError::PermissionDeniedRbac`]
     /// without `verifier:approve` on the Verifier or authority over the
-    /// subject; [`WyrdError::VerificationApprovalNotPending`] when another
+    /// subject; [`WyrdError::VerificationTargetNotFound`] when the
+    /// execution's exact Verifier and subject no longer resolve for a new
+    /// decision; [`WyrdError::VerificationApprovalNotPending`] when another
     /// decision was accepted or the execution ended, expired, or was
     /// superseded; and [`WyrdError::ServiceUnavailable`] or
     /// `WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE` when the decision cannot be
@@ -129,23 +131,31 @@ impl VerificationControl<'_> {
             .await
             .map_err(registry_db_error)?;
         // The runner's ceiling: the runtime timeout, capped by the exact
-        // Verifier's authored timeout, both counted from admission.
+        // Verifier's authored timeout, both counted from admission. A target
+        // that no longer resolves has no ceiling to decide under.
         let runtime = self.state.verification.execution_timeout();
-        let authored = self
+        let target = self
             .state
             .verification
             .verifier_cards()
-            .resolve(
-                Db::Pool(self.state.postgres.wyrd()),
-                tenant,
-                &verifier,
-                &subject,
-            )
+            .resolve(Db::Conn(conn.transaction()), tenant, &verifier, &subject)
             .await
             .map_err(registry_db_error)?
-            .ok()
-            .and_then(|target| target.authored_timeout());
-        let ceiling = authored.map_or(runtime, |authored| authored.min(runtime));
+            .map_err(|refusal| {
+                tracing::info!(?refusal, "the execution's exact target no longer resolves");
+                WyrdError::VerificationTargetNotFound {
+                    message:
+                        "no active Verifier and subject Card with these UIDs in the caller's tenant"
+                            .to_owned(),
+                    details: serde_json::json!({
+                        "verifier_card_uid": verifier,
+                        "card_uid": subject,
+                    }),
+                }
+            })?;
+        let ceiling = target
+            .authored_timeout()
+            .map_or(runtime, |authored| authored.min(runtime));
         let timeout = chrono::Duration::from_std(ceiling)
             .map_err(|error| WyrdError::internal(format!("execution timeout: {error}")))?;
         let open = self

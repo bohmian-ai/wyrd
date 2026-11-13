@@ -13,7 +13,7 @@ use wyrd_runtime::Permission;
 use wyrd_server::state::LimitsConfig;
 use wyrd_server::verification::VerificationRuntime;
 use wyrd_spec::ids::CardUid;
-use wyrd_testing::Bootstrap;
+use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 use super::pg_deferred_evidence::limits;
 use super::pg_github_pull_requests::{Deployment, REPOSITORY};
@@ -780,4 +780,123 @@ async fn a_discarded_speculative_approval_refuses_a_decision() {
     assert_eq!(refused["details"]["status"], "expired");
     let served = deployment.status(waiting).await;
     assert_eq!(served["status"], "waiting", "{served}");
+}
+
+/// A decision of an execution whose exact target no longer resolves is
+/// refused as a missing target, never accepted under the wider runtime
+/// ceiling.
+///
+/// The execution parks on its approval and the runtime stops. The editor
+/// deletes the Repository Card it verifies; deciding the still-listed
+/// occurrence is
+/// then refused with the target-not-found error, and the occurrence stays
+/// undecided.
+///
+/// # Panics
+/// Panics when the Repository is not deleted, the decision is accepted, or
+/// the occurrence gains a decision.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_decision_whose_target_no_longer_resolves_is_refused() {
+    let deployment = Deployment::start_with(false).await;
+    deployment.signoff().await;
+    let (stop, task) = deployment.runtime();
+    let waiting = deployment.open(13, H1).await;
+    let served = deployment.until(waiting, "waiting").await;
+    let approval = occurrence(&served)["approval_id"]
+        .as_str()
+        .expect("approval id")
+        .to_owned();
+    stop.cancel();
+    task.await.expect("the runtime task does not panic");
+
+    let mut conn = deployment.conn().await;
+    let (subject,): (Uuid,) =
+        sqlx::query_as("SELECT card_uid FROM wyrd.verifier_executions WHERE execution_id = $1")
+            .bind(waiting)
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("execution reads");
+    conn.commit().await.expect("read commits");
+    let request = axum::http::Request::builder()
+        .method(axum::http::Method::DELETE)
+        .uri(format!("/v1/cards/by-uid/Repository/{subject}"))
+        .body(axum::body::Body::empty())
+        .expect("delete request builds");
+    let response = deployment
+        .server
+        .oneshot_authenticated(&deployment.jwt, request)
+        .await
+        .expect("delete responds");
+    assert!(response.status().is_success(), "{}", response.status());
+
+    let (status, refused) = deployment
+        .decide(
+            &deployment.jwt,
+            waiting,
+            &approval,
+            &json!({"decision": "approved"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{refused}");
+    assert_eq!(refused["code"], "WYRD_VERIFICATION_404_TARGET_NOT_FOUND");
+    let served = deployment.status(waiting).await;
+    assert!(occurrence(&served)["actor_id"].is_null(), "{served}");
+    assert!(occurrence(&served)["decided_at"].is_null(), "{served}");
+}
+
+/// A decision whose target is not cached needs only the one connection it
+/// already holds.
+///
+/// The execution parks on its approval and the server restarts, so its
+/// target cache is empty and the decision resolves the exact Verifier from
+/// Postgres. The test holds every app-pool connection but one; the decision
+/// is still accepted on that one.
+///
+/// # Panics
+/// Panics when the pool cannot be narrowed or the decision is not accepted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cold_decision_needs_only_its_own_connection() {
+    let deployment = Deployment::start_with(false).await;
+    deployment.signoff().await;
+    let (stop, task) = deployment.runtime();
+    let waiting = deployment.open(14, H1).await;
+    let served = deployment.until(waiting, "waiting").await;
+    let approval = occurrence(&served)["approval_id"]
+        .as_str()
+        .expect("approval id")
+        .to_owned();
+    stop.cancel();
+    task.await.expect("the runtime task does not panic");
+    let Deployment { mock, server, .. } = deployment;
+    let server =
+        Box::pin(server.restart_bound(WyrdTestServer::builder().with_github_app_for_test(&mock)))
+            .await
+            .expect("server restarts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("pull-request-editor-again", &["editor"])
+        .await
+        .expect("editor bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let deployment = Deployment { mock, server, jwt };
+
+    let state = deployment.server.state();
+    let pool = state.postgres.wyrd().app_pool();
+    let max = pool.options().get_max_connections();
+    let mut held = Vec::new();
+    while max - pool.size() + u32::try_from(pool.num_idle()).expect("idle fits") > 1 {
+        held.push(pool.acquire().await.expect("a connection is held"));
+    }
+    let (status, receipt) = deployment
+        .decide(
+            &deployment.jwt,
+            waiting,
+            &approval,
+            &json!({"decision": "approved"}),
+        )
+        .await;
+    drop(held);
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["status"], "approved", "{receipt}");
 }

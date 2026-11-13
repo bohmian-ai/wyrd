@@ -111,7 +111,7 @@ const state = (
 ): DiagramNode => ({ id, kind: 'state', x, y, w, h, tone, glyph, title, detail });
 
 /** Execution states, as named by `VerificationExecutionStatus`. */
-export const RUN_STATES = ['pending', 'running', 'retrying', 'completed', 'cancelled', 'timed_out', 'errored'];
+export const RUN_STATES = ['pending', 'running', 'waiting', 'retrying', 'completed', 'cancelled', 'timed_out', 'errored'];
 /** Verdicts, as named by `VerificationVerdict`. */
 export const VERDICTS = ['passed', 'failed', 'inconclusive'];
 /** Operator dispatch states, as named by `OperatorDispatchStatus`. */
@@ -141,6 +141,7 @@ export const runLifecycle: DiagramSpec = {
         state('pending', 36, 74, 'progress', '○', run(badge('', '○', 'pending'), 'null', 'None yet', 'Wait. The execution is queued and no runner has claimed it.')),
         state('running', 176, 74, 'progress', '▶', run(badge('', '▶', 'running'), 'null', 'None yet', 'Wait. Each attempt has up to 5 minutes; an execution gets 3 attempts.')),
         state('retrying', 176, 184, 'progress', '↻', run(badge('', '↻', 'retrying'), 'null', 'None yet', 'Read <code>error</code> to see why the last attempt failed. It will run again.')),
+        state('waiting', 36, 184, 'progress', '⏸', run(badge('', '⏸', 'waiting'), 'null', 'None yet', 'Read <code>waiting</code> for the deferred inputs it needs, then publish them with <code>wyrd evidence publish</code>. It holds no runner meanwhile.')),
         state('completed', 380, 74, 'ok', '✓', run(badge('ok', '✓', 'completed'), 'Set', 'Depends on the verdict', 'Read the result from <code>status</code> or <code>wait</code>. Completed without a visible result: keep polling.')),
         state('timed_out', 380, 146, 'warn', '!', run(badge('warn', '!', 'timed_out'), 'null', 'Never', 'An attempt ran past 5 minutes, often a slow Agent step. No verdict exists.'), 120, 40),
         state('errored', 380, 196, 'danger', '✕', run(badge('danger', '✕', 'errored'), 'null', 'Never', 'Read <code>error.code</code> and <code>error.message</code>, such as an idempotency conflict. This is a failure to check, not a failure of your service.'), 120, 40),
@@ -195,8 +196,10 @@ export const runLifecycle: DiagramSpec = {
       edges: [
         { id: 'p_r', from: 'pending', to: 'running', kind: 'control', pts: [[156, 97], [176, 97]] },
         { id: 'r_c', from: 'running', to: 'completed', kind: 'control', pts: [[296, 90], [380, 90]] },
-        { id: 'r_rt', from: 'running', to: 'retrying', kind: 'control', pts: [[216, 120], [216, 184]], label: 'retryable error', lx: 210, ly: 156, anchor: 'end' },
-        { id: 'rt_r', from: 'retrying', to: 'running', kind: 'control', pts: [[256, 184], [256, 120]], label: 'next attempt', lx: 262, ly: 156, anchor: 'start' },
+        { id: 'r_rt', from: 'running', to: 'retrying', kind: 'control', pts: [[216, 120], [216, 184]], label: 'retryable error', lx: 222, ly: 146, anchor: 'start' },
+        { id: 'rt_r', from: 'retrying', to: 'running', kind: 'control', pts: [[256, 184], [256, 120]], label: 'next attempt', lx: 262, ly: 170, anchor: 'start' },
+        { id: 'r_w', from: 'running', to: 'waiting', kind: 'control', pts: [[176, 112], [166, 112], [166, 207], [156, 207]] },
+        { id: 'w_p', from: 'waiting', to: 'pending', kind: 'control', pts: [[96, 184], [96, 120]], label: 'evidence published', lx: 90, ly: 156, anchor: 'end' },
         { id: 'r_to', from: 'running', to: 'timed_out', kind: 'control', pts: [[296, 100], [336, 100], [336, 166], [380, 166]] },
         { id: 'r_e', from: 'running', to: 'errored', kind: 'control', pts: [[296, 108], [348, 108], [348, 216], [380, 216]] },
         { id: 'c_v', from: 'completed', to: 'verdict', kind: 'data', pts: [[500, 97], [556, 97]], label: 'result', lx: 528, ly: 89 },
@@ -217,6 +220,20 @@ export const runLifecycle: DiagramSpec = {
       name: 'Passes',
       path: ['pending', 'running', 'completed', 'verdict', 'passed'],
       say: ['A schedule or <code>submit</code> queued the execution.', 'A runner claimed it and is judging.', 'It produced a result, so it has a verdict.', 'The verdict is read from the result row.', '<b>Passed.</b> Nothing else happens.']
+    },
+    {
+      name: 'Waits for CI',
+      path: ['pending', 'running', 'waiting', 'pending', 'running', 'completed', 'verdict', 'passed'],
+      say: [
+        'A pull request queued the execution.',
+        'A runner claimed it; checks that do not need CI results run.',
+        '<b>Waiting.</b> A deferred input is missing, so the runner lets go.',
+        'CI published the input, so the same execution is queued again.',
+        'It resumes without repeating finished steps.',
+        'Completed: a verdict exists.',
+        'Read the verdict.',
+        '<b>Passed.</b>'
+      ]
     },
     {
       name: 'Retries, then pages',

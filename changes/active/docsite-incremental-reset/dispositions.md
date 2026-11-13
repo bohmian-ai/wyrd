@@ -42,7 +42,7 @@ Pending REQ-008 (TASK-006): the editor role still grants `policy:lock`; retained
 
 ## Handoff to SPEC-positioning
 
-Approval of SPEC-positioning revision 3 transfers these pages and surfaces
+Approval of SPEC-positioning transfers these pages and surfaces
 from this packet. Rows above stay as the record of this packet's earlier work;
 SPEC-positioning owns the next change to each.
 
@@ -51,7 +51,7 @@ SPEC-positioning owns the next change to each.
 | `README.md`, homepage (`docs/src/routes/+page.*`), package introductions | positioning TASK-001 | Lead with the real-time verification claim and the finance release example |
 | `get-started/introduction.md` | positioning TASK-001 | Rewritten around the finance release example |
 | `get-started/setup.md` | positioning TASK-001 | Ends with the model-free setup check (`examples/setup-check`) |
-| `get-started/quickstart.md` | positioning TASK-001 | Replaced by `examples/finance-release`; published on this branch, merge waits for the release that ships code authoring (v0.4.1 predates it) and its live-provider walkthrough |
+| `get-started/quickstart.md` | positioning TASK-001 | Replaced by `examples/finance-release`; published |
 | Verification education and FAQ pages | positioning TASK-002 | Not started |
 | Tutorial drafts this packet listed | positioning TASK-003 | Not started; TASK-003 records its own handoff |
 | Shared metadata, semantic rendering, sitemap | positioning TASK-004 | Not started |

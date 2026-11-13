@@ -1,6 +1,6 @@
 ---
 id: SPEC-positioning
-revision: 3
+revision: 4
 status: approved
 ---
 
@@ -54,7 +54,7 @@ The material cost is authoring, proving and maintaining a coherent content
 set. The policy Agent also requires a configured gateway/provider and incurs
 model usage; prerequisites and evidence exposure must be explicit. Scripted
 provider responses make automated journeys repeatable but do not prove live
-model quality or replace the documented-provider walkthrough.
+model quality.
 
 Targeted HTML/component repairs accompany the content where inspection finds
 reading or discovery gaps. This is not a mandate to rewrite working components.
@@ -386,21 +386,21 @@ fixtures or implementation structure.
 | AC-002 | Missing evidence and model uncertainty exercise native inconclusive behavior where appropriate. Request/execution error cases remain typed errors. Every non-pass/error holds and never invokes simulated release. | REQ-004; INV-002–003 |
 | AC-003 | Inspect the declared quickstart graph and real invocation: one Service binds one Verifier with exactly the three requirements, one call returns their results, and the policy Agent’s gateway interaction reads the selected PDF extraction. No step-overlap or timing proof is required. | REQ-003; INV-001–003 |
 | AC-004 | Two requests reuse the policy upload/extraction. A changed policy changes selected exact policy/Verifier/binding versions without retargeting the old declaration; public result/evidence inspection identifies the versions used. | REQ-005; INV-003 |
-| AC-005 | A fresh reader follows rendered setup/quickstart on the documented release with the documented gateway/provider. Copied programs and captured output reproduce pass/fail, policy reuse and the brief update follow-on. Shared snippets and handoff text agree. | REQ-006; INV-004–005 |
+| AC-005 | Rendered setup/quickstart embed the actual programs, the documented gateway/provider setup and the captured output; the actual-program journeys reproduce pass/fail, policy reuse and the brief update follow-on. Install pins name the release that ships this change. Shared snippets and handoff text agree. | REQ-006; INV-004–005 |
 | AC-006 | Rendered README/homepage show the exact opening, application proof before infrastructure, concise example, correct language links and working learning/setup/quickstart destinations. Six-section navigation, brand and responsive keyboard access remain usable. | REQ-001, REQ-007; INV-004 |
 | AC-007 | Every inventoried public surface has a reasoned disposition and canonical destination. Revised editorial/package/example surfaces agree, Author in code consumers remain coherent, and generated content is regenerated from its owner. | REQ-008; INV-001, INV-004 |
 | AC-008 | Built pages have purpose-specific metadata, valid canonicals/anchors/links, semantic structure and substantive prose/code without requiring interaction. Published coverage agrees across sitemap, search, navigation and compact/full agent text; drafts appear in none. Required docs/build/link/accessibility checks pass. | REQ-009; INV-004–006 |
 | AC-009 | A source-backed content review finds clear verification definitions, accurate relationships to adjacent disciplines, and distinct real-time/queued/scheduled explanations with native timeout/evidence/error boundaries. Examples and links agree with current authority. | REQ-010; INV-001–005 |
 | AC-010 | Each required practice explains its prevented failure, concrete good/bad examples and limitations. Coverage includes evidence completeness, requirement/version evolution, check/model reliability, and production decisions. Copyable code comes from tested source. | REQ-011; INV-002–005 |
-| AC-011 | Every published tutorial has the appropriate real-server journey on each surface it teaches, plus a rendered-release walkthrough. Tests establish the complete/skipped agent-step distinction from adequate evidence, scheduled execution with controlled pass/violation, and attributable failure investigation. Missing evidence never falsely establishes completion or absence. | REQ-012; INV-001–005 |
+| AC-011 | Every published tutorial has the appropriate real-server journey on each surface it teaches. Tests establish the complete/skipped agent-step distinction from adequate evidence, scheduled execution with controlled pass/violation, and attributable failure investigation. Missing evidence never falsely establishes completion or absence. | REQ-012; INV-001–005 |
 | AC-012 | The published FAQ directly answers every required adoption topic and links to the correct concept/procedure/reference. No answer promises unsupported enforcement, hosted behavior or model guarantees. | REQ-013; INV-002–005 |
 | AC-013 | The editorial query map assigns each intent family to canonical substantive content. A reader/agent given representative questions finds the right published page, its prerequisites and executable next step using public site/index surfaces, without repository archaeology. No arbitrary keyword frequency or live search position is required. | REQ-014; INV-004–006 |
 | AC-014 | Substantive external claims have primary-source attribution, demonstrations link to executed evidence, dates/credits are truthful, and the maintainer handoff identifies content/discovery/distribution responsibilities without performing external outreach. | REQ-015; INV-005–006 |
 | AC-015 | Publication evidence identifies the initial set and completion of the full required corpus. The handoff defines baseline and equal-window follow-up metrics, records available baseline data or explicit access gaps, and identifies a responsible maintainer for remaining account-dependent work. | REQ-016; INV-005–006 |
 
 Automated provider fixtures prove execution mechanics, not live model accuracy.
-Record actual supported release pins, provider/model setup, commands and observed
-outcomes for the rendered walkthroughs. Run the complete documentation checks
+Record the install pins, provider/model setup, commands and observed
+outcomes. Run the complete documentation checks
 and affected SDK/example journeys at integrated review; a successful build alone
 is insufficient. Verify targeted component changes for their affected rendering,
 accessibility and performance properties using existing tools. No backend hot
@@ -414,18 +414,23 @@ structure, category/query strategy, finance composition, educational/tutorial
 coverage and evidence boundaries are fixed above. Page splits, existing-example
 selection, provider/model choice within the supported gateway, reversible
 component repairs and exact commands belong to planning/implementation.
-Supported release availability and provider access must be established before
-publication. Unavailable account metrics are explicit handoff gaps, not product
+The documentation publishes with this change; its install pins name the
+release that ships it. Unavailable account metrics are explicit handoff gaps, not product
 choices or permission to omit required content.
 
-The maintainer explicitly approved revision 3 on 2026-11-12 and requested
-planning. Approval covers the complete positioning and documentation rollout,
+The maintainer approved revision 3 on 2026-11-12 and revision 4 on
+2026-11-13. Approval covers the complete positioning and documentation rollout,
 bounded ownership transfer, invariants and acceptance evidence. Implementation
-tasks must reference this approved revision; the old revision-2 scope must
+tasks must reference revision 4; the old revision-2 scope must
 not be executed as its plan. Spec approval does not approve implementation
 tasks or grant implementation readiness.
 
 ## Revision history
+
+- Revision 4 — Maintainer correction on 2026-11-13: the documentation
+  publishes with this change. Removed the live-provider walkthrough and
+  release-availability gates; install pins name the release that ships the
+  change, and the actual-program journeys are the proof.
 
 - Approval — The maintainer explicitly approved revision 3 on 2026-11-12 and
   requested task planning; no behavioral edits were made with approval.

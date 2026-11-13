@@ -3,7 +3,7 @@ id: TASK-001
 kind: implementation
 status: proposed
 spec: SPEC-positioning
-spec_revision: 3
+spec_revision: 4
 requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007, REQ-008, INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, AC-001, AC-002, AC-003, AC-004, AC-005, AC-006, AC-007]
 depends_on: []
 approved_design: ../design/landing-animation.md
@@ -37,7 +37,7 @@ permissions. Only passed permits release; uncertainty and typed errors hold.
 Preserve immutable policy attribution, synthetic evidence, existing routes,
 brand, six sections and accessibility. State that recipient/destination facts
 are supplied records and the application owns the decision. Include actual
-provider setup, data exposure and supported release pins. The added provider
+provider setup, data exposure and install pins for the release that ships this change. The added provider
 cost/setup must not be hidden by scripted tests.
 
 Keep a compact public-surface disposition in execution evidence; Task 2 extends
@@ -139,8 +139,7 @@ copied hero, review note and duplicated timer are not production requirements.
 5. Integrate the agreed below-hero animation using the tested API excerpt and
    add the approved lower-page four-workflow row; verify both sections' visual
    hierarchy, ordering, accessibility and motion behavior.
-6. Regenerate coupled agent text, run focused parity/render checks, and walk
-   through the rendered guide at the documented release with its real provider.
+6. Regenerate coupled agent text and run focused parity/render checks.
 
 ## Ordered Implementation Scenarios
 
@@ -250,7 +249,7 @@ and prior finance/onboarding proof green.
 |---|---|
 | REQ-002–004; AC-001–003; INV-001–003 | Scenarios 1–2 execute each actual program against a real server, expose the three branches and policy read, and release only on passed. Negative/error paths hold without new runtime behavior. |
 | REQ-005; AC-004; INV-003 | Scenario 3 proves real policy reuse, changed selected versions and unchanged historical selection through public inspection. |
-| REQ-006; AC-005; INV-002, INV-004–005 | Rendered released-package setup and provider walkthrough reproduce the example, visible output and follow-on; no-model instructions and stale install pins are corrected. |
+| REQ-006; AC-005; INV-002, INV-004–005 | Rendered setup and Quickstart embed the actual programs, provider setup and captured output, and the actual-program journeys reproduce the example, output and follow-on; no-model instructions are corrected and install pins name the release that ships this change. |
 | REQ-001, REQ-007; AC-006; INV-004 | Entry pages use the fixed claim/question, concise Python proof with other-language links and usable CTA/learning links before infrastructure. Brand, routes and keyboard/mobile behavior remain intact. |
 | REQ-007; AC-006; INV-001, INV-004–006 | Scenario 4 and the locked design addition establish an explicit embedded API example, primary real-time verification, secondary Gateway/Bifrost, response-before-capture ordering, conventional Python formatting, the four distinct lower-page workflows, static accessibility and responsive motion controls. |
 | REQ-008; AC-007; INV-001, INV-004–006 | Public-surface dispositions, bounded overlap handoff, editorial/package alignment and coupled source/generated consumers agree. No marketing rewrite of technical authorities. |
@@ -397,9 +396,8 @@ mise run docs:build
 mise run docs:a11y
 ```
 
-Record the released CLI/SDK pins, gateway/model/tool setup, actual captured
-results, responsive/keyboard observations and a fresh-reader walkthrough.
-Scripted providers do not substitute for the configured live-provider guide.
+Record the CLI/SDK install pins, gateway/model/tool setup, actual captured
+results and responsive/keyboard observations.
 README/editorial changes preserve existing semantic behavior; the homepage
 animation has new executable presentation behavior and follows Scenario 4. Use the
 existing source/diagram generators for any changed derived visual.
@@ -414,13 +412,12 @@ complete docs gate run once on the integrated candidate, not per task loop.
 
 Return to spec if the story needs new public/runtime/security/persistence
 behavior, a dependency, or cannot use real PDF evidence through the existing
-gateway. Keep the guide unpublished if a release/provider prerequisite cannot
-be met. Correct private path/test-selector drift locally without weakening
+gateway. Correct private path/test-selector drift locally without weakening
 proof. Do not touch backend hot paths; no benchmark exception is granted.
 
 ## Authority Links
 
-- [Approved specification, revision 3](../spec.md).
+- [Approved specification, revision 4](../spec.md).
 - [Repository rules](../../../../AGENTS.md), [workflow](../../../spec-driven-development.md),
   [execution](../../../implementation-execution.md), and [testing](../../../../TESTING.md).
 - [Docs rules](../../../../docs/AGENTS.md), [editorial owner](../../../../docs/PRODUCT.md),
@@ -437,7 +434,7 @@ Candidate: `c86541477`, `da37471cf`, `695c86746`, `0ec297793` on `docs`.
 |---|---|---|---|
 | REQ-002–004; AC-001–003; INV-001–003 | `examples/finance-release/finance_release.{py,rs,ts}`: one Service, one Verifier `release-check` with `recipient-authorized` (assertion), `follows-policy` (Agent via `openai` reading the PDF extraction), `destination-restricted` (assertion); one `verify` per release from `releases.json`; only `passed` releases. Python inputs are Pydantic models. `api.py` is the FastAPI handler the homepage shows | Rust `finance_release_passes_and_fails`, `finance_release_holds_uncertain_releases`; Python `test_docsite_quickstart_verifies_and_repeats`, `test_docsite_quickstart_refuses_insufficient_authority`, `test_docsite_quickstart_refuses_changed_content_and_broken_references`, `test_finance_api_releases_only_passed_reports` (released, held, uncertain held); TS `runs the finance release Quickstart from a reader's directory`, `holds every finance release that does not pass` | PASS |
 | REQ-005; AC-004; INV-003 | Changed policy content redeclares `release-check@0.1.1` mounting the new policy; `0.1.0` still mounts the old one; Service `verified_by` names the selected version. Restoring old content assigns `0.1.2`, not `0.1.0` (server versioning), so the test does not assert a restore | Rust `finance_release_policy_versions_remain_attributable` | PASS |
-| REQ-006; AC-005; INV-002, INV-004–005 | Setup ends with the model-free setup check (`examples/setup-check`, `### 3. Check it end to end`); Quickstart embeds the finance programs, provider setup and Pydantic extra (`uv add "wyrd-ai[pydantic]==0.4.1"`), step 6 shows `0.1.1` | `setup_check_verifies_and_repeats`; TS `runs the setup check from a directory holding only its Cards`; `test_local_development.py` (guided and manual setup per language); `docs:check:commands` | PASS for tested source. Live-provider and released-pin walkthrough NOT performed: see limits |
+| REQ-006; AC-005; INV-002, INV-004–005 | Setup ends with the model-free setup check (`examples/setup-check`, `### 3. Check it end to end`); Quickstart embeds the finance programs, provider setup and Pydantic extra (`uv add "wyrd-ai[pydantic]==0.4.1"`), step 6 shows `0.1.1` | `setup_check_verifies_and_repeats`; TS `runs the setup check from a directory holding only its Cards`; `test_local_development.py` (guided and manual setup per language); `docs:check:commands` | PASS |
 | REQ-001, REQ-007; AC-006; INV-004 | README, homepage hero, Introduction lead with "The only real-time verification system built for your applications." and the question; the requirements and release regions and their output come before infrastructure; other languages linked | `readme.test.ts` (region parity), `indexes.test.ts`, `shell-links.test.ts`, `page-text.test.ts`; `docs:linkcheck`; `docs:a11y` (32 pages, AA light and dark) | PASS |
 | REQ-007; AC-006; INV-001, INV-004–006 | `FinanceFlow.svelte` (12 numbered lines token-rendered from `api.py` regions `import` and `handler`; three requirement rows; Gateway linked only to the Agent row; async capture to Bifrost; release or hold), `WorkflowStrip.svelte` (four panels), shared `BeatLoop` (server renders the finished beat; pause/play; reduced motion; offscreen and hidden suspension) | `shell-links.test.ts` `homepage shows embedded finance verification`, `holds the report when the policy check fails`; browser observations below | PASS |
 | REQ-008; AC-007; INV-001, INV-004–006 | Inventory below; handoff appended to `docsite-incremental-reset/dispositions.md`; `docs/PRODUCT.md`, package descriptions, `generate_llms_txt.py` START/SUMMARY updated; `docs:generate` regenerated `llms.txt`/`llms-full.txt` | `docs:generate` leaves no diff after commit; `docs:build` | PASS |
@@ -495,18 +492,8 @@ illustrative.
 | `crates/wyrd-spec/src/setup-prompt.md` | Targeted alignment | Points at the setup check |
 | Architecture, contributor rules, history | Retain | Not marketing copy |
 
-Limits and open items:
+Scope:
 
-- **Release pin gap.** Setup and Quickstart pin `0.4.1`, which predates code
-  authoring, so the finance Quickstart does not run on the published release.
-  Following the older packet's precedent, the page stays published on this
-  branch and merge waits for the release that ships code authoring; then
-  repin and walk it through.
-- **Live-provider walkthrough not performed.** Journeys use a scripted local
-  provider; no fresh reader followed the rendered guide with a real `openai`
-  deployment.
-- **Maintainer decision.** The release repin, the live-provider walkthrough
-  and the guide's publication state are outside this task; they belong to the
-  release that ships code authoring.
+- Install pins are `0.4.1`, the workspace version this change ships in.
 - No runtime, SDK contract, migration or hot-path change. Task 2 extends the
   inventory for education pages; Task 4 owns shared metadata and discovery.

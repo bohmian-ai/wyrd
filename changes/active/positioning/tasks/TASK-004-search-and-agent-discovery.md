@@ -3,7 +3,7 @@ id: TASK-004
 kind: implementation
 status: proposed
 spec: SPEC-positioning
-spec_revision: 3
+spec_revision: 4
 requirements: [REQ-007, REQ-008, REQ-009, REQ-014, REQ-015, REQ-016, INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, AC-006, AC-007, AC-008, AC-013, AC-014, AC-015]
 depends_on: [TASK-001, TASK-002, TASK-003]
 ---
@@ -268,7 +268,7 @@ focused tests may adapt locally within the established owners.
 
 ## Authority Links
 
-- [Approved specification, revision 3](../spec.md).
+- [Approved specification, revision 4](../spec.md).
 - [Repository rules](../../../../AGENTS.md), [workflow](../../../spec-driven-development.md),
   [execution](../../../implementation-execution.md), and [testing](../../../../TESTING.md).
 - [Docs rules](../../../../docs/AGENTS.md), [editorial owner](../../../../docs/PRODUCT.md),

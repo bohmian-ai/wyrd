@@ -3,7 +3,7 @@ id: TASK-003
 kind: implementation
 status: proposed
 spec: SPEC-positioning
-spec_revision: 3
+spec_revision: 4
 requirements: [REQ-008, REQ-011, REQ-012, REQ-014, REQ-015, REQ-016, INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, AC-007, AC-010, AC-011, AC-013, AC-014, AC-015]
 depends_on: [TASK-001, TASK-002]
 ---
@@ -163,7 +163,7 @@ reference material; a simple investigation does not require notifications.
 
 | Obligations | Required observation |
 |---|---|
-| REQ-012; AC-011; INV-001–005 | All four actual tutorial programs execute through real SDK/server journeys on every language shown. Scenario-specific pass/violation and edge observations agree with rendered released-package walkthroughs. |
+| REQ-012; AC-011; INV-001–005 | All four actual tutorial programs execute through real SDK/server journeys on every language shown. Scenario-specific pass/violation and edge observations agree with the rendered tutorials. |
 | REQ-011–012; AC-010–011; INV-002–003 | The skipped-step example proves adequate original execution evidence; missing evidence never silently proves completion or absence. Investigation distinguishes a result from later visibility and does not rerun judging. |
 | REQ-008, REQ-014; AC-007, AC-013; INV-004–006 | Each tutorial has one reader purpose, a canonical route/disposition and accurate prerequisites/links; no duplicate finance procedure or invented keyword-only page. Query mapping is supplied to Task 4. |
 | REQ-015–016; AC-014–015; INV-005–006 | Executed evidence/captured output support all tutorial claims and truthful attribution. Publication evidence identifies the skipped-step priority and full required tutorial completion, not only the initial landing set. |
@@ -324,7 +324,7 @@ never silently omit a required workflow or language variant.
 
 ## Authority Links
 
-- [Approved specification, revision 3](../spec.md).
+- [Approved specification, revision 4](../spec.md).
 - [Repository rules](../../../../AGENTS.md), [workflow](../../../spec-driven-development.md),
   [execution](../../../implementation-execution.md), and [testing](../../../../TESTING.md).
 - [Docs rules](../../../../docs/AGENTS.md), [editorial owner](../../../../docs/PRODUCT.md),

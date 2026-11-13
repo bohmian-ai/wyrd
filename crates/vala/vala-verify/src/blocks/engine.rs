@@ -277,7 +277,7 @@ pub struct VerificationEngine {
     begun: Begun,
 }
 
-/// One run's highest begun attempt per block and instance.
+/// One run's highest begun attempt per step and instance.
 type Begun = Arc<std::sync::Mutex<HashMap<(TaskId, Instance), u32>>>;
 
 /// One invocation of a block: its zero-based fanout item and repeat
@@ -555,13 +555,20 @@ impl VerificationEngine {
             .collect()
     }
 
+    /// Note that step attempt `producer` is this run's highest begun
+    /// attempt of its instance, or `producer`'s predecessor once it is
+    /// forgotten, so a withheld contribution reports it. Only steps are
+    /// noted: [`Self::attempted`] reads step attempts alone.
+    fn note_step(&self, producer: &Producer, attempt: u32) {
+        self.begun_attempts()
+            .insert(instance_key(producer), attempt);
+    }
+
     /// Record that the attempt `producer` starts, before it is dispatched.
     ///
     /// # Errors
     /// Returns [`EngineError::Checkpoint`] when the record cannot commit.
     async fn begin(&self, producer: &Producer) -> Result<(), EngineError> {
-        self.begun_attempts()
-            .insert(instance_key(producer), producer.attempt);
         match &self.checkpoints {
             Some(checkpointed) => checkpointed
                 .store
@@ -578,8 +585,6 @@ impl VerificationEngine {
     /// # Errors
     /// Returns [`EngineError::Checkpoint`] when the record cannot be removed.
     async fn forget(&self, producer: &Producer) -> Result<(), EngineError> {
-        self.begun_attempts()
-            .insert(instance_key(producer), producer.attempt - 1);
         match &self.checkpoints {
             Some(checkpointed) => checkpointed
                 .store
@@ -1681,6 +1686,7 @@ impl VerificationEngine {
             }
             attempts += 1;
             let producer = producer(&step.id, instance, attempts);
+            self.note_step(&producer, attempts);
             self.begin(&producer).await?;
             let timeout = step
                 .timeout_seconds
@@ -1711,10 +1717,12 @@ impl VerificationEngine {
             timer.finish(result.is_ok());
             match result {
                 Err(BlockError::Busy { reason }) => {
+                    self.note_step(&producer, attempts - 1);
                     self.forget(&producer).await?;
                     return Err(EngineError::Busy(reason));
                 }
                 Err(BlockError::Unavailable { reason }) => {
+                    self.note_step(&producer, attempts - 1);
                     self.forget(&producer).await?;
                     return Err(EngineError::DefinitionUnavailable(reason));
                 }

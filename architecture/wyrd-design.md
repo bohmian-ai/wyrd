@@ -1585,8 +1585,9 @@ published later for one connected repository's commit with
 consumer of the slot, so a consumer and its dependents wait while independent
 steps run; there is no wait action, Trigger, or `depends_on` for it. When no
 runnable work remains the execution reports `waiting` with the slot names,
-releases its compute, keeps its lease until Scribe acknowledges the parked
-revision, and only then releases its queue row with the attempt refunded and
+releases its workspace, Python, and model capacity, keeps its claim and lease
+until Scribe acknowledges the parked revision, and only then releases its
+queue row with the attempt refunded and
 the original deadline kept. Publication is matched by tenant, repository,
 commit, and input to every active binding of that repository and every
 nonterminal execution of that commit whose Verifier declares the input as

@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use chrono::{SubsecRound, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use vala_verify::blocks::{EngineError, EvidenceReader as _, conform};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::repository::RepositoryRemote;
@@ -159,12 +159,7 @@ impl VerificationControl<'_> {
         // A replay wakes too: a publisher retrying an unacknowledged
         // acceptance resumes the consumers that acceptance never woke.
         self.wake(tenant, source, &subscribers).await;
-        let recorded_at = held
-            .values()
-            .map(|accepted| accepted.recorded_at)
-            .chain((!fresh.is_empty()).then_some(now))
-            .min()
-            .unwrap_or(now);
+        let (status, recorded_at) = receipt(&held, !fresh.is_empty(), now);
         tracing::Span::current().record("matched", subscribers.len());
         Ok(PublishEvidenceResponse {
             evidence_id: published.evidence_id,
@@ -174,11 +169,7 @@ impl VerificationControl<'_> {
             },
             tags: request.tags,
             input: request.input,
-            status: if fresh.is_empty() {
-                EvidenceStatus::Replayed
-            } else {
-                EvidenceStatus::Accepted
-            },
+            status,
             matched_subscriptions: u32::try_from(subscribers.len()).unwrap_or(u32::MAX),
             recorded_at,
         })
@@ -372,5 +363,82 @@ fn nonconforming(error: EngineError) -> WyrdError {
                 details: serde_json::json!({ "reason": reason }),
             }
         }
+    }
+}
+
+/// The receipt status and time a publication answers. `held` is every
+/// subscriber's canonical acceptance read back, including one a concurrent
+/// publisher won; `accepted_now` is whether this publication accepted the
+/// value for any subscriber at `now`. A publication that accepted nothing
+/// replays, and the receipt time is the first acceptance, so a losing
+/// offer's own `now` never reaches the receipt.
+fn receipt(
+    held: &BTreeMap<CardUid, Accepted>,
+    accepted_now: bool,
+    now: DateTime<Utc>,
+) -> (EvidenceStatus, DateTime<Utc>) {
+    let recorded_at = held
+        .values()
+        .map(|accepted| accepted.recorded_at)
+        .chain(accepted_now.then_some(now))
+        .min()
+        .unwrap_or(now);
+    let status = if accepted_now {
+        EvidenceStatus::Accepted
+    } else {
+        EvidenceStatus::Replayed
+    };
+    (status, recorded_at)
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::TimeDelta;
+
+    use super::*;
+
+    /// A publication that lost the acceptance race answers the winner's
+    /// receipt: replayed, at the first acceptance, not its own offer time.
+    #[test]
+    fn a_lost_race_replays_the_first_acceptance() {
+        let source = EvidenceSource {
+            host: "github.com",
+            repository_id: &RepositoryId::new("2").expect("id"),
+            commit: &"c0".repeat(20),
+        };
+        let input = SlotName::new("ci").expect("slot");
+        let published = DeferredEvidence::publish(
+            source,
+            &input,
+            serde_json::from_value(
+                serde_json::json!({"kind": "json", "value": {"status": "green"}}),
+            )
+            .expect("declaration"),
+        )
+        .expect("publishes");
+        let first = Utc::now().trunc_subsecs(6);
+        let offered = first + TimeDelta::seconds(5);
+        let held = BTreeMap::from([(
+            CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid"),
+            Accepted {
+                published: published.clone(),
+                recorded_at: first,
+            },
+        )]);
+
+        assert_eq!(
+            receipt(&held, false, offered),
+            (EvidenceStatus::Replayed, first)
+        );
+        assert_eq!(
+            held.values()
+                .next()
+                .map(|accepted| &accepted.published.evidence_id),
+            Some(&published.evidence_id)
+        );
+        assert_eq!(
+            receipt(&BTreeMap::new(), true, offered),
+            (EvidenceStatus::Accepted, offered)
+        );
     }
 }

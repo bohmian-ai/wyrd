@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
-use chrono::Utc;
+use chrono::{SubsecRound, Utc};
 use vala_verify::blocks::{EngineError, conform};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Attribution;
@@ -124,7 +124,8 @@ impl VerificationControl<'_> {
             .filter(|verifier| !held.contains_key(*verifier))
             .cloned()
             .collect();
-        let now = Utc::now();
+        // Bifrost keeps microseconds; a fresh receipt states what a replay reads.
+        let now = Utc::now().trunc_subsecs(6);
         if !fresh.is_empty() {
             let deadline = Instant::now() + self.state.settings.limits.timeout / 2;
             let attribution = Attribution::new(caller.principal.id, caller.principal.id);

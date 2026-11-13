@@ -6,14 +6,19 @@
 //! [`pg_github_pull_requests`](super::pg_github_pull_requests) and binds
 //! `ci-gate`, whose `ci` slot is deferred, to its pull requests.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode, header};
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use wyrd_server::state::LimitsConfig;
-use wyrd_server::verification::RuntimeLimits;
+use wyrd_server::verification::engines::EngineOutcome;
+use wyrd_server::verification::runner::EngineScript;
+use wyrd_server::verification::{RuntimeLimits, VerificationRuntime};
+use wyrd_spec::ids::SlotName;
 use wyrd_testing::Bootstrap;
 use wyrd_testing::github::PullRequest;
 
@@ -144,9 +149,10 @@ impl Deployment {
     /// with its result, and return it.
     ///
     /// # Panics
-    /// Panics when it is not within a minute.
+    /// Panics when it is not within two minutes, longer than a parked
+    /// execution's one-minute recheck.
     async fn until(&self, execution: Uuid, status: &str) -> Value {
-        let deadline = tokio::time::Instant::now() + Duration::from_mins(1);
+        let deadline = tokio::time::Instant::now() + Duration::from_mins(2);
         loop {
             let served = self.status(execution).await;
             // A completed execution's result lands in Bifrost after its status.
@@ -473,6 +479,56 @@ async fn parked_executions_end_by_supersession_and_deadline() {
         served["result"].is_null(),
         "missing evidence never passes: {served}"
     );
+}
+
+/// Evidence published while its consumer is still running reaches it.
+///
+/// The consumer's first run is held running and then parks, as one that
+/// read no `ci` does. Publishing `ci` meanwhile matches it, but the wake
+/// cannot touch a running row; the parked row's bounded recheck runs the
+/// real engine, which reads the accepted evidence, and the same execution
+/// passes without a republish.
+///
+/// # Panics
+/// Panics when the publication does not match the running consumer or the
+/// consumer does not pass.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn evidence_published_while_its_consumer_runs_reaches_it() {
+    let deployment = Deployment::start_with(false).await;
+    deployment.gate("1.1.0", "1.0.0").await;
+    let script = EngineScript::default();
+    script.hold();
+    script.push(EngineOutcome::Parked(BTreeSet::from([
+        SlotName::new("ci").expect("slot name")
+    ])));
+    let runtime = VerificationRuntime::builder(deployment.server.state())
+        .limits(limits(Duration::from_mins(5)))
+        .engine_script(script.clone())
+        .build()
+        .expect("the runtime composes");
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(runtime.run(stop.clone()));
+
+    let running = deployment.open(6, C1).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while script.entered() == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "the consumer runs");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(deployment.status(running).await["status"], "running");
+    let (status, receipt) = deployment.publish_ci(C1, json!({"status": "green"})).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(
+        receipt["matched_subscriptions"], 1,
+        "the running consumer subscribes"
+    );
+
+    script.release();
+    let served = deployment.until(running, "completed").await;
+    assert_eq!(served["result"]["outcome"]["verdict"], "passed", "{served}");
+    stop.cancel();
+    task.await.expect("the runtime task does not panic");
 }
 
 /// A resumed execution keeps its admission deadline.

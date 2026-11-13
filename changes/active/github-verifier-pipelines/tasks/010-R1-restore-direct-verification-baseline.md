@@ -1,7 +1,7 @@
 ---
 id: TASK-010-R1
 kind: remediation
-status: proposed
+status: complete
 spec: SPEC-github-verifier-pipelines
 spec_revision: 7
 approved_spec_revision: 7

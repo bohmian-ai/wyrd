@@ -31,7 +31,7 @@ acquisition/comparison/index/context and remains standalone.
 
 | Task | Deliverable consumed downstream |
 |---|---|
-| [001](001-isolate-queued-capacity.md) | Separate direct/queued execution/workspace/Python/model admission and original ceiling configuration; queued-only validation extended by 005/007/008 |
+| [001](001-isolate-queued-capacity.md) | **Complete.** Separate direct/queued execution/workspace/Python/model admission and original ceiling configuration; queued-only validation extended by 005/007/008 |
 | [002](002-github-app-connection.md) | Verified tenant installation/selected repository access, installation-token capability and revocation fence for 003/004/006/009 |
 | [003](003-repository-declaration.md) | **Complete.** Ready exact Repository receipt, selected policy/bindings and activation lifecycle for 006/007 |
 | [004](004-pinned-pr-preparation.md) | **Complete.** Reviewed pinned/baseline-aware ReviewPipeline revision, ObjectStorage adapter and PostgreSQL SnapshotStore/ContextStore metadata tables/adapters for 005 |
@@ -40,8 +40,8 @@ acquisition/comparison/index/context and remains standalone.
 | [007](007-deferred-evidence-and-resumption.md) | **Requires 010.** Durable source-matched evidence, waiting inspection and same-execution park/continuation lifecycle (compute released at park; background ACK before retirement) for 008/009 |
 | [008](008-approval-steps.md) | **Requires 010.** Exact pending approval identities, accepted decisions and continuation/progress for 009 |
 | [009](009-reports-and-github-delivery.md) | **Requires 010.** Optional standard report/helper authoring and recoverable Checks/comments with independent provider retry that never recomputes verification; no new SQL delivery fields |
-| [010](010-nonblocking-verification-execution.md) | **Proposed; blocks renewed 006 acceptance and 005/007–009.** Approved runtime spec revision 7; shared memory-owned engine, preserved preparation, bounded background terminal retention/lease/group-commit settlement, claim backpressure and resource-scaling proof; keeps Bifrost unchanged and PR/GitHub/Task 004 metadata |
-| [010-R1](010-R1-restore-direct-verification-baseline.md) | **Proposed remediation; blocks 010 acceptance and its dependents.** Maintainer-agreed direct resource-scaling restoration, destination batching and consumer closure; queued-only resumable state on the same engine; full L1 verification/gateway/Bifrost with no regression. L2 measurement is excluded. |
+| [010](010-nonblocking-verification-execution.md) | **Complete.** Approved runtime spec revision 7; shared memory-owned engine, preserved preparation, bounded background terminal retention/lease/group-commit settlement, claim backpressure and resource-scaling proof; keeps Bifrost unchanged and PR/GitHub/Task 004 metadata |
+| [010-R1](010-R1-restore-direct-verification-baseline.md) | **Complete remediation.** Maintainer-agreed direct resource-scaling restoration, destination batching and consumer closure; queued-only resumable state on the same engine; full L1 verification/gateway/Bifrost with no regression. L2 measurement is excluded. |
 
 Task 010 targets approved runtime spec revision 7 and must be completed before
 renewed 006 acceptance or 005/007–009 execution. Tasks 005 and 007–009 list 010 in

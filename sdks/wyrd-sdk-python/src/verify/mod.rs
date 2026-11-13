@@ -25,6 +25,7 @@ use wyrd_utils::py::{WyrdPyError, WyrdPyResult, json_to_pyobject, pyobject_to_js
 use crate::observe::invalid_argument;
 
 pub(crate) mod definitions;
+mod evidence;
 
 /// A local file to verify, read only when `verify` or `submit` uses it.
 #[pyclass(module = "wyrd._wyrd.verify", name = "File", frozen)]
@@ -586,6 +587,7 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyArtifactRef>()?;
     module.add_class::<PyRecorded>()?;
     module.add_class::<PyExecution>()?;
+    module.add_class::<evidence::PyEvidence>()?;
     module.add_class::<PyVerificationResult>()?;
     definitions::register(module)
 }

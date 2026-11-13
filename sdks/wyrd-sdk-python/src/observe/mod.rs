@@ -147,7 +147,7 @@ pub(crate) fn json_value(
 ///
 /// # Errors
 /// As [`json_value`].
-fn input(py: Python<'_>, field: &str, value: &Bound<'_, PyAny>) -> WyrdPyResult<Input> {
+pub(crate) fn input(py: Python<'_>, field: &str, value: &Bound<'_, PyAny>) -> WyrdPyResult<Input> {
     if let Ok(file) = value.cast::<PyFile>() {
         return Ok(Input::File(file.get().inner.clone()));
     }

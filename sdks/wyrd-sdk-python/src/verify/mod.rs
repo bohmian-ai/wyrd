@@ -18,8 +18,8 @@ use wyrd_client::verify::{
     PublicationSelector, TaskId,
 };
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::ExecutionId;
-use wyrd_spec::verification::execution::VerificationResult;
+use wyrd_spec::ids::{ApprovalId, ExecutionId};
+use wyrd_spec::verification::execution::{ApprovalDecision, VerificationResult};
 use wyrd_utils::py::{WyrdPyError, WyrdPyResult, json_to_pyobject, pyobject_to_json};
 
 use crate::observe::invalid_argument;
@@ -424,6 +424,35 @@ impl PyExecution {
     fn cancel(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         let cancelled = crate::trace::block_on(py, self.handle(py)?.cancel())?;
         Ok(json_to_pyobject(py, &serde_json::to_value(cancelled)?)?)
+    }
+
+    /// Approve or reject the pending approval occurrence `approval_id` and
+    /// return its durable receipt as its wire mapping; the same execution
+    /// then continues. The same decision and reason again replays it.
+    ///
+    /// # Errors
+    /// Raises `WYRD_SPEC_400_VALIDATION` for a malformed `approval_id` or a
+    /// `decision` other than `approved` or `rejected`, and the server's
+    /// authorization, `WYRD_VERIFICATION_404_APPROVAL_NOT_FOUND`,
+    /// `WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING`, availability, or
+    /// transport error.
+    #[pyo3(signature = (approval_id, decision, reason=None))]
+    fn decide(
+        &self,
+        py: Python<'_>,
+        approval_id: &str,
+        decision: &str,
+        reason: Option<String>,
+    ) -> WyrdPyResult<Py<PyAny>> {
+        let approval_id = approval_id
+            .parse::<ApprovalId>()
+            .map_err(|error| invalid_argument("approval_id", error))?;
+        let decision: ApprovalDecision =
+            serde_json::from_value(serde_json::Value::String(decision.to_owned()))
+                .map_err(|error| invalid_argument("decision", error))?;
+        let receipt =
+            crate::trace::block_on(py, self.handle(py)?.decide(approval_id, decision, reason))?;
+        Ok(json_to_pyobject(py, &serde_json::to_value(receipt)?)?)
     }
 }
 

@@ -2,7 +2,9 @@
 
 The pull request's execution waits for ``ci``; ``Evidence.publish`` names the
 repository and commit explicitly or through ``WYRD_REPOSITORY`` /
-``WYRD_COMMIT``, and the receipt is durable and replayable.
+``WYRD_COMMIT``, and the receipt is durable and replayable. A pull request may
+also wait for a person: another principal approves the pending signoff with
+``Execution.decide`` and the same execution passes.
 """
 
 import time
@@ -101,3 +103,57 @@ def test_published_evidence_resumes_the_waiting_execution(
         with pytest.raises(WyrdError) as refused:
             evidence.publish("ci", value, repository=repository)
         assert refused.value.code == code
+
+
+def client_for(server: WyrdTestServer, role: str) -> WyrdClient:
+    """A client acting as a fresh service holding ``role``."""
+    key = server.bootstrap_service([role], name=f"signoff-{role}")
+    return WyrdClient(server_url=server.base_url, credential=key, grpc_url=server.grpc_url)
+
+
+def test_a_person_approves_the_pending_signoff(
+    admin: WyrdClient,
+    mock: GithubAppMock,
+    server: WyrdTestServer,
+) -> None:
+    cards = Cards(admin)
+    receipt = cards.declare_from_path(FIXTURES / "cards/approvals/repository.yaml")
+    [binding] = binding_ids(cards, receipt.root)
+    mock.set_pull_request(2, 7, "b1" * 20, HEAD)
+    payload = mock.pull_request_event(101, 2, 7, "opened")
+    assert mock.deliver(server.base_url, "pull_request", payload) == 202
+    execution_id = binding_status(server, binding)["last_execution_id"]
+    execution = verify.Execution(execution_id, admin)
+    state = until(execution, "waiting")
+    assert state["waiting"] == ["ci"]
+    [pending] = state["approvals"]
+    assert pending["step_id"] == "signoff"
+    assert pending["message"] == "Ship this change?"
+    assert pending["status"] == "pending"
+    assert pending["actor_id"] is None
+    approval_id = pending["approval_id"]
+
+    verify.Evidence(admin).publish("ci", {"status": "green"}, repository="acme/web", commit=HEAD)
+    deadline = time.monotonic() + 30
+    while (state := execution.status())["status"] != "waiting" or state.get("waiting"):
+        assert time.monotonic() < deadline, state
+        time.sleep(0.1)
+
+    viewer = verify.Execution(execution_id, client_for(server, "viewer"))
+    with pytest.raises(WyrdError) as refused:
+        viewer.decide(approval_id, "approved")
+    assert refused.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
+
+    approver = verify.Execution(execution_id, client_for(server, "editor"))
+    decided = approver.decide(approval_id, "approved", reason="reviewed the diff")
+    assert decided["approval_id"] == approval_id
+    assert decided["status"] == "approved"
+    assert decided["reason"] == "reviewed the diff"
+    assert decided["actor_id"] is not None
+    assert decided["decided_at"] is not None
+    assert approver.decide(approval_id, "approved", reason="reviewed the diff") == decided
+
+    assert execution.wait(30).verdict == "passed"
+    [approved] = execution.status()["approvals"]
+    assert approved["status"] == "approved"
+    assert approved["actor_id"] == decided["actor_id"]

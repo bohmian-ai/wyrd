@@ -612,6 +612,39 @@ class PullRequestActivation(TypedDict):
     delivery_id: str
     """Provider delivery that admitted the source."""
 
+ApprovalStatus: TypeAlias = Literal["pending", "approved", "rejected", "expired"]
+"""Where one approval occurrence stands; ``expired`` ends with its execution."""
+
+class ApprovalOccurrence(TypedDict):
+    """One approval occurrence an execution reached, pending or decided.
+
+    It expires with the execution's own deadline; there is no per-approval
+    deadline. ``actor_id``, ``decided_at`` and ``reason`` are ``None`` until
+    a person decides it, and stay ``None`` for an expired occurrence.
+    """
+
+    approval_id: str
+    step_id: str
+    item: NotRequired[int]
+    """Zero-based fanout item, for a fanout step."""
+    iteration: NotRequired[int]
+    """Zero-based repeat iteration, for a repeating step."""
+    message: str
+    status: ApprovalStatus
+    actor_id: str | None
+    decided_at: str | None
+    reason: str | None
+
+class ApprovalReceipt(TypedDict):
+    """``Execution.decide()``: the durable decision of one approval occurrence."""
+
+    approval_id: str
+    status: ApprovalStatus
+    actor_id: str | None
+    decided_at: str | None
+    """RFC 3339 UTC time the decision was accepted."""
+    reason: str | None
+
 class ExecutionState(TypedDict, Generic[DataT]):
     """``Execution.status()``: the lifecycle, terminal error, visible result, and grouping."""
 
@@ -626,6 +659,8 @@ class ExecutionState(TypedDict, Generic[DataT]):
     pull_request: NotRequired[PullRequestActivation]
     waiting: NotRequired[list[str]]
     """The deferred inputs a ``waiting`` execution is parked for."""
+    approvals: NotRequired[list[ApprovalOccurrence]]
+    """Every approval occurrence the execution reached, in step order."""
 
 class EvidenceRepository(TypedDict):
     """The connected repository a publication's slug resolved to."""
@@ -1055,6 +1090,36 @@ class Execution:
                 absent or foreign execution; the ``verifier:run``
                 authorization error; and the client's connection or
                 transport error.
+        """
+        ...
+
+    def decide(
+        self,
+        approval_id: str,
+        decision: Literal["approved", "rejected"],
+        reason: str | None = None,
+    ) -> ApprovalReceipt:
+        """Approve or reject one pending approval occurrence and return its receipt.
+
+        The receipt returns only once the decision is durable, and the same
+        execution then continues. Sending the same decision and reason again
+        returns the same receipt, so a retry is safe.
+
+        Args:
+            approval_id: A pending occurrence from ``status()["approvals"]``.
+            decision: ``"approved"`` or ``"rejected"``.
+            reason: Why, recorded with the decision.
+
+        Raises:
+            WyrdError: ``WYRD_SPEC_400_VALIDATION`` for a malformed ID or
+                decision; ``WYRD_PERMISSION_403_DENIED_RBAC`` without
+                ``verifier:approve`` on the execution's Verifier or read
+                authority over its subject;
+                ``WYRD_VERIFICATION_404_APPROVAL_NOT_FOUND`` for an occurrence
+                the execution never reached;
+                ``WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING`` once another
+                decision was accepted or the execution ended or expired; and
+                the client's connection or transport error.
         """
         ...
 

@@ -101,6 +101,17 @@ fn tarball(files: &[(&str, &[u8])]) -> Vec<u8> {
     gz.finish().expect("gzip finish")
 }
 
+/// The files of a tree holding every `(path, text)` of `helpers` and the
+/// handler `handler`.
+fn tree<'a>(helpers: &'a [(String, String)], handler: &'a str) -> Vec<(&'a str, &'a [u8])> {
+    let mut files: Vec<(&str, &[u8])> = helpers
+        .iter()
+        .map(|(path, text)| (path.as_str(), text.as_bytes()))
+        .collect();
+    files.push(("src/handler.ts", handler.as_bytes()));
+    files
+}
+
 /// A connected, declared deployment whose GitHub serves `acme/policy`.
 struct Deployment {
     /// GitHub.
@@ -1261,13 +1272,17 @@ async fn missing_changed_source_fails_the_extraction_and_never_passes() {
 async fn omitted_context_is_recorded_and_fails_a_completeness_requirement() {
     let deployment =
         Deployment::start(&[("pr-review.yaml", COMPLETE_REVIEW), ("policy.yaml", POLICY)]).await;
-    let imports: String = (0..20)
-        .map(|i| format!("import {{ helper{i} }} from \"./h{i}\";\n"))
-        .collect();
-    let calls: String = (0..20).map(|i| format!("helper{i}(id); ")).collect();
-    let changed = format!("export const handle = (id: string) => {{ {calls}return id; }};");
-    let main_handler = format!("{imports}\nexport const handle = (id: string) => id;\n");
-    let head_handler = format!("{imports}\n{changed}\n");
+    let imports = (0..20)
+        .map(|i| format!("import {{ helper{i} }} from \"./h{i}\";"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let calls = (0..20)
+        .map(|i| format!("helper{i}(id);"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let changed = format!("export const handle = (id: string) => {{ {calls} return id; }};");
+    let main_handler = format!("{imports}\n\nexport const handle = (id: string) => id;\n");
+    let head_handler = format!("{imports}\n\n{changed}\n");
     let helpers: Vec<(String, String)> = (0..20)
         .map(|i| {
             (
@@ -1276,14 +1291,6 @@ async fn omitted_context_is_recorded_and_fails_a_completeness_requirement() {
             )
         })
         .collect();
-    fn tree<'a>(helpers: &'a [(String, String)], handler: &'a str) -> Vec<(&'a str, &'a [u8])> {
-        let mut files: Vec<(&str, &[u8])> = helpers
-            .iter()
-            .map(|(path, text)| (path.as_str(), text.as_bytes()))
-            .collect();
-        files.push(("src/handler.ts", handler.as_bytes()));
-        files
-    }
     let main = tree(&helpers, &main_handler);
     deployment.commit(&sha('c'), &sha('7'), &main);
     deployment.mock.serve_repository(

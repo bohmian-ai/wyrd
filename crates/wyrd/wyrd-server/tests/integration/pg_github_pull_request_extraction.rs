@@ -980,6 +980,97 @@ async fn queued_work_without_an_admitted_pull_request_extracts_nothing() {
     );
 }
 
+/// Execution history the extractor cannot read is a retryable failure, never
+/// permission to review as if no prior review existed: the step spends its
+/// retries, reads no comparison and the execution is never a baseline.
+///
+/// # Panics
+/// Panics when the history read succeeds, the step is not retried, any
+/// comparison is read, or the execution passes or becomes eligible.
+#[tokio::test(flavor = "multi_thread")]
+async fn unreadable_execution_history_is_retried_and_never_a_first_review() {
+    let review = REVIEW.replace(
+        "action: {kind: extract, extractor: pull_request}\n",
+        "action: {kind: extract, extractor: pull_request}\n      retries: 1\n",
+    );
+    let deployment =
+        Deployment::start(&[("pr-review.yaml", &review), ("policy.yaml", POLICY)]).await;
+    deployment.head(&sha('a'), &sha('8'), HANDLER_A);
+    deployment.compare(&sha('c'), &sha('a'), &sha('c'), HANDLER_A, PATCH_A);
+    // Only the baseline query reads `pr_source_extracted`, so withholding
+    // that one column from every runtime grantee makes execution history
+    // unreadable without touching admission, claims or completion.
+    let admin = deployment
+        .server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("the superuser pool is available");
+    sqlx::query(
+        "DO $$
+         DECLARE
+             grantee text;
+             visible text;
+         BEGIN
+             SELECT string_agg(quote_ident(column_name), ', ') INTO visible
+               FROM information_schema.columns
+              WHERE table_schema = 'wyrd' AND table_name = 'verifier_executions'
+                AND column_name <> 'pr_source_extracted';
+             FOR grantee IN
+                 SELECT DISTINCT g.grantee FROM information_schema.role_table_grants g
+                  WHERE g.table_schema = 'wyrd' AND g.table_name = 'verifier_executions'
+                    AND g.privilege_type = 'SELECT'
+                    AND g.grantee <> (SELECT tableowner FROM pg_tables
+                                       WHERE schemaname = 'wyrd' AND tablename = 'verifier_executions')
+             LOOP
+                 EXECUTE format('REVOKE SELECT ON wyrd.verifier_executions FROM %I', grantee);
+                 EXECUTE format('GRANT SELECT (%s) ON wyrd.verifier_executions TO %I', visible, grantee);
+             END LOOP;
+         END $$",
+    )
+    .execute(&admin)
+    .await
+    .expect("the history column is withheld");
+
+    let execution = deployment.review(&sha('a'), "opened").await;
+
+    let details = deployment
+        .get(&format!("/v1/verification/executions/{execution}/details"))
+        .await;
+    let step = &details["outcome"]["steps"][0];
+    assert_eq!(
+        (&step["id"], &step["status"], &step["attempts"]),
+        (&json!("pr"), &json!("failed"), &json!(2)),
+        "{details}"
+    );
+    assert_eq!(
+        step["reason"], "execution history is unavailable now",
+        "{details}"
+    );
+    assert!(
+        step["output"].is_null(),
+        "no review is pretended: {details}"
+    );
+    assert_eq!(details["outcome"]["verdict"], "inconclusive", "{details}");
+    assert_eq!(
+        deployment
+            .mock
+            .repository_reads(REPOSITORY)
+            .iter()
+            .filter(|read| read.starts_with("/compare/"))
+            .count(),
+        0,
+        "no source is acquired"
+    );
+    let extracted: bool = sqlx::query_scalar(
+        "SELECT pr_source_extracted FROM wyrd.verifier_executions WHERE execution_id = $1",
+    )
+    .bind(execution)
+    .fetch_one(&admin)
+    .await
+    .expect("the execution is recorded");
+    assert!(!extracted, "an unextracted review is never a baseline");
+}
+
 /// Hold every slot of `server`'s reserved Scribe share, so nothing more can
 /// be staged for persistence until the returned reservations drop.
 ///

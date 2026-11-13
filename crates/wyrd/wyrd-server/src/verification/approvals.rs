@@ -222,10 +222,35 @@ fn row(
 }
 
 /// An unreadable fence or invisible accepted decision as a retryable
-/// unavailability.
+/// unavailability. The cause is traced here and never reaches the caller.
 fn unavailable(error: &dyn std::fmt::Display) -> WyrdError {
+    tracing::warn!(cause = %error, "approval decisions cannot be read");
     WyrdError::ServiceUnavailable {
-        message: format!("approval decisions cannot be read now: {error}"),
+        message: "approval decisions cannot be read now; try again".to_owned(),
         details: serde_json::json!({ "table": APPROVALS_TABLE }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use wyrd_spec::error::WyrdError;
+
+    use super::{APPROVALS_TABLE, unavailable};
+
+    /// Proves an unreadable decision answers a retryable unavailability that
+    /// names the table but never the internal cause.
+    ///
+    /// # Panics
+    /// Panics when the error is not `ServiceUnavailable`, loses its table
+    /// detail, or carries the cause.
+    #[test]
+    fn an_unavailable_read_hides_its_cause() {
+        let WyrdError::ServiceUnavailable { message, details } =
+            unavailable(&"connection to 10.0.0.7:5432 refused")
+        else {
+            panic!("an unreadable decision is unavailable");
+        };
+        assert!(!message.contains("10.0.0.7"), "{message}");
+        assert_eq!(details["table"], APPROVALS_TABLE);
     }
 }

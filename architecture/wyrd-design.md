@@ -1644,7 +1644,7 @@ per-approval deadline: the occurrence parks the execution the way a deferred
 slot does, and the execution's original deadline, supersession, or
 cancellation expires it. `POST
 /v1/verification/executions/{execution_id}/approvals/{approval_id}` with
-`{decision: approve | reject, reason?}` returns the receipt `{approval_id,
+`{decision: approved | rejected, reason?}` returns the receipt `{approval_id,
 status, actor_id, decided_at, reason}` only after the decision is durable. The
 first decision is final: the same actor, decision, and reason replay the
 receipt, and anything else refuses

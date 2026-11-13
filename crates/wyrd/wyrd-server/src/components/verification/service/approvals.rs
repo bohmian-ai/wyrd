@@ -135,7 +135,7 @@ impl VerificationControl<'_> {
         let receipt = ApprovalReceipt {
             approval_id,
             status: request.decision.into(),
-            actor_id: Some(caller.principal.id),
+            actor_id: Some(caller.attribution().act_principal_id),
             // Bifrost keeps microseconds; a fresh receipt states what a replay reads.
             decided_at: Some(Utc::now().trunc_subsecs(6)),
             reason: request.reason.clone(),
@@ -187,8 +187,9 @@ impl VerificationControl<'_> {
     }
 }
 
-/// The receipt of `held`, an accepted decision, when `caller` sends the same
-/// decision and reason again.
+/// The receipt of `held`, an accepted decision, when the actor who decided
+/// it, `caller`'s acting principal rather than any subject it acts for, sends
+/// the same decision and reason again.
 ///
 /// # Errors
 /// Returns [`WyrdError::VerificationApprovalNotPending`] for any other actor,
@@ -198,7 +199,7 @@ fn replay(
     caller: &Caller,
     request: &DecideApprovalRequest,
 ) -> Result<ApprovalReceipt, WyrdError> {
-    if held.actor_id == Some(caller.principal.id)
+    if held.actor_id == Some(caller.attribution().act_principal_id)
         && held.status == ApprovalStatus::from(request.decision)
         && held.reason == request.reason
     {
@@ -213,5 +214,86 @@ fn not_pending(approval_id: ApprovalId, status: ApprovalStatus) -> WyrdError {
     WyrdError::VerificationApprovalNotPending {
         message: format!("approval {approval_id} is no longer pending"),
         details: serde_json::json!({ "approval_id": approval_id, "status": status }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use wyrd_runtime::permission::PermissionSet;
+    use wyrd_runtime::{DelegationStep, Principal, PrincipalKind, PrincipalRef};
+    use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::PrincipalId;
+    use wyrd_spec::error::WyrdError;
+    use wyrd_spec::ids::ApprovalId;
+    use wyrd_spec::verification::execution::{
+        ApprovalDecision, ApprovalReceipt, ApprovalStatus, DecideApprovalRequest,
+    };
+
+    use super::replay;
+    use crate::components::auth::Caller;
+
+    /// A new user of `tenant` making a request of its own.
+    fn person(tenant: DataTenantId) -> Caller {
+        Caller {
+            data_tenant_id: tenant,
+            principal: Principal::new(
+                PrincipalId::new(uuid::Uuid::now_v7()),
+                PrincipalKind::User,
+                tenant,
+                Vec::new(),
+                PermissionSet::default(),
+            ),
+            request_id: wyrd_spec::request_id::RequestId::now_v7(),
+            delegation_chain: Vec::new(),
+            executed_by: None,
+        }
+    }
+
+    /// `actor` acting for the fixture user `subject`.
+    fn acting(subject: &Caller, actor: &Caller) -> Caller {
+        Caller {
+            delegation_chain: vec![DelegationStep {
+                principal: PrincipalRef::from_principal(&actor.principal),
+            }],
+            ..subject.clone()
+        }
+    }
+
+    /// Proves a decision replays only for the actor who made it: another
+    /// actor for the same subject, and the subject directly, are refused.
+    ///
+    /// # Panics
+    /// Panics when the deciding actor's retry is refused, or another
+    /// identity's identical decision replays.
+    #[test]
+    fn only_the_deciding_actor_replays_a_decision() {
+        let tenant = DataTenantId::new_v7();
+        let subject = person(tenant);
+        let (first, second) = (person(tenant), person(tenant));
+        let actor = acting(&subject, &first);
+        let request = DecideApprovalRequest {
+            decision: ApprovalDecision::Approved,
+            reason: Some("reviewed".to_owned()),
+        };
+        let held = ApprovalReceipt {
+            approval_id: ApprovalId::new_v7(),
+            status: ApprovalStatus::Approved,
+            actor_id: Some(actor.attribution().act_principal_id),
+            decided_at: Some(Utc::now()),
+            reason: request.reason.clone(),
+        };
+        assert_eq!(held.actor_id, Some(first.principal.id));
+        assert_ne!(held.actor_id, Some(subject.principal.id));
+        assert_eq!(
+            replay(&held, &actor, &request).expect("the actor replays"),
+            held
+        );
+        for other in [acting(&subject, &second), subject] {
+            assert!(matches!(
+                replay(&held, &other, &request),
+                Err(WyrdError::VerificationApprovalNotPending { .. })
+            ));
+        }
     }
 }

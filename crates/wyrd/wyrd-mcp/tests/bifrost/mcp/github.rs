@@ -390,6 +390,11 @@ mod pg_tests {
         ///
         /// Returns server startup, bootstrap, connection, declaration, MCP
         /// transport, or tool-call failures.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the browser install does not answer 200 or the
+        /// `opened` webhook delivery is not accepted with 202.
         async fn start(repository: &str) -> Result<Self, McpJourneyError> {
             let mock = GithubAppMock::start()?;
             mock.add_installation(101, &[(2, "acme/web")]);

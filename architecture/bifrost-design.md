@@ -508,6 +508,18 @@ typed columns:
     PostgreSQL payload rows. Operator/provider deliveries and registry/principal,
     binding/schedule/group, webhook/generation and library metadata retain their
     independent lifetimes; delivery retry does not reexecute verification.
+- `bifrost.verification.evidence` is the standalone custody of published
+  deferred evidence, independent of any execution: one row per subscribed
+  exact Verifier version that accepted one publication. It names the source
+  (`host`, `repository_id`, `commit`), the `input`, the subscriber's
+  `verifier_card_uid`, the content digest `sha256` (canonical JSON of the
+  declaration without a display filename), the source-and-content-derived
+  `evidence_id` every subscriber of one publication shares, the sensitive
+  `value` Variant holding the declaration itself (inline JSON, or a File by
+  digest whose bytes stay in verification File storage), and `recorded_at`,
+  its time column. No PostgreSQL table or payload mirror holds it; a parked
+  execution's revision records only which slots it waits for, and its
+  consumers read the accepted rows when they resume.
 
 - Every nullable built-in Struct — the `bifrost.metrics.points` bucket sets and
   `bifrost.gateway.calls` `resolved_model` — has nullable children, because a
@@ -671,6 +683,18 @@ accepted append
 An append acknowledgement means the WAL append and batch fence are durable and
 the exact rows and their recorded table version are authoritative in Scribe.
 It does not wait for local Parquet, object publication, Iceberg promotion, or compaction.
+
+Deferred evidence publication is the one verification producer whose caller
+waits: its positive receipt is returned only after Scribe acknowledges every
+subscriber's acceptance, within half the request timeout; without that
+acknowledgement the publish answers `WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE`
+and a republish of the same content replays. `bifrost.verification.evidence` is
+fenced-only: the committed batch fence is the acceptance, so an unfenced batch
+is absent and a fenced acceptance whose row no query can see yet is
+unavailable, never absent, both for publish deduplication and for a consumer's
+recovery read. A parked execution's revision is acknowledged before its queue
+row is released, so a crash before then repeats unpersisted work, never loses
+the park.
 
 Bifrost durability is the only evidence durability. The
 [code-review source cache](wyrd-design.md#code-review-source-cache) is Wyrd
@@ -841,6 +865,10 @@ a fresh tenant transaction, retries identical absent fences, and poisons on
 unavailable/contradictory authority. RLS, group ownership and transaction
 counts do not change. Versioning adds no normal-ingest PostgreSQL call.
 No request is acknowledged before WAL sync and its durable fence commit.
+Each deferred evidence acceptance is its own batch whose id derives from its
+source, input, and subscriber, so the first fenced batch keeps the evidence,
+an identical retry replays it, and different content for the same id is the
+batch conflict the publish reports as `WYRD_VERIFICATION_409_EVIDENCE_CONFLICT`.
 
 An honest retry of a batch that is already fenced and visible can avoid the
 shard queue. The existing bounded committed-batch mirror returns its original
@@ -1505,12 +1533,13 @@ to: one row per authorized request rather than continuous high-rate ingest,
 date-range rather than recent-window queries, and retention measured in years
 rather than days.
 
-The five verification tables — `bifrost.drift.observations`,
+The six verification tables — `bifrost.drift.observations`,
 `bifrost.verification.execution_inputs`, `bifrost.verification.execution_outputs`,
-`bifrost.verification.execution_events`, and `bifrost.verification.results` —
-also partition by UTC day on each table's time column — `created_at` for
-observations, `recorded_at` for execution inputs, `occurred_at` for execution
-events, and `ended_at` for execution outputs and results —
+`bifrost.verification.execution_events`, `bifrost.verification.evidence`, and
+`bifrost.verification.results` — also partition by UTC day on each table's
+time column — `created_at` for observations, `recorded_at` for execution
+inputs and evidence, `occurred_at` for execution events, and `ended_at` for
+execution outputs and results —
 never by Verifier, subject, binding, or tenant ID. A Drift schedule window does
 not determine partition size. `bifrost.storage.objects` partitions by UTC day
 on `recorded_at`.
@@ -1983,10 +2012,11 @@ the namespace does not create another storage or authorization model.
 
 Permissions are scoped through `BifrostTable`, `BifrostRecord`, and
 `BifrostQuery`. Generic writes cannot target reserved or system-managed tables;
-`bifrost.gateway.calls`, the four verification tables
+`bifrost.gateway.calls`, the five verification tables
 (`bifrost.verification.results`, `bifrost.verification.execution_inputs`,
-`bifrost.verification.execution_outputs`, and
-`bifrost.verification.execution_events`), the `bifrost.storage.objects`
+`bifrost.verification.execution_outputs`,
+`bifrost.verification.execution_events`, and
+`bifrost.verification.evidence`), the `bifrost.storage.objects`
 inventory, and the `bifrost.metrics.series` index, which Scribe derives from
 admitted points, accept no public write at all: Gate refuses every principal. Only
 the server-internal capture writer writes them, together with

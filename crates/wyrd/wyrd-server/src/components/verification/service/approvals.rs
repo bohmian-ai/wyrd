@@ -15,6 +15,7 @@ use super::{DECIDE_APPROVAL, VerificationControl};
 use crate::components::auth::Caller;
 use crate::state::registry_db_error;
 use crate::verification::approvals::ApprovalDecisions;
+use crate::verification::cache::Db;
 use crate::verification::inputs::InputResolver;
 
 /// The longest reason, in characters, a decision may record.
@@ -33,7 +34,8 @@ impl VerificationControl<'_> {
     /// actor sends the same decision and reason, and refuses otherwise; a
     /// replay makes the execution due again, as a decision does. A new
     /// decision is accepted only while the execution is unfinished and before
-    /// its original deadline, written through Scribe, and returned once
+    /// its original deadline, the runtime timeout capped by the Verifier's
+    /// authored timeout, both from admission, written through Scribe, and returned once
     /// acknowledged; the execution is then made due so it continues under
     /// the same id. A lost wake loses nothing: the parked execution rechecks
     /// its decisions when its bounded park ends.
@@ -121,7 +123,25 @@ impl VerificationControl<'_> {
             .tenant_conn(tenant)
             .await
             .map_err(registry_db_error)?;
-        let timeout = chrono::Duration::from_std(self.state.verification.execution_timeout())
+        // The runner's ceiling: the runtime timeout, capped by the exact
+        // Verifier's authored timeout, both counted from admission.
+        let runtime = self.state.verification.execution_timeout();
+        let authored = self
+            .state
+            .verification
+            .verifier_cards()
+            .resolve(
+                Db::Pool(self.state.postgres.wyrd()),
+                tenant,
+                &verifier,
+                &subject,
+            )
+            .await
+            .map_err(registry_db_error)?
+            .ok()
+            .and_then(|target| target.authored_timeout());
+        let ceiling = authored.map_or(runtime, |authored| authored.min(runtime));
+        let timeout = chrono::Duration::from_std(ceiling)
             .map_err(|error| WyrdError::internal(format!("execution timeout: {error}")))?;
         let open = self
             .queue

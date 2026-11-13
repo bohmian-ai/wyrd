@@ -601,3 +601,68 @@ async fn an_unacknowledged_decision_is_unavailable_and_its_retry_replays() {
     let served = deployment.until(waiting, "completed").await;
     assert_eq!(served["result"]["outcome"]["verdict"], "passed", "{served}");
 }
+
+/// A decision is refused once the Verifier's own shorter timeout passes,
+/// even while no runtime has ended the execution yet.
+///
+/// The Verifier authors an 8 second timeout under a 5 minute runtime
+/// ceiling. A decision soon after admission is accepted. With the runtime
+/// stopped, a second execution's approval is decided after its authored
+/// timeout and refused as expired; the restarted runtime times it out.
+///
+/// # Panics
+/// Panics when the early decision is refused, the late one is accepted, or
+/// the late execution does not time out.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_decision_after_the_authored_timeout_is_refused() {
+    const AUTHORED: Duration = Duration::from_secs(8);
+    let deployment = Deployment::start_with(false).await;
+    deployment
+        .declare_files(
+            &[(
+                "signoff.yaml",
+                SIGNOFF.replace("spec:\n", "spec:\n  limits: {timeout_seconds: 8}\n"),
+            )],
+            POLICY,
+            "brief-signoff-policy",
+        )
+        .await;
+    let approve = json!({"decision": "approved"});
+    let pending = |served: &Value| {
+        occurrence(served)["approval_id"]
+            .as_str()
+            .expect("approval id")
+            .to_owned()
+    };
+
+    let (stop, task) = deployment.runtime();
+    let early = deployment.open(10, H1).await;
+    let served = deployment.until(early, "waiting").await;
+    let (status, receipt) = deployment
+        .decide(&deployment.jwt, early, &pending(&served), &approve)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    let admitted = tokio::time::Instant::now();
+    let late = deployment.open(11, H2).await;
+    let served = deployment.until(late, "waiting").await;
+    let approval = pending(&served);
+    stop.cancel();
+    task.await.expect("the runtime task does not panic");
+
+    tokio::time::sleep_until(admitted + AUTHORED + Duration::from_secs(1)).await;
+    let (status, refused) = deployment
+        .decide(&deployment.jwt, late, &approval, &approve)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(
+        refused["code"],
+        "WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING"
+    );
+    assert_eq!(refused["details"]["status"], "expired");
+
+    let (stop, task) = deployment.runtime();
+    let served = deployment.until(late, "timed_out").await;
+    assert!(occurrence(&served)["actor_id"].is_null(), "{served}");
+    stop.cancel();
+    task.await.expect("the runtime task does not panic");
+}

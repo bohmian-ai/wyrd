@@ -1451,12 +1451,12 @@ impl VerifierRunner {
         // and retry waits spend it and a reclaim never replenishes it.
         let claimed = tokio::time::Instant::from_std(loaded.0);
         let mut deadline = claimed + run.remaining;
-        if let Some(seconds) = verifier
+        if let Some(authored) = verifier
             .as_ref()
             .ok()
-            .and_then(|target| target.spec.limits.as_ref()?.timeout_seconds)
+            .and_then(|target| target.authored_timeout())
         {
-            let limit = Duration::from_secs(u64::from(seconds)).saturating_sub(run.age);
+            let limit = authored.saturating_sub(run.age);
             deadline = deadline.min(claimed + limit);
         }
         let telemetry = ExecutionTelemetry::start(ExecutionMode::Queued, Some(loaded.0));

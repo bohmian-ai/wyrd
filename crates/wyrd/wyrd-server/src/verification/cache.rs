@@ -30,6 +30,7 @@
 //! that delivery latency.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use lru::LruCache;
 use sqlx::PgConnection;
@@ -110,6 +111,17 @@ impl Target {
             subject: exact_ref(&subject),
             system_principal: read.system_principal.map(PrincipalId::new),
         })
+    }
+
+    /// The Verifier's authored `limits.timeout_seconds`, which counts from
+    /// admission and caps the runtime's execution ceiling; `None` when the
+    /// Verifier authors none.
+    pub(crate) fn authored_timeout(&self) -> Option<Duration> {
+        self.spec
+            .limits
+            .as_ref()?
+            .timeout_seconds
+            .map(|seconds| Duration::from_secs(u64::from(seconds)))
     }
 
     /// Parse a stored Card row, logging and discarding one that does not.

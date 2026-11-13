@@ -62,29 +62,27 @@ impl<O> RunLedger<O> {
             self.entries.push((task, settled));
         }
     }
-}
 
-impl<O> IntoIterator for RunLedger<O> {
-    /// One owned settlement: the task id and what it settled as.
-    type Item = (TaskId, O);
-    /// Consumes the ledger, yielding settlements in settlement order.
-    type IntoIter = std::vec::IntoIter<(TaskId, O)>;
-
-    /// Every settlement, in settlement order.
-    fn into_iter(self) -> Self::IntoIter {
-        self.entries.into_iter()
+    /// Consume the ledger into every settlement, in settlement order, and
+    /// each task's position among them, so a caller moves settlements out in
+    /// its own order without rebuilding a map.
+    pub(crate) fn into_parts(self) -> (HashMap<TaskId, usize>, Vec<O>) {
+        let settlements = self.entries.into_iter().map(|(_, settled)| settled);
+        (self.index, settlements.collect())
     }
 }
 
-/// A pending block future polled by [`Tasks`].
-pub(crate) type Running<O, E> = Pin<Box<dyn Future<Output = Result<O, E>> + Send>>;
+/// A pending block future polled by [`Tasks`]. It may borrow what outlives
+/// its run for `'a`, such as the engine, since it is polled in the caller's
+/// task and never spawned.
+pub(crate) type Running<'a, O, E> = Pin<Box<dyn Future<Output = Result<O, E>> + Send + 'a>>;
 
 /// How one ready block proceeds, decided before it runs.
-pub(crate) enum Prepared<O, E> {
+pub(crate) enum Prepared<'a, O, E> {
     /// Settled without running, such as a skip.
     Settled(O),
     /// Runs concurrently with every other running block.
-    Run(Running<O, E>),
+    Run(Running<'a, O, E>),
 }
 
 /// The running blocks of one run, keyed by `K`, polled together.
@@ -92,12 +90,12 @@ pub(crate) enum Prepared<O, E> {
 /// Dropping the set, or cancelling one key, drops its futures: work a
 /// dropped future already performed is not rolled back, and executors
 /// release their resources on drop.
-pub(crate) struct Tasks<K, O, E> {
+pub(crate) struct Tasks<'a, K, O, E> {
     /// Running futures with their keys.
-    running: Vec<(K, Running<O, E>)>,
+    running: Vec<(K, Running<'a, O, E>)>,
 }
 
-impl<K, O, E> Default for Tasks<K, O, E> {
+impl<K, O, E> Default for Tasks<'_, K, O, E> {
     /// No running work.
     fn default() -> Self {
         Self {
@@ -106,9 +104,9 @@ impl<K, O, E> Default for Tasks<K, O, E> {
     }
 }
 
-impl<K: PartialEq, O, E> Tasks<K, O, E> {
+impl<'a, K: PartialEq, O, E> Tasks<'a, K, O, E> {
     /// Start polling `task` under `key`.
-    pub(crate) fn push(&mut self, key: K, task: Running<O, E>) {
+    pub(crate) fn push(&mut self, key: K, task: Running<'a, O, E>) {
         self.running.push((key, task));
     }
 

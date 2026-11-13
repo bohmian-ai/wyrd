@@ -750,13 +750,15 @@ impl VerificationEngine {
         .map_err(|_| EngineError::DeadlineExceeded)??;
         // Every block has settled, so each settlement has one owner left and
         // moves into the outcome, its shared step output uncopied.
-        let mut settled: HashMap<TaskId, Done> = ledger
+        let (index, settlements) = ledger.into_parts();
+        let mut settled: Vec<Option<Done>> = settlements
             .into_iter()
-            .map(|(id, done)| (id, Arc::unwrap_or_clone(done)))
+            .map(|done| Some(Arc::unwrap_or_clone(done)))
             .collect();
+        let mut take = |id: &TaskId| index.get(id).and_then(|&at| settled[at].take());
         let (mut steps, mut requirements) = (Vec::new(), Vec::new());
         for id in plan.stages.iter().flat_map(|stage| &stage.tasks) {
-            if let Some(Done::Step(done)) = settled.remove(id) {
+            if let Some(Done::Step(done)) = take(id) {
                 let StepDone {
                     mut result,
                     state,
@@ -771,7 +773,7 @@ impl VerificationEngine {
             }
         }
         for requirement in &spec.requirements {
-            if let Some(Done::Requirement(result)) = settled.remove(&requirement.id) {
+            if let Some(Done::Requirement(result)) = take(&requirement.id) {
                 requirements.push(*result);
             }
         }
@@ -913,7 +915,7 @@ impl VerificationEngine {
             .map(Node::Step)
             .chain((0..spec.requirements.len()).map(Node::Requirement))
             .collect();
-        let mut tasks: Tasks<Node, Arc<Done>, EngineError> = Tasks::default();
+        let mut tasks: Tasks<'_, Node, Arc<Done>, EngineError> = Tasks::default();
         let mut disposed = BTreeSet::new();
         loop {
             let mut released = true;
@@ -944,7 +946,7 @@ impl VerificationEngine {
                     let decided =
                         self.decide_speculation(spec, &scope, index, settled, speculation, &reason);
                     disposed.insert(index);
-                    let engine = self.clone();
+                    let engine = self;
                     let control = ControlRecord::Disposition {
                         step: step.id.clone(),
                         speculation,
@@ -1039,7 +1041,7 @@ impl VerificationEngine {
         ledger: &Ledger,
         node: Node,
         deadline: Instant,
-    ) -> Result<Prepared<Arc<Done>, EngineError>, EngineError> {
+    ) -> Result<Prepared<'_, Arc<Done>, EngineError>, EngineError> {
         match node {
             Node::Step(index) | Node::Disposition(index) => {
                 self.step(spec, evidence, ledger, index, deadline)
@@ -1116,7 +1118,7 @@ impl VerificationEngine {
         ledger: &Ledger,
         index: usize,
         deadline: Instant,
-    ) -> Result<Prepared<Arc<Done>, EngineError>, EngineError> {
+    ) -> Result<Prepared<'_, Arc<Done>, EngineError>, EngineError> {
         let step = &spec.steps[index];
         let scope = Scope::new(evidence, ledger);
         let known = step
@@ -1142,7 +1144,7 @@ impl VerificationEngine {
             match record.clone() {
                 None => Ok(Prepared::Settled(done)),
                 Some(control) => {
-                    let engine = self.clone();
+                    let engine = self;
                     Ok(Prepared::Run(Box::pin(async move {
                         engine.control(&control).await?;
                         Ok(done)
@@ -1288,7 +1290,7 @@ impl VerificationEngine {
         if let Some(gap) = Missing::strongest(gaps) {
             return settle(StepStatus::Skipped, gap, speculation);
         }
-        let engine = self.clone();
+        let engine = self;
         let spec = Arc::clone(spec);
         let evidence = Arc::clone(evidence);
         let ledger = Arc::new(ledger.clone());
@@ -1331,11 +1333,11 @@ impl VerificationEngine {
             .as_ref()
             .and_then(|foreach| foreach.concurrency)
             .map(|bound| Arc::new(Semaphore::new(bound as usize)));
-        let mut running: Tasks<usize, Member, EngineError> = Tasks::default();
+        let mut running: Tasks<'_, usize, Member, EngineError> = Tasks::default();
         let total = items.len();
         for (at, item) in items.into_iter().enumerate() {
             let (engine, spec, evidence, ledger, bound) = (
-                self.clone(),
+                self,
                 Arc::clone(spec),
                 Arc::clone(evidence),
                 Arc::clone(ledger),
@@ -1535,7 +1537,7 @@ impl VerificationEngine {
     ) -> Result<Vec<ExecutedRequirement>, EngineError> {
         let instance = frame.instance();
         let mut results = Vec::new();
-        let mut running: Tasks<usize, ExecutedRequirement, EngineError> = Tasks::default();
+        let mut running: Tasks<'_, usize, ExecutedRequirement, EngineError> = Tasks::default();
         for at in 0..spec.steps[index].requirements.len() {
             let scope = Scope::new(evidence, ledger).framed(frame.clone());
             match self.requirement(spec, &scope, (Some(index), at), instance, deadline) {
@@ -1577,7 +1579,7 @@ impl VerificationEngine {
         key: Key,
         instance: Instance,
         deadline: Instant,
-    ) -> Prepared<ExecutedRequirement, EngineError> {
+    ) -> Prepared<'_, ExecutedRequirement, EngineError> {
         let requirement = requirement_at(spec, key);
         if let Some(InvocationSettlement::Requirement { result }) =
             self.restored(&requirement.id, instance)
@@ -1590,7 +1592,7 @@ impl VerificationEngine {
                 return Prepared::Settled(Judged::missing(gap).report(spec, key, instance));
             }
         };
-        let engine = self.clone();
+        let engine = self;
         let spec = Arc::clone(spec);
         Prepared::Run(Box::pin(async move {
             let requirement = requirement_at(&spec, key);
@@ -2286,7 +2288,7 @@ type Key = (Option<usize>, usize);
 /// Returns `finished`'s error.
 async fn settled<K: PartialEq, O>(
     finished: Result<O, EngineError>,
-    running: &mut Tasks<K, O, EngineError>,
+    running: &mut Tasks<'_, K, O, EngineError>,
 ) -> Result<O, EngineError> {
     if matches!(finished, Err(EngineError::Busy(_))) {
         running.drain(EngineError::Join).await;

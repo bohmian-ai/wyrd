@@ -61,6 +61,6 @@ Inspect the actual documentation against the unchanged complete helper bodies an
 |---|---|---|---|---|
 | R1-1 | field docs: `lock` is the open row-lock transaction whose commit releases the blocked batch; `write` is the second write pending in that batch | `pg_code_review_cache.rs` `HeldBatch` | content review against `start` (returns `HeldBatch { lock, write }` once a batch blocks) and `release` | PASS |
 | R1-2 | `# Panics` when the read fails or no row is visible | `pg_verifier_executions.rs` `source_extracted` | content review against `fetch_one(...).expect("execution reads")` | PASS |
-| R1-3 | 6 added comment lines, 2 files | `git diff --stat` | `mise run fmt:check` 0; `git diff --check` clean | PASS |
+| R1-3 | Rust changes are 6 added `///` lines in the two named test files; the only other file changed is this remediation task's ledger and evidence | `git show 912363eec` | inspection of `git show 912363eec` shows no executable line changed; `mise run fmt:check` 0; `git diff --check` clean | PASS |
 
-No RED: documentation only. No executable line, test, fixture or other file changed.
+No RED: documentation only. No executable line, test or fixture changed; besides the two test files, only this task file changed.

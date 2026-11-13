@@ -504,6 +504,9 @@ Limits and open items:
   repin and walk it through.
 - **Live-provider walkthrough not performed.** Journeys use a scripted local
   provider; no fresh reader followed the rendered guide with a real `openai`
-  deployment. Required before merge (AC-005).
+  deployment.
+- **Maintainer decision.** The release repin, the live-provider walkthrough
+  and the guide's publication state are outside this task; they belong to the
+  release that ships code authoring.
 - No runtime, SDK contract, migration or hot-path change. Task 2 extends the
   inventory for education pages; Task 4 owns shared metadata and discovery.

@@ -105,6 +105,23 @@ fact without reacquisition; cancelled work does not advance; policy change
 falls back. Verify at the SQL owner: single/batched parity, rollback, stale
 lease and replay.
 
+### Revision — no client projection of the extraction
+
+The extraction has no client consumer. Its consumers are server-side: the
+same Verifier's Agent and code steps and requirements through ordinary
+`steps.<id>.output` references, recovery from accepted state, the next head's
+baseline selection over execution history, and task 009's report validation
+against the retained pins. Without a defined client consumer, no client SDK
+surface or type is created for it.
+
+This drops from "Output, consumers and surfaces" and AC-011 the Rust, Python
+and TypeScript typed read projections of the extraction output, and SDK
+authoring helpers for `extractor: pull_request`. The action stays authorable in
+Card YAML and JSON through the shared loader and declaration route, and the
+regenerated TypeScript wire types carry only the action field. Inspection uses
+the existing execution details on HTTP, MCP and CLI, where the step output is
+ordinary JSON; this task adds no inspection-specific type or command.
+
 ## Agreed transformation and custody
 
 Select the last completed usable same-PR/same-policy review from retained
@@ -194,6 +211,6 @@ JSON fixture alone cannot prove any predecessor handoff in this journey.
 | X8 | REQ-007, REQ-017; Agreed transformation ¶3 | Recovery reuses the accepted extraction exactly, with source and context intact after library context expiry; unpersisted extraction may repeat | Tier 2 restart after cache expiry |
 | X9 | REQ-007; AC-004 | Missing required source, omissions and model-input limit failures stay honest; none turn a missing or failed review into passed | Tier 2 failure cases |
 | X10 | Revision — metadata batching | `CodeReviewMetadata` group-commits independent writes in short tenant-scoped transactions: concurrent writes share commits, a lone write commits at once, each reply follows its commit, failed batches fail their callers with existing semantics and no per-operation fallback, tenants never share a batch, pending work and workers are bounded, no transaction or lock spans GitHub/object IO; batch sizes recorded in tracing | `pg_code_review_cache` tests over real Postgres |
-| X11 | Output, consumers and surfaces; AC-011 | Action and output schemas, stable errors, Rust/Python/TypeScript authoring and typed reads, CLI and HTTP/MCP inspection of the extraction and `review.previous`; focused input/workspace guide | per-surface journeys; `codegen:check`; docs review |
+| X11 | Output, consumers and surfaces; AC-011; Revision — no client projection | Action schema with `extractor` in the regenerated wire types, stable errors; the extraction and `review.previous` are inspectable as ordinary step-output JSON through existing execution details on HTTP, MCP and CLI; no SDK typed read or authoring helper; focused input/workspace guide | `codegen:check`; inspection journey over existing details surfaces; docs review |
 | X12 | Agreed transformation ¶4 | `wyrd-design.md` Verifier / Agents, tools and workspaces and `bifrost-design.md` Durability/Ingest state typed extraction and source custody | content review |
 | X13 | Connected proof ¶3; INV-002 | New tests sit in existing targets; contract, dependency and tenant checks pass | `codegen:check`, `check:deps`, `check:tenant-isolation` |

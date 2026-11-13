@@ -76,3 +76,27 @@ Keep new connected assertions at the existing deferred-publication server journe
 Use the existing `mise` environment and `scripts/postgres/with-test-postgres.sh`, the owning migration task, and `cargo nextest run --locked -p wyrd-server --features test-support --test integration` with exact selectors. Confirm actual names from source/listing before recording commands for new assertions; do not accept a zero-test run. Preserve existing focused schema/File/conflict/unmatched and authority behavior affected by publication edits. Use source inspection and the affected focused SQL/publication checks for name mapping. Apply the repository's format/lint requirements to the actual bounded write set; no full gate or full test:sql/user-journey suite is required by this remediation. Broad integrated verification belongs to change review.
 
 Record exact commands, selected counts, outcomes and environment limits. The review sandbox could not access Docker; do not claim a fresh connected PASS without an environment that runs the repository Postgres lifecycle. Retain this original task/review and candidate for the next focused remediation review. Do not commit or push unless separately requested.
+
+## Obligations
+
+| ID | Promise (source) |
+|---|---|
+| FIND-007-1 | An Artifact is resolved and admitted against every subscriber slot under the publisher's authority before acceptance; refusal retains nothing |
+| FIND-007-2 | Accepted evidence rows carry the verified subject and outer actor |
+| FIND-007-3 | An identical publication that loses the acceptance race answers with the canonical receipt |
+| FIND-007-4 | The four lifecycle tests run in the normal Postgres family lane |
+| FIND-007-5 | New subscriber and wake rows are decoded by column name |
+
+## Evidence
+
+| Obligation | Implementation | Proof | Verification | Result |
+|---|---|---|---|---|
+| FIND-007-1 | `service/evidence.rs` `subscribers`: `TenantEvidence::admit` (existing owner) per kept subscriber for an Artifact; `EvidenceUnavailable` maps to 503 | `pg_deferred_evidence.rs` `artifact_evidence_is_admitted_before_it_is_accepted`: wrong format 400, missing path 400, unknown version 400, past slot `max_bytes` 413, then the valid file is `accepted` (nothing retained before). RED: the PDF was accepted (200). Publisher Card-read denial is the same owner's refusal, proven by `pg_hosted_artifacts.rs` `artifact_reads_refuse_before_use` | PASS | PASS |
+| FIND-007-2 | `caller.attribution()` replaces the principal/principal pair | Source inspection; the owner is proven by its existing callers' tests. No runtime test: delegation needs an actor token rooted at a Card, and publishing then requires that root to cover the Repository subject; no fixture credentials a Repository root (three fixture attempts refused) | source | PASS (source) |
+| FIND-007-3 | On a refused write whose race read covers every fresh subscriber, the raced acceptances join `held` and `fresh` clears, so status and `recorded_at` come from the canonical acceptance | Source inspection. No runtime test: Scribe serializes writes into the table, so a second publication blocks behind a held first one before any observable seam; a deterministic interleaving needs a new test-only hook, which this remediation forbids (two attempts: 503 timeout, hang) | source | PASS (source) |
+| FIND-007-4 | Four `#[ignore]` removed | `pg_deferred_evidence` module, 9/9 pass without `--run-ignored` | PASS | PASS |
+| FIND-007-5 | `pull_requests.rs` `evidence_subscribers`/`wake_evidence_consumers` use `Row::try_get` by name; `ORDER BY` by name | Source inspection; the publication, wake and resume tests above keep identities and behavior | PASS | PASS |
+| Rustdoc | `EvidenceTable` links name `EVIDENCE` | content | — | PASS |
+
+Commands: `scripts/postgres/with-test-postgres.sh` → `mise run db:migrate:all:inner`; `cargo nextest run --locked -p wyrd-server --features test-support --test integration -E 'test(/^pg_deferred_evidence::/)'` (9 passed); `mise run lints` PASS; `git diff --check` clean.
+Commits: 3ce725b56, 72282d0a8, 8b2c12322.

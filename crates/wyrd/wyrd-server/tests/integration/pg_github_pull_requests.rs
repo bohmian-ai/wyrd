@@ -19,14 +19,14 @@ use wyrd_spec::ids::VerificationResultId;
 use wyrd_spec::verification::VerificationVerdict;
 use wyrd_sql::queries::verifier_executions::{Settlement, TerminalStatus, VerifierExecutionQueue};
 use wyrd_testing::github::{GithubAppMock, GithubBrowser, PullRequest};
-use wyrd_testing::{Bootstrap, WyrdTestServer};
+use wyrd_testing::{Bootstrap, WyrdTestServer, WyrdTestServerBuilder};
 
 /// The connected repository.
 pub(crate) const REPOSITORY: u64 = 4242;
 /// A repository the installation reaches that the tenant did not select.
 pub(crate) const UNSELECTED: u64 = 4343;
 /// The connected installation.
-const INSTALLATION: u64 = 101;
+pub(crate) const INSTALLATION: u64 = 101;
 /// The Repository binding two queued review Verifiers to pull requests:
 /// `a-review` through an inline Trigger, `z-review` through the referenced
 /// [`ON_PULL_REQUEST`] Trigger Card.
@@ -92,7 +92,14 @@ impl Deployment {
     /// # Panics
     /// Panics when a step fails.
     pub(crate) async fn start_with(runtime: bool) -> Self {
-        Self::launch(runtime, None).await
+        Self::launch(|builder| {
+            if runtime {
+                builder.with_verification_runtime_for_test()
+            } else {
+                builder
+            }
+        })
+        .await
     }
 
     /// Start the deployment as [`Self::start`] does, running queued work
@@ -101,27 +108,28 @@ impl Deployment {
     /// # Panics
     /// Panics when a step fails.
     pub(crate) async fn start_limited(limits: RuntimeLimits) -> Self {
-        Self::launch(true, Some(limits)).await
+        Self::launch(|builder| {
+            builder
+                .with_verification_runtime_for_test()
+                .with_verification_runtime_limits_for_test(limits)
+        })
+        .await
     }
 
-    /// Start the deployment, running queued work when `runtime` is set,
-    /// under `limits` when given.
+    /// Start the deployment as [`Self::start`] does, its server further
+    /// configured by `configure`.
     ///
     /// # Panics
     /// Panics when a step fails.
-    async fn launch(runtime: bool, limits: Option<RuntimeLimits>) -> Self {
+    pub(crate) async fn launch(
+        configure: impl FnOnce(WyrdTestServerBuilder) -> WyrdTestServerBuilder,
+    ) -> Self {
         let mock = GithubAppMock::start().expect("the GitHub mock starts");
         mock.add_installation(INSTALLATION, &[(REPOSITORY, "acme/policy")]);
         mock.add_user("octo", &[INSTALLATION]);
         mock.sign_in("octo");
         mock.install_target(INSTALLATION);
-        let mut builder = WyrdTestServer::builder().with_github_app_for_test(&mock);
-        if runtime {
-            builder = builder.with_verification_runtime_for_test();
-        }
-        if let Some(limits) = limits {
-            builder = builder.with_verification_runtime_limits_for_test(limits);
-        }
+        let builder = configure(WyrdTestServer::builder().with_github_app_for_test(&mock));
         let server = builder
             .start_bound()
             .await
@@ -212,7 +220,7 @@ impl Deployment {
     ///
     /// # Panics
     /// Panics when the server was started without a bound listener.
-    fn base(&self) -> &str {
+    pub(crate) fn base(&self) -> &str {
         self.server.base_url().expect("bound")
     }
 

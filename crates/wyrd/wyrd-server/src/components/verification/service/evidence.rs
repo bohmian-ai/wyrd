@@ -42,8 +42,8 @@ impl VerificationControl<'_> {
     /// that already accepted the same content replays; different content is
     /// refused. New acceptances are written through Scribe, and the receipt
     /// is returned only once each is acknowledged; consumers parked on the
-    /// commit are then made due. Publication never starts an execution and
-    /// never reopens a settled one.
+    /// commit are then made due, on a replay as well. Publication never
+    /// starts an execution and never reopens a settled one.
     ///
     /// # Errors
     /// Returns [`WyrdError::PermissionDeniedRbac`] without any `verifier:run`
@@ -150,8 +150,10 @@ impl VerificationControl<'_> {
                     return Err(error);
                 }
             }
-            self.wake(tenant, source, &fresh).await;
         }
+        // A replay wakes too: a publisher retrying an unacknowledged
+        // acceptance resumes the consumers that acceptance never woke.
+        self.wake(tenant, source, &subscribers).await;
         let recorded_at = held
             .values()
             .map(|accepted| accepted.recorded_at)

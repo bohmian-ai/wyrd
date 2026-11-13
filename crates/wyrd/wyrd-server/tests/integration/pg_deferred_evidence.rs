@@ -12,10 +12,12 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode, header};
 use serde_json::{Value, json};
 use uuid::Uuid;
+use wyrd_server::state::LimitsConfig;
 use wyrd_server::verification::RuntimeLimits;
+use wyrd_testing::Bootstrap;
 use wyrd_testing::github::PullRequest;
 
-use super::pg_github_pull_requests::{Deployment, REPOSITORY};
+use super::pg_github_pull_requests::{Deployment, INSTALLATION, REPOSITORY};
 
 /// The connected repository's slug.
 const SLUG: &str = "acme/policy";
@@ -60,11 +62,20 @@ impl Deployment {
         .await;
     }
 
-    /// Publish `body` and return the status and JSON answer.
+    /// Publish `body` as the editor and return the status and JSON answer.
     ///
     /// # Panics
     /// Panics when the request cannot be served.
     async fn publish(&self, body: &Value) -> (StatusCode, Value) {
+        self.publish_as(&self.jwt, body).await
+    }
+
+    /// Publish `body` as the user holding `jwt` and return the status and
+    /// JSON answer.
+    ///
+    /// # Panics
+    /// Panics when the request cannot be served.
+    async fn publish_as(&self, jwt: &str, body: &Value) -> (StatusCode, Value) {
         let request = Request::builder()
             .method(Method::POST)
             .uri("/v1/verification/evidence/publish")
@@ -73,7 +84,7 @@ impl Deployment {
             .expect("request builds");
         let response = self
             .server
-            .oneshot_authenticated(&self.jwt, request)
+            .oneshot_authenticated(jwt, request)
             .await
             .expect("publication responds");
         let status = response.status();
@@ -233,6 +244,23 @@ async fn publication_is_matched_retained_and_resumes_the_waiting_execution() {
         assert_eq!(status, expected, "{body}: {answer}");
     }
 
+    let Bootstrap::User { jwt: viewer, .. } = deployment
+        .server
+        .bootstrap_user("evidence-viewer", &["viewer"])
+        .await
+        .expect("viewer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let (status, denied) = deployment
+        .publish_as(&viewer, &publication(SLUG, C0, "ci", json_value.clone()))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "publishing needs verifier:run: {denied}"
+    );
+
     let (status, receipt) = deployment.publish_ci(C0, json!({"status": "green"})).await;
     assert_eq!(status, StatusCode::OK, "{receipt}");
     assert_eq!(receipt["status"], "accepted");
@@ -334,5 +362,86 @@ async fn parked_executions_end_by_supersession_and_deadline() {
     assert!(
         served["result"].is_null(),
         "missing evidence never passes: {served}"
+    );
+}
+
+/// No receipt is given before Scribe acknowledges the acceptance: an
+/// unacknowledged publication answers unavailable, not accepted or absent,
+/// and the waiting execution keeps waiting. Once the held write lands, the
+/// publisher's retry replays the exact accepted evidence and resumes the
+/// execution.
+///
+/// # Panics
+/// Panics when a receipt precedes the acknowledgement, or the retry does not
+/// replay and resume.
+#[tokio::test(flavor = "multi_thread")]
+async fn unacknowledged_publication_is_unavailable_and_its_retry_resumes() {
+    let deployment = Deployment::launch(|builder| {
+        builder
+            .with_verification_runtime_for_test()
+            .with_verification_runtime_limits_for_test(limits(Duration::from_mins(5)))
+            .with_limits_for_test(LimitsConfig {
+                timeout: Duration::from_secs(4),
+                ..LimitsConfig::default()
+            })
+    })
+    .await;
+    deployment.gate("1.1.0", "1.0.0").await;
+    let waiting = deployment.open(5, C1).await;
+    deployment.until(waiting, "waiting").await;
+
+    let stall = deployment
+        .server
+        .stall_next_bifrost_write_into("bifrost.verification.evidence")
+        .expect("Scribe stalls");
+    let (status, unavailable) = deployment.publish_ci(C1, json!({"status": "green"})).await;
+    stall.wait_entered().await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{unavailable}");
+    assert_eq!(
+        unavailable["code"],
+        "WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE"
+    );
+    assert_eq!(deployment.status(waiting).await["status"], "waiting");
+
+    stall.release();
+    stall.wait_completed().await;
+    let (status, replay) = deployment.publish_ci(C1, json!({"status": "green"})).await;
+    assert_eq!(status, StatusCode::OK, "{replay}");
+    assert_eq!(
+        replay["status"], "replayed",
+        "the held acceptance landed and the retry reads it"
+    );
+    let served = deployment.until(waiting, "completed").await;
+    assert_eq!(served["result"]["outcome"]["verdict"], "passed", "{served}");
+}
+
+/// Losing repository access cancels a parked execution, and evidence
+/// published afterwards is refused and reopens nothing.
+///
+/// # Panics
+/// Panics when the parked execution survives the uninstall or the later
+/// publication is accepted.
+#[tokio::test(flavor = "multi_thread")]
+async fn lost_repository_access_fences_a_parked_execution() {
+    let deployment = Deployment::start_limited(limits(Duration::from_mins(5))).await;
+    deployment.gate("1.1.0", "1.0.0").await;
+    let parked = deployment.open(6, C1).await;
+    deployment.until(parked, "waiting").await;
+    let deleted = json!({"action": "deleted", "installation": {"id": INSTALLATION}});
+    let status = deployment
+        .mock
+        .deliver(deployment.base(), "installation", &deleted)
+        .await
+        .expect("delivery sends");
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let served = deployment.until(parked, "cancelled").await;
+    assert_eq!(served["error"]["code"], "repository_access_lost");
+
+    let (status, refused) = deployment.publish_ci(C1, json!({"status": "green"})).await;
+    assert!(status.is_client_error(), "{status}: {refused}");
+    assert_eq!(
+        deployment.status(parked).await["status"],
+        "cancelled",
+        "settled work never reopens"
     );
 }

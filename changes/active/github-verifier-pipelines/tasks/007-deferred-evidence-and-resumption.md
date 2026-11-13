@@ -190,3 +190,45 @@ checks. Task 008 owns the decision-specific half of AC-006/007.
 | INV-004 | Recovery and publish dedup return exact accepted state, authoritative absence, or explicit unavailability (503) — never fresh state on an unavailable read | integration: fenced-but-invisible evidence → unavailable, not absent |
 | REQ-016a | Source resolution is CI-agnostic: explicit argument → `WYRD_REPOSITORY`/`WYRD_COMMIT` → Git checkout read from `.git`; no CI-provider detection or provider variables anywhere, no `git` binary, missing value is a local error naming flag and variable (§Revision — repository slug and CI-agnostic source resolution) | client unit tests for each source and precedence, no checkout, missing value; source inspection for provider names |
 | REQ-016 | HTTP, shared client, Rust/Python/TypeScript SDKs, CLI (`wyrd evidence publish <input> --file f [--repository owner/name] [--commit sha]`; resolution per REQ-016a), MCP publish tool; waiting status with deferred names in execution inspection; stable errors/schemas; docs + upload-based example; wyrd-design Verifier and bifrost-design custody/ACK/parked sections; authorization guidance (AC-011) | SDK journeys ×3 + MCP journey; CLI test; codegen:check; docs content review |
+| AC-007 | Controlled crash fences before/after upload completion, publication ACK, pending checkpoint ACK, retirement, continuation commit and recovery read: exact accepted evidence and owed continuation survive without producer replay; unavailable canonical state never becomes fresh (AC-007, task §Connected proof) | real-dependency integration per fence |
+
+Acceptance mapping: AC-005 → REQ-009a–d, REQ-011b/c; AC-006 (deferred portion)
+→ REQ-008b, REQ-011a–c; AC-007 → AC-007, INV-004; AC-011 → REQ-016, REQ-016a.
+
+## Evidence
+
+| Obligation and required cases | Implementation evidence | Proof location | Verification evidence | Result |
+|---|---|---|---|---|
+| REQ-008a: json/media only; trace/samples refuse `deferred`; true → `queue_only`, false/omitted not; direct verify refused before any step | `crates/wyrd-spec/src/card/verifier/mod.rs` (`InputSlot::is_deferred`), registration derivation in the server registry | `crates/wyrd-spec/src/card/verifier/mod.rs` `only_json_and_media_slots_can_be_deferred`; `crates/wyrd/wyrd-server/tests/integration/pg_card_declaration_route.rs:1873` | both tests PASS | PASS |
+| REQ-008b: consumers of a missing deferred slot wait, independent steps run, park names slots, resume does not replay settled steps | `crates/vala/vala-verify/src/blocks/engine` waiting outcome | `crates/vala/vala-verify/src/blocks/engine/tests.rs:4256` | `deferred_inputs_hold_only_their_consumers_until_supplied` PASS | PASS |
+| REQ-009a: slug resolution, commit, input, tags commit only, `verifier:run`, unconnected repository refused; **wrong tenant** | `crates/wyrd/wyrd-server/src/verification/evidence.rs`, publish route | `pg_deferred_evidence.rs:214` (short commit 400, unknown input 409, unselected slug 403, viewer 403, resolved `{host, repository_id}`) | PASS; no test publishes from another tenant | FAIL (wrong-tenant case unproven) |
+| REQ-009b: wrong schema/type/format, incomplete File refused before acceptance | same | `pg_deferred_evidence.rs:239-262`; `sdks/wyrd-sdk-rust/tests/integration/deferred_evidence.rs:224` | PASS | PASS |
+| REQ-009c: unmatched 409 retains nothing; accepted before any PR consumed later without republish; replay/conflict; two policy pins each receive; later subscriber gets no historical evidence | evidence custody + subscriber batch ids | `pg_deferred_evidence.rs:214` | PASS | PASS |
+| REQ-009d: receipt only after Bifrost/Scribe ACK; no PG table or payload mirror | `bifrost.verification.evidence` FENCED_ONLY; no migrations in diff | `pg_deferred_evidence.rs:397` (held Scribe → 503, retry replays exact receipt) | PASS; `git diff --stat` shows no migration/SQL | PASS |
+| REQ-011a: compute released once nothing is runnable; claim/lease kept until the park ACK; row retired (pending, not leased, attempt refunded) after ACK | park branch in `crates/wyrd/wyrd-server/src/verification/runner.rs` (engine returns before `persisted()`) | `pg_verification_runtime.rs:4155` `a_parked_attempt_keeps_its_claim_until_acknowledged` | PASS for claim/lease/retirement; compute release is source inspection only, no runtime assertion | FAIL (compute-release case lacks runtime proof) |
+| REQ-011b: publish while waiting resumes same ExecutionId; attempts/pin preserved; wake by replay; **publish while running/queued**; settled step not replayed at integration level; deadline unchanged | evidence wake + pending-row canonical check | `pg_deferred_evidence.rs:214` (same id, pin 1.0.0, attempts 0→1); SDK/MCP journeys | waiting case PASS; running/queued consumer and integration-level no-replay untested | FAIL |
+| REQ-011c: supersession, revocation, deadline fence a parked execution; never reopens; missing evidence times out | runner/queue fences | `pg_deferred_evidence.rs:348`, `:444` | PASS | PASS |
+| INV-004: unavailable is never absent/fresh — publish dedup and recovery read | `evidence.rs:180` fenced-but-invisible → unavailable | `pg_deferred_evidence.rs:397` covers unacknowledged publish only | recovery-read unavailability and fenced-but-invisible read untested | FAIL |
+| REQ-016a: argument → `WYRD_REPOSITORY`/`WYRD_COMMIT` → `.git`; no provider variables; no `git` binary; missing value names flag and variable | `crates/shared/wyrd-client/src/verify/evidence.rs` | `evidence.rs:227` `source_prefers_arguments_then_variables_then_the_checkout`; Python/TS journeys run with env vars outside a checkout | PASS; grep for provider variables (`GITHUB_SHA`, `CI_COMMIT`, …) over client/CLI/SDK sources: none | PASS |
+| REQ-016: HTTP, shared client, Rust/Python/TS SDKs, CLI, MCP, waiting inspection, schemas/errors, docs, architecture, authorization | route, `wyrd_client::verify::Evidence`, SDK projections, `wyrd evidence publish`, `verification.publish_evidence` | Rust SDK `deferred_evidence.rs:169,224`; `test_deferred_evidence.py:65`; `deferred-evidence.test.ts:54`; `wyrd-cli/tests/github_journey.rs:376`; `wyrd-cli/src/evidence.rs:119`; `wyrd-mcp/tests/bifrost/mcp/github.rs:383`; `docs/.../publish-deferred-evidence.md`; `architecture/wyrd-design.md` Verifier, `bifrost-design.md`, `wyrd-security-posture.md` | all journeys PASS; `codegen:check`, `docs:check` PASS; content reviewed | PASS |
+| AC-007: crash fences | — | — | not implemented as controlled-crash integration tests | FAIL |
+
+**Commands:** `mise run fmt`, `lints`, `py:lints`, `py:typecheck`, `ts:lints`,
+`ts:typecheck`, `ts:napi:check`, `codegen:check`, `check:deps`, `docs:check`,
+`git diff --check`; Postgres tests through
+`scripts/postgres/with-test-postgres.sh` after `db:migrate:all:inner`, using
+`cargo nextest run --locked` with exact selectors for every test named above.
+
+**Process exceptions (written after code, no RED):** REQ-008a spec/registration,
+REQ-008b engine test, publish route/client/CLI/MCP tests, the three SDK
+journeys, wake on replay, REQ-009b refusal cases, the media journey and the
+REQ-011a claim test. These tests pin existing behavior.
+
+**Diagnoses:**
+- `recorded_at` replay mismatch. Cause: the receipt carried nanoseconds while Bifrost stores microseconds. Fix site: truncate at receipt creation.
+- Completed status was read before its `result` landed. Cause: the status and the Bifrost result become visible separately. Fix site: the test helper waits for both.
+- REQ-011a, reverted. I read "no execution permit remains attached to that ACK" as requiring the claim slot to be freed, and freed it early (c71be4283). That conflicts with task 010: the claim permit bounds the whole claim lifetime and is not compute. This task's text also says custody "keeps the claim permit". Reverted in 798df3e1d and replaced by the claim-kept test (0ba344d30).
+- The webhook-based claim test returned 504. Cause: the second PR's admission write queued behind the stalled events write in Scribe. Fix site: a direct submit in the test.
+- A lease-check false negative. Cause: `lease_token` stays set after release by design. Fix site: assert `lease_expires_at`.
+
+**Non-goals confirmed:** no Trigger, wait action, broker, new permission category, new PostgreSQL table, subscription API, or CI-provider detection; decision waits are left to task 008.

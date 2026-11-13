@@ -149,6 +149,7 @@ impl PullRequest {
     fn json(&self, repository: u64, number: u64) -> Value {
         json!({
             "number": number,
+            "html_url": format!("https://github.test/repositories/{repository}/pull/{number}"),
             "title": self.title,
             "state": if self.open { "open" } else { "closed" },
             "draft": self.draft,

@@ -609,6 +609,26 @@ async fn successive_heads_extract_the_full_then_the_incremental_change() {
     );
 }
 
+/// The `pr`, `changes` and `context` values [`REVIEWER`]'s Prompt rendered
+/// into `prompt`, parsed as JSON.
+///
+/// # Panics
+/// Panics when `prompt` is not that Prompt or a value is not JSON.
+fn prompt_values(prompt: &str) -> Vec<Value> {
+    let mut rest = prompt
+        .strip_prefix("Review pull request ")
+        .unwrap_or_else(|| panic!("the Card's Prompt: {prompt}"));
+    let mut rendered = Vec::new();
+    for then in [" changing ", " in ", "; the whole"] {
+        let mut values = serde_json::Deserializer::from_str(rest).into_iter::<Value>();
+        rendered.push(values.next().expect("a value").expect("JSON"));
+        rest = rest[values.byte_offset()..]
+            .strip_prefix(then)
+            .unwrap_or_else(|| panic!("{then} follows a value: {prompt}"));
+    }
+    rendered
+}
+
 /// The reviewer's model: it reads `/inputs/pr.json` and lists `/inputs`,
 /// then answers.
 async fn reads_the_workspace(model: &MockServer) {
@@ -732,6 +752,13 @@ async fn an_agent_reads_the_extraction_as_prompt_values_and_workspace_json() {
         .expect("the Prompt renders to text");
     for bound in [changed_line, &blob(HANDLER_A), &sha('a'), "\"number\":7"] {
         assert!(prompt.contains(bound), "{bound} in the Prompt: {prompt}");
+    }
+    let rendered = prompt_values(prompt);
+    for (placeholder, value) in ["pr", "changes", "context"].iter().zip(&rendered) {
+        assert_eq!(
+            value, &extraction[*placeholder],
+            "{{{{{placeholder}}}}} renders the exact bound value"
+        );
     }
     assert!(
         !prompt.contains("first_review"),
@@ -1444,12 +1471,25 @@ async fn recovery_reuses_the_accepted_extraction_after_library_contexts_expire()
     let prompt = recovered["messages"][0]["content"]
         .as_str()
         .expect("the Prompt renders to text");
-    for bound in ["lookupUser(id.trim());", &blob(HANDLER_A), &sha('a')] {
-        assert!(
-            prompt.contains(bound),
-            "{bound} in the recovered Prompt: {prompt}"
-        );
-    }
+    let stalled: Value = serde_json::from_slice(&requests[0].body).expect("JSON");
+    let live = stalled["messages"][0]["content"]
+        .as_str()
+        .expect("the Prompt renders to text");
+    let retained = deployment.extraction(execution).await;
+    assert_eq!(
+        prompt_values(prompt),
+        prompt_values(live),
+        "the recovered Prompt binds the values the crashed attempt saw"
+    );
+    assert_eq!(
+        prompt_values(live),
+        [
+            retained["pr"].clone(),
+            retained["changes"].clone(),
+            retained["context"].clone()
+        ],
+        "and they are the retained extraction"
+    );
     let answered: Value = serde_json::from_slice(&requests[2].body).expect("JSON");
     let read = answered["messages"]
         .as_array()
@@ -1467,7 +1507,7 @@ async fn recovery_reuses_the_accepted_extraction_after_library_contexts_expire()
         .collect();
     assert_eq!(
         serde_json::from_str::<Value>(&mounted.join("\n")).expect("the mount is JSON"),
-        deployment.extraction(execution).await,
+        retained,
         "the recovered workspace mounts the retained extraction"
     );
     let mut conn = deployment
@@ -1673,6 +1713,133 @@ async fn unreviewable_files_are_carried_by_identity_and_guidance_is_evidence() {
         [&json!("changes")],
         "only the Card's requirement is judged: {details}"
     );
+}
+
+/// A pull request from a fork whose base branch moved on after it forked
+/// keeps every identity apart: `pr.base` is the base branch's commit `d…`,
+/// `pr.merge_base` and the full review's `comparison_base` are the fork
+/// point `c…`, `pr.head` names the fork, and every `before` is read at
+/// `c…`, never at `d…`. A rename and a deletion are carried with their
+/// paths, and the handler's hunk is GitHub's patch.
+///
+/// # Panics
+/// Panics when an identity, metadata field or changed file differs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fork_behind_a_moved_base_keeps_base_merge_base_and_head_apart() {
+    const FORK: u64 = 5151;
+    const MOVED: &[u8] = b"export const handle = (id: string) => id;\n";
+    const OLD: &[u8] = b"export const old = 1;\n";
+    let deployment =
+        Deployment::start(&[("pr-review.yaml", REVIEW), ("policy.yaml", POLICY)]).await;
+    let fork_point = [
+        ("src/user.ts", USER),
+        ("src/handler.ts", HANDLER),
+        ("src/old.ts", OLD),
+    ];
+    deployment.commit(&sha('c'), &sha('7'), &fork_point);
+    deployment.mock.serve_repository(
+        REPOSITORY,
+        &format!("/tarball/{}", sha('c')),
+        StatusCode::OK,
+        tarball(&fork_point),
+    );
+    deployment.commit(
+        &sha('d'),
+        &sha('6'),
+        &[
+            ("src/user.ts", USER),
+            ("src/handler.ts", MOVED),
+            ("src/old.ts", OLD),
+        ],
+    );
+    deployment.commit(
+        &sha('a'),
+        &sha('8'),
+        &[("src/account.ts", USER), ("src/handler.ts", HANDLER_A)],
+    );
+    let files = json!([
+        {"filename": "src/handler.ts", "status": "modified",
+         "sha": blob(HANDLER_A), "patch": PATCH_A},
+        {"filename": "src/account.ts", "previous_filename": "src/user.ts",
+         "status": "renamed", "sha": blob(USER)},
+        {"filename": "src/old.ts", "status": "removed", "sha": blob(OLD),
+         "patch": "@@ -1,1 +0,0 @@\n-export const old = 1;"},
+    ]);
+    for base in [sha('d'), sha('c')] {
+        deployment.json(
+            &format!("/compare/{base}...{}", sha('a')),
+            &json!({"status": "diverged", "base_commit": {"sha": base},
+                    "merge_base_commit": {"sha": sha('c')},
+                    "commits": [{"sha": sha('a')}],
+                    "files": files}),
+        );
+    }
+    let mut pull = PullRequest::open(FORK, &sha('d'), &sha('a'));
+    pull.head_ref = "fork-feature".to_owned();
+    deployment.mock.set_pull_request(REPOSITORY, PR, pull);
+
+    let execution = deployment.review(&sha('a'), "synchronize").await;
+
+    let extraction = deployment.extraction(execution).await;
+    let pr = &extraction["pr"];
+    assert_eq!(
+        (&pr["base"], &pr["merge_base"], &pr["head"]),
+        (
+            &json!({"ref": "main", "sha": sha('d')}),
+            &json!(sha('c')),
+            &json!({"repository_id": FORK.to_string(), "ref": "fork-feature", "sha": sha('a')})
+        ),
+        "{extraction}"
+    );
+    assert_eq!(
+        (&pr["title"], &pr["body"], &pr["state"], &pr["draft"]),
+        (&json!("Change"), &json!(""), &json!("open"), &json!(false)),
+        "an absent body is empty text: {extraction}"
+    );
+    assert_eq!(
+        pr["url"], "https://github.test/repositories/4242/pull/7",
+        "the URL is GitHub's page for the PR: {extraction}"
+    );
+    assert_eq!(
+        (
+            &extraction["review"]["mode"],
+            &extraction["review"]["comparison_base"]
+        ),
+        (&json!("full"), &json!(sha('c'))),
+        "a first review compares from the merge base, not the moved base"
+    );
+    let files = extraction["changes"]["files"].as_array().expect("files");
+    let file = |path: &str| {
+        files
+            .iter()
+            .find(|file| file["path"] == path)
+            .unwrap_or_else(|| panic!("{path} is carried: {extraction}"))
+    };
+    let handler = file("src/handler.ts");
+    assert_eq!(
+        handler["before"]["text"],
+        std::str::from_utf8(HANDLER).expect("utf-8"),
+        "before is read at the merge base: {handler}"
+    );
+    assert_eq!(
+        handler["hunks"],
+        json!([{"old_start": 1, "old_lines": 3, "new_start": 1, "new_lines": 3, "patch": PATCH_A}]),
+        "{handler}"
+    );
+    let renamed = file("src/account.ts");
+    assert_eq!(
+        (&renamed["status"], &renamed["previous_path"]),
+        (&json!("renamed"), &json!("src/user.ts")),
+        "{renamed}"
+    );
+    assert_eq!(renamed["before"], renamed["after"], "{renamed}");
+    let removed = file("src/old.ts");
+    assert_eq!(
+        (&removed["status"], &removed["before"]["text"]),
+        (&json!("deleted"), &json!("export const old = 1;\n")),
+        "{removed}"
+    );
+    assert!(removed["after"].is_null(), "{removed}");
 }
 
 /// A changed file whose source GitHub cannot serve fails the extraction,

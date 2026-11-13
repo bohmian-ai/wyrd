@@ -289,9 +289,11 @@ impl<'a> VerificationControl<'a> {
                 owner_card_uid: identity.and_then(|identity| identity.owner_card_uid.clone()),
                 group: None,
                 pull_request: None,
+                waiting: std::collections::BTreeSet::new(),
             },
         };
         state.status = retained.status();
+        state.waiting = retained.waiting();
         if let Some(failure) = &retained.state.failure {
             state.error = Some(failure.error.clone());
         }

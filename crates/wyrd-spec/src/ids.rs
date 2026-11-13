@@ -380,6 +380,15 @@ uuid7_id_type!(
 );
 
 uuid7_id_type!(
+    /// Identity of one piece of published deferred evidence.
+    ///
+    /// Named by its source repository, commit, input name, and content, so
+    /// publishing the same content again for the same source answers the
+    /// same id, and every subscriber that accepted it holds the same id.
+    EvidenceId
+);
+
+uuid7_id_type!(
     /// Durable identity of one Operator dispatch in `wyrd.operator_dispatches`.
     ///
     /// Settlement of a failed binding-created run mints one per distinct

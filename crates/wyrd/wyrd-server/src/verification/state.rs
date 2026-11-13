@@ -26,6 +26,7 @@
 //! worker can race a replacement for one revision; whichever batch is fenced
 //! first keeps it, and the other writer breaks.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use chrono::{DateTime, Utc};
@@ -37,7 +38,7 @@ use vala_bifrost_redux::tables::staged::StagedRow;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, Sha256Hex};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{CardUid, ExecutionId, VerificationResultId};
+use wyrd_spec::ids::{CardUid, EvidenceId, ExecutionId, SlotName, VerificationResultId};
 use wyrd_spec::storage::StoredObjectRef;
 use wyrd_spec::vala::ids::RunId;
 use wyrd_spec::verification::TaskId;
@@ -763,6 +764,44 @@ impl RunState {
         }
         self.writer.changed(&mut held);
         Ok(decided)
+    }
+
+    /// Record that the execution parks waiting for the deferred inputs
+    /// `waiting`, because no runnable step remains; [`Self::persisted`]
+    /// awaits the parked revision before the queue delivery is retired.
+    ///
+    /// # Errors
+    /// Returns [`StateError::Stale`] once the writer broke or lost its
+    /// lease.
+    pub fn wait(&self, waiting: BTreeSet<SlotName>) -> Result<(), StateError> {
+        let mut held = self.writer.lock();
+        if !self.writer.current(&held) {
+            return Err(StateError::Stale);
+        }
+        if held.state.waiting != waiting {
+            held.state.waiting = waiting;
+            self.writer.changed(&mut held);
+        }
+        Ok(())
+    }
+
+    /// Record that deferred input `slot` was supplied from published
+    /// evidence `evidence`, which also ends any wait for it, so a
+    /// resumption reads exactly that evidence.
+    ///
+    /// # Errors
+    /// Returns [`StateError::Stale`] once the writer broke or lost its
+    /// lease.
+    pub fn accept_evidence(&self, slot: &SlotName, evidence: EvidenceId) -> Result<(), StateError> {
+        let mut held = self.writer.lock();
+        if !self.writer.current(&held) {
+            return Err(StateError::Stale);
+        }
+        let waited = held.state.waiting.remove(slot);
+        if held.state.evidence.insert(slot.clone(), evidence) != Some(evidence) || waited {
+            self.writer.changed(&mut held);
+        }
+        Ok(())
     }
 
     /// The receipt `call` already holds in the live state, when it holds

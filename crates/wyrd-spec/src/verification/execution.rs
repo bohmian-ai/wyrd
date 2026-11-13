@@ -14,6 +14,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 
+use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -28,7 +29,8 @@ use crate::auth::Sha256Hex;
 use crate::card::agent::{Authored, BuiltinTool, Compiled, ExecutionRoute, PromptForm};
 use crate::card::verifier::{Check, CodeRuntime};
 use crate::error::WyrdError;
-use crate::ids::{CardUid, ExecutionId, GroupId, RepositoryId, SlotName};
+use crate::ids::{CardUid, EvidenceId, ExecutionId, GroupId, RepositoryId, SlotName};
+use crate::origin::CommitSha;
 use crate::reference::CardRef;
 use crate::storage::ids::UploadId;
 use crate::storage::upload::UploadPlan;
@@ -139,6 +141,88 @@ pub struct EvidencePlanResponse {
     pub uploads: Vec<EvidenceUpload>,
 }
 
+/// The connected provider repository a deferred publication is about.
+///
+/// The stable identity a Repository Card names, not a Card reference: the
+/// provider web host and the provider's repository id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceRepository {
+    /// Provider web host, such as `github.com`.
+    pub host: String,
+    /// Stable provider id of the repository.
+    pub repository_id: RepositoryId,
+}
+
+/// The source tags a deferred publication matches on: only the commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceTags {
+    /// The exact full 40-character commit the evidence was produced from.
+    pub commit: CommitSha,
+}
+
+/// `POST /v1/verification/evidence/publish` request body.
+///
+/// Supplies `value` for every Verifier subscribed to the deferred `input`
+/// of `repository` at `tags.commit`. A File must already be a completed
+/// upload from `POST /v1/verification/evidence`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PublishEvidenceRequest {
+    /// The connected repository the evidence is about.
+    pub repository: EvidenceRepository,
+    /// The source the evidence was produced from.
+    pub tags: EvidenceTags,
+    /// The deferred input slot name the evidence supplies.
+    #[cfg_attr(feature = "server", schema(value_type = String))]
+    pub input: SlotName,
+    /// The evidence: inline JSON, a completed File, or an Artifact file.
+    pub value: InputDeclaration,
+}
+
+/// Whether a publication was newly accepted or an earlier acceptance
+/// replayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceStatus {
+    /// At least one subscriber accepted the evidence for the first time.
+    Accepted,
+    /// Every subscriber had already accepted this exact evidence.
+    Replayed,
+}
+
+/// `POST /v1/verification/evidence/publish` response: the durable receipt.
+///
+/// Returned only once every matched subscriber's acceptance is durable; it
+/// does not mean any execution ran.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PublishEvidenceResponse {
+    /// The evidence identity; the same for the same source and content.
+    #[cfg_attr(feature = "server", schema(value_type = String))]
+    pub evidence_id: EvidenceId,
+    /// The connected repository.
+    pub repository: EvidenceRepository,
+    /// The matched source tags.
+    pub tags: EvidenceTags,
+    /// The deferred input supplied.
+    #[cfg_attr(feature = "server", schema(value_type = String))]
+    pub input: SlotName,
+    /// Whether this call accepted the evidence or replayed an earlier
+    /// acceptance.
+    pub status: EvidenceStatus,
+    /// How many subscribed Verifier versions hold the evidence.
+    pub matched_subscriptions: u32,
+    /// When the evidence was first accepted.
+    pub recorded_at: DateTime<Utc>,
+}
+
 /// How to upload one missing file through the shared storage lifecycle.
 ///
 /// Transfer the bytes by `plan`, then finish with
@@ -208,6 +292,11 @@ pub struct VerificationExecutionState<T = Map<String, Value>> {
     /// admitted for, frozen at admission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pull_request: Option<PullRequestActivation>,
+    /// The deferred inputs a `waiting` execution is parked for; empty
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    #[cfg_attr(feature = "server", schema(value_type = Vec<String>))]
+    pub waiting: BTreeSet<SlotName>,
 }
 
 /// One side of a pull request as an admission pinned it: the branch name
@@ -1011,6 +1100,7 @@ impl VerificationExecutionState {
             owner_card_uid,
             group,
             pull_request,
+            waiting,
         } = self;
         Ok(VerificationExecutionState {
             execution_id,
@@ -1022,6 +1112,7 @@ impl VerificationExecutionState {
             owner_card_uid,
             group,
             pull_request,
+            waiting,
         })
     }
 }

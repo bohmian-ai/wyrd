@@ -223,6 +223,52 @@ impl Step {
     }
 }
 
+impl Step {
+    /// The input slots this step reads: through its action, `when`,
+    /// `foreach.items`, `repeat.until`, or any of its requirements' checks.
+    ///
+    /// The engine holds a step that reads a deferred slot whose evidence has
+    /// not arrived, so it and everything downstream of it wait while
+    /// independent steps run. Pure: no IO.
+    #[must_use]
+    pub fn input_slots(&self) -> BTreeSet<&SlotName> {
+        action_references(self)
+            .chain(self.when.iter().map(|when| &when.path))
+            .chain(
+                self.foreach
+                    .as_ref()
+                    .and_then(|foreach| foreach.items.as_ref()),
+            )
+            .chain(self.repeat.iter().map(|repeat| &repeat.until.path))
+            .filter_map(Reference::slot)
+            .chain(self.requirements.iter().flat_map(Requirement::input_slots))
+            .collect()
+    }
+}
+
+impl Requirement {
+    /// The input slots this requirement's check reads. Pure: no IO.
+    #[must_use]
+    pub fn input_slots(&self) -> BTreeSet<&SlotName> {
+        let references: Vec<&Reference> = match &self.check {
+            Check::Assert { path, each, .. } => path.iter().chain(each).collect(),
+            Check::Trace(trace) => vec![&trace.on],
+            Check::Agent(call) => call
+                .inputs
+                .values()
+                .chain(
+                    call.workspace
+                        .values()
+                        .filter_map(WorkspaceSource::reference),
+                )
+                .collect(),
+            Check::Code(check) => check.call.inputs.values().collect(),
+            Check::Drift(drift) => vec![&drift.on],
+        };
+        references.into_iter().filter_map(Reference::slot).collect()
+    }
+}
+
 /// Every reference a step's action binds.
 fn action_references(step: &Step) -> std::vec::IntoIter<&Reference> {
     let action: Vec<&Reference> = match &step.action {

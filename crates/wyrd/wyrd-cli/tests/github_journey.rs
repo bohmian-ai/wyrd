@@ -742,4 +742,24 @@ mod pg_tests {
             .await
             .expect("test server shuts down");
     }
+
+    /// The "Approve a pull request" guide shows the Cards and the approve
+    /// command that [`a_person_approves_a_pending_signoff_through_the_cli`]
+    /// runs.
+    ///
+    /// # Panics
+    /// Panics when the guide does not embed a fixture or show the command.
+    #[test]
+    fn the_approval_guide_shows_the_tested_cards_and_command() {
+        let guide = include_str!(
+            "../../../../docs/src/content/docs/build-and-verify/verify/approve-a-pull-request.md"
+        );
+        for embedded in [
+            "<CodeFromFile file=\"fixtures/cards/approvals/signoff.yaml\"",
+            "<CodeFromFile file=\"fixtures/cards/approvals/repository.yaml\"",
+            "wyrd execution approve --execution-id <execution_id> --approval-id <approval_id> --reason \"reviewed the diff\"",
+        ] {
+            assert!(guide.contains(embedded), "the guide shows {embedded}");
+        }
+    }
 }

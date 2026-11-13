@@ -119,14 +119,14 @@ pub(crate) fn repository_root(
     Ok((card, hint))
 }
 
-/// Read the `origin` remote of the Git checkout containing `start`.
+/// The Git directory and common directory of the checkout containing
+/// `start`.
 ///
-/// Walks ancestors to the first `.git` directory or `gitdir:` file, follows
-/// a linked worktree's `commondir` to the shared config, and reads
-/// `[remote "origin"] url`, whose variable name Git matches in any case and
-/// whose value may be double-quoted. Returns `None` outside a checkout, without an
-/// origin, or when the URL is not a repository remote.
-fn origin_remote(start: &Path) -> Option<RepositoryRemote> {
+/// Walks ancestors to the first `.git` directory or `gitdir:` file and
+/// follows a linked worktree's `commondir`, so `HEAD` is read from the first
+/// and config and shared refs from the second. Returns `None` outside a
+/// checkout.
+fn git_dirs(start: &Path) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     let dot_git = start
         .ancestors()
         .map(|dir| dir.join(".git"))
@@ -141,8 +141,51 @@ fn origin_remote(start: &Path) -> Option<RepositoryRemote> {
     };
     let common_dir = match std::fs::read_to_string(git_dir.join("commondir")) {
         Ok(common) => git_dir.join(common.trim()),
-        Err(_) => git_dir,
+        Err(_) => git_dir.clone(),
     };
+    Some((git_dir, common_dir))
+}
+
+/// Read the commit `HEAD` names in the Git checkout containing `start`,
+/// without running `git`.
+///
+/// A detached `HEAD` is its commit; a symbolic one is resolved through the
+/// loose ref, then `packed-refs`. Returns `None` outside a checkout, on an
+/// unborn branch, or when the ref is not a full 40-hex commit.
+#[must_use]
+pub fn head_commit(start: &Path) -> Option<String> {
+    let (git_dir, common_dir) = git_dirs(start)?;
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    let commit = match head.strip_prefix("ref:") {
+        None => head.to_owned(),
+        Some(name) => {
+            let name = name.trim();
+            match std::fs::read_to_string(common_dir.join(name)) {
+                Ok(loose) => loose.trim().to_owned(),
+                Err(_) => std::fs::read_to_string(common_dir.join("packed-refs"))
+                    .ok()?
+                    .lines()
+                    .find_map(|line| {
+                        let (commit, packed) = line.split_once(' ')?;
+                        (packed.trim() == name).then(|| commit.to_owned())
+                    })?,
+            }
+        }
+    };
+    (commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| commit.to_ascii_lowercase())
+}
+
+/// Read the `origin` remote of the Git checkout containing `start`.
+///
+/// Reads `[remote "origin"] url` from the checkout's shared config, whose
+/// variable name Git matches in any case and whose value may be
+/// double-quoted. Returns `None` outside a checkout, without an origin, or
+/// when the URL is not a repository remote.
+#[must_use]
+pub fn origin_remote(start: &Path) -> Option<RepositoryRemote> {
+    let (_, common_dir) = git_dirs(start)?;
     let config = std::fs::read_to_string(common_dir.join("config")).ok()?;
     let mut in_origin = false;
     for line in config.lines().map(str::trim) {
@@ -170,7 +213,7 @@ mod tests {
     use tempfile::TempDir;
     use wyrd_spec::card::repository::RepositoryRemote;
 
-    use super::origin_remote;
+    use super::{head_commit, origin_remote};
 
     /// The origin URL is read from a checkout and from a linked worktree,
     /// and other remotes are ignored.
@@ -237,6 +280,56 @@ mod tests {
                 "{line}"
             );
         }
+        Ok(())
+    }
+
+    /// `HEAD` resolves detached, through a loose branch ref, through
+    /// `packed-refs`, and from a linked worktree whose branch lives in the
+    /// shared refs; an unborn branch and a directory outside a checkout
+    /// resolve nothing.
+    ///
+    /// # Errors
+    /// Returns the IO error when the temporary checkout cannot be written.
+    ///
+    /// # Panics
+    /// Panics when a layout resolves a different commit.
+    #[test]
+    fn head_commit_reads_detached_loose_packed_and_worktree_heads() -> std::io::Result<()> {
+        let loose = "a".repeat(40);
+        let packed = "B".repeat(40);
+        let root = TempDir::new()?;
+        let main = root.path().join("main");
+        fs::create_dir_all(main.join(".git/refs/heads"))?;
+        fs::create_dir_all(main.join(".git/worktrees/feature"))?;
+        fs::write(main.join(".git/HEAD"), "ref: refs/heads/main\n")?;
+        fs::write(main.join(".git/refs/heads/main"), format!("{loose}\n"))?;
+        assert_eq!(head_commit(&main), Some(loose.clone()));
+
+        fs::write(
+            main.join(".git/packed-refs"),
+            format!("# pack-refs with: peeled\n{packed} refs/heads/feature\n"),
+        )?;
+        fs::write(main.join(".git/worktrees/feature/commondir"), "../..\n")?;
+        fs::write(
+            main.join(".git/worktrees/feature/HEAD"),
+            "ref: refs/heads/feature\n",
+        )?;
+        let worktree = root.path().join("feature");
+        fs::create_dir_all(&worktree)?;
+        fs::write(
+            worktree.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                main.join(".git/worktrees/feature").display()
+            ),
+        )?;
+        assert_eq!(head_commit(&worktree), Some(packed.to_ascii_lowercase()));
+
+        fs::write(main.join(".git/HEAD"), format!("{loose}\n"))?;
+        assert_eq!(head_commit(&main), Some(loose), "detached");
+        fs::write(main.join(".git/HEAD"), "ref: refs/heads/unborn\n")?;
+        assert_eq!(head_commit(&main), None, "unborn");
+        assert_eq!(head_commit(&root.path().join("elsewhere")), None);
         Ok(())
     }
 }

@@ -35,10 +35,15 @@ use wyrd_spec::verification::execution::{
 
 use crate::client::WyrdClient;
 
+mod evidence;
 mod execution;
 
 use crate::storage::upload::sha256_file;
 use crate::storage::{FileSource, WyrdStorageClient};
+pub use evidence::{
+    COMMIT_VAR, Evidence, EvidenceRepository, EvidenceStatus, PublishEvidenceResponse,
+    REPOSITORY_VAR, source,
+};
 pub use execution::Execution;
 /// The download plan [`Execution::download`] returns.
 pub use wyrd_spec::storage::DownloadInitResponse;

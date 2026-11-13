@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use wyrd_runtime::Permission;
+use wyrd_server::state::LimitsConfig;
 use wyrd_server::verification::VerificationRuntime;
 use wyrd_spec::ids::CardUid;
 use wyrd_testing::Bootstrap;
@@ -533,8 +534,70 @@ async fn a_decision_racing_supersession_releases_nothing() {
 
     let (stop, task) = deployment.runtime();
     let served = deployment.until(waiting, "cancelled").await;
-    assert!(served["result"]["outcome"]["verdict"] != "passed", "{served}");
+    assert!(
+        served["result"]["outcome"]["verdict"] != "passed",
+        "{served}"
+    );
     assert_eq!(occurrence(&served)["status"], "approved", "{served}");
     stop.cancel();
     task.await.expect("the runtime task does not panic");
+}
+
+/// No receipt is given before Scribe acknowledges the decision: an
+/// unacknowledged decision answers unavailable and the execution keeps
+/// waiting. Once the held write lands, the same decision replays the
+/// accepted receipt, makes the execution due, and it passes. CI evidence is
+/// published before the pull request opens, so only the approval holds it.
+///
+/// # Panics
+/// Panics when a receipt precedes the acknowledgement, or the retry does not
+/// replay and resume.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unacknowledged_decision_is_unavailable_and_its_retry_replays() {
+    let deployment = Deployment::launch(|builder| {
+        builder
+            .with_verification_runtime_for_test()
+            .with_verification_runtime_limits_for_test(limits(Duration::from_mins(5)))
+            .with_limits_for_test(LimitsConfig {
+                timeout: Duration::from_secs(4),
+                ..LimitsConfig::default()
+            })
+    })
+    .await;
+    deployment.signoff().await;
+    let (status, receipt) = deployment.publish_ci(H1, json!({"status": "green"})).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    let waiting = deployment.open(7, H1).await;
+    let served = deployment.until(waiting, "waiting").await;
+    let approval = occurrence(&served)["approval_id"]
+        .as_str()
+        .expect("approval id")
+        .to_owned();
+
+    let stall = deployment
+        .server
+        .stall_next_bifrost_write_into("bifrost.verification.approvals")
+        .expect("Scribe stalls");
+    let decision = json!({"decision": "approved", "reason": "ship it"});
+    let (status, unavailable) = deployment
+        .decide(&deployment.jwt, waiting, &approval, &decision)
+        .await;
+    stall.wait_entered().await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{unavailable}");
+    assert_eq!(
+        unavailable["code"],
+        "WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE"
+    );
+    assert_eq!(deployment.status(waiting).await["status"], "waiting");
+
+    stall.release();
+    stall.wait_completed().await;
+    let (status, replay) = deployment
+        .decide(&deployment.jwt, waiting, &approval, &decision)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{replay}");
+    assert_eq!(replay["status"], "approved", "{replay}");
+    assert_eq!(replay["reason"], "ship it", "{replay}");
+    let served = deployment.until(waiting, "completed").await;
+    assert_eq!(served["result"]["outcome"]["verdict"], "passed", "{served}");
 }

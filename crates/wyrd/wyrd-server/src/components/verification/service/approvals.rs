@@ -30,7 +30,8 @@ impl VerificationControl<'_> {
     /// recorded. The caller then needs `verifier:approve` on the execution's
     /// exact Verifier and current authority over its subject. A decision
     /// already accepted for the occurrence replays its receipt when the same
-    /// actor sends the same decision and reason, and refuses otherwise. A new
+    /// actor sends the same decision and reason, and refuses otherwise; a
+    /// replay makes the execution due again, as a decision does. A new
     /// decision is accepted only while the execution is unfinished and before
     /// its original deadline, written through Scribe, and returned once
     /// acknowledged; the execution is then made due so it continues under
@@ -109,7 +110,9 @@ impl VerificationControl<'_> {
         let tenant = caller.data_tenant_id;
         let custody = ApprovalDecisions::new(self.state, tenant);
         if let Some(held) = retained.decisions.get(&approval_id) {
-            return replay(held, caller, &request);
+            let receipt = replay(held, caller, &request)?;
+            self.wake_decided(tenant, execution_id).await;
+            return Ok(receipt);
         }
         let mut conn = self
             .state
@@ -153,10 +156,12 @@ impl VerificationControl<'_> {
             let raced = custody
                 .decided(&records, execution_id, &[approval_id])
                 .await?;
-            return match raced.get(&approval_id) {
-                Some(held) => replay(held, caller, &request),
-                None => Err(error),
-            };
+            let receipt = raced
+                .get(&approval_id)
+                .ok_or(error)
+                .and_then(|held| replay(held, caller, &request))?;
+            self.wake_decided(tenant, execution_id).await;
+            return Ok(receipt);
         }
         self.wake_decided(tenant, execution_id).await;
         Ok(receipt)

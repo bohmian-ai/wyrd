@@ -20,7 +20,9 @@ use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::error::WyrdClientError;
 use wyrd_client::transport::HttpTransport;
-use wyrd_client::{GithubConnection, GlobalConfig, OperatorConnections, Principals, WyrdClient};
+use wyrd_client::{
+    Evidence, GithubConnection, GlobalConfig, OperatorConnections, Principals, WyrdClient,
+};
 
 use crate::error::WyrdCliError;
 
@@ -106,6 +108,17 @@ pub async fn operator_connections(server: &str) -> Result<OperatorConnections, W
 /// Returns the same construction errors as [`from_global`], or the stable error of a refused required credential exchange.
 pub async fn github(server: &str) -> Result<GithubConnection, WyrdCliError> {
     Ok(GithubConnection::connect_with(&from_global(Some(server))?).await?)
+}
+
+/// Build the deferred evidence publisher for one deployment.
+///
+/// The caller's credential comes from the ambient chain; `server` re-points
+/// only the endpoint.
+///
+/// # Errors
+/// Returns the same construction errors as [`from_global`], or the stable error of a refused required credential exchange.
+pub async fn evidence(server: &str) -> Result<Evidence, WyrdCliError> {
+    Ok(Evidence::connect_with(&from_global(Some(server))?).await?)
 }
 
 /// Project a client-assembly failure onto the CLI's local error catalog.

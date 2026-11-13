@@ -1787,6 +1787,33 @@ async fn registration_derives_queue_only_from_publishing_agents_and_pull_request
                                           "operator": "is_not_null" } }],
         })
     };
+    for (name, action) in [
+        (
+            "qo-both-sources",
+            json!({ "kind": "extract", "extractor": "pull_request", "from": "inputs.report" }),
+        ),
+        ("qo-no-source", json!({ "kind": "extract" })),
+    ] {
+        let (status, problem) = declare_json(
+            &server,
+            &jwt,
+            name,
+            json!([submission_body(
+                "Verifier",
+                name,
+                Some("1.0.0"),
+                extracting(
+                    action,
+                    json!({ "report": { "type": "media", "formats": ["text"] } })
+                ),
+            )]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{name}: {problem}");
+        assert_eq!(problem["code"], "WYRD_SPEC_400_VALIDATION", "{problem}");
+        assert_eq!(problem["details"]["rule"], "extract_source", "{problem}");
+        assert_no_declaration_writes(&server, name, name).await;
+    }
     let mut disclaimed = extracting(
         json!({ "kind": "extract", "extractor": "pull_request" }),
         json!({}),

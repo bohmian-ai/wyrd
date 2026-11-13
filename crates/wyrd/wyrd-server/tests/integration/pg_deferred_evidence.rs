@@ -78,9 +78,19 @@ impl Deployment {
     /// # Panics
     /// Panics when the request cannot be served.
     async fn publish_as(&self, jwt: &str, body: &Value) -> (StatusCode, Value) {
+        self.post(jwt, "/v1/verification/evidence/publish", body)
+            .await
+    }
+
+    /// POST `body` to `uri` as the user holding `jwt` and return the status
+    /// and JSON answer.
+    ///
+    /// # Panics
+    /// Panics when the request cannot be served.
+    async fn post(&self, jwt: &str, uri: &str, body: &Value) -> (StatusCode, Value) {
         let request = Request::builder()
             .method(Method::POST)
-            .uri("/v1/verification/evidence/publish")
+            .uri(uri)
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(body.to_string()))
             .expect("request builds");
@@ -152,6 +162,20 @@ impl Deployment {
         }
     }
 
+    /// How many executions the tenant holds.
+    ///
+    /// # Panics
+    /// Panics when the read fails.
+    async fn executions(&self) -> i64 {
+        let mut conn = self.conn().await;
+        let (count,) = sqlx::query_as("SELECT count(*) FROM wyrd.verifier_executions")
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("executions count");
+        conn.commit().await.expect("read commits");
+        count
+    }
+
     /// The attempts `execution` has spent and the Verifier version it froze.
     ///
     /// # Panics
@@ -199,14 +223,16 @@ fn limits(deadline: Duration) -> RuntimeLimits {
 /// resumes the same waiting execution.
 ///
 /// With nothing declaring `ci`, publication is refused as unmatched and
-/// retains nothing. Once `ci-gate` is bound, malformed or foreign
-/// publications are refused; evidence published before any pull request is
-/// accepted, replays identically and refuses different content, and a pull
-/// request opened later consumes it without republishing. A pull request on
-/// the commit refused earlier waits naming `ci`; publishing while a newer
-/// policy pins another `ci-gate` version reaches both, and resumes the same
-/// execution under its own pin; the park spends no attempt. A later
-/// subscriber receives no historical evidence and waits.
+/// retains nothing. Once `ci-gate` is bound, malformed, foreign or
+/// incompletely uploaded publications are refused; evidence published before
+/// any pull request is accepted, replays identically, refuses different
+/// content and another tenant, starts nothing, and a pull request opened
+/// later consumes it without republishing. A pull request on the commit
+/// refused earlier waits naming `ci`; publishing while a newer policy pins
+/// another `ci-gate` version reaches both: it resumes the same execution
+/// under its own pin, the park spending no attempt, and a pull request under
+/// the newer pin consumes it too. A later subscriber receives no historical
+/// evidence and waits.
 ///
 /// # Panics
 /// Panics when a receipt, refusal, wait or resumption differs.
@@ -263,6 +289,30 @@ async fn publication_is_matched_retained_and_resumes_the_waiting_execution() {
         );
     }
 
+    let planned = json!({"sha256": "cd".repeat(32), "size_bytes": 3});
+    let (status, plan) = deployment
+        .post(
+            &deployment.jwt,
+            "/v1/verification/evidence",
+            &json!({"files": [planned]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    assert_eq!(plan["uploads"].as_array().map(Vec::len), Some(1), "{plan}");
+    let (status, refused) = deployment
+        .publish(&publication(
+            SLUG,
+            C0,
+            "report",
+            json!({"kind": "file", "sha256": "cd".repeat(32), "size_bytes": 3, "format": "csv"}),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert!(
+        refused.to_string().contains("completed"),
+        "a planned upload that never completed is refused: {refused}"
+    );
+
     let Bootstrap::User { jwt: viewer, .. } = deployment
         .server
         .bootstrap_user("evidence-viewer", &["viewer"])
@@ -298,6 +348,38 @@ async fn publication_is_matched_retained_and_resumes_the_waiting_execution() {
     let (status, conflict) = deployment.publish_ci(C0, json!({"status": "red"})).await;
     assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
     assert_eq!(conflict["code"], "WYRD_VERIFICATION_409_EVIDENCE_CONFLICT");
+    assert_eq!(
+        deployment.executions().await,
+        0,
+        "publication alone starts no execution"
+    );
+
+    let other = deployment
+        .server
+        .seed_tenant("evidence-other")
+        .await
+        .expect("second tenant seeds");
+    let Bootstrap::Machine { api_key, .. } = deployment
+        .server
+        .bootstrap_service_in_tenant(other, "evidence-other-admin", &["admin"])
+        .await
+        .expect("other tenant's admin bootstraps")
+    else {
+        panic!("service bootstrap returned a non-machine principal");
+    };
+    let foreign = deployment
+        .server
+        .exchange_api_key(&api_key)
+        .await
+        .expect("other tenant's key exchanges");
+    let (status, refused) = deployment
+        .publish_as(&foreign, &publication(SLUG, C0, "ci", json_value.clone()))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{refused}");
+    assert_eq!(
+        refused["code"], "WYRD_GITHUB_404_NOT_CONNECTED",
+        "another tenant cannot publish to, or replay, this tenant's evidence"
+    );
 
     let early = deployment.open(1, C0).await;
     let served = deployment.until(early, "completed").await;
@@ -328,8 +410,17 @@ async fn publication_is_matched_retained_and_resumes_the_waiting_execution() {
         "the same execution resumed under its pin, spending one attempt in all"
     );
 
+    let pinned = deployment.open(3, C1).await;
+    let served = deployment.until(pinned, "completed").await;
+    assert_eq!(served["result"]["outcome"]["verdict"], "passed", "{served}");
+    assert_eq!(
+        deployment.spent(pinned).await,
+        (1, "1.0.1".to_owned()),
+        "the selected pin consumes the evidence it accepted without republishing"
+    );
+
     deployment.gate("1.3.0", "1.0.2").await;
-    let later = deployment.open(3, C1).await;
+    let later = deployment.open(4, C1).await;
     let served = deployment.until(later, "waiting").await;
     assert_eq!(
         served["waiting"],

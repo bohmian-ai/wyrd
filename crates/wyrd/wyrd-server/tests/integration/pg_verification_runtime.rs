@@ -4141,6 +4141,69 @@ async fn the_runner_claims_no_more_than_its_execution_slots() {
     claim_first_round(3, 2).await;
 }
 
+/// A parked attempt gives up its execution slot before Scribe acknowledges
+/// the parked revision, yet keeps its claim until then.
+///
+/// With one slot and the parked revision held, a second queued run is
+/// claimed and computed while neither row has returned to the queue; once
+/// the revision is acknowledged, the parked row is pending again with its
+/// lease cleared and its attempt refunded.
+///
+/// # Panics
+/// Panics when the held park blocks the slot, returns its row before the
+/// acknowledgement, or keeps it after.
+#[tokio::test]
+async fn a_parked_attempt_frees_its_slot_and_keeps_its_claim_until_acknowledged() {
+    let harness = Harness::start().await;
+    let script = EngineScript::default();
+    let runs = [harness.submit().await, harness.submit().await];
+    script.push(EngineOutcome::Parked(
+        [SlotName::new("ci").expect("slot name")].into(),
+    ));
+    script.push(EngineOutcome::Completed(unscored_report()));
+    let stall = harness
+        .server
+        .stall_next_bifrost_write_into("bifrost.verification.execution_events")
+        .expect("Scribe stalls");
+    let limits = RuntimeLimits {
+        execution_slots: 1,
+        ..Harness::limits()
+    };
+    let runtime = harness.spawn(&limits, &script);
+    stall.wait_entered().await;
+    wait_until("the second run computes in the freed slot", || {
+        script.entered() == 2
+    })
+    .await;
+    let queued: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM wyrd.verifier_executions
+          WHERE execution_id = ANY($1) AND lease_expires_at IS NULL",
+    )
+    .bind(runs.map(|run| run.as_uuid()).to_vec())
+    .fetch_one(&harness.assertion)
+    .await
+    .expect("leases read");
+    assert_eq!(queued, 0, "the held park keeps its claim");
+
+    stall.release();
+    stall.wait_completed().await;
+    let mut settled = Vec::new();
+    for run in runs {
+        settled.push(
+            wait_execution_in(&harness.seed, run, |row| {
+                matches!(row.status.as_str(), "pending" | "completed")
+            })
+            .await,
+        );
+    }
+    let parked = settled
+        .iter()
+        .find(|row| row.status == "pending")
+        .unwrap_or_else(|| panic!("one run parked: {settled:?}"));
+    assert_eq!(parked.attempts, 0, "parking refunds its attempt");
+    runtime.stop().await;
+}
+
 /// A burst of queued runs in one tenant is claimed in the runner's first
 /// round up to its free slots, through repeated passes over the single due
 /// tenant, not one run per round.

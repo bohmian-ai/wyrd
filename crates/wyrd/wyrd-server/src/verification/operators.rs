@@ -25,7 +25,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue, RETRY_AFTER};
 use reqwest::{Client, Error as ReqwestError};
 use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use serde_json::Value;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use wyrd_auth_oidc::{ScreenError, ScreenedHttp};
@@ -488,6 +488,7 @@ impl LeasedWork for OperatorWorker {
         self: Arc<Self>,
         tenant: DataTenantId,
         dispatch: ClaimedDispatch,
+        _slot: OwnedSemaphorePermit,
         stop: CancellationToken,
         abandon: CancellationToken,
         _spawned_at: Instant,

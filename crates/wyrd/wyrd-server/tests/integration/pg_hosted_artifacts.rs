@@ -1408,7 +1408,6 @@ async fn artifact_evidence_is_admitted_against_its_slot_and_the_combined_limit()
                         mode: ExecutionMode::Direct,
                     },
                 )
-                .expect("engine builds")
                 .run(spec, evidence, Instant::now() + Duration::from_secs(30))
                 .await
         }

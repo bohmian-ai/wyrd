@@ -777,7 +777,7 @@ impl VerifierRunner {
         (drift, evidence, routes, run_id): Prepared,
     ) -> EngineOutcome {
         let caller = Caller::accepted(&run.authority, system);
-        let engine = match telemetry.time(Phase::Setup, || {
+        let engine = telemetry.time(Phase::Setup, || {
             self.blocks.engine(
                 &self.state,
                 Execution {
@@ -801,16 +801,7 @@ impl VerifierRunner {
                     mode: ExecutionMode::Queued,
                 },
             )
-        }) {
-            Ok(engine) => engine,
-            Err(error) => {
-                tracing::warn!(execution_id = %run.lease.execution_id, %error, "the execution engine cannot be built");
-                return EngineOutcome::Retry(failure(
-                    EXECUTION_INTERRUPTED,
-                    "the verification engine cannot be built",
-                ));
-            }
-        };
+        });
         let recorded = state.snapshot();
         let engine = engine.with_checkpoints(Arc::clone(state) as Arc<dyn Checkpoints>, &recorded);
         match engine

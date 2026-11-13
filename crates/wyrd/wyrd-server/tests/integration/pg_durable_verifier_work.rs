@@ -3186,7 +3186,6 @@ async fn concurrent_settlements_release_their_hosted_dependent() {
                     mode: ExecutionMode::Queued,
                 },
             )
-            .expect("the engine builds")
             .with_checkpoints(
                 Arc::clone(state) as Arc<dyn Checkpoints>,
                 &ExecutionState {

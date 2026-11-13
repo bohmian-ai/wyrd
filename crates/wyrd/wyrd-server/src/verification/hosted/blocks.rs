@@ -17,22 +17,27 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use monty_pool::PoolError;
 use skald_spec::PreparedSchemas;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::Instant;
 use vala_verify::blocks::{
-    ActionExecutor, ActionOutput, AgentCardResolver, AgentExecutor, BlockCall, BlockClock,
-    BlockError, CheckExecutor, CheckOutput, DriftChecks, EvidenceReader, PromptCardResolver,
-    VerificationEngine,
+    ActionExecutor, ActionOutput, AgentCardResolver, AgentExecutor, AgentToolset, BlockCall,
+    BlockClock, BlockError, CallInput, CheckExecutor, CheckOutput, DriftChecks, EvidenceReader,
+    PromptCardResolver, ToolSession, VerificationEngine,
 };
-use wyrd_spec::card::agent::ExecutionRoute;
+use vala_verify::{TraceSource, TraceUnavailable};
+use wyrd_spec::card::agent::{BuiltinTool, ExecutionRoute};
 use wyrd_spec::card::verifier::{Action, Check};
-use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
+use wyrd_spec::vala::ids::TraceId;
+use wyrd_spec::vala::trace::SpanRecord;
 use wyrd_spec::verification::TaskId;
+use wyrd_spec::verification::execution::Producer;
 
 use super::evidence::TenantEvidence;
 use super::registry::TenantRegistry;
@@ -227,25 +232,20 @@ impl HostedBlocks {
     /// Build the engine of one execution over `state`, on the lane of
     /// `execution.mode`.
     ///
-    /// The evidence reader, registry, code executor, built-in tools, and
-    /// gateway caller are all bound to `execution.caller`; the evidence
-    /// reader also admits the evidence the engine run pins, sharing the
-    /// engine's one copy, before any block runs, and
-    /// every block's run interval is recorded on `execution.clock`; Agent and Prompt
-    /// Cards resolve through the caller's audited `verifier:run` on
-    /// `execution.verifier`, and every
-    /// model call holds one of the lane's model-call permits while it goes
-    /// through the in-process gateway as that caller, attributed to
-    /// `execution.subject`.
-    ///
-    /// # Errors
-    /// Returns the [`CallerTraces::new`] refusal when the caller cannot form
-    /// a query context.
-    pub fn engine(
-        &self,
-        state: &AppState,
-        execution: Execution<'_>,
-    ) -> Result<VerificationEngine, WyrdError> {
+    /// Setup binds the execution once: its evidence reader, which admits the
+    /// evidence the engine run pins before any block runs, its code executor,
+    /// and an [`ExecutionBinding`] holding the accepted caller, Verifier,
+    /// attribution, route overrides, and lane capacity. The Agent executor,
+    /// its registry, built-in tools, gateway caller, and the trace reader are
+    /// built from that binding only when the execution first runs an Agent
+    /// block, opens a tool, or reads a trace, so a Verifier that never does
+    /// never builds them. Every one of them is bound to `execution.caller`:
+    /// Agent and Prompt Cards resolve through the caller's audited
+    /// `verifier:run` on `execution.verifier`, and every model call holds one
+    /// of the lane's model-call permits while it goes through the in-process
+    /// gateway as that caller, attributed to `execution.subject`. Every
+    /// block's run interval is recorded on `execution.clock`.
+    pub fn engine(&self, state: &AppState, execution: Execution<'_>) -> VerificationEngine {
         let caller = execution.caller;
         let lane = self.lane(execution.mode);
         let evidence = TenantEvidence::new(state.clone(), caller.clone(), self.limits);
@@ -253,69 +253,188 @@ impl HostedBlocks {
             Some(state) => evidence.with_execution(Arc::clone(state)),
             None => evidence,
         });
-        let registry = Arc::new(TenantRegistry::new(
-            state.clone(),
-            Some(caller.clone()),
-            execution.verifier.clone(),
-        ));
-        let agent = AgentExecutor::new(
-            Arc::default(),
-            Arc::clone(&registry) as Arc<dyn AgentCardResolver>,
-            registry as Arc<dyn PromptCardResolver>,
-        )
-        .with_evidence(Arc::clone(&evidence) as Arc<dyn EvidenceReader>)
-        .with_toolset(Arc::new({
-            let tools = HostedTools::new(
-                state.clone(),
-                caller.clone(),
-                Arc::clone(&evidence),
-                Arc::clone(&lane.workspaces),
-                Arc::clone(&lane.sandbox),
-                self.limits,
-            );
-            match &execution.execution {
-                Some(run) => tools.with_execution(Arc::clone(run)),
-                None => tools,
-            }
-        }))
-        .with_wyrd_gateway(Arc::new(
-            ServerWyrdGatewayCaller::new(state.clone(), caller.clone())
-                .attributed(Some(execution.subject))
-                .admitted(execution.mode.as_str(), Arc::clone(&lane.model_calls)),
-        ))
-        .with_route_overrides(execution.routes.clone())
-        .with_prepared_schemas(Arc::clone(&self.schemas));
+        let binding = Arc::new(ExecutionBinding {
+            state: state.clone(),
+            caller: caller.clone(),
+            verifier: execution.verifier.clone(),
+            subject: execution.subject,
+            routes: execution.routes.clone(),
+            execution: execution.execution,
+            mode: execution.mode,
+            evidence: Arc::clone(&evidence),
+            workspaces: Arc::clone(&lane.workspaces),
+            sandbox: Arc::clone(&lane.sandbox),
+            model_calls: Arc::clone(&lane.model_calls),
+            limits: self.limits,
+            schemas: Arc::clone(&self.schemas),
+            tools: OnceLock::new(),
+            traces: OnceLock::new(),
+        });
         let blocks = Arc::new(Blocks {
             code: CodeExecutor::new(Arc::clone(&lane.sandbox), Arc::clone(&evidence)),
-            evidence: Arc::clone(&evidence),
-            agent,
+            binding: Arc::clone(&binding),
+            agent: OnceLock::new(),
         });
-        let traces = CallerTraces::new(state.clone(), caller.clone())?;
         let engine = VerificationEngine::new(
             Arc::clone(&blocks) as Arc<dyn ActionExecutor>,
             blocks,
-            Arc::new(traces),
+            binding,
             STEP_CONCURRENCY,
         )
         .with_drift(execution.drift)
         .with_evidence(evidence)
         .with_clock(execution.clock);
-        Ok(if execution.defer_unlanded_traces {
+        if execution.defer_unlanded_traces {
             engine.with_unlanded_traces_deferred()
         } else {
             engine
+        }
+    }
+}
+
+/// One execution's accepted authority and lane capacity, from which its
+/// Agent executor, built-in tools, and trace reader are built on first use.
+///
+/// It is bound to exactly one execution and never shared with another, so
+/// interleaved executions never exchange authority, evidence, publications,
+/// or Python budgets. It owns nothing that owns it: [`Blocks`] holds it, and
+/// the Agent executor holds it as its toolset.
+struct ExecutionBinding {
+    /// Server state every Card, evidence, query, tool, and model call uses.
+    state: AppState,
+    /// The accepted caller every one of them is authorized and audited as.
+    caller: Caller,
+    /// The executing Verifier, whose `verifier:run` authorizes loading its
+    /// Agent and Prompt definitions.
+    verifier: CardUid,
+    /// The Card and application Run model calls are attributed to.
+    subject: GatewayCallContext,
+    /// Per-requirement or per-step Agent route overrides.
+    routes: BTreeMap<TaskId, ExecutionRoute>,
+    /// The execution state `publish` accepts into; `None` for an engine
+    /// bound to no execution.
+    execution: Option<Arc<RunState>>,
+    /// The accepted execution mode, which names the lane of model calls.
+    mode: ExecutionMode,
+    /// The execution's pinned evidence.
+    evidence: Arc<TenantEvidence>,
+    /// The lane's workspace permits.
+    workspaces: Arc<Workspaces>,
+    /// The lane's Python sandbox pool.
+    sandbox: Arc<Sandbox>,
+    /// The lane's model-call permits.
+    model_calls: Arc<Semaphore>,
+    /// The Deployment limits in force.
+    limits: HostedLimits,
+    /// The process's shared schema preparation.
+    schemas: Arc<PreparedSchemas>,
+    /// The execution's built-in tools, built when an Agent first opens a
+    /// tool session; they keep each action's Python budget across attempts.
+    tools: OnceLock<HostedTools>,
+    /// The execution's trace reader, built on its first trace read.
+    traces: OnceLock<CallerTraces>,
+}
+
+impl ExecutionBinding {
+    /// The Agent executor of `binding`'s execution, resolving Agent and
+    /// Prompt Cards as its caller and calling models through the gateway on
+    /// its lane, with `binding` as its toolset.
+    fn agent(binding: &Arc<Self>) -> AgentExecutor {
+        let registry = Arc::new(TenantRegistry::new(
+            binding.state.clone(),
+            Some(binding.caller.clone()),
+            binding.verifier.clone(),
+        ));
+        AgentExecutor::new(
+            Arc::default(),
+            Arc::clone(&registry) as Arc<dyn AgentCardResolver>,
+            registry as Arc<dyn PromptCardResolver>,
+        )
+        .with_evidence(Arc::clone(&binding.evidence) as Arc<dyn EvidenceReader>)
+        .with_toolset(Arc::clone(binding) as Arc<dyn AgentToolset>)
+        .with_wyrd_gateway(Arc::new(
+            ServerWyrdGatewayCaller::new(binding.state.clone(), binding.caller.clone())
+                .attributed(Some(binding.subject.clone()))
+                .admitted(binding.mode.as_str(), Arc::clone(&binding.model_calls)),
+        ))
+        .with_route_overrides(binding.routes.clone())
+        .with_prepared_schemas(Arc::clone(&binding.schemas))
+    }
+
+    /// The execution's built-in tools, built on first use.
+    fn tools(&self) -> &HostedTools {
+        self.tools.get_or_init(|| {
+            let tools = HostedTools::new(
+                self.state.clone(),
+                self.caller.clone(),
+                Arc::clone(&self.evidence),
+                Arc::clone(&self.workspaces),
+                Arc::clone(&self.sandbox),
+                self.limits,
+            );
+            match &self.execution {
+                Some(run) => tools.with_execution(Arc::clone(run)),
+                None => tools,
+            }
         })
+    }
+}
+
+#[async_trait]
+impl AgentToolset for ExecutionBinding {
+    /// Open the tool session through the execution's built-in tools; see
+    /// [`HostedTools`].
+    ///
+    /// # Errors
+    /// Returns the [`HostedTools`] refusal.
+    async fn open(
+        &self,
+        id: &TaskId,
+        workspace: &BTreeMap<String, CallInput>,
+        deadline: Instant,
+        tools: &[BuiltinTool],
+        producer: Option<&Producer>,
+    ) -> Result<ToolSession, BlockError> {
+        self.tools()
+            .open(id, workspace, deadline, tools, producer)
+            .await
+    }
+}
+
+#[async_trait]
+impl TraceSource for ExecutionBinding {
+    /// Read `trace_id` as the execution's caller; see [`CallerTraces`].
+    ///
+    /// # Errors
+    /// Returns the [`CallerTraces`] [`TraceUnavailable`].
+    async fn fetch(
+        &self,
+        trace_id: TraceId,
+        deadline: Duration,
+    ) -> Result<Arc<Vec<SpanRecord>>, TraceUnavailable> {
+        self.traces
+            .get_or_init(|| CallerTraces::new(self.state.clone(), self.caller.clone()))
+            .fetch(trace_id, deadline)
+            .await
     }
 }
 
 /// One execution's block executors, routed by block kind.
 struct Blocks {
-    /// Runs `extract` actions over the pinned evidence.
-    evidence: Arc<TenantEvidence>,
+    /// The execution's binding; runs `extract` actions over its evidence.
+    binding: Arc<ExecutionBinding>,
     /// Runs `code` actions and checks in the sandbox.
     code: CodeExecutor,
-    /// Runs `agent` actions and checks.
-    agent: AgentExecutor,
+    /// Runs `agent` actions and checks; built on the first one.
+    agent: OnceLock<AgentExecutor>,
+}
+
+impl Blocks {
+    /// The execution's Agent executor, built once on first use.
+    fn agent(&self) -> &AgentExecutor {
+        self.agent
+            .get_or_init(|| ExecutionBinding::agent(&self.binding))
+    }
 }
 
 #[async_trait]
@@ -326,8 +445,8 @@ impl ActionExecutor for Blocks {
     /// Returns the routed executor's [`BlockError`].
     async fn execute(&self, call: BlockCall<'_, Action>) -> Result<ActionOutput, BlockError> {
         match call.block {
-            Action::Extract { .. } => self.evidence.execute(call).await,
-            Action::Agent(_) => ActionExecutor::execute(&self.agent, call).await,
+            Action::Extract { .. } => self.binding.evidence.execute(call).await,
+            Action::Agent(_) => ActionExecutor::execute(self.agent(), call).await,
             Action::Code(_) => ActionExecutor::execute(&self.code, call).await,
         }
     }
@@ -344,7 +463,7 @@ impl CheckExecutor for Blocks {
     async fn execute(&self, call: BlockCall<'_, Check>) -> Result<CheckOutput, BlockError> {
         match call.block {
             Check::Code(_) => CheckExecutor::execute(&self.code, call).await,
-            _ => CheckExecutor::execute(&self.agent, call).await,
+            _ => CheckExecutor::execute(self.agent(), call).await,
         }
     }
 }
@@ -689,22 +808,20 @@ mod pg_tests {
             )]);
             let expected = evidence.clone();
             let (outcome, allocated) = CountingAllocator::measure(|| {
-                let engine = blocks
-                    .engine(
-                        &state,
-                        Execution {
-                            caller: &caller,
-                            verifier: &uid,
-                            routes: &routes,
-                            subject: GatewayCallContext::default(),
-                            defer_unlanded_traces: false,
-                            drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
-                            clock: BlockClock::default(),
-                            execution: None,
-                            mode: ExecutionMode::Direct,
-                        },
-                    )
-                    .expect("engine builds");
+                let engine = blocks.engine(
+                    &state,
+                    Execution {
+                        caller: &caller,
+                        verifier: &uid,
+                        routes: &routes,
+                        subject: GatewayCallContext::default(),
+                        defer_unlanded_traces: false,
+                        drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
+                        clock: BlockClock::default(),
+                        execution: None,
+                        mode: ExecutionMode::Direct,
+                    },
+                );
                 runtime.block_on(engine.run(Arc::clone(&assertion), evidence, deadline()))
             });
             let outcome = outcome.expect("outcome");

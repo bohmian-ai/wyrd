@@ -594,7 +594,7 @@ impl<'a> VerificationControl<'a> {
             });
         let deadline = tokio::time::Instant::now() + timeout;
         let owner = wyrd_runtime::owning_root(&caller.principal, &caller.delegation_chain);
-        let built = telemetry.time(Phase::Setup, || {
+        let engine = telemetry.time(Phase::Setup, || {
             blocks.engine(
                 self.state,
                 Execution {
@@ -615,10 +615,6 @@ impl<'a> VerificationControl<'a> {
                 },
             )
         });
-        let engine = match built {
-            Ok(engine) => engine,
-            Err(error) => return ("errored", Err(error)),
-        };
         let ran = telemetry
             .phase(
                 Phase::Engine,

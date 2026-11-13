@@ -43,14 +43,11 @@ pub struct CallerTraces {
 }
 
 impl CallerTraces {
-    /// A trace reader for `caller`.
-    ///
-    /// # Errors
-    /// Returns the [`ScheduledQueryCaller::authenticated`] refusal when the
-    /// caller cannot form an Oracle query context.
-    pub fn new(state: AppState, caller: Caller) -> Result<Self, wyrd_spec::error::WyrdError> {
-        crate::query::service::oracle_context(&caller)?;
-        Ok(Self { state, caller })
+    /// A trace reader for `caller`. Each fetch forms its own Oracle query
+    /// context, so a caller that cannot form one has its read refused.
+    #[must_use]
+    pub const fn new(state: AppState, caller: Caller) -> Self {
+        Self { state, caller }
     }
 
     /// The span statement of `trace_id`: every retained span of that exact

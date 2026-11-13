@@ -65,3 +65,22 @@ accurate; do not restate the library `context` shape.
 `mise run docs:check` exits 0; `git diff` shows the same change in
 `verifier-card.md` and `docs/public/llms-full.txt`; content review against the
 cited assertions. No test lane is required.
+
+## Obligations
+
+| ID | Promise | Source | Planned proof |
+|---|---|---|---|
+| R1-1 | The reference documents `changes`/`review.full_pr` as `{base, head, files}` with every per-file field, `status` value and side `kind` | FIND-005-1, AC-R1-1 | content review against `output.rs` and the journeys |
+| R1-2 | The guide's example check fails on an empty change | FIND-005-1, AC-R1-2, X6 | equals `REVIEW` in J:43, exercised by the empty-change journey |
+| R1-3 | The guide names the HTTP details read and the MCP tool | FIND-005-1, AC-R1-3, REQ-016 | content review against the route and MCP reference |
+
+## Evidence
+
+| Obligation | Implementation evidence | Proof location | Verification evidence | Result |
+|---|---|---|---|---|
+| R1-1 | `verifier-card.md:78`, mirrored in `llms-full.txt` | `output.rs` `ChangeSet`/`ChangedFile`/`ChangeKind`/`FileSource`; J `successive_heads…`, `a_fork_behind…`, `unreviewable_files…` assert `changes.files`, `previous_path`, `status`, `before`/`after` kinds | content review; `docs:check` 0 | PASS |
+| R1-2 | example `check: {kind: assert, path: steps.pr.output.changes.files, operator: is_non_empty}` | J:43 `REVIEW` uses the same check; `an_empty_incremental_change_is_evidence_and_never_a_pass` shows it not passing on an empty diff | content review | PASS |
+| R1-3 | `GET /v1/verification/executions/{id}/details` and `verification.get_execution_details` | `verification/routes.rs:617`, `wyrd-client/src/verify/execution.rs:278`; `reference/mcp-tools.md:43` | content review | PASS |
+
+No code, schema, SDK, CLI or other docs page changed. Commands: `mise run docs:generate`,
+`mise run docs:check` (exit 0 with the change staged), `git diff --check`. No RED: documentation only.

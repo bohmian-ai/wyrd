@@ -903,6 +903,83 @@ async fn direct_verification_of_a_pull_request_verifier_refuses_before_any_step(
     );
 }
 
+/// Queued work that was not admitted from a pull request has no accepted
+/// source, so the extractor fails its step before any acquisition and the
+/// review is never a pass.
+///
+/// # Panics
+/// Panics when the enqueue is refused, the step reads GitHub or succeeds, or
+/// the execution passes.
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_work_without_an_admitted_pull_request_extracts_nothing() {
+    let deployment =
+        Deployment::start(&[("pr-review.yaml", REVIEW), ("policy.yaml", POLICY)]).await;
+    let mut conn = deployment
+        .server
+        .tenant_conn_for(deployment.server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let mut uid = async |kind: &str, name: &str| -> Uuid {
+        sqlx::query_scalar("SELECT card_uid FROM wyrd.cards WHERE kind = $1 AND name = $2")
+            .bind(kind)
+            .bind(name)
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("the Card is declared")
+    };
+    let verifier = uid("Verifier", "pr-review").await;
+    let repository = uid("Repository", "policy").await;
+    conn.commit().await.expect("read commits");
+    let reads_before = deployment.mock.repository_reads(REPOSITORY).len();
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/verification/enqueue")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({"verifier_card_uid": verifier, "card_uid": repository, "inputs": {}})
+                .to_string(),
+        ))
+        .expect("request builds");
+    let response = deployment
+        .server
+        .oneshot_authenticated(&deployment.jwt, request)
+        .await
+        .expect("enqueue responds");
+    let status = response.status();
+    let accepted: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("body reads"),
+    )
+    .expect("JSON");
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    let execution: Uuid =
+        serde_json::from_value(accepted["execution_id"].clone()).expect("an execution ID");
+    deployment.settled(execution).await;
+
+    let details = deployment
+        .get(&format!("/v1/verification/executions/{execution}/details"))
+        .await;
+    let step = &details["outcome"]["steps"][0];
+    assert_eq!(
+        (&step["id"], &step["status"]),
+        (&json!("pr"), &json!("failed")),
+        "{details}"
+    );
+    assert_eq!(
+        step["reason"],
+        "the pull_request extractor reads only a queued pull request execution's accepted source",
+        "{details}"
+    );
+    assert_eq!(details["outcome"]["verdict"], "inconclusive", "{details}");
+    assert_eq!(
+        deployment.mock.repository_reads(REPOSITORY).len(),
+        reads_before,
+        "no source is read"
+    );
+}
+
 /// Hold every slot of `server`'s reserved Scribe share, so nothing more can
 /// be staged for persistence until the returned reservations drop.
 ///

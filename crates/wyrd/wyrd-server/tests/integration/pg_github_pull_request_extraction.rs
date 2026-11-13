@@ -447,6 +447,59 @@ impl Deployment {
         step["output"].clone()
     }
 
+    /// `execution`'s details read through the `/mcp` tool
+    /// `verification.get_execution_details` as the editor.
+    ///
+    /// # Panics
+    /// Panics when the call fails or answers no structured content.
+    async fn mcp_details(&self, execution: Uuid) -> Value {
+        let version = "2026-07-28";
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "verification.get_execution_details",
+                "arguments": {"execution_id": execution},
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": version,
+                    "io.modelcontextprotocol/clientInfo": {"name": "extraction-reader", "version": "1"},
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+            },
+        });
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header("mcp-protocol-version", version)
+            .header("mcp-method", "tools/call")
+            .header("mcp-name", "verification.get_execution_details")
+            .body(Body::from(body.to_string()))
+            .expect("MCP request builds");
+        let response = self
+            .server
+            .oneshot_authenticated(&self.jwt, request)
+            .await
+            .expect("MCP responds");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1 << 22)
+            .await
+            .expect("body reads");
+        let text = String::from_utf8_lossy(&bytes);
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let message = text
+            .lines()
+            .find_map(|line| line.strip_prefix("data:"))
+            .unwrap_or(&text);
+        let answer: Value = serde_json::from_str(message.trim()).expect("JSON-RPC answer");
+        let result = &answer["result"];
+        assert_ne!(result["isError"], true, "{answer}");
+        result["structuredContent"].clone()
+    }
+
     /// `GET uri` as the editor.
     ///
     /// # Panics
@@ -542,6 +595,11 @@ async fn successive_heads_extract_the_full_then_the_incremental_change() {
     assert_eq!(
         extraction["review"]["full_pr"]["files"][0]["before"]["text"],
         std::str::from_utf8(HANDLER).expect("utf-8")
+    );
+    let over_mcp = deployment.mcp_details(second).await;
+    assert_eq!(
+        over_mcp["outcome"]["steps"][0]["output"], extraction,
+        "MCP serves the same extraction and previous review"
     );
 }
 

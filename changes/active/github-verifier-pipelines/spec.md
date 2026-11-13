@@ -1,6 +1,6 @@
 ---
 id: SPEC-github-verifier-pipelines
-revision: 7
+revision: 8
 status: approved
 ---
 
@@ -173,8 +173,8 @@ injects actual selected source text; workspace JSON holds the same validated liv
 values. Dependent consumption does not wait for checkpoint/Scribe acceptance;
 recovery reuses only actually persisted exact extraction evidence (REQ-017). No filesystem-discovery step is required, no implicit injection into
 unrelated Agents, no invented evidence publication name and no required source
-checkout. Pinned Agent/Prompt owns policy; repository guidance comes from pinned
-base source, while PR edits to guidance are evidence. Reuse library context and
+checkout. Pinned Agent/Prompt owns policy; Wyrd supplies no separate repository
+guidance, and PR edits to guidance files are before/after evidence. Reuse library context and
 existing model limits; oversized input is an honest failure, never a clean review.
 Authors may use existing DAG/fanout primitives; no automatic splitting subsystem.
 
@@ -286,6 +286,9 @@ for the introduced capability. New writes require domain permission and MCP
 write scopes; reads remain discoverable. Expose isolated capacities and original
 execution ceiling through normal operator configuration. Documentation teaches
 App setup, declaration, publication, approval and diagnosis without a UI.
+The pull_request extraction is inspected as ordinary step output through the
+existing execution details over HTTP and MCP; it has no typed SDK read, SDK
+authoring helper, CLI read or SDK journey of its own.
 
 **REQ-017 — Memory execution and bounded background completion.** Direct and
 queued execution use the same stateful engine. Under the TASK-010-R1 amendment
@@ -400,7 +403,7 @@ without production GitHub credentials.
 | AC-008 | No/one/multiple/malformed report; every severity, absent location, valid/invalid suggested edit | Exact report convention; honest verdict/conclusion; no invented source anchor or applied source change | 012,013 |
 | AC-009 | GitHub timeout after remote success, annotation batch retry, restart, new head/access removal during delivery | Reconciliation avoids duplicates; provider retry does not rerun verification or claim stale success | 005,014 |
 | AC-010 | Hold queued execution/workspace/Python/model admission saturated while calling direct-eligible Verifier | Direct reserved resources still execute; queued-only direct call refuses before work | 015 |
-| AC-011 | Fresh reader follows CLI/SDK docs and uses execution, evidence, approval and delivery inspection | Complete journey without UI or hidden manual orchestration; schemas/errors match served operations | 016 |
+| AC-011 | Fresh reader follows CLI/SDK docs and uses execution, evidence, approval and delivery inspection; reads a pull_request extraction through execution details over HTTP and MCP | Complete journey without UI or hidden manual orchestration; schemas/errors match served operations | 016 |
 | AC-012 | Hold Scribe/outbox and background SQL replies while direct/queued graphs advance; fill terminal tracking, then restore persistence; crash/reclaim before/after acceptance and race cancellation/takeover | Engine progresses from memory, compute permits free, tracking bounded with room for running claims, new claims back off, direct remains isolated; restored persistence yields the same terminal evidence then batched fenced settlement; only unpersisted work may repeat | 011,015,017 |
 | AC-013 | Matched full immutable resource-scaling/candidate verification benchmarks with healthy evidence reconciliation | Existing latency/L2 targets met and RS throughput/CPU/memory baseline preserved; no invented tolerance or exit-zero-only performance claim | 018 |
 | AC-014 | Fresh isolated migration comparison and affected consumer/SQL tests | Only permitted GitHub/PR/Task 004 deltas beyond main plus RS; no generic execution payload schema, preserved grants/RLS/cancellation responsiveness and no Bifrost runtime redesign | 018 |
@@ -446,6 +449,7 @@ readiness. Implementation tasks derive from this approved revision.
 | 5 | approved 2026-11-10 | User directed the conventional GitHub App flow and removal of the Enterprise Server compatibility decision. Scope the provider to GitHub.com with its documented installation and OAuth protections. |
 | 6 | approved storage direction | Task 004 ObjectStorage over existing object storage and PostgreSQL SnapshotStore/ContextStore with their required metadata-table exception; reconcile the previously stale draft frontmatter. |
 | 7 | approved in current conversation | Shared memory execution, preserved preparation/Bifrost, bounded background queued completion and leases/group commit, explicit crash loss, compute-free park handoffs, resource-scaling proof and unreleased execution-schema cleanup. |
+| 8 | approved 2026-11-13 | User decisions during TASK-005, explicitly approved: REQ-016/AC-011 inspect the pull_request extraction only through existing HTTP/MCP execution details (no typed SDK read, SDK helper, CLI read or SDK journey for it); REQ-007 drops repository guidance from the pinned base, superseding that sentence in [extraction design](design/approved-code-review-support.md). Nothing else changes. |
 
 Subsequent explicit maintainer amendment: approval authoring has no separate
 expiration setting. Pending approvals and deferred waits share the execution's

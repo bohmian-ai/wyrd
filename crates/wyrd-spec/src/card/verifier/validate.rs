@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use skald_spec::{Prompt, ResponseFormat, ResponseType};
 
 use super::extract::ExtractOutput;
+use super::pull_request::{Extractor, PullRequestExtraction};
 use super::reference::{OrderBy, Reference, ReferenceRoot, SourceField};
 use super::schema_path::{admits, fits};
 use super::{
@@ -226,7 +227,7 @@ impl Step {
 /// Every reference a step's action binds.
 fn action_references(step: &Step) -> std::vec::IntoIter<&Reference> {
     let action: Vec<&Reference> = match &step.action {
-        Action::Extract { from } => vec![from],
+        Action::Extract { from, .. } => from.iter().collect(),
         Action::Agent(call) => call
             .inputs
             .values()
@@ -489,7 +490,27 @@ where
         }
         let action_path = format!("{path}.action");
         match &step.action {
-            Action::Extract { from } => {
+            Action::Extract {
+                from: None,
+                extractor: Some(_),
+            } => {}
+            Action::Extract {
+                from: None,
+                extractor: None,
+            }
+            | Action::Extract {
+                from: Some(_),
+                extractor: Some(_),
+            } => {
+                return Err(invalid(
+                    "extract_source",
+                    &action_path,
+                    "extract takes exactly one of `from` and `extractor`",
+                ));
+            }
+            Action::Extract {
+                from: Some(from), ..
+            } => {
                 self.validate_reference(from, position, false, false, &action_path)?;
                 let Some(InputSlot::Media { formats, .. }) = self.whole_slot(from) else {
                     return Err(invalid(
@@ -1024,7 +1045,11 @@ where
     /// Returns the known output schema of a step, when it has one.
     fn output_schema(&self, step: &'a Step) -> Option<Value> {
         match &step.action {
-            Action::Extract { from } => match self.whole_slot(from)? {
+            Action::Extract {
+                extractor: Some(Extractor::PullRequest),
+                ..
+            } => Some(PullRequestExtraction::schema()),
+            Action::Extract { from, .. } => match self.whole_slot(from.as_ref()?)? {
                 InputSlot::Media { formats, .. } => Some(ExtractOutput::schema_for(formats)),
                 _ => None,
             },
@@ -1748,6 +1773,14 @@ mod tests {
                 "extract_source",
             ),
             (
+                with("/steps/0/action/extractor", json!("pull_request")),
+                "extract_source",
+            ),
+            (
+                with("/steps/0/action/from", Value::Null),
+                "extract_source",
+            ),
+            (
                 with("/inputs/deck/formats", json!(["ppt"])),
                 "extract_format",
             ),
@@ -1801,6 +1834,44 @@ mod tests {
         let mut bad = self::drift();
         bad["requirements"][0]["check"]["on"] = json!("inputs.current.income");
         assert_eq!(rule(&bad), "drift_source");
+    }
+
+    /// A pull-request extraction step takes no media slot, and later steps
+    /// bind its typed output by field or whole: a path the output has
+    /// validates, and one it does not have is refused.
+    ///
+    /// # Panics
+    /// Panics when the valid Verifier is refused or the bad path is not.
+    #[test]
+    fn pull_request_extraction_output_binds_by_its_typed_fields() {
+        let body = json!({
+            "steps": [
+                {"id": "extract-pr", "action": {"kind": "extract", "extractor": "pull_request"}},
+                {"id": "review", "action": {"kind": "agent",
+                    "agent": agent(&["fs.read"], json!("{{pr}} {{changes}} {{context}}"), None),
+                    "inputs": {
+                        "pr": "steps.extract-pr.output.pr",
+                        "changes": "steps.extract-pr.output.changes.files",
+                        "context": "steps.extract-pr.output.context",
+                    },
+                    "workspace": {"/inputs/pr.json": "steps.extract-pr.output"}}}
+            ],
+            "requirements": [
+                {"id": "full", "statement": "The full PR is retained",
+                 "check": {"kind": "assert", "each": "steps.extract-pr.output.review.full_pr.files[*].path", "operator": "is_not_null"}}
+            ]
+        });
+        parse(&body)
+            .validate()
+            .expect("a pull-request extraction Verifier validates");
+        assert_eq!(
+            rule(&with(
+                body,
+                "/steps/1/action/inputs/changes",
+                json!("steps.extract-pr.output.diff"),
+            )),
+            "missing_field"
+        );
     }
 
     /// Agent calls follow their Prompt placeholders and position rules; a

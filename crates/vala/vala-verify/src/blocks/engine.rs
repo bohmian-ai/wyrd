@@ -1948,7 +1948,10 @@ impl Bindings {
 fn bindings(scope: &Scope<'_>, attached: &Attached, step: &Step) -> Result<Bindings, Missing> {
     let empty = || Ok(BTreeMap::new());
     let (inputs, workspace) = match &step.action {
-        Action::Extract { from } => (scope.resolve_all([("from", from)], None), empty()),
+        Action::Extract { from, .. } => (
+            scope.resolve_all(from.iter().map(|from| ("from", from)), None),
+            empty(),
+        ),
         Action::Agent(call) => (
             scope.resolve_all(&call.inputs, None),
             mount(scope, attached, &call.workspace, None),
@@ -1964,7 +1967,9 @@ fn bindings(scope: &Scope<'_>, attached: &Attached, step: &Step) -> Result<Bindi
             );
         }
     };
-    if let Action::Extract { from } = &step.action
+    if let Action::Extract {
+        from: Some(from), ..
+    } = &step.action
         && !matches!(
             inputs.get("from").map(|input| &input.value),
             Some(CallValue::Evidence(_))

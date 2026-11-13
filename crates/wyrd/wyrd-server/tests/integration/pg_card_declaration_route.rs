@@ -1719,18 +1719,19 @@ fn standalone_card_request(kind: &str, name: &str, spec: Value, key: &str) -> Re
 }
 
 /// Registration derives `queue_only` from the Agents a Verifier calls and
-/// ignores the value an author sends.
+/// its pull-request extraction, and ignores the value an author sends.
 ///
-/// A step calling an inline Agent declaring `publish`, or a registered
-/// Agent declaring it, makes its Verifier queue-only even when the author
-/// sent `false`; an assert-only Verifier sent with `true` is stored as
-/// not queue-only, and its stored spec omits the field.
+/// A step calling an inline Agent declaring `publish`, a registered Agent
+/// declaring it, or a pull-request `extract` makes its Verifier queue-only
+/// even when the author sent `false`; an assert-only Verifier sent with
+/// `true` and a media `extract` alone are stored as not queue-only, and
+/// their stored specs omit the field.
 ///
 /// # Panics
 /// Panics when the server fails to start, a declaration is refused, or a
 /// stored spec carries another `queue_only`.
 #[tokio::test(flavor = "current_thread")]
-async fn registration_derives_queue_only_from_publishing_agents() {
+async fn registration_derives_queue_only_from_publishing_agents_and_pull_request_extraction() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -1777,6 +1778,15 @@ async fn registration_derives_queue_only_from_publishing_agents() {
     );
     let mut ordinary = assertion_verifier_spec();
     ordinary["queue_only"] = json!(true);
+    let extracting = |action: Value, inputs: Value| {
+        json!({
+            "inputs": inputs,
+            "steps": [{ "id": "extract", "action": action }],
+            "requirements": [{ "id": "extracted", "statement": "The extraction ran.",
+                               "check": { "kind": "assert", "path": "steps.extract.status",
+                                          "operator": "is_not_null" } }],
+        })
+    };
     let cases = [
         (
             "qo-inline",
@@ -1818,6 +1828,32 @@ async fn registration_derives_queue_only_from_publishing_agents() {
                 "qo-ordinary",
                 Some("1.0.0"),
                 ordinary,
+            )],
+            false,
+        ),
+        (
+            "qo-pull-request",
+            vec![submission_body(
+                "Verifier",
+                "qo-pull-request",
+                Some("1.0.0"),
+                extracting(
+                    json!({ "kind": "extract", "extractor": "pull_request" }),
+                    json!({}),
+                ),
+            )],
+            true,
+        ),
+        (
+            "qo-media",
+            vec![submission_body(
+                "Verifier",
+                "qo-media",
+                Some("1.0.0"),
+                extracting(
+                    json!({ "kind": "extract", "from": "inputs.report" }),
+                    json!({ "report": { "type": "media", "formats": ["text"] } }),
+                ),
             )],
             false,
         ),

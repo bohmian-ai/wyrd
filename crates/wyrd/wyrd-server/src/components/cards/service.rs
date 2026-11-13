@@ -19,7 +19,8 @@ use wyrd_spec::card::drift::DriftSignal;
 use wyrd_spec::card::repository::infer_card_name;
 use wyrd_spec::card::trigger::TriggerActivation;
 use wyrd_spec::card::verifier::{
-    InputSlot, OWNER_OCCURRENCE_KEY, OrderBy, VerificationBinding, VerificationStatus, VerifierSpec,
+    Action, InputSlot, OWNER_OCCURRENCE_KEY, OrderBy, VerificationBinding, VerificationStatus,
+    VerifierSpec,
 };
 use wyrd_spec::envelope::{
     Card, CardKind, Metadata, Relationships, RepositoryStatus, Spec, Status,
@@ -1919,16 +1920,28 @@ fn pinned_uid(card_ref: Option<&CardRef>) -> Result<CardUid, WyrdError> {
 ///
 /// Called once per declared Verifier after its references are pinned and
 /// before its spec is hashed, so the stored value replaces any the author
-/// sent and never depends on a later read. A Verifier is queue-only when an
-/// inline or registered Agent it calls declares `publish`; a registered
-/// Agent is read by UID inside the declaration transaction, which already
-/// holds a sibling Agent persisted earlier in it. Later queued-only forms
-/// extend this one derivation.
+/// sent and never depends on a later read. A Verifier is queue-only when a
+/// step extracts a pull request, whose source only a queued `pull_request`
+/// activation supplies, or when an inline or registered Agent it calls
+/// declares `publish`; a registered Agent is read by UID inside the
+/// declaration transaction, which already holds a sibling Agent persisted
+/// earlier in it. Later queued-only forms extend this one derivation.
 ///
 /// # Errors
 /// Returns `WYRD_INTERNAL` when an Agent reference is unpinned or names
 /// another kind, and the registry error from reading a referenced Agent.
 async fn queue_only(conn: &mut TenantConn<'_>, verifier: &VerifierSpec) -> Result<bool, WyrdError> {
+    if verifier.steps.iter().any(|step| {
+        matches!(
+            step.action,
+            Action::Extract {
+                extractor: Some(_),
+                ..
+            }
+        )
+    }) {
+        return Ok(true);
+    }
     for (_, call) in verifier.agent_calls() {
         let publishes = if let Some(agent) = call.agent.as_inline() {
             agent.publishes()

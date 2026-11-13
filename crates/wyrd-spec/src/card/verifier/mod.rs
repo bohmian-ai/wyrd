@@ -33,6 +33,7 @@ use crate::verification::VerificationError;
 use crate::verification::{ComparisonOperator, JsonPath, TaskId};
 
 pub mod extract;
+pub mod pull_request;
 pub mod reference;
 mod schema_path;
 mod validate;
@@ -535,10 +536,17 @@ fn is_zero(value: &u32) -> bool {
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
-    /// Extract text and structure from one media slot.
+    /// Extract one document: text and structure from the media slot
+    /// `from`, or the pinned source of a queued pull request with
+    /// `extractor: pull_request`. Exactly one of the two is set; validation
+    /// refuses neither and both.
     Extract {
         /// The media slot, as `inputs.<slot>`.
-        from: Reference,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<Reference>,
+        /// The extractor to run instead of reading a media slot.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extractor: Option<pull_request::Extractor>,
     },
     /// Invoke an Agent; its output follows the Prompt's response schema.
     Agent(AgentCall),

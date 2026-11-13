@@ -534,6 +534,53 @@ async fn evidence_published_while_its_consumer_runs_reaches_it() {
     task.await.expect("the runtime task does not panic");
 }
 
+/// Accepted evidence survives a restart and the waiting execution still
+/// finishes.
+///
+/// The pull request's execution waits for `ci` under one verification
+/// runtime, which then stops. `ci` published while no runtime runs is
+/// accepted; a fresh runtime over the same deployment resumes the same
+/// execution, which passes having spent one attempt.
+///
+/// # Panics
+/// Panics when the execution does not wait, the publication is refused, or
+/// the restarted runtime does not pass the same execution.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn a_waiting_execution_finishes_after_a_restart() {
+    let deployment = Deployment::start_with(false).await;
+    deployment.gate("1.1.0", "1.0.0").await;
+    let runtime = || {
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(
+            VerificationRuntime::builder(deployment.server.state())
+                .limits(limits(Duration::from_mins(5)))
+                .build()
+                .expect("the runtime composes")
+                .run(stop.clone()),
+        );
+        (stop, task)
+    };
+
+    let (stop, task) = runtime();
+    let waiting = deployment.open(9, C1).await;
+    deployment.until(waiting, "waiting").await;
+    stop.cancel();
+    task.await.expect("the runtime task does not panic");
+
+    let (status, receipt) = deployment.publish_ci(C1, json!({"status": "green"})).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["status"], "accepted", "{receipt}");
+    assert_eq!(deployment.status(waiting).await["status"], "waiting");
+
+    let (stop, task) = runtime();
+    let served = deployment.until(waiting, "completed").await;
+    assert_eq!(served["result"]["outcome"]["verdict"], "passed", "{served}");
+    assert_eq!(deployment.spent(waiting).await, (1, "1.0.0".to_owned()));
+    stop.cancel();
+    task.await.expect("the runtime task does not panic");
+}
+
 /// A parked execution gives back its compute before its park is
 /// acknowledged.
 ///

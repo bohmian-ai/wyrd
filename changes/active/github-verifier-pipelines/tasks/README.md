@@ -84,7 +84,7 @@ listed in task metadata; their strongest crash/authority proof is identified her
 | REQ-006–007; AC-004 | 004 public pipeline full/active pinned comparisons→005 actual admitted extraction→same Prompt/workspace values and retained source after recovery/cache expiry |
 | REQ-008–009; AC-005 | 007: active binding subscription→real upload/publication→existing/new subscriber scenarios, source/type/auth matching and exact replay/conflict |
 | REQ-010–011; AC-006 | 007 independent work/all blocked→resource-free park→evidence continuation; 008 actual pending occurrence→authorized/rejected/expired decision→same execution |
-| REQ-009–011; AC-007 | 007 evidence ACK and background parked-checkpoint/queue ACK crash boundaries; 008 decision ACK boundaries, exact recovery/unavailability and no settled computation replay |
+| REQ-009–011; AC-007 | 007 restart while waiting for evidence; 008 restart while waiting for a decision, exact recovery/unavailability and no settled computation replay |
 | REQ-012–013; AC-008 | 009: retained successful outputs→zero/one/multiple/invalid report→pinned Check/comment/suggestion independent of authored verdict |
 | REQ-005,014; AC-009 | 009: provider remote success/timeout/batching/restart/new head/access loss→readback/reconciled independent delivery without recomputation |
 | REQ-015; AC-010 | 001 queued saturation→reserved direct execution; 005/007/008 direct queued-only refusal before any step; 006 supplies burst ingress |

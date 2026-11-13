@@ -156,12 +156,12 @@ is held, then the retired delivery/lease after ACK; publish and resume the
 same ExecutionId with settled work/spend/retries/deadline unchanged. Supersede
 through task 006 or revoke while parked; old acceptance cannot release work.
 
-**AC-007 (evidence/park):** Controlled crash before/after upload completion,
-publication ACK, pending checkpoint ACK, retirement, continuation commit and
-recovery read. After positive receipt observe exact accepted evidence and owed
-continuation without producer replay; lost notifications are repaired. Unavailable
-canonical state never becomes empty/fresh state. Assert through public journey
-where observable, and real-dependency integration for the exact crash fences.
+**AC-007 (evidence/park):** Restart while an execution waits for evidence. After
+a positive receipt, the accepted evidence survives and the same execution
+finishes without producer replay; a publication whose outcome is unknown is
+retried; evidence published while its consumer runs still reaches it.
+Unavailable canonical state never becomes empty/fresh state. Prove with ordinary
+restart, retry and refusal journeys; no test-only crash hooks.
 
 **AC-011 (evidence/wait):** Follow source-inference/override and publication docs,
 inspect waiting state and durable receipt using shipped surfaces.
@@ -180,10 +180,10 @@ checks. Task 008 owns the decision-specific half of AC-006/007.
 |---|---|---|
 | REQ-008 | `deferred: true` only on json/media slots; registration derives `queue_only`, users cannot set it, direct verify refuses; only consumers of a missing input wait (§Input, §Revision — queue_only) | none |
 | REQ-009 | Publish by tenant + repository slug + commit + input with `verifier:run`; validated against subscribers; matched, retained, replayed or refused; receipt only after the Bifrost ACK; publication alone starts nothing (§Input, §Selected custody, AC-005) | none |
-| REQ-011 | A parked execution releases compute, keeps its claim until the park ACK, resumes the same ExecutionId with work, attempts and deadline kept; supersession, revocation and deadline fence it (§Selected custody, AC-006) | none; maintainer decision: a park refunds its attempt (waiting is not failure), and a resume spends one, so retries are never replenished beyond the work actually done |
+| REQ-011 | A parked execution releases compute, keeps its claim until the park ACK, resumes the same ExecutionId with work, attempts, Agent budget and deadline kept; supersession, revocation and deadline fence it (§Selected custody, AC-006) | none; maintainer decision: a park refunds its attempt (waiting is not failure), and a resume spends one |
 | REQ-016 | CI-agnostic source resolution; HTTP, client, three SDKs, CLI (`--file`), MCP, waiting inspection, docs, upload-based example, architecture (§Revision — slug, §Outputs, AC-011) | none; maintainer decision: one `--file` flag, a `.json` file or stdin sent inline and any other file uploaded (a media slot accepting `json` cannot be fed from the CLI) |
-| INV-004 | Unavailable custody is never read as absent or fresh (§Selected custody) | none; maintainer decision: no test-only crash hooks; rests on the cited read paths and journeys |
-| AC-007 | Crash before/after upload completion, publication ACK, park ACK, retirement, continuation commit and recovery read keeps accepted evidence and owed continuation | none; maintainer decision: no test-only crash hooks (overkill); each fence maps to an existing restart, retry or refusal test |
+| INV-004 | Unavailable custody is never read as absent or fresh (spec INV-004) | none; maintainer decision: the evidence read path rests on source inspection plus the publish-path journey, no test-only hook |
+| AC-007 | Restart while an execution waits for evidence: accepted evidence survives and the same execution finishes; unknown publication outcomes retry; evidence published while its consumer runs reaches it (spec AC-007, revised by the maintainer to drop crash-point enumeration) | none |
 
 ## Evidence
 
@@ -191,10 +191,10 @@ checks. Task 008 owns the decision-specific half of AC-006/007.
 |---|---|---|---|---|
 | REQ-008 | `wyrd-spec` `InputSlot::is_deferred`; registry derivation; `vala-verify` engine wait | `card/verifier/mod.rs` `only_json_and_media_slots_can_be_deferred`; `pg_card_declaration_route.rs:1873`; `engine/tests.rs:4256` | PASS | PASS |
 | REQ-009 | `wyrd-server/src/verification/evidence.rs`; `bifrost.verification.evidence` (no migration) | `pg_deferred_evidence.rs` `publication_is_matched_retained_and_resumes_the_waiting_execution` (other tenant 404, planned-but-incomplete upload 400, zero executions after publication, pin 1.0.1 consumes), `unacknowledged_publication_is_unavailable_and_its_retry_resumes`; Rust SDK `deferred_evidence.rs:224` | PASS | PASS |
-| REQ-011 | `runner.rs` park branch; evidence wake; queue fences | `pg_deferred_evidence.rs` main test, `parked_executions_end_by_supersession_and_deadline`, `a_resumed_execution_keeps_its_admission_deadline`, `evidence_published_while_its_consumer_runs_reaches_it`, `a_parked_execution_releases_compute_before_its_park_is_acknowledged`, `lost_repository_access_fences_a_parked_execution`; `pg_verification_runtime.rs:4155` | PASS | PASS |
+| REQ-011 | `runner.rs` park branch; evidence wake; queue fences | `pg_deferred_evidence.rs` main test, `parked_executions_end_by_supersession_and_deadline`, `a_resumed_execution_keeps_its_admission_deadline`, `evidence_published_while_its_consumer_runs_reaches_it`, `a_parked_execution_releases_compute_before_its_park_is_acknowledged`, `lost_repository_access_fences_a_parked_execution`; `pg_verification_runtime.rs:4155`; `engine/tests.rs` `deferred_inputs_hold_only_their_consumers_until_supplied` (settled work not replayed), `a_resumed_execution_keeps_its_spent_agent_budget` (fails when the reseed is set to 0) | PASS | PASS |
 | REQ-016 | `wyrd_client::verify::Evidence`; SDKs; `wyrd evidence publish`; `verification.publish_evidence`; docs guide; architecture | `wyrd-client/src/verify/evidence.rs:227` (explicit precedence; each missing value names flag and variable); Rust/Python/TS journeys; `github_journey.rs` `ci_publishes_deferred_evidence_through_the_cli` (`--file results.json`), `ci_uploads_a_report_file_through_the_guide_script` (`examples/publish-deferred-evidence/publish.sh`); `wyrd-cli/src/evidence.rs` `publish_takes_one_file`, `json_files_are_sent_inline`; `wyrd-mcp/tests/bifrost/mcp/github.rs:383` | PASS; `codegen:check`, `docs:check`, `check:examples` PASS | PASS |
-| INV-004 | `evidence.rs:180` fenced-but-invisible → unavailable; `runner.rs:827,973,979` an unreadable evidence read defers or retries as `evidence_unavailable`, never absent | `pg_deferred_evidence.rs` `unacknowledged_publication_is_unavailable_and_its_retry_resumes`; missing evidence ends `timed_out`, never passed | PASS | PASS |
-| AC-007 | — | upload completion: incomplete upload refused (main `pg_deferred_evidence` test); publication ACK: `unacknowledged_publication_is_unavailable_and_its_retry_resumes`; lost wake: `evidence_published_while_its_consumer_runs_reaches_it`; park ACK and retirement: `pg_verification_runtime.rs` `expired_lease_is_reclaimed_and_the_stale_holder_is_fenced`, `crashed_runner_restarts_and_reclaims_without_duplicates`; continuation and recovery read: evidence published before admission consumed on first claim, `a_resumed_execution_keeps_its_admission_deadline`, `pg_verification_runtime.rs:4155` | PASS | PASS |
+| INV-004 | `evidence.rs:180` fenced-but-invisible → unavailable; `runner.rs:827,973,979,1714` an unreadable evidence read defers or retries as `evidence_unavailable`, never absent (source inspection) | `pg_deferred_evidence.rs` `unacknowledged_publication_is_unavailable_and_its_retry_resumes` | PASS | PASS |
+| AC-007 | — | `pg_deferred_evidence.rs` `a_waiting_execution_finishes_after_a_restart` (runtime stopped while waiting, evidence accepted with no runtime, fresh runtime passes the same execution, one attempt spent), `unacknowledged_publication_is_unavailable_and_its_retry_resumes`, `evidence_published_while_its_consumer_runs_reaches_it` | PASS | PASS |
 
 **Commands:** `mise run fmt`, `lints`, `py:lints`, `py:typecheck`, `ts:lints`,
 `ts:typecheck`, `ts:napi:check`, `codegen:check`, `check:deps`, `docs:check`,

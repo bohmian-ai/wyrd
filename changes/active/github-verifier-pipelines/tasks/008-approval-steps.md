@@ -110,8 +110,8 @@ fail safely. Repeat/fanout have distinct occurrence IDs; discarded speculation
 cannot authorize retained work. Observe independent progress and capacity release
 through the same resource path already proved by 007.
 
-**AC-007 (decisions):** Crash before/after decision ACK and continuation commit,
-then recover actual pending occurrence and accepted fact through 007. A positive
+**AC-007 (decisions):** Restart while an execution waits for a decision, then
+recover actual pending occurrence and accepted fact through 007. A positive
 receipt survives without another decision or replay of settled computation;
 unknown/unavailable canonical state is not a newly generated approval. Verify
 recovery and continuation preserve the same execution expiration. Race

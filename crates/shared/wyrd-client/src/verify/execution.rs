@@ -15,12 +15,13 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 use tokio::time::Instant;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::ExecutionId;
+use wyrd_spec::ids::{ApprovalId, ExecutionId};
 use wyrd_spec::storage::download::DownloadInitResponse;
 use wyrd_spec::verification::VerificationExecutionStatus;
 use wyrd_spec::verification::execution::{
-    CancelExecutionResponse, ExecutionPageQuery, InvocationPage, Publication, PublicationPage,
-    PublicationSelector, VerificationDetails, VerificationExecutionState, VerificationResult,
+    ApprovalDecision, ApprovalReceipt, CancelExecutionResponse, DecideApprovalRequest,
+    ExecutionPageQuery, InvocationPage, Publication, PublicationPage, PublicationSelector,
+    VerificationDetails, VerificationExecutionState, VerificationResult,
 };
 use wyrd_spec::verification::{PublicationName, TaskId};
 
@@ -229,6 +230,45 @@ impl Execution {
                 Method::POST,
                 &format!("/v1/verification/executions/{}/cancel", self.id),
                 None,
+            )
+            .await
+    }
+
+    /// Approve or reject the pending approval occurrence `approval_id`, one
+    /// of [`Self::status`]'s `approvals`, and return its receipt once the
+    /// decision is durable; the same execution then continues.
+    ///
+    /// Sending the same decision and reason again returns the same receipt,
+    /// so a retry after a lost answer is safe.
+    ///
+    /// # Arguments
+    /// * `approval_id` - The pending occurrence to decide.
+    /// * `decision` - `Approved` or `Rejected`.
+    /// * `reason` - Why, recorded with the decision.
+    ///
+    /// # Errors
+    /// Returns the server's permission error without `verifier:approve` on
+    /// the execution's Verifier or read authority over its subject,
+    /// `WYRD_VERIFICATION_404_APPROVAL_NOT_FOUND` for an occurrence the
+    /// execution never reached, `WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING`
+    /// once another decision was accepted or the execution ended or expired,
+    /// a `503` when the decision cannot be acknowledged now, and transport
+    /// errors.
+    pub async fn decide(
+        &self,
+        approval_id: ApprovalId,
+        decision: ApprovalDecision,
+        reason: Option<String>,
+    ) -> Result<ApprovalReceipt, WyrdError> {
+        self.client
+            .http
+            .request_json(
+                Method::POST,
+                &format!(
+                    "/v1/verification/executions/{}/approvals/{approval_id}",
+                    self.id
+                ),
+                Some(&DecideApprovalRequest { decision, reason }),
             )
             .await
     }

@@ -3,7 +3,9 @@
 //! repository commit, and the same execution resumes and passes. The receipt
 //! is durable: a replay answers the same identity, and different evidence or
 //! an unconnected repository is refused. A media input is a file uploaded by
-//! the publish itself.
+//! the publish itself. A pull request may also wait for a person: another
+//! principal approves the pending signoff with `Execution::decide`, and the
+//! same execution passes.
 
 /// Real-server and PostgreSQL cases, placed for the `pg-servers` test group.
 mod pg_tests {
@@ -13,7 +15,9 @@ mod pg_tests {
     use wyrd_ai::WyrdClient;
     use wyrd_ai::cards::CardSelector;
     use wyrd_ai::github::GithubConnection;
-    use wyrd_ai::verify::{Evidence, EvidenceStatus, Execution, File};
+    use wyrd_ai::verify::{
+        ApprovalDecision, ApprovalStatus, Evidence, EvidenceStatus, Execution, File,
+    };
     use wyrd_spec::verification::{VerificationExecutionStatus, VerificationVerdict};
     use wyrd_testing::WyrdTestServer;
     use wyrd_testing::github::{GithubAppMock, GithubBrowser, PullRequest};
@@ -270,6 +274,103 @@ mod pg_tests {
             .expect("the same report replays");
         assert_eq!(replayed.status, EvidenceStatus::Replayed);
         assert_eq!(replayed.evidence_id, accepted.evidence_id);
+        opened.deployment.shutdown().await;
+    }
+
+    /// Another principal approves the pending signoff once CI is green, and
+    /// the same execution passes.
+    ///
+    /// The execution waits for `ci` and lists the pending `signoff`
+    /// occurrence. Published CI resumes it, but it still waits for the
+    /// approval alone. A viewer's decision is refused; an editor's approval
+    /// returns the durable receipt, replays on retry, and the execution
+    /// passes under its original ID with the decision listed.
+    ///
+    /// # Panics
+    /// Panics when the occurrence is not pending, a decision or refusal
+    /// differs, or the execution does not pass.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the repository-managed Postgres journey lifecycle"]
+    async fn a_person_approves_the_pending_signoff() {
+        let opened = Opened::waiting_for(&fixture("cards/approvals/repository.yaml"), "ci").await;
+        let state = opened
+            .execution
+            .status()
+            .await
+            .expect("the execution reads");
+        let [pending] = state.approvals.as_slice() else {
+            panic!("one approval occurrence: {:?}", state.approvals);
+        };
+        assert_eq!(pending.step_id.as_str(), "signoff");
+        assert_eq!(pending.message, "Ship this change?");
+        assert_eq!(pending.status, ApprovalStatus::Pending);
+        let approval = pending.approval_id;
+        opened
+            .evidence()
+            .await
+            .publish(
+                "ci",
+                serde_json::json!({ "status": "green" }),
+                Some("acme/web"),
+                Some(&head()),
+            )
+            .await
+            .expect("CI is accepted");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let state = opened
+                .execution
+                .status()
+                .await
+                .expect("the execution reads");
+            if state.status == VerificationExecutionStatus::Waiting && state.waiting.is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{state:?}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let as_principal = |name: &'static str, role: &'static str| {
+            let deployment = &opened.deployment;
+            let id = *opened.execution.id();
+            async move {
+                let key = deployment.key(name, &[role]).await;
+                Execution::connect_with(id, &deployment.client(&key))
+                    .await
+                    .expect("the execution handle connects")
+            }
+        };
+        let refused = as_principal("signoff_viewer", "viewer")
+            .await
+            .decide(approval, ApprovalDecision::Approved, None)
+            .await
+            .expect_err("a viewer cannot approve");
+        assert_eq!(refused.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
+
+        let approver = as_principal("signoff_editor", "editor").await;
+        let reason = Some("reviewed the diff".to_owned());
+        let receipt = approver
+            .decide(approval, ApprovalDecision::Approved, reason.clone())
+            .await
+            .expect("the editor approves");
+        assert_eq!(receipt.approval_id, approval);
+        assert_eq!(receipt.status, ApprovalStatus::Approved);
+        assert_eq!(receipt.reason, reason);
+        assert!(receipt.actor_id.is_some() && receipt.decided_at.is_some());
+        let replayed = approver
+            .decide(approval, ApprovalDecision::Approved, reason)
+            .await
+            .expect("the same decision replays");
+        assert_eq!(replayed, receipt);
+
+        assert_eq!(opened.verdict().await, VerificationVerdict::Passed);
+        let state = opened
+            .execution
+            .status()
+            .await
+            .expect("the execution reads");
+        assert_eq!(state.approvals[0].status, ApprovalStatus::Approved);
+        assert_eq!(state.approvals[0].actor_id, receipt.actor_id);
         opened.deployment.shutdown().await;
     }
 }

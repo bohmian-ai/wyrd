@@ -4,8 +4,8 @@
 //! `verification.*` tools read binding and execution status and execution
 //! details, page an execution's invocations and publications, read a
 //! publication or plan its file download, plan evidence uploads, publish
-//! deferred evidence, verify now, enqueue a background execution, and cancel
-//! one. Authorization,
+//! deferred evidence, verify now, enqueue a background execution, cancel
+//! one, and decide a pending approval. Authorization,
 //! audit, tenancy, idempotency, and error mapping stay with
 //! [`VerificationControl`], so this module only parses arguments and
 //! projects answers.
@@ -16,13 +16,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use wyrd_runtime::permission::{Action, Resource};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{BindingId, ExecutionId, IdempotencyKey};
+use wyrd_spec::ids::{ApprovalId, BindingId, ExecutionId, IdempotencyKey};
 use wyrd_spec::storage::DownloadInitResponse;
 use wyrd_spec::verification::execution::{
-    CancelExecutionResponse, EnqueueVerificationResponse, EvidencePlanRequest,
-    EvidencePlanResponse, ExecutionPageQuery, InvocationPage, Publication, PublicationPage,
-    PublicationSelector, PublishEvidenceRequest, PublishEvidenceResponse, VerificationDetails,
-    VerificationExecutionState, VerificationRequest, VerificationResult,
+    ApprovalDecision, ApprovalReceipt, CancelExecutionResponse, DecideApprovalRequest,
+    EnqueueVerificationResponse, EvidencePlanRequest, EvidencePlanResponse, ExecutionPageQuery,
+    InvocationPage, Publication, PublicationPage, PublicationSelector, PublishEvidenceRequest,
+    PublishEvidenceResponse, VerificationDetails, VerificationExecutionState, VerificationRequest,
+    VerificationResult,
 };
 use wyrd_spec::verification::{PublicationName, TaskId, VerificationBindingStatus};
 
@@ -66,6 +67,9 @@ pub(super) const EXECUTE: &str = "verification.execute";
 
 /// Wire name of the background submission.
 pub(super) const ENQUEUE: &str = "verification.enqueue";
+
+/// Wire name of the approval decision.
+pub(super) const DECIDE_APPROVAL: &str = "verification.decide_approval";
 
 /// Arguments of `verification.get_binding`.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -121,6 +125,21 @@ struct EnqueueArgs {
     /// same `execution_id`.
     #[serde(default)]
     idempotency_key: Option<String>,
+}
+
+/// Arguments of `verification.decide_approval`: the HTTP path and body.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DecideApprovalArgs {
+    /// The execution whose approval is decided.
+    execution_id: ExecutionId,
+    /// A pending occurrence's ID from the execution's `approvals`.
+    approval_id: ApprovalId,
+    /// `approved` or `rejected`.
+    decision: ApprovalDecision,
+    /// Why, recorded with the decision.
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 /// The read tools every authenticated caller may be shown.
@@ -259,6 +278,39 @@ pub(super) fn write_descriptors() -> Vec<Tool> {
     ]
 }
 
+/// The decision tool shown only to a caller holding any `verifier:approve`
+/// grant.
+///
+/// A planning convenience, not the boundary: [`VerificationControl`]
+/// authorizes `verifier:approve` on the execution's exact Verifier and its
+/// subject, and audits that decision, when the tool is named directly.
+#[must_use]
+pub(super) fn approve_descriptors() -> Vec<Tool> {
+    vec![tool::<DecideApprovalArgs, ApprovalReceipt>(
+        DECIDE_APPROVAL,
+        "Decide a pending approval",
+        "Approve or reject one pending approval occurrence of a waiting execution, named by \
+         an approval_id from verification.get_execution's approvals, with an optional \
+         reason. The receipt (approval_id, status, actor_id, decided_at, reason) returns \
+         only once the decision is durable, and the same execution continues. Repeating \
+         the same decision and reason replays the receipt; any other decision, a decision \
+         by someone else, or one after the execution ended or expired is refused (409 \
+         approval not pending). Requires verifier:approve on the execution's Verifier and \
+         read authority over its subject.",
+        false,
+    )]
+}
+
+/// Whether this caller's token carries any `verifier:approve` grant.
+///
+/// Coarse admission only, as [`may_run_verifiers`].
+pub(super) fn may_approve(caller: &Caller) -> bool {
+    caller
+        .principal
+        .effective_permissions
+        .covers_operation(&Resource::Verifier, &Action::Approve)
+}
+
 /// Whether this caller's token carries any `verifier:run` grant.
 ///
 /// Coarse admission only: a grant of one Verifier UID shows the tools, and
@@ -387,7 +439,7 @@ impl WyrdMcpHandler {
     }
 
     /// Run one verification write tool: `evidence`, `publish_evidence`,
-    /// `execute`, `enqueue`, or `cancel`.
+    /// `execute`, `enqueue`, `cancel`, or `decide_approval`.
     ///
     /// Decodes the arguments exactly as the HTTP body; `enqueue` also takes
     /// the optional `idempotency_key`, validated with the shared key
@@ -436,6 +488,19 @@ impl WyrdMcpHandler {
             CANCEL => {
                 let args: GetExecutionArgs = serde_json::from_value(arguments).map_err(invalid)?;
                 structured(&control.cancel(&caller, args.execution_id).await?)
+            }
+            DECIDE_APPROVAL => {
+                let args: DecideApprovalArgs =
+                    serde_json::from_value(arguments).map_err(invalid)?;
+                let request = DecideApprovalRequest {
+                    decision: args.decision,
+                    reason: args.reason,
+                };
+                structured(
+                    &control
+                        .decide_approval(&caller, args.execution_id, args.approval_id, request)
+                        .await?,
+                )
             }
             _ => {
                 let args: EnqueueArgs = serde_json::from_value(arguments).map_err(invalid)?;

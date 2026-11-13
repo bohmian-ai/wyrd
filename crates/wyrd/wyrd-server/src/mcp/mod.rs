@@ -230,6 +230,7 @@ impl ServerHandler for WyrdMcpHandler {
             .chain(principals::write_descriptors())
             .chain(principals::admin_descriptors())
             .chain(verification::write_descriptors())
+            .chain(verification::approve_descriptors())
             .chain(operators::write_descriptors())
             .chain(github::write_descriptors())
             .chain(gateway::descriptors())
@@ -261,6 +262,9 @@ impl ServerHandler for WyrdMcpHandler {
             }
             if verification::may_run_verifiers(&caller) {
                 catalog.extend(verification::write_descriptors());
+            }
+            if verification::may_approve(&caller) {
+                catalog.extend(verification::approve_descriptors());
             }
             if operators::may_manage(&caller) {
                 catalog.extend(operators::write_descriptors());
@@ -454,7 +458,8 @@ impl WyrdMcpHandler {
             | verification::PUBLISH_EVIDENCE
             | verification::EXECUTE
             | verification::ENQUEUE
-            | verification::CANCEL) => {
+            | verification::CANCEL
+            | verification::DECIDE_APPROVAL) => {
                 let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
                 // Authorized and audited by the operation, like revocation.
                 self.mcp_verification_write(name, caller, request.arguments)
@@ -584,6 +589,7 @@ mod tests {
             .chain(principals::write_descriptors())
             .chain(principals::admin_descriptors())
             .chain(verification::write_descriptors())
+            .chain(verification::approve_descriptors())
             .chain(operators::write_descriptors())
             .chain(github::write_descriptors())
             .chain(gateway::descriptors())

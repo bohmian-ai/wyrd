@@ -252,6 +252,16 @@ pub enum ApprovalStatus {
     Expired,
 }
 
+impl From<ApprovalDecision> for ApprovalStatus {
+    /// The status an accepted `decision` gives its occurrence.
+    fn from(decision: ApprovalDecision) -> Self {
+        match decision {
+            ApprovalDecision::Approved => Self::Approved,
+            ApprovalDecision::Rejected => Self::Rejected,
+        }
+    }
+}
+
 /// `POST /v1/verification/executions/{execution_id}/approvals/{approval_id}`
 /// request body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

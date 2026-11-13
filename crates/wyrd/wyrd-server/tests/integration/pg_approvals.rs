@@ -1,0 +1,482 @@
+//! Human approval steps over HTTP: a pull request execution parks on a
+//! pending occurrence, a person with `verifier:approve` decides it through
+//! `POST /v1/verification/executions/{execution_id}/approvals/{approval_id}`,
+//! and the same execution continues to its verdict.
+
+use std::time::Duration;
+
+use axum::http::StatusCode;
+use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+use wyrd_runtime::Permission;
+use wyrd_server::verification::VerificationRuntime;
+use wyrd_spec::ids::CardUid;
+use wyrd_testing::Bootstrap;
+
+use super::pg_deferred_evidence::limits;
+use super::pg_github_pull_requests::{Deployment, REPOSITORY};
+
+/// The first head a signoff pull request opens at.
+const H1: &str = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
+/// A second, independent head.
+const H2: &str = "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2";
+/// The head that supersedes [`H2`].
+const H3: &str = "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3";
+
+/// The decide operation every approval permission check audits under.
+const DECIDE: &str = "verification.approval.decide";
+
+/// The `signoff` Verifier: it passes when the deferred `ci` evidence reports
+/// green and a person approves the `signoff` step. The approval does not
+/// depend on `ci`, so each progresses independently.
+const SIGNOFF: &str = "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: signoff\n  version: 1.0.0\nspec:\n  description: CI is green and a person signs off.\n  inputs:\n    ci: {type: json, deferred: true, schema: {type: object, required: [status]}}\n  steps:\n    - id: signoff\n      action: {kind: approval, message: Ship this change?}\n  requirements:\n    - id: green\n      statement: CI is green\n      check: {kind: assert, path: inputs.ci.status, operator: equals, expected: green}\n    - id: approved\n      statement: A person approved the change\n      check: {kind: assert, path: steps.signoff.output.status, operator: equals, expected: approved}\n";
+
+/// The Repository binding `signoff` to pull requests.
+const POLICY: &str = "apiVersion: wyrd/v1\nkind: Repository\nmetadata:\n  name: policy\n  version: 1.1.0\nspec:\n  repository_id: \"4242\"\n  verified_by:\n    - verifier: ./signoff.yaml\n      runs_on: {kind: pull_request}\n";
+
+impl Deployment {
+    /// Declare the `signoff` policy.
+    ///
+    /// # Panics
+    /// Panics when the declaration is refused.
+    async fn signoff(&self) {
+        self.declare_files(
+            &[("signoff.yaml", SIGNOFF.to_owned())],
+            POLICY,
+            "signoff-policy",
+        )
+        .await;
+    }
+
+    /// Decide `approval` of `execution` as the user holding `jwt` and return
+    /// the status and JSON answer.
+    ///
+    /// # Panics
+    /// Panics when the request cannot be served.
+    async fn decide(
+        &self,
+        jwt: &str,
+        execution: Uuid,
+        approval: &str,
+        body: &Value,
+    ) -> (StatusCode, Value) {
+        self.post(
+            jwt,
+            &format!("/v1/verification/executions/{execution}/approvals/{approval}"),
+            body,
+        )
+        .await
+    }
+
+    /// Wait until `execution` waits for nothing but its approvals and return
+    /// it.
+    ///
+    /// # Panics
+    /// Panics when it does not within two minutes.
+    async fn awaiting_approval(&self, execution: Uuid) -> Value {
+        let deadline = tokio::time::Instant::now() + Duration::from_mins(2);
+        loop {
+            let served = self.status(execution).await;
+            if served["status"] == "waiting" && served["waiting"].is_null() {
+                return served;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{execution} still waits for evidence: {served}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// The Verifier Card `execution` froze.
+    ///
+    /// # Panics
+    /// Panics when the read fails.
+    async fn verifier_of(&self, execution: Uuid) -> CardUid {
+        let mut conn = self.conn().await;
+        let (uid,): (Uuid,) = sqlx::query_as(
+            "SELECT verifier_card_uid FROM wyrd.verifier_executions WHERE execution_id = $1",
+        )
+        .bind(execution)
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("execution reads");
+        conn.commit().await.expect("read commits");
+        CardUid::from_uuid(uid).expect("card uid")
+    }
+
+    /// A user of this tenant holding `roles`, as its id and JWT.
+    ///
+    /// # Panics
+    /// Panics when the bootstrap fails.
+    async fn user(&self, name: &str, roles: &[&str]) -> (Uuid, String) {
+        let Bootstrap::User { id, jwt } = self
+            .server
+            .bootstrap_user(name, roles)
+            .await
+            .expect("user bootstraps")
+        else {
+            panic!("user bootstrap returned a non-user principal");
+        };
+        (id.as_uuid(), jwt)
+    }
+
+    /// The audited outcomes of `principal`'s `verifier:approve` checks.
+    ///
+    /// # Panics
+    /// Panics when the audit does not settle or the read fails.
+    async fn decide_audits(&self, principal: Uuid) -> Vec<String> {
+        self.server
+            .await_audit_retained()
+            .await
+            .expect("audit is retained");
+        let mut outcomes: Vec<String> = self
+            .server
+            .retained_audit_records(
+                self.server.data_tenant_id(),
+                "outcome",
+                &format!(
+                    "operation = '{DECIDE}' AND permission = 'verifier:approve' AND sub_principal_id = '{principal}'"
+                ),
+            )
+            .await
+            .expect("retained audit reads")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect();
+        outcomes.sort();
+        outcomes
+    }
+}
+
+/// The one approval occurrence `served` lists.
+///
+/// # Panics
+/// Panics when it lists other than one.
+fn occurrence(served: &Value) -> &Value {
+    let approvals = served["approvals"].as_array().expect("approvals listed");
+    assert_eq!(approvals.len(), 1, "{served}");
+    &approvals[0]
+}
+
+/// A pending approval is decided once, by an authorized person, and the
+/// same execution continues to the verdict that decision implies.
+///
+/// The pull request's execution waits for `ci` and a pending `signoff`
+/// occurrence. Publishing `ci` resumes it, but it still waits for the
+/// approval alone. A viewer, a person allowed to approve only another
+/// Verifier, and another tenant cannot decide; an unknown occurrence is not
+/// found. An editor approves with a reason and receives the durable receipt;
+/// the same request replays it, while a different decision or decider is
+/// refused as not pending. The execution passes under its original id and
+/// inspection shows who approved. A second pull request is rejected by a
+/// person granted `verifier:approve` on exactly this Verifier and read
+/// authority over its subject, and fails.
+/// Every decide check is audited.
+///
+/// # Panics
+/// Panics when a decision, refusal, receipt, verdict or audit differs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pending_approval_is_decided_once_and_resumes_the_same_execution() {
+    let deployment = Deployment::start_limited(limits(Duration::from_mins(5))).await;
+    deployment.signoff().await;
+    let execution = deployment.open(1, H1).await;
+    let served = deployment.until(execution, "waiting").await;
+    assert_eq!(served["waiting"], json!(["ci"]), "{served}");
+    let pending = occurrence(&served);
+    assert_eq!(pending["step_id"], "signoff");
+    assert_eq!(pending["message"], "Ship this change?");
+    assert_eq!(pending["status"], "pending");
+    assert!(pending["actor_id"].is_null(), "{pending}");
+    let approval = pending["approval_id"]
+        .as_str()
+        .expect("approval id")
+        .to_owned();
+
+    let (status, receipt) = deployment.publish_ci(H1, json!({"status": "green"})).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    let served = deployment.awaiting_approval(execution).await;
+    assert_eq!(
+        occurrence(&served)["approval_id"],
+        approval.as_str(),
+        "the occurrence keeps its id across resumptions"
+    );
+
+    let approve = json!({"decision": "approved", "reason": "reviewed the diff"});
+    let (viewer, viewer_jwt) = deployment.user("approval-viewer", &["viewer"]).await;
+    let (status, denied) = deployment
+        .decide(&viewer_jwt, execution, &approval, &approve)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+    assert_eq!(denied["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
+
+    let verifier = deployment.verifier_of(execution).await;
+    let other = CardUid::from_uuid(Uuid::now_v7()).expect("card uid");
+    deployment
+        .server
+        .seed_role(
+            "other_approver",
+            &[
+                Permission::verifier_read_any(),
+                Permission::verifier_approve(other),
+            ],
+        )
+        .await
+        .expect("role seeds");
+    let (_, misscoped) = deployment
+        .user("approval-misscoped", &["other_approver"])
+        .await;
+    let (status, denied) = deployment
+        .decide(&misscoped, execution, &approval, &approve)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "approving another Verifier does not cover this one: {denied}"
+    );
+
+    let foreign_tenant = deployment
+        .server
+        .seed_tenant("approval-other")
+        .await
+        .expect("second tenant seeds");
+    let Bootstrap::Machine { api_key, .. } = deployment
+        .server
+        .bootstrap_service_in_tenant(foreign_tenant, "approval-other-admin", &["admin"])
+        .await
+        .expect("other tenant's admin bootstraps")
+    else {
+        panic!("service bootstrap returned a non-machine principal");
+    };
+    let foreign = deployment
+        .server
+        .exchange_api_key(&api_key)
+        .await
+        .expect("other tenant's key exchanges");
+    let (status, refused) = deployment
+        .decide(&foreign, execution, &approval, &approve)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{refused}");
+
+    let (status, refused) = deployment
+        .decide(
+            &deployment.jwt,
+            execution,
+            &Uuid::now_v7().to_string(),
+            &approve,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{refused}");
+    assert_eq!(refused["code"], "WYRD_VERIFICATION_404_APPROVAL_NOT_FOUND");
+
+    let (approver, approver_jwt) = deployment.user("approval-editor", &["editor"]).await;
+    let (status, receipt) = deployment
+        .decide(&approver_jwt, execution, &approval, &approve)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["approval_id"], approval.as_str());
+    assert_eq!(receipt["status"], "approved");
+    assert_eq!(receipt["actor_id"], approver.to_string());
+    assert_eq!(receipt["reason"], "reviewed the diff");
+    assert!(receipt["decided_at"].is_string(), "{receipt}");
+
+    let (status, replayed) = deployment
+        .decide(&approver_jwt, execution, &approval, &approve)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{replayed}");
+    assert_eq!(replayed, receipt, "a retry replays the durable receipt");
+    for (jwt, body) in [
+        (
+            approver_jwt.as_str(),
+            json!({"decision": "rejected", "reason": "reviewed the diff"}),
+        ),
+        (approver_jwt.as_str(), json!({"decision": "approved"})),
+        (deployment.jwt.as_str(), approve.clone()),
+    ] {
+        let (status, refused) = deployment.decide(jwt, execution, &approval, &body).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}: {refused}");
+        assert_eq!(
+            refused["code"],
+            "WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING"
+        );
+        assert_eq!(refused["details"]["status"], "approved");
+    }
+
+    let served = deployment.until(execution, "completed").await;
+    assert_eq!(served["execution_id"], execution.to_string());
+    assert_eq!(served["result"]["outcome"]["verdict"], "passed", "{served}");
+    let decided = occurrence(&served);
+    assert_eq!(decided["status"], "approved");
+    assert_eq!(decided["actor_id"], approver.to_string());
+    assert_eq!(decided["reason"], "reviewed the diff");
+    assert_eq!(decided["decided_at"], receipt["decided_at"]);
+
+    deployment
+        .server
+        .seed_role(
+            "signoff_approver",
+            &[
+                Permission::card_read(),
+                Permission::verifier_read_any(),
+                Permission::verifier_approve(verifier),
+            ],
+        )
+        .await
+        .expect("role seeds");
+    let (scoped, scoped_jwt) = deployment
+        .user("approval-scoped", &["signoff_approver"])
+        .await;
+    let rejected = deployment.open(2, H2).await;
+    deployment.until(rejected, "waiting").await;
+    let (status, receipt) = deployment.publish_ci(H2, json!({"status": "green"})).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    let served = deployment.awaiting_approval(rejected).await;
+    let approval = occurrence(&served)["approval_id"]
+        .as_str()
+        .expect("approval id")
+        .to_owned();
+    let (status, receipt) = deployment
+        .decide(
+            &scoped_jwt,
+            rejected,
+            &approval,
+            &json!({"decision": "rejected"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["status"], "rejected");
+    assert!(receipt["reason"].is_null(), "{receipt}");
+    let served = deployment.until(rejected, "completed").await;
+    assert_eq!(
+        served["result"]["outcome"]["verdict"], "failed",
+        "a rejection is a verdict, not a crash: {served}"
+    );
+    assert_eq!(occurrence(&served)["status"], "rejected");
+
+    assert_eq!(deployment.decide_audits(viewer).await, ["denied"]);
+    assert_eq!(
+        deployment.decide_audits(approver).await,
+        ["allowed"; 4],
+        "the decision, its replay and both conflicts are each checked"
+    );
+    assert_eq!(deployment.decide_audits(scoped).await, ["allowed"]);
+}
+
+/// An approval expires with its execution and can no longer be decided.
+///
+/// A superseded head's execution is cancelled while its approval is
+/// pending; the next head's execution reaches its original deadline still
+/// waiting. Both list the occurrence as expired with no actor, and a
+/// decision of either is refused as not pending.
+///
+/// # Panics
+/// Panics when an ended execution's approval is pending or accepts a
+/// decision.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_approval_expires_with_its_execution() {
+    let deployment = Deployment::start_limited(limits(Duration::from_secs(8))).await;
+    deployment.signoff().await;
+    let superseded = deployment.open(3, H2).await;
+    let served = deployment.until(superseded, "waiting").await;
+    let first = occurrence(&served)["approval_id"]
+        .as_str()
+        .expect("approval id")
+        .to_owned();
+    deployment
+        .mock
+        .edit_pull_request(REPOSITORY, 3, |pr| H3.clone_into(&mut pr.head_sha));
+    assert_eq!(
+        deployment.send(3, "synchronize").await.0,
+        StatusCode::ACCEPTED
+    );
+    deployment.until(superseded, "cancelled").await;
+    let current = deployment
+        .rows(3)
+        .await
+        .into_iter()
+        .find(|row| row.head == H3)
+        .expect("the new head is admitted")
+        .execution_id;
+    let served = deployment.until(current, "waiting").await;
+    let second = occurrence(&served)["approval_id"]
+        .as_str()
+        .expect("approval id")
+        .to_owned();
+    assert_ne!(first, second, "each execution has its own occurrence");
+    deployment.until(current, "timed_out").await;
+
+    let (_, approver) = deployment.user("approval-late", &["editor"]).await;
+    for (execution, approval) in [(superseded, &first), (current, &second)] {
+        let served = deployment.status(execution).await;
+        let expired = occurrence(&served);
+        assert_eq!(expired["status"], "expired", "{served}");
+        assert!(expired["actor_id"].is_null(), "{served}");
+        let (status, refused) = deployment
+            .decide(
+                &approver,
+                execution,
+                approval,
+                &json!({"decision": "approved"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(
+            refused["code"],
+            "WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING"
+        );
+        assert_eq!(refused["details"]["status"], "expired");
+    }
+}
+
+/// A decision accepted while no runtime runs survives a restart, and the
+/// same execution finishes.
+///
+/// # Panics
+/// Panics when the decision is refused or the restarted runtime does not
+/// pass the same execution.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_decision_made_while_stopped_finishes_after_a_restart() {
+    let deployment = Deployment::start_with(false).await;
+    deployment.signoff().await;
+    let runtime = || {
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(
+            VerificationRuntime::builder(deployment.server.state())
+                .limits(limits(Duration::from_mins(5)))
+                .build()
+                .expect("the runtime composes")
+                .run(stop.clone()),
+        );
+        (stop, task)
+    };
+
+    let (stop, task) = runtime();
+    let waiting = deployment.open(5, H1).await;
+    let served = deployment.until(waiting, "waiting").await;
+    let approval = occurrence(&served)["approval_id"]
+        .as_str()
+        .expect("approval id")
+        .to_owned();
+    stop.cancel();
+    task.await.expect("the runtime task does not panic");
+
+    let (status, receipt) = deployment.publish_ci(H1, json!({"status": "green"})).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    let (status, receipt) = deployment
+        .decide(
+            &deployment.jwt,
+            waiting,
+            &approval,
+            &json!({"decision": "approved"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+
+    let (stop, task) = runtime();
+    let served = deployment.until(waiting, "completed").await;
+    assert_eq!(served["result"]["outcome"]["verdict"], "passed", "{served}");
+    stop.cancel();
+    task.await.expect("the runtime task does not panic");
+}

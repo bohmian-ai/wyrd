@@ -7,9 +7,7 @@ use chrono::{SubsecRound, Utc};
 use wyrd_runtime::Permission;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{ApprovalId, ExecutionId};
-use wyrd_spec::verification::execution::{
-    ApprovalDecision, ApprovalReceipt, ApprovalStatus, DecideApprovalRequest,
-};
+use wyrd_spec::verification::execution::{ApprovalReceipt, ApprovalStatus, DecideApprovalRequest};
 use wyrd_sql::queries::verifier_executions::VerifierExecutionQueue;
 
 use super::inspection::execution_not_found;
@@ -133,10 +131,7 @@ impl VerificationControl<'_> {
         }
         let receipt = ApprovalReceipt {
             approval_id,
-            status: match request.decision {
-                ApprovalDecision::Approved => ApprovalStatus::Approved,
-                ApprovalDecision::Rejected => ApprovalStatus::Rejected,
-            },
+            status: request.decision.into(),
             actor_id: Some(caller.principal.id),
             // Bifrost keeps microseconds; a fresh receipt states what a replay reads.
             decided_at: Some(Utc::now().trunc_subsecs(6)),
@@ -198,12 +193,8 @@ fn replay(
     caller: &Caller,
     request: &DecideApprovalRequest,
 ) -> Result<ApprovalReceipt, WyrdError> {
-    let decision = match request.decision {
-        ApprovalDecision::Approved => ApprovalStatus::Approved,
-        ApprovalDecision::Rejected => ApprovalStatus::Rejected,
-    };
     if held.actor_id == Some(caller.principal.id)
-        && held.status == decision
+        && held.status == ApprovalStatus::from(request.decision)
         && held.reason == request.reason
     {
         Ok(held.clone())

@@ -6,6 +6,8 @@
 
 mod identity_e2e;
 mod identity_ui_e2e;
+/// Human approval steps decided over HTTP under one execution.
+mod pg_approvals;
 /// Rust-owned opaque browser sessions through `/auth/browser`.
 mod pg_browser_sessions;
 mod pg_card_declaration_route;

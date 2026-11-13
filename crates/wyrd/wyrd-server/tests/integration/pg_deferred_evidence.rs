@@ -88,7 +88,7 @@ impl Deployment {
     ///
     /// # Panics
     /// Panics when the request cannot be served.
-    async fn publish_as(&self, jwt: &str, body: &Value) -> (StatusCode, Value) {
+    pub(crate) async fn publish_as(&self, jwt: &str, body: &Value) -> (StatusCode, Value) {
         self.post(jwt, "/v1/verification/evidence/publish", body)
             .await
     }
@@ -98,7 +98,7 @@ impl Deployment {
     ///
     /// # Panics
     /// Panics when the request cannot be served.
-    async fn post(&self, jwt: &str, uri: &str, body: &Value) -> (StatusCode, Value) {
+    pub(crate) async fn post(&self, jwt: &str, uri: &str, body: &Value) -> (StatusCode, Value) {
         let request = Request::builder()
             .method(Method::POST)
             .uri(uri)
@@ -124,7 +124,7 @@ impl Deployment {
     ///
     /// # Panics
     /// Panics when the request cannot be served.
-    async fn publish_ci(&self, commit: &str, value: Value) -> (StatusCode, Value) {
+    pub(crate) async fn publish_ci(&self, commit: &str, value: Value) -> (StatusCode, Value) {
         self.publish(&publication(
             SLUG,
             commit,
@@ -139,7 +139,7 @@ impl Deployment {
     /// # Panics
     /// Panics when the delivery is refused or admits other than one
     /// execution.
-    async fn open(&self, number: u64, head: &str) -> Uuid {
+    pub(crate) async fn open(&self, number: u64, head: &str) -> Uuid {
         self.mock.set_pull_request(
             REPOSITORY,
             number,
@@ -157,7 +157,7 @@ impl Deployment {
     /// # Panics
     /// Panics when it is not within two minutes, longer than a parked
     /// execution's one-minute recheck.
-    async fn until(&self, execution: Uuid, status: &str) -> Value {
+    pub(crate) async fn until(&self, execution: Uuid, status: &str) -> Value {
         let deadline = tokio::time::Instant::now() + Duration::from_mins(2);
         loop {
             let served = self.status(execution).await;
@@ -192,7 +192,7 @@ impl Deployment {
     ///
     /// # Panics
     /// Panics when the read fails.
-    async fn spent(&self, execution: Uuid) -> (i32, String) {
+    pub(crate) async fn spent(&self, execution: Uuid) -> (i32, String) {
         let mut conn = self.conn().await;
         let spent = sqlx::query_as(
             "SELECT e.attempts, v.version
@@ -210,7 +210,7 @@ impl Deployment {
 }
 
 /// A publish request body.
-fn publication(repository: &str, commit: &str, input: &str, value: Value) -> Value {
+pub(crate) fn publication(repository: &str, commit: &str, input: &str, value: Value) -> Value {
     json!({
         "repository": repository,
         "tags": {"commit": commit},
@@ -220,7 +220,7 @@ fn publication(repository: &str, commit: &str, input: &str, value: Value) -> Val
 }
 
 /// Runtime limits that settle work quickly and end it after `deadline`.
-fn limits(deadline: Duration) -> RuntimeLimits {
+pub(crate) fn limits(deadline: Duration) -> RuntimeLimits {
     RuntimeLimits {
         lease: Duration::from_mins(1),
         execution_timeout: deadline,

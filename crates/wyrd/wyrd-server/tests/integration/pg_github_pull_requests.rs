@@ -215,7 +215,16 @@ impl Deployment {
             .oneshot_authenticated(&self.jwt, request)
             .await
             .expect("declaration responds");
-        assert_eq!(response.status(), StatusCode::CREATED);
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("body reads");
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
     }
 
     /// The server's base URL.

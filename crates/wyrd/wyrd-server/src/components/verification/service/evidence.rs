@@ -120,17 +120,18 @@ impl VerificationControl<'_> {
         let query = self.records(&mut conn, caller).await?;
         conn.commit().await.map_err(registry_db_error)?;
         let records = InputResolver::new(&query, None);
-        let mut held = custody
+        let held = custody
             .accepted(&records, source, &request.input, &subscribers)
             .await?;
         conflicts(&held, &published.sha256, &request.input)?;
-        let mut fresh: Vec<CardUid> = subscribers
+        let fresh: Vec<CardUid> = subscribers
             .iter()
             .filter(|verifier| !held.contains_key(*verifier))
             .cloned()
             .collect();
         // Bifrost keeps microseconds; a fresh receipt states what a replay reads.
         let now = Utc::now().trunc_subsecs(6);
+        let mut raced = BTreeMap::new();
         if !fresh.is_empty() {
             let deadline = Instant::now() + self.state.settings.limits.timeout / 2;
             let accepted = custody
@@ -145,21 +146,19 @@ impl VerificationControl<'_> {
             if let Err(error) = accepted {
                 // A concurrent publisher may have won the fence first; its
                 // acceptance is the receipt this publication replays.
-                let raced = custody
+                raced = custody
                     .accepted(&records, source, &request.input, &fresh)
                     .await?;
                 conflicts(&raced, &published.sha256, &request.input)?;
                 if raced.len() < fresh.len() {
                     return Err(error);
                 }
-                held.extend(raced);
-                fresh.clear();
             }
         }
         // A replay wakes too: a publisher retrying an unacknowledged
         // acceptance resumes the consumers that acceptance never woke.
         self.wake(tenant, source, &subscribers).await;
-        let (status, recorded_at) = receipt(&held, !fresh.is_empty(), now);
+        let (status, recorded_at) = receipt(&held, &fresh, &raced, now);
         tracing::Span::current().record("matched", subscribers.len());
         Ok(PublishEvidenceResponse {
             evidence_id: published.evidence_id,
@@ -366,19 +365,24 @@ fn nonconforming(error: EngineError) -> WyrdError {
     }
 }
 
-/// The receipt status and time a publication answers. `held` is every
-/// subscriber's canonical acceptance read back, including one a concurrent
-/// publisher won; `accepted_now` is whether this publication accepted the
-/// value for any subscriber at `now`. A publication that accepted nothing
-/// replays, and the receipt time is the first acceptance, so a losing
-/// offer's own `now` never reaches the receipt.
+/// The receipt status and time a publication answers.
+///
+/// `held` is every subscriber's acceptance read before this publication
+/// offered; `fresh` is the subscribers it offered to at `now`; `raced` is
+/// the canonical acceptance a concurrent publisher won for any of them. A
+/// publication whose every fresh offer lost replays, and the receipt time is
+/// the first acceptance, so a losing offer's own `now` never reaches the
+/// receipt.
 fn receipt(
     held: &BTreeMap<CardUid, Accepted>,
-    accepted_now: bool,
+    fresh: &[CardUid],
+    raced: &BTreeMap<CardUid, Accepted>,
     now: DateTime<Utc>,
 ) -> (EvidenceStatus, DateTime<Utc>) {
+    let accepted_now = fresh.iter().any(|verifier| !raced.contains_key(verifier));
     let recorded_at = held
         .values()
+        .chain(raced.values())
         .map(|accepted| accepted.recorded_at)
         .chain(accepted_now.then_some(now))
         .min()
@@ -397,47 +401,49 @@ mod tests {
 
     use super::*;
 
-    /// A publication that lost the acceptance race answers the winner's
-    /// receipt: replayed, at the first acceptance, not its own offer time.
+    /// A publication whose fresh offer lost the acceptance race answers the
+    /// winner's receipt: replayed, at the first acceptance, not its own
+    /// offer time. An offer that won answers accepted at its own time.
     #[test]
     fn a_lost_race_replays_the_first_acceptance() {
+        let repository = RepositoryId::new("2").expect("id");
+        let commit = "c0".repeat(20);
         let source = EvidenceSource {
             host: "github.com",
-            repository_id: &RepositoryId::new("2").expect("id"),
-            commit: &"c0".repeat(20),
+            repository_id: &repository,
+            commit: &commit,
         };
         let input = SlotName::new("ci").expect("slot");
-        let published = DeferredEvidence::publish(
-            source,
-            &input,
+        let green = || {
             serde_json::from_value(
                 serde_json::json!({"kind": "json", "value": {"status": "green"}}),
             )
-            .expect("declaration"),
-        )
-        .expect("publishes");
+            .expect("declaration")
+        };
+        let winner = DeferredEvidence::publish(source, &input, green()).expect("publishes");
+        let loser = DeferredEvidence::publish(source, &input, green()).expect("publishes");
+        assert_eq!(
+            loser.evidence_id, winner.evidence_id,
+            "same content, same identity"
+        );
+        let subscriber = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid");
         let first = Utc::now().trunc_subsecs(6);
         let offered = first + TimeDelta::seconds(5);
-        let held = BTreeMap::from([(
-            CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid"),
+        let raced = BTreeMap::from([(
+            subscriber.clone(),
             Accepted {
-                published: published.clone(),
+                published: winner,
                 recorded_at: first,
             },
         )]);
+        let fresh = [subscriber];
 
         assert_eq!(
-            receipt(&held, false, offered),
+            receipt(&BTreeMap::new(), &fresh, &raced, offered),
             (EvidenceStatus::Replayed, first)
         );
         assert_eq!(
-            held.values()
-                .next()
-                .map(|accepted| &accepted.published.evidence_id),
-            Some(&published.evidence_id)
-        );
-        assert_eq!(
-            receipt(&BTreeMap::new(), true, offered),
+            receipt(&BTreeMap::new(), &fresh, &BTreeMap::new(), offered),
             (EvidenceStatus::Accepted, offered)
         );
     }

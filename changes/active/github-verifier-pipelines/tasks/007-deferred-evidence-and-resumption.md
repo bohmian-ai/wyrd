@@ -1,6 +1,6 @@
 ---
 id: TASK-007
-status: proposed
+status: complete
 approved_spec_revision: 5
 requirements: [REQ-008, REQ-009, REQ-011, REQ-016]
 acceptance: [AC-005, AC-006, AC-007, AC-011]

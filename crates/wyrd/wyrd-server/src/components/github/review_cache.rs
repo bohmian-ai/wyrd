@@ -5,10 +5,13 @@
 //! objects in the configured object store under `<tenant>/code-review/`;
 //! [`CodeReviewMetadata`] keeps its snapshot pointers, snapshot records and
 //! context records in PostgreSQL. Every call maps the pipeline identity's
-//! tenant to a Wyrd [`DataTenantId`], opens one RLS [`TenantConn`] for one
-//! statement and commits it before returning, so no transaction spans GitHub
-//! or object-storage IO. The cache is never accepted execution evidence:
-//! expiring it never touches what Bifrost retains.
+//! tenant to a Wyrd [`DataTenantId`] and runs on an RLS [`TenantConn`]. A
+//! read takes its own short transaction. A write is queued and group
+//! committed with the other writes of its tenant waiting at the same time,
+//! and its caller is answered only after that transaction commits; see
+//! [`CodeReviewMetadata`]. No transaction spans GitHub or object-storage IO.
+//! The cache is never accepted execution evidence: expiring it never touches
+//! what Bifrost retains.
 
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -21,11 +24,12 @@ use bohmian_code_review_pipeline::{
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use tokio::sync::{mpsc, oneshot};
 use wyrd_spec::DataTenantId;
 use wyrd_sql::queries::code_review_cache::{
-    CodeReviewRepository, CodeReviewSnapshotScope, claim_unreferenced_code_review_snapshots,
-    code_review_context, code_review_snapshot_pointer, delete_code_review_context,
-    delete_code_review_contexts, delete_code_review_snapshot_pointers,
+    CodeReviewContextStamps, CodeReviewRepository, CodeReviewSnapshotScope,
+    claim_unreferenced_code_review_snapshots, code_review_context, code_review_snapshot_pointer,
+    delete_code_review_context, delete_code_review_contexts, delete_code_review_snapshot_pointers,
     delete_code_review_snapshot_record, expired_code_review_contexts,
     publish_code_review_snapshot_pointer, touch_code_review_snapshot_record,
     upsert_code_review_context,
@@ -135,6 +139,18 @@ impl ObjectStorage for CodeReviewObjects {
     }
 }
 
+/// Flush workers, and so the most code-review metadata transactions open at
+/// once. A tenant's writes always go to the same worker, so two of its
+/// batches never hold row locks at the same time.
+const WORKERS: usize = 4;
+
+/// Most queued writes one worker commits in one transaction.
+const BATCH: usize = 64;
+
+/// Most writes one worker holds queued; a writer beyond it waits for room,
+/// holding no connection or lock.
+const PENDING: usize = 256;
+
 /// The pipeline's snapshot and context metadata in Wyrd's PostgreSQL.
 ///
 /// Rows are scoped by the identity's tenant through RLS, and by its
@@ -142,10 +158,222 @@ impl ObjectStorage for CodeReviewObjects {
 /// rename keeps its rows. The expiry sweep alone reads across tenants, on
 /// the operator pool, and refuses a row whose stored identity names another
 /// tenant than the row's.
+///
+/// Reads run at once on their own short transaction. Writes are group
+/// committed: each queues its statement on its tenant's worker, and a free
+/// worker takes everything queued for it, up to [`BATCH`], and commits each
+/// tenant's share in one transaction. Under load one transaction carries
+/// many writes; a lone write commits as soon as its worker is free, never
+/// waiting for another to arrive. Each caller is answered with its own
+/// statement's result after the commit; a failed batch answers every one of
+/// its callers with the failure and applies none of them. Statements of one
+/// batch run in arrival order, which is one valid order of the concurrent
+/// calls, so every write keeps the result it has alone.
 #[derive(Clone)]
 pub struct CodeReviewMetadata {
     /// Composed server Postgres handle.
     postgres: Arc<ServerPostgres>,
+    /// Each worker's queue, indexed by tenant.
+    workers: Arc<[mpsc::Sender<Queued>]>,
+}
+
+/// One queued metadata write.
+struct Queued {
+    /// The tenant whose transaction applies it.
+    tenant: DataTenantId,
+    /// The statement.
+    write: Write,
+    /// Receives the statement's result after its batch commits, or the
+    /// batch's failure.
+    reply: oneshot::Sender<Result<Written, Arc<str>>>,
+}
+
+/// One metadata write statement, owning its arguments.
+enum Write {
+    /// Publish a snapshot pointer when its tree is still `expected`.
+    Publish {
+        /// The scope's repository.
+        repository: CodeReviewRepository,
+        /// The scope's extraction version.
+        extraction_version: String,
+        /// The scope's format version.
+        format_version: i64,
+        /// The scope's file ceiling.
+        max_file_bytes: i64,
+        /// The tree the current pointer must name.
+        expected: Option<String>,
+        /// The new pointer.
+        pointer: serde_json::Value,
+        /// The new pointer's tree.
+        tree: String,
+    },
+    /// Insert or re-touch a snapshot record.
+    Touch(CodeReviewRepository, String),
+    /// Claim unreferenced snapshot records older than the grace period.
+    Claim(CodeReviewRepository, std::time::Duration),
+    /// Delete one snapshot record.
+    DeleteRecord(CodeReviewRepository, String),
+    /// Delete every snapshot pointer of a repository.
+    RemovePointers(CodeReviewRepository),
+    /// Record a context, keeping existing stamps.
+    UpsertContext {
+        /// The context's repository.
+        repository: CodeReviewRepository,
+        /// Context id.
+        id: String,
+        /// Encoded identity.
+        identity: serde_json::Value,
+        /// Encoded record.
+        record: serde_json::Value,
+    },
+    /// Delete one context.
+    DeleteContext(CodeReviewRepository, String),
+    /// Delete every context of a repository.
+    RemoveContexts(CodeReviewRepository),
+}
+
+/// What one write statement returned.
+enum Written {
+    /// A condition held: a published pointer or a touched record.
+    Flag(bool),
+    /// Object keys claimed or removed.
+    Keys(Vec<String>),
+    /// A context's stamps.
+    Stamps(CodeReviewContextStamps),
+    /// Nothing to report.
+    Done,
+}
+
+impl Write {
+    /// Run this statement on `conn`.
+    ///
+    /// # Errors
+    /// Returns the statement's [`SqlError`].
+    async fn apply(&self, conn: &mut TenantConn<'_>) -> Result<Written, SqlError> {
+        Ok(match self {
+            Self::Publish {
+                repository,
+                extraction_version,
+                format_version,
+                max_file_bytes,
+                expected,
+                pointer,
+                tree,
+            } => Written::Flag(
+                publish_code_review_snapshot_pointer(
+                    conn,
+                    CodeReviewSnapshotScope {
+                        repository: *repository,
+                        extraction_version,
+                        format_version: *format_version,
+                        max_file_bytes: *max_file_bytes,
+                    },
+                    expected.as_deref(),
+                    pointer,
+                    tree,
+                )
+                .await?,
+            ),
+            Self::Touch(repository, key) => {
+                Written::Flag(touch_code_review_snapshot_record(conn, *repository, key).await?)
+            }
+            Self::Claim(repository, grace) => Written::Keys(
+                claim_unreferenced_code_review_snapshots(conn, *repository, *grace).await?,
+            ),
+            Self::DeleteRecord(repository, key) => {
+                delete_code_review_snapshot_record(conn, *repository, key).await?;
+                Written::Done
+            }
+            Self::RemovePointers(repository) => {
+                delete_code_review_snapshot_pointers(conn, *repository).await?;
+                Written::Done
+            }
+            Self::UpsertContext {
+                repository,
+                id,
+                identity,
+                record,
+            } => Written::Stamps(
+                upsert_code_review_context(
+                    conn,
+                    *repository,
+                    id,
+                    identity,
+                    record,
+                    CONTEXT_LIFETIME,
+                )
+                .await?,
+            ),
+            Self::DeleteContext(repository, id) => {
+                delete_code_review_context(conn, *repository, id).await?;
+                Written::Done
+            }
+            Self::RemoveContexts(repository) => {
+                Written::Keys(delete_code_review_contexts(conn, *repository).await?)
+            }
+        })
+    }
+}
+
+/// One worker: commits its tenants' queued writes until every handle is
+/// dropped and its queue is empty.
+struct Worker {
+    /// Composed server Postgres handle.
+    postgres: Arc<ServerPostgres>,
+    /// This worker's queue.
+    queue: mpsc::Receiver<Queued>,
+}
+
+impl Worker {
+    /// Take everything queued, up to [`BATCH`], commit each tenant's share,
+    /// and repeat.
+    async fn run(mut self) {
+        let mut taken = Vec::with_capacity(BATCH);
+        while self.queue.recv_many(&mut taken, BATCH).await > 0 {
+            taken.sort_by_key(|queued| queued.tenant);
+            while let Some(tenant) = taken.last().map(|queued| queued.tenant) {
+                let first = taken.partition_point(|queued| queued.tenant < tenant);
+                let batch = taken.split_off(first);
+                self.commit(tenant, batch).await;
+            }
+        }
+    }
+
+    /// Apply `batch` in one transaction of `tenant` and answer each write.
+    ///
+    /// Every write is answered after the commit with its own result; any
+    /// failure answers every write of the batch with it, and nothing applies.
+    #[tracing::instrument(
+        skip_all,
+        fields(operation = "code_review.metadata.commit", tenant_id = %tenant, batch = batch.len())
+    )]
+    async fn commit(&self, tenant: DataTenantId, batch: Vec<Queued>) {
+        let applied = async {
+            let mut conn = self.postgres.tenant_conn(tenant).await?;
+            let mut written = Vec::with_capacity(batch.len());
+            for queued in &batch {
+                written.push(queued.write.apply(&mut conn).await?);
+            }
+            conn.commit().await?;
+            Ok::<_, SqlError>(written)
+        }
+        .await;
+        match applied {
+            Ok(written) => {
+                tracing::debug!("code-review metadata batch committed");
+                for (queued, written) in batch.into_iter().zip(written) {
+                    let _ = queued.reply.send(Ok(written));
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "a code-review metadata batch failed; none of its writes applied");
+                let failure: Arc<str> = error.to_string().into();
+                for queued in batch {
+                    let _ = queued.reply.send(Err(Arc::clone(&failure)));
+                }
+            }
+        }
+    }
 }
 
 /// A metadata failure as the pipeline's backend error.
@@ -205,27 +433,37 @@ fn repository(identity: &Identity) -> Result<CodeReviewRepository, PersistenceEr
 }
 
 impl CodeReviewMetadata {
-    /// Code-review metadata over `postgres`.
+    /// Code-review metadata over `postgres`, starting its [`WORKERS`] write
+    /// workers. They stop once every clone is dropped and their queues are
+    /// empty.
+    ///
+    /// # Panics
+    /// Panics when called outside a Tokio runtime, which spawning requires.
     #[must_use]
     pub fn new(postgres: Arc<ServerPostgres>) -> Self {
-        Self { postgres }
+        let workers = (0..WORKERS)
+            .map(|_| {
+                let (sender, queue) = mpsc::channel(PENDING);
+                tokio::spawn(
+                    Worker {
+                        postgres: Arc::clone(&postgres),
+                        queue,
+                    }
+                    .run(),
+                );
+                sender
+            })
+            .collect();
+        Self { postgres, workers }
     }
 
-    /// Run one statement on `identity`'s tenant connection and commit it.
-    ///
-    /// This is every metadata write's commit boundary, so each operation is
-    /// atomic: it lands whole or not at all.
-    ///
-    /// # Cancellation
-    /// A cancelled call or a lost commit reply can leave the statement
-    /// committed while the caller sees an error or nothing. The caller learns
-    /// the outcome only by reading or repeating; each operation documents what
-    /// a repeat after a committed attempt returns.
+    /// Run one read on `identity`'s tenant connection in its own
+    /// transaction.
     ///
     /// # Errors
     /// Returns [`PersistenceError::Backend`] when the tenant is not a Wyrd
     /// tenant, an id exceeds `BIGINT`, or Postgres fails.
-    async fn tenant<T>(
+    async fn read<T>(
         &self,
         identity: &Identity,
         statement: impl AsyncFnOnce(&mut TenantConn<'_>, CodeReviewRepository) -> Result<T, SqlError>,
@@ -240,6 +478,45 @@ impl CodeReviewMetadata {
         conn.commit().await.map_err(backend)?;
         Ok(value)
     }
+
+    /// Queue `write` of `identity`'s tenant and return its result once its
+    /// batch committed.
+    ///
+    /// This is every metadata write's commit boundary, so each operation is
+    /// atomic: it lands whole or not at all.
+    ///
+    /// # Cancellation
+    /// A cancelled call or a lost commit reply can leave the statement
+    /// committed while the caller sees an error or nothing. The caller learns
+    /// the outcome only by reading or repeating; each operation documents what
+    /// a repeat after a committed attempt returns.
+    ///
+    /// # Errors
+    /// Returns [`PersistenceError::Backend`] when the tenant is not a Wyrd
+    /// tenant, the batch holding the write failed, or the workers stopped.
+    async fn write(&self, identity: &Identity, write: Write) -> Result<Written, PersistenceError> {
+        let tenant = tenant(identity)?;
+        let worker = &self.workers
+            [usize::try_from(tenant.as_uuid().as_u128() % WORKERS as u128).unwrap_or_default()];
+        let (reply, written) = oneshot::channel();
+        worker
+            .send(Queued {
+                tenant,
+                write,
+                reply,
+            })
+            .await
+            .map_err(|_| backend("the code-review metadata writer stopped"))?;
+        written
+            .await
+            .map_err(|_| backend("the code-review metadata writer stopped"))?
+            .map_err(|failure| backend(format!("the batched metadata write failed: {failure}")))
+    }
+}
+
+/// A write result of another shape than its statement returns.
+fn unexpected() -> PersistenceError {
+    backend("a code-review metadata write returned another result shape")
 }
 
 /// The SQL scope of `scope`.
@@ -273,7 +550,7 @@ impl SnapshotStore for CodeReviewMetadata {
     ) -> Result<Option<SnapshotPointer>, PersistenceError> {
         let repository = repository(&scope.identity)?;
         let sql = sql_scope(scope, repository)?;
-        self.tenant(&scope.identity, async |conn, _| {
+        self.read(&scope.identity, async |conn, _| {
             code_review_snapshot_pointer(conn, sql).await
         })
         .await?
@@ -299,18 +576,19 @@ impl SnapshotStore for CodeReviewMetadata {
     ) -> Result<bool, PersistenceError> {
         let repository = repository(&scope.identity)?;
         let sql = sql_scope(scope, repository)?;
-        let json = to_json(pointer)?;
-        self.tenant(&scope.identity, async |conn, _| {
-            publish_code_review_snapshot_pointer(
-                conn,
-                sql,
-                expected.map(ObjectSha::as_str),
-                &json,
-                pointer.tree.as_str(),
-            )
-            .await
-        })
-        .await
+        let write = Write::Publish {
+            repository,
+            extraction_version: sql.extraction_version.to_owned(),
+            format_version: sql.format_version,
+            max_file_bytes: sql.max_file_bytes,
+            expected: expected.map(|tree| tree.as_str().to_owned()),
+            pointer: to_json(pointer)?,
+            tree: pointer.tree.as_str().to_owned(),
+        };
+        match self.write(&scope.identity, write).await? {
+            Written::Flag(published) => Ok(published),
+            _ => Err(unexpected()),
+        }
     }
 
     /// Insert or re-touch the record of `key`.
@@ -329,15 +607,11 @@ impl SnapshotStore for CodeReviewMetadata {
         identity: &Identity,
         key: &ObjectKey,
     ) -> Result<(), PersistenceError> {
-        let touched = self
-            .tenant(identity, async |conn, repository| {
-                touch_code_review_snapshot_record(conn, repository, key.as_str()).await
-            })
-            .await?;
-        if touched {
-            Ok(())
-        } else {
-            Err(PersistenceError::Collecting { key: key.clone() })
+        let write = Write::Touch(repository(identity)?, key.as_str().to_owned());
+        match self.write(identity, write).await? {
+            Written::Flag(true) => Ok(()),
+            Written::Flag(false) => Err(PersistenceError::Collecting { key: key.clone() }),
+            _ => Err(unexpected()),
         }
     }
 
@@ -355,13 +629,13 @@ impl SnapshotStore for CodeReviewMetadata {
         identity: &Identity,
         grace: std::time::Duration,
     ) -> Result<Vec<ObjectKey>, PersistenceError> {
-        self.tenant(identity, async |conn, repository| {
-            claim_unreferenced_code_review_snapshots(conn, repository, grace).await
-        })
-        .await?
-        .into_iter()
-        .map(object_key)
-        .collect()
+        match self
+            .write(identity, Write::Claim(repository(identity)?, grace))
+            .await?
+        {
+            Written::Keys(keys) => keys.into_iter().map(object_key).collect(),
+            _ => Err(unexpected()),
+        }
     }
 
     /// Delete the record of `key`; an absent record succeeds, so a repeat
@@ -376,10 +650,8 @@ impl SnapshotStore for CodeReviewMetadata {
         identity: &Identity,
         key: &ObjectKey,
     ) -> Result<(), PersistenceError> {
-        self.tenant(identity, async |conn, repository| {
-            delete_code_review_snapshot_record(conn, repository, key.as_str()).await
-        })
-        .await
+        let write = Write::DeleteRecord(repository(identity)?, key.as_str().to_owned());
+        self.write(identity, write).await.map(drop)
     }
 
     /// Delete every pointer of `identity`; a repeat after an interrupted
@@ -390,10 +662,9 @@ impl SnapshotStore for CodeReviewMetadata {
     /// Postgres failure.
     #[tracing::instrument(skip_all)]
     async fn remove_pointers(&self, identity: &Identity) -> Result<(), PersistenceError> {
-        self.tenant(identity, async |conn, repository| {
-            delete_code_review_snapshot_pointers(conn, repository).await
-        })
-        .await
+        self.write(identity, Write::RemovePointers(repository(identity)?))
+            .await
+            .map(drop)
     }
 }
 
@@ -412,20 +683,15 @@ impl ContextStore for CodeReviewMetadata {
         identity: &Identity,
         record: &ContextRecord,
     ) -> Result<ContextLifetime, PersistenceError> {
-        let (identity_json, record_json) = (to_json(identity)?, to_json(record)?);
-        let stamps = self
-            .tenant(identity, async |conn, repository| {
-                upsert_code_review_context(
-                    conn,
-                    repository,
-                    record.id.as_str(),
-                    &identity_json,
-                    &record_json,
-                    CONTEXT_LIFETIME,
-                )
-                .await
-            })
-            .await?;
+        let write = Write::UpsertContext {
+            repository: repository(identity)?,
+            id: record.id.as_str().to_owned(),
+            identity: to_json(identity)?,
+            record: to_json(record)?,
+        };
+        let Written::Stamps(stamps) = self.write(identity, write).await? else {
+            return Err(unexpected());
+        };
         Ok(ContextLifetime {
             published_at: SystemTime::from(stamps.published_at),
             expires_at: SystemTime::from(stamps.expires_at),
@@ -444,7 +710,7 @@ impl ContextStore for CodeReviewMetadata {
         id: &ContextId,
     ) -> Result<ContextLookup, PersistenceError> {
         let row = self
-            .tenant(identity, async |conn, repository| {
+            .read(identity, async |conn, repository| {
                 code_review_context(conn, repository, id.as_str()).await
             })
             .await?;
@@ -497,10 +763,8 @@ impl ContextStore for CodeReviewMetadata {
         identity: &Identity,
         id: &ContextId,
     ) -> Result<(), PersistenceError> {
-        self.tenant(identity, async |conn, repository| {
-            delete_code_review_context(conn, repository, id.as_str()).await
-        })
-        .await
+        let write = Write::DeleteContext(repository(identity)?, id.as_str().to_owned());
+        self.write(identity, write).await.map(drop)
     }
 
     /// Delete every context of `identity`, returning their object keys.
@@ -518,12 +782,12 @@ impl ContextStore for CodeReviewMetadata {
         &self,
         identity: &Identity,
     ) -> Result<Vec<ObjectKey>, PersistenceError> {
-        self.tenant(identity, async |conn, repository| {
-            delete_code_review_contexts(conn, repository).await
-        })
-        .await?
-        .into_iter()
-        .map(object_key)
-        .collect()
+        match self
+            .write(identity, Write::RemoveContexts(repository(identity)?))
+            .await?
+        {
+            Written::Keys(keys) => keys.into_iter().map(object_key).collect(),
+            _ => Err(unexpected()),
+        }
     }
 }

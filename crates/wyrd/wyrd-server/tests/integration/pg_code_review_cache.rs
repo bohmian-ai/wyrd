@@ -8,8 +8,11 @@
 //! and that absent, expired and failed lookups stay distinct and tenants
 //! stay apart.
 
+use std::future::Future;
 use std::io::Write as _;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use bohmian_code_review_pipeline::persistence::ContextLookup;
@@ -702,5 +705,249 @@ async fn competing_cold_reviews_converge_on_one_snapshot() {
         later.calls().get(Operation::Archive),
         0,
         "the later review reuses the converged snapshot"
+    );
+}
+
+/// The snapshot record key `name` under `identity`.
+fn record_key(identity: &Identity, name: &str) -> ObjectKey {
+    ObjectKey::snapshot(identity, name, SNAPSHOT_FORMAT_VERSION, 1024, &sha('a'))
+}
+
+/// The id of the transaction that committed the record of `key`, or `None`
+/// while it is uncommitted or absent.
+///
+/// # Panics
+/// Panics when the read fails.
+async fn committer(pool: &sqlx::PgPool, key: &ObjectKey) -> Option<String> {
+    sqlx::query_scalar(
+        "SELECT xmin::text FROM wyrd.code_review_snapshot_records WHERE object_key = $1",
+    )
+    .bind(key.as_str())
+    .fetch_optional(pool)
+    .await
+    .expect("read the record's committer")
+}
+
+/// A metadata write still in flight.
+type InFlight<'a> = Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
+
+/// Start `identity`'s write of `key`, returning once it is queued and
+/// waiting for its batch to commit.
+///
+/// # Panics
+/// Panics when the write finishes immediately.
+async fn queued_write<'a>(
+    metadata: &'a CodeReviewMetadata,
+    identity: &Identity,
+    key: &ObjectKey,
+) -> InFlight<'a> {
+    let (identity, key) = (identity.clone(), key.clone());
+    let mut write: InFlight<'a> =
+        Box::pin(async move { metadata.upsert_record(&identity, &key).await });
+    let waiting =
+        std::future::poll_fn(|cx| Poll::Ready(write.as_mut().poll(cx).is_pending())).await;
+    assert!(waiting, "a queued write waits for its batch to commit");
+    write
+}
+
+/// A tenant's metadata batch held open on a row lock, so that tenant's
+/// later writes queue behind it.
+struct HeldBatch<'a> {
+    lock: sqlx::Transaction<'static, sqlx::Postgres>,
+    write: InFlight<'a>,
+}
+
+impl<'a> HeldBatch<'a> {
+    /// Commit `key`, lock its row from another connection, then write it
+    /// again and wait until that write's batch blocks on the lock.
+    ///
+    /// # Panics
+    /// Panics when a write or lock fails, or no batch blocks within five
+    /// seconds.
+    async fn start(custody: &'a Custody, identity: &Identity, key: &ObjectKey) -> Self {
+        let pool = custody.fixture.superuser_pool().expect("superuser pool");
+        custody
+            .metadata
+            .upsert_record(identity, key)
+            .await
+            .expect("first write");
+        let mut lock = pool.begin().await.expect("lock transaction");
+        sqlx::query(
+            "SELECT 1 FROM wyrd.code_review_snapshot_records WHERE object_key = $1 FOR UPDATE",
+        )
+        .bind(key.as_str())
+        .execute(&mut *lock)
+        .await
+        .expect("lock the record");
+        let write = queued_write(&custody.metadata, identity, key).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let blocked: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                  WHERE pid <> pg_backend_pid() AND wait_event_type = 'Lock'
+                    AND query LIKE '%code_review_snapshot_records%'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("activity reads");
+            if blocked > 0 {
+                return HeldBatch { lock, write };
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the batch never blocked on the lock"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Release the lock and wait for the held batch to commit.
+    ///
+    /// # Panics
+    /// Panics when the held write fails.
+    async fn release(self) {
+        self.lock.commit().await.expect("release the lock");
+        self.write.await.expect("the held write commits");
+    }
+}
+
+/// A lone metadata write commits without waiting for other writes, and is
+/// visible from another connection once it returns.
+///
+/// # Panics
+/// Panics when the write waits or is not committed when it returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lone_metadata_write_commits_without_waiting() {
+    let custody = Custody::start().await;
+    let pool = custody.fixture.superuser_pool().expect("superuser pool");
+    let key = record_key(&custody.identity(), "lone");
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        custody.metadata.upsert_record(&custody.identity(), &key),
+    )
+    .await
+    .expect("a lone write waits for no other write")
+    .expect("the write commits");
+
+    assert!(
+        committer(&pool, &key).await.is_some(),
+        "committed when it returns"
+    );
+}
+
+/// Writes queued behind a tenant's busy batch commit together in one
+/// transaction once it finishes, are invisible until then, and never share
+/// that transaction with another tenant's write.
+///
+/// # Panics
+/// Panics when a queued write is visible early, the queued writes commit
+/// separately, or tenants share a transaction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writes_queued_behind_a_busy_batch_share_one_commit_per_tenant() {
+    let custody = Custody::start().await;
+    let pool = custody.fixture.superuser_pool().expect("superuser pool");
+    let tenant = custody.identity();
+    let other = identity(
+        custody
+            .fixture
+            .seed_additional_tenant("code-review-batch")
+            .await
+            .expect("tenant"),
+        "acme",
+        "app",
+    );
+    let held = HeldBatch::start(&custody, &tenant, &record_key(&tenant, "held")).await;
+    let queued = [
+        record_key(&tenant, "q1"),
+        record_key(&tenant, "q2"),
+        record_key(&tenant, "q3"),
+    ];
+    let other_key = record_key(&other, "other");
+    let mut writes = Vec::new();
+    for key in &queued {
+        writes.push(queued_write(&custody.metadata, &tenant, key).await);
+    }
+    writes.push(queued_write(&custody.metadata, &other, &other_key).await);
+    for key in &queued {
+        assert_eq!(
+            committer(&pool, key).await,
+            None,
+            "invisible before its batch commits"
+        );
+    }
+
+    held.release().await;
+    for write in writes {
+        write.await.expect("each queued write commits");
+    }
+
+    let q1 = committer(&pool, &queued[0]).await.expect("q1 committed");
+    for key in &queued[1..] {
+        assert_eq!(
+            committer(&pool, key).await.as_ref(),
+            Some(&q1),
+            "queued writes share one commit"
+        );
+    }
+    assert_ne!(
+        committer(&pool, &record_key(&tenant, "held"))
+            .await
+            .as_ref(),
+        Some(&q1),
+        "the held batch committed on its own"
+    );
+    assert_ne!(
+        committer(&pool, &other_key).await.as_ref(),
+        Some(&q1),
+        "another tenant's write commits in its own transaction"
+    );
+}
+
+/// When one write of a batch fails, every write in the batch is answered
+/// with the failure and none of them is applied.
+///
+/// # Panics
+/// Panics when any write of the failed batch succeeds or is applied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_metadata_batch_applies_none_of_its_writes() {
+    let custody = Custody::start().await;
+    let pool = custody.fixture.superuser_pool().expect("superuser pool");
+    let tenant = custody.identity();
+    let (healthy, refused) = (
+        record_key(&tenant, "healthy"),
+        record_key(&tenant, "refused"),
+    );
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE FUNCTION wyrd.refuse_record() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           IF NEW.object_key = '{refused}' THEN RAISE EXCEPTION 'refused record'; END IF;
+           RETURN NEW;
+         END $$;
+         CREATE TRIGGER refuse_record BEFORE INSERT ON wyrd.code_review_snapshot_records
+           FOR EACH ROW EXECUTE FUNCTION wyrd.refuse_record();",
+        refused = refused.as_str(),
+    )))
+    .execute(&pool)
+    .await
+    .expect("refuse one record");
+    let held = HeldBatch::start(&custody, &tenant, &record_key(&tenant, "held")).await;
+    let batch = [
+        queued_write(&custody.metadata, &tenant, &healthy).await,
+        queued_write(&custody.metadata, &tenant, &refused).await,
+    ];
+
+    held.release().await;
+
+    for write in batch {
+        assert!(
+            matches!(write.await, Err(PersistenceError::Backend { .. })),
+            "every write of the failed batch is answered with the failure"
+        );
+    }
+    assert_eq!(
+        committer(&pool, &healthy).await,
+        None,
+        "the healthy write is not applied"
     );
 }

@@ -1787,6 +1787,11 @@ async fn registration_derives_queue_only_from_publishing_agents_and_pull_request
                                           "operator": "is_not_null" } }],
         })
     };
+    let mut disclaimed = extracting(
+        json!({ "kind": "extract", "extractor": "pull_request" }),
+        json!({}),
+    );
+    disclaimed["queue_only"] = json!(false);
     let cases = [
         (
             "qo-inline",
@@ -1841,6 +1846,16 @@ async fn registration_derives_queue_only_from_publishing_agents_and_pull_request
                     json!({ "kind": "extract", "extractor": "pull_request" }),
                     json!({}),
                 ),
+            )],
+            true,
+        ),
+        (
+            "qo-pull-request-disclaimed",
+            vec![submission_body(
+                "Verifier",
+                "qo-pull-request-disclaimed",
+                Some("1.0.0"),
+                disclaimed,
             )],
             true,
         ),

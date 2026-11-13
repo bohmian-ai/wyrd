@@ -1637,6 +1637,24 @@ async fn omitted_context_is_recorded_and_fails_a_completeness_requirement() {
         Some(15),
         "{context}"
     );
+    let selected: u64 = context["spans"]
+        .as_array()
+        .expect("spans")
+        .iter()
+        .filter_map(|span| span["tokens"].as_u64())
+        .sum();
+    assert_eq!(
+        context["budget"]["selected_tokens"], selected,
+        "the library's budget accounts for exactly the selected spans: {context}"
+    );
+    assert!(
+        context["budget"]["context_tokens"].as_u64() >= Some(selected),
+        "{context}"
+    );
+    assert!(
+        context["coverage"]["files"]["indexed"].as_u64() > Some(0),
+        "the library's coverage is carried: {context}"
+    );
     let details = deployment
         .get(&format!("/v1/verification/executions/{execution}/details"))
         .await;

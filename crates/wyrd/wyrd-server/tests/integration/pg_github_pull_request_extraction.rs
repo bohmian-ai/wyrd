@@ -41,6 +41,8 @@ const PR: u64 = 7;
 const POLICY: &str = "apiVersion: wyrd/v1\nkind: Repository\nmetadata:\n  name: policy\n  version: 1.0.0\nspec:\n  repository_id: \"4242\"\n  verified_by:\n    - verifier: ./pr-review.yaml\n      runs_on: {kind: pull_request}\n";
 /// A queued Verifier extracting the pull request and requiring a change.
 const REVIEW: &str = "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: pr-review\n  version: 1.0.0\nspec:\n  description: The pull request changes source.\n  steps:\n    - id: pr\n      action: {kind: extract, extractor: pull_request}\n      requirements:\n        - id: changes\n          statement: The reviewed change touches a file\n          check: {kind: assert, path: steps.pr.output.changes.files, operator: is_non_empty}\n";
+/// [`REVIEW`] requiring complete library context instead.
+const COMPLETE_REVIEW: &str = "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: pr-review\n  version: 1.0.0\nspec:\n  description: The pull request is reviewed with complete context.\n  steps:\n    - id: pr\n      action: {kind: extract, extractor: pull_request}\n      requirements:\n        - id: complete\n          statement: No related declaration was left out\n          check: {kind: assert, path: steps.pr.output.context.omissions, operator: is_empty}\n";
 /// [`POLICY`] binding [`AGENT_REVIEW`] instead.
 const AGENT_POLICY: &str = "apiVersion: wyrd/v1\nkind: Repository\nmetadata:\n  name: policy\n  version: 1.0.0\nspec:\n  repository_id: \"4242\"\n  verified_by:\n    - verifier: ./agent-review.yaml\n      runs_on: {kind: pull_request}\n";
 /// A queued Verifier whose Agent reads the extraction twice: `pr`,
@@ -1216,4 +1218,169 @@ async fn superseded_running_work_never_becomes_the_baseline() {
         .get(&format!("/v1/verification/executions/{running}"))
         .await;
     assert_eq!(status["status"], "cancelled", "{status}");
+}
+
+/// A changed file whose source GitHub cannot serve fails the extraction,
+/// so the review is inconclusive and never passes.
+///
+/// # Panics
+/// Panics when the extraction succeeds or the review passes.
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_changed_source_fails_the_extraction_and_never_passes() {
+    let deployment =
+        Deployment::start(&[("pr-review.yaml", REVIEW), ("policy.yaml", POLICY)]).await;
+    deployment.head(&sha('a'), &sha('8'), HANDLER_A);
+    deployment.mock.serve_repository(
+        REPOSITORY,
+        &format!("/git/blobs/{}", blob(HANDLER_A)),
+        StatusCode::NOT_FOUND,
+        Vec::new(),
+    );
+    deployment.compare(&sha('c'), &sha('a'), &sha('c'), HANDLER_A, PATCH_A);
+
+    let execution = deployment.review(&sha('a'), "opened").await;
+
+    let details = deployment
+        .get(&format!("/v1/verification/executions/{execution}/details"))
+        .await;
+    assert_eq!(
+        details["outcome"]["steps"][0]["status"], "failed",
+        "{details}"
+    );
+    assert_eq!(details["outcome"]["verdict"], "inconclusive", "{details}");
+}
+
+/// Related declarations the library's context leaves out are recorded as
+/// omissions, never hidden: a change calling twenty helpers in twenty files
+/// selects fifteen and omits five at the file limit, so a Verifier requiring
+/// complete context fails.
+///
+/// # Panics
+/// Panics when the omissions are not recorded or the review passes.
+#[tokio::test(flavor = "multi_thread")]
+async fn omitted_context_is_recorded_and_fails_a_completeness_requirement() {
+    let deployment =
+        Deployment::start(&[("pr-review.yaml", COMPLETE_REVIEW), ("policy.yaml", POLICY)]).await;
+    let imports: String = (0..20)
+        .map(|i| format!("import {{ helper{i} }} from \"./h{i}\";\n"))
+        .collect();
+    let calls: String = (0..20).map(|i| format!("helper{i}(id); ")).collect();
+    let changed = format!("export const handle = (id: string) => {{ {calls}return id; }};");
+    let main_handler = format!("{imports}\nexport const handle = (id: string) => id;\n");
+    let head_handler = format!("{imports}\n{changed}\n");
+    let helpers: Vec<(String, String)> = (0..20)
+        .map(|i| {
+            (
+                format!("src/h{i}.ts"),
+                format!("export function helper{i}(id: string): string {{\n  return id;\n}}\n"),
+            )
+        })
+        .collect();
+    fn tree<'a>(helpers: &'a [(String, String)], handler: &'a str) -> Vec<(&'a str, &'a [u8])> {
+        let mut files: Vec<(&str, &[u8])> = helpers
+            .iter()
+            .map(|(path, text)| (path.as_str(), text.as_bytes()))
+            .collect();
+        files.push(("src/handler.ts", handler.as_bytes()));
+        files
+    }
+    let main = tree(&helpers, &main_handler);
+    deployment.commit(&sha('c'), &sha('7'), &main);
+    deployment.mock.serve_repository(
+        REPOSITORY,
+        &format!("/tarball/{}", sha('c')),
+        StatusCode::OK,
+        tarball(&main),
+    );
+    deployment.commit(&sha('a'), &sha('8'), &tree(&helpers, &head_handler));
+    deployment.json(
+        &format!("/compare/{}...{}", sha('c'), sha('a')),
+        &json!({"status": "ahead", "base_commit": {"sha": sha('c')},
+                "merge_base_commit": {"sha": sha('c')},
+                "commits": [{"sha": sha('a')}],
+                "files": [{"filename": "src/handler.ts", "status": "modified",
+                           "sha": blob(head_handler.as_bytes()),
+                           "patch": format!("@@ -22,1 +22,1 @@\n-export const handle = (id: string) => id;\n+{changed}")}]}),
+    );
+
+    let execution = deployment.review(&sha('a'), "opened").await;
+
+    let context = &deployment.extraction(execution).await["context"];
+    let omitted: Vec<(&str, &str)> = context["omissions"]
+        .as_array()
+        .expect("omissions")
+        .iter()
+        .map(|omission| {
+            (
+                omission["path"].as_str().expect("path"),
+                omission["reason"].as_str().expect("reason"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        omitted,
+        [
+            ("src/h5.ts", "FileLimit"),
+            ("src/h6.ts", "FileLimit"),
+            ("src/h7.ts", "FileLimit"),
+            ("src/h8.ts", "FileLimit"),
+            ("src/h9.ts", "FileLimit"),
+        ],
+        "{context}"
+    );
+    assert_eq!(
+        context["spans"].as_array().map(Vec::len),
+        Some(15),
+        "{context}"
+    );
+    let details = deployment
+        .get(&format!("/v1/verification/executions/{execution}/details"))
+        .await;
+    assert_eq!(details["outcome"]["verdict"], "failed", "{details}");
+}
+
+/// An extraction larger than the model accepts fails the Agent honestly:
+/// the provider refuses the input as over its context length, the review
+/// step fails, and the review is never passed.
+///
+/// # Panics
+/// Panics when the Agent step succeeds or the review passes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_refusing_the_input_size_never_passes_the_review() {
+    let deployment = Deployment::start(&[
+        ("agent-review.yaml", AGENT_REVIEW),
+        ("reviewer.yaml", REVIEWER),
+        ("policy.yaml", AGENT_POLICY),
+    ])
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error": {
+            "message": "This model's maximum context length is 8192 tokens.",
+            "type": "invalid_request_error", "param": "messages",
+            "code": "context_length_exceeded"}})))
+        .mount(&deployment.model)
+        .await;
+    deployment.head(&sha('a'), &sha('8'), HANDLER_A);
+    deployment.compare(&sha('c'), &sha('a'), &sha('c'), HANDLER_A, PATCH_A);
+
+    let execution = deployment.review(&sha('a'), "opened").await;
+
+    let details = deployment
+        .get(&format!("/v1/verification/executions/{execution}/details"))
+        .await;
+    let steps = &details["outcome"]["steps"];
+    assert_eq!(steps[0]["status"], "succeeded", "{details}");
+    assert_eq!(steps[1]["id"], "review", "{details}");
+    assert_eq!(steps[1]["status"], "failed", "{details}");
+    assert_ne!(details["outcome"]["verdict"], "passed", "{details}");
+    assert!(
+        !deployment
+            .model
+            .received_requests()
+            .await
+            .expect("requests are recorded")
+            .is_empty(),
+        "the model was asked and refused"
+    );
 }

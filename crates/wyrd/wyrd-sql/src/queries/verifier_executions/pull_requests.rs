@@ -23,8 +23,8 @@
 // raw-query grep allowlist: verifier execution tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use chrono::{DateTime, Utc};
-use sqlx::Error as SqlxError;
 use sqlx::types::{Json, Uuid};
+use sqlx::{Error as SqlxError, Row as _};
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_spec::auth::Attribution;
 use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, RepositoryId};
@@ -154,7 +154,7 @@ const SUBSCRIBERS_SQL: &str = "
      WHERE origin = 'pull_request' AND pull_request->>'host' = $2
        AND pull_request->>'repository_id' = $3 AND pull_request->'head'->>'sha' = $4
        AND status IN ('pending', 'retrying', 'running')
-     ORDER BY 1, 2
+     ORDER BY verifier_card_uid, card_uid
 ";
 
 /// Make the queued executions of Verifiers `$4` admitted for commit `$3` of
@@ -529,18 +529,18 @@ impl VerifierExecutionQueue {
         (host, repository_id, commit): (&str, &RepositoryId, &str),
     ) -> Result<Vec<(CardUid, CardUid)>, SqlxError> {
         timed("evidence_subscribers", async {
-            let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(SUBSCRIBERS_SQL)
+            let rows = sqlx::query(SUBSCRIBERS_SQL)
                 .bind(selected.map(CardUid::as_uuid))
                 .bind(host)
                 .bind(repository_id.as_str())
                 .bind(commit)
                 .fetch_all(&mut **conn.transaction())
                 .await?;
-            rows.into_iter()
-                .map(|(verifier, subject)| {
+            rows.iter()
+                .map(|row| {
                     Ok((
-                        stored(CardUid::from_uuid(verifier))?,
-                        stored(CardUid::from_uuid(subject))?,
+                        stored(CardUid::from_uuid(row.try_get("verifier_card_uid")?))?,
+                        stored(CardUid::from_uuid(row.try_get("card_uid")?))?,
                     ))
                 })
                 .collect()
@@ -567,15 +567,15 @@ impl VerifierExecutionQueue {
     ) -> Result<Vec<ExecutionId>, SqlxError> {
         timed("evidence_wake", async {
             let verifiers: Vec<Uuid> = verifiers.iter().map(CardUid::as_uuid).collect();
-            let rows: Vec<(Uuid,)> = sqlx::query_as(WAKE_SQL)
+            let rows = sqlx::query(WAKE_SQL)
                 .bind(host)
                 .bind(repository_id.as_str())
                 .bind(commit)
                 .bind(&verifiers)
                 .fetch_all(&mut **conn.transaction())
                 .await?;
-            rows.into_iter()
-                .map(|(id,)| stored(ExecutionId::new(id)))
+            rows.iter()
+                .map(|row| stored(ExecutionId::new(row.try_get("execution_id")?)))
                 .collect()
         })
         .await

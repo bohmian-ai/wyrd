@@ -25,9 +25,9 @@ use wyrd_spec::vala::api::PhysicalLayoutWire;
 /// a different value for it is refused as a batch conflict, and its durable
 /// batch fence names the acceptance whether or not a query can see the row
 /// yet. `sha256` is the content identity: the digest of the canonical JSON
-/// of [`VALUE`] without its display filename. `evidence_id` is derived from
+/// of [`EVIDENCE`] without its display filename. `evidence_id` is derived from
 /// the source and content, so every subscriber of the same publication
-/// holds the same id. [`VALUE`] is the declaration itself: inline JSON, or
+/// holds the same id. [`EVIDENCE`] is the declaration itself: inline JSON, or
 /// a File named by digest whose bytes stay in verification File storage.
 pub struct EvidenceTable;
 

@@ -496,7 +496,6 @@ async fn parked_executions_end_by_supersession_and_deadline() {
 /// Panics when the publication does not match the running consumer or the
 /// consumer does not pass.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn evidence_published_while_its_consumer_runs_reaches_it() {
     let deployment = Deployment::start_with(false).await;
     deployment.gate("1.1.0", "1.0.0").await;
@@ -546,7 +545,6 @@ async fn evidence_published_while_its_consumer_runs_reaches_it() {
 /// Panics when the execution does not wait, the publication is refused, or
 /// the restarted runtime does not pass the same execution.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn a_waiting_execution_finishes_after_a_restart() {
     let deployment = Deployment::start_with(false).await;
     deployment.gate("1.1.0", "1.0.0").await;
@@ -595,7 +593,6 @@ async fn a_waiting_execution_finishes_after_a_restart() {
 /// Panics when an admission is still held while the park is unacknowledged,
 /// or the execution does not wait and then pass.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn a_parked_execution_releases_compute_before_its_park_is_acknowledged() {
     const ONE: LaneLimits = LaneLimits {
         workspaces: 1,
@@ -671,7 +668,6 @@ async fn a_parked_execution_releases_compute_before_its_park_is_acknowledged() {
 /// Panics when the execution does not resume onto `lint` or does not time
 /// out by its admission deadline.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn a_resumed_execution_keeps_its_admission_deadline() {
     const DEADLINE: Duration = Duration::from_secs(10);
     let deployment = Deployment::start_limited(limits(DEADLINE)).await;

@@ -7,7 +7,6 @@ use std::time::Instant;
 use chrono::{SubsecRound, Utc};
 use vala_verify::blocks::{EngineError, conform};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::Attribution;
 use wyrd_spec::card::repository::RepositoryRemote;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, CardUid, RepositoryId, SlotName};
@@ -130,10 +129,9 @@ impl VerificationControl<'_> {
         let now = Utc::now().trunc_subsecs(6);
         if !fresh.is_empty() {
             let deadline = Instant::now() + self.state.settings.limits.timeout / 2;
-            let attribution = Attribution::new(caller.principal.id, caller.principal.id);
             let accepted = custody
                 .accept(
-                    attribution,
+                    caller.attribution(),
                     (source, &request.input),
                     &published,
                     (&fresh, now),

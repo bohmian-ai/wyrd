@@ -17,7 +17,10 @@ use flate2::write::GzEncoder;
 use serde_json::{Value, json};
 use sha1::{Digest as _, Sha1};
 use uuid::Uuid;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_loader::{build_declaration_input, load};
+use wyrd_runtime::Permission;
 use wyrd_testing::github::{GithubAppMock, PullRequest};
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
@@ -27,12 +30,24 @@ use super::pg_github_pull_requests::install;
 const REPOSITORY: u64 = 4242;
 /// The connected installation.
 const INSTALLATION: u64 = 101;
+/// The role invoking the gateway model.
+const MODEL_ROLE: &str = "pr_review_model";
+/// The role invoking Agent tools.
+const TOOL_ROLE: &str = "pr_review_tools";
 /// The reviewed pull request.
 const PR: u64 = 7;
 /// The Repository binding `pr-review` to its pull requests.
 const POLICY: &str = "apiVersion: wyrd/v1\nkind: Repository\nmetadata:\n  name: policy\n  version: 1.0.0\nspec:\n  repository_id: \"4242\"\n  verified_by:\n    - verifier: ./pr-review.yaml\n      runs_on: {kind: pull_request}\n";
 /// A queued Verifier extracting the pull request and requiring a change.
 const REVIEW: &str = "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: pr-review\n  version: 1.0.0\nspec:\n  description: The pull request changes source.\n  steps:\n    - id: pr\n      action: {kind: extract, extractor: pull_request}\n      requirements:\n        - id: changes\n          statement: The reviewed change touches a file\n          check: {kind: assert, path: steps.pr.output.changes.files, operator: is_non_empty}\n";
+/// [`POLICY`] binding [`AGENT_REVIEW`] instead.
+const AGENT_POLICY: &str = "apiVersion: wyrd/v1\nkind: Repository\nmetadata:\n  name: policy\n  version: 1.0.0\nspec:\n  repository_id: \"4242\"\n  verified_by:\n    - verifier: ./agent-review.yaml\n      runs_on: {kind: pull_request}\n";
+/// A queued Verifier whose Agent reads the extraction twice: `pr`,
+/// `changes` and `context` as Prompt values, and the whole output mounted
+/// as `/inputs/pr.json`.
+const AGENT_REVIEW: &str = "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: agent-review\n  version: 1.0.0\nspec:\n  description: An Agent reviews the pull request.\n  steps:\n    - id: pr\n      action: {kind: extract, extractor: pull_request}\n    - id: review\n      depends_on: [pr]\n      action:\n        kind: agent\n        agent: ./reviewer.yaml\n        inputs: {pr: steps.pr.output.pr, changes: steps.pr.output.changes, context: steps.pr.output.context}\n        workspace: {/inputs/pr.json: steps.pr.output}\n  requirements:\n    - id: reviewed\n      statement: The Agent answered\n      check: {kind: assert, path: steps.review.output, operator: is_non_empty}\n";
+/// The reviewing Agent.
+const REVIEWER: &str = "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: reviewer\n  version: 1.0.0\nspec:\n  execution_route: {kind: wyrd_gateway, deployment: openai}\n  tool_names: [fs.read]\n  run_config: {max_iterations: 3}\n  prompt:\n    provider: openai\n    model: gpt-test\n    messages:\n      - role: user\n        content: \"Review pull request {{pr}} changing {{changes}} in {{context}}; the whole extraction is /inputs/pr.json.\"\n";
 
 /// Declares `lookupUser`.
 const USER: &[u8] = b"export function lookupUser(id: string): string {\n  return id;\n}\n";
@@ -89,25 +104,30 @@ struct Deployment {
     mock: GithubAppMock,
     /// Wyrd, running queued work.
     server: WyrdTestServer,
+    /// The gateway's model provider.
+    model: MockServer,
     /// The declaring editor's JWT.
     jwt: String,
 }
 
 impl Deployment {
-    /// Start Wyrd with its Verifier runtime, connect the tenant through
-    /// GitHub's install page, declare [`POLICY`], and serve `main` at `c…`.
+    /// Start Wyrd with its Verifier runtime and a gateway model, connect
+    /// the tenant through GitHub's install page, declare `cards` (whose
+    /// `policy.yaml` is the Repository), and serve `main` at `c…`.
     ///
     /// # Panics
     /// Panics when a step fails.
-    async fn start() -> Self {
+    async fn start(cards: &[(&str, &str)]) -> Self {
         let mock = GithubAppMock::start().expect("the GitHub mock starts");
         mock.add_installation(INSTALLATION, &[(REPOSITORY, "acme/policy")]);
         mock.add_user("octo", &[INSTALLATION]);
         mock.sign_in("octo");
         mock.install_target(INSTALLATION);
+        let model = MockServer::start().await;
         let server = WyrdTestServer::builder()
             .with_github_app_for_test(&mock)
             .with_verification_runtime_for_test()
+            .with_gateway_provider_root_for_test(model.uri().parse().expect("model URL parses"))
             .start_bound()
             .await
             .expect("bound test server starts");
@@ -119,26 +139,42 @@ impl Deployment {
             "github_admin",
         )
         .await;
+        server
+            .deploy_gateway_model_for_test("gpt-test", MODEL_ROLE)
+            .await
+            .expect("the model deploys");
+        server
+            .seed_role(TOOL_ROLE, &[Permission::tool_invoke_any()])
+            .await
+            .expect("the tool role seeds");
         let Bootstrap::User { jwt, .. } = server
-            .bootstrap_user("pull-request-editor", &["editor"])
+            .bootstrap_user("pull-request-editor", &["editor", MODEL_ROLE, TOOL_ROLE])
             .await
             .expect("editor bootstraps")
         else {
             panic!("user bootstrap returned a non-user principal");
         };
-        let deployment = Self { mock, server, jwt };
-        deployment.declare().await;
+        let deployment = Self {
+            mock,
+            server,
+            model,
+            jwt,
+        };
+        deployment
+            .declare(cards, "pull-request-extraction-policy")
+            .await;
         deployment.serve_main();
         deployment
     }
 
-    /// Declare [`POLICY`] binding [`REVIEW`].
+    /// Declare `cards`, whose `policy.yaml` is the Repository, under
+    /// idempotency `key`.
     ///
     /// # Panics
     /// Panics when the declaration is refused.
-    async fn declare(&self) {
+    async fn declare(&self, cards: &[(&str, &str)], key: &str) {
         let dir = tempfile::tempdir().expect("checkout creates");
-        for (name, contents) in [("pr-review.yaml", REVIEW), ("policy.yaml", POLICY)] {
+        for (name, contents) in cards {
             std::fs::write(dir.path().join(name), contents).expect("card file writes");
         }
         let input = build_declaration_input(load(&dir.path().join("policy.yaml")).expect("loads"))
@@ -148,7 +184,7 @@ impl Deployment {
             .method(Method::POST)
             .uri("/v1/cards")
             .header(header::CONTENT_TYPE, "application/json")
-            .header("Idempotency-Key", "pull-request-extraction-policy")
+            .header("Idempotency-Key", key)
             .body(Body::from(body.to_string()))
             .expect("request builds");
         let response = self
@@ -351,7 +387,8 @@ impl Deployment {
 /// Panics when an extraction differs.
 #[tokio::test(flavor = "multi_thread")]
 async fn successive_heads_extract_the_full_then_the_incremental_change() {
-    let deployment = Deployment::start().await;
+    let deployment =
+        Deployment::start(&[("pr-review.yaml", REVIEW), ("policy.yaml", POLICY)]).await;
     deployment.head(&sha('a'), &sha('8'), HANDLER_A);
     deployment.compare(&sha('c'), &sha('a'), &sha('c'), HANDLER_A, PATCH_A);
 
@@ -412,5 +449,116 @@ async fn successive_heads_extract_the_full_then_the_incremental_change() {
     assert_eq!(
         extraction["review"]["full_pr"]["files"][0]["before"]["text"],
         std::str::from_utf8(HANDLER).expect("utf-8")
+    );
+}
+
+/// A model answer calling `fs.read` on `/inputs/pr.json`, then a final
+/// answer.
+async fn reads_the_workspace(model: &MockServer) {
+    let answer = |message: Value, finish: &str| {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-review", "object": "chat.completion", "created": 1, "model": "gpt-test",
+            "choices": [{"index": 0, "finish_reason": finish, "message": message}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }))
+    };
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(answer(
+            json!({"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_read", "type": "function",
+                "function": {"name": "fs_read", "arguments": "{\"path\":\"/inputs/pr.json\"}"}}]}),
+            "tool_calls",
+        ))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(model)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(answer(
+            json!({"role": "assistant", "content": "The handler trims the id."}),
+            "stop",
+        ))
+        .mount(model)
+        .await;
+}
+
+/// A normal Agent consumes one extraction twice: its Prompt receives the
+/// pinned `pr`, active `changes` with the exact head source, and `context`,
+/// and its workspace mounts the whole same output as JSON. GitHub is
+/// compared once for both consumers.
+///
+/// # Panics
+/// Panics when the Agent does not see the exact source in both, or the
+/// pull request is acquired again.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_agent_reads_the_extraction_as_prompt_values_and_workspace_json() {
+    let deployment = Deployment::start(&[
+        ("agent-review.yaml", AGENT_REVIEW),
+        ("reviewer.yaml", REVIEWER),
+        ("policy.yaml", AGENT_POLICY),
+    ])
+    .await;
+    reads_the_workspace(&deployment.model).await;
+    deployment.head(&sha('a'), &sha('8'), HANDLER_A);
+    deployment.compare(&sha('c'), &sha('a'), &sha('c'), HANDLER_A, PATCH_A);
+
+    let execution = deployment.review(&sha('a'), "opened").await;
+    let extraction = deployment.extraction(execution).await;
+    let details = deployment
+        .get(&format!("/v1/verification/executions/{execution}/details"))
+        .await;
+    assert_eq!(details["outcome"]["verdict"], "passed", "{details}");
+
+    let changed_line = "lookupUser(id.trim());";
+    let requests = deployment
+        .model
+        .received_requests()
+        .await
+        .expect("requests are recorded");
+    assert_eq!(requests.len(), 2, "one tool call, then the answer");
+    let first: Value = serde_json::from_slice(&requests[0].body).expect("JSON");
+    let prompt = first["messages"][0]["content"]
+        .as_str()
+        .expect("the Prompt renders to text");
+    for bound in [changed_line, &blob(HANDLER_A), &sha('a'), "\"number\":7"] {
+        assert!(prompt.contains(bound), "{bound} in the Prompt: {prompt}");
+    }
+    assert!(
+        !prompt.contains("first_review"),
+        "the unbound review section stays out of the Prompt: {prompt}"
+    );
+    let second: Value = serde_json::from_slice(&requests[1].body).expect("JSON");
+    let read = second["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .and_then(|message| message["content"].as_str())
+        .expect("the tool result is returned to the model");
+    let read: Value = serde_json::from_str(read).expect("fs.read answers JSON");
+    assert!(read.get("next").is_none_or(Value::is_null), "{read}");
+    let mounted: Vec<&str> = read["units"]
+        .as_array()
+        .expect("lines")
+        .iter()
+        .map(|unit| unit["text"].as_str().expect("line text"))
+        .collect();
+    assert_eq!(
+        serde_json::from_str::<Value>(&mounted.join("\n")).expect("the mount is JSON"),
+        extraction,
+        "/inputs/pr.json is the whole extraction"
+    );
+    assert_eq!(extraction["review"]["fallback_reason"], "first_review");
+    assert_eq!(
+        deployment
+            .mock
+            .repository_reads(REPOSITORY)
+            .iter()
+            .filter(|read| read.starts_with("/compare/"))
+            .count(),
+        1,
+        "both consumers share one acquisition"
     );
 }

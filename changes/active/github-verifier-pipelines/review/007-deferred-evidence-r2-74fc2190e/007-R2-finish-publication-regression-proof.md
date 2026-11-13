@@ -64,3 +64,27 @@ No new test-only production hooks, dependencies, public APIs, PostgreSQL tables/
 Use `mise`, the repository-managed `scripts/postgres/with-test-postgres.sh` lifecycle and `db:migrate:all:inner`. Run exact selectors for the changed Artifact publication case, the existing sequential publication/replay case, the new delegated-row case and the focused deterministic receipt test. Confirm actual test names/counts and record exact commands; a zero-test invocation is not proof. Run only the narrow affected regression cases and required formatting/lints for the write set; broad aggregates/full user-journey suites belong to change review. No need to repeat all four unchanged lifecycle cases solely for test-assertion edits.
 
 Docker was inaccessible in this review, so connected tests were not freshly executed. This environment limitation is not the finding: the missing assertions are absent from candidate source. Record implementation/source/fresh runtime evidence separately and execute the focused connected cases in an environment with the existing Postgres lifecycle. No commit, push or Git configuration is authorized by this task.
+
+## Obligations
+
+| ID | Promise | Source | Planned proof |
+|---|---|---|---|
+| FIND-007-6 | Every Artifact refusal asserts its stable code and status; the valid file is still accepted | this file, FIND-007-6 | `pg_deferred_evidence::artifact_evidence_is_admitted_before_it_is_accepted` |
+| FIND-007-3 | A publication whose offer lost to a canonical acceptance answers replayed, the first-accepted time and the canonical identity, through the production receipt logic | this file, FIND-007-3 | unit test on the extracted production `receipt` |
+| FIND-007-1 | A publisher with `verifier:run` but without Artifact read is refused before custody; the valid file then publishes `accepted` and the waiting consumer reads it and passes | this file, FIND-007-1 | `artifact_evidence_is_admitted_before_it_is_accepted` |
+| FIND-007-2 | Delegated publication's retained row names effective subject and outer actor | this file, FIND-007-2 | Rejected by the maintainer; see Evidence |
+
+## Evidence
+
+| Obligation and required cases | Implementation evidence | Proof location | Verification evidence | Result |
+|---|---|---|---|---|
+| FIND-007-6: format, path, version → `WYRD_VERIFICATION_400_INPUT_INVALID`/400; size → `WYRD_VERIFICATION_413_INPUT_TOO_LARGE`/413; valid file `accepted` | Refusal matrix asserts `refused["code"]` and status; wording no longer checked | `pg_deferred_evidence.rs` `artifact_evidence_is_admitted_before_it_is_accepted` | exact selector under `with-test-postgres.sh`: 1 passed | PASS |
+| FIND-007-3: losing offer at a later `now` → `Replayed`, first `recorded_at`; identity is the held acceptance's; a fresh acceptance → `Accepted` at `now` | `publish_evidence` answers status and time through `receipt` (`service/evidence.rs`), the only receipt logic | `service/evidence.rs` `tests::a_lost_race_replays_the_first_acceptance` | `cargo nextest run -p wyrd-server --features test-support --lib -E 'test(=components::verification::service::evidence::tests::a_lost_race_replays_the_first_acceptance)'`: 1 passed. Real custody and sequential replay: `publication_is_matched_retained_and_resumes_the_waiting_execution`, `unacknowledged_publication_is_unavailable_and_its_retry_resumes` pass. RED: none; the source correction predates the test (R1), recorded as a process exception | PASS |
+| FIND-007-1: run-only publisher refused before custody; format/path/version/size refusals retained; valid publish `accepted` (nothing retained); same execution waits on `report`, resumes and passes by extracting the Artifact | Test binds `report-gate` (deferred CSV `report`, `max_bytes: 64`, extract step) to the Repository; seeds a `verifier:run`-only role | `pg_deferred_evidence.rs` `artifact_evidence_is_admitted_before_it_is_accepted` | exact selector: 1 passed; module `pg_deferred_evidence`: 9/9 passed | PASS |
+| FIND-007-2 | Not implemented: rejected | — | — | REJECTED |
+
+The Card-read denial on the publish path answers `WYRD_VERIFICATION_400_INPUT_INVALID` (the admission refusal names the RBAC denial in `reason`), the same mapping every slot admission refusal takes. The test asserts that code.
+
+FIND-007-2 rejection (maintainer decision): a delegated actor token is rooted at a Card, and `authorize_run` requires a scoped caller's root to cover the Repository subject. No production caller or fixture credentials a Repository-rooted delegation, so no normal delegated publication exists to test. The source fix passes `caller.attribution()`, the existing owner its siblings already test, to `DeferredEvidence::accept`; that suffices.
+
+Commands: `mise exec -- scripts/postgres/with-test-postgres.sh` with `db:migrate:all:inner` and the exact nextest selectors above; `cargo fmt`; `cargo clippy -p wyrd-server --features test-support --all-targets -D warnings` (clean); `git diff --check` (clean).

@@ -1095,7 +1095,7 @@ impl From<StateError> for WyrdError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1110,14 +1110,14 @@ mod tests {
     use wyrd_spec::verification::execution::{
         ExecutedOutcome, Publication, PublicationContent, PublicationKind,
     };
-    use wyrd_spec::verification::state::ExecutionState;
+    use wyrd_spec::verification::state::{ApprovalOccurrence, ExecutionState};
     use wyrd_spec::verification::{TaskId, VerificationVerdict};
 
     use tokio_util::sync::CancellationToken;
 
     use super::{
         Decision, PublicationAcceptance, PublicationBudget, PublicationCall, RunState, StateError,
-        StateRow,
+        StateRow, approval_id,
     };
     use crate::components::gateway::recording::TableGate;
     use crate::scribe_outbox::{ScribeSink, ScribeTable};
@@ -1221,6 +1221,51 @@ mod tests {
             .filter(|frame| frame.table == ScribeTable::ExecutionEvents.fqn())
             .map(|frame| String::from_utf8_lossy(&frame.ipc).into_owned())
             .collect()
+    }
+
+    /// Proves an approval occurrence keeps its id across attempts and that
+    /// another step, fanout item, repeat iteration, or execution never shares
+    /// it, including item zero against no fanout.
+    ///
+    /// # Panics
+    /// Panics when two distinct occurrences share an id or one occurrence
+    /// derives two.
+    #[test]
+    fn each_approval_occurrence_has_its_own_stable_id() {
+        let execution = ExecutionId::new_v7();
+        let at = |step: &str, item: Option<u32>, iteration: Option<u32>| ApprovalOccurrence {
+            step: task(step),
+            item,
+            iteration,
+            message: "Ship?".to_owned(),
+        };
+        let occurrences = [
+            at("sign-off", None, None),
+            at("sign-off", Some(0), None),
+            at("sign-off", Some(1), None),
+            at("sign-off", None, Some(0)),
+            at("sign-off", Some(0), Some(1)),
+            at("review", None, None),
+        ];
+        let ids: BTreeSet<_> = occurrences
+            .iter()
+            .map(|occurrence| approval_id(execution, occurrence))
+            .collect();
+        assert_eq!(
+            ids.len(),
+            occurrences.len(),
+            "every occurrence has its own id"
+        );
+        assert_eq!(
+            approval_id(execution, &occurrences[0]),
+            approval_id(execution, &occurrences[0]),
+            "an occurrence keeps its id across attempts"
+        );
+        assert_ne!(
+            approval_id(execution, &occurrences[0]),
+            approval_id(ExecutionId::new_v7(), &occurrences[0]),
+            "another execution never shares an occurrence id"
+        );
     }
 
     /// Proves an engine transition completes from memory while Scribe holds

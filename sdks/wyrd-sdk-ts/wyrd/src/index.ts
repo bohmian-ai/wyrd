@@ -17,6 +17,11 @@ import {
 import type {
   AlterTableRequest as AlterTableRequestWire,
   ArtifactInventoryResponse,
+  ApprovalDecision,
+  ApprovalId,
+  ApprovalOccurrenceState,
+  ApprovalReceipt,
+  ApprovalStatus,
   ArtifactSpec,
   BifrostTableDescription as TableDescriptionWire,
   BifrostTableEntry as TableEntry,
@@ -185,6 +190,11 @@ export interface CancelRunningQueryResult {
 export type { WyrdErrorCode } from "./error-codes.js";
 /** Wire contracts generated from the `wyrd-spec` Rust types, under their SDK names. */
 export type {
+  ApprovalDecision,
+  ApprovalId,
+  ApprovalOccurrenceState,
+  ApprovalReceipt,
+  ApprovalStatus,
   ArtifactInventoryResponse,
   CardDeclarationOutcome,
   CardSummary,
@@ -2762,6 +2772,26 @@ export namespace verify {
      */
     async cancel(): Promise<CancelExecutionResponse> {
       return lifecycleValue(await this.#native.cancel());
+    }
+
+    /**
+     * Approve or reject a pending approval occurrence, one of
+     * {@link Execution.status}'s `approvals`, and return its receipt once the
+     * decision is durable; the same execution then continues. The same
+     * decision and reason again return the same receipt.
+     *
+     * @param approvalId - The pending occurrence's `approval_id`.
+     * @param decision - `approved` or `rejected`.
+     * @param reason - Why, recorded with the decision.
+     * @returns The receipt: `approval_id`, `status`, `actor_id`, `decided_at`, `reason`.
+     * @throws {@link WyrdError} `WYRD_PERMISSION_403_DENIED_RBAC` without
+     * `verifier:approve` on the execution's Verifier or read authority over its
+     * subject; `WYRD_VERIFICATION_404_APPROVAL_NOT_FOUND` for an occurrence the
+     * execution never reached; `WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING` once
+     * another decision was accepted or the execution ended or expired.
+     */
+    async decide(approvalId: ApprovalId, decision: ApprovalDecision, reason?: string): Promise<ApprovalReceipt> {
+      return lifecycleValue(await this.#native.decide(approvalId, decision, reason));
     }
 
     /**

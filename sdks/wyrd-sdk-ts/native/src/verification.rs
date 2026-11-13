@@ -1,5 +1,5 @@
 //! Thin napi projection of Verifier inputs, submissions, execution
-//! handles, and deferred evidence publication.
+//! handles, approval decisions, and deferred evidence publication.
 //!
 //! Slot projection, file pinning, routing, retry keys, and polling stay in
 //! `wyrd_client::verify`; this module only converts Node values into the
@@ -12,11 +12,11 @@ use napi::bindgen_prelude::{Buffer, PromiseRaw};
 use napi_derive::napi;
 use serde_json::{Value, json};
 use wyrd_client::verify::{
-    ArtifactRef, Evidence, Execution, ExecutionPageQuery, File, Input, Inputs, PublicationName,
-    PublicationSelector, Submission, TaskId,
+    ApprovalDecision, ArtifactRef, Evidence, Execution, ExecutionPageQuery, File, Input, Inputs,
+    PublicationName, PublicationSelector, Submission, TaskId,
 };
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::ExecutionId;
+use wyrd_spec::ids::{ApprovalId, ExecutionId};
 
 use crate::cards::parse_card_ref;
 use crate::client::NativeWyrdClient;
@@ -345,6 +345,43 @@ impl NativeExecution {
         let execution = self.execution.clone();
         crate::trace::spawn(env, async move {
             NativeLifecycleResult::outcome(execution.cancel().await)
+        })
+    }
+
+    /// Approves or rejects the pending approval occurrence `approval_id`
+    /// and resolves to its durable receipt; the same decision and reason
+    /// replay it.
+    ///
+    /// # Errors
+    /// Returns a napi error only when the receipt cannot be projected; an
+    /// invalid ID or decision and every server refusal are returned in
+    /// [`NativeLifecycleResult`].
+    #[napi]
+    pub fn decide<'env>(
+        &self,
+        env: &'env Env,
+        approval_id: String,
+        decision: String,
+        reason: Option<String>,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let execution = self.execution.clone();
+        let parsed = approval_id
+            .parse::<ApprovalId>()
+            .map_err(|error| WyrdError::Validation {
+                message: format!("approval ID is invalid: {error}"),
+                details: json!({ "field": "approval_id" }),
+            })
+            .and_then(|id| {
+                Ok((
+                    id,
+                    parsed::<ApprovalDecision>("decision", &json!(decision).to_string())?,
+                ))
+            });
+        crate::trace::spawn(env, async move {
+            NativeLifecycleResult::outcome(match parsed {
+                Ok((id, decision)) => execution.decide(id, decision, reason).await,
+                Err(error) => Err(error),
+            })
         })
     }
 }

@@ -101,6 +101,8 @@ WIRE_ROOTS = [
     "VerificationExecutionState",
     "VerificationResult",
     "PublishEvidenceResponse",
+    "ApprovalDecision",
+    "ApprovalReceipt",
 ]
 
 # Wire roots the SDK sends. Every definition reachable from one of these or

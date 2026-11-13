@@ -89,10 +89,10 @@ use wyrd_spec::vala::api::{
 };
 use wyrd_spec::vala::trace::SpanRecord;
 use wyrd_spec::verification::execution::{
-    CancelExecutionResponse, EnqueueVerificationResponse, EvidencePlanRequest,
-    EvidencePlanResponse, ExecutionPageQuery, InvocationPage, Publication, PublicationPage,
-    PublicationSelector, PublishEvidenceResponse, VerificationDetails, VerificationExecutionState,
-    VerificationRequest, VerificationResult,
+    ApprovalDecision, ApprovalReceipt, CancelExecutionResponse, EnqueueVerificationResponse,
+    EvidencePlanRequest, EvidencePlanResponse, ExecutionPageQuery, InvocationPage, Publication,
+    PublicationPage, PublicationSelector, PublishEvidenceResponse, VerificationDetails,
+    VerificationExecutionState, VerificationRequest, VerificationResult,
 };
 use wyrd_spec::verification::{ExecutionPlan, VerificationBindingStatus};
 
@@ -321,6 +321,8 @@ fn contracts() -> Value {
         VerificationResult,
         VerificationExecutionState,
         PublishEvidenceResponse,
+        ApprovalDecision,
+        ApprovalReceipt,
         InvocationPage,
         PublicationPage,
         Publication,

@@ -22,7 +22,7 @@ export type AccountAuthentication = "password" | "sso";
 /**
  * A data-producing step action. Actions read and compute only.
  */
-export type Action = ActionExtract | ActionAgent | ActionCode;
+export type Action = ActionExtract | ActionAgent | ActionCode | ActionApproval;
 
 /**
  * Invoke an Agent; its output follows the Prompt's response schema.
@@ -42,6 +42,20 @@ export interface ActionAgent {
    * destination, in step and check position alike.
    */
   readonly workspace?: Readonly<Record<string, WorkspaceSource>>;
+}
+
+/**
+ * Wait for a person to approve or reject this occurrence. The step's
+ * output is the decision receipt; a rejection is data, not a failure.
+ * Pending approvals share the execution's own expiration. A Verifier
+ * declaring one runs only as queued work.
+ */
+export interface ActionApproval {
+  readonly kind: "approval";
+  /**
+   * What the approver is asked, shown with the pending occurrence.
+   */
+  readonly message: string;
 }
 
 /**
@@ -175,6 +189,102 @@ export type AnnotationValue = string;
  * Canonical Wyrd API version.
  */
 export type ApiVersion = string;
+
+/**
+ * A person's decision on one pending approval.
+ */
+export type ApprovalDecision = "approved" | "rejected";
+
+/**
+ * Server-issued identity of one approval occurrence.
+ *
+ * Derived from the execution and the approval step's logical
+ * occurrence (step, fanout item, repeat iteration), so every attempt
+ * and recovery of the same execution reaching the same occurrence names
+ * the same approval, a fanout item or repeat iteration names another,
+ * and another execution, such as a newer pull request head, never
+ * shares one.
+ */
+export type ApprovalId = string;
+
+/**
+ * One approval occurrence of an execution, as inspection reports it.
+ *
+ * It expires with the execution itself; there is no per-approval deadline.
+ */
+export interface ApprovalOccurrenceState {
+  /**
+   * The principal who decided, once decided.
+   */
+  readonly actor_id: PrincipalId | null;
+  /**
+   * The identity a decision names.
+   */
+  readonly approval_id: ApprovalId;
+  /**
+   * When the decision was accepted, once decided.
+   */
+  readonly decided_at: string | null;
+  /**
+   * Zero-based fanout item, for a fanout step.
+   */
+  readonly item?: number | null;
+  /**
+   * Zero-based repeat iteration, for a repeating step.
+   */
+  readonly iteration?: number | null;
+  /**
+   * What the approver is asked.
+   */
+  readonly message: string;
+  /**
+   * The decider's stated reason.
+   */
+  readonly reason: string | null;
+  /**
+   * Where the occurrence stands.
+   */
+  readonly status: ApprovalStatus;
+  /**
+   * The approval step.
+   */
+  readonly step_id: TaskId;
+}
+
+/**
+ * The decision receipt of one approval occurrence, and an approval step's
+ * output.
+ *
+ * Returned only once the decision is durably accepted. `actor_id` and
+ * `decided_at` are absent while pending and for an expired occurrence.
+ */
+export interface ApprovalReceipt {
+  /**
+   * The principal who decided.
+   */
+  readonly actor_id: PrincipalId | null;
+  /**
+   * The occurrence decided.
+   */
+  readonly approval_id: ApprovalId;
+  /**
+   * When the decision was accepted.
+   */
+  readonly decided_at: string | null;
+  /**
+   * The decider's stated reason.
+   */
+  readonly reason: string | null;
+  /**
+   * `approved` or `rejected` once decided.
+   */
+  readonly status: ApprovalStatus;
+}
+
+/**
+ * Where one approval occurrence stands.
+ */
+export type ApprovalStatus = "pending" | "approved" | "rejected" | "expired";
 
 /**
  * Arrow serialization formats accepted by DataCard.
@@ -7878,6 +7988,11 @@ export interface VerificationError {
  * briefly lack a visible result.
  */
 export interface VerificationExecutionState {
+  /**
+   * Every approval occurrence the execution reached, pending or
+   * decided, in step order; empty when it reached none.
+   */
+  readonly approvals?: readonly ApprovalOccurrenceState[];
   /**
    * Every Operator dispatch of a failed background binding execution or a
    * changed group verdict, in identity order; empty otherwise. Delivery

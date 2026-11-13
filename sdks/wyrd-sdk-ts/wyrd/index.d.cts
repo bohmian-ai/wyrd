@@ -829,6 +829,17 @@ export declare class NativeExecution {
    * refusals are returned in [`NativeLifecycleResult`].
    */
   cancel(): Promise<NativeLifecycleResult>
+  /**
+   * Approves or rejects the pending approval occurrence `approval_id`
+   * and resolves to its durable receipt; the same decision and reason
+   * replay it.
+   *
+   * # Errors
+   * Returns a napi error only when the receipt cannot be projected; an
+   * invalid ID or decision and every server refusal are returned in
+   * [`NativeLifecycleResult`].
+   */
+  decide(approvalId: string, decision: string, reason?: string | undefined | null): Promise<NativeLifecycleResult>
 }
 
 /**

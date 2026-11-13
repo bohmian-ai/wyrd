@@ -119,8 +119,11 @@ and TypeScript typed read projections of the extraction output, and SDK
 authoring helpers for `extractor: pull_request`. The action stays authorable in
 Card YAML and JSON through the shared loader and declaration route, and the
 regenerated TypeScript wire types carry only the action field. Inspection uses
-the existing execution details on HTTP, MCP and CLI, where the step output is
-ordinary JSON; this task adds no inspection-specific type or command.
+the existing execution details on HTTP and MCP, where the step output is
+ordinary JSON; this task adds no inspection-specific type or command. The CLI
+has no execution-details read (`wyrd execution` reads status, invocations and
+publications), so CLI inspection of step output is not part of this task;
+AC-011's CLI wording for the extraction routes to the spec owner.
 
 The output shape is server-owned. `wyrd-spec` holds only what authors write:
 the `extractor` field of the `extract` action and its closed `Extractor`
@@ -219,6 +222,6 @@ JSON fixture alone cannot prove any predecessor handoff in this journey.
 | X8 | REQ-007, REQ-017; Agreed transformation ¶3 | Recovery reuses the accepted extraction exactly, with source and context intact after library context expiry; unpersisted extraction may repeat | Tier 2 restart after cache expiry |
 | X9 | REQ-007; AC-004 | Missing required source, omissions and model-input limit failures stay honest; none turn a missing or failed review into passed | Tier 2 failure cases |
 | X10 | Revision — metadata batching | `CodeReviewMetadata` group-commits independent writes in short tenant-scoped transactions: concurrent writes share commits, a lone write commits at once, each reply follows its commit, failed batches fail their callers with existing semantics and no per-operation fallback, tenants never share a batch, pending work and workers are bounded, no transaction or lock spans GitHub/object IO; batch sizes recorded in tracing | `pg_code_review_cache` tests over real Postgres |
-| X11 | Output, consumers and surfaces; AC-011; Revision — no client projection | Action schema with `extractor` in the regenerated wire types, stable errors; the extraction and `review.previous` are inspectable as ordinary step-output JSON through existing execution details on HTTP, MCP and CLI; no SDK typed read or authoring helper; focused input/workspace guide | `codegen:check`; inspection journey over existing details surfaces; docs review |
+| X11 | Output, consumers and surfaces; AC-011; Revision — no client projection | Action schema with `extractor` in the regenerated wire types, stable errors; the extraction and `review.previous` are inspectable as ordinary step-output JSON through the existing execution details on HTTP and MCP (no CLI details read exists; see the revision); no SDK typed read or authoring helper; focused input/workspace guide | `codegen:check`; inspection journey over existing details surfaces; docs review |
 | X12 | Agreed transformation ¶4 | `wyrd-design.md` Verifier / Agents, tools and workspaces and `bifrost-design.md` Durability/Ingest state typed extraction and source custody | content review |
 | X13 | Connected proof ¶3; INV-002 | New tests sit in existing targets; contract, dependency and tenant checks pass | `codegen:check`, `check:deps`, `check:tenant-isolation` |

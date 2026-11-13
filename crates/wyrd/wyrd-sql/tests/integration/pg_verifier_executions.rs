@@ -4721,6 +4721,56 @@ async fn pull_request_baseline_is_the_latest_extracted_review_under_the_same_pol
     );
 }
 
+/// Another tenant's extracted review is never a baseline: tenant B reviews
+/// the same pull request of the same repository id under a Verifier of the
+/// same name after tenant A completed one, and starts from a first review.
+///
+/// # Panics
+/// Panics when tenant B's baseline sees tenant A's history.
+#[tokio::test]
+async fn pull_request_baseline_is_tenant_isolated() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let other = fixture
+        .seed_additional_tenant("pull-request-baseline-other")
+        .await
+        .expect("second tenant seeds");
+    let queue = VerifierExecutionQueue::default();
+    let tenant_a = actor(fixture.data_tenant_id());
+    let mut conn = fixture.tenant_conn().await.expect("tenant A connection");
+    let (_, bindings) = repository_with_bindings(&mut conn, &tenant_a, 1).await;
+    let targets = pr_targets(&mut conn, tenant_a.id, &bindings).await;
+    let reviewed = running_generation(&queue, &mut conn, "a", &targets)
+        .await
+        .remove(0);
+    queue
+        .complete(
+            &mut conn,
+            &completion(&reviewed, VerificationVerdict::Passed, true),
+        )
+        .await
+        .expect("tenant A's extracted review completes");
+    conn.commit().await.expect("tenant A commits");
+
+    let tenant_b = actor(other);
+    let mut foreign = fixture
+        .tenant_conn_for(other)
+        .await
+        .expect("tenant B connection");
+    let (_, bindings) = repository_with_bindings(&mut foreign, &tenant_b, 1).await;
+    let targets = pr_targets(&mut foreign, tenant_b.id, &bindings).await;
+    let next = running_generation(&queue, &mut foreign, "c", &targets)
+        .await
+        .remove(0);
+    assert_eq!(
+        queue
+            .pull_request_baseline(&mut foreign, next.lease.execution_id)
+            .await
+            .expect("baseline reads"),
+        PullRequestBaseline::FirstReview,
+        "tenant A's review is invisible to tenant B"
+    );
+}
+
 /// A completed review whose extraction failed is never a baseline, while a
 /// failed or inconclusive judgment after a successful extraction is: the
 /// baseline follows the extracted source, not the verdict.

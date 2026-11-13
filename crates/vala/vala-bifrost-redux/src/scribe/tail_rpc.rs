@@ -379,6 +379,13 @@ pub struct FetchLiveTailRequest {
     /// The query's filter planned over `required_fields`, which Scribe prunes
     /// memory batches by before projecting them; `None` keeps every batch.
     pub pruning: Option<crate::scan_sizing::BatchPruning>,
+    /// The outputs and exact filter Scribe evaluates over `required_fields`,
+    /// returning only those outputs for the rows the filter keeps; `None`
+    /// returns `required_fields` whole.
+    pub(crate) requirements: Option<crate::scribe::memtable::ReadRequirements>,
+    /// The querying session's pool, which reserves every buffer the read
+    /// allocates for the query rather than shares with its capture.
+    pub(crate) memory: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
 }
 
 /// One shallow, structural hot snapshot returned by a shard owner.
@@ -408,10 +415,10 @@ pub struct HotBatch {
 pub struct LiveTailBatches {
     /// Memory batches in capture order, not yet filtered.
     memtable: Vec<HotBatch>,
-    /// Accounting owners of `memtable`'s Arrow buffers, shared with the
-    /// retained capture so retirement cannot uncharge them while this read
-    /// holds them.
-    charges: Vec<Arc<crate::scribe::memory::RetainedArrowCharge>>,
+    /// Accounting owners of `memtable`'s Arrow buffers: charges shared with
+    /// the retained capture, so retirement cannot uncharge them while this
+    /// read holds them, and the query's reservation of what it allocated.
+    charges: crate::scribe::memtable::LiveReadOwners,
     /// Staged run paths in merge order.
     runs: Vec<PathBuf>,
     /// Lease keeping `runs` on disk, shared with the retained capture.
@@ -422,7 +429,7 @@ pub struct LiveTailBatches {
 /// owners, staged run paths, and the lease keeping those runs on disk.
 pub(crate) type LiveTailParts = (
     Vec<HotBatch>,
-    Vec<Arc<crate::scribe::memory::RetainedArrowCharge>>,
+    crate::scribe::memtable::LiveReadOwners,
     Vec<PathBuf>,
     Option<Arc<StagedSourceLease>>,
 );
@@ -435,7 +442,7 @@ impl LiveTailBatches {
     pub fn from_snapshot(memtable: Vec<HotBatch>) -> Self {
         Self {
             memtable,
-            charges: Vec::new(),
+            charges: crate::scribe::memtable::LiveReadOwners::default(),
             runs: Vec::new(),
             staged: None,
         }
@@ -965,6 +972,8 @@ impl FetchLiveTailService {
             &(request.start_partition..=request.end_partition),
             &request.required_fields,
             request.pruning.as_ref(),
+            request.requirements.as_ref(),
+            &request.memory,
         )?;
         Ok(LiveTailBatches {
             memtable: read
@@ -977,7 +986,7 @@ impl FetchLiveTailService {
                     statistics: readable.statistics,
                 })
                 .collect(),
-            charges: read.charges,
+            charges: read.owners,
             runs: read.runs,
             staged: read.lease,
         })
@@ -1468,6 +1477,8 @@ pub(crate) mod tests {
             super::TenantTableBinding::resolve((tenant, table)).expect("fixture binding resolves");
         let request = super::FetchLiveTailRequest {
             pruning: None,
+            requirements: None,
+            memory: crate::scribe::memtable::tests::unbounded_pool(),
             binding,
             target_stream: stream,
             query_id: uuid::Uuid::new_v4(),
@@ -1592,6 +1603,8 @@ pub(crate) mod tests {
             super::TenantTableBinding::resolve((tenant, table)).expect("fixture binding resolves");
         let request = super::FetchLiveTailRequest {
             pruning: None,
+            requirements: None,
+            memory: crate::scribe::memtable::tests::unbounded_pool(),
             binding,
             target_stream: stream,
             query_id: uuid::Uuid::new_v4(),

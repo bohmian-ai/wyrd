@@ -168,13 +168,15 @@ pub struct EvidenceTags {
 ///
 /// Supplies `value` for every Verifier subscribed to the deferred `input`
 /// of `repository` at `tags.commit`. A File must already be a completed
-/// upload from `POST /v1/verification/evidence`.
+/// upload from `POST /v1/verification/evidence`. The server resolves the
+/// `owner/name` slug among the tenant's connected repositories and answers
+/// with the stable identity it matched.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct PublishEvidenceRequest {
-    /// The connected repository the evidence is about.
-    pub repository: EvidenceRepository,
+    /// The connected repository the evidence is about, as `owner/name`.
+    pub repository: String,
     /// The source the evidence was produced from.
     pub tags: EvidenceTags,
     /// The deferred input slot name the evidence supplies.
@@ -207,7 +209,7 @@ pub struct PublishEvidenceResponse {
     /// The evidence identity; the same for the same source and content.
     #[cfg_attr(feature = "server", schema(value_type = String))]
     pub evidence_id: EvidenceId,
-    /// The connected repository.
+    /// The connected repository the slug resolved to.
     pub repository: EvidenceRepository,
     /// The matched source tags.
     pub tags: EvidenceTags,

@@ -8,8 +8,9 @@ use chrono::{SubsecRound, Utc};
 use vala_verify::blocks::{EngineError, conform};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Attribution;
+use wyrd_spec::card::repository::RepositoryRemote;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{CardName, CardUid, SlotName};
+use wyrd_spec::ids::{CardName, CardUid, RepositoryId, SlotName};
 use wyrd_spec::verification::execution::{
     EvidenceRepository, EvidenceStatus, InputDeclaration, PublishEvidenceRequest,
     PublishEvidenceResponse,
@@ -78,15 +79,16 @@ impl VerificationControl<'_> {
             return Err(invalid("a deferred input is JSON or media, never a trace"));
         }
         let tenant = caller.data_tenant_id;
-        let repository_id = &request.repository.repository_id;
-        let (host, _) = GithubConnections::new(self.state)
-            .verify_repository(
-                tenant,
-                Some(&request.repository.host),
-                Some(repository_id),
-                None,
-            )
+        let connections = GithubConnections::new(self.state);
+        let remote = RepositoryRemote {
+            host: connections.host()?,
+            full_name: request.repository.clone(),
+        };
+        let (host, access) = connections
+            .verify_repository(tenant, None, None, Some(&remote))
             .await?;
+        let repository_id = &RepositoryId::new(access.repository_id)
+            .map_err(|error| WyrdError::internal(error.to_string()))?;
         let source = EvidenceSource {
             host: &host,
             repository_id,

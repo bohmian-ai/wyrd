@@ -15,7 +15,12 @@ use uuid::Uuid;
 use wyrd_server::verification::RuntimeLimits;
 use wyrd_testing::github::PullRequest;
 
-use super::pg_github_pull_requests::{Deployment, REPOSITORY, UNSELECTED};
+use super::pg_github_pull_requests::{Deployment, REPOSITORY};
+
+/// The connected repository's slug.
+const SLUG: &str = "acme/policy";
+/// A repository the installation reaches that the tenant did not select.
+const UNSELECTED_SLUG: &str = "acme/other";
 
 /// A commit no pull request has opened yet.
 const C0: &str = "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0";
@@ -87,8 +92,7 @@ impl Deployment {
     /// Panics when the request cannot be served.
     async fn publish_ci(&self, commit: &str, value: Value) -> (StatusCode, Value) {
         self.publish(&publication(
-            &self.mock.host(),
-            REPOSITORY,
+            SLUG,
             commit,
             "ci",
             json!({"kind": "json", "value": value}),
@@ -157,9 +161,9 @@ impl Deployment {
 }
 
 /// A publish request body.
-fn publication(host: &str, repository: u64, commit: &str, input: &str, value: Value) -> Value {
+fn publication(repository: &str, commit: &str, input: &str, value: Value) -> Value {
     json!({
-        "repository": {"host": host, "repository_id": repository.to_string()},
+        "repository": repository,
         "tags": {"commit": commit},
         "input": input,
         "value": value,
@@ -201,25 +205,23 @@ async fn publication_is_matched_retained_and_resumes_the_waiting_execution() {
     assert_eq!(refused["code"], "WYRD_VERIFICATION_409_EVIDENCE_UNMATCHED");
 
     deployment.gate("1.1.0", "1.0.0").await;
-    let host = deployment.mock.host();
     let json_value = json!({"kind": "json", "value": {"status": "green"}});
     for (body, expected) in [
         (
-            publication(&host, REPOSITORY, "c0c0c0c", "ci", json_value.clone()),
+            publication(SLUG, "c0c0c0c", "ci", json_value.clone()),
             StatusCode::BAD_REQUEST,
         ),
         (
-            publication(&host, REPOSITORY, C0, "other", json_value.clone()),
+            publication(SLUG, C0, "other", json_value.clone()),
             StatusCode::CONFLICT,
         ),
         (
-            publication(&host, UNSELECTED, C0, "ci", json_value.clone()),
+            publication(UNSELECTED_SLUG, C0, "ci", json_value.clone()),
             StatusCode::FORBIDDEN,
         ),
         (
             publication(
-                &host,
-                REPOSITORY,
+                SLUG,
                 C0,
                 "ci",
                 json!({"kind": "file", "sha256": "ab".repeat(32), "size_bytes": 3, "format": "csv"}),
@@ -236,6 +238,11 @@ async fn publication_is_matched_retained_and_resumes_the_waiting_execution() {
     assert_eq!(receipt["status"], "accepted");
     assert_eq!(receipt["matched_subscriptions"], 1);
     assert_eq!(receipt["tags"]["commit"], C0);
+    assert_eq!(
+        receipt["repository"],
+        json!({"host": deployment.mock.host(), "repository_id": REPOSITORY.to_string()}),
+        "the slug resolves to the connected repository's stable identity"
+    );
     let (status, replay) = deployment.publish_ci(C0, json!({"status": "green"})).await;
     assert_eq!(status, StatusCode::OK, "{replay}");
     assert_eq!(replay["status"], "replayed");

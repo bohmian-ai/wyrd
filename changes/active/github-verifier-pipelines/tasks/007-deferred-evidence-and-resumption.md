@@ -52,6 +52,32 @@ Verifier ID, execution ID, group_id or retry key; tags are limited to commit.
 Internal consumer matching still uses accepted execution context. Git metadata
 grants no permission.
 
+### Revision — repository slug and source resolution
+
+Decided with the maintainer during implementation, following the convention of
+CI evidence uploaders such as Codecov and SonarCloud: the client sends a slug,
+the server resolves it. This replaces the request's `repository:
+{host, repository_id}`; the receipt still returns the resolved
+`{host, repository_id}`.
+
+- Wire: `POST /v1/verification/evidence/publish` takes `repository:
+  "owner/name"`. The server resolves the slug, ignoring case, among the
+  tenant's selected repositories on the configured host through the existing
+  `GithubConnections::verify_repository` remote path; an unselected or unknown
+  slug is `WYRD_GITHUB_403_REPOSITORY_INACCESSIBLE`. Matching and custody use
+  only the resolved stable id, so a later rename does not affect accepted
+  evidence. Publishers need no connection-read permission.
+- CLI/SDK resolve `repository` and `commit` independently, first found wins,
+  with no knowledge of any particular CI system:
+  1. explicit `--repository`/`--commit` (SDK `repository=`/`commit=`);
+  2. the `WYRD_REPOSITORY`/`WYRD_COMMIT` environment variables, which any
+     pipeline can set from its own variables;
+  3. the Git checkout: `origin`'s `owner/name` and the `HEAD` commit, read from
+     `.git` without running `git`.
+  A value none of these supplies is a local input error naming the flag and
+  variable. No Git checkout is needed when 1 or 2 supply both. A pipeline that
+  checks out a merge revision supplies the reviewed head commit explicitly.
+
 ## Selected custody and dependency flow
 
 Reuse `EvidencePlanRequest`, client `verify::File` and storage's plan/upload/
@@ -155,7 +181,7 @@ checks. Task 008 owns the decision-specific half of AC-006/007.
 |---|---|---|
 | REQ-008a | `deferred: true` only on json/media slots; omitted/false and samples/source slots keep existing paths; registration derives `queue_only=true` for a deferred slot, false/omitted alone does not; direct verify refuses before any step; cold registry flag only (task §Revision) | declaration route integration (true/false/omitted, media) + direct refusal; wyrd-spec decode unit |
 | REQ-008b | References alone establish consumers: a step reading a missing deferred slot (and its dependents) waits while independent steps run; whole-Verifier requirements wait; no Trigger/wait action/depends_on (REQ-008, task §Input) | vala-verify engine unit (independent branch runs, consumers blocked, park outcome names slots) |
-| REQ-009a | `POST /v1/verification/evidence/publish` matches tenant + connected repository (host/repository_id resolved by server) + commit + input; no Verifier/execution/group/retry key; tags commit only; Git metadata grants nothing; existing evidence/subject permission, no new category (contracts §Deferred input publication) | server route integration: wrong tenant/repository/commit, unauthorized caller, unconnected repository |
+| REQ-009a | `POST /v1/verification/evidence/publish` matches tenant + connected repository (`owner/name` slug resolved by the server to host/repository_id, §Revision — repository slug) + commit + input; no Verifier/execution/group/retry key; tags commit only; Git metadata grants nothing; existing evidence/subject permission, no new category (contracts §Deferred input publication) | server route integration: wrong tenant/repository/commit, unauthorized caller, unconnected repository |
 | REQ-009b | Only completed verified File or canonical JSON is published; type/format/schema validated against authorized subscribers before acceptance; incompatible → refused | route integration: wrong type/format/schema, unknown/incomplete File |
 | REQ-009c | Subscribers = active selected bindings of the repository plus nonterminal executions of its commit whose Verifier declares the deferred input; accepted subscribers persisted internally; later subscribers get no historical evidence; no subscriber → explicit unmatched (409), nothing retained; identical identity+content replays receipt; conflicting replacement 409; different exact policy pins each receive (contracts table) | route + SQL integration: no subscription, new subscriber after unmatched/accepted publication, identical/conflicting retry, two policy pins |
 | REQ-009d | Positive receipt (`evidence_id, repository, tags, input, status accepted|replayed, matched_subscriptions, recorded_at`) only after durable Bifrost acceptance; standalone custody in Bifrost verification owner via Scribe; no new PG table or payload mirror (INV-002/003/007) | Scribe/Bifrost integration: receipt after fence; held-Scribe publish not acknowledged |
@@ -163,4 +189,4 @@ checks. Task 008 owns the decision-specific half of AC-006/007.
 | REQ-011b | Publication to a waiting execution stages continuation of the same ExecutionId through the existing queue; running/queued consumers receive it through normal scheduling; initialization/recovery read accepted evidence, so a lost wake is repaired by the pending row's bounded canonical-state check; continuation preserves settled work, attempts, spend and original deadline (REQ-011, INV-005) | journey: publish while waiting/running/queued/before admission → same ExecutionId completes; settled step not replayed; attempts/deadline unchanged |
 | REQ-011c | Completed/cancelled/superseded executions never reopen; supersession, revocation and deadline fence a parked execution; missing evidence expires under the original deadline and never passes (REQ-011, INV-006) | journey/integration: supersede and revoke while parked; deadline while parked → timed_out |
 | INV-004 | Recovery and publish dedup return exact accepted state, authoritative absence, or explicit unavailability (503) — never fresh state on an unavailable read | integration: fenced-but-invisible evidence → unavailable, not absent |
-| REQ-016 | HTTP, shared client, Rust/Python/TypeScript SDKs, CLI (`wyrd evidence publish <input> --file f [--repository] [--commit]`, Git inference), MCP publish tool; waiting status with deferred names in execution inspection; stable errors/schemas; docs + upload-based example; wyrd-design Verifier and bifrost-design custody/ACK/parked sections; authorization guidance (AC-011) | SDK journeys ×3 + MCP journey; CLI test; codegen:check; docs content review |
+| REQ-016 | HTTP, shared client, Rust/Python/TypeScript SDKs, CLI (`wyrd evidence publish <input> --file f [--repository owner/name] [--commit sha]`; flag → env → Git resolution, §Revision — repository slug), MCP publish tool; waiting status with deferred names in execution inspection; stable errors/schemas; docs + upload-based example; wyrd-design Verifier and bifrost-design custody/ACK/parked sections; authorization guidance (AC-011) | SDK journeys ×3 + MCP journey; CLI test; codegen:check; docs content review |

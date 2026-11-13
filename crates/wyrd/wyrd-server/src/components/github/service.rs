@@ -150,6 +150,18 @@ pub struct GithubConnections<'a> {
     pub(super) state: &'a AppState,
 }
 
+/// An installation token and the access it was minted under.
+pub(super) struct InstallationAccess {
+    /// The repository-scoped installation token.
+    pub(super) token: SecretString,
+    /// The slot binding the token was minted under.
+    pub(super) binding: GithubSlotBinding,
+    /// The installation the token belongs to.
+    pub(super) installation: u64,
+    /// The tenant-selected repository the token reaches.
+    pub(super) repository: GithubRepositoryAccess,
+}
+
 impl<'a> GithubConnections<'a> {
     /// Build the owner over this process's state.
     pub const fn new(state: &'a AppState) -> Self {
@@ -881,12 +893,13 @@ impl<'a> GithubConnections<'a> {
     ) -> Result<SecretString, WyrdError> {
         self.installation_access(tenant, None, repository_id)
             .await
-            .map(|(token, _)| token)
+            .map(|access| access.token)
     }
 
-    /// An installation token as [`Self::installation_token`] mints it, and
-    /// the slot binding it was minted under; when `installation` is given,
-    /// the slot must still be associated with that installation.
+    /// An installation token as [`Self::installation_token`] mints it, with
+    /// the slot binding, installation and selected repository it was minted
+    /// under; when `installation` is given, the slot must still be
+    /// associated with that installation.
     ///
     /// A webhook passes the installation it was routed by, so a delivery
     /// for an installation the tenant no longer holds is never served by
@@ -901,7 +914,7 @@ impl<'a> GithubConnections<'a> {
         tenant: DataTenantId,
         installation: Option<i64>,
         repository_id: u64,
-    ) -> Result<(SecretString, GithubSlotBinding), WyrdError> {
+    ) -> Result<InstallationAccess, WyrdError> {
         let app = self.app()?;
         let mut conn = self.conn(tenant).await?;
         let slot = github_installation(&mut conn)
@@ -919,13 +932,14 @@ impl<'a> GithubConnections<'a> {
             .repositories
             .0
             .iter()
-            .any(|entry| entry.repository_id == repository);
+            .find(|entry| entry.repository_id == repository)
+            .cloned();
         let routed = installation.is_none_or(|routed| slot.installation_id == Some(routed));
         let installation = slot
             .installation_id
             .and_then(|id| u64::try_from(id).ok())
-            .filter(|_| routed && selected && slot.suspended_at.is_none());
-        let Some(installation) = installation else {
+            .filter(|_| routed && slot.suspended_at.is_none());
+        let (Some(installation), Some(selected)) = (installation, selected) else {
             return Err(WyrdError::GithubRepositoryInaccessible {
                 message: "this repository is not selected for an active installation".to_owned(),
                 details: serde_json::json!({ "repository_id": repository }),
@@ -941,7 +955,12 @@ impl<'a> GithubConnections<'a> {
             drop(token);
             return Err(connection_changed());
         }
-        Ok((token, slot.binding()))
+        Ok(InstallationAccess {
+            token,
+            binding: slot.binding(),
+            installation,
+            repository: selected,
+        })
     }
 
     /// Lock `conn`'s tenant connection slot for the rest of its transaction

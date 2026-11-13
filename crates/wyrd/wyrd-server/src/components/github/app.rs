@@ -10,6 +10,10 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bohmian_code_review_pipeline::{
+    BoxFuture, GitHubClient, GitHubHost, HttpBody, HttpRequest, HttpResponse, HttpTransport,
+    InstallationToken, RequestLimits, TransportError,
+};
 use jsonwebtoken::{Algorithm, Header};
 use reqwest::{Method, RequestBuilder, StatusCode};
 use secrecy::{ExposeSecret, SecretString};
@@ -20,6 +24,7 @@ use wyrd_auth_oidc::{ScreenedHttp, read_bounded_body};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::github_connection::GithubRepositoryAccess;
 
+use super::review_cache::{CodeReviewMetadata, CodeReviewObjects};
 use crate::config::GithubAppSettings;
 
 /// GitHub REST API version every request pins.
@@ -161,6 +166,94 @@ pub struct GithubApp {
     settings: GithubAppSettings,
     /// Screened outbound HTTP for this deployment.
     http: ScreenedHttp,
+    /// The code-review pipeline's object cache in Wyrd's object store.
+    pub(crate) review_objects: CodeReviewObjects,
+    /// The code-review pipeline's metadata cache in Wyrd's PostgreSQL.
+    pub(crate) review_metadata: CodeReviewMetadata,
+}
+
+/// The code-review pipeline's GitHub transport over the deployment's
+/// screened HTTP.
+struct ReviewTransport {
+    /// Screened outbound HTTP; its clients never follow a redirect.
+    http: ScreenedHttp,
+    /// The configured API origin without a trailing slash, which takes the
+    /// place of GitHub.com's API base in every request URL.
+    api_origin: String,
+}
+
+impl HttpTransport for ReviewTransport {
+    /// Send `request` through a screened client, with its whole-request
+    /// timeout; the body streams.
+    ///
+    /// # Errors
+    /// Returns [`TransportError::Failed`] when screening refuses the URL or
+    /// the request fails, and [`TransportError::Timeout`] when it times out.
+    fn get(&self, request: HttpRequest) -> BoxFuture<'_, Result<HttpResponse, TransportError>> {
+        Box::pin(async move {
+            let public = GitHubHost::public();
+            let url = match request.url.strip_prefix(public.api_base()) {
+                Some(path) => format!("{}{path}", self.api_origin),
+                None => request.url,
+            };
+            let url =
+                Url::parse(&url).map_err(|_| TransportError::Failed("invalid URL".to_owned()))?;
+            let client = self
+                .http
+                .client_for(&url)
+                .await
+                .map_err(|_| TransportError::Failed("screening refused the URL".to_owned()))?;
+            let mut builder = client.get(url).timeout(request.timeout);
+            for (name, value) in &request.headers {
+                builder = builder.header(*name, value);
+            }
+            let response = builder.send().await.map_err(review_transport_error)?;
+            let headers = response
+                .headers()
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.as_str().to_owned(),
+                        String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                    )
+                })
+                .collect();
+            Ok(HttpResponse {
+                status: response.status().as_u16(),
+                headers,
+                body: Box::new(ReviewBody(response)),
+            })
+        })
+    }
+}
+
+/// A streaming response body of [`ReviewTransport`].
+struct ReviewBody(reqwest::Response);
+
+impl HttpBody for ReviewBody {
+    /// The next chunk of the body, or `None` at its end.
+    ///
+    /// # Errors
+    /// Returns [`TransportError`] when the body stream fails or times out.
+    fn chunk(&mut self) -> BoxFuture<'_, Result<Option<Vec<u8>>, TransportError>> {
+        Box::pin(async move {
+            self.0
+                .chunk()
+                .await
+                .map(|chunk| chunk.map(|bytes| bytes.to_vec()))
+                .map_err(review_transport_error)
+        })
+    }
+}
+
+/// Classify a request failure without its URL, which may carry an archive
+/// redirect's signed token.
+fn review_transport_error(error: reqwest::Error) -> TransportError {
+    if error.is_timeout() {
+        TransportError::Timeout
+    } else {
+        TransportError::Failed(error.without_url().to_string())
+    }
 }
 
 impl std::fmt::Debug for GithubApp {
@@ -173,11 +266,52 @@ impl std::fmt::Debug for GithubApp {
 }
 
 impl GithubApp {
-    /// The App over validated `settings`, reaching GitHub through `http`.
+    /// The App over validated `settings`, reaching GitHub through `http`,
+    /// with the code-review pipeline's cache custody.
     ///
     /// Configuration resolution already proved the signing key signs RS256.
-    pub const fn new(settings: GithubAppSettings, http: ScreenedHttp) -> Self {
-        Self { settings, http }
+    pub const fn new(
+        settings: GithubAppSettings,
+        http: ScreenedHttp,
+        review_objects: CodeReviewObjects,
+        review_metadata: CodeReviewMetadata,
+    ) -> Self {
+        Self {
+            settings,
+            http,
+            review_objects,
+            review_metadata,
+        }
+    }
+
+    /// The code-review pipeline's GitHub client acting with the
+    /// repository-scoped installation `token`.
+    ///
+    /// The pipeline addresses GitHub.com, the only API origin a production
+    /// deployment allows; its requests are screened, never follow a
+    /// redirect, and reach the configured API origin instead when a
+    /// non-production deployment points it elsewhere.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::GithubUnavailable`] when the token is not a
+    /// token GitHub could have issued.
+    pub(crate) fn review_client(&self, token: &SecretString) -> Result<GitHubClient, WyrdError> {
+        let token = InstallationToken::new(token.expose_secret())
+            .map_err(|_| unavailable("the installation token"))?;
+        Ok(GitHubClient::with_transport(
+            GitHubHost::public(),
+            token,
+            RequestLimits::default(),
+            Box::new(ReviewTransport {
+                http: self.http,
+                api_origin: self
+                    .settings
+                    .api_origin
+                    .as_str()
+                    .trim_end_matches('/')
+                    .to_owned(),
+            }),
+        ))
     }
 
     /// The validated configuration.

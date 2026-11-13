@@ -37,7 +37,7 @@ use wyrd_spec::ids::CardUid;
 use wyrd_spec::vala::ids::TraceId;
 use wyrd_spec::vala::trace::SpanRecord;
 use wyrd_spec::verification::TaskId;
-use wyrd_spec::verification::execution::Producer;
+use wyrd_spec::verification::execution::{CallProvenance, Producer};
 
 use super::evidence::TenantEvidence;
 use super::registry::TenantRegistry;
@@ -48,6 +48,8 @@ use super::workspace::Workspaces;
 use super::{HostedLimits, LaneLimits};
 use crate::components::auth::Caller;
 use crate::components::gateway::{GatewayCallContext, ServerWyrdGatewayCaller};
+use crate::components::github::extraction::{PULL_REQUEST_EXTRACT_VERSION, PullRequestSource};
+use crate::components::github::service::GithubConnections;
 use crate::state::AppState;
 use crate::verification::state::RunState;
 use crate::verification::telemetry::ExecutionMode;
@@ -140,6 +142,9 @@ pub struct Execution<'a> {
     /// The accepted execution mode, which selects the lane every Python
     /// operation, workspace, and model call takes capacity from.
     pub mode: ExecutionMode,
+    /// The accepted PR source a `pull_request` extractor reads; `None` for
+    /// an execution not admitted from a pull request.
+    pub pull_request: Option<PullRequestSource>,
 }
 
 impl HostedBlocks {
@@ -269,6 +274,7 @@ impl HostedBlocks {
             schemas: Arc::clone(&self.schemas),
             tools: OnceLock::new(),
             traces: OnceLock::new(),
+            pull_request: execution.pull_request,
         });
         let blocks = Arc::new(Blocks {
             code: CodeExecutor::new(Arc::clone(&lane.sandbox), Arc::clone(&evidence)),
@@ -333,9 +339,36 @@ struct ExecutionBinding {
     tools: OnceLock<HostedTools>,
     /// The execution's trace reader, built on its first trace read.
     traces: OnceLock<CallerTraces>,
+    /// The accepted PR source a `pull_request` extractor reads.
+    pull_request: Option<PullRequestSource>,
 }
 
 impl ExecutionBinding {
+    /// Extract the execution's accepted PR source as its caller's tenant;
+    /// see [`GithubConnections::extract_pull_request`].
+    ///
+    /// # Errors
+    /// Returns [`BlockError::Terminal`] before any acquisition when the
+    /// execution was not admitted from a pull request, and the extraction's
+    /// errors.
+    async fn pull_request(&self) -> Result<ActionOutput, BlockError> {
+        let source = self.pull_request.as_ref().ok_or_else(|| BlockError::Terminal {
+            reason: "the pull_request extractor reads only a queued pull request execution's accepted source".to_owned(),
+        })?;
+        let extraction = GithubConnections::new(&self.state)
+            .extract_pull_request(self.caller.data_tenant_id, source)
+            .await?;
+        Ok(ActionOutput {
+            output: serde_json::to_value(extraction).map_err(|error| BlockError::Terminal {
+                reason: format!("extraction output does not serialize: {error}"),
+            })?,
+            provenance: Some(CallProvenance::Extract {
+                version: PULL_REQUEST_EXTRACT_VERSION.to_owned(),
+            }),
+            tool_calls: Vec::new(),
+        })
+    }
+
     /// The Agent executor of `binding`'s execution, resolving Agent and
     /// Prompt Cards as its caller and calling models through the gateway on
     /// its lane, with `binding` as its toolset.
@@ -445,6 +478,9 @@ impl ActionExecutor for Blocks {
     /// Returns the routed executor's [`BlockError`].
     async fn execute(&self, call: BlockCall<'_, Action>) -> Result<ActionOutput, BlockError> {
         match call.block {
+            Action::Extract {
+                extractor: Some(_), ..
+            } => self.binding.pull_request().await,
             Action::Extract { .. } => self.binding.evidence.execute(call).await,
             Action::Agent(_) => ActionExecutor::execute(self.agent(), call).await,
             Action::Code(_) => ActionExecutor::execute(&self.code, call).await,
@@ -820,6 +856,7 @@ mod pg_tests {
                         clock: BlockClock::default(),
                         execution: None,
                         mode: ExecutionMode::Direct,
+                        pull_request: None,
                     },
                 );
                 runtime.block_on(engine.run(Arc::clone(&assertion), evidence, deadline()))

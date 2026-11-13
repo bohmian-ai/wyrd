@@ -52,7 +52,7 @@ use wyrd_sql::queries::verifier_executions::{
 };
 
 use super::app::{GithubApp, PullRequestBody, unavailable};
-use super::service::GithubConnections;
+use super::service::{GithubConnections, InstallationAccess};
 use crate::audit;
 use crate::components::auth::Caller;
 use crate::scribe_outbox::ScribeWrite;
@@ -216,7 +216,7 @@ impl GithubConnections<'_> {
             repository_id: &repository_id,
             number: event.number,
         };
-        let (token, binding) = match self
+        let InstallationAccess { token, binding, .. } = match self
             .installation_access(tenant, Some(installation), event.repository.id)
             .await
         {

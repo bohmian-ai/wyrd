@@ -7,10 +7,13 @@
 //! and OAuth callback redirects, webhooks and installation tokens; HTTP and
 //! MCP are thin projections of it, and [`pull_requests`] admits its
 //! pull-request deliveries into the Verifier queue. [`review_cache`] keeps the code-review
-//! pipeline's cache in Wyrd's object store and PostgreSQL.
+//! pipeline's cache in Wyrd's object store and PostgreSQL, and [`extraction`]
+//! acquires a queued PR execution's pinned source through that pipeline.
 
 /// The deployment GitHub App's provider protocol.
 pub mod app;
+/// Pull-request source extraction for queued PR executions.
+pub mod extraction;
 /// Pull-request admission into the Verifier queue and failed-delivery
 /// recovery.
 pub mod pull_requests;

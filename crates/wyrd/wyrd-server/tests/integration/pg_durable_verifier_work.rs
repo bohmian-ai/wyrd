@@ -3184,6 +3184,7 @@ async fn concurrent_settlements_release_their_hosted_dependent() {
                     clock: BlockClock::default(),
                     execution: Some(Arc::clone(state)),
                     mode: ExecutionMode::Queued,
+                    pull_request: None,
                 },
             )
             .with_checkpoints(

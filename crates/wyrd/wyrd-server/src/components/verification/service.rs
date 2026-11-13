@@ -612,6 +612,7 @@ impl<'a> VerificationControl<'a> {
                     clock: telemetry.clock(),
                     execution: None,
                     mode: ExecutionMode::Direct,
+                    pull_request: None,
                 },
             )
         });

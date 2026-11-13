@@ -61,6 +61,7 @@ use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
 use crate::boot::data_root::{BifrostDataRoot, BifrostDataRootError};
 use crate::components::auth::ServerAuth;
 use crate::components::gateway::Gateway;
+use crate::components::github::review_cache::{CodeReviewMetadata, CodeReviewObjects};
 use crate::components::health::Health;
 use crate::components::operators::keys::{KeyError, KeyFailure, OperatorKeys};
 use crate::config::{BifrostRuntimeRole, WorkloadBindingEntry, WyrdServerConfig};
@@ -1354,6 +1355,8 @@ impl AppState {
                     Arc::new(crate::components::github::GithubApp::new(
                         settings,
                         config.deployment_profile.screened_http(),
+                        CodeReviewObjects::new(Arc::clone(&dependencies.storage)),
+                        CodeReviewMetadata::new(Arc::clone(&dependencies.postgres)),
                     ))
                 });
             Ok::<_, ServerBootError>((gateway, verification, github))

@@ -85,6 +85,7 @@ use super::state::{Decision, RunState, StateError, StateRow};
 use super::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
 use crate::components::auth::Caller;
 use crate::components::gateway::GatewayCallContext;
+use crate::components::github::extraction::PullRequestSource;
 use crate::query::scheduled::ScheduledQueryCaller;
 use crate::scribe_outbox::{ScribeOutbox, ScribeWrite};
 use crate::state::AppState;
@@ -799,6 +800,14 @@ impl VerifierRunner {
                     clock: telemetry.clock(),
                     execution: Some(Arc::clone(state)),
                     mode: ExecutionMode::Queued,
+                    pull_request: match &run.input {
+                        ExecutionInput::PullRequest { pull_request } => Some(PullRequestSource {
+                            execution_id: run.lease.execution_id,
+                            repository: run.card_uid.clone(),
+                            activation: (**pull_request).clone(),
+                        }),
+                        _ => None,
+                    },
                 },
             )
         });

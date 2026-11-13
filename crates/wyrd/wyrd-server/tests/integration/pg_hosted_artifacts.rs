@@ -1406,6 +1406,7 @@ async fn artifact_evidence_is_admitted_against_its_slot_and_the_combined_limit()
                         clock: BlockClock::default(),
                         execution: None,
                         mode: ExecutionMode::Direct,
+                        pull_request: None,
                     },
                 )
                 .run(spec, evidence, Instant::now() + Duration::from_secs(30))

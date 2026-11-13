@@ -557,14 +557,8 @@ async fn successive_heads_extract_the_full_then_the_incremental_change() {
             .is_some_and(|host| !host.is_empty()),
         "{extraction}"
     );
-    assert_eq!(
-        (
-            &extraction["changes"]["base"],
-            &extraction["changes"]["head"]
-        ),
-        (&json!(sha('c')), &json!(sha('a'))),
-        "{extraction}"
-    );
+    assert_eq!(extraction["changes"]["base"], sha('c'), "{extraction}");
+    assert_eq!(extraction["changes"]["head"], sha('a'), "{extraction}");
     let details = deployment
         .get(&format!("/v1/verification/executions/{first}/details"))
         .await;

@@ -362,4 +362,179 @@ mod pg_tests {
         }
         server.shutdown().await.expect("test server shuts down");
     }
+
+    /// CI publishes a deferred input with `wyrd evidence publish`, naming the
+    /// repository and commit only through `WYRD_REPOSITORY` and `WYRD_COMMIT`
+    /// from a directory that is no checkout: the waiting pull request
+    /// execution resumes and passes, the same publication replays, and a
+    /// missing commit is a local error naming its flag and variable.
+    ///
+    /// # Panics
+    /// Panics when a command fails, the execution does not wait and resume,
+    /// or a receipt or refusal differs.
+    #[tokio::test]
+    async fn ci_publishes_deferred_evidence_through_the_cli() {
+        let head = "a1".repeat(20);
+        let mock = GithubAppMock::start().expect("the GitHub mock starts");
+        mock.add_installation(101, &[(1, "acme/api"), (2, "acme/web")]);
+        mock.add_user("octo", &[101]);
+        mock.sign_in("octo");
+        mock.install_target(101);
+        let server = WyrdTestServer::builder()
+            .with_github_app_for_test(&mock)
+            .with_verification_runtime_for_test()
+            .start_bound()
+            .await
+            .expect("test server starts");
+        let base = server.base_url().expect("bound").to_owned();
+        let admin = key(&server, "evidence_cli_admin", &["admin"]).await;
+        let receipt = json("connect", &github("connect", &base, &admin).await);
+        let mut browser = GithubBrowser::sign_in(&base, server.pg_fixture().tenant_slug(), &admin)
+            .await
+            .expect("browser signs in");
+        let url = receipt["authorization_url"]
+            .as_str()
+            .expect("connect prints the install URL");
+        assert_eq!(
+            browser.open(url).await.expect("browser navigates").status,
+            200
+        );
+        let declared = json(
+            "declare",
+            &wyrd(
+                &[
+                    "declare",
+                    concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../../fixtures/cards/deferred_evidence/repository.yaml"
+                    ),
+                    "--format",
+                    "json",
+                ],
+                &base,
+                &admin,
+            )
+            .await,
+        );
+        let uid = declared["root"]["uid"]
+            .as_str()
+            .expect("the root has a uid");
+        let card = json(
+            "get",
+            &wyrd(
+                &[
+                    "get",
+                    "--kind",
+                    "Repository",
+                    "--uid",
+                    uid,
+                    "--format",
+                    "json",
+                ],
+                &base,
+                &admin,
+            )
+            .await,
+        );
+        let binding = card["status"]["verification"]["binding_ids"][0]
+            .as_str()
+            .expect("the Repository serves its binding")
+            .to_owned();
+        mock.set_pull_request(2, 7, PullRequest::open(2, &"b1".repeat(20), &head));
+        let opened = mock.pull_request_event(101, 2, 7, "opened");
+        assert_eq!(
+            mock.deliver(&base, "pull_request", &opened)
+                .await
+                .expect("delivery sends"),
+            202
+        );
+        let token = server
+            .exchange_api_key(&admin.clone().into())
+            .await
+            .expect("the key exchanges");
+        let status: Value = reqwest::Client::new()
+            .get(format!("{base}/v1/verification/bindings/{binding}"))
+            .header("x-wyrd-access-token", format!("Bearer {token}"))
+            .send()
+            .await
+            .expect("binding reads")
+            .json()
+            .await
+            .expect("binding is JSON");
+        let execution = status["last_execution_id"]
+            .as_str()
+            .expect("the pull request admitted an execution")
+            .to_owned();
+        let until = async |wanted: &str| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let state = json(
+                    "execution status",
+                    &wyrd(
+                        &["execution", "status", "--execution-id", &execution],
+                        &base,
+                        &admin,
+                    )
+                    .await,
+                );
+                if state["status"] == wanted {
+                    return state;
+                }
+                assert!(std::time::Instant::now() < deadline, "{state}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        };
+        assert_eq!(until("waiting").await["waiting"], serde_json::json!(["ci"]));
+
+        let ci = tempfile::tempdir().expect("a directory that is no checkout");
+        std::fs::write(ci.path().join("results.json"), r#"{"status": "green"}"#)
+            .expect("results write");
+        let publish = |commit: Option<&str>| {
+            let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("wyrd"));
+            command
+                .args(["evidence", "publish", "ci", "--json", "results.json"])
+                .current_dir(ci.path());
+            let mut sources = vec![
+                ("WYRD_SERVER_URL", base.clone()),
+                ("WYRD_API_KEY", admin.clone()),
+                ("WYRD_REPOSITORY", "acme/web".to_owned()),
+            ];
+            if let Some(commit) = commit {
+                sources.push(("WYRD_COMMIT", commit.to_owned()));
+            } else {
+                command.env_remove("WYRD_COMMIT");
+            }
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let sources: Vec<(&str, &str)> = sources
+                        .iter()
+                        .map(|(name, value)| (*name, value.as_str()))
+                        .collect();
+                    run_scrubbed(command, &sources)
+                })
+                .await
+                .expect("CLI subprocess joins")
+            }
+        };
+        let accepted = json("evidence publish", &publish(Some(&head)).await);
+        assert_eq!(accepted["status"], "accepted");
+        assert_eq!(accepted["matched_subscriptions"], 1);
+        assert_eq!(accepted["tags"]["commit"], head.as_str());
+        let completed = until("completed").await;
+        assert_eq!(completed["status"], "completed");
+        let replayed = json("evidence publish again", &publish(Some(&head)).await);
+        assert_eq!(replayed["status"], "replayed");
+        assert_eq!(replayed["evidence_id"], accepted["evidence_id"]);
+        let missing = publish(None).await;
+        failed_with(
+            "evidence publish without a commit",
+            &missing,
+            "WYRD_VERIFICATION_400_INPUT_INVALID",
+        );
+        assert!(
+            String::from_utf8_lossy(&missing.stderr).contains("WYRD_COMMIT"),
+            "the refusal names the variable: {missing:?}"
+        );
+        server.shutdown().await.expect("test server shuts down");
+    }
 }

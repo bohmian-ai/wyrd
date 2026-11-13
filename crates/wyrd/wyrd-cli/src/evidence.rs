@@ -1,17 +1,17 @@
 //! Deferred evidence publication from the command line.
 //!
-//! `wyrd evidence publish <input>` is one call through
-//! `wyrd_client::Evidence`: a `--file` is uploaded for a media input, a
-//! `--json` file (or `-` for stdin) is sent inline for a JSON input. The
+//! `wyrd evidence publish <input> --file <path>` is one call through
+//! `wyrd_client::Evidence`: a `.json` file (or `-` for stdin) is sent inline
+//! as a JSON value; any other file is uploaded for a media input. The
 //! repository and commit come from `--repository`/`--commit`, else
 //! `WYRD_REPOSITORY`/`WYRD_COMMIT`, else the working directory's Git
 //! checkout; the receipt is printed as JSON.
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{ArgGroup, Args, Subcommand};
+use clap::{Args, Subcommand};
 use serde_json::Value;
 use wyrd_client::verify::File;
 
@@ -29,17 +29,14 @@ pub enum EvidenceCommand {
 
 /// `wyrd evidence publish` arguments.
 #[derive(Debug, Args)]
-#[command(group(ArgGroup::new("value").required(true).args(["file", "json"])))]
 pub struct PublishArgs {
     /// The deferred input name the evidence supplies.
     #[arg(value_name = "INPUT")]
     pub input: String,
-    /// A file to upload for a media input; its extension sets the format.
+    /// The evidence: a `.json` file, or `-` for stdin, is sent inline as
+    /// JSON; any other file is uploaded and its extension sets the format.
     #[arg(long, value_name = "PATH")]
-    pub file: Option<PathBuf>,
-    /// A JSON document to send inline for a JSON input; `-` reads stdin.
-    #[arg(long, value_name = "PATH")]
-    pub json: Option<PathBuf>,
+    pub file: PathBuf,
     /// The repository as `owner/name`; defaults to `WYRD_REPOSITORY`, then
     /// the checkout's `origin`.
     #[arg(long, value_name = "OWNER/NAME")]
@@ -64,20 +61,24 @@ pub async fn dispatch(command: EvidenceCommand) -> Result<ExitCode, WyrdCliError
     let evidence = crate::client::evidence(args.endpoint.server.as_str()).await?;
     let repository = args.repository.as_deref();
     let commit = args.commit.as_deref();
-    let receipt = match (args.file, args.json) {
-        (Some(path), _) => {
-            evidence
-                .publish(&args.input, File::path(path), repository, commit)
-                .await?
-        }
-        (None, Some(path)) => {
-            evidence
-                .publish(&args.input, read_json(&path)?, repository, commit)
-                .await?
-        }
-        (None, None) => unreachable!("clap requires --file or --json"),
+    let receipt = if is_json(&args.file) {
+        evidence
+            .publish(&args.input, read_json(&args.file)?, repository, commit)
+            .await?
+    } else {
+        evidence
+            .publish(&args.input, File::path(args.file), repository, commit)
+            .await?
     };
     print_json(&receipt).map(|()| ExitCode::SUCCESS)
+}
+
+/// Whether `path` is sent inline as JSON: stdin (`-`) or a `.json` file.
+fn is_json(path: &Path) -> bool {
+    path.as_os_str() == "-"
+        || path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
 }
 
 /// Read and parse the JSON document at `path`, or stdin for `-`.
@@ -85,7 +86,7 @@ pub async fn dispatch(command: EvidenceCommand) -> Result<ExitCode, WyrdCliError
 /// # Errors
 /// Returns [`WyrdCliError::Io`] when it cannot be read and
 /// [`WyrdCliError::InvalidArgument`] when it is not JSON.
-fn read_json(path: &std::path::Path) -> Result<Value, WyrdCliError> {
+fn read_json(path: &Path) -> Result<Value, WyrdCliError> {
     let text = if path.as_os_str() == "-" {
         let mut text = String::new();
         std::io::stdin()
@@ -96,7 +97,7 @@ fn read_json(path: &std::path::Path) -> Result<Value, WyrdCliError> {
         std::fs::read_to_string(path).map_err(|source| WyrdCliError::Io { source })?
     };
     serde_json::from_str(&text).map_err(|error| WyrdCliError::InvalidArgument {
-        field: "--json".to_owned(),
+        field: "--file".to_owned(),
         value: path.display().to_string(),
         expected: format!("a JSON document ({error})"),
     })
@@ -110,13 +111,13 @@ mod tests {
 
     use super::EvidenceCommand;
 
-    /// `publish` takes exactly one of `--file` and `--json`, and the source
-    /// flags are optional.
+    /// `publish` takes one required `--file`, and the source flags are
+    /// optional; there is no separate JSON flag.
     ///
     /// # Panics
     /// Panics when a valid form is refused or an invalid one parses.
     #[test]
-    fn publish_requires_exactly_one_value_source() {
+    fn publish_takes_one_file() {
         let parse = |args: &[&str]| {
             Cli::try_parse_from(
                 [
@@ -131,11 +132,12 @@ mod tests {
                 .chain(args),
             )
         };
-        let parsed = parse(&["--json", "results.json"]).expect("json parses");
+        let parsed = parse(&["--file", "results.json"]).expect("a file parses");
         let Command::Evidence(EvidenceCommand::Publish(args)) = parsed.command else {
             panic!("evidence publish");
         };
         assert_eq!(args.input, "ci");
+        assert_eq!(args.file, std::path::PathBuf::from("results.json"));
         assert!(args.repository.is_none() && args.commit.is_none());
         assert!(
             parse(&[
@@ -148,10 +150,28 @@ mod tests {
             ])
             .is_ok()
         );
-        assert!(parse(&[]).is_err(), "a value is required");
+        assert!(parse(&[]).is_err(), "a file is required");
         assert!(
-            parse(&["--file", "a.pdf", "--json", "b.json"]).is_err(),
-            "only one value"
+            parse(&["--json", "results.json"]).is_err(),
+            "there is no --json flag"
         );
+    }
+
+    /// A `.json` file or stdin is a JSON value sent inline; any other file is
+    /// uploaded.
+    ///
+    /// # Panics
+    /// Panics when a path is classified otherwise.
+    #[test]
+    fn json_files_are_sent_inline() {
+        for (path, inline) in [
+            ("results.json", true),
+            ("RESULTS.JSON", true),
+            ("-", true),
+            ("report.csv", false),
+            ("report", false),
+        ] {
+            assert_eq!(super::is_json(std::path::Path::new(path)), inline, "{path}");
+        }
     }
 }

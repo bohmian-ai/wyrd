@@ -492,7 +492,7 @@ mod pg_tests {
         let publish = |commit: Option<&str>| {
             let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("wyrd"));
             command
-                .args(["evidence", "publish", "ci", "--json", "results.json"])
+                .args(["evidence", "publish", "ci", "--file", "results.json"])
                 .current_dir(ci.path());
             let mut sources = vec![
                 ("WYRD_SERVER_URL", base.clone()),

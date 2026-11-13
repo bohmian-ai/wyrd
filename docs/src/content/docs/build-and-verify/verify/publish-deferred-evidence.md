@@ -49,7 +49,7 @@ export WYRD_SERVER_URL=https://wyrd.example.com
 export WYRD_API_KEY=<ci_credential>
 export WYRD_REPOSITORY=acme/web
 export WYRD_COMMIT=<head_commit_sha>
-wyrd evidence publish ci --json results.json
+wyrd evidence publish ci --file results.json
 ```
 
 Set `WYRD_REPOSITORY` and `WYRD_COMMIT` from whatever your CI system provides, or pass `--repository` and `--commit`. In a checkout of the repository you can omit both: `wyrd` reads `origin` and the checked-out commit from `.git`.
@@ -60,7 +60,7 @@ A `media` input takes a file, such as a test report:
 
 <CodeFromFile file="fixtures/cards/deferred_evidence/report-gate.yaml" lang="yaml" title="report-gate.yaml" />
 
-Pass `--file` instead of `--json`; the file is uploaded first:
+A `.json` file is sent as JSON; any other file is uploaded first:
 
 ```bash
 wyrd evidence publish report --file report.csv

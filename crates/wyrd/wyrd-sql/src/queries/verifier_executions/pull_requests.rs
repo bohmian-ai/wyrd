@@ -186,8 +186,8 @@ const ACTIVATE_SQL: &str = "
     RETURNING execution_id
 ";
 
-/// The newest completed review of execution `$1`'s PR observed before it
-/// under the same Verifier name, preferring the exact same Verifier
+/// The newest completed review of execution `$1`'s PR that extracted its
+/// source, observed before it under the same Verifier name, preferring the exact same Verifier
 /// version: its id, its reviewed head, and whether it ran that version.
 const BASELINE_SQL: &str = "
     WITH current AS (
@@ -200,7 +200,7 @@ const BASELINE_SQL: &str = "
            e.verifier_card_uid = c.verifier_card_uid AS same_policy
       FROM current c
       JOIN wyrd.verifier_executions e
-        ON e.origin = 'pull_request' AND e.status = 'completed'
+        ON e.origin = 'pull_request' AND e.status = 'completed' AND e.pr_source_extracted
        AND e.pull_request->>'host' = c.pull_request->>'host'
        AND e.pull_request->>'repository_id' = c.pull_request->>'repository_id'
        AND (e.pull_request->>'number')::bigint = (c.pull_request->>'number')::bigint
@@ -215,11 +215,14 @@ const BASELINE_SQL: &str = "
 /// PR's completed execution history.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PullRequestBaseline {
-    /// No earlier execution of the PR under this Verifier name completed.
+    /// No earlier execution of the PR under this Verifier name completed
+    /// with its source extracted.
     FirstReview,
-    /// Only another version of the Verifier completed a review of the PR.
+    /// Only another version of the Verifier completed an extracted review
+    /// of the PR.
     PolicyChanged,
-    /// The newest earlier completed review under the exact same Verifier.
+    /// The newest earlier completed, extracted review under the exact same
+    /// Verifier.
     Previous {
         /// The completed execution.
         execution_id: ExecutionId,
@@ -689,10 +692,13 @@ impl VerifierExecutionQueue {
 
     /// The baseline of PR execution `execution`: the newest completed
     /// execution of the same PR observed before it under the exact same
-    /// Verifier, else whether another version of that Verifier completed
-    /// one. Cancelled, failed and unfinished executions never count, so a
-    /// generation admitted while an earlier one still runs reviews from the
-    /// last completed review.
+    /// Verifier that extracted its source, else whether another version of
+    /// that Verifier completed one. Cancelled, failed and unfinished
+    /// executions, and completed ones whose extraction failed, never count,
+    /// so a generation admitted while an earlier one still runs, or after
+    /// one could not read its source, reviews from the last extracted
+    /// review. A failed or inconclusive judgment after a successful
+    /// extraction still counts.
     ///
     /// # Errors
     /// Returns the database error when the read fails, or a decode error

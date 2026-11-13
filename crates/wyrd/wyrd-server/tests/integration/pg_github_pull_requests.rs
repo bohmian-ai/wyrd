@@ -16,7 +16,9 @@ use wyrd_loader::{build_declaration_input, load};
 use wyrd_server::components::github::service::GithubConnections;
 use wyrd_spec::ids::VerificationResultId;
 use wyrd_spec::verification::VerificationVerdict;
-use wyrd_sql::queries::verifier_executions::{Settlement, TerminalStatus, VerifierExecutionQueue};
+use wyrd_sql::queries::verifier_executions::{
+    Completion, Settlement, TerminalStatus, VerifierExecutionQueue,
+};
 use wyrd_testing::github::{GithubAppMock, GithubBrowser, PullRequest};
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
@@ -1012,11 +1014,14 @@ async fn completed_baseline_survives_when_a_new_head_supersedes_running_work() {
         let settled = queue
             .complete(
                 &mut conn,
-                claimed.lease,
-                VerificationResultId::new_v7(),
-                VerificationVerdict::Passed,
-                "P passes",
-                None,
+                &Completion {
+                    lease: claimed.lease,
+                    result_id: VerificationResultId::new_v7(),
+                    verdict: VerificationVerdict::Passed,
+                    summary: "P passes".into(),
+                    drift: None,
+                    pr_source_extracted: true,
+                },
             )
             .await
             .expect("P completes");
@@ -1053,11 +1058,14 @@ async fn completed_baseline_survives_when_a_new_head_supersedes_running_work() {
         let late = queue
             .complete(
                 &mut conn,
-                claimed.lease,
-                VerificationResultId::new_v7(),
-                VerificationVerdict::Passed,
-                "A finished late",
-                None,
+                &Completion {
+                    lease: claimed.lease,
+                    result_id: VerificationResultId::new_v7(),
+                    verdict: VerificationVerdict::Passed,
+                    summary: "A finished late".into(),
+                    drift: None,
+                    pr_source_extracted: false,
+                },
             )
             .await
             .expect("settlement runs");
@@ -1087,11 +1095,14 @@ async fn a_new_head_supersedes_work_when_the_policy_binds_nothing() {
         let settled = queue
             .complete(
                 &mut conn,
-                claimed.lease,
-                VerificationResultId::new_v7(),
-                VerificationVerdict::Passed,
-                "P passes",
-                None,
+                &Completion {
+                    lease: claimed.lease,
+                    result_id: VerificationResultId::new_v7(),
+                    verdict: VerificationVerdict::Passed,
+                    summary: "P passes".into(),
+                    drift: None,
+                    pr_source_extracted: true,
+                },
             )
             .await
             .expect("P completes");
@@ -1139,11 +1150,14 @@ async fn a_new_head_supersedes_work_when_the_policy_binds_nothing() {
     let late = queue
         .complete(
             &mut conn,
-            running.lease,
-            VerificationResultId::new_v7(),
-            VerificationVerdict::Passed,
-            "A finished late",
-            None,
+            &Completion {
+                lease: running.lease,
+                result_id: VerificationResultId::new_v7(),
+                verdict: VerificationVerdict::Passed,
+                summary: "A finished late".into(),
+                drift: None,
+                pr_source_extracted: false,
+            },
         )
         .await
         .expect("settlement runs");
@@ -1433,11 +1447,14 @@ async fn close_fences_running_work_and_failed_reads_stay_retryable() {
     let late = VerifierExecutionQueue::default()
         .complete(
             &mut conn,
-            running.lease,
-            VerificationResultId::new_v7(),
-            VerificationVerdict::Passed,
-            "finished after the close",
-            None,
+            &Completion {
+                lease: running.lease,
+                result_id: VerificationResultId::new_v7(),
+                verdict: VerificationVerdict::Passed,
+                summary: "finished after the close".into(),
+                drift: None,
+                pr_source_extracted: false,
+            },
         )
         .await
         .expect("settlement runs");

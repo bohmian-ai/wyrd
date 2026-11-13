@@ -153,6 +153,9 @@ pub enum Transition {
         /// The one drift requirement's feature counts frozen into failure
         /// dispatches, when the outcome has exactly one.
         drift: Option<DriftCounts>,
+        /// Whether a pull_request execution extracted its source, recorded
+        /// with the completion as its baseline eligibility.
+        pr_source_extracted: bool,
     },
     /// Try the same execution and input again within its attempt budget.
     Retry(VerificationError),
@@ -965,6 +968,7 @@ impl VerifierRunner {
             verdict,
             summary,
             drift,
+            pr_source_extracted,
         } = &transition
         {
             let completion = Completion {
@@ -973,6 +977,7 @@ impl VerifierRunner {
                 verdict: *verdict,
                 summary: summary.clone(),
                 drift: *drift,
+                pr_source_extracted: *pr_source_extracted,
             };
             if let Some(settlement) = self.completions.complete(tenant, completion).await? {
                 return Ok(settled(settlement, "completed"));
@@ -1002,11 +1007,17 @@ impl VerifierRunner {
                 verdict,
                 summary,
                 drift,
+                pr_source_extracted,
             } => {
-                let settlement = self
-                    .queue
-                    .complete(&mut conn, lease, result_id, verdict, &summary, drift)
-                    .await?;
+                let completion = Completion {
+                    lease,
+                    result_id,
+                    verdict,
+                    summary,
+                    drift,
+                    pr_source_extracted,
+                };
+                let settlement = self.queue.complete(&mut conn, &completion).await?;
                 settled(settlement, "completed")
             }
             Transition::Retry(error) => {
@@ -1478,6 +1489,7 @@ fn result(
             verdict: payload.verdict(),
             summary: engines::summary(outcome),
             drift: engines::drift_counts(outcome),
+            pr_source_extracted: engines::pr_source_extracted(outcome),
         },
         ScribeWrite::Result {
             payload,

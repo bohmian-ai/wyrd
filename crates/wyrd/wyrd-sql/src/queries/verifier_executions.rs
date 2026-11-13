@@ -479,13 +479,15 @@ const RENEW_LEASES_SQL: &str = r"
 /// Complete a leased execution, or re-apply the same completion idempotently.
 ///
 /// A group execution also keeps its verdict (`$4`) so later group results of
-/// its binding and group can be compared with it. `replayed` is whether the
+/// its binding and group can be compared with it. `$5` records whether a
+/// `pull_request` execution extracted its admitted source. `replayed` is whether the
 /// execution had already completed before this statement, read from the
 /// statement's snapshot of the row.
 const COMPLETE_SQL: &str = r"
     UPDATE wyrd.verifier_executions e
        SET status = 'completed', result_id = $3, error = NULL,
            group_verdict = CASE WHEN e.origin = 'group' THEN $4 END,
+           pr_source_extracted = $5,
            lease_expires_at = NULL, next_attempt_at = NULL,
            settled_at = COALESCE(e.settled_at, statement_timestamp()),
            updated_at = statement_timestamp()
@@ -500,7 +502,8 @@ const COMPLETE_SQL: &str = r"
 /// Complete many leased non-group executions in one round trip through
 /// `wyrd.complete_verifier_executions`, or re-apply the same completions
 /// idempotently, exactly as [`COMPLETE_SQL`] does one: `$1` executions, `$2`
-/// their lease tokens, and `$3` their results, aligned by position. Returns
+/// their lease tokens, `$3` their results, and `$4` whether each extracted
+/// its pull request source, aligned by position. Returns
 /// each applied execution with its binding and frozen Operators; a group
 /// execution, a lost lease, or a different result returns nothing.
 ///
@@ -510,7 +513,7 @@ const COMPLETE_SQL: &str = r"
 /// executions never deadlock.
 const COMPLETE_MANY_SQL: &str = r"
     SELECT execution_id, binding_id, operators
-      FROM wyrd.complete_verifier_executions($1, $2, $3)
+      FROM wyrd.complete_verifier_executions($1, $2, $3, $4)
 ";
 
 /// Insert one Operator dispatch; the (tenant, execution, Operator) key absorbs retries.
@@ -1554,6 +1557,10 @@ pub struct Completion {
     pub summary: String,
     /// The counts of the Verifier's one drift check, when it has exactly one.
     pub drift: Option<DriftCounts>,
+    /// Whether a `pull_request` execution's pull_request extraction of its
+    /// admitted source succeeded, which makes it eligible as a later
+    /// review's baseline. Always `false` for other origins.
+    pub pr_source_extracted: bool,
 }
 
 /// An execution claimed for running, with every frozen identity the runner needs.
@@ -2886,7 +2893,8 @@ impl VerifierExecutionQueue {
         .await
     }
 
-    /// Settle a claimed execution `completed`, pointing at its staged result.
+    /// Settle a claimed execution `completed`, pointing at its staged result,
+    /// and record [`Completion::pr_source_extracted`] in the same statement.
     ///
     /// Only the current lease holder can complete; re-completing with the
     /// same token and result is an idempotent [`Settlement::Applied`]. For a
@@ -2914,16 +2922,20 @@ impl VerifierExecutionQueue {
     /// # Errors
     /// Returns the database error when a statement fails, or a decode error
     /// when the frozen Operators are malformed.
-    #[tracing::instrument(skip(self, conn), fields(operation = "verification.executions.complete", execution_id = %lease.execution_id))]
+    #[tracing::instrument(skip(self, conn), fields(operation = "verification.executions.complete", execution_id = %completion.lease.execution_id))]
     pub async fn complete(
         &self,
         conn: &mut TenantConn<'_>,
-        lease: ExecutionLease,
-        result_id: VerificationResultId,
-        verdict: VerificationVerdict,
-        summary: &str,
-        drift: Option<DriftCounts>,
+        completion: &Completion,
     ) -> Result<Settlement, SqlxError> {
+        let Completion {
+            lease,
+            result_id,
+            verdict,
+            ref summary,
+            drift,
+            pr_source_extracted,
+        } = *completion;
         timed("complete", async {
             let verdict_text: &'static str = verdict.into();
             sqlx::query(LOCK_GROUP_BINDING_SQL)
@@ -2935,6 +2947,7 @@ impl VerifierExecutionQueue {
                 .bind(lease.token.0)
                 .bind(result_id.as_uuid())
                 .bind(verdict_text)
+                .bind(pr_source_extracted)
                 .fetch_optional(&mut **conn.transaction())
                 .await?;
             let Some((binding_id, Json(operators), grouped, replayed)) = settled else {
@@ -2996,20 +3009,20 @@ impl VerifierExecutionQueue {
     ) -> Result<Vec<Settlement>, SqlxError> {
         let applied: Vec<(Uuid, Option<Uuid>, Json<Vec<FrozenTarget>>)> =
             timed("complete_many", async {
-                let (executions, (tokens, results)): (Vec<Uuid>, (Vec<Uuid>, Vec<Uuid>)) =
-                    completions
-                        .iter()
-                        .map(|c| {
-                            (
-                                c.lease.execution_id.as_uuid(),
-                                (c.lease.token.0, c.result_id.as_uuid()),
-                            )
-                        })
-                        .unzip();
+                let executions: Vec<Uuid> = completions
+                    .iter()
+                    .map(|c| c.lease.execution_id.as_uuid())
+                    .collect();
+                let tokens: Vec<Uuid> = completions.iter().map(|c| c.lease.token.0).collect();
+                let results: Vec<Uuid> =
+                    completions.iter().map(|c| c.result_id.as_uuid()).collect();
+                let extracted: Vec<bool> =
+                    completions.iter().map(|c| c.pr_source_extracted).collect();
                 sqlx::query_as(COMPLETE_MANY_SQL)
                     .bind(executions)
                     .bind(tokens)
                     .bind(results)
+                    .bind(extracted)
                     .fetch_all(&mut **conn.transaction())
                     .await
             })
@@ -3036,10 +3049,7 @@ impl VerifierExecutionQueue {
                     }
                     Settlement::Applied
                 }
-                None => {
-                    self.complete(conn, c.lease, c.result_id, c.verdict, &c.summary, c.drift)
-                        .await?
-                }
+                None => self.complete(conn, c).await?,
             };
             settlements.push(settlement);
         }

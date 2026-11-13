@@ -7,9 +7,13 @@
 //! context from a completed [`ExecutedOutcome`].
 
 use wyrd_spec::card::operator::DriftCounts;
-use wyrd_spec::verification::execution::{ExecutedOutcome, RequirementDetail, RequirementOutcome};
+use wyrd_spec::verification::execution::{
+    CallProvenance, ExecutedOutcome, RequirementDetail, RequirementOutcome, StepStatus,
+};
 use wyrd_spec::verification::{DriftVerdict, VerificationError};
 use wyrd_sql::queries::verifier_executions::TerminalStatus;
+
+use crate::components::github::extraction::PULL_REQUEST_EXTRACT_VERSION;
 
 /// The typed result of one engine execution.
 ///
@@ -81,6 +85,24 @@ pub fn drift_counts(outcome: &ExecutedOutcome) -> Option<DriftCounts> {
                 .count(),
         ),
         total_features: count(report.features.len()),
+    })
+}
+
+/// Whether `outcome` extracted its pull request source: some step succeeded
+/// with the pull_request extractor's server-assigned provenance.
+///
+/// Recorded with the completion as the execution's eligibility to be a later
+/// head's incremental review baseline. The judgment's verdict plays no part:
+/// a failed or inconclusive review of extracted source still counts, and a
+/// failed extraction never does.
+#[must_use]
+pub fn pr_source_extracted(outcome: &ExecutedOutcome) -> bool {
+    outcome.steps.iter().any(|step| {
+        step.status == StepStatus::Succeeded
+            && matches!(
+                &step.provenance,
+                Some(CallProvenance::Extract { version }) if version == PULL_REQUEST_EXTRACT_VERSION
+            )
     })
 }
 

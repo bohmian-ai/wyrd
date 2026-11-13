@@ -1632,11 +1632,14 @@ async fn reclaimed_lease_fences_the_stale_token() {
         queue
             .complete(
                 &mut conn,
-                stale.lease,
-                result,
-                VerificationVerdict::Passed,
-                "drift detected",
-                Some(DRIFT_COUNTS)
+                &Completion {
+                    lease: stale.lease,
+                    result_id: result,
+                    verdict: VerificationVerdict::Passed,
+                    summary: "drift detected".into(),
+                    drift: Some(DRIFT_COUNTS),
+                    pr_source_extracted: false
+                },
             )
             .await
             .expect("stale completion answers"),
@@ -1654,11 +1657,14 @@ async fn reclaimed_lease_fences_the_stale_token() {
             queue
                 .complete(
                     &mut conn,
-                    current.lease,
-                    result,
-                    VerificationVerdict::Passed,
-                    "drift detected",
-                    Some(DRIFT_COUNTS)
+                    &Completion {
+                        lease: current.lease,
+                        result_id: result,
+                        verdict: VerificationVerdict::Passed,
+                        summary: "drift detected".into(),
+                        drift: Some(DRIFT_COUNTS),
+                        pr_source_extracted: false
+                    },
                 )
                 .await
                 .expect("completion answers"),
@@ -1669,11 +1675,14 @@ async fn reclaimed_lease_fences_the_stale_token() {
         queue
             .complete(
                 &mut conn,
-                current.lease,
-                VerificationResultId::new_v7(),
-                VerificationVerdict::Passed,
-                "drift detected",
-                Some(DRIFT_COUNTS),
+                &Completion {
+                    lease: current.lease,
+                    result_id: VerificationResultId::new_v7(),
+                    verdict: VerificationVerdict::Passed,
+                    summary: "drift detected".into(),
+                    drift: Some(DRIFT_COUNTS),
+                    pr_source_extracted: false
+                },
             )
             .await
             .expect("conflicting completion answers"),
@@ -2025,11 +2034,14 @@ async fn failed_binding_runs_dispatch_each_distinct_operator_once() {
                 queue
                     .complete(
                         &mut conn,
-                        claimed.lease,
-                        result,
-                        verdict,
-                        "drift detected",
-                        Some(DRIFT_COUNTS)
+                        &Completion {
+                            lease: claimed.lease,
+                            result_id: result,
+                            verdict,
+                            summary: "drift detected".into(),
+                            drift: Some(DRIFT_COUNTS),
+                            pr_source_extracted: false
+                        },
                     )
                     .await
                     .expect("completion answers"),
@@ -2215,11 +2227,14 @@ async fn queue_state_is_tenant_isolated() {
     queue
         .complete(
             &mut conn,
-            claimed.lease,
-            VerificationResultId::new_v7(),
-            VerificationVerdict::Failed,
-            "drift detected",
-            Some(DRIFT_COUNTS),
+            &Completion {
+                lease: claimed.lease,
+                result_id: VerificationResultId::new_v7(),
+                verdict: VerificationVerdict::Failed,
+                summary: "drift detected".into(),
+                drift: Some(DRIFT_COUNTS),
+                pr_source_extracted: false,
+            },
         )
         .await
         .expect("execution completes");
@@ -2494,11 +2509,14 @@ async fn database_clock_owns_verifier_queue_deadlines() {
         queue
             .complete(
                 &mut conn,
-                settled.lease,
-                VerificationResultId::new_v7(),
-                VerificationVerdict::Failed,
-                "drift detected",
-                Some(DRIFT_COUNTS),
+                &Completion {
+                    lease: settled.lease,
+                    result_id: VerificationResultId::new_v7(),
+                    verdict: VerificationVerdict::Failed,
+                    summary: "drift detected".into(),
+                    drift: Some(DRIFT_COUNTS),
+                    pr_source_extracted: false
+                },
             )
             .await
             .expect("completion answers"),
@@ -2589,11 +2607,14 @@ async fn failed_execution_with_two_dispatches(
     queue
         .complete(
             conn,
-            claimed.lease,
-            VerificationResultId::new_v7(),
-            VerificationVerdict::Failed,
-            &summary,
-            Some(DRIFT_COUNTS),
+            &Completion {
+                lease: claimed.lease,
+                result_id: VerificationResultId::new_v7(),
+                verdict: VerificationVerdict::Failed,
+                summary: summary.clone(),
+                drift: Some(DRIFT_COUNTS),
+                pr_source_extracted: false,
+            },
         )
         .await
         .expect("failed completion settles");
@@ -3178,7 +3199,17 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
     let complete =
         async |conn: &mut TenantConn<'_>, claimed: &ClaimedExecution, result, verdict| {
             queue
-                .complete(conn, claimed.lease, result, verdict, "verification", None)
+                .complete(
+                    conn,
+                    &Completion {
+                        lease: claimed.lease,
+                        result_id: result,
+                        verdict,
+                        summary: "verification".into(),
+                        drift: None,
+                        pr_source_extracted: false,
+                    },
+                )
                 .await
                 .expect("group settles")
         };
@@ -3649,6 +3680,7 @@ async fn a_batch_completes_many_executions_like_complete() {
         verdict,
         summary: "drift detected".to_owned(),
         drift: Some(DRIFT_COUNTS),
+        pr_source_extracted: false,
     };
     let batch = vec![
         completion(failed_claim.lease, VerificationVerdict::Failed),
@@ -4555,8 +4587,37 @@ async fn running_generation(
     claims
 }
 
+/// The completion of `claimed` with `verdict`, recording whether its pull
+/// request source was `extracted`.
+fn completion(
+    claimed: &ClaimedExecution,
+    verdict: VerificationVerdict,
+    extracted: bool,
+) -> Completion {
+    Completion {
+        lease: claimed.lease,
+        result_id: VerificationResultId::new_v7(),
+        verdict,
+        summary: "verification".to_owned(),
+        drift: None,
+        pr_source_extracted: extracted,
+    }
+}
+
+/// Whether `execution`'s row records its pull request source as extracted.
+async fn source_extracted(conn: &mut TenantConn<'_>, execution: ExecutionId) -> bool {
+    sqlx::query_scalar(
+        "SELECT pr_source_extracted FROM wyrd.verifier_executions WHERE execution_id = $1",
+    )
+    .bind(execution.as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("execution reads")
+}
+
 /// A PR execution's baseline is the latest completed execution of the same
-/// PR under the exact same Verifier: with none it is the first review, and
+/// PR under the exact same Verifier that extracted its source: with none it
+/// is the first review, and
 /// when only another version of the Verifier completed, the policy changed.
 /// Work that never completed is never a baseline, and a later generation
 /// reviews against the newest completed one, not the one it superseded.
@@ -4564,7 +4625,7 @@ async fn running_generation(
 /// # Panics
 /// Panics when a selected baseline differs.
 #[tokio::test]
-async fn pull_request_baseline_is_the_latest_completed_review_under_the_same_policy() {
+async fn pull_request_baseline_is_the_latest_extracted_review_under_the_same_policy() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let actor = actor(fixture.data_tenant_id());
     let queue = VerifierExecutionQueue::default();
@@ -4575,11 +4636,7 @@ async fn pull_request_baseline_is_the_latest_completed_review_under_the_same_pol
         queue
             .complete(
                 conn,
-                claimed.lease,
-                VerificationResultId::new_v7(),
-                VerificationVerdict::Passed,
-                "verification",
-                None,
+                &completion(claimed, VerificationVerdict::Passed, true),
             )
             .await
             .expect("execution settles");
@@ -4645,5 +4702,211 @@ async fn pull_request_baseline_is_the_latest_completed_review_under_the_same_pol
             .await
             .expect("baseline reads"),
         PullRequestBaseline::PolicyChanged
+    );
+}
+
+/// A completed review whose extraction failed is never a baseline, while a
+/// failed or inconclusive judgment after a successful extraction is: the
+/// baseline follows the extracted source, not the verdict.
+///
+/// # Panics
+/// Panics when a selected baseline differs.
+#[tokio::test]
+async fn pull_request_baseline_follows_extracted_source_not_the_verdict() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture.tenant_conn().await.expect("tenant connection");
+    let (_, bindings) = repository_with_bindings(&mut conn, &actor, 1).await;
+    let targets = pr_targets(&mut conn, actor.id, &bindings).await;
+    let reviewed = running_generation(&queue, &mut conn, "a", &targets)
+        .await
+        .remove(0);
+    queue
+        .complete(
+            &mut conn,
+            &completion(&reviewed, VerificationVerdict::Passed, true),
+        )
+        .await
+        .expect("the extracted review completes");
+    let unreadable = running_generation(&queue, &mut conn, "c", &targets)
+        .await
+        .remove(0);
+    queue
+        .complete(
+            &mut conn,
+            &completion(&unreadable, VerificationVerdict::Inconclusive, false),
+        )
+        .await
+        .expect("the review whose extraction failed completes");
+
+    let next = running_generation(&queue, &mut conn, "d", &targets)
+        .await
+        .remove(0);
+    assert_eq!(
+        queue
+            .pull_request_baseline(&mut conn, next.lease.execution_id)
+            .await
+            .expect("baseline reads"),
+        PullRequestBaseline::Previous {
+            execution_id: reviewed.lease.execution_id,
+            head: "a".repeat(40),
+        },
+        "the review that could not read its source is skipped"
+    );
+
+    queue
+        .complete(
+            &mut conn,
+            &completion(&next, VerificationVerdict::Inconclusive, true),
+        )
+        .await
+        .expect("the extracted but inconclusive review completes");
+    let last = running_generation(&queue, &mut conn, "e", &targets)
+        .await
+        .remove(0);
+    assert_eq!(
+        queue
+            .pull_request_baseline(&mut conn, last.lease.execution_id)
+            .await
+            .expect("baseline reads"),
+        PullRequestBaseline::Previous {
+            execution_id: next.lease.execution_id,
+            head: "d".repeat(40),
+        },
+        "an inconclusive judgment of extracted source still advances"
+    );
+}
+
+/// Batched completion records each execution's extracted source exactly as
+/// single completion does, and an identical replay keeps it.
+///
+/// # Panics
+/// Panics when a recorded fact differs.
+#[tokio::test]
+async fn batched_and_single_completion_record_extracted_source_alike() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture.tenant_conn().await.expect("tenant connection");
+    let (_, bindings) = repository_with_bindings(&mut conn, &actor, 3).await;
+    let targets = pr_targets(&mut conn, actor.id, &bindings).await;
+    let claims = running_generation(&queue, &mut conn, "a", &targets).await;
+    let batch = [
+        completion(&claims[0], VerificationVerdict::Passed, true),
+        completion(&claims[1], VerificationVerdict::Failed, false),
+    ];
+    let single = completion(&claims[2], VerificationVerdict::Passed, true);
+
+    let settled = queue
+        .complete_many(&mut conn, &batch)
+        .await
+        .expect("batch completes");
+    assert_eq!(settled, [Settlement::Applied, Settlement::Applied]);
+    assert_eq!(
+        queue
+            .complete(&mut conn, &single)
+            .await
+            .expect("single completes"),
+        Settlement::Applied
+    );
+    let recorded = [
+        source_extracted(&mut conn, claims[0].lease.execution_id).await,
+        source_extracted(&mut conn, claims[1].lease.execution_id).await,
+        source_extracted(&mut conn, claims[2].lease.execution_id).await,
+    ];
+    assert_eq!(recorded, [true, false, true]);
+
+    let replayed = queue
+        .complete_many(&mut conn, &batch)
+        .await
+        .expect("replay completes");
+    assert_eq!(replayed, [Settlement::Applied, Settlement::Applied]);
+    assert!(source_extracted(&mut conn, claims[0].lease.execution_id).await);
+}
+
+/// A completion under a lost lease, and one whose transaction rolls back,
+/// record no extracted source.
+///
+/// # Panics
+/// Panics when a stale or rolled-back completion leaves the fact behind.
+#[tokio::test]
+async fn stale_or_rolled_back_completion_records_no_extracted_source() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture.tenant_conn().await.expect("tenant connection");
+    let (_, bindings) = repository_with_bindings(&mut conn, &actor, 1).await;
+    let targets = pr_targets(&mut conn, actor.id, &bindings).await;
+    let stale = running_generation(&queue, &mut conn, "a", &targets)
+        .await
+        .remove(0);
+    expire_deadlines(&mut conn, stale.lease.execution_id).await;
+    let current = claim(&queue, &mut conn).await;
+    conn.commit().await.expect("the reclaimed review commits");
+
+    let mut conn = fixture.tenant_conn().await.expect("tenant connection");
+    assert_eq!(
+        queue
+            .complete(
+                &mut conn,
+                &completion(&stale, VerificationVerdict::Passed, true)
+            )
+            .await
+            .expect("stale completion answers"),
+        Settlement::StaleLease
+    );
+    assert_eq!(
+        queue
+            .complete(
+                &mut conn,
+                &completion(&current, VerificationVerdict::Passed, true)
+            )
+            .await
+            .expect("completion applies"),
+        Settlement::Applied
+    );
+    conn.rollback().await.expect("completion rolls back");
+
+    let mut conn = fixture.tenant_conn().await.expect("tenant connection");
+    assert!(!source_extracted(&mut conn, current.lease.execution_id).await);
+}
+
+/// Only a completed `pull_request` execution can record extracted source:
+/// a submission's completion claiming it is refused.
+///
+/// # Panics
+/// Panics when the database accepts the fact on another origin.
+#[tokio::test]
+async fn only_pull_request_executions_record_extracted_source() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let actor = actor(tenant);
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture.tenant_conn().await.expect("tenant connection");
+    let (owner, _) = declare_service(&mut conn, &actor, "svc").await;
+    let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
+    submitted(
+        &queue,
+        &mut conn,
+        &submission(tenant, authority(&actor), request(&verifier, &owner), None),
+    )
+    .await;
+    let claimed = claim(&queue, &mut conn).await;
+
+    let refused = queue
+        .complete(
+            &mut conn,
+            &completion(&claimed, VerificationVerdict::Passed, true),
+        )
+        .await
+        .expect_err("a submission cannot record extracted source");
+
+    assert_eq!(
+        refused
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref(),
+        Some("23514")
     );
 }

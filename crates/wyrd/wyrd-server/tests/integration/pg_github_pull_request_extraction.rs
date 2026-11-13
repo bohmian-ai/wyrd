@@ -692,3 +692,73 @@ async fn an_empty_incremental_change_is_evidence_and_never_a_pass() {
         .await;
     assert_eq!(details["outcome"]["verdict"], "failed", "{details}");
 }
+
+/// A review whose source could not be extracted never becomes the baseline:
+/// after the completed review at `a…`, GitHub cannot serve head `d…`, so its
+/// extraction step fails and the review is inconclusive; head `b…` is then
+/// reviewed incrementally from `a…`.
+///
+/// # Panics
+/// Panics when the unreadable head extracts, passes or becomes the baseline.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unextracted_review_never_becomes_the_baseline() {
+    let (deployment, first) = Deployment::reviewed_at_a().await;
+
+    let unreadable = deployment.review(&sha('d'), "synchronize").await;
+    let details = deployment
+        .get(&format!("/v1/verification/executions/{unreadable}/details"))
+        .await;
+    assert_eq!(details["outcome"]["steps"][0]["id"], "pr", "{details}");
+    assert_eq!(
+        details["outcome"]["steps"][0]["status"], "failed",
+        "{details}"
+    );
+    assert_eq!(details["outcome"]["verdict"], "inconclusive", "{details}");
+
+    deployment.serve_b();
+    deployment.compare(&sha('a'), &sha('b'), &sha('a'), HANDLER_B, PATCH_AB);
+    let second = deployment.review(&sha('b'), "synchronize").await;
+
+    let extraction = deployment.extraction(second).await;
+    assert_eq!(extraction["review"]["mode"], "incremental", "{extraction}");
+    assert_eq!(
+        extraction["review"]["previous"],
+        json!({"execution_id": first, "head": sha('a')})
+    );
+}
+
+/// A review that extracted its source is the next baseline whatever its
+/// verdict: head `b…` changes nothing since `a…`, so its review fails, and
+/// head `d…` is still reviewed incrementally from `b…`.
+///
+/// # Panics
+/// Panics when the failed review is not the next baseline.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_extracted_review_that_fails_is_the_next_baseline() {
+    let (deployment, _) = Deployment::reviewed_at_a().await;
+    deployment.head(&sha('b'), &sha('8'), HANDLER_A);
+    deployment.compare(&sha('c'), &sha('b'), &sha('c'), HANDLER_A, PATCH_A);
+    deployment.json(
+        &format!("/compare/{}...{}", sha('a'), sha('b')),
+        &json!({"status": "ahead", "base_commit": {"sha": sha('a')},
+                "merge_base_commit": {"sha": sha('a')},
+                "commits": [{"sha": sha('b')}], "files": []}),
+    );
+    let failed = deployment.review(&sha('b'), "synchronize").await;
+    let details = deployment
+        .get(&format!("/v1/verification/executions/{failed}/details"))
+        .await;
+    assert_eq!(details["outcome"]["verdict"], "failed", "{details}");
+
+    deployment.head(&sha('d'), &sha('9'), HANDLER_B);
+    deployment.compare(&sha('c'), &sha('d'), &sha('c'), HANDLER_B, PATCH_B);
+    deployment.compare(&sha('b'), &sha('d'), &sha('b'), HANDLER_B, PATCH_AB);
+    let next = deployment.review(&sha('d'), "synchronize").await;
+
+    let extraction = deployment.extraction(next).await;
+    assert_eq!(extraction["review"]["mode"], "incremental", "{extraction}");
+    assert_eq!(
+        extraction["review"]["previous"],
+        json!({"execution_id": failed, "head": sha('b')})
+    );
+}

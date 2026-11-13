@@ -475,6 +475,62 @@ async fn parked_executions_end_by_supersession_and_deadline() {
     );
 }
 
+/// A resumed execution keeps its admission deadline.
+///
+/// `ci-gate` here also defers `lint`. Halfway to the deadline `ci` is
+/// published: the same execution resumes, parks again waiting for `lint`,
+/// and times out at its original deadline, not one restarted by the resume.
+///
+/// # Panics
+/// Panics when the execution does not resume onto `lint` or does not time
+/// out by its admission deadline.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn a_resumed_execution_keeps_its_admission_deadline() {
+    const DEADLINE: Duration = Duration::from_secs(10);
+    let deployment = Deployment::start_limited(limits(DEADLINE)).await;
+    let both = ci_gate("1.0.0").replace(
+        "  requirements:\n",
+        "    lint: {type: json, deferred: true}\n  requirements:\n    - id: linted\n      statement: Lint is clean\n      check: {kind: assert, path: inputs.lint.clean, operator: equals, expected: true}\n",
+    );
+    deployment
+        .declare_files(&[("ci-gate.yaml", both)], &gated("1.1.0"), "gate-both")
+        .await;
+    let admitted = tokio::time::Instant::now();
+    let execution = deployment.open(5, C0).await;
+    let served = deployment.until(execution, "waiting").await;
+    assert_eq!(served["waiting"], json!(["ci", "lint"]));
+
+    tokio::time::sleep_until(admitted + DEADLINE / 2).await;
+    let (status, receipt) = deployment.publish_ci(C0, json!({"status": "green"})).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while deployment.status(execution).await["waiting"] != json!(["lint"]) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{execution} resumes onto lint"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    deployment.until(execution, "timed_out").await;
+    let mut conn = deployment.conn().await;
+    let (lived,): (f64,) = sqlx::query_as(
+        "SELECT EXTRACT(EPOCH FROM updated_at - created_at)::float8
+           FROM wyrd.verifier_executions WHERE execution_id = $1",
+    )
+    .bind(execution)
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("execution reads");
+    conn.commit().await.expect("read commits");
+    assert!(
+        lived < DEADLINE.as_secs_f64() + 3.0,
+        "timed out {lived}s after admission; a deadline restarted at the resume ends after {}s",
+        DEADLINE.as_secs_f64() * 1.5
+    );
+}
+
 /// No receipt is given before Scribe acknowledges the acceptance: an
 /// unacknowledged publication answers unavailable, not accepted or absent,
 /// and the waiting execution keeps waiting. Once the held write lands, the

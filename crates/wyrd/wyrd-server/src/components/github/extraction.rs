@@ -13,13 +13,13 @@ use bohmian_code_review_pipeline::{
     GitHubError, Identity, InstallationId, ObjectSha, PinnedReview, PipelineError, PipelineLimits,
     PullRequestPins, RepositoryIdentity, ReviewPipeline, TenantId,
 };
-use vala_verify::blocks::BlockError;
-use wyrd_spec::DataTenantId;
-use wyrd_spec::card::verifier::pull_request::{
+use output::{
     ChangeKind, ChangeSet, ChangedFile, ExclusionReason, FallbackReason, FileSource, Hunk,
     PreviousReview, PullRequestExtraction, PullRequestFormat, PullRequestHead, PullRequestMetadata,
     PullRequestRepository, PullRequestReview, PullRequestState, ReviewMode,
 };
+use vala_verify::blocks::BlockError;
+use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardUid, ExecutionId, RepositoryId};
 use wyrd_spec::reference::CardRef;
@@ -29,6 +29,8 @@ use wyrd_sql::queries::verifier_executions::{PullRequestBaseline, VerifierExecut
 
 use super::review_cache::{CodeReviewMetadata, CodeReviewObjects};
 use super::service::GithubConnections;
+
+mod output;
 
 /// The extractor version a `pull_request` extraction's provenance records.
 pub const PULL_REQUEST_EXTRACT_VERSION: &str = "pull_request/1";
@@ -68,7 +70,7 @@ impl GithubConnections<'_> {
         fields(operation = "verification.extract.pull_request", tenant_id = %tenant,
                execution_id = %source.execution_id)
     )]
-    pub async fn extract_pull_request(
+    pub(crate) async fn extract_pull_request(
         &self,
         tenant: DataTenantId,
         source: &PullRequestSource,

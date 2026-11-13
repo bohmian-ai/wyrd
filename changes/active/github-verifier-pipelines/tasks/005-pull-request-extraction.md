@@ -122,6 +122,14 @@ regenerated TypeScript wire types carry only the action field. Inspection uses
 the existing execution details on HTTP, MCP and CLI, where the step output is
 ordinary JSON; this task adds no inspection-specific type or command.
 
+The output shape is server-owned. `wyrd-spec` holds only what authors write:
+the `extractor` field of the `extract` action and its closed `Extractor`
+values. The extraction's output types live with the server's extractor, and
+client-side Verifier validation knows no output schema for
+`extractor: pull_request`, exactly as for code steps: a reference path into
+`steps.<id>.output` is not type-checked at authoring or declaration and
+resolves at execution.
+
 ## Agreed transformation and custody
 
 Select the last completed usable same-PR/same-policy review from retained

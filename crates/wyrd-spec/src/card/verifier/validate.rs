@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use skald_spec::{Prompt, ResponseFormat, ResponseType};
 
 use super::extract::ExtractOutput;
-use super::pull_request::{Extractor, PullRequestExtraction};
+use super::pull_request::Extractor;
 use super::reference::{OrderBy, Reference, ReferenceRoot, SourceField};
 use super::schema_path::{admits, fits};
 use super::{
@@ -1048,7 +1048,8 @@ where
             Action::Extract {
                 extractor: Some(Extractor::PullRequest),
                 ..
-            } => Some(PullRequestExtraction::schema()),
+            }
+            | Action::Code(_) => None,
             Action::Extract { from, .. } => match self.whole_slot(from.as_ref()?)? {
                 InputSlot::Media { formats, .. } => Some(ExtractOutput::schema_for(formats)),
                 _ => None,
@@ -1057,7 +1058,6 @@ where
                 ResponseType::JsonSchema { schema, .. } => Some(Value::clone(schema)),
                 ResponseType::Text => Some(json!({ "type": "string" })),
             },
-            Action::Code(_) => None,
         }
     }
 }
@@ -1776,10 +1776,7 @@ mod tests {
                 with("/steps/0/action/extractor", json!("pull_request")),
                 "extract_source",
             ),
-            (
-                with("/steps/0/action/from", Value::Null),
-                "extract_source",
-            ),
+            (with("/steps/0/action/from", Value::Null), "extract_source"),
             (
                 with("/inputs/deck/formats", json!(["ppt"])),
                 "extract_format",
@@ -1837,13 +1834,14 @@ mod tests {
     }
 
     /// A pull-request extraction step takes no media slot, and later steps
-    /// bind its typed output by field or whole: a path the output has
-    /// validates, and one it does not have is refused.
+    /// bind its output by field or whole. Its shape is server-owned, so
+    /// validation knows no output schema and leaves paths into it, as into
+    /// code output, to resolve at execution.
     ///
     /// # Panics
-    /// Panics when the valid Verifier is refused or the bad path is not.
+    /// Panics when either Verifier is refused.
     #[test]
-    fn pull_request_extraction_output_binds_by_its_typed_fields() {
+    fn pull_request_extraction_output_binds_without_a_client_schema() {
         let body = json!({
             "steps": [
                 {"id": "extract-pr", "action": {"kind": "extract", "extractor": "pull_request"}},
@@ -1864,14 +1862,13 @@ mod tests {
         parse(&body)
             .validate()
             .expect("a pull-request extraction Verifier validates");
-        assert_eq!(
-            rule(&with(
-                body,
-                "/steps/1/action/inputs/changes",
-                json!("steps.extract-pr.output.diff"),
-            )),
-            "missing_field"
-        );
+        parse(&with(
+            body,
+            "/steps/1/action/inputs/changes",
+            json!("steps.extract-pr.output.diff"),
+        ))
+        .validate()
+        .expect("a path into the output is not checked before execution");
     }
 
     /// Agent calls follow their Prompt placeholders and position rules; a

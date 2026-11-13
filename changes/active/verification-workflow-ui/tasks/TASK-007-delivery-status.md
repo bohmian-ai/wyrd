@@ -3,7 +3,7 @@ id: TASK-007
 kind: implementation
 status: proposed
 spec: SPEC-verification-workflow-ui
-spec_revision: 2
+spec_revision: 3
 requirements: [REQ-009, REQ-014, AC-005, AC-008, AC-009]
 depends_on: [TASK-002, TASK-005]
 ---
@@ -17,8 +17,8 @@ judgment from GitHub publication state. A provider retry changes delivery state,
 not the execution or its verdict. This separate dependency-bound addition lets
 the core viewer/PR navigation finish without waiting for report delivery.
 
-Consume 002's execution page and 005's PR context, plus backend GitHub task 009's
-redacted authorized delivery inspection attached to exact execution/provider
+Consume TASK-002's execution page and TASK-005's PR context, plus the delivered
+redacted authorized provider delivery inspection attached to exact execution/provider
 identity. Require delivered normal SDK/MCP projections and real provider
 reconciliation proof. Backend owns report conventions, provider writes, retry
 and recovery; this task consumes them and adds no retry controller or action.
@@ -35,7 +35,10 @@ does not create a primary output or a specialized finding UI.
 Use retained outputs from actual admitted executions and backend-controlled
 provider failure/retry/recovery. Through real public reads and the browser,
 observe a stable selected result/verdict while delivery changes and retained
-evidence remains readable. New head/history selection keeps exact delivery
+evidence remains readable. Also exercise delayed/unavailable execution details:
+a compact judgment or visible output is not proof of provider delivery; a denied
+delivery read must not erase otherwise authorized inspection. New head/history
+selection keeps exact delivery
 association; foreign/denied reads reveal no provider details. Assert no UI
 execution retry, recomputation or provider write. Use existing shared host and
 production browser owners plus the verification commands below.
@@ -44,10 +47,12 @@ do not invent a new delivery dashboard or management workflow.
 
 ## Execution and verification
 
-This task is proposed against draft spec revision 2. Activation requires
-explicit spec approval, the applicable scope transfer, and only this task's
-named contract/authority and predecessor outputs. Unrelated backend delivery
-or authority amendments do not block it. Record the integrated source revisions
+This task is against approved spec revision 3, whose scope transfer is
+synchronized. Activation requires only this task's named contract/authority
+and predecessor outputs. Unrelated backend delivery
+or authority amendments do not block it. This packet consumes existing read/action
+capabilities and adds no underlying server changes; a missing required capability
+remains an explicit external dependency. Record the integrated source revisions
 and actual dependency journeys it consumes; upstream task status is not proof.
 
 Read the repo-local `wyrd-ui` skill before UI edits. Reuse the shared component,
@@ -76,9 +81,8 @@ the approved mock on desktop/mobile, light/dark, keyboard/focus/touch, long
 content and error states. Record reference regions, screenshots and individual
 human acceptance. Fixtures and automated checks alone do not prove fidelity.
 
-Regenerate changed catalog/contracts through their owning generators and run
-`codegen:check` when applicable. Changed Rust/SDK owners require their narrow
-format/lint/type and real boundary journeys; preserve their existing tenancy,
-Python stub and N-API checks. Do not add a runner or substitute fixtures for
-an unavailable backend output. Integrated change review joins the delivered
-flows and runs the required full shipped-surface journey lanes.
+Regenerate changed UI catalog/contracts through their existing generator and run
+`codegen:check` where applicable. Existing backend/SDK operations are dependency
+inputs, not a Rust/SDK implementation assignment here. Do not add a runner or
+substitute fixtures for unavailable inputs. Integrated change review joins the
+delivered flows and runs the required shipped-surface journey lanes.

@@ -52,8 +52,7 @@ DOCS = re.compile(
 # hand-edit to any of them. The UI is bundled beside the server binary, not
 # compiled into it, so it does not select the server's Rust closure.
 UI = re.compile(
-    r"^(crates/wyrd/wyrd-server/wyrd-ui/|docs/src/styles/wyrd-tokens\.css"
-    r"|\.agents/skills/wyrd-ui/references/wyrd-theme\.css)"
+    r"^(crates/wyrd/wyrd-server/wyrd-ui/|docs/src/styles/wyrd-tokens\.css)"
 )
 # A docs example (examples/<guide>/) is run by every SDK's journeys, so its
 # Card files select both language lanes as well as its program.
@@ -389,6 +388,7 @@ def select(paths, root):
             else f"TypeScript input {typescript[0]}"
         )
         sel.flag("typescript", why)
+        sel.flag("ui", why)
         sel.lane("ts:napi:check", why)
         sel.lane("ts:test:integration", why)
         sel.flag("identity", why)

@@ -3,7 +3,7 @@ id: TASK-003
 kind: implementation
 status: proposed
 spec: SPEC-verification-workflow-ui
-spec_revision: 2
+spec_revision: 3
 requirements: [REQ-001, REQ-002, REQ-003, REQ-014, AC-001, AC-008, AC-009]
 depends_on: [TASK-002]
 ---
@@ -12,74 +12,71 @@ depends_on: [TASK-002]
 
 ## Outcome
 
-An engineer enters Verify, discovers unfinished and completed executions,
-combines filters, opens 002's workflow page and returns to the same list state.
-The compact verdict and Verifier charts, facet counts and table agree. This
-task delivers the required new domain reads with their actual page consumer;
-it does not wait for GitHub review extraction/delivery.
+An engineer enters Verify, discovers visible unfinished and completed executions,
+combines filters, opens TASK-002's page and returns to the same list state. The
+two charts, facet counts and table describe the same authorized population.
+Implement shared UI queries/loaders and the page over existing operations; do
+not add discovery endpoints, server fields, query services or wire contracts.
 
-## Input, extension and consumer
+## Input, queries and consumer
 
-Use accepted execution/status and selected-result records at existing
-`VerificationControl`/queue/retained-read owners, not results-only enumeration.
-Add bounded execution-summary/filter/aggregate reads to `wyrd-spec`, the owning
-server verification routes/service and normal shared client, Rust/Python/
-TypeScript SDK and MCP projections. Reuse existing generated identity/error
-contracts and domain authorization. No new runtime/table or browser fetch of
-all IDs. Exact schema/route spelling follows owner conventions; refuse and
-escalate if it requires a material behavior/ownership change from REQ-003.
+TASK-002 supplies exact inspection and read adapters. Reuse the existing
+`bifrost.query` contract/executors, parameter binding and row/byte bounds to read
+retained execution metadata/state plus result summaries. A completed-result table
+alone cannot list unfinished work. Use existing accepted identity/status and
+selected-result facts; do not replay an execution engine, choose an arbitrary
+latest result row or fetch every execution's status/details in the browser.
 
-Summaries include exact execution/subject/Verifier and nullable selected result/
-verdict, lifecycle, existing Service/Workload/Run/session/binding correlations
-and applicable repository/PR context. 005 adds the actual PR admission/review
-association and history reads; this task must not fabricate those values.
-Authorize exact Verifier scope before list pagination, counts and facets.
-Counts/charts cover the same filtered population across pages; no-result work
-uses a neutral bucket, not a failed or fourth verdict. Status/verdict combine
-normally, including empty incompatible combinations. Preserve existing null
-correlations and distinction between application Run and execution.
+At activation, record the existing authorized sources for lifecycle, selected
+result, filter correlations and counts. Tenant and exact Verifier restrictions
+must already be enforced by the selected read/query authority before pagination
+and counts. A WHERE clause based on user input is not an authorization boundary.
+If current access/data cannot supply an approved field or scoped population,
+record that exact external capability dependency and leave the affected work
+proposed; do not weaken the boundary or implement a server extension here.
 
-Consume these generated operations through the shared closed WireRequest,
-Node/MCP executors and portable loaders, then reuse Chart/FacetRail/RecordTable
-and Observe's investigation grammar at `/t/[tenantKey]/verify`. Match the
-[dashboard composition](../design/consolidation.md#approved-dashboard-behavior)
-and [mock](../design/mock/README.md): dense table including Service, separate
-Status/Verdict columns, short chart legends and combined general filters.
-Dragging either chart changes the shared time range. Preserve WHERE/range/
-Live/grouping and return position. Rows open the page directly, without a
-drawer/Expand requirement. Connect 001's Results in Verify using exact Verifier
-identity. Grouping is navigation only, not a calculated aggregate judgment.
+Rows contain exact execution/subject/Verifier, nullable selected result identity/
+verdict, lifecycle and existing Service/Workload/Run/session/binding correlations.
+TASK-005 supplies actual PR admission association where delivered; no fabricated
+membership. Rows/filters/counts/charts use matching bounded query predicates and
+the same population across pages. No-result work has a neutral chart bucket,
+not a failed or fourth verdict. Status and verdict combine, including empty
+incompatible combinations. A live result alone does not establish a retained row.
+Do not hydrate full result/detail bodies per row.
+
+Reuse Chart/FacetRail/RecordTable and Observe's investigation grammar at
+`/t/[tenantKey]/verify`, with shared portable loaders and existing Node/MCP/BFF
+hosts. Match the approved dashboard/mock: dense table including Service, separate
+Status/Verdict columns, short legends, general WHERE/range/Live/group controls.
+Either chart brushes the shared range. Preserve return position. Rows open the
+exact page directly; connect TASK-001's Results in Verify using exact identity.
+Grouping is navigation, never a combined judgment.
 
 ## Observable proof
 
-Use real SDK → server/Postgres → client journeys on all new shipped read
-surfaces to create queued/running/terminal executions, absent and recorded
-verdicts, distinct scopes/tenants and enough rows for pagination. Assert
-combined filter results, aggregates across pages, no unauthorized counts,
-nullable correlations and structured denied/unavailable outcomes. Implement
-pure filter/shape tests only where behavior needs them; no fixture can replace
-the domain journey.
+Use normal public setup to produce visible queued/running/terminal work,
+with and without recorded judgments, enough rows for pagination, distinct tenants
+and restricted viewers. Through existing Bifrost/domain read paths and the UI,
+assert matching filters/aggregates across pages, no foreign or unauthorized
+counts, nullable correlations and truthful denied/unavailable states. Include
+result-visibility lag. Record any source/access prerequisite that is absent;
+fixtures cannot establish it.
 
-Through the production BFF browser, navigate the rail, filter/group/brush/page,
-open exact intermediate/terminal execution, copy its link and return. Assert
-list state restoration and that a delayed/superseded load cannot overwrite
-the new filter/selection. Exercise the same projection in existing Node/MCP/
-custom/built-artifact host proof. Independently compare both charts, facets,
-table columns/scrolling and empty/error states to the approved mock.
-
-Use the verification owners and commands below,
-including domain surface/schema/type checks for the introduced operations.
-This task owns its read extension; it must not mislabel it an upstream GitHub
-prerequisite. Specification approval, the applicable scope transfer and 002's delivered
-inspection owner remain activation dependencies; unrelated GitHub amendments
-do not block this task.
+Prove the list load uses bounded shared queries, without per-row details/status
+hydration. In the production browser, filter/group/brush/page, open TASK-002's
+exact intermediate/terminal execution and return. Preserve filters/range/position;
+superseded loads cannot replace new selection. Repeat affected reads through
+Node/MCP/custom/built-artifact hosts and compare charts/facets/table/empty/error
+states with the mock. Existing read permissions remain unchanged.
 
 ## Execution and verification
 
-This task is proposed against draft spec revision 2. Activation requires
-explicit spec approval, the applicable scope transfer, and only this task's
-named contract/authority and predecessor outputs. Unrelated backend delivery
-or authority amendments do not block it. Record the integrated source revisions
+This task is against approved spec revision 3, whose scope transfer is
+synchronized. Activation requires only this task's named contract/authority
+and predecessor outputs. Unrelated backend delivery
+or authority amendments do not block it. This packet consumes existing read/action
+capabilities and adds no underlying server changes; a missing required capability
+remains an explicit external dependency. Record the integrated source revisions
 and actual dependency journeys it consumes; upstream task status is not proof.
 
 Read the repo-local `wyrd-ui` skill before UI edits. Reuse the shared component,
@@ -108,14 +105,8 @@ the approved mock on desktop/mobile, light/dark, keyboard/focus/touch, long
 content and error states. Record reference regions, screenshots and individual
 human acceptance. Fixtures and automated checks alone do not prove fidelity.
 
-For introduced domain reads, use the existing server/MCP verification journey
-owners (`wyrd-testing/tests/bifrost/server/verification_runtime.rs` and
-`wyrd-mcp/tests/bifrost/mcp/verification.rs`) and the normal SDK integration
-trees. Select affected stories through `test:bifrost:journey:server`,
-`test:bifrost:journey:mcp`, `test:rust-sdk:journey`, `py:test:integration` and
-`ts:test:integration`; preserve the spec's shipped-surface and negative-flow
-proof. Exact new selectors are recorded by the implementer. Regenerate through
-the owning generators and run `codegen:check`; Rust changes add `fmt`/`lints`,
-and SDK changes add their owning format/lint/type, Python stub and N-API
-checks. Relevant tenancy/dependency changes add `check:tenant-isolation` and
-`check:deps`. Full shipped-surface lanes belong to integrated change review.
+Use the existing UI integration owners to prove real Bifrost/domain inputs through
+Node/MCP/BFF/custom/built-artifact adapters. Do not add or change server/SDK wire
+contracts or their generators. Regenerate the UI catalog when schemas change and
+run `mise run codegen:check` where applicable. Full shipped-surface journey lanes
+belong to integrated change review; focused UI/host journeys prove this task.

@@ -25,7 +25,6 @@
     observe: 'M3 12h4l3-7 4 14 3-7h4',
     verify: 'M5 12l5 5L20 7',
     query: 'M4 6c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3zM4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6',
-    changes: 'M6 8v8M8 6h3a5 5 0 0 1 5 5M4 6a2 2 0 1 0 4 0 2 2 0 1 0-4 0M4 18a2 2 0 1 0 4 0 2 2 0 1 0-4 0M16 12a2 2 0 1 0 4 0 2 2 0 1 0-4 0',
     settings: 'M12 9a3 3 0 1 0 0 6 3 3 0 1 0 0-6M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1'
   } as const;
   const groups = $derived<readonly (readonly Destination[])[]>([
@@ -37,8 +36,7 @@
       { label: 'Observe', href: `${base}/observe`, icon: ICONS.observe },
       { label: 'Verify', icon: ICONS.verify },
       { label: 'Query', href: `${base}/query`, icon: ICONS.query }
-    ],
-    [{ label: 'Changes', icon: ICONS.changes }]
+    ]
   ]);
   const current = (href: string) => (href === base ? page.url.pathname === base : page.url.pathname.startsWith(href));
 </script>

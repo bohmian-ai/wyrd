@@ -121,3 +121,16 @@ test('a used pair below its contrast floor fails in the mode that breaks it', ()
   assert.ok(failures.length > 0);
   assert.ok(failures.every((f) => f.includes('--muted') && f.includes('[dark]')), failures.join('\n'));
 });
+
+test('component contracts list exactly the built components and the placeable catalog', async () => {
+  const { readFileSync } = await import('node:fs');
+  const read = (path) => readFileSync(new URL(path, import.meta.url), 'utf8');
+  const { components } = JSON.parse(read('./components.json'));
+  const exported = [...read('../packages/ui/src/lib/index.ts').matchAll(/export \{ default as (\w+)/g)].map((m) => m[1]);
+  const chrome = Object.keys(components).filter((name) => !exported.includes(name));
+  assert.deepEqual(exported.filter((name) => !components[name]), [], 'every wyrd-ai-ui component has a contract');
+  for (const name of chrome) assert.equal(components[name].catalog, false, `${name} is chrome, never placeable`);
+  const placeable = Object.keys(components).filter((name) => components[name].catalog).sort();
+  const catalog = Object.keys(JSON.parse(read('../packages/ui/src/lib/catalog.json')).components).sort();
+  assert.deepEqual(placeable, catalog, 'catalog: true matches catalog.json');
+});

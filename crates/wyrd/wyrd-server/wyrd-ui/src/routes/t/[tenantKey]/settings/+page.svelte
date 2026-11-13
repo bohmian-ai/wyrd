@@ -100,7 +100,7 @@
           <form class="stack" method="POST" action="?/activate">
             <input type="hidden" name="revision" value={candidate.revision} />
             <label for="recovery">Recovery API key</label>
-            <input id="recovery" class="app-input" type="password" name="recoveryApiKey" required autocomplete="off" />
+            <input id="recovery" class="app-input mono" type="password" name="recoveryApiKey" required autocomplete="off" />
             <p>A key for a headless principal of this tenant with identity_connections:write. It is verified and discarded.</p>
             <button class="app-control primary" type="submit">Activate</button>
           </form>
@@ -109,9 +109,9 @@
       <form class="stack" method="POST" action="?/stage">
         <input type="hidden" name="revision" value={candidate?.revision ?? ''} />
         <label for="issuer">Issuer URL</label>
-        <input id="issuer" class="app-input" name="issuer" type="url" required value={candidate?.issuer ?? ''} />
+        <input id="issuer" class="app-input mono" name="issuer" type="url" required value={candidate?.issuer ?? ''} />
         <label for="client-id">Client ID</label>
-        <input id="client-id" class="app-input" name="clientId" required value={candidate?.client_id ?? ''} />
+        <input id="client-id" class="app-input mono" name="clientId" required value={candidate?.client_id ?? ''} />
         <label for="client-auth">Client authentication</label>
         <select id="client-auth" class="app-input" name="clientAuth">
           {#each ['SecretBasic', 'SecretPost', 'Public'] as method (method)}
@@ -119,13 +119,13 @@
           {/each}
         </select>
         <label for="client-secret">Client secret</label>
-        <input id="client-secret" class="app-input" type="password" name="clientSecret" autocomplete="off" />
+        <input id="client-secret" class="app-input mono" type="password" name="clientSecret" autocomplete="off" />
         <label for="email-claim">Email claim</label>
-        <input id="email-claim" class="app-input" name="emailClaim" value={candidate?.claim_mapping.email ?? 'email'} />
+        <input id="email-claim" class="app-input mono" name="emailClaim" value={candidate?.claim_mapping.email ?? 'email'} />
         <label for="groups-claim">Groups claim</label>
-        <input id="groups-claim" class="app-input" name="groupsClaim" value={candidate?.claim_mapping.groups ?? ''} />
+        <input id="groups-claim" class="app-input mono" name="groupsClaim" value={candidate?.claim_mapping.groups ?? ''} />
         <label for="group-roles">Group to role mapping (one <code>group = role, role</code> per line)</label>
-        <textarea id="group-roles" class="app-input" name="groupRoles" rows="4">{candidate ? roles(candidate.group_role_map) : ''}</textarea>
+        <textarea id="group-roles" class="app-input mono" name="groupRoles" rows="4">{candidate ? roles(candidate.group_role_map) : ''}</textarea>
         <button class="app-control primary" type="submit">{candidate ? 'Replace candidate' : 'Stage candidate'}</button>
       </form>
     </section>

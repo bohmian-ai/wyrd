@@ -1,7 +1,7 @@
 ---
 id: TASK-001
 kind: implementation
-status: ready
+status: complete
 spec: SPEC-verification-workflow-ui
 spec_revision: 2
 requirements: [REQ-004, REQ-014, AC-002, AC-009]
@@ -9,6 +9,12 @@ depends_on: []
 ---
 
 # Shared graph and exact Verifier definition
+
+Marked complete at the user's request on 2026-11-11 after the
+[passing remediation review](../review/TASK-001-2026-11-11-02/verdict.md)
+of candidate `9c38fdfc3`. `FIND-TASK-001-1` is closed. Human visual
+acceptance and a green full integration aggregate remain uncertified;
+completion does not change the verification evidence recorded below.
 
 ## Outcome
 

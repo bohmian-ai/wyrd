@@ -1,143 +1,99 @@
 ---
 name: wyrd-ui
-description: "Use this repo-level skill when building, editing, debugging, styling, or extending the Wyrd SvelteKit UI in `crates/wyrd/wyrd-server/wyrd-ui`. Trigger for Svelte 5 components, SvelteKit routes and load functions, Tailwind v4 or Skeleton styling, theme work, frontend UX, visual changes, and any request mentioning Wyrd UI, wyrd-theme.css, Evidence Thread, dark mode, or Wyrd frontend patterns. Wyrd UI is the styling source of truth, not the product or workflow source of truth."
+description: "Use this repo-level skill when building, editing, debugging, styling, or extending the Wyrd UI in `crates/wyrd/wyrd-server/wyrd-ui`: the `wyrd-ai-ui` component package, the SvelteKit host app, Svelte 5 components, routes and load functions, Tailwind v4 styling, theme tokens, view documents, loaders and executors, and any request mentioning Wyrd UI, Evidence Thread, dark mode, or Wyrd frontend patterns. Wyrd UI is the styling source of truth, not the product or workflow source of truth."
 ---
 
 # Wyrd UI
 
-This is the canonical repo-level skill for Wyrd frontend work. Use it before touching files under `crates/wyrd/wyrd-server/wyrd-ui/`.
+Use this skill before touching anything under `crates/wyrd/wyrd-server/wyrd-ui/`.
+Precedence: the user's instructions, then current code, then `brand/DESIGN.md`, then
+this skill.
 
-The skill is standalone. Do not rely on external repositories, deprecated product docs, or a user's local filesystem outside this repo. Use the references bundled here.
+## Product boundary
 
-## Product Boundary
+The Rust server owns durable behavior; the UI is one client among MCP, CLI, HTTP, and
+the SDKs. Never add a workflow only the UI can perform, and never re-derive
+server-owned meaning: status, judgments, thresholds, lineage, sorting, pagination,
+aggregation. The UI owns presentation only: display formatting (`wyrd-ai-ui`'s
+`format.ts`), widths, relative time, truncation, verdict→token mapping. Every path is
+tenant-scoped; the browser never holds a credential.
 
-Wyrd follows a language-agnostic client/server model. The Rust server owns
-durable behavior and core logic; contracts live on the API wire through typed
-schemas, HTTP/MCP payloads, generated docs, and stable errors so any language
-can implement a client.
+## Two packages
 
-The SvelteKit UI is a supported developer client and the styling source of
-truth. It is not the product or workflow source of truth. Do not add behavior
-that can only be performed through the UI, and do not duplicate server-owned
-registry, storage, policy, audit, tenancy, relationship, status, or evaluation
-logic in frontend code.
+| Path | What it is | Put here |
+|---|---|---|
+| `packages/ui` (`wyrd-ai-ui`) | Publishable components, Zod input schemas, `catalog.json`, view documents (`WyrdView`), portable loaders, the Node and MCP App executors, `theme.css` | Reusable components and anything another host (MCP App, `examples/ui-app`) renders |
+| `src/` (host app) | SvelteKit BFF: sign-in and sessions, tenant routing, the `t/[tenantKey]/…` pages, URL state, the `_gallery` dev page | Routes, server-only code, page composition, host URL state |
 
-Wyrd is agent-first and headless. MCP, CLI, HTTP, generated schemas, stable
-errors, and machine-readable docs are primary surfaces. UI work must preserve
-those headless paths and must respect both self-hosted and cloud SaaS tenant
-separation.
+Map and conventions: `references/wyrd-working-map.md`. Server/client split, errors,
+and auth: `references/wyrd-sveltekit-architecture.md`.
 
-## Precedence
+## Styling: Evidence Thread
 
-Apply rules in this order:
+Authority is `brand/`: read `DESIGN.md` first, then `palette.json` and
+`components.json`; `renders/styleguide.html` is the rendered reference.
 
-1. Direct user instructions for this task.
-2. Current Wyrd repository code under `crates/wyrd/wyrd-server/wyrd-ui/`.
-3. Wyrd UI styling and brand guidance in this skill.
-4. Bundled Wyrd references for architecture, Svelte, data, UX, and verification patterns.
-
-Do not import product-specific naming, routes, client wrappers, visual tokens, or examples from older systems. If a pattern is useful, port the idea into Wyrd terms and Wyrd paths before using it.
-
-## What Wyrd UI Is
-
-Wyrd UI uses **Evidence Thread**, the one design system shared with the documentation
-site: scientific provenance rendered flat and ruled on a neutral mineral canvas. Light and
-dark are two complete renderings of the same structure; only token values change.
-
-The authority is `crates/wyrd/wyrd-server/wyrd-ui/brand/`: read `DESIGN.md` first, then
-`palette.json` and `components.json`. `renders/styleguide.html` is the rendered reference.
-
-## Non-Negotiable Styling Rules
-
-- **Tokens only.** Use `var(--token)` or the Tailwind utilities that resolve through
-  `brand/theme.css`. Never hardcode a hex in a component.
-- **Semantics.** `--declare` (cobalt/periwinkle) is Declaration, links, selection, focus, and the primary
-  action; `--observe` (lime) is observed fact; `--evidence` (lime) is retained Evidence
-  only — never an accent, hover, or secondary action; `--ok`/`--warn`/`--danger` keep status
-  meaning and always pair with a glyph or word.
-- **Geometry.** 1px rules (`--border`, `--border-soft`), 2px radius (`--r`), no decorative
-  elevation: no hard-offset or blurred shadows, glow, gradients, scanlines, or lift/sink
-  motion.
+- **Tokens only.** `var(--token)` or Tailwind utilities that resolve through
+  `brand/theme.css`. No hex in components, no inline styles that bypass tokens.
+- **Modes.** The root layout sets `data-mode="light|dark"` (`src/lib/theme.svelte.ts`,
+  persisted in the `wyrd-mode` cookie). Light and dark swap token values, never
+  structure.
+- **Semantics.** `--declare` is Declaration, links, selection, focus, and the primary
+  action. `--observe` is observed fact. `--evidence` is retained Evidence only, never an
+  accent, hover, or secondary action. `--ok`/`--warn`/`--danger` mean state and always
+  pair with a glyph or word; chart series carry a dash and marker, not color alone.
+- **Geometry.** 1px rules (`--border`, `--border-soft`), 2px radius (`--r`). No
+  shadows, glow, gradients, scanlines, or lift/sink motion.
 - **Type.** Familjen Grotesk (`--font-sans`) for interface and reading; Fragment Mono
-  (`--font-mono`) only for machine-shaped values. Both ship locally; never import a font
-  service.
-- **Mark.** The Wyrd mark SVGs are generated from the palette; never redraw them.
+  (`--font-mono`) only for machine-shaped values.
+- **Host controls.** `.app-control` and `.app-input` (`src/app.css`) match the approved
+  mock's buttons: 1px rule, 32px, 13px sans. Add `.mono` to an input that holds a machine
+  value (key, issuer, client id, claim, tenant key). Fonts ship via `@fontsource`; never
+  import a font service. No UI component library: Tailwind v4 plus tokens.
+- **Generated, never hand-edited:** `brand/theme.css`, `packages/ui/src/lib/theme.css`,
+  `docs/src/styles/wyrd-tokens.css`, the mark SVGs. Change `palette.json`, run
+  `pnpm tokens`. `palette.json`'s `pairs` block is a contrast gate in both modes.
 
-`references/wyrd-theme.css` is a **generated artifact**: the same tokens under the
-`[data-theme='wyrd'].theme-light` / `.theme-dark` selectors, emitted from
-`brand/palette.json` by `brand/gen-theme.mjs`. Do not edit any generated projection by
-hand — change `palette.json`, then run `pnpm tokens`.
-`mise run codegen:check` runs the generator tests and fails on drift.
+## Adding or changing a component
 
-Also inspect the current app files:
+1. Contract in `brand/components.json` (`status: "spec"`).
+2. Component in `packages/ui/src/lib/components/`, exported from `index.ts`. Data
+   components render from typed props alone; fetching belongs to loaders.
+3. If hosts can place it in a view document, add its input schema to
+   `packages/ui/src/lib/schemas.ts` and a loader in `loaders.ts`, then run
+   `pnpm --filter wyrd-ai-ui catalog` (regenerates `catalog.json` and `problems.json`).
+4. Add a fixture in `src/lib/ui-fixtures.ts` so `_gallery` and the tests render it.
+5. Flip the contract to `built`, set `catalog` to match `catalog.json`, and add a test.
+   `brand/gen-theme.test.mjs` fails if the contracts, exports, and catalog disagree.
 
-- `crates/wyrd/wyrd-server/wyrd-ui/src/app.css`
-- `crates/wyrd/wyrd-server/wyrd-ui/src/routes/+layout.svelte`
-- `crates/wyrd/wyrd-server/wyrd-ui/src/routes/+page.svelte`
-- `crates/wyrd/wyrd-server/wyrd-ui/brand/brand-skill.md`
-- `crates/wyrd/wyrd-server/wyrd-ui/brand/theme.css`
-- `crates/wyrd/wyrd-server/wyrd-ui/brand/palette.json`
+## Frontend rules
 
-## Standalone References
-
-Load these only when relevant. They are Wyrd-native and should be enough to use this skill without any outside repository.
-
-- Feature boundary and code navigation: `references/wyrd-working-map.md`
-- SvelteKit routing, server routes, load functions, invalidation, and auth/session boundaries: `references/wyrd-sveltekit-architecture.md`
-- Svelte 5 runes, snippets, effects, `.svelte.ts` modules, and TypeScript patterns: `references/wyrd-svelte5-patterns.md`
-- Large tables, trace-style views, files, charts, pagination, virtualization, search/filtering, and payload budgets: `references/wyrd-data-performance.md`
-- Developer workflow UX, filters, drilldowns, empty/loading/error states: `references/wyrd-developer-ux.md`
-- Tailwind v4, Skeleton, token usage, dark mode, icons, semantic colors: `references/wyrd-theming.md`
-- Vitest, Svelte Testing Library, build checks, accessibility, and performance verification: `references/wyrd-testing-verification.md`
-
-## Frontend Rules
-
-- Work inside the existing SvelteKit app instead of treating this as a generic Svelte project.
-- Keep the app dense, scannable, and task-oriented. Wyrd is a developer tool, not a marketing site.
-- Prefer existing local patterns and package choices before adding abstractions or dependencies.
-- Keep data fetching server-side by default when server boundaries exist. Prefer SvelteKit server load functions and route handlers over browser-direct backend calls.
-- Use Svelte 5 runes deliberately: `$derived` for pure derived state, `$effect` for external side effects.
-- Do not add new UI libraries unless the user explicitly asks.
-- Use icons from the existing enabled icon stack when available; do not invent custom inline icons for common actions.
-- Preserve accessibility basics: semantic elements, keyboard behavior, visible focus, useful empty/loading/error states, and responsive layouts.
-
-## Plan Remediation
-
-When `$wyrd-implement-plan` resumes UI work after review, require an active
-orchestrator-owned `Remediation revision RR<N>` in the canonical task. Treat
-the original task plus that revision as the executable assignment. It must be
-decision-complete at the same density as the original task: exact correction,
-owners and symbols, interfaces, consequential control flow, UI states and edge
-behavior, tests and critical assertions, verification, allowed/prohibited
-scope, escalation boundaries, and finding closure. Reviewer findings, a diff,
-or a desired visual outcome alone are not implementation instructions. Stop
-before editing rather than choosing a material fix that the revision omits.
-
-## Editing Order
-
-When making UI changes, inspect in this order:
-
-1. Route entrypoint: `+page.svelte`, `+page.ts`, `+page.server.ts`, or `+layout.*`.
-2. Feature component under `src/lib/components/...`, if present.
-3. Server helper or route handler under `src/lib/server/...` or `src/routes/api/...`, if present.
-4. Theme and brand files.
-5. Shared route constants, schemas, stores, and local feature types.
-
-The Wyrd UI is intentionally small right now. If a referenced directory does not exist yet, create it only when the feature needs that boundary.
+- Dense, scannable, task-oriented. One dominant work region per page; progressive
+  disclosure; names before IDs (`DESIGN.md` § Workbench composition).
+- Server loads by default. Browser-called reads go through host `+server.ts` routes
+  that use the session cookie (for example `t/[tenantKey]/ui/load`), never the backend
+  directly.
+- State users share, reload, or go Back to lives in the URL (`cards-host.ts`,
+  `observe-host.ts`). Page through bounded results from the server; never fetch all
+  pages to sort or filter in the browser.
+- Svelte 5 runes: `$derived` for pure values, `$effect` only for external side effects,
+  `.svelte.ts` modules only for state several components share. Strict TypeScript;
+  `unknown` at boundaries, then narrow with the Zod schemas.
+- Empty, loading, error, unauthorized, and unavailable states are distinct and
+  reachable. Errors are stable problems (code, title, remediation), not raw messages.
+- Accessibility: semantic elements, keyboard reach, visible focus in both modes, dense
+  data in a labeled horizontal scroll region rather than crushed.
+- No new dependency unless the user asks.
 
 ## Verification
 
-Run checks from `crates/wyrd/wyrd-server/wyrd-ui` when relevant:
-
-```bash
-pnpm build
-pnpm check
-```
-
-For visual work, inspect both light and dark behavior when theme support exists. Check that text fits, controls are reachable, and the flat ruled geometry is intact.
+Narrowest first: `references/wyrd-testing-verification.md`. The minimum for any change
+under `wyrd-ui/` is `mise run ui:check`, the same lane CI's `ui` job runs. It builds the
+`wyrd-ai` addon, then runs `pnpm check` and `pnpm test`. Add `mise run codegen:check`
+when touching `palette.json`, `schemas.ts`, or the error catalog. For visual work,
+check both modes in `/_gallery` and the affected route.
 
 ## Handoff
 
-Report only the visible outcome, changed route or component, verification
-status, and any material limitation. Do not narrate implementation steps or
-repeat details visible in the diff.
+Report the visible outcome, the changed route or component, verification status, and
+any material limitation.

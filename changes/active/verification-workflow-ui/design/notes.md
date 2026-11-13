@@ -2,10 +2,10 @@
 
 Status: finalized
 
-The user approved the centralized verification UI and authorized removal of the
-superseded prototypes. `design/mock/` is the sole approved mock. This finalizes
-the agreed design for specification; it does not approve a production spec or
-implementation.
+The centralized visual design remains approved and `design/mock/` remains the
+sole approved mock. The user finalized the existing-read, UI-only approach on
+2026-11-12 and requested revised tasks. Specification revision 3 records that
+agreement; TASK-001 stays complete and TASK-002 through TASK-007 remain proposed.
 
 Verify discovery opens exact workflow pages. Repositories is a separate visible
 workspace; the existing Cards UI is not redesigned. Repository identity remains
@@ -40,6 +40,44 @@ running, waiting or completed verification in Verify or follows a PR link,
 understands the workflow, inspects exact retained outputs, makes an authorized
 approval decision or cancels unfinished work, and reopens the same evidence
 later. All verification workflows use the same viewer.
+
+## Reopened UI-only contract alignment (2026-11-12)
+
+The user agreed this approach and requested task revisions on 2026-11-12.
+The direction is to adapt the approved UI to
+existing verification state and stored data, accounting for the resource-scaling
+contract changes. Do not redesign the server to support the UI.
+
+Fixed boundary: no new server fields, endpoints, domain query services, storage,
+execution logic or authorization changes. The earlier proposed status-context,
+drift-context and discovery API extensions are rejected. This finalized boundary
+supersedes those earlier implementation proposals. Do not remove approved visual
+features merely to simplify this investigation.
+
+Retained data already lives in Bifrost. Compact VerificationResult is a response
+projection, not deletion of detail from storage. Reuse existing Bifrost query
+operations and existing domain status/details/invocation/publication/action
+operations under their current permissions. UI responsibilities are field
+projection, loading/availability, graph/inspector rendering, selection/navigation
+and supported-host adapters.
+
+The field-to-existing-read map carries this agreement into the revised tasks.
+Record unsupported or undelivered inputs as specific external dependencies; do
+not turn them into backend implementation assignments or invent state. [Source research](contract-alignment-research.md) is the current
+map and supersedes the discarded backend-expansion proposal.
+
+TASK-001 remains complete. TASK-002 needs result/details/live-record adapter work,
+missing runtime presentation and shared graph adaptation for current Step types.
+TASK-003 should use existing permitted Bifrost queries instead of its proposed
+new server discovery APIs. Other tasks consume those same components/read owners;
+existing external capabilities remain dependencies, not work for this UI packet.
+The task revisions preserve IDs/order and expose remaining input dependencies
+without changing their server owners.
+
+Specification revision 3 records the user-agreed boundary. TASK-002 through
+TASK-007 are revised as proposed work; TASK-001 keeps its historical completion
+and revision-2 proof. No production code or branch integration is part of this
+planning pass.
 
 ## Agreed decisions
 
@@ -88,9 +126,9 @@ second manual connection-confirmation feature or separate integration-disable
 product. No UI-only permissions or fresh-login policy. Do not reclassify sensitive
 Bifrost payloads or use public SQL to bypass domain read permissions.
 
-The selected native Repository/deferred-input/approval/GitHub semantics come from
-approved backend revision 4, revalidated during specification (public behavior
-unchanged from revision 3). Its dedicated installation table is backend-owned;
+The selected native Repository/deferred-input/approval/GitHub semantics remain
+external backend contracts. The refreshed source map records revision 7 and
+distinguishes approved semantics from actual delivered operations. Its dedicated installation table is backend-owned;
 this UI packet adds no table. That work is a delivery and
 authority-update dependency; design approval does not imply it is implemented.
 
@@ -98,8 +136,8 @@ authority-update dependency; design approval does not imply it is implemented.
 
 ### Shared Verify discovery and navigation
 
-Extend the existing verification read owner with the bounded summary/filter and
-review-set projections required by the approved list. The current results-only
+Use existing bounded Bifrost queries and delivered domain operations for the
+summary/filter and review-set presentation required by the approved list. The current results-only
 list cannot discover executions that have no result yet. Reuse accepted execution
 and admission records; do not have the browser enumerate status for every ID or
 assemble review membership from timestamps, names, commit SHA alone or caller
@@ -115,8 +153,9 @@ Review membership comes from the server's exact selected Repository policy,
 source and review occurrence. The general PR link follows its current review
 set across source updates. History selection and individual execution links
 remain exact. Live list refresh never replaces an open exact execution or
-selected historical inspection. The backend owner must expose that association;
-no new review engine or Card kind is needed.
+selected historical inspection. Consume that association only when an existing authorized surface supplies it;
+missing accepted membership remains an external dependency. No review engine,
+server projection or Card kind is added here.
 
 Latest user direction: selecting a list execution opens its workflow page,
 preserving list filters/range/position on return. The current mock has no quick
@@ -212,11 +251,13 @@ not presented as the original source file.
 
 Use one component/loader implementation across the gallery, conventional UI,
 custom consumers and supported MCP App artifact. Extend the existing closed read
-contract, Node/MCP executors and host action intents. Server operations and normal
-SDK/MCP projections remain primary; the UI adds no durable workflow.
+contract, Node/MCP executors and host action intents. Existing server operations and
+normal SDK/MCP projections remain the read/action owners; this packet adds UI
+adapters and no server contract or durable workflow.
 
-This packet owns the shared verification viewer, the required summary/review-set
-read extensions, Repository presentation and GitHub connection UI. The backend
+This packet owns the shared verification viewer, summary/review-set
+UI queries/adapters over existing surfaces, Repository presentation and GitHub
+connection UI. The backend
 pipeline packet owns its engine/integration semantics and authority amendments.
 Transfer overlapping verification scope from original TASK-007 and repository
 scope from TASK-009 through explicit spec/task reconciliation. Retain their
@@ -240,9 +281,9 @@ Approved visual references:
 
 [Source alignment](source-alignment.md) records inspected owners, callers/tests,
 missing projections, authority boundaries and exact prototype check commands.
-Backend contract inspection used worktree HEAD ec87d12e1 and approved
-`github-verifier-pipelines` revision 3 on 2026-11-10. Earlier inspection of the
-superseded verifier-review-pipelines packet is not current delivery evidence.
+The refreshed source map records UI `9c38fdfc3`, resource-scaling `443a79337`
+and newer integrated backend `54aa8f4a9`. Earlier 2026-11-10 worktree/revision
+references are historical evidence, not current dependency-delivery claims.
 
 The graph-plus-inspector pattern was informed by GitHub Actions and Airflow;
 local Mitari and official CodeRabbit/Devin documentation informed the separation
@@ -293,8 +334,8 @@ never overrides those contracts by itself.
 ## Remaining implementation-owned choices
 
 The combined mock and behavior are approved. There are no remaining product
-decisions for this design. The spec must record the required public read/action
-behavior through existing domain owners after revalidating the backend worktree.
+decisions for this design. The spec records UI behavior over existing public read/action
+owners. Missing input capability is a dependency, not a new backend assignment.
 Exact internal query/layout/cursor mechanics remain implementation-owned. Do not
 add another storage or orchestration owner.
 
@@ -306,22 +347,18 @@ ordinary implementation work within the accepted visual contract.
 
 ## Handoff
 
-The [specification](../spec.md), revision 2, now records this finalized design
-and the approved mock as a **draft** behavioral contract in this separate
-packet. Backend revision 4 and current inspection owners were revalidated;
-see [source alignment](source-alignment.md). Existing operations remain distinct
-from required all-status summary and review-set read extensions.
-Explicitly transfer overlapping verification scope from original TASK-007 and
-Repository scope from TASK-009 without taking their unrelated work. Preserve
-session/drift, evidence permissions and supported-host obligations.
+The [specification](../spec.md), revision 3, records the user's 2026-11-12
+agreement: adapt the approved UI to existing Card/Bifrost/verification reads and
+the compact/details split, with no underlying server changes. The visual design
+and original scope transfer remain intact. Revised TASK-002 through TASK-007
+carry the existing-read map, inputs, consumers and proof; TASK-001 stays complete.
 
-At the user's explicit request, `$wyrd-plan` has drafted
-[proposed tasks](../tasks/) before specification approval. Implementation
-activation requires that approval, the applicable scope transfer and only each
-task's named contract/authority outputs. Approval of the UI behavior does not
-require unrelated backend work to land. The backend admission owner still needs
-to confirm the supported same-commit review-request input and replay identity;
-that dependency is recorded on TASK-005, without adding a UI rerun action.
+The external admission owner still needs to confirm the supported same-commit
+review-request input and replay identity and expose accepted membership to an
+existing authorized read. That dependency remains on TASK-005, without adding a
+UI rerun action or a new server read. Other tasks depend only on their named
+inputs. Integration and real input proof, not another packet's task numbers,
+establish readiness.
 
 The connected flow is Verify → exact workflow → contextual evidence → return;
 Repositories → policy/activity/PR review set → the same execution; Settings →

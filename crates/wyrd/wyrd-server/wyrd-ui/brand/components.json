@@ -1,5 +1,5 @@
 {
-  "$comment": "Machine-readable component contracts for Wyrd's Evidence Thread design system. `catalog: true` marks a component a future composed view may place by name: its props are typed, JSON-safe and semantic. `catalog: false` marks trusted application code — chrome that resolves tenant identity, session state and navigation — which an authored view must never be able to place, replace or impersonate. `consumers` lists the accepted product mock pages that require the component; a shared component earns its place only with at least two. The rendered reference is ./renders/styleguide.html.",
+  "$comment": "Machine-readable contracts for Wyrd's Evidence Thread components. `components` lists exactly what is built (every export of packages/ui/src/lib/index.ts plus the host chrome) and approved-but-unbuilt chrome (`status: \"spec\"`). `catalog: true` marks a component a view document may place by name and must equal packages/ui/src/lib/catalog.json; `catalog: false` marks components only trusted code composes, including chrome that resolves tenant identity, session state and navigation, which an authored view must never place, replace or impersonate. `consumers` lists where a component is used. `styles` holds shared visual rules that are not components of their own, with the components that implement them. The rendered reference is ./renders/styleguide.html; gen-theme.test.mjs pins the catalog and export sets.",
   "altitudes": {
     "quiet": "workbench default — 1px --border rule, 2px radius, no elevation",
     "raised": "the page's single attention surface — 1px --text rule, no elevation",
@@ -24,562 +24,290 @@
     "redundancy": "Status carries a glyph, thresholds carry a tick, chart series carry a dash and a marker. Colour is never the sole carrier of a meaning."
   },
   "components": {
-    "Panel": {
+    "Chart": {
       "status": "built",
       "catalog": true,
       "altitude": "quiet",
       "consumers": [
-        "H-02",
-        "C-02",
-        "O-01",
-        "CR-03",
-        "S-01"
-      ],
-      "tokens": [
-        "--surface",
-        "--border",
-        "--muted",
-        "--text",
-        "--r",
-        "--border-soft"
-      ],
-      "props": {
-        "variant": "quiet | raised | flat | wide | accent",
-        "title": "string?",
-        "children": "content"
-      },
-      "variants": [
-        "quiet",
-        "raised",
-        "flat",
-        "wide",
-        "accent"
-      ],
-      "anatomy": [
-        "head",
-        "body"
-      ],
-      "rules": [
-        "named Panel, never Card: a Wyrd Card is a registered domain record, a panel is only a surface it may be drawn on",
-        "1px rule, 2px radius, no decorative elevation",
-        "quiet = --border rule; raised = --text rule marking the page's single attention surface; flat = --border-soft rule for a subordinate block",
-        "wide spans grid-column 1 / -1",
-        "accent = the page's single dominant work region: a --declare-soft head over a --surface body; at most one accent panel per page",
-        "container-type: inline-size so contained components respond to the panel, not the viewport"
-      ]
-    },
-    "Button": {
-      "status": "built",
-      "catalog": true,
-      "altitude": "quiet",
-      "consumers": [
-        "CR-02",
-        "CR-04",
-        "Q-01",
-        "H-01"
+        "src/routes/t/[tenantKey]/observe/+layout.svelte",
+        "view documents (WyrdView)"
       ],
       "tokens": [
         "--border",
-        "--surface",
-        "--text",
+        "--border-soft",
         "--declare",
-        "--declare-ink",
+        "--declare-soft",
+        "--font-mono",
+        "--font-sans",
+        "--muted",
         "--r",
-        "--surface-2",
-        "--surface-hover"
+        "--surface",
+        "--text",
+        "--warn"
       ],
       "props": {
-        "variant": "primary | secondary | ghost",
-        "href": "string?",
-        "children": "content"
+        "input": "ChartInput (schemas.ts)",
+        "result": "loader result",
+        "actions?": "per-action state",
+        "onaction?": "(intent) => void",
+        "identity?": "readonly string[]",
+        "summary?": "Loaded<QueryResult>",
+        "shown?": "ReadonlySet<string>",
+        "onseries?": "(shown: ReadonlySet<string>) => void",
+        "compact?": "boolean",
+        "headline?": "{ value: string; detail?: string; tone?: string }",
+        "note?": "string",
+        "bars?": "boolean",
+        "colors?": "Readonly<Record<string, string>>",
+        "heading?": "Snippet"
       },
-      "variants": [
-        "primary",
-        "secondary",
-        "ghost"
-      ],
-      "anatomy": [
-        "label"
-      ],
       "rules": [
-        "primary = --declare fill with --declare-ink label — the one strong action on a surface",
-        "secondary = neutral --surface-2 fill with --text label; lime is reserved for retained Evidence and never marks an action",
-        "ghost = surface fill, no accent",
-        "href renders an <a> with identical treatment, so a catalog-safe view offers navigation without a callback crossing the contract",
-        "1px --border rule, 2px radius, no shadow; hover moves to --surface-hover (or a stronger --declare on primary)",
-        "no lift, sink, or offset motion: state is carried by fill and rule, not by displacement",
-        "focus-visible draws an explicit 2px --declare outline with offset so it stays visible on every fill"
+        "One chart over read-only SQL: timeseries, bar, stat or table.",
+        "A non-populated state renders EmptyState in place of the plot and never a value; a degraded terminal draws the plot with its partial notice.",
+        "The footer names the exact SQL and offers Open in Query with the executed binds.",
+        "A timeseries lists its series with their latest, largest and mean plotted values; unticking a series hides its line, and the series keeps its style while hidden.",
+        "A host may key the series by typed `identity` columns instead: every recorded point stays on its own series, nothing is summed or folded, and the series table shows the exact `summary` rows under the same identity.",
+        "Past twenty series only the first twenty start shown, and the table says so.",
+        "A host that passes `shown` owns which series are drawn and hears each change through `onseries`.",
+        "A `headline` sets its value beside the title with a muted detail, and a `note` reads under the plot.",
+        "`compact` draws a headline overview tile without the table and footer: a 56px plot with no axis text, its time labels beneath, and a key when the host names several `colors`; `bars` stacks a timeseries' series as bars, coloured by `colors` when the host names a colour per caption.",
+        "Series take the palette's series order by position unless the host names a colour, and every fill is drawn at full strength.",
+        "A host `heading` replaces the chart's own header and splits it into two cards: the plot under that heading, then the selectable series summary with Show all and Open in Query in place of the SQL footer.",
+        "A keyed series' caption stays one line; opening it lists every recorded identity cell, and an equal-instant sample keeps its own marker and tooltip value.",
+        "A keyed result's `text` column, when present, is the tooltip's spelling of each value, so a host-qualified value such as a lower bound reads `≥`."
       ]
     },
-    "Badge": {
+    "CardHeader": {
       "status": "built",
       "catalog": true,
       "altitude": "quiet",
       "consumers": [
-        "C-01",
-        "CR-03",
-        "O-09",
-        "S-01",
-        "E-04"
+        "src/routes/t/[tenantKey]/cards/detail/+page.svelte",
+        "view documents (WyrdView)"
       ],
       "tokens": [
-        "--ok",
-        "--warn",
+        "--border",
+        "--declare",
+        "--declare-soft",
+        "--font-mono",
+        "--font-sans",
+        "--muted",
+        "--r",
+        "--selected-border",
+        "--surface-2",
+        "--surface-hover",
+        "--text",
+        "--warn"
+      ],
+      "props": {
+        "input": "CardHeaderInput (schemas.ts)",
+        "result": "loader result",
+        "actions?": "per-action state",
+        "onaction?": "(intent) => void",
+        "primary?": "Snippet"
+      },
+      "rules": [
+        "One exact Card version: name, kind, version select, lifecycle status, copyable identity, host tabs and Open in Observe.",
+        "The version listing has its own state, so a failed listing never hides the Card itself."
+      ]
+    },
+    "CardInventory": {
+      "status": "built",
+      "catalog": true,
+      "altitude": "quiet",
+      "consumers": [
+        "src/routes/t/[tenantKey]/cards/+page.svelte",
+        "view documents (WyrdView)"
+      ],
+      "tokens": [
+        "--bg",
+        "--border",
+        "--border-soft",
         "--danger",
         "--declare",
+        "--declare-soft",
+        "--font-mono",
+        "--font-sans",
         "--muted",
-        "--surface"
+        "--ok",
+        "--r",
+        "--selected-border",
+        "--surface",
+        "--surface-2",
+        "--surface-hover",
+        "--text",
+        "--weight-strong"
       ],
       "props": {
-        "tone": "neutral | ok | warn | danger | running",
-        "children": "content"
+        "input": "CardInventoryInput (schemas.ts)",
+        "result": "loader result",
+        "actions?": "per-action state",
+        "onaction?": "(intent) => void"
       },
-      "variants": [
-        "neutral",
-        "ok",
-        "warn",
-        "danger",
-        "running"
-      ],
-      "anatomy": [
-        "glyph",
-        "label"
-      ],
       "rules": [
-        "tone is a status signal, not decoration",
-        "tone drives border, label, and tint from one --bc custom property; --ok/--warn/--danger each clear 4.5:1 as text on --surface and --bg in both modes",
-        "1px border in tone colour, 12% tinted fill, 2px radius",
-        "MUST render an aria-hidden glyph before the label — ok=✓ warn=! danger=✕ running=●. Status hues can collapse under colour-vision deficiency, so a colour-only badge makes pass and fail identical for some readers.",
-        "neutral takes no glyph and no tint: 'neutral' means no status, and a 12% --muted wash lands at 4.46:1 in dark, which the contrast contract rejects"
-      ],
-      "tones": []
+        "Every registered Card version, one row each in registration order, with the filters cards.list takes.",
+        "Filters and paging are host actions, so the host owns the applied state (its URL) and a reload or Back restores it.",
+        "A whole row opens its exact version."
+      ]
     },
-    "Chip": {
+    "CardFacts": {
       "status": "built",
       "catalog": true,
       "altitude": "quiet",
       "consumers": [
-        "C-01",
-        "O-01",
-        "O-10",
-        "M-01"
+        "src/routes/t/[tenantKey]/cards/detail/+page.svelte",
+        "view documents (WyrdView)"
       ],
       "tokens": [
-        "--border",
-        "--surface",
-        "--surface-2",
-        "--text",
+        "--declare",
+        "--font-mono",
         "--muted"
       ],
       "props": {
-        "label": "string",
-        "value": "string",
-        "removeHref": "string?"
+        "input": "CardFactsInput (schemas.ts)",
+        "result": "loader result"
       },
-      "variants": [],
-      "anatomy": [
-        "key",
-        "value",
-        "remove"
-      ],
       "rules": [
-        "states one applied filter as key + value, never an unlabeled value",
-        "removal is a link to the same route minus that param — never a callback, so filter state stays in the URL and stays restorable",
-        "the ✕ carries an aria-label naming the filter it removes",
-        "the value ellipsizes; the chip never grows past its container"
+        "An exact Card's server-managed facts, or, with `yaml`, the whole Card as the server returned it.",
+        "Nothing here is editable."
       ]
     },
-    "Select": {
+    "RelationshipList": {
       "status": "built",
       "catalog": true,
       "altitude": "quiet",
       "consumers": [
-        "C-01",
-        "O-03",
-        "O-04",
-        "S-01"
+        "src/routes/t/[tenantKey]/cards/detail/+page.svelte",
+        "view documents (WyrdView)"
       ],
       "tokens": [
-        "--surface",
-        "--border",
-        "--text",
-        "--muted",
-        "--r",
-        "--declare-soft",
-        "--declare",
-        "--surface-hover"
-      ],
-      "props": {
-        "label": "string",
-        "name": "string",
-        "options": "Array<{ value: string, label: string }>",
-        "value": "string?",
-        "auto": "boolean?"
-      },
-      "variants": [],
-      "anatomy": [
-        "label",
-        "select"
-      ],
-      "rules": [
-        "a native <select>: keyboard operation, screen-reader labeling and the mobile picker come from the platform, not from local menu code",
-        "the visible <label> is bound by id — a filter control is never labeled by placement alone",
-        "auto submits the enclosing form on change; the component takes no callback, so the destination stays a server-owned action or GET route",
-        "time-range control is this component with range options, not a separate component",
-        "appearance:none plus a wrapper caret gives the control the workbench geometry — 1px --border rule, 2px radius, --surface-hover on hover, 2px --declare focus ring — while the element underneath stays a real <select>. The option list is still drawn by the OS; that is the trade for free keyboard operation, a real mobile picker and correct screen-reader semantics.",
-        "the option list is styled through customizable select (appearance: base-select + ::picker(select)) inside an @supports guard. Where that is unsupported the browser draws its own popup and nothing else changes — the element is always a real <select>, so keyboard operation, the mobile picker and screen-reader semantics never depend on the enhancement."
-      ]
-    },
-    "Table": {
-      "status": "built",
-      "catalog": true,
-      "altitude": "quiet",
-      "consumers": [
-        "C-01",
-        "C-02",
-        "O-04",
-        "E-04",
-        "CR-01"
-      ],
-      "tokens": [
-        "--surface",
-        "--border",
-        "--muted",
-        "--text",
-        "--declare-soft",
-        "--declare",
-        "--r",
         "--border-soft",
-        "--surface-hover"
-      ],
-      "props": {
-        "label": "string",
-        "children": "content"
-      },
-      "variants": [],
-      "anatomy": [
-        "scroller",
-        "thead",
-        "tbody"
-      ],
-      "rules": [
-        "header is plain surface (not gray) relying on a 1px --border bottom rule",
-        "selection wash uses --declare-soft plus a 3px --declare inset left marker, never lime — selection is positional as well as tinted",
-        "1px --border-soft row dividers, last row borderless",
-        "an irreducibly wide table scrolls rather than dropping columns; the scroller is role=region with an aria-label and tabindex=0 so a keyboard-only reader can focus and pan it",
-        "a row is interactive only when it carries a link: tbody tr:has(a) takes a --surface-hover wash and an inset --declare marker on focus-visible, and the linked cell underlines. A static readout row gets no hover, so the treatment never promises a click that is not there."
-      ]
-    },
-    "KpiTile": {
-      "status": "built",
-      "catalog": true,
-      "altitude": "quiet",
-      "consumers": [
-        "H-02",
-        "C-09",
-        "O-01",
-        "E-01"
-      ],
-      "tokens": [
-        "--muted",
-        "--text",
-        "--ok",
-        "--danger"
-      ],
-      "props": {
-        "label": "string",
-        "value": "string | number",
-        "delta": "string?",
-        "trend": "up | down | flat",
-        "spark": "content"
-      },
-      "variants": [
-        "up",
-        "down",
-        "flat"
-      ],
-      "anatomy": [
-        "label",
-        "value",
-        "delta",
-        "spark"
-      ],
-      "rules": [
-        "value is set in --font-sans (Familjen Grotesk 700) with tabular numerals",
-        "delta trend up = --ok, down = --danger, and the delta text states the direction so the tone is never the only signal",
-        "min-width:0 + overflow:hidden so wide values never blow out a grid track"
-      ]
-    },
-    "Disclosure": {
-      "status": "built",
-      "catalog": true,
-      "altitude": "quiet",
-      "consumers": [
-        "C-05",
-        "C-14",
-        "E-08",
-        "M-01"
-      ],
-      "tokens": [
-        "--surface",
-        "--surface-2",
-        "--border",
-        "--text",
-        "--muted",
-        "--r"
-      ],
-      "props": {
-        "summary": "string",
-        "meta": "string?",
-        "open": "boolean?",
-        "children": "content"
-      },
-      "variants": [],
-      "anatomy": [
-        "summary",
-        "body"
-      ],
-      "rules": [
-        "native <details>/<summary>: open state, keyboard operation and the expanded/collapsed announcement come from the platform",
-        "open is the initial state only — the element owns it afterwards",
-        "1px --border-soft divider between summary and body, matching the internal-divider rule"
-      ]
-    },
-    "StateBlock": {
-      "status": "built",
-      "catalog": true,
-      "altitude": "flat",
-      "consumers": [
-        "C-01",
-        "C-03",
-        "O-03",
-        "CR-01",
-        "Q-01"
-      ],
-      "tokens": [
-        "--surface",
-        "--muted",
-        "--text",
-        "--danger",
-        "--warn",
         "--declare",
-        "--r"
-      ],
-      "props": {
-        "state": "loading | empty | partial | error | unauthorized | absent",
-        "title": "string",
-        "detail": "string?",
-        "code": "string?",
-        "actionLabel": "string?",
-        "actionHref": "string?"
-      },
-      "variants": [
-        "loading",
-        "empty",
-        "partial",
-        "error",
-        "unauthorized",
-        "absent"
-      ],
-      "anatomy": [
-        "glyph",
-        "state",
-        "title",
-        "detail",
-        "code",
-        "action"
-      ],
-      "rules": [
-        "the one place the workbench says there is nothing to draw and why — no surface silently renders an empty region",
-        "the state word is always written out beside the glyph; the dashed border and tone are secondary",
-        "loading takes role=status and aria-busy so the wait is announced; every other state takes role=note",
-        "code carries the server's stable Wyrd error code verbatim and never a stack, connection detail or invented UI vocabulary",
-        "absent is the earned-absent inset: an optional section the server has nothing for, stated rather than hidden"
-      ]
-    },
-    "CodeBlock": {
-      "status": "built",
-      "catalog": true,
-      "altitude": "quiet",
-      "consumers": [
-        "C-05",
-        "C-14",
-        "Q-01"
-      ],
-      "tokens": [
-        "--code-bg",
-        "--code-text",
+        "--declare-soft",
+        "--font-mono",
+        "--muted",
         "--r",
-        "--evidence"
-      ],
-      "props": {
-        "code": "string",
-        "copy": "boolean?"
-      },
-      "variants": [],
-      "anatomy": [
-        "pre",
-        "copy"
-      ],
-      "rules": [
-        "--code-bg block with --code-text in --font-mono (Fragment Mono), 2px radius, horizontally scrollable, dark in both modes",
-        "optional copy button via navigator.clipboard; copied feedback is a written word plus glyph, and may take the --evidence fill because it confirms capture",
-        "renders text, never markup: the code prop is escaped content, not HTML"
-      ]
-    },
-    "ChartPanel": {
-      "status": "built",
-      "catalog": true,
-      "altitude": "quiet",
-      "consumers": [
-        "C-09",
-        "C-11",
-        "O-03",
-        "O-07",
-        "S-01"
-      ],
-      "tokens": [
-        "--surface",
-        "--border",
-        "--muted",
-        "--text",
-        "--declare",
-        "--font-sans"
-      ],
-      "props": {
-        "title": "string",
-        "measure": "string",
-        "unit": "string?",
-        "latestValue": "string | number?",
-        "source": "string?",
-        "freshness": "{ label: string, at: string }?",
-        "from": "{ label: string, at: string }?",
-        "to": "{ label: string, at: string }?",
-        "link": "{ label: string, href: string }?",
-        "state": "ok | loading | empty | partial | unauthorized | error",
-        "detail": "string?",
-        "code": "string?",
-        "children": "content"
-      },
-      "variants": [
-        "ok",
-        "loading",
-        "empty",
-        "partial",
-        "unauthorized",
-        "error"
-      ],
-      "anatomy": [
-        "head",
-        "latest",
-        "state",
-        "plot",
-        "foot"
-      ],
-      "rules": [
-        "the one frame every Wyrd chart is drawn in: measure, unit, latest value, freshness, visible range, source, canonical link and the unavailable states",
-        "a non-ok state renders a StateBlock in place of the plot and NEVER a latest value — a stale, absent or unauthorized reading shown as a number is a health claim the server never made",
-        "partial draws the plot and the partial notice together; it never silently presents an incomplete series as complete",
-        "freshness and range use <time datetime> so the instant is machine-readable, not just formatted prose",
-        "composes Panel and StateBlock; it is a frame, never one component per metric and never a universal chart"
-      ]
-    },
-    "Line": {
-      "status": "built",
-      "catalog": true,
-      "altitude": "quiet",
-      "consumers": [
-        "O-03",
-        "C-09",
-        "C-11",
-        "S-01"
-      ],
-      "tokens": [
-        "--declare",
-        "--observe",
-        "--danger",
-        "--border",
-        "--surface",
-        "--muted",
+        "--selected-border",
+        "--surface-2",
         "--text"
       ],
       "props": {
-        "series": "Array<{ label: string, points: number[] }>",
-        "labels": "Array<{ label: string, at: string }>?",
-        "unit": "string?",
-        "threshold": "{ value: number, label: string }?",
-        "min": "number?"
+        "input": "RelationshipListInput (schemas.ts)",
+        "result": "loader result",
+        "actions?": "per-action state",
+        "onaction?": "(intent) => void"
       },
-      "variants": [],
-      "anatomy": [
-        "grid",
-        "axis",
-        "threshold",
-        "series",
-        "legend",
-        "tooltip"
-      ],
       "rules": [
-        "inline SVG 300x148, multi-series, dashed gridlines",
-        "series take no colour prop: stroke, stroke-dasharray and marker shape are chosen by series position from a fixed four-style table; more than four series are rejected, so a serialized view can never name a token",
-        "each series MUST carry a distinct dash and marker (solid square, '6 3' circle, '2 3' triangle, '8 2 2 2' diamond) in --declare, --observe, --series-3, --series-4, --series-5 by position (a host may name a semantic series explicitly, e.g. p95 --observe and p50 --declare), and the legend MUST mirror both as a line sample, not a block swatch. Hue alone cannot separate two percentiles.",
-        "a threshold is drawn as a labeled dashed rule plus a positional tick on the axis — never an unlabeled red line",
-        "values are reported by a tooltip pinned to the point under the cursor. It is not pointer-only: focusing the plot opens it on the most recent point and arrow/Home/End walk it, so a keyboard or touch reader reaches every value. It anchors inward at the ends of the range and never takes pointer events."
+        "An exact Card's server-derived relationships: the Cards it references, then the Cards that reference it, each an exact version the host can open."
       ]
     },
-    "Bars": {
+    "ArtifactTable": {
       "status": "built",
       "catalog": true,
       "altitude": "quiet",
       "consumers": [
-        "O-07",
-        "C-03"
+        "src/routes/t/[tenantKey]/cards/detail/+page.svelte",
+        "view documents (WyrdView)"
+      ],
+      "tokens": [],
+      "props": {
+        "input": "ArtifactTableInput (schemas.ts)",
+        "result": "loader result"
+      },
+      "rules": [
+        "The files registration recorded for one exact Card version, as stored: relative path, size, SHA-256 digest and content type."
+      ]
+    },
+    "PromptMessages": {
+      "status": "built",
+      "catalog": true,
+      "altitude": "quiet",
+      "consumers": [
+        "src/routes/t/[tenantKey]/cards/detail/+page.svelte",
+        "view documents (WyrdView)"
       ],
       "tokens": [
-        "--declare",
         "--border",
-        "--text",
-        "--muted"
+        "--declare",
+        "--declare-soft",
+        "--font-mono",
+        "--font-sans",
+        "--muted",
+        "--r",
+        "--surface-2",
+        "--text"
       ],
       "props": {
-        "data": "Array<{ label: string, value: number }>",
-        "unit": "string?"
+        "input": "PromptMessagesInput (schemas.ts)",
+        "result": "loader result"
       },
-      "variants": [],
-      "anatomy": [
-        "axis",
-        "bar",
-        "value",
-        "category"
-      ],
       "rules": [
-        "inline SVG 300x148, --declare fill, value above and category under every bar",
-        "bars take no colour prop; the reading is positional and textual, and the SVG carries an aria-label naming every category and value"
+        "An exact Prompt as authored, which is exactly what the provider receives: provider, model and response format, then portable system text and numbered turns, or the native format's body unchanged, extension fields included."
       ]
     },
-    "Spark": {
+    "PromptVariables": {
       "status": "built",
       "catalog": true,
       "altitude": "quiet",
       "consumers": [
-        "C-09",
-        "H-02"
+        "src/routes/t/[tenantKey]/cards/detail/+page.svelte",
+        "view documents (WyrdView)"
+      ],
+      "tokens": [],
+      "props": {
+        "input": "PromptVariablesInput (schemas.ts)",
+        "result": "loader result"
+      },
+      "rules": [
+        "The variables the server's Prompt compiler derived from an exact Prompt."
+      ]
+    },
+    "UsedBy": {
+      "status": "built",
+      "catalog": true,
+      "altitude": "quiet",
+      "consumers": [
+        "src/routes/t/[tenantKey]/cards/detail/+page.svelte",
+        "view documents (WyrdView)"
+      ],
+      "tokens": [],
+      "props": {
+        "input": "UsedByInput (schemas.ts)",
+        "result": "loader result",
+        "actions?": "per-action state",
+        "onaction?": "(intent) => void"
+      },
+      "rules": [
+        "The Agents whose spec references an exact Prompt, each with its execution route and the Services that reference it.",
+        "A refused Agent read keeps its row."
+      ]
+    },
+    "VersionDiff": {
+      "status": "built",
+      "catalog": true,
+      "altitude": "quiet",
+      "consumers": [
+        "src/routes/t/[tenantKey]/cards/detail/+page.svelte",
+        "view documents (WyrdView)"
       ],
       "tokens": [
-        "--muted"
+        "--border",
+        "--declare",
+        "--font-mono",
+        "--muted",
+        "--r",
+        "--surface-2",
+        "--text"
       ],
       "props": {
-        "points": "number[]",
-        "width": "number?",
-        "height": "number?"
+        "input": "VersionDiffInput (schemas.ts)",
+        "result": "loader result",
+        "actions?": "per-action state",
+        "onaction?": "(intent) => void"
       },
-      "variants": [],
-      "anatomy": [
-        "polyline"
-      ],
       "rules": [
-        "90x24 polyline, no fill; shape carries the trend",
-        "neutral geometry only: shape carries the trend beside a labeled value, never status or health"
+        "The authored differences between two registered versions of one Prompt, from the other version to the selected one.",
+        "Choosing the other version is a host action."
       ]
     },
     "VerifierDefinition": {
@@ -599,12 +327,6 @@
         "input": "VerifierInput (schemas.ts)",
         "result": "loader result"
       },
-      "variants": [],
-      "anatomy": [
-        "description",
-        "VerifierGraph",
-        "declaration of the selected node"
-      ],
       "rules": [
         "An exact Verifier as declared: its description, its graph, and the authored declaration of the selected node.",
         "Definition only: no execution state, and nothing edits the Verifier.",
@@ -632,11 +354,6 @@
         "actions?": "per-action state",
         "onaction?": "(intent) => void"
       },
-      "variants": [],
-      "anatomy": [
-        "owner row (opens the Card)",
-        "binding rows: subject and when it runs"
-      ],
       "rules": [
         "The Services and Agents whose bindings pin an exact Verifier version, each binding's subject and when it runs.",
         "A refused owner read keeps its row.",
@@ -669,14 +386,6 @@
         "graph": "DefinitionGraph (verifier.ts)",
         "selected?": "string, bindable: the selected node key"
       },
-      "variants": [],
-      "anatomy": [
-        "zoom tools",
-        "stage headings",
-        "input, step and requirement nodes",
-        "attached requirements inside their step",
-        "labelled dependency edges"
-      ],
       "rules": [
         "A read-only Svelte Flow drawing of declared inputs, steps, attached and whole-Verifier requirements under stage headings, with labelled dependency arrows.",
         "Nothing drags, connects or deletes; no execution colour or state is drawn.",
@@ -684,12 +393,467 @@
         "Selection and focus use --declare; arrow keys move between nodes."
       ]
     },
+    "Panel": {
+      "status": "built",
+      "catalog": false,
+      "altitude": "quiet",
+      "consumers": [
+        "packages/ui/src/lib/components/ArtifactTable.svelte",
+        "packages/ui/src/lib/components/CardFacts.svelte",
+        "packages/ui/src/lib/components/PromptMessages.svelte",
+        "packages/ui/src/lib/components/PromptVariables.svelte",
+        "packages/ui/src/lib/components/RelationshipList.svelte",
+        "packages/ui/src/lib/components/RunsOn.svelte",
+        "packages/ui/src/lib/components/UsedBy.svelte",
+        "packages/ui/src/lib/components/VerifierDefinition.svelte",
+        "packages/ui/src/lib/components/VerifierGraph.svelte",
+        "packages/ui/src/lib/components/VersionDiff.svelte"
+      ],
+      "tokens": [
+        "--border",
+        "--border-soft",
+        "--declare",
+        "--font-mono",
+        "--font-sans",
+        "--muted",
+        "--r",
+        "--surface",
+        "--surface-2",
+        "--text"
+      ],
+      "props": {
+        "title": "string",
+        "note?": "string",
+        "tools?": "Snippet",
+        "children": "Snippet"
+      },
+      "rules": [
+        "One ruled panel: an uppercase title, an optional muted note saying where its facts come from, optional head controls, then the body.",
+        "Tables, code blocks and row buttons inside a panel share these rules."
+      ]
+    },
+    "StatStrip": {
+      "status": "built",
+      "catalog": true,
+      "altitude": "quiet",
+      "consumers": [
+        "view documents (WyrdView)"
+      ],
+      "tokens": [
+        "--border",
+        "--border-soft",
+        "--font-mono",
+        "--font-sans",
+        "--muted",
+        "--r",
+        "--surface",
+        "--text"
+      ],
+      "props": {
+        "input": "StatStripInput (schemas.ts)",
+        "result": "loader result"
+      },
+      "rules": [
+        "A row of totals over the range, each with its per-bucket trend.",
+        "A stat with nothing recorded reads \"—\", never 0; cost shows one amount per recorded currency and never adds currencies together."
+      ]
+    },
+    "FacetRail": {
+      "status": "built",
+      "catalog": true,
+      "altitude": "quiet",
+      "consumers": [
+        "src/routes/t/[tenantKey]/observe/+layout.svelte",
+        "view documents (WyrdView)"
+      ],
+      "tokens": [
+        "--danger",
+        "--declare",
+        "--font-mono",
+        "--font-sans",
+        "--muted",
+        "--r",
+        "--surface-hover",
+        "--text",
+        "--warn"
+      ],
+      "props": {
+        "input": "FacetRailInput (schemas.ts)",
+        "result": "loader result",
+        "actions?": "per-action state",
+        "onaction?": "(intent) => void"
+      },
+      "rules": [
+        "Value counts of each facet column under the list's own WHERE and range.",
+        "Choosing a value asks the host to filter by it; a null value reads \"not set\" and filters by IS NULL.",
+        "Values already in the WHERE render pressed.",
+        "A facet shows its first values and expands to every value read; when the read found more than it returns, the count of hidden values says so with \"+\".",
+        "A severity text value reads in the colour of the highest severity number recorded with it."
+      ]
+    },
+    "RecordTable": {
+      "status": "built",
+      "catalog": true,
+      "altitude": "quiet",
+      "consumers": [
+        "src/routes/t/[tenantKey]/observe/+layout.svelte",
+        "src/routes/t/[tenantKey]/query/+page.svelte",
+        "view documents (WyrdView)"
+      ],
+      "tokens": [
+        "--border",
+        "--border-soft",
+        "--danger",
+        "--declare",
+        "--declare-soft",
+        "--font-mono",
+        "--font-sans",
+        "--muted",
+        "--observe",
+        "--r",
+        "--series-3",
+        "--surface",
+        "--surface-hover",
+        "--text",
+        "--warn"
+      ],
+      "props": {
+        "input": "RecordTableInput (schemas.ts)",
+        "result": "loader result",
+        "actions?": "per-action state",
+        "onaction?": "(intent) => void",
+        "paused?": "boolean",
+        "oncolumns?": "(columns: readonly string[]) => void",
+        "controls?": "HTMLElement",
+        "tools?": "Snippet"
+      },
+      "rules": [
+        "Signal rows as typed cells: one row per root span for traces, one per span, log record or metric point otherwise, or the rows of authored SQL.",
+        "Trace rows carry span and error counts read for the visible traces only.",
+        "Only a signal list reads canonical columns: its headings are words and its durations, statuses, instants and services are typed cells.",
+        "Authored SQL keeps its returned headings and values as text, whatever its aliases are called.",
+        "A live list holds what is on screen, rows and counts together, while the reader hovers, focuses or scrolls it, after it opens a record until the reader resumes, or while the host pauses it; it offers \"↑ N new\" instead of moving rows under the pointer.",
+        "The footer states the returned extent and never a total it did not read.",
+        "A trace, span or log list sorts on the server: a sortable heading asks the host to read it again in that column's order, and Newer and Older ask for the page before the first row or after the last.",
+        "Authored SQL is refused rather than truncated, so its rows are complete and sort in the page.",
+        "Columns hides read columns; a host that passes `oncolumns` instead offers every column the signal may show and reads the reader's choice again.",
+        "CSV saves the rows and columns on screen.",
+        "A host that passes `controls` places Wrap, Columns and CSV in that element, such as its list bar, instead of above the table; a host `tools` snippet renders before them.",
+        "Span rows show their shortened trace and parent span ids before Duration, and trace rows their counts before Status; a log record's severity reads in its level's colour, decided by the recorded severity number."
+      ]
+    },
+    "TraceWaterfall": {
+      "status": "built",
+      "catalog": true,
+      "altitude": "quiet",
+      "consumers": [
+        "src/routes/t/[tenantKey]/observe/+page.svelte",
+        "view documents (WyrdView)"
+      ],
+      "tokens": [
+        "--border",
+        "--border-soft",
+        "--danger",
+        "--declare",
+        "--declare-soft",
+        "--font-mono",
+        "--font-sans",
+        "--muted",
+        "--r",
+        "--surface",
+        "--surface-2",
+        "--surface-hover",
+        "--text"
+      ],
+      "props": {
+        "input": "TraceWaterfallInput (schemas.ts)",
+        "result": "loader result",
+        "actions?": "per-action state",
+        "onaction?": "(intent) => void"
+      },
+      "rules": [
+        "Every retained span of one trace as a tree against the trace's timeline.",
+        "Levels below the second start collapsed, except the path to the selected span; a collapsed span shows how many children it holds.",
+        "\"Expand all\" opens every level and \"Errors only\" keeps error spans and their ancestors.",
+        "An axis marks round offsets from the trace start up to its end.",
+        "Names come from data and never colour a span: each recorded service takes the series palette's colour by first appearance, named in the Services key, and an error span takes the failure colour beside its ✕ by recorded status alone."
+      ]
+    },
+    "RecordDetail": {
+      "status": "built",
+      "catalog": true,
+      "altitude": "quiet",
+      "consumers": [
+        "src/routes/t/[tenantKey]/observe/+page.svelte",
+        "view documents (WyrdView)"
+      ],
+      "tokens": [
+        "--bg",
+        "--border",
+        "--code-bg",
+        "--code-text",
+        "--danger",
+        "--danger-soft",
+        "--declare",
+        "--font-mono",
+        "--font-sans",
+        "--muted",
+        "--r",
+        "--text",
+        "--warn"
+      ],
+      "props": {
+        "input": "RecordDetailInput (schemas.ts)",
+        "result": "loader result",
+        "actions?": "per-action state",
+        "onaction?": "(intent) => void"
+      },
+      "rules": [
+        "One stored span or log record, whole.",
+        "A span reads as GenAI messages beside its other attributes, with Attributes, Events, Exception and Raw tabs counted from what was recorded; a log record reads as its body and attributes.",
+        "A recorded exception heads either.",
+        "Message roles and parts come from the recorded message attributes; a value that is not the GenAI message shape shows as recorded.",
+        "A section with nothing recorded names the attribute or column that would fill it; nothing is inferred."
+      ]
+    },
+    "EmptyState": {
+      "status": "built",
+      "catalog": false,
+      "altitude": "quiet",
+      "consumers": [
+        "packages/ui/src/lib/WyrdView.svelte",
+        "packages/ui/src/lib/components/ArtifactTable.svelte",
+        "packages/ui/src/lib/components/CardFacts.svelte",
+        "packages/ui/src/lib/components/CardHeader.svelte",
+        "packages/ui/src/lib/components/Chart.svelte",
+        "packages/ui/src/lib/components/FacetRail.svelte",
+        "packages/ui/src/lib/components/PromptMessages.svelte",
+        "packages/ui/src/lib/components/PromptVariables.svelte",
+        "packages/ui/src/lib/components/RecordDetail.svelte",
+        "packages/ui/src/lib/components/RecordTable.svelte",
+        "packages/ui/src/lib/components/RelationshipList.svelte",
+        "packages/ui/src/lib/components/StatStrip.svelte",
+        "packages/ui/src/lib/components/TraceWaterfall.svelte",
+        "packages/ui/src/lib/components/UsedBy.svelte",
+        "packages/ui/src/lib/components/VersionDiff.svelte",
+        "src/routes/t/[tenantKey]/cards/+page.svelte",
+        "src/routes/t/[tenantKey]/cards/detail/+page.svelte",
+        "src/routes/t/[tenantKey]/observe/+layout.svelte",
+        "src/routes/t/[tenantKey]/observe/+page.svelte",
+        "src/routes/t/[tenantKey]/query/+page.svelte"
+      ],
+      "tokens": [
+        "--border",
+        "--danger",
+        "--font-mono",
+        "--font-sans",
+        "--muted",
+        "--r",
+        "--text",
+        "--warn"
+      ],
+      "props": {
+        "state": "'loading' | 'empty' | 'denied' | 'error'",
+        "title?": "string",
+        "detail?": "string",
+        "problem?": "Problem"
+      },
+      "rules": [
+        "The one place a component says there is nothing to draw and why.",
+        "The state word is always written beside its glyph; `code` is the server's stable Wyrd error code verbatim."
+      ]
+    },
+    "ActionButton": {
+      "status": "built",
+      "catalog": false,
+      "altitude": "quiet",
+      "consumers": [
+        "packages/ui/src/lib/WyrdView.svelte",
+        "packages/ui/src/lib/components/CardHeader.svelte",
+        "packages/ui/src/lib/components/Chart.svelte",
+        "packages/ui/src/lib/components/RecordDetail.svelte",
+        "packages/ui/src/lib/components/RecordTable.svelte",
+        "src/routes/t/[tenantKey]/cards/detail/+page.svelte"
+      ],
+      "tokens": [
+        "--border",
+        "--declare",
+        "--declare-ink",
+        "--font-mono",
+        "--font-sans",
+        "--r",
+        "--surface-2",
+        "--surface-hover",
+        "--text"
+      ],
+      "props": {
+        "label": "string",
+        "state?": "ActionState",
+        "variant?": "'primary' | 'secondary' | 'link'",
+        "lead?": "string",
+        "icon?": "string",
+        "disabled?": "boolean",
+        "onclick": "() => void"
+      },
+      "rules": [
+        "One typed action control.",
+        "The host reports each action's state: `pending` disables the control so an intent is never sent twice, and a refusal or failure stays visible beside it until the next attempt."
+      ]
+    },
+    "CardRefChip": {
+      "status": "built",
+      "catalog": false,
+      "altitude": "quiet",
+      "consumers": [
+        "src/routes/_gallery/+page.svelte (public package component)"
+      ],
+      "tokens": [
+        "--border",
+        "--declare",
+        "--font-mono",
+        "--r",
+        "--surface-2",
+        "--surface-hover",
+        "--text"
+      ],
+      "props": {
+        "cardRef": "CardRef",
+        "href?": "string"
+      },
+      "rules": [
+        "One exact Card reference, `Kind/name@version`; a link only when the host supplies one."
+      ]
+    },
+    "VerdictPill": {
+      "status": "built",
+      "catalog": false,
+      "altitude": "quiet",
+      "consumers": [
+        "src/routes/_gallery/+page.svelte (public package component)"
+      ],
+      "tokens": [],
+      "props": {
+        "verdict": "CardTypes.VerificationVerdict"
+      },
+      "rules": [
+        "A verification verdict as a StatusPill: the word and glyph carry the result."
+      ]
+    },
+    "StatusPill": {
+      "status": "built",
+      "catalog": false,
+      "altitude": "quiet",
+      "consumers": [
+        "packages/ui/src/lib/components/CardHeader.svelte",
+        "packages/ui/src/lib/components/Chart.svelte",
+        "packages/ui/src/lib/components/RecordDetail.svelte",
+        "packages/ui/src/lib/components/RecordTable.svelte",
+        "packages/ui/src/lib/components/VerdictPill.svelte",
+        "src/routes/t/[tenantKey]/observe/+page.svelte"
+      ],
+      "tokens": [
+        "--border",
+        "--danger",
+        "--declare",
+        "--font-mono",
+        "--muted",
+        "--ok",
+        "--r",
+        "--text",
+        "--warn"
+      ],
+      "props": {
+        "tone?": "Tone",
+        "label": "string"
+      },
+      "rules": [
+        "A status badge.",
+        "Tone drives border, label and tint; every non-neutral tone carries a glyph so status never rests on hue alone."
+      ]
+    },
+    "Sparkline": {
+      "status": "built",
+      "catalog": false,
+      "altitude": "quiet",
+      "consumers": [
+        "packages/ui/src/lib/components/StatStrip.svelte"
+      ],
+      "tokens": [
+        "--muted"
+      ],
+      "props": {
+        "points": "readonly number[]",
+        "label": "string",
+        "width?": "number",
+        "height?": "number"
+      },
+      "rules": [
+        "A neutral trend polyline beside a labeled value; shape carries the trend, never status."
+      ]
+    },
+    "DurationBar": {
+      "status": "built",
+      "catalog": false,
+      "altitude": "quiet",
+      "consumers": [
+        "packages/ui/src/lib/components/RecordTable.svelte"
+      ],
+      "tokens": [
+        "--border-soft",
+        "--declare",
+        "--font-mono",
+        "--muted",
+        "--r",
+        "--text"
+      ],
+      "props": {
+        "ms": "number",
+        "max": "number",
+        "label?": "string"
+      },
+      "rules": [
+        "One duration against the longest in its set: the bar is positional, the text carries the value."
+      ]
+    },
+    "Drawer": {
+      "status": "built",
+      "catalog": false,
+      "altitude": "quiet",
+      "consumers": [
+        "src/routes/t/[tenantKey]/observe/+layout.svelte",
+        "src/routes/t/[tenantKey]/observe/+page.svelte"
+      ],
+      "tokens": [
+        "--border",
+        "--border-soft",
+        "--font-sans",
+        "--muted",
+        "--r",
+        "--surface",
+        "--text",
+        "--weight-strong"
+      ],
+      "props": {
+        "open": "boolean",
+        "title": "string",
+        "onclose": "() => void",
+        "children": "Snippet",
+        "width?": "string",
+        "heading?": "Snippet",
+        "tools?": "Snippet"
+      },
+      "rules": [
+        "A side panel on the native modal <dialog>: focus trapping, Escape and the backdrop come from the platform, and a click on the backdrop closes it like Escape.",
+        "The host owns `open`; closing reports through `onclose`.",
+        "A host may widen it with `width` (never past the viewport), replace the title text with a `heading` (the title stays its accessible name) and add header `tools` before Close."
+      ]
+    },
     "Shell": {
       "status": "built",
       "catalog": false,
       "altitude": "quiet",
       "consumers": [
-        "every authenticated route"
+        "src/routes/t/[tenantKey]/+layout.svelte"
       ],
       "tokens": [
         "--surface",
@@ -697,19 +861,17 @@
         "--bg"
       ],
       "props": {
-        "sidebar": "content",
-        "topbar": "content",
         "children": "content"
       },
       "variants": [],
       "anatomy": [
         "sidebar",
-        "topbar",
         "main"
       ],
       "rules": [
-        "212px sidebar + topbar + main grid; 1px --border rules between regions on a neutral --bg canvas",
-        "trusted application chrome — not catalog: it frames every authored view and must never be placeable by one"
+        "a persistent left rail beside the page; the rail collapses to icons, and below 768px it becomes a top bar",
+        "1px --border rule between rail and page on a neutral --bg canvas",
+        "trusted application chrome, not catalog: it frames every authored view and must never be placeable by one"
       ]
     },
     "Sidebar": {
@@ -717,7 +879,7 @@
       "catalog": false,
       "altitude": "quiet",
       "consumers": [
-        "every authenticated route"
+        "src/routes/t/[tenantKey]/+layout.svelte"
       ],
       "tokens": [
         "--surface",
@@ -728,52 +890,49 @@
         "--r"
       ],
       "props": {
-        "brand": "string?",
-        "groups": "Array<{ label: string, items: object[] }>"
+        "groups": "Array<Array<{ label: string, href?: string, icon: string }>>"
       },
       "variants": [],
       "anatomy": [
         "brand",
-        "nav"
+        "find",
+        "nav",
+        "foot"
       ],
       "rules": [
-        "nav groups; active item takes a --declare-soft wash, --declare label, and a 3px --declare inset marker — positional as well as tinted",
-        "brand slot is the Wyrd mark (logo.svg / logo-light.svg, generated from palette.json) followed by the 'Wyrd' wordmark in --font-sans",
-        "carries the five product entries and no per-item kind bar: navigation is not a typed plane",
-        "trusted application chrome — not catalog: it owns navigation, which an authored view must never redirect"
+        "groups: Home and Cards, then Observe, Verify, and Query, separated by a 1px rule; Settings and the identity menu sit in the foot",
+        "a destination without href is not delivered yet: it stays visible, aria-disabled, and says so in its title; deferred work is not listed at all",
+        "active item takes a --declare-soft wash and a 2px --declare inset marker, positional as well as tinted",
+        "brand slot is the generated Wyrd mark followed by the Wyrd wordmark in --font-sans",
+        "the identity menu holds tenant switch, Account, theme, and Sign out as .app-control buttons",
+        "trusted application chrome, not catalog: it owns navigation, which an authored view must never redirect"
       ]
     },
     "Topbar": {
-      "status": "built",
+      "status": "spec",
       "catalog": false,
       "altitude": "quiet",
       "consumers": [
-        "every authenticated route"
+        "changes/active/verification-workflow-ui/design/mock (approved)"
       ],
       "tokens": [
-        "--surface",
-        "--surface-2",
         "--border",
-        "--text",
+        "--font-mono",
         "--muted",
-        "--r"
+        "--text"
       ],
       "props": {
-        "crumbs": "string[]",
-        "search": "string?",
-        "env": "{ label: string, status: string }?"
+        "crumbs": "Array<{ label: string, href?: string }>"
       },
-      "variants": [],
       "anatomy": [
-        "breadcrumb",
-        "search",
-        "env"
+        "crumbs",
+        "theme"
       ],
       "rules": [
-        "breadcrumb + search + environment badge",
-        "the environment reads through Badge so its state carries a glyph and text; a bare coloured dot would make the state hue-only",
-        "hosts the ProductPill immediately after the wordmark",
-        "trusted application chrome — not catalog: it carries tenant identity and the principal menu"
+        "min-height 48px, 10px 16px padding, 1px --border bottom rule",
+        "breadcrumb in --font-mono; the last crumb is aria-current=page and every earlier crumb is a link",
+        "the theme control is a small button (30px, 12px) naming the mode it switches to",
+        "trusted application chrome, not catalog"
       ]
     },
     "ModeProvider": {
@@ -781,8 +940,8 @@
       "catalog": false,
       "altitude": "quiet",
       "consumers": [
-        "root layout",
-        "styleguide"
+        "src/routes/+layout.svelte",
+        "brand/renders/styleguide.html"
       ],
       "tokens": [
         "--bg",
@@ -797,39 +956,204 @@
         "root"
       ],
       "rules": [
-        "applies data-mode and the shared font shorthands; every token in this file resolves beneath it",
-        "trusted application chrome — not catalog: it is composed by the layout, never placed by name"
+        "the root layout sets data-mode from src/lib/theme.svelte.ts; the wyrd-mode cookie persists the choice so SSR paints the right mode on first byte",
+        "every token resolves beneath data-mode; light and dark change values, never structure",
+        "trusted application chrome, not catalog: it is composed by the layout, never placed by name"
       ]
     },
     "ProductPill": {
-      "status": "spec",
+      "status": "built",
       "catalog": false,
       "altitude": "quiet",
       "consumers": [
-        "every authenticated route"
+        "src/lib/Entry.svelte",
+        "src/routes/+page.svelte"
       ],
       "tokens": [
         "--declare",
         "--declare-ink",
         "--border",
-        "--r"
+        "--r",
+        "--font-mono",
+        "--weight-strong"
       ],
-      "props": {
-        "product": "wyrd"
-      },
+      "props": {},
+      "anatomy": [
+        "label"
+      ],
+      "rules": [
+        "WYRD in --font-mono, 10px, --weight-strong, on a --declare fill with --declare-ink text; 4px 12px padding, 2px --border rule, 2px radius",
+        "sits immediately after the Wyrd wordmark on the sign-in and tenant-entry surfaces",
+        "names the product the surface belongs to; it is identity, never a control",
+        "trusted application chrome, not catalog: an authored view must never label itself as a product"
+      ]
+    }
+  },
+  "styles": {
+    "Button": {
+      "implementedBy": [
+        ".app-control (src/app.css)",
+        "ActionButton"
+      ],
+      "tokens": [
+        "--border",
+        "--surface",
+        "--text",
+        "--declare",
+        "--declare-ink",
+        "--r",
+        "--surface-2",
+        "--surface-hover"
+      ],
       "variants": [
-        "wyrd"
+        "primary",
+        "secondary",
+        "ghost"
       ],
       "anatomy": [
         "label"
       ],
       "rules": [
-        "uppercase --font-mono, 10px, 700, .08em tracking",
-        "wyrd = --declare fill + --declare-ink",
-        "--declare-ink on --declare holds ≥4.5:1 in both modes (asserted by gen-theme.mjs)",
-        "1px border, 2px radius — sits immediately after the Wyrd wordmark in the Topbar",
-        "names the product layer the current surface belongs to; it is identity, never a control",
-        "trusted application chrome — not catalog: an authored view must never label itself as a product layer"
+        "primary = --declare fill and border with --declare-ink label, the one strong action on a surface",
+        "default = --surface fill with --text label; lime is reserved for retained Evidence and never marks an action",
+        "1px --border rule, 2px radius, 32px tall, 13px --font-sans; the compact form is 30px and 12px",
+        "hover moves to --surface-hover; disabled drops to 0.6 opacity with a not-allowed cursor",
+        "no lift, sink, or offset motion: state is carried by fill and rule",
+        "focus-visible draws a 2px --declare outline with offset so it stays visible on every fill"
+      ]
+    },
+    "Badge": {
+      "implementedBy": [
+        "StatusPill",
+        "VerdictPill"
+      ],
+      "tokens": [
+        "--ok",
+        "--warn",
+        "--danger",
+        "--declare",
+        "--muted",
+        "--surface"
+      ],
+      "variants": [
+        "neutral",
+        "ok",
+        "warn",
+        "danger",
+        "running"
+      ],
+      "anatomy": [
+        "glyph",
+        "label"
+      ],
+      "rules": [
+        "tone is a status signal, not decoration",
+        "tone drives border, label, and tint from one --bc custom property; --ok/--warn/--danger each clear 4.5:1 as text on --surface and --bg in both modes",
+        "1px border in tone colour, 12% tinted fill, 2px radius",
+        "MUST render an aria-hidden glyph before the label — ok=✓ warn=! danger=✕ running=●. Status hues can collapse under colour-vision deficiency, so a colour-only badge makes pass and fail identical for some readers.",
+        "neutral takes no glyph and no tint: 'neutral' means no status, and a 12% --muted wash lands at 4.46:1 in dark, which the contrast contract rejects"
+      ]
+    },
+    "Select": {
+      "implementedBy": [
+        ".app-input (src/app.css)"
+      ],
+      "tokens": [
+        "--surface",
+        "--border",
+        "--text",
+        "--muted",
+        "--r",
+        "--declare-soft",
+        "--declare",
+        "--surface-hover"
+      ],
+      "variants": [],
+      "anatomy": [
+        "label",
+        "select"
+      ],
+      "rules": [
+        "a native <select> styled as .app-input: 1px --border rule, 2px radius, 32px tall, 13px --font-sans",
+        "the visible <label> is bound by id; a control is never labeled by placement alone",
+        "fields holding machine values (keys, issuers, client ids, claim names, tenant keys) add .mono for --font-mono at 12px"
+      ]
+    },
+    "Table": {
+      "implementedBy": [
+        "Panel",
+        "RecordTable",
+        "CardInventory",
+        "ArtifactTable"
+      ],
+      "tokens": [
+        "--surface",
+        "--border",
+        "--muted",
+        "--text",
+        "--declare-soft",
+        "--declare",
+        "--r",
+        "--border-soft",
+        "--surface-hover"
+      ],
+      "variants": [],
+      "anatomy": [
+        "scroller",
+        "thead",
+        "tbody"
+      ],
+      "rules": [
+        "header is plain surface (not gray) relying on a 1px --border bottom rule",
+        "selection wash uses --declare-soft plus a 3px --declare inset left marker, never lime — selection is positional as well as tinted",
+        "1px --border-soft row dividers, last row borderless",
+        "an irreducibly wide table scrolls rather than dropping columns; the scroller is role=region with an aria-label and tabindex=0 so a keyboard-only reader can focus and pan it",
+        "a row is interactive only when it carries a link: tbody tr:has(a) takes a --surface-hover wash and an inset --declare marker on focus-visible, and the linked cell underlines. A static readout row gets no hover, so the treatment never promises a click that is not there."
+      ]
+    },
+    "Disclosure": {
+      "implementedBy": [
+        "Panel"
+      ],
+      "tokens": [
+        "--surface",
+        "--surface-2",
+        "--border",
+        "--text",
+        "--muted",
+        "--r"
+      ],
+      "variants": [],
+      "anatomy": [
+        "summary",
+        "body"
+      ],
+      "rules": [
+        "native <details>/<summary>: open state, keyboard operation and the expanded/collapsed announcement come from the platform",
+        "open is the initial state only — the element owns it afterwards",
+        "1px --border-soft divider between summary and body, matching the internal-divider rule"
+      ]
+    },
+    "CodeBlock": {
+      "implementedBy": [
+        "Panel",
+        "RecordDetail"
+      ],
+      "tokens": [
+        "--code-bg",
+        "--code-text",
+        "--r",
+        "--evidence"
+      ],
+      "variants": [],
+      "anatomy": [
+        "pre",
+        "copy"
+      ],
+      "rules": [
+        "--code-bg block with --code-text in --font-mono (Fragment Mono), 2px radius, horizontally scrollable, dark in both modes",
+        "optional copy button via navigator.clipboard; copied feedback is a written word plus glyph, and may take the --evidence fill because it confirms capture",
+        "renders text, never markup: the code prop is escaped content, not HTML"
       ]
     }
   }

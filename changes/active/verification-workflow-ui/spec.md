@@ -1,7 +1,7 @@
 ---
 id: SPEC-verification-workflow-ui
-revision: 2
-status: draft
+revision: 3
+status: approved
 ---
 
 # One verification UI
@@ -29,12 +29,12 @@ Where the visual references differ, the centralized mock and the decisions
 recorded in this specification govern. This specification defines required
 behavior; sample interactions do not add obligations.
 
-The approach extends existing verification reads and shared UI components,
-then mounts those components in the conventional UI and supported hosts. This
-keeps durable behavior on the server and avoids separate viewers for PRs,
-sessions and drift. Costs include new discovery projections, host adaptations
-and real-server visual/journey proof; the prototype supplies none of that
-production evidence.
+The approach builds shared UI components and adapters over existing Card,
+Bifrost and verification operations, then mounts them in the conventional UI
+and supported hosts. The server continues to own durable behavior. This packet
+adds no server fields, endpoints, query services, storage or execution logic.
+Costs are UI queries, adapters, presentation and real-server visual/journey proof;
+the prototype supplies none of that production evidence.
 
 ## Required behavior
 
@@ -64,15 +64,20 @@ Refresh may update recorded progress but must not replace the inspected
 execution or selected historical judgment. Use the existing tenant shell and
 exact Card routing; do not create a second Cards browser.
 
-**REQ-003 — Domain discovery reads.** Extend the existing verification read
-owner with bounded, paginated execution summaries, matching aggregates/facets
-and PR review-set/history reads. Expose these through the normal HTTP, SDK and
-MCP contracts and typed UI read adapters. Summaries carry exact execution,
-Verifier and subject references, lifecycle status, nullable selected result and
-recorded verdict, the discovery correlations above, and repository/PR/review-set
-association when present. Apply current tenant and exact Verifier read scope
-before pagination or counts. Discovery must not require the browser to fetch
-every execution, query protected payloads, or infer review membership.
+**REQ-003 — Existing reads for discovery.** Use existing authorized Bifrost
+queries and delivered domain reads for bounded execution rows, matching
+aggregates/facets and PR review-set/history presentation. Reuse the typed UI
+read adapters; do not add server endpoints, response fields or query services.
+Rows carry exact execution, Verifier and subject identity, lifecycle status,
+nullable selected result and recorded verdict, the discovery correlations above,
+and repository/PR/review-set association when recorded. Completed-result rows
+alone do not represent unfinished executions. Current tenant and exact Verifier
+read restrictions must be enforced by existing read/query authority before
+pagination and counts; a browser filter is never authorization. If an existing
+surface cannot supply a required authorized projection, record that precise
+external dependency and leave the affected work proposed rather than changing
+the server, relaxing access or fabricating records. Discovery must not enumerate
+every execution in the browser or infer review membership.
 
 ### Inspect one workflow
 
@@ -100,6 +105,15 @@ action success, requirement verdict, speculative/discarded disposition and
 execution status. A fresh recorded judgment initially selects its first failed
 requirement when present; subsequent updates do not steal selection. Read the
 execution's selected result before treating retained output as authoritative.
+Load the graph from the exact Verifier Card through existing registry APIs.
+Render compact result judgments without assuming they contain steps, checks,
+provenance or evidence; obtain those recorded fields through the existing
+explicit details read or authorized Bifrost queries. Use existing invocation
+and publication reads for accepted progress and exact producers. Status,
+judgment, details and file access can be independently available; an optional
+read failure must not erase other authorized content. A live result does not
+certify that retained records are already visible. Show truthful availability
+and normal refresh without waiting inside a page load or resubmitting work.
 Exact trace/span citations use current viewer permissions independently of the
 originating list's time/workload/subject filters. Keep return context and expose
 bounded-read failures. Current retained spans do not claim to reproduce a past
@@ -211,9 +225,9 @@ and internal scrolling/pan/zoom. Fixtures do not close live dependencies.
 
 No visual workflow editor, new verification kind, finding schema, separate PR
 dashboard, general Cards redesign, activation/pause/rollback editor or broader
-Changes/collaboration product is included. No new runtime, scheduler, registry,
-graph store, browser execution ledger, event bus or PostgreSQL table is
-authorized by this UI packet. Internal layout algorithms, cursor encoding,
+Changes/collaboration product is included. No new server API, response field, query service, authorization behavior,
+runtime, scheduler, registry, graph store, browser execution ledger, event bus
+or PostgreSQL table is authorized by this UI packet. Internal layout algorithms, cursor encoding,
 refresh scheduling and component decomposition remain implementation-owned.
 
 ## Dependencies, authority and scope transfer
@@ -224,34 +238,40 @@ The governing owners are [Wyrd doctrine/Cards/Verifier](../../../architecture/wy
 sensitive payload classifications and current tenant/scope checks. The UI never
 widens accepted execution authority or implements durable workflow behavior.
 
-The approved backend dependency is `SPEC-github-verifier-pipelines` revision 4
-and its public contracts, revalidated on 2026-11-10 in
-`/home/thorrester/Documents/GitHub/wyrd-worktrees/github-verifier-pipelines-task-002`
-at HEAD `5d6fb4116`. It owns native Repository declaration/selection, GitHub
-admission/delivery, deferred input, approval, connection lifecycle and their
-architecture amendments. Its dedicated `wyrd.github_installations` table is
-an approved backend cost, not permission for this UI packet to add storage.
-Main's Card-kind and related authority updates are still dependencies; a mock
-does not enact them. See [source alignment](design/source-alignment.md) for
-existing owners and the distinction between delivered and proposed behavior.
+External dependencies are capabilities, not task numbers from another packet.
+Existing Card APIs load registry declarations; Bifrost retains verification
+summary/output/input data and accepted progress; existing verification APIs
+supply status/details/invocations/publications and authorized actions. The
+[finalized read map](design/contract-alignment-research.md) records inspected
+sources and the [source alignment](design/source-alignment.md) distinguishes
+source presence from integration into this UI checkout. Revision 3 records the
+user's 2026-11-12 agreement to this UI-only approach.
 
-This draft proposes the following bounded transfer on approval. It does not
-silently revise the currently approved original packet:
+Native Repository, connection, admission, deferred input, approval and delivery
+remain external backend capabilities with their owning authority amendments.
+The newest inspected backend contract is revision 7 at source `54aa8f4a9`; its
+approved nonblocking-execution semantics are not proof of implementation.
+Positive approval receipts retain durable decision acceptance; direct/live
+results do not certify retained visibility. This packet neither implements those
+semantics nor changes their storage, credential or permission owners.
+
+Approval of revision 2 enacts the following bounded transfer. The original
+packet records it beside the affected requirements and tasks:
 
 | Original scope | Replacement and retained responsibility |
 |---|---|
-| [UI spec revision 28](../wyrd-ui-main-integration/spec.md), REQ-018/026/027; [TASK-007](../wyrd-ui-main-integration/tasks/TASK-007-verification.md) | This packet owns verification components, discovery, workflow/definition pages, session/drift and evidence navigation. Replace results-only/no-list-API restrictions, drawer-first navigation and prohibition on exact inspector attempt identity. Preserve recorded judgment, scoped membership, citation, host and real-journey obligations. Internal retry/backoff controls remain excluded. |
+| [UI spec revision 28](../wyrd-ui-main-integration/spec.md), REQ-018/026/027; [TASK-007](../wyrd-ui-main-integration/tasks/TASK-007-verification.md) | This packet owns verification components, discovery, workflow/definition pages, session/drift and evidence navigation. Replace results-only and drawer-first navigation restrictions and the prohibition on exact inspector attempt identity; revision 3 preserves the no-new-server-API boundary. Preserve recorded judgment, scoped membership, citation, host and real-journey obligations. Internal retry/backoff controls remain excluded. |
 | Original REQ-029 repository portion; [TASK-009](../wyrd-ui-main-integration/tasks/TASK-009-changes-and-repositories.md) | This packet owns Repository presentation and GitHub connection UI. Native declaration/access/policy replaces folder-scan/configuration-path editing. Change Requests, discussion/review, revisions and their unrelated components remain in the original packet. |
 | Original shared delivery obligations, including REQ-030/034/062 | Continue to apply to these components and pages; ownership transfer removes neither supported-host proof nor paired component/conventional delivery. |
 
-This section is the scope-reconciliation record. The proposed transfer is
-fully enumerated above; the original approved revision 28 and its tasks have
-not been edited or reclassified by drafting this packet. On explicit approval
-of the transfer, synchronize those affected references/statuses without
-changing the retained Changes obligations. Do not execute conflicting original tasks
-or mark the entire original Changes task superseded. Discovery/review-set read
-extensions belong to this packet at existing contract/server/client owners;
-backend engine and installation semantics remain with the backend packet.
+This section is the scope-reconciliation record. The transfer is fully
+enumerated above and was synchronized into the original packet on approval
+(2026-11-11): its REQ-018/026/027/029 entries, plan, TASK-007 and TASK-009 point
+here, and its retained Changes obligations are unchanged. Do not execute conflicting original tasks
+or mark the entire original Changes task superseded. Discovery/review-set UI queries and adapters belong to this packet over existing
+read surfaces. Server contract, engine and installation changes remain outside
+this packet; a missing input is an external dependency, not an implementation
+assignment here.
 
 The following backend-owned authority amendments are dependencies of the tasks
 that consume them. They are not a prerequisite for approving the UI behavior
@@ -259,9 +279,9 @@ or starting unrelated work:
 
 | Owning document | Required backend amendment and current boundary |
 |---|---|
-| `architecture/wyrd-design.md` and root contributor Card inventory | Native Repository Card/declaration and TOML root, closed PR activation, deferred-input/approval and public inspection contracts. Main still describes 12 Card kinds and the older verification surface; this draft does not amend them. |
+| `architecture/wyrd-design.md` and root contributor Card inventory | Native Repository Card/declaration and TOML root, closed PR activation, deferred-input/approval and public inspection contracts. Main still describes 12 Card kinds and the older verification surface; this specification does not amend them. |
 | `architecture/wyrd-security-posture.md` | Backend-owned connection authorization, exact approve scope and accepted-authority rules for PR/deferred/approval behavior. Consume its approved amendments; do not derive authority from this UI. |
-| `architecture/bifrost-design.md` | Backend-owned evidence custody/admission changes, retaining sensitive-payload protections. This packet authorizes domain discovery projections, not public payload reclassification. |
+| `architecture/bifrost-design.md` | Backend-owned evidence custody/admission changes, retaining sensitive-payload protections. This packet consumes existing authorized queries/reads; no new domain projection or payload reclassification is authorized. |
 
 Specification approval fixes the agreed UI behavior and bounded scope transfer;
 it does not certify backend delivery. Synchronize the affected original-packet
@@ -270,22 +290,22 @@ record only the integrated contract/authority revisions and real dependency
 proof that task consumes. No task may implement behavior that conflicts with
 its applicable current authority.
 
-| UI task | Required backend/authority output before activation |
+| UI task | Existing capability or predecessor input required |
 |---|---|
-| 001 — Definition graph | Existing exact Card/Verifier definition owners; no GitHub amendment or API dependency. |
-| 002 — Execution inspection | Building-block exact execution/evidence/cancel reads and their scoped authorization. |
-| 003 — Verify discovery | 002's inspection input; this task delivers its own authorized discovery contract and owner amendments. No GitHub completion dependency. |
-| 004 — Repositories/settings | Backend 002/003 connection and Repository operations plus their owning amendments. |
-| 005 — PR review sets | Backend 006 admission identity/membership and confirmed same-commit request semantics described below. |
-| 006 — Waiting/approval | Backend 007/008 wait, approval and continuation operations plus their owning amendments. |
-| 007 — Delivery status | Backend 009's authorized delivery projection. |
+| 001 — Definition graph | Existing exact Card/Verifier definitions; complete against revision 2. |
+| 002 — Execution inspection | 001 graph; existing status, compact result, explicit details, invocation/publication/file/cancel operations and permitted Bifrost context queries. |
+| 003 — Verify discovery | 002 inspector; existing authorized accepted-execution/result data for bounded queries, counts and filters. Missing read coverage remains an external dependency; no server extension. |
+| 004 — Repositories/settings | 001/003 plus delivered connection/access and native Repository/selected-policy operations with owning authority. |
+| 005 — PR review sets | 002/003/004 plus actual accepted admission membership/history and confirmed same-commit request semantics. |
+| 006 — Waiting/approval | 002 plus delivered occurrence/wait/decision/readback/continuation operations and owning authority. |
+| 007 — Delivery status | 002/005 plus delivered authorized provider delivery projection. |
 
 For 005, a distinct explicit request at an unchanged commit must produce a new
 server-recorded review occurrence; retry/redelivery of that same request must
 reuse its accepted occurrence and frozen membership. The backend admission
 owner must identify the supported request input, durable occurrence identity
-and replay behavior. The approved backend revision-4 admission contract does
-not yet specify that request path; confirmation remains a named dependency of
+and replay behavior. The inspected backend admission contract does
+not establish that request path; confirmation remains a named dependency of
 005, not permission for the UI to invent an endpoint, synthesize membership or
 add a rerun control. Unrelated UI tasks can proceed; tasks that depend on 005
 still require its completed output. Exact public schema spellings follow owner
@@ -293,13 +313,13 @@ conventions.
 
 ## Acceptance observations
 
-Use real public server/Postgres journeys for domain behavior on the surfaces
-shipped, and real browser journeys for conventional UI behavior. UI fixtures
+Use existing public server/Postgres/Bifrost reads for real UI input journeys on
+the supported hosts, and real browser journeys for conventional UI behavior. UI fixtures
 supplement rendering/error coverage. The mock's 28 browser checks establish
 prototype behavior only. Each proof below must assert the stated observation,
 not merely the existence of a route/component or a successful command.
 
-| Proof | Situation and expected observation | Obligations |
+| Proof | Situation and expected observation | Requirements (REQ-*) |
 |---|---|---|
 | AC-001 Discovery and return | Create unfinished and completed ordinary/session/drift/PR executions. Combine status/verdict/general/repository filters, brush both charts, page/group, open a row and return. Counts and rows describe the same authorized population; no-result work has no verdict; discovery context survives. | 001–003 |
 | AC-002 Exact graph and publications | Follow an execution link during parallel/repeated work, choose item/iteration/attempt and open intermediate outputs; refresh as work progresses and reopen after completion. Producer/result identity, selection and viewport remain stable, all outputs are peers and unsafe/oversized previews fail visibly without executing content. Check ordinary and wide graphs against the approved mock. | 002,004–006 |
@@ -313,16 +333,14 @@ not merely the existence of a route/component or a successful command.
 
 ## Approval and revision history
 
-Revision 2 is **draft**. Approval is requested for the behavior, limits,
-cross-packet scope replacement and visual target above. Design/mock approval
-does not approve this specification. No new product decision is proposed;
-scope transfer is recorded above and backend readiness is checked per task. At the
-user's explicit request, `$wyrd-plan` has drafted [proposed tasks](tasks/)
-while this revision remains draft. Implementation activation still requires
-specification approval, the applicable scope transfer and only that task's
-named dependency outputs.
+Revision 3 records the user's explicit agreement on 2026-11-12 to adapt the
+approved UI to existing reads and resource-scaling's compact/details split,
+with no underlying server changes, and the request to revise the tasks.
+The visual behavior and revision-2 scope transfer remain approved. External
+capability readiness is still checked per task; unavailable data is not invented.
 
 | Revision | Status | Change |
 |---|---|---|
 | 1 | draft | Convert the finalized centralized design into one verification UI contract; align the dependency with backend revision 4 and explicitly bound the original UI scope transfer. Clarify the agreed charts, graph presentation, session return and drift-window highlight. |
-| 2 | draft | Separate UI specification approval from task-specific backend delivery; record the unconfirmed same-commit review-request input as a direct dependency of TASK-005. |
+| 2 | approved (2026-11-11) | Separate UI specification approval from task-specific backend delivery; record the unconfirmed same-commit review-request input as a direct dependency of TASK-005. |
+| 3 | approved (2026-11-12) | Record the user-agreed UI-only implementation boundary: existing Card/Bifrost/domain reads, compact judgments and explicit details, unchanged task order, no new server APIs/fields/query services or runtime behavior. |

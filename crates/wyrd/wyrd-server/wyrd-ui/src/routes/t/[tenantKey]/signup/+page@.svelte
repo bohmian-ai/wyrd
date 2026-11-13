@@ -9,7 +9,7 @@
 <Entry heading="Join {data.tenant.key}" issue={form?.problem ?? data.problem}>
   <form class="fields" method="POST">
     <label for="invitation-code">Invitation code</label>
-    <input id="invitation-code" class="app-input" type="password" name="invitationCode" required autocomplete="off" />
+    <input id="invitation-code" class="app-input mono" type="password" name="invitationCode" required autocomplete="off" />
     <label for="username">Username</label>
     <input id="username" class="app-input" name="username" required minlength="3" maxlength="64" autocomplete="username" value={form?.username ?? ''} />
     <p>3–64 characters: letters, digits, dot, underscore or hyphen, starting with a letter or digit. Stored in lowercase.</p>

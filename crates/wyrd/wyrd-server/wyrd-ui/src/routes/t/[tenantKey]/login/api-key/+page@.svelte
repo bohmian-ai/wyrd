@@ -8,7 +8,7 @@
 <Entry heading="Sign in to {data.tenant.key}" issue={form?.problem ?? data.problem}>
   <form class="fields api-key" method="POST">
     <label for="api-key">API key</label>
-    <input id="api-key" class="app-input" type="password" name="apiKey" required autocomplete="off" />
+    <input id="api-key" class="app-input mono" type="password" name="apiKey" required autocomplete="off" />
     <p>Recovery sign-in with an operator API key, for a tenant without SSO or when SSO is unavailable. This browser keeps the key only inside an encrypted, HttpOnly cookie.</p>
     <button class="app-control primary wide" type="submit">Sign in with API key</button>
   </form>

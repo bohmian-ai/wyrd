@@ -282,22 +282,17 @@ jobs:
     needs: changes
     if: needs.changes.outputs.full_gate == 'true' || needs.changes.outputs.ui == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
 
-      - name: Set up mise
-        uses: jdx/mise-action@v5
+      # The UI typechecks and tests against the built wyrd-ai addon.
+      - uses: ./.github/actions/setup-rust-ci
         with:
-          install: true
-          cache: true
+          cache-key: napi
 
-      - name: Check UI package
-        working-directory: crates/wyrd/wyrd-server/wyrd-ui
-        run: |
-          pnpm install --frozen-lockfile
-          pnpm exec svelte-kit sync
-          pnpm exec vite --version
+      - name: Typecheck and test the UI
+        run: mise run ui:check
 
       - name: Token drift lock
         working-directory: crates/wyrd/wyrd-server/wyrd-ui

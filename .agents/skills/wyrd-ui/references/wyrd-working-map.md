@@ -1,32 +1,52 @@
 # Wyrd UI Working Map
 
-Use this file to find the right feature area quickly before editing.
+Paths are relative to `crates/wyrd/wyrd-server/wyrd-ui`.
 
-## App root
+## Brand (`brand/`)
 
-- UI root: `crates/wyrd/wyrd-server/wyrd-ui`
-- Global CSS: `src/app.css`
-- App shell: `src/routes/+layout.svelte`
-- Home route: `src/routes/+page.svelte`
-- Brand assets and tokens: `brand/`
+- `DESIGN.md`: doctrine. `palette.json`: canonical tokens. `components.json`: component
+  contracts. `gen-theme.mjs`: emits every token projection and the mark SVGs.
+- `renders/`: the styleguide and product mocks.
 
-## Suggested feature boundaries
+## Component package (`packages/ui/src/lib`, published as `wyrd-ai-ui`)
 
-Create these directories only when the feature needs them:
+- `components/*.svelte`: every reusable component, exported from `index.ts`.
+- `schemas.ts`: Zod input schemas, the view-document schema, and the layout schema.
+  `scripts/catalog.ts` derives `catalog.json` (and `problems.json` from the Rust error
+  catalog) from them.
+- `contract.ts`: the read contract (`Executor`, `Problem`, `wyrdProblem`) shared by
+  loaders, executors, and components. Domain types come from `wyrd-ai` wire types.
+- `loaders.ts`: portable loaders. They plan reads, run them through an executor, and
+  shape the props. No Node, browser, or credential.
+- `node.ts`: server-only executor over the `wyrd-ai` SDK. `mcp.ts`: the MCP App
+  executor over `App.callServerTool`.
+- `view.ts` and `WyrdView.svelte`: render a view document; `mountView` serves non-Svelte
+  hosts.
+- `format.ts`: display formatting. `theme.css`: generated tokens.
+- `src/app/main.ts`: the standalone MCP App bundle (`wyrd-view.html`).
 
-- Shared visual components: `src/lib/components/`
-- Route-local components: keep beside the route when they are not reused.
-- Server-only helpers: `src/lib/server/`
-- Internal API endpoints: `src/routes/api/...`
-- Shared client state: `src/lib/state/` or `src/lib/components/settings/`, depending on local convention.
-- Shared types: keep with the feature first; move to `src/lib/types/` only when reused across features.
+`examples/ui-app` is a second consumer of the package; keep its contract working.
 
-## Editing order
+## Host app (`src/`)
 
-1. Inspect the route entrypoint.
-2. Inspect the nearest feature component.
-3. Inspect server helpers or API endpoints.
-4. Inspect theme and brand files.
-5. Inspect shared state, schemas, or route constants.
+- `hooks.server.ts`: per-request session handling and the browser side of the
+  authorization server.
+- `lib/server/`: server-only code. `auth/` (sessions), `upstream.ts` (the internal
+  server origin), `problem.ts` (safe problem projection), `form.ts`, `routing/`,
+  `development.ts` (local sign-in, unavailable in production builds).
+- `lib/theme.svelte.ts`: the light/dark mode state and its cookie.
+- `lib/cards-host.ts`, `lib/observe-host.ts`: URL state for the Cards and Observe pages.
+- `lib/ui-fixtures.ts`: synthetic component data for `_gallery` and the tests.
+- `routes/t/[tenantKey]/`: tenant pages (`cards`, `cards/detail`, `observe`, `query`,
+  `settings`). `login`, `signup`, and `reset` use `+page@.svelte` to escape the
+  tenant shell. `ui/load/+server.ts` loads one catalog panel for the browser session.
+- `routes/_gallery`: the dev component gallery.
 
-Avoid broad refactors while adding a feature. Wyrd's UI is still small, so local clarity is usually better than early abstraction.
+## Where a change goes
+
+- A reusable visual or data component goes in the package, never in `src/lib/components`.
+- A component used only by one page stays beside that route.
+- Code that must hold a credential or reach the backend goes in `src/lib/server/` or a
+  `+page.server.ts`/`+server.ts`.
+- A type stays with its feature until a second feature needs it. Wire types come from
+  `wyrd-ai`; never redeclare them.

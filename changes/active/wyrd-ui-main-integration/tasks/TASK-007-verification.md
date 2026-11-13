@@ -1,6 +1,6 @@
 # TASK-007 — Verification components and investigation
 
-Spec: [revision 28, approved](../spec.md). Status: Proposed; the requirement-detail prerequisite below prevents full completion from the current checkout.
+Spec: [revision 28, approved](../spec.md). Status: **Superseded** (2026-11-11) by [verification-workflow-ui](../../verification-workflow-ui/spec.md#dependencies-authority-and-scope-transfer) revision 2, which owns every outcome below. Do not execute this task.
 Dependencies: completed TASK-003, TASK-004 live shell/Observe and TASK-027; [TASK-005 Cards and Prompts](TASK-005-cards-and-prompts.md) for exact Card routing and shared Card content.
 Mapped obligations: REQ-018/020/022/023/024/026/027/030/034/062; AC-007/009/010/011/013/016/017/019/041; INV-001–INV-007 apply, with installation-only obligations retained by their existing owners.
 Absorbs former TASK-007's VerifierGraph, VerificationResult, RequirementDetail and DriftFeatureTable obligations and all former TASK-023 outcomes. VerificationBindings belongs to TASK-008; AttentionList belongs to TASK-010. Those transfers do not remove their library obligations.

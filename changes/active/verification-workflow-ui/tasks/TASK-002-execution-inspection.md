@@ -3,7 +3,7 @@ id: TASK-002
 kind: implementation
 status: proposed
 spec: SPEC-verification-workflow-ui
-spec_revision: 2
+spec_revision: 3
 requirements: [REQ-002, REQ-004, REQ-005, REQ-006, REQ-007, REQ-009, REQ-014, AC-002, AC-003, AC-005, AC-008, AC-009]
 depends_on: [TASK-001]
 ---
@@ -12,87 +12,115 @@ depends_on: [TASK-001]
 
 ## Outcome and prerequisite
 
-An execution ID from a public SDK call opens a working workflow page with live
-recorded state, exact producer outputs and contextual judgment evidence. Session
-and drift use this same graph/inspector; cancel preserves accepted evidence.
-No discovery list or GitHub engine is needed to open that exact ID.
+Opening `/t/[tenantKey]/verify/executions/[executionId]` shows that execution's
+workflow, current recorded state, judgments and retained outputs. Selecting a
+node shows its recorded details; refresh preserves graph position, viewport and
+exact producer selection. Session and drift use the same inspector. Cancel
+uses the existing action. TASK-003 supplies discovery later; no list or PR
+admission is required to open an existing execution.
 
-Consume 001's shared graph. Activation additionally requires the existing
-building-block contract delivery researched in
-[source alignment](../design/source-alignment.md): exact Verifier-authorized
-retained execution/result reads, bounded invocations/publications, content/
-download and cancel, with generated SDK/MCP projections and real journeys.
-Main's older `get_execution`/Card-read/query path is not that dependency output.
-Record the integrated source revision; do not duplicate the runtime or expose
-sensitive Bifrost payloads to make this task appear unblocked.
+Consume TASK-001's graph and existing backend operations recorded in the
+[finalized read map](../design/contract-alignment-research.md). Record their
+integrated revision and real host proof. This is UI work: components, Bifrost
+queries, typed UI adapters, navigation and tests. No server fields/endpoints,
+SDK wire-contract changes, query services, storage or execution logic. An
+undelivered read/host capability remains an explicit prerequisite, never a
+fixture substitute or permission to implement the backend here.
 
-## Flow and owner
+## Data and existing owners
 
-Extend the shared component/loader family (`VerificationResult`, requirement
-detail and drift feature presentation) and typed read/action contracts in
-`packages/ui/src/lib/{contract,loaders,node,mcp}.ts`, catalog/view entries and
-host dispatch. Reuse existing Chart, Card content and exact trace inspection.
-Inputs come from domain execution state, pinned group snapshots, invocation and
-publication pages; bodies are fetched only for an opened exact producer.
-For drift history/adjacent-window navigation, reuse authorized contextual reads
-when available; if the delivered inspector lacks the bounded projection, extend
-that existing domain read and normal client surfaces here. Do not depend on the
-later dashboard or bypass permissions with public payload SQL.
+| Content | Existing source | UI change and consumer |
+|---|---|---|
+| Graph and description | Exact Verifier Card from the Postgres-backed registry through existing Card APIs | Resolve its exact reference/UID, then reuse TASK-001's graph and exact Card content. No direct browser database access. |
+| Current lifecycle/error and selected judgment | Existing execution status; compact VerificationResult | Shared execution context and requirement presentation; lifecycle and verdict stay separate. |
+| Completed steps/checks/provenance/evidence | Existing explicit Execution.details operation | Selected-node inspector; do not assume compact result contains these fields. |
+| Attempts and accepted progress | Existing bounded invocation pages | Exact step/item/iteration/attempt selection and recorded speculative disposition. |
+| Outputs | Existing publication pages, exact publication/manifest and file/content/download operations | Equal named metadata first; selected body only, with bounded safe previews and normal host download. |
+| Correlation, retained lookup and history | Existing permitted Bifrost results/inputs/outputs/events queries | Parameterized bounded UI queries, preserving server-selected result identity rather than choosing the latest result row. |
+| Session/drift/citations | Recorded group snapshot, requirement drift detail, executed provenance/window, existing Bifrost history and exact trace reads | Contextual inspector with recorded members, features, scores and thresholds; never recompute a verdict or membership. |
 
-Mount the same components at the existing agreed production execution route
-`/t/[tenantKey]/verify/executions/[executionId]`. Use generated identities,
-not mock hash routes. Public SDK-created IDs provide the first real consumer
-journey before 003's list exists. Preserve exact execution/result, selected
-step/requirement, item/iteration/attempt and output across refresh and copy links.
-New publications/failures do not relayout nodes or steal selection. Retained
-speculative/discarded state does not become successful judgment state.
+Extend `packages/ui/src/lib/{contract,loaders,node,mcp}.ts`, catalog/view exports
+and host dispatch. Deliver the missing runtime requirement/step/session/drift
+panels within that existing family; they are not already implemented components.
+Reuse Chart, generic panels, existing exact trace inspection and TASK-001's
+projection/layout rather than creating a second loader or graph owner.
 
-Show equal named output metadata with bounded safe text/Markdown/JSON/directory
-previews and authorized downloads, never a primary-report shortcut. Render
-session pinned chronological members and recorded requirements, with exact
-member/citation navigation and restored selection on return. A failed session
-requirement does not make passing members or edges appear responsible. Drift
-retains baseline/method/window, all recorded features, threshold/history and
-highlighted viewed window; previous/next uses exact recorded results. Never
-derive a verdict, membership or baseline distribution in the browser.
+For a completed execution, its result supplies exact Card references. Before
+that, existing Bifrost execution metadata exposes `verifier_card_uid`; existing
+HTTP/MCP Card reads accept kind and UID. Wire the missing UI host adapter to
+that existing operation. TypeScript Cards.get currently accepts a versioned
+reference, not a bare UID: do not pass an unsupported selector. Reuse an exact
+retained CardRef where available or the existing UID-capable host operation.
+Until identity/definition is visible or authorized, explain that availability
+without erasing readable execution state or inventing a different declaration.
 
-Trace reads use current evidence permissions and exact span identity, outside
-list predicates; current spans do not pretend to be a past snapshot. The
-server-selected result stays authoritative after later spans arrive. Inputs
-start collapsed; initial failed-requirement selection yields to explicit links
-and subsequent user selection.
+Adapt the shared graph projection to integrated Step contracts: dependency
+lists and any_succeeded, foreach, repeat and speculative controls. Include their
+declared external references and annotations while retaining one node per
+authored step. Runtime state never owns layout. Preserve the existing exact
+Verifier Card view with no runtime coloring; TASK-001 stays complete.
 
-Cancel is an authorized host action, guarded while pending and confirmed by
-domain readback. Completion can win; keep its terminal result. Reopening
-cancelled work retains accepted outputs. Unknown/foreign, denied, unavailable,
-not-yet-visible, skipped and terminal-error states remain distinguishable.
-No UI retry/resubmission controller. Exact wait details/approval actions belong
-to 006; GitHub delivery projection belongs to 007.
+## Interaction and failure behavior
+
+Compact results retain requirement judgments, actual/citations/custom data and
+check-specific drift detail. Load full details explicitly when needed for the
+inspector, using authored recorded data without compiling Prompts or invoking
+providers. Details are completed records, not the progress source or a wait loop.
+Keep state, judgment, details and output availability independent. A live/direct
+result does not certify retained visibility; normal refresh may reveal records
+later. Unknown, foreign, denied, unavailable and not-yet-visible responses must
+remain truthful. Do not treat every 404 as running, block a BFF load on wait,
+resubmit work or issue dependent sensitive reads after a denied prerequisite.
+
+Use generated producer identity, including nullable item/iteration and one-based
+attempt. Preserve exact execution/result, step/requirement, producer and output
+in navigation/copy links; a stale response cannot replace newer selection.
+Respect opaque cursors and bounded pages. Do not replace selected publications
+with StepResult.output, a final-step shortcut or a primary-report heuristic.
+Preview bounded JSON, safe text/Markdown and directory manifests; never execute
+HTML or download a directory merely to list it. File access stays with hosts.
+
+Use the selected execution's recorded group snapshot for ordered session members
+and restore selection when returning. Keep drift window/method/baseline facts,
+all recorded features, scores/thresholds and bounded history from the existing
+reads; if context is missing or refused, say so instead of adding a server read
+or inventing it from current Card status. Later spans do not revise judgments.
+Exact citations use current trace permissions independently of list filters.
+
+Host cancellation guards duplicate pending actions and reads back existing
+status; terminal completion can win. Retained progress/outputs stay readable.
+Waiting/approval decisions belong to TASK-006; provider delivery to TASK-007.
 
 ## Observable proof
 
-At existing UI unit owners, test selection/producer changes, safe/oversized
-preview refusal, stable graph viewport, session return and drift history. At
-the real server/host and production browser owners, create ordinary parallel/
-repeated work through public clients, open intermediate output while running,
-refresh and reopen terminal state. Assert exact identities and no invented
-verdict; page and shared host component show the same retained records.
+At the existing UI unit owners, prove graph controls and stable selection,
+compact-only judgment rendering, explicitly loaded details and independent
+refusals, exact producer/output changes and safe/oversized previews. Prove that
+the shared projection still renders the definition page after Step adaptation.
 
-Create owner-distinct session reviews and drift windows through the existing
-public setup; inspect members, cross-workload/untagged/out-of-range trace
-citations, later spans, denied/truncated evidence and foreign IDs. Exercise
-cancel before settlement and a synchronized completion race, retaining evidence.
-Compare ordinary/session/drift and wide graph/inspector regions with the mock;
-include keyboard/mobile and both themes. Use the verification owners and commands below
-and the domain dependency's real surface journeys; fixtures alone cannot close
-this task's delivery dependency or acceptance.
+Through existing public SDK/server setup and the production BFF/Chromium page,
+open an exact execution while unfinished, select an intermediate publication,
+refresh and reopen after settlement. The page and shared host component must
+show the same recorded identities. Include no-result and delayed-details states;
+loading or refusing details must not hide other readable content. Inspection
+must not invoke a provider or create replacement work.
+
+Exercise owner-distinct pinned sessions, drift history, out-of-range/exact trace
+citations, later spans, foreign/denied/unavailable reads and cancel/completion
+races. Repeat affected adapters in Node/MCP/custom/built-artifact hosts. Compare
+ordinary/session/drift and wide graph/inspector regions with the approved mock,
+both themes and narrow/wide layouts, keyboard/focus/touch. Fixtures supplement
+these real journeys. Existing scoped operations and Bifrost permissions must
+produce the refusals; UI filters are not authorization.
 
 ## Execution and verification
 
-This task is proposed against draft spec revision 2. Activation requires
-explicit spec approval, the applicable scope transfer, and only this task's
-named contract/authority and predecessor outputs. Unrelated backend delivery
-or authority amendments do not block it. Record the integrated source revisions
+This task is against approved spec revision 3, whose scope transfer is
+synchronized. Activation requires only this task's named contract/authority
+and predecessor outputs. Unrelated backend delivery
+or authority amendments do not block it. This packet consumes existing read/action
+capabilities and adds no underlying server changes; a missing required capability
+remains an explicit external dependency. Record the integrated source revisions
 and actual dependency journeys it consumes; upstream task status is not proof.
 
 Read the repo-local `wyrd-ui` skill before UI edits. Reuse the shared component,
@@ -121,14 +149,8 @@ the approved mock on desktop/mobile, light/dark, keyboard/focus/touch, long
 content and error states. Record reference regions, screenshots and individual
 human acceptance. Fixtures and automated checks alone do not prove fidelity.
 
-For introduced domain reads, use the existing server/MCP verification journey
-owners (`wyrd-testing/tests/bifrost/server/verification_runtime.rs` and
-`wyrd-mcp/tests/bifrost/mcp/verification.rs`) and the normal SDK integration
-trees. Select affected stories through `test:bifrost:journey:server`,
-`test:bifrost:journey:mcp`, `test:rust-sdk:journey`, `py:test:integration` and
-`ts:test:integration`; preserve the spec's shipped-surface and negative-flow
-proof. Exact new selectors are recorded by the implementer. Regenerate through
-the owning generators and run `codegen:check`; Rust changes add `fmt`/`lints`,
-and SDK changes add their owning format/lint/type, Python stub and N-API
-checks. Relevant tenancy/dependency changes add `check:tenant-isolation` and
-`check:deps`. Full shipped-surface lanes belong to integrated change review.
+Use the existing UI integration owners to prove real Bifrost/domain inputs through
+Node/MCP/BFF/custom/built-artifact adapters. Do not add or change server/SDK wire
+contracts or their generators. Regenerate the UI catalog when schemas change and
+run `mise run codegen:check` where applicable. Full shipped-surface journey lanes
+belong to integrated change review; focused UI/host journeys prove this task.

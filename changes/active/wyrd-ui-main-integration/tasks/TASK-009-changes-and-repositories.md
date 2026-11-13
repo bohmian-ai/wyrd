@@ -1,6 +1,6 @@
 # TASK-009 — Changes and repository workflows
 
-Spec: [revision 28, approved](../spec.md). Status: Proposed; **externally gated**, not executable to completion against current main.
+Spec: [revision 28, approved](../spec.md). Status: Proposed; **externally gated**, not executable to completion against current main. Repository presentation and GitHub connection moved to [verification-workflow-ui](../../verification-workflow-ui/spec.md#dependencies-authority-and-scope-transfer) revision 2 (2026-11-11); the Change Request scope remains here and is deferred.
 Dependencies: completed TASK-003/TASK-004/TASK-027, [Cards and Prompts](TASK-005-cards-and-prompts.md), [Verification](TASK-007-verification.md).
 Mapped obligations: REQ-020/021/022/029/030/034/062; AC-010/011/013/041; INV-001–INV-007.
 

@@ -1159,6 +1159,12 @@ description = "Run the local UI on localhost:3000 with the development sign-in i
 dir = "crates/wyrd/wyrd-server/wyrd-ui"
 run = "WYRD_UI_LOCAL_AUTH=${WYRD_UI_LOCAL_AUTH:-true} pnpm run dev --host 127.0.0.1 --port ${WYRD_UI_PORT:-3000}"
 
+[tasks."ui:check"]
+description = "Typecheck the wyrd-ai-ui package and the UI host, then run the UI unit and component tests"
+depends = ["ts:build"]
+dir = "crates/wyrd/wyrd-server/wyrd-ui"
+run = ["pnpm install --frozen-lockfile", "pnpm check", "pnpm test"]
+
 [tasks."docs:install"]
 hide = true
 description = "Install docs dependencies from the lockfile"

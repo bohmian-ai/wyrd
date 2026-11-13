@@ -14,7 +14,11 @@ const fromWyrdUi = {
   enforce: 'pre',
   async resolveId(id, importer) {
     if (!BORROWED.test(id) || !importer?.startsWith(here)) return null;
-    return this.resolve(id, join(ui, 'package.json'), { skipSelf: true });
+    // Svelte Flow is a dependency of the component package, not of the workspace root.
+    return (
+      (await this.resolve(id, join(ui, 'package.json'), { skipSelf: true })) ??
+      this.resolve(id, join(ui, 'packages/ui/package.json'), { skipSelf: true })
+    );
   },
 };
 

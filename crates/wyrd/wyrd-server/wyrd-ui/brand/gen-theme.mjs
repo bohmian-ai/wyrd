@@ -3,15 +3,12 @@
 // canonical token source):
 //   brand/theme.css                                   workbench Tailwind theme
 //   docs/src/styles/wyrd-tokens.css                   docs site tokens
-//   .agents/skills/wyrd-ui/references/wyrd-theme.css  wyrd-ui skill reference
 //   packages/ui/src/lib/theme.css                     wyrd-ai-ui component tokens
 //   brand/logo.svg, brand/logo-light.svg, brand/app-icon.svg,
 //   docs/src/assets/wyrd-mark.svg, docs/public/favicon.svg   Wyrd mark renderings
 // Usage:
 //   node brand/gen-theme.mjs           regenerate every target
 //   node brand/gen-theme.mjs --check   exit non-zero if any target is stale
-//
-// .claude/skills is a symlink to .agents/skills, so it needs no copy.
 import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -185,19 +182,6 @@ function packageCss({ modes, scale, tokens }) {
   return [BANNER, '', fonts, '', ...modeBlocks, ''].join('\n');
 }
 
-/** wyrd-ui skill reference: the same tokens under the skill's theme selectors. */
-function skillCss({ modes, scale, tokens }) {
-  const modeBlocks = modes.map((mode) => {
-    const selector =
-      mode === 'light'
-        ? "[data-theme='wyrd'].theme-light,\n[data-theme='wyrd']:not(.theme-dark)"
-        : `[data-theme='wyrd'].theme-${mode}`;
-    const lines = ['  /* fonts */', ...fontLines(scale), '', ...tokenLines(tokens, mode)];
-    return `${selector} {\n${lines.join('\n')}\n}`;
-  });
-  return [BANNER, '', ...modeBlocks, ''].join('\n');
-}
-
 const BANNER = [
   '/* GENERATED FILE — do not edit by hand.',
   ' * Source of truth: crates/wyrd/wyrd-server/wyrd-ui/brand/palette.json.',
@@ -239,7 +223,6 @@ export function renderTargets(palette) {
   return [
     { path: join(here, 'theme.css'), content: workbenchCss(palette) },
     { path: join(repo, 'docs/src/styles/wyrd-tokens.css'), content: docsCss(palette) },
-    { path: join(repo, '.agents/skills/wyrd-ui/references/wyrd-theme.css'), content: skillCss(palette) },
     { path: join(here, '../packages/ui/src/lib/theme.css'), content: packageCss(palette) },
     { path: join(here, 'logo.svg'), content: markSvg(palette, 'dark') },
     { path: join(here, 'logo-light.svg'), content: markSvg(palette, 'light') },

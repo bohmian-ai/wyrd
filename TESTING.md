@@ -197,6 +197,7 @@ mise run check                           # format check + workspace Clippy toget
 mise run py:format py:lints              # when Python changed
 mise run py:typecheck                    # when Python stubs, exports, or typing changed
 mise run ts:typecheck                    # when TypeScript changed
+mise run ui:check                        # when the UI or wyrd-ai-ui changed
 mise run codegen:check                   # TS wire types, error codes, UI examples, theme tokens
 mise run codegen:regen                   # regenerate every consumed output from source
 ```

@@ -157,8 +157,8 @@ check_selection "UI-only change runs UI checks" \
 check_selection "Python SDK change runs Python on both platforms and its journey" \
   "full_gate=false python=true typescript=false ci_lanes~py:test:integration ci_lanes~codegen:check" \
   "sdks/wyrd-sdk-python/python/wyrd/__init__.py"
-check_selection "TypeScript SDK change runs TypeScript on both platforms and its journey" \
-  "full_gate=false typescript=true python=false ci_lanes~ts:test:integration ci_lanes~ts:napi:check" \
+check_selection "TypeScript SDK change runs TypeScript on both platforms, its journey, and the UI" \
+  "full_gate=false typescript=true ui=true python=false ci_lanes~ts:test:integration ci_lanes~ts:napi:check" \
   "sdks/wyrd-sdk-ts/wyrd/src/index.ts"
 check_selection "Python example runs Python checks" "full_gate=false python=true" \
   "examples/python/demo.py"

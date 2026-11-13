@@ -1259,7 +1259,9 @@ implementor never sees two versions of anything.
 - **REQ-017 — Metrics.** The Metrics page (canvas `Metrics`) built from
   `Chart` and `RecordTable`, as its own inspectable outcome with current canonical metric shapes, time bounds, and
   honest treatment of missing data. Never invent a value from a mock default.
-- **REQ-018 — Generic verification.** The Verify page and Verifier Card
+- **REQ-018 — Generic verification.** *Transferred to [verification-workflow-ui](../verification-workflow-ui/spec.md#dependencies-authority-and-scope-transfer)
+  revision 2; recorded-judgment, membership, citation, host and journey obligations
+  continue there.* The Verify page and Verifier Card
   (REQ-026, REQ-027; canvas `Verify`, `VerifySession`, `VerifyDrift`,
   `Verifier`) built from the REQ-030 Verify components on main's generic
   Verifier, binding, execution, requirement, verdict, and evidence
@@ -1381,7 +1383,9 @@ not protocol authority.
   - Validation: registration checks the result schema (no execution) against
     the shape rules and rejects with a stable `WyrdError`; render re-checks and
     shows the error in the chart, never a blank chart.
-- **REQ-026 — Verify: the results workbench, shaped like Traces.** One list
+- **REQ-026 — Verify: the results workbench, shaped like Traces.** *Transferred to
+  [verification-workflow-ui](../verification-workflow-ui/spec.md#dependencies-authority-and-scope-transfer) revision 2, which replaces the results-only
+  and drawer-first restrictions below.* One list
   of recorded results answers "what is failing"; a result opens in a drawer
   over the list so filters and position survive. No duration, hash, retry
   internals, provenance, or table-name detail anywhere. For an execution already
@@ -1425,7 +1429,8 @@ not protocol authority.
     reconstruct the exact span collection seen by a past verification attempt.
     Late-arriving spans never recompute or revise the recorded result; a new
     judgment requires a new server verification execution.
-- **REQ-027 — Verifier Card: the Verifier graph.** One component built only
+- **REQ-027 — Verifier Card: the Verifier graph.** *Transferred to
+  [verification-workflow-ui](../verification-workflow-ui/spec.md#dependencies-authority-and-scope-transfer) revision 2.* One component built only
   from `VerifierSpec`: inputs, then steps layered by the outputs they read
   and `depends_on` (edges labelled by the output read), step requirements
   under their step, then Verifier-level requirements. The Card shows it
@@ -1485,7 +1490,10 @@ not protocol authority.
     versus zero and integer precision through supported encodings; do not
     coerce every point to a generic float, invent percentiles, or manufacture
     trace correlation for a metric aggregating many executions.
-- **REQ-029 — Change Requests (design ahead of contract).** A Change Request
+- **REQ-029 — Change Requests (design ahead of contract).** *The repository and
+  GitHub connection portion is transferred to [verification-workflow-ui](../verification-workflow-ui/spec.md#dependencies-authority-and-scope-transfer)
+  revision 2; Change Requests, discussion, review and revisions remain here and are
+  deferred: the sidebar does not list Changes until they ship.* A Change Request
   is defined as: repositories connect to a Wyrd GitHub webhook; a repository
   `wyrd.toml` points to a folder of Verifiers (with requirements) to run; a CR
   can be started at any time; a PR creates one if none exists; Verifiers start
@@ -2403,6 +2411,12 @@ review verdicts are not rewritten. A host lacking supported integration is a
 reported live-proof blocker, never an assumed capability or silent pass.
 
 ## Revision history and authorities
+
+- Scope transfer (2026-11-11), on approval of [verification-workflow-ui](../verification-workflow-ui/spec.md#dependencies-authority-and-scope-transfer)
+  revision 2: REQ-018/026/027, TASK-007 and the repository portion of REQ-029 and
+  TASK-009 move there. REQ-030/034/062 delivery obligations still apply to the
+  transferred components. Change Requests stay here, deferred; the sidebar no longer
+  lists Changes.
 
 - Revision 28 approved (2026-11-06): eight remaining delivery tasks pair shared
   components/gallery and live conventional consumers, add REQ-062/AC-041, and

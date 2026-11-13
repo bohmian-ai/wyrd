@@ -16,14 +16,21 @@ body {
 /* Trusted application forms; the semantic component catalog has no executable props. */
 .app-control,
 .app-input {
-  border: 2px solid var(--border);
+  box-sizing: border-box;
+  min-height: 32px;
+  border: 1px solid var(--border);
   border-radius: var(--r);
-  padding: 8px 12px;
+  padding: 6px 10px;
   background: var(--surface);
   color: var(--text);
-  font: var(--weight-strong) 12px var(--font-mono);
+  font: 13px var(--font-sans);
   min-width: 0;
   max-width: 100%;
+}
+/* Machine-shaped values: keys, issuers, client ids, claim names, tenant keys. */
+.app-input.mono {
+  font-family: var(--font-mono);
+  font-size: 12px;
 }
 /* A page's content inside the shell, inset as Observe's board: 24px, 16px on a narrow screen. */
 .app-page {
@@ -35,14 +42,29 @@ body {
   }
 }
 .app-control {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  white-space: nowrap;
+  text-decoration: none;
   cursor: pointer;
 }
 .app-control:hover {
-  background: var(--surface-2);
+  background: var(--surface-hover);
 }
 .app-control.primary {
+  border-color: var(--declare);
   background: var(--declare);
   color: var(--declare-ink);
+  font-weight: var(--weight-strong);
+}
+.app-control.primary:hover {
+  opacity: 0.9;
+}
+.app-control:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
 }
 :focus-visible {
   outline: 2px solid var(--declare);

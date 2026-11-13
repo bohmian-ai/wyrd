@@ -1,42 +1,37 @@
 # Wyrd SvelteKit Architecture
 
-## Stack
-
-Wyrd UI is a SvelteKit app using Svelte 5, TypeScript, Vite, Tailwind v4, and Skeleton. Keep changes aligned with the app in `crates/wyrd/wyrd-server/wyrd-ui`.
+Stack: SvelteKit 2 on `adapter-node`, Svelte 5, TypeScript, Vite, Tailwind v4,
+`@fontsource` fonts, Zod, and `@xyflow/svelte` for graphs. There is no component
+library.
 
 ## Server and client split
 
-- Keep backend access server-side by default.
-- Use `+page.server.ts` or `+layout.server.ts` for page data that requires secrets, auth, or backend calls.
-- Use `src/routes/api/.../+server.ts` for browser-callable internal endpoints.
-- Put shared server-only logic under `src/lib/server/`.
-- Keep client components focused on rendering, interaction, and local state.
+- The host is a BFF. `+page.server.ts` and `+layout.server.ts` call the server through
+  the `wyrd-ai` SDK via `wyrd-ai-ui/node`, as the signed-in session.
+- The browser calls only host routes (`+server.ts`), which validate input against the
+  catalog schema and forward the session cookie. The browser never holds a token or an
+  API key: refresh tokens and API keys live in HttpOnly cookies, and access tokens stay in
+  server memory.
+- Tenant comes from the `[tenantKey]` route and the session's memberships, never from the
+  request body. A route that cannot prove the tenant refuses the request.
+- `wyrd-ai` is SSR-external (`vite.config.ts`). Never import it into browser code;
+  `contract.ts` imports only its types.
 
-## Route conventions
+## Errors
 
-- Prefer route groups and nested layouts only when they simplify repeated UI structure.
-- Keep route parameters explicit and typed.
-- Co-locate route-specific parsing and validation near the route.
-- Reuse shared path builders or route constants once string duplication becomes error-prone.
+- Errors are problems projected from the Rust `WyrdError` catalog: stable `code`,
+  `title`, and `remediation`. Use `wyrdProblem` (`packages/ui`) and `problem.ts` (host);
+  never invent a response envelope or a code.
+- `problem.ts` keeps known canonical metadata only and drops arbitrary upstream
+  diagnostics.
+- Expired or missing sessions redirect to sign-in from hooks. `+error.svelte` covers
+  only errors raised after route resolution.
 
-## API boundary conventions
+## Routes and state
 
-Use a consistent response envelope for internal endpoints:
-
-```ts
-type ApiResult<T> = { response: T; error: null } | { response: null; error: string };
-```
-
-Normalize backend errors at the server boundary. Components should receive typed data and actionable error messages, not raw exception shapes.
-
-## Invalidation
-
-- Use SvelteKit invalidation for data that changes after mutations.
-- Keep cache keys, route dependencies, and refresh triggers near the route or server helper that owns the data.
-- Avoid global invalidation when a feature-level invalidation is enough.
-
-## Auth and session boundaries
-
-- Validate auth and session information in hooks, server loads, or server helpers.
-- Do not expose tokens or backend credentials to browser code.
-- Make unauthenticated, unauthorized, empty, and backend-error states visually distinct.
+- Shareable view state round-trips through the URL (`cards-host.ts`,
+  `observe-host.ts`), so reload, Back, and shared links restore the view.
+- Use `+page@.svelte` to escape the tenant shell, as the auth pages do; don't add a
+  route group for it.
+- After a mutation, invalidate the narrowest dependency rather than everything.
+- Validate form fields with `src/lib/server/form.ts`.

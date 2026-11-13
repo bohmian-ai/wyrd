@@ -1,143 +1,73 @@
-# Source alignment and delivery boundaries
+# Source alignment and existing-read boundaries
 
-Inspected 2026-11-10. This is design research, not runtime verification or an
-implementation assignment. Main checkout supplies the existing UI owners;
-`/home/thorrester/Documents/GitHub/wyrd-worktrees/code-review-workflow` at
-`ec87d12e1` supplies execution inspection and the approved GitHub pipeline
-contract. Worktree changes are not evidence of delivery to main.
+Updated 2026-11-12 for the user-agreed UI-only revision. The selected approach is
+in [notes](notes.md#reopened-ui-only-contract-alignment-2026-11-12) and the
+[field-to-existing-read map](contract-alignment-research.md). This is inspected
+source and planning evidence, not runtime verification or branch integration.
 
-## Existing owners and precise extensions
+## Source revisions
 
-### Specification revalidation, 2026-11-10
+- UI source: `9c38fdfc3`; existing shared graph/catalog/loaders/executors and Card
+  routes. TASK-001's completion and prior review proof remain historical evidence.
+- Resource-scaling: `443a79337`; compact results and explicit details, with full
+  retained outputs/inputs still in Bifrost.
+- Integrated backend inspected at `54aa8f4a9` in the
+  `github-verifier-pipelines-task-004` worktree includes that contract split and
+  existing status/invocation/publication/file/cancel reads. This does not establish
+  their integration into this UI checkout.
+- Approved backend contract revision 7 describes nonblocking computation versus
+  background retention; its proposed implementation task is not delivery proof.
 
-The UI [specification revision 1](../spec.md) revalidated the newer worktree
-`/home/thorrester/Documents/GitHub/wyrd-worktrees/github-verifier-pipelines-task-002`
-at HEAD `5d6fb4116`. Its `github-verifier-pipelines/spec.md` and `contracts.md`
-are approved revision 4. Revision 4 changes installation storage only: the
-backend owns the approved `wyrd.github_installations` table. Public revision-3
-shapes remain unchanged. The UI adds no table or installation lifecycle owner.
+These replace the older 2026-11-10 research revisions as planning inputs. A
+worktree name or task status never substitutes for the actual integrated inputs.
 
-The current verification route registration still provides exact execution,
-invocation/publication/content/download and cancel operations; no all-execution
-list or review-set read appears in that route owner. `get_execution` still
-reads selected terminal result identity and pinned group membership. The
-discovery/review projections below remain required extensions, not delivered
-APIs. Native Repository, approval and connection behavior remain approved
-backend dependencies; this inspection does not establish their full delivery.
-Main's CodeGraph was consulted for the shared UI read/loader owners; the task
-worktree has no CodeGraph index, so its exact source was inspected directly.
+## Reuse and task ownership
 
-| Capability | Inspected owner | Selected extension and limit |
-|---|---|---|
-| Shared reads and props | UI `packages/ui/src/lib/contract.ts::WireRequest/WireResponses/Loaded`; `loaders.ts::LoadContext/loadPanel` | Add typed domain read projections and pure verification/repository loaders to this owner. Existing states already distinguish loading/populated/empty/denied/error. Do not add page-local transport or a second loader framework. |
-| SDK and MCP host reads | UI `packages/ui/src/lib/node.ts::nodeExecutor`; `mcp.ts::tool/mcpExecutor` | Extend their closed operations for the same authorized server reads. Currently they expose `verification.get_execution`, Cards and Bifrost operations, not the full proposed viewer. Keep credentials with hosts. |
-| Host actions | UI `contract.ts::ActionIntent/ActionState/ActionProps`; current server BFF/session owners | Use typed action intents for cancel, approval and integration actions. The read executor stays read-only. Extend existing host action dispatch and session forwarding; components never hold authority. |
-| Exact Card content | UI `loaders.ts::loadCardHeader`, `cards.ts`, CardHeader/CardFacts and exact Card routes | Repository is another Card projection. Reuse version navigation and bindings; viewing an old version is read-only. No second Repository registry or inline declaration engine. |
-| Exact execution/result | Worktree `components/verification/service.rs::VerificationControl::get_execution`; `service/inspection.rs::retained` | Reuse the accepted execution state, exact selected result and current scoped authorization, including retained reads after queue/Card removal. A result not visible yet is not an invented verdict. |
-| Invocation/publication inspection | Worktree `service/inspection.rs::invocations/publications/publication/download`; shared client `verify/execution.rs::Execution` | Reuse bounded metadata pages, fixed listing cuts and exact Producer selection. Public file content/download routes already exist. Extend UI adapters rather than build a browser event ledger or query protected payload tables directly. |
-| Cancel | Worktree `service/inspection.rs::cancel`, route `cancel_execution`, client `Execution::cancel` | Use the existing server cancellation fence and read back status. Already-settled results remain settled. Cancellation neither deletes accepted publications nor guarantees a provider call already sent disappears. |
-| Repository/GitHub/wait/approval | Approved `changes/active/github-verifier-pipelines/spec.md` and `contracts.md`, revision 3 in the worktree | Consume its Repository declaration/selection, singular integration connection, exact PR admission, waiting inspection, approval action and delivery state. These are approved contract dependencies, not all implemented methods in the inspected source. |
-| All-status list and review grouping | Worktree verification routes list exact execution reads and child/publication lists; no aggregate execution-list route was found. Current TASK-007 lists recorded results only. | Extend the existing VerificationControl read boundary with bounded summary/filter/review-set projections needed by the agreed UI. This is missing public behavior and needs inclusion in the new spec with SDK/MCP projections, not a browser join over every execution or a new runtime owner. |
-| Sensitive detail | `architecture/bifrost-design.md` verification tables; worktree `inspection.rs::retained` | Domain execution reads already authorize exact Verifier read before internal retained-state access. Reuse that boundary. Public SQL retains its table grants and sensitive columns remain sensitive. No ordinary-viewer Bifrost payload bypass or payload reclassification. |
+| Existing owner | Input/output and task use |
+|---|---|
+| Card registry APIs | Load exact Verifier/Repository declarations from the Postgres-backed registry. TASK-002 reuses TASK-001's graph; browser components hold no database connection. |
+| UI contract/loaders/catalog/view | Extend existing typed UI operations/props and component catalog. TASK-002 delivers missing runtime panels, not another transport/loader family. |
+| Node/MCP executors and BFF | Adapt existing reads and host actions; keep credentials/transport with hosts. Existing UI status and Bifrost query operations are already available. |
+| Bifrost verification results | Bounded result identity, verdict, correlations and timing queries for TASK-002 history and TASK-003 discovery. A result row alone does not prove selected outcome or unfinished execution state. |
+| Bifrost execution inputs/outputs/events | Existing retained input context, judgment detail and accepted progress under current query/payload permissions. No new table, payload classification or browser event replay. |
+| Existing execution status/details | Status and server-selected compact judgment; explicit completed check/provenance/step/evidence read. Read availability is independent; details is not a wait/progress API. |
+| Existing invocation/publication/File operations | Bounded exact producer instances and output metadata; selected JSON/manifest/file access; normal host-held download. |
+| Existing cancel/approval/delivery operations | Consume delivered authority/receipts/state only. Backend lifecycle, same-execution continuation and provider writes remain outside this packet. |
 
-The existing TypeScript client exposes `verify.Execution.invocations`,
-`publications`, publication reads and cancellation. Its integration tests include
-`verify-in-real-time.test.ts`, `verifier-building-blocks.test.ts`,
-`verifier-orchestration.test.ts` and `durable-verifier-work.test.ts`.
-The current UI host integration test exercises `verification.get_execution`.
-These are reuse/verification owners, not claims that their journeys prove the
-new UI or future approval/GitHub contract.
+Running definition lookup can use scalar `verifier_card_uid` in retained execution
+metadata and the existing HTTP/MCP Card UID read. The TypeScript Cards.get wrapper
+accepts a versioned reference, not a bare UID: use a supported existing host
+operation or retained exact CardRef. Missing host adapter/input is not a reason
+for a new server endpoint. If no record is visible yet, show truthful availability.
 
-## Necessary public read behavior
+## Required dependencies and limits
 
-The approved all-status Verify page necessarily needs a summary read that covers
-accepted queued/running/waiting/terminal work, including executions with no
-recorded result. A result-table query alone cannot provide it.
+TASK-003 must establish existing authorized data for unfinished as well as terminal
+rows and matching counts. TASK-005 must consume actual frozen admission membership
+and history, including confirmed same-commit request semantics. Neither task may
+add domain query endpoints or derive authority/membership in browser code. If the
+existing surfaces lack the required data or scope enforcement, retain the exact
+external dependency and proposed status rather than weaken the spec or implement
+backend work here. Current tenant/Verifier restrictions and independent Bifrost
+payload grants remain unchanged.
 
-The summary projection must carry exact execution, subject and Verifier
-identity, lifecycle status, nullable recorded verdict/result selection, existing
-correlation/filter fields, and repository/PR/review-set association when present.
-It must support the approved list filters, bounded pagination, matching chart
-and facet populations, and exact execution navigation. Unfinished work has no
-verdict. Verdict filters apply to recorded verdicts; status and verdict filters
-combine normally, so an incompatible combination produces no matches.
+Session membership uses the selected execution's recorded snapshot, never group
+text. Drift detail/history comes from recorded judgments/windows through existing
+reads; current Card status cannot manufacture a past baseline. Exact citations
+retain current trace permissions. Result success does not certify retained
+visibility, and an approval decision receipt does not certify later completion.
 
-Review-set membership is server-recorded admission context: the exact selected
-Repository policy, PR source and review occurrence identify the Verifier
-executions requested together. Preserve that context in the existing admission/
-accepted-record owners; do not add a new Card kind, orchestration service or
-Postgres table. Expose it to typed list/history reads rather than infer it from
-timestamps, display names, commit SHA alone, or session `group_id` text.
-The specification records these public read obligations at the existing owner.
-Exact schema and operation spellings must follow that owner's conventions when
-the contract extension is implemented; this design does not claim an existing
-API for them.
+## Visual and verification references
 
-The general PR link resolves the current review set for that PR, across source
-updates; earlier sets remain explicitly selectable. Exact execution and selected
-historical-set links stay pinned. Live list refresh can show current work but
-must not replace an open exact execution/selected historical inspection.
-
-Summary reads use the same current tenant/domain access as execution inspection,
-with per-execution Verifier scope applied before pagination/counts. Repository
-and Card reads retain their own authorization. No follow-up sensitive read is
-issued after a denied prerequisite. Unknown/foreign IDs follow the owning
-not-found policy; denied, unavailable and genuinely empty remain distinct.
-
-Connection projections supply provider-access repositories; Card reads supply
-registered Repository versions and selected bindings. A registered Card remains
-visible through authorized Card reads even when provider access is gone.
-The UI may combine those bounded projections by stable provider identity for
-display, but registration, selection, access and readiness are server facts.
-Unavailable access state must never become a guessed active/inactive state.
-
-## Authority and scope reconciliation
-
-- Backend revision 3 explicitly excludes UI. It owns Repository kind/declaration,
-  GitHub admission, evidence custody, waits, approval semantics and provider
-  delivery, including necessary architecture amendments. This UI change consumes
-  that work rather than silently reimplementing its engine or install protocol.
-- This packet owns the new summary/review-set read projection required by its
-  discovery UI, in existing contract/server/client owners. Coordinate accepted
-  admission fields with the backend owner. This is a necessary consequence of
-  the user-approved list/grouping, not permission for a new backend subsystem.
-- Existing UI TASK-007 must transfer verification components/Verify/definition
-  graph scope here. Preserve session/drift, exact selected results, trace evidence
-  navigation, gallery and portable-host coverage. Its results-only list and
-  prohibition on inspector attempt identity need explicit replacement.
-- TASK-009 transfers its repository/connection/Card projection scope here.
-  Its broader Changes/collaboration scope remains in the original UI packet.
-  Do not pull those workflows into this change or silently supersede the whole
-  task. The old folder-scan/default-branch configuration canvas is not the new
-  native declaration contract.
-- Native Repository is approved design input and backend revision-3 behavior;
-  the current main architecture/Card-kind list still needs its owning update.
-  Do not add an alias or implement contradictory definitions in the UI.
-- Standard code-review report delivery in the backend does not contradict equal
-  UI output treatment. The generic viewer exposes every authorized output
-  equally; provider delivery can consume its declared report convention without
-  the UI inventing a primary-output selector.
-
-## Verification evidence and remaining private work
-
-The sole centralized mock is built and checked with:
+`mock/` remains the sole approved combined visual target, supported by the
+preserved original canvases. Its existing checks are:
 
 ```bash
 mise exec -- node changes/active/verification-workflow-ui/design/mock/build.mjs
 mise exec -- node changes/active/verification-workflow-ui/design/mock/selfcheck.mjs
 ```
 
-Its 28 browser checks passed and the user approved the centralized UI.
-Superseded prototypes were removed with authorization.
-
-These prove prototype behavior only. No production server/browser journey was
-run for this design-completion pass. Implementation must use the existing real
-server, browser, SDK and MCP test owners for the connected observations in the
-design notes. Exact future test selectors belong to planning after tests/owners
-are revalidated; do not manufacture them here.
-
-Private implementation work includes layout sizing, graph grouping mechanics,
-refresh scheduling, component decomposition, cursor encoding and fixing the
-prototype zoom-control anomaly. The graph uses already-installed Svelte Flow;
-Dagre is proven in the preview and is the starting layout choice. These do not
-reopen the approved appearance, read-only interaction or status stability.
+The earlier 28 browser checks are prototype evidence, not a new execution in this
+planning pass. Revised tasks keep the existing UI unit, real-host/built-artifact
+and production browser test owners, public setup and explicit visual acceptance.
+No new tests/selectors or runtime success are claimed by this source map.

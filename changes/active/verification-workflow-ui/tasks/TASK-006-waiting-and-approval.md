@@ -3,7 +3,7 @@ id: TASK-006
 kind: implementation
 status: proposed
 spec: SPEC-verification-workflow-ui
-spec_revision: 2
+spec_revision: 3
 requirements: [REQ-008, REQ-009, REQ-014, AC-004, AC-005, AC-008, AC-009]
 depends_on: [TASK-002]
 ---
@@ -17,11 +17,10 @@ peers run. An authorized user decides one exact pending occurrence and observes
 continuation of that same execution; a viewer can inspect but cannot approve.
 
 002 provides execution/instance inspection and host action/cancel behavior.
-Backend GitHub tasks 007/008 must deliver waiting inspection, exact approval
-occurrences/readback, approve scope, decision receipts/errors and same-execution
-continuation. Their earlier backend dependencies are their responsibility;
-this UI does not repeat that engine work or wait for provider delivery task 009.
-Record actual integrated operations and real dependency proof, not task status.
+Requires delivered waiting inspection, exact approval occurrences/readback,
+approve scope, decision receipts/errors and same-execution continuation. Their
+backend implementation is outside this task. Record actual integrated operations
+and real dependency proof; this UI does not wait for unrelated provider delivery.
 
 ## Flow and existing owner
 
@@ -29,6 +28,9 @@ Extend 002's typed props/loaders and shared inspector with generated pending
 input names and approval occurrence identity, step/item/iteration, message,
 expiry and recorded decision. Waiting remains nonterminal/no final verdict and
 coexists with running peers. No separate approval dashboard or wait framework.
+Read these live facts independently of completed VerificationDetails. An accepted
+approval receipt records a durable decision, not completed continuation or proof
+that later progress/evidence is retained. Use existing authoritative readback.
 
 Use existing host action intent/state/session forwarding for the approved
 `POST /v1/verification/executions/{execution_id}/approvals/{approval_id}`
@@ -59,6 +61,9 @@ Exercise those actions through the production browser and existing supported
 Node/MCP/custom/built-artifact host dispatch. Assert exact occurrence request,
 optional reason, pending guards, authoritative receipt and safe error states.
 Cancel parked work and race continuation/completion; reopen retained outputs.
+Include a waiting branch and running peer with no completed details, then a
+durable decision receipt before later progress becomes visible. Delayed/missing
+details must not hide readable occurrences or replace their exact selection.
 Use existing owner tests and the verification commands below.
 Compare waiting/approval inspector regions with the approved mock in light/dark,
 mobile/desktop and keyboard interaction. No fixture action can replace a real
@@ -66,10 +71,12 @@ authorized decision and downstream continuation.
 
 ## Execution and verification
 
-This task is proposed against draft spec revision 2. Activation requires
-explicit spec approval, the applicable scope transfer, and only this task's
-named contract/authority and predecessor outputs. Unrelated backend delivery
-or authority amendments do not block it. Record the integrated source revisions
+This task is against approved spec revision 3, whose scope transfer is
+synchronized. Activation requires only this task's named contract/authority
+and predecessor outputs. Unrelated backend delivery
+or authority amendments do not block it. This packet consumes existing read/action
+capabilities and adds no underlying server changes; a missing required capability
+remains an explicit external dependency. Record the integrated source revisions
 and actual dependency journeys it consumes; upstream task status is not proof.
 
 Read the repo-local `wyrd-ui` skill before UI edits. Reuse the shared component,
@@ -98,9 +105,8 @@ the approved mock on desktop/mobile, light/dark, keyboard/focus/touch, long
 content and error states. Record reference regions, screenshots and individual
 human acceptance. Fixtures and automated checks alone do not prove fidelity.
 
-Regenerate changed catalog/contracts through their owning generators and run
-`codegen:check` when applicable. Changed Rust/SDK owners require their narrow
-format/lint/type and real boundary journeys; preserve their existing tenancy,
-Python stub and N-API checks. Do not add a runner or substitute fixtures for
-an unavailable backend output. Integrated change review joins the delivered
-flows and runs the required full shipped-surface journey lanes.
+Regenerate changed UI catalog/contracts through their existing generator and run
+`codegen:check` where applicable. Existing backend/SDK operations are dependency
+inputs, not a Rust/SDK implementation assignment here. Do not add a runner or
+substitute fixtures for unavailable inputs. Integrated change review joins the
+delivered flows and runs the required shipped-surface journey lanes.

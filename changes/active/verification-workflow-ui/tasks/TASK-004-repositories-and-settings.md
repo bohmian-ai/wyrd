@@ -3,7 +3,7 @@ id: TASK-004
 kind: implementation
 status: proposed
 spec: SPEC-verification-workflow-ui
-spec_revision: 2
+spec_revision: 3
 requirements: [REQ-010, REQ-011, REQ-013, REQ-014, AC-006, AC-008, AC-009]
 depends_on: [TASK-001, TASK-003]
 ---
@@ -17,13 +17,12 @@ and verification activity; Settings manages provider access. An accessible
 provider repository can have no Card, while a registered Card can lack access.
 Neither viewing a version nor connecting the App declares or selects policy.
 
-Activate after backend GitHub task 002 supplies verified connect/read/disconnect
-and redacted access projections, and task 003 supplies native Repository kind,
-declaration receipts, selected policy and exact bindings. Require their normal
-SDK/MCP operations, authorization and real journeys, with owning architecture
-amendments delivered. 001 supplies definition rendering and 003 supplies filtered
-Verify. Backend task numbers refer to the approved revision-4 packet identified
-in [the specification](../spec.md#dependencies-authority-and-scope-transfer), not this packet's IDs.
+Requires delivered connection/read/disconnect and redacted access operations,
+plus native Repository declaration/selected policy/exact binding operations and
+their owning authority amendments. Record the actual integrated capability and
+contract revision, not another packet's task status. TASK-001 supplies definition
+rendering and TASK-003 supplies filtered Verify. Missing backend capabilities
+remain external dependencies; this task adds only UI presentation/adapters.
 
 ## Flow and reuse
 
@@ -42,6 +41,9 @@ Detail shows viewed version separately from selected policy, exact Verifier
 bindings/activation, read-only YAML/TOML and verification activity. Label
 reconstructed TOML as a projection. Link definitions through 001 and existing
 execution/filtered Verify through 003. 005 adds exact PR review-set navigation.
+Activity reuses TASK-003's existing-read queries and opens TASK-002's inspector;
+do not hydrate detailed outcomes in the Repository loader or add a read service.
+A missing execution detail must not disable readable policy/access/activity.
 
 Settings → Integrations → GitHub consumes the singular existing connect flow,
 provider navigation and server callback-completed association for Wyrd-first
@@ -79,10 +81,12 @@ editor, activate/pause/rollback control or broader Changes UI is included.
 
 ## Execution and verification
 
-This task is proposed against draft spec revision 2. Activation requires
-explicit spec approval, the applicable scope transfer, and only this task's
-named contract/authority and predecessor outputs. Unrelated backend delivery
-or authority amendments do not block it. Record the integrated source revisions
+This task is against approved spec revision 3, whose scope transfer is
+synchronized. Activation requires only this task's named contract/authority
+and predecessor outputs. Unrelated backend delivery
+or authority amendments do not block it. This packet consumes existing read/action
+capabilities and adds no underlying server changes; a missing required capability
+remains an explicit external dependency. Record the integrated source revisions
 and actual dependency journeys it consumes; upstream task status is not proof.
 
 Read the repo-local `wyrd-ui` skill before UI edits. Reuse the shared component,
@@ -111,9 +115,8 @@ the approved mock on desktop/mobile, light/dark, keyboard/focus/touch, long
 content and error states. Record reference regions, screenshots and individual
 human acceptance. Fixtures and automated checks alone do not prove fidelity.
 
-Regenerate changed catalog/contracts through their owning generators and run
-`codegen:check` when applicable. Changed Rust/SDK owners require their narrow
-format/lint/type and real boundary journeys; preserve their existing tenancy,
-Python stub and N-API checks. Do not add a runner or substitute fixtures for
-an unavailable backend output. Integrated change review joins the delivered
-flows and runs the required full shipped-surface journey lanes.
+Regenerate changed UI catalog/contracts through their existing generator and run
+`codegen:check` where applicable. Existing backend/SDK operations are dependency
+inputs, not a Rust/SDK implementation assignment here. Do not add a runner or
+substitute fixtures for unavailable inputs. Integrated change review joins the
+delivered flows and runs the required shipped-surface journey lanes.

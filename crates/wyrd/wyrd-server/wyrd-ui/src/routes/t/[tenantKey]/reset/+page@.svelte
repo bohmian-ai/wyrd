@@ -9,7 +9,7 @@
 <Entry heading="Reset your {data.tenant.key} password" issue={form?.problem ?? data.problem}>
   <form class="fields" method="POST">
     <label for="reset-code">Reset code</label>
-    <input id="reset-code" class="app-input" type="password" name="resetCode" required autocomplete="off" />
+    <input id="reset-code" class="app-input mono" type="password" name="resetCode" required autocomplete="off" />
     <p>Ask a tenant administrator for a reset code; it works once, for fifteen minutes.</p>
     <label for="new-password">New password</label>
     <PasswordInput id="new-password" name="newPassword" required autocomplete="new-password" />

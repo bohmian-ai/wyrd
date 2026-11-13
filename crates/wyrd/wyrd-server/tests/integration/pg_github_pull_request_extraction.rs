@@ -22,6 +22,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_loader::{build_declaration_input, load};
 use wyrd_runtime::Permission;
 use wyrd_testing::github::{GithubAppMock, PullRequest};
+use wyrd_testing::server::ScribeReservation;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 use super::pg_github_pull_requests::install;
@@ -283,6 +284,17 @@ impl Deployment {
     /// # Panics
     /// Panics when the delivery is refused or no result appears in a minute.
     async fn review(&self, head: &str, action: &str) -> Uuid {
+        let execution = self.admit(head, action).await;
+        self.settled(execution).await;
+        execution
+    }
+
+    /// Point PR [`PR`] at `head`, deliver `action`, and return the admitted
+    /// execution.
+    ///
+    /// # Panics
+    /// Panics when the delivery is refused or admits nothing for `head`.
+    async fn admit(&self, head: &str, action: &str) -> Uuid {
         match action {
             "opened" => {
                 self.mock.set_pull_request(
@@ -322,6 +334,14 @@ impl Deployment {
         .await
         .expect("the head was admitted");
         conn.commit().await.expect("read commits");
+        execution
+    }
+
+    /// Wait until `execution`'s result is visible.
+    ///
+    /// # Panics
+    /// Panics when no result appears in a minute.
+    async fn settled(&self, execution: Uuid) {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_mins(1);
         while self
             .get(&format!("/v1/verification/executions/{execution}"))
@@ -334,7 +354,6 @@ impl Deployment {
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        execution
     }
 
     /// Start with [`REVIEW`] bound and complete the first review of PR
@@ -826,5 +845,132 @@ async fn direct_verification_of_a_pull_request_verifier_refuses_before_any_step(
         deployment.mock.repository_reads(REPOSITORY).len(),
         reads_before,
         "no source is read"
+    );
+}
+
+/// Hold every slot of `server`'s reserved Scribe share, so nothing more can
+/// be staged for persistence until the returned reservations drop.
+///
+/// Staged work is flushed between attempts, so slots that in-flight writes
+/// free are taken as they return.
+///
+/// # Panics
+/// Panics when Bifrost cannot flush or the share is not held within 30
+/// seconds.
+async fn hold_scribe(server: &WyrdTestServer) -> Vec<ScribeReservation> {
+    let outbox = server.state().bifrost.scribe_outbox();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut share = Vec::new();
+    loop {
+        server.flush_bifrost().await.expect("staged work drains");
+        let full = outbox
+            .reserve(usize::MAX)
+            .expect_err("no reservation holds every slot");
+        if full.admitted == full.limit {
+            return share;
+        }
+        share.push(
+            outbox
+                .reserve(full.limit - full.admitted)
+                .expect("the free reservable share is held"),
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Scribe slots stay held elsewhere"
+        );
+    }
+}
+
+/// An Agent consumes the live extraction while nothing can be persisted:
+/// the extraction stalls on GitHub, Scribe's whole reserved share is held,
+/// and once GitHub answers the Agent's model call already carries the
+/// extracted source while the execution is still running. Releasing
+/// persistence settles it with no second model call or acquisition.
+///
+/// # Panics
+/// Panics when the Agent waits for persistence, the execution settles while
+/// persistence is held, or settling repeats any work.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_agent_consumes_the_live_extraction_while_persistence_is_held() {
+    let deployment = Deployment::start(&[
+        ("agent-review.yaml", AGENT_REVIEW),
+        ("reviewer.yaml", REVIEWER),
+        ("policy.yaml", AGENT_POLICY),
+    ])
+    .await;
+    reads_the_workspace(&deployment.model).await;
+    deployment.head(&sha('a'), &sha('8'), HANDLER_A);
+    deployment.compare(&sha('c'), &sha('a'), &sha('c'), HANDLER_A, PATCH_A);
+    let head = sha('a');
+    let admission_read = deployment.mock.hold_next_pull_request_read();
+    let (execution, extraction_read) = tokio::join!(deployment.admit(&head, "opened"), async {
+        admission_read.arrived().await;
+        let extraction_read = deployment.mock.hold_next_pull_request_read();
+        admission_read.release();
+        extraction_read
+    });
+    extraction_read.arrived().await;
+
+    let share = hold_scribe(&deployment.server).await;
+    extraction_read.release();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_mins(1);
+    while deployment
+        .model
+        .received_requests()
+        .await
+        .expect("requests are recorded")
+        .len()
+        < 2
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the Agent waited for persistence"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let requests = deployment
+        .model
+        .received_requests()
+        .await
+        .expect("requests are recorded");
+    let prompt: Value = serde_json::from_slice(&requests[0].body).expect("JSON");
+    let prompt = prompt["messages"][0]["content"]
+        .as_str()
+        .expect("the Prompt renders to text");
+    assert!(
+        prompt.contains("lookupUser(id.trim());"),
+        "the Prompt carries the extracted head source: {prompt}"
+    );
+    let status = deployment
+        .get(&format!("/v1/verification/executions/{execution}"))
+        .await;
+    assert_eq!(status["status"], "running", "{status}");
+    assert_eq!(status["result"], Value::Null, "{status}");
+
+    drop(share);
+    deployment.settled(execution).await;
+    let details = deployment
+        .get(&format!("/v1/verification/executions/{execution}/details"))
+        .await;
+    assert_eq!(details["outcome"]["verdict"], "passed", "{details}");
+    assert_eq!(
+        deployment
+            .model
+            .received_requests()
+            .await
+            .expect("requests are recorded")
+            .len(),
+        2,
+        "settling calls the model no more"
+    );
+    assert_eq!(
+        deployment
+            .mock
+            .repository_reads(REPOSITORY)
+            .iter()
+            .filter(|read| read.starts_with("/compare/"))
+            .count(),
+        1,
+        "settling acquires nothing again"
     );
 }

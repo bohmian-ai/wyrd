@@ -69,6 +69,17 @@ fn psi_drift() -> Value {
     })
 }
 
+/// The PSI Verifier's baseline Data Card, registered before it so its
+/// `baseline_ref` resolves.
+fn psi_baseline() -> Value {
+    json!({
+        "interface": { "kind": "Pandas",
+                       "meta": { "framework_version": "2.2.2", "compression": "Snappy" } },
+        "schema": { "columns": [{ "name": "score", "dtype": "float64" }] },
+        "stats": { "byte_count": 1, "sha256": "0".repeat(64) }
+    })
+}
+
 /// The tenant fixture: one Service, an assertion Verifier for direct and
 /// queued executions, and a ready and an unready Drift binding.
 struct Fixture {
@@ -105,6 +116,9 @@ impl Fixture {
             .custom_drift_verifier("vr-custom", "latency", 100.0, 10.0)
             .await
             .expect("Custom Drift Verifier registers");
+        seed.declare("Data", "vr-psi-baseline", &psi_baseline())
+            .await
+            .expect("PSI baseline registers");
         let psi = seed
             .verifier("vr-psi", &psi_drift())
             .await

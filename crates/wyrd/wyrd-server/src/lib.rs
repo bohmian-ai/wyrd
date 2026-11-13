@@ -42,6 +42,8 @@ pub use boot::{
     BootedServer, ServerBootError, StartInputs, check_card_recovery_pool, spawn_storage_sweeper,
 };
 #[cfg(feature = "test-support")]
+pub use components::cards::service::declare_card;
+#[cfg(feature = "test-support")]
 pub use config::BifrostTarget;
 pub use config::{ServeMode, WyrdServerConfig};
 pub use http::build_router;

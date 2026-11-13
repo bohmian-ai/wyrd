@@ -1564,11 +1564,11 @@ spec:
 ```
 
 `queue_only` is derived when the Verifier registers and is stored with its
-spec: `true` when a step or check Agent, inline or a referenced registered
-Agent, declares the `publish` tool, or a slot declares `deferred: true`, else
-`false`. A value an author sends is
-replaced, never honored. Later queued-only forms extend this derivation at
-registration; execution never re-infers it.
+spec: `true` when a requirement judges a scheduled window, a step extracts a
+pull request, a step or check Agent, inline or a referenced registered Agent,
+declares the `publish` tool, or a slot declares `deferred: true`, else
+`false`. A value an author sends is replaced, never honored. Every queued-only
+form is derived here at registration; execution never re-infers it.
 
 | Slot | Evidence |
 |---|---|
@@ -2020,7 +2020,7 @@ Verifier Card's status, its spec on a cache miss, and any fitted drift
 baselines. Resolved targets are cached per process by tenant, Verifier,
 subject, and mode (direct or queued) in one fixed 64 MiB least-recently-used
 cache that is never shared across tenants. Direct verify checks direct
-eligibility (`queue_only` or a scheduled window) only on a direct miss and
+eligibility (`queue_only`) only on a direct miss and
 caches only an admitted target under direct; a direct hit runs with no further
 check, and a queued entry never answers a direct lookup. A Card or tenant
 invalidation removes both modes.
@@ -2278,9 +2278,8 @@ call takes its side's permit before entering the ordinary gateway path, whose
 tenant and subject limits, budgets, and accounting still apply. Both sides
 run the one engine with the same authority, evidence, billing, cancellation,
 and platform behavior. The reservation covers these admissions only; CPU,
-Postgres, gateway, and provider capacity remain shared. A Verifier using a
-queued-only form (a scheduled-window check, or registration-derived
-`queue_only`) is refused by `verify`
+Postgres, gateway, and provider capacity remain shared. A Verifier whose
+registration-derived `queue_only` is true is refused by `verify`
 before any step runs, never converted to a queued request. The queued
 execution deadline is the original ceiling of everything a queued execution
 waits for, including approval periods; waiting never resets it.

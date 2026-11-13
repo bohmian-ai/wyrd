@@ -1590,9 +1590,10 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
     server.shutdown().await.expect("server shuts down");
 }
 
-/// The Verification surface is exactly eleven typed operations.
+/// The Verification surface is exactly thirteen typed operations.
 ///
-/// Binding status, evidence planning, direct execution, enqueue, execution
+/// Binding status, evidence planning, deferred evidence publication, direct
+/// execution, enqueue, execution
 /// status, invocation and publication pages, publication read, download, and
 /// local content, and cancellation publish their typed request and response
 /// schemas; local content answers `application/octet-stream` bytes,
@@ -1621,7 +1622,7 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
 /// disposition, or producer field is unpublished, or when the document names
 /// a retired evaluation identifier.
 #[tokio::test]
-async fn verification_contract_publishes_twelve_typed_operations_and_the_local_upload() {
+async fn verification_contract_publishes_thirteen_typed_operations_and_the_local_upload() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -1645,6 +1646,7 @@ async fn verification_contract_publishes_twelve_typed_operations_and_the_local_u
             ("/v1/verification/bindings/{binding_id}", "get"),
             ("/v1/verification/enqueue", "post"),
             ("/v1/verification/evidence", "post"),
+            ("/v1/verification/evidence/publish", "post"),
             ("/v1/verification/execute", "post"),
             ("/v1/verification/executions/{execution_id}", "get"),
             ("/v1/verification/executions/{execution_id}/cancel", "post"),

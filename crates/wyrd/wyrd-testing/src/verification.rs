@@ -23,7 +23,6 @@ use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_verify::blocks::Checkpoints as _;
 use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};
 use wyrd_runtime::{AcceptedAuthority, Permission, PermissionSet};
-use wyrd_server::AppState;
 use wyrd_server::components::auth::Caller;
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
 use wyrd_server::scribe_outbox::{ScribeOutbox, ScribeWrite};
@@ -34,12 +33,13 @@ use wyrd_server::verification::hosted::workspace::Workspace;
 use wyrd_server::verification::inputs::InputResolver;
 use wyrd_server::verification::results::{InputRecord, ResultPayloadBuilder, ResultRun};
 use wyrd_server::verification::state::{RunState, StateError, StateRow};
+use wyrd_server::{AppState, declare_card};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Attribution;
 use wyrd_spec::card::verifier::{OWNER_OCCURRENCE_KEY, VerifierSpec};
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, SlotName};
-use wyrd_spec::registry::DeclarationOperationId;
+use wyrd_spec::registry::{DeclarationOperationId, DeclareCardRequest};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::verification::execution::{InputDeclaration, Producer, VerificationRequest};
 use wyrd_spec::verification::state::{ExecutionIdentity, ExecutionState};
@@ -103,6 +103,8 @@ pub struct ExecutionRow {
 /// Seeds and reads verification state in one tenant.
 #[derive(Clone)]
 pub struct VerificationFixture {
+    /// The server state whose declaration registers Verifiers.
+    state: AppState,
     /// Wyrd Postgres owner; every statement runs in a tenant transaction it
     /// opens.
     postgres: WyrdPostgres,
@@ -143,6 +145,7 @@ impl VerificationFixture {
         .await?;
         conn.commit().await?;
         Ok(Self {
+            state: state.clone(),
             postgres: postgres.clone(),
             outbox: Arc::clone(state.bifrost.scribe_outbox()),
             tenant,
@@ -249,23 +252,14 @@ impl VerificationFixture {
     }
 
     /// Register one active Custom Drift Verifier Card named `name` whose
-    /// `samples` slot reads the `latency_ms` metric.
+    /// `samples` slot reads the `latency_ms` metric, scored against a mean
+    /// of 250 with a threshold of 10.
     ///
     /// # Errors
     /// Returns [`VerificationFixtureError`] when a write fails.
     pub async fn drift_verifier(&self, name: &str) -> Result<CardUid, VerificationFixtureError> {
-        self.verifier(
-            name,
-            &drift_spec(
-                "latency_ms",
-                serde_json::json!({
-                    "method": "Custom",
-                    "signal": { "kind": "Metric", "name": "latency_ms" },
-                    "condition": { "kind": "Above", "limit": 250.0 }
-                }),
-            ),
-        )
-        .await
+        self.custom_drift_verifier(name, "latency_ms", 250.0, 10.0)
+            .await
     }
 
     /// Register one active Custom Drift Verifier named `name` whose profile
@@ -303,17 +297,49 @@ impl VerificationFixture {
         .await
     }
 
-    /// Register one active Verifier Card named `name` with `spec`.
+    /// Register one active `1.0.0` Verifier Card named `name` with `spec`
+    /// through the server's own declaration, so it is validated and stores
+    /// every server-derived field, such as `queue_only`, exactly as a real
+    /// registration does.
     ///
     /// # Errors
-    /// Returns [`VerificationFixtureError`] when `spec` is not a Verifier spec
-    /// or a write fails.
+    /// Returns [`VerificationFixtureError::Card`] when the declaration refuses
+    /// `spec` or names no Verifier outcome.
     pub async fn verifier(
         &self,
         name: &str,
         spec: &Value,
     ) -> Result<CardUid, VerificationFixtureError> {
-        self.declare("Verifier", name, spec).await
+        let failed = |error: String| VerificationFixtureError::Card(format!("{name}: {error}"));
+        let request: DeclareCardRequest = serde_json::from_value(serde_json::json!({
+            "submissions": [{
+                "apiVersion": "wyrd/v1",
+                "kind": "Verifier",
+                "metadata": { "name": name, "version": "1.0.0" },
+                "spec": spec,
+            }],
+        }))
+        .map_err(|error| failed(error.to_string()))?;
+        let mut principal = self.actor.clone();
+        principal
+            .effective_permissions
+            .insert(Permission::card_write());
+        let caller = Caller {
+            data_tenant_id: self.tenant,
+            principal,
+            request_id: RequestId::now_v7(),
+            delegation_chain: Vec::new(),
+            executed_by: None,
+        };
+        let response = declare_card(&self.state, &caller, &Uuid::now_v7().to_string(), request)
+            .await
+            .map_err(|error| failed(error.to_string()))?;
+        response
+            .outcomes
+            .into_iter()
+            .find(|outcome| outcome.card_ref.kind == CardKind::Verifier)
+            .and_then(|outcome| outcome.card_ref.uid)
+            .ok_or_else(|| failed("the declaration named no Verifier".to_owned()))
     }
 
     /// Register one active `1.0.0` Card of `kind` named `name` with `spec`,
@@ -359,7 +385,6 @@ impl VerificationFixture {
             .next()
             .map(|(requirement, _)| requirement.clone())
             .ok_or_else(|| VerificationFixtureError::Card(format!("{name} has no drift check")))?;
-        let verifier = self.verifier(name, spec).await?;
         let data = card(
             "Data",
             &format!("{name}-baseline"),
@@ -374,6 +399,9 @@ impl VerificationFixture {
         let queue = DriftBaselineQueue::default();
         let mut conn = self.postgres.tenant_conn(self.tenant).await?;
         let data = self.insert(&mut conn, &data).await?;
+        conn.commit().await?;
+        let verifier = self.verifier(name, spec).await?;
+        let mut conn = self.postgres.tenant_conn(self.tenant).await?;
         queue
             .insert_pending(&mut conn, &verifier, &requirement, &data)
             .await?;

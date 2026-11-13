@@ -19,7 +19,7 @@ use wyrd_runtime::outbox::{OutboxFull, Reservation};
 use wyrd_runtime::permission::{Action, Resource};
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_runtime::{AcceptedAuthority, CardAttribution, Permission};
-use wyrd_spec::card::verifier::{CheckEvidence, VerifierSpec};
+use wyrd_spec::card::verifier::VerifierSpec;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, IdempotencyKey};
 use wyrd_spec::vala::api::AuditOutcome;
@@ -151,40 +151,27 @@ fn environment_tag(request: &VerificationRequest) -> Result<(), WyrdError> {
 
 /// Refuse a Verifier that only queued execution may run, before any step.
 ///
-/// This is the single direct-eligibility rule `verify` applies once its
-/// target is read on a direct cache miss and before it is cached for direct
-/// use or the engine is built: a direct request is
-/// never converted to a queued one and never runs part of its graph. A
-/// Verifier judging a scheduled window is queued-only, and so is one
-/// registration marked [`VerifierSpec::queue_only`]. A direct cache hit
-/// skips this rule entirely. Pure: no IO.
+/// `verify` applies this once its target is read on a direct cache miss and
+/// before it is cached for direct use or the engine is built: a direct
+/// request is never converted to a queued one and never runs part of its
+/// graph. It only reads [`VerifierSpec::queue_only`], which registration
+/// derives as the single queued-only decision. A direct cache hit skips this
+/// rule entirely. Pure: no IO.
 ///
 /// # Errors
 /// Returns [`WyrdError::VerificationInputUnsupported`] for a queued-only
 /// Verifier.
 fn direct_eligibility(verifier: &CardUid, spec: &VerifierSpec) -> Result<(), WyrdError> {
     if spec.queue_only {
-        return Err(WyrdError::VerificationInputUnsupported {
-            message: "this Verifier runs only as queued work; submit it instead of verifying now"
-                .to_owned(),
-            details: serde_json::json!({ "verifier_card_uid": verifier }),
-        });
-    }
-    if spec
-        .all_requirements()
-        .any(|requirement| requirement.check.evidence() == CheckEvidence::Window)
-    {
-        return Err(window_refusal(verifier));
+        return Err(queue_only_refusal(verifier));
     }
     Ok(())
 }
 
-/// The refusal of a direct request for a Verifier that judges a scheduled
-/// window.
-fn window_refusal(verifier: &CardUid) -> WyrdError {
+/// The refusal of a direct request for a queued-only Verifier.
+fn queue_only_refusal(verifier: &CardUid) -> WyrdError {
     WyrdError::VerificationInputUnsupported {
-        message: "a drift Verifier judges a scheduled window; record samples and submit \
-                  them instead of verifying now"
+        message: "this Verifier runs only as queued work; submit it instead of verifying now"
             .to_owned(),
         details: serde_json::json!({ "verifier_card_uid": verifier }),
     }
@@ -940,9 +927,9 @@ impl<'a> VerificationControl<'a> {
     /// [`direct_eligibility`] admitted on its miss is cached for direct use.
     /// A miss reads both Cards, the Verifier's readiness, and the tenant
     /// SYSTEM principal in one autocommit statement that binds the caller's
-    /// tenant for RLS, so a Card of another tenant is invisible. A drift
-    /// Verifier judges a scheduled window and cannot verify now, whether or
-    /// not its baseline is ready.
+    /// tenant for RLS, so a Card of another tenant is invisible. A Verifier
+    /// whose baseline is not ready judges a scheduled window, so it is
+    /// registered queued-only and refused the same way.
     ///
     /// # Errors
     /// Returns a registry error when the read fails,
@@ -965,7 +952,7 @@ impl<'a> VerificationControl<'a> {
                 |resolved| match resolved {
                     Ok(target) => direct_eligibility(verifier, &target.spec).map(|()| target),
                     Err(EnqueueRefusal::NotReady(VerifierReadiness::BaselineNotReady)) => {
-                        Err(window_refusal(verifier))
+                        Err(queue_only_refusal(verifier))
                     }
                     Err(_) => Err(WyrdError::VerificationTargetNotFound {
                         message:
@@ -1160,48 +1147,30 @@ mod tests {
 
     use super::direct_eligibility;
 
-    /// A Verifier judging a scheduled window or marked `queue_only` is
-    /// refused as queued-only; an ordinary assert-only Verifier is eligible.
+    /// A Verifier registration marked `queue_only` is refused; an unmarked
+    /// one is eligible.
     ///
     /// # Panics
-    /// Panics when a spec does not parse or the rule decides either wrongly.
+    /// Panics when the spec does not parse or the rule decides either wrongly.
     #[test]
     fn direct_eligibility_refuses_only_queued_only_verifiers() {
         let verifier = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("a v7 UUID is a Card UID");
-        let spec = |inputs: serde_json::Value, check: serde_json::Value| -> VerifierSpec {
-            serde_json::from_value(json!({
-                "inputs": inputs,
-                "requirements": [{ "id": "r", "statement": "s", "check": check }],
-            }))
-            .expect("the spec parses")
-        };
-        let window = spec(
-            json!({ "latency": { "type": "samples", "features": ["latency"] } }),
-            json!({
-                "kind": "drift", "on": "inputs.latency", "method": "Psi",
-                "signal": { "kind": "Distribution", "features": ["latency"],
-                            "baseline_ref": { "kind": "Data", "name": "baseline", "version": "1.0.0" } },
-                "condition": { "kind": "Statistical" },
-                "profile": { "kind": "Psi", "binning_strategy": { "kind": "EqualWidth", "n_bins": 10 },
-                             "threshold": { "kind": "Fixed", "value": 0.25 } },
-            }),
-        );
-        let ordinary = spec(
-            json!({ "question": { "type": "json" } }),
-            json!({ "kind": "assert", "path": "inputs.question", "operator": "is_not_null" }),
-        );
-
+        let ordinary: VerifierSpec = serde_json::from_value(json!({
+            "inputs": { "question": { "type": "json" } },
+            "requirements": [{ "id": "r", "statement": "s",
+                               "check": { "kind": "assert", "path": "inputs.question",
+                                          "operator": "is_not_null" } }],
+        }))
+        .expect("the spec parses");
         let marked = VerifierSpec {
             queue_only: true,
             ..ordinary.clone()
         };
 
-        for queued_only in [&window, &marked] {
-            assert!(matches!(
-                direct_eligibility(&verifier, queued_only),
-                Err(WyrdError::VerificationInputUnsupported { .. })
-            ));
-        }
+        assert!(matches!(
+            direct_eligibility(&verifier, &marked),
+            Err(WyrdError::VerificationInputUnsupported { .. })
+        ));
         assert!(direct_eligibility(&verifier, &ordinary).is_ok());
     }
 }

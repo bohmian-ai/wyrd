@@ -1346,19 +1346,44 @@ async fn verification_records_have_one_payload_owner() {
 }
 
 /// Without a scripted outcome the real Drift engine refuses a scheduled
-/// occurrence of the fixture Verifier, which declares no profile, settling
-/// the execution `errored` with `drift_invalid` and publishing nothing.
+/// occurrence of a registered PSI Verifier whose stored fitted baseline does
+/// not decode, settling the execution `errored` with `drift_invalid` and
+/// publishing nothing.
 ///
 /// # Panics
-/// Panics when the execution is not errored with that code or anything is
-/// written.
+/// Panics when the Verifier does not register, or the execution is not
+/// errored with that code or anything is written.
 #[tokio::test]
 async fn unscorable_verifier_errors_without_publishing() {
     let harness = Harness::start().await;
+    let verifier = harness
+        .seed
+        .fitted_verifier(
+            "unscorable",
+            &serde_json::json!({
+                "inputs": { "samples": { "type": "samples", "features": ["value"] } },
+                "requirements": [{
+                    "id": "drift",
+                    "statement": "The window does not drift.",
+                    "check": {
+                        "kind": "drift", "on": "inputs.samples", "method": "Psi",
+                        "signal": { "kind": "Distribution",
+                                    "baseline_ref": { "kind": "Data", "name": "unscorable-baseline",
+                                                      "version": "1.0.0" },
+                                    "features": ["value"] },
+                        "condition": { "kind": "Statistical" },
+                        "profile": { "kind": "Psi",
+                                     "binning_strategy": { "kind": "EqualWidth", "n_bins": 10 },
+                                     "threshold": { "kind": "Fixed", "value": 0.25 } }
+                    }
+                }]
+            }),
+            &serde_json::json!({ "Psi": { "format": 2 } }),
+        )
+        .await
+        .expect("the PSI Verifier registers with a baseline that does not decode");
     let runtime = harness.spawn(&Harness::limits(), &EngineScript::default());
-    let run = harness
-        .schedule("unscorable-owner", &harness.verifier)
-        .await;
+    let run = harness.schedule("unscorable-owner", &verifier).await;
 
     let row = harness.wait_execution(run, status("errored")).await;
     assert_eq!(row.error_code.as_deref(), Some(DRIFT_INVALID));
@@ -3471,8 +3496,13 @@ async fn queued_origins_require_their_own_input_ack() {
         .seed_additional_tenant_with_uuid(elsewhere, "queued-elsewhere")
         .await
         .expect("second tenant seeds");
-    let (queued, subject, _, caller) =
-        traced_tenant(&harness.server, elsewhere, "queued-caller").await;
+    let (queued, subject, _, caller) = traced_tenant(
+        &harness.server,
+        elsewhere,
+        "queued-caller",
+        Registration::Declared,
+    )
+    .await;
     let other = enqueue(&harness.server, &caller, (&queued, &subject)).await;
     let reader = VerificationFixture::provision(harness.server.state(), elsewhere)
         .await
@@ -3496,6 +3526,7 @@ async fn queued_origins_require_their_own_input_ack() {
         &harness.server,
         harness.server.pg_fixture().data_tenant_id(),
         "direct-caller",
+        Registration::Declared,
     )
     .await;
     let (direct, ()) = tokio::join!(
@@ -4893,6 +4924,17 @@ fn assertion_spec() -> serde_json::Value {
     })
 }
 
+/// How [`traced_tenant`] registers its assertion Verifier.
+#[derive(Clone, Copy)]
+enum Registration {
+    /// Through the server's declaration, as every real Verifier is.
+    Declared,
+    /// Written directly, for a cluster whose Scribe is down from the start,
+    /// where a declaration cannot store its Card. The assertion Verifier has
+    /// no server-derived field, so the row equals the declared one.
+    WithoutScribe,
+}
+
 /// Seeds a deterministic assertion Verifier and a subject in `tenant` and returns
 /// a token for a caller there, so a traced execution needs no provider.
 ///
@@ -4902,6 +4944,7 @@ async fn traced_tenant(
     server: &WyrdTestServer,
     tenant: DataTenantId,
     name: &str,
+    registration: Registration,
 ) -> (CardUid, CardUid, wyrd_spec::auth::PrincipalId, String) {
     server
         .ensure_builtin_tables_for_test(tenant)
@@ -4911,10 +4954,14 @@ async fn traced_tenant(
         .await
         .expect("tenant provisions");
     let (subject, _) = seed.service("traced").await.expect("subject registers");
-    let verifier = seed
-        .verifier("traced-assertion", &assertion_spec())
-        .await
-        .expect("assertion Verifier registers");
+    let verifier = match registration {
+        Registration::Declared => seed.verifier("traced-assertion", &assertion_spec()).await,
+        Registration::WithoutScribe => {
+            seed.declare("Verifier", "traced-assertion", &assertion_spec())
+                .await
+        }
+    }
+    .expect("assertion Verifier registers");
     let wyrd_testing::Bootstrap::Machine { id, api_key, .. } = server
         .bootstrap_service_in_tenant(tenant, name, &["editor"])
         .await
@@ -5109,7 +5156,8 @@ async fn continued_request_spans_reach_operator_and_tenant() {
         .await
         .expect("test server starts");
     let tenant = server.data_tenant_id();
-    let (verifier, subject, principal, jwt) = traced_tenant(&server, tenant, "traced-caller").await;
+    let (verifier, subject, principal, jwt) =
+        traced_tenant(&server, tenant, "traced-caller", Registration::Declared).await;
     let unsampled = "5bf92f3577b34da6a3ce929d0e0e4736";
     let checkpoint = traces.checkpoint();
     for (trace, flags) in [(EXPORT_TRACE, "01"), (unsampled, "00")] {
@@ -5169,7 +5217,7 @@ async fn operator_rejected_requests_still_reach_a_continuing_tenant() {
         .expect("test server starts");
     let tenant = server.data_tenant_id();
     let (verifier, subject, principal, jwt) =
-        traced_tenant(&server, tenant, "rejected-caller").await;
+        traced_tenant(&server, tenant, "rejected-caller", Registration::Declared).await;
     let unsampled = "6bf92f3577b34da6a3ce929d0e0e4736";
     let checkpoint = traces.checkpoint();
     for (trace, flags) in [(EXPORT_TRACE, "01"), (unsampled, "00")] {
@@ -5228,7 +5276,8 @@ async fn same_inbound_trace_id_routes_each_tenant_separately() {
         (server.data_tenant_id(), "first-caller", "00f067aa0ba902b1"),
         (other, "second-caller", "00f067aa0ba902b2"),
     ] {
-        let (verifier, subject, principal, jwt) = traced_tenant(&server, tenant, name).await;
+        let (verifier, subject, principal, jwt) =
+            traced_tenant(&server, tenant, name, Registration::Declared).await;
         let status = traced_execute(
             &server,
             Some(&jwt),
@@ -5272,7 +5321,8 @@ async fn unrouted_spans_export_only_to_the_operator() {
         .await
         .expect("test server starts");
     let tenant = server.data_tenant_id();
-    let (verifier, subject, _, _) = traced_tenant(&server, tenant, "unrouted-caller").await;
+    let (verifier, subject, _, _) =
+        traced_tenant(&server, tenant, "unrouted-caller", Registration::Declared).await;
     let checkpoint = traces.checkpoint();
     let status = traced_execute(
         &server,
@@ -5429,7 +5479,8 @@ async fn sustained_scribe_outage_caps_tenant_spans() {
         .expect("the Oracle pods start without their Scribe");
     let tenant = cluster.data_tenant_id();
     let oracle = cluster.server(0).expect("an Oracle pod");
-    let (verifier, subject, _, jwt) = traced_tenant(oracle, tenant, "outage-caller").await;
+    let (verifier, subject, _, jwt) =
+        traced_tenant(oracle, tenant, "outage-caller", Registration::WithoutScribe).await;
     let outbox = Arc::clone(oracle.state().bifrost.scribe_outbox());
     let assertion = oracle
         .pg_fixture()
@@ -6925,7 +6976,8 @@ async fn accepted_origins_run_without_local_notification() {
     let producer = cluster.server(0).expect("a producer pod");
     let replica = cluster.server(1).expect("a runner pod");
     let state = producer.state();
-    let (assertion, subject, _, jwt) = traced_tenant(producer, tenant, "producer-caller").await;
+    let (assertion, subject, _, jwt) =
+        traced_tenant(producer, tenant, "producer-caller", Registration::Declared).await;
     let seed = VerificationFixture::provision(state, tenant)
         .await
         .expect("tenant provisions");

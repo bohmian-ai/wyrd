@@ -1718,12 +1718,14 @@ fn standalone_card_request(kind: &str, name: &str, spec: Value, key: &str) -> Re
     )
 }
 
-/// Registration derives `queue_only` from the Agents a Verifier calls and
-/// its pull-request extraction, and ignores the value an author sends.
+/// Registration derives `queue_only` from a scheduled-window check, the
+/// Agents a Verifier calls and its pull-request extraction, and ignores the
+/// value an author sends.
 ///
-/// A step calling an inline Agent declaring `publish`, a registered Agent
-/// declaring it, or a pull-request `extract` makes its Verifier queue-only
-/// even when the author sent `false`; an assert-only Verifier sent with
+/// A drift requirement judging a scheduled window, a step calling an inline
+/// Agent declaring `publish`, a registered Agent declaring it, or a
+/// pull-request `extract` makes its Verifier queue-only even when the author
+/// sent `false`; an assert-only Verifier sent with
 /// `true` and a media `extract` alone are stored as not queue-only, and
 /// their stored specs omit the field.
 ///
@@ -1731,7 +1733,8 @@ fn standalone_card_request(kind: &str, name: &str, spec: Value, key: &str) -> Re
 /// Panics when the server fails to start, a declaration is refused, or a
 /// stored spec carries another `queue_only`.
 #[tokio::test(flavor = "current_thread")]
-async fn registration_derives_queue_only_from_publishing_agents_and_pull_request_extraction() {
+async fn registration_derives_queue_only_from_windows_publishing_agents_and_pull_request_extraction()
+ {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -1819,7 +1822,58 @@ async fn registration_derives_queue_only_from_publishing_agents_and_pull_request
         json!({}),
     );
     disclaimed["queue_only"] = json!(false);
+    let window = json!({
+        "inputs": { "samples": { "type": "samples", "features": ["score"] } },
+        "requirements": [{
+            "id": "drift",
+            "statement": "The window does not drift.",
+            "check": {
+                "kind": "drift", "on": "inputs.samples", "method": "Psi",
+                "signal": { "kind": "Distribution",
+                            "baseline_ref": { "kind": "Data", "name": "qo-baseline", "version": "1.0.0" },
+                            "features": ["score"] },
+                "condition": { "kind": "Statistical" },
+                "profile": { "kind": "Psi",
+                             "binning_strategy": { "kind": "EqualWidth", "n_bins": 10 },
+                             "threshold": { "kind": "Fixed", "value": 0.25 } }
+            }
+        }],
+        "queue_only": false,
+    });
+    let baseline = json!({
+        "interface": { "kind": "Parquet", "meta": { "compression": "Snappy" } },
+        "schema": { "columns": [{ "name": "score", "dtype": "float64" }] },
+        "stats": { "row_count": 1, "col_count": 1, "byte_count": 1,
+                   "sha256": "c4f7700b380aff2662e88d034154d1890c33d3c12c8dda1a0ca9481f43bb9906" },
+    });
+    let (status, body) = declare_json(
+        &server,
+        &jwt,
+        "qo-baseline",
+        json!([submission_body(
+            "Data",
+            "qo-baseline",
+            Some("1.0.0"),
+            baseline
+        )]),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "the baseline registers: {body}"
+    );
     let cases = [
+        (
+            "qo-window",
+            vec![submission_body(
+                "Verifier",
+                "qo-window",
+                Some("1.0.0"),
+                window,
+            )],
+            true,
+        ),
         (
             "qo-inline",
             vec![submission_body(

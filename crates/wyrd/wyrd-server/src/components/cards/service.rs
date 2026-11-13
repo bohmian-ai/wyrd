@@ -19,8 +19,8 @@ use wyrd_spec::card::drift::DriftSignal;
 use wyrd_spec::card::repository::infer_card_name;
 use wyrd_spec::card::trigger::TriggerActivation;
 use wyrd_spec::card::verifier::{
-    Action, InputSlot, OWNER_OCCURRENCE_KEY, OrderBy, VerificationBinding, VerificationStatus,
-    VerifierSpec,
+    Action, CheckEvidence, InputSlot, OWNER_OCCURRENCE_KEY, OrderBy, VerificationBinding,
+    VerificationStatus, VerifierSpec,
 };
 use wyrd_spec::envelope::{
     Card, CardKind, Metadata, Relationships, RepositoryStatus, Spec, Status,
@@ -1920,13 +1920,16 @@ fn pinned_uid(card_ref: Option<&CardRef>) -> Result<CardUid, WyrdError> {
 ///
 /// Called once per declared Verifier after its references are pinned and
 /// before its spec is hashed, so the stored value replaces any the author
-/// sent and never depends on a later read. A Verifier is queue-only when a
-/// step extracts a pull request, whose source only a queued `pull_request`
-/// activation supplies; when it declares a deferred input, whose evidence only
-/// a parked queued execution can wait for; or when an inline or registered
-/// Agent it calls declares `publish`. A registered Agent is read by UID inside
-/// the declaration transaction, which already holds a sibling Agent persisted
-/// earlier in it. Later queued-only forms extend this one derivation.
+/// sent and never depends on a later read. This is the one place that
+/// decides whether a Verifier may run directly. It is queue-only when a
+/// requirement judges a scheduled window, which only its binding schedule
+/// supplies; when a step extracts a pull request, whose source only a queued
+/// `pull_request` activation supplies; when it declares a deferred input,
+/// whose evidence only a parked queued execution can wait for; or when an
+/// inline or registered Agent it calls declares `publish`. A registered Agent
+/// is read by UID inside the declaration transaction, which already holds a
+/// sibling Agent persisted earlier in it. Later queued-only forms extend this
+/// one derivation.
 ///
 /// # Errors
 /// Returns `WYRD_INTERNAL` when an Agent reference is unpinned or names
@@ -1941,7 +1944,13 @@ async fn queue_only(conn: &mut TenantConn<'_>, verifier: &VerifierSpec) -> Resul
             }
         )
     });
-    if extracts_pull_request || verifier.inputs.values().any(InputSlot::is_deferred) {
+    let judges_window = verifier
+        .all_requirements()
+        .any(|requirement| requirement.check.evidence() == CheckEvidence::Window);
+    if judges_window
+        || extracts_pull_request
+        || verifier.inputs.values().any(InputSlot::is_deferred)
+    {
         return Ok(true);
     }
     for (_, call) in verifier.agent_calls() {

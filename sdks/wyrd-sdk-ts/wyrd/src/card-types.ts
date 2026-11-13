@@ -7567,6 +7567,11 @@ export type TypedInputSlot = TypedInputSlotJson | TypedInputSlotMedia | TypedInp
  */
 export interface TypedInputSlotJson {
   /**
+   * Whether the value arrives later as published evidence instead of
+   * with the request. See [`InputSlot::is_deferred`].
+   */
+  readonly deferred?: boolean;
+  /**
    * JSON Schema the value must satisfy.
    */
   readonly schema?: JsonValue;
@@ -7577,6 +7582,11 @@ export interface TypedInputSlotJson {
  * A pinned file in one of the accepted formats.
  */
 export interface TypedInputSlotMedia {
+  /**
+   * Whether the file arrives later as published evidence instead of
+   * with the request. See [`InputSlot::is_deferred`].
+   */
+  readonly deferred?: boolean;
   /**
    * Accepted formats.
    */
@@ -7816,6 +7826,11 @@ export interface VerificationExecutionState {
    * Lifecycle status, independent of the verdict.
    */
   readonly status: VerificationExecutionStatus;
+  /**
+   * The deferred inputs a `waiting` execution is parked for; empty
+   * otherwise.
+   */
+  readonly waiting?: readonly SlotName[];
 }
 
 /**
@@ -7825,7 +7840,7 @@ export interface VerificationExecutionState {
  * result. `cancelled`, `timed_out`, and `errored` never carry a verdict or
  * dispatch an Operator.
  */
-export type VerificationExecutionStatus = "pending" | "running" | "retrying" | "completed" | "cancelled" | "timed_out" | "errored";
+export type VerificationExecutionStatus = "pending" | "running" | "retrying" | "waiting" | "completed" | "cancelled" | "timed_out" | "errored";
 
 /**
  * Overall verdict with its requirement judgments.

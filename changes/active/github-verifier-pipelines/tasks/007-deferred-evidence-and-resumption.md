@@ -42,41 +42,40 @@ step, and unchanged ordinary-input eligibility. Task 010-R1 implements publish
 detection only; this task owns the deferred-input extension and its proof.
 
 Publishers use `wyrd evidence publish ci_results --file results.json` or
-`client.evidence.publish(name, value, repository=None, commit=None)`. CLI/SDK infer
-remote and commit from Git; explicit source overrides support absent checkout or
-CI merge revision. Resolve remote through server verification of stable connected
-host/repository_id. Raw HTTP is the approved
-`POST /v1/verification/evidence/publish` request, matching tenant + repository +
-commit + input. The publisher does not supply a Repository policy version,
-Verifier ID, execution ID, group_id or retry key; tags are limited to commit.
-Internal consumer matching still uses accepted execution context. Git metadata
-grants no permission.
+`client.evidence.publish(name, value, repository=None, commit=None)` from any
+environment: a developer machine, a script, or any CI system. Wyrd is
+CI-agnostic: no client or server code detects, names or reads the variables of
+a particular CI provider, and nothing requires a Git checkout or a `git`
+binary. Raw HTTP is `POST /v1/verification/evidence/publish`, matching tenant +
+repository + commit + input. The publisher does not supply a Repository policy
+version, Verifier ID, execution ID, group_id or retry key; tags are limited to
+commit. Internal consumer matching still uses accepted execution context.
+Client-supplied source identity grants no permission.
 
-### Revision — repository slug and source resolution
+### Revision — repository slug and CI-agnostic source resolution
 
-Decided with the maintainer during implementation, following the convention of
-CI evidence uploaders such as Codecov and SonarCloud: the client sends a slug,
-the server resolves it. This replaces the request's `repository:
-{host, repository_id}`; the receipt still returns the resolved
-`{host, repository_id}`.
+Decided with the maintainer during implementation, following the conventional
+uploader shape (the client names the repository by slug, the server resolves
+it). This replaces the request's `repository: {host, repository_id}`; the
+receipt still returns the resolved `{host, repository_id}`.
 
-- Wire: `POST /v1/verification/evidence/publish` takes `repository:
-  "owner/name"`. The server resolves the slug, ignoring case, among the
-  tenant's selected repositories on the configured host through the existing
-  `GithubConnections::verify_repository` remote path; an unselected or unknown
-  slug is `WYRD_GITHUB_403_REPOSITORY_INACCESSIBLE`. Matching and custody use
-  only the resolved stable id, so a later rename does not affect accepted
-  evidence. Publishers need no connection-read permission.
-- CLI/SDK resolve `repository` and `commit` independently, first found wins,
-  with no knowledge of any particular CI system:
+- Wire: the request takes `repository: "owner/name"`. The server resolves the
+  slug, ignoring case, among the tenant's selected repositories on the
+  configured host through the existing `GithubConnections::verify_repository`
+  remote path; an unselected or unknown slug is
+  `WYRD_GITHUB_403_REPOSITORY_INACCESSIBLE`. Matching and custody use only the
+  resolved stable id, so a later rename does not affect accepted evidence.
+  Publishers need no connection-read permission.
+- CLI/SDK resolve `repository` and `commit` independently; the first source
+  that supplies a value wins:
   1. explicit `--repository`/`--commit` (SDK `repository=`/`commit=`);
-  2. the `WYRD_REPOSITORY`/`WYRD_COMMIT` environment variables, which any
-     pipeline can set from its own variables;
-  3. the Git checkout: `origin`'s `owner/name` and the `HEAD` commit, read from
-     `.git` without running `git`.
+  2. `WYRD_REPOSITORY`/`WYRD_COMMIT`, which the caller sets however its
+     environment provides the values;
+  3. a Git checkout when one is present: `origin`'s `owner/name` and the
+     `HEAD` commit, read from `.git` without running `git`.
   A value none of these supplies is a local input error naming the flag and
-  variable. No Git checkout is needed when 1 or 2 supply both. A pipeline that
-  checks out a merge revision supplies the reviewed head commit explicitly.
+  the variable. The caller decides which commit the evidence is about; Wyrd
+  never guesses a different one.
 
 ## Selected custody and dependency flow
 
@@ -189,4 +188,5 @@ checks. Task 008 owns the decision-specific half of AC-006/007.
 | REQ-011b | Publication to a waiting execution stages continuation of the same ExecutionId through the existing queue; running/queued consumers receive it through normal scheduling; initialization/recovery read accepted evidence, so a lost wake is repaired by the pending row's bounded canonical-state check; continuation preserves settled work, attempts, spend and original deadline (REQ-011, INV-005) | journey: publish while waiting/running/queued/before admission → same ExecutionId completes; settled step not replayed; attempts/deadline unchanged |
 | REQ-011c | Completed/cancelled/superseded executions never reopen; supersession, revocation and deadline fence a parked execution; missing evidence expires under the original deadline and never passes (REQ-011, INV-006) | journey/integration: supersede and revoke while parked; deadline while parked → timed_out |
 | INV-004 | Recovery and publish dedup return exact accepted state, authoritative absence, or explicit unavailability (503) — never fresh state on an unavailable read | integration: fenced-but-invisible evidence → unavailable, not absent |
-| REQ-016 | HTTP, shared client, Rust/Python/TypeScript SDKs, CLI (`wyrd evidence publish <input> --file f [--repository owner/name] [--commit sha]`; flag → env → Git resolution, §Revision — repository slug), MCP publish tool; waiting status with deferred names in execution inspection; stable errors/schemas; docs + upload-based example; wyrd-design Verifier and bifrost-design custody/ACK/parked sections; authorization guidance (AC-011) | SDK journeys ×3 + MCP journey; CLI test; codegen:check; docs content review |
+| REQ-016a | Source resolution is CI-agnostic: explicit argument → `WYRD_REPOSITORY`/`WYRD_COMMIT` → Git checkout read from `.git`; no CI-provider detection or provider variables anywhere, no `git` binary, missing value is a local error naming flag and variable (§Revision — repository slug and CI-agnostic source resolution) | client unit tests for each source and precedence, no checkout, missing value; source inspection for provider names |
+| REQ-016 | HTTP, shared client, Rust/Python/TypeScript SDKs, CLI (`wyrd evidence publish <input> --file f [--repository owner/name] [--commit sha]`; resolution per REQ-016a), MCP publish tool; waiting status with deferred names in execution inspection; stable errors/schemas; docs + upload-based example; wyrd-design Verifier and bifrost-design custody/ACK/parked sections; authorization guidance (AC-011) | SDK journeys ×3 + MCP journey; CLI test; codegen:check; docs content review |

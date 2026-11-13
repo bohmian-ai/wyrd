@@ -225,8 +225,8 @@ wyrd evidence publish ci_results --file results.json --repository <owner/name> -
 The first form resolves repository and commit from `WYRD_REPOSITORY`/
 `WYRD_COMMIT`, then the checkout's `origin` and `HEAD`; no checkout is needed
 when the variables are set. Wyrd assumes no particular CI system.
-The second supplies only missing or different source identity, for example when
-CI checks out a merge revision instead of the reviewed head. SDK capability is
+The second supplies source identity explicitly, for example where there is no
+checkout or the checkout is not the reviewed commit. SDK capability is
 `client.evidence.publish(name, value, repository=None, commit=None)`. Reuse
 existing typed JSON/File/Artifact input handling and upload completion.
 
@@ -248,8 +248,7 @@ Raw HTTP uses POST /v1/verification/evidence/publish after upload completion:
 ```
 
 The server resolves the `owner/name` slug to this connected repository
-identity (TASK-007 §Revision — repository slug, which also fixes the CLI/SDK
-flag → env → Git resolution order);
+identity (TASK-007 §Revision — repository slug and CI-agnostic source resolution);
 client-supplied Git metadata is never permission. tags is limited to commit for
 this change. No group_id, caller retry key or arbitrary filter language.
 

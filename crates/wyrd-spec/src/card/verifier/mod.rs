@@ -1168,6 +1168,42 @@ mod tests {
 
     use super::{InputSlot, VerifierSpec};
 
+    /// Only `json` and `media` slots decode `deferred`; `false` and an
+    /// omitted flag are not deferred, and a `trace` or `samples` slot
+    /// refuses the field.
+    ///
+    /// # Panics
+    /// Panics when a slot decodes otherwise.
+    #[test]
+    fn only_json_and_media_slots_can_be_deferred() {
+        let decode = |slot: Value| serde_json::from_value::<InputSlot>(slot);
+        for slot in [
+            json!({"type": "json", "deferred": true}),
+            json!({"type": "media", "formats": ["csv"], "deferred": true}),
+        ] {
+            assert!(
+                decode(slot.clone()).expect("decodes").is_deferred(),
+                "{slot}"
+            );
+        }
+        for slot in [
+            json!({"type": "json", "deferred": false}),
+            json!({"type": "json"}),
+            json!({"type": "media", "formats": ["csv"]}),
+        ] {
+            assert!(
+                !decode(slot.clone()).expect("decodes").is_deferred(),
+                "{slot}"
+            );
+        }
+        for slot in [
+            json!({"type": "trace", "deferred": true}),
+            json!({"type": "samples", "features": ["latency"], "deferred": true}),
+        ] {
+            assert!(decode(slot.clone()).is_err(), "{slot} refuses deferred");
+        }
+    }
+
     /// The generated schema offers exactly the four typed slot objects and
     /// the source string, the forms decoding accepts; a `{type: "source"}`
     /// object is neither generated nor decoded.

@@ -2806,8 +2806,10 @@ spec:
 
 A `.json` file is sent as JSON; any other file is uploaded first:
 
-```bash
+```bash title="publish.sh"
+# In the CI job, after the tests write report.csv:
 wyrd evidence publish report --file report.csv
+
 ```
 
 It prints the receipt:

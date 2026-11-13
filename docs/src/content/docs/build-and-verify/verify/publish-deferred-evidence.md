@@ -58,13 +58,11 @@ Set `WYRD_REPOSITORY` and `WYRD_COMMIT` from whatever your CI system provides, o
 
 A `media` input takes a file, such as a test report:
 
-<CodeFromFile file="fixtures/cards/deferred_evidence/report-gate.yaml" lang="yaml" title="report-gate.yaml" />
+<CodeFromFile file="examples/publish-deferred-evidence/report-gate.yaml" lang="yaml" title="report-gate.yaml" />
 
 A `.json` file is sent as JSON; any other file is uploaded first:
 
-```bash
-wyrd evidence publish report --file report.csv
-```
+<CodeFromFile file="examples/publish-deferred-evidence/publish.sh" lang="bash" />
 
 </Aside>
 

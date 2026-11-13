@@ -18,7 +18,16 @@ mod pg_tests {
     use wyrd_testing::WyrdTestServer;
     use wyrd_testing::github::{GithubAppMock, GithubBrowser, PullRequest};
 
-    use crate::support::{Deployment, declare, fixture};
+    use crate::support::{Deployment, fixture};
+
+    /// `name` in the "Publish CI results" guide's example directory.
+    fn example(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/publish-deferred-evidence"
+        ))
+        .join(name)
+    }
 
     /// The head commit of pull request 7.
     fn head() -> String {
@@ -26,7 +35,7 @@ mod pg_tests {
     }
 
     /// A deployment whose administrator connected installation 101
-    /// (`acme/api`, `acme/web`) and declared the Repository fixture at
+    /// (`acme/api`, `acme/web`) and declared the Repository file at
     /// `repository`, with pull request 7 of `acme/web` opened at [`head`].
     struct Opened {
         /// The running deployment.
@@ -46,7 +55,7 @@ mod pg_tests {
         /// # Panics
         /// Panics when a setup step is refused or the execution does not
         /// wait for `input` within 30 seconds.
-        async fn waiting_for(repository: &str, input: &str) -> Self {
+        async fn waiting_for(repository: &std::path::Path, input: &str) -> Self {
             let mock = GithubAppMock::start().expect("the GitHub mock starts");
             mock.add_installation(101, &[(1, "acme/api"), (2, "acme/web")]);
             mock.add_user("octo", &[101]);
@@ -80,7 +89,11 @@ mod pg_tests {
             assert_eq!(answer.status, 200, "{:?}", answer.body);
 
             let cards = deployment.cards().await;
-            let root = declare(&cards, repository).await.root;
+            let root = cards
+                .declare_from_path(repository)
+                .await
+                .expect("the Repository declares")
+                .root;
             let binding = cards
                 .get(CardSelector::exact(root))
                 .await
@@ -168,7 +181,8 @@ mod pg_tests {
     #[ignore = "requires the repository-managed Postgres journey lifecycle"]
     async fn published_evidence_resumes_the_waiting_execution() {
         let head = head();
-        let opened = Opened::waiting_for("cards/deferred_evidence/repository.yaml", "ci").await;
+        let opened =
+            Opened::waiting_for(&fixture("cards/deferred_evidence/repository.yaml"), "ci").await;
         let evidence = opened.evidence().await;
         let green = serde_json::json!({ "status": "green" });
         let accepted = evidence
@@ -223,10 +237,9 @@ mod pg_tests {
     #[ignore = "requires the repository-managed Postgres journey lifecycle"]
     async fn published_file_resumes_the_waiting_execution() {
         let head = head();
-        let opened =
-            Opened::waiting_for("cards/deferred_evidence/report-repository.yaml", "report").await;
+        let opened = Opened::waiting_for(&example("repository.yaml"), "report").await;
         let evidence = opened.evidence().await;
-        let report = fixture("cards/deferred_evidence/report.csv");
+        let report = example("report.csv");
         let refused = evidence
             .publish(
                 "report",

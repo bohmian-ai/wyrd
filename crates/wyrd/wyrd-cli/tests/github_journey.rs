@@ -363,6 +363,185 @@ mod pg_tests {
         server.shutdown().await.expect("test server shuts down");
     }
 
+    /// A bound deployment whose tenant connected installation 101
+    /// (`acme/api`, `acme/web`) and declared a Repository, with pull request
+    /// 7 of `acme/web` opened at [`Waiting::HEAD`] and its execution waiting.
+    struct Waiting {
+        /// The running server.
+        server: WyrdTestServer,
+        /// The GitHub mock, kept alive with the server.
+        _mock: GithubAppMock,
+        /// The server's base URL.
+        base: String,
+        /// The administrator's API key.
+        admin: String,
+        /// The pull request's execution.
+        execution: String,
+    }
+
+    impl Waiting {
+        /// The pull request's head commit.
+        const HEAD: &str = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
+
+        /// Connect through the CLI, declare `repository`, open the pull
+        /// request, and wait until its execution waits for exactly `input`.
+        ///
+        /// # Panics
+        /// Panics when a step fails or the execution does not wait for
+        /// `input`.
+        async fn open(repository: &str, input: &str) -> Self {
+            let mock = GithubAppMock::start().expect("the GitHub mock starts");
+            mock.add_installation(101, &[(1, "acme/api"), (2, "acme/web")]);
+            mock.add_user("octo", &[101]);
+            mock.sign_in("octo");
+            mock.install_target(101);
+            let server = WyrdTestServer::builder()
+                .with_github_app_for_test(&mock)
+                .with_verification_runtime_for_test()
+                .start_bound()
+                .await
+                .expect("test server starts");
+            let base = server.base_url().expect("bound").to_owned();
+            let admin = key(&server, "evidence_cli_admin", &["admin"]).await;
+            let receipt = json("connect", &github("connect", &base, &admin).await);
+            let mut browser =
+                GithubBrowser::sign_in(&base, server.pg_fixture().tenant_slug(), &admin)
+                    .await
+                    .expect("browser signs in");
+            let url = receipt["authorization_url"]
+                .as_str()
+                .expect("connect prints the install URL");
+            assert_eq!(
+                browser.open(url).await.expect("browser navigates").status,
+                200
+            );
+            let declared = json(
+                "declare",
+                &wyrd(&["declare", repository, "--format", "json"], &base, &admin).await,
+            );
+            let uid = declared["root"]["uid"]
+                .as_str()
+                .expect("the root has a uid");
+            let card = json(
+                "get",
+                &wyrd(
+                    &[
+                        "get",
+                        "--kind",
+                        "Repository",
+                        "--uid",
+                        uid,
+                        "--format",
+                        "json",
+                    ],
+                    &base,
+                    &admin,
+                )
+                .await,
+            );
+            let binding = card["status"]["verification"]["binding_ids"][0]
+                .as_str()
+                .expect("the Repository serves its binding")
+                .to_owned();
+            mock.set_pull_request(2, 7, PullRequest::open(2, &"b1".repeat(20), Self::HEAD));
+            let opened = mock.pull_request_event(101, 2, 7, "opened");
+            assert_eq!(
+                mock.deliver(&base, "pull_request", &opened)
+                    .await
+                    .expect("delivery sends"),
+                202
+            );
+            let token = server
+                .exchange_api_key(&admin.clone().into())
+                .await
+                .expect("the key exchanges");
+            let status: Value = reqwest::Client::new()
+                .get(format!("{base}/v1/verification/bindings/{binding}"))
+                .header("x-wyrd-access-token", format!("Bearer {token}"))
+                .send()
+                .await
+                .expect("binding reads")
+                .json()
+                .await
+                .expect("binding is JSON");
+            let execution = status["last_execution_id"]
+                .as_str()
+                .expect("the pull request admitted an execution")
+                .to_owned();
+            let waiting = Self {
+                server,
+                _mock: mock,
+                base,
+                admin,
+                execution,
+            };
+            assert_eq!(
+                waiting.until("waiting").await["waiting"],
+                serde_json::json!([input])
+            );
+            waiting
+        }
+
+        /// Poll `wyrd execution status` until the execution is `wanted`, for
+        /// at most 30 seconds, and return it.
+        ///
+        /// # Panics
+        /// Panics when it does not reach `wanted` in time.
+        async fn until(&self, wanted: &str) -> Value {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let state = json(
+                    "execution status",
+                    &wyrd(
+                        &["execution", "status", "--execution-id", &self.execution],
+                        &self.base,
+                        &self.admin,
+                    )
+                    .await,
+                );
+                if state["status"] == wanted {
+                    return state;
+                }
+                assert!(std::time::Instant::now() < deadline, "{state}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+
+        /// Run `command` in `dir` as a CI job would: the server and key
+        /// from `WYRD_SERVER_URL`/`WYRD_API_KEY`, the repository from
+        /// `WYRD_REPOSITORY`, and the commit from `WYRD_COMMIT` when given.
+        ///
+        /// # Panics
+        /// Panics when the subprocess cannot run or join.
+        async fn ci(
+            &self,
+            mut command: std::process::Command,
+            dir: &std::path::Path,
+            commit: Option<&str>,
+        ) -> Output {
+            command.current_dir(dir);
+            let mut sources = vec![
+                ("WYRD_SERVER_URL", self.base.clone()),
+                ("WYRD_API_KEY", self.admin.clone()),
+                ("WYRD_REPOSITORY", "acme/web".to_owned()),
+            ];
+            if let Some(commit) = commit {
+                sources.push(("WYRD_COMMIT", commit.to_owned()));
+            } else {
+                command.env_remove("WYRD_COMMIT");
+            }
+            tokio::task::spawn_blocking(move || {
+                let sources: Vec<(&str, &str)> = sources
+                    .iter()
+                    .map(|(name, value)| (*name, value.as_str()))
+                    .collect();
+                run_scrubbed(command, &sources)
+            })
+            .await
+            .expect("CLI subprocess joins")
+        }
+    }
+
     /// CI publishes a deferred input with `wyrd evidence publish`, naming the
     /// repository and commit only through `WYRD_REPOSITORY` and `WYRD_COMMIT`
     /// from a directory that is no checkout: the waiting pull request
@@ -374,155 +553,31 @@ mod pg_tests {
     /// or a receipt or refusal differs.
     #[tokio::test]
     async fn ci_publishes_deferred_evidence_through_the_cli() {
-        let head = "a1".repeat(20);
-        let mock = GithubAppMock::start().expect("the GitHub mock starts");
-        mock.add_installation(101, &[(1, "acme/api"), (2, "acme/web")]);
-        mock.add_user("octo", &[101]);
-        mock.sign_in("octo");
-        mock.install_target(101);
-        let server = WyrdTestServer::builder()
-            .with_github_app_for_test(&mock)
-            .with_verification_runtime_for_test()
-            .start_bound()
-            .await
-            .expect("test server starts");
-        let base = server.base_url().expect("bound").to_owned();
-        let admin = key(&server, "evidence_cli_admin", &["admin"]).await;
-        let receipt = json("connect", &github("connect", &base, &admin).await);
-        let mut browser = GithubBrowser::sign_in(&base, server.pg_fixture().tenant_slug(), &admin)
-            .await
-            .expect("browser signs in");
-        let url = receipt["authorization_url"]
-            .as_str()
-            .expect("connect prints the install URL");
-        assert_eq!(
-            browser.open(url).await.expect("browser navigates").status,
-            200
-        );
-        let declared = json(
-            "declare",
-            &wyrd(
-                &[
-                    "declare",
-                    concat!(
-                        env!("CARGO_MANIFEST_DIR"),
-                        "/../../../fixtures/cards/deferred_evidence/repository.yaml"
-                    ),
-                    "--format",
-                    "json",
-                ],
-                &base,
-                &admin,
-            )
-            .await,
-        );
-        let uid = declared["root"]["uid"]
-            .as_str()
-            .expect("the root has a uid");
-        let card = json(
-            "get",
-            &wyrd(
-                &[
-                    "get",
-                    "--kind",
-                    "Repository",
-                    "--uid",
-                    uid,
-                    "--format",
-                    "json",
-                ],
-                &base,
-                &admin,
-            )
-            .await,
-        );
-        let binding = card["status"]["verification"]["binding_ids"][0]
-            .as_str()
-            .expect("the Repository serves its binding")
-            .to_owned();
-        mock.set_pull_request(2, 7, PullRequest::open(2, &"b1".repeat(20), &head));
-        let opened = mock.pull_request_event(101, 2, 7, "opened");
-        assert_eq!(
-            mock.deliver(&base, "pull_request", &opened)
-                .await
-                .expect("delivery sends"),
-            202
-        );
-        let token = server
-            .exchange_api_key(&admin.clone().into())
-            .await
-            .expect("the key exchanges");
-        let status: Value = reqwest::Client::new()
-            .get(format!("{base}/v1/verification/bindings/{binding}"))
-            .header("x-wyrd-access-token", format!("Bearer {token}"))
-            .send()
-            .await
-            .expect("binding reads")
-            .json()
-            .await
-            .expect("binding is JSON");
-        let execution = status["last_execution_id"]
-            .as_str()
-            .expect("the pull request admitted an execution")
-            .to_owned();
-        let until = async |wanted: &str| {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            loop {
-                let state = json(
-                    "execution status",
-                    &wyrd(
-                        &["execution", "status", "--execution-id", &execution],
-                        &base,
-                        &admin,
-                    )
-                    .await,
-                );
-                if state["status"] == wanted {
-                    return state;
-                }
-                assert!(std::time::Instant::now() < deadline, "{state}");
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        };
-        assert_eq!(until("waiting").await["waiting"], serde_json::json!(["ci"]));
-
+        let waiting = Waiting::open(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../fixtures/cards/deferred_evidence/repository.yaml"
+            ),
+            "ci",
+        )
+        .await;
         let ci = tempfile::tempdir().expect("a directory that is no checkout");
         std::fs::write(ci.path().join("results.json"), r#"{"status": "green"}"#)
             .expect("results write");
-        let publish = |commit: Option<&str>| {
+        let publish = |commit: Option<&'static str>| {
             let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("wyrd"));
-            command
-                .args(["evidence", "publish", "ci", "--file", "results.json"])
-                .current_dir(ci.path());
-            let mut sources = vec![
-                ("WYRD_SERVER_URL", base.clone()),
-                ("WYRD_API_KEY", admin.clone()),
-                ("WYRD_REPOSITORY", "acme/web".to_owned()),
-            ];
-            if let Some(commit) = commit {
-                sources.push(("WYRD_COMMIT", commit.to_owned()));
-            } else {
-                command.env_remove("WYRD_COMMIT");
-            }
-            async move {
-                tokio::task::spawn_blocking(move || {
-                    let sources: Vec<(&str, &str)> = sources
-                        .iter()
-                        .map(|(name, value)| (*name, value.as_str()))
-                        .collect();
-                    run_scrubbed(command, &sources)
-                })
-                .await
-                .expect("CLI subprocess joins")
-            }
+            command.args(["evidence", "publish", "ci", "--file", "results.json"]);
+            waiting.ci(command, ci.path(), commit)
         };
-        let accepted = json("evidence publish", &publish(Some(&head)).await);
+        let accepted = json("evidence publish", &publish(Some(Waiting::HEAD)).await);
         assert_eq!(accepted["status"], "accepted");
         assert_eq!(accepted["matched_subscriptions"], 1);
-        assert_eq!(accepted["tags"]["commit"], head.as_str());
-        let completed = until("completed").await;
-        assert_eq!(completed["status"], "completed");
-        let replayed = json("evidence publish again", &publish(Some(&head)).await);
+        assert_eq!(accepted["tags"]["commit"], Waiting::HEAD);
+        assert_eq!(waiting.until("completed").await["status"], "completed");
+        let replayed = json(
+            "evidence publish again",
+            &publish(Some(Waiting::HEAD)).await,
+        );
         assert_eq!(replayed["status"], "replayed");
         assert_eq!(replayed["evidence_id"], accepted["evidence_id"]);
         let missing = publish(None).await;
@@ -535,6 +590,64 @@ mod pg_tests {
             String::from_utf8_lossy(&missing.stderr).contains("WYRD_COMMIT"),
             "the refusal names the variable: {missing:?}"
         );
-        server.shutdown().await.expect("test server shuts down");
+        waiting
+            .server
+            .shutdown()
+            .await
+            .expect("test server shuts down");
+    }
+
+    /// The guide's `examples/publish-deferred-evidence/publish.sh`, run as
+    /// published from the example directory, uploads `report.csv` for the
+    /// waiting `report` input, and the execution reads it and passes.
+    ///
+    /// # Panics
+    /// Panics when the guide does not embed the script, the script fails, or
+    /// the execution does not pass.
+    #[tokio::test]
+    async fn ci_uploads_a_report_file_through_the_guide_script() {
+        const DIR: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../examples/publish-deferred-evidence"
+        );
+        assert!(
+            include_str!(
+                "../../../../docs/src/content/docs/build-and-verify/verify/publish-deferred-evidence.md"
+            )
+            .contains(
+                "<CodeFromFile file=\"examples/publish-deferred-evidence/publish.sh\" lang=\"bash\" />"
+            ),
+            "the guide embeds publish.sh"
+        );
+        let waiting = Waiting::open(&format!("{DIR}/repository.yaml"), "report").await;
+        let wyrd = assert_cmd::cargo::cargo_bin("wyrd");
+        let ambient = std::env::var_os("PATH").unwrap_or_default();
+        let path = std::env::join_paths(
+            std::iter::once(
+                wyrd.parent()
+                    .expect("the binary has a directory")
+                    .to_path_buf(),
+            )
+            .chain(std::env::split_paths(&ambient)),
+        )
+        .expect("PATH joins");
+        let mut bash = std::process::Command::new("bash");
+        bash.args(["-euo", "pipefail", "publish.sh"])
+            .env("PATH", path);
+        let accepted = json(
+            "publish.sh",
+            &waiting
+                .ci(bash, std::path::Path::new(DIR), Some(Waiting::HEAD))
+                .await,
+        );
+        assert_eq!(accepted["status"], "accepted");
+        assert_eq!(accepted["input"], "report");
+        let completed = waiting.until("completed").await;
+        assert_eq!(completed["status"], "completed", "{completed}");
+        waiting
+            .server
+            .shutdown()
+            .await
+            .expect("test server shuts down");
     }
 }

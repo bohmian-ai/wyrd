@@ -49,3 +49,17 @@ Use the existing inline server unit-test owner and `mise` runner. The current ex
 `mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --lib -E 'test(=components::verification::service::evidence::tests::a_lost_race_replays_the_first_acceptance)'`
 
 If the test is renamed, use its actual exact selector and record selected count. Run format and narrow applicable lint checks for the actual write set. Preserve existing connected custody/replay assertions and their recorded evidence; no full SDK, whole-task journey or broad aggregate rerun is prescribed. Docker is unavailable in the review sandbox; do not convert that environment limit into an additional requirement or claim fresh connected execution. Record source, fresh unit and carried-forward connected evidence separately. No commit, push or Git configuration.
+
+## Obligations
+
+| ID | Promise | Source | Planned proof |
+|---|---|---|---|
+| FIND-007-3 | A publication whose fresh offer lost to a canonical acceptance answers Replayed at the earlier first-accepted time with unchanged identity, through production reconciliation that fails if the canonical acceptance is not used or the losing offer stays fresh | this file, Acceptance | inline unit test of the production receipt, plus mutation checks |
+
+## Evidence
+
+| Obligation and required cases | Implementation evidence | Proof location | Verification evidence | Result |
+|---|---|---|---|---|
+| FIND-007-3: losing offer (fresh, offered 5 s later) with a canonical winner → `Replayed` at the winner's time; winning offer → `Accepted` at its own time; a second publication of the same content derives the same `evidence_id` | `publish_evidence` keeps the race read in `raced` and answers through `receipt(held, fresh, raced, now)`, which owns the transfer: a fresh subscriber the race read covers is not accepted now, and the canonical time joins the minimum. The former `held.extend`/`fresh.clear` lines are gone | `service/evidence.rs` `tests::a_lost_race_replays_the_first_acceptance` | `mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --lib -E 'test(=components::verification::service::evidence::tests::a_lost_race_replays_the_first_acceptance)'`: 1 passed. RED: the test first failed to compile against the old receipt. Mutations: dropping the canonical time (`raced.values()`) fails with the offered time; treating the losing offer as fresh fails with `Accepted`. Connected: module `pg_deferred_evidence` 9/9 passed under `with-test-postgres.sh` | PASS |
+
+Commands also run: `cargo fmt`; `cargo clippy -p wyrd-server --features test-support --all-targets -D warnings` (clean); `git diff --check` (clean).

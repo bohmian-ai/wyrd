@@ -258,7 +258,11 @@ struct WyrdTestServerInner {
     /// Lifetime guard retained only for local storage-backed servers.
     storage_root: Option<Arc<TempDir>>,
     /// Lifetime guard for a harness-created Bifrost data directory.
-    _bifrost_data_dir: Arc<TempDir>,
+    bifrost_data_dir: Arc<TempDir>,
+    /// The directory [`Self::bifrost_data_root`] was prepared over: the
+    /// caller's durable root when one was mounted, else
+    /// [`Self::bifrost_data_dir`]. A restart reopens exactly this path.
+    bifrost_data_path: std::path::PathBuf,
     /// Exclusive owner of this server's one Bifrost data root.
     bifrost_data_root: BifrostDataRoot,
     state: AppState,
@@ -980,9 +984,13 @@ impl WyrdTestServer {
     /// This is what a process restart looks like to durable state: every
     /// committed row — principals, API keys, role grants, gateway
     /// configuration, and sealed managed-secret envelopes — survives, while
-    /// in-memory state, the token-signing key, sockets, and the Bifrost data
-    /// root are rebuilt. The fixture and storage are retained across the
-    /// shutdown so dropping the old server does not release the database.
+    /// in-memory state, the token-signing key, and sockets are rebuilt. The
+    /// fixture and storage are retained across the shutdown so dropping the
+    /// old server does not release the database. The Bifrost data root is a
+    /// pod's volume: unless `builder` mounts another, the replacement reopens
+    /// the same directory, after shutdown released the old owner's lock, so
+    /// acknowledged data still in its WAL or staged files, and its volume
+    /// identity, survive even a shutdown that aborted at its budget.
     /// Previously minted access tokens are signed by the old process's key, so
     /// callers exchange their API keys again against the restarted server.
     ///
@@ -996,7 +1004,11 @@ impl WyrdTestServer {
         let fixture = Arc::clone(&self.inner.fixture);
         let storage = Arc::clone(&self.inner.state.storage);
         let storage_root = self.inner.storage_root.clone();
+        let data_dir = Arc::clone(&self.inner.bifrost_data_dir);
+        let data_path = self.inner.bifrost_data_path.clone();
         self.shutdown().await?;
+        builder.bifrost_data_dir.get_or_insert(data_dir);
+        builder.bifrost_data_path.get_or_insert(data_path);
         if builder.bind_addrs.is_none() {
             builder.bind_addrs = Some((reserve_loopback_addr()?, reserve_loopback_addr()?));
         }
@@ -5199,9 +5211,12 @@ impl WyrdTestServerBuilder {
         let data_dir = self.bifrost_data_dir.clone().unwrap_or(Arc::new(
             tempfile::tempdir().map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
         ));
-        let data_root =
-            BifrostDataRoot::prepare(self.bifrost_data_path.as_deref().unwrap_or(data_dir.path()))
-                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        let bifrost_data_path = self
+            .bifrost_data_path
+            .clone()
+            .unwrap_or_else(|| data_dir.path().to_path_buf());
+        let data_root = BifrostDataRoot::prepare(&bifrost_data_path)
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         let scratch_root = data_root.oracle_spill().to_path_buf();
         let volume_roots = (!self.bifrost_roles.is_empty()).then(|| data_root.volume_roots());
         let snapshot = self.system_resources.unwrap_or(SystemResourceSnapshot {
@@ -5470,7 +5485,8 @@ impl WyrdTestServerBuilder {
                 fixture,
                 operator_keys_dir,
                 storage_root,
-                _bifrost_data_dir: data_dir,
+                bifrost_data_dir: data_dir,
+                bifrost_data_path,
                 bifrost_data_root,
                 state,
                 router,

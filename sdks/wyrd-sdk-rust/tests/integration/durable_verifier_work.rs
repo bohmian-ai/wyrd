@@ -124,6 +124,9 @@ async fn calls(assistant: &Assistant, marker: &str) -> usize {
 /// first judgment of its requirement is held at the judge while the server
 /// restarts without releasing its lease, as a crash does; the lease is then
 /// expired on the database clock so the new server reclaims the execution.
+/// Nothing is flushed first: the held call keeps the shutdown from draining
+/// within its budget, and the restarted pod recovers the acknowledged
+/// checkpoint from the data root it keeps.
 ///
 /// # Panics
 /// Panics when a committed action runs again, the result differs, or a
@@ -165,14 +168,6 @@ async fn action_checkpoint_survives_unfinished_requirements() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     assert_eq!(calls(&assistant, REVIEW).await, 1, "the action committed");
-    // The harness keeps Bifrost's local data root only across a clean
-    // shutdown, so the acknowledged input record is published first.
-    assistant
-        .deployment
-        .server()
-        .flush_bifrost()
-        .await
-        .expect("Bifrost flushes");
 
     let assistant = assistant.restart().await;
     let server = assistant.deployment.server();
@@ -197,12 +192,6 @@ async fn action_checkpoint_survives_unfinished_requirements() {
         calls(&assistant, JUDGE).await,
     );
     assert_eq!(judged, (1, 2), "only the unsettled requirement ran again");
-    assistant
-        .deployment
-        .server()
-        .flush_bifrost()
-        .await
-        .expect("Bifrost flushes");
 
     let assistant = assistant.restart().await;
     let service = assistant.deployment.service_client(&reviewed.root).await;

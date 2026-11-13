@@ -655,8 +655,9 @@ fn invocations(state: &ExecutionState) -> Vec<(String, u32)> {
 
 /// Recovery loads exactly the accepted revision or fails closed.
 ///
-/// A writer accepts two invocation revisions. When a third revision's batch
-/// fence is durable but its row is not visible, as when the Scribe holding
+/// A writer accepts two invocations, which background persistence may
+/// coalesce into one revision or write as two. When the next revision's
+/// batch fence is durable but its row is not visible, as when the Scribe holding
 /// it was unavailable before the read discovered it, a takeover is refused
 /// as unavailable instead of starting fresh or loading the older revision,
 /// and changes nothing. Once every fenced revision is readable, a takeover
@@ -692,18 +693,33 @@ async fn execution_recovery_requires_exact_accepted_state() {
         .pg_fixture()
         .superuser_pool()
         .expect("fixture exposes a superuser pool");
-    let unseen = revision_fence(server.data_tenant_id(), execution, 3);
-    sqlx::query(
+    let fences: Vec<Uuid> = (1..=2)
+        .map(|revision| revision_fence(server.data_tenant_id(), execution, revision))
+        .collect();
+    let (last,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM vala.scribe_batch_commits WHERE batch_id = ANY($1)")
+            .bind(&fences)
+            .fetch_one(&pool)
+            .await
+            .expect("the accepted fences read");
+    assert!(last >= 1, "the accepted invocations are fenced");
+    let unseen = revision_fence(server.data_tenant_id(), execution, last + 1);
+    let fenced = sqlx::query(
         "INSERT INTO vala.scribe_batch_commits \
          SELECT (jsonb_populate_record(c, jsonb_build_object('batch_id', $2::uuid))).* \
            FROM vala.scribe_batch_commits c \
           WHERE logical_table_fqn = 'bifrost.verification.execution_events' AND batch_id = $1",
     )
-    .bind(revision_fence(server.data_tenant_id(), execution, 2))
+    .bind(revision_fence(server.data_tenant_id(), execution, last))
     .bind(unseen)
     .execute(&pool)
     .await
-    .expect("a third revision's fence is durable");
+    .expect("the next revision's fence is durable");
+    assert_eq!(
+        fenced.rows_affected(),
+        1,
+        "exactly the next fence is copied"
+    );
     let refused = take_over(&fixture, &server, execution).await;
     assert!(
         matches!(refused, Err(StateError::Unavailable(_))),
@@ -737,6 +753,93 @@ async fn execution_recovery_requires_exact_accepted_state() {
             .expect("the accepted revision reads after replay"),
         Some(accepted)
     );
+    server.shutdown().await.expect("the server drains cleanly");
+}
+
+/// A restarted pod keeps its own Bifrost data root, so a checkpoint
+/// acknowledged into its WAL but never published survives a shutdown that
+/// aborts at its budget and recovers exactly.
+///
+/// Every object write is held and a publication of the acknowledged
+/// revisions is in flight at the hold when the pod stops, so its Bifrost
+/// drain cannot finish within the shutdown budget and is aborted. The harness
+/// restart mounts no explicit data root; the replacement reopens the original
+/// one, reads the accepted revision, and a takeover recovers it without
+/// running an accepted invocation again.
+///
+/// # Panics
+///
+/// Panics when the pod cannot start or restart, the revisions are not
+/// accepted, or the state after restart differs from the accepted one.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn restart_recovers_an_acknowledged_unpublished_checkpoint() {
+    let faults = PersistenceFaults::default();
+    faults.hold_object_writes_for_test();
+    let server = WyrdTestServer::builder()
+        .with_scribe_persistence_faults_for_test(faults.clone())
+        .start_bound()
+        .await
+        .expect("the pod starts");
+    let fixture = VerificationFixture::provision(server.state(), server.data_tenant_id())
+        .await
+        .expect("the tenant provisions");
+    let (subject, _) = fixture.service("unpublished").await.expect("service");
+    let verifier = fixture
+        .drift_verifier("unpublished-recovery")
+        .await
+        .expect("verifier");
+    let execution = fixture
+        .submit(&verifier, &subject, std::collections::BTreeMap::new())
+        .await
+        .expect("the execution is admitted");
+    let (_, writer) = fixture
+        .claim_state(server.state())
+        .await
+        .expect("the execution is claimable");
+    let writer = writer.expect("a fresh execution's state claims");
+    for step in ["review", "judge"] {
+        writer
+            .begin(&Producer::plain(&TaskId::new(step).expect("task"), 1))
+            .await
+            .expect("the revision is accepted");
+    }
+    writer
+        .persisted()
+        .await
+        .expect("the revisions are acknowledged before any publishes");
+    let accepted = writer.snapshot();
+    drop(writer);
+    let state = server.state().clone();
+    let publishing = tokio::spawn(async move { state.flush_scribe_for_test().await });
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        faults.wait_for_held_object_writes_for_test(1),
+    )
+    .await
+    .expect("the acknowledged revisions start publishing");
+
+    let server = Box::pin(server.restart_bound(WyrdTestServer::builder()))
+        .await
+        .expect("the pod restarts on its own data root");
+    publishing.abort();
+    assert_eq!(
+        fixture
+            .execution_state(server.state(), execution)
+            .await
+            .expect("the acknowledged revision reads after restart"),
+        Some(accepted.clone())
+    );
+    let recovered = take_over(&fixture, &server, execution)
+        .await
+        .expect("the acknowledged revision recovers");
+    assert_eq!(recovered.snapshot(), accepted);
+    assert_eq!(
+        invocations(&recovered.snapshot()),
+        [("review".to_owned(), 1), ("judge".to_owned(), 1)],
+        "no accepted invocation is recomputed"
+    );
+    drop(recovered);
     server.shutdown().await.expect("the server drains cleanly");
 }
 

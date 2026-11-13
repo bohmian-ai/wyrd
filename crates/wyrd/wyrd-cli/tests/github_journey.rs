@@ -650,4 +650,96 @@ mod pg_tests {
             .await
             .expect("test server shuts down");
     }
+
+    /// A person approves a waiting pull request's pending signoff with
+    /// `wyrd execution approve` and the same execution passes.
+    ///
+    /// `wyrd execution status` lists the pending `signoff` occurrence. Once
+    /// CI publishes `ci`, a viewer's approval is refused; an editor's prints
+    /// the durable receipt and replays, and a later rejection of the decided
+    /// occurrence is refused as not pending.
+    ///
+    /// # Panics
+    /// Panics when a command fails, the occurrence is not pending, a
+    /// receipt or refusal differs, or the execution does not pass.
+    #[tokio::test]
+    async fn a_person_approves_a_pending_signoff_through_the_cli() {
+        let waiting = Waiting::open(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../fixtures/cards/approvals/repository.yaml"
+            ),
+            "ci",
+        )
+        .await;
+        let state = waiting.until("waiting").await;
+        let pending = &state["approvals"][0];
+        assert_eq!(pending["step_id"], "signoff");
+        assert_eq!(pending["status"], "pending");
+        let approval = pending["approval_id"]
+            .as_str()
+            .expect("the occurrence has an approval_id")
+            .to_owned();
+        let ci = tempfile::tempdir().expect("a CI directory");
+        std::fs::write(ci.path().join("results.json"), r#"{"status": "green"}"#)
+            .expect("results write");
+        let mut publish = std::process::Command::new(assert_cmd::cargo::cargo_bin("wyrd"));
+        publish.args(["evidence", "publish", "ci", "--file", "results.json"]);
+        json(
+            "evidence publish",
+            &waiting.ci(publish, ci.path(), Some(Waiting::HEAD)).await,
+        );
+
+        let decide = |verb: &'static str, key: String| {
+            let arguments = [
+                "execution",
+                verb,
+                "--execution-id",
+                waiting.execution.as_str(),
+                "--approval-id",
+                approval.as_str(),
+                "--reason",
+                "reviewed the diff",
+            ];
+            let base = waiting.base.clone();
+            async move { wyrd(&arguments, &base, &key).await }
+        };
+        let viewer = key(&waiting.server, "signoff_cli_viewer", &["viewer"]).await;
+        failed_with(
+            "a viewer's approval",
+            &decide("approve", viewer).await,
+            "WYRD_PERMISSION_403_DENIED_RBAC",
+        );
+        let editor = key(&waiting.server, "signoff_cli_editor", &["editor"]).await;
+        let receipt = json(
+            "execution approve",
+            &decide("approve", editor.clone()).await,
+        );
+        assert_eq!(receipt["approval_id"], approval.as_str());
+        assert_eq!(receipt["status"], "approved");
+        assert_eq!(receipt["reason"], "reviewed the diff");
+        assert_eq!(
+            json(
+                "execution approve again",
+                &decide("approve", editor.clone()).await
+            ),
+            receipt,
+            "the same decision replays its receipt"
+        );
+        failed_with(
+            "a rejection after the approval",
+            &decide("reject", editor).await,
+            "WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING",
+        );
+        let completed = waiting.until("completed").await;
+        assert_eq!(
+            completed["approvals"][0]["status"], "approved",
+            "{completed}"
+        );
+        waiting
+            .server
+            .shutdown()
+            .await
+            .expect("test server shuts down");
+    }
 }

@@ -1,5 +1,5 @@
-//! `wyrd execution` inspection and cancellation of one queued Verifier
-//! execution.
+//! `wyrd execution` inspection, cancellation, and approval decisions of one
+//! queued Verifier execution.
 //!
 //! Each verb is one call on the shared [`wyrd_client::verify::Execution`]
 //! handle and prints the server's typed response as JSON. Pages, producer
@@ -12,10 +12,10 @@ use clap::{Args, Subcommand};
 use serde_json::Value;
 use wyrd_client::WyrdClient;
 use wyrd_client::verify::{
-    Execution, ExecutionPageQuery, PublicationName, PublicationSelector, TaskId,
+    ApprovalDecision, Execution, ExecutionPageQuery, PublicationName, PublicationSelector, TaskId,
 };
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::ExecutionId;
+use wyrd_spec::ids::{ApprovalId, ExecutionId};
 
 use crate::card::print_json;
 use crate::error::WyrdCliError;
@@ -32,7 +32,8 @@ pub struct ExecutionCommand {
     pub verb: ExecutionVerb,
 }
 
-/// Execution verbs; reads need `verifier:read`, cancel needs `verifier:run`.
+/// Execution verbs; reads need `verifier:read`, cancel needs `verifier:run`,
+/// and approve or reject need `verifier:approve` on the execution's Verifier.
 #[derive(Debug, Clone, Subcommand)]
 pub enum ExecutionVerb {
     /// Read the execution's lifecycle status, terminal error, and result.
@@ -48,6 +49,26 @@ pub enum ExecutionVerb {
     Download(PublicationArgs),
     /// Cancel the execution durably; repeating answers its current status.
     Cancel(ExecutionArg),
+    /// Approve one pending approval occurrence and print the durable
+    /// receipt; the same execution continues.
+    Approve(ApprovalArgs),
+    /// Reject one pending approval occurrence and print the durable
+    /// receipt; the same execution continues with the rejection.
+    Reject(ApprovalArgs),
+}
+
+/// Address one approval occurrence and state why.
+#[derive(Debug, Clone, Args)]
+pub struct ApprovalArgs {
+    /// Execution that waits for the decision.
+    #[command(flatten)]
+    pub execution: ExecutionArg,
+    /// A pending occurrence's `approval_id` from `wyrd execution status`.
+    #[arg(long, value_name = "UUID")]
+    pub approval_id: ApprovalId,
+    /// Why, recorded with the decision; repeat it exactly to replay.
+    #[arg(long)]
+    pub reason: Option<String>,
 }
 
 /// Address one execution.
@@ -125,6 +146,7 @@ impl ExecutionVerb {
     fn id(&self) -> ExecutionId {
         match self {
             Self::Status(arg) | Self::Cancel(arg) => arg.execution_id,
+            Self::Approve(args) | Self::Reject(args) => args.execution.execution_id,
             Self::Invocations(page) | Self::Publications(page) => page.execution.execution_id,
             Self::Publication(publication) | Self::Download(publication) => {
                 publication.execution.execution_id
@@ -173,6 +195,24 @@ async fn run(verb: ExecutionVerb, client: &WyrdClient) -> Result<Value, WyrdErro
                 .await?,
         ),
         ExecutionVerb::Cancel(_) => serde_json::to_value(execution.cancel().await?),
+        ExecutionVerb::Approve(args) => serde_json::to_value(
+            execution
+                .decide(
+                    args.approval_id,
+                    ApprovalDecision::Approved,
+                    args.reason.clone(),
+                )
+                .await?,
+        ),
+        ExecutionVerb::Reject(args) => serde_json::to_value(
+            execution
+                .decide(
+                    args.approval_id,
+                    ApprovalDecision::Rejected,
+                    args.reason.clone(),
+                )
+                .await?,
+        ),
     };
     value.map_err(|error| WyrdError::Internal {
         message: format!("an execution response did not serialize: {error}"),

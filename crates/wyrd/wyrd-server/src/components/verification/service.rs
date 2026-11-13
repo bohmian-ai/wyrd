@@ -51,7 +51,7 @@ use crate::query::scheduled::ScheduledQueryCaller;
 use crate::scribe_outbox::{ScribeSink, ScribeWrite};
 use crate::state::{AppState, registry_db_error};
 use crate::verification::authority::SystemReadAuthority;
-use crate::verification::cache::{Db, Target};
+use crate::verification::cache::Target;
 use crate::verification::hosted::blocks::{Execution, HostedBlocks};
 use crate::verification::inputs::InputResolver;
 use crate::verification::results::{
@@ -148,12 +148,12 @@ fn environment_tag(request: &VerificationRequest) -> Result<(), WyrdError> {
 /// Refuse a Verifier that only queued execution may run, before any step.
 ///
 /// This is the single direct-eligibility rule `verify` applies once its
-/// target resolves and before the engine is built: a direct request is
+/// target is read on a direct cache miss and before it is cached for direct
+/// use or the engine is built: a direct request is
 /// never converted to a queued one and never runs part of its graph. A
 /// Verifier judging a scheduled window is queued-only, and so is one
-/// registration marked [`VerifierSpec::queue_only`]. That flag is read from
-/// the resolved spec, so a cached target answers it with no scan of steps,
-/// tools or referenced Agents. Pure: no IO.
+/// registration marked [`VerifierSpec::queue_only`]. A direct cache hit
+/// skips this rule entirely. Pure: no IO.
 ///
 /// # Errors
 /// Returns [`WyrdError::VerificationInputUnsupported`] for a queued-only
@@ -930,56 +930,53 @@ impl<'a> VerificationControl<'a> {
         }
     }
 
-    /// Resolve a direct execution's target through the one read route every
-    /// Verifier execution shares,
-    /// [`VerifierCardCache::resolve`](crate::verification::cache::VerifierCardCache::resolve).
+    /// Resolve a direct execution's target through
+    /// [`VerifierCardCache::resolve_direct`](crate::verification::cache::VerifierCardCache::resolve_direct).
     ///
-    /// A cached target costs no IO; a miss reads both Cards, the Verifier's
-    /// readiness, and the tenant SYSTEM principal in one autocommit statement
-    /// that binds the caller's tenant for RLS, so a Card of another tenant is
-    /// invisible. A drift Verifier judges a scheduled window and cannot
-    /// verify now, whether or not its baseline is ready.
+    /// A direct hit costs no IO and no eligibility check: only a target
+    /// [`direct_eligibility`] admitted on its miss is cached for direct use.
+    /// A miss reads both Cards, the Verifier's readiness, and the tenant
+    /// SYSTEM principal in one autocommit statement that binds the caller's
+    /// tenant for RLS, so a Card of another tenant is invisible. A drift
+    /// Verifier judges a scheduled window and cannot verify now, whether or
+    /// not its baseline is ready.
     ///
     /// # Errors
     /// Returns a registry error when the read fails,
-    /// [`WyrdError::VerificationInputUnsupported`] for a Window Verifier, and
+    /// [`WyrdError::VerificationInputUnsupported`] for a queued-only Verifier, and
     /// [`WyrdError::VerificationTargetNotFound`] for any other refused target.
     async fn resolve(
         &self,
         caller: &Caller,
         request: &VerificationRequest,
     ) -> Result<Arc<Target>, WyrdError> {
-        let resolved = self
-            .state
+        let verifier = &request.verifier_card_uid;
+        self.state
             .verification
             .verifier_cards()
-            .resolve(
-                Db::Pool(self.state.postgres.wyrd()),
+            .resolve_direct(
+                self.state.postgres.wyrd(),
                 caller.data_tenant_id,
-                &request.verifier_card_uid,
+                verifier,
                 &request.card_uid,
+                |resolved| match resolved {
+                    Ok(target) => direct_eligibility(verifier, &target.spec).map(|()| target),
+                    Err(EnqueueRefusal::NotReady(VerifierReadiness::BaselineNotReady)) => {
+                        Err(window_refusal(verifier))
+                    }
+                    Err(_) => Err(WyrdError::VerificationTargetNotFound {
+                        message:
+                            "no active Verifier and subject Card with these UIDs in the caller's tenant"
+                                .to_owned(),
+                        details: serde_json::json!({
+                            "verifier_card_uid": request.verifier_card_uid,
+                            "card_uid": request.card_uid,
+                        }),
+                    }),
+                },
             )
             .await
-            .map_err(registry_db_error)?;
-        let target = match resolved {
-            Ok(target) => target,
-            Err(EnqueueRefusal::NotReady(VerifierReadiness::BaselineNotReady)) => {
-                return Err(window_refusal(&request.verifier_card_uid));
-            }
-            Err(_) => {
-                return Err(WyrdError::VerificationTargetNotFound {
-                    message:
-                        "no active Verifier and subject Card with these UIDs in the caller's tenant"
-                            .to_owned(),
-                    details: serde_json::json!({
-                        "verifier_card_uid": request.verifier_card_uid,
-                        "card_uid": request.card_uid,
-                    }),
-                });
-            }
-        };
-        direct_eligibility(&request.verifier_card_uid, &target.spec)?;
-        Ok(target)
+            .map_err(registry_db_error)?
     }
 
     /// The process's hosted Verifier blocks.

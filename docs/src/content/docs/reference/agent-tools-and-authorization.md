@@ -54,7 +54,7 @@ A name is unique within one step attempt: publishing it again in that attempt is
 
 A later step mounts `steps.<id>.publications.<name>` or the whole `steps.<id>.publications` collection, whose `manifest.json` lists each entry's actual path. A step whose named publication is missing fails before its model call. Publications read back through the execution's publication endpoints with their manifests and download plans.
 
-Publications belong to queued executions. A `verify` call whose Verifier declares a step Agent with `publish`, or mounts `steps.<id>.publications`, is refused with `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` before any step runs; submit it instead. A `verify` execution has no invocation or publication history, so those endpoints answer it as not found.
+Publications belong to queued executions. Registration marks a Verifier `queue_only` when one of its step or check Agents, inline or a referenced registered Agent, declares `publish`; the server sets this flag and ignores any value you send. A `verify` call for such a Verifier is refused with `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` before any step runs; submit it instead. A `verify` execution has no invocation or publication history, so those endpoints answer it as not found.
 
 ## Failed tool calls
 

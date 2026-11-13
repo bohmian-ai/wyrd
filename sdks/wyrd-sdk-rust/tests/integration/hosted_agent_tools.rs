@@ -719,7 +719,8 @@ fn selector(attempt: u32, path: Option<&str>) -> PublicationSelector {
 /// typed rule and change nothing; the peeker, a later step, sees none of the
 /// scribe's files and writes its own. These ordinary tools run directly,
 /// while a direct verify of the publishing report pipeline is refused as
-/// queued-only before any step calls the model.
+/// queued-only before any step calls the model, even after a queued run
+/// cached its target.
 ///
 /// # Panics
 /// Panics when the verification is refused, a write, read, refusal, or
@@ -806,9 +807,11 @@ async fn agent_writes_private_workspace_files() {
         "every call is recorded under its dotted built-in name"
     );
 
-    // The first call loads the target cold; the second is served from the
-    // cache and is refused by the same registration-derived flag.
-    for attempt in ["cold", "cached"] {
+    // A settled queued run caches the target for queued work first; neither
+    // direct call may reuse it, so each is refused by the
+    // registration-derived flag on its own cold load.
+    desk.verify("report-pipeline", "FULL-RUN").await;
+    for attempt in ["after queued", "again"] {
         let refused = desk
             .state
             .run()

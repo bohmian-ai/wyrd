@@ -4,9 +4,13 @@
 //! Every Verifier execution first resolves its target: the exact Verifier and
 //! its spec, the exact subject, and the tenant's SYSTEM principal, or the
 //! [`EnqueueRefusal`] that keeps it from running. [`VerifierCardCache::resolve`]
-//! is the only way any path does that. It reads `wyrd.verification_target`,
+//! (queued work) and [`VerifierCardCache::resolve_direct`] are the only ways
+//! any path does that. Both read `wyrd.verification_target`,
 //! whose `wyrd.verifier_readiness` is the one rule deciding whether a Verifier
-//! can run, and caches each resolved target by tenant, Verifier, and subject.
+//! can run, and the cache keeps each resolved target by tenant, Verifier, subject,
+//! and [`Mode`]. A direct entry exists only for a target its caller admitted
+//! on the miss that read it, so a direct hit needs no admission and a queued
+//! entry never answers a direct lookup.
 //! Entries are never shared across tenants and are bounded by total bytes
 //! with least-recently-used eviction, because every Wyrd-owned buffer is
 //! bounded. Refusals are never cached, so a Card registered after one is seen
@@ -48,8 +52,21 @@ pub(crate) const TARGET_CHANNEL: &str = "wyrd_verification_target";
 /// Total bytes of cached targets one process keeps.
 const CACHE_BYTES: usize = 64 * 1024 * 1024;
 
-/// Cache key: tenant, Verifier Card UID, and subject Card UID.
-type TargetKey = (DataTenantId, Uuid, Uuid);
+/// Which execution path a cached target serves.
+///
+/// Part of the cache key, never of the registry read: a direct entry was
+/// admitted for direct execution when it was read, and a queued entry was
+/// not, so neither can satisfy the other's lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Mode {
+    /// `verify`: entries hold only targets admitted for direct execution.
+    Direct,
+    /// Submission acceptance and the queued runner.
+    Queued,
+}
+
+/// Cache key: tenant, Verifier Card UID, subject Card UID, and mode.
+type TargetKey = (DataTenantId, Uuid, Uuid, Mode);
 
 /// The exact Verifier and subject an execution resolved.
 #[derive(Debug)]
@@ -185,13 +202,14 @@ impl VerifierCardCache {
         self.entries.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Resolve `verifier` on `subject` in `tenant`: the one read route of
-    /// every Verifier execution.
+    /// Resolve `verifier` on `subject` in `tenant` for queued work:
+    /// submission acceptance and the runner's claim.
     ///
-    /// A target cached while listening is returned with no IO. Otherwise
-    /// `wyrd.verification_target` reads it from `db` in one statement and
-    /// [`Target::resolved`] applies the database's answer; a resolved target
-    /// is cached unless an invalidation or lost listener raced the read.
+    /// A target cached for queued work while listening is returned with no
+    /// IO. Otherwise `wyrd.verification_target` reads it from `db` in one
+    /// statement and [`Target::resolved`] applies the database's answer; a
+    /// resolved target is cached unless an invalidation or lost listener
+    /// raced the read.
     ///
     /// # Errors
     /// Returns [`SqlError::Connect`] when a [`Db::Pool`] miss cannot get a
@@ -204,11 +222,59 @@ impl VerifierCardCache {
         verifier: &CardUid,
         subject: &CardUid,
     ) -> Result<Result<Arc<Target>, EnqueueRefusal>, SqlError> {
-        let key = (tenant, verifier.as_uuid(), subject.as_uuid());
+        self.load(db, tenant, verifier, subject, Mode::Queued, |resolved| {
+            resolved
+        })
+        .await
+    }
+
+    /// Resolve `verifier` on `subject` in `tenant` for direct verification.
+    ///
+    /// A direct hit is returned with no IO and no admission: it was admitted
+    /// when it was read. A miss reads the target as [`Self::resolve`] does and
+    /// passes the database's answer to `admit`, which returns the target it
+    /// admits for direct execution or the caller's refusal; only an admitted
+    /// target is cached, under [`Mode::Direct`].
+    ///
+    /// # Errors
+    /// Returns [`SqlError::Connect`] when no connection is available and
+    /// [`SqlError::Query`] when the read fails or its readiness does not
+    /// decode. A refusal from `admit` is `Ok(Err(_))`.
+    pub(crate) async fn resolve_direct<E>(
+        &self,
+        postgres: &WyrdPostgres,
+        tenant: DataTenantId,
+        verifier: &CardUid,
+        subject: &CardUid,
+        admit: impl FnOnce(Result<Target, EnqueueRefusal>) -> Result<Target, E>,
+    ) -> Result<Result<Arc<Target>, E>, SqlError> {
+        let db = Db::Pool(postgres);
+        self.load(db, tenant, verifier, subject, Mode::Direct, admit)
+            .await
+    }
+
+    /// The target cached for `mode`, or the one `db` reads and `admit`
+    /// admits, cached under `mode` unless an invalidation or lost listener
+    /// raced the read.
+    ///
+    /// # Errors
+    /// Returns [`SqlError::Connect`] when a [`Db::Pool`] miss cannot get a
+    /// connection and [`SqlError::Query`] when the read fails. A refusal
+    /// from `admit` is `Ok(Err(_))` and is not cached.
+    async fn load<E>(
+        &self,
+        db: Db<'_>,
+        tenant: DataTenantId,
+        verifier: &CardUid,
+        subject: &CardUid,
+        mode: Mode,
+        admit: impl FnOnce(Result<Target, EnqueueRefusal>) -> Result<Target, E>,
+    ) -> Result<Result<Arc<Target>, E>, SqlError> {
+        let key = (tenant, verifier.as_uuid(), subject.as_uuid(), mode);
         if let Some(target) = self.cached(&key) {
             return Ok(Ok(target));
         }
-        tracing::debug!("verification target cache miss");
+        tracing::debug!(?mode, "verification target cache miss");
         let generation = self.fill_generation();
         let read = match db {
             Db::Pool(postgres) => {
@@ -224,7 +290,7 @@ impl VerifierCardCache {
             }
         }
         .map_err(SqlError::Query)?;
-        Ok(Target::resolved(read).map(|target| self.insert(key, generation, target)))
+        Ok(admit(Target::resolved(read)).map(|target| self.insert(key, generation, target)))
     }
 
     /// The target cached for `key`, marked most recently used, served only
@@ -304,7 +370,7 @@ impl VerifierCardCache {
             .targets
             .iter()
             .map(|(key, _)| *key)
-            .filter(|(owner, verifier, subject)| {
+            .filter(|(owner, verifier, subject, _)| {
                 Some(*owner) == tenant
                     && card.is_none_or(|card| *verifier == card || *subject == card)
             })
@@ -360,7 +426,7 @@ mod tests {
     use wyrd_spec::card::verifier::VerifierSpec;
     use wyrd_spec::reference::CardRef;
 
-    use super::{Target, TargetKey, VerifierCardCache};
+    use super::{Mode, Target, TargetKey, VerifierCardCache};
 
     /// A static Card reference of `kind`.
     ///
@@ -395,9 +461,14 @@ mod tests {
         }
     }
 
-    /// A fresh key in `tenant`.
+    /// A fresh queued key in `tenant`.
     fn key(tenant: DataTenantId) -> TargetKey {
-        (tenant, Uuid::now_v7(), Uuid::now_v7())
+        (tenant, Uuid::now_v7(), Uuid::now_v7(), Mode::Queued)
+    }
+
+    /// The direct key of the same tenant, Verifier, and subject as `key`.
+    fn direct(key: TargetKey) -> TargetKey {
+        (key.0, key.1, key.2, Mode::Direct)
     }
 
     /// Caches a target for `key` as one read under the current generation
@@ -424,7 +495,7 @@ mod tests {
         fill(&cache, b);
         assert!(cache.cached(&a).is_some());
         assert!(
-            cache.cached(&(other, a.1, a.2)).is_none(),
+            cache.cached(&(other, a.1, a.2, a.3)).is_none(),
             "never across tenants"
         );
 
@@ -449,6 +520,48 @@ mod tests {
         cache.reset(false);
         cache.reset(true);
         assert!(cache.cached(&a).is_none(), "a lost listener forgets");
+    }
+
+    /// A queued entry never answers a direct lookup, so queued-first
+    /// population cannot skip direct admission; a direct entry stays in its
+    /// tenant, and a Card notification forgets both modes.
+    #[test]
+    fn direct_entries_are_separate_from_queued_and_invalidated_with_them() {
+        let cache = VerifierCardCache::default();
+        cache.reset(true);
+        let (tenant, other) = (DataTenantId::new_v7(), DataTenantId::new_v7());
+        let queued = key(tenant);
+
+        fill(&cache, queued);
+        assert!(cache.cached(&queued).is_some());
+        assert!(
+            cache.cached(&direct(queued)).is_none(),
+            "queued is not admitted"
+        );
+
+        fill(&cache, direct(queued));
+        assert!(cache.cached(&direct(queued)).is_some());
+        let foreign = (other, queued.1, queued.2, Mode::Direct);
+        assert!(cache.cached(&foreign).is_none(), "never across tenants");
+
+        cache.invalidate(&format!("{}|{}", tenant.as_uuid(), queued.1));
+        assert!(cache.cached(&queued).is_none(), "queued entry forgotten");
+        assert!(
+            cache.cached(&direct(queued)).is_none(),
+            "direct entry forgotten"
+        );
+
+        let (queued, foreign) = (key(tenant), (other, queued.1, queued.2, Mode::Direct));
+        for entry in [queued, direct(queued), foreign] {
+            fill(&cache, entry);
+        }
+        cache.invalidate(&format!("{}", tenant.as_uuid()));
+        assert!(cache.cached(&queued).is_none(), "tenant-wide: queued");
+        assert!(
+            cache.cached(&direct(queued)).is_none(),
+            "tenant-wide: direct"
+        );
+        assert!(cache.cached(&foreign).is_some(), "another tenant is kept");
     }
 
     /// The byte ceiling evicts the least recently used target first, and a

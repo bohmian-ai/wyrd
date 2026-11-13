@@ -2276,7 +2276,7 @@ pub enum WyrdError {
         code = "WYRD_VERIFICATION_404_APPROVAL_NOT_FOUND",
         status = 404,
         title = "Verification approval not found",
-        remediation = "Read the execution and decide an approval_id its approvals list as pending."
+        remediation = "Read the execution and decide an approval_id listed in its approvals."
     )]
     VerificationApprovalNotFound {
         /// Human-readable error message.

@@ -50,6 +50,7 @@ Tool names contain dots, which many model providers refuse, so each framework fo
 | `verification.execute` | `verifier:run` on exact Verifier | Verifier, subject, optional `run_id`, and named input declarations → `VerificationResult` | Verify now and store the result; no Operator dispatch |
 | `verification.enqueue` | `verifier:run` on exact Verifier | The `verification.execute` arguments plus optional `idempotency_key` → `{execution_id}` | Queue a verification; poll `verification.get_execution` |
 | `verification.cancel` | `verifier:run` on the execution's Verifier | `{execution_id}` → `{execution_id, status}` | Cancel unfinished queued work; settled work keeps its status |
+| `verification.decide_approval` | `verifier:approve` on the execution's Verifier and `cards:read` on its subject | `{execution_id, approval_id, decision, reason?}` → `{approval_id, status, actor_id, decided_at, reason}` | Approve or reject one pending approval; the same execution continues; the same decision and reason replays |
 
 `cards.list.filter` is a query string, such as `labels.env = "prod" and labels.deprecated not exists`, over `labels.<key>`, `annotations.<key>`, and `attributes.<key>`, with `=`, `in`, `not exists`, `and`, `or`, and `not`; at most 64 predicates. A caller passes `next_cursor` back unchanged with the same filters. Missing and foreign-tenant Cards look the same. `verification.execute` refuses a scheduled drift Verifier.
 

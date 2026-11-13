@@ -2847,6 +2847,136 @@ The SDKs publish the same way: `verify.Evidence().publish("ci", value)` in Pytho
 
 [Bind more Verifiers](/wyrd/build-and-verify/declare/bind-a-verifier/) to the repository's pull requests.
 
+# Approve a pull request
+
+Page: /wyrd/build-and-verify/verify/approve-a-pull-request/
+
+> Add a step that waits for a person, find its pending approval on the pull request's execution, and approve or reject it so the same execution finishes.
+
+Have a pull request's Verifier wait for a person to sign off, then approve it so the same execution finishes with a verdict.
+
+## Before you start
+
+- A repository connected and declared as in [Repositories](/wyrd/build-and-verify/declare/declare-a-repository/).
+- A credential for the approver that holds `verifier:approve` on the Verifier, such as one with the `editor` role.
+
+## 1. Add an approval step
+
+Add a step with `action: {kind: approval, message}`, and a requirement that passes only when it is approved:
+
+```yaml title="signoff.yaml"
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: signoff
+  version: 1.0.0
+spec:
+  description: CI is green and a person signed off on the pull request.
+  inputs:
+    ci: {type: json, deferred: true}
+  steps:
+    - id: signoff
+      action: {kind: approval, message: Ship this change?}
+  requirements:
+    - id: green
+      statement: CI is green
+      check: {kind: assert, path: inputs.ci.status, operator: equals, expected: green}
+    - id: approved
+      statement: A person approved the change
+      check: {kind: assert, path: steps.signoff.output.status, operator: equals, expected: approved}
+
+```
+
+Bind it to the repository's pull requests:
+
+```yaml title="repository.yaml"
+apiVersion: wyrd/v1
+kind: Repository
+metadata:
+  name: web
+spec:
+  repository_id: "2"
+  verified_by:
+    - verifier: ./signoff.yaml
+      runs_on: {kind: pull_request}
+
+```
+
+```bash
+wyrd declare repository.yaml
+```
+
+The `approved` requirement is what makes approval matter: the step alone records a decision but passes nothing.
+
+## 2. Find the pending approval
+
+Open a pull request. Find its execution as in [Watch a pull request run](/wyrd/build-and-verify/declare/declare-a-repository/#5-watch-a-pull-request-run), then inspect it:
+
+```bash
+wyrd execution status --execution-id <execution_id>
+```
+
+It shows `"status": "waiting"` and lists the approval:
+
+```json
+"approvals": [
+  {
+    "approval_id": "…",
+    "step_id": "signoff",
+    "message": "Ship this change?",
+    "status": "pending",
+    "actor_id": null,
+    "decided_at": null,
+    "reason": null
+  }
+]
+```
+
+This Verifier also waits for `ci`, published as in [Publish CI results to a pull request](/wyrd/build-and-verify/verify/publish-deferred-evidence/). Each wait is independent: publishing CI does not decide the approval, and approving does not supply CI.
+
+## 3. Approve it
+
+As the approver:
+
+```bash
+wyrd execution approve --execution-id <execution_id> --approval-id <approval_id> --reason "reviewed the diff"
+```
+
+It prints the receipt once the decision is stored:
+
+```json
+{
+  "approval_id": "…",
+  "status": "approved",
+  "actor_id": "…",
+  "decided_at": "…",
+  "reason": "reviewed the diff"
+}
+```
+
+Inspect the execution again: the same execution continues and ends `completed` with a verdict. Running the same command again prints the same receipt, so a retry is safe.
+
+`wyrd execution reject` takes the same arguments. A rejection is a decision, not an error: the `approved` requirement fails and the verdict is `failed`.
+
+An approval has no deadline of its own. If the execution times out, or a new commit supersedes it, its pending approvals become `expired` and can no longer be decided.
+
+**From code or an agent:**
+
+The SDKs decide on the execution handle: `execution.decide(approval_id, "approved", reason)` in Python, `Execution::decide` in Rust, and `execution.decide(approvalId, "approved", reason)` in TypeScript. Agents use the `verification.decide_approval` [MCP tool](/wyrd/reference/mcp-tools/).
+
+## If it fails
+
+| You see | Fix |
+| --- | --- |
+| `WYRD_PERMISSION_403_DENIED_RBAC` | The approver needs `verifier:approve` on this Verifier and read access to the Card it verifies |
+| `WYRD_VERIFICATION_404_APPROVAL_NOT_FOUND` | Copy the `approval_id` from this execution's `approvals`; each execution has its own |
+| `WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING` | It was already decided, or the execution ended; `details.status` says which. Inspect the execution |
+| `WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE` | The outcome is unknown: run the same command again; a stored decision replays |
+
+## Next
+
+[Bind more Verifiers](/wyrd/build-and-verify/declare/bind-a-verifier/) to the repository's pull requests.
+
 # LLM gateway
 
 Page: /wyrd/connect/set-up-the-llm-gateway/
@@ -4506,10 +4636,12 @@ When to use each kind is in [Steps and checks](/wyrd/understand/how-verification
 | `extract` | `extractor: pull_request` | The pinned source of the pull request the execution was queued for, described below |
 | `agent` | `agent`, `inputs`, `workspace` | The Agent's response, shaped by its Prompt `response_format` |
 | `code` | `runtime` (`python`, default), `entrypoint`, `source`, `inputs` | The function's return value, as JSON |
+| `approval` | `message` | The decision receipt: `{approval_id, status, actor_id, decided_at, reason}`, `status` `approved` or `rejected` |
 
 - `extract` reads `pdf`, `text`, `markdown`, `csv`, `json`, `html`, `docx`, `xlsx`, and `pptx`, choosing the extractor by format.
 - `agent` is a path such as `./reader.yaml` or a CardRef. `inputs` maps each Prompt placeholder to a reference; a placeholder takes text, so a `media` slot goes through `extract` first. `workspace` maps paths under `/inputs/` to a reference such as `inputs.policy`, or to `{artifact: {card: {kind: Artifact, name, version}, path}}`, which mounts one file, a directory, or (without `path`) every file of an uploaded Artifact version, unchanged and pinned with the Verifier. Tools are in [Agent tools and authorization](/wyrd/reference/agent-tools-and-authorization/).
 - `extract` with `extractor: pull_request` takes no `from`. It runs only in an execution queued by a [Repository's](/wyrd/build-and-verify/declare/declare-a-repository/) `pull_request` Trigger, so a Verifier holding it is queued-only: verifying it directly is refused with `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` before any step runs. Its output is JSON with `format`, `pr` (number, title, body, `base`, `head`, `merge_base`), `review` (`mode`, `comparison_base`, `previous` execution, `fallback_reason`, and the whole pull request as `full_pr`), `changes` (the reviewed range), and `context` (related code with its `omissions`). `changes` and `review.full_pr` are each `{base, head, files}`; every entry in `files` is `{path, previous_path, status, before, after, hunks}`, with `status` one of `added`, `modified`, `deleted`, `renamed` or `type_changed`. `before` is `null` for an added file and `after` is `null` for a deleted one; otherwise a side is `{kind: text, blob, text}`, `{kind: binary, blob}`, `{kind: unavailable, blob, limit_bytes}` or `{kind: excluded, blob, reason}`. The first review, or one after a policy change or when the previous head was rewritten or is unavailable, is `full`, naming why in `fallback_reason` (`first_review`, `policy_changed`, `history_rewritten`, `history_unavailable`); later ones review only the commits since the last execution that extracted source. Pass it to an Agent through `inputs` or `workspace`, for example `workspace: {/inputs/pr.json: steps.pr.output}`. Wyrd never checks out the repository. A binary file, a file over 1 MiB, a symlink, a submodule and vendored or generated files are carried by blob id with `kind` `binary`, `unavailable` or `excluded` instead of text; a changed file GitHub cannot serve fails the step, and an empty change is never a pass. `changes.files` is empty when nothing changed since the previous review, so assert on it rather than on `changes`: `check: {kind: assert, path: steps.pr.output.changes.files, operator: is_non_empty}`. Read the output with `GET /v1/verification/executions/{id}/details`, or the MCP tool `verification.get_execution_details`.
+- `approval` waits for a person, as in [Approve a pull request](/wyrd/build-and-verify/verify/approve-a-pull-request/). Each step, fanout item and repeat iteration it reaches is one occurrence with its own `approval_id`, listed in the execution's `approvals` with `step_id`, `item`, `iteration`, `message` and `status` (`pending`, `approved`, `rejected` or `expired`). Steps that do not depend on it keep running; the execution reports `waiting` while an occurrence is pending and continues under the same ID once it is decided. It has no deadline of its own: when the execution ends or times out, an undecided occurrence is `expired` with no actor. Deciding needs `verifier:approve` on the Verifier and read access to its subject. Completing the step proves nothing; require approval explicitly with `check: {kind: assert, path: steps.<id>.output.status, operator: equals, expected: approved}`, which a rejection fails. A Verifier with an approval step is queued-only: `verify` refuses it.
 - `code` calls the function `entrypoint` with `inputs` as keyword arguments. `source` is `{inline: "<python>"}` or `{artifact: {card, path?}}`, where `card` names an Artifact Card.
 
 ## Requirements
@@ -5039,6 +5171,7 @@ Tool names contain dots, which many model providers refuse, so each framework fo
 | `verification.execute` | `verifier:run` on exact Verifier | Verifier, subject, optional `run_id`, and named input declarations → `VerificationResult` | Verify now and store the result; no Operator dispatch |
 | `verification.enqueue` | `verifier:run` on exact Verifier | The `verification.execute` arguments plus optional `idempotency_key` → `{execution_id}` | Queue a verification; poll `verification.get_execution` |
 | `verification.cancel` | `verifier:run` on the execution's Verifier | `{execution_id}` → `{execution_id, status}` | Cancel unfinished queued work; settled work keeps its status |
+| `verification.decide_approval` | `verifier:approve` on the execution's Verifier and `cards:read` on its subject | `{execution_id, approval_id, decision, reason?}` → `{approval_id, status, actor_id, decided_at, reason}` | Approve or reject one pending approval; the same execution continues; the same decision and reason replays |
 
 `cards.list.filter` is a query string, such as `labels.env = "prod" and labels.deprecated not exists`, over `labels.<key>`, `annotations.<key>`, and `attributes.<key>`, with `=`, `in`, `not exists`, `and`, `or`, and `not`; at most 64 predicates. A caller passes `next_cursor` back unchanged with the same filters. Missing and foreign-tenant Cards look the same. `verification.execute` refuses a scheduled drift Verifier.
 
@@ -5672,10 +5805,12 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_VERIFICATION_400_INPUT_INVALID` | 400 | Invalid verification input | Send `{ verifier_card_uid, card_uid, inputs }` where inputs maps each declared Verifier slot to a json, file, artifact, or trace value; run_id and execution_route_overrides are optional. |
 | `WYRD_VERIFICATION_400_INVALID_TARGET` | 400 | Invalid verification run target | Target an existing binding, or an active Verifier Card UID plus an active subject Card UID in this tenant, whose implementation accepts the requested input. |
 | `WYRD_VERIFICATION_400_INVALID_WINDOW` | 400 | Invalid Drift window | Send a UTC half-open drift_window with start before end spanning at most 31 days. |
+| `WYRD_VERIFICATION_404_APPROVAL_NOT_FOUND` | 404 | Verification approval not found | Read the execution and decide an approval_id listed in its approvals. |
 | `WYRD_VERIFICATION_404_BINDING_NOT_FOUND` | 404 | Verification binding not found | Read the owner Card's card.status.verification.binding_ids and retry with one of those binding IDs. |
 | `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND` | 404 | Verification execution not found | Use the execution_id returned by POST /v1/verification/enqueue in the same tenant; a just-accepted execution may take a moment to become visible. |
 | `WYRD_VERIFICATION_404_PUBLICATION_NOT_FOUND` | 404 | Verification publication not found | List GET /v1/verification/executions/`{execution_id}`/publications and select a listed name with its exact producer attempt, item_index, and iteration_index. |
 | `WYRD_VERIFICATION_404_TARGET_NOT_FOUND` | 404 | Verification target not found | Use an active Verifier Card UID and an active subject Card UID declared in the caller's tenant. |
+| `WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING` | 409 | Verification approval not pending | An accepted decision is final and an ended execution takes none: read the execution for the occurrence's status, and decide a pending occurrence of a current execution instead. |
 | `WYRD_VERIFICATION_409_BASELINE_LEGACY` | 409 | Verification baseline legacy | Register a new Verifier version so its baseline is refitted under the current format. |
 | `WYRD_VERIFICATION_409_BASELINE_NOT_READY` | 409 | Verification baseline not ready | Poll the Verifier Card's card.status.verification.baseline until it is ready, then retry. |
 | `WYRD_VERIFICATION_409_EVIDENCE_CONFLICT` | 409 | Verification evidence conflict | Accepted evidence is never replaced: republish the original content to replay its receipt, or publish the new content for a new commit. |

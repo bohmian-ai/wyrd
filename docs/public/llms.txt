@@ -32,6 +32,7 @@ Set up a local server, run one verification, then choose what to build, in this 
 - [Write a Verifier](/wyrd/build-and-verify/verify/author-a-verifier/): Write a Verifier, bind it to your Service, call it from your code, and read its verdict, then add a Python check and a model judge.
 - [Recipes](/wyrd/build-and-verify/verify/verifier-recipes/): Copyable Verifiers for common checks, each with its YAML and the Python that calls it - assertions, traces, Python checks, model judges, multi-step, uploaded files, grouped sessions, and drift.
 - [Publish CI results to a pull request](/wyrd/build-and-verify/verify/publish-deferred-evidence/): Declare a Verifier input that arrives after review starts, watch the pull request's execution wait for it, and publish it from any CI system with wyrd evidence publish.
+- [Approve a pull request](/wyrd/build-and-verify/verify/approve-a-pull-request/): Add a step that waits for a person, find its pending approval on the pull request's execution, and approve or reject it so the same execution finishes.
 
 ## Connect
 

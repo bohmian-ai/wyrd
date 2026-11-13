@@ -168,6 +168,48 @@ impl Deployment {
         deployment
     }
 
+    /// Restart Wyrd over the same Postgres, Bifrost volume, GitHub and model,
+    /// as a crashed process comes back, and sign the editor in again.
+    ///
+    /// # Panics
+    /// Panics when the server does not restart or the editor cannot sign in.
+    async fn restart(self) -> Self {
+        let Self {
+            mock,
+            server,
+            model,
+            ..
+        } = self;
+        let server = Box::pin(
+            server.restart_bound(
+                WyrdTestServer::builder()
+                    .with_github_app_for_test(&mock)
+                    .with_verification_runtime_for_test()
+                    .with_gateway_provider_root_for_test(
+                        model.uri().parse().expect("model URL parses"),
+                    ),
+            ),
+        )
+        .await
+        .expect("server restarts");
+        let Bootstrap::User { jwt, .. } = server
+            .bootstrap_user(
+                "pull-request-editor-again",
+                &["editor", MODEL_ROLE, TOOL_ROLE],
+            )
+            .await
+            .expect("editor bootstraps")
+        else {
+            panic!("user bootstrap returned a non-user principal");
+        };
+        Self {
+            mock,
+            server,
+            model,
+            jwt,
+        }
+    }
+
     /// Declare `cards`, whose `policy.yaml` is the Repository, under
     /// idempotency `key`.
     ///
@@ -972,5 +1014,167 @@ async fn an_agent_consumes_the_live_extraction_while_persistence_is_held() {
             .count(),
         1,
         "settling acquires nothing again"
+    );
+}
+
+/// Recovery reuses the accepted extraction exactly, even once the review
+/// library's context records have expired: the Agent, allowed one retry,
+/// stalls on its first
+/// model call after the extraction's checkpoint is accepted, the library's
+/// contexts expire, Wyrd restarts and the lost claim's lease expires. The
+/// reclaimed execution gives the
+/// Agent the identical Prompt without reading GitHub again, and its
+/// completion records that the source was extracted.
+///
+/// # Panics
+/// Panics when recovery reads GitHub, changes the extraction, or does not
+/// record the extracted source.
+#[tokio::test(flavor = "multi_thread")]
+async fn recovery_reuses_the_accepted_extraction_after_library_contexts_expire() {
+    let retrying = AGENT_REVIEW.replace(
+        "      depends_on: [pr]\n",
+        "      depends_on: [pr]\n      retries: 1\n",
+    );
+    let deployment = Deployment::start(&[
+        ("agent-review.yaml", &retrying),
+        ("reviewer.yaml", REVIEWER),
+        ("policy.yaml", AGENT_POLICY),
+    ])
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(500).set_delay(std::time::Duration::from_secs(600)))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&deployment.model)
+        .await;
+    reads_the_workspace(&deployment.model).await;
+    deployment.head(&sha('a'), &sha('8'), HANDLER_A);
+    deployment.compare(&sha('c'), &sha('a'), &sha('c'), HANDLER_A, PATCH_A);
+    let execution = deployment.admit(&sha('a'), "opened").await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_mins(1);
+    while deployment
+        .model
+        .received_requests()
+        .await
+        .expect("requests are recorded")
+        .is_empty()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the Agent never called its model"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    deployment
+        .server
+        .flush_bifrost()
+        .await
+        .expect("the extraction checkpoint is accepted");
+    let mut conn = deployment
+        .server
+        .tenant_conn_for(deployment.server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let expired = sqlx::query(
+        "UPDATE wyrd.code_review_contexts SET expires_at = published_at + interval '1 microsecond'",
+    )
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("contexts expire");
+    conn.commit().await.expect("expiry commits");
+    assert!(
+        expired.rows_affected() > 0,
+        "the library published a context"
+    );
+    let reads = deployment.mock.repository_reads(REPOSITORY);
+
+    let deployment = deployment.restart().await;
+    let mut conn = deployment
+        .server
+        .tenant_conn_for(deployment.server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let expired = sqlx::query(
+        "UPDATE wyrd.verifier_executions SET lease_expires_at = statement_timestamp()
+          WHERE execution_id = $1 AND status = 'running'",
+    )
+    .bind(execution)
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("the lost lease expires");
+    conn.commit().await.expect("expiry commits");
+    assert_eq!(
+        expired.rows_affected(),
+        1,
+        "the crashed claim was still running"
+    );
+    deployment.settled(execution).await;
+
+    let details = deployment
+        .get(&format!("/v1/verification/executions/{execution}/details"))
+        .await;
+    assert_eq!(details["outcome"]["verdict"], "passed", "{details}");
+    assert_eq!(
+        deployment.mock.repository_reads(REPOSITORY),
+        reads,
+        "recovery reads GitHub no more"
+    );
+    let requests = deployment
+        .model
+        .received_requests()
+        .await
+        .expect("requests are recorded");
+    assert_eq!(
+        requests.len(),
+        3,
+        "the stalled call, then the recovered Agent"
+    );
+    let recovered: Value = serde_json::from_slice(&requests[1].body).expect("JSON");
+    let prompt = recovered["messages"][0]["content"]
+        .as_str()
+        .expect("the Prompt renders to text");
+    for bound in ["lookupUser(id.trim());", &blob(HANDLER_A), &sha('a')] {
+        assert!(
+            prompt.contains(bound),
+            "{bound} in the recovered Prompt: {prompt}"
+        );
+    }
+    let answered: Value = serde_json::from_slice(&requests[2].body).expect("JSON");
+    let read = answered["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .and_then(|message| message["content"].as_str())
+        .expect("the tool result is returned to the model");
+    let read: Value = serde_json::from_str(read).expect("fs.read answers JSON");
+    let mounted: Vec<&str> = read["units"]
+        .as_array()
+        .expect("lines")
+        .iter()
+        .map(|unit| unit["text"].as_str().expect("line text"))
+        .collect();
+    assert_eq!(
+        serde_json::from_str::<Value>(&mounted.join("\n")).expect("the mount is JSON"),
+        deployment.extraction(execution).await,
+        "the recovered workspace mounts the retained extraction"
+    );
+    let mut conn = deployment
+        .server
+        .tenant_conn_for(deployment.server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let extracted: bool = sqlx::query_scalar(
+        "SELECT pr_source_extracted FROM wyrd.verifier_executions WHERE execution_id = $1",
+    )
+    .bind(execution)
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("the execution reads");
+    conn.commit().await.expect("read commits");
+    assert!(
+        extracted,
+        "the recovered completion records the extracted source"
     );
 }

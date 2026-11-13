@@ -447,7 +447,7 @@ Commands, run sequentially on the candidate:
 | Command | Result |
 |---|---|
 | `cargo nextest run -p wyrd-rust-examples --test finance_release --test setup_check -P journey --run-ignored=all` (with test Postgres) | 4 passed |
-| `pytest -m integration test_docsite_quickstart.py test_asgi_integration.py test_local_development.py` | 22 passed, 3 skipped (fixtures needing the installed-CLI env and sibling example repos) |
+| `pytest -m integration test_docsite_quickstart.py test_asgi_integration.py test_local_development.py` | 22 passed, 3 skipped: `test_cli_bootstrap_saved_config` and `test_cli_gateway_agents` run as subprocesses of the passing installed-CLI tests and skip at top level by design; `test_standalone_examples_use_saved_local_setup` needs `wyrd-example-{py,ts,rs}` beside the repo, not checked out here |
 | `vitest run tests/integration/finance-release.test.ts tests/integration/declare-and-pull.test.ts` | 17 passed |
 | `pnpm --dir docs exec vitest run src/lib/readme.test.ts src/lib/indexes.test.ts src/routes/shell-links.test.ts` | 18 passed |
 | `docs:svelte:check`, `docs:check:commands`, `docs:linkcheck`, `docs:build`, `docs:a11y` | pass |
@@ -468,9 +468,11 @@ the code), Gateway on the Agent row only, async capture below. At 390 and 800
 wide the page has no horizontal overflow; the figure scrolls sideways with its
 hint; the strip reflows to one and two columns. Pause freezes both figures,
 Play resumes, and scrolling either offscreen stops its beats. No console
-errors. Not observed directly: reduced motion (code path skips autoplay and
-CSS removes transitions; SSR test proves the static finished state) and
-hidden-tab suspension (`visibilitychange` handler). Asset cost: three source
+errors. Hidden tab (`document.hidden` true plus `visibilitychange`): both
+figures froze for 2.5 s and resumed when visible. Reduced motion (fresh
+document whose `matchMedia` reports `prefers-reduced-motion: reduce`): both
+hydrated without autoplay, showed the finished pass state with Play buttons,
+and Play ran one loop. Asset cost: three source
 files (`FinanceFlow.svelte`, `WorkflowStrip.svelte`, `beat-loop.svelte.ts`),
 inline SVG, no images, fonts or dependencies. Timing is labelled
 illustrative.

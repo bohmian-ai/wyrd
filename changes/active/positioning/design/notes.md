@@ -423,3 +423,15 @@ evaluation, a three-reviewer fanout/fan-in DAG, and session evidence accumulatio
 before verification. [Browser evidence](mockups/workflows/README.md) records
 four columns/dashed rules, 203px desktop diagrams, tablet/mobile reflow, controls,
 reduced motion and offscreen/hidden suspension. The maintainer approved this composition and it is recorded in Task 1.
+
+## Dedicated, cited verification foundations
+
+The maintainer clarified that Task 2 must establish subject expertise through
+a dedicated, tool-independent starting guide, not only documentation about
+Wyrd. Task 2 now explicitly requires foundational comparisons, verification
+under uncertainty, evidence and judgment limits, leakage/drift and skipped-action
+examples, the infrastructure/requirements challenges, and a practical starting
+method with primary citations. See the [research brief](verification-foundations.md).
+The guide must remain useful without adopting Wyrd; product mechanics and
+integration follow through links. This makes REQ-010/011 explicit without
+changing runtime scope or adding a top-level navigation section.

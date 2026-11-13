@@ -52,13 +52,70 @@ remaining runnable tutorial implementations, and Task 4 owns shared discovery
 logic. Keep copyable examples source-backed and tested. Link only to published
 procedures, then close reciprocal tutorial links as Task 3 publishes them.
 
+### Foundational guide: verification beyond a tool
+
+Publish a dedicated starting page under Understand, with a descriptive title
+such as “Foundations of verification”. This is a substantive, cited introduction
+to verification as an engineering discipline, useful to readers who never adopt
+Wyrd. Keep Wyrd APIs, setup and native execution modes in the linked product
+mechanics/category pages. A new top-level navigation section is not required.
+
+The guide must teach:
+
+- Verification, validation, testing, statistical/model evaluation, evaluation of
+  agent trajectories, observability and assurance: their questions, evidence,
+  overlaps and limits. Definitions vary by field; cite the definition used and
+  avoid presenting an arbitrary taxonomy as a universal standard.
+- Formal methods and runtime verification as overlapping approaches, not a
+  deterministic-versus-probabilistic binary. Explain properties, assumptions,
+  abstractions and observed executions, plus the difference between a proof
+  under a model and a judgment supported by finite operational evidence.
+  Formal methods can reason about probabilistic systems; runtime monitors can
+  check formally specified properties. Neither establishes universal correctness.
+- Verification when no single reference answer exists: scope requirements to
+  context, policy, invariants, prohibited actions and acceptable outcome ranges;
+  select evidence and deterministic/statistical/model-assisted checks; account
+  for incomplete or delayed evidence and produce an inconclusive judgment when
+  warranted. Distinguish uncertainty in the system, evidence and judge.
+- Plausible outputs that mask failure. Include traditional ML data leakage
+  (apparently strong scores undermined by split/provenance/time contamination),
+  drift (a changed distribution or relationship requiring investigation, not
+  automatically an incorrect prediction), and an agent giving a plausible answer
+  while skipping a required action. Explain what evidence reveals each failure
+  and what output-only judging cannot establish.
+- The two practical difficulties: reliable low-overhead capture/execution/
+  retention infrastructure, and discovering/maintaining adequate requirements.
+  Explain how agentic tools can assist implementation, requirements elicitation,
+  counterexample generation and contextual judgment, while retaining domain
+  accountability and independent checks. Runtime verification predates LLM
+  agents; “AI made it possible” or “AI solved reliability” is not an established
+  historical or empirical conclusion.
+- A repeatable starting method: identify a consequential decision and its
+  failures; declare scoped requirements; determine adequate evidence; choose and
+  validate checks against known positive/negative/uncertain cases; decide how to
+  respond; retain evidence and revise assumptions as the system changes. Model
+  judges are fallible; self-consistency and another model's agreement are not
+  independent proof. Explain calibration only where actually measured.
+
+Cite primary research and authoritative definitions beside the claims they
+support, with a concise bibliography. Distinguish established results, reported
+experiments, proposals/proofs of concept, philosophical arguments and economic
+models. Include methods/limitations where relevant; do not use a paper about
+LLM reasoning or an economic thesis as proof of generic runtime reliability.
+Provide the publication date/version and source links. Concrete examples and
+an actionable learning path should carry the page, rather than a literature
+list or marketing claims. Link onward to practices, then optionally to Wyrd.
+
+See the [foundations research brief](../design/verification-foundations.md) for
+the maintainer's motivation, supplied references and their intended roles.
+
 ## Approach
 
 1. Extend Task 1's content disposition with a canonical owner and reader
    question for the foundation, each practice and the FAQ. Record this
    educational/practice/FAQ portion of the approved ownership transfer in
    the older docsite packet, preserving its unrelated obligations.
-2. Publish the source-backed foundation, real-time explanation and technical
+2. Publish the dedicated cited foundations guide, real-time explanation and technical
    FAQ as the educational part of the initial release set.
 3. Complete practical guidance for requirements/checks, evidence, evolution
    and production decisions, reusing existing examples and references.
@@ -98,7 +155,7 @@ just because the initial set is ready.
 
 | Obligations | Required observation |
 |---|---|
-| REQ-010; AC-009; INV-001–005 | Foundation and real-time coverage accurately explain adjacent disciplines, native execution/evidence semantics and limits, with tested examples and current authority links. No new product guarantee is invented. |
+| REQ-010; AC-009; INV-001–005 | A dedicated cited foundations page stands alone without Wyrd adoption: it explains uncertain systems, formal/runtime overlap, adjacent disciplines, leakage/drift and plausible-but-invalid behavior, evidence sufficiency and a practical starting method. Separate real-time/product coverage explains native semantics. Research claims are attributed and qualified; copyable code stays tested. No new product guarantee is invented. |
 | REQ-011; AC-010; INV-002–005 | Every required practice has its prevented failure, concrete good/bad examples and limits; evidence completeness, check/model reliability, version evolution and production decisions are covered. |
 | REQ-013; AC-012; INV-002–005 | The technical FAQ directly answers every required topic, links to its canonical owner and avoids unsupported enforcement, hosted or model-quality promises. |
 | REQ-007–008, REQ-014; AC-006–007, AC-013; INV-004–006 | The learning route and content disposition lead to distinct published pages with natural query wording, reciprocal links and no duplicate procedures. This task supplies its query/content mapping to Task 4. |
@@ -154,7 +211,12 @@ mise exec -- git diff --check
 Record content dispositions, primary-source/authority validation, example proof
 references inherited from Task 1 and existing journeys, published routes and
 cross-links. Do not claim existing tests or previous completion records prove
-new instructions. A fresh reader/agent using rendered pages should explain a
+new instructions. A fresh reader/agent using the rendered foundation without Wyrd instructions
+should distinguish a proof from an evidence-supported judgment, explain why a
+plausible output or high ML score is insufficient, identify what leakage/drift
+checks need beyond an answer, and outline a scoped verification workflow.
+Review each material empirical/definition/historical claim against its cited
+source, recording unsupported claims removed or qualified. Then the reader should explain a
 verifiable requirement, distinguish evidence gaps from failure, find the
 relevant practice and reach the actual runnable next step. Record gaps/repairs.
 Task 4 performs final built HTML/query/index integration, and integrated review

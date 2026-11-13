@@ -5,6 +5,7 @@
 //! the queue only learns whether the execution is still open and that it is
 //! due. Expiry is the execution's own deadline, its admission plus the
 //! configured execution timeout, on PostgreSQL's clock.
+// raw-query grep allowlist: verifier execution tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use chrono::Duration;
 use sqlx::Error as SqlxError;

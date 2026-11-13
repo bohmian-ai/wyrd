@@ -49,6 +49,23 @@ impl Deployment {
         .await;
     }
 
+    /// Start a verification runtime over this server, returning the token
+    /// that stops it and its task.
+    ///
+    /// # Panics
+    /// Panics when the runtime does not compose.
+    fn runtime(&self) -> (CancellationToken, tokio::task::JoinHandle<()>) {
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(
+            VerificationRuntime::builder(self.server.state())
+                .limits(limits(Duration::from_mins(5)))
+                .build()
+                .expect("the runtime composes")
+                .run(stop.clone()),
+        );
+        (stop, task)
+    }
+
     /// Decide `approval` of `execution` as the user holding `jwt` and return
     /// the status and JSON answer.
     ///
@@ -440,19 +457,8 @@ async fn an_approval_expires_with_its_execution() {
 async fn a_decision_made_while_stopped_finishes_after_a_restart() {
     let deployment = Deployment::start_with(false).await;
     deployment.signoff().await;
-    let runtime = || {
-        let stop = CancellationToken::new();
-        let task = tokio::spawn(
-            VerificationRuntime::builder(deployment.server.state())
-                .limits(limits(Duration::from_mins(5)))
-                .build()
-                .expect("the runtime composes")
-                .run(stop.clone()),
-        );
-        (stop, task)
-    };
 
-    let (stop, task) = runtime();
+    let (stop, task) = deployment.runtime();
     let waiting = deployment.open(5, H1).await;
     let served = deployment.until(waiting, "waiting").await;
     let approval = occurrence(&served)["approval_id"]
@@ -474,9 +480,61 @@ async fn a_decision_made_while_stopped_finishes_after_a_restart() {
         .await;
     assert_eq!(status, StatusCode::OK, "{receipt}");
 
-    let (stop, task) = runtime();
+    let (stop, task) = deployment.runtime();
     let served = deployment.until(waiting, "completed").await;
     assert_eq!(served["result"]["outcome"]["verdict"], "passed", "{served}");
+    stop.cancel();
+    task.await.expect("the runtime task does not panic");
+}
+
+/// A decision accepted before its head is superseded, but not yet consumed,
+/// never releases the superseded execution.
+///
+/// While no runtime runs, CI reports green and a person approves the parked
+/// execution, so it would pass if it resumed; then a new head supersedes it.
+/// After a restart the approved execution is cancelled, never completed, and
+/// keeps the accepted receipt as its record.
+///
+/// # Panics
+/// Panics when the decision is refused or the superseded execution passes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_decision_racing_supersession_releases_nothing() {
+    let deployment = Deployment::start_with(false).await;
+    deployment.signoff().await;
+
+    let (stop, task) = deployment.runtime();
+    let waiting = deployment.open(6, H2).await;
+    let served = deployment.until(waiting, "waiting").await;
+    let approval = occurrence(&served)["approval_id"]
+        .as_str()
+        .expect("approval id")
+        .to_owned();
+    stop.cancel();
+    task.await.expect("the runtime task does not panic");
+
+    let (status, receipt) = deployment.publish_ci(H2, json!({"status": "green"})).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    let (status, receipt) = deployment
+        .decide(
+            &deployment.jwt,
+            waiting,
+            &approval,
+            &json!({"decision": "approved"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    deployment
+        .mock
+        .edit_pull_request(REPOSITORY, 6, |pr| H3.clone_into(&mut pr.head_sha));
+    assert_eq!(
+        deployment.send(6, "synchronize").await.0,
+        StatusCode::ACCEPTED
+    );
+
+    let (stop, task) = deployment.runtime();
+    let served = deployment.until(waiting, "cancelled").await;
+    assert!(served["result"]["outcome"]["verdict"] != "passed", "{served}");
+    assert_eq!(occurrence(&served)["status"], "approved", "{served}");
     stop.cancel();
     task.await.expect("the runtime task does not panic");
 }

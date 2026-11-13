@@ -1,0 +1,37 @@
+# TASK-008 round 2 security review
+
+Result: **FAIL**. FIND-008-4 is corrected in production source but its explicitly required connected closure proof remains missing. FIND-008-7 is closed. No new security defect is proposed.
+
+Subject: `798b6b0e83595356c0d2328fa541119267e84fb2..cac4a4ce3ba4b6c41d23e81e927f6afbe1de284a`; HEAD checked as the latter. Scope and shared navigation: [scope.md](scope.md). Original task, spec revision 8 REQ-010/015, contracts Human approval, prior verdict/validation/security review and R1 remediation are acceptance context. Governing authority: root AGENTS, `agent_docs/index.md`, maintainer style, errors/Public errors, and security posture accepted execution authority/approval (145–178) and Delegation and federation (447–468). CodeGraph preceded source inspection. Where its ambiguous path queries omitted the named file, targeted source reads supplied the missing body.
+
+## Coverage and acceptance matrix
+
+| Obligation / boundary | Actual source and verification inspected | Result |
+|---|---|---|
+| Verified current actor is receipt actor; authorization stays on effective subject | `service/approvals.rs:107–113` preserves `authorize_subject`; `:160–176` now stamps `caller.attribution().act_principal_id` and stages the same attribution. `Caller::attribution` uses the verified outermost actor, or direct principal (`caller_extractor.rs:100–104`); canonical attribution documents this split (`wyrd-spec/src/auth/attribution.rs:5–19`). | PASS implementation |
+| Exact same actor/decision/reason replay, including concurrent acceptance | Shared `replay` at `service/approvals.rs:222–234` now compares current actor, status and reason. Both retained-decision (`:116–119`) and failed-acceptance race (`:177–189`) use it. Existing wake, authorization and custody remain. | PASS implementation |
+| FIND-008-4 ordinary real exchange, persisted receipt/inspection and actor conflict proof | New `only_the_deciding_actor_replays_a_decision` at `:295–326` calls only `replay`; `person`/`acting` manually construct callers (`:261–285`) with User actors and empty permissions. Receipt is also manually constructed from the expected actor (`:304–310`). It does not call exchange, authentication, decision acceptance, durable custody, or inspection. | FAIL required closure |
+| FIND-008-7 diagnostic redaction and stable typed retryable error | `verification/approvals.rs:226–232` traces `cause = %error`, returns a fixed safe message and table detail under the unchanged `ServiceUnavailable` variant. Read errors at `:88/91/107` all use this owner. Test `an_unavailable_read_hides_its_cause` (`:247–257`) asserts marker absence and table. `wyrd-spec/src/error.rs:3780–3795` preserves 503/code; HTTP mapper `http/error.rs:145–165` builds the body with `as_problem_json`, with no access to the discarded diagnostic. | PASS |
+| Normal authentication, exact approve scope, tenant/subject authority, audit, first-wins custody and direct users | Prior `domain-review-security.md` and `findings-validation.md` cover these unchanged contracts and direct HTTP negative/replay assertions. The changed service still calls the same retained/authorization/custody owners, keeps tenant from Caller and sends no new identity input. | PASS carried forward |
+
+## Proposed finding: SEC-R2-1 — FIND-008-4 lacks its required real delegated acceptance proof
+
+Classification: **MISSING**, continuing FIND-008-4 rather than creating a new issue ID. Location: `crates/wyrd/wyrd-server/src/components/verification/service/approvals.rs:261–326`; R1 remediation `Closure evidence`, FIND-008-4 row.
+
+The production correction uses the authoritative actor in both receipt creation and shared replay. The remaining defect is the required evidence: R1 explicitly requires ordinary token exchange for actor A on behalf of S, receipt **and inspection** naming A, exact A retry, and conflicts for authorized B sharing S and direct S. The unit test manufactures the expected receipt itself and tests only replay. Changing production receipt creation at `:163` back to subject identity would not fail it. Its synthetic User actors do not model the supported Service-actor exchange profile.
+
+The implementation's claimed unreachability is restricted to the existing pull-request fixture. It is not true of the required ordinary approval capability:
+
+1. Spec REQ-015 (`spec.md:272–276`) explicitly includes **manual queued approvals**. Rooting a Service at a Repository is unnecessary.
+2. Public `routes.rs::enqueue:265–283` decodes a generic `VerificationRequest`; `service.rs::enqueue:741–856` authorizes the selected Verifier and `request.card_uid` and hands the ordinary submission to the queue. It imposes no PR or Repository condition.
+3. `VerificationTarget::refusal` (`wyrd-sql/src/queries/verification_target.rs:46–58`) checks readiness and subject presence, without restricting the subject to Repository. The queued route's existing `pg_verification_routes.rs` fixture (`:83–160`) uses a Service as every execution's subject.
+4. `DelegateToken::execute` (`exchange_api_key.rs:277–321`) verifies both tokens and issues the normal narrowed delegated grant; `delegation_chain:372–401` requires a direct Service actor with a selected Service root, not a Repository root. `authorize_subject` (`service.rs:1017–1054`) requires normal Verifier permission and subject Card scope. An approval-only queued Verifier judging the actor's Service root satisfies that scope under ordinary custom/editor grants.
+5. Existing `WyrdTestServer::credential_registered_service`, `bootstrap_service:3275`, `delegate:3796–3814` and generic enqueue fixture provide the necessary owners. `pg_verification_routes::enqueue_admits_only_signed_scope_subjects:714–783` already combines rooted Service credentials, real token exchange, generic enqueue and signed subject scope; use an authorized matching subject rather than its unrelated-root negative case.
+
+Materiality: this is an explicit, previously diagnosed provenance/replay security boundary and an explicitly prescribed connected closure test. A correct isolated comparison is not proof that authenticated attribution survives durable acceptance and inspection. Root AGENTS also says unit tests cannot substitute for the user-facing journey. This does not claim the source fix is wrong or expand authentication requirements.
+
+Smallest correction: retain the two correct production actor uses; add the focused real-exchange acceptance scenario through existing server/identity/approval fixtures using a Service subject and an approval-only queued Verifier. Verify A's durable receipt and inspected actor, exact retry, and typed 409 for another authorized actor B sharing S and direct S. Preserve direct principal and scope refusals. No new credential type, auth bypass, token profile, workflow harness, or product decision is needed. The existing unit test may remain, but cannot replace connected proof. This is bounded test work, not a full language-journey rerun.
+
+## Limits
+
+No Cargo commands, benchmarks or source changes were made by this reviewer; root owns sequential test execution. No unrelated auth or error cleanup is requested. FIND-008-7's local assertion does not itself invoke the public mapper, but source proves that only the safe typed fields can reach it; this is sufficient for the remediation's explicitly permitted local projection proof. Broad runtime/outage qualification remains with the data reviewer and integrated change review.

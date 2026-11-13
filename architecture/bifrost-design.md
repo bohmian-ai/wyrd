@@ -476,6 +476,14 @@ typed columns:
     terminal decision and its result rows; the runner retains that terminal state
     in memory until then. There is no execution-head table, separate finalizer or
     second writer. Existing inputs/results/outputs retain their meanings.
+  - A pull request extraction's output, with its exact pinned source and
+    selected context, is retained as ordinary step output in the queued
+    execution's checkpoint revisions and result rows. Recovery reuses it from
+    the accepted revision without reacquiring from GitHub; the code-review
+    library's cache and context-record lifetime are acquisition aids, never
+    evidence custody. The baseline eligibility it earns
+    (`pr_source_extracted`) is a coordination column written with the lease-
+    fenced completion, not a copy of the evidence.
   - The existing shared Scribe outbox provides bounded batching and stable retry
     identities for revisions flushed in background; engine transitions never wait
     for its acknowledgement.

@@ -1588,7 +1588,7 @@ aggregation are unchanged.
 
 | Action | Does |
 |---|---|
-| `extract` | Reads one `media` slot into the format-discriminated extraction JSON (PDF, PPTX, DOCX, XLSX, CSV, JSON, text/Markdown/HTML). Text and structure only; no OCR or rendering |
+| `extract` | Exactly one of `from` or `extractor`. `from` reads one `media` slot into the format-discriminated extraction JSON (PDF, PPTX, DOCX, XLSX, CSV, JSON, text/Markdown/HTML); text and structure only, no OCR or rendering. `extractor: pull_request` reads the accepted source of the pull request a queued `pull_request` execution was admitted for (see below) |
 | `agent` | Calls an inline, file-authored, or declared Agent with `inputs` matching its Prompt placeholders, optionally over a bounded `workspace` with built-in tools |
 | `code` | Runs sandboxed Python (`runtime: python`) from inline source or an exact Artifact, with a named `entrypoint` and bound `inputs`; returns JSON |
 
@@ -1608,7 +1608,8 @@ appears only in `each`. Step and requirement IDs are unique across the whole
 Verifier and key results, route overrides, and fitted drift state. References
 in actions and `when` create dependencies; declaration rejects cycles,
 unknown references, checks that read another requirement's verdict, and
-fields absent from a known output schema. Independent steps run concurrently;
+fields absent from a known output schema; code and `extractor: pull_request`
+outputs have no client-known schema and resolve at execution. Independent steps run concurrently;
 a step's requirements run before its dependents start.
 
 An Agent workspace source may also name `steps.<id>.publications.<name>` or
@@ -2164,6 +2165,32 @@ destinations are refused at declaration, and a selection matching no file is
 refused before any model call. Only selected files are staged, unparsed;
 each is a citable attachment slot counted with the other inputs. `/work` is
 bounded scratch for that invocation only.
+
+`extract` with `extractor: pull_request` is the one way an Agent reviews
+pull request source. It reads only the queued execution's admitted pins and
+its tenant's GitHub connection; a Verifier holding it is registered
+`queue_only`, and an execution with no accepted pull request source is
+refused before any acquisition. The extractor chooses the review baseline
+from the pull request's execution history: the newest completed execution of
+the same pull request under the exact same Verifier whose source was
+extracted, recorded with its completion and independent of its verdict.
+Without one, or when the pipeline reports that head rewritten or
+unavailable, the review is full with `first_review`, `policy_changed`,
+`history_rewritten` or `history_unavailable`. It calls the code-review
+pipeline once for pinned evidence; Wyrd never clones, indexes or ranks the
+repository. The output is ordinary step output whose shape the server owns:
+`format`, the pinned `pr`, `review` (mode, `comparison_base`, `previous`
+execution, `fallback_reason`, and the whole pull request as `full_pr`), the
+active `changes` with exact before/after source or binary, unavailable or
+excluded identity, and the library's selected `context` with its omissions,
+budget and coverage, unchanged. Agents receive it only through declared
+`inputs` and `workspace` JSON mounts; it is not a source checkout or implicit
+input to other Agents. Dependents consume the live value without waiting for
+persistence; only extraction held in an accepted revision is reused on
+recovery, so the library's context lifetime never invalidates retained
+evidence. An empty active change is evidence, never a pass, and missing
+source, omissions and model input limits fail honestly through existing
+step, requirement and model limits.
 
 `AgentSpec.tool_names` selects server-owned built-ins: `cards.list`,
 `cards.get`, `bifrost.list_tables`,

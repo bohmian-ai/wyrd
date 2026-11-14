@@ -8,7 +8,7 @@
 //! webhook delivery log and redelivery. Each request goes through the deployment's [`ScreenedHttp`] with
 //! a bounded body, and no token or key is logged or returned in an error.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bohmian_code_review_pipeline::{
     BoxFuture, GitHubClient, GitHubHost, HttpBody, HttpRequest, HttpResponse, HttpTransport,
@@ -17,8 +17,8 @@ use bohmian_code_review_pipeline::{
 use jsonwebtoken::{Algorithm, Header};
 use reqwest::{Method, RequestBuilder, StatusCode};
 use secrecy::{ExposeSecret, SecretString};
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use url::Url;
 use wyrd_auth_oidc::{ScreenedHttp, read_bounded_body};
 use wyrd_spec::error::WyrdError;
@@ -142,6 +142,51 @@ struct AppClaims {
     exp: u64,
     /// The App id.
     iss: String,
+}
+
+/// Why a delivery request to GitHub did not succeed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeliveryFailure {
+    /// GitHub rate-limited the token; try again after this long.
+    Cooldown(Duration),
+    /// GitHub could not be reached, failed, or answered unreadably; a
+    /// write may still have landed.
+    Unavailable,
+    /// GitHub refused the request with this client error status; repeating
+    /// it cannot succeed.
+    Refused(u16),
+}
+
+/// A created or updated resource, as far as delivery reads it.
+#[derive(Deserialize)]
+struct Created {
+    /// Its id.
+    id: u64,
+}
+
+/// One page of `GET .../commits/{sha}/check-runs`.
+#[derive(Deserialize)]
+struct CheckRunsPage {
+    /// The page's Check runs.
+    check_runs: Vec<FoundCheckRun>,
+}
+
+/// A Check run as delivery looks it up.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct FoundCheckRun {
+    /// Its id.
+    pub(crate) id: u64,
+    /// The execution it reports, when set.
+    pub(crate) external_id: Option<String>,
+    /// `queued`, `in_progress` or `completed`.
+    pub(crate) status: String,
+}
+
+/// A pull request review as delivery looks it up.
+#[derive(Deserialize)]
+struct FoundReview {
+    /// Its body; null for a review without one.
+    body: Option<String>,
 }
 
 /// The refusal for a GitHub failure Wyrd cannot attribute to the caller.
@@ -643,6 +688,197 @@ impl GithubApp {
             return Err(unavailable("the redelivery request"));
         }
         Ok(())
+    }
+
+    /// The Check runs named `name` on commit `head` of repository
+    /// `repository_id`, read with installation `token`, every page.
+    ///
+    /// # Errors
+    /// Returns the [`DeliveryFailure`] of an unsuccessful read.
+    pub(crate) async fn check_runs(
+        &self,
+        token: &SecretString,
+        repository_id: u64,
+        head: &str,
+        name: &str,
+    ) -> Result<Vec<FoundCheckRun>, DeliveryFailure> {
+        let mut url = self.api(&format!(
+            "/repositories/{repository_id}/commits/{head}/check-runs"
+        ));
+        url.query_pairs_mut()
+            .append_pair("check_name", name)
+            .append_pair("filter", "all");
+        let pages: Vec<CheckRunsPage> = self.pages(token, url).await?;
+        Ok(pages.into_iter().flat_map(|page| page.check_runs).collect())
+    }
+
+    /// Create a Check run on repository `repository_id`, answering its id.
+    ///
+    /// # Errors
+    /// Returns the [`DeliveryFailure`] of an unsuccessful write; an
+    /// [`DeliveryFailure::Unavailable`] write may still have landed.
+    pub(crate) async fn create_check_run(
+        &self,
+        token: &SecretString,
+        repository_id: u64,
+        body: &impl Serialize,
+    ) -> Result<u64, DeliveryFailure> {
+        let url = self.api(&format!("/repositories/{repository_id}/check-runs"));
+        let created: Created = self.write(token, Method::POST, &url, body).await?;
+        Ok(created.id)
+    }
+
+    /// Update Check run `id` of repository `repository_id` in place.
+    ///
+    /// # Errors
+    /// Returns the [`DeliveryFailure`] of an unsuccessful write.
+    pub(crate) async fn update_check_run(
+        &self,
+        token: &SecretString,
+        repository_id: u64,
+        id: u64,
+        body: &impl Serialize,
+    ) -> Result<(), DeliveryFailure> {
+        let url = self.api(&format!("/repositories/{repository_id}/check-runs/{id}"));
+        let _: Created = self.write(token, Method::PATCH, &url, body).await?;
+        Ok(())
+    }
+
+    /// The bodies of every review on pull request `number` of repository
+    /// `repository_id`, every page.
+    ///
+    /// # Errors
+    /// Returns the [`DeliveryFailure`] of an unsuccessful read.
+    pub(crate) async fn review_bodies(
+        &self,
+        token: &SecretString,
+        repository_id: u64,
+        number: u64,
+    ) -> Result<Vec<String>, DeliveryFailure> {
+        let url = self.api(&format!(
+            "/repositories/{repository_id}/pulls/{number}/reviews"
+        ));
+        let pages: Vec<Vec<FoundReview>> = self.pages(token, url).await?;
+        Ok(pages
+            .into_iter()
+            .flatten()
+            .filter_map(|review| review.body)
+            .collect())
+    }
+
+    /// Create a review on pull request `number` of repository
+    /// `repository_id`.
+    ///
+    /// # Errors
+    /// Returns the [`DeliveryFailure`] of an unsuccessful write; an
+    /// [`DeliveryFailure::Unavailable`] write may still have landed.
+    pub(crate) async fn create_review(
+        &self,
+        token: &SecretString,
+        repository_id: u64,
+        number: u64,
+        body: &impl Serialize,
+    ) -> Result<(), DeliveryFailure> {
+        let url = self.api(&format!(
+            "/repositories/{repository_id}/pulls/{number}/reviews"
+        ));
+        let _: Created = self.write(token, Method::POST, &url, body).await?;
+        Ok(())
+    }
+
+    /// Every page of the installation listing at `url`, up to
+    /// [`MAX_PAGES`], following GitHub's `Link` header.
+    ///
+    /// # Errors
+    /// Returns the [`DeliveryFailure`] of the first unsuccessful page.
+    async fn pages<T: DeserializeOwned>(
+        &self,
+        token: &SecretString,
+        mut url: Url,
+    ) -> Result<Vec<T>, DeliveryFailure> {
+        url.query_pairs_mut()
+            .append_pair("per_page", &PAGE_SIZE.to_string());
+        let mut pages = Vec::new();
+        for _ in 0..MAX_PAGES {
+            let response = self
+                .request(Method::GET, &url)
+                .await
+                .map_err(|_| DeliveryFailure::Unavailable)?
+                .bearer_auth(token.expose_secret())
+                .send()
+                .await
+                .map_err(|_| DeliveryFailure::Unavailable)?;
+            let next = Self::next_page(response.headers());
+            pages.push(Self::answer(response).await?);
+            let Some(next) = next.filter(|next| self.same_api(next)) else {
+                break;
+            };
+            url = next;
+        }
+        Ok(pages)
+    }
+
+    /// Send one installation write of `body` to `url`.
+    ///
+    /// # Errors
+    /// Returns the [`DeliveryFailure`] of an unsuccessful write.
+    async fn write<T: DeserializeOwned>(
+        &self,
+        token: &SecretString,
+        method: Method,
+        url: &Url,
+        body: &impl Serialize,
+    ) -> Result<T, DeliveryFailure> {
+        let response = self
+            .request(method, url)
+            .await
+            .map_err(|_| DeliveryFailure::Unavailable)?
+            .bearer_auth(token.expose_secret())
+            .json(body)
+            .send()
+            .await
+            .map_err(|_| DeliveryFailure::Unavailable)?;
+        Self::answer(response).await
+    }
+
+    /// Decode a successful delivery answer or classify its failure: a
+    /// rate limit is a cooldown for its `Retry-After` (else one minute), a
+    /// server error or an undecodable body is unavailable, and any other
+    /// client error is a refusal.
+    ///
+    /// # Errors
+    /// Returns the classified [`DeliveryFailure`].
+    async fn answer<T: DeserializeOwned>(
+        response: reqwest::Response,
+    ) -> Result<T, DeliveryFailure> {
+        let status = response.status();
+        let limited = status == StatusCode::TOO_MANY_REQUESTS
+            || (status == StatusCode::FORBIDDEN
+                && (response
+                    .headers()
+                    .contains_key(reqwest::header::RETRY_AFTER)
+                    || response
+                        .headers()
+                        .get("x-ratelimit-remaining")
+                        .is_some_and(|remaining| remaining == "0")));
+        if limited {
+            let seconds = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()?.parse().ok())
+                .unwrap_or(60);
+            return Err(DeliveryFailure::Cooldown(Duration::from_secs(seconds)));
+        }
+        if status.is_server_error() {
+            return Err(DeliveryFailure::Unavailable);
+        }
+        if !status.is_success() {
+            return Err(DeliveryFailure::Refused(status.as_u16()));
+        }
+        let body = read_bounded_body(response)
+            .await
+            .map_err(|_| DeliveryFailure::Unavailable)?;
+        serde_json::from_slice(&body).map_err(|_| DeliveryFailure::Unavailable)
     }
 
     /// The `rel="next"` target of a response's `Link` header.

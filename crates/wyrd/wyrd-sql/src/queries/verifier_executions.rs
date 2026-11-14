@@ -3272,6 +3272,7 @@ impl VerifierExecutionQueue {
                     pull_request: row.pull_request.map(|Json(pull_request)| pull_request),
                     waiting: std::collections::BTreeSet::new(),
                     approvals: Vec::new(),
+                    github_delivery: None,
                 },
                 attribution: Attribution::new(
                     PrincipalId::new(row.sub_principal_id),

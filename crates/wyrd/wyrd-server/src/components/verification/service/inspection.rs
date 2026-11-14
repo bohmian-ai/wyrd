@@ -31,14 +31,16 @@ use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::verification::execution::{
     ApprovalOccurrenceState, ApprovalReceipt, ApprovalStatus, CancelExecutionResponse,
     EXECUTION_PAGE_DEFAULT, EXECUTION_PAGE_MAX, ExecutionInvocation, ExecutionPageQuery,
-    HistoryProjection, InvocationPage, InvocationProgress, InvocationSettlement, Publication,
-    PublicationContent, PublicationFile, PublicationPage, PublicationSelector, PublicationSummary,
-    Speculation,
+    HistoryProjection, InvocationPage, InvocationProgress, InvocationSettlement, OutcomeDetails,
+    Publication, PublicationContent, PublicationFile, PublicationPage, PublicationSelector,
+    PublicationSummary, PullRequestActivation, Speculation, StepResult,
 };
 use wyrd_spec::verification::state::{
     AcceptedPublication, ExecutionIdentity, ExecutionState, InvocationRecord, RecordedApproval,
 };
-use wyrd_spec::verification::{PublicationName, TaskId, VerificationExecutionStatus};
+use wyrd_spec::verification::{
+    PublicationName, TaskId, VerificationExecutionStatus, VerificationVerdict,
+};
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::cards::get_card_by_uid;
 use wyrd_sql::queries::verifier_executions::ExecutionStatus;
@@ -348,6 +350,24 @@ impl Retained {
     }
 }
 
+/// One queued `pull_request` execution as GitHub delivery presents it.
+pub(crate) struct Presented {
+    /// The PR source it was admitted for.
+    pub(crate) activation: PullRequestActivation,
+    /// Its accepted revision; 0 before any.
+    pub(crate) revision: i64,
+    /// Its status, as inspection reports it.
+    pub(crate) status: VerificationExecutionStatus,
+    /// What a `waiting` execution waits for, one line each; empty otherwise.
+    pub(crate) waiting: String,
+    /// A completed execution's verdict and final step results.
+    pub(crate) outcome: Option<(VerificationVerdict, Vec<StepResult>)>,
+    /// Its queue row.
+    pub(crate) queued: ExecutionStatus,
+    /// The record reader it was read through.
+    pub(crate) query: crate::query::scheduled::ScheduledQueryCaller,
+}
+
 /// The not-found refusal of an execution the caller's tenant does not hold.
 pub(super) fn execution_not_found(execution_id: ExecutionId) -> WyrdError {
     WyrdError::VerificationExecutionNotFound {
@@ -467,7 +487,9 @@ impl<'a> VerificationControl<'a> {
             .execution_status(&mut conn, execution_id)
             .await
             .map_err(registry_db_error)?;
-        let query = self.records(&mut conn, caller).await?;
+        let query = self
+            .records(&mut conn, caller.data_tenant_id, Some(caller))
+            .await?;
         conn.commit().await.map_err(registry_db_error)?;
         let (revision, state) = RunState::accepted(
             self.state,
@@ -542,6 +564,101 @@ impl<'a> VerificationControl<'a> {
             direct,
             decisions,
         })
+    }
+
+    /// What GitHub delivery presents of `tenant`'s queued `pull_request`
+    /// execution `execution_id`, read as [`Self::retained`] reads it but as
+    /// the tenant's SYSTEM principal serving no caller, with no
+    /// authorization: delivery is server work on the execution's own
+    /// accepted state. `None` when the execution has no queue row or is not
+    /// a `pull_request` execution.
+    ///
+    /// A completed execution also carries its selected result's verdict and
+    /// final step results, read from its retained records, never recomputed.
+    ///
+    /// # Errors
+    /// Returns a registry error when a read fails, and
+    /// `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` when the accepted state,
+    /// an accepted decision, or the selected result cannot be read now.
+    pub(crate) async fn presented(
+        &self,
+        tenant: wyrd_spec::DataTenantId,
+        execution_id: ExecutionId,
+    ) -> Result<Option<Presented>, WyrdError> {
+        let mut conn = self.state.registry_tenant_conn(tenant).await?;
+        let queued = self
+            .queue
+            .execution_status(&mut conn, execution_id)
+            .await
+            .map_err(registry_db_error)?;
+        let Some(activation) = queued
+            .as_ref()
+            .and_then(|queued| queued.state.pull_request.clone())
+        else {
+            return Ok(None);
+        };
+        let query = self.records(&mut conn, tenant, None).await?;
+        conn.commit().await.map_err(registry_db_error)?;
+        let records = InputResolver::new(&query, None);
+        let (revision, state) =
+            RunState::accepted(self.state, tenant, execution_id, &records).await?;
+        let approvals: Vec<ApprovalId> = state
+            .approvals
+            .iter()
+            .map(|recorded| recorded.approval_id)
+            .collect();
+        let decisions = ApprovalDecisions::new(self.state, tenant)
+            .decided(&records, execution_id, &approvals)
+            .await?;
+        let retained = Retained {
+            queued,
+            revision,
+            state,
+            query,
+            direct: None,
+            decisions,
+        };
+        let status = retained.status();
+        let waiting = retained
+            .waiting()
+            .iter()
+            .map(|slot| format!("Waiting for evidence `{slot}`.\n"))
+            .chain(
+                retained
+                    .approvals()
+                    .into_iter()
+                    .filter(|approval| approval.status == ApprovalStatus::Pending)
+                    .map(|approval| {
+                        format!(
+                            "Waiting for approval of step `{}`: {}\n",
+                            approval.step_id.as_str(),
+                            approval.message
+                        )
+                    }),
+            )
+            .collect();
+        let mut outcome = None;
+        if status == VerificationExecutionStatus::Completed
+            && let Some(result_id) = retained.result_id()
+        {
+            let (_, details) = InputResolver::new(&retained.query, None)
+                .result::<OutcomeDetails>(result_id)
+                .await?
+                .ok_or(BifrostError::QueryVisibilityUnavailable)?;
+            outcome = Some((details.verdict, details.steps));
+        }
+        let Some(queued) = retained.queued else {
+            return Ok(None);
+        };
+        Ok(Some(Presented {
+            activation,
+            revision: retained.revision,
+            status,
+            waiting,
+            outcome,
+            queued,
+            query: retained.query,
+        }))
     }
 
     /// The result and exact identity of direct execution `execution_id`

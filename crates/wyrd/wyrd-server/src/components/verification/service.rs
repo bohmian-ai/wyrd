@@ -19,6 +19,7 @@ use wyrd_runtime::outbox::{OutboxFull, Reservation};
 use wyrd_runtime::permission::{Action, Resource};
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_runtime::{AcceptedAuthority, Permission};
+use wyrd_spec::DataTenantId;
 use wyrd_spec::card::verifier::VerifierSpec;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, IdempotencyKey};
@@ -27,8 +28,8 @@ use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::vala::ids::{SpanId, TraceId};
 use wyrd_spec::verification::execution::{
     EnqueueVerificationResponse, EvidencePlanRequest, EvidencePlanResponse, EvidenceUpload,
-    ExecutedOutcome, OutcomeDetails, VerificationDetails, VerificationExecutionState,
-    VerificationRequest, VerificationResult,
+    ExecutedOutcome, GithubDelivery, GithubDeliveryStatus, OutcomeDetails, VerificationDetails,
+    VerificationExecutionState, VerificationRequest, VerificationResult,
 };
 use wyrd_spec::verification::{
     VerificationBindingStatus, VerificationExecutionStatus, VerifierReadiness,
@@ -42,6 +43,7 @@ use wyrd_sql::queries::verifier_executions::{
 use crate::audit;
 use crate::components::auth::Caller;
 use crate::components::gateway::GatewayCallContext;
+use crate::components::github::delivery::GithubDeliveries;
 use crate::components::storage::inventory::ObjectInventory;
 use crate::components::storage::routes::storage_caller;
 use crate::http::error::permission_deny_reason_to_wyrd;
@@ -63,6 +65,8 @@ use crate::verification::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
 mod approvals;
 mod evidence;
 mod inspection;
+
+pub(crate) use inspection::Presented;
 
 /// Audit operation of a binding status read.
 const GET_BINDING: &str = "verification.binding.read";
@@ -288,11 +292,22 @@ impl<'a> VerificationControl<'a> {
                 pull_request: None,
                 waiting: std::collections::BTreeSet::new(),
                 approvals: Vec::new(),
+                github_delivery: None,
             },
         };
         state.status = retained.status();
         state.waiting = retained.waiting();
         state.approvals = retained.approvals();
+        if state.pull_request.is_some() {
+            let recorded = GithubDeliveries::new(self.state, caller.data_tenant_id)
+                .recorded(&records, execution_id, retained.revision)
+                .await?;
+            state.github_delivery = Some(recorded.unwrap_or(GithubDelivery {
+                status: GithubDeliveryStatus::Pending,
+                reason: None,
+                problems: Vec::new(),
+            }));
+        }
         if let Some(failure) = &retained.state.failure {
             state.error = Some(failure.error.clone());
         }
@@ -1077,11 +1092,10 @@ impl<'a> VerificationControl<'a> {
         }
     }
 
-    /// The record reader of an execution read: the tenant's SYSTEM
-    /// principal granted only `bifrost.verification.execution_inputs`,
-    /// `results`, `execution_outputs`, `execution_events`, `evidence`, and
-    /// `approvals`,
-    /// serving `caller`.
+    /// The record reader of an execution read: `tenant`'s SYSTEM principal
+    /// granted only `bifrost.verification.execution_inputs`, `results`,
+    /// `execution_outputs`, `execution_events`, `evidence`, and `approvals`,
+    /// serving `caller` when one reads, or no one for background delivery.
     ///
     /// # Errors
     /// Returns a registry error when the SYSTEM principal cannot be read, and
@@ -1090,7 +1104,8 @@ impl<'a> VerificationControl<'a> {
     pub(super) async fn records(
         &self,
         conn: &mut TenantConn<'_>,
-        caller: &Caller,
+        tenant: DataTenantId,
+        caller: Option<&Caller>,
     ) -> Result<ScheduledQueryCaller, WyrdError> {
         let system = system_principal_id(conn)
             .await
@@ -1105,16 +1120,18 @@ impl<'a> VerificationControl<'a> {
             "approvals",
         ]
         .map(|name| TableRef::new(BifrostNamespace::Verification, name));
-        let read = SystemReadAuthority::resolve(self.state, caller.data_tenant_id, system, &tables)
+        let mut read = SystemReadAuthority::resolve(self.state, tenant, system, &tables)
             .await
             .map_err(|error| {
                 tracing::warn!(%error, "the execution record reader is unavailable");
                 WyrdError::from(BifrostError::QueryVisibilityUnavailable)
-            })?
-            .serving(&AcceptedAuthority::new(
+            })?;
+        if let Some(caller) = caller {
+            read = read.serving(&AcceptedAuthority::new(
                 &caller.principal,
                 &caller.delegation_chain,
             ));
+        }
         Ok(ScheduledQueryCaller::new(
             self.state.clone(),
             read.into_context(),

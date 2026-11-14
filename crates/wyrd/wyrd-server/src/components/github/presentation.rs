@@ -7,12 +7,15 @@
 //! Every report anchor is checked against that retained source: an anchor
 //! inside the PR diff becomes an inline comment, an anchor outside it stays
 //! in the Check summary, and an anchor the source does not hold is a
-//! [`Problem`] shown in the summary, never moved to another line. Severity
+//! [`AnchorProblem`] shown in the summary, never moved to another line. Severity
 //! and confidence are shown with each finding and never decide the Check
 //! conclusion, which follows the verdict alone.
 
+use std::fmt::Write as _;
+
 use serde::Serialize;
 use wyrd_spec::ids::ExecutionId;
+use wyrd_spec::verification::execution::{AnchorProblem, AnchorProblemReason};
 use wyrd_spec::verification::report::{
     CodeReviewReport, Finding, ReportSelection, ReportSource, SourceAnchor,
 };
@@ -89,16 +92,6 @@ pub(crate) struct ReviewComment {
     pub(crate) body: String,
 }
 
-/// A finding anchor the retained source does not hold.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct Problem {
-    /// The finding.
-    pub(crate) finding: String,
-    /// `anchor_commit_mismatch`, `anchor_path_unknown`,
-    /// `anchor_source_unavailable` or `anchor_out_of_range`.
-    pub(crate) reason: &'static str,
-}
-
 /// What one execution shows on GitHub.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Presentation {
@@ -108,7 +101,7 @@ pub(crate) struct Presentation {
     /// least one inline comment.
     pub(crate) review: Option<Review>,
     /// Anchors refused because the retained source does not hold them.
-    pub(crate) problems: Vec<Problem>,
+    pub(crate) problems: Vec<AnchorProblem>,
 }
 
 /// One execution's state as delivery presents it.
@@ -128,12 +121,22 @@ impl Settled {
         match (self.status, self.verdict) {
             (Status::Completed, Some(VerificationVerdict::Passed)) => Some("success"),
             (Status::Completed, Some(VerificationVerdict::Inconclusive)) => Some("action_required"),
-            (Status::Completed, _) | (Status::Errored, _) => Some("failure"),
+            (Status::Completed | Status::Errored, _) => Some("failure"),
             (Status::Cancelled, _) => Some("cancelled"),
             (Status::TimedOut, _) => Some("timed_out"),
             (Status::Pending | Status::Running | Status::Retrying | Status::Waiting, _) => None,
         }
     }
+}
+
+/// A completed execution's report selection and the extraction that pinned
+/// the source it reviewed.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Completed<'a> {
+    /// The report its accepted outputs hold.
+    pub(crate) selection: &'a ReportSelection,
+    /// The extraction among its step results.
+    pub(crate) extraction: &'a PullRequestExtraction,
 }
 
 /// Where a valid anchor lands.
@@ -145,9 +148,9 @@ enum Placement {
 }
 
 impl Presentation {
-    /// Render execution `execution_id` of the binding named `name` in
-    /// state `settled`, with the report `selection` its accepted outputs
-    /// hold and the `extraction` that pinned its source.
+    /// Render execution `execution_id` of the binding named `name`, which
+    /// reviews commit `head`, in state `settled`; `completed` is present once
+    /// it completed.
     ///
     /// A waiting execution's Check is `in_progress` and explains `waiting`.
     /// Only a completed execution renders its report.
@@ -155,12 +158,12 @@ impl Presentation {
     pub(crate) fn render(
         name: &str,
         execution_id: ExecutionId,
+        head: &str,
         settled: Settled,
         waiting: &str,
-        selection: &ReportSelection,
-        extraction: &PullRequestExtraction,
+        completed: Option<Completed<'_>>,
     ) -> Self {
-        let head = extraction.pr.head.sha.clone();
+        let head = head.to_owned();
         let conclusion = settled.conclusion();
         let mut summary = String::new();
         let mut comments = Vec::new();
@@ -174,7 +177,12 @@ impl Presentation {
             (Some(_), Some(verdict)) => format!("Verdict: {verdict}"),
             (Some(_), None) => format!("Execution {}", label(&settled.status)),
         };
-        if conclusion.is_some() && settled.status == VerificationExecutionStatus::Completed {
+        if let Some(Completed {
+            selection,
+            extraction,
+        }) = completed.filter(|_| {
+            conclusion.is_some() && settled.status == VerificationExecutionStatus::Completed
+        }) {
             Self::report(
                 selection,
                 extraction,
@@ -219,26 +227,28 @@ impl Presentation {
         extraction: &PullRequestExtraction,
         summary: &mut String,
         comments: &mut Vec<ReviewComment>,
-        problems: &mut Vec<Problem>,
+        problems: &mut Vec<AnchorProblem>,
     ) {
         let report = match selection {
             ReportSelection::None => return,
             ReportSelection::Ambiguous { sources } => {
                 let names: Vec<String> = sources.iter().map(source_name).collect();
-                summary.push_str(&format!(
+                let _ = writeln!(
+                    summary,
                     "**Report not shown:** more than one step returned a `code_review` \
-                     report ({}).\n",
+                     report ({}).",
                     names.join(", ")
-                ));
+                );
                 return;
             }
             ReportSelection::Invalid { source, problem } => {
-                summary.push_str(&format!(
+                let _ = writeln!(
+                    summary,
                     "**Report not shown:** the `code_review` report of {} is unusable \
-                     (`{}`).\n",
+                     (`{}`).",
                     source_name(source),
                     problem.reason()
-                ));
+                );
                 return;
             }
             ReportSelection::One { report, .. } => report,
@@ -248,7 +258,7 @@ impl Presentation {
         if !report.coverage.complete {
             summary.push_str("\n**Coverage incomplete.**\n");
             for limitation in &report.coverage.limitations {
-                summary.push_str(&format!("- {limitation}\n"));
+                let _ = writeln!(summary, "- {limitation}");
             }
         }
         render_findings(report, extraction, summary, comments, problems);
@@ -262,7 +272,7 @@ fn render_findings(
     extraction: &PullRequestExtraction,
     summary: &mut String,
     comments: &mut Vec<ReviewComment>,
-    problems: &mut Vec<Problem>,
+    problems: &mut Vec<AnchorProblem>,
 ) {
     if report.findings.is_empty() {
         return;
@@ -273,14 +283,16 @@ fn render_findings(
             .anchors()
             .find_map(|anchor| place(anchor, extraction).err());
         if let Some(reason) = refused {
-            problems.push(Problem {
+            problems.push(AnchorProblem {
                 finding: finding.id.clone(),
                 reason,
             });
-            summary.push_str(&format!(
-                "- {} — not shown inline: `{reason}`\n",
-                heading(finding)
-            ));
+            let _ = writeln!(
+                summary,
+                "- {} — not shown inline: `{}`",
+                heading(finding),
+                reason.as_str()
+            );
             continue;
         }
         let edit = finding
@@ -292,24 +304,22 @@ fn render_findings(
             .or_else(|| finding.locations.first());
         let inline =
             anchor.filter(|anchor| matches!(place(anchor, extraction), Ok(Placement::Inline)));
-        match inline {
-            Some(anchor) => {
-                summary.push_str(&format!("- {} — {}\n", heading(finding), at(anchor)));
-                comments.push(comment(
-                    finding,
-                    anchor,
-                    edit.filter(|edit| &edit.location == anchor)
-                        .map(|edit| edit.replacement.as_str()),
-                ));
-            }
-            None => {
-                let place = anchor.map_or_else(String::new, |anchor| format!(" — {}", at(anchor)));
-                summary.push_str(&format!(
-                    "- {}{place}\n  {}\n",
-                    heading(finding),
-                    finding.explanation
-                ));
-            }
+        if let Some(anchor) = inline {
+            let _ = writeln!(summary, "- {} — {}", heading(finding), at(anchor));
+            comments.push(comment(
+                finding,
+                anchor,
+                edit.filter(|edit| &edit.location == anchor)
+                    .map(|edit| edit.replacement.as_str()),
+            ));
+        } else {
+            let place = anchor.map_or_else(String::new, |anchor| format!(" — {}", at(anchor)));
+            let _ = writeln!(
+                summary,
+                "- {}{place}\n  {}",
+                heading(finding),
+                finding.explanation
+            );
         }
     }
 }
@@ -317,14 +327,14 @@ fn render_findings(
 /// Where `anchor` lands in `extraction`'s retained head source.
 ///
 /// # Errors
-/// Returns the [`Problem`] reason when the retained source does not hold
-/// it.
+/// Returns the [`AnchorProblemReason`] when the retained source does not
+/// hold it.
 fn place(
     anchor: &SourceAnchor,
     extraction: &PullRequestExtraction,
-) -> Result<Placement, &'static str> {
+) -> Result<Placement, AnchorProblemReason> {
     if anchor.commit != extraction.pr.head.sha {
-        return Err("anchor_commit_mismatch");
+        return Err(AnchorProblemReason::AnchorCommitMismatch);
     }
     let file: &ChangedFile = extraction
         .review
@@ -332,15 +342,15 @@ fn place(
         .files
         .iter()
         .find(|file| file.path == anchor.path)
-        .ok_or("anchor_path_unknown")?;
+        .ok_or(AnchorProblemReason::AnchorPathUnknown)?;
     let Some(FileSource::Text { text, .. }) = &file.after else {
-        return Err("anchor_source_unavailable");
+        return Err(AnchorProblemReason::AnchorSourceUnavailable);
     };
     let start = anchor.start_line.get();
     let end = anchor.end_line.get();
     let lines = u32::try_from(text.lines().count()).unwrap_or(u32::MAX);
     if end > lines {
-        return Err("anchor_out_of_range");
+        return Err(AnchorProblemReason::AnchorOutOfRange);
     }
     let inside = file.hunks.iter().any(|hunk| {
         hunk.new_lines > 0
@@ -359,12 +369,12 @@ fn place(
 fn comment(finding: &Finding, anchor: &SourceAnchor, replacement: Option<&str>) -> ReviewComment {
     let mut body = format!("**{}**\n\n{}\n", heading(finding), finding.explanation);
     if let Some(remediation) = &finding.remediation {
-        body.push_str(&format!("\n{}\n", remediation.explanation));
+        let _ = write!(body, "\n{}\n", remediation.explanation);
     }
     if let Some(replacement) = replacement {
         let fence = "`".repeat(longest_backtick_run(replacement).max(2) + 1);
         let replacement = replacement.strip_suffix('\n').unwrap_or(replacement);
-        body.push_str(&format!("\n{fence}suggestion\n{replacement}\n{fence}\n"));
+        let _ = write!(body, "\n{fence}suggestion\n{replacement}\n{fence}\n");
     }
     let (start, end) = (anchor.start_line.get(), anchor.end_line.get());
     ReviewComment {
@@ -502,13 +512,17 @@ mod tests {
             status: VerificationExecutionStatus::Completed,
             verdict: Some(verdict),
         };
+        let extraction = extraction();
         Presentation::render(
             "wyrd/review",
             ExecutionId::new_v7(),
+            &extraction.pr.head.sha,
             settled,
             "",
-            selection,
-            &extraction(),
+            Some(Completed {
+                selection,
+                extraction: &extraction,
+            }),
         )
     }
 
@@ -565,10 +579,13 @@ mod tests {
         let shown = Presentation::render(
             "wyrd/review",
             ExecutionId::new_v7(),
+            "abc",
             settled,
             "Waiting for approval `ship`.",
-            &selection,
-            &extraction(),
+            Some(Completed {
+                selection: &selection,
+                extraction: &extraction(),
+            }),
         );
         assert_eq!(shown.check.status, "in_progress");
         assert_eq!(shown.check.conclusion, None);
@@ -634,10 +651,19 @@ mod tests {
         let mut stale = anchor("src/lib.rs", 2, 2);
         stale["commit"] = json!("2".repeat(40));
         let cases = [
-            (stale, "anchor_commit_mismatch"),
-            (anchor("src/other.rs", 1, 1), "anchor_path_unknown"),
-            (anchor("logo.png", 1, 1), "anchor_source_unavailable"),
-            (anchor("src/lib.rs", 4, 5), "anchor_out_of_range"),
+            (stale, AnchorProblemReason::AnchorCommitMismatch),
+            (
+                anchor("src/other.rs", 1, 1),
+                AnchorProblemReason::AnchorPathUnknown,
+            ),
+            (
+                anchor("logo.png", 1, 1),
+                AnchorProblemReason::AnchorSourceUnavailable,
+            ),
+            (
+                anchor("src/lib.rs", 4, 5),
+                AnchorProblemReason::AnchorOutOfRange,
+            ),
         ];
         for (bad, reason) in cases {
             let edit = json!({"location": bad, "replacement": "q\n"});
@@ -645,13 +671,13 @@ mod tests {
             let shown = completed(VerificationVerdict::Failed, &selection);
             assert_eq!(
                 shown.problems,
-                vec![Problem {
+                vec![AnchorProblem {
                     finding: "F".to_owned(),
                     reason
                 }]
             );
-            assert!(shown.review.is_none(), "{reason}");
-            assert!(shown.check.output.summary.contains(reason));
+            assert!(shown.review.is_none(), "{reason:?}");
+            assert!(shown.check.output.summary.contains(reason.as_str()));
             assert_eq!(shown.check.conclusion, Some("failure"));
         }
     }

@@ -87,6 +87,7 @@ use super::state::{Decision, RunState, StateError, StateRow};
 use super::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
 use crate::components::auth::Caller;
 use crate::components::gateway::GatewayCallContext;
+use crate::components::github::delivery::GithubDeliveries;
 use crate::components::github::extraction::PullRequestSource;
 use crate::query::scheduled::ScheduledQueryCaller;
 use crate::scribe_outbox::{ScribeOutbox, ScribeWrite};
@@ -1526,6 +1527,14 @@ impl VerifierRunner {
         let failed = !matches!(outcome, "completed" | "released" | "deferred" | "parked");
         if failed {
             span.record("otel.status_code", "ERROR");
+        }
+        if run.origin.as_str() == "pull_request"
+            && matches!(
+                outcome,
+                "parked" | "completed" | "exhausted" | "cancelled" | "timed_out" | "errored"
+            )
+        {
+            GithubDeliveries::spawn(self.state.clone(), tenant, run.lease.execution_id);
         }
         if matches!(outcome, "deferred" | "parked") {
             return refused;

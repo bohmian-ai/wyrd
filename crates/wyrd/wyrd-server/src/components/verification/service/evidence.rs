@@ -118,7 +118,9 @@ impl VerificationControl<'_> {
             .tenant_conn(tenant)
             .await
             .map_err(registry_db_error)?;
-        let query = self.records(&mut conn, caller).await?;
+        let query = self
+            .records(&mut conn, caller.data_tenant_id, Some(caller))
+            .await?;
         conn.commit().await.map_err(registry_db_error)?;
         let records = InputResolver::new(&query, None);
         let held = custody

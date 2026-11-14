@@ -414,6 +414,103 @@ pub struct VerificationExecutionState<T = Map<String, Value>> {
     /// decided, in step order; empty when it reached none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub approvals: Vec<ApprovalOccurrenceState>,
+    /// How far GitHub delivery of a `pull_request` execution's current
+    /// state got; absent for every other origin. Delivery never changes the
+    /// verdict, and its failure never fails the execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_delivery: Option<GithubDelivery>,
+}
+
+/// The GitHub delivery of one `pull_request` execution's current state: its
+/// one Check and its one `COMMENT` review.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct GithubDelivery {
+    /// The outcome recorded for the execution's current state.
+    pub status: GithubDeliveryStatus,
+    /// Why a `skipped` or `failed` delivery did not finish; absent
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<GithubDeliveryReason>,
+    /// Report findings whose anchors the retained source does not hold.
+    /// Each is listed in the Check summary instead of inline, never moved
+    /// to another line.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub problems: Vec<AnchorProblem>,
+}
+
+/// One outcome of GitHub delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum GithubDeliveryStatus {
+    /// Nothing is recorded for the current state yet: delivery has not run
+    /// or is still running. Waiting and unfinished executions stay here
+    /// until their state is delivered.
+    Pending,
+    /// The Check, and the review when there is one, are on GitHub.
+    Delivered,
+    /// Not delivered because a newer source superseded the execution or
+    /// the repository's access was removed; nothing is written again.
+    Skipped,
+    /// GitHub refused a write, or stayed unavailable through every retry.
+    Failed,
+}
+
+/// Why GitHub delivery was skipped or failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum GithubDeliveryReason {
+    /// A newer source of the pull request, or its close, superseded the
+    /// execution.
+    Superseded,
+    /// The App lost access to the repository.
+    AccessRemoved,
+    /// GitHub refused a Check or review write; retrying cannot help.
+    GithubRefused,
+    /// GitHub stayed unavailable or rate limited through every retry.
+    GithubUnavailable,
+}
+
+/// A report finding anchor the retained source does not hold.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct AnchorProblem {
+    /// The finding's report ID.
+    pub finding: String,
+    /// Why the anchor was refused.
+    pub reason: AnchorProblemReason,
+}
+
+/// Why a finding anchor was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AnchorProblemReason {
+    /// The anchor names another commit than the reviewed one.
+    AnchorCommitMismatch,
+    /// The reviewed change holds no file at the anchor's path.
+    AnchorPathUnknown,
+    /// The file's source was not retained, so no line can be checked.
+    AnchorSourceUnavailable,
+    /// The anchor's lines lie beyond the file.
+    AnchorOutOfRange,
+}
+
+impl AnchorProblemReason {
+    /// The reason's wire code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AnchorCommitMismatch => "anchor_commit_mismatch",
+            Self::AnchorPathUnknown => "anchor_path_unknown",
+            Self::AnchorSourceUnavailable => "anchor_source_unavailable",
+            Self::AnchorOutOfRange => "anchor_out_of_range",
+        }
+    }
 }
 
 /// One side of a pull request as an admission pinned it: the branch name
@@ -1219,6 +1316,7 @@ impl VerificationExecutionState {
             pull_request,
             waiting,
             approvals,
+            github_delivery,
         } = self;
         Ok(VerificationExecutionState {
             execution_id,
@@ -1232,6 +1330,7 @@ impl VerificationExecutionState {
             pull_request,
             waiting,
             approvals,
+            github_delivery,
         })
     }
 }

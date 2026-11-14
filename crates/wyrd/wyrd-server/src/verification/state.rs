@@ -60,7 +60,7 @@ use crate::state::AppState;
 
 /// The table every revision is a row of, and the logical table of every
 /// revision's batch fence.
-const STATE_TABLE: &str = "bifrost.verification.execution_events";
+pub(crate) const STATE_TABLE: &str = "bifrost.verification.execution_events";
 
 /// How many revisions one fence lookup asks about while recovery finds the
 /// accepted revision.

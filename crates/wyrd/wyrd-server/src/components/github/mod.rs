@@ -12,6 +12,9 @@
 
 /// The deployment GitHub App's provider protocol.
 pub mod app;
+/// Background GitHub delivery of one `pull_request` execution and its
+/// restart recovery.
+pub(crate) mod delivery;
 /// Pull-request source extraction for queued PR executions.
 pub mod extraction;
 /// What a pull_request execution shows on GitHub, rendered from retained

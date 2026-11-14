@@ -30,7 +30,9 @@ use wyrd_spec::ids::{
 };
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::ids::RunId;
-use wyrd_spec::verification::execution::{ApprovalReceipt, ApprovalStatus, InputDeclaration};
+use wyrd_spec::verification::execution::{
+    ApprovalReceipt, ApprovalStatus, GithubDelivery, InputDeclaration,
+};
 use wyrd_spec::verification::{DriftWindow, GroupSnapshot, GroupSourceSnapshot, TaskId};
 
 use super::drift::ObservationWindow;
@@ -282,7 +284,7 @@ impl<'q> InputResolver<'q> {
         let batches = self
             .rows(&format!(
                 "SELECT value FROM bifrost.verification.execution_events \
-                 WHERE execution_id = {} AND sequence = {revision}",
+                 WHERE execution_id = {} AND sequence = {revision} AND event = 'checkpoint'",
                 quote(&execution.to_string())
             ))
             .await?;
@@ -291,6 +293,48 @@ impl<'q> InputResolver<'q> {
             .find(|batch| batch.num_rows() > 0)
             .map(|batch| variant(batch, "value", 0))
             .transpose()
+    }
+
+    /// The GitHub delivery outcome recorded for `execution`'s state at
+    /// exactly `revision`; `None` while no such row is visible.
+    ///
+    /// # Errors
+    /// Returns the query refusal or failure, and an internal error when the
+    /// stored row is malformed.
+    pub(crate) async fn delivery(
+        &self,
+        execution: ExecutionId,
+        revision: i64,
+    ) -> Result<Option<GithubDelivery>, WyrdError> {
+        let batches = self
+            .rows(&format!(
+                "SELECT status, reason, value FROM bifrost.verification.execution_events \
+                 WHERE execution_id = {} AND sequence = {revision} AND event = 'github_delivery'",
+                quote(&execution.to_string())
+            ))
+            .await?;
+        let Some(batch) = batches.iter().find(|batch| batch.num_rows() > 0) else {
+            return Ok(None);
+        };
+        let malformed =
+            |error: serde_json::Error| WyrdError::internal(format!("GitHub delivery row: {error}"));
+        let reason = (!column(batch, "reason")?.is_null(0))
+            .then(|| text(batch, "reason", 0))
+            .transpose()?;
+        let problems = variant(batch, "value", 0)?;
+        Ok(Some(GithubDelivery {
+            status: serde_json::from_value(Value::String(text(batch, "status", 0)?))
+                .map_err(malformed)?,
+            reason: reason
+                .map(|reason| serde_json::from_value(Value::String(reason)))
+                .transpose()
+                .map_err(malformed)?,
+            problems: if problems.is_null() {
+                Vec::new()
+            } else {
+                serde_json::from_value(problems).map_err(malformed)?
+            },
+        }))
     }
 
     /// Every visible acceptance of deferred evidence for `input` of `source`,

@@ -26,6 +26,7 @@ use chrono::{DateTime, Utc};
 use sqlx::types::{Json, Uuid};
 use sqlx::{Error as SqlxError, Row as _};
 use wyrd_runtime::principal::PrincipalId;
+use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Attribution;
 use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, RepositoryId};
 use wyrd_spec::verification::execution::PullRequestActivation;
@@ -34,7 +35,7 @@ use wyrd_spec::verification::{VerificationError, VerificationExecutionStatus};
 use super::{
     EnqueueRefusal, ExecutionAuthority, VerifierExecutionQueue, resolve_binding, stored, timed,
 };
-use crate::TenantConn;
+use crate::{OperatorPool, TenantConn};
 
 /// Advisory lock class of [`LOCK_PULL_REQUEST_SQL`], apart from every other
 /// advisory lock in the database.
@@ -73,6 +74,23 @@ const CURRENT_SQL: &str = concat!(
     this_pull_request!(),
     ") ORDER BY binding_id"
 );
+
+/// Every tenant holding an execution of a PR generation not deactivated.
+const PULL_REQUEST_TENANTS_SQL: &str =
+    "SELECT DISTINCT data_tenant_id FROM wyrd.verifier_executions
+      WHERE origin = 'pull_request' AND pr_deactivated_at IS NULL";
+
+/// Every execution of each PR's newest generation that is not deactivated,
+/// oldest observation first.
+const CURRENT_EXECUTIONS_SQL: &str = "SELECT e.execution_id FROM wyrd.verifier_executions e
+      WHERE e.origin = 'pull_request' AND e.pr_deactivated_at IS NULL
+        AND e.pr_observed_at = (
+            SELECT max(c.pr_observed_at) FROM wyrd.verifier_executions c
+             WHERE c.origin = 'pull_request'
+               AND c.pull_request->>'host' = e.pull_request->>'host'
+               AND c.pull_request->>'repository_id' = e.pull_request->>'repository_id'
+               AND (c.pull_request->>'number')::bigint = (e.pull_request->>'number')::bigint)
+      ORDER BY e.pr_observed_at, e.execution_id";
 
 /// Cancel the PR's unfinished executions with error `$4`, fencing their
 /// workers as [`super::CANCEL_SQL`] does, and mark every generation not yet
@@ -849,6 +867,50 @@ impl VerifierExecutionQueue {
             let ids: Vec<Uuid> = executions.iter().map(ExecutionId::as_uuid).collect();
             let rows: Vec<Uuid> = sqlx::query_scalar(ACTIVATE_SQL)
                 .bind(&ids)
+                .fetch_all(&mut **conn.transaction())
+                .await?;
+            rows.into_iter()
+                .map(|id| stored(ExecutionId::new(id)))
+                .collect()
+        })
+        .await
+    }
+
+    /// Every tenant holding an execution of a PR generation that is not
+    /// deactivated, for delivery recovery to visit.
+    ///
+    /// # Errors
+    /// Returns the database error when the read fails, or a decode error when
+    /// a stored tenant key is malformed.
+    // tenant-isolation: cross-tenant OperatorPool
+    pub async fn tenants_with_pull_requests(
+        &self,
+        operator: &OperatorPool,
+    ) -> Result<Vec<DataTenantId>, SqlxError> {
+        timed("pull_request_tenants", async {
+            let rows: Vec<Uuid> = sqlx::query_scalar(PULL_REQUEST_TENANTS_SQL)
+                .fetch_all(operator.pool())
+                .await?;
+            rows.into_iter()
+                .map(|tenant| stored(DataTenantId::new(tenant)))
+                .collect()
+        })
+        .await
+    }
+
+    /// Every execution of each of the tenant's PRs' newest generation that
+    /// is not deactivated: the executions whose GitHub delivery may still
+    /// be outstanding.
+    ///
+    /// # Errors
+    /// Returns the database error when the read fails, or a decode error when
+    /// a stored identity is malformed.
+    pub async fn current_pull_request_executions(
+        &self,
+        conn: &mut TenantConn<'_>,
+    ) -> Result<Vec<ExecutionId>, SqlxError> {
+        timed("pull_request_current", async {
+            let rows: Vec<Uuid> = sqlx::query_scalar(CURRENT_EXECUTIONS_SQL)
                 .fetch_all(&mut **conn.transaction())
                 .await?;
             rows.into_iter()

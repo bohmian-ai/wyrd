@@ -659,6 +659,13 @@ impl BoundServer {
         }
 
         if self.state.github.is_some() {
+            set.spawn(worker_task(
+                TaskId::Worker("github_report_recovery"),
+                crate::components::github::delivery::GithubDeliveries::recover(
+                    self.state.clone(),
+                    shutdown.clone(),
+                ),
+            ));
             let state = self.state.clone();
             let shutdown = shutdown.clone();
             set.spawn(worker_task(

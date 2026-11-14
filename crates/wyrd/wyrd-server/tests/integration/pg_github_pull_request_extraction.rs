@@ -535,6 +535,31 @@ impl Deployment {
         assert_eq!(status, StatusCode::OK, "{uri}: {body}");
         body
     }
+
+    /// `POST uri` with JSON `body` as the editor.
+    ///
+    /// # Panics
+    /// Panics when the write is not `200 OK` JSON.
+    pub(super) async fn post(&self, uri: &str, body: &Value) -> Value {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("request builds");
+        let response = self
+            .server
+            .oneshot_authenticated(&self.jwt, request)
+            .await
+            .expect("write responds");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1 << 22)
+            .await
+            .expect("body reads");
+        let answer: Value = serde_json::from_slice(&bytes).expect("JSON");
+        assert_eq!(status, StatusCode::OK, "{uri}: {answer}");
+        answer
+    }
 }
 
 /// The first review of a pull request extracts its pinned source in full

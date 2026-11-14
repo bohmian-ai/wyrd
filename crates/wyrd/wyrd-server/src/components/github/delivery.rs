@@ -11,7 +11,8 @@
 //! GitHub REST has no idempotency key, so every write is lookup-before-
 //! create: the Check is found by name, head and `external_id` and updated in
 //! place, the review by its execution marker and never created twice once
-//! found. After an unanswered write the next attempt looks up again first.
+//! found. A waiting delivery only creates the Check and never updates an
+//! existing one, so a completed Check never returns to `in_progress`. After an unanswered write the next attempt looks up again first.
 //! A write whose answer is lost and which is not visible yet may land twice;
 //! that rare duplicate is accepted. Before each attempt the repository's
 //! current access and the PR's current generation are rechecked: an
@@ -20,9 +21,14 @@
 //!
 //! One outcome is recorded per accepted state revision as a `github_delivery`
 //! row of `bifrost.verification.execution_events`, under a batch id derived
-//! from the execution and revision, so a re-park at the same revision
-//! delivers nothing and the first recorded outcome is final. Inspection
-//! reads the outcome of the current revision; a revision without one is
+//! from the event, execution and revision, so a re-park at the same revision
+//! delivers nothing and the first recorded outcome is final. Cancellation
+//! settles only the queue row and writes no revision, so a cancelled
+//! execution's outcome is a separate `github_delivery_cancelled` row at the
+//! same revision: cancelling delivers once more and updates the Check to
+//! `cancelled`. Public cancellation starts that delivery; a principal
+//! revocation's is delivered by restart recovery. Inspection reads the
+//! outcome the current status and revision need; without one it is
 //! `pending`.
 
 use std::sync::{Arc, LazyLock, Mutex};
@@ -68,6 +74,9 @@ use crate::verification::state::STATE_TABLE;
 /// The `event` of a delivery outcome row.
 const EVENT: &str = "github_delivery";
 
+/// The `event` of a cancelled execution's delivery outcome row.
+const CANCELLED_EVENT: &str = "github_delivery_cancelled";
+
 /// Attempts of one Check or review write, and of one whole delivery whose
 /// reads are unavailable.
 const ATTEMPTS: u32 = 5;
@@ -104,6 +113,8 @@ enum Halt {
 }
 
 impl From<DeliveryFailure> for Halt {
+    /// A refusal fails delivery for good; every other failure is tried
+    /// again.
     fn from(failure: DeliveryFailure) -> Self {
         match failure {
             DeliveryFailure::Refused(status) => {
@@ -147,8 +158,9 @@ impl Write<'_> {
                     .into_iter()
                     .find(|run| run.external_id.as_deref() == Some(external.as_str()));
                 match found {
-                    // A completed Check is never set back to in_progress.
-                    Some(run) if run.status == "completed" && check.status != "completed" => Ok(()),
+                    // Waiting only creates the Check: an update could land
+                    // after a terminal one and set it back to in_progress.
+                    Some(_) if check.status != "completed" => Ok(()),
                     Some(run) => app.update_check_run(token, repository, run.id, check).await,
                     None => app
                         .create_check_run(token, repository, check)
@@ -290,7 +302,7 @@ impl<'a> GithubDeliveries<'a> {
         }
         let records = InputResolver::new(&presented.query, None);
         if self
-            .recorded(&records, execution_id, presented.revision)
+            .recorded(&records, execution_id, presented.revision, presented.status)
             .await?
             .is_some()
         {
@@ -323,8 +335,9 @@ impl<'a> GithubDeliveries<'a> {
         self.record(execution_id, &presented, &delivery).await
     }
 
-    /// The outcome recorded for `execution_id`'s state at `revision`, read
-    /// through `records`; `None` while none is recorded.
+    /// The outcome recorded for `execution_id` in `status` at `revision`,
+    /// read through `records`: a cancelled execution's own outcome, else its
+    /// revision's; `None` while none is recorded.
     ///
     /// # Errors
     /// Returns `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` when the fence
@@ -336,11 +349,13 @@ impl<'a> GithubDeliveries<'a> {
         records: &InputResolver<'_>,
         execution_id: ExecutionId,
         revision: i64,
+        status: VerificationExecutionStatus,
     ) -> Result<Option<GithubDelivery>, WyrdError> {
+        let event = event(status);
         let fence = fenced_batch_id(
             self.tenant,
             ScribeTable::ExecutionEvents,
-            key(execution_id, revision),
+            key(event, execution_id, revision),
         );
         let mut conn = self
             .app
@@ -357,7 +372,7 @@ impl<'a> GithubDeliveries<'a> {
             return Ok(None);
         }
         records
-            .delivery(execution_id, revision)
+            .delivery(execution_id, revision, event)
             .await?
             .ok_or_else(|| unavailable(&"a recorded outcome is not visible yet"))
             .map(Some)
@@ -565,7 +580,7 @@ impl<'a> GithubDeliveries<'a> {
             self.tenant,
             ScribeWrite::Fenced {
                 table: ScribeTable::ExecutionEvents,
-                batch: key(execution_id, presented.revision),
+                batch: key(event(presented.status), execution_id, presented.revision),
                 row,
                 attribution: presented.queued.attribution,
                 acked: Mutex::new(Some(sender)),
@@ -578,11 +593,21 @@ impl<'a> GithubDeliveries<'a> {
     }
 }
 
-/// The batch identity of the outcome of `execution`'s state at `revision`,
-/// apart from every state revision's.
-fn key(execution: ExecutionId, revision: i64) -> Uuid {
+/// The outcome event of an execution in `status`: a cancelled execution
+/// has its own, apart from its revision's.
+fn event(status: VerificationExecutionStatus) -> &'static str {
+    if status == VerificationExecutionStatus::Cancelled {
+        CANCELLED_EVENT
+    } else {
+        EVENT
+    }
+}
+
+/// The batch identity of the `event` outcome of `execution`'s state at
+/// `revision`, apart from every state revision's and the other event's.
+fn key(event: &str, execution: ExecutionId, revision: i64) -> Uuid {
     let digest = Sha256::new()
-        .chain_update(EVENT.as_bytes())
+        .chain_update(event.as_bytes())
         .chain_update(execution.as_uuid().as_bytes())
         .chain_update(revision.to_be_bytes())
         .finalize();
@@ -638,7 +663,7 @@ fn row(
             "event_id" => Cell::text(Some(event_id.as_str())),
             "execution_id" => Cell::text(Some(execution.as_str())),
             "sequence" => Cell::Int(Some(presented.revision)),
-            "event" => Cell::text(Some(EVENT)),
+            "event" => Cell::text(Some(event(presented.status))),
             "status" => Cell::text(status.as_deref()),
             "verifier_card_uid" => Cell::text(Some(verifier.as_str())),
             "reason" => Cell::text(reason.as_deref()),
@@ -662,23 +687,28 @@ fn unavailable(error: &dyn std::fmt::Display) -> WyrdError {
     WyrdError::from(BifrostError::QueryVisibilityUnavailable)
 }
 
+/// Unit proofs of outcome identity.
 #[cfg(test)]
 mod tests {
     use wyrd_spec::ids::ExecutionId;
 
-    use super::key;
+    use super::{CANCELLED_EVENT, EVENT, key};
 
-    /// Proves an outcome's batch identity is stable for one execution and
-    /// revision and differs for another revision or execution.
+    /// Proves an outcome's batch identity is stable for one event,
+    /// execution and revision and differs for another of any of them.
     ///
     /// # Panics
     /// Panics when two identities that must match differ, or two that must
     /// differ match.
     #[test]
-    fn outcome_identity_is_per_execution_and_revision() {
+    fn outcome_identity_is_per_event_execution_and_revision() {
         let execution = ExecutionId::new_v7();
-        assert_eq!(key(execution, 3), key(execution, 3));
-        assert_ne!(key(execution, 3), key(execution, 4));
-        assert_ne!(key(execution, 3), key(ExecutionId::new_v7(), 3));
+        assert_eq!(key(EVENT, execution, 3), key(EVENT, execution, 3));
+        assert_ne!(key(EVENT, execution, 3), key(EVENT, execution, 4));
+        assert_ne!(key(EVENT, execution, 3), key(CANCELLED_EVENT, execution, 3));
+        assert_ne!(
+            key(EVENT, execution, 3),
+            key(EVENT, ExecutionId::new_v7(), 3)
+        );
     }
 }

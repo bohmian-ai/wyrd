@@ -50,6 +50,7 @@ use wyrd_storage::tenant_path::ValidatedPath;
 use super::VerificationControl;
 use crate::audit;
 use crate::components::auth::Caller;
+use crate::components::github::delivery::GithubDeliveries;
 use crate::state::registry_db_error;
 use crate::verification::approvals::ApprovalDecisions;
 use crate::verification::cache::exact_ref;
@@ -1005,9 +1006,10 @@ impl<'a> VerificationControl<'a> {
     /// cancellation fence commits.
     ///
     /// Unfinished work settles `cancelled` with its terminal delivery due,
-    /// which the runner records in the execution's state; settled work keeps
-    /// its status, result, and publications, so a repeat answers the current
-    /// status.
+    /// which the runner records in the execution's state; a `pull_request`
+    /// execution's GitHub delivery of the cancellation starts in the
+    /// background once that commits. Settled work keeps its status, result,
+    /// and publications, so a repeat answers the current status.
     ///
     /// # Errors
     /// The errors of [`Self::retained`] for `verifier:run`, and a registry
@@ -1020,7 +1022,8 @@ impl<'a> VerificationControl<'a> {
         let (mut conn, _) = self
             .authorized(caller, execution_id, Action::Run, CANCEL)
             .await?;
-        self.queue
+        let cancelled = self
+            .queue
             .cancel(&mut conn, execution_id)
             .await
             .map_err(registry_db_error)?;
@@ -1031,6 +1034,9 @@ impl<'a> VerificationControl<'a> {
             .map_err(registry_db_error)?
             .ok_or_else(|| execution_not_found(execution_id))?;
         conn.commit().await.map_err(registry_db_error)?;
+        if cancelled && status.state.pull_request.is_some() {
+            GithubDeliveries::spawn(self.state.clone(), caller.data_tenant_id, execution_id);
+        }
         Ok(CancelExecutionResponse {
             execution_id,
             status: status.state.status,

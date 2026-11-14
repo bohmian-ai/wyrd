@@ -8,8 +8,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use axum::body::{Body, to_bytes};
-use axum::http::{Method, Request, StatusCode, header};
+use axum::http::StatusCode;
 use serde_json::{Value, json};
 use uuid::Uuid;
 use wiremock::matchers::{body_string_contains, method, path};
@@ -148,6 +147,21 @@ async fn delivered(deployment: &Deployment, count: usize) -> BTreeMap<String, De
     }
 }
 
+/// The reviews on PR [`PR`] carrying `execution`'s marker.
+fn reviews_of(deployment: &Deployment, execution: &str) -> Vec<Value> {
+    let marker = format!("<!-- wyrd:execution:{execution} -->");
+    deployment
+        .mock
+        .reviews(REPOSITORY, PR)
+        .into_iter()
+        .filter(|review| {
+            review["body"]
+                .as_str()
+                .is_some_and(|body| body.contains(&marker))
+        })
+        .collect()
+}
+
 /// The reviewer's model answers every review with `report`.
 async fn answers_with(deployment: &Deployment, report: &Value) {
     Mock::given(method("POST"))
@@ -166,9 +180,10 @@ async fn answers_with(deployment: &Deployment, report: &Value) {
 /// An Agent's `code_review` report becomes the execution's one Check and
 /// one `COMMENT` review on the reviewed commit: a finding inside the diff
 /// is an inline comment carrying its exact suggestion, one without a
-/// location stays in the summary, and anchors the retained source does not
-/// hold (an unchanged file, another commit, lines past the end) are refused
-/// by name, never moved. Every
+/// location stays in the summary, one in a selected unchanged context span
+/// stays in the summary as valid, and anchors the retained source does not
+/// hold (a file it never read, another commit, lines past the end) are
+/// refused by name, never moved. An empty report is still reviewed. Every
 /// severity is shown. The authored requirement alone decides the verdict:
 /// a critical finding does not fail it, and an empty report with
 /// incomplete coverage does not pass it.
@@ -198,6 +213,7 @@ async fn a_code_review_report_becomes_one_check_and_one_comment_review() {
                     json!({"explanation": "Edit another commit.",
                            "suggested_edit": {"location": at("src/handler.ts", &sha('b'), 3, 3), "replacement": fix}})),
             finding("F-5", "low", json!([at("src/handler.ts", &head, 40, 41)]), Value::Null),
+            finding("F-6", "low", json!([at("src/missing.ts", &head, 1, 1)]), Value::Null),
         ],
     });
     let agent = verifier(
@@ -240,10 +256,11 @@ async fn a_code_review_report_becomes_one_check_and_one_comment_review() {
     for shown in [
         "The handler normalizes ids.",
         "[critical/high confidence] Finding F-1 (`F-1`) — `src/handler.ts:3-3`",
-        "[high/high confidence] Finding F-2 (`F-2`) — not shown inline: `anchor_path_unknown`",
+        "[high/high confidence] Finding F-2 (`F-2`) — `src/user.ts:2-2`\n  Explained F-2.",
         "[medium/high confidence] Finding F-3 (`F-3`)\n  Explained F-3.",
         "[low/high confidence] Finding F-4 (`F-4`) — not shown inline: `anchor_commit_mismatch`",
         "[low/high confidence] Finding F-5 (`F-5`) — not shown inline: `anchor_out_of_range`",
+        "[low/high confidence] Finding F-6 (`F-6`) — not shown inline: `anchor_path_unknown`",
     ] {
         assert!(summary.contains(shown), "{shown:?} in {summary}");
     }
@@ -251,9 +268,9 @@ async fn a_code_review_report_becomes_one_check_and_one_comment_review() {
     assert_eq!(
         served["github_delivery"],
         json!({"status": "delivered", "problems": [
-            {"finding": "F-2", "reason": "anchor_path_unknown"},
             {"finding": "F-4", "reason": "anchor_commit_mismatch"},
             {"finding": "F-5", "reason": "anchor_out_of_range"},
+            {"finding": "F-6", "reason": "anchor_path_unknown"},
         ]}),
         "{served}"
     );
@@ -268,7 +285,7 @@ async fn a_code_review_report_becomes_one_check_and_one_comment_review() {
         "MCP serves the same delivery outcome: {over_mcp}"
     );
 
-    let reviews = deployment.mock.reviews(REPOSITORY, PR);
+    let reviews = reviews_of(&deployment, execution);
     assert_eq!(
         reviews.len(),
         1,
@@ -315,11 +332,17 @@ async fn a_code_review_report_becomes_one_check_and_one_comment_review() {
         "{summary}"
     );
     assert_eq!(served["github_delivery"], json!({"status": "delivered"}));
-    assert_eq!(
-        deployment.mock.reviews(REPOSITORY, PR).len(),
-        1,
-        "an empty report has nothing to comment"
+    let reviews = reviews_of(
+        &deployment,
+        served["execution_id"].as_str().expect("execution id"),
     );
+    assert_eq!(
+        reviews.len(),
+        1,
+        "an empty report is still reviewed: {reviews:#?}"
+    );
+    assert_eq!(reviews[0]["event"], "COMMENT");
+    assert_eq!(reviews[0]["comments"], json!([]), "with nothing inline");
 }
 
 /// Each execution selects its report from its accepted final outputs: no
@@ -460,27 +483,12 @@ async fn each_execution_selects_its_report_from_its_accepted_final_outputs() {
     let approval = served["approvals"][0]["approval_id"]
         .as_str()
         .expect("approval id");
-    let request = Request::builder()
-        .method(Method::POST)
-        .uri(format!("{uri}/approvals/{approval}"))
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(json!({"decision": "rejected"}).to_string()))
-        .expect("request builds");
-    let response = deployment
-        .server
-        .oneshot_authenticated(&deployment.jwt, request)
-        .await
-        .expect("decision responds");
-    let status = response.status();
-    let bytes = to_bytes(response.into_body(), 1 << 20)
-        .await
-        .expect("body reads");
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "{}",
-        String::from_utf8_lossy(&bytes)
-    );
+    deployment
+        .post(
+            &format!("{uri}/approvals/{approval}"),
+            &json!({"decision": "rejected"}),
+        )
+        .await;
 
     let shown = delivered(&deployment, 6).await;
     let summary = |name: &str| {
@@ -525,9 +533,22 @@ async fn each_execution_selects_its_report_from_its_accepted_final_outputs() {
         shown["wyrd/report-speculation"].check["id"], waiting["id"],
         "the waiting Check is completed in place"
     );
-    assert!(
-        deployment.mock.reviews(REPOSITORY, PR).is_empty(),
-        "no report here has an inline finding"
+    for name in ["wyrd/report-repeat", "wyrd/report-speculation"] {
+        let execution = shown[name].served["execution_id"]
+            .as_str()
+            .expect("execution id");
+        let reviews = reviews_of(&deployment, execution);
+        assert_eq!(reviews.len(), 1, "{name}: {reviews:#?}");
+        assert_eq!(
+            reviews[0]["comments"],
+            json!([]),
+            "{name} has nothing inline"
+        );
+    }
+    assert_eq!(
+        deployment.mock.reviews(REPOSITORY, PR).len(),
+        2,
+        "only the rendered reports are reviewed"
     );
 }
 
@@ -854,5 +875,161 @@ async fn the_review_example_fails_on_a_high_finding_and_comments_its_fix() {
         body.contains("[high/medium confidence] Mixed-case ids miss their user (`case`)")
             && body.contains(&format!("```suggestion\n{fix}```")),
         "{body}"
+    );
+}
+
+/// A Verifier whose `gates` approval steps run one after another before a
+/// code step returns an empty report.
+fn gated(gates: &[&str]) -> String {
+    let mut steps = String::new();
+    let mut after = "pr".to_owned();
+    for gate in gates {
+        steps.push_str(&format!(
+            "    - id: {gate}\n      depends_on: [{after}]\n      action: {{kind: approval, message: Ship {gate}?}}\n"
+        ));
+        after = (*gate).to_owned();
+    }
+    steps.push_str(
+        &code("review", "", &[], &report("'Clean'"))
+            .replace("depends_on: [pr]", &format!("depends_on: [{after}]")),
+    );
+    verifier("gated", &steps, CHANGES)
+}
+
+/// `execution` once it waits for approval step `step` and the outcome of
+/// that waiting state is recorded; returns the inspection and the pending
+/// approval's id.
+///
+/// # Panics
+/// Panics when that does not happen in two minutes.
+async fn waiting_for(deployment: &Deployment, execution: Uuid, step: &str) -> (Value, String) {
+    let uri = format!("/v1/verification/executions/{execution}");
+    let deadline = tokio::time::Instant::now() + Duration::from_mins(2);
+    loop {
+        let served = deployment.get(&uri).await;
+        let pending = served["approvals"].as_array().and_then(|approvals| {
+            approvals
+                .iter()
+                .find(|approval| approval["step_id"] == step && approval["status"] == "pending")
+        });
+        if let Some(approval) = pending
+            && served["status"] == "waiting"
+            && served["github_delivery"]["status"] != "pending"
+        {
+            let id = approval["approval_id"]
+                .as_str()
+                .expect("approval id")
+                .to_owned();
+            return (served, id);
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{execution} never waited on `{step}` with an outcome: {served}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A waiting delivery creates the Check but never updates one: when the
+/// execution waits again on a second approval the Check is left as the
+/// first wait wrote it, with no update sent, and only the terminal delivery
+/// completes it in place. A late waiting update can therefore never set a
+/// completed Check back to `in_progress`.
+///
+/// # Panics
+/// Panics when a waiting delivery updates the Check or the terminal one
+/// does not complete it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_waiting_delivery_never_updates_an_existing_check() {
+    let deployment = bound(&[("gated", gated(&["first", "second"]))], &[]).await;
+    let execution = deployment.admit(&sha('a'), "opened").await;
+    let uri = format!("/v1/verification/executions/{execution}");
+
+    let (_, first) = waiting_for(&deployment, execution, "first").await;
+    let created = deployment.mock.check_runs(REPOSITORY);
+    assert_eq!(created.len(), 1);
+    assert_eq!(created[0]["status"], "in_progress");
+    deployment
+        .post(
+            &format!("{uri}/approvals/{first}"),
+            &json!({"decision": "approved"}),
+        )
+        .await;
+
+    let (served, second) = waiting_for(&deployment, execution, "second").await;
+    assert_eq!(served["github_delivery"], json!({"status": "delivered"}));
+    assert_eq!(
+        sent(&deployment, "PATCH "),
+        0,
+        "waiting never updates the Check"
+    );
+    assert_eq!(deployment.mock.check_runs(REPOSITORY), created);
+    deployment
+        .post(
+            &format!("{uri}/approvals/{second}"),
+            &json!({"decision": "approved"}),
+        )
+        .await;
+
+    let shown = delivered(&deployment, 1).await;
+    let Delivered { check, served } = &shown["wyrd/gated"];
+    assert_eq!(
+        (&check["id"], &check["conclusion"]),
+        (&created[0]["id"], &json!("success"))
+    );
+    assert_eq!(served["github_delivery"], json!({"status": "delivered"}));
+    assert_eq!(sent(&deployment, "PATCH "), 1);
+}
+
+/// Cancelling a waiting execution delivers once more: its same Check is
+/// completed `cancelled` in place, inspection serves the cancelled
+/// outcome, and a restart delivers nothing again.
+///
+/// # Panics
+/// Panics when the Check stays `in_progress`, a second Check appears, the
+/// outcome differs, or the restart writes again.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_a_waiting_execution_completes_its_check_cancelled() {
+    let deployment = bound(&[("gated", gated(&["first"]))], &[]).await;
+    let execution = deployment.admit(&sha('a'), "opened").await;
+    let uri = format!("/v1/verification/executions/{execution}");
+    let (_, _) = waiting_for(&deployment, execution, "first").await;
+    let waiting = deployment.mock.check_runs(REPOSITORY);
+    assert_eq!(waiting[0]["status"], "in_progress");
+
+    let cancelled = deployment.post(&format!("{uri}/cancel"), &json!({})).await;
+    assert_eq!(cancelled["status"], "cancelled", "{cancelled}");
+    let deadline = tokio::time::Instant::now() + Duration::from_mins(2);
+    let served = loop {
+        let served = deployment.get(&uri).await;
+        if served["github_delivery"]["status"] != "pending" {
+            break served;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the cancellation was never delivered: {served}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(served["status"], "cancelled", "{served}");
+    assert_eq!(served["github_delivery"], json!({"status": "delivered"}));
+    let checks = deployment.mock.check_runs(REPOSITORY);
+    assert_eq!(checks.len(), 1, "{checks:#?}");
+    assert_eq!(
+        (
+            &checks[0]["id"],
+            &checks[0]["status"],
+            &checks[0]["conclusion"]
+        ),
+        (&waiting[0]["id"], &json!("completed"), &json!("cancelled"))
+    );
+    let writes = sent(&deployment, "PATCH ") + sent(&deployment, "POST ");
+
+    let deployment = deployment.restart().await;
+    let served = deployment.get(&uri).await;
+    assert_eq!(served["github_delivery"], json!({"status": "delivered"}));
+    assert_eq!(
+        sent(&deployment, "PATCH ") + sent(&deployment, "POST "),
+        writes
     );
 }

@@ -295,8 +295,8 @@ impl<'q> InputResolver<'q> {
             .transpose()
     }
 
-    /// The GitHub delivery outcome recorded for `execution`'s state at
-    /// exactly `revision`; `None` while no such row is visible.
+    /// The GitHub delivery outcome `event` recorded for `execution`'s state
+    /// at exactly `revision`; `None` while no such row is visible.
     ///
     /// # Errors
     /// Returns the query refusal or failure, and an internal error when the
@@ -305,12 +305,14 @@ impl<'q> InputResolver<'q> {
         &self,
         execution: ExecutionId,
         revision: i64,
+        event: &str,
     ) -> Result<Option<GithubDelivery>, WyrdError> {
         let batches = self
             .rows(&format!(
                 "SELECT status, reason, value FROM bifrost.verification.execution_events \
-                 WHERE execution_id = {} AND sequence = {revision} AND event = 'github_delivery'",
-                quote(&execution.to_string())
+                 WHERE execution_id = {} AND sequence = {revision} AND event = {}",
+                quote(&execution.to_string()),
+                quote(event)
             ))
             .await?;
         let Some(batch) = batches.iter().find(|batch| batch.num_rows() > 0) else {

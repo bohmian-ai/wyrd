@@ -300,7 +300,7 @@ impl<'a> VerificationControl<'a> {
         state.approvals = retained.approvals();
         if state.pull_request.is_some() {
             let recorded = GithubDeliveries::new(self.state, caller.data_tenant_id)
-                .recorded(&records, execution_id, retained.revision)
+                .recorded(&records, execution_id, retained.revision, state.status)
                 .await?;
             state.github_delivery = Some(recorded.unwrap_or(GithubDelivery {
                 status: GithubDeliveryStatus::Pending,

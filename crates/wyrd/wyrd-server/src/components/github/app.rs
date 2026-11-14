@@ -178,8 +178,6 @@ pub(crate) struct FoundCheckRun {
     pub(crate) id: u64,
     /// The execution it reports, when set.
     pub(crate) external_id: Option<String>,
-    /// `queued`, `in_progress` or `completed`.
-    pub(crate) status: String,
 }
 
 /// A pull request review as delivery looks it up.

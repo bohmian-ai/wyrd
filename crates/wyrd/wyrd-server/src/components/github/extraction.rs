@@ -191,7 +191,7 @@ async fn review(
         PullRequestBaseline::FirstReview => FallbackReason::FirstReview,
         PullRequestBaseline::PolicyChanged => FallbackReason::PolicyChanged,
         PullRequestBaseline::Previous { execution_id, head } => match ObjectSha::new(head) {
-            Ok(head) => match reviews.pinned(client, identity, pins, Some(&head)).await {
+            Ok(head) => match pinned(reviews, client, identity, pins, Some(&head)).await {
                 Ok(review) => return Ok((review, Some((*execution_id, head)), None)),
                 Err(PipelineError::Comparison(ComparisonError::BaselineUnusable {
                     problem: BaselineProblem::Rewritten,
@@ -207,11 +207,33 @@ async fn review(
             Err(_) => FallbackReason::HistoryUnavailable,
         },
     };
-    let review = reviews
-        .pinned(client, identity, pins, None)
+    let review = pinned(reviews, client, identity, pins, None)
         .await
         .map_err(|error| pipeline_failure(&error))?;
     Ok((review, None, Some(reason)))
+}
+
+/// The pinned review of `pins` against `previous`, retried once when
+/// another execution's concurrent cold build published the snapshot first:
+/// the pipeline documents that `PointerConflict` as a retry state, and the
+/// retry reuses the winner's snapshot.
+///
+/// # Errors
+/// Returns the pipeline error of the last attempt.
+async fn pinned(
+    reviews: &ReviewPipeline<'_, CodeReviewObjects, CodeReviewMetadata>,
+    client: &GitHubClient,
+    identity: &Identity,
+    pins: &PullRequestPins,
+    previous: Option<&ObjectSha>,
+) -> Result<PinnedReview, PipelineError> {
+    match reviews.pinned(client, identity, pins, previous).await {
+        Err(
+            PipelineError::Snapshot(ColdBuildError::PointerConflict)
+            | PipelineError::Context(ContextError::Snapshot(ColdBuildError::PointerConflict)),
+        ) => reviews.pinned(client, identity, pins, previous).await,
+        reviewed => reviewed,
+    }
 }
 
 /// The typed extraction of `review` under `repository`.
@@ -385,13 +407,16 @@ fn connection_failure(error: WyrdError) -> BlockError {
 }
 
 /// The block failure of a pipeline error: retryable when GitHub asks for a
-/// retry or the cache is unavailable, terminal when the source itself
+/// retry, the cache is unavailable or a concurrent build published first,
+/// terminal when the source itself
 /// cannot be acquired or verified, which never becomes a pass.
 fn pipeline_failure(error: &PipelineError) -> BlockError {
     let provider = |error: &GitHubError| matches!(error.disposition(), Disposition::Retry { .. });
     let snapshot = |error: &ColdBuildError| match error {
         ColdBuildError::GitHub(error) => provider(error),
-        ColdBuildError::Storage(_) | ColdBuildError::Persistence(_) => true,
+        ColdBuildError::Storage(_)
+        | ColdBuildError::Persistence(_)
+        | ColdBuildError::PointerConflict => true,
         _ => false,
     };
     let retryable = match error {

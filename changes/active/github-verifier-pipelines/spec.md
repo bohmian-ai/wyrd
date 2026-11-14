@@ -1,6 +1,6 @@
 ---
 id: SPEC-github-verifier-pipelines
-revision: 8
+revision: 9
 status: approved
 ---
 
@@ -247,28 +247,30 @@ zero means normal summary, one means render that report, multiple means explicit
 ambiguity. Invalid/unsupported envelopes are visible delivery errors. Failed
 attempts, discarded speculation and intermediate repeat outputs do not count.
 No Verifier/binding selector or automatic concatenation. Report selection never
-changes an accepted verdict. Provide the agreed optional helpers for report
-validation, aggregation/sorting, finding-ID preservation and authored severity
-thresholds through ordinary review outputs/checks. They do not introduce a
-mandatory preparation stage or another review engine.
+changes an accepted verdict. Severity thresholds and aggregation stay ordinary
+authored outputs/checks; no mandatory preparation stage, helper library or
+another review engine.
 
-**REQ-013 — GitHub presentation.** Publish a Check and valid report findings as
-PR comments/suggestions, pinned to reviewed source. Severity and confidence stay
-separate from verdict. Critical/high map to failure annotations, medium warning,
-low notice; unlocated findings stay in summary. Passed→success, failed→failure,
+**REQ-013 — GitHub presentation.** Publish one Check per execution and one
+`COMMENT` review holding the valid report findings as inline comments/suggestions,
+both pinned to the reviewed commit. Severity and confidence are shown with each
+finding and stay separate from verdict; unlocated findings stay in the Check
+summary. No Check annotations. Passed→success, failed→failure,
 inconclusive→action_required, cancelled→cancelled, timed_out→timed_out,
 errored→failure. Pending evidence/approval uses in_progress with explanation.
-Preserve finding identity and reuse comments where possible. Do not auto-resolve
-threads because a finding is absent from an incremental report. No automatic
-APPROVE, REQUEST_CHANGES or source modification is authorized.
+Do not auto-resolve threads. No automatic APPROVE, REQUEST_CHANGES or source
+modification is authorized.
 
-**REQ-014 — Recoverable delivery.** Retry GitHub delivery from retained report and
-progress independently of computation. Reconcile ambiguous Check/review/comment
-writes before retrying; never blindly append annotations or duplicate comments.
-Respect provider cooldowns, bound retries, and expose permanent/ambiguous failure
-rather than pretend success. Recheck access and current generation at each
-write. Existing execution inspection exposes delivery state separately from
-execution verdict. No new result mirror or finalizer service.
+**REQ-014 — Recoverable delivery.** Deliver in the background from the retained
+report, never recomputing verification or blocking the verdict. Before creating a
+Check or review, look it up by its execution marker and update or skip an existing
+one; after a provider timeout, retry the lookup and create only when it is absent.
+A rare duplicate after a lost provider answer is accepted. Respect provider
+cooldowns and bound retries. Recheck access and current generation before each
+write. Record one delivery outcome per execution in Bifrost; restart re-runs
+delivery for PR executions without one. Execution inspection exposes the outcome
+and safe error separately from the verdict. No progress ledger, new SQL table or
+column, result mirror or finalizer service.
 
 **REQ-015 — Resource isolation.** Direct and queued execution, workspace, Python
 and model-call admission use separate capacity without borrowing. PR extraction,
@@ -402,7 +404,7 @@ without production GitHub credentials.
 | AC-006 | Parallel branch plus deferred input/approval, all blocked, authorized/rejected/expired decision, stale occurrence and unauthorized caller | Peers continue, blocked work releases capacity; same execution resumes once under original authority | 010,011 |
 | AC-007 | Restart while an execution waits for evidence or a decision, then supply it | Accepted evidence or decision survives and the same execution finishes; unavailable state is not absence; no second accepted approval or replay of durably settled predecessors; unpersisted work can repeat under REQ-017. Proven with ordinary restart, retry and refusal tests, no test-only crash hooks | 009,010,011 |
 | AC-008 | No/one/multiple/malformed report; every severity, absent location, valid/invalid suggested edit | Exact report convention; honest verdict/conclusion; no invented source anchor or applied source change | 012,013 |
-| AC-009 | GitHub timeout after remote success, annotation batch retry, restart, new head/access removal during delivery | Reconciliation avoids duplicates; provider retry does not rerun verification or claim stale success | 005,014 |
+| AC-009 | GitHub timeout after remote success, restart, rate limit, permanent refusal, new head/access removal during delivery | Lookup-before-create finds the landed write; restart delivers once; failure is visible; no rerun of verification or stale write | 005,014 |
 | AC-010 | Hold queued execution/workspace/Python/model admission saturated while calling direct-eligible Verifier | Direct reserved resources still execute; queued-only direct call refuses before work | 015 |
 | AC-011 | Fresh reader follows CLI/SDK docs and uses execution, evidence, approval and delivery inspection; reads a pull_request extraction through execution details over HTTP and MCP | Complete journey without UI or hidden manual orchestration; schemas/errors match served operations | 016 |
 | AC-012 | Hold Scribe/outbox and background SQL replies while direct/queued graphs advance; fill terminal tracking, then restore persistence; crash/reclaim before/after acceptance and race cancellation/takeover | Engine progresses from memory, compute permits free, tracking bounded with room for running claims, new claims back off, direct remains isolated; restored persistence yields the same terminal evidence then batched fenced settlement; only unpersisted work may repeat | 011,015,017 |
@@ -451,6 +453,7 @@ readiness. Implementation tasks derive from this approved revision.
 | 6 | approved storage direction | Task 004 ObjectStorage over existing object storage and PostgreSQL SnapshotStore/ContextStore with their required metadata-table exception; reconcile the previously stale draft frontmatter. |
 | 7 | approved in current conversation | Shared memory execution, preserved preparation/Bifrost, bounded background queued completion and leases/group commit, explicit crash loss, compute-free park handoffs, resource-scaling proof and unreleased execution-schema cleanup. |
 | 8 | approved 2026-11-13 | User decisions during TASK-005, explicitly approved: REQ-016/AC-011 inspect the pull_request extraction only through existing HTTP/MCP execution details (no typed SDK read, SDK helper, CLI read or SDK journey for it); REQ-007 drops repository guidance from the pinned base, superseding that sentence in [extraction design](design/approved-code-review-support.md). Nothing else changes. |
+| 9 | approved 2026-11-13 | User decision during TASK-009: GitHub REST offers no idempotency key, so delivery is lookup-before-create with a rare duplicate accepted; drop Check annotations, the delivery progress ledger, comment reuse/moved-anchor history and the optional report helpers; one Bifrost delivery outcome per execution. Amends REQ-012–014 and AC-009 and supersedes conflicting text in [report delivery](design/approved-report-delivery.md), [runtime and GitHub](design/approved-runtime-and-github.md), contracts and task 009. |
 
 Subsequent explicit maintainer amendment: approval authoring has no separate
 expiration setting. Pending approvals and deferred waits share the execution's

@@ -324,13 +324,6 @@ impl CodeReviewReport {
         }
         Ok(())
     }
-
-    /// Orders findings most severe first, then by id, leaving every finding
-    /// unchanged.
-    pub fn sort_findings(&mut self) {
-        self.findings
-            .sort_by(|left, right| (left.severity, &left.id).cmp(&(right.severity, &right.id)));
-    }
 }
 
 impl Finding {
@@ -647,16 +640,6 @@ mod tests {
                 .expect_err(pointer);
             assert_eq!(problem.reason(), reason, "{pointer}");
         }
-    }
-
-    /// Sorting puts the most severe first and changes no finding.
-    #[test]
-    fn sorting_keeps_findings_and_orders_by_severity() {
-        let mut decoded = CodeReviewReport::deserialize(&report()).expect("report");
-        let before = decoded.findings.clone();
-        decoded.sort_findings();
-        assert_eq!(decoded.findings[0].id, "F-1");
-        assert_eq!(decoded.findings[1], before[0]);
     }
 
     /// A Verifier with plain steps `a`, `b`, `c` and fanout step `fan`.

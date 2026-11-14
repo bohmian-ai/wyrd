@@ -1,7 +1,7 @@
 ---
 id: TASK-009
 status: proposed
-approved_spec_revision: 7
+approved_spec_revision: 9
 requirements: [REQ-005, REQ-012, REQ-013, REQ-014, REQ-016]
 acceptance: [AC-008, AC-009, AC-011]
 invariants: [INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007]
@@ -31,10 +31,9 @@ pure `wyrd-spec` owner. Extend the existing named Prompt response-format resolve
 (currently `verdict`) with `code_review`. AgentExecutor already returns normal
 schema-validated JSON step output; normal code may emit the same envelope.
 Intermediate reviewers may reuse Finding schemas in ordinary outputs; a normal
-consolidator emits the final envelope. Supply the approved optional validation,
-aggregation/sorting, ID-preservation and authored severity-threshold helpers
-through existing authoring/helper owners, using ordinary report outputs/checks.
-No mandatory prep step, report selector, new Verifier kind or review engine.
+consolidator emits the final envelope. Severity thresholds and aggregation stay ordinary authored outputs/checks (spec
+revision 9 drops the helper library). No mandatory prep step, report selector,
+new Verifier kind or review engine.
 
 Select per execution from accepted successful final logical outputs: retained
 fanout items each count; only final retained repeat output counts; failed attempts
@@ -49,60 +48,46 @@ never truncate a large report into a clean review.
 
 Validate every supplied anchor against task 005's retained canonical relative
 path/commit/inclusive line range and source. Suggestions replace precisely that
-range with supplied replacement. Invalid edit/source content yields safe visible
+range with supplied replacement. Invalid edit/source content yields a safe visible
 delivery error, never invented line 1 or a modified finding. Empty location arrays
-stay summary-only. Preserve ID, severity and confidence independently; map
-critical/high→failure annotation, medium→warning, low→notice.
+stay summary-only. Show ID, severity and confidence with each finding.
 
-Use a stable Check name per binding, external_id for exact execution and reviewed
-SHA. Map passed→success, failed→failure, inconclusive→action_required,
-cancelled→cancelled, timed_out→timed_out, errored→failure. Waiting evidence or
-approval remains in_progress with explanation. Publish review as COMMENT pinned
-to reviewed commit, with valid inline findings and suggestions. Reuse comments by
-retained finding/provider identity where possible; moved anchors preserve history
-and link replacement rather than silently relocating old comments. Absence from
-an incremental report does not auto-resolve threads. No APPROVE, REQUEST_CHANGES,
-merge decision, source change or autofix is authorized.
+One Check per execution: stable name per binding, external_id = execution,
+head_sha = reviewed commit. Map passed→success, failed→failure,
+inconclusive→action_required, cancelled→cancelled, timed_out→timed_out,
+errored→failure. Waiting evidence or approval stays in_progress with explanation;
+a completed Check is never set back to in_progress. No Check annotations. One
+`COMMENT` review pinned to the reviewed commit carries the execution marker and
+the valid inline findings and suggestions. No auto-resolve, APPROVE,
+REQUEST_CHANGES, merge decision, source change or autofix.
 
-## Existing delivery workflow and consequential handoffs
+## Delivery (spec revision 9)
 
-Task 010 removes owed terminal-delivery queue operations (`delivery_due_at`,
-claim/redeliver/delivered, `Owe`); queued settlement follows the terminal Bifrost
-ACK in the runner. GitHub delivery is a separate provider lifecycle with its own
-independent retry: it consumes retained accepted reports and validates current
-authority, and a provider retry never recomputes verification. Keep report/
-source/progress in canonical Bifrost verification state and coordination in
-existing queue/control owners, without new SQL delivery fields, report payloads in
-SQL or a revived terminal-delivery mechanism. No finalizer service, second payload
-store or table.
+GitHub REST has no idempotency key, so delivery is lookup-before-create: find the
+Check by name/head/external_id and the review by its execution marker; update the
+Check in place, skip an existing review, create only what is absent. After a
+provider timeout, look up again before creating. A rare duplicate after a lost
+answer is accepted. Respect Retry-After/rate-limit cooldown and bound retries.
+Before each write, recheck task 002's current access and task 006's current
+source generation; a superseded or access-removed execution is recorded as
+skipped and never writes again.
 
-Retain enough accepted progress for every consequential Check/review/comment/
-annotation batch effect to be reconciled after timeout/restart. Stable IDs and
-provider readback must distinguish remote success from absence before retrying
-an unknown create/append; annotation requests respect the provider limit (50)
-and append semantics. Never blindly append again. If readback cannot establish
-outcome, expose unresolved/ambiguous delivery rather than claim success. Respect
-provider cooldown, bound retry and expose permanent failure. Recheck task 002's
-current access and task 006's source generation at **each** remote write; a
-provider request already sent may finish and must be reconciled with its pins.
-Superseded work never claims current-result delivery or starts a continuation.
-
-Provider retry reads retained outputs/progress and consumes no new verification
-attempt, approval or model computation. Record acknowledged provider progress
-before retiring a provider delivery obligation; recovery rediscovers the remaining
-obligation from retained state. Execution inspection exposes delivery status/error separately from
-verdict, through existing read authorization, even after computation completes.
-Amend **wyrd-design.md → Prompt / Verifier / queued delivery** and appropriate
-**bifrost-design.md → canonical evidence / Durability and visibility**; delivery
-policy remains Wyrd-owned, generic HTTP provider calls may reuse the library.
+Delivery runs in the background after settlement or park, reads only retained
+accepted outputs (`select_report`) and retained source, and never recomputes
+verification or blocks the verdict. One outcome per execution is recorded in
+Bifrost; on restart, delivery re-runs for PR executions without one. No progress
+ledger, new SQL table or column, result mirror or finalizer service. Execution
+inspection exposes the outcome and safe error separately from the verdict,
+through existing read authorization. Amend **wyrd-design.md → Prompt / Verifier /
+queued delivery** and **bifrost-design.md → canonical evidence** accordingly.
 
 ## Surfaces and connected proof
 
-Ship report/schema/helper authoring, typed delivery inspection and safe errors in
+Ship report schema authoring, typed delivery inspection and safe errors in
 shared Rust client, all SDKs, CLI and HTTP/MCP here. Update the standard-report
 example into a runnable public story with actual declaration→queued extraction→
 Prompt/workspace→normal requirement→Check/comment; docs explain optional reports,
-severity versus verdict, waiting, ambiguous delivery and retry diagnosis. Earlier
+severity versus verdict, waiting, delivery outcome and retry diagnosis. Earlier
 tasks already own their introduced operations and docs; this is not deferred
 surface implementation for the whole change.
 
@@ -112,16 +97,15 @@ malformed reports; retained fanout/repeat and discarded speculation exercise rea
 engine output selection. Assert provider Check/conclusion plus every severity,
 unlocated summary, valid suggestion and invalid exact-source edit; authored
 requirements alone determine verdict. One successful model output or empty
-findings never proves an otherwise incomplete review passed. Helpers preserve
-finding IDs through authored aggregation and threshold checks.
+findings never proves an otherwise incomplete review passed.
 
 **AC-009:** On that same completed/waiting review, have local provider transport
-commit a remote write then time out; interrupt annotation batches and restart.
-Inspect reconciled IDs/comments/batches and independent delivery state, with no
-review recomputation or duplicate append. Push a new head through 006 and remove
-access through 002 during delivery; no later stale write is authorized, and
-already-sent effects remain pinned/visibly reconciled. Also exercise cooldown,
-permanent failure and ambiguous readback without pretending completion.
+commit a Check/review write then time out: the lookup finds it and nothing is
+created twice. Restart before an outcome is recorded: delivery runs again from the
+retained report without recomputation and finds what already landed. Push a new
+head through 006 and remove access through 002 during delivery: no later write,
+outcome skipped. Rate-limit cooldown is honored; permanent refusal is a visible
+failed outcome.
 
 **AC-011 (complete journey):** Fresh reader follows the combined CLI/SDK guides
 from App setup to declare, PR admission, deferred publish, approval and result/
@@ -131,15 +115,14 @@ receipts/accepted states at every seam, not seeded report/activation fixtures.
 Tier 1: matched Rust/Python/TypeScript stories and `wyrd-mcp` journeys with real
 WyrdTestServer/Postgres and local protocol/model transports, using README runners;
 the local GitHub is the existing `wyrd-testing` `GithubAppMock`, extended with
-Check run, pull-request review and review-comment endpoints with readback, and
-scripted faults: commit a write then lose its answer, rate-limit cooldown and
-permanent refusal;
-server verification runtime journeys cover restart. Tier 2: provider delivery
-progress and canonical reads against real dependencies; tier 3: schema, selection,
-anchor/rendering and helper branches. Record actual new focused commands when
+Check run and pull-request review endpoints with readback, and scripted faults:
+commit a write then lose its answer, rate-limit cooldown and permanent refusal;
+server verification runtime journeys cover restart. Tier 2: delivery outcome
+record and canonical reads against real dependencies; tier 3: schema, selection
+and anchor/rendering branches. Record actual new focused commands when
 tests exist. Apply README surface/contract/type/boundary checks; integrated change
-review owns full shipped-surface lanes and required broad aggregate. Planning
-neither runs tests nor promises exactly-once remote HTTP effects.
+review owns full shipped-surface lanes and required broad aggregate. Exactly-once
+remote HTTP effects are not promised (spec revision 9).
 
 ## Obligations
 
@@ -148,7 +131,7 @@ contracts → Standard code review report / Errors, inspection and delivery.
 
 | ID | Promise and required cases | Planned proof |
 |---|---|---|
-| REPORT (REQ-012, AC-008) | Exact closed report schema in `wyrd-spec`; `response_format: code_review` beside `verdict`; normal code may emit it. Per execution, from accepted successful final outputs: each fanout item counts, only the final repeat output, never failed attempts or discarded speculation; 0 → summary, 1 → render, >1 → visible ambiguity even if consumed, malformed → visible error. Never changes the verdict; never truncated into a clean review. Optional helpers (validate, aggregate/sort, keep finding IDs, severity threshold) as ordinary outputs/checks | `wyrd-spec` unit tests; AC-008 journey |
-| RENDER (REQ-013, AC-008) | Anchors checked against task 005 retained path/commit/range/source; suggestion replaces exactly that range; invalid → visible delivery error, never line 1 or altered finding; unlocated stays in summary; severity → failure/warning/notice. Check: stable name per binding, `external_id` = execution, reviewed `head_sha`, verdict → conclusion mapping, waiting → `in_progress` with explanation. Review: `COMMENT` on reviewed commit, comments reused by finding ID, moved anchor links replacement, no auto-resolve, no APPROVE/REQUEST_CHANGES/source change | rendering unit tests; AC-008 journey over the mock's Check/review/comments |
-| DELIVERY (REQ-014, REQ-005, INV-001–006, AC-009) | Own provider lifecycle after settlement/park, reading retained state only: no recomputation, no new SQL fields/tables or report in SQL. Progress acknowledged in Bifrost before the obligation retires; restart rediscovers it. Readback by stable IDs before retrying an unknown create/append; annotations ≤ 50 per request, never blindly re-appended; unresolvable → visible ambiguous. Cooldown, bounded retry, visible permanent failure. Access (002) and generation (006) rechecked at every write; superseded work never claims current delivery | reconciliation unit tests; AC-009 journey (lost answer, interrupted batches, restart, new head, access loss, rate limit, refusal) |
-| SURFACES (REQ-016, AC-011) | Delivery status/error in execution inspection, separate from verdict, under existing read authorization on HTTP, MCP, Rust client, three SDKs and CLI; report/helper authoring on the SDKs; runnable standard-report example; docs (optional reports, severity vs verdict, waiting, ambiguous delivery, retry diagnosis); wyrd-design and bifrost-design amended. A fresh reader completes App setup → declare → PR → evidence → approval → result/delivery from the guides | SDK/MCP/CLI journeys; codegen/docs/examples checks; content review |
+| REPORT (REQ-012, AC-008) | Exact closed report schema in `wyrd-spec`; `response_format: code_review` beside `verdict`; normal code may emit it. Per execution, from accepted successful final outputs: each fanout item counts, only the final repeat output, never failed attempts or discarded speculation; 0 → summary, 1 → render, >1 → visible ambiguity even if consumed, malformed → visible error. Never changes the verdict; never truncated into a clean review | `wyrd-spec` unit tests; AC-008 journey |
+| RENDER (REQ-013, AC-008) | Anchors checked against task 005 retained path/commit/range/source; suggestion replaces exactly that range; invalid → visible delivery error, never line 1 or altered finding; unlocated stays in summary; ID, severity, confidence shown per finding; no annotations. Check: stable name per binding, `external_id` = execution, reviewed `head_sha`, verdict → conclusion mapping, waiting → `in_progress` with explanation, never back from completed. Review: one `COMMENT` on reviewed commit with execution marker, no auto-resolve, no APPROVE/REQUEST_CHANGES/source change | rendering unit tests; AC-008 journey over the mock's Check/review |
+| DELIVERY (REQ-014, REQ-005, INV-001–006, AC-009) | Background after settlement/park from retained state only; no recomputation, no verdict wait, no new SQL table/column or report in SQL. Lookup-before-create for Check and review, also after a timeout; rare duplicate accepted. Cooldown, bounded retry, visible failure. Access (002) and generation (006) rechecked before each write; superseded/revoked → skipped. One Bifrost outcome per execution; restart re-runs delivery for executions without one | delivery unit tests; AC-009 journey (lost answer, restart, new head, access loss, rate limit, refusal) |
+| SURFACES (REQ-016, AC-011) | Delivery outcome/error in execution inspection, separate from verdict, under existing read authorization on HTTP, MCP, Rust client, three SDKs and CLI; report schema authoring on the SDKs; runnable standard-report example; docs (optional reports, severity vs verdict, waiting, delivery outcome, retry diagnosis); wyrd-design and bifrost-design amended. A fresh reader completes App setup → declare → PR → evidence → approval → result/delivery from the guides | SDK/MCP/CLI journeys; codegen/docs/examples checks; content review |

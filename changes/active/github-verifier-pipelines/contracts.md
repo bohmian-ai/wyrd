@@ -331,10 +331,14 @@ nonterminal; waiting branches can coexist with running branches. Existing direct
 and queued callers retain status/result semantics otherwise. Read APIs remain
 available through CLI/SDK/MCP/HTTP with the existing verifier-read authorization.
 
-Check name is stable per Repository/Verifier binding; external_id names the exact
-execution. PR review comments use COMMENT, exact reviewed commit and stable
-finding identity. Retain enough provider delivery progress to reconcile ambiguous writes;
-provider IDs are reused instead of duplicating delivery. Reuse valid existing comments; if an anchor moves, preserve
-history and link replacement rather than silently changing its source location.
-Provider-side annotation batching respects its documented limit and append
-semantics. No transport retry may blindly append after an unknown outcome.
+Revision 9 delivery. Each pull_request execution gets one Check, named stably
+per Repository/Verifier binding with external_id naming the exact execution, and
+one `COMMENT` review on the exact reviewed commit whose body carries the
+execution marker; its inline comments carry the finding ID, severity and
+confidence. Delivery looks each one up by that identity before creating it,
+updates the Check in place and never creates a second review it can find. A
+completed Check is never set back to in_progress. No Check annotations, comment
+reuse across executions or moved-anchor history. A lost provider answer whose
+write is not yet visible may produce a rare duplicate; that is accepted.
+Inspection reports one delivery outcome per execution: pending (none recorded),
+delivered, skipped (superseded or access removed) or failed with a safe reason.

@@ -55,7 +55,7 @@ Open a pull request on the repository. Wyrd queues the review as in [Watch a pul
 
 While the execution waits for [evidence](/build-and-verify/verify/publish-deferred-evidence/) or an [approval](/build-and-verify/verify/approve-a-pull-request/), the Check stays `in_progress` and says what it waits for. Its summary lists every finding with its ID, severity and confidence.
 
-With a report, Wyrd also posts one `COMMENT` review on the reviewed commit. A finding located inside the change becomes an inline comment, and its suggested edit a GitHub suggestion you can commit. Wyrd never approves, requests changes, resolves threads or edits your source. A finding whose location is not in the reviewed source, such as a line past the end of the file or another commit, stays in the Check summary with the reason; Wyrd never moves it to another line.
+With a report, Wyrd also posts one `COMMENT` review on the reviewed commit, even when no finding is inline. A finding located inside the change becomes an inline comment, and its suggested edit a GitHub suggestion you can commit. Locations and evidence may also point at the base side of a changed file or at the context the extraction selected; such a finding stays in the Check summary. Wyrd never approves, requests changes, resolves threads or edits your source. A finding whose location is not in the retained source, such as a line past the end of the file or another commit, stays in the Check summary with the reason; Wyrd never moves it to another line. Cancelling the execution completes the same Check as `cancelled`.
 
 ## 5. Inspect the delivery
 
@@ -79,7 +79,7 @@ Read the execution with the MCP tool `verification.get_execution` or `GET /v1/ve
 | `report_ambiguous` | Several outputs held a report; the Check shows only the verdict |
 | `report_invalid` | The report did not match the format; the Check shows only the verdict |
 
-Delivery runs after the verdict, from the stored result: it never reruns the review. Wyrd waits out GitHub's rate-limit cooldown and retries a few times. Before writing it looks for the Check and review it may already have posted, so a retry or a server restart updates them in place. If GitHub accepted a write but its answer was lost, a rare duplicate review is possible.
+Delivery runs after the verdict, from the stored result: it never reruns the review. Wyrd waits as long as GitHub's `Retry-After` or rate-limit reset asks and retries a few times. Before writing it looks for the Check and review it may already have posted, so a retry or a server restart updates them in place. If GitHub accepted a write but its answer was lost, a rare duplicate review is possible.
 
 ## If it fails
 
@@ -88,6 +88,7 @@ Delivery runs after the verdict, from the stored result: it never reruns the rev
 | No Check on the pull request | Check the execution's status; a pull request that is a draft or whose repository is not selected queues nothing |
 | The Check shows only the verdict | Read `github_delivery.reason`: make the review the only step that returns a report, or fix its shape |
 | A finding is in the summary, not inline | Its location is not in the reviewed change; `github_delivery.problems` names why |
+| Every finding shows `anchor_source_unavailable` | No step extracted the pull request; add the `pr` step with `extractor: pull_request` |
 | `github_delivery.status` is `failed` | Fix the App's permissions or wait for GitHub; push a commit to review again |
 
 ## Next

@@ -73,6 +73,9 @@ fn policy(verifiers: &[&str]) -> String {
 
 /// Start with `verifiers` (file stem, Card) bound to pull requests beside
 /// the `extra` Cards they use, serving head `a…` of PR [`PR`].
+///
+/// # Panics
+/// Panics when the deployment does not start or its Cards do not declare.
 async fn bound(verifiers: &[(&str, String)], extra: &[(&str, &str)]) -> Deployment {
     let names: Vec<&str> = verifiers.iter().map(|(name, _)| *name).collect();
     let files: Vec<(String, String)> = verifiers
@@ -881,13 +884,15 @@ async fn the_review_example_fails_on_a_high_finding_and_comments_its_fix() {
 /// A Verifier whose `gates` approval steps run one after another before a
 /// code step returns an empty report.
 fn gated(gates: &[&str]) -> String {
+    use std::fmt::Write as _;
     let mut steps = String::new();
-    let mut after = "pr".to_owned();
+    let mut after = "pr";
     for gate in gates {
-        steps.push_str(&format!(
+        let _ = write!(
+            steps,
             "    - id: {gate}\n      depends_on: [{after}]\n      action: {{kind: approval, message: Ship {gate}?}}\n"
-        ));
-        after = (*gate).to_owned();
+        );
+        after = gate;
     }
     steps.push_str(
         &code("review", "", &[], &report("'Clean'"))

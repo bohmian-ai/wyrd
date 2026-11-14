@@ -63,6 +63,9 @@ pub struct ReportVersion;
 
 impl Serialize for ReportVersion {
     /// Serializes as the integer `1`.
+    ///
+    /// # Errors
+    /// Returns the serializer's error.
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_u32(CODE_REVIEW_VERSION)
     }
@@ -84,10 +87,12 @@ impl<'de> Deserialize<'de> for ReportVersion {
 }
 
 impl JsonSchema for ReportVersion {
+    /// The schema's name in generated definitions.
     fn schema_name() -> std::borrow::Cow<'static, str> {
         "ReportVersion".into()
     }
 
+    /// An integer that can only be [`CODE_REVIEW_VERSION`].
     fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
         schemars::json_schema!({ "type": "integer", "enum": [CODE_REVIEW_VERSION] })
     }
@@ -505,6 +510,7 @@ pub fn select_report(spec: &VerifierSpec, steps: &[StepResult]) -> ReportSelecti
     }
 }
 
+/// Unit proofs of the report contract, its schema and report selection.
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -534,6 +540,9 @@ mod tests {
     /// The generated schema is closed, requires every member including the
     /// nullable ones, pins format and version, and admits exactly what
     /// decoding admits.
+    ///
+    /// # Panics
+    /// Panics when the schema is invalid or admits or refuses a value decoding does not.
     #[test]
     fn the_schema_is_closed_and_requires_every_member() {
         let schema = Value::Object(CodeReviewReport::schema().clone());
@@ -572,6 +581,9 @@ mod tests {
 
     /// `code_review` resolves the report schema, refuses `data`, and
     /// `verdict` still resolves the Verdict.
+    ///
+    /// # Panics
+    /// Panics when a named format does not resolve to its schema.
     #[test]
     fn the_named_resolver_serves_both_formats() {
         let named = |name: &str| NamedResponseFormat::Name(name.to_owned());
@@ -596,6 +608,9 @@ mod tests {
 
     /// Envelope recognition ignores other outputs, decodes valid reports and
     /// names what makes an envelope unusable.
+    ///
+    /// # Panics
+    /// Panics when an envelope is misrecognized or a problem is misreported.
     #[test]
     fn envelopes_are_recognized_and_validated() {
         assert!(CodeReviewReport::envelope(&json!({"findings": []})).is_none());
@@ -643,6 +658,9 @@ mod tests {
     }
 
     /// A Verifier with plain steps `a`, `b`, `c` and fanout step `fan`.
+    ///
+    /// # Panics
+    /// Panics when the authored Verifier does not deserialize.
     fn spec() -> VerifierSpec {
         let code = |id: &str| {
             json!({"id": id, "action": {"kind": "code", "entrypoint": "f",
@@ -660,6 +678,9 @@ mod tests {
     }
 
     /// A settled step result.
+    ///
+    /// # Panics
+    /// Panics when `id` is not a valid step id.
     fn step(id: &str, status: StepStatus, output: Option<Value>) -> StepResult {
         StepResult {
             id: TaskId::new(id).expect("task id"),
@@ -676,6 +697,9 @@ mod tests {
     /// Only succeeded outputs count; each fanout item is its own candidate;
     /// an envelope a later step consumed still counts; one malformed
     /// envelope is invalid, never ignored.
+    ///
+    /// # Panics
+    /// Panics when a selection differs from the one expected.
     #[test]
     fn selection_counts_each_retained_final_output() {
         let spec = spec();

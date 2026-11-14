@@ -138,7 +138,10 @@ enum Write<'p> {
 impl Write<'_> {
     /// Look the write's target up with `token` and make the write unless
     /// it is already there, for `execution_id` on PR `number` of
-    /// `repository`.
+    /// `repository`. A waiting Check is only created, never updated.
+    ///
+    /// Dropping the future after the write was sent does not undo it; the
+    /// next attempt's lookup finds whatever landed.
     ///
     /// # Errors
     /// Returns the [`DeliveryFailure`] of the lookup or the write.
@@ -197,6 +200,9 @@ impl<'a> GithubDeliveries<'a> {
     /// Deliver `tenant`'s execution `execution_id` in the background,
     /// retrying a delivery whose reads are unavailable a bounded number of
     /// times. Does nothing when this server has no GitHub App.
+    ///
+    /// # Panics
+    /// Panics when called outside a Tokio runtime.
     pub(crate) fn spawn(app: AppState, tenant: DataTenantId, execution_id: ExecutionId) {
         if app.github.is_none() {
             return;
@@ -449,6 +455,9 @@ impl<'a> GithubDeliveries<'a> {
     /// generation before each attempt and waiting out each cooldown or
     /// backoff between them.
     ///
+    /// Dropping the future mid-attempt leaves any write already sent in
+    /// place and records nothing; a later delivery looks it up first.
+    ///
     /// # Errors
     /// Returns [`Halt::Skipped`] once access or generation is gone,
     /// [`Halt::Failed`] on a refusal, and the last [`Halt::Again`] once
@@ -550,6 +559,10 @@ impl<'a> GithubDeliveries<'a> {
     /// Record `delivery` as the outcome of `presented`'s current state and
     /// wait for its Scribe acknowledgement. A second record of the same
     /// revision is absorbed or refused by its batch fence; the first stays.
+    ///
+    /// Once staged, the row is flushed even when this future is dropped or
+    /// times out waiting; a delivery that then runs again finds it through
+    /// its fence or is absorbed by it.
     ///
     /// # Errors
     /// Returns `WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE` when the outcome

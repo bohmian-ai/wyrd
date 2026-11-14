@@ -714,7 +714,8 @@ impl GithubApp {
     ///
     /// # Errors
     /// Returns the [`DeliveryFailure`] of an unsuccessful write; an
-    /// [`DeliveryFailure::Unavailable`] write may still have landed.
+    /// [`DeliveryFailure::Unavailable`] write may still have landed, and
+    /// dropping the future after it was sent does not undo it.
     pub(crate) async fn create_check_run(
         &self,
         token: &SecretString,
@@ -729,7 +730,9 @@ impl GithubApp {
     /// Update Check run `id` of repository `repository_id` in place.
     ///
     /// # Errors
-    /// Returns the [`DeliveryFailure`] of an unsuccessful write.
+    /// Returns the [`DeliveryFailure`] of an unsuccessful write; an
+    /// [`DeliveryFailure::Unavailable`] write may still have landed, and
+    /// dropping the future after it was sent does not undo it.
     pub(crate) async fn update_check_run(
         &self,
         token: &SecretString,
@@ -769,7 +772,8 @@ impl GithubApp {
     ///
     /// # Errors
     /// Returns the [`DeliveryFailure`] of an unsuccessful write; an
-    /// [`DeliveryFailure::Unavailable`] write may still have landed.
+    /// [`DeliveryFailure::Unavailable`] write may still have landed, and
+    /// dropping the future after it was sent does not undo it.
     pub(crate) async fn create_review(
         &self,
         token: &SecretString,

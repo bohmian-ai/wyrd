@@ -557,6 +557,7 @@ fn longest_backtick_run(text: &str) -> usize {
 /// `summary` cut to GitHub's limit, saying so when cut; the conclusion
 /// stays the verdict's, so a cut never reads as a clean review.
 fn bounded(summary: String) -> String {
+    /// Appended to a cut summary.
     const NOTE: &str = "\n\n… summary truncated; read the full report in Wyrd.";
     if summary.chars().count() <= SUMMARY_LIMIT {
         return summary;
@@ -567,12 +568,15 @@ fn bounded(summary: String) -> String {
     cut
 }
 
+/// Unit proofs of rendering: conclusions, findings, anchors, reviews and
+/// summary bounds.
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
 
     use super::*;
 
+    /// The reviewed head commit.
     const HEAD: &str = "1111111111111111111111111111111111111111";
 
     /// The merge base the extraction compares from.
@@ -679,12 +683,18 @@ mod tests {
 
     /// Render a completed execution with `verdict` and `selection` against
     /// [`extraction`].
+    ///
+    /// # Panics
+    /// Panics when [`extraction`] does not decode.
     fn completed(verdict: VerificationVerdict, selection: &ReportSelection) -> Presentation {
         shown(verdict, selection, Some(&extraction()))
     }
 
     /// Every status maps to its approved conclusion; unfinished work has
     /// none.
+    ///
+    /// # Panics
+    /// Panics when a status maps to another conclusion.
     #[test]
     fn conclusions_follow_the_verdict_and_status() {
         use VerificationExecutionStatus as Status;
@@ -721,6 +731,9 @@ mod tests {
 
     /// A waiting execution is in_progress with its explanation and renders
     /// no review, whatever its outputs hold.
+    ///
+    /// # Panics
+    /// Panics when a waiting Check is completed, lacks its reason, or is reviewed.
     #[test]
     fn waiting_is_in_progress_with_an_explanation() {
         let settled = Settled {
@@ -754,6 +767,9 @@ mod tests {
     /// the head, an unlocated finding and an anchor outside the diff stay
     /// in the summary, and a suggestion replaces exactly its range. Severity
     /// never changes the conclusion.
+    ///
+    /// # Panics
+    /// Panics when a finding is misplaced, unlabelled or its suggestion differs.
     #[test]
     fn findings_render_inline_or_in_the_summary() {
         let edit = json!({"location": anchor("src/lib.rs", 2, 3), "replacement": "z\n"});
@@ -857,6 +873,9 @@ mod tests {
     /// No report renders only the verdict; an ambiguous or invalid report
     /// is named in the summary and as the report error, and renders no
     /// review.
+    ///
+    /// # Panics
+    /// Panics when a report error is lost or an unrendered report is reviewed.
     #[test]
     fn missing_ambiguous_and_invalid_reports_render_no_review() {
         let none = completed(VerificationVerdict::Passed, &ReportSelection::None);
@@ -981,6 +1000,9 @@ mod tests {
     }
 
     /// A summary past GitHub's limit is cut with an explicit note.
+    ///
+    /// # Panics
+    /// Panics when a long summary is not cut to the limit with its note.
     #[test]
     fn long_summaries_are_cut_visibly() {
         let cut = bounded("x".repeat(SUMMARY_LIMIT + 10));

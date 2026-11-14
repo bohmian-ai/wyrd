@@ -18,7 +18,7 @@
 //! the mock, keeping Wyrd's cookies. Webhooks are delivered signed with the
 //! configured secret, or deliberately missigned.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use axum::Router;
@@ -109,8 +109,8 @@ impl HeldAnswer {
     }
 }
 
-/// GitHub's scripted answer to the next Check run or pull request review
-/// request Wyrd sends, in place of the ordinary one.
+/// GitHub's scripted answer to one Check run or pull request review request
+/// Wyrd sends, in place of the ordinary one.
 #[derive(Debug, Clone)]
 pub enum DeliveryFault {
     /// Apply a write, then answer `504 Gateway Timeout`, as when GitHub
@@ -269,8 +269,9 @@ struct MockState {
     /// Every pull request review, as (repository id, number, review with
     /// its `id`), in creation order.
     reviews: Vec<(u64, u64, Value)>,
-    /// Faults of the next Check run and review requests, in order.
-    delivery_faults: VecDeque<DeliveryFault>,
+    /// Scripted faults, as (request method and path prefix, fault), each
+    /// answering the first matching request once, in order.
+    delivery_faults: Vec<(String, DeliveryFault)>,
     /// Every Check run and review request, as (arrival, method and path),
     /// in arrival order.
     delivery_requests: Vec<(std::time::Instant, String)>,
@@ -613,18 +614,22 @@ impl GithubAppMock {
         hold
     }
 
-    /// Answer the next Check run or review request with `fault`; faults
-    /// queue in order.
-    pub fn fail_next_delivery_request(&self, fault: DeliveryFault) {
-        self.state().delivery_faults.push_back(fault);
+    /// Answer the next Check run or review request whose method and path
+    /// start with `request`, such as `POST /check-runs` or
+    /// `POST /pulls/7/reviews`, with `fault`. Faults for the same request
+    /// answer in order.
+    pub fn fail_next_delivery_request(&self, request: &str, fault: DeliveryFault) {
+        self.state()
+            .delivery_faults
+            .push((request.to_owned(), fault));
     }
 
-    /// Hold the next Check run or review request until released, then
-    /// answer it `502 Bad Gateway`.
+    /// Hold the next Check run or review request starting with `request`
+    /// until released, then answer it `502 Bad Gateway`.
     #[must_use]
-    pub fn stall_next_delivery_request(&self) -> HeldAnswer {
+    pub fn stall_next_delivery_request(&self, request: &str) -> HeldAnswer {
         let hold = HeldAnswer::default();
-        self.fail_next_delivery_request(DeliveryFault::Stall(hold.clone()));
+        self.fail_next_delivery_request(request, DeliveryFault::Stall(hold.clone()));
         hold
     }
 
@@ -1238,7 +1243,7 @@ async fn pull_request(
 
 /// Answer one Check run or review request `label` on `repository` from an
 /// installation token: apply `act` and answer what it returns, unless the
-/// next [`DeliveryFault`] answers instead. A `write` applies `act` before
+/// first [`DeliveryFault`] scripted for `label` answers instead. A `write` applies `act` before
 /// losing its answer.
 async fn delivery_request(
     weak: &Weak,
@@ -1261,7 +1266,12 @@ async fn delivery_request(
         if !reachable {
             return StatusCode::NOT_FOUND.into_response();
         }
-        match state.delivery_faults.pop_front() {
+        let fault = state
+            .delivery_faults
+            .iter()
+            .position(|(request, _)| label.starts_with(request.as_str()))
+            .map(|index| state.delivery_faults.remove(index).1);
+        match fault {
             None => (act(&mut state), None),
             Some(DeliveryFault::LoseAnswer) => {
                 if write {

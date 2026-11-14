@@ -201,10 +201,12 @@ impl<'a> GithubDeliveries<'a> {
 
     /// Deliver every current PR execution of every tenant that has no
     /// outcome for its current state, once, retrying the scan until it
-    /// succeeds or `shutdown` fires.
+    /// succeeds, then idle until `shutdown`: a supervised worker runs until
+    /// shutdown.
     // ponytail: one execution at a time; bound a concurrent pool if restart backlogs grow.
     pub(crate) async fn recover(app: AppState, shutdown: CancellationToken) {
         let Some(operator) = app.postgres.operator_pool() else {
+            shutdown.cancelled().await;
             return;
         };
         let queue = VerifierExecutionQueue::default();
@@ -234,7 +236,7 @@ impl<'a> GithubDeliveries<'a> {
             }
             .await;
             match scanned {
-                Ok(()) => return,
+                Ok(()) => break,
                 Err(error) => {
                     tracing::warn!(%error, "GitHub delivery recovery scan failed; retrying");
                 }
@@ -244,6 +246,7 @@ impl<'a> GithubDeliveries<'a> {
                 () = tokio::time::sleep(RECOVERY_RETRY) => {}
             }
         }
+        shutdown.cancelled().await;
     }
 
     /// [`Self::deliver`], tried again with backoff while it fails.
@@ -251,7 +254,7 @@ impl<'a> GithubDeliveries<'a> {
         let mut wait = BACKOFF;
         for attempt in 1..=ATTEMPTS {
             match self.deliver(execution_id).await {
-                Ok(()) => return,
+                Ok(()) => break,
                 Err(error) => {
                     tracing::warn!(%execution_id, attempt, %error, "GitHub delivery could not run");
                 }

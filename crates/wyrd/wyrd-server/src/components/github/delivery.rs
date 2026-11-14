@@ -402,9 +402,9 @@ impl<'a> GithubDeliveries<'a> {
                 verdict,
             },
             &presented.waiting,
-            extraction.as_ref().map(|extraction| Completed {
+            Some(Completed {
                 selection: &selection,
-                extraction,
+                extraction: extraction.as_ref(),
             }),
         ))
     }

@@ -2537,26 +2537,35 @@ execution has one Check, named per binding, with `external_id` the execution
 and `head_sha` the reviewed commit: `passed` concludes `success`, `failed` and
 `errored` `failure`, `inconclusive` `action_required`, `cancelled` and
 `timed_out` themselves; waiting evidence or approval is `in_progress` with an
-explanation, and a completed Check never returns to it. Of the execution's
+explanation; waiting only creates the Check, never updates an existing one,
+so a completed Check never returns to it. Of the execution's
 accepted successful final step outputs (each fanout item, only a repeat's
 final output, never a failed attempt or discarded speculation), none holding a
 `code_review` envelope gives a summary-only Check, one renders, and more than
 one, or a malformed one, is shown as `report_ambiguous` or `report_invalid`.
-A rendered report adds one `COMMENT` review on the reviewed commit carrying the
-execution marker, with each finding whose anchor and suggested edit match the
-retained source inline; a finding whose anchor does not is listed in the Check
-summary with its reason, never moved. There are no Check annotations, approvals,
+A rendered report, even one with no inline finding, adds one `COMMENT` review
+on the reviewed commit carrying the execution marker. Every anchor must lie in
+retained source: either side of a changed file or a selected context span. A
+finding whose anchors do and whose location lies in a head-side hunk is inline,
+with its suggested edit; other valid findings stay in the Check summary; a
+finding with an anchor the retained source does not hold is listed there with
+its reason, never moved. Without a retained extraction the report still
+renders in the summary and its anchors are refused as unavailable. There are no Check annotations, approvals,
 change requests, resolutions or source changes. GitHub REST has no idempotency
 key, so each write looks up the Check by name, head and `external_id` and the
 review by its marker before creating, also after an unanswered write; a rare
-duplicate after a lost answer is accepted. Writes honor `Retry-After` and retry
+duplicate after a lost answer is accepted. Writes honor `Retry-After` and the
+rate-limit reset in full and retry
 a bounded number of times, and each is preceded by a check of current
 repository access and pull request generation: a superseded or access-removed
 execution is `skipped` and never written again. One outcome per accepted state
-revision is retained in Bifrost (see
+revision, and one more once the execution is cancelled, is retained in Bifrost
+(see
 [Storage format and Variant](./bifrost-design.md#storage-format-and-variant)); execution inspection over HTTP and
 MCP serves it as `github_delivery`, `pending` until recorded, separate from the
-verdict and under the execution's read authorization.
+verdict and under the execution's read authorization. Public cancellation
+starts the cancelled delivery at once; a principal revocation's is delivered by
+the next restart recovery.
 
 Other external pushes are deliberately not an activation.
 

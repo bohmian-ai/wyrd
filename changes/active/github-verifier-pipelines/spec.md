@@ -1,6 +1,6 @@
 ---
 id: SPEC-github-verifier-pipelines
-revision: 10
+revision: 11
 status: approved
 ---
 
@@ -267,8 +267,13 @@ Check or review, look it up by its execution marker and update or skip an existi
 one; after a provider timeout, retry the lookup and create only when it is absent.
 A rare duplicate after a lost provider answer is accepted. Respect provider
 cooldowns and bound retries. Recheck access and current generation before each
-write. Record one delivery outcome per execution in Bifrost; restart re-runs
-delivery for PR executions without one. Execution inspection exposes the outcome
+write attempt; a change that lands during that attempt's lookup may still let its
+write through. Record one delivery outcome per execution in Bifrost; restart re-runs
+delivery for PR executions without one. Cancellation is its own delivery:
+a cancelled execution's outcome is recorded once under its accepted revision,
+apart from the outcome that revision already has, and its Check is updated in
+place to cancelled. Public cancellation starts that delivery at once; a
+principal revocation's is delivered by the next restart recovery. Execution inspection exposes the outcome
 and safe error separately from the verdict. No progress ledger, new SQL table or
 column, result mirror or finalizer service.
 
@@ -457,6 +462,7 @@ readiness. Implementation tasks derive from this approved revision.
 | 8 | approved 2026-11-13 | User decisions during TASK-005, explicitly approved: REQ-016/AC-011 inspect the pull_request extraction only through existing HTTP/MCP execution details (no typed SDK read, SDK helper, CLI read or SDK journey for it); REQ-007 drops repository guidance from the pinned base, superseding that sentence in [extraction design](design/approved-code-review-support.md). Nothing else changes. |
 | 9 | approved 2026-11-13 | User decision during TASK-009: GitHub REST offers no idempotency key, so delivery is lookup-before-create with a rare duplicate accepted; drop Check annotations, the delivery progress ledger, comment reuse/moved-anchor history and the optional report helpers; one Bifrost delivery outcome per execution. Amends REQ-012–014 and AC-009 and supersedes conflicting text in [report delivery](design/approved-report-delivery.md), [runtime and GitHub](design/approved-runtime-and-github.md), contracts and task 009. |
 | 10 | approved 2026-11-13 | User decision during TASK-009: the GitHub delivery outcome has no typed Rust client, SDK or CLI projection; it is read through existing HTTP/MCP execution inspection. Amends REQ-016 and AC-011 and task 009 surfaces. Nothing else changes. |
+| 11 | approved 2026-11-14 | User decisions after the TASK-009 review: cancellation is its own delivery, recorded once per revision apart from that revision's outcome (FIND-009-8; amends REQ-014 and the bifrost-design one-outcome-per-revision rule). Deferred as accepted limits: report source is the first retained pull_request extraction output and an extraction-shaped decoy is not distinguished (FIND-009-2); access and generation are rechecked before each write attempt, not again after its lookup (FIND-009-6); startup recovery waiting on a provider cooldown may hold shutdown until the drain deadline (FIND-009-9). Nothing else changes. |
 
 Subsequent explicit maintainer amendment: approval authoring has no separate
 expiration setting. Pending approvals and deferred waits share the execution's

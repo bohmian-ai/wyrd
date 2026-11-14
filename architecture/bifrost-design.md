@@ -489,7 +489,10 @@ typed columns:
     sequence, holding the status (`delivered`, `skipped` or `failed`), safe
     reason and refused finding anchors. It is a fenced Scribe write whose batch
     id derives from event, execution and revision, so the first recorded
-    outcome is final and a replay records nothing. A revision without one reads
+    outcome is final and a replay records nothing. A cancelled execution's
+    outcome is a separate `github_delivery_cancelled` row at the same sequence,
+    with its own batch id, because cancellation settles only the queue row and
+    writes no revision. A revision without the outcome its status needs reads
     as `pending`, and recovery redelivers it. No report, Check or review payload
     is copied; the report stays in the accepted step output.
   - The existing shared Scribe outbox provides bounded batching and stable retry

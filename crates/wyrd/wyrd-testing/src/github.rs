@@ -11,19 +11,21 @@
 //! installation tokens, as is repository content the test serves verbatim
 //! with every read recorded; every webhook delivery is logged with its
 //! `X-GitHub-Delivery` id so Wyrd can list and redeliver failed ones, as
-//! GitHub's App delivery API allows. [`GithubBrowser`] is a
+//! GitHub's App delivery API allows. Check runs and pull request reviews
+//! Wyrd delivers are stored and read back, and a [`DeliveryFault`] scripts
+//! GitHub's next answer to one of those requests. [`GithubBrowser`] is a
 //! browser signed in to Wyrd that follows the redirect chain across Wyrd and
 //! the mock, keeping Wyrd's cookies. Webhooks are delivered signed with the
 //! configured secret, or deliberately missigned.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use axum::Router;
-use axum::extract::{Form, Path, Query, State};
+use axum::extract::{Form, Json, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use base64::Engine as _;
 use secrecy::SecretString;
 use serde::Deserialize;
@@ -105,6 +107,24 @@ impl HeldAnswer {
         self.arrived.notify_one();
         self.released.notified().await;
     }
+}
+
+/// GitHub's scripted answer to the next Check run or pull request review
+/// request Wyrd sends, in place of the ordinary one.
+#[derive(Debug, Clone)]
+pub enum DeliveryFault {
+    /// Apply a write, then answer `504 Gateway Timeout`, as when GitHub
+    /// commits a write whose answer never reaches Wyrd; a read answers
+    /// `504` and changes nothing.
+    LoseAnswer,
+    /// Answer `429 Too Many Requests` with `Retry-After` this many seconds,
+    /// applying nothing.
+    RateLimit(u64),
+    /// Answer `422 Unprocessable Entity`, applying nothing.
+    Refuse,
+    /// Hold the request until released, then answer `502 Bad Gateway`,
+    /// applying nothing.
+    Stall(HeldAnswer),
 }
 
 /// One pull request as GitHub holds it, which the test edits.
@@ -243,6 +263,17 @@ struct MockState {
     deliveries: Vec<DeliveryAttempt>,
     /// Wyrd's public base URL, where redeliveries are sent.
     public_url: Option<String>,
+    /// Every Check run, as (repository id, Check run with its `id`), in
+    /// creation order.
+    check_runs: Vec<(u64, Value)>,
+    /// Every pull request review, as (repository id, number, review with
+    /// its `id`), in creation order.
+    reviews: Vec<(u64, u64, Value)>,
+    /// Faults of the next Check run and review requests, in order.
+    delivery_faults: VecDeque<DeliveryFault>,
+    /// Every Check run and review request, as (arrival, method and path),
+    /// in arrival order.
+    delivery_requests: Vec<(std::time::Instant, String)>,
     /// Counter for unique codes and tokens.
     serial: u64,
 }
@@ -582,6 +613,51 @@ impl GithubAppMock {
         hold
     }
 
+    /// Answer the next Check run or review request with `fault`; faults
+    /// queue in order.
+    pub fn fail_next_delivery_request(&self, fault: DeliveryFault) {
+        self.state().delivery_faults.push_back(fault);
+    }
+
+    /// Hold the next Check run or review request until released, then
+    /// answer it `502 Bad Gateway`.
+    #[must_use]
+    pub fn stall_next_delivery_request(&self) -> HeldAnswer {
+        let hold = HeldAnswer::default();
+        self.fail_next_delivery_request(DeliveryFault::Stall(hold.clone()));
+        hold
+    }
+
+    /// Every Check run on `repository`, with its `id`, in creation order.
+    #[must_use]
+    pub fn check_runs(&self, repository: u64) -> Vec<Value> {
+        self.state()
+            .check_runs
+            .iter()
+            .filter(|(id, _)| *id == repository)
+            .map(|(_, run)| run.clone())
+            .collect()
+    }
+
+    /// Every review of pull request `number` of `repository`, with its
+    /// `id`, in creation order.
+    #[must_use]
+    pub fn reviews(&self, repository: u64, number: u64) -> Vec<Value> {
+        self.state()
+            .reviews
+            .iter()
+            .filter(|(id, pull, _)| *id == repository && *pull == number)
+            .map(|(_, _, review)| review.clone())
+            .collect()
+    }
+
+    /// Every Check run and review request, as (arrival, method and path),
+    /// in arrival order.
+    #[must_use]
+    pub fn delivery_requests(&self) -> Vec<(std::time::Instant, String)> {
+        self.state().delivery_requests.clone()
+    }
+
     /// Record that Wyrd's answer to the latest attempt of delivery `guid`
     /// never reached GitHub, as when Wyrd stopped before answering: GitHub
     /// then shows the delivery failed.
@@ -779,6 +855,22 @@ fn router(inner: std::sync::Weak<Inner>) -> Router {
         .route(
             "/api/v3/repositories/{id}/pulls/{number}",
             get(pull_request),
+        )
+        .route(
+            "/api/v3/repositories/{id}/pulls/{number}/reviews",
+            get(list_reviews).post(create_review),
+        )
+        .route(
+            "/api/v3/repositories/{id}/commits/{sha}/check-runs",
+            get(list_check_runs),
+        )
+        .route(
+            "/api/v3/repositories/{id}/check-runs",
+            post(create_check_run),
+        )
+        .route(
+            "/api/v3/repositories/{id}/check-runs/{check_run}",
+            patch(update_check_run),
         )
         .route("/api/v3/app/hook/deliveries", get(hook_deliveries))
         .route(
@@ -1142,6 +1234,176 @@ async fn pull_request(
         hold.hold().await;
     }
     answer
+}
+
+/// Answer one Check run or review request `label` on `repository` from an
+/// installation token: apply `act` and answer what it returns, unless the
+/// next [`DeliveryFault`] answers instead. A `write` applies `act` before
+/// losing its answer.
+async fn delivery_request(
+    weak: &Weak,
+    headers: &HeaderMap,
+    (repository, label, write): (u64, String, bool),
+    act: impl FnOnce(&mut MockState) -> Response,
+) -> Response {
+    let Some(mock) = weak.mock() else {
+        return gone();
+    };
+    let (answer, hold) = {
+        let mut state = mock.state();
+        state
+            .delivery_requests
+            .push((std::time::Instant::now(), label.clone()));
+        let (issued, reachable) = installation_read(&mut state, headers, repository, &label);
+        if !issued {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        if !reachable {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        match state.delivery_faults.pop_front() {
+            None => (act(&mut state), None),
+            Some(DeliveryFault::LoseAnswer) => {
+                if write {
+                    drop(act(&mut state));
+                }
+                (StatusCode::GATEWAY_TIMEOUT.into_response(), None)
+            }
+            Some(DeliveryFault::RateLimit(seconds)) => (
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(header::RETRY_AFTER, seconds.to_string())],
+                )
+                    .into_response(),
+                None,
+            ),
+            Some(DeliveryFault::Refuse) => (StatusCode::UNPROCESSABLE_ENTITY.into_response(), None),
+            Some(DeliveryFault::Stall(hold)) => {
+                (StatusCode::BAD_GATEWAY.into_response(), Some(hold))
+            }
+        }
+    };
+    if let Some(hold) = hold {
+        hold.hold().await;
+    }
+    answer
+}
+
+/// Check run listing query.
+#[derive(Deserialize)]
+struct CheckRunsQuery {
+    /// Only Check runs of this name.
+    check_name: Option<String>,
+}
+
+/// `GET /api/v3/repositories/{id}/commits/{sha}/check-runs`: every Check
+/// run on the commit, of the queried name, in one page.
+async fn list_check_runs(
+    State(weak): State<Weak>,
+    Path((repository, sha)): Path<(u64, String)>,
+    Query(query): Query<CheckRunsQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let label = format!("GET /commits/{sha}/check-runs");
+    delivery_request(&weak, &headers, (repository, label, false), |state| {
+        let runs: Vec<&Value> = state
+            .check_runs
+            .iter()
+            .filter(|(id, run)| {
+                *id == repository
+                    && run["head_sha"] == sha.as_str()
+                    && query
+                        .check_name
+                        .as_deref()
+                        .is_none_or(|name| run["name"] == name)
+            })
+            .map(|(_, run)| run)
+            .collect();
+        axum::Json(json!({"total_count": runs.len(), "check_runs": runs})).into_response()
+    })
+    .await
+}
+
+/// `POST /api/v3/repositories/{id}/check-runs`: create a Check run.
+async fn create_check_run(
+    State(weak): State<Weak>,
+    Path(repository): Path<u64>,
+    headers: HeaderMap,
+    Json(mut body): Json<Value>,
+) -> Response {
+    let label = "POST /check-runs".to_owned();
+    delivery_request(&weak, &headers, (repository, label, true), |state| {
+        state.serial += 1;
+        let id = state.serial;
+        body["id"] = json!(id);
+        state.check_runs.push((repository, body));
+        (StatusCode::CREATED, axum::Json(json!({"id": id}))).into_response()
+    })
+    .await
+}
+
+/// `PATCH /api/v3/repositories/{id}/check-runs/{check_run}`: update the
+/// Check run's given fields in place.
+async fn update_check_run(
+    State(weak): State<Weak>,
+    Path((repository, check_run)): Path<(u64, u64)>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let label = format!("PATCH /check-runs/{check_run}");
+    delivery_request(&weak, &headers, (repository, label, true), |state| {
+        let found = state
+            .check_runs
+            .iter_mut()
+            .find(|(id, run)| *id == repository && run["id"] == check_run);
+        let (Some((_, run)), Value::Object(fields)) = (found, body) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        for (field, value) in fields {
+            run[field] = value;
+        }
+        axum::Json(json!({"id": check_run})).into_response()
+    })
+    .await
+}
+
+/// `GET /api/v3/repositories/{id}/pulls/{number}/reviews`: every review of
+/// the pull request, in one page.
+async fn list_reviews(
+    State(weak): State<Weak>,
+    Path((repository, number)): Path<(u64, u64)>,
+    headers: HeaderMap,
+) -> Response {
+    let label = format!("GET /pulls/{number}/reviews");
+    delivery_request(&weak, &headers, (repository, label, false), |state| {
+        let reviews: Vec<&Value> = state
+            .reviews
+            .iter()
+            .filter(|(id, pull, _)| *id == repository && *pull == number)
+            .map(|(_, _, review)| review)
+            .collect();
+        axum::Json(reviews).into_response()
+    })
+    .await
+}
+
+/// `POST /api/v3/repositories/{id}/pulls/{number}/reviews`: create a
+/// review.
+async fn create_review(
+    State(weak): State<Weak>,
+    Path((repository, number)): Path<(u64, u64)>,
+    headers: HeaderMap,
+    Json(mut body): Json<Value>,
+) -> Response {
+    let label = format!("POST /pulls/{number}/reviews");
+    delivery_request(&weak, &headers, (repository, label, true), |state| {
+        state.serial += 1;
+        let id = state.serial;
+        body["id"] = json!(id);
+        state.reviews.push((repository, number, body));
+        axum::Json(json!({"id": id})).into_response()
+    })
+    .await
 }
 
 /// Record an installation read of `path` below `repository` and report

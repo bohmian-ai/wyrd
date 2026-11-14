@@ -30,7 +30,7 @@ use wyrd_sql::queries::verifier_executions::{PullRequestBaseline, VerifierExecut
 use super::review_cache::{CodeReviewMetadata, CodeReviewObjects};
 use super::service::GithubConnections;
 
-mod output;
+pub(crate) mod output;
 
 /// The extractor version a `pull_request` extraction's provenance records.
 pub const PULL_REQUEST_EXTRACT_VERSION: &str = "pull_request/1";

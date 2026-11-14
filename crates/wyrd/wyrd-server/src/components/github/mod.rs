@@ -14,6 +14,9 @@
 pub mod app;
 /// Pull-request source extraction for queued PR executions.
 pub mod extraction;
+/// What a pull_request execution shows on GitHub, rendered from retained
+/// evidence.
+pub(crate) mod presentation;
 /// Pull-request admission into the Verifier queue and failed-delivery
 /// recovery.
 pub mod pull_requests;

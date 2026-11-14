@@ -1,7 +1,7 @@
 ---
 id: TASK-009
 status: proposed
-approved_spec_revision: 9
+approved_spec_revision: 10
 requirements: [REQ-005, REQ-012, REQ-013, REQ-014, REQ-016]
 acceptance: [AC-008, AC-009, AC-011]
 invariants: [INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007]
@@ -83,8 +83,9 @@ queued delivery** and **bifrost-design.md → canonical evidence** accordingly.
 
 ## Surfaces and connected proof
 
-Ship report schema authoring, typed delivery inspection and safe errors in
-shared Rust client, all SDKs, CLI and HTTP/MCP here. Update the standard-report
+Ship report schema authoring here. The delivery outcome and safe error are
+read through existing execution inspection over HTTP/MCP only; spec revision 10
+drops its Rust client, SDK and CLI projection. Update the standard-report
 example into a runnable public story with actual declaration→queued extraction→
 Prompt/workspace→normal requirement→Check/comment; docs explain optional reports,
 severity versus verdict, waiting, delivery outcome and retry diagnosis. Earlier
@@ -134,4 +135,4 @@ contracts → Standard code review report / Errors, inspection and delivery.
 | REPORT (REQ-012, AC-008) | Exact closed report schema in `wyrd-spec`; `response_format: code_review` beside `verdict`; normal code may emit it. Per execution, from accepted successful final outputs: each fanout item counts, only the final repeat output, never failed attempts or discarded speculation; 0 → summary, 1 → render, >1 → visible ambiguity even if consumed, malformed → visible error. Never changes the verdict; never truncated into a clean review | `wyrd-spec` unit tests; AC-008 journey |
 | RENDER (REQ-013, AC-008) | Anchors checked against task 005 retained path/commit/range/source; suggestion replaces exactly that range; invalid → visible delivery error, never line 1 or altered finding; unlocated stays in summary; ID, severity, confidence shown per finding; no annotations. Check: stable name per binding, `external_id` = execution, reviewed `head_sha`, verdict → conclusion mapping, waiting → `in_progress` with explanation, never back from completed. Review: one `COMMENT` on reviewed commit with execution marker, no auto-resolve, no APPROVE/REQUEST_CHANGES/source change | rendering unit tests; AC-008 journey over the mock's Check/review |
 | DELIVERY (REQ-014, REQ-005, INV-001–006, AC-009) | Background after settlement/park from retained state only; no recomputation, no verdict wait, no new SQL table/column or report in SQL. Lookup-before-create for Check and review, also after a timeout; rare duplicate accepted. Cooldown, bounded retry, visible failure. Access (002) and generation (006) rechecked before each write; superseded/revoked → skipped. One Bifrost outcome per execution; restart re-runs delivery for executions without one | delivery unit tests; AC-009 journey (lost answer, restart, new head, access loss, rate limit, refusal) |
-| SURFACES (REQ-016, AC-011) | Delivery outcome/error in execution inspection, separate from verdict, under existing read authorization on HTTP, MCP, Rust client, three SDKs and CLI; report schema authoring on the SDKs; runnable standard-report example; docs (optional reports, severity vs verdict, waiting, delivery outcome, retry diagnosis); wyrd-design and bifrost-design amended. A fresh reader completes App setup → declare → PR → evidence → approval → result/delivery from the guides | SDK/MCP/CLI journeys; codegen/docs/examples checks; content review |
+| SURFACES (REQ-016, AC-011) | Delivery outcome/error in execution inspection, separate from verdict, under existing read authorization on HTTP and MCP only (no Rust client, SDK or CLI projection, spec revision 10); report schema authoring on the SDKs; runnable standard-report example; docs (optional reports, severity vs verdict, waiting, delivery outcome, retry diagnosis); wyrd-design and bifrost-design amended. A fresh reader completes App setup → declare → PR → evidence → approval → result/delivery from the guides | HTTP/MCP inspection journeys; codegen/docs/examples checks; content review |

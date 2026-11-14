@@ -1,6 +1,6 @@
 ---
 id: SPEC-github-verifier-pipelines
-revision: 9
+revision: 10
 status: approved
 ---
 
@@ -291,7 +291,9 @@ execution ceiling through normal operator configuration. Documentation teaches
 App setup, declaration, publication, approval and diagnosis without a UI.
 The pull_request extraction is inspected as ordinary step output through the
 existing execution details over HTTP and MCP; it has no typed SDK read, SDK
-authoring helper, CLI read or SDK journey of its own.
+authoring helper, CLI read or SDK journey of its own. The GitHub delivery
+outcome is likewise read only through execution inspection over HTTP and MCP;
+it has no typed Rust client, SDK or CLI projection.
 
 **REQ-017 — Memory execution and bounded background completion.** Direct and
 queued execution use the same stateful engine. Under the TASK-010-R1 amendment
@@ -406,7 +408,7 @@ without production GitHub credentials.
 | AC-008 | No/one/multiple/malformed report; every severity, absent location, valid/invalid suggested edit | Exact report convention; honest verdict/conclusion; no invented source anchor or applied source change | 012,013 |
 | AC-009 | GitHub timeout after remote success, restart, rate limit, permanent refusal, new head/access removal during delivery | Lookup-before-create finds the landed write; restart delivers once; failure is visible; no rerun of verification or stale write | 005,014 |
 | AC-010 | Hold queued execution/workspace/Python/model admission saturated while calling direct-eligible Verifier | Direct reserved resources still execute; queued-only direct call refuses before work | 015 |
-| AC-011 | Fresh reader follows CLI/SDK docs and uses execution, evidence, approval and delivery inspection; reads a pull_request extraction through execution details over HTTP and MCP | Complete journey without UI or hidden manual orchestration; schemas/errors match served operations | 016 |
+| AC-011 | Fresh reader follows CLI/SDK docs and uses execution, evidence and approval inspection; reads a pull_request extraction and the delivery outcome through execution inspection over HTTP and MCP | Complete journey without UI or hidden manual orchestration; schemas/errors match served operations | 016 |
 | AC-012 | Hold Scribe/outbox and background SQL replies while direct/queued graphs advance; fill terminal tracking, then restore persistence; crash/reclaim before/after acceptance and race cancellation/takeover | Engine progresses from memory, compute permits free, tracking bounded with room for running claims, new claims back off, direct remains isolated; restored persistence yields the same terminal evidence then batched fenced settlement; only unpersisted work may repeat | 011,015,017 |
 | AC-013 | Matched full immutable resource-scaling/candidate verification benchmarks with healthy evidence reconciliation | Existing latency/L2 targets met and RS throughput/CPU/memory baseline preserved; no invented tolerance or exit-zero-only performance claim | 018 |
 | AC-014 | Fresh isolated migration comparison and affected consumer/SQL tests | Only permitted GitHub/PR/Task 004 deltas beyond main plus RS; no generic execution payload schema, preserved grants/RLS/cancellation responsiveness and no Bifrost runtime redesign | 018 |
@@ -454,6 +456,7 @@ readiness. Implementation tasks derive from this approved revision.
 | 7 | approved in current conversation | Shared memory execution, preserved preparation/Bifrost, bounded background queued completion and leases/group commit, explicit crash loss, compute-free park handoffs, resource-scaling proof and unreleased execution-schema cleanup. |
 | 8 | approved 2026-11-13 | User decisions during TASK-005, explicitly approved: REQ-016/AC-011 inspect the pull_request extraction only through existing HTTP/MCP execution details (no typed SDK read, SDK helper, CLI read or SDK journey for it); REQ-007 drops repository guidance from the pinned base, superseding that sentence in [extraction design](design/approved-code-review-support.md). Nothing else changes. |
 | 9 | approved 2026-11-13 | User decision during TASK-009: GitHub REST offers no idempotency key, so delivery is lookup-before-create with a rare duplicate accepted; drop Check annotations, the delivery progress ledger, comment reuse/moved-anchor history and the optional report helpers; one Bifrost delivery outcome per execution. Amends REQ-012–014 and AC-009 and supersedes conflicting text in [report delivery](design/approved-report-delivery.md), [runtime and GitHub](design/approved-runtime-and-github.md), contracts and task 009. |
+| 10 | approved 2026-11-13 | User decision during TASK-009: the GitHub delivery outcome has no typed Rust client, SDK or CLI projection; it is read through existing HTTP/MCP execution inspection. Amends REQ-016 and AC-011 and task 009 surfaces. Nothing else changes. |
 
 Subsequent explicit maintainer amendment: approval authoring has no separate
 expiration setting. Pending approvals and deferred waits share the execution's

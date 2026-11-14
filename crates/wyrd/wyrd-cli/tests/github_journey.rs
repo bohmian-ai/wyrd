@@ -370,7 +370,7 @@ mod pg_tests {
         /// The running server.
         server: WyrdTestServer,
         /// The GitHub mock, kept alive with the server.
-        _mock: GithubAppMock,
+        mock: GithubAppMock,
         /// The server's base URL.
         base: String,
         /// The administrator's API key.
@@ -470,7 +470,7 @@ mod pg_tests {
                 .to_owned();
             let waiting = Self {
                 server,
-                _mock: mock,
+                mock,
                 base,
                 admin,
                 execution,
@@ -503,6 +503,63 @@ mod pg_tests {
                     return state;
                 }
                 assert!(std::time::Instant::now() < deadline, "{state}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+
+        /// The execution's `github_delivery` as the MCP tool
+        /// `verification.get_execution` serves it, once it is no longer
+        /// `pending`, polled for at most 30 seconds.
+        ///
+        /// # Panics
+        /// Panics when the call fails or delivery stays pending.
+        async fn delivered(&self) -> Value {
+            let token = self
+                .server
+                .exchange_api_key(&self.admin.clone().into())
+                .await
+                .expect("the key exchanges");
+            let version = "2026-07-28";
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "verification.get_execution",
+                    "arguments": {"execution_id": self.execution},
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": version,
+                        "io.modelcontextprotocol/clientInfo": {"name": "journey", "version": "1"},
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    },
+                },
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let text = reqwest::Client::new()
+                    .post(format!("{}/mcp", self.base))
+                    .header("x-wyrd-access-token", format!("Bearer {token}"))
+                    .header("accept", "application/json, text/event-stream")
+                    .header("mcp-protocol-version", version)
+                    .header("mcp-method", "tools/call")
+                    .header("mcp-name", "verification.get_execution")
+                    .json(&body)
+                    .send()
+                    .await
+                    .expect("MCP responds")
+                    .text()
+                    .await
+                    .expect("MCP answers");
+                let message = text
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data:"))
+                    .unwrap_or(&text);
+                let answer: Value = serde_json::from_str(message.trim()).expect("JSON-RPC answer");
+                let delivery = answer["result"]["structuredContent"]["github_delivery"].clone();
+                if delivery["status"] != "pending" && !delivery.is_null() {
+                    return delivery;
+                }
+                assert!(std::time::Instant::now() < deadline, "{answer}");
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
@@ -657,7 +714,9 @@ mod pg_tests {
     /// `wyrd execution status` lists the pending `signoff` occurrence. Once
     /// CI publishes `ci`, a viewer's approval is refused; an editor's prints
     /// the durable receipt and replays, and a later rejection of the decided
-    /// occurrence is refused as not pending.
+    /// occurrence is refused as not pending. The passed execution then
+    /// reaches GitHub as one `success` Check on the head commit, and the MCP
+    /// tool `verification.get_execution` reads its delivery as `delivered`.
     ///
     /// # Panics
     /// Panics when a command fails, the occurrence is not pending, a
@@ -736,6 +795,24 @@ mod pg_tests {
             completed["approvals"][0]["status"], "approved",
             "{completed}"
         );
+        let delivery = waiting.delivered().await;
+        assert_eq!(delivery, serde_json::json!({"status": "delivered"}));
+        let checks = waiting.mock.check_runs(2);
+        assert_eq!(checks.len(), 1, "one Check for the execution: {checks:#?}");
+        assert_eq!(
+            (
+                &checks[0]["name"],
+                &checks[0]["head_sha"],
+                &checks[0]["conclusion"]
+            ),
+            (
+                &serde_json::json!("wyrd/signoff"),
+                &serde_json::json!(Waiting::HEAD),
+                &serde_json::json!("success")
+            ),
+            "{checks:#?}"
+        );
+        assert_eq!(checks[0]["external_id"], waiting.execution.as_str());
         waiting
             .server
             .shutdown()

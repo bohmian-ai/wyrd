@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use chrono::Utc;
 use secrecy::SecretString;
+use serde::Deserialize as _;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -128,7 +129,8 @@ enum Write<'p> {
 
 impl Write<'_> {
     /// Look the write's target up with `token` and make the write unless
-    /// it is already there, for `execution_id` on the PR of `activation`.
+    /// it is already there, for `execution_id` on PR `number` of
+    /// `repository`.
     ///
     /// # Errors
     /// Returns the [`DeliveryFailure`] of the lookup or the write.
@@ -136,13 +138,9 @@ impl Write<'_> {
         self,
         app: &GithubApp,
         token: &SecretString,
-        (execution_id, activation): (ExecutionId, &PullRequestActivation),
+        execution_id: ExecutionId,
+        (repository, number): (u64, u64),
     ) -> Result<(), DeliveryFailure> {
-        let repository = activation
-            .repository_id
-            .as_str()
-            .parse()
-            .map_err(|_| DeliveryFailure::Refused(404))?;
         match self {
             Self::Check(check) => {
                 let external = execution_id.to_string();
@@ -163,14 +161,11 @@ impl Write<'_> {
             }
             Self::Review(review) => {
                 let marker = review_marker(execution_id);
-                let bodies = app
-                    .review_bodies(token, repository, activation.number)
-                    .await?;
+                let bodies = app.review_bodies(token, repository, number).await?;
                 if bodies.iter().any(|body| body.contains(&marker)) {
                     return Ok(());
                 }
-                app.create_review(token, repository, activation.number, review)
-                    .await
+                app.create_review(token, repository, number, review).await
             }
         }
     }
@@ -305,7 +300,7 @@ impl<'a> GithubDeliveries<'a> {
         let delivery = match self.send(execution_id, &presented, &presentation).await {
             Ok(()) => GithubDelivery {
                 status: GithubDeliveryStatus::Delivered,
-                reason: None,
+                reason: presentation.report_error,
                 problems: presentation.problems,
             },
             Err(Halt::Skipped(reason)) => GithubDelivery {
@@ -393,8 +388,8 @@ impl<'a> GithubDeliveries<'a> {
         };
         let extraction = steps
             .iter()
-            .filter_map(|step| step.output.clone())
-            .find_map(|output| serde_json::from_value::<PullRequestExtraction>(output).ok());
+            .filter_map(|step| step.output.as_ref())
+            .find_map(|output| PullRequestExtraction::deserialize(output).ok());
         Ok(Presentation::render(
             &name,
             execution_id,
@@ -454,12 +449,13 @@ impl<'a> GithubDeliveries<'a> {
             .github
             .as_deref()
             .ok_or(Halt::Skipped(GithubDeliveryReason::AccessRemoved))?;
+        let repository = repository(activation)?;
         let mut wait = BACKOFF;
         let mut last = DeliveryFailure::Unavailable;
         for _ in 0..ATTEMPTS {
-            let outcome = match self.allowed(activation).await {
+            let outcome = match self.allowed(activation, repository).await {
                 Ok(token) => write
-                    .send(app, &token, (execution_id, activation))
+                    .send(app, &token, execution_id, (repository, activation.number))
                     .await
                     .map_err(Halt::from),
                 Err(halt) => Err(halt),
@@ -482,20 +478,24 @@ impl<'a> GithubDeliveries<'a> {
         Err(Halt::Again(last))
     }
 
-    /// A token for the repository of `activation`, minted only while the
-    /// tenant still has access to it and the activation is still its PR's
-    /// current, active generation.
+    /// A token for `repository`, the repository of `activation`, minted
+    /// only while the tenant still has access to it and the activation is
+    /// still its PR's current, active generation.
     ///
     /// # Errors
     /// Returns [`Halt::Skipped`] with `access_removed` or `superseded`, and
     /// [`Halt::Again`] when either cannot be read now.
-    async fn allowed(&self, activation: &PullRequestActivation) -> Result<SecretString, Halt> {
+    async fn allowed(
+        &self,
+        activation: &PullRequestActivation,
+        repository: u64,
+    ) -> Result<SecretString, Halt> {
         let again = |error: &dyn std::fmt::Display| {
             tracing::warn!(%error, "GitHub delivery access or generation cannot be read now");
             Halt::Again(DeliveryFailure::Unavailable)
         };
         let token = match GithubConnections::new(self.app)
-            .installation_token(self.tenant, repository(activation)?)
+            .installation_token(self.tenant, repository)
             .await
         {
             Ok(token) => token,

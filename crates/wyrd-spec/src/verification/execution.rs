@@ -429,8 +429,8 @@ pub struct VerificationExecutionState<T = Map<String, Value>> {
 pub struct GithubDelivery {
     /// The outcome recorded for the execution's current state.
     pub status: GithubDeliveryStatus,
-    /// Why a `skipped` or `failed` delivery did not finish; absent
-    /// otherwise.
+    /// Why a `skipped` or `failed` delivery did not finish, or why a
+    /// `delivered` Check shows no report; absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<GithubDeliveryReason>,
     /// Report findings whose anchors the retained source does not hold.
@@ -458,7 +458,8 @@ pub enum GithubDeliveryStatus {
     Failed,
 }
 
-/// Why GitHub delivery was skipped or failed.
+/// Why GitHub delivery was skipped or failed, or why a delivered Check
+/// shows no report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
@@ -472,6 +473,12 @@ pub enum GithubDeliveryReason {
     GithubRefused,
     /// GitHub stayed unavailable or rate limited through every retry.
     GithubUnavailable,
+    /// More than one accepted output is a `code_review` report, so none is
+    /// shown; the Check summary names them.
+    ReportAmbiguous,
+    /// The one `code_review` report is malformed or unsupported, so it is
+    /// not shown; the Check summary names the problem.
+    ReportInvalid,
 }
 
 /// A report finding anchor the retained source does not hold.

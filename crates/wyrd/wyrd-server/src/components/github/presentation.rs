@@ -15,7 +15,9 @@ use std::fmt::Write as _;
 
 use serde::Serialize;
 use wyrd_spec::ids::ExecutionId;
-use wyrd_spec::verification::execution::{AnchorProblem, AnchorProblemReason};
+use wyrd_spec::verification::execution::{
+    AnchorProblem, AnchorProblemReason, GithubDeliveryReason,
+};
 use wyrd_spec::verification::report::{
     CodeReviewReport, Finding, ReportSelection, ReportSource, SourceAnchor,
 };
@@ -102,6 +104,9 @@ pub(crate) struct Presentation {
     pub(crate) review: Option<Review>,
     /// Anchors refused because the retained source does not hold them.
     pub(crate) problems: Vec<AnchorProblem>,
+    /// Why the selected report is not shown, when it is ambiguous or
+    /// invalid.
+    pub(crate) report_error: Option<GithubDeliveryReason>,
 }
 
 /// One execution's state as delivery presents it.
@@ -177,20 +182,13 @@ impl Presentation {
             (Some(_), Some(verdict)) => format!("Verdict: {verdict}"),
             (Some(_), None) => format!("Execution {}", label(&settled.status)),
         };
-        if let Some(Completed {
-            selection,
-            extraction,
-        }) = completed.filter(|_| {
-            conclusion.is_some() && settled.status == VerificationExecutionStatus::Completed
-        }) {
-            Self::report(
-                selection,
-                extraction,
-                &mut summary,
-                &mut comments,
-                &mut problems,
-            );
-        }
+        let report_error = completed
+            .filter(|_| {
+                conclusion.is_some() && settled.status == VerificationExecutionStatus::Completed
+            })
+            .and_then(|completed| {
+                Self::report(completed, &mut summary, &mut comments, &mut problems)
+            });
         let review = (!comments.is_empty()).then(|| Review {
             commit_id: head.clone(),
             body: format!(
@@ -218,19 +216,23 @@ impl Presentation {
             },
             review,
             problems,
+            report_error,
         }
     }
 
-    /// Append the report section of a completed execution.
+    /// Append the report section of a completed execution; returns why its
+    /// report is not shown, when it is ambiguous or invalid.
     fn report(
-        selection: &ReportSelection,
-        extraction: &PullRequestExtraction,
+        Completed {
+            selection,
+            extraction,
+        }: Completed<'_>,
         summary: &mut String,
         comments: &mut Vec<ReviewComment>,
         problems: &mut Vec<AnchorProblem>,
-    ) {
+    ) -> Option<GithubDeliveryReason> {
         let report = match selection {
-            ReportSelection::None => return,
+            ReportSelection::None => return None,
             ReportSelection::Ambiguous { sources } => {
                 let names: Vec<String> = sources.iter().map(source_name).collect();
                 let _ = writeln!(
@@ -239,7 +241,7 @@ impl Presentation {
                      report ({}).",
                     names.join(", ")
                 );
-                return;
+                return Some(GithubDeliveryReason::ReportAmbiguous);
             }
             ReportSelection::Invalid { source, problem } => {
                 let _ = writeln!(
@@ -249,7 +251,7 @@ impl Presentation {
                     source_name(source),
                     problem.reason()
                 );
-                return;
+                return Some(GithubDeliveryReason::ReportInvalid);
             }
             ReportSelection::One { report, .. } => report,
         };
@@ -262,6 +264,7 @@ impl Presentation {
             }
         }
         render_findings(report, extraction, summary, comments, problems);
+        None
     }
 }
 
@@ -683,11 +686,13 @@ mod tests {
     }
 
     /// No report renders only the verdict; an ambiguous or invalid report
-    /// is named in the summary and renders no review.
+    /// is named in the summary and as the report error, and renders no
+    /// review.
     #[test]
     fn missing_ambiguous_and_invalid_reports_render_no_review() {
         let none = completed(VerificationVerdict::Passed, &ReportSelection::None);
         assert!(none.review.is_none());
+        assert_eq!(none.report_error, None);
         assert_eq!(none.check.output.title, "Verdict: passed");
         let source = |step: &str| -> ReportSource {
             serde_json::from_value(json!({"step": step})).expect("source")
@@ -698,12 +703,20 @@ mod tests {
         let shown = completed(VerificationVerdict::Passed, &ambiguous);
         assert!(shown.review.is_none());
         assert!(shown.check.output.summary.contains("more than one step"));
+        assert_eq!(
+            shown.report_error,
+            Some(GithubDeliveryReason::ReportAmbiguous)
+        );
         let invalid = ReportSelection::Invalid {
             source: source("a"),
             problem: wyrd_spec::verification::report::ReportProblem::EmptyFindingId,
         };
         let shown = completed(VerificationVerdict::Passed, &invalid);
         assert!(shown.check.output.summary.contains("finding_id_empty"));
+        assert_eq!(
+            shown.report_error,
+            Some(GithubDeliveryReason::ReportInvalid)
+        );
         assert_eq!(shown.check.conclusion, Some("success"));
     }
 

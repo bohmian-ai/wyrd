@@ -28,15 +28,15 @@ use wyrd_testing::{Bootstrap, WyrdTestServer};
 use super::pg_github_pull_requests::install;
 
 /// The connected repository.
-const REPOSITORY: u64 = 4242;
+pub(super) const REPOSITORY: u64 = 4242;
 /// The connected installation.
-const INSTALLATION: u64 = 101;
+pub(super) const INSTALLATION: u64 = 101;
 /// The role invoking the gateway model.
 const MODEL_ROLE: &str = "pr_review_model";
 /// The role invoking Agent tools.
 const TOOL_ROLE: &str = "pr_review_tools";
 /// The reviewed pull request.
-const PR: u64 = 7;
+pub(super) const PR: u64 = 7;
 /// The Repository binding `pr-review` to its pull requests.
 const POLICY: &str = "apiVersion: wyrd/v1\nkind: Repository\nmetadata:\n  name: policy\n  version: 1.0.0\nspec:\n  repository_id: \"4242\"\n  verified_by:\n    - verifier: ./pr-review.yaml\n      runs_on: {kind: pull_request}\n";
 /// A queued Verifier extracting the pull request and requiring a change.
@@ -63,18 +63,18 @@ const USER: &[u8] = b"export function lookupUser(id: string): string {\n  return
 /// The handler on `main`.
 const HANDLER: &[u8] = b"import { lookupUser } from \"./user\";\n\nexport const handle = (id: string) => lookupUser(id);\n";
 /// The handler at head `a…`.
-const HANDLER_A: &[u8] = b"import { lookupUser } from \"./user\";\n\nexport const handle = (id: string) => lookupUser(id.trim());\n";
+pub(super) const HANDLER_A: &[u8] = b"import { lookupUser } from \"./user\";\n\nexport const handle = (id: string) => lookupUser(id.trim());\n";
 /// The handler at head `b…`.
-const HANDLER_B: &[u8] = b"import { lookupUser } from \"./user\";\n\nexport const handle = (id: string) => lookupUser(id.trim().toLowerCase());\n";
+pub(super) const HANDLER_B: &[u8] = b"import { lookupUser } from \"./user\";\n\nexport const handle = (id: string) => lookupUser(id.trim().toLowerCase());\n";
 /// `main` to head `a…`.
-const PATCH_A: &str = "@@ -1,3 +1,3 @@\n import { lookupUser } from \"./user\";\n \n-export const handle = (id: string) => lookupUser(id);\n+export const handle = (id: string) => lookupUser(id.trim());";
+pub(super) const PATCH_A: &str = "@@ -1,3 +1,3 @@\n import { lookupUser } from \"./user\";\n \n-export const handle = (id: string) => lookupUser(id);\n+export const handle = (id: string) => lookupUser(id.trim());";
 /// Head `a…` to head `b…`.
 const PATCH_AB: &str = "@@ -1,3 +1,3 @@\n import { lookupUser } from \"./user\";\n \n-export const handle = (id: string) => lookupUser(id.trim());\n+export const handle = (id: string) => lookupUser(id.trim().toLowerCase());";
 /// `main` to head `b…`.
-const PATCH_B: &str = "@@ -1,3 +1,3 @@\n import { lookupUser } from \"./user\";\n \n-export const handle = (id: string) => lookupUser(id);\n+export const handle = (id: string) => lookupUser(id.trim().toLowerCase());";
+pub(super) const PATCH_B: &str = "@@ -1,3 +1,3 @@\n import { lookupUser } from \"./user\";\n \n-export const handle = (id: string) => lookupUser(id);\n+export const handle = (id: string) => lookupUser(id.trim().toLowerCase());";
 
 /// Forty copies of `ch`, a commit or tree id.
-fn sha(ch: char) -> String {
+pub(super) fn sha(ch: char) -> String {
     ch.to_string().repeat(40)
 }
 
@@ -119,15 +119,15 @@ fn tree<'a>(helpers: &'a [(String, String)], handler: &'a str) -> Vec<(&'a str, 
 }
 
 /// A connected, declared deployment whose GitHub serves `acme/policy`.
-struct Deployment {
+pub(super) struct Deployment {
     /// GitHub.
-    mock: GithubAppMock,
+    pub(super) mock: GithubAppMock,
     /// Wyrd, running queued work.
-    server: WyrdTestServer,
+    pub(super) server: WyrdTestServer,
     /// The gateway's model provider.
-    model: MockServer,
+    pub(super) model: MockServer,
     /// The declaring editor's JWT.
-    jwt: String,
+    pub(super) jwt: String,
 }
 
 impl Deployment {
@@ -137,7 +137,7 @@ impl Deployment {
     ///
     /// # Panics
     /// Panics when a step fails.
-    async fn start(cards: &[(&str, &str)]) -> Self {
+    pub(super) async fn start(cards: &[(&str, &str)]) -> Self {
         let mock = GithubAppMock::start().expect("the GitHub mock starts");
         mock.add_installation(INSTALLATION, &[(REPOSITORY, "acme/policy")]);
         mock.add_user("octo", &[INSTALLATION]);
@@ -192,7 +192,7 @@ impl Deployment {
     ///
     /// # Panics
     /// Panics when the server does not restart or the editor cannot sign in.
-    async fn restart(self) -> Self {
+    pub(super) async fn restart(self) -> Self {
         let Self {
             mock,
             server,
@@ -308,7 +308,7 @@ impl Deployment {
     }
 
     /// Serve head `head` (tree `tree`) whose handler is `handler`.
-    fn head(&self, head: &str, tree: &str, handler: &[u8]) {
+    pub(super) fn head(&self, head: &str, tree: &str, handler: &[u8]) {
         self.commit(
             head,
             tree,
@@ -318,7 +318,14 @@ impl Deployment {
 
     /// Serve the comparison `base...head`, `head` ahead of `merge_base`,
     /// modifying the handler to `handler` with `patch`.
-    fn compare(&self, base: &str, head: &str, merge_base: &str, handler: &[u8], patch: &str) {
+    pub(super) fn compare(
+        &self,
+        base: &str,
+        head: &str,
+        merge_base: &str,
+        handler: &[u8],
+        patch: &str,
+    ) {
         self.json(
             &format!("/compare/{base}...{head}"),
             &json!({"status": "ahead", "base_commit": {"sha": base},
@@ -355,7 +362,7 @@ impl Deployment {
     ///
     /// # Panics
     /// Panics when the delivery is refused or admits nothing for `head`.
-    async fn admit(&self, head: &str, action: &str) -> Uuid {
+    pub(super) async fn admit(&self, head: &str, action: &str) -> Uuid {
         match action {
             "opened" => {
                 self.mock.set_pull_request(
@@ -402,7 +409,7 @@ impl Deployment {
     ///
     /// # Panics
     /// Panics when no result appears in a minute.
-    async fn settled(&self, execution: Uuid) {
+    pub(super) async fn settled(&self, execution: Uuid) {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_mins(1);
         while self
             .get(&format!("/v1/verification/executions/{execution}"))
@@ -431,7 +438,7 @@ impl Deployment {
     }
 
     /// Serve head `b…` and the full comparison `c…...b…`.
-    fn serve_b(&self) {
+    pub(super) fn serve_b(&self) {
         self.head(&sha('b'), &sha('9'), HANDLER_B);
         self.compare(&sha('c'), &sha('b'), &sha('c'), HANDLER_B, PATCH_B);
     }
@@ -458,7 +465,7 @@ impl Deployment {
     ///
     /// # Panics
     /// Panics when the call fails or answers no structured content.
-    async fn mcp_details(&self, execution: Uuid) -> Value {
+    pub(super) async fn mcp_details(&self, execution: Uuid) -> Value {
         let version = "2026-07-28";
         let body = json!({
             "jsonrpc": "2.0",
@@ -510,7 +517,7 @@ impl Deployment {
     ///
     /// # Panics
     /// Panics when the read is not `200 OK` JSON.
-    async fn get(&self, uri: &str) -> Value {
+    pub(super) async fn get(&self, uri: &str) -> Value {
         let request = Request::builder()
             .uri(uri)
             .body(Body::empty())
@@ -1258,7 +1265,7 @@ async fn unreadable_execution_history_is_retried_and_never_a_first_review() {
 /// # Panics
 /// Panics when Bifrost cannot flush or the share is not held within 30
 /// seconds.
-async fn hold_scribe(server: &WyrdTestServer) -> Vec<ScribeReservation> {
+pub(super) async fn hold_scribe(server: &WyrdTestServer) -> Vec<ScribeReservation> {
     let outbox = server.state().bifrost.scribe_outbox();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut share = Vec::new();

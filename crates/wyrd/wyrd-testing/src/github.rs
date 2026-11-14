@@ -1259,7 +1259,7 @@ async fn delivery_request(
         state
             .delivery_requests
             .push((std::time::Instant::now(), label.clone()));
-        let (issued, reachable) = installation_read(&mut state, headers, repository, &label);
+        let (issued, reachable) = installation_access(&state, headers, repository);
         if !issued {
             return StatusCode::UNAUTHORIZED.into_response();
         }
@@ -1426,6 +1426,12 @@ fn installation_read(
     path: &str,
 ) -> (bool, bool) {
     state.repository_reads.push((repository, path.to_owned()));
+    installation_access(state, headers, repository)
+}
+
+/// Whether the bearer is an issued installation token and whether a live
+/// installation of this App reaches `repository`.
+fn installation_access(state: &MockState, headers: &HeaderMap, repository: u64) -> (bool, bool) {
     let issued = bearer(headers).is_some_and(|token| {
         token.starts_with(INSTALLATION_TOKEN_PREFIX) && state.issued.iter().any(|t| t == token)
     });

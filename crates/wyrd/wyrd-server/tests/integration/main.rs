@@ -22,6 +22,8 @@ mod pg_durable_verifier_work;
 // forwards it.
 /// The GitHub installation token facility against the GitHub App mock.
 mod pg_github_connection;
+/// GitHub Check and review delivery of pull request executions.
+mod pg_github_delivery;
 mod pg_github_pull_request_extraction;
 mod pg_github_pull_requests;
 #[cfg(feature = "test-support")]

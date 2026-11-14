@@ -88,32 +88,36 @@
     <section class="qs" aria-labelledby="qs-h">
       <div>
         <p class="eyebrow">Get started</p>
-        <h2 id="qs-h">Release only what passes.</h2>
-        <p class="sub">One finance Service and one Verifier with three requirements, one step per tab: declare them, verify each release, and act on the verdict.</p>
-        <nav class="links" aria-label="Get started">
-          {#each startPages as item (item.path)}
-            <a href={`${base}${item.path}`}>{item.label}</a>
-          {/each}
-          {#if foundation}<a href={`${base}${foundation.path}`}>{foundation.label}</a>{/if}
-        </nav>
+        <h2 id="qs-h">From intent to evidence.</h2>
+        <p class="sub">One finance Service and one Verifier, one step per tab: declare what a report release must satisfy, verify two releases, and read the verdict.</p>
       </div>
+      <nav class="links" aria-label="Get started">
+        {#each startPages as item (item.path)}
+          <a href={`${base}${item.path}`}>{item.label}</a>
+        {/each}
+        {#if foundation}<a href={`${base}${foundation.path}`}>{foundation.label}</a>{/if}
+      </nav>
       <div class="loop">
         <Tabs>
           <Tab label="01 Declare">
-            <p class="step">The <code>release-check</code> Verifier states three requirements: two assertions on records your application supplies, and an Agent that reads the company sharing policy PDF.</p>
-            <CodeBlock lang="python" {...data.declare} />
-          </Tab>
-          <Tab label="02 Verify">
-            <p class="step">Declare the Service, then verify each proposed release with one call. Only a <code>passed</code> verdict releases the report.</p>
+            <p class="step">The Service binds one Verifier. The Verifier declares the release it takes and three requirements: two assertions on records your application supplies, and an Agent that judges the report against the company sharing policy.</p>
             <LangTabs langs={['python', 'rust', 'typescript']}>
-              {#each data.verify as o (o.lang)}
+              {#each data.declare as o (o.lang)}
                 <LangTab lang={o.lang}><CodeBlock lang={o.lang} title={o.title} html={o.html} /></LangTab>
               {/each}
             </LangTabs>
           </Tab>
-          <Tab label="03 Decide">
-            <p class="step">The second report names a bank account, which the policy forbids, so the API holds it. A failed verdict is a result, not an exception.</p>
-            <CodeBlock lang="text" {...data.decide} />
+          <Tab label="02 Observe">
+            <p class="step">Declare, start a Run, and verify two releases. <code>verify</code> waits for the verdict; <code>submit</code> queues the check and returns at once.</p>
+            <LangTabs langs={['python', 'rust', 'typescript']}>
+              {#each data.observe as o (o.lang)}
+                <LangTab lang={o.lang}><CodeBlock lang={o.lang} title={o.title} html={o.html} /></LangTab>
+              {/each}
+            </LangTabs>
+          </Tab>
+          <Tab label="03 Verify">
+            <p class="step">The second report names a bank account. Its verdict names each requirement, its outcome, and the reason. A failed check is a result, not an exception.</p>
+            <CodeBlock lang="json" {...data.verify} />
           </Tab>
         </Tabs>
       </div>
@@ -307,10 +311,13 @@
 
   .qs {
     display: grid;
-    grid-template-columns: minmax(0, 2fr) minmax(0, 3fr);
-    gap: 48px;
-    align-items: start;
+    grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+    gap: 32px 48px;
+    align-items: end;
     padding: 48px 0 56px;
+  }
+  .qs .loop {
+    grid-column: 1 / -1;
   }
   h2 {
     margin: 0;
@@ -329,7 +336,6 @@
   .links {
     display: grid;
     gap: 10px;
-    margin-top: 22px;
     padding-left: 16px;
     border-left: 2px solid var(--warn);
     font: 16px var(--font-mono);

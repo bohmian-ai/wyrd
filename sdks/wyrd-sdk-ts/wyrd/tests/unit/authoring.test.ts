@@ -4,6 +4,7 @@
 import { fileURLToPath } from "node:url";
 
 import { expect, test } from "vitest";
+import { z } from "zod";
 
 import { type CardTypes, verify, WyrdError } from "wyrd-ai";
 
@@ -619,4 +620,24 @@ test("versions_are_optional_and_prompts_are_native", () => {
   }
   expect(refused).toBeInstanceOf(WyrdError);
   expect((refused as WyrdError).code).toBe("WYRD_PROMPT_400_EMPTY_MODEL");
+});
+
+test("a Zod schema is a json input slot of the JSON Schema it emits", () => {
+  const Release = z.object({ report: z.object({ text: z.string() }), authorized: z.boolean() });
+  const verifier = new Verifier("release-check", {
+    version: "1.0.0",
+    inputs: { release: Release },
+    requirements: [
+      new Requirement(
+        "authorized",
+        "The recipient is authorized.",
+        Check.assert("inputs.release.authorized", "equals", true),
+      ),
+    ],
+  }).addInput("again", Release);
+
+  const inputs = (verifier.spec() as { inputs: Record<string, unknown> }).inputs;
+  expect(inputs.release).toEqual({ type: "json", schema: z.toJSONSchema(Release) });
+  expect(inputs.again).toEqual(inputs.release);
+  expect(() => verifier.plan()).not.toThrow();
 });

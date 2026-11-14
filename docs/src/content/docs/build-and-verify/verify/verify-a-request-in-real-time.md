@@ -79,7 +79,7 @@ A `failed` verdict is a normal return value, not an exception:
 <LangTab lang="python">
 
 ```python
-if result.verdict != "passed":
+if not result.passed:
     answer = "Let me pass this to our billing team."
 ```
 
@@ -87,9 +87,7 @@ if result.verdict != "passed":
 <LangTab lang="rust">
 
 ```rust
-use wyrd_ai::VerificationVerdict;
-
-if result.outcome.verdict != VerificationVerdict::Passed {
+if !result.is_passed() {
     answer = "Let me pass this to our billing team.".to_owned();
 }
 ```
@@ -98,7 +96,7 @@ if result.outcome.verdict != VerificationVerdict::Passed {
 <LangTab lang="typescript">
 
 ```typescript
-const reply = result.outcome.verdict === "passed" ? answer : "Let me pass this to our billing team.";
+const reply = result.passed ? answer : "Let me pass this to our billing team.";
 ```
 
 </LangTab>

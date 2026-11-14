@@ -576,6 +576,21 @@ class VerificationResult(Generic[DataT]):
         ...
 
     @property
+    def passed(self) -> bool:
+        """Whether ``verdict`` is ``passed``: the only verdict that releases what was verified."""
+        ...
+
+    @property
+    def failed(self) -> bool:
+        """Whether ``verdict`` is ``failed``: an expectation was violated."""
+        ...
+
+    @property
+    def inconclusive(self) -> bool:
+        """Whether ``verdict`` is ``inconclusive``: no judgment could be made, never a pass."""
+        ...
+
+    @property
     def requirements(self) -> list[RequirementResult[DataT]]:
         """Every requirement's judgment as its wire mapping, in plan order."""
         ...

@@ -34,7 +34,7 @@ Run the CLI as `uv run wyrd`.
 ```bash
 cargo install wyrd-cli --version 0.4.1 --locked
 cargo new quickstart && cd quickstart
-cargo add wyrd-ai@0.4.1 tokio --features tokio/full
+cargo add wyrd-ai@0.4.1 tokio serde schemars --features tokio/full,serde/derive
 ```
 
 </LangTab>
@@ -43,7 +43,7 @@ cargo add wyrd-ai@0.4.1 tokio --features tokio/full
 ```bash
 mkdir quickstart && cd quickstart
 pnpm init && pnpm pkg set type=module
-pnpm add wyrd-ai@0.4.1
+pnpm add wyrd-ai@0.4.1 zod
 ```
 
 Run the CLI as `pnpm wyrd`.

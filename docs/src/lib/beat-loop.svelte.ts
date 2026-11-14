@@ -34,6 +34,12 @@ export class BeatLoop {
     this.playing = !this.playing;
   };
 
+  /** Play from the first beat. */
+  replay = (): void => {
+    this.beat = 0;
+    this.playing = true;
+  };
+
   /** Advance one beat after the current beat's duration; returns the cancel for an `$effect`. */
   tick(): (() => void) | undefined {
     if (!this.running) return undefined;

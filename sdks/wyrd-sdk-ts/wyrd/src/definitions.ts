@@ -118,10 +118,40 @@ export type BindingArg = Authorable<Wire.VerificationBinding> | Verifier | CardR
 
 /**
  * One Verifier input slot: an {@link InputSlot}, a canonical slot object, a
- * source slot's reference string, or the bare JSON Schema of a `json` slot.
- * Values are schemas, never examples to infer one from.
+ * source slot's reference string, the bare JSON Schema of a `json` slot, or a
+ * schema that emits one, such as a Zod 4 schema. Values are schemas, never examples to infer one from.
  */
-export type InputSlotArg = InputSlot | Wire.InputSlot | Readonly<Record<string, Wire.JsonValue>> | boolean;
+export type InputSlotArg =
+  | InputSlot
+  | Wire.InputSlot
+  | Readonly<Record<string, Wire.JsonValue>>
+  | JsonSchemaSource
+  | boolean;
+
+/**
+ * Anything that can describe itself as JSON Schema.
+ *
+ * Zod 4 schemas satisfy this by construction; the shape is named structurally
+ * so a Verifier input slot or `TableConfig.fromJsonSchema` accepts one without
+ * this SDK depending on Zod, or on any other schema library.
+ */
+export interface JsonSchemaSource {
+  toJSONSchema(params?: {
+    override?(context: { zodSchema: unknown; jsonSchema: Record<string, unknown> }): void;
+  }): Readonly<Record<string, unknown>>;
+}
+
+/**
+ * `slot`, or the `json` slot of the JSON Schema it emits when it is a
+ * {@link JsonSchemaSource}. The schema crosses as JSON text, which drops the
+ * non-JSON properties a library attaches, such as Zod's `~standard`.
+ */
+function inputSlot(slot: InputSlotArg): InputSlotArg {
+  const source = slot as Partial<JsonSchemaSource>;
+  return typeof source.toJSONSchema === "function"
+    ? InputSlot.json(JSON.parse(JSON.stringify(source.toJSONSchema())) as Wire.JsonValue)
+    : slot;
+}
 
 /** Service spec fields as authored. */
 type ServiceFields = Omit<Fields<Wire.ServiceSpec>, "verified_by"> & { readonly verified_by?: readonly BindingArg[] };
@@ -1379,8 +1409,11 @@ export class Verifier extends AuthoredCard {
    * setter sets it.
    */
   constructor(name: string, options: VerifierOptions = {}) {
-    const { version, ...fields } = options;
+    const { version, inputs, ...fields } = options;
     super(NativeAuthored.card("Verifier", name, version));
+    if (inputs !== undefined) {
+      this.inputs(inputs);
+    }
     apply(this, fields);
   }
 
@@ -1485,7 +1518,11 @@ export class Verifier extends AuthoredCard {
    * @returns This value.
    */
   inputs(entries: Value<VerifierFields, "inputs">): this {
-    return set(this, "inputs", entries);
+    return set(
+      this,
+      "inputs",
+      Object.fromEntries(Object.entries(entries).map(([key, slot]) => [key, inputSlot(slot)])),
+    );
   }
 
   /**
@@ -1496,7 +1533,7 @@ export class Verifier extends AuthoredCard {
    * @returns This value.
    */
   addInput(key: string, value: Entry<VerifierFields, "inputs">): this {
-    return insert(this, "inputs", key, value);
+    return insert(this, "inputs", key, inputSlot(value));
   }
 }
 

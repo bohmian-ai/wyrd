@@ -316,15 +316,33 @@ pub struct PyVerificationResult {
     /// The requirements with every present `data` already converted by a
     /// typed read's `data_type`; `None` for an ordinary result.
     typed: Option<Py<PyAny>>,
+    /// Whether the verdict is `passed`, set once from the result.
+    #[pyo3(get)]
+    passed: bool,
+    /// Whether the verdict is `failed`, set once from the result.
+    #[pyo3(get)]
+    failed: bool,
+    /// Whether the verdict is `inconclusive`, set once from the result.
+    #[pyo3(get)]
+    inconclusive: bool,
 }
 
 impl PyVerificationResult {
+    /// `result` and its `typed` requirements, with the verdict predicates
+    /// set once from its verdict.
+    const fn new(result: VerificationResult, typed: Option<Py<PyAny>>) -> Self {
+        Self {
+            passed: result.is_passed(),
+            failed: result.is_failed(),
+            inconclusive: result.is_inconclusive(),
+            result,
+            typed,
+        }
+    }
+
     /// An ordinary result, whose `data` reads as JSON.
     pub(crate) const fn plain(result: VerificationResult) -> Self {
-        Self {
-            result,
-            typed: None,
-        }
+        Self::new(result, None)
     }
 
     /// `result` with every present requirement `data` converted by
@@ -343,10 +361,7 @@ impl PyVerificationResult {
         let requirements =
             json_to_pyobject(py, &serde_json::to_value(&result.outcome.requirements)?)?;
         decode_data(requirements.bind(py), data_type)?;
-        Ok(Self {
-            result,
-            typed: Some(requirements),
-        })
+        Ok(Self::new(result, Some(requirements)))
     }
 }
 

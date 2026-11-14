@@ -2,7 +2,7 @@
 import { expectTypeOf } from "vitest";
 import { z } from "zod";
 
-import type { CardTypes, Observe, VerdictData, VerificationResult, verify } from "wyrd-ai";
+import type { CardTypes, Observe, VerdictData, VerdictPredicates, VerificationResult, verify } from "wyrd-ai";
 import { verdictFormat } from "wyrd-ai";
 
 const Judge = z.object({ score: z.number(), category: z.string() });
@@ -10,7 +10,11 @@ const Judge = z.object({ score: z.number(), category: z.string() });
 // Untyped reads keep the wire result, plain JSON data included.
 expectTypeOf<VerificationResult>().toEqualTypeOf<VerificationResult<VerdictData>>();
 expectTypeOf<VerificationResult["outcome"]["requirements"][number]["data"]>().toEqualTypeOf<VerdictData | undefined>();
-expectTypeOf<CardTypes.VerificationResult>().toExtend<VerificationResult>();
+// The wire result is the SDK result without the verdict predicates the SDK sets.
+expectTypeOf<CardTypes.VerificationResult>().toExtend<Omit<VerificationResult, keyof VerdictPredicates>>();
+expectTypeOf<VerificationResult["passed"]>().toEqualTypeOf<boolean>();
+expectTypeOf<VerificationResult["failed"]>().toEqualTypeOf<boolean>();
+expectTypeOf<VerificationResult["inconclusive"]>().toEqualTypeOf<boolean>();
 
 // Typed operations infer the parser's output type.
 declare const observe: Observe;

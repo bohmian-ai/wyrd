@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "wyrd-ai": "workspace:*"
+    "wyrd-ai": "workspace:*",
+    "zod": "^4.5.4"
   },
   "devDependencies": {
     "@types/node": "24.10.0",

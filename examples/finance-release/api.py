@@ -38,10 +38,10 @@ state = WyrdState.from_path(".wyrd-bundle")
 
 
 @api.post("/reports/send")
-def send_report(release: Release) -> dict[str, str]:
+def send_report(release: Release):
     with state.run() as run:
-        result = run.observe.verify("release-check", **release.model_dump())
-    if result.verdict == "passed":
+        r = run.observe.verify("release-check", release)
+    if r.passed:
         return release_report(release)
     return hold_for_review(release)
 # ANCHOR_END: handler

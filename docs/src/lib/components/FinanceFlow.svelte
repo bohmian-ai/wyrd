@@ -13,7 +13,8 @@
 
   const loop = new BeatLoop([250, 200, 250, 200, 1800]);
   const at = loop.at;
-  const pass = $derived(!failing);
+  // The reader can switch cases; the prop sets the first one.
+  let pass = $derived(!failing);
   let figure: HTMLElement;
 
   $effect(() => loop.attach(figure));
@@ -23,7 +24,7 @@
   const ROWS = [
     { name: 'Recipient authorized', kind: 'ASSERT', y: 48 },
     { name: 'Sharing policy · PDF', kind: 'AGENT', y: 84 },
-    { name: 'Destination restricted', kind: 'ASSERT', y: 120 }
+    { name: 'Destination private', kind: 'ASSERT', y: 120 }
   ];
 </script>
 
@@ -34,7 +35,7 @@
     api.post for /reports/send. Inside a state.run block the handler makes one synchronous call into Wyrd,
     run.observe.verify, then releases the report if the verdict passed and holds it for review otherwise. During that
     call, Wyrd's real-time verification judges three requirements: an assertion that the recipient is authorized, an
-    Agent judgment of the sharing policy using the policy PDF, and an assertion that the destination restricts access.
+    Agent judgment of the sharing policy using the policy PDF, and an assertion that the destination is private.
     {pass
       ? 'All three pass, the verdict returns to the handler, and the handler releases the report.'
       : 'The sharing policy check fails while both assertions pass, the verdict returns to the handler, and the handler holds the report.'}
@@ -47,13 +48,13 @@
   <div class="scroll" role="group" aria-label="Diagram" aria-describedby="flow-hint">
     <svg viewBox="0 0 960 256" role="img" aria-label="Your finance API calls Wyrd to verify a report before releasing it" aria-describedby="flow-desc">
       <g transform="translate(0 14)">
-        <rect class="frame" x="10" y="4" width="490" height="166" rx="2" />
-        <text class="cap mid" x="255" y="19">YOUR FINANCE API</text>
-        <path class="rule" d="M10 26 H500 M36 32 V164" />
+        <rect class="frame" x="10" y="4" width="420" height="166" rx="2" />
+        <text class="cap mid" x="220" y="19">YOUR FINANCE API</text>
+        <path class="rule" d="M10 26 H430 M36 32 V164" />
         <rect class="stripe" x="37" y="118" width="2" height="11" />
-        <rect class="band" class:on={at('0-3')} x="37" y="118" width="462" height="11" />
-        <rect class="band" class:on={at('4') && pass} x="37" y="140" width="462" height="11" />
-        <rect class="band" class:on={at('4') && !pass} x="37" y="151" width="462" height="11" />
+        <rect class="band" class:on={at('0-3')} x="37" y="118" width="392" height="11" />
+        <rect class="band" class:on={at('4') && pass} x="37" y="140" width="392" height="11" />
+        <rect class="band" class:on={at('4') && !pass} x="37" y="151" width="392" height="11" />
         <g class="ln">
           {#each code as _, i (i)}<text x="30" y={38 + 11 * i}>{i + 1}</text>{/each}
         </g>
@@ -62,52 +63,52 @@
             <text x="44" y={38 + 11 * i}>{#each line as token, j (j)}<tspan style:fill={token.color}>{token.content}</tspan>{/each}</text>
           {/each}
         </g>
-        <rect class="fill call" class:on={at('0-4')} x="470" y="120" width="18" height="6" rx="2" />
-        <rect class="slot" x="470" y="120" width="18" height="6" rx="2" />
-        <text class="mark" class:on={at('4')} x="491" y="126">{pass ? '✓' : '✕'}</text>
+        <rect class="fill call" class:on={at('0-4')} x="386" y="120" width="26" height="6" rx="2" />
+        <rect class="slot" x="386" y="120" width="26" height="6" rx="2" />
+        <text class="mark" class:on={at('4')} x="418" y="126">{pass ? '✓' : '✕'}</text>
         {#if pass}
-          <text class="mark out end" class:on={at('4')} x="490" y="148">→ Release</text>
+          <text class="mark out end" class:on={at('4')} x="424" y="148">→ Release</text>
         {:else}
-          <text class="mark out end" class:on={at('4')} x="490" y="159">‖ Hold</text>
+          <text class="mark out end" class:on={at('4')} x="424" y="159">‖ Hold</text>
         {/if}
       </g>
 
-      <path class="link" d="M503 137 H560" />
-      <circle class="port" cx="500" cy="137" r="2.5" />
-      <text class="cap out mid" class:on={at('3-4')} x="531" y="155">{pass ? '✓ PASSED' : '✕ FAILED'}</text>
+      <path class="link" d="M433 137 H500" />
+      <circle class="port" cx="430" cy="137" r="2.5" />
+      <text class="cap out mid" class:on={at('3-4')} x="466" y="155">{pass ? '✓ PASSED' : '✕ FAILED'}</text>
 
-      <g transform="translate(560 38)">
-        <rect class="frame wyrd" x="0" y="0" width="250" height="146" rx="2" />
+      <g transform="translate(500 38)">
+        <rect class="frame wyrd" x="0" y="0" width="280" height="146" rx="2" />
         <text class="cap w" x="12" y="17">WYRD · REAL-TIME VERIFICATION</text>
-        <path class="rule w" d="M0 24 H250" />
+        <path class="rule w" d="M0 24 H280" />
         {#each ROWS as row (row.name)}
           {@const agent = row.kind === 'AGENT'}
           <text class="name" x="12" y={row.y}>{row.name}</text>
           <text class="cap" x="12" y={row.y + 13}>{row.kind}</text>
-          <rect class="fill" class:agent class:bad={agent && !pass} class:on={at('1-4')} x="130" y={row.y - 9} width="88" height="8" rx="2" />
-          <rect class="slot" x="130" y={row.y - 9} width="88" height="8" rx="2" />
-          <text class="mark" class:on={at(agent ? '3-4' : '1-4')} x="226" y={row.y - 1}>{agent && !pass ? '✕' : '✓'}</text>
+          <rect class="fill" class:agent class:bad={agent && !pass} class:on={at('1-4')} x="150" y={row.y - 9} width="100" height="8" rx="2" />
+          <rect class="slot" x="150" y={row.y - 9} width="100" height="8" rx="2" />
+          <text class="mark" class:on={at(agent ? '3-4' : '1-4')} x="258" y={row.y - 1}>{agent && !pass ? '✕' : '✓'}</text>
         {/each}
       </g>
 
-      <path class="link gw" d="M810 117 H876" />
-      <rect class="frame gw" x="876" y="108" width="72" height="18" rx="2" />
-      <text class="cap gw mid" x="912" y="121">GATEWAY</text>
-      <text class="cap gw mid" x="912" y="100">MODEL CALL</text>
+      <path class="link gw" d="M780 117 H870" />
+      <rect class="frame gw" x="870" y="108" width="72" height="18" rx="2" />
+      <text class="cap gw mid" x="906" y="121">GATEWAY</text>
+      <text class="cap gw mid" x="825" y="110">MODEL CALL</text>
 
-      <path class="tap" d="M40 184 V224 M770 184 V224" />
+      <path class="tap" d="M40 184 V224 M740 184 V224" />
       <circle class="tap-port" cx="40" cy="184" r="1.5" />
-      <circle class="tap-port" cx="770" cy="184" r="1.5" />
+      <circle class="tap-port" cx="740" cy="184" r="1.5" />
       <text class="cap bif" x="48" y="208">ASYNC CAPTURE</text>
       <rect class="frame bif" x="10" y="224" width="940" height="26" rx="2" />
       <text class="cap bif" x="24" y="241">BIFROST</text>
       <text class="name" x="96" y="241">Records · traces · app data</text>
 
-      <circle class="dot call" class:on={at('0')} r="3.5" style="--x0:500px;--y0:137px;--x1:560px;--y1:137px" />
-      <circle class="dot" class:ok={pass} class:bad={!pass} class:on={at('3')} r="3.5" style="--x0:560px;--y0:137px;--x1:500px;--y1:137px" />
-      <circle class="dot gw" class:on={at('1')} r="2.5" style="--x0:810px;--y0:117px;--x1:876px;--y1:117px" />
-      <circle class="dot gw" class:on={at('2')} r="2.5" style="--x0:876px;--y0:117px;--x1:810px;--y1:117px" />
-      {#each [[40, 0.35], [40, 0.8], [770, 0.5], [770, 0.95]] as [x, delay], i (i)}
+      <circle class="dot call" class:on={at('0')} r="3.5" style="--x0:430px;--y0:137px;--x1:500px;--y1:137px" />
+      <circle class="dot" class:ok={pass} class:bad={!pass} class:on={at('3')} r="3.5" style="--x0:500px;--y0:137px;--x1:430px;--y1:137px" />
+      <circle class="dot gw" class:on={at('1')} r="2.5" style="--x0:780px;--y0:117px;--x1:870px;--y1:117px" />
+      <circle class="dot gw" class:on={at('2')} r="2.5" style="--x0:870px;--y0:117px;--x1:780px;--y1:117px" />
+      {#each [[40, 0.35], [40, 0.8], [740, 0.5], [740, 0.95]] as [x, delay], i (i)}
         <circle class="dot ev" class:on={at('4')} r="2" style="--x0:{x}px;--y0:184px;--x1:{x}px;--y1:224px;--delay:{delay}s" />
       {/each}
     </svg>
@@ -115,9 +116,12 @@
 
   <figcaption>
     <p class="status">{pass ? 'All three pass · the API releases the report' : 'Sharing policy fails · the API holds the report'}</p>
-    <div class="controls">
-      <span>Illustrative animation</span>
+    <div class="controls" role="group" aria-label="Animation controls">
+      <span class="tag">Illustrative animation</span>
+      <label><input type="radio" name="flow-case" checked={pass} onchange={() => ((pass = true), loop.replay())} /><span>Allowed</span></label>
+      <label><input type="radio" name="flow-case" checked={!pass} onchange={() => ((pass = false), loop.replay())} /><span>Policy violation</span></label>
       <button type="button" onclick={loop.toggle}>{loop.playing ? 'Pause' : 'Play'}</button>
+      <button type="button" onclick={loop.replay}>Replay</button>
     </div>
   </figcaption>
 </figure>
@@ -206,7 +210,7 @@
     stroke: var(--muted);
   }
   .src text {
-    font: 9px var(--font-mono);
+    font: 9.5px var(--font-mono);
     white-space: pre;
   }
   .ln text {
@@ -353,8 +357,8 @@
   }
   .controls {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
-    justify-content: space-between;
     gap: 12px;
     margin-top: 10px;
     padding-top: 8px;
@@ -371,6 +375,19 @@
     color: var(--text);
     font: inherit;
     cursor: pointer;
+  }
+  .tag {
+    margin-right: auto;
+  }
+  .controls label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+  }
+  .controls input {
+    accent-color: var(--declare);
+    margin: 0;
   }
   .controls button:hover {
     border-color: var(--text);

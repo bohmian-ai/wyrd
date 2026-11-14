@@ -4,7 +4,8 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { createRequire } from "node:module";
 
 import * as definitions from "./definitions.js";
-import type { AuthoredCard } from "./definitions.js";
+import type { AuthoredCard, JsonSchemaSource } from "./definitions.js";
+export type { JsonSchemaSource } from "./definitions.js";
 import {
   authoredOf,
   IncompleteQueryStreamError,
@@ -289,10 +290,37 @@ export type VerificationOutcome<T = VerdictData> = Omit<WireVerificationOutcome,
   readonly requirements: readonly RequirementResult<T>[];
 };
 
+/**
+ * Whether a result's verdict is each of its three values. The SDK sets them
+ * once when it builds the result, as non-enumerable values, so the result's
+ * JSON and spreads keep the wire shape; `outcome.verdict` stays the source.
+ */
+export type VerdictPredicates = {
+  /** Whether the verdict is `passed`: the only verdict that releases what was verified. */
+  readonly passed: boolean;
+  /** Whether the verdict is `failed`: an expectation was violated. */
+  readonly failed: boolean;
+  /** Whether the verdict is `inconclusive`: no judgment could be made, never a pass. */
+  readonly inconclusive: boolean;
+};
+
 /** The attributable result of one Verifier execution, custom `data` typed `T`. */
 export type VerificationResult<T = VerdictData> = Omit<WireVerificationResult, "outcome"> & {
   readonly outcome: VerificationOutcome<T>;
-};
+} & VerdictPredicates;
+
+/** A result as the wire carries it, before the SDK sets its {@link VerdictPredicates}. */
+type WireResult<T = VerdictData> = Omit<VerificationResult<T>, keyof VerdictPredicates>;
+
+/** `result` with its {@link VerdictPredicates} set once from `outcome.verdict`. */
+function withVerdict<T>(result: WireResult<T>): VerificationResult<T> {
+  const { verdict } = result.outcome;
+  return Object.defineProperties(result, {
+    passed: { value: verdict === "passed" },
+    failed: { value: verdict === "failed" },
+    inconclusive: { value: verdict === "inconclusive" },
+  }) as VerificationResult<T>;
+}
 
 /** One requirement's judgment with its authored check and provenance, custom `data` typed `T`. */
 export type RequirementDetails<T = VerdictData> = Omit<WireRequirementDetails, "data"> & { readonly data?: T };
@@ -356,10 +384,10 @@ function typedRequirements<R extends { readonly id: string; readonly data?: Verd
 
 /** {@link typedRequirements} over `result`'s requirements. */
 function typedResult<T>(result: VerificationResult, parser: VerdictDataParser<T>): VerificationResult<T> {
-  return {
+  return withVerdict({
     ...result,
     outcome: { ...result.outcome, requirements: typedRequirements(result.outcome.requirements, parser) },
-  };
+  });
 }
 
 /**
@@ -686,19 +714,6 @@ export interface TableConfigOptions {
   readonly compactionTargetFileSizeBytes?: number;
   /** Forge compaction type; omitted, Forge compacts the table `small-files`. */
   readonly compactionType?: CompactionType;
-}
-
-/**
- * Anything that can describe itself as JSON Schema.
- *
- * Zod 4 schemas satisfy this by construction; the shape is named structurally
- * so {@link TableConfig.fromJsonSchema} accepts one without this SDK depending
- * on Zod, or on any other schema library.
- */
-export interface JsonSchemaSource {
-  toJSONSchema(params?: {
-    override?(context: { zodSchema: unknown; jsonSchema: Record<string, unknown> }): void;
-  }): Readonly<Record<string, unknown>>;
 }
 
 /**
@@ -2494,7 +2509,12 @@ export namespace verify {
      * all, and the authorization or transport failure.
      */
     async status(): Promise<VerificationExecutionState> {
-      return lifecycleValue(await this.#native.status());
+      const state = lifecycleValue<
+        Omit<VerificationExecutionState, "result"> & { readonly result?: WireResult | null }
+      >(await this.#native.status());
+      return state.result == null
+        ? (state as VerificationExecutionState)
+        : { ...state, result: withVerdict(state.result) };
     }
 
     /**
@@ -2506,7 +2526,7 @@ export namespace verify {
      * or a non-transient read failure.
      */
     async wait(options: { readonly timeoutMs: number }): Promise<VerificationResult> {
-      return lifecycleValue(await this.#native.wait(options.timeoutMs));
+      return withVerdict(lifecycleValue<WireResult>(await this.#native.wait(options.timeoutMs)));
     }
 
     /**
@@ -2659,7 +2679,9 @@ export class Observe {
     inputs: VerifierInput | VerifierInputs,
     options?: VerifierInputOptions,
   ): Promise<VerificationResult> {
-    return lifecycleValue(await this.#native.verify(verifier, nativeInputs(inputs, options), options?.group_id));
+    return withVerdict(
+      lifecycleValue<WireResult>(await this.#native.verify(verifier, nativeInputs(inputs, options), options?.group_id)),
+    );
   }
 
   /**

@@ -251,18 +251,22 @@ def handbook_verdict(messages: list[dict]) -> str:
     return json.dumps({"outcome": "passed", "reason": reason, "citations": [citation]})
 
 
-READ_SHARING_POLICY = {
-    "role": "assistant",
-    "content": None,
-    "tool_calls": [
-        {
-            "id": "call-policy",
-            "type": "function",
-            "function": {"name": "fs_read", "arguments": '{"path":"/inputs/policy.json"}'},
-        }
-    ],
-}
-"""The sharing-policy judge's first turn: read its mounted policy as ``fs_read``."""
+def read_sharing_policy(text: str) -> dict:
+    """The sharing-policy judge's first turn: ``fs_read`` the policy path its prompt in ``text`` names."""
+    found = re.search(r"read (/inputs/[\w./-]+) with fs\.read", text, re.IGNORECASE)
+    assert found is not None, "the judge's prompt names the policy it reads"
+    path = found[1]
+    return {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "call-policy",
+                "type": "function",
+                "function": {"name": "fs_read", "arguments": json.dumps({"path": path})},
+            }
+        ],
+    }
 
 
 FINANCE_POLICY_JUDGE = "Decide whether the company sharing policy permits sharing this report"
@@ -286,8 +290,13 @@ def sharing_verdict(messages: list[dict]) -> str:
     lines = [unit for unit in output.get("units", []) if "external-audit" in unit["text"]]
     if not lines:
         return "the policy did not read"
+    # The finance example's Verifier takes the report inside its one `release` slot.
+    if FINANCE_POLICY_JUDGE in release:
+        report = {"slot": "release", "locator": {"json_pointer": "/report/text"}}
+    else:
+        report = {"slot": "report", "locator": {"json_pointer": "/text"}}
     citations = [
-        {"slot": "report", "locator": {"json_pointer": "/text"}},
+        report,
         {"slot": output["sources"][0], "locator": lines[0]["locator"]},
     ]
     if "PROVIDER-UNCERTAIN" in release:
@@ -381,7 +390,7 @@ def completion(body: dict) -> tuple[int, dict]:
         message = (
             {"role": "assistant", "content": sharing_verdict(body["messages"])}
             if returned
-            else READ_SHARING_POLICY
+            else read_sharing_policy(text)
         )
     elif "accurately summarizes the source" in text:
         message = {"role": "assistant", "content": REPORT_SUPPORTED}

@@ -26,15 +26,15 @@ Wyrd is open source. You build the verification your system needs from three ste
 
 ## Example
 
-An application shares synthetic customer reports with outside auditors. Before it sends one, it checks three requirements: the recipient is authorized, the company sharing policy PDF permits the release, and the destination restricts access. A model judges the policy; the other two are assertions on records the application supplies.
+An application shares synthetic customer reports with outside auditors. Before it sends one, it checks three requirements: the recipient is authorized, the company sharing policy permits the release, and the destination restricts access. A model judges the policy; the other two are assertions on records the application supplies.
 
-<!-- example: examples/finance-release/finance_release.py region=requirements -->
+<!-- example: examples/finance-release/finance_service.py region=requirements -->
 ```python
 requirements=[
     Requirement(
         "recipient-authorized",
         "The recipient is authorized to receive the report.",
-        Check.assert_("inputs.recipient.authorized", ComparisonOperator.Equals, True),
+        Check.assert_("inputs.release.recipient.authorized", ComparisonOperator.Equals, True),
     ),
     Requirement(
         "follows-policy",
@@ -44,40 +44,42 @@ requirements=[
     Requirement(
         "destination-restricted",
         "The destination restricts access to the report.",
-        Check.assert_("inputs.destination.restricted", ComparisonOperator.Equals, True),
+        Check.assert_("inputs.release.destination.restricted", ComparisonOperator.Equals, True),
     ),
 ],
 ```
 
-The application verifies each release with one call and sends only a passed one:
+The application verifies each release with one call:
 
-<!-- example: examples/finance-release/finance_release.py region=release -->
+<!-- example: examples/finance-release/finance_release.py -->
 ```python
-for release in releases:
-    name = release.pop("name")
-    try:
-        with state.run() as run:
-            # One synchronous call judges all three requirements.
-            result = run.observe.verify("release-check", **release)
-    except WyrdError as error:
-        print(f"{name}: {error.code} -> held for review")
-        continue
-    verifier = result.verifier
-    # Only a passed verdict releases the report.
-    decision = "released" if result.verdict == "passed" else "held for review"
-    print(f"{name}: {result.verdict} ({verifier.name}@{verifier.version}) -> {decision}")
-    for requirement in result.requirements:
-        if requirement["outcome"] != "passed":
-            print(f"  {requirement['id']} {requirement['outcome']}: {requirement['reason']}")
+from wyrd import WyrdState
+
+from finance_service import Destination, Recipient, Release, Report, service
+
+# Upload the policy, declare every Card, and get a ready state.
+state = WyrdState.declare(service)
+run = state.run()
+
+recipient = Recipient(email="auditor@example.test", authorized=True)
+destination = Destination(url="https://auditor.example.test/reports", restricted=True)
+for text in (
+    "Synthetic customer report: quarterly total $120.",
+    "Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001.",
+):
+    release = Release(report=Report(text=text), recipient=recipient, destination=destination)
+    result = run.observe.verify("release-check", release)
+    print(f"{result.verdict}: {text}")
+
+state.shutdown()
 ```
 
 ```text
-quarterly-report: passed (release-check@0.1.0) -> released
-report-with-bank-account: failed (release-check@0.1.0) -> held for review
-  follows-policy failed: the report names a bank account identifier
+passed: Synthetic customer report: quarterly total $120.
+failed: Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001.
 ```
 
-The full program is in [Python](https://github.com/bohmian-ai/wyrd/blob/main/examples/finance-release/finance_release.py), [Rust](https://github.com/bohmian-ai/wyrd/blob/main/examples/finance-release/finance_release.rs), and [TypeScript](https://github.com/bohmian-ai/wyrd/blob/main/examples/finance-release/finance_release.ts). [Run your first verification](https://docs.bohmian.ai/wyrd/get-started/quickstart/) runs it against your own server and model.
+The full example is in [`examples/finance-release`](https://github.com/bohmian-ai/wyrd/tree/main/examples/finance-release) for Python, Rust, and TypeScript. [Run your first verification](https://docs.bohmian.ai/wyrd/get-started/quickstart/) runs it against your own server and model.
 
 ## What you can build
 
@@ -132,10 +134,10 @@ uv add "wyrd-ai==0.4.1"
 
 # Rust
 cargo install wyrd-cli --version 0.4.1 --locked
-cargo add wyrd-ai@0.4.1 tokio --features tokio/full
+cargo add wyrd-ai@0.4.1 tokio serde schemars --features tokio/full,serde/derive
 
 # TypeScript
-pnpm add wyrd-ai@0.4.1
+pnpm add wyrd-ai@0.4.1 zod
 ```
 
 Start a local server with `wyrd init` (`uv run wyrd init` or `pnpm wyrd init`), or let your coding agent do it with `wyrd init guided`. [Set up Wyrd](https://docs.bohmian.ai/wyrd/get-started/setup/) has the details.

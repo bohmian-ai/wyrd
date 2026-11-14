@@ -172,7 +172,7 @@ Release controls: passed
 
 `ComparisonOperator` and `ExecutionRoute` are typed forms of the YAML values, and `AgentRunConfig`, also from `wyrd.verify`, sets an Agent's run limits through `run_config`:
 
-<CodeFromFile file="examples/finance-release/finance_release.py" region="run-config" lang="python" title="finance_release.py" />
+<CodeFromFile file="examples/finance-release/finance_service.py" region="run-config" lang="python" title="finance_service.py" />
 
 The [Verifier reference](/reference/verifier-card/) lists every operator and field.
 

@@ -44,8 +44,14 @@ export function toolTurn(calls: readonly unknown[]): Reply {
   };
 }
 
-/** The sharing-policy judge's first turn: read its mounted policy. */
-const READ_POLICY = [toolCall("call-policy", "fs.read", { path: "/inputs/policy.json" })];
+/** The sharing-policy judge's first turn: `fs.read` the policy path its prompt in `body` names. */
+function readPolicy(body: string): ReturnType<typeof toolCall>[] {
+  const path = /read (\/inputs\/[\w./-]+) with fs\.read/i.exec(body)?.[1];
+  if (path === undefined) {
+    throw new Error("the judge's prompt names no policy to read");
+  }
+  return [toolCall("call-policy", "fs.read", { path })];
+}
 
 /** The sharing-policy judge's Verdict once `body` carries its `fs.read` result; no Verdict when the read has no `external-audit` line. */
 function sharingVerdict(body: string): string {
@@ -61,10 +67,11 @@ function sharingVerdict(body: string): string {
   if (line === undefined) {
     return "the policy did not read";
   }
-  const citations = [
-    { slot: "report", locator: { json_pointer: "/text" } },
-    { slot: output.sources?.[0], locator: line.locator },
-  ];
+  // The finance example's Verifier takes the report inside its one `release` slot.
+  const report = release.includes("Decide whether the company sharing policy permits")
+    ? { slot: "release", locator: { json_pointer: "/report/text" } }
+    : { slot: "report", locator: { json_pointer: "/text" } };
+  const citations = [report, { slot: output.sources?.[0], locator: line.locator }];
   if (release.includes("PROVIDER-UNCERTAIN")) {
     return JSON.stringify({
       outcome: "inconclusive",
@@ -79,14 +86,16 @@ function sharingVerdict(body: string): string {
 }
 
 /**
- * The sharing-policy judge's reply: it reads `/inputs/policy.json` with
+ * The sharing-policy judge's reply: it reads the policy its prompt names with
  * `fs.read` first, then is inconclusive for a release naming
  * `PROVIDER-UNCERTAIN`, fails one naming `BANK-ACCOUNT-DEMO-001`, and
  * otherwise passes, citing the report text and the policy line permitting
  * `external-audit`.
  */
 export function sharingPolicyJudge(request: ReceivedRequest): Reply {
-  return /"role"\s*:\s*"tool"/.test(request.body) ? judgeReply(sharingVerdict(request.body)) : toolTurn(READ_POLICY);
+  return /"role"\s*:\s*"tool"/.test(request.body)
+    ? judgeReply(sharingVerdict(request.body))
+    : toolTurn(readPolicy(request.body));
 }
 
 /** One judge call's `bifrost.gateway.calls` identity and attribution. */

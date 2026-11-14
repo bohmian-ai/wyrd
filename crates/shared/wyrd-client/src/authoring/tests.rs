@@ -1942,3 +1942,45 @@ tables:
         serde_json::from_value(service.spec()).expect("authored tables decode as a Service spec");
     assert_eq!(authored, canonical);
 }
+
+/// A model slot carries its type's derived JSON Schema, nested types
+/// included, which requires every field the type serializes, and validates
+/// as a Verifier input.
+///
+/// # Panics
+/// Panics when the slot's schema differs from `schemars`', misses a field,
+/// or the Verifier refuses it.
+#[test]
+fn model_slot_carries_the_derived_schema() {
+    #[derive(serde::Serialize, schemars::JsonSchema)]
+    struct Report {
+        text: String,
+    }
+    #[derive(serde::Serialize, schemars::JsonSchema)]
+    struct Release {
+        report: Report,
+        authorized: bool,
+    }
+
+    let verifier = Verifier::new("release-check", "1.0.0")
+        .inputs([("release", InputSlot::model::<Release>())])
+        .requirements([Requirement::new(
+            "authorized",
+            "The recipient is authorized.",
+            Check::assert("inputs.release.authorized", "equals", true),
+        )]);
+
+    let schema = &verifier.spec()["inputs"]["release"]["schema"];
+    let derived = serde_json::to_value(schemars::schema_for!(Release)).expect("schema is JSON");
+    assert_eq!(schema, &derived);
+    let release = serde_json::to_value(Release {
+        report: Report {
+            text: "quarterly total".into(),
+        },
+        authorized: true,
+    })
+    .expect("release is JSON");
+    let fields: Vec<&String> = release.as_object().expect("an object").keys().collect();
+    assert_eq!(schema["required"], json!(fields));
+    verifier.plan().expect("a model slot validates");
+}

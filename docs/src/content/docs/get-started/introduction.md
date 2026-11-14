@@ -12,18 +12,17 @@ Wyrd is the only real-time verification system built for your applications. Befo
 
 ## An example
 
-An application shares synthetic customer reports with outside auditors. Before it sends one, it checks three requirements in one Verifier. A model reads the company sharing policy PDF and judges the report; the other two are assertions on records the application supplies:
+An application shares synthetic customer reports with outside auditors. Before it sends one, it checks three requirements in one Verifier. A model reads the company sharing policy and judges the report; the other two are assertions on records the application supplies:
 
-<CodeFromFile file="examples/finance-release/finance_release.py" region="requirements" lang="python" title="finance_release.py" />
+<CodeFromFile file="examples/finance-release/finance_service.py" region="requirements" lang="python" title="finance_service.py" />
 
-The application verifies each release with one call and sends only a passed one:
+The application verifies each release with one call:
 
-<CodeFromFile file="examples/finance-release/finance_release.py" region="release" lang="python" title="finance_release.py" />
+<CodeFromFile file="examples/finance-release/finance_release.py" lang="python" title="finance_release.py" />
 
 ```text
-quarterly-report: passed (release-check@0.1.0) -> released
-report-with-bank-account: failed (release-check@0.1.0) -> held for review
-  follows-policy failed: the report names a bank account identifier
+passed: Synthetic customer report: quarterly total $120.
+failed: Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001.
 ```
 
 The second report names a bank account, which the policy forbids. [Run your first verification](/get-started/quickstart/) runs the full program in Python, Rust, or TypeScript. A Verifier can also run Python, judge a whole session, or compare samples with a baseline on a schedule; [What can I build?](/get-started/what-can-i-build/) matches each to a problem.

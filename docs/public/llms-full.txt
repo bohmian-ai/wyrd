@@ -24,14 +24,14 @@ Wyrd is the only real-time verification system built for your applications. Befo
 
 ## An example
 
-An application shares synthetic customer reports with outside auditors. Before it sends one, it checks three requirements in one Verifier. A model reads the company sharing policy PDF and judges the report; the other two are assertions on records the application supplies:
+An application shares synthetic customer reports with outside auditors. Before it sends one, it checks three requirements in one Verifier. A model reads the company sharing policy and judges the report; the other two are assertions on records the application supplies:
 
-```python title="finance_release.py"
+```python title="finance_service.py"
 requirements=[
     Requirement(
         "recipient-authorized",
         "The recipient is authorized to receive the report.",
-        Check.assert_("inputs.recipient.authorized", ComparisonOperator.Equals, True),
+        Check.assert_("inputs.release.recipient.authorized", ComparisonOperator.Equals, True),
     ),
     Requirement(
         "follows-policy",
@@ -41,36 +41,39 @@ requirements=[
     Requirement(
         "destination-restricted",
         "The destination restricts access to the report.",
-        Check.assert_("inputs.destination.restricted", ComparisonOperator.Equals, True),
+        Check.assert_("inputs.release.destination.restricted", ComparisonOperator.Equals, True),
     ),
 ],
 ```
 
-The application verifies each release with one call and sends only a passed one:
+The application verifies each release with one call:
 
 ```python title="finance_release.py"
-for release in releases:
-    name = release.pop("name")
-    try:
-        with state.run() as run:
-            # One synchronous call judges all three requirements.
-            result = run.observe.verify("release-check", **release)
-    except WyrdError as error:
-        print(f"{name}: {error.code} -> held for review")
-        continue
-    verifier = result.verifier
-    # Only a passed verdict releases the report.
-    decision = "released" if result.verdict == "passed" else "held for review"
-    print(f"{name}: {result.verdict} ({verifier.name}@{verifier.version}) -> {decision}")
-    for requirement in result.requirements:
-        if requirement["outcome"] != "passed":
-            print(f"  {requirement['id']} {requirement['outcome']}: {requirement['reason']}")
+from wyrd import WyrdState
+
+from finance_service import Destination, Recipient, Release, Report, service
+
+# Upload the policy, declare every Card, and get a ready state.
+state = WyrdState.declare(service)
+run = state.run()
+
+recipient = Recipient(email="auditor@example.test", authorized=True)
+destination = Destination(url="https://auditor.example.test/reports", restricted=True)
+for text in (
+    "Synthetic customer report: quarterly total $120.",
+    "Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001.",
+):
+    release = Release(report=Report(text=text), recipient=recipient, destination=destination)
+    result = run.observe.verify("release-check", release)
+    print(f"{result.verdict}: {text}")
+
+state.shutdown()
+
 ```
 
 ```text
-quarterly-report: passed (release-check@0.1.0) -> released
-report-with-bank-account: failed (release-check@0.1.0) -> held for review
-  follows-policy failed: the report names a bank account identifier
+passed: Synthetic customer report: quarterly total $120.
+failed: Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001.
 ```
 
 The second report names a bank account, which the policy forbids. [Run your first verification](/wyrd/get-started/quickstart/) runs the full program in Python, Rust, or TypeScript. A Verifier can also run Python, judge a whole session, or compare samples with a baseline on a schedule; [What can I build?](/wyrd/get-started/what-can-i-build/) matches each to a problem.
@@ -139,7 +142,7 @@ Run the CLI as `uv run wyrd`.
 ```bash
 cargo install wyrd-cli --version 0.4.1 --locked
 cargo new quickstart && cd quickstart
-cargo add wyrd-ai@0.4.1 tokio --features tokio/full
+cargo add wyrd-ai@0.4.1 tokio serde schemars --features tokio/full,serde/derive
 ```
 
 **TypeScript**
@@ -147,7 +150,7 @@ cargo add wyrd-ai@0.4.1 tokio --features tokio/full
 ```bash
 mkdir quickstart && cd quickstart
 pnpm init && pnpm pkg set type=module
-pnpm add wyrd-ai@0.4.1
+pnpm add wyrd-ai@0.4.1 zod
 ```
 
 Run the CLI as `pnpm wyrd`.
@@ -378,7 +381,7 @@ A `failed` verdict is a result, not an error: the second answer promises a guara
 
 Page: /wyrd/get-started/quickstart/
 
-> Verify a finance report against three requirements, including a model that reads a policy PDF, in one call, and release it only when the verdict passes. Python, Rust, or TypeScript.
+> Verify a finance report against three requirements, including a model that reads a sharing policy, in one call, and release it only when the verdict passes. Python, Rust, or TypeScript.
 
 Your application is about to send a customer report to an outside auditor. Before it does, it asks Wyrd one question: does this release meet the requirements? Wyrd returns a verdict, and your code releases the report or holds it for review.
 
@@ -387,10 +390,10 @@ You build one Service, `finance-release`, verified by one Verifier, `release-che
 | Requirement | How it is judged |
 | --- | --- |
 | `recipient-authorized` | An assertion on the recipient record your application supplies |
-| `follows-policy` | A model reads the company sharing policy PDF and judges the report |
+| `follows-policy` | A model reads the company sharing policy and judges the report |
 | `destination-restricted` | An assertion on the destination record your application supplies |
 
-One call judges all three. The reports, recipients, and destinations are synthetic, and nothing is sent anywhere: the program prints what it would do.
+One call judges all three. The reports, recipients, and destinations are synthetic, and nothing is sent anywhere: the program prints each verdict.
 
 ## Prerequisites
 
@@ -399,7 +402,7 @@ One call judges all three. The reports, recipients, and destinations are synthet
 
 **What the model sees:**
 
-The policy judge sends the report text, the recipient record, and the policy's extracted text to OpenAI through your server. Use the synthetic data in this guide, not real customer data.
+The policy judge sends the report text, the recipient record, and the policy text to OpenAI through your server. Use the synthetic data in this guide, not real customer data.
 
 ## 1. Connect a model provider
 
@@ -416,39 +419,9 @@ JSON
 
 The key stays on the server. [LLM gateway](/wyrd/connect/set-up-the-llm-gateway/) explains both commands.
 
-## 2. Save the policy and the releases
+## 2. Declare and verify
 
-Download the company sharing policy into `quickstart`:
-
-```bash
-curl -LO https://raw.githubusercontent.com/bohmian-ai/wyrd/main/examples/finance-release/company-sharing-policy.pdf
-```
-
-It allows reports to be shared only for external audits and forbids bank account identifiers such as `BANK-ACCOUNT-DEMO-001`.
-
-Save the two releases your application proposes as `releases.json`. The second report names a bank account:
-
-```json title="releases.json"
-[
-  {
-    "name": "quarterly-report",
-    "report": { "text": "Synthetic customer report: quarterly total $120." },
-    "recipient": { "email": "auditor@example.test", "authorized": true },
-    "destination": { "url": "https://auditor.example.test/reports", "restricted": true }
-  },
-  {
-    "name": "report-with-bank-account",
-    "report": { "text": "Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001." },
-    "recipient": { "email": "auditor@example.test", "authorized": true },
-    "destination": { "url": "https://auditor.example.test/reports", "restricted": true }
-  }
-]
-
-```
-
-## 3. Verify each release
-
-Save the program in `quickstart` and run it:
+Save the declaration and the program in `quickstart`, and run the program. The declaration builds the Service, the Verifier, and the judge Agent; the program declares them and verifies two releases. The second report names a bank account:
 
 **Python**
 
@@ -458,28 +431,10 @@ The program declares its inputs as Pydantic models. Add Pydantic with the SDK's 
 uv add "wyrd-ai[pydantic]==0.4.1"
 ```
 
-```python title="finance_release.py"
-"""Verify each proposed report release before the application sends it.
-
-The ``finance-release`` Service shares synthetic customer reports with outside
-auditors. Before it releases one, it calls the ``release-check`` Verifier once,
-and the Verifier judges three requirements together:
-
-- ``recipient-authorized``: the supplied recipient record says the recipient
-  is authorized (an assertion).
-- ``follows-policy``: ``policy-judge`` reads the company sharing policy PDF and
-  judges the report against it (an Agent check, through the Wyrd gateway).
-- ``destination-restricted``: the supplied destination record says access is
-  restricted (an assertion).
-
-Wyrd returns the verdict; the application decides. Only ``passed`` releases
-the report; anything else holds it for review. Nothing is sent anywhere.
-"""
-
-import json
+```python title="finance_service.py"
+from pathlib import Path
 
 from pydantic import BaseModel
-from wyrd import WyrdError, WyrdState
 from wyrd.verify import (
     Agent,
     AgentRunConfig,
@@ -506,9 +461,22 @@ class Destination(BaseModel):
     url: str
     restricted: bool
 
-# The company sharing policy, uploaded once from this directory with its text
-# extracted so the judge can read it.
-policy = Artifact.from_path("company-sharing-policy", "company-sharing-policy.pdf").extract(True)
+class Release(BaseModel):
+    report: Report
+    recipient: Recipient
+    destination: Destination
+
+# The company sharing policy. The program saves it beside itself the first
+# time; edit the file and run again to publish a new policy version.
+POLICY = """# Company sharing policy
+
+Reports may be shared outside the company only for external-audit purposes.
+A shared report must never contain a bank account identifier such as BANK-ACCOUNT-DEMO-001.
+"""
+policy_file = Path("company-sharing-policy.md")
+if not policy_file.exists():
+    policy_file.write_text(POLICY)
+policy = Artifact.from_path("company-sharing-policy", policy_file)
 
 # `policy-judge`: a model that reads the policy with `fs.read` and returns a
 # verdict on the report. Its model calls go through the `openai` gateway
@@ -518,7 +486,7 @@ policy_judge = Agent(
     prompt=Prompt.openai_chat(
         "gpt-4o",
         messages=(
-            "Read /inputs/policy.json with fs.read. Decide whether the company sharing "
+            "Read /inputs/policy.md with fs.read. Decide whether the company sharing "
             "policy permits sharing this report with this recipient, citing the report "
             "and the policy line you apply. Report: {{report}} Recipient: {{recipient}}"
         ),
@@ -531,19 +499,19 @@ policy_judge = Agent(
 
 follows_policy = (
     Check.agent(policy_judge)
-    .inputs({"report": "inputs.report", "recipient": "inputs.recipient"})
-    .add_workspace("/inputs/policy.json", policy.file("extracted/company-sharing-policy.pdf.json"))
+    .inputs({"report": "inputs.release.report", "recipient": "inputs.release.recipient"})
+    .add_workspace("/inputs/policy.md", policy.file("company-sharing-policy.md"))
 )
 
 release_check = Verifier(
     "release-check",
-    # Each input must match its model.
-    inputs={"report": Report, "recipient": Recipient, "destination": Destination},
+    # Each release must match its model.
+    inputs={"release": Release},
     requirements=[
         Requirement(
             "recipient-authorized",
             "The recipient is authorized to receive the report.",
-            Check.assert_("inputs.recipient.authorized", ComparisonOperator.Equals, True),
+            Check.assert_("inputs.release.recipient.authorized", ComparisonOperator.Equals, True),
         ),
         Requirement(
             "follows-policy",
@@ -553,37 +521,35 @@ release_check = Verifier(
         Requirement(
             "destination-restricted",
             "The destination restricts access to the report.",
-            Check.assert_("inputs.destination.restricted", ComparisonOperator.Equals, True),
+            Check.assert_("inputs.release.destination.restricted", ComparisonOperator.Equals, True),
         ),
     ],
 )
 
 service = Service("finance-release", verified_by=[release_check])
 
+```
+
+```python title="finance_release.py"
+from wyrd import WyrdState
+
+from finance_service import Destination, Recipient, Release, Report, service
+
 # Upload the policy, declare every Card, and get a ready state.
 state = WyrdState.declare(service)
+run = state.run()
 
-try:
-    with open("releases.json") as file:
-        releases = json.load(file)
-    for release in releases:
-        name = release.pop("name")
-        try:
-            with state.run() as run:
-                # One synchronous call judges all three requirements.
-                result = run.observe.verify("release-check", **release)
-        except WyrdError as error:
-            print(f"{name}: {error.code} -> held for review")
-            continue
-        verifier = result.verifier
-        # Only a passed verdict releases the report.
-        decision = "released" if result.verdict == "passed" else "held for review"
-        print(f"{name}: {result.verdict} ({verifier.name}@{verifier.version}) -> {decision}")
-        for requirement in result.requirements:
-            if requirement["outcome"] != "passed":
-                print(f"  {requirement['id']} {requirement['outcome']}: {requirement['reason']}")
-finally:
-    state.shutdown()
+recipient = Recipient(email="auditor@example.test", authorized=True)
+destination = Destination(url="https://auditor.example.test/reports", restricted=True)
+for text in (
+    "Synthetic customer report: quarterly total $120.",
+    "Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001.",
+):
+    release = Release(report=Report(text=text), recipient=recipient, destination=destination)
+    result = run.observe.verify("release-check", release)
+    print(f"{result.verdict}: {text}")
+
+state.shutdown()
 
 ```
 
@@ -593,96 +559,68 @@ uv run finance_release.py
 
 **Rust**
 
-```rust title="src/main.rs"
-//! Verify each proposed report release before the application sends it.
-//!
-//! The `finance-release` Service shares synthetic customer reports with
-//! outside auditors. Before it releases one, it calls the `release-check`
-//! Verifier once, and the Verifier judges three requirements together:
-//!
-//! - `recipient-authorized`: the supplied recipient record says the
-//!   recipient is authorized (an assertion).
-//! - `follows-policy`: `policy-judge` reads the company sharing policy PDF
-//!   and judges the report against it (an Agent check, through the Wyrd
-//!   gateway).
-//! - `destination-restricted`: the supplied destination record says access
-//!   is restricted (an assertion).
-//!
-//! Wyrd returns the verdict; the application decides. Only `passed` releases
-//! the report; anything else holds it for review. Nothing is sent anywhere.
-
+```rust title="src/finance_service.rs"
 use std::error::Error;
+use std::path::Path;
 
-use wyrd_ai::serde_json::{self, Map, Value, json};
-use wyrd_ai::state::WyrdState;
+use schemars::JsonSchema;
+use serde::Serialize;
+use wyrd_ai::ExecutionRoute;
 use wyrd_ai::verify::{
-    Agent, AgentRunConfigSpec, Artifact, Check, ComparisonOperator, Inputs, OpenAiChatOptions,
+    Agent, AgentRunConfigSpec, Artifact, Check, ComparisonOperator, InputSlot, OpenAiChatOptions,
     Requirement, ResponseFormat, Service, Verifier, openai_chat,
 };
-use wyrd_ai::{ExecutionRoute, RequirementOutcome, VerificationVerdict};
 
-/// Declare the finance release, then verify each proposed release in
-/// `releases.json` and print the application's decision.
+/// The report to send.
+#[derive(Serialize, JsonSchema)]
+pub struct Report {
+    pub text: String,
+}
+
+/// Who receives the report.
+#[derive(Serialize, JsonSchema)]
+pub struct Recipient {
+    pub email: String,
+    pub authorized: bool,
+}
+
+/// Where the report goes.
+#[derive(Serialize, JsonSchema)]
+pub struct Destination {
+    pub url: String,
+    pub restricted: bool,
+}
+
+/// One proposed report release: the `release-check` input.
+#[derive(Serialize, JsonSchema)]
+pub struct Release {
+    pub report: Report,
+    pub recipient: Recipient,
+    pub destination: Destination,
+}
+
+/// The company sharing policy the judge applies.
+const POLICY: &str = "# Company sharing policy
+
+Reports may be shared outside the company only for external-audit purposes.
+A shared report must never contain a bank account identifier such as BANK-ACCOUNT-DEMO-001.
+";
+
+/// The `finance-release` Service, verified by `release-check`.
 ///
 /// # Errors
-/// Returns the ambient client's configuration or credential error, the
-/// declaration's refusal (an invalid graph, an unreadable policy file, or
-/// the registry's refusal), and an unreadable `releases.json`. A refused
-/// verification holds its release instead.
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    // The company sharing policy, uploaded once from this directory with its
-    // text extracted so the judge can read it.
-    let policy = Artifact::from_path("company-sharing-policy", None, "company-sharing-policy.pdf")
-        .extract(true);
-    let service = Service::new("finance-release", None).verified_by([release_check(&policy)?]);
-
-    // Upload the policy, declare every Card, and get a ready state.
-    let state = WyrdState::declare(&service).await?;
-
-    let releases: Vec<Map<String, Value>> =
-        serde_json::from_str(&std::fs::read_to_string("releases.json")?)?;
-    for mut release in releases {
-        let name = release.remove("name").unwrap_or_default();
-        let name = name.as_str().unwrap_or_default();
-        // One synchronous call judges all three requirements.
-        let result = match state
-            .run()
-            .observe()
-            .verify("release-check", Inputs::named(release))
-            .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                println!("{name}: {} -> held for review", error.code());
-                continue;
-            }
-        };
-        let verdict = result.outcome.verdict;
-        // Only a passed verdict releases the report.
-        let decision = if verdict == VerificationVerdict::Passed {
-            "released"
-        } else {
-            "held for review"
-        };
-        let verifier = &result.verifier;
-        println!(
-            "{name}: {verdict} ({}@{}) -> {decision}",
-            verifier.name, verifier.version
-        );
-        for requirement in &result.outcome.requirements {
-            if requirement.outcome != RequirementOutcome::Passed {
-                let outcome = json!(requirement.outcome);
-                let outcome = outcome.as_str().unwrap_or_default();
-                println!(
-                    "  {} {outcome}: {}",
-                    requirement.id.as_str(),
-                    requirement.reason
-                );
-            }
-        }
+/// Returns a refused policy write, or the policy judge's Prompt or route
+/// refusal.
+pub fn service() -> Result<Service, Box<dyn Error>> {
+    // The company sharing policy. The program saves it beside itself the
+    // first time; edit the file and run again to publish a new policy
+    // version.
+    let policy_file = Path::new("company-sharing-policy.md");
+    if !policy_file.exists() {
+        std::fs::write(policy_file, POLICY)?;
     }
-    Ok(())
+    let policy = Artifact::from_path("company-sharing-policy", None, policy_file);
+    Ok(Service::new("finance-release", None).verified_by([release_check(&policy)?]))
 }
 
 /// `release-check`: the recipient and destination assertions, and the
@@ -692,55 +630,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
 /// Returns the policy judge's Prompt or route refusal.
 fn release_check(policy: &Artifact) -> Result<Verifier, Box<dyn Error>> {
     let mut follows_policy = Check::agent(policy_judge()?).inputs([
-        ("report", "inputs.report"),
-        ("recipient", "inputs.recipient"),
+        ("report", "inputs.release.report"),
+        ("recipient", "inputs.release.recipient"),
     ]);
     follows_policy.add_workspace(
-        "/inputs/policy.json",
-        policy.file("extracted/company-sharing-policy.pdf.json"),
+        "/inputs/policy.md",
+        policy.file("company-sharing-policy.md"),
     );
 
     Ok(Verifier::new("release-check", None)
-        // The evidence the application sends, and the JSON Schema each must
-        // match.
-        .inputs([
-            (
-                "report",
-                json!({
-                    "type": "object",
-                    "required": ["text"],
-                    "properties": { "text": { "type": "string" } },
-                }),
-            ),
-            (
-                "recipient",
-                json!({
-                    "type": "object",
-                    "required": ["email", "authorized"],
-                    "properties": {
-                        "email": { "type": "string" },
-                        "authorized": { "type": "boolean" },
-                    },
-                }),
-            ),
-            (
-                "destination",
-                json!({
-                    "type": "object",
-                    "required": ["url", "restricted"],
-                    "properties": {
-                        "url": { "type": "string" },
-                        "restricted": { "type": "boolean" },
-                    },
-                }),
-            ),
-        ])
+        // The release the application sends.
+        .inputs([("release", InputSlot::model::<Release>())])
         .requirements([
             Requirement::new(
                 "recipient-authorized",
                 "The recipient is authorized to receive the report.",
                 Check::assert(
-                    "inputs.recipient.authorized",
+                    "inputs.release.recipient.authorized",
                     ComparisonOperator::Equals,
                     true,
                 ),
@@ -754,7 +660,7 @@ fn release_check(policy: &Artifact) -> Result<Verifier, Box<dyn Error>> {
                 "destination-restricted",
                 "The destination restricts access to the report.",
                 Check::assert(
-                    "inputs.destination.restricted",
+                    "inputs.release.destination.restricted",
                     ComparisonOperator::Equals,
                     true,
                 ),
@@ -773,7 +679,7 @@ fn policy_judge() -> Result<Agent, Box<dyn Error>> {
         "gpt-4o",
         OpenAiChatOptions {
             messages: vec![
-                "Read /inputs/policy.json with fs.read. Decide whether the company sharing \
+                "Read /inputs/policy.md with fs.read. Decide whether the company sharing \
                  policy permits sharing this report with this recipient, citing the report \
                  and the policy line you apply. Report: {{report}} Recipient: {{recipient}}"
                     .into(),
@@ -796,37 +702,91 @@ fn policy_judge() -> Result<Agent, Box<dyn Error>> {
 
 ```
 
+```rust title="src/main.rs"
+//! Verify two proposed report releases against the `finance-release`
+//! Service that `finance_service.rs` declares.
+
+mod finance_service;
+
+use std::error::Error;
+
+use wyrd_ai::serde_json;
+use wyrd_ai::state::WyrdState;
+
+use finance_service::{Destination, Recipient, Release, Report};
+
+/// Declare the finance release, then verify two releases and print each
+/// verdict.
+///
+/// # Errors
+/// Returns the ambient client's configuration or credential error, the
+/// declaration's refusal, or a refused verification.
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    // Upload the policy, declare every Card, and get a ready state.
+    let state = WyrdState::declare(&finance_service::service()?).await?;
+    let run = state.run();
+
+    for text in [
+        "Synthetic customer report: quarterly total $120.",
+        "Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001.",
+    ] {
+        let release = Release {
+            report: Report { text: text.into() },
+            recipient: Recipient {
+                email: "auditor@example.test".into(),
+                authorized: true,
+            },
+            destination: Destination {
+                url: "https://auditor.example.test/reports".into(),
+                restricted: true,
+            },
+        };
+        let result = run
+            .observe()
+            .verify("release-check", serde_json::to_value(release)?)
+            .await?;
+        println!("{}: {text}", result.outcome.verdict);
+    }
+    Ok(())
+}
+
+```
+
 ```bash
 cargo run
 ```
 
 **TypeScript**
 
-```typescript title="finance_release.ts"
-// Verify each proposed report release before the application sends it.
-//
-// The `finance-release` Service shares synthetic customer reports with outside
-// auditors. Before it releases one, it calls the `release-check` Verifier once,
-// and the Verifier judges three requirements together:
-//
-// - `recipient-authorized`: the supplied recipient record says the recipient
-//   is authorized (an assertion).
-// - `follows-policy`: `policy-judge` reads the company sharing policy PDF and
-//   judges the report against it (an Agent check, through the Wyrd gateway).
-// - `destination-restricted`: the supplied destination record says access is
-//   restricted (an assertion).
-//
-// Wyrd returns the verdict; the application decides. Only `passed` releases
-// the report; anything else holds it for review. Nothing is sent anywhere.
-import { readFileSync } from "node:fs";
+```typescript title="finance_service.ts"
+import { existsSync, writeFileSync } from "node:fs";
 
-import { type CardTypes, verify, WyrdError, WyrdState } from "wyrd-ai";
+import { verify } from "wyrd-ai";
+import { z } from "zod";
 
 const { Agent, Artifact, Check, Prompt, Requirement, Service, Verifier } = verify;
 
-// The company sharing policy, uploaded once from this directory with its text
-// extracted so the judge can read it.
-const policy = Artifact.fromPath("company-sharing-policy", "company-sharing-policy.pdf").extract(true);
+// One proposed report release: the `release-check` input.
+export const Release = z.object({
+  report: z.object({ text: z.string() }),
+  recipient: z.object({ email: z.string(), authorized: z.boolean() }),
+  destination: z.object({ url: z.string(), restricted: z.boolean() }),
+});
+export type Release = z.infer<typeof Release>;
+
+// The company sharing policy. The program saves it beside itself the first
+// time; edit the file and run again to publish a new policy version.
+const POLICY = `# Company sharing policy
+
+Reports may be shared outside the company only for external-audit purposes.
+A shared report must never contain a bank account identifier such as BANK-ACCOUNT-DEMO-001.
+`;
+const policyFile = "company-sharing-policy.md";
+if (!existsSync(policyFile)) {
+  writeFileSync(policyFile, POLICY);
+}
+const policy = Artifact.fromPath("company-sharing-policy", policyFile);
 
 // `policy-judge`: a model that reads the policy with `fs.read` and returns a
 // verdict on the report. Its model calls go through the `openai` gateway
@@ -834,7 +794,7 @@ const policy = Artifact.fromPath("company-sharing-policy", "company-sharing-poli
 const policyJudge = new Agent("policy-judge", {
   prompt: Prompt.openaiChat("gpt-4o", {
     messages:
-      "Read /inputs/policy.json with fs.read. Decide whether the company sharing " +
+      "Read /inputs/policy.md with fs.read. Decide whether the company sharing " +
       "policy permits sharing this report with this recipient, citing the report " +
       "and the policy line you apply. Report: {{report}} Recipient: {{recipient}}",
     responseFormat: { type: "verdict" },
@@ -845,71 +805,52 @@ const policyJudge = new Agent("policy-judge", {
 });
 
 const followsPolicy = Check.agent(policyJudge)
-  .inputs({ report: "inputs.report", recipient: "inputs.recipient" })
-  .addWorkspace("/inputs/policy.json", policy.file("extracted/company-sharing-policy.pdf.json"));
+  .inputs({ report: "inputs.release.report", recipient: "inputs.release.recipient" })
+  .addWorkspace("/inputs/policy.md", policy.file("company-sharing-policy.md"));
 
 const releaseCheck = new Verifier("release-check", {
-  // The evidence the application sends, and the JSON Schema each must match.
-  inputs: {
-    report: { type: "object", required: ["text"], properties: { text: { type: "string" } } },
-    recipient: {
-      type: "object",
-      required: ["email", "authorized"],
-      properties: { email: { type: "string" }, authorized: { type: "boolean" } },
-    },
-    destination: {
-      type: "object",
-      required: ["url", "restricted"],
-      properties: { url: { type: "string" }, restricted: { type: "boolean" } },
-    },
-  },
+  // The release the application sends.
+  inputs: { release: Release },
   requirements: [
     new Requirement(
       "recipient-authorized",
       "The recipient is authorized to receive the report.",
-      Check.assert("inputs.recipient.authorized", "equals", true),
+      Check.assert("inputs.release.recipient.authorized", "equals", true),
     ),
     new Requirement("follows-policy", "The company sharing policy permits this release.", followsPolicy),
     new Requirement(
       "destination-restricted",
       "The destination restricts access to the report.",
-      Check.assert("inputs.destination.restricted", "equals", true),
+      Check.assert("inputs.release.destination.restricted", "equals", true),
     ),
   ],
 });
 
-const service = new Service("finance-release", { verified_by: [releaseCheck] });
+export const service = new Service("finance-release", { verified_by: [releaseCheck] });
+
+```
+
+```typescript title="finance_release.ts"
+import { WyrdState } from "wyrd-ai";
+
+import { type Release, service } from "./finance_service.ts";
 
 // Upload the policy, declare every Card, and get a ready state.
 const state = await WyrdState.declare(service);
+const run = state.run();
 
-try {
-  const releases = JSON.parse(readFileSync("releases.json", "utf8")) as Record<string, CardTypes.JsonValue>[];
-  for (const { name, ...evidence } of releases) {
-    let result;
-    try {
-      // One synchronous call judges all three requirements.
-      result = await state.run().observe.verify("release-check", evidence);
-    } catch (error) {
-      if (!(error instanceof WyrdError)) {
-        throw error;
-      }
-      console.log(`${name}: ${error.code} -> held for review`);
-      continue;
-    }
-    const { verdict, requirements } = result.outcome;
-    // Only a passed verdict releases the report.
-    const decision = verdict === "passed" ? "released" : "held for review";
-    console.log(`${name}: ${verdict} (${result.verifier.name}@${result.verifier.version}) -> ${decision}`);
-    for (const requirement of requirements) {
-      if (requirement.outcome !== "passed") {
-        console.log(`  ${requirement.id} ${requirement.outcome}: ${requirement.reason}`);
-      }
-    }
-  }
-} finally {
-  await state.shutdown();
+const recipient = { email: "auditor@example.test", authorized: true };
+const destination = { url: "https://auditor.example.test/reports", restricted: true };
+for (const text of [
+  "Synthetic customer report: quarterly total $120.",
+  "Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001.",
+]) {
+  const release: Release = { report: { text }, recipient, destination };
+  const result = await run.observe.verify("release-check", { release });
+  console.log(`${result.outcome.verdict}: ${text}`);
 }
+
+await state.shutdown();
 
 ```
 
@@ -917,25 +858,24 @@ try {
 node finance_release.ts
 ```
 
-The program uploads the policy and declares the Service, the Verifier, and the judge Agent. Then it verifies each release with one call and prints its decision:
+The program saves the policy as `company-sharing-policy.md`, uploads it, and declares the Service, the Verifier, and the judge Agent. Then it verifies each release with one call and prints its verdict:
 
 ```text
-quarterly-report: passed (release-check@0.1.0) -> released
-report-with-bank-account: failed (release-check@0.1.0) -> held for review
-  follows-policy failed: the report names a bank account identifier
+passed: Synthetic customer report: quarterly total $120.
+failed: Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001.
 ```
 
-The second release passes both assertions and fails `follows-policy`: the judge read the policy and found the bank account. Its reason is in the model's own words, so yours differs.
+The second release passes both assertions and fails `follows-policy`: the judge read the policy and found the bank account.
 
-Only a `passed` verdict releases a report. A `failed` or `inconclusive` verdict, or an error such as evidence that does not match the Verifier's inputs, holds it. Wyrd never sends or blocks anything itself; your code decides.
+Only a `passed` verdict releases a report. Wyrd never sends or blocks anything itself; your code decides.
 
-Run the program again. Nothing changed, so it declares nothing new and the verdicts name the same `release-check@0.1.0`.
+Run the program again. Nothing changed, so it declares nothing new.
 
-## 4. Check the other requirements
+## 3. Check the other requirements
 
-Edit `releases.json` so the first release goes to `"authorized": false`, and run again. `recipient-authorized` fails and the release is held. Set `"restricted": false` on a destination, and `destination-restricted` fails instead. Each requirement is judged on its own, so the verdict names the one that failed.
+In `finance_release`, set the recipient's `authorized` to `false` and run again. Both releases fail `recipient-authorized`. Set the destination's `restricted` to `false` instead, and `destination-restricted` fails. Each requirement is judged on its own.
 
-## 5. Confirm the stored verdicts
+## 4. Confirm the stored verdicts
 
 The server keeps every verdict as evidence. Read the Service to get its `uid`:
 
@@ -959,18 +899,16 @@ wyrd query --server http://127.0.0.1:8080 --file stored-verdicts.sql
 
 It prints one JSON row per stored verdict, newest first. The server publishes rows shortly after the program ends: if a verdict is missing, repeat the query for up to a minute.
 
-## 6. Update the policy
+## 5. Update the policy
 
-Replace `company-sharing-policy.pdf` with a revised policy and run the program again. The server registers the new file as a new policy version, and with it new versions of `release-check` and `finance-release`, so the verdicts name `release-check@0.1.1`. Verdicts from `0.1.0` still name the policy they were judged against.
+Edit `company-sharing-policy.md` and run the program again. The server registers the edited file as a new policy version, and with it new versions `release-check@0.1.1` and `finance-release@0.1.1`. `release-check@0.1.0` still mounts the policy it judged against.
 
 ## If it fails
 
 | You see | Fix |
 | --- | --- |
 | `WYRD_GATEWAY_404_MODEL_UNAVAILABLE` | Create the `openai` deployment as in step 1 |
-| `WYRD_LOADER_400_INVALID_ENVELOPE` | Run from the directory that holds `company-sharing-policy.pdf` |
 | `WYRD_CLIENT_401_NO_CREDENTIALS` | Use the same `WYRD_CONFIG_HOME` as the server terminal |
-| `follows-policy` is `inconclusive` | The judge could not settle the release; check the reason it gave |
 
 ## Next
 
@@ -2025,7 +1963,7 @@ Release controls: passed
 
 `ComparisonOperator` and `ExecutionRoute` are typed forms of the YAML values, and `AgentRunConfig`, also from `wyrd.verify`, sets an Agent's run limits through `run_config`:
 
-```python title="finance_release.py"
+```python title="finance_service.py"
 # `policy-judge`: a model that reads the policy with `fs.read` and returns a
 # verdict on the report. Its model calls go through the `openai` gateway
 # deployment.
@@ -2034,7 +1972,7 @@ policy_judge = Agent(
     prompt=Prompt.openai_chat(
         "gpt-4o",
         messages=(
-            "Read /inputs/policy.json with fs.read. Decide whether the company sharing "
+            "Read /inputs/policy.md with fs.read. Decide whether the company sharing "
             "policy permits sharing this report with this recipient, citing the report "
             "and the policy line you apply. Report: {{report}} Recipient: {{recipient}}"
         ),

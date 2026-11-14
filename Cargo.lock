@@ -10508,6 +10508,7 @@ dependencies = [
  "anyhow",
  "axum",
  "reqwest 0.13.4",
+ "schemars 1.2.1",
  "secrecy",
  "serde",
  "serde_json",

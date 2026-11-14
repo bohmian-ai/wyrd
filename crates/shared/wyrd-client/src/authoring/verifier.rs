@@ -120,6 +120,14 @@ impl InputSlot {
         slot
     }
 
+    /// A JSON value constrained by the JSON Schema of `T`, such as a struct
+    /// deriving `schemars::JsonSchema`: the Rust twin of a Pydantic model or
+    /// Zod schema passed as a slot.
+    #[must_use]
+    pub fn model<T: schemars::JsonSchema>() -> Self {
+        Self::json(schemars::schema_for!(T))
+    }
+
     /// A slot of `type` listing `items` under `field`.
     fn listing<I>(kind: &str, field: &str, items: I) -> Self
     where

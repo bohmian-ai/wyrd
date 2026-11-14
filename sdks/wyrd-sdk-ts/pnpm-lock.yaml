@@ -95,6 +95,9 @@ importers:
       wyrd-ai:
         specifier: workspace:*
         version: link:../sdks/wyrd-sdk-ts/wyrd
+      zod:
+        specifier: ^4.5.4
+        version: 4.5.4
     devDependencies:
       '@types/node':
         specifier: 24.10.0

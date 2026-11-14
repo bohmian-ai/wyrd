@@ -86,13 +86,15 @@ describe('landing finance figure', () => {
     const lines = [...body.matchAll(/<text x="44" y="\d+"[^>]*>([\s\S]*?)<\/text>/g)].map(([, line]) => text(line));
     expect(lines).toHaveLength(12);
     expect(lines[0]).toBe('from wyrd import WyrdState');
-    expect(lines.slice(5, 7)).toEqual(['@api.post("/reports/send")', 'def send_report(release: Release) -> dict[str, str]:']);
+    expect(lines.slice(5, 7)).toEqual(['@api.post("/reports/send")', 'def send_report(release: Release):']);
     for (const line of lines.filter(Boolean)) expect(api).toContain(line);
-    for (const name of ['Recipient authorized', 'Sharing policy · PDF', 'Destination restricted', 'GATEWAY', 'BIFROST'])
+    for (const name of ['Recipient authorized', 'Sharing policy · PDF', 'Destination private', 'GATEWAY', 'BIFROST'])
       expect(body).toContain(name);
     expect(body).toMatch(/flow asynchronously to Bifrost\. The handler's response does not wait/);
     expect(body).toContain('→ Release');
     expect(body).toMatch(/<button[^>]*>Play<\/button>/);
+    expect(body).toMatch(/<button[^>]*>Replay<\/button>/);
+    expect(body).toContain('Policy violation');
     for (const story of ['Real-time verification', 'Agent evaluation', 'Code review', 'Session evaluation'])
       expect(body).toMatch(new RegExp(`<h3[^>]*>${story}</h3>`));
   });

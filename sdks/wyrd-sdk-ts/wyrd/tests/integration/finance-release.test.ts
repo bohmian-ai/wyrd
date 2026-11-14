@@ -1,15 +1,14 @@
 // The docs Quickstart's TypeScript program, `examples/finance-release`, run
-// as a reader runs it: from a directory holding only the policy PDF and
-// `releases.json`, against a server whose `openai` gateway deployment forwards
-// the policy judge to a local model that reads the policy first.
+// as a reader runs it: from an empty directory, where it saves the policy, against a server whose `openai` gateway
+// deployment forwards the policy judge to a local model that reads the policy first.
 import { execFile } from "node:child_process";
-import { cpSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 
 import { expect, vi } from "vitest";
-import { WyrdClient } from "wyrd-ai";
+import { WyrdClient, WyrdState } from "wyrd-ai";
 
 import { sharingPolicyJudge } from "../support/assistant.js";
 import type { ReceivedRequest, Reply } from "../support/http-receiver.js";
@@ -39,9 +38,6 @@ const test = serverTest({
     async ({ server: _ }, use) => {
       await configureGateway(WyrdClient.connect());
       const reader = mkdtempSync(join(tmpdir(), "wyrd-ts-finance-reader-"));
-      for (const file of ["company-sharing-policy.pdf", "releases.json"]) {
-        cpSync(join(EXAMPLE, file), join(reader, file));
-      }
       await use(reader);
     },
     { scope: "file" },
@@ -67,37 +63,32 @@ function verdictRequests(provider: { readonly received: readonly ReceivedRequest
 test("runs the finance release Quickstart from a reader's directory", async ({ reader, provider }) => {
   const first = await run(reader);
   expect(first).toBe(
-    "quarterly-report: passed (release-check@0.1.0) -> released\n" +
-      "report-with-bank-account: failed (release-check@0.1.0) -> held for review\n" +
-      "  follows-policy failed: the report names a bank account identifier\n",
+    "passed: Synthetic customer report: quarterly total $120.\n" +
+      "failed: Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001.\n",
   );
   expect(await run(reader), "the rerun declares nothing new").toBe(first);
   const verdicts = verdictRequests(provider);
   expect(verdicts).toHaveLength(4);
   expect(
     verdicts.every((body) => body.includes("external-audit")),
-    "each verdict follows a read of the policy extraction",
+    "each verdict follows a read of the policy",
   ).toBe(true);
 });
 
-test("holds every finance release that does not pass", async ({ reader }) => {
-  writeFileSync(
-    join(reader, "releases.json"),
-    JSON.stringify([
-      { name: "unknown-recipient", ...PERMITTED, recipient: { email: "x@example.test", authorized: false } },
-      { name: "public-destination", ...PERMITTED, destination: { url: "https://example.test", restricted: false } },
-      { name: "uncertain-policy", ...PERMITTED, report: { text: "Synthetic report flagged PROVIDER-UNCERTAIN." } },
-      { name: "unreadable-report", ...PERMITTED, report: { text: 123 } },
-    ]),
-  );
-  const lines = (await run(reader)).trimEnd().split("\n");
-  expect(lines[0]).toBe("unknown-recipient: failed (release-check@0.1.0) -> held for review");
-  expect(lines[1]).toMatch(/^ {2}recipient-authorized failed: /);
-  expect(lines[2]).toBe("public-destination: failed (release-check@0.1.0) -> held for review");
-  expect(lines[3]).toMatch(/^ {2}destination-restricted failed: /);
-  expect(lines.slice(4)).toEqual([
-    "uncertain-policy: inconclusive (release-check@0.1.0) -> held for review",
-    "  follows-policy inconclusive: the policy does not settle this release",
-    "unreadable-report: WYRD_VERIFICATION_400_INPUT_INVALID -> held for review",
-  ]);
+test("judges each finance requirement on its own", async ({ reader }) => {
+  // The declared Service, loaded from the reader's directory, where it saved its policy.
+  process.chdir(reader);
+  const { service } = await import(join(EXAMPLE, "finance_service.ts"));
+  const state = await WyrdState.declare(service);
+  const run = state.run();
+  const verdicts = [];
+  for (const release of [
+    { ...PERMITTED, recipient: { email: "x@example.test", authorized: false } },
+    { ...PERMITTED, destination: { url: "https://example.test", restricted: false } },
+    { ...PERMITTED, report: { text: "Synthetic report flagged PROVIDER-UNCERTAIN." } },
+  ]) {
+    verdicts.push((await run.observe.verify("release-check", { release })).outcome.verdict);
+  }
+  await state.shutdown();
+  expect(verdicts).toEqual(["failed", "failed", "inconclusive"]);
 });

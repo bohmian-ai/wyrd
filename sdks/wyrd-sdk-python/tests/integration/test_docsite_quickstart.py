@@ -1,11 +1,11 @@
 """The docsite Quickstart, run as a reader runs it.
 
-``examples/finance-release`` holds ``finance_release.py``, the company sharing
-policy PDF, and ``releases.json``. The program declares the ``finance-release``
-Service with its three-requirement ``release-check`` Verifier, verifies each
-proposed release once, and releases only a passed one. The journey copies the
-files to an empty directory and runs the program against a real server whose
-gateway forwards the policy judge to a local model that reads the policy first.
+``examples/finance-release`` holds ``finance_service.py``, which saves the
+company sharing policy and declares the ``finance-release`` Service with its
+three-requirement ``release-check`` Verifier, and ``finance_release.py``, which
+verifies two proposed releases against it. The journey copies the files to an
+empty directory and runs the program against a real server whose gateway
+forwards the policy judge to a local model that reads the policy first.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import io
 import json
 import runpy
 import shutil
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -45,15 +46,12 @@ PERMITTED: dict[str, Any] = {
 
 def run_quickstart(directory: Path) -> tuple[dict, str]:
     """Run the Quickstart program in ``directory``; return its globals and printed output."""
+    # Each run imports the reader's `finance_service.py` afresh.
+    sys.modules.pop("finance_service", None)
     printed = io.StringIO()
     with contextlib.redirect_stdout(printed):
         script = runpy.run_path(str(directory / "finance_release.py"), run_name="__main__")
     return script, printed.getvalue()
-
-
-def write_releases(directory: Path, releases: list[dict]) -> None:
-    """Replace the reader's ``releases.json`` with ``releases``."""
-    (directory / "releases.json").write_text(json.dumps(releases))
 
 
 @pytest.fixture
@@ -61,9 +59,10 @@ def reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """An empty directory holding only the Quickstart's files, as the working directory."""
     reader = tmp_path / "quickstart"
     reader.mkdir()
-    for name in ("finance_release.py", "company-sharing-policy.pdf", "releases.json"):
+    for name in ("finance_service.py", "finance_release.py"):
         shutil.copy(EXAMPLE / name, reader)
     monkeypatch.chdir(reader)
+    monkeypatch.syspath_prepend(str(reader))
     # Keep the developer's saved Wyrd config out of the SDK credential chain.
     monkeypatch.setenv("WYRD_CONFIG_HOME", str(tmp_path / "config"))
     return reader
@@ -108,9 +107,8 @@ def test_docsite_quickstart_verifies_and_repeats(
             "0.1.0",
         )
     assert printed[0] == (
-        "quarterly-report: passed (release-check@0.1.0) -> released\n"
-        "report-with-bank-account: failed (release-check@0.1.0) -> held for review\n"
-        "  follows-policy failed: the report names a bank account identifier\n"
+        "passed: Synthetic customer report: quarterly total $120.\n"
+        "failed: Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001.\n"
     )
     assert printed[1] == printed[0], "the rerun declares nothing new"
     judged = [
@@ -123,37 +121,25 @@ def test_docsite_quickstart_verifies_and_repeats(
         "each verdict follows a read of the policy extraction"
     )
 
-    write_releases(
-        reader,
-        [
-            {
-                "name": "unknown-recipient",
-                **PERMITTED,
-                "recipient": {"email": "x@example.test", "authorized": False},
-            },
-            {
-                "name": "public-destination",
-                **PERMITTED,
-                "destination": {"url": "https://example.test", "restricted": False},
-            },
-            {
-                "name": "uncertain-policy",
-                **PERMITTED,
-                "report": {"text": "Synthetic report flagged PROVIDER-UNCERTAIN."},
-            },
-            {"name": "unreadable-report", **PERMITTED, "report": {"text": 123}},
-        ],
-    )
-    script, output = run_quickstart(reader)
-    lines = output.splitlines()
-    assert lines[0] == "unknown-recipient: failed (release-check@0.1.0) -> held for review"
-    assert lines[1].startswith("  recipient-authorized failed: ")
-    assert lines[2] == "public-destination: failed (release-check@0.1.0) -> held for review"
-    assert lines[3].startswith("  destination-restricted failed: ")
-    assert lines[4:] == [
-        "uncertain-policy: inconclusive (release-check@0.1.0) -> held for review",
-        "  follows-policy inconclusive: the policy does not settle this release",
-        "unreadable-report: WYRD_VERIFICATION_400_INPUT_INVALID -> held for review",
+    # Each requirement is judged on its own, and exactly one verdict predicate holds.
+    state = WyrdState.declare(script["service"])
+    run = state.run()
+    results = [
+        run.observe.verify("release-check", release)
+        for release in (
+            PERMITTED,
+            {**PERMITTED, "recipient": {"email": "x@example.test", "authorized": False}},
+            {**PERMITTED, "destination": {"url": "https://example.test", "restricted": False}},
+            {**PERMITTED, "report": {"text": "Synthetic report flagged PROVIDER-UNCERTAIN."}},
+        )
+    ]
+    state.shutdown()
+    assert [r.verdict for r in results] == ["passed", "failed", "failed", "inconclusive"]
+    assert [(r.passed, r.failed, r.inconclusive) for r in results] == [
+        (True, False, False),
+        (False, True, False),
+        (False, True, False),
+        (False, False, True),
     ]
 
 
@@ -172,7 +158,7 @@ def test_docsite_quickstart_refuses_insufficient_authority(
         WyrdState.declare(service, client)
     state = WyrdState.from_path(reader.parent / "bundle", client)
     with pytest.raises(WyrdError) as verified:
-        state.run().observe.verify("release-check", **PERMITTED)
+        state.run().observe.verify("release-check", PERMITTED)
 
     assert declared.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
     assert verified.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
@@ -182,15 +168,14 @@ def test_docsite_quickstart_refuses_changed_content_and_broken_references(
     reader: Path, server: WyrdTestServer
 ) -> None:
     run_quickstart(reader)
-    policy = reader / "company-sharing-policy.pdf"
-    policy.write_bytes(policy.read_bytes() + b"% revision 2\n")
+    policy = reader / "company-sharing-policy.md"
+    policy.write_text(policy.read_text() + "Revision 2.\n")
 
     # The registered policy version keeps its content; a new one is a new version.
     with pytest.raises(WyrdError) as drifted:
         WyrdState.declare(Artifact.from_path("company-sharing-policy", "0.1.0", policy))
-    policy.unlink()
     with pytest.raises(WyrdError) as missing:
-        run_quickstart(reader)
+        WyrdState.declare(Artifact.from_path("company-sharing-policy", reader / "missing.md"))
 
     assert drifted.value.code == "WYRD_REGISTRY_409_SPEC_DRIFT"
     assert missing.value.code == "WYRD_LOADER_400_INVALID_ENVELOPE"
@@ -204,11 +189,11 @@ def test_finance_api_releases_only_passed_reports(
     WyrdState.declare(script["service"], bundle_dir=reader / ".wyrd-bundle")
     shutil.copy(EXAMPLE / "api.py", reader)
     example = runpy.run_path(str(reader / "api.py"))
-    releases = json.loads((EXAMPLE / "releases.json").read_text())
+    bank_account = {**PERMITTED, "report": {"text": "Paid from BANK-ACCOUNT-DEMO-001."}}
     with TestClient(example["api"]) as client:
         decisions = [
-            client.post("/reports/send", json={key: release[key] for key in PERMITTED}).json()
-            for release in releases
+            client.post("/reports/send", json=release).json()
+            for release in (PERMITTED, bank_account)
         ]
         uncertain = client.post(
             "/reports/send",

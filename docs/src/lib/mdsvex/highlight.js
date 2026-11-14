@@ -193,8 +193,11 @@ export function sliceRegion(src, name, file) {
   return dedent(lines.slice(start + 1, end));
 }
 
-/** @param {string} body */
-function stripAnchors(body) {
+/**
+ * `body` without its `ANCHOR:` and `ANCHOR_END:` lines.
+ * @param {string} body
+ */
+export function stripAnchors(body) {
   return body.split('\n').filter((l) => !ANCHOR.test(l)).join('\n');
 }
 

@@ -1,14 +1,13 @@
 //! The finance release Rust program, run as a reader runs it.
 //!
-//! Each journey copies the policy PDF and a `releases.json` into an empty
-//! directory and runs the built `finance_release` binary there against a
-//! real server. A local model stands in for the policy judge: it reads
-//! `/inputs/policy.json` with `fs.read`, then fails a report naming
+//! Each journey runs the built `finance_release` binary in an empty
+//! directory against a real server. A local model stands in for the policy
+//! judge: it reads `/inputs/policy.md` with `fs.read`, then fails a report naming
 //! `BANK-ACCOUNT-DEMO-001`, is inconclusive for one naming
 //! `PROVIDER-UNCERTAIN`, and otherwise passes, citing the policy line it
 //! read. Without that line in the read, it answers no verdict.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 use secrecy::{ExposeSecret, SecretString};
@@ -16,14 +15,13 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+use wyrd_ai::VerificationVerdict;
 use wyrd_ai::WyrdClient;
-use wyrd_ai::cards::{CardRef, CardSelector, Cards};
+use wyrd_ai::cards::{BundleMode, CardRef, CardSelector, Cards};
 use wyrd_ai::config::ClientConfig;
+use wyrd_ai::state::WyrdState;
 use wyrd_ai::transport::{GrpcConfig, HttpConfig};
 use wyrd_testing::server::WyrdTestServer;
-
-/// The finance release example's directory.
-const EXAMPLE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/finance-release");
 
 /// The policy line the judge must read before it judges.
 const POLICY_LINE: &str = "external-audit";
@@ -55,7 +53,7 @@ fn judge_policy(request: &Request) -> ResponseTemplate {
         let call = json!({
             "id": "call-policy",
             "type": "function",
-            "function": { "name": "fs_read", "arguments": r#"{"path":"/inputs/policy.json"}"# },
+            "function": { "name": "fs_read", "arguments": r#"{"path":"/inputs/policy.md"}"# },
         });
         return completion(json!({ "role": "assistant", "content": null, "tool_calls": [call] }));
     };
@@ -73,7 +71,7 @@ fn judge_policy(request: &Request) -> ResponseTemplate {
         return completion(json!({ "role": "assistant", "content": "the policy did not read" }));
     };
     let citations = json!([
-        { "slot": "report", "locator": { "json_pointer": "/text" } },
+        { "slot": "release", "locator": { "json_pointer": "/report/text" } },
         { "slot": output["sources"][0], "locator": line["locator"] },
     ]);
     let verdict = if release.contains("PROVIDER-UNCERTAIN") {
@@ -86,20 +84,19 @@ fn judge_policy(request: &Request) -> ResponseTemplate {
     completion(json!({ "role": "assistant", "content": verdict.to_string() }))
 }
 
-/// A proposed release named `name`: a synthetic report with `text`, to an
-/// auditor whose record says `authorized`, at a destination whose record
-/// says `restricted`.
-fn release(name: &str, text: &str, authorized: bool, restricted: bool) -> Value {
+/// A proposed release: a synthetic report with `text`, to an auditor whose
+/// record says `authorized`, at a destination whose record says
+/// `restricted`.
+fn release(text: &str, authorized: bool, restricted: bool) -> Value {
     json!({
-        "name": name,
         "report": { "text": text },
         "recipient": { "email": "auditor@example.test", "authorized": authorized },
         "destination": { "url": "https://auditor.example.test/reports", "restricted": restricted },
     })
 }
 
-/// A running server, its scripted policy judge, and a reader's directory
-/// holding the example's policy PDF.
+/// A running server, its scripted policy judge, and a reader's empty
+/// directory.
 struct Story {
     /// The verifying server the reader's program reaches.
     server: WyrdTestServer,
@@ -120,11 +117,10 @@ struct Story {
 
 impl Story {
     /// Start the scripted judge and a server whose `openai` deployment
-    /// forwards to it, and copy the policy PDF into an empty directory.
+    /// forwards to it, and an empty reader directory.
     ///
     /// # Panics
-    /// Panics when the server cannot start, the judge model cannot deploy,
-    /// or the policy cannot copy.
+    /// Panics when the server cannot start or the judge model cannot deploy.
     async fn start() -> Self {
         let model = MockServer::start().await;
         Mock::given(method("POST"))
@@ -143,11 +139,6 @@ impl Story {
             .await
             .expect("the judge model deploys");
         let dir = tempfile::tempdir().expect("reader directory creates");
-        std::fs::copy(
-            Path::new(EXAMPLE).join("company-sharing-policy.pdf"),
-            dir.path().join("company-sharing-policy.pdf"),
-        )
-        .expect("policy copies");
         let server_url = server
             .base_url()
             .expect("bound server has a URL")
@@ -170,13 +161,11 @@ impl Story {
         }
     }
 
-    /// Run the program over `releases` and return what it printed.
+    /// Run the program in the reader's directory and return what it printed.
     ///
     /// # Panics
     /// Panics when the binary cannot start or exits unsuccessfully.
-    async fn run(&self, releases: &Value) -> String {
-        std::fs::write(self.dir.path().join("releases.json"), releases.to_string())
-            .expect("releases write");
+    async fn run(&self) -> String {
         let command = self.command();
         // The in-process server keeps serving while the binary runs.
         let output = tokio::task::spawn_blocking(move || {
@@ -202,15 +191,23 @@ impl Story {
         String::from_utf8(output.stdout).expect("the program prints UTF-8")
     }
 
-    /// Run the program over the example's own `releases.json`.
+    /// The state for the `finance-release` Service the program declared,
+    /// pulled as a deployed application would load it.
     ///
     /// # Panics
-    /// Panics as [`Story::run`] does, or when the example file is unreadable.
-    async fn run_example(&self) -> String {
-        let releases = std::fs::read_to_string(Path::new(EXAMPLE).join("releases.json"))
-            .expect("the example's releases read");
-        self.run(&serde_json::from_str(&releases).expect("the example's releases parse"))
+    /// Panics when the Service cannot be pulled or loaded.
+    async fn state(&self) -> WyrdState {
+        let bundle = self.dir.path().join("bundle");
+        let service: CardRef = serde_json::from_value(
+            json!({ "kind": "Service", "name": "finance-release", "version": "0.1.0" }),
+        )
+        .expect("card reference parses");
+        self.cards()
             .await
+            .pull(CardSelector::exact(service), &bundle, BundleMode::Complete)
+            .await
+            .expect("the Service pulls");
+        WyrdState::from_path_with(&bundle, self.client()).expect("the bundle loads")
     }
 
     /// The reader's directory, config directory, server URL, gRPC URL, and
@@ -230,7 +227,17 @@ impl Story {
     /// # Panics
     /// Panics when the client cannot build or connect.
     async fn cards(&self) -> Cards {
-        let admin = WyrdClient::with_config(ClientConfig {
+        Cards::connect_with(&self.client())
+            .await
+            .expect("Cards connects")
+    }
+
+    /// The tenant administrator's client.
+    ///
+    /// # Panics
+    /// Panics when the client cannot build.
+    fn client(&self) -> WyrdClient {
+        WyrdClient::with_config(ClientConfig {
             http: HttpConfig {
                 base_url: self.server_url.clone(),
                 ..HttpConfig::default()
@@ -242,8 +249,7 @@ impl Story {
             credential: Some(SecretString::from(self.key.clone())),
             ..ClientConfig::default()
         })
-        .expect("client builds");
-        Cards::connect_with(&admin).await.expect("Cards connects")
+        .expect("client builds")
     }
 
     /// The policy judge's verdict requests: each carries the `fs.read`
@@ -284,14 +290,14 @@ async fn spec(cards: &Cards, kind: &str, name: &str, version: &str) -> Value {
 /// Panics when the Verifier cannot be read.
 async fn mounted_policy(cards: &Cards, version: &str) -> Value {
     let verifier = spec(cards, "Verifier", "release-check", version).await;
-    verifier["requirements"][1]["check"]["workspace"]["/inputs/policy.json"]["artifact"]["card"]
+    verifier["requirements"][1]["check"]["workspace"]["/inputs/policy.md"]["artifact"]["card"]
         ["version"]
         .clone()
 }
 
-/// The program releases the permitted report and holds each release that
-/// breaks one requirement, naming that requirement alone; the judge reads
-/// the selected policy extraction through the gateway before every verdict;
+/// The program passes the permitted report and fails the one naming a bank
+/// account, and a release breaking either assertion fails on its own; the judge reads
+/// the saved policy through the gateway before every verdict;
 /// one Service binds one Verifier with exactly the three requirements; and
 /// an unchanged rerun prints the same exact versions.
 ///
@@ -303,60 +309,42 @@ async fn mounted_policy(cards: &Cards, version: &str) -> Value {
 async fn finance_release_passes_and_fails() {
     let story = Story::start().await;
 
-    let first = story.run_example().await;
+    let first = story.run().await;
     assert_eq!(
         first,
-        "quarterly-report: passed (release-check@0.1.0) -> released\n\
-         report-with-bank-account: failed (release-check@0.1.0) -> held for review\n\
-         \x20 follows-policy failed: the report names a bank account identifier\n",
+        "passed: Synthetic customer report: quarterly total $120.\n\
+         failed: Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001.\n",
     );
-    assert_eq!(
-        story.run_example().await,
-        first,
-        "the rerun declares nothing new"
-    );
+    assert_eq!(story.run().await, first, "the rerun declares nothing new");
 
-    let others = json!([
+    // Each assertion is judged on its own.
+    let state = story.state().await;
+    let run = state.run();
+    for evidence in [
         release(
-            "unknown-recipient",
             "Synthetic customer report: quarterly total $120.",
             false,
-            true
+            true,
         ),
         release(
-            "public-destination",
             "Synthetic customer report: quarterly total $120.",
             true,
-            false
+            false,
         ),
-    ]);
-    let printed = story.run(&others).await;
-    let lines: Vec<&str> = printed.lines().collect();
-    let [recipient, recipient_reason, destination, destination_reason] = lines[..] else {
-        panic!("each release names its one failed requirement: {printed}");
-    };
-    assert_eq!(
-        recipient,
-        "unknown-recipient: failed (release-check@0.1.0) -> held for review"
-    );
-    assert!(
-        recipient_reason.starts_with("  recipient-authorized failed: "),
-        "{printed}"
-    );
-    assert_eq!(
-        destination,
-        "public-destination: failed (release-check@0.1.0) -> held for review"
-    );
-    assert!(
-        destination_reason.starts_with("  destination-restricted failed: "),
-        "{printed}"
-    );
+    ] {
+        let result = run
+            .observe()
+            .verify("release-check", evidence)
+            .await
+            .expect("the release verifies");
+        assert_eq!(result.outcome.verdict, VerificationVerdict::Failed);
+    }
 
     let verdicts = story.verdict_requests().await;
     assert_eq!(verdicts.len(), 6, "one policy judgment per release");
     assert!(
         verdicts.iter().all(|body| body.contains(POLICY_LINE)),
-        "each verdict follows a read of the policy extraction"
+        "each verdict follows a read of the policy"
     );
 
     let cards = story.cards().await;
@@ -391,67 +379,44 @@ async fn finance_release_passes_and_fails() {
         .expect("test server shuts down");
 }
 
-/// An inconclusive policy judgment and a missing destination record each
-/// hold the release with an `inconclusive` verdict, keeping the other
-/// requirements' actual outcomes; an invalid report is a typed request
-/// error, and the program holds that release too.
+/// An uncertain policy judgment returns `inconclusive`; a release without a
+/// destination record violates the `release` slot's schema, so `verify`
+/// refuses it before any judgment.
 ///
 /// # Panics
-/// Panics when the server cannot start, the program fails, or it prints
-/// anything else.
+/// Panics when the server cannot start, the program fails, or either verdict
+/// differs.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn finance_release_holds_uncertain_releases() {
     let story = Story::start().await;
-    let mut missing = release("no-destination", "Synthetic customer report.", true, true);
+    story.run().await;
+    let state = story.state().await;
+    let run = state.run();
+
+    let uncertain = run
+        .observe()
+        .verify(
+            "release-check",
+            release("Synthetic report flagged PROVIDER-UNCERTAIN.", true, true),
+        )
+        .await
+        .expect("the release verifies");
+    assert_eq!(uncertain.outcome.verdict, VerificationVerdict::Inconclusive);
+
+    let mut missing = release("Synthetic customer report.", true, true);
     missing
         .as_object_mut()
         .expect("a release is an object")
         .remove("destination");
-    let mut invalid = release("unreadable-report", "", true, true);
-    invalid["report"]["text"] = json!(123);
-    let releases = json!([
-        release(
-            "uncertain-policy",
-            "Synthetic report flagged PROVIDER-UNCERTAIN.",
-            true,
-            true
-        ),
-        missing,
-        invalid,
-    ]);
-
-    let printed = story.run(&releases).await;
-    let lines: Vec<&str> = printed.lines().collect();
-    let [
-        uncertain,
-        uncertain_reason,
-        unknown,
-        unknown_reason,
-        refused,
-    ] = lines[..]
-    else {
-        panic!("each held release names why: {printed}");
-    };
-    assert_eq!(
-        uncertain,
-        "uncertain-policy: inconclusive (release-check@0.1.0) -> held for review"
-    );
-    assert_eq!(
-        uncertain_reason,
-        "  follows-policy inconclusive: the policy does not settle this release"
-    );
-    assert_eq!(
-        unknown,
-        "no-destination: inconclusive (release-check@0.1.0) -> held for review"
-    );
+    let refused = run
+        .observe()
+        .verify("release-check", missing)
+        .await
+        .expect_err("an incomplete release is refused");
     assert!(
-        unknown_reason.starts_with("  destination-restricted inconclusive: "),
-        "only the requirement reading the missing record is inconclusive: {printed}"
-    );
-    assert_eq!(
-        refused,
-        "unreadable-report: WYRD_VERIFICATION_400_INPUT_INVALID -> held for review"
+        refused.to_string().contains("destination"),
+        "the refusal names the missing record: {refused}"
     );
     story
         .server
@@ -460,10 +425,9 @@ async fn finance_release_holds_uncertain_releases() {
         .expect("test server shuts down");
 }
 
-/// Both releases in one run judge the one uploaded policy; a changed policy
-/// PDF declares new exact policy, Verifier, and Service versions whose
-/// verdicts name the new Verifier, while the old Verifier still mounts the
-/// old policy.
+/// Both releases in one run judge the one uploaded policy; an edited policy
+/// file declares new exact policy, Verifier, and Service versions, while the
+/// old Verifier still mounts the old policy.
 ///
 /// # Panics
 /// Panics when the server cannot start, the program fails, or a version
@@ -472,8 +436,7 @@ async fn finance_release_holds_uncertain_releases() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn finance_release_policy_versions_remain_attributable() {
     let story = Story::start().await;
-    let first = story.run_example().await;
-    assert!(first.contains("(release-check@0.1.0)"), "{first}");
+    let first = story.run().await;
     let verdicts = story.verdict_requests().await;
     assert_eq!(verdicts.len(), 2, "one judgment per release");
     let source = |body: &str| -> Value {
@@ -493,12 +456,13 @@ async fn finance_release_policy_versions_remain_attributable() {
         "both releases read the one uploaded policy"
     );
 
-    let pdf = story.dir.path().join("company-sharing-policy.pdf");
-    let mut revised = std::fs::read(&pdf).expect("policy reads");
-    revised.extend_from_slice(b"% revision 2\n");
-    std::fs::write(&pdf, revised).expect("revised policy writes");
-    let changed = story.run_example().await;
-    assert_eq!(changed, first.replace("@0.1.0", "@0.1.1"));
+    // The program saved the policy on its first run; the reader edits it.
+    let policy = story.dir.path().join("company-sharing-policy.md");
+    let mut revised = std::fs::read_to_string(&policy).expect("the saved policy reads");
+    revised.push_str("Revision 2.\n");
+    std::fs::write(&policy, revised).expect("revised policy writes");
+    let changed = story.run().await;
+    assert_eq!(changed, first, "the new policy judges the same releases");
 
     let cards = story.cards().await;
     assert_eq!(mounted_policy(&cards, "0.1.0").await, "0.1.0");

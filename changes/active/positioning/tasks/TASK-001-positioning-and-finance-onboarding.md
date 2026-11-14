@@ -1,7 +1,7 @@
 ---
 id: TASK-001
 kind: implementation
-status: proposed
+status: complete
 spec: SPEC-positioning
 spec_revision: 4
 requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007, REQ-008, INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, AC-001, AC-002, AC-003, AC-004, AC-005, AC-006, AC-007]
@@ -428,7 +428,28 @@ proof. Do not touch backend hot paths; no benchmark exception is granted.
 
 ## Execution Evidence
 
-Candidate: `c86541477`, `da37471cf`, `695c86746`, `0ec297793` on `docs`.
+Candidate: `c86541477`, `da37471cf`, `695c86746`, `0ec297793`, `6452e02c0` on `docs`.
+
+Completed by the user's direct approval after reviewing the landing page; no
+independent `$wyrd-task-review` ran.
+
+### Final candidate `6452e02c0`
+
+The rows below record the first candidate; this section supersedes them where
+they differ.
+
+| Change | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Declare, observe, verify | `finance_service.{py,rs,ts}` builds the Service, its Verifier with one `release` slot, and the judge; `finance_release.{py,rs,ts}` declares it, creates a `WyrdState`, and verifies two inline releases; the homepage tabs show both files and the result. `releases.json` is gone | Rust `finance_release` journeys (3); Python `test_docsite_quickstart.py` (4); TS `finance-release.test.ts` (2) | PASS |
+| Copy-paste runnable policy | The program saves the two-line policy as `company-sharing-policy.md` when missing; the judge reads `/inputs/policy.md`; editing the file publishes a new policy version. The PDF and the Quickstart download step are gone | Rust `finance_release_policy_versions_remain_attributable`; Python `test_docsite_quickstart_refuses_changed_content_and_broken_references`; Python and TS authoring journeys with the shared judge mocks | PASS |
+| Typed input models (SDK) | Rust `InputSlot::model::<T>()` from a `schemars` type; TS Verifier inputs accept any `toJSONSchema()` schema such as Zod | `wyrd-client` `model_slot_carries_the_derived_schema`; TS `a Zod schema is a json input slot of the JSON Schema it emits`; the finance journeys | PASS |
+| Verdict predicates (SDK) | `is_passed()`, `is_failed()`, `is_inconclusive()` on Rust `VerificationResult`; Python `passed`, `failed`, `inconclusive` set at construction; TS values set once when the result is built, outside its JSON | `wyrd-spec` `verdict_predicates_match_the_verdict`; TS observe unit tests and `verification-data.test-d.ts`; Python quickstart journey asserts all three | PASS |
+| Homepage layout | Get started header row above full-width tabs; region anchors stripped through `stripAnchors` | `docs:test` (102); `docs:svelte:check`; user review in the browser | PASS |
+
+Also run: `cargo clippy -D warnings` and `cargo fmt` on the changed crates,
+`py:lints`, `py:typecheck`, `ts:format`, `ts:lints`, `ts:typecheck`,
+`docs:check:commands`, `git diff --check`. Not run: the full `docs:check`,
+broad `test:*` lanes, `codegen:check` (no generated contract changed).
 
 | Acceptance criterion | Implementation evidence | Verification evidence | Result |
 |---|---|---|---|
@@ -495,5 +516,7 @@ illustrative.
 Scope:
 
 - Install pins are `0.4.1`, the workspace version this change ships in.
-- No runtime, SDK contract, migration or hot-path change. Task 2 extends the
+- No runtime, migration, wire contract or hot-path change. `6452e02c0` adds
+  SDK authoring and result conveniences: typed input models and verdict
+  predicates. Task 2 extends the
   inventory for education pages; Task 4 owns shared metadata and discovery.

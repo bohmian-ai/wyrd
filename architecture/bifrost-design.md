@@ -484,6 +484,14 @@ typed columns:
     evidence custody. The baseline eligibility it earns
     (`pr_source_extracted`) is a coordination column written with the lease-
     fenced completion, not a copy of the evidence.
+  - A `pull_request` execution's GitHub delivery outcome is one
+    `github_delivery` event row per accepted state revision, at that revision's
+    sequence, holding the status (`delivered`, `skipped` or `failed`), safe
+    reason and refused finding anchors. It is a fenced Scribe write whose batch
+    id derives from event, execution and revision, so the first recorded
+    outcome is final and a replay records nothing. A revision without one reads
+    as `pending`, and recovery redelivers it. No report, Check or review payload
+    is copied; the report stays in the accepted step output.
   - The existing shared Scribe outbox provides bounded batching and stable retry
     identities for revisions flushed in background; engine transitions never wait
     for its acknowledgement.

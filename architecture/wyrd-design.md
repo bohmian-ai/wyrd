@@ -532,14 +532,14 @@ spec:
   system?: string
   messages: [{ role: user | assistant, content: string | [ContentBlock] }]
   settings?: PortableSettings      # temperature, top_p, max_output_tokens, top_k, stop_sequences, seed, presence_penalty, frequency_penalty, reasoning_effort (chat_completion only)
-  response_format?: JsonSchema | verdict | { kind: verdict, data?: JsonSchema }
+  response_format?: JsonSchema | verdict | { kind: verdict, data?: JsonSchema } | code_review
 # Native form: one protocol body passed through unchanged.
 spec:
   provider: ProviderName
   model: string
   format: chat_completion | responses | messages | generate_content | system_one
   body: { ... }                    # that protocol's request body, extension options preserved
-  response_format?: verdict | { kind: verdict, data?: JsonSchema }
+  response_format?: verdict | { kind: verdict, data?: JsonSchema } | code_review
 ```
 
 `response_format: verdict` (or `{kind: verdict}`) compiles the closed
@@ -557,8 +557,18 @@ authored form, never the expanded provider settings. On a native body the
 named format is lowered into that protocol's structured-output settings; a
 body that also sets its own response settings, or a `system_one` body, is
 refused. Skald owns the
-compiler but no format names: Wyrd resolves `verdict` when it compiles a
-Prompt, and an unresolved named format cannot render.
+compiler but no format names: Wyrd resolves `verdict` and `code_review` when
+it compiles a Prompt, and an unresolved named format cannot render.
+
+`response_format: code_review` compiles the closed standard code review
+report: `format: code_review`, `version: 1`, a `summary`, `coverage`
+(`complete` and `limitations`) and `findings`, each with a report-unique
+`id`, `severity`, `confidence`, `title`, `explanation`, source `locations`
+and `evidence` anchors (path, commit, inclusive line range) and an optional
+`remediation` with an optional `suggested_edit`. It takes no `data`. The
+report is ordinary step output: normal code may return the same envelope,
+authored requirements judge it like any other output, and its severities
+never decide a verdict. It is optional; only GitHub delivery reads it.
 
 `provider` names the Prompt's protocol family and the native destination; a
 custom name is an OpenAI-compatible Chat provider. It never names a gateway
@@ -2517,6 +2527,36 @@ waiting on GitHub. Reading a pull request's execution, or its progress and
 publications, needs `cards:read` in addition to `verifier:read` on its exact
 Verifier, decided from the queue row or, once that is gone, the accepted
 input record's origin.
+
+A `pull_request` execution's results reach GitHub in the background once the
+runner settles or parks it, and again for every current pull request
+execution when the server starts. Delivery reads only the accepted state, its
+selected result and the retained extraction; it never recomputes verification,
+never waits on or changes the verdict, and owns no SQL table or column. Each
+execution has one Check, named per binding, with `external_id` the execution
+and `head_sha` the reviewed commit: `passed` concludes `success`, `failed` and
+`errored` `failure`, `inconclusive` `action_required`, `cancelled` and
+`timed_out` themselves; waiting evidence or approval is `in_progress` with an
+explanation, and a completed Check never returns to it. Of the execution's
+accepted successful final step outputs (each fanout item, only a repeat's
+final output, never a failed attempt or discarded speculation), none holding a
+`code_review` envelope gives a summary-only Check, one renders, and more than
+one, or a malformed one, is shown as `report_ambiguous` or `report_invalid`.
+A rendered report adds one `COMMENT` review on the reviewed commit carrying the
+execution marker, with each finding whose anchor and suggested edit match the
+retained source inline; a finding whose anchor does not is listed in the Check
+summary with its reason, never moved. There are no Check annotations, approvals,
+change requests, resolutions or source changes. GitHub REST has no idempotency
+key, so each write looks up the Check by name, head and `external_id` and the
+review by its marker before creating, also after an unanswered write; a rare
+duplicate after a lost answer is accepted. Writes honor `Retry-After` and retry
+a bounded number of times, and each is preceded by a check of current
+repository access and pull request generation: a superseded or access-removed
+execution is `skipped` and never written again. One outcome per accepted state
+revision is retained in Bifrost (see
+[Storage format and Variant](./bifrost-design.md#storage-format-and-variant)); execution inspection over HTTP and
+MCP serves it as `github_delivery`, `pending` until recorded, separate from the
+verdict and under the execution's read authorization.
 
 Other external pushes are deliberately not an activation.
 

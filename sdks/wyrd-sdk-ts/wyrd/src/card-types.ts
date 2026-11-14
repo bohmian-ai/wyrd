@@ -181,6 +181,25 @@ export interface AlterTableRequest {
 }
 
 /**
+ * A report finding anchor the retained source does not hold.
+ */
+export interface AnchorProblem {
+  /**
+   * The finding's report ID.
+   */
+  readonly finding: string;
+  /**
+   * Why the anchor was refused.
+   */
+  readonly reason: AnchorProblemReason;
+}
+
+/**
+ * Why a finding anchor was refused.
+ */
+export type AnchorProblemReason = "anchor_commit_mismatch" | "anchor_path_unknown" | "anchor_source_unavailable" | "anchor_out_of_range";
+
+/**
  * Validated value for free-form Card annotations.
  */
 export type AnnotationValue = string;
@@ -3045,6 +3064,39 @@ export interface GithubConnectionView {
    */
   readonly updated_at?: string | null;
 }
+
+/**
+ * The GitHub delivery of one `pull_request` execution's current state: its
+ * one Check and its one `COMMENT` review.
+ */
+export interface GithubDelivery {
+  /**
+   * Report findings whose anchors the retained source does not hold.
+   * Each is listed in the Check summary instead of inline, never moved
+   * to another line.
+   */
+  readonly problems?: readonly AnchorProblem[];
+  /**
+   * Why a `skipped` or `failed` delivery did not finish, or why a
+   * `delivered` Check shows no report; absent otherwise.
+   */
+  readonly reason?: GithubDeliveryReason | null;
+  /**
+   * The outcome recorded for the execution's current state.
+   */
+  readonly status: GithubDeliveryStatus;
+}
+
+/**
+ * Why GitHub delivery was skipped or failed, or why a delivered Check
+ * shows no report.
+ */
+export type GithubDeliveryReason = "superseded" | "access_removed" | "github_refused" | "github_unavailable" | "report_ambiguous" | "report_invalid";
+
+/**
+ * One outcome of GitHub delivery.
+ */
+export type GithubDeliveryStatus = "pending" | "delivered" | "skipped" | "failed";
 
 /**
  * A repository the tenant selected that its installation can currently
@@ -8007,6 +8059,12 @@ export interface VerificationExecutionState {
    * The execution.
    */
   readonly execution_id: ExecutionId;
+  /**
+   * How far GitHub delivery of a `pull_request` execution's current
+   * state got; absent for every other origin. Delivery never changes the
+   * verdict, and its failure never fails the execution.
+   */
+  readonly github_delivery?: GithubDelivery | null;
   /**
    * The source snapshot a group execution judges.
    */

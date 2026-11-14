@@ -257,6 +257,16 @@ async fn a_code_review_report_becomes_one_check_and_one_comment_review() {
         ]}),
         "{served}"
     );
+    let over_mcp = deployment
+        .mcp_read(
+            "verification.get_execution",
+            execution.parse().expect("execution uuid"),
+        )
+        .await;
+    assert_eq!(
+        over_mcp["github_delivery"], served["github_delivery"],
+        "MCP serves the same delivery outcome: {over_mcp}"
+    );
 
     let reviews = deployment.mock.reviews(REPOSITORY, PR);
     assert_eq!(

@@ -159,8 +159,10 @@ pub(super) fn descriptors_unscoped() -> Vec<Tool> {
             "Read a verification execution",
             "Read one Verifier execution's status, terminal error, Operator dispatch statuses, \
              and its compact result once published: the verdict and each requirement's \
-             outcome, reason, actual, citations, custom data, and drift detail. A \
-             just-enqueued execution may briefly be not found, and a completed one may \
+             outcome, reason, actual, citations, custom data, and drift detail. A pull \
+             request execution also carries github_delivery: its Check and review delivery \
+             outcome (pending, delivered, skipped or failed) and safe reason, separate from \
+             the verdict. A just-enqueued execution may briefly be not found, and a completed one may \
              briefly lack its result; poll again. Requires verifier:read on the execution's \
              Verifier.",
             true,

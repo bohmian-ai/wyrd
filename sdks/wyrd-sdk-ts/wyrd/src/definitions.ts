@@ -2304,14 +2304,16 @@ export class Check {
 
 /**
  * One response format for a {@link Prompt}: plain text, a JSON object, a
- * named JSON Schema, or the canonical Verdict with an optional custom `data`
- * schema, which the native builder expands.
+ * named JSON Schema, the canonical Verdict with an optional custom `data`
+ * schema, which the native builder expands, or the standard code review
+ * report (`code_review`), whose schema is fixed.
  */
 export type ResponseFormat =
   | { readonly type: "text" }
   | { readonly type: "json_object" }
   | { readonly type: "json_schema"; readonly name: string; readonly schema: Readonly<Record<string, Wire.JsonValue>> }
-  | { readonly type: "verdict"; readonly data?: Readonly<Record<string, Wire.JsonValue>> };
+  | { readonly type: "verdict"; readonly data?: Readonly<Record<string, Wire.JsonValue>> }
+  | { readonly type: "code_review" };
 
 /** The options every {@link Prompt} factory takes, by the native builder's names. */
 export type PromptOptions = {

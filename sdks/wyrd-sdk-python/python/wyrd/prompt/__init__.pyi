@@ -1205,9 +1205,22 @@ class ResponseFormat:
         """
         ...
 
+    @staticmethod
+    def code_review() -> ResponseFormat:
+        """Request the standard code review report: a summary and findings.
+
+        The schema is fixed. GitHub delivery renders one such report from an
+        execution as its Check and pull request review; the report never
+        changes the verdict.
+
+        Returns:
+            the ``code_review`` format.
+        """
+        ...
+
     def to_dict(self) -> JsonDict:
-        """Return ``{"type": ...}`` plus ``name`` and ``schema`` for JSON Schema; a Verdict is
-        ``{"kind": "verdict"}`` plus its ``data`` schema when it has one."""
+        """Return ``{"type": ...}`` plus ``name`` and ``schema`` for JSON Schema; a named
+        format is ``{"kind": name}`` plus its ``data`` schema when it has one."""
         ...
 
     def __str__(self) -> str:

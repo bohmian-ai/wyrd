@@ -321,3 +321,9 @@ def test_response_format_verdict_shares_the_class_and_inspects_expanded() -> Non
     for refused in (1, "verdict", ["not", "a", "schema"]):
         with pytest.raises(WyrdError):
             ResponseFormat.verdict(refused)  # ty: ignore[invalid-argument-type]
+
+    review = ResponseFormat.code_review()
+    assert review.to_dict() == {"kind": "code_review"}
+    assert repr(review) == "ResponseFormat.code_review()"
+    reviewer = Prompt.openai_chat("gpt-4o", messages="Review {{diff}}", response_format=review)
+    assert json.loads(str(reviewer))["response_format"] == "code_review"

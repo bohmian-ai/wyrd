@@ -578,6 +578,47 @@ mod builder_tests {
         assert!(refused.to_string().contains("2020-12"), "{refused}");
     }
 
+    /// `ResponseFormat::code_review` authors the named `code_review` format,
+    /// whose fixed report schema resolves into the native request.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the format does not build, keep its name, or resolve to
+    /// the report schema.
+    #[test]
+    fn code_review_format_resolves_to_the_report_schema() {
+        let prompt = openai_chat(
+            "gpt-4o",
+            OpenAiChatOptions {
+                messages: vec!["Review {{diff}}".into()],
+                response_format: Some(ResponseFormat::code_review()),
+                ..Default::default()
+            },
+        )
+        .expect("code_review builds");
+        assert_eq!(
+            serde_json::to_value(
+                &prompt
+                    .native()
+                    .authored()
+                    .expect("authored")
+                    .response_format
+            )
+            .expect("serializes"),
+            json!("code_review")
+        );
+        let ProviderRequest::OpenAiChatCompletion(request) = &prompt.native().request else {
+            panic!("an OpenAI Chat request");
+        };
+        let Some(OpenAiResponseFormat::JsonSchema { json_schema }) = &request.response_format
+        else {
+            panic!("the report schema is native: {:?}", request.response_format);
+        };
+        let schema = json_schema.schema.as_ref().expect("a schema");
+        assert!(schema["properties"].get("summary").is_some(), "{schema:?}");
+        assert!(schema["properties"].get("findings").is_some(), "{schema:?}");
+    }
+
     #[test]
     fn openai_chat_emits_native_variant_and_response_format() {
         let schema = json!({

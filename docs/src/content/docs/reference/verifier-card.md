@@ -183,6 +183,8 @@ A citation names the original slot, or the `attachment_<n>` slot a fixed workspa
 
 `response_format: verdict` (or `{kind: verdict}`) asks for exactly the verdict above. `{kind: verdict, data: <JSON Schema>}` also requires a `data` object matching that object schema, written in JSON Schema 2020-12 (omit `$schema` or declare 2020-12) and without a root `$id`. An Agent declares it on its Prompt; a `code` check declares it on the check, beside `entrypoint`, and returns `data` in its verdict. Without a `data` schema, a verdict must not carry `data`.
 
+An Agent step's Prompt may instead declare `response_format: code_review`, the standard code review report Wyrd renders on a pull request's Check and review; it takes no `data`. See [Review a pull request](/build-and-verify/verify/review-a-pull-request/).
+
 The server validates the whole verdict against the declared schema. Data must fit both limits, inclusive:
 
 | Limit | Bound |

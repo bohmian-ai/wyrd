@@ -25,7 +25,7 @@ use super::pg_github_pull_request_extraction::{
 const CHANGES: &str = "    - id: changes\n      statement: The reviewed change touches a file\n      check: {kind: assert, path: steps.pr.output.changes.files, operator: is_non_empty}\n";
 
 /// An Agent whose Prompt answers in the standard `code_review` format.
-const REVIEWER: &str = "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: reviewer\n  version: 1.0.0\nspec:\n  execution_route: {kind: wyrd_gateway, deployment: openai}\n  run_config: {max_iterations: 1}\n  prompt:\n    provider: openai\n    model: gpt-test\n    response_format: code_review\n    messages:\n      - role: user\n        content: \"Review pull request {{pr}}.\"\n";
+const REVIEWER: &str = "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: reviewer\n  version: 1.0.0\nspec:\n  execution_route: {kind: wyrd_gateway, deployment: openai}\n  run_config: {max_iterations: 1}\n  prompt:\n    provider: openai\n    model: gpt-4o\n    response_format: code_review\n    messages:\n      - role: user\n        content: \"Review pull request {{pr}}.\"\n";
 
 /// The Verifier `name`: extract the pull request, run `steps`, and judge
 /// `requirements`.
@@ -154,7 +154,7 @@ async fn answers_with(deployment: &Deployment, report: &Value) {
         .and(path("/v1/chat/completions"))
         .and(body_string_contains("Review pull request"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "chatcmpl-review", "object": "chat.completion", "created": 1, "model": "gpt-test",
+            "id": "chatcmpl-review", "object": "chat.completion", "created": 1, "model": "gpt-4o",
             "choices": [{"index": 0, "finish_reason": "stop",
                          "message": {"role": "assistant", "content": report.to_string()}}],
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
@@ -773,4 +773,86 @@ async fn a_permanent_refusal_is_a_visible_failed_outcome() {
     assert_eq!(sent(&deployment, "POST "), 1, "a refusal is not retried");
     assert!(deployment.mock.check_runs(REPOSITORY).is_empty());
     assert!(deployment.mock.reviews(REPOSITORY, PR).is_empty());
+}
+
+/// The public `examples/review-a-pull-request` policy, declared as
+/// published: the pull request is extracted, its Agent's `code_review`
+/// report with one high finding fails the example's requirement, and the
+/// Check concludes `failure` beside one `COMMENT` review whose inline
+/// comment carries the exact suggestion.
+///
+/// # Panics
+/// Panics when the example does not declare, or its Check, review or
+/// outcome differs.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_review_example_fails_on_a_high_finding_and_comments_its_fix() {
+    let example = |file: &str| {
+        std::fs::read_to_string(format!(
+            "{}/../../../examples/review-a-pull-request/{file}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("the example file reads")
+    };
+    let (repository, verifier, reviewer) = (
+        example("repository.yaml"),
+        example("verifier.yaml"),
+        example("reviewer.yaml"),
+    );
+    let deployment = Deployment::start(&[
+        ("policy.yaml", &repository),
+        ("verifier.yaml", &verifier),
+        ("reviewer.yaml", &reviewer),
+    ])
+    .await;
+    let head = sha('a');
+    deployment.head(&head, &sha('8'), HANDLER_A);
+    deployment.compare(&sha('c'), &head, &sha('c'), HANDLER_A, PATCH_A);
+    let line = json!({"path": "src/handler.ts", "commit": head, "start_line": 3, "end_line": 3});
+    let fix = "export const handle = (id: string) => lookupUser(id.trim().toLowerCase());\n";
+    let report = json!({
+        "format": "code_review", "version": 1, "summary": "Ids are trimmed but not normalized.",
+        "coverage": {"complete": true, "limitations": []},
+        "findings": [{"id": "case", "severity": "high", "confidence": "medium",
+                      "title": "Mixed-case ids miss their user",
+                      "explanation": "lookupUser compares lower-case ids.",
+                      "locations": [line], "evidence": [],
+                      "remediation": {"explanation": "Lower-case the id.",
+                                      "suggested_edit": {"location": line, "replacement": fix}}}],
+    });
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("Active changes"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-review", "object": "chat.completion", "created": 1, "model": "gpt-4o",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": report.to_string()}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        })))
+        .mount(&deployment.model)
+        .await;
+    deployment.admit(&head, "opened").await;
+
+    let shown = delivered(&deployment, 1).await;
+    let Delivered { check, served } = &shown["wyrd/code-review"];
+    assert_eq!(served["result"]["outcome"]["verdict"], "failed", "{served}");
+    assert_eq!(
+        served["result"]["outcome"]["requirements"][0]["reason"],
+        "The review found critical or high issues."
+    );
+    assert_eq!(
+        (&check["head_sha"], &check["conclusion"]),
+        (&json!(head), &json!("failure")),
+        "{check}"
+    );
+    assert_eq!(served["github_delivery"], json!({"status": "delivered"}));
+    let reviews = deployment.mock.reviews(REPOSITORY, PR);
+    assert_eq!(reviews.len(), 1, "{reviews:#?}");
+    let comments = reviews[0]["comments"].as_array().expect("comments");
+    assert_eq!(comments.len(), 1, "{reviews:#?}");
+    let body = comments[0]["body"].as_str().expect("comment body");
+    assert!(
+        body.contains("[high/medium confidence] Mixed-case ids miss their user (`case`)")
+            && body.contains(&format!("```suggestion\n{fix}```")),
+        "{body}"
+    );
 }

@@ -1,0 +1,28 @@
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: code-reviewer
+  version: 1.0.0
+spec:
+  execution_route: {kind: wyrd_gateway, deployment: openai}  # your gateway deployment
+  tool_names: [fs.read]
+  prompt:
+    provider: openai
+    model: gpt-4o
+    system: |
+      Review the active changes using the supplied source context.
+      Return supported findings with severity, confidence, explanation,
+      source locations and remediation when available.
+      Disclose incomplete coverage. Do not invent findings or fixes.
+    messages:
+      - role: user
+        content: |
+          Pull request:
+          {{pr}}
+
+          Active changes:
+          {{changes}}
+
+          Supporting source context:
+          {{context}}
+    response_format: code_review  # the standard report GitHub delivery renders

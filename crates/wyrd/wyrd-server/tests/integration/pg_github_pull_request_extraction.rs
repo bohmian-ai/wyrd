@@ -50,13 +50,13 @@ const AGENT_POLICY: &str = "apiVersion: wyrd/v1\nkind: Repository\nmetadata:\n  
 /// as `/inputs/pr.json`.
 const AGENT_REVIEW: &str = "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: agent-review\n  version: 1.0.0\nspec:\n  description: An Agent reviews the pull request.\n  steps:\n    - id: pr\n      action: {kind: extract, extractor: pull_request}\n    - id: review\n      depends_on: [pr]\n      action:\n        kind: agent\n        agent: ./reviewer.yaml\n        inputs: {pr: steps.pr.output.pr, changes: steps.pr.output.changes, context: steps.pr.output.context}\n        workspace: {/inputs/pr.json: steps.pr.output}\n  requirements:\n    - id: reviewed\n      statement: The Agent answered\n      check: {kind: assert, path: steps.review.output, operator: is_non_empty}\n";
 /// The reviewing Agent.
-const REVIEWER: &str = "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: reviewer\n  version: 1.0.0\nspec:\n  execution_route: {kind: wyrd_gateway, deployment: openai}\n  tool_names: [fs.read, fs.list]\n  run_config: {max_iterations: 3}\n  prompt:\n    provider: openai\n    model: gpt-test\n    messages:\n      - role: user\n        content: \"Review pull request {{pr}} changing {{changes}} in {{context}}; the whole extraction is /inputs/pr.json.\"\n";
+const REVIEWER: &str = "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: reviewer\n  version: 1.0.0\nspec:\n  execution_route: {kind: wyrd_gateway, deployment: openai}\n  tool_names: [fs.read, fs.list]\n  run_config: {max_iterations: 3}\n  prompt:\n    provider: openai\n    model: gpt-4o\n    messages:\n      - role: user\n        content: \"Review pull request {{pr}} changing {{changes}} in {{context}}; the whole extraction is /inputs/pr.json.\"\n";
 
 /// [`AGENT_REVIEW`] with a bystander Agent that follows the extraction but
 /// binds none of it.
 const BYSTANDER_REVIEW: &str = "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: agent-review\n  version: 1.0.0\nspec:\n  description: An Agent reviews the pull request beside a bystander.\n  steps:\n    - id: pr\n      action: {kind: extract, extractor: pull_request}\n    - id: review\n      depends_on: [pr]\n      action:\n        kind: agent\n        agent: ./reviewer.yaml\n        inputs: {pr: steps.pr.output.pr, changes: steps.pr.output.changes, context: steps.pr.output.context}\n        workspace: {/inputs/pr.json: steps.pr.output}\n    - id: aside\n      depends_on: [pr]\n      action: {kind: agent, agent: ./bystander.yaml}\n  requirements:\n    - id: reviewed\n      statement: The Agent answered\n      check: {kind: assert, path: steps.review.output, operator: is_non_empty}\n";
 /// An Agent binding no extraction; without a declared workspace it has none.
-const BYSTANDER: &str = "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: bystander\n  version: 1.0.0\nspec:\n  execution_route: {kind: wyrd_gateway, deployment: openai}\n  run_config: {max_iterations: 1}\n  prompt:\n    provider: openai\n    model: gpt-test\n    messages:\n      - role: user\n        content: \"Bystander: say what you were given.\"\n";
+const BYSTANDER: &str = "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: bystander\n  version: 1.0.0\nspec:\n  execution_route: {kind: wyrd_gateway, deployment: openai}\n  run_config: {max_iterations: 1}\n  prompt:\n    provider: openai\n    model: gpt-4o\n    messages:\n      - role: user\n        content: \"Bystander: say what you were given.\"\n";
 
 /// Declares `lookupUser`.
 const USER: &[u8] = b"export function lookupUser(id: string): string {\n  return id;\n}\n";
@@ -160,7 +160,7 @@ impl Deployment {
         )
         .await;
         server
-            .deploy_gateway_model_for_test("gpt-test", MODEL_ROLE)
+            .deploy_gateway_model_for_test("gpt-4o", MODEL_ROLE)
             .await
             .expect("the model deploys");
         server
@@ -665,7 +665,7 @@ fn prompt_values(prompt: &str) -> Vec<Value> {
 async fn reads_the_workspace(model: &MockServer) {
     let answer = |message: Value, finish: &str| {
         ResponseTemplate::new(200).set_body_json(json!({
-            "id": "chatcmpl-review", "object": "chat.completion", "created": 1, "model": "gpt-test",
+            "id": "chatcmpl-review", "object": "chat.completion", "created": 1, "model": "gpt-4o",
             "choices": [{"index": 0, "finish_reason": finish, "message": message}],
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         }))
@@ -702,7 +702,7 @@ async fn answers_the_bystander(model: &MockServer) {
         .and(path("/v1/chat/completions"))
         .and(body_string_contains("Bystander"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "chatcmpl-aside", "object": "chat.completion", "created": 1, "model": "gpt-test",
+            "id": "chatcmpl-aside", "object": "chat.completion", "created": 1, "model": "gpt-4o",
             "choices": [{"index": 0, "finish_reason": "stop",
                          "message": {"role": "assistant", "content": "Nothing."}}],
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},

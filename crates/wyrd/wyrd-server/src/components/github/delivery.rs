@@ -75,9 +75,6 @@ const ATTEMPTS: u32 = 5;
 /// Wait after the first unavailable attempt; doubles after each later one.
 const BACKOFF: Duration = Duration::from_secs(1);
 
-/// Longest provider cooldown delivery waits out before its next attempt.
-const COOLDOWN_MAX: Duration = Duration::from_mins(15);
-
 /// How long recording an outcome may wait for its Scribe acknowledgement.
 const RECORD_DEADLINE: Duration = Duration::from_secs(30);
 
@@ -469,7 +466,7 @@ impl<'a> GithubDeliveries<'a> {
                 Err(halt) => return Err(halt),
             };
             let pause = if let DeliveryFailure::Cooldown(cooldown) = failure {
-                cooldown.min(COOLDOWN_MAX)
+                cooldown
             } else {
                 let pause = wait;
                 wait = wait.saturating_mul(2);

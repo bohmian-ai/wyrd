@@ -842,7 +842,7 @@ impl GithubApp {
     }
 
     /// Decode a successful delivery answer or classify its failure: a
-    /// rate limit is a cooldown for its `Retry-After` (else one minute), a
+    /// rate limit is a cooldown for as long as [`Self::cooldown`] says, a
     /// server error or an undecodable body is unavailable, and any other
     /// client error is a refusal.
     ///
@@ -862,12 +862,10 @@ impl GithubApp {
                         .get("x-ratelimit-remaining")
                         .is_some_and(|remaining| remaining == "0")));
         if limited {
-            let seconds = response
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|value| value.to_str().ok()?.parse().ok())
-                .unwrap_or(60);
-            return Err(DeliveryFailure::Cooldown(Duration::from_secs(seconds)));
+            return Err(DeliveryFailure::Cooldown(Self::cooldown(
+                response.headers(),
+                chrono::Utc::now().timestamp(),
+            )));
         }
         if status.is_server_error() {
             return Err(DeliveryFailure::Unavailable);
@@ -879,6 +877,23 @@ impl GithubApp {
             .await
             .map_err(|_| DeliveryFailure::Unavailable)?;
         serde_json::from_slice(&body).map_err(|_| DeliveryFailure::Unavailable)
+    }
+
+    /// How long a rate-limited answer with `headers`, received at Unix
+    /// second `now`, asks delivery to wait: its whole `Retry-After`, else
+    /// until its `x-ratelimit-reset` once `x-ratelimit-remaining` is `0`,
+    /// else one minute, as GitHub documents.
+    fn cooldown(headers: &reqwest::header::HeaderMap, now: i64) -> Duration {
+        let number = |name| -> Option<i64> { headers.get(name)?.to_str().ok()?.parse().ok() };
+        let seconds = number(reqwest::header::RETRY_AFTER.as_str())
+            .or_else(|| {
+                (number("x-ratelimit-remaining") == Some(0))
+                    .then(|| number("x-ratelimit-reset"))
+                    .flatten()
+                    .map(|reset| reset.saturating_sub(now).max(1))
+            })
+            .unwrap_or(60);
+        Duration::from_secs(u64::try_from(seconds).unwrap_or(0))
     }
 
     /// The `rel="next"` target of a response's `Link` header.
@@ -1078,6 +1093,50 @@ mod tests {
             "https://ghe.example.com/other/app/hook/deliveries",
         ] {
             assert!(!GithubApp::under(&base, &url(foreign)), "{foreign}");
+        }
+    }
+
+    /// A cooldown lasts the whole `Retry-After`, even past fifteen minutes;
+    /// without one, an exhausted primary limit lasts until its reset; with
+    /// neither, one minute.
+    ///
+    /// # Panics
+    /// Panics when a header fails to parse or a cooldown differs.
+    #[test]
+    fn cooldowns_last_as_long_as_github_asks() {
+        let headers = |pairs: &[(&'static str, &str)]| {
+            let mut headers = reqwest::header::HeaderMap::new();
+            for (name, value) in pairs {
+                headers.insert(*name, value.parse().expect("header value"));
+            }
+            headers
+        };
+        let now = 1_000_000;
+        let cases = [
+            (headers(&[("retry-after", "1800")]), 1800),
+            (
+                headers(&[
+                    ("x-ratelimit-remaining", "0"),
+                    ("x-ratelimit-reset", "1003600"),
+                ]),
+                3600,
+            ),
+            (
+                headers(&[
+                    ("x-ratelimit-remaining", "0"),
+                    ("x-ratelimit-reset", "999000"),
+                ]),
+                1,
+            ),
+            (headers(&[("x-ratelimit-remaining", "3")]), 60),
+            (headers(&[]), 60),
+        ];
+        for (headers, seconds) in cases {
+            assert_eq!(
+                GithubApp::cooldown(&headers, now),
+                Duration::from_secs(seconds),
+                "{headers:?}"
+            );
         }
     }
 }

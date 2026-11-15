@@ -183,38 +183,147 @@ impl ServeMode {
     }
 }
 
-/// Internal process composition for the Forge maintenance topology.
+/// Closed process target selected by `WYRD_TARGET`.
+///
+/// One binary runs every deployment shape. `Combined` is the all-in-one
+/// default; the other targets split Verifier work and Bifrost owners across
+/// separately provisioned pods so direct verification never shares capacity
+/// with queued work. Every split target runs only in explicit peer mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 #[clap(rename_all = "kebab-case")]
-pub enum BifrostTarget {
-    /// Serve APIs, schedule Forge work, and run the embedded worker.
+pub enum ServerTarget {
+    /// Serve every route, run direct and queued verification, and run Scribe,
+    /// Oracle, and both Forge roles in-process.
     #[default]
-    All,
-    /// Serve APIs and schedule Forge work without executing tasks.
-    Server,
-    /// Serve only Oracle query, lifecycle, and persisted follower capabilities.
-    Oracle,
+    Combined,
+    /// Execute only synchronous `verify`, with Scribe and Oracle in-process.
+    Direct,
+    /// Admit and execute only queued verification, with Scribe and Oracle
+    /// in-process.
+    Worker,
     /// Serve only Scribe ingest, tail, and live follower capabilities.
-    Scribe,
-    /// Run Forge workers without opening public API listeners.
-    ForgeWorker,
+    BifrostIngest,
+    /// Serve only Oracle query, lifecycle, and persisted follower capabilities.
+    BifrostQuery,
+    /// Run the Forge coordinator and worker without public API listeners.
+    BifrostMaintenance,
 }
 
-impl BifrostTarget {
-    /// Returns whether this role owns public API listeners.
+impl ServerTarget {
+    /// The `WYRD_TARGET` spelling of every target, in declaration order.
+    pub const NAMES: [&'static str; 6] = [
+        "combined",
+        "direct",
+        "worker",
+        "bifrost-ingest",
+        "bifrost-query",
+        "bifrost-maintenance",
+    ];
+
+    /// Parses one `WYRD_TARGET` value.
+    ///
+    /// Returns `None` for any value outside [`Self::NAMES`]; the removed
+    /// targets have no aliases.
     #[must_use]
-    pub(crate) fn serves_api(self) -> bool {
-        matches!(self, Self::All | Self::Server | Self::Oracle | Self::Scribe)
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "combined" => Some(Self::Combined),
+            "direct" => Some(Self::Direct),
+            "worker" => Some(Self::Worker),
+            "bifrost-ingest" => Some(Self::BifrostIngest),
+            "bifrost-query" => Some(Self::BifrostQuery),
+            "bifrost-maintenance" => Some(Self::BifrostMaintenance),
+            _ => None,
+        }
     }
 
-    /// Returns whether this target owns only part of the Scribe/Oracle pair.
+    /// Returns whether this target owns public API listeners.
+    #[must_use]
+    pub(crate) fn serves_api(self) -> bool {
+        !matches!(self, Self::BifrostMaintenance)
+    }
+
+    /// Returns whether this target executes synchronous `verify`.
+    #[must_use]
+    pub fn runs_direct(self) -> bool {
+        matches!(self, Self::Combined | Self::Direct)
+    }
+
+    /// Returns whether this target admits and executes queued verification:
+    /// enqueue, GitHub webhooks, deferred inputs, approvals, queued-only
+    /// controls, and execution claims.
+    #[must_use]
+    pub fn runs_queued(self) -> bool {
+        matches!(self, Self::Combined | Self::Worker)
+    }
+
+    /// Returns whether this target serves any Verifier work.
+    #[must_use]
+    pub fn serves_verifiers(self) -> bool {
+        self.runs_direct() || self.runs_queued()
+    }
+
+    /// The `WYRD_TARGET` spelling of this target.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        Self::NAMES[self as usize]
+    }
+
+    /// Refuses synchronous `verify` on a target that does not run it.
     ///
-    /// A split target cannot reach its counterpart in-process, so it runs only
-    /// in explicit peer mode.
+    /// Callers check this before authorization, admission, or any write, so a
+    /// refused call leaves nothing behind.
+    ///
+    /// # Errors
+    /// Returns [`wyrd_spec::error::WyrdError::VerificationWrongTarget`] unless
+    /// [`Self::runs_direct`].
+    pub(crate) fn require_direct(self, operation: &str) -> Result<(), wyrd_spec::error::WyrdError> {
+        self.require(self.runs_direct(), "direct", operation)
+    }
+
+    /// Refuses queued Verifier work on a target that does not run it.
+    ///
+    /// Callers check this before authorization, admission, or any write, so a
+    /// refused call leaves nothing behind.
+    ///
+    /// # Errors
+    /// Returns [`wyrd_spec::error::WyrdError::VerificationWrongTarget`] unless
+    /// [`Self::runs_queued`].
+    pub(crate) fn require_queued(self, operation: &str) -> Result<(), wyrd_spec::error::WyrdError> {
+        self.require(self.runs_queued(), "queued", operation)
+    }
+
+    /// Builds the shared wrong-target refusal for `work`.
+    fn require(
+        self,
+        runs: bool,
+        work: &str,
+        operation: &str,
+    ) -> Result<(), wyrd_spec::error::WyrdError> {
+        if runs {
+            return Ok(());
+        }
+        Err(wyrd_spec::error::WyrdError::VerificationWrongTarget {
+            message: format!(
+                "{operation} is {work} Verifier work, which this server's '{}' target does not run",
+                self.name()
+            ),
+            details: serde_json::json!({
+                "target": self.name(),
+                "work": work,
+                "operation": operation,
+            }),
+        })
+    }
+
+    /// Returns whether this target is one part of a split deployment.
+    ///
+    /// A split target cannot reach the owners it does not run in-process, so
+    /// it runs only in explicit peer mode.
     #[must_use]
     pub fn requires_peer(self) -> bool {
-        matches!(self, Self::Oracle | Self::Scribe)
+        !matches!(self, Self::Combined)
     }
 }
 
@@ -418,9 +527,9 @@ pub struct BifrostRoles {
 impl BifrostRoles {
     /// Constructs the exact effective roles for one public process target.
     #[must_use]
-    pub fn for_target(target: BifrostTarget) -> Self {
+    pub fn for_target(target: ServerTarget) -> Self {
         let selected = match target {
-            BifrostTarget::All => [
+            ServerTarget::Combined => [
                 BifrostRuntimeRole::Scribe,
                 BifrostRuntimeRole::ForgeCoordinator,
                 BifrostRuntimeRole::ForgeWorker,
@@ -428,16 +537,19 @@ impl BifrostRoles {
             ]
             .into_iter()
             .collect(),
-            BifrostTarget::Server => [
-                BifrostRuntimeRole::Scribe,
+            ServerTarget::Direct | ServerTarget::Worker => {
+                [BifrostRuntimeRole::Scribe, BifrostRuntimeRole::Oracle]
+                    .into_iter()
+                    .collect()
+            }
+            ServerTarget::BifrostQuery => [BifrostRuntimeRole::Oracle].into_iter().collect(),
+            ServerTarget::BifrostIngest => [BifrostRuntimeRole::Scribe].into_iter().collect(),
+            ServerTarget::BifrostMaintenance => [
                 BifrostRuntimeRole::ForgeCoordinator,
-                BifrostRuntimeRole::Oracle,
+                BifrostRuntimeRole::ForgeWorker,
             ]
             .into_iter()
             .collect(),
-            BifrostTarget::Oracle => [BifrostRuntimeRole::Oracle].into_iter().collect(),
-            BifrostTarget::Scribe => [BifrostRuntimeRole::Scribe].into_iter().collect(),
-            BifrostTarget::ForgeWorker => [BifrostRuntimeRole::ForgeWorker].into_iter().collect(),
         };
         Self { selected }
     }
@@ -1180,9 +1292,7 @@ impl BifrostRuntimeConfig {
 /// Oracle, and Forge in-process and opens no private socket. Peer mode is
 /// enabled by supplying both `address` and `tls_dir`, even for the first of
 /// several replicas; each replica publishes its own address through the
-/// existing fenced `vala.cluster_nodes` membership. A dedicated `forge-worker`
-/// opens no listener, so it takes `tls_dir` alone: its credentials only dial
-/// the elected Forge leader's peer route.
+/// existing fenced `vala.cluster_nodes` membership.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BifrostPeerConfig {
@@ -1252,35 +1362,17 @@ impl BifrostPeerConfig {
         }))
     }
 
-    /// Validates the explicit peer-mode inputs for a process that does, or
-    /// does not, serve a peer listener.
+    /// Validates the explicit peer-mode inputs.
     ///
-    /// A listening target needs both `address` and `tls_dir` or neither. A
-    /// dial-only target (`listens == false`, the dedicated Forge worker) may
-    /// name `tls_dir` alone and never an `address`, because it publishes no
-    /// endpoint for anyone to dial.
+    /// Every target that runs in peer mode opens the private listener, so peer
+    /// mode takes both `address` and `tls_dir` or neither.
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError::Invalid`] when a listening target supplies only
-    /// one of `address` and `tls_dir`, a dial-only target supplies an
-    /// `address`, `tls_dir` is empty, or `address` is not a bare `host:port`.
-    fn validate(&self, listens: bool) -> Result<(), ConfigError> {
-        if !listens {
-            if self.address.is_some() {
-                return Err(ConfigError::Invalid {
-                    message: "the forge-worker target serves no peer listener; \
-                              unset WYRD_PEER_ADDRESS and keep only WYRD_PEER_TLS_DIR"
-                        .to_owned(),
-                });
-            }
-            return match &self.tls_dir {
-                Some(tls_dir) if tls_dir.as_os_str().is_empty() => Err(ConfigError::Invalid {
-                    message: "WYRD_PEER_TLS_DIR must name a directory".to_owned(),
-                }),
-                _ => Ok(()),
-            };
-        }
+    /// Returns [`ConfigError::Invalid`] when only one of `address` and
+    /// `tls_dir` is supplied, `tls_dir` is empty, or `address` is not a bare
+    /// `host:port`.
+    fn validate(&self) -> Result<(), ConfigError> {
         let (address, tls_dir) = match (&self.address, &self.tls_dir) {
             (None, None) => return Ok(()),
             (Some(address), Some(tls_dir)) => (address, tls_dir),
@@ -2769,7 +2861,7 @@ pub struct WyrdServerConfig {
     pub deployment_profile: DeploymentProfile,
     /// Closed process target derived from `WYRD_TARGET`.
     #[serde(default)]
-    pub role: BifrostTarget,
+    pub role: ServerTarget,
     /// HTTP server bind configuration.
     #[serde(default)]
     pub http: HttpConfig,
@@ -2794,7 +2886,7 @@ pub struct WyrdServerConfig {
     /// Role-aware Bifrost runtime configuration.
     #[serde(default)]
     pub bifrost: BifrostRuntimeConfig,
-    /// Forge worker capacity for `all` and `forge-worker` roles.
+    /// Forge worker capacity for the `combined` and `bifrost-maintenance` targets.
     #[serde(default)]
     pub forge: ForgeRuntimeConfig,
     /// Prometheus metrics server configuration.
@@ -3503,21 +3595,15 @@ impl WyrdServerConfig {
             self.bifrost.data_dir = Some(PathBuf::from(value));
         }
         if let Some(value) = env_opt("WYRD_TARGET")? {
-            self.role = match value.as_str() {
-                "all" => BifrostTarget::All,
-                "server" => BifrostTarget::Server,
-                "oracle" => BifrostTarget::Oracle,
-                "scribe" => BifrostTarget::Scribe,
-                "forge-worker" => BifrostTarget::ForgeWorker,
-                _ => {
-                    return Err(ConfigError::BadEnvVar {
-                        key: "WYRD_TARGET".to_owned(),
-                        message: format!(
-                            "expected 'all', 'server', 'oracle', 'scribe', or 'forge-worker', got {value:?}"
-                        ),
-                    });
-                }
-            };
+            self.role = ServerTarget::parse(&value).ok_or_else(|| ConfigError::BadEnvVar {
+                key: "WYRD_TARGET".to_owned(),
+                message: format!(
+                    "expected one of {}, got {value:?}",
+                    ServerTarget::NAMES
+                        .map(|name| format!("'{name}'"))
+                        .join(", ")
+                ),
+            })?;
         }
         self.bifrost.resources.process_memory_limit_bytes = parse_optional_env(
             "WYRD_BIFROST_PROCESS_MEMORY_LIMIT_BYTES",
@@ -3908,14 +3994,12 @@ impl WyrdServerConfig {
             self.validate_oracle_calibration()?;
         }
 
-        // Peer mode is explicit and all-or-nothing for a listening target. A
-        // split Scribe or Oracle target cannot reach its counterpart
-        // in-process and needs it; a Forge worker never opens the socket and
-        // takes only the credentials it dials the Forge leader with.
-        self.bifrost.peer.validate(serves_api)?;
+        // Peer mode is explicit and all-or-nothing. A split target cannot
+        // reach the owners it does not run in-process, so it needs peer mode.
+        self.bifrost.peer.validate()?;
         if self.role.requires_peer() && !self.bifrost.peer.is_enabled() {
             return Err(ConfigError::Invalid {
-                message: "split oracle and scribe targets require peer mode \
+                message: "every WYRD_TARGET except 'combined' requires peer mode \
                           (WYRD_PEER_ADDRESS and WYRD_PEER_TLS_DIR)"
                     .to_owned(),
             });
@@ -4474,37 +4558,100 @@ mod tests {
     #[test]
     fn default_config_validates() {
         let cfg = WyrdServerConfig::default();
-        assert_eq!(cfg.role, BifrostTarget::All);
+        assert_eq!(cfg.role, ServerTarget::Combined);
         assert_eq!(cfg.bifrost_roles().len(), 4);
         cfg.validate()
             .expect("default all-in-one config validates without a calibration profile");
     }
 
-    /// Proves the closed public role derives the internal Bifrost topology.
+    /// Proves each closed target parses from its one spelling and derives its
+    /// Bifrost owners and Verifier work; removed targets have no alias.
     #[test]
-    fn public_roles_derive_internal_bifrost_roles() {
+    fn targets_derive_bifrost_owners_and_verifier_work() {
+        use BifrostRuntimeRole::{ForgeCoordinator, ForgeWorker, Oracle, Scribe};
         let cases = [
-            (BifrostTarget::All, 4, true),
-            (BifrostTarget::Server, 3, true),
-            (BifrostTarget::Oracle, 1, true),
-            (BifrostTarget::Scribe, 1, true),
-            (BifrostTarget::ForgeWorker, 1, false),
+            (
+                "combined",
+                vec![Scribe, ForgeCoordinator, ForgeWorker, Oracle],
+                true,
+                true,
+            ),
+            ("direct", vec![Scribe, Oracle], true, false),
+            ("worker", vec![Scribe, Oracle], false, true),
+            ("bifrost-ingest", vec![Scribe], false, false),
+            ("bifrost-query", vec![Oracle], false, false),
+            (
+                "bifrost-maintenance",
+                vec![ForgeCoordinator, ForgeWorker],
+                false,
+                false,
+            ),
         ];
-        for (target, count, serves_gate) in cases {
+        assert_eq!(cases.len(), ServerTarget::NAMES.len());
+        for (name, owners, direct, queued) in cases {
+            let target = ServerTarget::parse(name).expect("a closed target parses");
+            assert_eq!(target.name(), name);
             let roles = BifrostRoles::for_target(target);
-            assert_eq!(roles.len(), count, "{target:?}");
-            assert_eq!(roles.serves_gate(), serves_gate, "{target:?}");
+            assert_eq!(roles.len(), owners.len(), "{name}");
+            assert!(owners.iter().all(|role| roles.contains(role)), "{name}");
+            assert_eq!(target.runs_direct(), direct, "{name}");
+            assert_eq!(target.runs_queued(), queued, "{name}");
+            assert_eq!(target.requires_peer(), name != "combined", "{name}");
+            assert_eq!(target.serves_api(), name != "bifrost-maintenance", "{name}");
+        }
+        for removed in ["all", "server", "oracle", "scribe", "forge-worker"] {
+            assert_eq!(ServerTarget::parse(removed), None, "{removed} has no alias");
         }
     }
 
-    /// Proves a dedicated Forge worker ignores malformed settings for services
-    /// it does not own while retaining its local concurrency guard.
+    /// Proves each target refuses the Verifier work it does not run with the
+    /// one stable wrong-target error naming the target.
     #[test]
-    fn forge_worker_validation_ignores_api_only_settings() {
+    fn targets_refuse_verifier_work_they_do_not_run() {
+        let code = |result: Result<(), wyrd_spec::error::WyrdError>| {
+            result.err().map(|error| error.code())
+        };
+        for target in [ServerTarget::Combined, ServerTarget::Direct] {
+            assert_eq!(code(target.require_direct("verification.execute")), None);
+        }
+        for target in [ServerTarget::Combined, ServerTarget::Worker] {
+            assert_eq!(code(target.require_queued("verification.enqueue")), None);
+        }
+        let refused = ServerTarget::Direct
+            .require_queued("verification.enqueue")
+            .expect_err("direct refuses queued work");
+        assert_eq!(refused.status(), 421);
+        let wyrd_spec::error::WyrdError::VerificationWrongTarget { details, .. } = refused else {
+            panic!("direct refuses with the wrong-target error");
+        };
+        assert_eq!(details["target"], "direct", "the refusal names this target");
+        for target in [
+            ServerTarget::Worker,
+            ServerTarget::BifrostIngest,
+            ServerTarget::BifrostQuery,
+            ServerTarget::BifrostMaintenance,
+        ] {
+            assert_eq!(
+                code(target.require_direct("verification.execute")),
+                Some("WYRD_VERIFICATION_421_WRONG_TARGET"),
+                "{target:?}"
+            );
+        }
+    }
+
+    /// Proves the Forge maintenance target ignores malformed settings for
+    /// services it does not own while retaining its local concurrency guard.
+    #[test]
+    fn maintenance_validation_ignores_api_only_settings() {
         let mut config = WyrdServerConfig {
             deployment_profile: DeploymentProfile::Production,
-            role: BifrostTarget::ForgeWorker,
+            role: ServerTarget::BifrostMaintenance,
             ..WyrdServerConfig::default()
+        };
+        config.bifrost.peer = BifrostPeerConfig {
+            address: Some("maintenance-0.peers.svc:50052".to_owned()),
+            tls_dir: Some(PathBuf::from("/etc/wyrd/peer")),
+            ..BifrostPeerConfig::default()
         };
         config.bifrost.scribe.coordination_threads = Some(0);
         config.bifrost.oracle.admission_waiters = 0;
@@ -4520,13 +4667,13 @@ mod tests {
 
         config
             .validate()
-            .expect("ForgeWorker should validate only owned Forge and metrics settings");
+            .expect("bifrost-maintenance validates only owned Forge, peer, and metrics settings");
     }
 
     /// Proves API-owning roles reject the same malformed service settings.
     #[test]
     fn api_roles_reject_forge_worker_only_validation_bypass() {
-        for role in [BifrostTarget::All, BifrostTarget::Server] {
+        for role in [ServerTarget::Combined, ServerTarget::Direct] {
             let mut config = WyrdServerConfig {
                 deployment_profile: DeploymentProfile::Production,
                 role,
@@ -4554,7 +4701,7 @@ mod tests {
     #[test]
     fn production_peer_target_needs_no_public_grpc_certificate() {
         let directory = tempfile::tempdir().expect("key temp directory");
-        for role in [BifrostTarget::All, BifrostTarget::Oracle] {
+        for role in [ServerTarget::Combined, ServerTarget::BifrostQuery] {
             let mut config = WyrdServerConfig {
                 deployment_profile: DeploymentProfile::Production,
                 role,
@@ -5499,20 +5646,25 @@ minimum_slots = 2
         );
     }
 
-    /// An oversized Operator key version is ignored by a dedicated Forge
-    /// worker, which owns no Operator keys, and refused before boot for an
-    /// API-bearing role.
+    /// An oversized Operator key version is ignored by the Forge maintenance
+    /// target, which owns no Operator keys, and refused before boot for an
+    /// API-bearing target.
     #[test]
     fn oversized_operator_key_version_follows_role_ownership() {
         for (role, accepted) in [
-            (BifrostTarget::ForgeWorker, true),
-            (BifrostTarget::Server, false),
+            (ServerTarget::BifrostMaintenance, true),
+            (ServerTarget::Direct, false),
         ] {
             let mut config = WyrdServerConfig {
                 role,
                 ..WyrdServerConfig::default()
             };
             config.bifrost.oracle.allow_unapproved_profile = true;
+            config.bifrost.peer = BifrostPeerConfig {
+                address: Some("pod-0.peers.svc:50052".to_owned()),
+                tls_dir: Some(PathBuf::from("/etc/wyrd/peer")),
+                ..BifrostPeerConfig::default()
+            };
             config.verification.operator_keys.active_version =
                 NonZeroU32::new(2_147_483_648).expect("positive");
             match config.validate() {
@@ -5588,8 +5740,9 @@ minimum_slots = 2
     ///
     /// The default target needs no peer input. A split target without peer
     /// mode, half of the peer inputs, a URI-shaped or portless address, a
-    /// loopback gRPC bind on the wildcard peer port, and a Forge worker with
-    /// peer inputs are each refused before boot.
+    /// loopback gRPC bind on the wildcard peer port, and peer credentials
+    /// without an address are each refused before boot. Every split target,
+    /// including the Forge maintenance target, needs peer mode.
     #[test]
     fn peer_mode_is_explicit_and_validated() {
         let peer = |address: &str| BifrostPeerConfig {
@@ -5602,7 +5755,7 @@ minimum_slots = 2
             .validate()
             .expect("the default target needs no peer mode");
 
-        config.role = BifrostTarget::Oracle;
+        config.role = ServerTarget::BifrostQuery;
         assert!(config.validate().is_err(), "a split target needs peer mode");
         config.bifrost.peer = peer("oracle-0.peers.svc:50052");
         config.validate().expect("a complete split peer validates");
@@ -5639,60 +5792,26 @@ minimum_slots = 2
         );
         config.grpc.bind = WyrdServerConfig::default().grpc.bind;
 
-        config.role = BifrostTarget::ForgeWorker;
-        config.bifrost.peer = peer("worker-0.peers.svc:50052");
-        assert!(
-            config.validate().is_err(),
-            "a Forge worker opens no peer socket"
-        );
-    }
-
-    /// A dedicated Forge worker takes peer credentials without an address and
-    /// reads them to dial the leader; a listening target may not.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a dial-only worker is refused or reads no bundle, or when a
-    /// listening target accepts credentials without an address.
-    #[test]
-    fn forge_worker_takes_dial_only_peer_credentials() {
-        let dir = tempfile::tempdir().expect("peer TLS directory");
-        for (name, contents) in [("ca.crt", "ca"), ("tls.crt", "leaf"), ("tls.key", "key")] {
-            std::fs::write(dir.path().join(name), contents).expect("peer TLS file");
+        for role in [
+            ServerTarget::Direct,
+            ServerTarget::Worker,
+            ServerTarget::BifrostIngest,
+            ServerTarget::BifrostMaintenance,
+        ] {
+            config.role = role;
+            config.bifrost.peer = BifrostPeerConfig::default();
+            assert!(config.validate().is_err(), "{role:?} needs peer mode");
+            config.bifrost.peer = BifrostPeerConfig {
+                tls_dir: Some(PathBuf::from("/etc/wyrd/peer")),
+                ..BifrostPeerConfig::default()
+            };
+            assert!(
+                config.validate().is_err(),
+                "{role:?} needs an address with its credentials"
+            );
+            config.bifrost.peer = peer("pod-0.peers.svc:50052");
+            config.validate().expect("a complete split peer validates");
         }
-        let dial_only = BifrostPeerConfig {
-            tls_dir: Some(dir.path().to_path_buf()),
-            ..BifrostPeerConfig::default()
-        };
-        let mut config = WyrdServerConfig {
-            role: BifrostTarget::ForgeWorker,
-            ..WyrdServerConfig::default()
-        };
-        config.bifrost.peer = dial_only.clone();
-        config
-            .validate()
-            .expect("a Forge worker dials the leader with credentials alone");
-        assert_eq!(config.bifrost.peer.advertised_uri(), None);
-        let bundle = config
-            .bifrost
-            .peer
-            .read_bundle()
-            .expect("the dial-only bundle reads")
-            .expect("dial-only credentials are peer mode");
-        assert_eq!(bundle.certificate_chain, b"leaf");
-
-        config.bifrost.peer.tls_dir = Some(PathBuf::new());
-        assert!(
-            config.validate().is_err(),
-            "an empty dial-only directory is refused"
-        );
-
-        config.role = BifrostTarget::Server;
-        config.bifrost.peer = dial_only;
-        assert!(
-            config.validate().is_err(),
-            "a listening target needs an address with its credentials"
-        );
     }
 
     /// Proves the canonical peer environment names land on the validated fields.

@@ -934,11 +934,24 @@ async fn published_snapshot(server: &WyrdTestServer) -> Arc<ReadinessSnapshot> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn forge_checks_follow_target_selection() {
     for (target, coordinator, worker) in [
-        (wyrd_server::config::BifrostTarget::All, true, true),
-        (wyrd_server::config::BifrostTarget::Server, true, false),
-        (wyrd_server::config::BifrostTarget::Oracle, false, false),
-        (wyrd_server::config::BifrostTarget::Scribe, false, false),
-        (wyrd_server::config::BifrostTarget::ForgeWorker, false, true),
+        (wyrd_server::config::ServerTarget::Combined, true, true),
+        (wyrd_server::config::ServerTarget::Direct, false, false),
+        (wyrd_server::config::ServerTarget::Worker, false, false),
+        (
+            wyrd_server::config::ServerTarget::BifrostQuery,
+            false,
+            false,
+        ),
+        (
+            wyrd_server::config::ServerTarget::BifrostIngest,
+            false,
+            false,
+        ),
+        (
+            wyrd_server::config::ServerTarget::BifrostMaintenance,
+            true,
+            true,
+        ),
     ] {
         let server = WyrdTestServer::builder()
             .with_bifrost_target_for_test(target)
@@ -2352,7 +2365,7 @@ async fn forge_runtime_composes_only_for_forge_targets() {
     server.shutdown().await.expect("server shuts down");
 
     let scribe = WyrdTestServer::builder()
-        .with_bifrost_target_for_test(wyrd_server::config::BifrostTarget::Scribe)
+        .with_bifrost_target_for_test(wyrd_server::config::ServerTarget::BifrostIngest)
         .start_in_process()
         .await
         .expect("a Scribe-only server starts");

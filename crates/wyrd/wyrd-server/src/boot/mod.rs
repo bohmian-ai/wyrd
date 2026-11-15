@@ -334,7 +334,7 @@ async fn build_bifrost_external_dependencies(
     dsns: &ResolvedDsns,
     config: &crate::config::BifrostRuntimeConfig,
     forge: &ForgeRuntimeConfig,
-    target: crate::config::BifrostTarget,
+    target: crate::config::ServerTarget,
 ) -> Result<BifrostExternalDependencies, ServerBootError> {
     let data_root = BifrostDataRoot::prepare(config.data_dir())?;
     let postgres = Arc::new(ServerPostgres::connect_from_dsns(dsns).await?);
@@ -1353,7 +1353,7 @@ impl AppState {
                 config.deployment_profile,
                 sealing_key.clone(),
             )?;
-            let blocks = if config.verification.enabled && config.role.serves_api() {
+            let blocks = if config.verification.enabled && config.role.serves_verifiers() {
                 Some(
                     HostedBlocks::start(
                         worker,
@@ -1446,8 +1446,9 @@ impl AppState {
 
     /// The engine-owned background work this process runs until shutdown:
     /// each owner's cache invalidation listener where its cache serves, and
-    /// the verification runtime of an API-serving process with verification
-    /// enabled, its drain grace clipped inside the server's shutdown budget.
+    /// the queued verification runtime of a target that runs queued work with
+    /// verification enabled, its drain grace clipped inside the server's
+    /// shutdown budget. A `direct` target never claims queued executions.
     fn engine_workers(&self, config: &WyrdServerConfig) -> Vec<EngineWorker> {
         let postgres = self.postgres.wyrd();
         let shutdown = &self.shutdown_token;
@@ -1466,6 +1467,7 @@ impl AppState {
         #[cfg(not(feature = "test-support"))]
         let held = false;
         if config.verification.enabled
+            && config.role.runs_queued()
             && !held
             && let Some(runtime) = VerificationRuntime::builder(self)
                 .limits(
@@ -1720,7 +1722,7 @@ struct OracleRoleBuilder<'a> {
     /// Validated Bifrost configuration borrowed for this activation.
     config: &'a crate::config::BifrostRuntimeConfig,
     /// Closed process target controlling Oracle selection.
-    target: crate::config::BifrostTarget,
+    target: crate::config::ServerTarget,
     /// Deployment posture used for remote TLS validation.
     deployment_profile: crate::config::DeploymentProfile,
     /// Cluster registry owning the role fence and readiness publication.
@@ -2638,18 +2640,19 @@ pub(crate) mod pg_tests {
     /// Panics when the shared boot helper duplicates Gate, catalog, peer, or tail owners.
     #[test]
     fn production_and_test_server_share_bifrost_composition() {
-        use crate::config::{BifrostRoles, BifrostRuntimeRole as Role, BifrostTarget};
+        use crate::config::{BifrostRoles, BifrostRuntimeRole as Role, ServerTarget};
 
         let cases = [
+            (ServerTarget::Direct, vec![Role::Scribe, Role::Oracle]),
+            (ServerTarget::Worker, vec![Role::Scribe, Role::Oracle]),
+            (ServerTarget::BifrostQuery, vec![Role::Oracle]),
+            (ServerTarget::BifrostIngest, vec![Role::Scribe]),
             (
-                BifrostTarget::Server,
-                vec![Role::Scribe, Role::ForgeCoordinator, Role::Oracle],
+                ServerTarget::BifrostMaintenance,
+                vec![Role::ForgeCoordinator, Role::ForgeWorker],
             ),
-            (BifrostTarget::Oracle, vec![Role::Oracle]),
-            (BifrostTarget::Scribe, vec![Role::Scribe]),
-            (BifrostTarget::ForgeWorker, vec![Role::ForgeWorker]),
             (
-                BifrostTarget::All,
+                ServerTarget::Combined,
                 vec![
                     Role::Scribe,
                     Role::ForgeCoordinator,

@@ -8286,12 +8286,15 @@ async fn custom_query_preserves_evidence_and_limits() -> Result<(), ServerJourne
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the serialized Postgres-backed journey lane"]
 async fn scaled_outboxes_preserve_sdk_evidence() -> Result<(), ServerJourneyError> {
-    use wyrd_server::config::BifrostTarget;
+    use wyrd_server::config::ServerTarget;
     const EXECUTIONS: usize = 40;
     for (targets, cpu) in [
-        (&[BifrostTarget::All][..], 4),
-        (&[BifrostTarget::All][..], 16),
-        (&[BifrostTarget::Oracle, BifrostTarget::Scribe][..], 16),
+        (&[ServerTarget::Combined][..], 4),
+        (&[ServerTarget::Combined][..], 16),
+        (
+            &[ServerTarget::BifrostQuery, ServerTarget::BifrostIngest][..],
+            16,
+        ),
     ] {
         let mut spec = BifrostClusterSpec::for_targets(targets);
         for node in &mut spec.nodes {

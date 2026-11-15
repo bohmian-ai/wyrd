@@ -60,8 +60,8 @@ use wyrd_server::boot::data_root::BifrostDataRoot;
 use wyrd_server::boot::{BifrostExternalDependencies, BootedServer, StartInputs};
 use wyrd_server::components::platform::builtins::BuiltinTables;
 use wyrd_server::config::{
-    BifrostRuntimeRole, BifrostTarget, ForgeRuntimeConfig, GatewayConfig, IssuerEntry,
-    OperatorKeySource, OperatorKeysConfig, ServeMode, WorkloadBindingEntry,
+    BifrostRuntimeRole, ForgeRuntimeConfig, GatewayConfig, IssuerEntry, OperatorKeySource,
+    OperatorKeysConfig, ServeMode, ServerTarget, WorkloadBindingEntry,
 };
 use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
@@ -279,7 +279,7 @@ struct WyrdTestServerInner {
     /// Ranged-read probe wrapping this server's Bifrost object store.
     object_reads: Arc<ObjectReadProbe>,
     /// Process composition selected for this test server.
-    forge_process_role: BifrostTarget,
+    forge_process_role: ServerTarget,
     /// Stable identity assigned to this server process.
     node_id: NodeId,
     /// Atomic one-shot query truncation controls for language journeys.
@@ -542,7 +542,7 @@ pub struct WyrdTestServerBuilder {
     /// Exact private peer address this server binds and advertises.
     peer_bind: Option<std::net::SocketAddr>,
     /// Production Forge process role used by bound test servers.
-    forge_process_role: BifrostTarget,
+    forge_process_role: ServerTarget,
     /// Optional observer of successful supervised worker completions.
     forge_completion_observer: Option<ForgeWorkerCompletionObserver>,
     /// Optional test-only Forge catalog wrapper.
@@ -701,7 +701,7 @@ impl Default for WyrdTestServerBuilder {
             peer_tls: None,
             peer_tls_root: None,
             peer_bind: None,
-            forge_process_role: BifrostTarget::All,
+            forge_process_role: ServerTarget::Combined,
             forge_completion_observer: None,
             forge_catalog: None,
             forge_config: None,
@@ -2658,7 +2658,7 @@ impl WyrdTestServer {
 
     /// Return the production Forge process role selected for this server.
     #[must_use]
-    pub const fn forge_process_role(&self) -> BifrostTarget {
+    pub const fn forge_process_role(&self) -> ServerTarget {
         self.inner.forge_process_role
     }
 
@@ -4380,24 +4380,6 @@ impl WyrdTestServer {
         let state = self.inner.state.clone();
         let shutdown_token = state.shutdown_token.clone();
 
-        if self.forge_process_role() == BifrostTarget::ForgeWorker {
-            let worker = wyrd_server::boot::spawn_forge_worker(&state, shutdown_token.clone())
-                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-            // A dedicated Forge worker never runs the bounded Bifrost drain, so
-            // its serve task reports that nothing drained rather than claiming a
-            // drain outcome it did not produce.
-            let serve_handle = wyrd_runtime::runtime().spawn(async move {
-                worker
-                    .await
-                    .map(|()| BifrostShutdownReport::none_drained())
-                    .map_err(|error| wyrd_server::BootExit::Other(Box::new(error)))
-            });
-            self.shutdown_token = Some(shutdown_token);
-            self.serve_handle = Some(serve_handle);
-            self.mode = Mode::InProcess;
-            return Ok(self);
-        }
-
         // Ephemeral ports, metrics off (the recorder is a process-global
         // singleton that must not be installed per-test), reflection off.
         let loopback = "127.0.0.1:0"
@@ -4432,6 +4414,16 @@ impl WyrdTestServer {
             .bind(ServeMode::Both)
             .await
             .map_err(|e| WyrdTestServerError::Bind(format!("{e:?}")))?;
+
+        // The Forge maintenance target opens no public listener: it runs the
+        // production serving owner's scheduler, worker, and peer listener only.
+        if self.forge_process_role() == ServerTarget::BifrostMaintenance {
+            let serve_handle = wyrd_runtime::runtime().spawn(async move { bound.run().await });
+            self.shutdown_token = Some(shutdown_token);
+            self.serve_handle = Some(serve_handle);
+            self.mode = Mode::InProcess;
+            return Ok(self);
+        }
 
         let addr = bound
             .http_addr()
@@ -4542,7 +4534,7 @@ impl WyrdTestServerBuilder {
 
     /// Select the production Forge process role for this fixture.
     #[must_use]
-    pub fn with_forge_process_role_for_test(mut self, role: BifrostTarget) -> Self {
+    pub fn with_forge_process_role_for_test(mut self, role: ServerTarget) -> Self {
         self.forge_process_role = role;
         self
     }
@@ -5034,7 +5026,7 @@ impl WyrdTestServerBuilder {
     /// server activates exactly the subsystems a Scribe pod activates, without
     /// a test-specific topology.
     #[must_use]
-    pub fn with_bifrost_target_for_test(mut self, target: BifrostTarget) -> Self {
+    pub fn with_bifrost_target_for_test(mut self, target: ServerTarget) -> Self {
         self.bifrost_roles = wyrd_server::config::BifrostRoles::for_target(target)
             .iter()
             .copied()
@@ -6290,7 +6282,7 @@ mod production_composition_tests {
         BifrostResourcePolicy, BifrostRuntimeResources, ResourceSource, SystemResourceSnapshot,
     };
 
-    use super::{BifrostRuntimeRole, BifrostTarget, WyrdTestServerBuilder};
+    use super::{BifrostRuntimeRole, ServerTarget, WyrdTestServerBuilder};
 
     /// Injected raw observations reach production composition unmodified.
     ///
@@ -6345,7 +6337,7 @@ mod production_composition_tests {
         assert_eq!(sources.cpu, ResourceSource::Injected);
 
         let builder = WyrdTestServerBuilder::default();
-        assert_eq!(builder.forge_process_role, BifrostTarget::All);
+        assert_eq!(builder.forge_process_role, ServerTarget::Combined);
         assert_eq!(
             builder.bifrost_roles,
             [

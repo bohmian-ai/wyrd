@@ -1012,13 +1012,15 @@ impl<'a> VerificationControl<'a> {
     /// and publications, so a repeat answers the current status.
     ///
     /// # Errors
-    /// The errors of [`Self::retained`] for `verifier:run`, and a registry
-    /// error when the update or commit fails.
+    /// [`WyrdError::VerificationWrongTarget`] on a target that does not run
+    /// queued work, the errors of [`Self::retained`] for `verifier:run`, and
+    /// a registry error when the update or commit fails.
     pub(crate) async fn cancel(
         &self,
         caller: &Caller,
         execution_id: ExecutionId,
     ) -> Result<CancelExecutionResponse, WyrdError> {
+        self.state.settings.role.require_queued(CANCEL)?;
         let (mut conn, _) = self
             .authorized(caller, execution_id, Action::Run, CANCEL)
             .await?;

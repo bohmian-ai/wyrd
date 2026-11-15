@@ -42,8 +42,9 @@ impl VerificationControl<'_> {
     /// its decisions when its bounded park ends.
     ///
     /// # Errors
-    /// Returns [`WyrdError::VerificationInputInvalid`] for an oversized
-    /// reason; [`WyrdError::PermissionDeniedRbac`] without `verifier:approve`
+    /// Returns [`WyrdError::VerificationWrongTarget`] on a target that does
+    /// not run queued work; [`WyrdError::VerificationInputInvalid`] for an
+    /// oversized reason; [`WyrdError::PermissionDeniedRbac`] without `verifier:approve`
     /// on the execution's exact Verifier; the read errors of an inspection;
     /// [`WyrdError::VerificationApprovalNotFound`] when the execution
     /// recorded no such occurrence; [`WyrdError::VerificationTargetNotFound`] when the
@@ -65,6 +66,7 @@ impl VerificationControl<'_> {
         approval_id: ApprovalId,
         request: DecideApprovalRequest,
     ) -> Result<ApprovalReceipt, WyrdError> {
+        self.state.settings.role.require_queued(DECIDE_APPROVAL)?;
         if request
             .reason
             .as_ref()

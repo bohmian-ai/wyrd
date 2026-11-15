@@ -50,8 +50,9 @@ impl VerificationControl<'_> {
     /// starts an execution and never reopens a settled one.
     ///
     /// # Errors
-    /// Returns [`WyrdError::PermissionDeniedRbac`] without any `verifier:run`
-    /// grant, or when every subscriber is one the caller may not run;
+    /// Returns [`WyrdError::VerificationWrongTarget`] on a target that does
+    /// not run queued work; [`WyrdError::PermissionDeniedRbac`] without any
+    /// `verifier:run` grant, or when every subscriber is one the caller may not run;
     /// [`WyrdError::VerificationInputInvalid`] for an abbreviated commit, a
     /// trace, a File that is not a completed upload, or a value that does not
     /// conform to a subscriber's slot; [`WyrdError::VerificationInputTooLarge`]
@@ -69,6 +70,7 @@ impl VerificationControl<'_> {
         caller: &Caller,
         request: PublishEvidenceRequest,
     ) -> Result<PublishEvidenceResponse, WyrdError> {
+        self.state.settings.role.require_queued(PUBLISH_EVIDENCE)?;
         self.authorize_evidence(caller, PUBLISH_EVIDENCE, "verification.evidence.publish")?;
         let invalid = |reason: &str| WyrdError::VerificationInputInvalid {
             message: format!("input {}: {reason}", request.input),

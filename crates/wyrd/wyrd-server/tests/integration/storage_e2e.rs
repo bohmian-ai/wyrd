@@ -19,7 +19,7 @@ use wyrd_client::storage::WyrdStorageClient;
 use wyrd_client::transport::HttpTransport;
 use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
-use wyrd_server::config::BifrostTarget;
+use wyrd_server::config::ServerTarget;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::ids::CardUid;
@@ -154,7 +154,7 @@ async fn register_card(
 /// Starts a bound artifact-storage server over `settings`.
 ///
 /// Storage journeys exercise artifact upload and download only, so the server
-/// runs the API `Server` target without an embedded Forge worker: a worker
+/// runs the `direct` target, which composes no Forge worker: a worker
 /// refuses staging backends lacking native `start_after` listing (Azure), which
 /// is Forge behavior these journeys do not cover.
 ///
@@ -163,7 +163,7 @@ async fn register_card(
 /// Panics when the server fails to start or become ready.
 async fn server_from_settings(settings: StorageSettings) -> WyrdTestServer {
     WyrdTestServer::builder()
-        .with_bifrost_target_for_test(BifrostTarget::Server)
+        .with_bifrost_target_for_test(ServerTarget::Direct)
         .with_storage_settings(settings)
         .start_bound()
         .await

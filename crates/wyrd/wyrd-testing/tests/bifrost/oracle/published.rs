@@ -17,7 +17,7 @@ use vala_bifrost_redux::forge::ForgeConfig;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_client::WyrdClient;
 use wyrd_runtime::Permission;
-use wyrd_server::config::BifrostTarget;
+use wyrd_server::config::ServerTarget;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdProblem;
 use wyrd_spec::vala::api::{BifrostQueryRequest, QueryClass};
@@ -873,10 +873,10 @@ async fn variant_sql_registry_covers_every_session() {
 /// topology has followers.
 async fn prove_variant_sql_sessions() -> Result<(), JourneyError> {
     let cluster = PeerCluster::start_with_slots(&[
-        (BifrostTarget::Oracle, Some(2)),
-        (BifrostTarget::Oracle, Some(2)),
-        (BifrostTarget::Oracle, Some(2)),
-        (BifrostTarget::Scribe, None),
+        (ServerTarget::BifrostQuery, Some(2)),
+        (ServerTarget::BifrostQuery, Some(2)),
+        (ServerTarget::BifrostQuery, Some(2)),
+        (ServerTarget::BifrostIngest, None),
     ])
     .await?;
     let suffix = uuid::Uuid::now_v7().simple();
@@ -1193,7 +1193,7 @@ async fn prove_worker_tenant_refusal(
         .await?;
     cluster.refresh_snapshots().await?;
     let baseline = cluster
-        .indices_of(BifrostTarget::Oracle)
+        .indices_of(ServerTarget::BifrostQuery)
         .into_iter()
         .map(|index| Ok((index, cluster.ownership_snapshot(index)?)))
         .collect::<Result<Vec<_>, JourneyError>>()?;

@@ -401,7 +401,7 @@ async fn dedicated_forge_worker_shutdown_drains_its_claim_before_storage_settles
     let observer = vala_bifrost_redux::forge::ForgeWorkerCompletionObserver::new();
     observer.hold_after_claims_for_test(1);
     let worker = wyrd_testing::WyrdTestServer::builder()
-        .with_forge_process_role_for_test(wyrd_server::BifrostTarget::ForgeWorker)
+        .with_forge_process_role_for_test(wyrd_server::ServerTarget::BifrostMaintenance)
         .with_forge_completion_observer_for_test(observer.clone())
         .start_bound()
         .await?;
@@ -618,7 +618,7 @@ fn observation(cpu: usize) -> vala_bifrost_redux::resources::SystemResourceSnaps
 #[ignore = "requires Postgres and object storage"]
 async fn startup_consumers_share_one_resource_configuration() {
     use vala_bifrost_redux::resources::{ScribeWorkerOverrides, ScribeWorkers};
-    use wyrd_server::config::BifrostTarget;
+    use wyrd_server::config::ServerTarget;
     use wyrd_testing::bifrost::TestOracleResources;
 
     let assert_node =
@@ -639,7 +639,7 @@ async fn startup_consumers_share_one_resource_configuration() {
         };
 
     let mut split =
-        BifrostClusterSpec::for_targets(&[BifrostTarget::Oracle, BifrostTarget::Scribe]);
+        BifrostClusterSpec::for_targets(&[ServerTarget::BifrostQuery, ServerTarget::BifrostIngest]);
     for (node, cpu) in split.nodes.iter_mut().zip([16, 4]) {
         node.oracle = Some(TestOracleResources {
             system_resources: Some(observation(cpu)),
@@ -661,7 +661,7 @@ async fn startup_consumers_share_one_resource_configuration() {
         ingress_cpu_threads: Some(5),
         ..ScribeWorkerOverrides::default()
     };
-    let mut combined = BifrostClusterSpec::for_targets(&[BifrostTarget::All]);
+    let mut combined = BifrostClusterSpec::for_targets(&[ServerTarget::Combined]);
     combined.nodes[0].oracle = Some(TestOracleResources {
         system_resources: Some(observation(32)),
         effective_cpu_cap: Some(8),

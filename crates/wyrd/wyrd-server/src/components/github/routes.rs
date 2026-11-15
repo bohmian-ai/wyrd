@@ -291,6 +291,8 @@ async fn callback(
           (WYRD_GITHUB_401_WEBHOOK_REFUSED)", body = WyrdProblem),
         (status = 409, description = "The connection changed while GitHub reported a \
           suspension; redeliver (WYRD_GITHUB_409_CONNECTION_CONFLICT)", body = WyrdProblem),
+        (status = 421, description = "This server's WYRD_TARGET does not run queued Verifier \
+          work (WYRD_VERIFICATION_421_WRONG_TARGET)", body = WyrdProblem),
         (status = 503, description = "No GitHub App is configured, GitHub could not report \
           a suspension, or the registry is unavailable (WYRD_GITHUB_503_NOT_CONFIGURED, \
           WYRD_GITHUB_503_PROVIDER_UNAVAILABLE, WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE)", body = WyrdProblem)

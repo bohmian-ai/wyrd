@@ -36,7 +36,7 @@ use wyrd_client::WyrdClient;
 use wyrd_client::bifrost::BifrostClientError;
 use wyrd_runtime::permission::PermissionSet;
 use wyrd_runtime::{Permission, Principal, PrincipalKind};
-use wyrd_server::config::BifrostTarget;
+use wyrd_server::config::ServerTarget;
 use wyrd_server::oracle::{
     ScribeFragmentFault, arm_scribe_fragment_fault_for_test, arm_tail_listing_stale_for_test,
     arm_tail_listing_stall_for_test,
@@ -1938,11 +1938,11 @@ async fn published_workers_and_live_scribes_share_one_plan() -> Result<(), Journ
     /// Scribe pods that each hold live rows.
     const SCRIBES: [usize; 2] = [3, 4];
     let cluster = PeerCluster::start(&[
-        BifrostTarget::Oracle,
-        BifrostTarget::Oracle,
-        BifrostTarget::Oracle,
-        BifrostTarget::Scribe,
-        BifrostTarget::Scribe,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostIngest,
+        ServerTarget::BifrostIngest,
     ])
     .await?;
     let api_key = cluster
@@ -3037,10 +3037,10 @@ async fn iceberg_assigned_field_ids_promote_fresh_signal_tables() -> Result<(), 
 async fn canonical_signal_rows_survive_publication_recovery_and_compaction()
 -> Result<(), JourneyError> {
     let spec = BifrostClusterSpec::for_targets(&[
-        BifrostTarget::Scribe,
-        BifrostTarget::Oracle,
-        BifrostTarget::ForgeWorker,
-        BifrostTarget::Server,
+        ServerTarget::BifrostIngest,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostMaintenance,
+        ServerTarget::Direct,
     ]);
     let scribe_node = spec
         .nodes
@@ -3373,9 +3373,10 @@ const CUSTOM_BLOOM_COLUMN: &str = "label";
 async fn hot_filtering_mechanisms_cover_all_table_kinds() -> Result<(), JourneyError> {
     let cluster = WyrdTestCluster::start_spec_with_forge_config_and_completion_observer(
         BifrostClusterSpec::for_targets(&[
-            BifrostTarget::Scribe,
-            BifrostTarget::Oracle,
-            BifrostTarget::Server,
+            ServerTarget::BifrostIngest,
+            ServerTarget::BifrostQuery,
+            ServerTarget::BifrostMaintenance,
+            ServerTarget::Direct,
         ]),
         ForgeConfig::default(),
         true,
@@ -3453,10 +3454,10 @@ const REWRITE_ROW_GROUP_BYTES: u64 = 768 * 1024;
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn iceberg_filtering_mechanisms_cover_all_table_kinds() -> Result<(), JourneyError> {
     let spec = BifrostClusterSpec::for_targets(&[
-        BifrostTarget::Scribe,
-        BifrostTarget::Oracle,
-        BifrostTarget::ForgeWorker,
-        BifrostTarget::Server,
+        ServerTarget::BifrostIngest,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostMaintenance,
+        ServerTarget::Direct,
     ]);
     let coordinator = spec
         .nodes
@@ -3646,10 +3647,10 @@ const POLICIES_ENDING_EMPTY: [&[&str]; POLICY_FILES] = [
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn bloom_policy_versions_answer_exactly_through_compaction() -> Result<(), JourneyError> {
     let spec = BifrostClusterSpec::for_targets(&[
-        BifrostTarget::Scribe,
-        BifrostTarget::Oracle,
-        BifrostTarget::ForgeWorker,
-        BifrostTarget::Server,
+        ServerTarget::BifrostIngest,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostMaintenance,
+        ServerTarget::Direct,
     ]);
     let coordinator = spec
         .nodes

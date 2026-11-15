@@ -20,7 +20,7 @@ use vala_bifrost_redux::oracle::analytical::AnalyticalLiveInspection;
 use wyrd_client::Bifrost;
 use wyrd_client::WyrdClient;
 use wyrd_client::bifrost::{BifrostClientError, QueryResultStream};
-use wyrd_server::config::BifrostTarget;
+use wyrd_server::config::ServerTarget;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{BifrostQueryRequest, QueryClass};
@@ -677,10 +677,10 @@ async fn single_planner_root_selects_path_and_capacity() {
 /// incorrect rows, or physical-build/ownership evidence inconsistent with the query.
 async fn prove_single_planner_routing() -> Result<(), JourneyError> {
     let mut cluster = PeerCluster::start(&[
-        BifrostTarget::Oracle,
-        BifrostTarget::Oracle,
-        BifrostTarget::Oracle,
-        BifrostTarget::Scribe,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostIngest,
     ])
     .await?;
     let api_key = cluster
@@ -1063,10 +1063,10 @@ async fn prove_public_activation() -> Result<(), JourneyError> {
     // a statement about admitted capacity instead of about whatever the
     // envelope happened to divide into.
     let mut cluster = PeerCluster::start_with_slots(&[
-        (BifrostTarget::Oracle, Some(2)),
-        (BifrostTarget::Oracle, Some(2)),
-        (BifrostTarget::Oracle, Some(2)),
-        (BifrostTarget::Scribe, None),
+        (ServerTarget::BifrostQuery, Some(2)),
+        (ServerTarget::BifrostQuery, Some(2)),
+        (ServerTarget::BifrostQuery, Some(2)),
+        (ServerTarget::BifrostIngest, None),
     ])
     .await?;
 
@@ -1246,7 +1246,7 @@ async fn prove_public_activation() -> Result<(), JourneyError> {
 
 /// Returns every Oracle pod index in one peer topology.
 fn oracle_indices(cluster: &PeerCluster) -> Vec<usize> {
-    cluster.indices_of(BifrostTarget::Oracle)
+    cluster.indices_of(ServerTarget::BifrostQuery)
 }
 
 /// Fallback is a pre-selection decision only, and a selected Analytical query
@@ -1321,10 +1321,10 @@ async fn prove_under_privileged_refusal() -> Result<(), JourneyError> {
 /// Returns the first claim that broke.
 async fn prove_selected_failure_is_terminal() -> Result<(), JourneyError> {
     let mut cluster = PeerCluster::start(&[
-        BifrostTarget::Oracle,
-        BifrostTarget::Oracle,
-        BifrostTarget::Oracle,
-        BifrostTarget::Scribe,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostIngest,
     ])
     .await?;
     let api_key = cluster
@@ -1545,11 +1545,11 @@ async fn analytical_reserves_only_configured_workers() {
 /// Returns the first selection, isolation, floor, or cleanup claim that broke.
 async fn prove_bounded_worker_reservation() -> Result<(), JourneyError> {
     let mut cluster = PeerCluster::start(&[
-        BifrostTarget::Oracle,
-        BifrostTarget::Oracle,
-        BifrostTarget::Oracle,
-        BifrostTarget::Oracle,
-        BifrostTarget::Scribe,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostIngest,
     ])
     .await?;
     let api_key = cluster

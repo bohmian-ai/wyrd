@@ -2359,6 +2359,26 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: Value,
     },
+    /// This server's deployment target does not run the requested Verifier
+    /// work.
+    ///
+    /// Refused before authorization, admission, or any write, so nothing of
+    /// the refused call exists and the identical call may be sent to a server
+    /// whose target runs it.
+    #[error("[WYRD_VERIFICATION_421_WRONG_TARGET] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_421_WRONG_TARGET",
+        status = 421,
+        title = "Verification sent to the wrong target",
+        remediation = "Nothing of the refused call was recorded: send synchronous verify to a `direct` or `combined` server and queued work (enqueue, webhooks, deferred evidence, approvals, cancellation) to a `worker` or `combined` server; `details.target` names this server's target."
+    )]
+    VerificationWrongTarget {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload naming this server's target and the
+        /// refused work.
+        details: Value,
+    },
     /// An Operator template, URL origin, or header violates the Operator contract.
     #[error("[WYRD_SPEC_400_INVALID_OPERATOR] {message}")]
     #[wyrd_error(
@@ -4289,6 +4309,7 @@ impl WyrdError {
             | Self::VerificationToolBudgetExceeded { message, details }
             | Self::VerificationExecutionTimedOut { message, details }
             | Self::VerificationStagingFull { message, details }
+            | Self::VerificationWrongTarget { message, details }
             | Self::SpecInvalidOperator { message, details }
             | Self::SpecOperatorConnectionUnavailable { message, details }
             | Self::OperatorConnectionNotFound { message, details }

@@ -634,7 +634,9 @@ impl<'a> GithubConnections<'a> {
     /// permission.
     ///
     /// # Errors
-    /// Returns [`WyrdError::GithubNotConfigured`],
+    /// Returns [`WyrdError::VerificationWrongTarget`] on a target that does
+    /// not run queued work, which owns webhook ingress;
+    /// [`WyrdError::GithubNotConfigured`],
     /// [`WyrdError::GithubWebhookRefused`] for a missing or wrong signature,
     /// [`WyrdError::GithubRequestInvalid`] for a body that is not an event,
     /// [`WyrdError::GithubUnavailable`] when GitHub cannot report a
@@ -648,6 +650,10 @@ impl<'a> GithubConnections<'a> {
         signature: Option<&str>,
         body: &[u8],
     ) -> Result<(), WyrdError> {
+        self.state
+            .settings
+            .role
+            .require_queued("github_connection.webhook")?;
         let app = self.app()?;
         if !app.verify_webhook(body, signature) {
             return Err(WyrdError::GithubWebhookRefused {

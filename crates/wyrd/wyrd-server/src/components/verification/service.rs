@@ -477,8 +477,9 @@ impl<'a> VerificationControl<'a> {
     /// load, engine bookkeeping, and staging less the Verifier blocks.
     ///
     /// # Errors
-    /// Returns [`WyrdError::PermissionDeniedRbac`] without `verifier:run` on
-    /// the Verifier,
+    /// Returns [`WyrdError::VerificationWrongTarget`] on a target that does
+    /// not run direct work, [`WyrdError::PermissionDeniedRbac`] without
+    /// `verifier:run` on the Verifier,
     /// [`WyrdError::VerificationTargetNotFound`] for an
     /// unknown, inactive, or non-Verifier target,
     /// [`WyrdError::VerificationInputUnsupported`] for a Window Verifier,
@@ -507,6 +508,7 @@ impl<'a> VerificationControl<'a> {
         edge_timer: Option<&EdgeTimer>,
         arrival: Option<RequestArrival>,
     ) -> Result<VerificationResult, WyrdError> {
+        self.state.settings.role.require_direct(EXECUTE)?;
         let arrived = arrival.map_or_else(std::time::Instant::now, RequestArrival::instant);
         let telemetry = ExecutionTelemetry::start(ExecutionMode::Direct, Some(arrived));
         let (label, result) = self
@@ -762,9 +764,10 @@ impl<'a> VerificationControl<'a> {
     /// execution's [`Cause`], which its attempts link to.
     ///
     /// # Errors
-    /// Returns [`WyrdError::PermissionDeniedRbac`] without `verifier:run` on
-    /// the Verifier, [`WyrdError::VerificationInputTooLarge`] for inputs
-    /// past a Variant limit, `WYRD_SPEC_400_VALIDATION` for an empty
+    /// Returns [`WyrdError::VerificationWrongTarget`] on a target that does
+    /// not run queued work, [`WyrdError::PermissionDeniedRbac`] without
+    /// `verifier:run` on the Verifier, [`WyrdError::VerificationInputTooLarge`]
+    /// for inputs past a Variant limit, `WYRD_SPEC_400_VALIDATION` for an empty
     /// `deployment_environment`, [`WyrdError::ServiceUnavailable`] when this
     /// process hosts no Verifier queue or the submission was lost before its
     /// admission committed, [`WyrdError::RegistryIdempotencyConflict`] when
@@ -777,6 +780,7 @@ impl<'a> VerificationControl<'a> {
         request: VerificationRequest,
         key: Option<&IdempotencyKey>,
     ) -> Result<EnqueueVerificationResponse, WyrdError> {
+        self.state.settings.role.require_queued(ENQUEUE)?;
         let submissions = self
             .state
             .bifrost

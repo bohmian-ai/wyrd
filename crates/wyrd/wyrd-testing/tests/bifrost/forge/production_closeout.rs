@@ -19,9 +19,8 @@ use rand::{RngCore, SeedableRng, rngs::StdRng};
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef, TenantTableBinding};
 use vala_bifrost_redux::forge::{
-    ForgeCommitNotice, ForgeCompactionDispatch, ForgeCompactionOutcome, ForgeCompactionType,
-    ForgeConfig, ForgeError, ForgeHeldTerm, ForgeLifecycleEvent, ForgeTableKey, ForgeTableSettings,
-    ForgeWorkerCompletionObserver,
+    ForgeCommitNotice, ForgeCompactionOutcome, ForgeConfig, ForgeError, ForgeHeldTerm,
+    ForgeLifecycleEvent, ForgeTableKey, ForgeTableSettings, ForgeWorkerCompletionObserver,
 };
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::resources::{ResourceSource, SystemResourceSnapshot};
@@ -3055,114 +3054,21 @@ async fn empty_maintenance_restart_protects_orphans() {
     journey.cluster.shutdown().await.expect("cluster drains");
 }
 
-/// Compactors pull the oldest due tables on either route and both replicas work.
+/// Both replicas' workers pull due compaction from the one leader and drain it.
 ///
-/// Mirrors RisingWave's compactor pull (`compactor/mod.rs:1606-1640`) and
-/// oldest-due dispatch (`schedule.rs:428-490,915-993`) at e23ddf95: a pull
-/// names only table identities, a failed delivery returns the table to Idle
-/// with its commits, and success consumes only the commits counted at
-/// dispatch. The first cluster runs coordinators without workers so every
-/// pull is the test's own; the second lets both replicas' workers pull.
+/// Mirrors RisingWave's compactor pull (`compactor/mod.rs:1606-1640`) at
+/// e23ddf95. Pull order, limits, failed hand-back, and stale reports are
+/// pinned by the Forge leader tests and the production route tests; no
+/// deployment target runs a coordinator without its worker, so this journey
+/// proves only that every replica's worker executes pulled work.
 ///
 /// # Panics
-/// Panics when a pull returns tables out of due order or beyond its limit,
-/// a route disagrees with the other, a report loses a commit, or the workers
-/// of only one replica execute the dispatched backlog.
+/// Panics when the backlog does not drain, a table gets other than one
+/// succeeded attempt, or the workers of only one replica execute it.
 #[tokio::test]
 #[ignore = "requires Postgres and two replicas"]
-async fn compactors_pull_oldest_due_with_capacity() {
+async fn replicas_pull_and_drain_due_compaction() {
     let due_now = [("wyrd.forge.compaction.trigger-snapshot-count", "1")];
-    let mut spec = BifrostClusterSpec::two_mixed();
-    for node in &mut spec.nodes {
-        node.roles.remove(&BifrostRuntimeRole::ForgeWorker);
-    }
-    let (first, second) = (spec.nodes[0].node_id, spec.nodes[1].node_id);
-    let journey = LeaderJourney::start(spec, false).await;
-    journey.pass(first).await;
-    journey.pass(second).await;
-    let (leader, _) = journey.leaders()[0];
-    let standby = if leader == first { second } else { first };
-    let forge = |node: NodeId| {
-        Arc::clone(
-            journey
-                .node(node)
-                .state()
-                .forge_coordinator()
-                .expect("coordinator"),
-        )
-    };
-    let mut keys = Vec::new();
-    let mut tables = Vec::new();
-    for index in 0..5_i64 {
-        let table = journey
-            .register_table_with(leader, "pull_due", &due_now)
-            .await;
-        journey.write_hot(leader, &table, &[index]).await;
-        journey.await_promoted(&table).await;
-        keys.push(journey.key(&table));
-        tables.push(table);
-    }
-    let pulled_keys = |dispatches: &[ForgeCompactionDispatch]| {
-        dispatches
-            .iter()
-            .map(|dispatch| dispatch.key.clone())
-            .collect::<Vec<_>>()
-    };
-
-    // The peer route and the in-process route share one oldest-due order.
-    let peer = forge(standby).pull_compaction(2).await.expect("peer pull");
-    assert_eq!(pulled_keys(&peer), keys[..2], "the two oldest due tables");
-    assert!(
-        peer.iter()
-            .all(|dispatch| dispatch.compaction_type == ForgeCompactionType::SmallFiles),
-        "a dispatch names the table and its task type, never files: {peer:?}"
-    );
-    let local = forge(leader).pull_compaction(2).await.expect("local pull");
-    assert_eq!(pulled_keys(&local), keys[2..4], "the next two due tables");
-
-    // A failed delivery returns the table to Idle, due now, with its commit.
-    forge(standby)
-        .report_compaction(&peer[0], ForgeCompactionOutcome::NotStarted)
-        .await
-        .expect("peer report");
-    let term = journey.held(leader).expect("leader term");
-    let reverted = term.schedule().track_for_test(&keys[0]).expect("track");
-    assert_eq!((reverted.pending_commits, reverted.in_flight), (1, None));
-    let again = forge(leader).pull_compaction(4).await.expect("local pull");
-    assert_eq!(
-        pulled_keys(&again),
-        vec![keys[0].clone(), keys[4].clone()],
-        "only due Idle tables are offered, oldest due first, within the limit"
-    );
-
-    // A commit during execution survives success; a stale report is ignored.
-    journey.write_hot(leader, &tables[1], &[10]).await;
-    journey.await_promoted(&tables[1]).await;
-    forge(standby)
-        .report_compaction(&peer[1], ForgeCompactionOutcome::Succeeded)
-        .await
-        .expect("peer report");
-    let finished = term.schedule().track_for_test(&keys[1]).expect("track");
-    assert_eq!(
-        (finished.pending_commits, finished.in_flight),
-        (1, None),
-        "success consumes only the commit counted at dispatch"
-    );
-    forge(leader)
-        .report_compaction(&peer[0], ForgeCompactionOutcome::Failed)
-        .await
-        .expect("local report");
-    assert_eq!(
-        term.schedule()
-            .track_for_test(&keys[0])
-            .expect("track")
-            .in_flight,
-        Some(again[0].task_id),
-        "a report for an earlier task changes nothing"
-    );
-    journey.cluster.shutdown().await.expect("cluster drains");
-
-    // Both replicas' workers pull from the one leader and execute the backlog.
     let journey = LeaderJourney::start(BifrostClusterSpec::two_mixed(), false).await;
     let nodes = journey
         .cluster

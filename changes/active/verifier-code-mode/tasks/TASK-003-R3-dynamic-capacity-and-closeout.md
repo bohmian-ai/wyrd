@@ -405,7 +405,7 @@ approved in revision 9 to Spec revision required above. Each row is carried, not
 | REQ-009/030; INV-004/006; AC-010/017/018/031 | Service/runner/edge/SDKs, Scenario 5/V3: shared-memory waiting-charge refusal as 503/Retry-After: 1, wait/504/429, execute/enqueue edge bypass and retained other-route 1,024 protection/body charges, no false judgment/late result/replay, accepted authority, non-blocking audit and queued attempt recovery. |
 | REQ-031; INV-007/009; AC-032 | Telemetry/process-window owners, Scenario 6/V4 plus V1/V2: balanced transitions, named admission phase, parent/child/churn coverage, bounded labels, unavailable readings and historical scopes preserved. |
 | REQ-019–023/032; AC-019–024/033 | Existing benchmark owners, V4/V5: all six public SDK populations, one Assert/two independent Agents/four governed exchanges/two real code operations per acknowledged verification; exact citations/data, compact/details, total call-return/result-ready boundaries. Clean qualified release evidence with zero c64 errors, every repetition's sample floor, unchanged overhead criterion and frozen measured target. |
-| REQ-033; AC-034 | Harness owners, V6: sustained >=200 tenants, saturation/drain/recovery, bounded fair local progress and stable parent/worker memory/disk/descriptors; repeat on two real replicas with disjoint budgets and no global fairness/scaling claim. |
+| REQ-033; AC-034 | Harness owners, V6: sustained 100 tenants (amended; was >=200), saturation/drain/recovery, bounded fair local progress and stable parent/worker memory/disk/descriptors; repeat on two real replicas with disjoint budgets and no global fairness/scaling claim. |
 | REQ-024/026; INV-008/009; AC-025/027 | Shared recorder/profile/build/package owners, V7: actual phase/CPU/native/Python/V8 artifact findings, exact process/window/feature identities and production exclusion; SR6 resolves Python managed volume. Capture count or VALID smoke alone is insufficient. |
 | REQ-025; AC-022/026; all remaining TASK-003/R1 rows | V4/V5/V7: L2 unchanged, original code-mode records/citations/permissions, compact decisions and explicit authorized details, persisted schema-3 reports and actual legacy-method regeneration. Reconcile every R1 Obligations and Implementation Evidence row, including R1-DUP and R1-DOC; independent task-review PASS required for parent closeout. |
 
@@ -621,6 +621,8 @@ Source cleanliness needing Git action is caller-owned; no commit/push/reset is
 authorized. A dirty/smoke/profile/subset run cannot become qualification.
 
 ### V6 Sustained saturation/recovery and two replicas
+
+(amended by GitHub Verifier pipelines spec revision 12, 2026-11-15: the sustained experiment below uses 100 active tenants; the two-replica proof is owned by that packet's TASK-014. See `changes/active/github-verifier-pipelines/design/code-mode-port.md`.)
 
 Extend existing experiment/harness only for missing hosted workloads. Record
 exact invocations before running; no existing flag is assumed. These are opt-in

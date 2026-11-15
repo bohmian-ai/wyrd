@@ -858,6 +858,7 @@ service or tenant quota is introduced.
   counts, clean-source/quiet-host gates and total-time boundaries. No proposed
   2,000/3,200 verifications/s or 50/100-ms targets from the diagnoses are adopted.
 - **REQ-033 — Sustained recovery and closeout.** In addition to L1, run a
+  (amended by GitHub Verifier pipelines spec revision 12, 2026-11-15: the sustained experiment uses 100 active tenants; the two-replica proof is owned by that packet's TASK-014. See `changes/active/github-verifier-pipelines/design/code-mode-port.md`.)
   sustained hundreds-of-tenants saturation/recovery experiment and a two-replica
   experiment. Show bounded queues/reservations, fair progress, stable
   parent-plus-worker memory/disk/descriptors and recovery after pressure ends;
@@ -877,7 +878,7 @@ service or tenant quota is introduced.
 | AC-031 | Public SDK/HTTP/MCP journeys prove wait then success, shared-memory waiting-charge refusal as existing 503 with `Retry-After: 1`, arrival-deadline 504, recording 429, cancellation and queued deferral/recovery without spending an attempt or replaying a direct call. Verification execute/enqueue bypass generic edge concurrency like public queries; other routes retain the 1,024 limit and charge buffered bodies to shared memory. |
 | AC-032 | Operational telemetry reconciles resource transitions with bounded labels; benchmark parent/child collection covers worker churn without relabelling parent-only historical CPU as total execution CPU. |
 | AC-033 | Clean six-population L1 satisfies unchanged integrity/sample/overhead rules and the measurement-derived c64 throughput target; full results and derivation are retained even if targets miss. |
-| AC-034 | Sustained hundreds-of-tenants and two-replica evidence establishes local fairness, finite resources, changing-demand borrowing, disjoint co-located host/filesystem budgets and recovery; remaining R1 V3/V4/ledger obligations are accounted for and independently reviewed before TASK-003 closes. |
+| AC-034 | Sustained hundreds-of-tenants and two-replica evidence establishes local fairness, finite resources, changing-demand borrowing, disjoint co-located host/filesystem budgets and recovery; remaining R1 V3/V4/ledger obligations are accounted for and independently reviewed before TASK-003 closes. | (amended by GitHub Verifier pipelines spec revision 12, 2026-11-15: the sustained experiment uses 100 active tenants; the two-replica proof is owned by that packet's TASK-014. See `changes/active/github-verifier-pipelines/design/code-mode-port.md`.)
 
 ### Architecture owner obligations
 

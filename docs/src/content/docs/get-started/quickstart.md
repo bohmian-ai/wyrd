@@ -114,7 +114,7 @@ Run the program again. Nothing changed, so it declares nothing new.
 
 ## 3. Check the other requirements
 
-In the program (`src/main.rs` in Rust), set the recipient's `authorized` to `false` and run again. Every release fails `recipient-authorized`. Set the destination's `restricted` to `false` instead, and `destination-restricted` fails. Each requirement is judged on its own.
+In the program (`src/main.rs` in Rust), set the recipient's `authorized` to `false` and run again. Every release fails `recipient-authorized`. Set the destination's `restricted` to `false` instead, and `destination-restricted` fails. Each requirement is judged on its own. Set both back to `true` before you continue.
 
 ## 4. Confirm the stored verdicts
 

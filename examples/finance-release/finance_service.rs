@@ -1,3 +1,6 @@
+//! Declare the `finance-release` Service: the typed release inputs, the policy
+//! Artifact, the judge Agent, and the `release-check` Verifier's requirements.
+
 use std::error::Error;
 
 use schemars::JsonSchema;

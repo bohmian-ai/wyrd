@@ -8,12 +8,12 @@ import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 
 import { expect, vi } from "vitest";
-import { WyrdClient, WyrdState } from "wyrd-ai";
+import { Cards, WyrdClient, WyrdState } from "wyrd-ai";
 
 import { sharingPolicyJudge } from "../support/assistant.js";
 import type { ReceivedRequest, Reply } from "../support/http-receiver.js";
 import { configureGateway } from "../support/local-development.js";
-import { serverTest } from "../support/server.js";
+import { details, serverTest } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 300_000 });
 
@@ -65,6 +65,19 @@ function verdictRequests(provider: { readonly received: readonly ReceivedRequest
     .filter((body) => body.includes(JUDGE) && /"role"\s*:\s*"tool"/.test(body));
 }
 
+/** A requirement with the policy file its check mounts for the judge. */
+type PolicyRequirement = {
+  readonly id: string;
+  readonly check: { readonly workspace: Record<string, { readonly artifact: { readonly card: { version: string } } }> };
+};
+
+/** The policy Artifact file the `follows-policy` requirement of a Verifier spec or execution outcome mounts for its judge. */
+function policyFile(owner: object): unknown {
+  const { requirements } = owner as { readonly requirements: readonly PolicyRequirement[] };
+  const followsPolicy = requirements.find(({ id }) => id === "follows-policy");
+  return followsPolicy?.check.workspace["/inputs/company-sharing-policy.pdf.json"]?.artifact;
+}
+
 test("runs the finance release Quickstart from a reader's directory", async ({ reader, provider }) => {
   const first = await run(reader);
   expect(first).toBe(FIRST_RUN);
@@ -81,6 +94,36 @@ test("runs the finance release Quickstart from a reader's directory", async ({ r
     verdicts.some((body) => body.includes("marketing partnership")),
     "the judge sees each release's purpose",
   ).toBe(true);
+
+  // An execution under the original policy, kept for inspection after the update.
+  process.chdir(reader);
+  const { service } = await import(join(EXAMPLE, "finance_service.ts"));
+  const state = await WyrdState.declare(service);
+  const earlier = await state.run().observe.verify("release-check", PERMITTED);
+  await state.shutdown();
+
+  // The reader downloads the revised policy over the original and reruns.
+  copyFileSync(join(EXAMPLE, "company-sharing-policy-revised.pdf"), join(reader, "company-sharing-policy.pdf"));
+  expect(await run(reader), "the revised policy releases the regulator request").toBe(
+    FIRST_RUN.replace(
+      "regulator request · Synthetic customer report: quarterly total $120. → failed\n" +
+        "  follows-policy: the policy does not permit sharing for this purpose\n",
+      "regulator request · Synthetic customer report: quarterly total $120. → passed\n",
+    ),
+  );
+
+  const cards = await Cards.connect();
+  const originalCheck = await cards.get({ kind: "Verifier", name: "release-check", version: "0.1.0" });
+  const revisedCheck = await cards.get({ kind: "Verifier", name: "release-check", version: "0.1.1" });
+  const revisedService = await cards.get({ kind: "Service", name: "finance-release", version: "0.1.1" });
+  expect(policyFile(originalCheck.spec)).toMatchObject({ card: { version: "0.1.0" } });
+  expect(policyFile(revisedCheck.spec)).toMatchObject({ card: { version: "0.1.1" } });
+  expect(revisedService.spec).toMatchObject({ verified_by: [{ verifier: { version: "0.1.1" } }] });
+
+  // The earlier execution still names the original policy file.
+  const earlierDetails = await details(earlier.execution_id);
+  expect(earlierDetails.verifier.version).toBe("0.1.0");
+  expect(policyFile(earlierDetails.outcome)).toEqual(policyFile(originalCheck.spec));
 });
 
 test("judges each finance requirement on its own", async ({ reader }) => {

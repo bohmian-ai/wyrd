@@ -329,9 +329,10 @@ against this checklist:
   credentials, and gRPC URLs go only to the `WyrdClient` constructor, and no
   test switches principals by editing the environment.
 - [ ] **Public surfaces only.** Public SDK modules, the in-process CLI
-  functions, the narrowly scoped test controls (`wait_for_baseline`,
-  `make_binding_due`, and for contended process memory
-  `occupy_hosted_memory` with `wait_for_hosted_waiters`), and the server's credential
+  functions, exactly the six sanctioned test controls (`flush_bifrost`,
+  `wait_for_baseline`, `make_binding_due`, `hold_publications`, and for
+  contended process memory `occupy_hosted_memory` with
+  `wait_for_hosted_waiters`), and the server's credential
   fixtures for principals that are not Service accounts. A Service or Agent
   runtime key comes from its family's Service account, created through the
   public `Principals` surface holding `workload`, and its client selects the

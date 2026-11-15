@@ -23,7 +23,7 @@ drift, not permission for code and documentation to diverge.
 - [Doctrine](#doctrine) — 21 design principles
 - [Recording and eventual consistency](#recording-and-eventual-consistency) — asynchronous recording and explicit durability boundaries
 - [Client model](#client-model) — language-agnostic protocol and first-class SDKs
-- [Kind catalog](#kind-catalog) — 12 registrable kinds + External discriminator
+- [Kind catalog](#kind-catalog) — 13 registrable kinds + External discriminator
 - [Per-kind specs](#per-kind-specs) — field shapes per kind
   - [Data](#data) · [Model](#model) · [Artifact](#artifact) · [Experiment](#experiment)
   - [Prompt](#prompt) · [Agent](#agent) · [Mcp](#mcp)

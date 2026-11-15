@@ -159,7 +159,10 @@ against it. A tool call that an Agent's `code.run` Python makes through
 `call_tool` is such an action: it uses the same accepted authority and the
 same exact `tool:invoke` and capability checks and non-blocking audit as the
 model's direct call, and nothing in the program can select or widen the
-identity, tenant, delegation, or credentials it runs under.
+identity, tenant, delegation, or credentials it runs under. The bridge
+refuses `code.run`, `fs.write`, and `publish`, so a program cannot recurse
+or publish, and writes only its private `/work` through the interpreter's
+parent-mediated mount.
 
 Publishing deferred evidence adds no permission and no authority to the
 execution that consumes it. The publisher needs current `verifier:run` on

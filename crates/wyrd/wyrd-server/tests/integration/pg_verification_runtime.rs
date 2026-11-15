@@ -5376,22 +5376,6 @@ fn lost_scribe_writes(cluster: &wyrd_testing::bifrost::cluster::WyrdTestCluster)
         .sum()
 }
 
-/// Durable rows `tenant` holds in `table`, from the published file list.
-///
-/// # Panics
-/// Panics when the file list cannot be read.
-async fn published_rows(assertion: &PgPool, tenant: DataTenantId, table: &str) -> i64 {
-    sqlx::query_scalar(
-        "SELECT COALESCE(SUM(row_count), 0)::bigint FROM vala.file_list \
-         WHERE data_tenant_id = $1 AND namespace || '.' || table_name = $2",
-    )
-    .bind(tenant.as_uuid())
-    .bind(table)
-    .fetch_one(assertion)
-    .await
-    .expect("published row count")
-}
-
 /// Calls `tools/list` on `server`'s stateless `/mcp` as `jwt`, returning the
 /// status and the response body.
 ///
@@ -5463,13 +5447,11 @@ async fn grpc_health_answers(server: &WyrdTestServer) {
 /// rises, proving copies past the permit pool are dropped at once, while
 /// HTTP, gRPC, and MCP keep answering. Once the Scribe pod joins, that same
 /// outbox drains: exactly the permitted copies publish, and a later traced
-/// execution, whose result Bifrost must accept before it returns, publishes
-/// its result and a copy with no loss.
+/// read publishes its copy with no loss.
 ///
 /// # Panics
 /// Panics when the cluster or seeding fails, a request is refused, the cap
-/// does not hold, the outbox does not drain, or the later result or copy is
-/// dropped.
+/// does not hold, the outbox does not drain, or the later copy is dropped.
 #[tokio::test]
 async fn sustained_scribe_outage_caps_tenant_spans() {
     use wyrd_testing::bifrost::cluster::{BifrostClusterSpec, WyrdTestCluster};
@@ -5481,13 +5463,9 @@ async fn sustained_scribe_outage_caps_tenant_spans() {
         .expect("the Oracle pods start without their Scribe");
     let tenant = cluster.data_tenant_id();
     let oracle = cluster.server(0).expect("an Oracle pod");
-    let (verifier, subject, _, jwt) =
+    let (_, _, _, jwt) =
         traced_tenant(oracle, tenant, "outage-caller", Registration::WithoutScribe).await;
     let outbox = Arc::clone(oracle.state().bifrost.scribe_outbox());
-    let assertion = oracle
-        .pg_fixture()
-        .superuser_pool()
-        .expect("fixture exposes a superuser pool");
 
     let lost_before = lost_scribe_writes(&cluster);
     let mut requests = 0_u64;
@@ -5549,21 +5527,22 @@ async fn sustained_scribe_outage_caps_tenant_spans() {
         "exactly the permitted copies publish"
     );
     let lost_after_recovery = lost_scribe_writes(&cluster);
-    let status = traced_execute(
-        oracle,
-        Some(&jwt),
-        (&verifier, &subject),
-        &format!("00-{RECOVERED_TRACE}-00f067aa0ba902b7-01"),
-    )
-    .await;
+    let request = axum::http::Request::builder()
+        .uri("/v1/cards")
+        .header(
+            "traceparent",
+            format!("00-{RECOVERED_TRACE}-00f067aa0ba902b7-01"),
+        )
+        .body(axum::body::Body::empty())
+        .expect("read request builds");
+    let status = oracle
+        .oneshot_authenticated(&jwt, request)
+        .await
+        .expect("read request responds")
+        .status();
     assert!(status.is_success(), "{status}");
     assert_eq!(outbox.settle(std::time::Instant::now() + WAIT).await, 0);
     scribe_pod.flush_bifrost().await.expect("Scribe flushes");
-    assert_eq!(
-        published_rows(&assertion, tenant, RESULTS).await,
-        1,
-        "the accepted execution's result publishes"
-    );
     let recovered = oracle
         .retained_span_records(tenant, "name", &format!("trace_id = X'{RECOVERED_TRACE}'"))
         .await

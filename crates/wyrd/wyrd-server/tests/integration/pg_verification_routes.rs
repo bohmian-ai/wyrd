@@ -1822,7 +1822,7 @@ async fn direct_execution_waits_end_at_the_arrival_deadline() {
             .verification
             .blocks()
             .expect("blocks are hosted")
-            .sandbox(wyrd_server::verification::telemetry::ExecutionMode::Direct),
+            .sandbox(),
     );
     // Short of one session envelope, with room left for the Scribe work
     // that shares process memory.

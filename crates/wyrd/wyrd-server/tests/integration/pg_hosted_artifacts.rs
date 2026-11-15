@@ -1529,7 +1529,7 @@ async fn busy_queued_execution_is_deferred_until_capacity_frees() {
             .verification
             .blocks()
             .expect("blocks are hosted")
-            .sandbox(ExecutionMode::Queued),
+            .sandbox(),
     );
     // Process memory short of one session envelope, with room left for the
     // Scribe and Oracle work that shares it, makes the queued operation

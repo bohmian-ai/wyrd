@@ -72,7 +72,7 @@ use wyrd_server::state::{
 /// The runtime bounds [`WyrdTestServerBuilder::with_verification_runtime_limits_for_test`] takes.
 pub use wyrd_server::verification::RuntimeLimits;
 /// The hosted Verifier limits [`WyrdTestServerBuilder::with_verification_limits_for_test`] takes.
-pub use wyrd_server::verification::hosted::{HostedLimits, LaneLimits, QueuedShare};
+pub use wyrd_server::verification::hosted::{HostedLimits, LaneLimits};
 /// The execution lane a journey selects hosted capacity by.
 pub use wyrd_server::verification::telemetry::ExecutionMode;
 /// Reserved Scribe outbox slots a journey holds to fill the server's
@@ -3014,7 +3014,7 @@ impl WyrdTestServer {
         }
     }
 
-    /// The direct-lane hosted Python sandbox of this server's Verifier blocks.
+    /// The hosted Python sandbox of this server's Verifier blocks.
     ///
     /// # Errors
     /// Returns an error when this server hosts no Verifier blocks.
@@ -3026,7 +3026,7 @@ impl WyrdTestServer {
             .state
             .verification
             .blocks()
-            .map(|blocks| blocks.sandbox(ExecutionMode::Direct))
+            .map(|blocks| blocks.sandbox())
             .ok_or_else(|| WyrdTestServerError::Start("server hosts no Verifier blocks".to_owned()))
     }
 

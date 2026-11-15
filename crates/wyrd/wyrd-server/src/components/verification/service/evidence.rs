@@ -228,15 +228,12 @@ impl VerificationControl<'_> {
         let artifacts = match &request.value {
             InputDeclaration::Artifact { .. } => {
                 let blocks = self.blocks()?;
-                // A request-path admission, charged to direct capacity.
+                // A request-path admission, charged to process memory.
                 Some(TenantEvidence::new(
                     self.state.clone(),
                     caller.clone(),
                     *blocks.limits(),
-                    blocks
-                        .resources(crate::verification::telemetry::ExecutionMode::Direct)
-                        .memory()
-                        .clone(),
+                    blocks.resources().memory().clone(),
                 ))
             }
             _ => None,

@@ -588,7 +588,7 @@ async fn a_waiting_execution_finishes_after_a_restart() {
 /// `ci-gate` here also runs an independent Python step. With one queued
 /// model call, the step runs in Python and a workspace, then the execution
 /// parks waiting for `ci`. While the park's write is held unacknowledged the
-/// execution is still `running`, yet the queued share holds no scratch, no
+/// execution is still `running`, yet it holds no scratch, no
 /// Python worker is checked out, and its model call is free; once the park
 /// lands it waits, and publishing `ci` resumes it.
 ///
@@ -634,11 +634,11 @@ async fn a_parked_execution_releases_compute_before_its_park_is_acknowledged() {
         .blocks()
         .expect("blocks are hosted");
     assert_eq!(
-        blocks.resources(ExecutionMode::Queued).scratch().used(),
+        blocks.resources().scratch().used(),
         0,
         "the workspace's scratch is released while the park is unacknowledged"
     );
-    let sandbox = blocks.sandbox(ExecutionMode::Queued);
+    let sandbox = blocks.sandbox();
     assert_eq!(
         BTreeSet::from_iter(sandbox.charged_worker_pids()),
         BTreeSet::from_iter(sandbox.idle_worker_pids()),

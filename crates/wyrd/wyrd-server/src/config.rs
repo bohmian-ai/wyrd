@@ -1760,26 +1760,11 @@ pub struct VerificationConfig {
     /// `WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS` overrides it.
     #[serde(default)]
     pub execution_timeout_ms: Option<u64>,
-    /// Percent of effective CPUs queued executions run on, from 1 to 99;
-    /// unset keeps the default. `WYRD_VERIFICATION_QUEUED_CPU_PERCENT`
-    /// overrides it.
-    #[serde(default)]
-    pub queued_cpu_percent: Option<usize>,
-    /// Percent of process memory reserved for queued executions, from 1 to
-    /// 99; unset keeps the default. `WYRD_VERIFICATION_QUEUED_MEMORY_PERCENT`
-    /// overrides it.
-    #[serde(default)]
-    pub queued_memory_percent: Option<usize>,
-    /// Percent of process scratch reserved for queued executions, from 1 to
-    /// 99; unset keeps the default.
-    /// `WYRD_VERIFICATION_QUEUED_SCRATCH_PERCENT` overrides it.
-    #[serde(default)]
-    pub queued_scratch_percent: Option<usize>,
-    /// Capacity `verify` calls hold apart from queued executions.
+    /// Model-call permits `verify` calls hold apart from queued executions.
     /// `WYRD_VERIFICATION_DIRECT_*` overrides each value.
     #[serde(default)]
     pub direct: VerificationLaneConfig,
-    /// Capacity queued executions hold apart from `verify` calls.
+    /// Model-call permits queued executions hold apart from `verify` calls.
     /// `WYRD_VERIFICATION_QUEUED_*` overrides each value.
     #[serde(default)]
     pub queued: VerificationLaneConfig,
@@ -1817,9 +1802,6 @@ impl Default for VerificationConfig {
             direct_executions: None,
             queued_executions: None,
             execution_timeout_ms: None,
-            queued_cpu_percent: None,
-            queued_memory_percent: None,
-            queued_scratch_percent: None,
             direct: VerificationLaneConfig::default(),
             queued: VerificationLaneConfig::default(),
             limits: HostedLimits::default(),
@@ -1830,7 +1812,7 @@ impl Default for VerificationConfig {
 
 impl VerificationConfig {
     /// Resolve [`Self::limits`] and [`Self::runtime`]: the approved defaults,
-    /// then each execution capacity, the queued share, and the queued
+    /// then each execution capacity and the queued
     /// deadline from its `WYRD_VERIFICATION_*` variable when set, else from
     /// the file; then every other `WYRD_VERIFICATION_*` Deployment limit;
     /// then refuse inconsistent merged limits, whatever their source.
@@ -1838,8 +1820,7 @@ impl VerificationConfig {
     /// Each value is checked only once it wins, so a valid variable repairs
     /// a stale file value. Each limit is a positive integer; `_MIB`/`_KIB`
     /// are binary units and `_ms`/`_MS` milliseconds. Admission counts must
-    /// fit a semaphore, each queued share percentage is below 100 so direct
-    /// work keeps reserved capacity, and the queued deadline must be a timestamp from now. Unset values keep
+    /// fit a semaphore, and the queued deadline must be a timestamp from now. Unset values keep
     /// the approved defaults.
     ///
     /// # Errors
@@ -1849,10 +1830,6 @@ impl VerificationConfig {
     /// positive integer, overflows its unit, or exceeds its runtime
     /// representation, and [`ConfigError::Invalid`] naming the variables of
     /// an inconsistent pair.
-    ///
-    /// # Panics
-    /// Never in practice: each queued share percentage is bounded to 99
-    /// before it narrows to `u8`.
     pub fn resolve_limits(&mut self) -> Result<(), ConfigError> {
         /// One kibibyte.
         const KIB: u64 = 1024;
@@ -1901,34 +1878,6 @@ impl VerificationConfig {
             "WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS",
         )? {
             self.runtime.execution_timeout = timeout.deadline()?;
-        }
-        let share = &mut limits.queued_share;
-        for (name, value, target) in [
-            (
-                "queued_cpu_percent",
-                self.queued_cpu_percent,
-                &mut share.cpu_percent,
-            ),
-            (
-                "queued_memory_percent",
-                self.queued_memory_percent,
-                &mut share.memory_percent,
-            ),
-            (
-                "queued_scratch_percent",
-                self.queued_scratch_percent,
-                &mut share.scratch_percent,
-            ),
-        ] {
-            let mut percent = usize::from(*target);
-            set_count(
-                &format!("verification.{name}"),
-                value,
-                &format!("WYRD_VERIFICATION_{}", name.to_uppercase()),
-                99,
-                &mut percent,
-            )?;
-            *target = u8::try_from(percent).expect("set_count bounds the percent to 99");
         }
         set_scaled(
             "WYRD_VERIFICATION_MONTY_MIN_WORKERS",
@@ -4496,7 +4445,7 @@ mod tests {
     use chrono::{DateTime, Utc};
 
     use super::*;
-    use crate::verification::hosted::{LaneLimits, QueuedShare};
+    use crate::verification::hosted::LaneLimits;
     use vala_bifrost_redux::resources::{
         ORACLE_PARTITION_WORKING_MEMORY_BYTES, ResourcePlan, ScribeWorkers, oracle_worker_slots,
     };
@@ -4885,9 +4834,8 @@ maintenance_interval_secs = 45
     /// unrepresentable file value is refused naming its key: a count above
     /// the semaphore maximum, which itself applies, or a deadline past the
     /// latest `DateTime<Utc>` from now, while one just inside applies. A
-    /// queued share percentage must be 1 to 99, so direct work always keeps
-    /// reserved capacity; a negative count and a removed per-lane Python or
-    /// workspace key do not parse.
+    /// negative count and a removed per-lane Python, workspace, or queued
+    /// share key do not parse.
     ///
     /// # Panics
     /// Panics when a file value is not resolved, the environment does not
@@ -4901,9 +4849,6 @@ maintenance_interval_secs = 45
             direct_executions = 7
             queued_executions = 9
             execution_timeout_ms = 7200000
-            queued_cpu_percent = 30
-            queued_memory_percent = 40
-            queued_scratch_percent = 20
             [verification.direct]
             model_calls = 11
             [verification.queued]
@@ -4931,14 +4876,6 @@ maintenance_interval_secs = 45
             )
         );
         assert_eq!(
-            config.limits.queued_share,
-            QueuedShare {
-                cpu_percent: 30,
-                memory_percent: 40,
-                scratch_percent: 20,
-            }
-        );
-        assert_eq!(
             (config.limits.verify_timeout, config.runtime.lease),
             (
                 HostedLimits::default().verify_timeout,
@@ -4950,7 +4887,6 @@ maintenance_interval_secs = 45
             [
                 ("WYRD_VERIFICATION_DIRECT_EXECUTIONS", Some("2")),
                 ("WYRD_VERIFICATION_QUEUED_MODEL_CALLS", Some("23")),
-                ("WYRD_VERIFICATION_QUEUED_MEMORY_PERCENT", Some("10")),
             ],
             || {
                 let mut config = file(FILE).expect("the file parses");
@@ -4961,10 +4897,8 @@ maintenance_interval_secs = 45
                         config.limits.queued.model_calls,
                         config.limits.direct.model_calls,
                         config.runtime.execution_slots,
-                        config.limits.queued_share.memory_percent,
-                        config.limits.queued_share.cpu_percent,
                     ),
-                    (2, 23, 11, 9, 10, 30),
+                    (2, 23, 11, 9),
                     "the environment wins over the file, value by value"
                 );
             },
@@ -4974,13 +4908,11 @@ maintenance_interval_secs = 45
         let stale = "
             [verification]
             queued_executions = 0
-            queued_cpu_percent = 100
             execution_timeout_ms = 9223372036854775807
         ";
         temp_env::with_vars(
             [
                 ("WYRD_VERIFICATION_QUEUED_EXECUTIONS", Some("9")),
-                ("WYRD_VERIFICATION_QUEUED_CPU_PERCENT", Some("60")),
                 ("WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS", Some("7200000")),
             ],
             || {
@@ -4991,10 +4923,9 @@ maintenance_interval_secs = 45
                 assert_eq!(
                     (
                         config.runtime.execution_slots,
-                        config.limits.queued_share.cpu_percent,
                         config.runtime.execution_timeout,
                     ),
-                    (9, 60, Duration::from_hours(2))
+                    (9, Duration::from_hours(2))
                 );
             },
         );
@@ -5008,11 +4939,6 @@ maintenance_interval_secs = 45
                 "WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS",
                 "18446744073709551615",
                 "[verification]\nexecution_timeout_ms = 7200000",
-            ),
-            (
-                "WYRD_VERIFICATION_QUEUED_SCRATCH_PERCENT",
-                "100",
-                "[verification]\nqueued_scratch_percent = 50",
             ),
         ] {
             temp_env::with_vars([(key, Some(value))], || {
@@ -5035,14 +4961,6 @@ maintenance_interval_secs = 45
             (
                 "[verification.direct]\nmodel_calls = 0",
                 "verification.direct.model_calls",
-            ),
-            (
-                "[verification]\nqueued_memory_percent = 0",
-                "verification.queued_memory_percent",
-            ),
-            (
-                "[verification]\nqueued_memory_percent = 100",
-                "verification.queued_memory_percent",
             ),
         ] {
             let error = file(contents)
@@ -5111,13 +5029,16 @@ maintenance_interval_secs = 45
             file("[verification.queued]\npython_workers = 2").is_err(),
             "the per-lane Python and workspace counts are gone"
         );
+        assert!(
+            file("[verification]\nqueued_memory_percent = 25").is_err(),
+            "the queued share percentages are gone"
+        );
     }
 
     /// Unset Deployment limits keep the approved defaults; set ones apply
     /// in their binary units; malformed, zero, overflowing, inconsistent, and
     /// unrepresentable values refuse startup naming the variable: a count
-    /// above the semaphore maximum, a queued share percentage of 0 or 100 or
-    /// more, and a queued deadline beyond signed milliseconds or the timestamp
+    /// above the semaphore maximum and a queued deadline beyond signed milliseconds or the timestamp
     /// range.
     ///
     /// # Panics
@@ -5141,9 +5062,6 @@ maintenance_interval_secs = 45
                 ("WYRD_VERIFICATION_DIRECT_MODEL_CALLS", Some("9")),
                 ("WYRD_VERIFICATION_QUEUED_EXECUTIONS", Some("11")),
                 ("WYRD_VERIFICATION_QUEUED_MODEL_CALLS", Some("19")),
-                ("WYRD_VERIFICATION_QUEUED_CPU_PERCENT", Some("75")),
-                ("WYRD_VERIFICATION_QUEUED_MEMORY_PERCENT", Some("33")),
-                ("WYRD_VERIFICATION_QUEUED_SCRATCH_PERCENT", Some("10")),
                 ("WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS", Some("7200000")),
                 ("WYRD_VERIFICATION_AGENT_TOOL_MAX_CALLS", Some("3")),
                 ("WYRD_VERIFICATION_TOOL_ARGUMENT_MAX_KIB", Some("2")),
@@ -5157,14 +5075,6 @@ maintenance_interval_secs = 45
                 assert_eq!(config.limits.direct_executions, 3);
                 assert_eq!(config.limits.direct, LaneLimits { model_calls: 9 });
                 assert_eq!(config.limits.queued, LaneLimits { model_calls: 19 });
-                assert_eq!(
-                    config.limits.queued_share,
-                    QueuedShare {
-                        cpu_percent: 75,
-                        memory_percent: 33,
-                        scratch_percent: 10,
-                    }
-                );
                 assert_eq!(config.runtime.execution_slots, 11);
                 assert_eq!(config.runtime.execution_timeout, Duration::from_hours(2));
                 assert_eq!(
@@ -5180,9 +5090,6 @@ maintenance_interval_secs = 45
             ("WYRD_VERIFICATION_QUEUED_MODEL_CALLS", "-2"),
             ("WYRD_VERIFICATION_QUEUED_EXECUTIONS", "many"),
             ("WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS", "0"),
-            ("WYRD_VERIFICATION_QUEUED_CPU_PERCENT", "0"),
-            ("WYRD_VERIFICATION_QUEUED_CPU_PERCENT", "100"),
-            ("WYRD_VERIFICATION_QUEUED_MEMORY_PERCENT", "fifty"),
             ("WYRD_VERIFICATION_CODE_TIMEOUT_MS", "ten"),
             ("WYRD_VERIFICATION_SCRATCH_MAX_MIB", "-1"),
             ("WYRD_VERIFICATION_FILES_MAX_MIB", "18446744073709551615"),

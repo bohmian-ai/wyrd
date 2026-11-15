@@ -38,7 +38,7 @@ pub(crate) fn statement_caller(
 }
 
 /// Every free permit of `permits`, held until the returned permit drops, so
-/// a test can saturate an idle lane.
+/// a test can saturate an idle admission.
 ///
 /// # Panics
 /// Panics when `permits` is closed or a permit is taken concurrently.
@@ -96,13 +96,11 @@ pub struct HostedLimits {
     /// Most concurrently running direct `verify` executions per process;
     /// queued executions are bounded by the runtime's own execution slots.
     pub direct_executions: usize,
-    /// Capacity reserved for direct `verify` executions.
+    /// Model-call admission of direct `verify` executions.
     pub direct: LaneLimits,
-    /// Capacity reserved for queued executions, continuations included.
+    /// Model-call admission of queued executions, continuations included.
     pub queued: LaneLimits,
-    /// The share of the process queued executions run in.
-    pub queued_share: QueuedShare,
-    /// Python worker processes each lane prewarms when its memory holds
+    /// Python worker processes the pool prewarms when process memory holds
     /// them; a target, not a floor, since idle workers are reaped under
     /// pressure.
     pub monty_min_workers: usize,
@@ -130,58 +128,16 @@ impl HostedLimits {
     }
 }
 
-/// The model-call admission one execution lane owns alone.
+/// The model-call admission of one execution mode.
 ///
-/// Direct and queued executions each hold a lane; neither takes the other's
-/// model-call permits, so a saturated queue cannot starve direct `verify`
-/// of gateway calls.
+/// Direct and queued executions each hold their own permits, which hold
+/// nothing while unused; neither takes the other's, so a saturated queue
+/// cannot take every model-call permit from direct `verify`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LaneLimits {
     /// Most concurrent gateway model calls; a further call waits for one to
     /// finish before it reaches gateway admission.
     pub model_calls: usize,
-}
-
-/// The share of the process plan reserved for queued executions, each as a
-/// percentage of the whole.
-///
-/// Queued engine, model-call, blocking, and nested tool work runs on its own
-/// runtime with `cpu_percent` of the effective CPUs as worker threads, and
-/// its Python turns hold at most as many runnable permits. Its workspaces,
-/// Python sessions, and execution state charge a reservation of
-/// `memory_percent` of process memory and `scratch_percent` of scratch, which
-/// nothing else can take and which it can never exceed. Direct executions
-/// charge what remains of the process ledgers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct QueuedShare {
-    /// Effective CPUs, at least one.
-    pub cpu_percent: u8,
-    /// Process memory.
-    pub memory_percent: u8,
-    /// Process scratch.
-    pub scratch_percent: u8,
-}
-
-impl QueuedShare {
-    /// The queued plan reserved from `process` at these percentages: at
-    /// least one CPU, rounding bytes down.
-    ///
-    /// # Errors
-    /// Returns [`ProcessResources::reserve`]'s refusal when `process` has
-    /// already promised more than the remaining bytes.
-    pub fn reserve(
-        self,
-        process: &wyrd_runtime::resources::ProcessResources,
-    ) -> Result<wyrd_runtime::resources::ProcessResources, wyrd_runtime::resources::LedgerRefusal>
-    {
-        let share = |whole: u64, percent: u8| whole / 100 * u64::from(percent);
-        let cpus = process.effective_cpu().get() * usize::from(self.cpu_percent) / 100;
-        process.reserve(
-            std::num::NonZeroUsize::new(cpus).unwrap_or(std::num::NonZeroUsize::MIN),
-            share(process.memory().limit(), self.memory_percent),
-            share(process.scratch().limit(), self.scratch_percent),
-        )
-    }
 }
 
 impl Default for HostedLimits {
@@ -206,62 +162,11 @@ impl Default for HostedLimits {
             direct_executions: 256,
             direct: LaneLimits { model_calls: 256 },
             queued: LaneLimits { model_calls: 256 },
-            queued_share: QueuedShare {
-                cpu_percent: 50,
-                memory_percent: 25,
-                scratch_percent: 50,
-            },
             monty_min_workers: 1,
             monty_memory_bytes: 256 * MIB,
             code_timeout: Duration::from_secs(10),
             agent_code_budget: Duration::from_secs(60),
             verify_timeout: Duration::from_secs(60),
         }
-    }
-}
-
-/// The queued share reserves its percentages of the process plan.
-#[cfg(test)]
-mod tests {
-    use std::num::NonZeroUsize;
-
-    use wyrd_runtime::resources::ProcessResources;
-
-    use super::{HostedLimits, QueuedShare};
-
-    /// Defaults give queued work half the CPUs, a quarter of memory, and half
-    /// of scratch; a single-CPU process still runs it on one CPU, and a share
-    /// the process has already promised is refused.
-    ///
-    /// # Panics
-    /// Panics when a percentage is misapplied or an overcommitted share is
-    /// accepted.
-    #[test]
-    fn queued_share_reserves_its_percentages() {
-        let share = HostedLimits::default().queued_share;
-        let process = ProcessResources::new(NonZeroUsize::new(8).expect("8"), 400, 200);
-        let queued = share.reserve(&process).expect("fits an idle process");
-        assert_eq!(
-            (
-                queued.effective_cpu().get(),
-                queued.memory().limit(),
-                queued.scratch().limit()
-            ),
-            (4, 100, 100)
-        );
-        assert_eq!(process.memory().used(), 100);
-        let single = ProcessResources::new(NonZeroUsize::MIN, 400, 200);
-        assert_eq!(
-            share.reserve(&single).expect("fits").effective_cpu().get(),
-            1
-        );
-        let full = QueuedShare {
-            memory_percent: 100,
-            ..share
-        };
-        assert!(
-            full.reserve(&process).is_err(),
-            "a quarter is already reserved"
-        );
     }
 }

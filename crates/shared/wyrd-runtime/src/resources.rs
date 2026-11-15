@@ -232,9 +232,6 @@ pub struct ProcessResources {
     effective_cpu: NonZeroUsize,
     memory: ByteLedger,
     scratch: ByteLedger,
-    /// The parent memory and scratch a reserved plan holds while any clone
-    /// of it lives; `None` for the process's own plan.
-    _reservation: Option<Arc<(ByteCharge, ByteCharge)>>,
 }
 
 impl ProcessResources {
@@ -245,38 +242,7 @@ impl ProcessResources {
             effective_cpu,
             memory: ByteLedger::new(memory_bytes),
             scratch: ByteLedger::new(scratch_bytes),
-            _reservation: None,
         }
-    }
-
-    /// Reserve `memory_bytes` and `scratch_bytes` of this plan for one
-    /// capability that may run on at most `effective_cpu` CPUs.
-    ///
-    /// The returned plan's ledgers promise only the reserved bytes, and this
-    /// plan holds them charged until every clone of the returned plan drops,
-    /// so the reservation counts once here and what the capability actually
-    /// owns counts once inside it. Nothing charged to this plan can take the
-    /// reserved bytes, and nothing charged to the reserved plan can take
-    /// more. An infallible charge past the reserved limit overshoots only
-    /// the reserved ledger.
-    ///
-    /// # Errors
-    /// Returns [`LedgerRefusal`], leaving both ledgers unchanged, when either
-    /// reservation exceeds what this plan has unpromised.
-    pub fn reserve(
-        &self,
-        effective_cpu: NonZeroUsize,
-        memory_bytes: u64,
-        scratch_bytes: u64,
-    ) -> Result<Self, LedgerRefusal> {
-        let memory = self.memory.try_charge(memory_bytes)?;
-        let scratch = self.scratch.try_charge(scratch_bytes)?;
-        Ok(Self {
-            effective_cpu: effective_cpu.min(self.effective_cpu),
-            memory: ByteLedger::new(memory_bytes),
-            scratch: ByteLedger::new(scratch_bytes),
-            _reservation: Some(Arc::new((memory, scratch))),
-        })
     }
 
     /// CPUs the process may run on, the bound on hosted runnable Python turns.
@@ -341,64 +307,6 @@ mod tests {
         assert_eq!(ledger.available(), 0);
         drop((moved, overshoot));
         assert_eq!(ledger.used(), 0);
-    }
-
-    /// A reservation counts once in its parent, bounds what its owner can
-    /// charge, is untouchable by the parent's other owners, and returns
-    /// when its last clone drops; one that does not fit changes nothing.
-    ///
-    /// # Panics
-    /// Panics when a reservation is double counted, borrowed across, or
-    /// leaked.
-    #[test]
-    fn reservation_counts_once_and_isolates_both_sides() {
-        let process = ProcessResources::new(NonZeroUsize::new(4).expect("4"), 100, 10);
-        let queued = process
-            .reserve(NonZeroUsize::new(8).expect("8"), 40, 4)
-            .expect("the reservation fits");
-        assert_eq!(
-            queued.effective_cpu().get(),
-            4,
-            "a share never exceeds its parent"
-        );
-        assert_eq!((process.memory().used(), process.scratch().used()), (40, 4));
-        let held = queued
-            .memory()
-            .try_charge(40)
-            .expect("the reservation is usable");
-        assert_eq!(process.memory().used(), 40, "actual use inside counts once");
-        assert!(
-            queued.memory().try_charge(1).is_err(),
-            "it never takes more"
-        );
-        let direct = process
-            .memory()
-            .try_charge(60)
-            .expect("the rest stays direct");
-        assert!(
-            process.memory().try_charge(1).is_err(),
-            "the parent cannot take it"
-        );
-        assert_eq!(
-            process
-                .reserve(NonZeroUsize::MIN, 0, 7)
-                .expect_err("scratch is spent"),
-            LedgerRefusal {
-                requested: 7,
-                available: 6,
-                limit: 10
-            }
-        );
-        assert_eq!(
-            process.memory().used(),
-            100,
-            "a refused reservation changes nothing"
-        );
-        let clone = queued.clone();
-        drop((held, direct, queued));
-        assert_eq!(process.memory().used(), 40, "a live clone keeps it");
-        drop(clone);
-        assert_eq!((process.memory().used(), process.scratch().used()), (0, 0));
     }
 
     /// A waiter registered before retrying sees a release that happens

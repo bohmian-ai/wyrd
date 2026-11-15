@@ -52,7 +52,7 @@ SPEC-positioning owns the next change to each.
 | `get-started/introduction.md` | positioning TASK-001 | Rewritten around the finance release example |
 | `get-started/setup.md` | positioning TASK-001 | Ends with the model-free setup check (`examples/setup-check`) |
 | `get-started/quickstart.md` | positioning TASK-001 | Replaced by `examples/finance-release`; published |
-| Verification education and FAQ pages | positioning TASK-002 | Not started |
+| Verification education and FAQ pages | positioning TASK-002 | Published: `understand/foundations-of-verification`, `understand/real-time-verification`, `understand/technical-questions`, and practice guides `declare/write-verifiable-requirements`, `observe/establish-sufficient-evidence`, `verify/act-on-verdicts-in-production`; `how-verification-works`, `author-a-verifier`, `verifier-recipes` retained with links and claim repairs. Dispositions in positioning TASK-002 |
 | Tutorial drafts this packet listed | positioning TASK-003 | Not started; TASK-003 records its own handoff |
 | Shared metadata, semantic rendering, sitemap | positioning TASK-004 | Not started |
 

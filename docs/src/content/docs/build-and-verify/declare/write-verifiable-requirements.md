@@ -21,7 +21,7 @@ Write one statement per failure you care about, naming the context it applies to
 | --- | --- |
 | The agent should be reliable. | The recipient is authorized to receive the report. |
 | The report should be safe to share. | A report shared externally names no bank account identifier. |
-| The agent should follow company policy. | The company sharing policy permits sharing this report for this purpose. |
+| The agent should follow company policy. | The company sharing policy permits this release. |
 
 Each statement on the right fails in one way, and a person reading a failed result knows what broke. `release-check` declares three such requirements, each with its own `id` and verdict:
 

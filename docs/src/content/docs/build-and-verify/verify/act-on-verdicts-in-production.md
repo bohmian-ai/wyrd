@@ -39,7 +39,7 @@ In Python, `verify` raises on an error or timeout, so the handler above returns 
 
 A `verify` call is bounded by `WYRD_VERIFICATION_TIMEOUT_MS`, 60 seconds by default, and the SDK does not retry it. Your request almost certainly has a shorter budget. Keep checks that must decide before the response on the request path, and move the rest:
 
-- Assertions and code checks run without a model and suit most request paths.
+- Assertions and code checks add no model call. A code check can wait for a free Python worker.
 - A model judge adds at least one model call. Keep it on the request path only when its measured time fits, as the finance policy judge must because the release cannot happen without it.
 - A check that can be decided after the response belongs in `submit`, which returns once the inputs are staged.
 

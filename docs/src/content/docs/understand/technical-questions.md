@@ -22,7 +22,7 @@ Use `verify` when the application must decide before it responds or acts. Use `s
 
 The requirements that need the missing evidence come back `inconclusive`, and the others are judged normally. With the default decision rule, any inconclusive requirement makes the verdict inconclusive unless another requirement failed. `inconclusive` is never a pass and never a claim that the subject failed.
 
-A trace that has not landed yet is a special case: `verify` judges the `trace` check inconclusive at once, and a queued execution tries again before it does. A missing trace on its own does not prove an action was skipped. [Trace evidence](/understand/how-verification-works/#trace-evidence) has the rules.
+A trace that has not landed yet is a special case: `verify` judges the `trace` check inconclusive at once, and a queued execution tries 3 times before it does. A missing trace on its own does not prove an action was skipped. [Trace evidence](/understand/how-verification-works/#trace-evidence) has the rules.
 
 ## What happens on a timeout or an error?
 
@@ -58,7 +58,7 @@ Python, Rust, and TypeScript have first-class SDKs with the same calls. Any lang
 
 ## Can I run it locally or on my own infrastructure?
 
-Yes. [Set up Wyrd](/get-started/setup/) runs a local server against your PostgreSQL 16 on macOS (Apple silicon) or Linux. [Deploy for a team](/operate/deploy-wyrd-for-a-team/) runs it on your own infrastructure with PostgreSQL and an object store. Self-hosted and multi-tenant deployments run the same server.
+Yes. [Set up Wyrd](/get-started/setup/) runs a local server against your PostgreSQL 16 on macOS (Apple silicon) or Linux. [Deploy for a team](/operate/deploy-wyrd-for-a-team/) runs it on your own infrastructure with PostgreSQL and an object store.
 
 ## Next
 

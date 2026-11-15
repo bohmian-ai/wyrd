@@ -71,11 +71,11 @@ These overlap. A test suite contains verifications; an evaluation can be run as 
 
 ## Proofs and observed executions
 
-Formal verification and runtime verification are often drawn as opposites: certainty for deterministic software, approximation for probabilistic AI. Neither half of that picture is accurate.
+Formal verification and runtime verification are often drawn as opposites: certainty for deterministic software, approximation for probabilistic AI. The overlap is larger than that picture suggests.
 
 - Formal methods reason about probabilistic systems. Statistical model checking samples executions of a stochastic system and decides whether a probabilistic property holds, with quantified statistical confidence ([Agha and Palmskog, 2018](#sources)).
 - Runtime monitors check formally specified properties. Temporal-logic monitors judge a finite trace as satisfying, violating, or inconclusive when the trace so far cannot settle the property ([Bauer, Leucker and Schallhart, 2011](#sources)).
-- Agent decision-making has been formally verified for years before language-model agents: [Dennis et al. (2016)](#sources) model-check the decision logic of agent programs that control hybrid autonomous systems. Recent proposals learn a probabilistic model of an LLM agent from observed runs and model-check it at runtime ([Koohestani, 2025](#sources), a proof-of-concept workshop paper).
+- Formal verification of agent decision-making predates language-model agents: [Dennis et al. (2016)](#sources) model-check the decision logic of agent programs that control hybrid autonomous systems. Recent proposals learn a probabilistic model of an LLM agent from observed runs and model-check it at runtime ([Koohestani, 2025](#sources), a proof-of-concept workshop paper).
 
 The real distinction is what a result rests on. A proof holds for every execution of a model, under the model's assumptions; if the deployed system departs from the model, the proof says nothing about the departure. A runtime judgment rests on finite observed evidence; it says what this execution did, not what every execution will do. Neither establishes that a system is correct in general.
 
@@ -96,7 +96,7 @@ Uncertainty enters from three places, and each needs a different response:
 | The evidence | The authorization record was not captured | Return inconclusive instead of guessing |
 | The judge | A model judge is unsure whether the policy covers this purpose | Return inconclusive, or route to a person |
 
-An inconclusive judgment is a result, not a failure to produce one. Temporal-logic monitoring has formalized it for years ([Bauer, Leucker and Schallhart, 2011](#sources)), and an application has to decide what it does with one.
+An inconclusive judgment is a result, not a failure to produce one. Its reason should say which source caused it, so an operator can tell a capture gap from an unsure judge. Temporal-logic monitoring has formalized it for years ([Bauer, Leucker and Schallhart, 2011](#sources)), and an application has to decide what it does with one.
 
 ## Failures that look like success
 
@@ -104,7 +104,7 @@ Three failures produce attractive results, and each is revealed by different evi
 
 **Leakage.** A fraud model scores 0.98 AUC on its test set because transactions from the same customers appear in both training and test data, or because a feature was computed after the fraud label was known. A survey of machine-learning-based science compiled reports of leakage in 17 fields, affecting 294 papers ([Kapoor and Narayanan, 2023](#sources)). No output check catches it: the predictions look excellent. Detecting it needs evidence about the evaluation itself: how the split was made, where each feature came from, and when each value became available.
 
-**Drift.** Six months later the mix of merchant categories has changed. That is a change in the input distribution, which may or may not change the relationship between inputs and fraud; the literature separates the two as virtual and real concept drift ([Gama et al., 2014](#sources)). A drift alarm is a signal to investigate, not proof that any prediction is wrong. The model's own confidence is a weak guide here: uncertainty estimates that were well calibrated on the original distribution can degrade under shift ([Ovadia et al., 2019](#sources)).
+**Drift.** Six months later the mix of merchant categories has changed. That is a change in the input distribution, which may or may not change the relationship between inputs and fraud; the literature separates the two as virtual and real concept drift ([Gama et al., 2014](#sources)). Detecting a shift in inputs needs a baseline window to compare against; telling whether the input-outcome relationship changed needs outcomes, which often arrive late ([Gama et al., 2014](#sources)). A drift alarm is a signal to investigate, not proof that any prediction is wrong. The model's own confidence is a weak guide here: uncertainty estimates that were well calibrated on the original distribution can degrade under shift ([Ovadia et al., 2019](#sources)).
 
 **A skipped step.** The assistant from the first example says it confirmed authorization. The evidence that settles the claim is a record of the lookup: a trace span or tool-call log showing the authorization service was called for this recipient. An output check cannot settle it.
 
@@ -125,7 +125,7 @@ Treat a model judge as a check that needs its own verification:
 
 Practical verification depends on two things, and solving one does not solve the other.
 
-**Infrastructure.** Evidence has to be captured as the system runs, checks have to execute inside the application's time budget, every judgment has to name the exact versions it judged, and the evidence has to be retained for investigation. Capture that slows the application gets turned off; judgments without versions cannot be reproduced.
+**Infrastructure.** Evidence has to be captured as the system runs, checks have to execute inside the application's time budget, every judgment has to name the exact versions it judged, and the evidence has to be retained for investigation. Capture has to cost the application little enough to stay on, and a judgment without versions cannot be reproduced.
 
 **Requirements.** Requirements describe the world the system acts in, not only the system. Requirements engineering separates knowledge of the environment, the requirements themselves, and the specification the machine implements ([Zave and Jackson, 1997](#sources)). Production ML adds tests for data, models, infrastructure, and monitoring, because a model's prediction behavior is difficult to specify in advance ([Breck et al., 2017](#sources)).
 
@@ -162,8 +162,7 @@ Coding agents and model judges can help with both: drafting capture and check co
 | NASA (2024). [NASA Systems Engineering Handbook, 5.0 Product realization](https://www.nasa.gov/reference/5-0-product-realization/), sections 5.3 Product verification and 5.4 Product validation. Online edition, updated 12 August 2024. | Engineering guidance, not research | Definitions of product verification and validation |
 | Catalini, C., Hui, X. and Wu, J. (2026). [Some simple economics of AGI](https://arxiv.org/abs/2602.20946). arXiv:2602.20946 v2. | Preprint, economic argument | Verification capacity as a constraint; correlated checker errors |
 
-Shin's [Automating epistemology](https://link.springer.com/article/10.1007/s00146-025-02560-y) (*AI & Society*, 2025) discusses, as philosophy rather than engineering evidence, how AI changes who holds the authority to declare something verified.
 
 ## Next
 
-[Write verifiable requirements](/build-and-verify/declare/write-verifiable-requirements/), [Establish sufficient evidence](/build-and-verify/observe/establish-sufficient-evidence/), and [Act on verdicts in production](/build-and-verify/verify/act-on-verdicts-in-production/) turn the starting method into practice. [Real-time verification](/understand/real-time-verification/) shows how Wyrd returns a judgment before the application acts.
+[Write verifiable requirements](/build-and-verify/declare/write-verifiable-requirements/), [Establish sufficient evidence](/build-and-verify/observe/establish-sufficient-evidence/), and [Act on verdicts in production](/build-and-verify/verify/act-on-verdicts-in-production/) turn the starting method into practice. [Real-time verification](/understand/real-time-verification/) shows how Wyrd returns a judgment before the application acts, and the [Quickstart](/get-started/quickstart/) runs that example.

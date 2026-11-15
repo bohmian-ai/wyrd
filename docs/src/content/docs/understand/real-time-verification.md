@@ -41,8 +41,8 @@ The declaration fixes what the application can rely on:
 | --- | --- |
 | `inputs` | The named evidence slots the caller must fill, each with a type and optional schema |
 | `requirements` | Each `id` and `statement`, and the one `check` that decides it |
-| Decision rule | How requirement outcomes combine into the verdict. Here every requirement must pass |
-| Version | The exact Verifier, policy file, and subject versions each result names |
+| `decide` | How requirement outcomes combine. Omitted here, so the default `all` applies: any failed requirement fails the verdict, otherwise any inconclusive one makes it inconclusive |
+| Version | Assigned by the server at declaration, `0.1.0` and then `0.1.1` when anything changes. Each result names the exact Verifier, policy file, and subject versions |
 
 When the policy changes, Wyrd registers a new Verifier version that mounts the new file. Results judged by the old version still name it, so a past decision can be traced to the policy it applied. [How verification works](/understand/how-verification-works/) explains each part, and the [Verifier Card reference](/reference/verifier-card/) lists every field.
 
@@ -56,7 +56,7 @@ Whether a verdict fits a request depends on the application's latency budget and
 
 **Evidence.** JSON evidence arrives in the request. A `File` is hashed by the SDK, which uploads only digests the server lacks, so a repeated file uploads once; each execution resolves its file and Artifact metadata once and reuses it. A step such as PDF extraction, or a `trace` check that reads spans from Bifrost, adds its own read time.
 
-**Checks.** An `assert` or `trace` check runs in the check engine without a model. A `code` check runs in a sandboxed Python worker. An `agent` check calls a model through the LLM gateway, possibly several times with tool calls between them, and usually dominates the total. In the finance example, the two assertions add little; the policy judge adds a model call and up to three tool turns.
+**Checks.** An `assert` or `trace` check runs in the check engine without a model. A `code` check runs in a sandboxed Python worker. An `agent` check calls a model through the LLM gateway, possibly several times with tool calls between them, and usually dominates the total. In the finance example, the two assertions add little; the policy judge (`policy-judge.yaml` in the Quickstart) adds a model call and up to three tool turns.
 
 Returning the verdict does not wait for the evidence to be published. The server stages the result and its pinned inputs on its in-process outbox and answers; Bifrost then stores them, and they become queryable shortly after. The verdict the application received stands even if an abrupt server stop loses the staged copy before it is written. [Runs and evidence](/understand/runs-observations-and-evidence/) and [Bifrost](/understand/bifrost/) explain retention.
 

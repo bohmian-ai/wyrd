@@ -68,8 +68,8 @@ pub fn service() -> Result<Service, Box<dyn Error>> {
 /// Returns the policy judge's Prompt or route refusal.
 fn release_check(policy: &Artifact) -> Result<Verifier, Box<dyn Error>> {
     let mut follows_policy = Check::agent(policy_judge()?).inputs([
-        ("report", "inputs.release.report"),
-        ("recipient", "inputs.release.recipient"),
+        ("report", "inputs.report"),
+        ("recipient", "inputs.recipient"),
     ]);
     follows_policy.add_workspace(
         "/inputs/policy.md",
@@ -77,14 +77,13 @@ fn release_check(policy: &Artifact) -> Result<Verifier, Box<dyn Error>> {
     );
 
     Ok(Verifier::new("release-check", None)
-        // The release the application sends.
-        .inputs([("release", InputSlot::model::<Release>())])
+        .inputs(InputSlot::fields_of::<Release>())
         .requirements([
             Requirement::new(
                 "recipient-authorized",
                 "The recipient is authorized to receive the report.",
                 Check::assert(
-                    "inputs.release.recipient.authorized",
+                    "inputs.recipient.authorized",
                     ComparisonOperator::Equals,
                     true,
                 ),
@@ -98,7 +97,7 @@ fn release_check(policy: &Artifact) -> Result<Verifier, Box<dyn Error>> {
                 "destination-restricted",
                 "The destination restricts access to the report.",
                 Check::assert(
-                    "inputs.release.destination.restricted",
+                    "inputs.destination.restricted",
                     ComparisonOperator::Equals,
                     true,
                 ),

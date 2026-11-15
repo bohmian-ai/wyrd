@@ -67,10 +67,7 @@ function sharingVerdict(body: string): string {
   if (line === undefined) {
     return "the policy did not read";
   }
-  // The finance example's Verifier takes the report inside its one `release` slot.
-  const report = release.includes("Decide whether the company sharing policy permits")
-    ? { slot: "release", locator: { json_pointer: "/report/text" } }
-    : { slot: "report", locator: { json_pointer: "/text" } };
+  const report = { slot: "report", locator: { json_pointer: "/text" } };
   const citations = [report, { slot: output.sources?.[0], locator: line.locator }];
   if (release.includes("PROVIDER-UNCERTAIN")) {
     return JSON.stringify({

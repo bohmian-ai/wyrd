@@ -42,16 +42,17 @@ for (const theme of ['light', 'dark'] as const) {
 }
 
 // Each README code block marked `<!-- example: <path> [region=<name>] -->` is a
-// verbatim copy of that tested example file, or of its named region as
+// verbatim copy of that tested example file, or of its named region, as
 // `<CodeFromFile>` embeds it, since GitHub cannot embed files.
 it('README examples match their tested files', () => {
   const readme = readFileSync(new URL('../../../README.md', import.meta.url), 'utf8');
   const blocks = [...readme.matchAll(/<!-- example: (\S+)(?: region=([\w-]+))? -->\s*```\w*\n([\s\S]*?)```/g)];
   expect(blocks.length).toBeGreaterThan(0);
   for (const [, path, region, code] of blocks) {
-    const expected = region
-      ? embedCodeFromFile(`<CodeFromFile file="${path}" region="${region}" lang="text" />`, (body) => `${body}\n`).code
-      : readFileSync(new URL(`../../../${path}`, import.meta.url), 'utf8');
+    const regionAttr = region ? ` region="${region}"` : '';
+    const expected = embedCodeFromFile(`<CodeFromFile file="${path}"${regionAttr} lang="text" />`, (body) =>
+      body.endsWith('\n') ? body : `${body}\n`,
+    ).code;
     expect(code, path).toBe(expected);
   }
 });

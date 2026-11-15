@@ -53,6 +53,7 @@
     <h1><span class="d">Declare.</span><br /><span class="o">Observe.</span><br />Verify.</h1>
     <p class="tagline">The only real-time verification system built for your applications.</p>
     <p class="lede">You built the system. How do you know it's behaving correctly?</p>
+    <p class="lede">Live verification puts the verdict before the decision.</p>
     <div class="cta">
       {#if start}
         {#if quickstart}<a class="button primary" href={`${base}${quickstart.path}`}>Verify in real time →</a>{/if}
@@ -208,6 +209,9 @@
     color: var(--muted);
     font-size: 18px;
     line-height: 1.45;
+  }
+  .lede + .lede {
+    margin-top: 8px;
   }
   .cta {
     display: flex;

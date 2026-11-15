@@ -15,12 +15,12 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
-use wyrd_ai::VerificationVerdict;
 use wyrd_ai::WyrdClient;
 use wyrd_ai::cards::{BundleMode, CardRef, CardSelector, Cards};
 use wyrd_ai::config::ClientConfig;
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::transport::{GrpcConfig, HttpConfig};
+use wyrd_ai::{RequirementOutcome, VerificationVerdict};
 use wyrd_testing::server::WyrdTestServer;
 
 /// The policy line the judge must read before it judges.
@@ -71,7 +71,7 @@ fn judge_policy(request: &Request) -> ResponseTemplate {
         return completion(json!({ "role": "assistant", "content": "the policy did not read" }));
     };
     let citations = json!([
-        { "slot": "release", "locator": { "json_pointer": "/report/text" } },
+        { "slot": "report", "locator": { "json_pointer": "/text" } },
         { "slot": output["sources"][0], "locator": line["locator"] },
     ]);
     let verdict = if release.contains("PROVIDER-UNCERTAIN") {
@@ -379,9 +379,9 @@ async fn finance_release_passes_and_fails() {
         .expect("test server shuts down");
 }
 
-/// An uncertain policy judgment returns `inconclusive`; a release without a
-/// destination record violates the `release` slot's schema, so `verify`
-/// refuses it before any judgment.
+/// An uncertain policy judgment returns `inconclusive`, and so does a release
+/// without a destination record: its `destination` slot is missing evidence,
+/// so `destination-restricted` cannot be judged. Neither is released.
 ///
 /// # Panics
 /// Panics when the server cannot start, the program fails, or either verdict
@@ -409,15 +409,19 @@ async fn finance_release_holds_uncertain_releases() {
         .as_object_mut()
         .expect("a release is an object")
         .remove("destination");
-    let refused = run
+    let incomplete = run
         .observe()
         .verify("release-check", missing)
         .await
-        .expect_err("an incomplete release is refused");
-    assert!(
-        refused.to_string().contains("destination"),
-        "the refusal names the missing record: {refused}"
-    );
+        .expect("the incomplete release verifies");
+    assert!(incomplete.is_inconclusive(), "{:?}", incomplete.outcome);
+    let destination = incomplete
+        .outcome
+        .requirements
+        .iter()
+        .find(|requirement| requirement.id.as_str() == "destination-restricted")
+        .expect("the destination requirement is judged");
+    assert_eq!(destination.outcome, RequirementOutcome::Inconclusive);
     story
         .server
         .shutdown()

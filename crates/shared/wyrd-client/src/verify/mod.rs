@@ -236,11 +236,13 @@ impl From<ArtifactRef> for Input {
     }
 }
 
-/// The values of one call: named by slot, or one value for a single-slot
+/// The values of one call: named by slot, or one value for the whole
 /// Verifier.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Inputs {
-    /// One value for the Verifier's only slot.
+    /// One value: a single-slot Verifier's slot value, or for a Verifier with
+    /// several slots, an object whose keys name the slots it fills, such as a
+    /// model whose fields are the Verifier's slots.
     One(Input),
     /// Values keyed by slot name.
     Named(BTreeMap<String, Input>),
@@ -266,7 +268,7 @@ impl Inputs {
 }
 
 impl<T: Into<Input>> From<T> for Inputs {
-    /// One value for a single-slot Verifier.
+    /// One value for the whole Verifier, as [`Inputs::One`].
     fn from(value: T) -> Self {
         Self::One(value.into())
     }
@@ -328,20 +330,28 @@ impl Target<'_> {
     ///
     /// # Errors
     /// Returns `WYRD_VERIFICATION_400_INPUT_INVALID` for an unknown slot
-    /// name, a positional value for a Verifier without exactly one slot, or
-    /// a value of the wrong kind for its slot.
+    /// name, a positional value other than an object for a Verifier with
+    /// several slots, or a value of the wrong kind for its slot.
     pub(crate) fn project(&self, inputs: Inputs) -> Result<Projected, WyrdError> {
         let named = match inputs {
             Inputs::Named(named) => named,
             Inputs::One(value) => {
                 let mut slots = self.spec.inputs.keys();
-                let (Some(slot), None) = (slots.next(), slots.next()) else {
-                    return Err(input_invalid(
-                        "a positional value needs a Verifier with exactly one input slot",
-                        json!({ "slots": self.spec.inputs.keys().collect::<Vec<_>>() }),
-                    ));
-                };
-                BTreeMap::from([(slot.as_str().to_owned(), value)])
+                match ((slots.next(), slots.next()), value) {
+                    ((Some(slot), None), value) => {
+                        BTreeMap::from([(slot.as_str().to_owned(), value)])
+                    }
+                    (_, Input::Value(Value::Object(fields))) => fields
+                        .into_iter()
+                        .map(|(slot, value)| (slot, Input::Value(value)))
+                        .collect(),
+                    _ => {
+                        return Err(input_invalid(
+                            "a positional value for a Verifier with several input slots is an object keyed by slot",
+                            json!({ "slots": self.spec.inputs.keys().collect::<Vec<_>>() }),
+                        ));
+                    }
+                }
             }
         };
         let window = self

@@ -813,9 +813,10 @@ fn result_body(id: &wyrd_spec::ids::ExecutionId) -> Value {
 }
 
 /// Samples fill a Window projection as one flat feature object, a
-/// single-measurement slot takes a bare value, and a positional value fills a
-/// single-slot Verifier; unknown slots, wrong kinds, bad trace IDs,
-/// undeclared measurements, and ambiguous positional values are refused.
+/// single-measurement slot takes a bare value, a positional value fills a
+/// single-slot Verifier, and a positional object fills the slots its keys
+/// name; unknown slots, wrong kinds, bad trace IDs, undeclared measurements,
+/// and positional non-objects for several slots are refused.
 ///
 /// # Panics
 /// Panics when a projection differs or a refusal passes.
@@ -848,10 +849,14 @@ fn values_project_onto_named_slots_by_slot_type() {
     run_evidence(&single, json!("yes").into());
 
     let run = run_verifier();
+    run_evidence(
+        &run,
+        json!({ "answer": "yes", "trace": "4bf92f3577b34da6a3ce929d0e0e4736" }).into(),
+    );
     let refusals: [(
         &wyrd_spec::card::verifier::VerifierSpec,
         crate::verify::Inputs,
-    ); 7] = [
+    ); 8] = [
         (&run, crate::verify::Inputs::named([("missing", json!(1))])),
         (
             &run,
@@ -866,6 +871,7 @@ fn values_project_onto_named_slots_by_slot_type() {
             crate::verify::Inputs::named([("trace", json!("not-a-trace"))]),
         ),
         (&run, json!("positional needs one slot").into()),
+        (&run, json!({ "answer": "yes", "missing": 1 }).into()),
         (
             &window,
             crate::verify::Inputs::named([("current", json!({ "age": 1 }))]),

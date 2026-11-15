@@ -1984,3 +1984,47 @@ fn model_slot_carries_the_derived_schema() {
     assert_eq!(schema["required"], json!(fields));
     verifier.plan().expect("a model slot validates");
 }
+
+/// A type's fields become one slot each, named as a value of the type
+/// serializes them so one value fills them all, a nested type's slot carrying
+/// its definition inline, and the Verifier validates paths into them.
+///
+/// # Panics
+/// Panics when the slots differ from the value's fields, a nested schema
+/// stays a reference, or the Verifier refuses the slots.
+#[test]
+fn fields_of_declares_one_slot_per_field() {
+    #[derive(serde::Serialize, schemars::JsonSchema)]
+    struct Report {
+        text: String,
+    }
+    #[derive(serde::Serialize, schemars::JsonSchema)]
+    struct Release {
+        report: Report,
+        authorized: bool,
+    }
+
+    let verifier = Verifier::new("release-check", "1.0.0")
+        .inputs(InputSlot::fields_of::<Release>())
+        .requirements([Requirement::new(
+            "authorized",
+            "The recipient is authorized.",
+            Check::assert("inputs.authorized", "equals", true),
+        )]);
+
+    let inputs = verifier.spec()["inputs"].clone();
+    let release = serde_json::to_value(Release {
+        report: Report {
+            text: "quarterly total".into(),
+        },
+        authorized: true,
+    })
+    .expect("release is JSON");
+    let slots: Vec<&String> = inputs.as_object().expect("an object").keys().collect();
+    let fields: Vec<&String> = release.as_object().expect("an object").keys().collect();
+    assert_eq!(slots, fields);
+    let report = &inputs["report"]["schema"];
+    assert_eq!(report.get("$ref"), None);
+    assert_eq!(report["properties"]["text"]["type"], json!("string"));
+    verifier.plan().expect("field slots validate");
+}

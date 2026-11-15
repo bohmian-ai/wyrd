@@ -20,33 +20,118 @@
 
 **You built the system. How do you know it's behaving correctly?**
 
-Wyrd tells you while it runs. Before your application acts, it sends Wyrd what it is about to do. Wyrd judges that against the requirements you declare and returns a verdict for each one, with a reason. Your code decides what happens next, and Wyrd keeps the evidence beside the exact versions it judged.
+Every system has its own requirements, workflows, and definitions of correct behavior. Turning them into repeatable checks usually means stitching together evaluation frameworks, observability tools, custom scripts, and data pipelines.
 
-Wyrd is open source. You build the verification your system needs from three steps: **Declare** what you ship and what it must do, **Observe** what it does, and **Verify** it.
+Wyrd gives you open-source building blocks for your own verification systems. **Declare** requirements. **Observe** real behavior. **Verify** live, during execution, or continuously over time.
+
+Live verification puts the verdict before the decision. Your application asks Wyrd whether what it is about to do meets your requirements, gets an evidence-backed verdict for each one, and decides what happens next. The same verdicts are available from queued and continuous checks.
 
 ## Example
 
 An application shares synthetic customer reports with outside auditors. Before it sends one, it checks three requirements: the recipient is authorized, the company sharing policy permits the release, and the destination restricts access. A model judges the policy; the other two are assertions on records the application supplies.
 
-<!-- example: examples/finance-release/finance_service.py region=requirements -->
+<!-- example: examples/finance-release/finance_service.py -->
 ```python
-requirements=[
-    Requirement(
-        "recipient-authorized",
-        "The recipient is authorized to receive the report.",
-        Check.assert_("inputs.release.recipient.authorized", ComparisonOperator.Equals, True),
+from pathlib import Path
+
+from pydantic import BaseModel
+from wyrd.verify import (
+    Agent,
+    AgentRunConfig,
+    Artifact,
+    Check,
+    ComparisonOperator,
+    ExecutionRoute,
+    Prompt,
+    Requirement,
+    ResponseFormat,
+    Service,
+    Verifier,
+)
+
+
+# The evidence the application sends for each release.
+class Report(BaseModel):
+    text: str
+
+
+class Recipient(BaseModel):
+    email: str
+    authorized: bool
+
+
+class Destination(BaseModel):
+    url: str
+    restricted: bool
+
+
+class Release(BaseModel):
+    report: Report
+    recipient: Recipient
+    destination: Destination
+
+
+# The company sharing policy. The program saves it beside itself the first
+# time; edit the file and run again to publish a new policy version.
+POLICY = """# Company sharing policy
+
+Reports may be shared outside the company only for external-audit purposes.
+A shared report must never contain a bank account identifier such as BANK-ACCOUNT-DEMO-001.
+"""
+policy_file = Path("company-sharing-policy.md")
+if not policy_file.exists():
+    policy_file.write_text(POLICY)
+policy = Artifact.from_path("company-sharing-policy", policy_file)
+
+# `policy-judge`: a model that reads the policy with `fs.read` and returns a
+# verdict on the report. Its model calls go through the `openai` gateway
+# deployment.
+policy_judge = Agent(
+    "policy-judge",
+    prompt=Prompt.openai_chat(
+        "gpt-4o",
+        messages=(
+            "Read /inputs/policy.md with fs.read. Decide whether the company sharing "
+            "policy permits sharing this report with this recipient, citing the report "
+            "and the policy line you apply. Report: {{report}} Recipient: {{recipient}}"
+        ),
+        response_format=ResponseFormat.verdict(),
     ),
-    Requirement(
-        "follows-policy",
-        "The company sharing policy permits this release.",
-        follows_policy,
-    ),
-    Requirement(
-        "destination-restricted",
-        "The destination restricts access to the report.",
-        Check.assert_("inputs.release.destination.restricted", ComparisonOperator.Equals, True),
-    ),
-],
+    execution_route=ExecutionRoute.wyrd_gateway(deployment="openai"),
+    tool_names=["fs.read"],
+    run_config=AgentRunConfig(max_iterations=3),
+)
+
+follows_policy = (
+    Check.agent(policy_judge)
+    .inputs({"report": "inputs.report", "recipient": "inputs.recipient"})
+    .add_workspace("/inputs/policy.md", policy.file("company-sharing-policy.md"))
+)
+
+release_check = Verifier(
+    "release-check",
+    inputs=Release,
+    requirements=[
+        Requirement(
+            "recipient-authorized",
+            "The recipient is authorized to receive the report.",
+            Check.assert_("inputs.recipient.authorized", ComparisonOperator.Equals, True),
+        ),
+        Requirement(
+            "follows-policy",
+            "The company sharing policy permits this release.",
+            follows_policy,
+        ),
+        Requirement(
+            "destination-restricted",
+            "The destination restricts access to the report.",
+            Check.assert_("inputs.destination.restricted", ComparisonOperator.Equals, True),
+        ),
+    ],
+)
+
+service = Service("finance-release", verified_by=[release_check])
+
 ```
 
 The application verifies each release with one call:

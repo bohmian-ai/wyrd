@@ -13,7 +13,7 @@ for (const text of [
   "Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001.",
 ]) {
   const release: Release = { report: { text }, recipient, destination };
-  const result = await run.observe.verify("release-check", { release });
+  const result = await run.observe.verify("release-check", release);
   console.log(`${result.outcome.verdict}: ${text}`);
 }
 

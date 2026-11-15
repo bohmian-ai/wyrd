@@ -43,23 +43,22 @@ const policyJudge = new Agent("policy-judge", {
 });
 
 const followsPolicy = Check.agent(policyJudge)
-  .inputs({ report: "inputs.release.report", recipient: "inputs.release.recipient" })
+  .inputs({ report: "inputs.report", recipient: "inputs.recipient" })
   .addWorkspace("/inputs/policy.md", policy.file("company-sharing-policy.md"));
 
 const releaseCheck = new Verifier("release-check", {
-  // The release the application sends.
-  inputs: { release: Release },
+  inputs: Release,
   requirements: [
     new Requirement(
       "recipient-authorized",
       "The recipient is authorized to receive the report.",
-      Check.assert("inputs.release.recipient.authorized", "equals", true),
+      Check.assert("inputs.recipient.authorized", "equals", true),
     ),
     new Requirement("follows-policy", "The company sharing policy permits this release.", followsPolicy),
     new Requirement(
       "destination-restricted",
       "The destination restricts access to the report.",
-      Check.assert("inputs.release.destination.restricted", "equals", true),
+      Check.assert("inputs.destination.restricted", "equals", true),
     ),
   ],
 });

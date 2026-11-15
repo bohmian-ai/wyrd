@@ -290,11 +290,7 @@ def sharing_verdict(messages: list[dict]) -> str:
     lines = [unit for unit in output.get("units", []) if "external-audit" in unit["text"]]
     if not lines:
         return "the policy did not read"
-    # The finance example's Verifier takes the report inside its one `release` slot.
-    if FINANCE_POLICY_JUDGE in release:
-        report = {"slot": "release", "locator": {"json_pointer": "/report/text"}}
-    else:
-        report = {"slot": "report", "locator": {"json_pointer": "/text"}}
+    report = {"slot": "report", "locator": {"json_pointer": "/text"}}
     citations = [
         report,
         {"slot": output["sources"][0], "locator": lines[0]["locator"]},

@@ -8,13 +8,17 @@ order: 1
 
 **You built the system. How do you know it's behaving correctly?**
 
-Wyrd is the only real-time verification system built for your applications. Before your application acts, it sends Wyrd what it is about to do. Wyrd judges that against the requirements you declare and returns a verdict for each one, with a reason. Your code decides what happens next, and Wyrd keeps the evidence beside the exact versions it judged.
+Every system has its own requirements, workflows, and definitions of correct behavior. Turning them into repeatable checks usually means stitching together evaluation frameworks, observability tools, custom scripts, and data pipelines.
+
+Wyrd is the only real-time verification system built for your applications: open-source building blocks for your own verification systems. **Declare** requirements. **Observe** real behavior. **Verify** live, during execution, or continuously over time.
+
+Live verification puts the verdict before the decision. Your application asks Wyrd whether what it is about to do meets your requirements, gets an evidence-backed verdict for each one, and decides what happens next. The same verdicts are available from queued and continuous checks.
 
 ## An example
 
 An application shares synthetic customer reports with outside auditors. Before it sends one, it checks three requirements in one Verifier. A model reads the company sharing policy and judges the report; the other two are assertions on records the application supplies:
 
-<CodeFromFile file="examples/finance-release/finance_service.py" region="requirements" lang="python" title="finance_service.py" />
+<CodeFromFile file="examples/finance-release/finance_service.py" lang="python" title="finance_service.py" />
 
 The application verifies each release with one call:
 

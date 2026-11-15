@@ -20,30 +20,112 @@ Page: /wyrd/get-started/introduction/
 
 **You built the system. How do you know it's behaving correctly?**
 
-Wyrd is the only real-time verification system built for your applications. Before your application acts, it sends Wyrd what it is about to do. Wyrd judges that against the requirements you declare and returns a verdict for each one, with a reason. Your code decides what happens next, and Wyrd keeps the evidence beside the exact versions it judged.
+Every system has its own requirements, workflows, and definitions of correct behavior. Turning them into repeatable checks usually means stitching together evaluation frameworks, observability tools, custom scripts, and data pipelines.
+
+Wyrd is the only real-time verification system built for your applications: open-source building blocks for your own verification systems. **Declare** requirements. **Observe** real behavior. **Verify** live, during execution, or continuously over time.
+
+Live verification puts the verdict before the decision. Your application asks Wyrd whether what it is about to do meets your requirements, gets an evidence-backed verdict for each one, and decides what happens next. The same verdicts are available from queued and continuous checks.
 
 ## An example
 
 An application shares synthetic customer reports with outside auditors. Before it sends one, it checks three requirements in one Verifier. A model reads the company sharing policy and judges the report; the other two are assertions on records the application supplies:
 
 ```python title="finance_service.py"
-requirements=[
-    Requirement(
-        "recipient-authorized",
-        "The recipient is authorized to receive the report.",
-        Check.assert_("inputs.release.recipient.authorized", ComparisonOperator.Equals, True),
+from pathlib import Path
+
+from pydantic import BaseModel
+from wyrd.verify import (
+    Agent,
+    AgentRunConfig,
+    Artifact,
+    Check,
+    ComparisonOperator,
+    ExecutionRoute,
+    Prompt,
+    Requirement,
+    ResponseFormat,
+    Service,
+    Verifier,
+)
+
+# The evidence the application sends for each release.
+class Report(BaseModel):
+    text: str
+
+class Recipient(BaseModel):
+    email: str
+    authorized: bool
+
+class Destination(BaseModel):
+    url: str
+    restricted: bool
+
+class Release(BaseModel):
+    report: Report
+    recipient: Recipient
+    destination: Destination
+
+# The company sharing policy. The program saves it beside itself the first
+# time; edit the file and run again to publish a new policy version.
+POLICY = """# Company sharing policy
+
+Reports may be shared outside the company only for external-audit purposes.
+A shared report must never contain a bank account identifier such as BANK-ACCOUNT-DEMO-001.
+"""
+policy_file = Path("company-sharing-policy.md")
+if not policy_file.exists():
+    policy_file.write_text(POLICY)
+policy = Artifact.from_path("company-sharing-policy", policy_file)
+
+# `policy-judge`: a model that reads the policy with `fs.read` and returns a
+# verdict on the report. Its model calls go through the `openai` gateway
+# deployment.
+policy_judge = Agent(
+    "policy-judge",
+    prompt=Prompt.openai_chat(
+        "gpt-4o",
+        messages=(
+            "Read /inputs/policy.md with fs.read. Decide whether the company sharing "
+            "policy permits sharing this report with this recipient, citing the report "
+            "and the policy line you apply. Report: {{report}} Recipient: {{recipient}}"
+        ),
+        response_format=ResponseFormat.verdict(),
     ),
-    Requirement(
-        "follows-policy",
-        "The company sharing policy permits this release.",
-        follows_policy,
-    ),
-    Requirement(
-        "destination-restricted",
-        "The destination restricts access to the report.",
-        Check.assert_("inputs.release.destination.restricted", ComparisonOperator.Equals, True),
-    ),
-],
+    execution_route=ExecutionRoute.wyrd_gateway(deployment="openai"),
+    tool_names=["fs.read"],
+    run_config=AgentRunConfig(max_iterations=3),
+)
+
+follows_policy = (
+    Check.agent(policy_judge)
+    .inputs({"report": "inputs.report", "recipient": "inputs.recipient"})
+    .add_workspace("/inputs/policy.md", policy.file("company-sharing-policy.md"))
+)
+
+release_check = Verifier(
+    "release-check",
+    inputs=Release,
+    requirements=[
+        Requirement(
+            "recipient-authorized",
+            "The recipient is authorized to receive the report.",
+            Check.assert_("inputs.recipient.authorized", ComparisonOperator.Equals, True),
+        ),
+        Requirement(
+            "follows-policy",
+            "The company sharing policy permits this release.",
+            follows_policy,
+        ),
+        Requirement(
+            "destination-restricted",
+            "The destination restricts access to the report.",
+            Check.assert_("inputs.destination.restricted", ComparisonOperator.Equals, True),
+        ),
+    ],
+)
+
+service = Service("finance-release", verified_by=[release_check])
+
 ```
 
 The application verifies each release with one call:
@@ -499,19 +581,18 @@ policy_judge = Agent(
 
 follows_policy = (
     Check.agent(policy_judge)
-    .inputs({"report": "inputs.release.report", "recipient": "inputs.release.recipient"})
+    .inputs({"report": "inputs.report", "recipient": "inputs.recipient"})
     .add_workspace("/inputs/policy.md", policy.file("company-sharing-policy.md"))
 )
 
 release_check = Verifier(
     "release-check",
-    # Each release must match its model.
-    inputs={"release": Release},
+    inputs=Release,
     requirements=[
         Requirement(
             "recipient-authorized",
             "The recipient is authorized to receive the report.",
-            Check.assert_("inputs.release.recipient.authorized", ComparisonOperator.Equals, True),
+            Check.assert_("inputs.recipient.authorized", ComparisonOperator.Equals, True),
         ),
         Requirement(
             "follows-policy",
@@ -521,7 +602,7 @@ release_check = Verifier(
         Requirement(
             "destination-restricted",
             "The destination restricts access to the report.",
-            Check.assert_("inputs.release.destination.restricted", ComparisonOperator.Equals, True),
+            Check.assert_("inputs.destination.restricted", ComparisonOperator.Equals, True),
         ),
     ],
 )
@@ -630,8 +711,8 @@ pub fn service() -> Result<Service, Box<dyn Error>> {
 /// Returns the policy judge's Prompt or route refusal.
 fn release_check(policy: &Artifact) -> Result<Verifier, Box<dyn Error>> {
     let mut follows_policy = Check::agent(policy_judge()?).inputs([
-        ("report", "inputs.release.report"),
-        ("recipient", "inputs.release.recipient"),
+        ("report", "inputs.report"),
+        ("recipient", "inputs.recipient"),
     ]);
     follows_policy.add_workspace(
         "/inputs/policy.md",
@@ -639,14 +720,13 @@ fn release_check(policy: &Artifact) -> Result<Verifier, Box<dyn Error>> {
     );
 
     Ok(Verifier::new("release-check", None)
-        // The release the application sends.
-        .inputs([("release", InputSlot::model::<Release>())])
+        .inputs(InputSlot::fields_of::<Release>())
         .requirements([
             Requirement::new(
                 "recipient-authorized",
                 "The recipient is authorized to receive the report.",
                 Check::assert(
-                    "inputs.release.recipient.authorized",
+                    "inputs.recipient.authorized",
                     ComparisonOperator::Equals,
                     true,
                 ),
@@ -660,7 +740,7 @@ fn release_check(policy: &Artifact) -> Result<Verifier, Box<dyn Error>> {
                 "destination-restricted",
                 "The destination restricts access to the report.",
                 Check::assert(
-                    "inputs.release.destination.restricted",
+                    "inputs.destination.restricted",
                     ComparisonOperator::Equals,
                     true,
                 ),
@@ -805,23 +885,22 @@ const policyJudge = new Agent("policy-judge", {
 });
 
 const followsPolicy = Check.agent(policyJudge)
-  .inputs({ report: "inputs.release.report", recipient: "inputs.release.recipient" })
+  .inputs({ report: "inputs.report", recipient: "inputs.recipient" })
   .addWorkspace("/inputs/policy.md", policy.file("company-sharing-policy.md"));
 
 const releaseCheck = new Verifier("release-check", {
-  // The release the application sends.
-  inputs: { release: Release },
+  inputs: Release,
   requirements: [
     new Requirement(
       "recipient-authorized",
       "The recipient is authorized to receive the report.",
-      Check.assert("inputs.release.recipient.authorized", "equals", true),
+      Check.assert("inputs.recipient.authorized", "equals", true),
     ),
     new Requirement("follows-policy", "The company sharing policy permits this release.", followsPolicy),
     new Requirement(
       "destination-restricted",
       "The destination restricts access to the report.",
-      Check.assert("inputs.release.destination.restricted", "equals", true),
+      Check.assert("inputs.destination.restricted", "equals", true),
     ),
   ],
 });
@@ -846,7 +925,7 @@ for (const text of [
   "Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001.",
 ]) {
   const release: Release = { report: { text }, recipient, destination };
-  const result = await run.observe.verify("release-check", { release });
+  const result = await run.observe.verify("release-check", release);
   console.log(`${result.outcome.verdict}: ${text}`);
 }
 

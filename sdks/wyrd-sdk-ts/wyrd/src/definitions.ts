@@ -147,10 +147,38 @@ export interface JsonSchemaSource {
  * non-JSON properties a library attaches, such as Zod's `~standard`.
  */
 function inputSlot(slot: InputSlotArg): InputSlotArg {
-  const source = slot as Partial<JsonSchemaSource>;
-  return typeof source.toJSONSchema === "function"
-    ? InputSlot.json(JSON.parse(JSON.stringify(source.toJSONSchema())) as Wire.JsonValue)
-    : slot;
+  return isSchemaSource(slot) ? InputSlot.json(emitted(slot)) : slot;
+}
+
+/** Whether `value` is a {@link JsonSchemaSource}. */
+function isSchemaSource(value: unknown): value is JsonSchemaSource {
+  return typeof (value as Partial<JsonSchemaSource> | null)?.toJSONSchema === "function";
+}
+
+/** The JSON Schema `source` emits, as plain JSON. */
+function emitted(source: JsonSchemaSource): Wire.JsonValue {
+  return JSON.parse(JSON.stringify(source.toJSONSchema())) as Wire.JsonValue;
+}
+
+/**
+ * A Verifier's `inputs`: the slots by name, or one `json` slot per property
+ * of the object schema a {@link JsonSchemaSource} such as a Zod object emits,
+ * each carrying the schema's `$defs` so references still resolve.
+ */
+function inputSlots(entries: VerifierInputs): Record<string, InputSlotArg> {
+  if (!isSchemaSource(entries)) {
+    return Object.fromEntries(Object.entries(entries).map(([key, slot]) => [key, inputSlot(slot)]));
+  }
+  const { properties = {}, $defs } = emitted(entries) as {
+    properties?: Record<string, Readonly<Record<string, Wire.JsonValue>>>;
+    $defs?: Wire.JsonValue;
+  };
+  return Object.fromEntries(
+    Object.entries(properties).map(([name, schema]) => [
+      name,
+      InputSlot.json($defs === undefined ? schema : { ...schema, $defs }),
+    ]),
+  );
 }
 
 /** Service spec fields as authored. */
@@ -159,8 +187,13 @@ type ServiceFields = Omit<Fields<Wire.ServiceSpec>, "verified_by"> & { readonly 
 type AgentFields = Omit<Fields<Wire.AgentSpec>, "verified_by"> & { readonly verified_by?: readonly BindingArg[] };
 /** Verifier spec fields as authored. */
 type VerifierFields = Omit<Fields<Wire.VerifierSpec>, "inputs"> & {
-  readonly inputs?: Readonly<Record<string, InputSlotArg>>;
+  readonly inputs?: VerifierInputs;
 };
+/**
+ * A Verifier's `inputs` as authored: the slots by name, or a schema such as a
+ * Zod object whose properties are the slots, so one value of it fills them all.
+ */
+type VerifierInputs = Readonly<Record<string, InputSlotArg>> | JsonSchemaSource;
 /** Artifact spec fields as authored. */
 type ArtifactFields = Fields<Wire.ArtifactSpec>;
 /** Model spec fields as authored. */
@@ -1514,15 +1547,12 @@ export class Verifier extends AuthoredCard {
   /**
    * Set the whole `inputs` map, replacing every earlier entry and whatever it referenced.
    *
-   * @param entries - The new entries.
+   * @param entries - The slots by name, or a schema such as a Zod object whose
+   * properties are the slots.
    * @returns This value.
    */
   inputs(entries: Value<VerifierFields, "inputs">): this {
-    return set(
-      this,
-      "inputs",
-      Object.fromEntries(Object.entries(entries).map(([key, slot]) => [key, inputSlot(slot)])),
-    );
+    return set(this, "inputs", inputSlots(entries));
   }
 
   /**
@@ -1532,7 +1562,7 @@ export class Verifier extends AuthoredCard {
    * @param value - The entry's value.
    * @returns This value.
    */
-  addInput(key: string, value: Entry<VerifierFields, "inputs">): this {
+  addInput(key: string, value: InputSlotArg): this {
     return insert(this, "inputs", key, inputSlot(value));
   }
 }

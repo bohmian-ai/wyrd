@@ -87,7 +87,7 @@ test("judges each finance requirement on its own", async ({ reader }) => {
     { ...PERMITTED, destination: { url: "https://example.test", restricted: false } },
     { ...PERMITTED, report: { text: "Synthetic report flagged PROVIDER-UNCERTAIN." } },
   ]) {
-    verdicts.push((await run.observe.verify("release-check", { release })).outcome.verdict);
+    verdicts.push((await run.observe.verify("release-check", release)).outcome.verdict);
   }
   await state.shutdown();
   expect(verdicts).toEqual(["failed", "failed", "inconclusive"]);

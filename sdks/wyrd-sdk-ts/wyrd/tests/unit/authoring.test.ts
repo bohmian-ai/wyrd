@@ -641,3 +641,22 @@ test("a Zod schema is a json input slot of the JSON Schema it emits", () => {
   expect(inputs.again).toEqual(inputs.release);
   expect(() => verifier.plan()).not.toThrow();
 });
+
+test("a Zod object as the whole inputs declares one slot per property", () => {
+  const Release = z.object({ report: z.object({ text: z.string() }), authorized: z.boolean() });
+  const verifier = new Verifier("release-check", {
+    version: "1.0.0",
+    inputs: Release,
+    requirements: [
+      new Requirement("authorized", "The recipient is authorized.", Check.assert("inputs.authorized", "equals", true)),
+    ],
+  });
+
+  const inputs = (verifier.spec() as { inputs: Record<string, unknown> }).inputs;
+  const { properties } = z.toJSONSchema(Release) as { properties: Record<string, unknown> };
+  expect(inputs).toEqual({
+    report: { type: "json", schema: properties.report },
+    authorized: { type: "json", schema: properties.authorized },
+  });
+  expect(() => verifier.plan()).not.toThrow();
+});

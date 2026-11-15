@@ -128,6 +128,45 @@ impl InputSlot {
         Self::json(schemars::schema_for!(T))
     }
 
+    /// One slot per field of `T`, such as a struct deriving
+    /// `schemars::JsonSchema`, as [`InputSlot::fields`] reads its schema: the
+    /// Rust twin of passing a Pydantic model or Zod object as a Verifier's
+    /// whole `inputs`. A value of `T` passed to `verify` then fills every slot
+    /// at once. A `T` without fields, such as an enum, declares no slots.
+    #[must_use]
+    pub fn fields_of<T: schemars::JsonSchema>() -> Vec<(String, Self)> {
+        Self::fields(&Value::from(schemars::schema_for!(T))).unwrap_or_default()
+    }
+
+    /// One slot per property of the object JSON Schema `schema`, named by
+    /// the property and constrained by its schema; `None` when `schema`
+    /// declares no `properties`. A property that references one of the
+    /// schema's `$defs` becomes that definition, carrying the definitions it
+    /// reaches, so nested types and references still resolve. A recursive
+    /// type's schema is a root `$ref` to its own definition, whose properties
+    /// are the slots.
+    #[must_use]
+    pub fn fields(schema: &Value) -> Option<Vec<(String, Self)>> {
+        let empty = serde_json::Map::new();
+        let defs = schema
+            .get("$defs")
+            .and_then(Value::as_object)
+            .unwrap_or(&empty);
+        let root = schema
+            .get("$ref")
+            .and_then(Value::as_str)
+            .and_then(local_def)
+            .and_then(|name| defs.get(name))
+            .unwrap_or(schema);
+        let properties = root.get("properties").and_then(Value::as_object)?;
+        Some(
+            properties
+                .iter()
+                .map(|(name, property)| (name.clone(), Self::from(standalone(property, defs))))
+                .collect(),
+        )
+    }
+
     /// A slot of `type` listing `items` under `field`.
     fn listing<I>(kind: &str, field: &str, items: I) -> Self
     where
@@ -173,6 +212,64 @@ impl InputSlot {
         body.fields
             .insert("source".to_owned(), Value::from(text.into()));
         Self { body }
+    }
+}
+
+/// `property` as a schema of its own: a lone local `$ref` replaced by the
+/// definition it names, with the other keys kept, and `$defs` holding every
+/// definition the result still references.
+fn standalone(property: &Value, defs: &serde_json::Map<String, Value>) -> Value {
+    let mut schema = property.clone();
+    if let Value::Object(object) = &mut schema
+        && let Some(target) = object
+            .get("$ref")
+            .and_then(Value::as_str)
+            .and_then(local_def)
+        && let Some(Value::Object(definition)) = defs.get(target)
+    {
+        object.remove("$ref");
+        for (key, value) in definition {
+            object.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+    let mut reached = serde_json::Map::new();
+    let mut pending = vec![schema.clone()];
+    while let Some(value) = pending.pop() {
+        for name in local_refs(&value) {
+            if let Some(definition) = defs.get(name.as_str())
+                && !reached.contains_key(&name)
+            {
+                reached.insert(name, definition.clone());
+                pending.push(definition.clone());
+            }
+        }
+    }
+    if let (Value::Object(object), false) = (&mut schema, reached.is_empty()) {
+        object.insert("$defs".to_owned(), Value::Object(reached));
+    }
+    schema
+}
+
+/// The `$defs` name a local `#/$defs/<name>` reference points at.
+fn local_def(reference: &str) -> Option<&str> {
+    reference.strip_prefix("#/$defs/")
+}
+
+/// Every `$defs` name `value` references locally, at any depth.
+fn local_refs(value: &Value) -> Vec<String> {
+    match value {
+        Value::Object(object) => object
+            .iter()
+            .flat_map(|(key, value)| match (key.as_str(), value) {
+                ("$ref", Value::String(reference)) => local_def(reference)
+                    .map(str::to_owned)
+                    .into_iter()
+                    .collect(),
+                _ => local_refs(value),
+            })
+            .collect(),
+        Value::Array(items) => items.iter().flat_map(local_refs).collect(),
+        _ => Vec::new(),
     }
 }
 

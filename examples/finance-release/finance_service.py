@@ -72,20 +72,19 @@ policy_judge = Agent(
 
 follows_policy = (
     Check.agent(policy_judge)
-    .inputs({"report": "inputs.release.report", "recipient": "inputs.release.recipient"})
+    .inputs({"report": "inputs.report", "recipient": "inputs.recipient"})
     .add_workspace("/inputs/policy.md", policy.file("company-sharing-policy.md"))
 )
 
 release_check = Verifier(
     "release-check",
-    # Each release must match its model.
-    inputs={"release": Release},
+    inputs=Release,
     # ANCHOR: requirements
     requirements=[
         Requirement(
             "recipient-authorized",
             "The recipient is authorized to receive the report.",
-            Check.assert_("inputs.release.recipient.authorized", ComparisonOperator.Equals, True),
+            Check.assert_("inputs.recipient.authorized", ComparisonOperator.Equals, True),
         ),
         Requirement(
             "follows-policy",
@@ -95,7 +94,7 @@ release_check = Verifier(
         Requirement(
             "destination-restricted",
             "The destination restricts access to the report.",
-            Check.assert_("inputs.release.destination.restricted", ComparisonOperator.Equals, True),
+            Check.assert_("inputs.destination.restricted", ComparisonOperator.Equals, True),
         ),
     ],
     # ANCHOR_END: requirements

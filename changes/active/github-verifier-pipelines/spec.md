@@ -1,6 +1,6 @@
 ---
 id: SPEC-github-verifier-pipelines
-revision: 11
+revision: 12
 status: approved
 ---
 
@@ -277,8 +277,13 @@ principal revocation's is delivered by the next restart recovery. Execution insp
 and safe error separately from the verdict. No progress ledger, new SQL table or
 column, result mirror or finalizer service.
 
-**REQ-015 — Resource isolation.** Direct and queued execution, workspace, Python
-and model-call admission use separate capacity without borrowing. PR extraction,
+**REQ-015 — Resource isolation.** Queued work never degrades direct verification. Queued execution runs on
+its own long-lived runtime and sandbox worker pool with a bounded CPU share
+(covering its engine, model, blocking, Python and nested tool work) and a
+memory reservation. Direct keeps reserved capacity queued work never takes;
+direct may borrow idle queued capacity, and queued never borrows direct. The
+one process memory/scratch ledger accounts both. Direct c64 latency and
+throughput stay unchanged while queued work saturates its share. PR extraction,
 deferred inputs and approval are queued-only, including manual calls; refuse a
 direct request before any step. Under the TASK-010-R1 amendment, a Verifier
 whose step or check Agent, inline or a referenced registered Agent, declares
@@ -463,6 +468,7 @@ readiness. Implementation tasks derive from this approved revision.
 | 9 | approved 2026-11-13 | User decision during TASK-009: GitHub REST offers no idempotency key, so delivery is lookup-before-create with a rare duplicate accepted; drop Check annotations, the delivery progress ledger, comment reuse/moved-anchor history and the optional report helpers; one Bifrost delivery outcome per execution. Amends REQ-012–014 and AC-009 and supersedes conflicting text in [report delivery](design/approved-report-delivery.md), [runtime and GitHub](design/approved-runtime-and-github.md), contracts and task 009. |
 | 10 | approved 2026-11-13 | User decision during TASK-009: the GitHub delivery outcome has no typed Rust client, SDK or CLI projection; it is read through existing HTTP/MCP execution inspection. Amends REQ-016 and AC-011 and task 009 surfaces. Nothing else changes. |
 | 11 | approved 2026-11-14 | User decisions after the TASK-009 review: cancellation is its own delivery, recorded once per revision apart from that revision's outcome (FIND-009-8; amends REQ-014 and the bifrost-design one-outcome-per-revision rule). Deferred as accepted limits: report source is the first retained pull_request extraction output and an extraction-shaped decoy is not distinguished (FIND-009-2); access and generation are rechecked before each write attempt, not again after its lookup (FIND-009-6); startup recovery waiting on a provider cooldown may hold shutdown until the drain deadline (FIND-009-9). Nothing else changes. |
+| 12 | approved 2026-11-15 | Maintainer integration decisions for porting code mode (TASK-012/013/014): REQ-015 replaces separate capacity without borrowing with queued runtime/pool isolation, a bounded queued CPU share and memory reservation, reserved direct capacity, direct-only borrowing of idle queued capacity and one ledger. Nested code-mode calls exclude fs.write and publish. Tool-call spend is restored from the attempt records used for max_agent_invocations; an unsettled attempt counts its whole allowance. Repository is the thirteenth Card kind. The sanctioned test-control set is the reconciled union, guard strictness unchanged. Monty stays on its crates.io release. Nothing else changes. |
 
 Subsequent explicit maintainer amendment: approval authoring has no separate
 expiration setting. Pending approvals and deferred waits share the execution's

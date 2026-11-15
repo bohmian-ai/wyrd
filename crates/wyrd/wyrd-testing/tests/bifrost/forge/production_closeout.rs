@@ -187,18 +187,19 @@ struct CloseoutJourney {
     cluster: WyrdTestCluster,
     /// Notification source emitted after production worker outcomes.
     observer: ForgeWorkerCompletionObserver,
-    /// Stable identity of the initially delayed coordinator.
+    /// Stable identity of the initially delayed maintenance node.
     coordinator_node: NodeId,
     /// Stable identity of the independent ingest process.
     scribe_node: NodeId,
     /// Stable identity of the independent query process.
     oracle_node: NodeId,
-    /// Stable identity of the dedicated maintenance worker.
+    /// Stable identity of the maintenance node's worker, the coordinator's
+    /// own node.
     worker_node: NodeId,
 }
 
 impl CloseoutJourney {
-    /// Starts dedicated ingest, query, and worker nodes, retaining a delayed coordinator.
+    /// Starts dedicated ingest and query nodes and one delayed maintenance node.
     ///
     /// # Panics
     /// Panics if the production topology cannot start or lacks its observer.
@@ -217,20 +218,22 @@ impl CloseoutJourney {
                 .with_staging_target_file_size_bytes(profile.scribe_target_bytes)
                 .expect("the selected staging target is a valid geometry"),
         );
-        let coordinator_node = spec.nodes[3].node_id;
-        let scribe_node = spec.nodes[0].node_id;
-        let oracle_node = spec.nodes[2].node_id;
-        let worker_node = spec.nodes[1].node_id;
-        let scribe_roles = spec.nodes[0].roles.clone();
-        spec.nodes[3].roles = scribe_roles;
+        // `bifrost-ingest`, `bifrost-query`, and one delayed
+        // `bifrost-maintenance` node, which is both the coordinator and the
+        // worker.
+        spec.nodes.truncate(3);
         spec.nodes[0].roles = [BifrostRuntimeRole::Scribe].into_iter().collect();
-        spec.nodes[2].roles = [BifrostRuntimeRole::Oracle].into_iter().collect();
+        spec.nodes[1].roles = [BifrostRuntimeRole::Oracle].into_iter().collect();
+        let scribe_node = spec.nodes[0].node_id;
+        let oracle_node = spec.nodes[1].node_id;
+        let coordinator_node = spec.nodes[2].node_id;
+        let worker_node = coordinator_node;
         // Only the qualification profile needs an oversized worker pod: its
         // 512 MiB inputs decode into a working set that would spill heavily
         // under an ordinary pod's shared cap. The scaled default runs on the
         // harness default snapshot.
         if profile.production_resources {
-            spec.nodes[1].oracle = Some(TestOracleResources {
+            spec.nodes[2].oracle = Some(TestOracleResources {
                 data_root_parent: None,
                 system_resources: Some(SystemResourceSnapshot {
                     memory_limit_bytes: 32 * 1024 * 1024 * 1024,
@@ -266,7 +269,7 @@ impl CloseoutJourney {
         let observer = cluster
             .forge_completion_observer()
             .expect("worker observer");
-        assert_eq!(cluster.configured_node_ids().len(), 4);
+        assert_eq!(cluster.configured_node_ids().len(), 3);
         eprintln!(
             "closeout role/node identities: {:?}",
             cluster.configured_node_ids()

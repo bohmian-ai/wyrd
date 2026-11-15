@@ -34,7 +34,7 @@ use wyrd_ai::verify::{Submission, VerificationExecutionStatus};
 use wyrd_ai::{StepStatus, VerificationResult, WyrdClient};
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::auth::TokenAudience;
-use wyrd_testing::server::{HostedLimits, LaneLimits, WyrdTestServer};
+use wyrd_testing::server::{HostedLimits, WyrdTestServer};
 
 use crate::local_development::configure_gateway;
 use crate::support::{Deployment, declare, pull};
@@ -654,26 +654,24 @@ impl PublishDesk {
 /// # Panics
 /// Panics when the upstream's URL does not parse.
 pub(crate) fn builder(upstream: &MockServer) -> wyrd_testing::server::WyrdTestServerBuilder {
-    model_calls(upstream, HostedLimits::default().queued.model_calls)
+    model_calls(upstream, HostedLimits::default().model_calls)
 }
 
-/// [`builder`]'s server admitting at most `queued_model_calls` concurrent
-/// queued model calls across every execution and tenant.
+/// [`builder`]'s server admitting at most `model_calls` concurrent model
+/// calls across every execution and tenant.
 ///
 /// # Panics
 /// Panics when the upstream's URL does not parse.
 pub(crate) fn model_calls(
     upstream: &MockServer,
-    queued_model_calls: usize,
+    model_calls: usize,
 ) -> wyrd_testing::server::WyrdTestServerBuilder {
     let limits = HostedLimits::default();
     WyrdTestServer::builder()
         .with_verification_limits_for_test(HostedLimits {
             monty_min_workers: 0,
             work_write_max_bytes: WORK as u64,
-            queued: LaneLimits {
-                model_calls: queued_model_calls,
-            },
+            model_calls,
             ..limits
         })
         .with_verification_runtime_for_test()

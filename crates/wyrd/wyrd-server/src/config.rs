@@ -1852,14 +1852,11 @@ pub struct VerificationConfig {
     /// `WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS` overrides it.
     #[serde(default)]
     pub execution_timeout_ms: Option<u64>,
-    /// Model-call permits `verify` calls hold apart from queued executions.
-    /// `WYRD_VERIFICATION_DIRECT_*` overrides each value.
+    /// Gateway model calls every `verify` call and queued execution of one
+    /// process make at once; unset keeps the default.
+    /// `WYRD_VERIFICATION_MODEL_CALLS` overrides it.
     #[serde(default)]
-    pub direct: VerificationLaneConfig,
-    /// Model-call permits queued executions hold apart from `verify` calls.
-    /// `WYRD_VERIFICATION_QUEUED_*` overrides each value.
-    #[serde(default)]
-    pub queued: VerificationLaneConfig,
+    pub model_calls: Option<usize>,
     /// The resolved Deployment limits: defaults, then the file capacities
     /// above, then `WYRD_VERIFICATION_*`, validated at startup.
     #[serde(skip)]
@@ -1868,16 +1865,6 @@ pub struct VerificationConfig {
     /// queued execution deadline are configurable, resolved as `limits` is.
     #[serde(skip)]
     pub runtime: RuntimeLimits,
-}
-
-/// One verification execution lane's capacity in the server TOML file; an
-/// unset value keeps the lane's default.
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VerificationLaneConfig {
-    /// Gateway model calls the lane makes at once.
-    #[serde(default)]
-    pub model_calls: Option<usize>,
 }
 
 /// Serde default for [`VerificationConfig::enabled`].
@@ -1894,8 +1881,7 @@ impl Default for VerificationConfig {
             direct_executions: None,
             queued_executions: None,
             execution_timeout_ms: None,
-            direct: VerificationLaneConfig::default(),
-            queued: VerificationLaneConfig::default(),
+            model_calls: None,
             limits: HostedLimits::default(),
             runtime: RuntimeLimits::default(),
         }
@@ -1928,28 +1914,13 @@ impl VerificationConfig {
         /// One mebibyte.
         const MIB: u64 = 1024 * KIB;
         let limits = &mut self.limits;
-        for (lane, file, table, prefix) in [
-            (
-                &mut limits.direct,
-                self.direct,
-                "verification.direct",
-                "WYRD_VERIFICATION_DIRECT",
-            ),
-            (
-                &mut limits.queued,
-                self.queued,
-                "verification.queued",
-                "WYRD_VERIFICATION_QUEUED",
-            ),
-        ] {
-            set_count(
-                &format!("{table}.model_calls"),
-                file.model_calls,
-                &format!("{prefix}_MODEL_CALLS"),
-                Semaphore::MAX_PERMITS,
-                &mut lane.model_calls,
-            )?;
-        }
+        set_count(
+            "verification.model_calls",
+            self.model_calls,
+            "WYRD_VERIFICATION_MODEL_CALLS",
+            Semaphore::MAX_PERMITS,
+            &mut limits.model_calls,
+        )?;
         set_count(
             "verification.direct_executions",
             self.direct_executions,
@@ -4529,7 +4500,6 @@ mod tests {
     use chrono::{DateTime, Utc};
 
     use super::*;
-    use crate::verification::hosted::LaneLimits;
     use vala_bifrost_redux::resources::{
         ORACLE_PARTITION_WORKING_MEMORY_BYTES, ResourcePlan, ScribeWorkers, oracle_worker_slots,
     };
@@ -4971,9 +4941,8 @@ maintenance_interval_secs = 45
         }
     }
 
-    /// The server TOML file sets each lane's model-call capacity, the
-    /// direct and queued execution slots, the queued share, and the
-    /// queued deadline; values it
+    /// The server TOML file sets the process model-call capacity, the
+    /// direct and queued execution slots, and the queued deadline; values it
     /// leaves out keep their defaults, and an environment variable overrides
     /// its file value alone, repairing a file value that is zero, overflows
     /// its unit, or is no representable deadline; an invalid variable refuses
@@ -4981,8 +4950,8 @@ maintenance_interval_secs = 45
     /// unrepresentable file value is refused naming its key: a count above
     /// the semaphore maximum, which itself applies, or a deadline past the
     /// latest `DateTime<Utc>` from now, while one just inside applies. A
-    /// negative count and a removed per-lane Python, workspace, or queued
-    /// share key do not parse.
+    /// negative count, a removed per-lane model-call key, and a removed
+    /// queued share key do not parse.
     ///
     /// # Panics
     /// Panics when a file value is not resolved, the environment does not
@@ -4996,10 +4965,7 @@ maintenance_interval_secs = 45
             direct_executions = 7
             queued_executions = 9
             execution_timeout_ms = 7200000
-            [verification.direct]
             model_calls = 11
-            [verification.queued]
-            model_calls = 19
         ";
         let _guard = ENV_LOCK.lock().expect("environment test lock");
         let file = |contents: &str| {
@@ -5015,13 +4981,7 @@ maintenance_interval_secs = 45
             ),
             (7, 9, Duration::from_hours(2))
         );
-        assert_eq!(
-            (config.limits.direct, config.limits.queued),
-            (
-                LaneLimits { model_calls: 11 },
-                LaneLimits { model_calls: 19 }
-            )
-        );
+        assert_eq!(config.limits.model_calls, 11);
         assert_eq!(
             (config.limits.verify_timeout, config.runtime.lease),
             (
@@ -5033,7 +4993,7 @@ maintenance_interval_secs = 45
         temp_env::with_vars(
             [
                 ("WYRD_VERIFICATION_DIRECT_EXECUTIONS", Some("2")),
-                ("WYRD_VERIFICATION_QUEUED_MODEL_CALLS", Some("23")),
+                ("WYRD_VERIFICATION_MODEL_CALLS", Some("23")),
             ],
             || {
                 let mut config = file(FILE).expect("the file parses");
@@ -5041,11 +5001,10 @@ maintenance_interval_secs = 45
                 assert_eq!(
                     (
                         config.limits.direct_executions,
-                        config.limits.queued.model_calls,
-                        config.limits.direct.model_calls,
+                        config.limits.model_calls,
                         config.runtime.execution_slots,
                     ),
-                    (2, 23, 11, 9),
+                    (2, 23, 9),
                     "the environment wins over the file, value by value"
                 );
             },
@@ -5106,8 +5065,8 @@ maintenance_interval_secs = 45
                 "verification.execution_timeout_ms",
             ),
             (
-                "[verification.direct]\nmodel_calls = 0",
-                "verification.direct.model_calls",
+                "[verification]\nmodel_calls = 0",
+                "verification.model_calls",
             ),
         ] {
             let error = file(contents)
@@ -5150,8 +5109,8 @@ maintenance_interval_secs = 45
                 "verification.queued_executions",
             ),
             (
-                format!("[verification.direct]\nmodel_calls = {}", permits + 1),
-                "verification.direct.model_calls",
+                format!("[verification]\nmodel_calls = {}", permits + 1),
+                "verification.model_calls",
             ),
             (
                 "[verification]\nexecution_timeout_ms = 9223372036854775807".to_owned(),
@@ -5169,12 +5128,12 @@ maintenance_interval_secs = 45
             assert!(error.to_string().contains(named), "{contents}: {error}");
         }
         assert!(
-            file("[verification.queued]\nmodel_calls = -1").is_err(),
+            file("[verification]\nmodel_calls = -1").is_err(),
             "a negative count does not parse"
         );
         assert!(
-            file("[verification.queued]\npython_workers = 2").is_err(),
-            "the per-lane Python and workspace counts are gone"
+            file("[verification.queued]\nmodel_calls = 2").is_err(),
+            "the per-lane model-call counts are gone"
         );
         assert!(
             file("[verification]\nqueued_memory_percent = 25").is_err(),
@@ -5206,9 +5165,8 @@ maintenance_interval_secs = 45
                 ("WYRD_VERIFICATION_TOOL_RESULT_MAX_KIB", Some("8")),
                 ("WYRD_VERIFICATION_TIMEOUT_MS", Some("1500")),
                 ("WYRD_VERIFICATION_DIRECT_EXECUTIONS", Some("3")),
-                ("WYRD_VERIFICATION_DIRECT_MODEL_CALLS", Some("9")),
+                ("WYRD_VERIFICATION_MODEL_CALLS", Some("9")),
                 ("WYRD_VERIFICATION_QUEUED_EXECUTIONS", Some("11")),
-                ("WYRD_VERIFICATION_QUEUED_MODEL_CALLS", Some("19")),
                 ("WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS", Some("7200000")),
                 ("WYRD_VERIFICATION_AGENT_TOOL_MAX_CALLS", Some("3")),
                 ("WYRD_VERIFICATION_TOOL_ARGUMENT_MAX_KIB", Some("2")),
@@ -5220,8 +5178,7 @@ maintenance_interval_secs = 45
                 assert_eq!(config.limits.tool_result_max_bytes, 8 * 1024);
                 assert_eq!(config.limits.verify_timeout, Duration::from_millis(1500));
                 assert_eq!(config.limits.direct_executions, 3);
-                assert_eq!(config.limits.direct, LaneLimits { model_calls: 9 });
-                assert_eq!(config.limits.queued, LaneLimits { model_calls: 19 });
+                assert_eq!(config.limits.model_calls, 9);
                 assert_eq!(config.runtime.execution_slots, 11);
                 assert_eq!(config.runtime.execution_timeout, Duration::from_hours(2));
                 assert_eq!(
@@ -5234,7 +5191,7 @@ maintenance_interval_secs = 45
             },
         );
         for (key, value) in [
-            ("WYRD_VERIFICATION_QUEUED_MODEL_CALLS", "-2"),
+            ("WYRD_VERIFICATION_MODEL_CALLS", "-2"),
             ("WYRD_VERIFICATION_QUEUED_EXECUTIONS", "many"),
             ("WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS", "0"),
             ("WYRD_VERIFICATION_CODE_TIMEOUT_MS", "ten"),
@@ -5273,8 +5230,7 @@ maintenance_interval_secs = 45
         for key in [
             "WYRD_VERIFICATION_DIRECT_EXECUTIONS",
             "WYRD_VERIFICATION_QUEUED_EXECUTIONS",
-            "WYRD_VERIFICATION_QUEUED_MODEL_CALLS",
-            "WYRD_VERIFICATION_DIRECT_MODEL_CALLS",
+            "WYRD_VERIFICATION_MODEL_CALLS",
         ] {
             temp_env::with_vars([(key, Some(over.as_str()))], || {
                 let error = VerificationConfig::default()

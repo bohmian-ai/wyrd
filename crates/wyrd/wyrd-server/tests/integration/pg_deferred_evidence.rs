@@ -18,9 +18,8 @@ use wyrd_client::cards::Cards;
 use wyrd_loader::{build_declaration_input, load};
 use wyrd_server::state::LimitsConfig;
 use wyrd_server::verification::engines::EngineOutcome;
-use wyrd_server::verification::hosted::{HostedLimits, LaneLimits};
+use wyrd_server::verification::hosted::HostedLimits;
 use wyrd_server::verification::runner::EngineScript;
-use wyrd_server::verification::telemetry::ExecutionMode;
 use wyrd_server::verification::{RuntimeLimits, VerificationRuntime};
 use wyrd_spec::ids::SlotName;
 use wyrd_testing::Bootstrap;
@@ -585,8 +584,8 @@ async fn a_waiting_execution_finishes_after_a_restart() {
 /// A parked execution gives back its compute before its park is
 /// acknowledged.
 ///
-/// `ci-gate` here also runs an independent Python step. With one queued
-/// model call, the step runs in Python and a workspace, then the execution
+/// `ci-gate` here also runs an independent Python step. With one model
+/// call, the step runs in Python and a workspace, then the execution
 /// parks waiting for `ci`. While the park's write is held unacknowledged the
 /// execution is still `running`, yet it holds no scratch, no
 /// Python worker is checked out, and its model call is free; once the park
@@ -597,14 +596,13 @@ async fn a_waiting_execution_finishes_after_a_restart() {
 /// the execution does not wait and then pass.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_parked_execution_releases_compute_before_its_park_is_acknowledged() {
-    const ONE: LaneLimits = LaneLimits { model_calls: 1 };
     let deployment = Deployment::launch(|builder| {
         builder
             .with_verification_runtime_for_test()
             .with_verification_runtime_limits_for_test(limits(Duration::from_mins(5)))
             .with_verification_limits_for_test(HostedLimits {
                 monty_min_workers: 0,
-                queued: ONE,
+                model_calls: 1,
                 ..HostedLimits::default()
             })
     })
@@ -645,9 +643,7 @@ async fn a_parked_execution_releases_compute_before_its_park_is_acknowledged() {
         "no Python worker is checked out while the park is unacknowledged"
     );
     assert_eq!(
-        blocks
-            .hold_model_calls_for_test(ExecutionMode::Queued)
-            .num_permits(),
+        blocks.hold_model_calls_for_test().num_permits(),
         1,
         "the model call is released while the park is unacknowledged"
     );

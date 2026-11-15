@@ -3980,24 +3980,24 @@ Decide which processes run Verifiers and how much Python each runs at once. Ever
 
 Every API-serving process runs Verifiers by default. To keep one out, set `WYRD_VERIFICATION_ENABLED=0`, or `enabled = false` under `[verification]` in the [server TOML file](/wyrd/reference/verification-runtime-limits/#server-toml-file). Route verification traffic to the processes that keep it on.
 
-## Split direct and queued capacity
+## Keep `verify` calls apart from queued work
 
-Each process keeps capacity for `verify` calls apart from queued executions. Queued executions run on their own Tokio runtime and Python pool, limited to `WYRD_VERIFICATION_QUEUED_CPU_PERCENT` of the effective CPUs, and charge a memory and scratch reservation of `WYRD_VERIFICATION_QUEUED_MEMORY_PERCENT` and `WYRD_VERIFICATION_QUEUED_SCRATCH_PERCENT` of the process budgets. Queued work can never exceed its reservation or take what `verify` calls use. `verify` calls run on the request runtime and charge the rest. Each side also has its own model-call limit and execution slots, so a full queue cannot block `verify`. Set these with the `WYRD_VERIFICATION_DIRECT_*` and `WYRD_VERIFICATION_QUEUED_*` settings in [runtime limits](/wyrd/reference/verification-runtime-limits/#direct-and-queued-capacity), or under `[verification]`, `[verification.direct]`, and `[verification.queued]` in the [server TOML file](/wyrd/reference/verification-runtime-limits/#server-toml-file). Postgres, the gateway, and model providers stay shared.
+`verify` calls and queued executions on one process share its Python pool, CPU, model calls, memory, and scratch, so a busy queue can slow `verify`. `WYRD_VERIFICATION_DIRECT_EXECUTIONS` and `WYRD_VERIFICATION_QUEUED_EXECUTIONS` cap how many of each run at once, and `WYRD_VERIFICATION_MODEL_CALLS` caps model calls for both together; see [runtime limits](/wyrd/reference/verification-runtime-limits/#direct-and-queued-capacity) or the [server TOML file](/wyrd/reference/verification-runtime-limits/#server-toml-file). To keep `verify` calls apart from the queue, run `direct` and `worker` processes on separate pods (see [deployment targets](/wyrd/understand/architecture/#one-binary-several-roles)). Postgres, the gateway, and model providers stay shared.
 
 `WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS` (`execution_timeout_ms` under `[verification]`) bounds each queued execution from its first claim, waits and retries included. Raise it to fit the longest wait an execution is meant to survive, such as an intended human approval period.
 
 ## Size the worker pools
 
-The server starts its own Python workers; there is nothing to install. Each process has a direct and a queued pool, and a process that runs Verifiers prewarms up to `WYRD_VERIFICATION_MONTY_MIN_WORKERS` workers in each, as many as fit in that side's memory, before it reports ready.
+The server starts its own Python workers; there is nothing to install. A process that runs Verifiers prewarms up to `WYRD_VERIFICATION_MONTY_MIN_WORKERS` workers, as many as fit in its memory, before it reports ready.
 
-There is no worker count to set. Direct Python operations share the process's memory with everything else the server runs; queued ones share the queued reservation. Each operation is charged one session envelope: twice its allocator ceiling (`WYRD_VERIFICATION_MONTY_MEMORY_MIB` plus 4 MiB of headroom), plus 32 MiB for the worker itself. That is 552 MiB at the defaults. A worker keeps that charge until its process exits, because a reset returns no memory to the system. Idle workers are stopped whenever an operation is waiting for memory.
+There is no worker count to set. Python operations share the process's memory with everything else the server runs. Each operation is charged one session envelope: twice its allocator ceiling (`WYRD_VERIFICATION_MONTY_MEMORY_MIB` plus 4 MiB of headroom), plus 32 MiB for the worker itself. That is 552 MiB at the defaults. A worker keeps that charge until its process exits, because a reset returns no memory to the system. Idle workers are stopped whenever an operation is waiting for memory.
 
-- To run more Python at once, give the process more memory, or move the split with `WYRD_VERIFICATION_QUEUED_MEMORY_PERCENT`.
+- To run more Python at once, give the process more memory.
 - To give each operation more memory, raise `WYRD_VERIFICATION_MONTY_MEMORY_MIB`. Fewer operations then fit at once.
 - Operations waiting for memory are served first-in first-out within a tenant and round robin across tenants.
-- Workspaces are written under `verification-scratch/` in the Bifrost data directory. Each one charges its side's scratch budget for the bytes it holds plus each `/work` write as it is admitted, up to `WYRD_VERIFICATION_SCRATCH_MAX_MIB`. A write past the workspace's own `/work` limit fails with `OSError` in Python or a `work_budget` tool error. A write that budget cannot hold now stops the operation as busy instead, so a queued execution is deferred and a direct one returns 503; process load never reaches the program or the model. A workspace streams each input from storage straight to disk, verifying its length and SHA-256 as it arrives, so process memory holds only the chunk in flight; scratch is charged for the declared size before the transfer starts, and an archive input holds its compressed and unpacked bytes together until it is unpacked. Every other evidence read (native media, the `extract` action, citations, Artifact code) and `fs.extract` charges process memory for its bytes before it reads them. There is no workspace count.
+- Workspaces are written under `verification-scratch/` in the Bifrost data directory. Each one charges the process scratch budget for the bytes it holds plus each `/work` write as it is admitted, up to `WYRD_VERIFICATION_SCRATCH_MAX_MIB`. A write past the workspace's own `/work` limit fails with `OSError` in Python or a `work_budget` tool error. A write that budget cannot hold now stops the operation as busy instead, so a queued execution is deferred and a direct one returns 503; process load never reaches the program or the model. A workspace streams each input from storage straight to disk, verifying its length and SHA-256 as it arrives, so process memory holds only the chunk in flight; scratch is charged for the declared size before the transfer starts, and an archive input holds its compressed and unpacked bytes together until it is unpacked. Every other evidence read (native media, the `extract` action, citations, Artifact code) and `fs.extract` charges process memory for its bytes before it reads them. There is no workspace count.
 
-A `code.run` program keeps its worker and its memory while it waits on `call_tool`, so a program that calls many tools holds them longer than one that only computes. While it waits, it frees its CPU turn: at most one Python turn per effective CPU of its side runs at once. Each call from Python is authorized and audited on its own, like a call from the model, so fewer model turns do not mean fewer permission checks or audit rows.
+A `code.run` program keeps its worker and its memory while it waits on `call_tool`, so a program that calls many tools holds them longer than one that only computes. While it waits, it frees its CPU turn: at most one Python turn per effective CPU runs at once. Each call from Python is authorized and audited on its own, like a call from the model, so fewer model turns do not mean fewer permission checks or audit rows.
 
 Settings are read at startup; restart to apply a change.
 
@@ -5220,9 +5220,9 @@ A failed call does not end the step. The model, or the program for a call from P
 
 Page: /wyrd/reference/verification-runtime-limits/
 
-> Server settings that bound Verifier files, extraction, workspaces, Python code, model calls, and direct and queued capacity, with defaults and startup rules.
+> Server settings that bound Verifier files, extraction, workspaces, Python code, model calls, and direct and queued executions, with defaults and startup rules.
 
-Environment variables on `wyrd-server`, read once at startup; a change takes a restart. Direct and queued capacity, the queued share, and the queued execution timeout can also be set in the [server TOML file](#server-toml-file); the other settings are environment variables only. Each process applies them on its own.
+Environment variables on `wyrd-server`, read once at startup; a change takes a restart. Execution slots, model calls, and the queued execution timeout can also be set in the [server TOML file](#server-toml-file); the other settings are environment variables only. Each process applies them on its own.
 
 ## Settings
 
@@ -5244,14 +5244,10 @@ Environment variables on `wyrd-server`, read once at startup; a change takes a r
 | `WYRD_VERIFICATION_SCRATCH_MAX_MIB` | 250 | All bytes in one workspace: materialized `/inputs` plus `/work` |
 | `WYRD_VERIFICATION_WORK_WRITE_MAX_MIB` | 50 | Bytes held under `/work` in one workspace |
 | `WYRD_VERIFICATION_TOOL_RESULT_MAX_KIB` | 64 | One tool result or one Python operation's printed output, cut off while it is collected |
-| `WYRD_VERIFICATION_DIRECT_MODEL_CALLS` | 256 | Gateway model calls `verify` calls make at once; another waits for one to finish |
-| `WYRD_VERIFICATION_QUEUED_MODEL_CALLS` | 256 | Gateway model calls queued executions make at once; another waits for one to finish |
-| `WYRD_VERIFICATION_QUEUED_CPU_PERCENT` | 50 | Percent of effective CPUs, at least one, queued executions run on: 1 to 99 |
-| `WYRD_VERIFICATION_QUEUED_MEMORY_PERCENT` | 25 | Percent of process memory reserved for queued executions: 1 to 99 |
-| `WYRD_VERIFICATION_QUEUED_SCRATCH_PERCENT` | 50 | Percent of process scratch reserved for queued executions: 1 to 99 |
+| `WYRD_VERIFICATION_MODEL_CALLS` | 256 | Gateway model calls `verify` calls and queued executions make at once in one server process; another waits for one to finish |
 | `WYRD_VERIFICATION_TOOL_ARGUMENT_MAX_KIB` | 64 | One tool call's arguments as compact JSON, `code.run` source included |
 | `WYRD_VERIFICATION_AGENT_TOOL_MAX_CALLS` | 128 | Tool calls of one Agent step or check, from the model and from Python together, across its retries |
-| `WYRD_VERIFICATION_MONTY_MIN_WORKERS` | 1 | Python workers prewarmed with the server in each of the direct and queued pools, as many as fit in that side's memory; stopped when an operation needs their memory |
+| `WYRD_VERIFICATION_MONTY_MIN_WORKERS` | 1 | Python workers prewarmed with the server, as many as fit in process memory; stopped when an operation needs their memory |
 | `WYRD_VERIFICATION_MONTY_MEMORY_MIB` | 256 | Memory one Python operation may allocate |
 | `WYRD_VERIFICATION_CODE_TIMEOUT_MS` | 10000 | One Python operation, from waiting for a worker through compiling, running, its file calls, and its waits on `call_tool` |
 | `WYRD_VERIFICATION_AGENT_CODE_BUDGET_MS` | 60000 | All `code.run` calls of one Agent step together, waits on `call_tool` included, across its retries |
@@ -5260,9 +5256,9 @@ Environment variables on `wyrd-server`, read once at startup; a change takes a r
 
 ## Direct and queued capacity
 
-`verify` calls and queued executions each have their own execution slots and model-call admission, set by the `DIRECT_` and `QUEUED_` settings above. Queued executions also run on their own Tokio runtime and Python pool with `QUEUED_CPU_PERCENT` of the effective CPUs, and charge a reservation of `QUEUED_MEMORY_PERCENT` of process memory and `QUEUED_SCRATCH_PERCENT` of process scratch that nothing else can take and that they can never exceed. `verify` calls run on the request runtime and charge what remains of the process budgets, which every other server capability also charges. A full queue never takes what `verify` needs, and queued work never takes direct capacity. A queued execution resumed after it waited, was deferred, or was retried runs on queued capacity again. Both run the same engine with the same authority, evidence, billing, and cancellation rules, and every model call still passes the gateway's own tenant and subject limits and budgets.
+`verify` calls and queued executions share one process's Python pool, CPU turns, model calls, memory, and scratch, charged only while in use; nothing is reserved for either. `DIRECT_EXECUTIONS` and `QUEUED_EXECUTIONS` cap how many of each run at once and hold nothing while idle. A queued execution resumed after it waited, was deferred, or was retried is admitted again. Both run the same engine with the same authority, evidence, billing, and cancellation rules, and every model call still passes the gateway's own tenant and subject limits and budgets.
 
-Postgres, the gateway, and model providers stay shared, so a saturated queue can still slow `verify` calls through them; run separate server processes for stronger separation.
+On a `combined` process, a busy queue can slow `verify` calls. To keep them apart, run `direct` and `worker` processes on separately provisioned pods (see [deployment targets](/wyrd/understand/architecture/#one-binary-several-roles)). Postgres, the gateway, and model providers stay shared.
 
 The defaults give each process headroom to start from, not measured throughput or latency guarantees, and not every mix of workloads is guaranteed to fit a host.
 
@@ -5280,26 +5276,20 @@ The defaults give each process headroom to start from, not measured throughput o
 
 With no file, the server uses its defaults and environment variables.
 
-Under `[verification]`, the file can set direct and queued capacity, the queued share, and the queued execution timeout. The matching environment variable overrides each value on its own, and a value left out keeps its default.
+Under `[verification]`, the file can set the execution slots, model calls, and the queued execution timeout. The matching environment variable overrides each value on its own, and a value left out keeps its default.
 
 | TOML key | Environment variable |
 | --- | --- |
 | `[verification] direct_executions` | `WYRD_VERIFICATION_DIRECT_EXECUTIONS` |
 | `[verification] queued_executions` | `WYRD_VERIFICATION_QUEUED_EXECUTIONS` |
 | `[verification] execution_timeout_ms` | `WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS` |
-| `[verification] queued_cpu_percent`, `queued_memory_percent`, `queued_scratch_percent` | `WYRD_VERIFICATION_QUEUED_CPU_PERCENT`, `_MEMORY_PERCENT`, `_SCRATCH_PERCENT` |
-| `[verification.direct] model_calls` | `WYRD_VERIFICATION_DIRECT_MODEL_CALLS` |
-| `[verification.queued] model_calls` | `WYRD_VERIFICATION_QUEUED_MODEL_CALLS` |
+| `[verification] model_calls` | `WYRD_VERIFICATION_MODEL_CALLS` |
 
 ```toml
 [verification]
 direct_executions = 256
 queued_executions = 64
 execution_timeout_ms = 300000
-queued_cpu_percent = 50
-queued_memory_percent = 25
-
-[verification.queued]
 model_calls = 256
 ```
 
@@ -5310,7 +5300,7 @@ The server refuses to start, naming the variable, when a value is empty, not a p
 - `FILE_MAX_MIB` above `FILES_MAX_MIB`
 - `WORK_WRITE_MAX_MIB` above `SCRATCH_MAX_MIB`
 
-A `QUEUED_*_PERCENT` of 0 or of 100 or more is refused, so `verify` calls always keep capacity of their own. A process that runs Verifiers also refuses to start when the direct or queued memory cannot hold one Python session envelope: twice `MONTY_MEMORY_MIB` + 4 MiB of allocator headroom, plus 32 MiB for the worker, which is 552 MiB at the defaults. There is no worker or waiter count. Each side's memory bounds how many of its operations run and wait.
+A process that runs Verifiers also refuses to start when process memory cannot hold one Python session envelope: twice `MONTY_MEMORY_MIB` + 4 MiB of allocator headroom, plus 32 MiB for the worker, which is 552 MiB at the defaults. There is no worker or waiter count. Process memory bounds how many operations run and wait.
 
 ## If a limit is reached
 
@@ -5319,9 +5309,9 @@ A `QUEUED_*_PERCENT` of 0 or of 100 or more is refused, so `verify` calls always
 | A file over its slot or `FILE_MAX_MIB`, or a request over `FILES_MAX_MIB` | `WYRD_VERIFICATION_413_INPUT_TOO_LARGE` before anything runs |
 | The server's verification staging is full (`scribe.outbox_capacity` or `scribe.outbox_bytes`) | Direct and new queued calls: `WYRD_VERIFICATION_429_STAGING_FULL` with `Retry-After`, before anything is staged. Accepted queued executions stay queued until there is room for their result |
 | `TIMEOUT_MS` in `verify` | `WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT` |
-| No direct execution slot, or direct memory or scratch cannot hold a Python operation's waiting bytes, frees too late for its envelope, or cannot hold a workspace | `verify`: `WYRD_SERVER_503_SERVICE_UNAVAILABLE`, even when queued capacity is free |
-| No queued execution slot, or the queued reservation cannot hold the same | Queued: stays queued, attempt not counted, even when direct capacity is free |
-| Every model call of the lane in use | The call waits for its lane, within the execution's deadline |
+| No direct execution slot, or process memory or scratch cannot hold a Python operation's waiting bytes, frees too late for its envelope, or cannot hold a workspace | `verify`: `WYRD_SERVER_503_SERVICE_UNAVAILABLE` |
+| No queued execution slot, or process memory or scratch cannot hold the same | Queued: stays queued, attempt not counted |
+| Every model call in use | The call waits for one, within the execution's deadline |
 | Verification disabled on this process | `WYRD_SERVER_503_SERVICE_UNAVAILABLE` |
 | A publication over `FILE_MAX_MIB`, `FILES_MAX_MIB`, or `PUBLICATIONS_MAX` | The publish call is refused with the limit and nothing is published; the execution's accepted publications and their totals survive retries and recovery |
 | `AGENT_TOOL_MAX_CALLS` | The step fails or the check is `inconclusive`, with `WYRD_VERIFICATION_422_TOOL_BUDGET_EXCEEDED` in its `reason`; a program cannot catch it |

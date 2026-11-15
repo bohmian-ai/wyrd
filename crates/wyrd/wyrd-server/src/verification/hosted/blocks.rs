@@ -70,10 +70,8 @@ pub struct HostedBlocks {
     sandbox: Arc<Sandbox>,
     /// The process workspaces, charged to `resources`.
     workspaces: Arc<Workspaces>,
-    /// Model-call permits of direct `verify` executions.
-    direct_model_calls: Arc<Semaphore>,
-    /// Model-call permits of queued executions and their continuations.
-    queued_model_calls: Arc<Semaphore>,
+    /// Model-call permits every direct and queued execution shares.
+    model_calls: Arc<Semaphore>,
     /// One permit per running direct execution.
     direct_executions: Arc<Semaphore>,
     /// The Deployment limits every block enforces.
@@ -110,8 +108,8 @@ pub struct Execution<'a> {
     /// The execution state whose accepted publications workspaces mount;
     /// `None` for an engine bound to no execution.
     pub execution: Option<Arc<RunState>>,
-    /// The accepted execution mode, which selects the model-call permits
-    /// the execution's model calls take.
+    /// The accepted execution mode, which labels the execution's model
+    /// calls.
     pub mode: ExecutionMode,
     /// The accepted PR source a `pull_request` extractor reads; `None` for
     /// an execution not admitted from a pull request.
@@ -135,8 +133,7 @@ impl HostedBlocks {
         Ok(Self {
             sandbox: Arc::new(Sandbox::start(worker, limits, process).await?),
             workspaces: Arc::new(Workspaces::new(limits, process, scratch)),
-            direct_model_calls: Arc::new(Semaphore::new(limits.direct.model_calls)),
-            queued_model_calls: Arc::new(Semaphore::new(limits.queued.model_calls)),
+            model_calls: Arc::new(Semaphore::new(limits.model_calls)),
             direct_executions: Arc::new(Semaphore::new(limits.direct_executions)),
             resources: process.clone(),
             limits,
@@ -173,14 +170,13 @@ impl HostedBlocks {
         &self.resources
     }
 
-    /// Every free model-call permit of `mode`, held until the returned
-    /// permit drops.
+    /// Every free model-call permit, held until the returned permit drops.
     ///
     /// # Panics
     /// Panics when a permit is taken concurrently.
     #[cfg(feature = "test-support")]
-    pub fn hold_model_calls_for_test(&self, mode: ExecutionMode) -> OwnedSemaphorePermit {
-        super::hold_all(self.model_calls(mode))
+    pub fn hold_model_calls_for_test(&self) -> OwnedSemaphorePermit {
+        super::hold_all(&self.model_calls)
     }
 
     /// Every free direct execution permit, held until the returned permit
@@ -191,14 +187,6 @@ impl HostedBlocks {
     #[cfg(feature = "test-support")]
     pub fn hold_direct_executions_for_test(&self) -> OwnedSemaphorePermit {
         super::hold_all(&self.direct_executions)
-    }
-
-    /// The model-call permits `mode` executes with.
-    const fn model_calls(&self, mode: ExecutionMode) -> &Arc<Semaphore> {
-        match mode {
-            ExecutionMode::Direct => &self.direct_model_calls,
-            ExecutionMode::Queued => &self.queued_model_calls,
-        }
     }
 
     /// The Deployment limits in force.
@@ -247,7 +235,7 @@ impl HostedBlocks {
             evidence: Arc::clone(&evidence),
             workspaces: Arc::clone(&self.workspaces),
             sandbox: Arc::clone(&self.sandbox),
-            model_calls: Arc::clone(self.model_calls(execution.mode)),
+            model_calls: Arc::clone(&self.model_calls),
             limits: self.limits,
             schemas: Arc::clone(&self.schemas),
             tools: OnceLock::new(),
@@ -309,7 +297,7 @@ struct ExecutionBinding {
     workspaces: Arc<Workspaces>,
     /// The process Python sandbox pool.
     sandbox: Arc<Sandbox>,
-    /// The model-call permits of the execution's mode.
+    /// The process model-call permits.
     model_calls: Arc<Semaphore>,
     /// The Deployment limits in force.
     limits: HostedLimits,
@@ -351,7 +339,7 @@ impl ExecutionBinding {
 
     /// The Agent executor of `binding`'s execution, resolving Agent and
     /// Prompt Cards as its caller and calling models through the gateway on
-    /// its mode's permits, with `binding` as its toolset.
+    /// the process model-call permits, with `binding` as its toolset.
     fn agent(binding: &Arc<Self>) -> AgentExecutor {
         let registry = Arc::new(TenantRegistry::new(
             binding.state.clone(),

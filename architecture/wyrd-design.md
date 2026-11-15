@@ -2356,8 +2356,8 @@ those same ledgers. The ledgers carry no policy;
 each capability decides what it charges and how it answers a refusal. The
 server composes them from the Bifrost plan
 ([Admission and memory](bifrost-design.md#admission-and-memory)); Vala never
-imports server concepts, and `wyrd-spec` holds none of it. Each pool allows
-one runnable Python turn per effective CPU of its side.
+imports server concepts, and `wyrd-spec` holds none of it. The process pool
+allows one runnable Python turn per effective CPU.
 
 A Python operation charges its code and globals to process memory before it
 waits, and is refused at once when even those do not fit. It then waits, FIFO
@@ -2414,26 +2414,21 @@ part, nested inside the Verifier's blocks so it never enters the server
 overhead residual; benchmark collection records worker CPU, memory, and
 churn apart from parent-only server CPU (`benchmarks/README.md`).
 
-Direct `verify` and queued executions admit work from separate capacity.
-Queued executions, continuations included, run on their own long-lived
-runtime with `WYRD_VERIFICATION_QUEUED_CPU_PERCENT` (default 50) of the
-effective CPUs, at least one, as worker and blocking threads, covering their
-engine, model-call, blocking, Python, and nested tool work, and on their own
-Python pool. Their workspaces, Python sessions, and execution state charge a
-reservation of `WYRD_VERIFICATION_QUEUED_MEMORY_PERCENT` (default 25) of
-process memory and `WYRD_VERIFICATION_QUEUED_SCRATCH_PERCENT` (default 50) of
-scratch, held in the one process ledger, which direct work never takes and
-queued work never exceeds. Each percentage is 1 to 99, so direct keeps
-reserved capacity: the server runtime, its own pool, and the rest of the
-ledgers. Each side also has its own execution slots and model-call permits.
-Direct may borrow idle queued capacity; this release does not. Queued work
-never borrows direct capacity. Direct admission refuses when its side is full; queued work waits, and
-a resumed or retried queued execution takes queued capacity again. A model
-call takes its side's permit before entering the ordinary gateway path, whose
-tenant and subject limits, budgets, and accounting still apply. Both sides
-run the one engine with the same authority, evidence, billing, cancellation,
-and platform behavior. Postgres, gateway, and provider capacity remain
-shared. A Verifier whose
+Direct `verify` and queued executions share one hosted capacity owner per
+process: one Python sandbox pool, one runnable-turn bound of the effective
+CPUs, and one model-call limit (`WYRD_VERIFICATION_MODEL_CALLS`), all
+charged to the one process memory and scratch ledger only while in use, with
+no fixed queued reservation. `WYRD_VERIFICATION_DIRECT_EXECUTIONS` and
+`WYRD_VERIFICATION_QUEUED_EXECUTIONS` cap each mode's concurrent executions
+and hold nothing idle. Colocated in `combined`, direct work is not isolated
+from queued work; operators isolate it by running `direct` and `worker`
+targets on separately provisioned pods. Direct admission refuses when
+capacity is full; queued work waits, and a resumed or retried queued
+execution is admitted again. A model call takes a permit before entering the
+ordinary gateway path, whose tenant and subject limits, budgets, and
+accounting still apply. Both modes run the one engine with the same
+authority, evidence, billing, cancellation, and platform behavior. Postgres,
+gateway, and provider capacity remain shared. A Verifier whose
 registration-derived `queue_only` is true is refused by `verify`
 before any step runs, never converted to a queued request. The queued
 execution deadline is the original ceiling of everything a queued execution

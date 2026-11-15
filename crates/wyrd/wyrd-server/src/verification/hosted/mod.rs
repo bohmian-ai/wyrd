@@ -96,10 +96,10 @@ pub struct HostedLimits {
     /// Most concurrently running direct `verify` executions per process;
     /// queued executions are bounded by the runtime's own execution slots.
     pub direct_executions: usize,
-    /// Model-call admission of direct `verify` executions.
-    pub direct: LaneLimits,
-    /// Model-call admission of queued executions, continuations included.
-    pub queued: LaneLimits,
+    /// Most concurrent gateway model calls of every direct and queued
+    /// execution in the process; a further call waits for one to finish
+    /// before it reaches gateway admission.
+    pub model_calls: usize,
     /// Python worker processes the pool prewarms when process memory holds
     /// them; a target, not a floor, since idle workers are reaped under
     /// pressure.
@@ -128,18 +128,6 @@ impl HostedLimits {
     }
 }
 
-/// The model-call admission of one execution mode.
-///
-/// Direct and queued executions each hold their own permits, which hold
-/// nothing while unused; neither takes the other's, so a saturated queue
-/// cannot take every model-call permit from direct `verify`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LaneLimits {
-    /// Most concurrent gateway model calls; a further call waits for one to
-    /// finish before it reaches gateway admission.
-    pub model_calls: usize,
-}
-
 impl Default for HostedLimits {
     /// The approved Deployment limit defaults.
     fn default() -> Self {
@@ -160,8 +148,7 @@ impl Default for HostedLimits {
             tool_argument_max_bytes: 64 * 1024,
             agent_tool_max_calls: 128,
             direct_executions: 256,
-            direct: LaneLimits { model_calls: 256 },
-            queued: LaneLimits { model_calls: 256 },
+            model_calls: 256,
             monty_min_workers: 1,
             monty_memory_bytes: 256 * MIB,
             code_timeout: Duration::from_secs(10),

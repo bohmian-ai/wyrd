@@ -72,7 +72,7 @@ use wyrd_server::state::{
 /// The runtime bounds [`WyrdTestServerBuilder::with_verification_runtime_limits_for_test`] takes.
 pub use wyrd_server::verification::RuntimeLimits;
 /// The hosted Verifier limits [`WyrdTestServerBuilder::with_verification_limits_for_test`] takes.
-pub use wyrd_server::verification::hosted::{HostedLimits, LaneLimits};
+pub use wyrd_server::verification::hosted::HostedLimits;
 /// The execution lane a journey selects hosted capacity by.
 pub use wyrd_server::verification::telemetry::ExecutionMode;
 /// Reserved Scribe outbox slots a journey holds to fill the server's

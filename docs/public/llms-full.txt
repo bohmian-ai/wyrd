@@ -4319,7 +4319,7 @@ _Diagram `wyrd-deployment`: see the web page._
 
 ## One binary, several roles
 
-Every pod runs `wyrd-server`. `WYRD_TARGET` chooses what a pod does: `all` runs everything and is a complete deployment on its own; `server`, `scribe`, `oracle`, and `forge-worker` split API, writes, queries, and compaction so each scales on its own load. Splitting changes resource ownership, not the API: clients see one server either way. [Bifrost](/wyrd/understand/bifrost/#where-each-part-runs) shows which part each target runs.
+Every pod runs `wyrd-server`. `WYRD_TARGET` chooses what a pod does: `combined` runs everything and is a complete deployment on its own. `direct` runs synchronous verification, `worker` runs queued verification and GitHub webhooks, and `bifrost-ingest`, `bifrost-query`, and `bifrost-maintenance` run writes, queries, and compaction, so each scales on its own load. A pod refuses verification work its target does not run with `WYRD_VERIFICATION_421_WRONG_TARGET`. Splitting changes resource ownership, not the API: clients see one server either way. [Bifrost](/wyrd/understand/bifrost/#where-each-part-runs) shows which part each target runs.
 
 ## One endpoint
 
@@ -4661,7 +4661,7 @@ Tables are Apache Iceberg tables of Parquet files in the deployment's object sto
 
 ## Where each part runs
 
-Every pod runs the same `wyrd-server` binary, and `WYRD_TARGET` picks which parts it runs. The default, `all`, runs every part, so a single pod is a complete deployment. A larger team splits writes, queries, and compaction so each scales on its own load.
+Every pod runs the same `wyrd-server` binary, and `WYRD_TARGET` picks which parts it runs. The default, `combined`, runs every part, so a single pod is a complete deployment. A larger team splits writes, queries, and compaction so each scales on its own load.
 
 _Diagram `bifrost-pods`: see the web page._
 
@@ -6024,6 +6024,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_VERIFICATION_409_SNAPSHOT_INCOMPLETE` | 409 | Verification snapshot incomplete | Check Bifrost publication for the named source executions, then submit a new turn to the group. |
 | `WYRD_VERIFICATION_409_VERIFIER_NOT_READY` | 409 | Verifier not ready | Poll the Verifier Card's card.status.verification.baseline until it is ready, then retry. |
 | `WYRD_VERIFICATION_413_INPUT_TOO_LARGE` | 413 | Verification input too large | Keep the request body and each evidence file within the Deployment's verification limits, or upload large files through verification.evidence and pass them by digest. |
+| `WYRD_VERIFICATION_421_WRONG_TARGET` | 421 | Verification sent to the wrong target | Nothing of the refused call was recorded: send synchronous verify to a `direct` or `combined` server and queued work (enqueue, webhooks, deferred evidence, approvals, cancellation) to a `worker` or `combined` server; `details.target` names this server's target. |
 | `WYRD_VERIFICATION_422_INPUT_INCOMPATIBLE` | 422 | Verification input incompatible | Supply every feature the Verifier scores, with the value type its baseline or profile expects. |
 | `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` | 422 | Verification input unsupported | Execute and enqueue run request-scoped Verifiers; a Verifier that judges a scheduled window runs only on its binding schedule. |
 | `WYRD_VERIFICATION_422_TOOL_BUDGET_EXCEEDED` | 422 | Verification tool budget exceeded | Make fewer tool calls per Agent step or check, for example by reducing evidence inside one code.run program, or raise WYRD_VERIFICATION_AGENT_TOOL_MAX_CALLS on the server. |

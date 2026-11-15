@@ -156,6 +156,17 @@ pub struct InvocationRecord {
     /// The committed settlement; `None` while the attempt is unsettled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settlement: Option<InvocationSettlement>,
+    /// Tool requests the attempt's invocation had spent when the attempt was
+    /// refused process capacity or its definition after its host work
+    /// settled; `None` while that spend is unknown, so a reclaimed unsettled
+    /// attempt counts its whole allowance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls_spent: Option<u32>,
+    /// Whether the refused attempt retained nothing: it spends no retry, is
+    /// not reported as an invocation, and is kept only for
+    /// [`Self::tool_calls_spent`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub released: bool,
 }
 
 /// One recorded scheduling decision of an execution.

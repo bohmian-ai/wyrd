@@ -2710,6 +2710,8 @@ mod tests {
                         result: Box::new(requirement.clone()),
                     },
                 ),
+                tool_calls_spent: None,
+                released: false,
             });
         state.terminal = Some(wyrd_spec::verification::state::TerminalSelection {
             result_id: wyrd_spec::ids::VerificationResultId::new_v7(),

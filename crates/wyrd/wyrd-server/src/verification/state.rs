@@ -1014,35 +1014,41 @@ impl vala_verify::blocks::Checkpoints for RunState {
                 sequence: state.sequence,
                 producer: producer.clone(),
                 settlement: None,
+                tool_calls_spent: None,
+                released: false,
             });
             Ok(true)
         })
     }
 
-    /// Remove the unsettled attempt `producer`, refused capacity or its
-    /// definition before it retained anything, so a later attempt replays
-    /// it, from the live state.
+    /// Record in the live state that the unsettled attempt `producer`,
+    /// refused capacity or its definition after its host work settled, had
+    /// spent `tool_calls_spent` tool requests, so a reclaimed invocation
+    /// resumes from that count.
     ///
-    /// An attempt that already accepted a publication keeps its record: its
-    /// retained work stays attributed to it, so the attempt is spent and
+    /// An attempt that retained nothing is released: it spends no retry, so
+    /// a later attempt replays it. One that already accepted a publication
+    /// stays a spent attempt: its retained work stays attributed to it, so
     /// restoration starts fresh work at the next attempt.
     ///
     /// # Errors
     /// Returns a bounded reason when the writer broke or lost its lease.
-    async fn forget(&self, producer: &Producer) -> Result<(), String> {
+    async fn forget(&self, producer: &Producer, tool_calls_spent: u32) -> Result<(), String> {
         self.change(|state| {
-            if state
+            let retained = state
                 .publications
                 .iter()
-                .any(|accepted| &accepted.publication.producer == producer)
-            {
+                .any(|accepted| &accepted.publication.producer == producer);
+            let Some(record) = state.invocations.iter_mut().find(|record| {
+                &record.producer == producer
+                    && record.settlement.is_none()
+                    && record.tool_calls_spent.is_none()
+            }) else {
                 return Ok(false);
-            }
-            let recorded = state.invocations.len();
-            state
-                .invocations
-                .retain(|record| &record.producer != producer || record.settlement.is_some());
-            Ok(state.invocations.len() != recorded)
+            };
+            record.tool_calls_spent = Some(tool_calls_spent);
+            record.released = !retained;
+            Ok(true)
         })
     }
 
@@ -1061,7 +1067,9 @@ impl vala_verify::blocks::Checkpoints for RunState {
             let record = state
                 .invocations
                 .iter_mut()
-                .find(|record| &record.producer == producer && record.settlement.is_none())
+                .find(|record| {
+                    &record.producer == producer && record.settlement.is_none() && !record.released
+                })
                 .ok_or_else(|| "the invocation attempt is not recorded unsettled".to_owned())?;
             record.settlement = Some(settled.clone());
             Ok(true)

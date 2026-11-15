@@ -131,20 +131,27 @@ impl Default for ToolCallsOwner {
 }
 
 impl ToolCallsOwner {
-    /// The invocation as an earlier run of its execution left it: fresh when
-    /// it recorded no attempt (`recorded` is zero), otherwise with its whole
-    /// allowance spent.
+    /// The invocation as earlier runs of its execution left it: having spent
+    /// `spent` requests, or its whole allowance when `spent` is `None`.
     ///
-    /// A recorded attempt without a settlement never reported its spend, so
+    /// An attempt interrupted before it settled never reported its spend, so
     /// it counts as having spent everything; a takeover never replenishes
     /// the allowance an interrupted attempt may have used.
     #[must_use]
-    pub fn resumed(recorded: u32) -> Self {
+    pub fn resumed(spent: Option<u32>) -> Self {
         let owner = Self::default();
-        if recorded > 0 {
-            owner.calls.inner.spent.store(u32::MAX, Ordering::SeqCst);
-        }
         owner
+            .calls
+            .inner
+            .spent
+            .store(spent.unwrap_or(u32::MAX), Ordering::SeqCst);
+        owner
+    }
+
+    /// Requests the invocation has spent so far, restored spend included.
+    #[must_use]
+    pub fn spent(&self) -> u32 {
+        self.calls.inner.spent.load(Ordering::SeqCst)
     }
 
     /// A handle an attempt records into, spends from, and registers its host
@@ -247,7 +254,7 @@ impl ToolCalls {
     }
 
     /// Spend one request of `limit`, or `false` once all are spent.
-    fn spend(&self, limit: u32) -> bool {
+    pub(super) fn spend(&self, limit: u32) -> bool {
         self.inner
             .spent
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |spent| {
@@ -1030,20 +1037,25 @@ impl std::io::Write for Capped {
 mod tests {
     use super::ToolCallsOwner;
 
-    /// An invocation an earlier run never recorded spends its allowance
-    /// afresh, while one with a recorded, unsettled attempt starts with the
-    /// whole allowance spent, so a takeover never replenishes it.
+    /// An invocation with nothing spent spends its allowance afresh, one
+    /// with a known spend resumes from it, and one whose spend is unknown
+    /// starts with the whole allowance spent, so a takeover never
+    /// replenishes it.
     ///
     /// # Panics
-    /// Panics when a resumed allowance admits a request or a fresh one
-    /// refuses its first.
+    /// Panics when a resumed allowance admits a request past its limit or
+    /// refuses one within it.
     #[test]
     fn resumed_invocation_counts_an_interrupted_attempt_as_fully_spent() {
-        let fresh = ToolCallsOwner::resumed(0).handle();
+        let fresh = ToolCallsOwner::resumed(Some(0)).handle();
         assert!(fresh.spend(1));
         assert!(!fresh.spend(1), "the allowance holds one request");
-        let resumed = ToolCallsOwner::resumed(1).handle();
-        assert!(!resumed.spend(u32::MAX - 1));
-        assert!(!resumed.spend(128));
+        let known = ToolCallsOwner::resumed(Some(2));
+        assert!(known.handle().spend(3), "two of three spent leaves one");
+        assert!(!known.handle().spend(3));
+        assert_eq!(known.spent(), 3);
+        let unknown = ToolCallsOwner::resumed(None).handle();
+        assert!(!unknown.spend(u32::MAX - 1));
+        assert!(!unknown.spend(128));
     }
 }

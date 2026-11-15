@@ -742,6 +742,7 @@ impl<'a> VerificationControl<'a> {
             state
                 .invocations
                 .iter()
+                .filter(|record| !record.released)
                 .map(|record| (record.sequence, record.clone())),
             &state,
             position,

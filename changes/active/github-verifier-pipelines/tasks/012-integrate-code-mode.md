@@ -87,9 +87,10 @@ dispatcher, persistence service or resource authority:
   Ordinary declared model calls retain both tools; check Agents still cannot
   publish. Nested publication identities are outside tasks 012–014.
 - Restore tool-call spend through the same attempt records B uses for
-  `max_agent_invocations` after `db5520e38`. Count an unsettled attempt's whole
-  tool allowance as spent; accepted settled attempts restore their counted
-  spend. Share allowance across authored retries and preserve the original
+  `max_agent_invocations` after `db5520e38`. Count the whole tool allowance of
+  an attempt interrupted before settling as spent; accepted settled attempts
+  restore their counted spend, and an attempt refused capacity or its
+  definition records its known spend for the deferred retry (revision 14). Share allowance across authored retries and preserve the original
   deadline across park/takeover. No per-call persistence or direct resumable
   state is introduced.
 - `wyrd-server/src/verification/hosted/` composes A's reusable fresh-session
@@ -240,7 +241,7 @@ publication identity extension belongs here.
 | OBL-2 | Contract reconciliation before affected code: wyrd-design Verifier/Agents/tools/workspaces, bifrost-design Admission/memory, security accepted-authority; no OS-identity/network-isolation wording; no queued-reservation/reserved-direct/borrowing claims; operations target table and readiness mapping; Repository kind 13 incl. stale count; six-control union in REQ-195 and contributor guidance (REQ-015, rev 12–13) | Content review of owner sections |
 | OBL-3 | Engine: B's step/item/iteration/attempt identities, producer restriction, checkpoints and `walk.rs` scheduling kept; A's tool ownership settles host work before retry, result selection, checkpoint or resource release, including when a block future is dropped (AC-010, INV-001..003; code-mode AC) | vala-verify unit/integration tests incl. cancel/timeout during host work |
 | OBL-4 | One direct/nested dispatcher: name/typed-arg validation, per-call tool/data permission + nonblocking audit, bounded args/results, shared request/concurrency budget, start order, recipient tags, citations, check-Agent records; provider `call_id` and producer forwarded; nested bridge excludes `code.run`, `fs.write`, `publish`; check Agents cannot publish (rev 12) | blocks_agent/tools tests; hosted tools pg_tests; code-mode journey |
-| OBL-5 | Tool-call spend restored from attempt records like `max_agent_invocations`; unsettled attempt counts whole allowance; allowance shared across retries; original deadline kept across park/takeover; no per-call persistence (rev 12) | engine recovery tests; pg_durable_verifier_work takeover |
+| OBL-5 | Tool-call spend restored from attempt records like `max_agent_invocations`; a Busy/unavailable-refused attempt records its known spend and the deferred retry resumes from it; only an attempt interrupted before settling counts whole allowance; allowance shared across retries; original deadline kept across park/takeover; no per-call persistence (rev 12, rev 14) | engine recovery tests; pg_durable_verifier_work takeover |
 | OBL-6 | Hosted workspace: A's reusable fresh-session sandbox, runnable-turn bound, charged streamed workspace composed with B's publication/collection mounts, extraction, writes, immutable snapshots; charge before mutation, replacement vs no-overwrite, unchanged on refusal, release after delete/transfer; suspended envelopes charged until reset/reap (REQ-015, code-mode resource reqs) | workspace tests/pg_tests, sandbox_worker, pg_hosted_* |
 | OBL-7 | One `wyrd-runtime` memory/scratch ledger covers Bifrost, edge bodies, live queued state, frozen copies, encoding, terminal/outbox custody; reserve before copy; transfers without gap/double count; B's memory-first progress, group commit, ACK-before-retirement, claim backpressure kept; no persistence waits on engine mutation/direct path (REQ-017/018, AC-012/013) | runtime/state unit tests; pg_durable_verifier_work |
 | OBL-8 | Direct path: arrival-based deadline lowered by authored timeout through lookup/admission/model; verification-only capture bypass; destination-batched direct evidence; individually fenced queued ACKs; mode-aware target cache + invalidation; queue-only refusal before steps; compact/details; HTTP/MCP-only inspection; RBAC-only authz and `verifier:approve` (REQ-016, AC-011) | pg_verification_routes/runtime, existing selectors |

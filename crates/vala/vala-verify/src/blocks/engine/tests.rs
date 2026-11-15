@@ -99,6 +99,15 @@ enum Behavior {
         /// Items whose first attempt is refused capacity.
         busy: Vec<u32>,
     },
+    /// Spend `first` tool requests of `limit` and then be refused capacity
+    /// on the first attempt; on later attempts, spend requests until the
+    /// allowance refuses one and return how many were admitted.
+    Spends {
+        /// Requests the refused first attempt spends.
+        first: u32,
+        /// The invocation's request allowance.
+        limit: u32,
+    },
 }
 
 /// The log label of one call: its block ID, then `[item]` and `#iteration`
@@ -218,6 +227,21 @@ impl ActionExecutor for Script {
                 std::future::pending().await
             }
             Some(Behavior::Panic(message)) => panic!("{message}"),
+            Some(Behavior::Spends { first, limit }) => {
+                if attempt == 0 {
+                    for _ in 0..*first {
+                        assert!(call.tool_calls.spend(*limit), "the first attempt spends");
+                    }
+                    return Err(BlockError::Busy {
+                        reason: "no worker".to_owned(),
+                    });
+                }
+                let mut admitted = 0_u32;
+                while call.tool_calls.spend(*limit) {
+                    admitted += 1;
+                }
+                Ok(output(&json!(admitted)))
+            }
             Some(Behavior::Echo { delays, fail, busy }) => {
                 let item = call.item_index.unwrap_or(0);
                 if attempt == 0 && busy.contains(&item) {
@@ -1869,6 +1893,83 @@ async fn capacity_refusal_stops_the_execution_without_judging() {
     assert_eq!(step(&retried, "draft").attempts, 2);
 }
 
+/// A refused attempt's tool-call spend survives its deferral: the reclaimed
+/// attempt resumes from the two requests the refused one spent and is
+/// admitted only the remaining three of five, spending no retry, while an
+/// attempt interrupted with an unknown spend leaves the next attempt none
+/// and a fresh invocation all five.
+///
+/// # Panics
+/// Panics when a resumed allowance admits other than its remaining
+/// requests, or the refusal spends a retry.
+#[tokio::test]
+async fn refused_attempts_keep_their_tool_spend() {
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "steps": [{"id": "draft", "retries": 1, "action": code_action(json!({"x": "inputs.answer"}))}]
+    }));
+    let spends = || {
+        Arc::new(Script {
+            actions: HashMap::from([("draft", Behavior::Spends { first: 2, limit: 5 })]),
+            ..Script::default()
+        })
+    };
+    let ledger = Arc::new(Ledger::default());
+    let refused = engine(&spends(), InMemoryTraceSource::new(), 1).with_checkpoints(
+        Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+        &ExecutionState::default(),
+    );
+    assert!(matches!(
+        run(&refused, &spec, json!({"answer": 1})).await,
+        Err(EngineError::Busy(_))
+    ));
+
+    let reclaimed = |state: &ExecutionState| {
+        let script = spends();
+        // The reclaim's script starts past its refused first attempt.
+        script
+            .attempts
+            .lock()
+            .expect("attempts")
+            .insert("draft".to_owned(), 1);
+        engine(&script, InMemoryTraceSource::new(), 1)
+            .with_checkpoints(Arc::clone(&ledger) as Arc<dyn Checkpoints>, state)
+    };
+    let resumed = run(&reclaimed(&ledger.recorded()), &spec, json!({"answer": 1}))
+        .await
+        .expect("outcome");
+    let draft = step(&resumed, "draft");
+    assert_eq!(
+        (draft.output.clone(), draft.attempts),
+        (Some(json!(3)), 1),
+        "the retry resumes from two spent and spends no retry"
+    );
+
+    let interrupted = ExecutionState {
+        invocations: vec![InvocationRecord {
+            sequence: 1,
+            producer: Producer::plain(&TaskId::new("draft").expect("task"), 1),
+            settlement: None,
+            tool_calls_spent: None,
+            released: false,
+        }],
+        ..ExecutionState::default()
+    };
+    let exhausted = run(&reclaimed(&interrupted), &spec, json!({"answer": 1}))
+        .await
+        .expect("outcome");
+    assert_eq!(step(&exhausted, "draft").output, Some(json!(0)));
+
+    let fresh = run(
+        &reclaimed(&ExecutionState::default()),
+        &spec,
+        json!({"answer": 1}),
+    )
+    .await
+    .expect("outcome");
+    assert_eq!(step(&fresh, "draft").output, Some(json!(5)));
+}
+
 /// A capacity refusal defers the execution without throwing away work
 /// already dispatched: a fanout sibling and an unrelated step that were
 /// running settle and are recorded before the refusal returns, the refused
@@ -2573,6 +2674,8 @@ async fn publication_references_resolve_to_attempts_and_statuses() {
 struct Ledger {
     /// Every recorded attempt and its settlement, once it has one.
     attempts: Mutex<BTreeMap<Producer, Option<InvocationSettlement>>>,
+    /// Every forgotten refused attempt and the tool requests it recorded.
+    released: Mutex<Vec<(Producer, u32)>>,
     /// Every recorded scheduling decision, in order.
     controls: Mutex<Vec<ControlRecord>>,
     /// Every reached approval occurrence, in order.
@@ -2592,7 +2695,22 @@ impl Ledger {
                     sequence,
                     producer: producer.clone(),
                     settlement: settled.clone(),
+                    tool_calls_spent: None,
+                    released: false,
                 })
+                .chain(
+                    self.released
+                        .lock()
+                        .expect("ledger")
+                        .iter()
+                        .map(|(producer, spent)| InvocationRecord {
+                            sequence: 0,
+                            producer: producer.clone(),
+                            settlement: None,
+                            tool_calls_spent: Some(*spent),
+                            released: true,
+                        }),
+                )
                 .collect(),
             controls: self.controls.lock().expect("ledger").clone(),
             ..ExecutionState::default()
@@ -2636,15 +2754,19 @@ impl Checkpoints for Ledger {
         Ok(())
     }
 
-    /// Remove the attempt.
+    /// Release the attempt, keeping the tool requests it spent.
     ///
     /// # Errors
     /// Never returns an error.
     ///
     /// # Panics
-    /// Panics when another call panicked while holding the lock.
-    async fn forget(&self, producer: &Producer) -> Result<(), String> {
+    /// Panics when another call panicked while holding a lock.
+    async fn forget(&self, producer: &Producer, tool_calls_spent: u32) -> Result<(), String> {
         self.attempts.lock().expect("ledger").remove(producer);
+        self.released
+            .lock()
+            .expect("ledger")
+            .push((producer.clone(), tool_calls_spent));
         Ok(())
     }
 

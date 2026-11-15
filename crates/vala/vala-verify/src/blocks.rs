@@ -370,12 +370,15 @@ pub trait Checkpoints: Send + Sync {
     async fn begin(&self, producer: &Producer) -> Result<(), String>;
 
     /// Forget the unsettled attempt `producer`, which was refused process
-    /// capacity or its definition, so it spends nothing. A host keeps the
-    /// record of an attempt that already retained work, which stays spent.
+    /// capacity or its definition after its host work settled, so it spends
+    /// no retry, while recording `tool_calls_spent`, the requests its
+    /// invocation had spent, so the deferred retry resumes from that count.
+    /// A host keeps the record of an attempt that already retained work as a
+    /// spent attempt.
     ///
     /// # Errors
-    /// Returns a bounded reason when the record cannot be removed.
-    async fn forget(&self, producer: &Producer) -> Result<(), String>;
+    /// Returns a bounded reason when the record cannot commit.
+    async fn forget(&self, producer: &Producer, tool_calls_spent: u32) -> Result<(), String>;
 
     /// Commit `settled` as the outcome of the attempt `producer`.
     ///

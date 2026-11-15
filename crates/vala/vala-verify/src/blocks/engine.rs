@@ -313,8 +313,12 @@ struct Checkpointed {
     /// Every settled invocation by block and instance.
     settled: HashMap<(TaskId, Instance), InvocationSettlement>,
     /// The highest attempt already recorded per block and instance, settled
-    /// or not.
+    /// or not; a released refusal spends none.
     attempts: HashMap<(TaskId, Instance), u32>,
+    /// Tool requests unsettled attempts already spent per block and
+    /// instance; `None` once any of them was interrupted with an unknown
+    /// spend.
+    tool_calls_spent: HashMap<(TaskId, Instance), Option<u32>>,
     /// Every recorded scheduling decision.
     controls: Vec<ControlRecord>,
 }
@@ -405,6 +409,7 @@ impl VerificationEngine {
             store,
             settled: HashMap::new(),
             attempts: HashMap::new(),
+            tool_calls_spent: HashMap::new(),
             controls: state.controls.clone(),
         };
         for record in &state.invocations {
@@ -413,11 +418,18 @@ impl VerificationEngine {
                 producer.step_id.clone(),
                 (producer.item_index, producer.iteration_index),
             );
-            let seen = checkpointed.attempts.entry(key.clone()).or_default();
-            *seen = (*seen).max(producer.attempt);
+            if !record.released {
+                let seen = checkpointed.attempts.entry(key.clone()).or_default();
+                *seen = (*seen).max(producer.attempt);
+            }
             if let Some(settlement) = &record.settlement {
                 checkpointed.settled.insert(key, settlement.clone());
+                continue;
             }
+            let spent = checkpointed.tool_calls_spent.entry(key).or_insert(Some(0));
+            *spent = spent
+                .zip(record.tool_calls_spent)
+                .map(|(seen, recorded)| seen.max(recorded));
         }
         self.checkpoints = Some(Arc::new(checkpointed));
         self
@@ -463,6 +475,23 @@ impl VerificationEngine {
             }
             InvocationSettlement::Requirement { .. } => None,
         }
+    }
+
+    /// The tool-call allowance of `task`'s `instance`, resumed from what
+    /// earlier runs of this execution spent: whole when an attempt was
+    /// interrupted with an unknown spend.
+    fn resumed_tool_calls(&self, task: &TaskId, instance: Instance) -> ToolCallsOwner {
+        ToolCallsOwner::resumed(
+            self.checkpoints
+                .as_ref()
+                .and_then(|checkpointed| {
+                    checkpointed
+                        .tool_calls_spent
+                        .get(&(task.clone(), instance))
+                        .copied()
+                })
+                .unwrap_or(Some(0)),
+        )
     }
 
     /// Attempts of `task`'s `instance` already recorded by earlier runs of
@@ -634,15 +663,17 @@ impl VerificationEngine {
     }
 
     /// Forget the unsettled attempt `producer`, refused process capacity or
-    /// its definition; the store keeps an attempt that already retained work.
+    /// its definition after its host work settled, recording the
+    /// `tool_calls_spent` its invocation had spent; the store keeps an
+    /// attempt that already retained work.
     ///
     /// # Errors
-    /// Returns [`EngineError::Checkpoint`] when the record cannot be removed.
-    async fn forget(&self, producer: &Producer) -> Result<(), EngineError> {
+    /// Returns [`EngineError::Checkpoint`] when the record cannot commit.
+    async fn forget(&self, producer: &Producer, tool_calls_spent: u32) -> Result<(), EngineError> {
         match &self.checkpoints {
             Some(checkpointed) => checkpointed
                 .store
-                .forget(producer)
+                .forget(producer, tool_calls_spent)
                 .await
                 .map_err(EngineError::Checkpoint),
             None => Ok(()),
@@ -1759,16 +1790,9 @@ impl VerificationEngine {
             engine.begin(&producer).await?;
             let step = key.0.map(|index| &spec.steps[index].id);
             let capture = spec.context_capture.unwrap_or(ContextCapture::Full);
-            let judged = match engine
+            let judged = engine
                 .judge(requirement, step, inputs, capture, deadline, &producer)
-                .await
-            {
-                Err(error @ (EngineError::Busy(_) | EngineError::DefinitionUnavailable(_))) => {
-                    engine.forget(&producer).await?;
-                    return Err(error);
-                }
-                judged => judged?,
-            };
+                .await?;
             let result = judged.report(&spec, key, instance);
             // Only a checkpointed run records the settlement, so only it
             // copies the judged actual value into one.
@@ -1834,7 +1858,7 @@ impl VerificationEngine {
         let _permits = self.admit().await;
         let started = Instant::now();
         let agent = matches!(step.action, Action::Agent(_));
-        let tool_calls = ToolCallsOwner::resumed(attempts);
+        let tool_calls = self.resumed_tool_calls(&step.id, instance);
         loop {
             if agent && !self.spend() {
                 return Ok(Attempted {
@@ -1884,12 +1908,12 @@ impl VerificationEngine {
             match result {
                 Err(BlockError::Busy { reason }) => {
                     self.note_step(&producer, attempts - 1);
-                    self.forget(&producer).await?;
+                    self.forget(&producer, tool_calls.spent()).await?;
                     return Err(EngineError::Busy(reason));
                 }
                 Err(BlockError::Unavailable { reason }) => {
                     self.note_step(&producer, attempts - 1);
-                    self.forget(&producer).await?;
+                    self.forget(&producer, tool_calls.spent()).await?;
                     return Err(EngineError::DefinitionUnavailable(reason));
                 }
                 Err(error) if error.is_retryable() && attempts <= step.retries => {
@@ -1920,12 +1944,14 @@ impl VerificationEngine {
     /// not judge (an uncomparable value, an unreadable trace, a failed or
     /// refused executor) records `outcome="error"`. Host work an Agent or
     /// code check started settles before its outcome is classified or its
-    /// records read.
+    /// records read. An Agent or code check resumes its invocation's tool
+    /// allowance, and a refused attempt is forgotten with what it spent.
     ///
     /// # Errors
     /// Returns [`EngineError::Busy`] when an Agent or code check is refused
     /// process capacity and [`EngineError::DefinitionUnavailable`] when its
-    /// exact definition is unavailable, neither of which is judged, and
+    /// exact definition is unavailable, neither of which is judged and both
+    /// of which forget `producer`'s attempt first, an error forgetting it,
     /// [`EngineError::EvidenceUnavailable`] when a deferring engine's trace
     /// has not landed yet, and [`EngineError::Capture`] when the actual value
     /// cannot be captured under `capture`.
@@ -1981,7 +2007,10 @@ impl VerificationEngine {
                 }
             }
             Check::Agent(_) | Check::Code(_) => {
-                let tool_calls = ToolCallsOwner::resumed(producer.attempt - 1);
+                let tool_calls = self.resumed_tool_calls(
+                    &producer.step_id,
+                    (producer.item_index, producer.iteration_index),
+                );
                 let call = BlockCall {
                     id: &requirement.id,
                     position: step
@@ -2001,10 +2030,12 @@ impl VerificationEngine {
                     Ok(output) => (Judged::cited(output, &sources, capture), true),
                     Err(BlockError::Busy { reason }) => {
                         timer.finish(false);
+                        self.forget(producer, tool_calls.spent()).await?;
                         return Err(EngineError::Busy(reason));
                     }
                     Err(BlockError::Unavailable { reason }) => {
                         timer.finish(false);
+                        self.forget(producer, tool_calls.spent()).await?;
                         return Err(EngineError::DefinitionUnavailable(reason));
                     }
                     Err(error) => (Ok(Judged::inconclusive(reason(&error))), false),

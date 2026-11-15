@@ -2020,20 +2020,21 @@ async fn deleted_agent_definition_errors_queued_execution_as_unavailable() {
             .await
             .expect("the state reads")
             .expect("the execution claimed its state");
-        let invocations: Vec<(&str, bool)> = accepted
+        let invocations: Vec<(&str, bool, bool)> = accepted
             .invocations
             .iter()
             .map(|entry| {
                 (
                     entry.producer.step_id.as_str(),
                     matches!(entry.settlement, Some(InvocationSettlement::Action { .. })),
+                    entry.released,
                 )
             })
             .collect();
         assert_eq!(
             invocations,
-            [("prepare", true)],
-            "only the predecessor's settled checkpoint remains"
+            [("prepare", true, false), ("review", false, true)],
+            "the predecessor's checkpoint settles and the refused review keeps only its tool spend"
         );
     }
 }

@@ -1814,11 +1814,13 @@ async fn retained_publications_keep_their_busy_attempt() {
         .expect("test server shuts down");
 }
 
-/// The (step, attempt) of every invocation `state` records, in commit order.
+/// The (step, attempt) of every invocation `state` records as a spent
+/// attempt, in commit order; a released refusal spends none.
 fn attempts(state: &ExecutionState) -> Vec<(String, u32)> {
     state
         .invocations
         .iter()
+        .filter(|invocation| !invocation.released)
         .map(|invocation| {
             (
                 invocation.producer.step_id.as_str().to_owned(),
@@ -2337,12 +2339,15 @@ fn outcome(verdict: VerificationVerdict) -> ExecutedOutcome {
 
 /// A reclaim resumes invocation attempts from the accepted Bifrost state.
 ///
-/// The first claim begins two attempts and abandons a third before it ran.
-/// The reclaim recovers exactly the two begun attempts, both still spent, so
-/// a retry of one starts its next attempt, and the abandoned attempt is gone.
+/// The first claim begins two attempts and a third that is refused capacity
+/// after spending three tool requests. The reclaim recovers exactly the two
+/// begun attempts, both still spent, so a retry of one starts its next
+/// attempt; the refused attempt spends no retry but keeps its three
+/// requests, unknown for the two still unsettled.
 ///
 /// # Panics
-/// Panics when a revision is refused or the reclaim recovers other attempts.
+/// Panics when a revision is refused, the reclaim recovers other attempts,
+/// or the refused attempt's spend is lost.
 #[tokio::test(flavor = "multi_thread")]
 async fn invocations_resume_from_bifrost() {
     let leased = Leased::start().await;
@@ -2356,7 +2361,7 @@ async fn invocations_resume_from_bifrost() {
     }
     leased
         .run
-        .forget(&Producer::plain(&task("refused"), 1))
+        .forget(&Producer::plain(&task("refused"), 1), 3)
         .await
         .expect("the attempt refused capacity is forgotten");
     leased.settled().await;
@@ -2365,6 +2370,26 @@ async fn invocations_resume_from_bifrost() {
     assert_eq!(
         attempts(&current.snapshot()),
         [("review".to_owned(), 1), ("judge".to_owned(), 1)]
+    );
+    let spent = current
+        .snapshot()
+        .invocations
+        .iter()
+        .map(|invocation| {
+            (
+                invocation.producer.step_id.as_str().to_owned(),
+                invocation.tool_calls_spent,
+                invocation.released,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        spent,
+        [
+            ("review".to_owned(), None, false),
+            ("judge".to_owned(), None, false),
+            ("refused".to_owned(), Some(3), true)
+        ]
     );
     current
         .begin(&Producer::plain(&task("judge"), 2))

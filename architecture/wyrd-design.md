@@ -2311,7 +2311,10 @@ One logical Agent invocation, across its authored retries, has one request
 allowance (`WYRD_VERIFICATION_AGENT_TOOL_MAX_CALLS`, default 128) counting
 direct calls, `code.run`, and nested requests, refused ones included, with no
 refund; the request after the last fails with
-`WYRD_VERIFICATION_422_TOOL_BUDGET_EXCEEDED`. Arguments are bounded by
+`WYRD_VERIFICATION_422_TOOL_BUDGET_EXCEEDED`. An attempt refused capacity or
+its definition records the requests spent once its host work settles, and
+the deferred retry resumes from that count; an attempt interrupted before
+settling has an unknown spend and counts the whole allowance. Arguments are bounded by
 `WYRD_VERIFICATION_TOOL_ARGUMENT_MAX_KIB` (default 64). The Agent's
 `tool_concurrency_cap` (default 8) bounds active non-code calls of both
 origins together; `code.run` holds no permit its children need. A suspended

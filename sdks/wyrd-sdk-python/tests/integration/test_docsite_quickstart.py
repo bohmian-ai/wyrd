@@ -18,21 +18,21 @@ import json
 import runpy
 import shutil
 import sys
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 from wyrd import WyrdError
-from wyrd.cards import Cards
+from wyrd.cards import CardRef, Cards
 from wyrd.client import WyrdClient
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
 from wyrd.verify import Artifact, Service
 
 from .conftest import serving
-from .support import Receiver
+from .support import Receiver, details
 from .test_local_development import configure_gateway
 
 pytestmark = pytest.mark.integration
@@ -59,6 +59,14 @@ def run_quickstart(directory: Path) -> tuple[dict, str]:
     with contextlib.redirect_stdout(printed):
         script = runpy.run_path(str(directory / "finance_release.py"), run_name="__main__")
     return script, printed.getvalue()
+
+
+def policy_file(requirements: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """The policy Artifact file the ``follows-policy`` requirement mounts for its judge."""
+    [follows_policy] = [each for each in requirements if each["id"] == "follows-policy"]
+    return follows_policy["check"]["workspace"]["/inputs/company-sharing-policy.pdf.json"][
+        "artifact"
+    ]
 
 
 @pytest.fixture
@@ -150,6 +158,33 @@ def test_docsite_quickstart_verifies_and_repeats(
         (False, True, False),
         (False, False, True),
     ]
+
+    # The reader downloads the revised policy over the original and reruns.
+    shutil.copy(
+        EXAMPLE / "company-sharing-policy-revised.pdf", reader / "company-sharing-policy.pdf"
+    )
+    script, revised = run_quickstart(reader)
+    assert revised == FIRST_RUN.replace(
+        "regulator request · Synthetic customer report: quarterly total $120. → failed\n"
+        "  follows-policy: the policy does not permit sharing for this purpose\n",
+        "regulator request · Synthetic customer report: quarterly total $120. → passed\n",
+    ), "the revised policy releases the regulator request"
+    assert str(script["state"].root_ref.version) == "0.1.1"
+
+    cards = Cards()
+    original_check = cards.get(CardRef("Verifier", "release-check", "0.1.0")).spec
+    revised_check = cards.get(CardRef("Verifier", "release-check", "0.1.1")).spec
+    revised_service = cards.get(CardRef("Service", "finance-release", "0.1.1")).spec
+    assert policy_file(original_check["requirements"])["card"]["version"] == "0.1.0"
+    assert policy_file(revised_check["requirements"])["card"]["version"] == "0.1.1"
+    assert revised_service["verified_by"][0]["verifier"]["version"] == "0.1.1"
+
+    # An execution from before the update still names the original policy file.
+    earlier = details(results[0].execution_id)
+    assert earlier["verifier"]["version"] == "0.1.0"
+    assert policy_file(earlier["outcome"]["requirements"]) == policy_file(
+        original_check["requirements"]
+    )
 
 
 def test_yaml_release_check_judges_like_the_code(

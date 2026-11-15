@@ -1,7 +1,7 @@
 ---
 id: TASK-013
 status: proposed
-approved_spec_revision: 12
+approved_spec_revision: 13
 requirements: [REQ-015, REQ-017, REQ-018]
 acceptance: [AC-010, AC-013]
 invariants: [INV-001, INV-007]
@@ -15,7 +15,10 @@ client round-trip latency. Add one standard mixed run: Rust SDK clients offer
 canonical direct verifications at a fixed declared pace while a queued canonical
 flood runs. The mixed run uses 100 active authenticated tenants in total.
 Submit the same canonical Verifier through the public queued path. Compare with
-a direct-only control at the same pace on the same host and build.
+a direct-only control at the same pace on the same host and build. Under
+revision 13, direct traffic goes to a `direct` server and the queued flood to
+separate `worker` servers; the control runs the same `direct` server with no
+queued traffic.
 
 ## Inputs and existing owner
 

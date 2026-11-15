@@ -1,7 +1,7 @@
 ---
 id: TASK-014
 status: proposed
-approved_spec_revision: 12
+approved_spec_revision: 13
 requirements: [REQ-015, REQ-017, REQ-018]
 acceptance: [AC-010, AC-012, AC-013]
 invariants: [INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007]
@@ -72,7 +72,7 @@ not success.
 |---|---|
 | Worker and total CPU | Report live plus reaped worker CPU separately and parent+worker CPU per completion on the same windows. Keep parent and worker scopes visible rather than hiding moved work. These are measurements, not new CPU budgets or a prescribed attribution. Retain historical parent-only scope rather than rewriting old records. |
 | Server overhead at c64 | REQ-018's existing target: **p99 strictly below 500 µs**, in each SDK/repetition, using the existing elapsed-server-time minus union-of-blocks definition, never subtracting percentiles or changing span/envelope boundaries. CPU time and elapsed overhead are separate measures. |
-| Queued isolation | Use TASK-013's mixed run and its same-pace direct-only control. With the same direct reserved configuration and c64 Rust callers at the declared direct pace (record actual server concurrency), direct throughput and latency remain unchanged within measured repeat-to-repeat variability while queued work saturates its allowed CPU, memory, Python and model share. Establish variability from paired repeated direct-only controls before evaluating interference; no invented fixed regression allowance. Direct progress must not depend on queued load subsiding. |
+| Queued isolation | Use TASK-013's mixed run and its same-pace direct-only control. With the same `direct` pod configuration and c64 Rust callers at the declared direct pace (record actual server concurrency), direct throughput and latency remain unchanged within measured repeat-to-repeat variability while separately provisioned `worker` pods saturate queued work. Establish variability from paired repeated direct-only controls before evaluating interference; no invented fixed regression allowance. Direct progress must not depend on queued load subsiding. |
 
 Apply the existing qualification integrity/sample rules to every repetition; do
 not average away a failing SDK, window, target or wrong verdict. Retain
@@ -111,14 +111,11 @@ deadline propagation and host-work settlement. Do not remove required tracing,
 records, audits or diagnostic instrumentation to win a number.
 
 Finish the capacity design for high-throughput, multi-tenant, many-replica
-`wyrd-server`: queued work uses its own long-lived runtime and reusable sandbox
-pool, bounded CPU share and memory reservation, while direct retains capacity
-queued work never takes. Direct may borrow idle queued capacity; queued never
-borrows direct. Explain how queued engine execution, model/host callbacks,
-blocking tasks, Python turns and nested tools stay inside its CPU bound, and how
-borrowed ownership returns without delaying direct. A thread-count limit,
-semaphore or separate runtime alone is not evidence of CPU isolation. The one
-process memory/scratch ledger charges both lanes, retained/suspended work,
+`wyrd-server` under revision 13's deployment targets: isolation comes from
+separately provisioned `direct` and `worker` pods, and `combined` shares one
+hosted capacity owner charged per use with no reservation. Never reintroduce
+an idle queued reservation or a borrowing scheme. The one process
+memory/scratch ledger charges direct and queued work, retained/suspended work,
 queued snapshots, recording buffers and Bifrost without double promises.
 Preserve tenant-fair progress, bounded nested-call progress and safe per-replica
 host/filesystem assignments. Never introduce forbidden OS controls, credential
@@ -129,7 +126,7 @@ than describing a weaker guarantee as implemented.
 No numeric CPU budget, bottleneck attribution, scheduler choice or sequence of
 fixes is prescribed. The implementer chooses the redesign and experiment sizes.
 Fixed constraints are behavior/contracts, tenancy, security, portable platform
-rules, queued isolation and no capping, queueing or shedding of direct work.
+rules, target-based queued isolation and no capping, queueing or shedding of direct work.
 
 ## Measurement and implementation evidence
 
@@ -154,7 +151,7 @@ diagnostics cannot qualify them.
 |---|---|
 | Maintainer direct-throughput outcome; REQ-018/AC-013; code-mode benchmark/resource obligations | Run the unchanged canonical Verifier through real public Rust/Python/TypeScript `observe().verify` against the composed server and repository Postgres. Rust results show progress toward the stated throughput/round-trip outcome together on the same workload and windows; report the full sweep and misses. All SDK/repetitions retain the inherited integrity/sample rules and meet REQ-018's c64 p99 server-overhead target with correct verdicts, no healthy-load refusal/lost write, full phase/envelope populations and unchanged exchange/code/workspace counts. Achieved server concurrency, paced arrival lateness/GC and sample counts demonstrate comparable offered work. |
 | Engine invariants and code-mode settlement guarantees | If scheduling changes, unit/in-process tests at the chosen execution owners prove keyed cancellation, panic conversion, settlement/drain and ready-dependency behavior without timing sleeps; performance improvement is measured by the harness. Server and tier-1 pipeline journeys then prove the actual scheduler still drives fanout/repeat/speculation, nested calls and cancellation through the same evidence and settlement flow. |
-| REQ-015/017, AC-010/012, INV-001–007; code-mode AC-028–034 | TASK-013's mixed run and paired same-pace direct-only controls prove isolation while exercising real queued canonical engine/model/Python work, not only held permits. The canonical fixture declares only `code.run`; prove nested-tool isolation separately through the combined code-mode journeys retained by TASK-012, without changing that fixture. Direct can use idle queued capacity safely; restoring queued pressure never takes direct reserves. Held persistence, cancellation and park/takeover retain bounded charged custody, tool spend and original deadlines without recomputation of accepted predecessors. |
+| REQ-015/017, AC-010/012, INV-001–007; code-mode AC-028–034 | TASK-013's mixed run and paired same-pace direct-only controls prove isolation while exercising real queued canonical engine/model/Python work, not only held permits. The canonical fixture declares only `code.run`; prove nested-tool isolation separately through the combined code-mode journeys retained by TASK-012, without changing that fixture. `direct` pods are unaffected by queued pressure on `worker` pods; `combined` holds no idle queued reservation. Held persistence, cancellation and park/takeover retain bounded charged custody, tool spend and original deadlines without recomputation of accepted predecessors. |
 | Inherited TASK-003-R3 V3–V7, TASK-003/R1 and code-mode AC-025/028–034 | Carry TASK-012's row-level ledger to actual PASS/FAIL/UNVERIFIED evidence: full six-population c1/c64 qualification plus matched-rate steps, artifact-level CPU/native/Node/Python diagnosis, legacy report rendering, production feature/package exclusion and inherited cleanup/docs/ledger obligations. Preserve the managed-Python volume exception; it does not remove retention/peak evidence. No pending required row permits closing TASK-003/R3. |
 | TASK-003-R3 V6 and maintainer HA/multi-tenant direction | Sustained saturation and recovery with **100 active authenticated tenants** (the maintainer's amendment replaces inherited REQ-033/AC-034 and R3 V6's 200-tenant wording), a continuously busy tenant, suspended code, direct/queued and Bifrost-only/changing mixed demand shows eligible progress without starvation, bounded memory/scratch/descriptors/queues, repeated worker reuse and complete drain. Repeat on **two real server processes** sharing repository Postgres/storage, with recorded routing and disjoint co-located memory/filesystem assignments; saturate one while the other has headroom. Each replica progresses and recovers. No cluster-wide quota, global fairness or linear-speedup promise is added. |
 

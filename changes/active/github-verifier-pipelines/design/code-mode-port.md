@@ -107,9 +107,10 @@ or by B's normative contracts:
   identities, producer and `call_id` forwarding, and checkpoints.
 - **Hosted capacity** (`hosted/*`, `boot`, `config`, `runner`, `service`,
   gateway caller, `wyrd-testing` server): A's byte-charged workspaces,
-  reusable sessions and process ledgers, with revision 12's queued runtime,
-  pool and CPU/memory/scratch share in place of A's single pool, and B's
-  lanes reduced to model-call permits.
+  reusable sessions and process ledgers. The ported tree still carries revision
+  12's queued runtime, pool and CPU/memory/scratch share; revision 13 replaces
+  them with one per-use capacity owner in `combined` and isolation by
+  deployment target (`direct`, `worker`), which is pending in TASK-012 OBL-9.
 - **Tests**: A's and B's tests both kept; B tests that saturated removed
   counts now hold lane memory, scratch or model calls.
 - **Contracts, docs and projections**: reconciled at their owners and
@@ -124,18 +125,17 @@ or by B's normative contracts:
 | `[patch.crates-io]` entries for `monty`, `monty-fs`, `monty-macros`, `monty-pool`, `monty-proto` and `monty-types` (fork revision `e7a848cf0`) | Revision 12: Monty stays on its crates.io release. |
 | The fork-only `service_mounts`/`resume_serviced` split in the sandbox | Depends on the excluded fork. The runnable-turn bound runs on the crates.io API. |
 | Nested `fs.write` and `publish` through `call_tool` | Revision 12: the nested bridge excludes `code.run`, `fs.write` and `publish`. |
-| A's one shared pool with no fixed hosted share | Revision 12, REQ-015: separate queued runtime, pool and reservation. |
 | A's `apply_limits_env` entry point | B's `resolve_limits` owns the same resolution and now also serves the capacity benchmark. |
 | A's 200-tenant thresholds | Replaced by 100 tenants; see the amendment below. |
 
 `monty-type-checking`, a local path stand-in, is not from A. It entered at
 `0e886ceec` before the merge base and is unchanged by this port.
 
-## Not implemented
+## Superseded
 
-Direct borrowing of idle queued capacity, which REQ-015 permits ("may"), is
-not built: direct runs within its own remainder of the ledgers. Queued work
-never borrows direct capacity.
+Revision 12's queued reservation was ported without the direct borrowing it
+permitted. The maintainer rejected the reservation, and revision 13 replaces it
+([deployment targets](approved-deployment-targets.md)).
 
 ## Inherited packet
 
@@ -156,12 +156,12 @@ this; their older threshold no longer applies.
 | Row | Disposition | Owner now |
 |---|---|---|
 | R3-PLAN | carried: process plan unchanged by the port | TASK-012 evidence |
-| R3-MEM | changed: one ledger now also holds the queued reservation, counted once | TASK-012 OBL-7/OBL-9 |
+| R3-MEM | pending: revision 13 removes the queued reservation from the one ledger | TASK-012 OBL-7/OBL-9 |
 | R3-CACHE | carried | unverified on the port; TASK-012 lanes |
 | R3-SPILL | carried | unverified on the port; TASK-012 lanes |
 | R3-REPLICA | pending | TASK-014 two-replica record |
 | R3-CPU | changed: queued work also has a bounded CPU share on its own runtime | TASK-012 OBL-9; TASK-014 |
-| R3-ADMIT | changed: tenant-fair waits kept; queued has a fixed reservation; no direct borrowing yet | TASK-012 OBL-9; TASK-014 |
+| R3-ADMIT | pending: tenant-fair waits kept; revision 13 isolates by deployment target | TASK-012 OBL-9; TASK-014 |
 | R3-WORKER | carried, per lane | TASK-012 OBL-6 |
 | R3-DEADLINE | changed: arrival deadline also lowered by the Verifier's `limits.timeout_seconds` | TASK-012 OBL-8 |
 | R3-EDGE | carried | TASK-012 OBL-8 |

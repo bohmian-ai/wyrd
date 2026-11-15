@@ -1,7 +1,7 @@
 ---
 id: TASK-012
 status: proposed
-approved_spec_revision: 12
+approved_spec_revision: 13
 requirements: [REQ-015, REQ-016, REQ-017, REQ-018]
 acceptance: [AC-010, AC-011, AC-012, AC-013, AC-014]
 invariants: [INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007]
@@ -19,13 +19,14 @@ three-language benchmark consumed by TASK-013 and TASK-014.
 
 ## Authority, inputs and integration choice
 
-This task derives from approved GitHub pipeline spec revision 12 and contracts,
-code-mode spec revision 9 as amended by pipeline revision 12, and the settled
+This task derives from approved GitHub pipeline spec revision 13 and contracts,
+code-mode spec revision 9 as amended by pipeline revisions 12 and 13, and the settled
 maintainer directions recorded in TASK-013 and TASK-014. Revision 12 decides
 nested exclusions, crates.io Monty, capacity isolation, recovery spend and the
 contributor-contract reconciliation. The current directions also replace A's
 200-tenant requirement with 100 tenants and assign two-replica proof to
-TASK-014. Reconcile those contracts at their owners before affected
+TASK-014. Revision 13 replaces revision 12's capacity isolation with deployment
+targets ([decision](../design/approved-deployment-targets.md)). Reconcile those contracts at their owners before affected
 implementation. The present planning handoff changes only tasks and their index.
 
 Inputs are B at `fa7c86dba8c3148a9621248dac94a7353ead24c8`, A at
@@ -123,27 +124,28 @@ dispatcher, persistence service or resource authority:
 
 ## Capacity boundary and architecture handoff
 
-**Isolation is necessary for a correct port, so its minimum execution boundary
-lands here rather than waiting for TASK-014.** A shared reusable Python pool or
-shared runtime would weaken the maintainer's direct protection. Keep separate
-direct/queued sandbox pools; route queued engine, model and Python mediation
-onto its own long-lived runtime with a bounded CPU share and memory reservation.
-Preserve direct reserved capacity that queued work never consumes. Direct may
-borrow idle queued capacity only without delaying direct reclamation; lack of
-safe borrowing is not permission for queued borrowing. The ledger accounts both
-reservations and actual ownership once. Admission is tenant-fair and replica
-budgets are local and non-overlapping, never independently promised host memory.
+**Revision 13 sets the isolation boundary through deployment targets, and it
+lands here.** Delete the rejected queued reservation (`QueuedShare`,
+`HostedLimits.queued_share`, the queued CPU/memory/scratch percent settings,
+reservation-only tests and `ProcessResources::reserve` unless another
+production owner uses it). In `combined`, direct and queued work share one
+hosted capacity owner (one sandbox pool, runnable-turn bound and model-call
+limit) charged to the one process ledger only while in use;
+`WYRD_VERIFICATION_QUEUED_EXECUTIONS` caps queued concurrency and holds nothing
+idle. Admission stays tenant-fair, replica budgets stay local, and the paths
+stay portable with no OS isolation controls.
 
-Separate runtime thread counts or byte/slot lanes alone do not establish CPU
-isolation: include queued engine work, model callbacks, blocking work, Python
-workers and nested tool work in the bounded share. Use portable mechanisms
-consistent with root rules; no OS isolation controls or platform-specific path.
-Record the bound, enforcement point, in-flight reclamation limits and measured
-effect. If this cannot be enforced within the agreed boundary, report that
-specific blocker before claiming the port correct; do not reinterpret isolation
-as merely reserved permits. TASK-014 owns the full target capacity design,
-optimization and final saturation qualification, not repair of a known unsafe
-port.
+Replace the closed `WYRD_TARGET` set with `combined` (default), `direct`,
+`worker`, `bifrost-ingest`, `bifrost-query` and `bifrost-maintenance`, with no
+aliases. Decouple public serving, Verifier capabilities and Bifrost roles so a
+target with no Bifrost role boots and stages outbox writes to a peer Scribe.
+Route, readiness, hosted blocks, gateway, queued runtime and GitHub ingress
+follow the target's capabilities. A target refuses work it does not accept
+before admission or any side effect, identically over HTTP and MCP, and never
+forwards it. Update test-server target derivation and the Kubernetes
+deployment manifests. Original deadlines, Busy deferral, fenced takeover and
+ordered drain are unchanged. TASK-014 owns throughput optimization and final
+saturation qualification on `direct` pods.
 
 Before affected changes, reconcile only the shipped contract in
 `architecture/wyrd-design.md` (Verifier / Agents, tools, and workspaces),
@@ -151,7 +153,8 @@ Before affected changes, reconcile only the shipped contract in
 invariants) and the accepted-authority security section. B's orchestration,
 recovery, GitHub and Repository contracts stay normative; A's `call_tool` and
 ledger mechanics stay normative. Remove forbidden OS-identity/network-isolation
-wording and conflicting no-borrowing/dynamic-sharing claims; describe portable
+wording and every queued-reservation, reserved-direct and borrowing claim; document
+the target set in `architecture/operations/`; describe portable
 interpreter/allocator limits and parent-mediated access honestly. TASK-014
 rewrites the in-revision direct/capacity design; do not claim HA qualification
 from functional integration. Keep Repository as kind 13, including the stale
@@ -167,7 +170,7 @@ unsanctioned control, blocking wait semantics and production exclusion.
 |---|---|
 | Code-mode revision 9 functional requirements/invariants and AC-001–018; diagnosis conflicts 1–3,7–8,11,13 | Real declared Agent step and check call nested tools inside fanout/repeat; dependent calls complete at concurrency one, record recipients and retain citations. Preserve the existing reduced-evidence efficiency journey and its byte bound, least-privilege recovery and authored-code isolation. Model-originated publication replays its original receipt; nested write/publication and check publication refuse. Cancel/timeout during host work, retry, park and take over: settled work and receipts persist, unsettled attempts consume their allowance, authority/deadline never replenish, and ownership releases only after settlement. |
 | Pipeline REQ-001–014/016, AC-001–009/011 and INV-001–007; conflicts 9–13,16 | Retain connect→Repository→PR admission→pinned extraction→review→approval/deferred evidence→same execution→report/Check/comment journeys and negative flows across shipped surfaces. Source supersession/access loss fences continuation and delivery; provider retry never recomputes verification. No newly added SDK/CLI inspection where HTTP/MCP alone is sanctioned. |
-| REQ-015/017–018, AC-010/012–014; code-mode resource requirements and AC-028–034; conflicts 1,4–6,10,12,14 | Pressure on publication mounts, scratch replacement, queued snapshots and held persistence remains fully charged and bounded; compute frees before queued ACK without losing custody. Saturate queued CPU/model/Python/engine work and compare direct c64 latency and throughput with direct-only under identical reserved settings: no degradation beyond measured run variability. No warm-cache direct SQL/state, queued-only cache bypass, lost write, starvation or premature release. |
+| REQ-015/017–018, AC-010/012–014; code-mode resource requirements and AC-028–034; conflicts 1,4–6,10,12,14 | Pressure on publication mounts, scratch replacement, queued snapshots and held persistence remains fully charged and bounded; compute frees before queued ACK without losing custody. Each target accepts exactly its work and refuses the rest before any side effect over HTTP and MCP; `combined` holds no idle queued reservation; a `worker` completes webhook, deferred-input and approval journeys through a peer Scribe and its crash allows takeover without resetting deadlines; a `direct` pod never claims queued work. Compare direct c64 latency and throughput on a `direct` pod with and without saturated `worker` pods: no degradation beyond measured run variability. No warm-cache direct SQL/state, queued-only cache bypass, lost write, starvation or premature release. |
 | REQ-195 and both packets' projection/isolation obligations; conflicts 14–17 | Exact six-control guard rejects any additional hook in all projections. Dependencies resolve against crates.io Monty with no fork patch; regenerated consumers compile, historical records decode, production packages exclude testing/benchmark machinery. |
 | Diagnosis sections 5/7 and inherited TASK-003/R1/R3 obligations | Retain A's tracked packet and referenced evidence in B's change tracking with source identities and an explicit carried/changed/pending disposition for every inherited row. Keep TASK-003-R2 superseded and TASK-003-R3 open. TASK-013 owns the Rust-only 100-tenant mixed comparison; TASK-014 owns sustained 100-tenant saturation/recovery, remaining qualification, artifact analysis and two-real-replica evidence. Record the 100-tenant amendment against inherited REQ-033/AC-034 and R3 V6 rather than retaining their older threshold; no historical FAIL/UNVERIFIED becomes PASS by importing it. Preserve the shared resource-scaling packet, historical deprecated verifier-review packet and B's intentional execution/inspection distinctions. Reconcile packet coverage/status only against actual evidence, never invent review verdicts. |
 
@@ -235,14 +238,14 @@ publication identity extension belongs here.
 | ID | Promise (contract source) | Planned proof |
 |---|---|---|
 | OBL-1 | Port integrity: A's delta `11474b4a9..0eb5ccdd9` is ported into B owners; every A-only path is carried, adapted or excluded with a reason; source identities retained; A's payload-sizing and software-factory work excluded; local task index and TASK-011 untouched (task: integration choice) | Coverage record below; `git diff` audit |
-| OBL-2 | Contract reconciliation before affected code: wyrd-design Verifier/Agents/tools/workspaces, bifrost-design Admission/memory, security accepted-authority; no OS-identity/network-isolation wording; no conflicting borrowing claims; Repository kind 13 incl. stale count; six-control union in REQ-195 and contributor guidance (REQ-015, rev 12) | Content review of owner sections |
+| OBL-2 | Contract reconciliation before affected code: wyrd-design Verifier/Agents/tools/workspaces, bifrost-design Admission/memory, security accepted-authority; no OS-identity/network-isolation wording; no queued-reservation/reserved-direct/borrowing claims; operations target table and readiness mapping; Repository kind 13 incl. stale count; six-control union in REQ-195 and contributor guidance (REQ-015, rev 12–13) | Content review of owner sections |
 | OBL-3 | Engine: B's step/item/iteration/attempt identities, producer restriction, checkpoints and `walk.rs` scheduling kept; A's tool ownership settles host work before retry, result selection, checkpoint or resource release, including when a block future is dropped (AC-010, INV-001..003; code-mode AC) | vala-verify unit/integration tests incl. cancel/timeout during host work |
 | OBL-4 | One direct/nested dispatcher: name/typed-arg validation, per-call tool/data permission + nonblocking audit, bounded args/results, shared request/concurrency budget, start order, recipient tags, citations, check-Agent records; provider `call_id` and producer forwarded; nested bridge excludes `code.run`, `fs.write`, `publish`; check Agents cannot publish (rev 12) | blocks_agent/tools tests; hosted tools pg_tests; code-mode journey |
 | OBL-5 | Tool-call spend restored from attempt records like `max_agent_invocations`; unsettled attempt counts whole allowance; allowance shared across retries; original deadline kept across park/takeover; no per-call persistence (rev 12) | engine recovery tests; pg_durable_verifier_work takeover |
 | OBL-6 | Hosted workspace: A's reusable fresh-session sandbox, runnable-turn bound, charged streamed workspace composed with B's publication/collection mounts, extraction, writes, immutable snapshots; charge before mutation, replacement vs no-overwrite, unchanged on refusal, release after delete/transfer; suspended envelopes charged until reset/reap (REQ-015, code-mode resource reqs) | workspace tests/pg_tests, sandbox_worker, pg_hosted_* |
 | OBL-7 | One `wyrd-runtime` memory/scratch ledger covers Bifrost, edge bodies, live queued state, frozen copies, encoding, terminal/outbox custody; reserve before copy; transfers without gap/double count; B's memory-first progress, group commit, ACK-before-retirement, claim backpressure kept; no persistence waits on engine mutation/direct path (REQ-017/018, AC-012/013) | runtime/state unit tests; pg_durable_verifier_work |
 | OBL-8 | Direct path: arrival-based deadline lowered by authored timeout through lookup/admission/model; verification-only capture bypass; destination-batched direct evidence; individually fenced queued ACKs; mode-aware target cache + invalidation; queue-only refusal before steps; compact/details; HTTP/MCP-only inspection; RBAC-only authz and `verifier:approve` (REQ-016, AC-011) | pg_verification_routes/runtime, existing selectors |
-| OBL-9 | Isolation boundary: separate direct/queued sandbox pools; queued engine/model/Python/nested tool work on its own long-lived runtime with bounded CPU share and memory reservation; direct reserved capacity never taken by queued; direct may borrow idle queued capacity only without delaying reclamation; ledger counts reservation and ownership once; tenant-fair admission; replica-local budgets; portable only. Record bound, enforcement point, reclamation limits, measured effect (REQ-015, AC-014) | pressure journeys; direct c64 with/without queued saturation |
+| OBL-9 | Isolation by deployment target: closed `WYRD_TARGET` set `combined` (default)/`direct`/`worker`/`bifrost-ingest`/`bifrost-query`/`bifrost-maintenance`, old values removed; each target accepts exactly its work and refuses the rest before admission or side effect over HTTP and MCP, never forwarding; readiness follows capabilities; role-free targets boot and stage outbox writes to a peer Scribe; `combined` has one hosted capacity owner charged per use, no reservation, queued concurrency cap; reservation code and percent settings deleted; deadlines, Busy deferral, fenced takeover and drain unchanged; portable only (REQ-015, AC-010, rev 13) | target journeys over HTTP/MCP; pg seam tests; direct c64 on `direct` pod with and without saturated `worker` pods |
 | OBL-10 | Dependencies: Monty on crates.io, no `[patch.crates-io]`/git type-checking patch/fork-only `service_mounts`/`resume_serviced`; runnable-turn bound works on crates.io API; B's code-review pin kept; lockfile/workspace-hack/features coherent; benchmark deps diagnostic-only and out of SDK packages (rev 12) | `check:deps`, Cargo.toml inspection, package contents |
 | OBL-11 | Projections: authored Python stubs/exports and native sources composed; wire types, errors, loaders/declarations, testing declarations, docs regenerated; historical records decode; six-control guard rejects any extra hook in Rust/Python/TS with blocking waits and production exclusion (REQ-195) | codegen:check, ts:napi:check, testing d.ts inspection, guard tests |
 | OBL-12 | Pipeline journeys preserved: connect→Repository→PR admission→pinned extraction→review→approval/deferred→same execution→report/Check/comment and negatives; supersession/access loss fences; provider retry never recomputes (REQ-001–014/016, AC-001–009/011, INV-001–007) | combined server seam selector; SDK journey lanes |

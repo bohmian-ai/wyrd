@@ -1,6 +1,6 @@
 ---
 id: SPEC-github-verifier-pipelines
-revision: 12
+revision: 13
 status: approved
 ---
 
@@ -277,13 +277,26 @@ principal revocation's is delivered by the next restart recovery. Execution insp
 and safe error separately from the verdict. No progress ledger, new SQL table or
 column, result mirror or finalizer service.
 
-**REQ-015 — Resource isolation.** Queued work never degrades direct verification. Queued execution runs on
-its own long-lived runtime and sandbox worker pool with a bounded CPU share
-(covering its engine, model, blocking, Python and nested tool work) and a
-memory reservation. Direct keeps reserved capacity queued work never takes;
-direct may borrow idle queued capacity, and queued never borrows direct. The
-one process memory/scratch ledger accounts both. Direct c64 latency and
-throughput stay unchanged while queued work saturates its share. PR extraction,
+**REQ-015 — Resource isolation.** The closed `WYRD_TARGET` set is `combined`
+(default), `direct`, `worker`, `bifrost-ingest`, `bifrost-query` and
+`bifrost-maintenance`; the old values are removed without aliases. `combined`
+serves every route and runs every Bifrost role; direct and queued work share
+one hosted capacity owner charged to the one process memory/scratch ledger
+only while in use, with no fixed queued reservation, and
+`WYRD_VERIFICATION_QUEUED_EXECUTIONS` bounds queued concurrency without
+holding idle capacity. Colocation does not guarantee direct noninterference.
+Operators isolate direct work by running `direct` and `worker` targets on
+separately provisioned pods: `direct` executes only synchronous `verify`;
+`worker` admits queued submissions, webhooks, deferred inputs, approvals and
+queued-only controls and is the only non-`combined` target that claims queued
+executions. `bifrost-ingest`, `bifrost-query` and `bifrost-maintenance` run
+only Scribe, Oracle and Forge (coordinator and worker) respectively and serve
+no Verifier work. A target refuses work it does not accept before admission or
+any side effect, identically over HTTP and MCP, and never forwards it.
+Readiness follows the target's capabilities. Original deadlines, Busy deferral,
+fenced takeover and graceful drain are unchanged. Direct c64 latency and
+throughput on a `direct` pod stay unchanged while `worker` pods saturate queued
+work; provider quota, Postgres and Bifrost remain shared. PR extraction,
 deferred inputs and approval are queued-only, including manual calls; refuse a
 direct request before any step. Under the TASK-010-R1 amendment, a Verifier
 whose step or check Agent, inline or a referenced registered Agent, declares
@@ -296,7 +309,7 @@ there is no completion-time SLA for arbitrary DAGs.
 **REQ-016 — Surfaces and operation.** Ship typed Rust/Python/TypeScript, CLI and
 HTTP/MCP operations, stable errors, schemas, inspection and focused user guides
 for the introduced capability. New writes require domain permission and MCP
-write scopes; reads remain discoverable. Expose isolated capacities and original
+write scopes; reads remain discoverable. Expose deployment targets, queued concurrency and original
 execution ceiling through normal operator configuration. Documentation teaches
 App setup, declaration, publication, approval and diagnosis without a UI.
 The pull_request extraction is inspected as ordinary step output through the
@@ -331,7 +344,7 @@ retries persistence and performs token-fenced queue settlement after canonical
 terminal evidence acceptance. A shed terminal offer is not queue completion.
 Account for admitted running claims so every one can finish without waiting for
 tracking space. Full tracking pauses new claims rather than running computation;
-isolated direct capacity remains available. This is live memory custody, not a
+direct verification remains admissible. This is live memory custody, not a
 new durable result mirror or stronger crash guarantee.
 
 The existing background lease owner renews claims and updates local cancellation;
@@ -417,9 +430,9 @@ without production GitHub credentials.
 | AC-007 | Restart while an execution waits for evidence or a decision, then supply it | Accepted evidence or decision survives and the same execution finishes; unavailable state is not absence; no second accepted approval or replay of durably settled predecessors; unpersisted work can repeat under REQ-017. Proven with ordinary restart, retry and refusal tests, no test-only crash hooks | 009,010,011 |
 | AC-008 | No/one/multiple/malformed report; every severity, absent location, valid/invalid suggested edit | Exact report convention; honest verdict/conclusion; no invented source anchor or applied source change | 012,013 |
 | AC-009 | GitHub timeout after remote success, restart, rate limit, permanent refusal, new head/access removal during delivery | Lookup-before-create finds the landed write; restart delivers once; failure is visible; no rerun of verification or stale write | 005,014 |
-| AC-010 | Hold queued execution/workspace/Python/model admission saturated while calling direct-eligible Verifier | Direct reserved resources still execute; queued-only direct call refuses before work | 015 |
+| AC-010 | Hold queued execution/workspace/Python/model admission saturated while calling direct-eligible Verifier | On a `direct` pod beside saturated `worker` pods, direct executes with unchanged c64 latency/throughput; in `combined`, queued holds no idle reservation and direct still executes; queued-only direct call refuses before work; each target refuses work it does not accept before any side effect | 015 |
 | AC-011 | Fresh reader follows CLI/SDK docs and uses execution, evidence and approval inspection; reads a pull_request extraction and the delivery outcome through execution inspection over HTTP and MCP | Complete journey without UI or hidden manual orchestration; schemas/errors match served operations | 016 |
-| AC-012 | Hold Scribe/outbox and background SQL replies while direct/queued graphs advance; fill terminal tracking, then restore persistence; crash/reclaim before/after acceptance and race cancellation/takeover | Engine progresses from memory, compute permits free, tracking bounded with room for running claims, new claims back off, direct remains isolated; restored persistence yields the same terminal evidence then batched fenced settlement; only unpersisted work may repeat | 011,015,017 |
+| AC-012 | Hold Scribe/outbox and background SQL replies while direct/queued graphs advance; fill terminal tracking, then restore persistence; crash/reclaim before/after acceptance and race cancellation/takeover | Engine progresses from memory, compute permits free, tracking bounded with room for running claims, new claims back off, direct remains admissible; restored persistence yields the same terminal evidence then batched fenced settlement; only unpersisted work may repeat | 011,015,017 |
 | AC-013 | Matched full immutable resource-scaling/candidate verification benchmarks with healthy evidence reconciliation | Existing latency/L2 targets met and RS throughput/CPU/memory baseline preserved; no invented tolerance or exit-zero-only performance claim | 018 |
 | AC-014 | Fresh isolated migration comparison and affected consumer/SQL tests | Only permitted GitHub/PR/Task 004 deltas beyond main plus RS; no generic execution payload schema, preserved grants/RLS/cancellation responsiveness and no Bifrost runtime redesign | 018 |
 
@@ -469,6 +482,7 @@ readiness. Implementation tasks derive from this approved revision.
 | 10 | approved 2026-11-13 | User decision during TASK-009: the GitHub delivery outcome has no typed Rust client, SDK or CLI projection; it is read through existing HTTP/MCP execution inspection. Amends REQ-016 and AC-011 and task 009 surfaces. Nothing else changes. |
 | 11 | approved 2026-11-14 | User decisions after the TASK-009 review: cancellation is its own delivery, recorded once per revision apart from that revision's outcome (FIND-009-8; amends REQ-014 and the bifrost-design one-outcome-per-revision rule). Deferred as accepted limits: report source is the first retained pull_request extraction output and an extraction-shaped decoy is not distinguished (FIND-009-2); access and generation are rechecked before each write attempt, not again after its lookup (FIND-009-6); startup recovery waiting on a provider cooldown may hold shutdown until the drain deadline (FIND-009-9). Nothing else changes. |
 | 12 | approved 2026-11-15 | Maintainer integration decisions for porting code mode (TASK-012/013/014): REQ-015 replaces separate capacity without borrowing with queued runtime/pool isolation, a bounded queued CPU share and memory reservation, reserved direct capacity, direct-only borrowing of idle queued capacity and one ledger. Nested code-mode calls exclude fs.write and publish. Tool-call spend is restored from the attempt records used for max_agent_invocations; an unsettled attempt counts its whole allowance. Repository is the thirteenth Card kind. The sanctioned test-control set is the reconciled union, guard strictness unchanged. Monty stays on its crates.io release. Nothing else changes. |
+| 13 | approved 2026-11-15 | Maintainer rejected revision 12's queued reservation because it holds idle capacity, and approved deployment targets instead: REQ-015 replaces the queued runtime CPU share, memory/scratch reservation, reserved direct capacity and borrowing with the closed `combined`/`direct`/`worker`/`bifrost-ingest`/`bifrost-query`/`bifrost-maintenance` target set, per-use charging in `combined` with a queued concurrency cap, and isolation by separately provisioned `direct` and `worker` pods. Amends REQ-015/016, AC-010/012 and the live-custody paragraph. Recorded in [deployment targets](design/approved-deployment-targets.md). Nothing else changes. |
 
 Subsequent explicit maintainer amendment: approval authoring has no separate
 expiration setting. Pending approvals and deferred waits share the execution's
@@ -484,7 +498,8 @@ Design: [current index](design/notes.md), [declaration](design/approved-declarat
 [publication/approval](design/approved-deferred-inputs.md),
 [reports](design/approved-report-delivery.md),
 [App/runtime](design/approved-runtime-and-github.md),
-[nonblocking execution](design/approved-nonblocking-execution.md).
+[nonblocking execution](design/approved-nonblocking-execution.md),
+[deployment targets](design/approved-deployment-targets.md).
 
 Revision 7 supersedes conflicting earlier execution ACK/SQL requirements for this
 change. Required owner-document updates remain task work before affected runtime

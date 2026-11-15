@@ -3142,3 +3142,216 @@ async fn details_preserve_visibility_and_read_authority() {
     );
     server.shutdown().await.expect("test server shuts down");
 }
+
+/// Call one `/mcp` tool as `jwt` and return its JSON-RPC answer.
+///
+/// # Panics
+/// Panics when the request cannot be built, the transport does not answer
+/// `200 OK`, or the answer is not JSON.
+async fn mcp_call(server: &WyrdTestServer, jwt: &str, tool: &str, arguments: &Value) -> Value {
+    let version = "2026-07-28";
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": tool,
+            "arguments": arguments,
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": version,
+                "io.modelcontextprotocol/clientInfo": {"name": "target-journey", "version": "1"},
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+        },
+    });
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/mcp")
+        .header(header::HOST, "localhost")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "application/json, text/event-stream")
+        .header("mcp-protocol-version", version)
+        .header("mcp-method", "tools/call")
+        .header("mcp-name", tool)
+        .body(Body::from(body.to_string()))
+        .expect("MCP request builds");
+    let response = server
+        .oneshot_authenticated(jwt, request)
+        .await
+        .expect("MCP responds");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 1 << 22)
+        .await
+        .expect("body reads");
+    let text = String::from_utf8_lossy(&bytes);
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let message = text
+        .lines()
+        .find_map(|line| line.strip_prefix("data:"))
+        .unwrap_or(&text);
+    serde_json::from_str(message.trim()).expect("JSON-RPC answer")
+}
+
+/// Assert an HTTP answer is the wrong-target refusal naming `target`.
+///
+/// # Panics
+/// Panics when the status, code, or named target differs.
+fn assert_wrong_target_http(target: &str, (status, body): &(StatusCode, Value)) {
+    assert_eq!(*status, StatusCode::MISDIRECTED_REQUEST, "{body}");
+    assert_eq!(body["code"], "WYRD_VERIFICATION_421_WRONG_TARGET", "{body}");
+    assert_eq!(body["details"]["target"], target, "{body}");
+}
+
+/// Assert an MCP answer is the wrong-target refusal naming `target`.
+///
+/// # Panics
+/// Panics when the answer is not a JSON-RPC error carrying that refusal.
+fn assert_wrong_target_mcp(target: &str, answer: &Value) {
+    let problem = &answer["error"]["data"];
+    assert_eq!(
+        problem["code"], "WYRD_VERIFICATION_421_WRONG_TARGET",
+        "{answer}"
+    );
+    assert_eq!(problem["details"]["target"], target, "{answer}");
+}
+
+/// A `direct` server judges synchronous `verify` over HTTP and MCP and
+/// refuses queued work: enqueue and cancel on both surfaces and the GitHub
+/// webhook answer `WYRD_VERIFICATION_421_WRONG_TARGET` before authorization,
+/// so the refused calls leave no execution and no audited decision, and the
+/// server never composes the queued runtime that would claim executions.
+///
+/// # Panics
+/// Panics when the server or seeding fails, direct work is not judged, or any
+/// queued call is not refused without side effects.
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_target_runs_only_direct_work() {
+    let server = WyrdTestServer::builder()
+        .with_bifrost_target_for_test(wyrd_server::config::ServerTarget::Direct)
+        .with_verification_runtime_for_test()
+        .start_bound()
+        .await
+        .expect("direct server starts");
+    assert!(
+        !server.state().verification.health.is_composed(),
+        "a direct server never claims queued executions"
+    );
+    let fixture = Fixture::seed(&server).await;
+    let (caller, jwt) = user(&server, "vt-direct", &["editor"]).await;
+    let body = fixture.request(&fixture.assertion, json!(1));
+
+    let (status, judged) = execute(&server, &jwt, body.to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{judged}");
+    assert_eq!(judged["outcome"]["verdict"], "passed", "{judged}");
+    let answer = mcp_call(&server, &jwt, "verification.execute", &body).await;
+    assert_eq!(
+        answer["result"]["structuredContent"]["outcome"]["verdict"], "passed",
+        "{answer}"
+    );
+
+    assert_wrong_target_http("direct", &enqueue(&server, &jwt, &body, None).await);
+    assert_wrong_target_mcp(
+        "direct",
+        &mcp_call(&server, &jwt, "verification.enqueue", &body).await,
+    );
+    let unknown = Uuid::now_v7();
+    assert_wrong_target_http(
+        "direct",
+        &post(
+            &server,
+            &jwt,
+            &format!("/v1/verification/executions/{unknown}/cancel"),
+            "{}".to_owned(),
+            None,
+        )
+        .await,
+    );
+    assert_wrong_target_mcp(
+        "direct",
+        &mcp_call(
+            &server,
+            &jwt,
+            "verification.cancel",
+            &json!({"execution_id": unknown}),
+        )
+        .await,
+    );
+    let webhook = server
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/integrations/github/webhook")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .expect("webhook request builds"),
+        )
+        .await
+        .expect("webhook responds");
+    assert_wrong_target_http("direct", &decoded(webhook).await);
+
+    assert_eq!(fixture.queued().await, 0, "no refused call queued work");
+    assert_eq!(
+        decisions(&server, "verification.enqueue", caller).await,
+        Vec::<(String, String)>::new(),
+        "refusal precedes authorization"
+    );
+    assert_eq!(
+        decisions(&server, "verification.execute", caller).await,
+        vec![run_decision("allowed"); 2]
+    );
+    server.shutdown().await.expect("direct server shuts down");
+}
+
+/// A `worker` server admits and runs queued work over HTTP and MCP and
+/// refuses synchronous `verify` on both surfaces with
+/// `WYRD_VERIFICATION_421_WRONG_TARGET` before authorization, leaving no
+/// execution and no audited decision.
+///
+/// # Panics
+/// Panics when the server or seeding fails, a direct call is not refused
+/// without side effects, or enqueued work does not complete.
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_target_runs_only_queued_work() {
+    let server = WyrdTestServer::builder()
+        .with_bifrost_target_for_test(wyrd_server::config::ServerTarget::Worker)
+        .with_verification_runtime_for_test()
+        .start_bound()
+        .await
+        .expect("worker server starts");
+    assert!(server.state().verification.health.is_composed());
+    let fixture = Fixture::seed(&server).await;
+    let (caller, jwt) = user(&server, "vt-worker", &["editor"]).await;
+    let body = fixture.request(&fixture.assertion, json!(1));
+
+    assert_wrong_target_http("worker", &execute(&server, &jwt, body.to_string()).await);
+    assert_wrong_target_mcp(
+        "worker",
+        &mcp_call(&server, &jwt, "verification.execute", &body).await,
+    );
+    assert_eq!(fixture.queued().await, 0, "no refused call ran or queued");
+    assert_eq!(
+        decisions(&server, "verification.execute", caller).await,
+        Vec::<(String, String)>::new(),
+        "refusal precedes authorization"
+    );
+
+    let (status, accepted) = enqueue(&server, &jwt, &body, None).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    let answer = mcp_call(&server, &jwt, "verification.enqueue", &body).await;
+    let via_mcp = execution_id(&answer["result"]["structuredContent"]);
+    for execution in [execution_id(&accepted), via_mcp] {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let state = visible_execution(&server, &jwt, execution).await;
+            if state["status"] == "completed" {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the worker never completed {execution}: {state}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    server.shutdown().await.expect("worker server shuts down");
+}

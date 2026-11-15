@@ -574,6 +574,7 @@ if (!nativeBinding) {
 module.exports = nativeBinding
 module.exports.NativeGithubAppMock = nativeBinding.NativeGithubAppMock
 module.exports.NativeGithubBrowser = nativeBinding.NativeGithubBrowser
+module.exports.NativeHeldMemory = nativeBinding.NativeHeldMemory
 module.exports.NativeWyrdTestServer = nativeBinding.NativeWyrdTestServer
 module.exports.cliDeclare = nativeBinding.cliDeclare
 module.exports.cliDeclareCheck = nativeBinding.cliDeclareCheck

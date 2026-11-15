@@ -55,12 +55,22 @@ export declare class NativeGithubBrowser {
 }
 
 /**
+ * Process memory a journey holds on its test server; `release` returns it,
+ * and so does garbage collection of the handle.
+ */
+export declare class NativeHeldMemory {
+  /** Return the memory; releasing twice does nothing. */
+  release(): void
+}
+
+/**
  * In-process server handle used only by TypeScript integration tests.
  *
- * Journeys steer the server through exactly four test controls, each backed
+ * Journeys steer the server through exactly six test controls, each backed
  * by the production code path: `flushBifrost`, `waitForBaseline`,
- * `makeBindingDue`, and `holdPublications`. The remaining members start,
- * address, or credential the server.
+ * `makeBindingDue`, `holdPublications`, and, for contended process memory,
+ * `occupyHostedMemory` and `waitForHostedWaiters`. The remaining members
+ * start, address, or credential the server.
  */
 export declare class NativeWyrdTestServer {
   /** Returns the bound HTTP base URL. */
@@ -124,6 +134,29 @@ export declare class NativeWyrdTestServer {
    * the last observed baseline status when `timeoutMs` elapses first.
    */
   waitForBaseline(verifier: string, timeoutMs: number): void
+  /**
+   * Hold process memory so at most `leave` bytes stay free until the
+   * returned hold is released, so a hosted verification whose session
+   * does not fit waits and one whose request does not fit is refused.
+   *
+   * # Errors
+   *
+   * Throws a `WyrdError`-shaped error when the harness is closed or hosts
+   * no Verifiers.
+   */
+  occupyHostedMemory(leave: number): NativeHeldMemory
+  /**
+   * Return once exactly `count` hosted Python operations wait for process
+   * memory, such as behind `occupyHostedMemory`, waiting at most
+   * `timeoutMs`. A verify already called keeps running meanwhile: the
+   * native call starts it before its promise is awaited.
+   *
+   * # Errors
+   *
+   * Throws a `WyrdError`-shaped error when the harness is closed, hosts no
+   * Verifiers, or `timeoutMs` elapses first, with the last observed count.
+   */
+  waitForHostedWaiters(count: number, timeoutMs: number): void
   /**
    * The fixture tenant's slug, which a browser signs in to.
    *
@@ -516,6 +549,11 @@ export interface NativeTestServerOptions {
    * GitHub mock, reachable as `githubApp`; omitted, no App is configured.
    */
   githubApp?: boolean
+  /**
+   * Direct verification deadline from arrival in milliseconds, so a
+   * journey reaches it quickly; omitted keeps the production deadline.
+   */
+  verifyTimeoutMs?: number
 }
 
 /**

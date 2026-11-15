@@ -1,7 +1,7 @@
 ---
 id: TASK-002
 kind: implementation
-status: proposed
+status: review
 spec: SPEC-positioning
 spec_revision: 4
 requirements: [REQ-007, REQ-008, REQ-010, REQ-011, REQ-013, REQ-014, REQ-015, REQ-016, INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, AC-006, AC-007, AC-009, AC-010, AC-012, AC-013, AC-014, AC-015]
@@ -326,3 +326,137 @@ repairs remain implementation-owned.
 - [Wyrd doctrine, Verifiers and public surfaces](../../../../architecture/wyrd-design.md),
   [Bifrost evidence](../../../../architecture/bifrost-design.md), and
   [security boundaries](../../../../architecture/wyrd-security-posture.md).
+
+## Execution Evidence
+
+Candidate commits on `docs`: `0748e4e88` (pages and links), `5b1a676dd`
+(citation corrections), `4e1736df2` (reader findings), and the evidence
+commit that adds this section. Prose, frontmatter and links only: no runtime,
+SDK, schema, migration, example or test change. No independent
+`$wyrd-task-review` has run.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-010; AC-009; INV-001–005 | `understand/foundations-of-verification.md`: plausible-but-false reply → requirement/evidence/judgment/decision → decision timing (before/during/after) in the third section → adjacent-discipline table with NASA definitions → formal/runtime overlap (SMC, LTL3, Dennis, AgentGuard) → oracle problem and metamorphic relations → system/evidence/judge uncertainty → leakage, drift, skipped step and absent-trace rule → model judges → two hard problems → six-step method → cited Sources table. No Wyrd API. `understand/real-time-verification.md`: request → `release-check` contract → `verify` → verdict → release/hold → response, using the tested `api.py` handler region and `release-check.yaml`; contract table; engine/evidence/check time; outbox staging; timeout bound and "not hard real-time"; then queued/scheduled table and missing-evidence/timeout/error table. No numeric latency | Claim ledger below; foundation reader (answers below); real-time reader; `api.py` proven by `test_finance_api_releases_only_passed_reports`, `release-check.yaml` read by `test_docsite_quickstart.py` | PASS |
+| REQ-011; AC-010; INV-002–005 | `declare/write-verifiable-requirements.md` (scope, evidence, check choice and judge testing, pass/fail/inconclusive cases, versioned change), `observe/establish-sufficient-evidence.md` (source evidence, citations, exact versions, missing evidence, absence is not proof), `verify/act-on-verdicts-in-production.md` (every outcome, deadline fit, provider exposure, model cost). Each practice states **Prevents**, a good/bad example and **Limits** | Examples trace to tested behavior: four Quickstart releases and policy update (`finance_release` journeys); missing destination → `inconclusive` (`finance_release_holds_uncertain_releases`); `release-check.yaml` range 14–31 | PASS |
+| REQ-013; AC-012; INV-002–005 | `understand/technical-questions.md`: enforcement ownership, verify/submit/schedule, missing evidence, timeouts/errors, latency, provider exposure, judge trust, versions, evidence retention, languages, local and self-hosted deployment; each links to its owner | Real-time reader answers 7–8; no hosted, latency or accuracy promise (reader check (c)) | PASS |
+| REQ-007–008, REQ-014; AC-006–007, AC-013; INV-004–006 | Learning path: Introduction and Quickstart `## Next` → foundation and real-time; What can I build → real-time; How verification works opening → real-time; Write a Verifier and Recipes → judge testing. Understand reordered so the foundation leads. `docs/PRODUCT.md` records the learning path and claim rule; older packet handoff row updated | Dispositions and query map below; `docs:linkcheck`; nav/content/index tests | PASS |
+| REQ-015–016; AC-014–015; INV-005–006 | Every external claim cites its source beside it; Sources table gives authors, year, venue, version, evidence type and what each supports. No reviewer, date or result invented | Claim ledger; initial-set pages identified below | PASS |
+
+### Content dispositions
+
+| Surface | Disposition | Reader question |
+|---|---|---|
+| `understand/foundations-of-verification.md` | New (Concept) | What is AI verification, and how is it different from evaluation, validation, testing and formal proof? |
+| `understand/real-time-verification.md` | New (Concept), required route | How do I get a verdict before my application responds or acts, and what does it cost in time? |
+| `understand/technical-questions.md` | New (Concept/FAQ), required route | Before adopting: who enforces, which call, what if evidence is missing, what does the provider see? |
+| `build-and-verify/declare/write-verifiable-requirements.md` | New (Guide) | How do I turn a vague goal into requirements, choose checks, test a judge and change requirements safely? |
+| `build-and-verify/observe/establish-sufficient-evidence.md` | New (Guide) | Is my evidence enough, and how do I tell a gap from a failure? |
+| `build-and-verify/verify/act-on-verdicts-in-production.md` | New (Guide) | What should my application do with each outcome, and how do I reason about latency, cost and data exposure? |
+| `understand/how-verification-works.md` | Retain, link | Mechanics owner; opening links to the real-time page |
+| `build-and-verify/verify/author-a-verifier.md` | Targeted repair | Unmeasured "milliseconds" and "seconds" claims replaced; links to judge testing |
+| `build-and-verify/verify/verifier-recipes.md`, `get-started/introduction.md`, `get-started/quickstart.md`, `get-started/what-can-i-build.md` | Targeted alignment | Learning-path links |
+| Other Understand pages | Retain | `order` renumbered only |
+| `docs/PRODUCT.md` | Targeted alignment | Learning path and claim rule |
+| `docs/public/llms.txt`, `llms-full.txt` | Generated | `docs:generate` |
+| `verify/verify-a-request-in-real-time.md` and other Build and verify drafts | Retain as drafts | TASK-003 owns them; no published page links to a draft |
+
+Initial publication set from this task: the foundation, the real-time page and
+the FAQ. The three practice guides complete REQ-011 coverage now.
+
+### Query map for TASK-004
+
+| Intent family | Canonical page |
+|---|---|
+| Real-time category | `understand/real-time-verification` |
+| Broad education ("what is AI verification", "verification versus evaluation") | `understand/foundations-of-verification` |
+| Behavioral correctness ("verify AI agents against requirements") | `declare/write-verifiable-requirements`, then `get-started/quickstart` |
+| Workflow correctness ("verify an agent completed every step") | `observe/establish-sufficient-evidence` §5 now; TASK-003 skipped-step tutorial when published |
+| Application integration ("verify a proposed action before the application executes it") | `understand/real-time-verification`, `verify/act-on-verdicts-in-production` |
+| Policy judgment ("verify AI output against a policy document") | `get-started/quickstart`, `declare/write-verifiable-requirements` §3 |
+| Production continuity | `understand/real-time-verification` (queued and scheduled); TASK-003 continuous tutorial when published |
+
+Handoffs: TASK-004 owns the agreed HTML titles (REQ-009) — the template renders
+`<title>{title} — Wyrd docs</title>`, so the frontmatter titles are
+`Real-time verification` and `Technical questions` and the agreed forms
+("Real-Time Verification for AI Applications | Wyrd", "Real-Time Verification:
+Technical Questions") need its metadata owner. TASK-003 adds reciprocal links
+when it publishes: request tutorial ↔ real-time page and production guide;
+skipped-step tutorial ↔ evidence guide §5; failure investigation ↔ production
+guide §1.
+
+### Claim-to-source ledger
+
+A background agent opened every cited source (full text except Dennis et al.
+and Agha and Palmskog, abstract and institutional record only; NASA web
+edition). Corrections were applied in `5b1a676dd`.
+
+| Claim | Source and passage | Type | Result |
+|---|---|---|---|
+| RV checks whether a run satisfies or violates a property; online and offline monitoring | Leucker and Schallhart 2009 §2, §2.1 | Journal | Supported |
+| RV "decades older" than LLM agents | Same §2 ("relatively new") | Journal | Overstated → "established field more than a decade before" |
+| Three-valued finite-trace monitoring | Bauer et al. 2011 abstract, §1 (LTL3) | Journal | Supported |
+| SMC bounds probability with confidence and error | Agha and Palmskog 2018 abstract | Survey | Narrowed → "quantified statistical confidence" |
+| Formal verification of agent decision-making | Dennis et al. 2016 abstract | Journal | Scoped to hybrid autonomous systems; issue and online date added |
+| Learned MDP plus probabilistic model checking at runtime | Koohestani 2025 abstract | Workshop paper, proof of concept | Supported; type corrected |
+| Oracle problem | Barr et al. 2015 abstract | Survey | Reworded to the source's definition |
+| Metamorphic relations | Segura et al. 2016 §2 | Survey | Supported |
+| Leakage across fields | Kapoor and Narayanan 2023 abstract | Journal | Made exact: compiled reports, 17 fields, 294 papers |
+| Real versus virtual drift; delayed outcomes | Gama et al. 2014 §2 | Survey | Supported |
+| Calibration degrades under shift | Ovadia et al. 2019 §5 | Conference, empirical | Supported |
+| Judge agreement at human-human level; position and verbosity bias; weak math grading | Zheng et al. 2023 abstract, §3.3 | Conference, empirical | Supported |
+| Self-enhancement bias | Same §3.3 ("cannot determine") | Conference, empirical | Overstated → "could not confirm" |
+| Consistency plus tool verification beats baselines | Han, Buntine and Shareghi 2025 abstract | Conference, empirical | Supported; authors corrected |
+| Multi-step agent benchmarks | Liu et al. 2024 abstract | Conference, benchmark | Supported |
+| Production ML requirements hard to state | Breck et al. 2017 abstract | Conference, experience | Wrong subject → model behavior is hard to specify |
+| Environment, requirements, specification | Zave and Jackson 1997 abstract | Journal | Supported; "knowledge of the environment" |
+| Verification versus validation definitions | NASA SEH §5.3, §5.4 (web edition, 2024) | Engineering guidance | Supported; citation corrected |
+| Verification bandwidth; correlated blind spots | Catalini, Hui and Wu 2026 v2 extended abstract | Preprint, economic argument | Reworded to the source |
+
+Removed: the Shin paragraph (philosophy; the reader did not need it). Wyrd
+mechanics on the real-time page cite repository authority:
+`architecture/wyrd-design.md` (Run/Window table: `verify` within 60 s;
+"Neither Run entry point writes Postgres on the request path"; outbox and
+`429_STAGING_FULL`; statuses; Operators), `crates/wyrd/wyrd-server/src/verification/cache.rs`
+(target cache, listener, reload on miss), `reference/verification-runtime-limits.md`
+(timeout, 503 admission), `understand/how-verification-works.md` (trace
+retries, citations). No numeric latency appears; no benchmark was run.
+
+### Reader proof
+
+Two fresh agents read only the rendered page sources.
+
+- Foundation only: distinguished a proof under a model from a judgment on finite
+  evidence and rejected the deterministic/probabilistic split; explained why a
+  fluent reply or 0.98 AUC is insufficient; named split, feature-provenance and
+  time evidence for leakage and called a drift alarm a signal; concluded
+  `inconclusive` for a missing span; wrote a scoped refund requirement with
+  evidence and checks; outlined the six-step method; treated a model judge as
+  a check needing labeled cases. Gaps repaired in `4e1736df2`: drift evidence,
+  inconclusive reasons, Dennis scope, overstated framing sentence, runnable next
+  step; Shin paragraph cut.
+- Real-time, FAQ and practices: explained release/hold before the response;
+  named inputs, requirements, decision rule and versions as Wyrd's format, not
+  a proof; separated engine, evidence and check time with the model judge
+  dominant, plus the PostgreSQL reload and 429/503 admission; said publication
+  does not wait and the returned verdict stands; found no latency bound and
+  described measuring; chose `submit` or schedules correctly; handled every
+  non-pass outcome with the application enforcing; wrote a refund requirement
+  with pass/fail/inconclusive cases; went to the Quickstart. Repairs in
+  `4e1736df2`: `decide` default and server-assigned versions in the contract
+  table, consistent `follows-policy` statement, queued trace retry count,
+  hosted hint removed, code-check worker caveat.
+
+### Commands
+
+| Command | Result |
+|---|---|
+| `mise run docs:install`, `mise run docs:generate` | pass; `llms.txt`/`llms-full.txt` regenerated |
+| `pnpm --dir docs exec vitest run src/lib/content.test.ts src/lib/derived-nav.test.ts src/lib/indexes.test.ts src/lib/mdsvex/page-text.test.ts` | 57 passed |
+| `docs:check:commands`, `docs:linkcheck`, `docs:svelte:check` (0 errors) | pass |
+| `docs:build` | pass |
+| `docs:a11y` | 38 pages, AA light and dark |
+| humanizer lint on the six new pages; `git diff --check` | clean |
+
+Not run: the full `docs:check` with example journeys (integrated review runs
+it once); no backend tests or benchmarks, as the task requires.

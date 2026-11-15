@@ -99,6 +99,12 @@ pub struct Usage {
     /// Server resident memory as the window opened, or `None` when it was
     /// never sampled.
     pub opening_memory_bytes: Option<u64>,
+    /// CPU seconds the server's worker children used in the window, apart
+    /// from `server_cpu_seconds`; see [`Resources::worker_cpu_seconds`].
+    pub worker_cpu_seconds: Option<f64>,
+    /// Sampled peak of the worker children's summed resident memory, apart
+    /// from `peak_memory_bytes`, or `None` when no worker was sampled.
+    pub worker_peak_memory_bytes: Option<u64>,
     /// CPU seconds this benchmark process used, to show the driver was not
     /// the bottleneck; `None` when unreadable.
     pub driver_cpu_seconds: Option<f64>,
@@ -121,6 +127,8 @@ pub struct Window {
     started: Instant,
     /// Server CPU and peak memory since the start.
     resources: ResourceWindow,
+    /// The server's reaped worker CPU in the opening scrape.
+    reaped: Option<f64>,
     /// This process's CPU seconds at start.
     driver_cpu_seconds: Option<f64>,
 }
@@ -135,7 +143,8 @@ impl Window {
     pub async fn open(server: &LocalServer) -> Result<(Self, Metrics), Error> {
         let metrics = server.metrics().await?;
         let window = Self {
-            resources: ResourceWindow::open([server]),
+            resources: ResourceWindow::open(server),
+            reaped: reaped_worker_cpu(&metrics),
             driver_cpu_seconds: driver_cpu_seconds(),
             started: Instant::now(),
         };
@@ -175,11 +184,12 @@ impl Window {
         let Self {
             started,
             mut resources,
+            reaped,
             driver_cpu_seconds: driver_opened,
         } = self;
         let mut driver = None;
         let (output, at_stop, stopped) = until_stop(stop, work, || {
-            resources.freeze([server]);
+            resources.freeze(server);
             driver = elapsed(driver_opened, driver_cpu_seconds());
             server.metrics()
         })
@@ -187,13 +197,14 @@ impl Window {
         let at_stop = at_stop?;
         let drain_seconds = stopped.elapsed().as_secs_f64();
         let seconds = stopped.duration_since(started).as_secs_f64();
-        let resources = resources.finish([server], seconds);
-        let used = resources.first();
+        let used = resources.finish(server, seconds, [reaped, reaped_worker_cpu(&at_stop)]);
         let usage = Usage {
             seconds,
-            server_cpu_seconds: used.and_then(|used| used.cpu_seconds),
-            peak_memory_bytes: used.and_then(|used| used.peak_memory),
-            opening_memory_bytes: used.and_then(|used| used.opening_memory),
+            server_cpu_seconds: used.cpu_seconds,
+            peak_memory_bytes: used.peak_memory,
+            opening_memory_bytes: used.opening_memory,
+            worker_cpu_seconds: used.worker_cpu_seconds,
+            worker_peak_memory_bytes: used.worker_peak_memory,
             driver_cpu_seconds: driver,
             drain_seconds,
         };
@@ -226,11 +237,13 @@ async fn until_stop<T, S: Future>(
     (output, snapshot, stopped)
 }
 
-/// One server process's resource use over a measurement window.
+/// One server process's resource use over a measurement window, and its
+/// worker children's apart from it.
 #[derive(Debug, Clone, Serialize)]
 pub struct Resources {
-    /// CPU seconds consumed, or `None` when the process was lost or its
-    /// counter was unavailable or went backwards.
+    /// CPU seconds the server process itself consumed, never its workers',
+    /// or `None` when the process was lost or its counter was unavailable or
+    /// went backwards.
     pub cpu_seconds: Option<f64>,
     /// Mean cores: CPU seconds over window seconds, when CPU was read.
     pub cores: Option<f64>,
@@ -239,84 +252,121 @@ pub struct Resources {
     /// Resident memory as the window opened, bytes, or `None` when never
     /// sampled.
     pub opening_memory: Option<u64>,
+    /// CPU seconds the server's worker children used inside the window,
+    /// including workers that started or exited in it, or `None` when a
+    /// reading was missing; see [`worker_cpu_seconds`].
+    pub worker_cpu_seconds: Option<f64>,
+    /// Sampled peak of the worker children's summed resident memory, bytes,
+    /// or `None` when no worker was sampled.
+    pub worker_peak_memory: Option<u64>,
 }
 
-/// Server process CPU and sampled peak-memory readings at a window's start.
+/// Server process and worker CPU and sampled peak-memory readings at a
+/// window's start.
 ///
 /// A benchmark opens the window before its workload, freezes CPU when the
 /// measured interval ends (before any drain), and finishes once it no longer
 /// needs peak memory, so CPU covers only the measured interval while peak
-/// memory covers everything after the open.
+/// memory covers everything after the open. Exited workers' CPU comes from
+/// the server's own scrapes either side of the window, passed to
+/// [`Self::finish`]: one taken just before the open, one started just after
+/// the freeze.
 pub struct ResourceWindow {
-    /// Each process's CPU microseconds at the open and its memory sampler.
-    opened: Vec<(Option<u64>, Option<PeakSampler>)>,
-    /// Each process's CPU microseconds once [`Self::freeze`] ran.
-    frozen: Option<Vec<Option<u64>>>,
+    /// The server's and its live workers' CPU microseconds at the open.
+    opened: [Option<u64>; 2],
+    /// The server's and its workers' memory samplers.
+    samplers: [Option<PeakSampler>; 2],
+    /// The same CPU readings once [`Self::freeze`] ran.
+    frozen: Option<[Option<u64>; 2]>,
 }
 
 impl ResourceWindow {
-    /// Reads every server process's CPU counter and starts sampling its
-    /// resident memory.
-    pub fn open<'a>(servers: impl IntoIterator<Item = &'a LocalServer>) -> Self {
+    /// Reads the server's and its live workers' CPU counters and starts
+    /// sampling their resident memory.
+    pub fn open(server: &LocalServer) -> Self {
         Self {
-            opened: servers
-                .into_iter()
-                .map(|server| (server.cpu_usec(), server.memory_peak()))
-                .collect(),
+            opened: [server.cpu_usec(), server.worker_cpu_usec()],
+            samplers: [server.memory_peak(), server.worker_memory_peak()],
             frozen: None,
         }
     }
 
-    /// Reads every server process's CPU counter at the end of the measured
-    /// interval.
-    ///
-    /// `servers` must be the same processes, in the same order, as the open;
-    /// a later call replaces the earlier reading.
-    pub fn freeze<'a>(&mut self, servers: impl IntoIterator<Item = &'a LocalServer>) {
-        self.frozen = Some(servers.into_iter().map(LocalServer::cpu_usec).collect());
+    /// Reads the server's and its live workers' CPU counters at the end of
+    /// the measured interval; a later call replaces the earlier reading.
+    pub fn freeze(&mut self, server: &LocalServer) {
+        self.frozen = Some([server.cpu_usec(), server.worker_cpu_usec()]);
     }
 
-    /// Each process's resources over `window_seconds`, using the frozen CPU
-    /// reading, or a fresh one from `servers` when never frozen. A missing
-    /// reading at either end, or a counter that went backwards, leaves CPU
-    /// `None`.
-    pub fn finish<'a>(
+    /// The server's resources over `window_seconds`, using the frozen CPU
+    /// readings, or fresh ones when never frozen, and `reaped`, the
+    /// server's reaped worker CPU ([`reaped_worker_cpu`]) at the open and at
+    /// the freeze. A missing reading at either end, or a counter that went
+    /// backwards, leaves that CPU `None`.
+    pub fn finish(
         mut self,
-        servers: impl IntoIterator<Item = &'a LocalServer>,
+        server: &LocalServer,
         window_seconds: f64,
-    ) -> Vec<Resources> {
-        if self.frozen.is_none() {
-            self.freeze(servers);
+        reaped: [Option<f64>; 2],
+    ) -> Resources {
+        let [server_after, workers_after] = *self
+            .frozen
+            .get_or_insert_with(|| [server.cpu_usec(), server.worker_cpu_usec()]);
+        let [server_before, workers_before] = self.opened;
+        let cpu_seconds = usec_elapsed(server_before, server_after);
+        let [memory, workers] = self
+            .samplers
+            .map(|sampler| sampler.and_then(|sampler| sampler.finish().ok()));
+        Resources {
+            cpu_seconds,
+            cores: cpu_seconds
+                .filter(|_| window_seconds > 0.0)
+                .map(|cpu| cpu / window_seconds),
+            peak_memory: memory.map(|memory| memory.peak),
+            opening_memory: memory.map(|memory| memory.opening),
+            worker_cpu_seconds: worker_cpu_seconds(reaped, [workers_before, workers_after]),
+            worker_peak_memory: workers.map(|workers| workers.peak),
         }
-        let frozen = self.frozen.unwrap_or_default();
-        self.opened
-            .into_iter()
-            .zip(frozen)
-            .map(|((before, sampler), after)| {
-                let cpu_seconds = match (before, after) {
-                    (Some(before), Some(after)) if after >= before => {
-                        Some((after - before) as f64 / 1e6)
-                    }
-                    _ => None,
-                };
-                let memory = sampler.and_then(|sampler| sampler.finish().ok());
-                Resources {
-                    cpu_seconds,
-                    cores: cpu_seconds
-                        .filter(|_| window_seconds > 0.0)
-                        .map(|cpu| cpu / window_seconds),
-                    peak_memory: memory.map(|memory| memory.peak),
-                    opening_memory: memory.map(|memory| memory.opening),
-                }
-            })
-            .collect()
     }
+}
+
+/// The server's reaped worker CPU seconds in `scrape`, or `None` when the
+/// server did not report it (a build without `bench`, or an unreadable
+/// counter).
+#[must_use]
+pub fn reaped_worker_cpu(scrape: &Metrics) -> Option<f64> {
+    scrape.value(wyrd_server::app::metrics::PROCESS_REAPED_CHILDREN_CPU_SECONDS)
+}
+
+/// The CPU seconds worker children used inside a window: the growth of the
+/// server's `reaped` children CPU, which holds each worker that exited by
+/// then, plus the growth of the `live` workers' CPU microseconds, which holds
+/// each still running. A worker exiting in the window leaves the live sum
+/// and enters the reaped one with its whole lifetime, so the two growths
+/// together count exactly its CPU inside the window; one starting in it
+/// counts from zero. `None` when a reading is missing at either end, or the
+/// total went backwards.
+// ponytail: a worker exiting in the few milliseconds between a live read and
+// its scrape is counted at both or neither; workers are pooled and rarely
+// exit, so the error is at most one worker's CPU.
+#[must_use]
+pub fn worker_cpu_seconds(reaped: [Option<f64>; 2], live: [Option<u64>; 2]) -> Option<f64> {
+    let reaped = elapsed(reaped[0], reaped[1])?;
+    let live = (live[1]? as f64 - live[0]? as f64) / 1e6;
+    Some(reaped + live).filter(|total| *total >= 0.0)
 }
 
 /// CPU seconds this process has used (user plus system), or `None` when
 /// unreadable.
 pub fn driver_cpu_seconds() -> Option<f64> {
     crate::release_server::os::self_cpu_seconds()
+}
+
+/// CPU seconds process `pid` has used (user plus system), such as a client
+/// process the benchmark started, or `None` once it is gone or unreadable,
+/// so a lost process never reads as idle.
+#[must_use]
+pub fn process_cpu_seconds(pid: u32) -> Option<f64> {
+    crate::release_server::os::process_cpu_usec(pid).map(|usec| usec as f64 / 1e6)
 }
 
 /// The growth of a cumulative CPU-microsecond counter, in seconds, or
@@ -443,6 +493,25 @@ impl Population {
     pub async fn collect_driver(before: &BenchmarkSnapshot, expected: &[Expected<'_>]) -> Self {
         let read = || std::future::ready(Ok(wyrd_benchmark::snapshot()));
         Self::wait(read, Role::Driver, before, expected, COLLECTION_WAIT).await
+    }
+
+    /// The `role` population a language driver process reported from its
+    /// own recorder: `after` since `before`, reconciled against `expected`.
+    /// Its observations end before each call returns, so it is complete when
+    /// reported and owes no collection wait.
+    #[must_use]
+    pub fn reported(
+        role: Role,
+        before: &BenchmarkSnapshot,
+        after: BenchmarkSnapshot,
+        expected: &[Expected<'_>],
+    ) -> Self {
+        let mut population = match Self::between(before, after) {
+            Ok(population) => Self { role, ..population },
+            Err(reason) => return Self::refused(role, reason),
+        };
+        population.expect(expected);
+        population
     }
 
     /// Polls `read`'s snapshot of the `role` process until the counts are

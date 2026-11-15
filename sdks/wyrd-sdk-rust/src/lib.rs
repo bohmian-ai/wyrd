@@ -187,8 +187,8 @@ pub use wyrd_spec::ExecutionRoute;
 pub use wyrd_spec::verification::VerificationVerdict;
 pub use wyrd_spec::verification::execution::{
     CallProvenance, Citation, Locator, OutcomeDetails, RequirementDetail, RequirementDetails,
-    RequirementOutcome, RequirementResult, StepResult, StepStatus, VerificationDetails,
-    VerificationOutcome, VerificationResult,
+    RequirementOutcome, RequirementResult, StepResult, StepStatus, ToolCallRecord, ToolRecipient,
+    VerificationDetails, VerificationOutcome, VerificationResult,
 };
 
 /// The identity of one queued Verifier execution, as `submit` returns it and

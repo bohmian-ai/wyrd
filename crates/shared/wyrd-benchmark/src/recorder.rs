@@ -29,7 +29,8 @@ use metrics::{
 use num_traits::ToPrimitive as _;
 use serde::{Deserialize, Serialize};
 
-use crate::{Buckets, REGISTRY, durations, locked, metric_values, read, record_into, write};
+use crate::Buckets;
+use crate::registry::{REGISTRY, durations, locked, metric_values, read, record_into, write};
 
 /// The most standard metric series one process keeps.
 pub const MAX_METRIC_SERIES: usize = 1024;
@@ -478,7 +479,7 @@ impl IntervalMetric {
     /// rebuild.
     fn between(later: &MetricSnapshot, earlier: Option<&MetricSnapshot>) -> Result<Self, String> {
         let what = format!("metric `{}`", later.name);
-        let rejected = crate::counted(
+        let rejected = crate::registry::counted(
             later.rejected,
             earlier.map_or(0, |prior| prior.rejected),
             &what,
@@ -489,7 +490,7 @@ impl IntervalMetric {
                     Some(MetricValue::Counter { total }) => *total,
                     _ => 0,
                 };
-                IntervalValue::Counter(crate::counted(*total, prior, &what)?)
+                IntervalValue::Counter(crate::registry::counted(*total, prior, &what)?)
             }
             (MetricValue::Gauge { value, peak }, _) => IntervalValue::Gauge {
                 value: *value,
@@ -507,7 +508,7 @@ impl IntervalMetric {
                 };
                 IntervalValue::Histogram {
                     unit: *unit,
-                    distribution: crate::interval_of(buckets, prior, || unit.empty())?,
+                    distribution: crate::registry::interval_of(buckets, prior, || unit.empty())?,
                 }
             }
         };
@@ -627,7 +628,7 @@ mod tests {
         metrics::counter!("bench_held_total").increment(1);
         let series = registered("bench_held_total");
         let shared = Arc::strong_count(&series);
-        let held = crate::locked(&series.metric);
+        let held = crate::registry::locked(&series.metric);
         let (done, finished) = mpsc::channel();
         // The timeouts only guard a deadlock; they are not latency bounds.
         let deadline = Instant::now() + Duration::from_secs(10);

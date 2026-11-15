@@ -30,6 +30,7 @@ from .gateway.support import PROVIDER_KEY, Upstream
 from .support import (
     ASSESSMENT,
     BASELINE_TIMEOUT_SECONDS,
+    FIXTURES,
     FRAME_CLAIM,
     HOLD_ARRIVED,
     HOLD_RELEASED,
@@ -179,6 +180,55 @@ INVESTIGATE = {
 The model names each tool by its provider-facing name, the dotted wire name
 spelled with underscores.
 """
+
+NESTED = (FIXTURES / "cards/verifier_building_blocks/programs/nested-investigation.py").read_text()
+"""The Python a ``NESTED`` investigation runs through ``code.run``.
+
+It reads the policy desk's Card, then queries Bifrost; a denied query is
+caught by its catalog code and repaired with a second Card read. It prints
+``query <allowed or code> repaired <whether the second read matched the first>``.
+"""
+
+REDUCE = (FIXTURES / "cards/verifier_building_blocks/programs/reduce-notes.py").read_text()
+"""The Python a ``CODE`` ``evidence-reduction`` Agent runs through ``code.run``.
+
+It lists the notes, reads each one, and searches the note over the limit,
+then prints only the hits and the search's match count.
+"""
+
+OVER = "n07"
+"""The one ``evidence-reduction`` note over the refund limit."""
+
+REDUCED = {
+    "REDUCE-STEP": json.dumps({"hits": [OVER]}),
+    "REDUCE-CHECK": json.dumps(
+        {
+            "outcome": "failed",
+            "reason": "one note is over the limit",
+            "citations": [{"slot": "notes", "locator": {"json_pointer": f"/{OVER}"}}],
+            "data": {"hits": [OVER]},
+        }
+    ),
+}
+"""Each ``evidence-reduction`` Agent's answer once its program returned: the step's
+hits, and the check's failed Verdict citing the note over the limit with the same
+hits as data."""
+
+
+def run_code(source: str) -> dict:
+    """An assistant turn calling only ``code.run`` with ``source``."""
+    return {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "call-code",
+                "type": "function",
+                "function": {"name": "code_run", "arguments": json.dumps({"source": source})},
+            }
+        ],
+    }
+
 
 REVIEWED = (
     '{"outcome":"passed","reason":"the spans were read",'
@@ -585,7 +635,10 @@ def completion(body: dict) -> tuple[int, dict]:
     schema on ``OFF-SCHEMA``, and answers after ``SLOW_SECONDS`` on
     ``SLOW-READER``; otherwise it first calls ``fs.extract`` and, once the tool
     result is back, answers a 100-dollar limit. The investigator calls each
-    of its tools once and finishes once the results are back. The coding
+    of its tools once and finishes once the results are back; a ``NESTED``
+    investigation and each ``evidence-reduction`` Agent in ``CODE`` mode call
+    only ``code.run`` with ``NESTED`` or ``REDUCE`` and then finish, the
+    latter answering ``REDUCED``. The coding
     judge reads the trace's spans live through ``bifrost_query`` and passes,
     citing the first trace ID, once the read is back. The frame judge fails
     the frame carrying ``UNBADGED_BASE64`` and passes every other. The policy
@@ -637,6 +690,13 @@ def completion(body: dict) -> tuple[int, dict]:
         )
     elif "FS PROBE: " in text:
         message = probe_turn(body["messages"])
+    elif "INVESTIGATE: NESTED" in text:
+        done = {"role": "assistant", "content": '{"done":true}'}
+        message = done if returned else run_code(NESTED)
+    elif "REDUCE-" in text:
+        [marker] = [each for each in REDUCED if f"{each}: CODE" in text]
+        content = REDUCED[marker]
+        message = {"role": "assistant", "content": content} if returned else run_code(REDUCE)
     elif "INVESTIGATE" in text:
         message = {"role": "assistant", "content": '{"done":true}'} if returned else INVESTIGATE
     elif FRAME_CLAIM in text:

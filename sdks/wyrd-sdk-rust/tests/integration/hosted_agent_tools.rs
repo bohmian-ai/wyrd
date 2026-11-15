@@ -654,17 +654,17 @@ impl PublishDesk {
 /// # Panics
 /// Panics when the upstream's URL does not parse.
 pub(crate) fn builder(upstream: &MockServer) -> wyrd_testing::server::WyrdTestServerBuilder {
-    workspaces(upstream, HostedLimits::default().queued.workspaces)
+    model_calls(upstream, HostedLimits::default().queued.model_calls)
 }
 
-/// [`builder`]'s server admitting at most `queued_workspaces` concurrent
-/// queued Agent workspaces across every execution and tenant.
+/// [`builder`]'s server admitting at most `queued_model_calls` concurrent
+/// queued model calls across every execution and tenant.
 ///
 /// # Panics
 /// Panics when the upstream's URL does not parse.
-pub(crate) fn workspaces(
+pub(crate) fn model_calls(
     upstream: &MockServer,
-    queued_workspaces: usize,
+    queued_model_calls: usize,
 ) -> wyrd_testing::server::WyrdTestServerBuilder {
     let limits = HostedLimits::default();
     WyrdTestServer::builder()
@@ -672,8 +672,7 @@ pub(crate) fn workspaces(
             monty_min_workers: 0,
             work_write_max_bytes: WORK as u64,
             queued: LaneLimits {
-                workspaces: queued_workspaces,
-                ..limits.queued
+                model_calls: queued_model_calls,
             },
             ..limits
         })

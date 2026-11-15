@@ -546,13 +546,22 @@ run = [
   "cargo build --locked --release -p wyrd-testing --bin capacity --target-dir target/profiling",
 ]
 
+[tasks."bench:build:sdks"]
+hide = true
+description = "Builds the local diagnostic SDK modules the bench:l1:verification Python and TypeScript drivers load through their public packages: the release-profile Python extension with the `bench` feature and without the wyrd.testing harness, into the Python SDK's environment, and the release-profile wyrd-ai napi addon with the `bench` feature, over the package's compiled JavaScript. `bench` adds the shared benchmark recorder, the `sdk.verify` boundary timings, and the native heap sampler; these are never published artifacts. Its type declarations go to target/benchmark-sdk/ and bypass napi's shared type-definition cache, so neither this build nor a later cached ts:build writes the bench exports into the committed index.d.ts. It replaces the development extension and addon, so run py:setup and ts:build again before SDK tests or packaging, after any benchmark."
+run = [
+  "cd sdks/wyrd-sdk-python && uv sync --all-extras --group dev && uv run maturin develop --release --features bench",
+  "mise run ts:build",
+  "mkdir -p target/benchmark-sdk && cd sdks/wyrd-sdk-ts/wyrd && pnpm exec napi build --platform --profile release --features bench --manifest-path ../native/Cargo.toml --output-dir . --package-json-path package.json --no-js --no-dts-cache --dts ../../../target/benchmark-sdk/index.d.ts",
+]
+
 [tasks."bench:results"]
 description = "Writes every recorded benchmark run under benchmarks/history/ (the benchmark-records worktree) into one self-contained HTML page at target/benchmarks/results.html: each experiment's question, method, results and verdict, and its runs in chronological order with a history chart per metric and step and a side-by-side comparison of chosen runs. Reads only the records; runs no benchmark."
 run = "cargo run --locked --quiet -p wyrd-testing --bin capacity -- results"
 
 [tasks."bench:smoke"]
 description = "Smoke of every default benchmark plan: `capacity l1 --smoke` (Bifrost writes-parquet, hot and parquet, Verification, Gateway) and `capacity l2 <engine> --smoke` for Bifrost, Verification and Gateway, each under its own fresh Postgres. A smoke runs the normal command's whole workflow (fixture loading and publication waits, every declared step, capacity/overload/recovery, measured stop, drain, exact reconciliation, judgment, record, timing evidence and report) at smoke-scale fixtures with one 1 s warmup and one 3 s repetition per L1 step (3 s and 36 s at L2), within a 10 min (L1) or 15 min (L2) budget. A smoke judges no criterion: readings, errors and target misses are recorded beside inapplicable criteria, so it is VALID, or INVALID when the measurement itself is broken; a busy driver does not invalidate it. Records `mode: smoke` under target/benchmarks/smoke/, never benchmarks/history/, and is never a calibration. Full bench:l1 and bench:l2 commands never run it first; pass --smoke to one of them to smoke just that plan. Exits 0 only when every smoke exits 0, else 2. Opt-in; part of no gate, CI or verify lane."
-depends = ["bench:build"]
+depends = ["bench:build", "bench:build:sdks"]
 run = """
 worst=0
 target/profiling/release/capacity l1 --smoke || worst=2
@@ -588,8 +597,8 @@ depends = ["bench:build"]
 run = "scripts/postgres/with-test-postgres.sh -- target/profiling/release/capacity l1 bifrost parquet"
 
 [tasks."bench:l1:verification"]
-description = "Level 1 Verification `direct-verify` (5 s warmup, 3 x 5 s per step, 5 min budget): direct observe().verify at 1 and 64 closed-loop clients, server overhead p99 < 500 us at 64 clients, server overhead components and verifications per server CPU-second, with correct verdicts, no refusal and no lost Scribe outbox write in every repetition. Opt-in benchmark experiment; part of no gate, CI or verify lane. Builds the release wyrd-server and capacity driver with frame pointers into target/profiling before the experiment clock starts, `--smoke` runs the same plan at smoke scale instead (see bench:smoke), then runs under a fresh repository Postgres on the whole host (macOS arm64, Linux x86_64, Linux arm64) with a file:// store. Exits 0 (VALID) or 2 (INVALID: a busy host, dirty source unless --allow-dirty, overrun, unresolved evidence, or a correctness or integrity criterion failing in any repetition); performance targets are reported as met, missed or unsettled and never change the exit. Appends one schema-3 record under benchmarks/history/<engine>/<experiment>/ (the benchmark-records worktree; a --steps, --profile or --allow-dirty run under target/benchmarks/ instead) and prints its report; raw artifacts stay under target/benchmarks/. `--profile` adds optional samply CPU captures and per-step server heap profiles, `--steps a,b` runs a declared subset that records its omissions. See benchmarks/README.md."
-depends = ["bench:build"]
+description = "Level 1 Verification `direct-verify` (5 s warmup, 3 x 5 s per step, 5 min budget): direct observe().verify of the canonical Verifier (one Assert, two code-running Agent checks) through the Rust, Python and TypeScript SDKs at 1 and 64 closed-loop clients and at 64 clients paced to 3,000 verifications/s (the matched-load comparison across SDKs, INVALID on a missed or late arrival), server overhead p99 < 500 us at 64 closed-loop clients, the server concurrency each step carried, server overhead components and verifications per server CPU-second; `server` is server-induced latency and `client` is end-to-end client-server-client latency holding all elapsed work, reported as call-return and result-ready totals with no target, with correct verdicts, no refusal and no lost Scribe outbox write in every repetition. Opt-in benchmark experiment; part of no gate, CI or verify lane. Builds the release wyrd-server and capacity driver with frame pointers into target/profiling before the experiment clock starts, `--smoke` runs the same plan at smoke scale instead (see bench:smoke), then runs under a fresh repository Postgres on the whole host (macOS arm64, Linux x86_64, Linux arm64) with a file:// store. Exits 0 (VALID) or 2 (INVALID: a busy host, dirty source unless --allow-dirty, overrun, unresolved evidence, or a correctness or integrity criterion failing in any repetition); performance targets are reported as met, missed or unsettled and never change the exit. Appends one schema-3 record under benchmarks/history/<engine>/<experiment>/ (the benchmark-records worktree; a --steps, --profile or --allow-dirty run under target/benchmarks/ instead) and prints its report; raw artifacts stay under target/benchmarks/. `--profile` adds optional samply CPU captures and per-step server heap profiles, `--steps a,b` runs a declared subset that records its omissions. See benchmarks/README.md."
+depends = ["bench:build", "bench:build:sdks"]
 run = "scripts/postgres/with-test-postgres.sh -- target/profiling/release/capacity l1 verification"
 
 [tasks."bench:l1:gateway"]
@@ -1091,7 +1100,7 @@ run = "uv run python -m pytest -q -m integration tests/integration/state/test_st
 
 [tasks."check:py-wheel-no-testing"]
 hide = true
-description = "Assert the production wyrd-sdk-python wheel does not expose wyrd.testing"
+description = "Assert the production wyrd-sdk-python wheel exposes neither wyrd.testing nor benchmark machinery"
 dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
 # py:setup installs the testing-enabled development build, so the check builds
@@ -1108,6 +1117,22 @@ if uv run --isolated --no-project --with "$wheel" python -c 'import wyrd.testing
   echo 'FAIL: wyrd.testing leaked into the default wyrd-sdk-python wheel'
   exit 1
 fi
+# A bench build has the _benchmark submodule and the benchmark registry,
+# whose histogram setup message no other code carries.
+if uv run --isolated --no-project --with "$wheel" python -c 'import wyrd._wyrd._benchmark' 2>/dev/null; then
+  echo 'FAIL: the benchmark recorder leaked into the default wyrd-sdk-python wheel'
+  exit 1
+fi
+python3 - "$wheel" <<'PY'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as wheel:
+    native = [name for name in wheel.namelist() if name.endswith((".so", ".pyd", ".dylib"))]
+    if not native:
+        sys.exit("FAIL: the wheel holds no native module")
+    for name in native:
+        if b"constant duration histogram bounds are valid" in wheel.read(name):
+            sys.exit(f"FAIL: {name} holds the benchmark registry")
+PY
 """
 
 [tasks."examples:python:datacard"]

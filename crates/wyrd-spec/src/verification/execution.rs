@@ -736,6 +736,10 @@ pub struct RequirementDetails<T = Map<String, Value>, F: PromptForm = Authored> 
     /// What executed the check, for Agent, code, and drift checks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<CallProvenance>,
+    /// Tools an Agent check called, direct and nested, in start order;
+    /// empty for every other check and for historical results.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCallRecord>,
 }
 
 /// The full outcome an engine produces and records: details holding each
@@ -1240,12 +1244,12 @@ pub struct CancelExecutionResponse {
     pub status: VerificationExecutionStatus,
 }
 
-/// One tool call an Agent action made.
+/// One tool call an Agent step or check made, directly or from its Python.
 ///
-/// Records what the model received, never the raw tool output: the digest
-/// and size describe the bounded output actually returned. A call that
-/// returned no output, such as one that failed, has no digest and zero
-/// returned bytes rather than a digest of nothing.
+/// Records what its recipient received, never the raw tool output: the
+/// digest and size describe the bounded output actually delivered. A call
+/// that delivered no output, such as one that failed or was cancelled, has
+/// no digest and zero returned bytes rather than a digest of nothing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct ToolCallRecord {
@@ -1253,16 +1257,35 @@ pub struct ToolCallRecord {
     pub tool: BuiltinTool,
     /// Call arguments.
     pub arguments: Value,
-    /// SHA-256 of the bounded output returned to the model; absent when the
-    /// call returned none.
+    /// Where the output went, or would have gone: the model for a direct
+    /// call, Python for a call `code.run` made. Absent on historical
+    /// records, which were all direct.
+    #[serde(default)]
+    pub recipient: ToolRecipient,
+    /// SHA-256 of the bounded output delivered to the recipient; absent
+    /// when the call delivered none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "server", schema(value_type = Option<String>))]
     pub output_sha256: Option<Sha256Hex>,
-    /// Bytes of output returned to the model; zero when it returned none.
+    /// Bytes of output delivered to the recipient; zero when it delivered
+    /// none.
     pub returned_bytes: u64,
-    /// Error the tool returned, when it failed.
+    /// Error the tool returned, when it failed or was cancelled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// Who receives a tool call's output.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ToolRecipient {
+    /// The model requested the call and receives its output.
+    #[default]
+    Model,
+    /// Python inside `code.run` awaited the call and receives its output;
+    /// the model sees only what that program returns.
+    Code,
 }
 
 /// Most bytes of compact UTF-8 JSON one Verdict's custom `data` may take.
@@ -1413,6 +1436,7 @@ impl VerificationDetails {
                             result: requirement.result.decode_data()?,
                             check: requirement.check,
                             provenance: requirement.provenance,
+                            tool_calls: requirement.tool_calls,
                         })
                     })
                     .collect::<Result<_, WyrdError>>()?,
@@ -1805,10 +1829,13 @@ mod tests {
         }
     }
 
-    /// Details with every locator kind, drift detail, provenance, tool calls
-    /// with and without returned output, and a skipped step keep their
-    /// documented wire form; records without a returned size, naming a
-    /// non-built-in tool, or with a non-canonical digest are refused.
+    /// Details with every locator kind, drift detail, provenance, step and
+    /// check tool calls with and without returned output for both
+    /// recipients, and a skipped step keep their documented wire form; a
+    /// historical record without a recipient reads as model-directed and a
+    /// historical requirement as calling no tools; records without a
+    /// returned size, naming a non-built-in tool or an unknown recipient, or
+    /// with a non-canonical digest are refused.
     ///
     /// # Panics
     /// Panics when the documented details do not round-trip.
@@ -1831,7 +1858,12 @@ mod tests {
                         {"slot": "contract", "locator": {"region": {"page": 7, "x": 0.5, "y": 1.0, "width": 2.0, "height": 0.25}}}
                     ],
                     "check": {"kind": "assert", "path": "inputs.contract", "operator": "is_not_null"},
-                    "provenance": {"kind": "agent", "route": {"kind": "wyrd_gateway", "deployment": "eu-west"}}
+                    "provenance": {"kind": "agent", "route": {"kind": "wyrd_gateway", "deployment": "eu-west"}},
+                    "tool_calls": [
+                        {"tool": "code.run", "arguments": {"source": "1"}, "recipient": "model", "output_sha256": "d".repeat(64), "returned_bytes": 9},
+                        {"tool": "fs.read", "arguments": {"path": "/inputs/a.txt"}, "recipient": "code", "output_sha256": "e".repeat(64), "returned_bytes": 40},
+                        {"tool": "bifrost.query", "arguments": {"sql": "SELECT 1"}, "recipient": "code", "returned_bytes": 0, "error": "WYRD_PERMISSION_403_DENIED_RBAC: denied"}
+                    ]
                 }, {
                     "id": "stable", "statement": "Inputs are stable",
                     "outcome": "not_applicable", "reason": "step skipped",
@@ -1843,8 +1875,8 @@ mod tests {
                     "id": "structure", "status": "skipped", "attempts": 0, "duration_ms": 0,
                     "reason": "when was false",
                     "tool_calls": [
-                        {"tool": "fs.read", "arguments": {"path": "/inputs/a.pdf"}, "output_sha256": "c".repeat(64), "returned_bytes": 512},
-                        {"tool": "fs.search", "arguments": {"query": "cap"}, "returned_bytes": 0, "error": "workspace read timed out"}
+                        {"tool": "fs.read", "arguments": {"path": "/inputs/a.pdf"}, "recipient": "model", "output_sha256": "c".repeat(64), "returned_bytes": 512},
+                        {"tool": "fs.search", "arguments": {"query": "cap"}, "recipient": "model", "returned_bytes": 0, "error": "workspace read timed out"}
                     ]
                 }],
                 "evidence": {"contract": {"kind": "file", "sha256": "b".repeat(64), "size_bytes": 4, "format": "pdf"}}
@@ -1853,6 +1885,61 @@ mod tests {
         let parsed: VerificationDetails =
             serde_json::from_value(result.clone()).expect("documented details");
         assert_eq!(serde_json::to_value(&parsed).expect("serialize"), result);
+        let recipients: Vec<ToolRecipient> = parsed.outcome.requirements[0]
+            .tool_calls
+            .iter()
+            .map(|call| call.recipient)
+            .collect();
+        assert_eq!(
+            recipients,
+            [
+                ToolRecipient::Model,
+                ToolRecipient::Code,
+                ToolRecipient::Code
+            ],
+            "new records keep their recipients"
+        );
+        assert!(
+            parsed.outcome.requirements[1].tool_calls.is_empty(),
+            "a requirement without calls carries none"
+        );
+        let typed = parsed
+            .clone()
+            .decode_data::<Map<String, Value>>()
+            .expect("typed");
+        assert_eq!(
+            typed.outcome.requirements[0].tool_calls, parsed.outcome.requirements[0].tool_calls,
+            "custom-data decoding keeps check tool calls"
+        );
+        let mut historical = result.clone();
+        for call in historical["outcome"]["steps"][0]["tool_calls"]
+            .as_array_mut()
+            .expect("calls")
+        {
+            call.as_object_mut().expect("record").remove("recipient");
+        }
+        historical["outcome"]["requirements"][0]
+            .as_object_mut()
+            .expect("requirement")
+            .remove("tool_calls");
+        let historical: VerificationDetails =
+            serde_json::from_value(historical).expect("historical details");
+        assert!(
+            historical.outcome.steps[0]
+                .tool_calls
+                .iter()
+                .all(|call| call.recipient == ToolRecipient::Model),
+            "a historical record without a recipient was model-directed"
+        );
+        assert!(
+            historical.outcome.requirements[0].tool_calls.is_empty(),
+            "a historical requirement has no tool calls"
+        );
+        assert_eq!(
+            serde_json::to_value(&historical.outcome.steps[0].tool_calls[0]).expect("record")["recipient"],
+            "model",
+            "a newly emitted record names its recipient"
+        );
         assert!(
             serde_json::from_value::<Verdict>(
                 json!({"outcome": "passed", "reason": "ok", "citations": [], "score": 1})
@@ -1863,6 +1950,7 @@ mod tests {
             json!({"tool": "fs.read", "arguments": {}}),
             json!({"tool": "http.fetch", "arguments": {}, "returned_bytes": 0}),
             json!({"tool": "fs.read", "arguments": {}, "output_sha256": "C".repeat(64), "returned_bytes": 1}),
+            json!({"tool": "fs.read", "arguments": {}, "recipient": "python", "returned_bytes": 0}),
         ] {
             assert!(
                 serde_json::from_value::<ToolCallRecord>(record.clone()).is_err(),

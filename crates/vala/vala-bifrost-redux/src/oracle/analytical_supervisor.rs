@@ -1330,6 +1330,7 @@ mod tests {
         };
         let policy = BifrostResourcePolicy {
             roles: [BifrostRole::Oracle].into_iter().collect(),
+            process_memory_limit_bytes: None,
             server_memory_min_bytes: None,
             bifrost_memory_limit_bytes: None,
             scratch_limit_bytes: None,

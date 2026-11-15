@@ -11,12 +11,17 @@ use wyrd_spec::ids::{CardUid, SlotName};
 use wyrd_spec::vala::api::AuditDetail;
 use wyrd_spec::verification::TaskId;
 
-use super::super::workspace::Staged;
+use super::super::workspace::{ScratchRoot, Staged};
 use super::*;
 
 use crate::components::gateway::recording::RecordingScribe;
 use crate::test_support::{test_caller as caller, test_state as state, test_tenant};
 use crate::verification::state::{StateRow, stand_in_identity};
+
+/// Process resources with room for every test here.
+fn roomy() -> wyrd_runtime::resources::ProcessResources {
+    wyrd_runtime::resources::ProcessResources::new(std::num::NonZeroUsize::MIN, 4 << 30, 4 << 30)
+}
 
 /// A sandbox that never spawns a worker; no test here runs Python.
 ///
@@ -30,7 +35,7 @@ async fn idle_sandbox(limits: HostedLimits) -> Arc<Sandbox> {
                 monty_min_workers: 0,
                 ..limits
             },
-            limits.queued,
+            &roomy(),
         )
         .await
         .expect("an empty pool starts"),
@@ -40,8 +45,8 @@ async fn idle_sandbox(limits: HostedLimits) -> Arc<Sandbox> {
 /// An invocation as `caller` over a workspace holding `/inputs/notes.txt`.
 ///
 /// # Panics
-/// Panics when the workspace cannot materialize or the shared fixture or
-/// empty pool cannot start.
+/// Panics when the workspace does not materialize or the sandbox does not
+/// start.
 async fn invocation(caller: Caller, limits: HostedLimits) -> Invocation {
     let workspace = Workspace::materialize(
         vec![Staged {
@@ -63,6 +68,8 @@ async fn invocation(caller: Caller, limits: HostedLimits) -> Invocation {
         code_budget: Arc::new(Mutex::new(limits.agent_code_budget)),
         publisher: None,
         limits,
+        work: TaskTracker::new(),
+        envelopes: Envelopes::default(),
     }
 }
 
@@ -97,32 +104,35 @@ fn tools_require_their_exact_invoke_grant() {
 
         assert_eq!(
             exact
-                .call(BuiltinTool::FsRead, None, read.clone())
+                .call(BuiltinTool::FsRead, None, read.clone(), None)
                 .await
                 .expect("granted")["units"][1]["text"],
             "beta"
         );
         assert_eq!(
-            code(none.call(BuiltinTool::FsRead, None, read.clone()).await),
+            code(
+                none.call(BuiltinTool::FsRead, None, read.clone(), None)
+                    .await
+            ),
             "WYRD_PERMISSION_403_DENIED_RBAC"
         );
         assert_eq!(
             code(
                 exact
-                    .call(BuiltinTool::FsList, None, json!({"path": "/inputs"}))
+                    .call(BuiltinTool::FsList, None, json!({"path": "/inputs"}), None)
                     .await
             ),
             "WYRD_PERMISSION_403_DENIED_RBAC"
         );
         assert!(
             global
-                .call(BuiltinTool::FsSearch, None, json!({"query": "ALPHA"}))
+                .call(BuiltinTool::FsSearch, None, json!({"query": "ALPHA"}), None)
                 .await
                 .is_ok()
         );
         assert_eq!(
             code(
-                none.call(BuiltinTool::CodeRun, None, json!({"source": "1"}))
+                none.call(BuiltinTool::CodeRun, None, json!({"source": "1"}), None)
                     .await
             ),
             "WYRD_PERMISSION_403_DENIED_RBAC"
@@ -156,14 +166,14 @@ fn tool_and_domain_grants_are_both_required() {
             (BuiltinTool::CardsList, json!({})),
             (BuiltinTool::BifrostListTables, json!({})),
         ] {
-            let result = tools_only.call(tool, None, args).await;
+            let result = tools_only.call(tool, None, args, None).await;
             assert!(denied(&result), "{tool:?}: {result:?}");
         }
         for (tool, args) in [
             (BuiltinTool::CardsList, json!({})),
             (BuiltinTool::BifrostQuery, json!({"sql": "SELECT 1"})),
         ] {
-            let result = data_only.call(tool, None, args).await;
+            let result = data_only.call(tool, None, args, None).await;
             assert_eq!(code(result), "WYRD_PERMISSION_403_DENIED_RBAC", "{tool:?}");
         }
     });
@@ -190,10 +200,10 @@ fn tools_refuse_forged_arguments_and_spent_budgets() {
             (BuiltinTool::BifrostQuery, json!({"sql": "SELECT 1", "tenant": "other"})),
             (BuiltinTool::CardsList, json!({"delegation_chain": []})),
         ] {
-            let result = invocation.call(tool, None, args).await;
+            let result = invocation.call(tool, None, args, None).await;
             assert!(matches!(result, Err(ToolError::InvalidInput(_))), "{tool:?}: {result:?}");
         }
-        let spent = invocation.call(BuiltinTool::CodeRun, None, json!({"source": "1"})).await;
+        let spent = invocation.call(BuiltinTool::CodeRun, None, json!({"source": "1"}), None).await;
         assert!(
             matches!(&spent, Err(ToolError::Invocation { detail, .. }) if detail.contains("budget")),
             "{spent:?}"
@@ -216,8 +226,13 @@ fn reading_tools_need_a_declared_workspace() {
         let tools = HostedTools::new(
             state().await,
             caller([Permission::tool_invoke_any()]),
-            Arc::new(TenantEvidence::new(state().await, caller([]), limits)),
-            Arc::new(Workspaces::new(limits, limits.queued.workspaces)),
+            Arc::new(TenantEvidence::new(
+                state().await,
+                caller([]),
+                limits,
+                wyrd_runtime::resources::ByteLedger::new(u64::MAX),
+            )),
+            Arc::new(Workspaces::new(limits, &roomy(), std::env::temp_dir())),
             idle_sandbox(limits).await,
             limits,
         );
@@ -274,8 +289,13 @@ fn retries_keep_their_actions_spent_time() {
         let tools = HostedTools::new(
             state().await,
             caller([]),
-            Arc::new(TenantEvidence::new(state().await, caller([]), limits)),
-            Arc::new(Workspaces::new(limits, limits.queued.workspaces)),
+            Arc::new(TenantEvidence::new(
+                state().await,
+                caller([]),
+                limits,
+                wyrd_runtime::resources::ByteLedger::new(u64::MAX),
+            )),
+            Arc::new(Workspaces::new(limits, &roomy(), std::env::temp_dir())),
             idle_sandbox(limits).await,
             limits,
         );
@@ -434,6 +454,7 @@ fn file_publications_decide_their_file_permission() {
                 BuiltinTool::FsWrite,
                 None,
                 json!({"path": "/work/tree/a.md", "content": "alpha"}),
+                None,
             )
             .await
             .expect("the scratch file writes");
@@ -441,7 +462,7 @@ fn file_publications_decide_their_file_permission() {
         let receipt = json!({"name": "tree", "kind": "directory"});
         assert_eq!(
             publisher
-                .call(BuiltinTool::Publish, Some("p-tree"), tree.clone())
+                .call(BuiltinTool::Publish, Some("p-tree"), tree.clone(), None)
                 .await
                 .expect("the tree publishes"),
             receipt
@@ -451,7 +472,8 @@ fn file_publications_decide_their_file_permission() {
                 .call(
                     BuiltinTool::Publish,
                     Some("p-json"),
-                    json!({"name": "j", "value": 1})
+                    json!({"name": "j", "value": 1}),
+                    None
                 )
                 .await
                 .expect("the value publishes"),
@@ -467,7 +489,7 @@ fn file_publications_decide_their_file_permission() {
         .expect("scratch removed");
         assert_eq!(
             publisher
-                .call(BuiltinTool::Publish, Some("p-tree"), tree)
+                .call(BuiltinTool::Publish, Some("p-tree"), tree, None)
                 .await
                 .expect("the replay answers its receipt"),
             receipt,
@@ -493,6 +515,7 @@ fn file_publications_decide_their_file_permission() {
                 BuiltinTool::Publish,
                 Some("p-ghost"),
                 json!({"name": "tree", "path": "/work/missing"}),
+                None,
             )
             .await;
         assert_eq!(code(denied), "WYRD_PERMISSION_403_DENIED_RBAC");
@@ -500,6 +523,179 @@ fn file_publications_decide_their_file_permission() {
             decisions(&tool_only).await,
             [invoke(BuiltinTool::Publish), files("denied"),],
             "the File decision precedes any File work"
+        );
+    });
+}
+
+/// Interrupted blocking workspace work keeps the workspace until it
+/// settles.
+///
+/// An extraction is held after it starts and its call is dropped. Until it
+/// is released, `/work` stays locked, the tracked work stays unsettled, and
+/// the workspace keeps its directory and its admission. Once released, the
+/// extraction completes into the still-present workspace, the work
+/// settles, the last owner's drop removes the directory and returns its
+/// scratch charge, and a new workspace extracts normally.
+///
+/// # Panics
+/// Panics when the workspace is released, unlocked, or settled before the
+/// interrupted work ends, or is not reusable after it.
+#[test]
+fn extraction_settles_before_workspace_release() {
+    use futures_util::FutureExt as _;
+
+    wyrd_runtime::runtime().block_on(async {
+        let limits = HostedLimits::default();
+        let scratch = ScratchRoot {
+            dir: std::env::temp_dir(),
+            ledger: wyrd_runtime::resources::ByteLedger::new(1 << 30),
+        };
+        let workspace = |scratch: &ScratchRoot| {
+            Arc::new(
+                Workspace::materialize(
+                    vec![Staged {
+                        path: "/inputs/notes.txt".to_owned(),
+                        bytes: b"alpha\nbeta\n".to_vec(),
+                        format: Some(MediaFormat::Text),
+                        sources: BTreeSet::from([SlotName::new("notes").expect("slot")]),
+                    }],
+                    limits,
+                    scratch.clone(),
+                )
+                .expect("workspace materializes"),
+            )
+        };
+        let held = workspace(&scratch);
+        let root = held.work_dir();
+        let interrupted = Invocation {
+            workspace: Some(Arc::clone(&held)),
+            ..invocation(caller([Permission::tool_invoke_any()]), limits).await
+        };
+        let (started, on_start) = tokio::sync::oneshot::channel();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        {
+            let work = Arc::clone(&held);
+            let call = interrupted.blocking(Some(held.writer().await), move || {
+                started.send(()).expect("the test awaits the start");
+                gate.recv().expect("the test releases the work");
+                work.extract("/inputs/notes.txt", "/work/notes.json")
+            });
+            tokio::pin!(call);
+            tokio::select! {
+                ended = &mut call => panic!("the work ended while held: {ended:?}"),
+                started = on_start => started.expect("the work starts"),
+            }
+        }
+        assert!(
+            held.writer().now_or_never().is_none(),
+            "/work stays locked by the interrupted work"
+        );
+        let work = interrupted.work.clone();
+        work.close();
+        drop(interrupted);
+        let settled = work.wait();
+        tokio::pin!(settled);
+        drop(held);
+        assert!(
+            (&mut settled).now_or_never().is_none(),
+            "the interrupted work is still tracked"
+        );
+        assert!(root.is_dir(), "the workspace outlives its interrupted work");
+        assert!(scratch.ledger.used() > 0, "the scratch charge stays held");
+        release.send(()).expect("the work waits for release");
+        settled.await;
+        assert!(!root.exists(), "the last owner removes the workspace");
+        assert_eq!(scratch.ledger.used(), 0, "the scratch charge returns");
+
+        let fresh = workspace(&scratch);
+        let reused = Invocation {
+            workspace: Some(Arc::clone(&fresh)),
+            ..invocation(caller([Permission::tool_invoke_any()]), limits).await
+        };
+        let extracted = reused
+            .call(
+                BuiltinTool::FsExtract,
+                None,
+                json!({"path": "/inputs/notes.txt", "output_path": "/work/notes.json"}),
+                None,
+            )
+            .await
+            .expect("a new workspace extracts");
+        assert_eq!(extracted["output_path"], json!("/work/notes.json"));
+        assert!(fresh.work_dir().join("notes.json").is_file());
+    });
+}
+
+/// A `code.run` waiting for `/work` ends at its own Python deadline, not
+/// the attempt's.
+///
+/// While another writer holds `/work` past the call's code timeout, the
+/// call fails on that deadline with a typed time-limit stop, long before
+/// the attempt deadline and without reaching a worker (this sandbox has
+/// none to start). The waited time stays spent: the next call gets only
+/// what is left and fails when it runs out, and the one after finds the
+/// budget spent.
+///
+/// # Panics
+/// Panics when the call outlives its deadline, reaches the sandbox, or a
+/// waited-out call returns its time.
+#[test]
+fn code_workspace_wait_obeys_operation_deadline() {
+    wyrd_runtime::runtime().block_on(async {
+        let limits = HostedLimits {
+            code_timeout: Duration::from_millis(300),
+            agent_code_budget: Duration::from_millis(450),
+            ..HostedLimits::default()
+        };
+        let invocation = invocation(caller([Permission::tool_invoke_any()]), limits).await;
+        let _writer = invocation.workspace().expect("workspace").writer().await;
+        let stop = |result: Result<Value, ToolError>| match result {
+            Err(ToolError::Invocation {
+                cause: Some(cause), ..
+            }) => match cause.downcast::<BlockError>() {
+                Ok(error) => *error,
+                Err(cause) => panic!("an untyped stop: {cause}"),
+            },
+            other => panic!("expected a typed stop, got {other:?}"),
+        };
+        let code = json!({"source": "1"});
+        let began = Instant::now();
+        let first = stop(
+            invocation
+                .call(BuiltinTool::CodeRun, None, code.clone(), None)
+                .await,
+        );
+        let waited = began.elapsed();
+        assert!(
+            matches!(&first, BlockError::Terminal { reason } if reason.contains("time limit")),
+            "{first}"
+        );
+        assert!(
+            waited >= limits.code_timeout && waited < Duration::from_secs(5),
+            "the wait ends at the code deadline: {waited:?}"
+        );
+        let left = *invocation.code_budget.lock().expect("budget");
+        assert!(
+            left <= limits.agent_code_budget.saturating_sub(limits.code_timeout),
+            "the waited time stays spent: {left:?}"
+        );
+        let second = stop(
+            invocation
+                .call(BuiltinTool::CodeRun, None, code.clone(), None)
+                .await,
+        );
+        assert!(
+            matches!(&second, BlockError::Terminal { reason } if reason.contains("time limit")),
+            "{second}"
+        );
+        let spent = stop(
+            invocation
+                .call(BuiltinTool::CodeRun, None, code, None)
+                .await,
+        );
+        assert!(
+            matches!(&spent, BlockError::Terminal { reason } if reason.contains("budget is spent")),
+            "{spent}"
         );
     });
 }

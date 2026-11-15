@@ -4,6 +4,8 @@
 //! without it compiles an empty library and never activates `PyO3` or an
 //! owner crate's Python boundary.
 
+#[cfg(feature = "bench")]
+mod benchmark;
 #[cfg(feature = "python")]
 mod bifrost;
 #[cfg(feature = "python")]
@@ -143,6 +145,14 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     principals::register(&principals)?;
     m.add_submodule(&principals)?;
     register_submodule(py, "wyrd._wyrd.auth", &principals)?;
+
+    #[cfg(feature = "bench")]
+    {
+        let benchmark = PyModule::new(py, "_benchmark")?;
+        benchmark::register(&benchmark)?;
+        m.add_submodule(&benchmark)?;
+        register_submodule(py, "wyrd._wyrd._benchmark", &benchmark)?;
+    }
 
     #[cfg(feature = "testing")]
     {

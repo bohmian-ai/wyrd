@@ -10,7 +10,9 @@
 // calls `fs.extract` on its workspace copy of the policy and then answers a
 // 100-dollar limit, the judge passes every answer with a citation unless the
 // answer names a scripted case, and the `tool-review` investigator calls the
-// Card, Bifrost, and code tools at once and then finishes. Scripted answer
+// Card, Bifrost, and code tools at once and then finishes, or on `NESTED` makes
+// its Card and Bifrost calls from one `code.run` program; `evidence-reduction`
+// reads twenty notes from one program per Agent. Scripted answer
 // texts also fail the reader's provider, schema, and deadline and the code step
 // and check; scoped and delegated principals exercise every tool grant.
 // `handbook-desk`'s judges mount an uploaded, extracted Artifact and cite the
@@ -40,6 +42,7 @@ import {
 } from "wyrd-ai";
 import { spanExporter } from "wyrd-ai/otel";
 
+import { BENCHMARK, Heap, materialize, readout, timed } from "../profile/verification-driver.mjs";
 import { judgeReply, toolCall, toolTurn } from "../support/assistant.js";
 import type { ReceivedRequest, Reply } from "../support/http-receiver.js";
 import { configureGateway } from "../support/local-development.js";
@@ -102,6 +105,45 @@ const INVESTIGATION = [
   toolCall("call-code", TOOLS[2], { source: "6 * 7" }),
 ];
 
+/**
+ * The Python a `NESTED` investigation runs through `code.run`: it reads the
+ * policy desk's Card, then queries Bifrost; a denied query is caught by its
+ * catalog code and repaired with a second Card read. It prints `query
+ * <allowed or code> repaired <whether the second read matched the first>`.
+ */
+const NESTED = readFileSync(fixture("cards/verifier_building_blocks/programs/nested-investigation.py"), "utf8");
+
+/**
+ * The Python a `CODE` `evidence-reduction` Agent runs through `code.run`: it
+ * lists the notes, reads each one, and searches the note over the limit, then
+ * prints only the hits and the search's match count.
+ */
+const REDUCE = readFileSync(fixture("cards/verifier_building_blocks/programs/reduce-notes.py"), "utf8");
+
+/** The one `evidence-reduction` note over the refund limit. */
+const OVER = "n07";
+
+/** The `evidence-reduction` check's one citation: the pinned note over the limit. */
+const NOTES_CITED = [{ slot: "notes", locator: { json_pointer: `/${OVER}` } }];
+
+/**
+ * Each `evidence-reduction` Agent's answer once its program returned: the
+ * step's hits, and the check's failed Verdict citing the note over the limit
+ * with the same hits as data.
+ */
+const REDUCED: ReadonlyArray<readonly [string, string]> = [
+  ["REDUCE-STEP", JSON.stringify({ hits: [OVER] })],
+  [
+    "REDUCE-CHECK",
+    JSON.stringify({
+      outcome: "failed",
+      reason: "one note is over the limit",
+      citations: NOTES_CITED,
+      data: { hits: [OVER] },
+    }),
+  ],
+];
+
 /** The `scored-judge`'s custom data for an answer naming no scripted case. */
 const SCORED = { score: 0.9, category: "refund" };
 
@@ -133,6 +175,13 @@ function upstream(request: ReceivedRequest): Reply {
   }
   if (body.includes("HANDBOOK JUDGE")) {
     return toolResults ? judgeReply(handbookVerdict(body)) : toolTurn(READ_HANDBOOK);
+  }
+  if (body.includes("INVESTIGATE: NESTED")) {
+    return toolResults ? judgeReply('{"done":true}') : toolTurn([toolCall("call-code", TOOLS[2], { source: NESTED })]);
+  }
+  const reduced = REDUCED.find(([marker]) => body.includes(`${marker}: CODE`));
+  if (reduced !== undefined) {
+    return toolResults ? judgeReply(reduced[1]) : toolTurn([toolCall("call-code", TOOLS[2], { source: REDUCE })]);
   }
   if (body.includes("INVESTIGATE")) {
     return toolResults ? judgeReply('{"done":true}') : toolTurn(INVESTIGATION);
@@ -421,6 +470,107 @@ test("refund over the limit fails the assertion", async ({ desk }) => {
   expect(result.outcome.verdict).toBe("failed");
   const over = requirement(result, "refund-within-limit");
   expect([over.outcome, over.actual]).toEqual(["failed", false]);
+});
+
+test("benchmark driver preserves public call boundary", async ({ desk }) => {
+  let ticks = 0;
+  const converted: number[] = [];
+  const clock = () => ticks++;
+  const deferred = (result: VerificationResult) => ({
+    ...result,
+    get outcome() {
+      converted.push(clock());
+      return result.outcome;
+    },
+  });
+
+  const { result, outcome, returned, ready } = await timed(
+    async () => deferred(await reviewNow(desk, review("Refunds follow our policy.", 500))),
+    clock,
+  );
+
+  expect(
+    [returned, converted, ready],
+    "materialization is after the call returns and inside result-ready, once",
+  ).toEqual([1, [2], 3]);
+  expect(outcome.verdict).toBe("failed");
+  expect(outcome.requirements.map((each: RequirementResult) => each.id)).toContain("refund-within-limit");
+  expect(materialize(result)).toEqual(outcome);
+  const refused = await timed(() => desk.state.run().observe.verify("no-such-verifier", { d: "yes" })).catch(
+    (error: unknown) => error,
+  );
+  expect(refused).toBeInstanceOf(WyrdError);
+  expect((refused as WyrdError).code).toBe("WYRD_SDK_404_UNKNOWN_VERIFIER");
+
+  if (BENCHMARK === null) {
+    expect(readout(), "an addon without bench reports no recorder window").toBeNull();
+    return;
+  }
+  BENCHMARK.benchmarkInstall();
+  const before = readout();
+  await reviewNow(desk, review("Refunds follow our policy.", 500));
+  await desk.state
+    .run()
+    .observe.verify("no-such-verifier", { d: "yes" })
+    .catch(() => undefined);
+  const after = readout();
+
+  expect(after.process).toBe(before.process);
+  for (const boundary of ["sdk.verify", "client.verify"]) {
+    expect(recorded(before, after, boundary, "success"), boundary).toBe(1);
+  }
+  for (const boundary of ["client.http", "client.http.attempt"]) {
+    expect(
+      recorded(before, after, boundary, "success"),
+      `${boundary}: the policy file's evidence plan, then the execution`,
+    ).toBe(2);
+  }
+  expect(recorded(before, after, "sdk.verify", "error"), "a refused call records its own outcome").toBe(1);
+  expect(components(after, "sdk.verify")).toEqual(expect.arrayContaining(["dispatch", "input", "core", "output"]));
+  expect(components(after, "client.http")).toEqual(
+    expect.arrayContaining(["serialize", "auth", "send", "body", "decode"]),
+  );
+});
+
+type Snapshot = {
+  process: string;
+  series: { boundary: string; outcome: string; count: number }[];
+  metrics: { name: string; labels: Record<string, string> }[];
+};
+
+/** Observations of `boundary` with `outcome` that `after` holds beyond `before`. */
+function recorded(before: Snapshot, after: Snapshot, boundary: string, outcome: string): number {
+  const count = (snapshot: Snapshot) =>
+    snapshot.series
+      .filter((series) => series.boundary === boundary && series.outcome === outcome)
+      .reduce((total, series) => total + series.count, 0);
+  return count(after) - count(before);
+}
+
+/** The components `snapshot` records for `boundary`. */
+function components(snapshot: Snapshot, boundary: string): string[] {
+  return snapshot.metrics
+    .filter((metric) => metric.name === "wyrd_benchmark_component_seconds" && metric.labels.boundary === boundary)
+    .map((metric) => metric.labels.component);
+}
+
+test("benchmark heap capture holds real conversion work", async ({ desk }) => {
+  const directory = mkdtempSync(join(tmpdir(), "wyrd-profile-"));
+  const heap = new Heap();
+  await heap.start();
+  const outcome = materialize(await reviewNow(desk, review("Refunds follow our policy.", 500)));
+  const stem = join(directory, "heap-typescript-step");
+  const captured = await heap.capture(stem);
+  heap.session.disconnect();
+
+  const native = BENCHMARK === null ? [] : [`${stem}.pb.gz`];
+  expect(captured).toEqual({ paths: [`${stem}.heapprofile`, `${stem}.heapsnapshot`, ...native] });
+  expect(outcome.requirements.length, "the native result was read into JavaScript").toBeGreaterThan(0);
+  const sampled = JSON.parse(readFileSync(`${stem}.heapprofile`, "utf8"));
+  expect(sampled.samples.length, "the sampling profile holds allocations").toBeGreaterThan(0);
+  expect(readFileSync(`${stem}.heapsnapshot`, "utf8"), "the snapshot holds the converted result").toContain(
+    "refund-within-limit",
+  );
 });
 
 test("judge verdict fails the agent check", async ({ desk }) => {
@@ -809,6 +959,136 @@ test("delegated tools keep the narrower authority", async ({ server, provider, d
     z.object({ sub_principal_id: z.string(), act_principal_id: z.string() }),
   );
   expect(attributed).toEqual([{ sub_principal_id: subjectId, act_principal_id: actorId }]);
+});
+
+/** The twenty `evidence-reduction` notes: 4 KiB or more each, only {@link OVER} over the limit. */
+function notes(): Record<string, string> {
+  return Object.fromEntries(
+    Array.from({ length: 20 }, (_, index) => {
+      const name = `n${String(index + 1).padStart(2, "0")}`;
+      const mark = name === OVER ? "OVER-LIMIT" : "within";
+      return [name, `${name} ${mark}: ${`refund ${name} kept. `.repeat(300)}`];
+    }),
+  );
+}
+
+/** The `evidence-reduction` check's custom data: the notes over the limit. */
+const Hits = z.object({ hits: z.array(z.string()) }).strict();
+
+/** Each of `calls` as its recipient and tool, in start order. */
+function recipients(calls: readonly CardTypes.ToolCallRecord[] | undefined): [string, string][] {
+  return (calls ?? []).map((call) => [call.recipient, call.tool]);
+}
+
+/**
+ * Assert `result` judged the notes through one model-visible `code.run` per
+ * Agent: the step names the note over the limit, the check fails citing the
+ * pinned note with the same hits as data, and each Agent's records are one
+ * model-directed `code.run` and the program's code-directed calls, every one
+ * returning output, read from the execution's details.
+ */
+async function assertReduced(result: VerificationResult<unknown>): Promise<void> {
+  expect(result.outcome.verdict, JSON.stringify(result.outcome.requirements)).toBe("failed");
+  const judged = requirement(result, "within-limit");
+  expect([judged.outcome, judged.citations, judged.data]).toEqual(["failed", NOTES_CITED, { hits: [OVER] }]);
+  const described = (await details(result.execution_id)).outcome;
+  expect(Object.keys(described.evidence), "the citation names pinned evidence").toContain("notes");
+  const prepared = described.steps.find((each) => each.id === "over-limit");
+  const checked = described.requirements.find((each) => each.id === "within-limit");
+  expect([prepared?.status, prepared?.output]).toEqual(["succeeded", { hits: [OVER] }]);
+  const nested = ["fs.list", ...Array<string>(20).fill("fs.read"), "fs.search"];
+  const expected = [["model", "code.run"], ...nested.map((tool) => ["code", tool])];
+  for (const calls of [prepared?.tool_calls, checked?.tool_calls]) {
+    expect(recipients(calls)).toEqual(expected);
+    for (const call of calls ?? []) {
+      expect(call.error ?? null, call.tool).toBeNull();
+      expect(call.output_sha256, call.tool).toMatch(/^[0-9a-f]{64}$/);
+      expect(call.returned_bytes, call.tool).toBeGreaterThanOrEqual(call.tool === "fs.read" ? 4096 : 1);
+    }
+  }
+}
+
+test("code_mode_reduces_evidence_and_preserves_citations", async ({ server, provider, desk }) => {
+  const credential = server.scopedApiKey("code_reducer", [
+    ...VERIFIES,
+    "tool:invoke",
+    "cards:read",
+    "bifrost_query:read",
+  ]);
+  const observe = WyrdState.fromPath(desk.bundle, { client: WyrdClient.connect({ credential }) }).run().observe;
+  const inputs = { mode: "CODE", notes: notes() };
+
+  await assertReduced(await observe.verify("evidence-reduction", inputs));
+  expect(
+    provider.received.some((request) => request.body.includes("REDUCE-") && request.body.includes("kept.")),
+    "no note reaches the model",
+  ).toBe(false);
+  const typed = await observe.verifyTyped("evidence-reduction", inputs, Hits);
+  await assertReduced(typed);
+  const submitted = await observe.submit("evidence-reduction", inputs);
+  if (submitted.kind !== "queued") {
+    throw new Error("Run evidence queues an execution");
+  }
+  const waited = await submitted.execution.wait({ timeoutMs: WAIT_MS });
+  await assertReduced(waited);
+  await assertReduced(await submitted.execution.waitTyped({ timeoutMs: WAIT_MS }, Hits));
+  expect((await submitted.execution.status()).result).toEqual(waited);
+  server.flushBifrost();
+  const rows = await (await Bifrost.connect()).sql(
+    "SELECT to_json(output) AS output FROM bifrost.verification.execution_outputs WHERE execution_id = $1",
+    [waited.execution_id],
+    z.object({ output: z.string() }),
+  );
+  expect(rows).toHaveLength(1);
+  const kept = JSON.parse(rows[0]?.output ?? "null") as { requirements: unknown; steps: unknown };
+  const described = (await submitted.execution.details()).outcome;
+  expect([kept.requirements, kept.steps], "the retained output keeps every record").toEqual([
+    described.requirements,
+    described.steps,
+  ]);
+
+  for (const [name, extra, children, printed] of [
+    [
+      "NESTED no_domain_grant",
+      ["tool:invoke", "cards:read"],
+      [
+        [TOOLS[0], true],
+        [TOOLS[1], false],
+        [TOOLS[0], true],
+      ],
+      `query ${DENIED} repaired True`,
+    ],
+    [
+      "NESTED all_tools",
+      ["tool:invoke", "cards:read", "bifrost_query:read"],
+      [
+        [TOOLS[0], true],
+        [TOOLS[1], true],
+      ],
+      "query allowed repaired False",
+    ],
+  ] as const) {
+    const key = server.scopedApiKey(name.toLowerCase().replace(" ", "_"), [...VERIFIES, ...extra]);
+    const investigated = await step(
+      await investigate(desk, WyrdClient.connect({ credential: key }), name),
+      "investigate",
+    );
+    expect(investigated.status, name).toBe("succeeded");
+    const calls = investigated.tool_calls ?? [];
+    expect(
+      calls.map((call) => [call.recipient, call.tool, call.error == null]),
+      name,
+    ).toEqual([["model", TOOLS[2], true], ...children.map(([tool, allowed]) => ["code", tool, allowed])]);
+    for (const call of calls.filter((each) => each.error != null)) {
+      expect(call.error, name).toContain(DENIED);
+      expect([call.output_sha256 ?? null, call.returned_bytes], name).toEqual([null, 0]);
+    }
+    const turn = provider.received.find(
+      (request) => request.body.includes(name) && /"role"\s*:\s*"tool"/.test(request.body),
+    );
+    expect(turn?.body, name).toContain(printed);
+    expect(turn?.body, `${name}: a nested Card read never reaches the model`).not.toContain("document-formats");
+  }
 });
 
 /** The custom data of `scored-review`'s scored checks: a score with its category, or the step check's word count. */

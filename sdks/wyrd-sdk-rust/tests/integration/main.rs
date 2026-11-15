@@ -43,6 +43,8 @@ mod signed_in_development;
 mod support;
 /// The canonical support desk, from the checked-in example.
 mod support_desk;
+/// Hosted verification under contended process memory and its deadline.
+mod verification_capacity;
 /// Every Verifier action and Run check kind, and every extractable format.
 mod verifier_building_blocks;
 /// Verifier steps fan out, branch, repeat, and speculate over real Agents.

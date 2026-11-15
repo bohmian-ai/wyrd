@@ -12,7 +12,7 @@ authors = { workspace = true }
 # every benchmark timing, the Scribe stage/publish control, and the sampled
 # heap profile. Only `bench:build` enables it; a build without it records only
 # operational metrics and refuses `metrics.benchmark_snapshot`.
-bench = ["wyrd-benchmark/bench"]
+bench = ["wyrd-benchmark/bench", "dep:nix"]
 cloud = ["wyrd-storage/cloud", "vala-bifrost-redux/cloud"]
 storage-emulator = ["cloud", "wyrd-storage/emulator"]
 test-support = [
@@ -30,6 +30,8 @@ path = "src/main.rs"
 bohmian-code-review-pipeline = { workspace = true }
 wyrd-benchmark = { workspace = true }
 mimalloc = { workspace = true }
+# `bench` only: the snapshot route's reaped-worker CPU reading.
+nix = { workspace = true, optional = true }
 async-stream = { workspace = true }
 futures-util = { workspace = true }
 arc-swap = { workspace = true }

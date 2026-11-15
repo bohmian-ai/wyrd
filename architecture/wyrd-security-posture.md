@@ -155,7 +155,11 @@ without SYSTEM, accepts no run and nothing falls back to another identity or
 SYSTEM. The accepted authority is stored server-side with no credential,
 survives claim, retry, and restart, and is not refreshed by later grant
 changes; every protected downstream action still checks its own permission
-against it.
+against it. A tool call that an Agent's `code.run` Python makes through
+`call_tool` is such an action: it uses the same accepted authority and the
+same exact `tool:invoke` and capability checks and non-blocking audit as the
+model's direct call, and nothing in the program can select or widen the
+identity, tenant, delegation, or credentials it runs under.
 
 Publishing deferred evidence adds no permission and no authority to the
 execution that consumes it. The publisher needs current `verifier:run` on

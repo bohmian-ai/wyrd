@@ -28,7 +28,7 @@
 //! history, and reporting. Profiling through [`crate::profile`] is optional
 //! diagnostic evidence that never changes a verdict.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::future::Future;
 use std::io::Write as _;
@@ -1394,15 +1394,24 @@ pub enum Role {
     Server,
     /// The capacity driver: its clients and its local provider fixture.
     Driver,
+    /// A Python SDK client process the driver starts: its clients only.
+    Python,
+    /// A TypeScript SDK client process the driver starts: its clients only.
+    TypeScript,
 }
 
 impl Role {
+    /// Every role, in report order.
+    pub const ALL: [Self; 4] = [Self::Server, Self::Driver, Self::Python, Self::TypeScript];
+
     /// The role's name in records and reports.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
             Self::Server => "server",
             Self::Driver => "driver",
+            Self::Python => "python",
+            Self::TypeScript => "typescript",
         }
     }
 }
@@ -1662,6 +1671,23 @@ pub trait Workload: Send {
         None
     }
 
+    /// The client processes beside the server and this driver, each with
+    /// its role, for optional profiling; none by default. A workload that
+    /// has any starts them in [`Self::prepare`] when profiled, so every
+    /// step's captures include them.
+    fn clients(&self) -> Vec<(Role, u32)> {
+        Vec::new()
+    }
+
+    /// Saves each of [`Self::clients`]'s own heap captures of `step` under
+    /// `directory`, returning the captures and a note for each
+    /// one missing or partial. The runner calls it after every measured step
+    /// of a profiled run; by default there is nothing to save.
+    async fn capture_clients(&mut self, step: &str, directory: &Path) -> ProfileNote {
+        let _ = (step, directory);
+        ProfileNote::default()
+    }
+
     /// Runs `phase` of `step` for `window` and returns what it measured.
     /// The runner calls it once per warmup and repetition and never retries
     /// a failed call.
@@ -1729,6 +1755,21 @@ pub struct Judgment {
     /// Whether the criterion was judged: false only in a smoke, which
     /// judges no criterion once its evidence is present.
     pub applicable: bool,
+}
+
+/// The `compare` control an experiment may declare: which step param the
+/// report's summary puts side by side, the metrics it compares, and a note
+/// per step group, keyed by the group's params as the summary labels them
+/// (such as `clients=64 rate=3000`).
+#[derive(Debug, Deserialize)]
+struct Comparison {
+    /// The step param whose values become the summary's columns.
+    by: String,
+    /// The metrics compared, one row each, in order.
+    metrics: Vec<String>,
+    /// What each group answers, for a literal reader.
+    #[serde(default)]
+    notes: BTreeMap<String, String>,
 }
 
 /// One metric's spread over the repetitions.
@@ -1948,17 +1989,22 @@ where
         }
         let profiles = options.artifacts.join("profiles");
         let profiling = options.profile.as_ref().filter(|_| stopped.is_none());
+        let clients = workload.clients();
         let targets: Vec<(Role, u32)> = workload
             .processes()
             .into_iter()
             .map(|pid| (Role::Server, pid))
             .chain(std::iter::once((Role::Driver, std::process::id())))
+            .chain(clients.iter().copied())
             .collect();
         profile = ProfileNote {
             requested: profiling.is_some(),
             mode: profiling.map(|profiling| profiling.mode),
             roles: if profiling.is_some() {
-                vec![Role::Server, Role::Driver]
+                [Role::Server, Role::Driver]
+                    .into_iter()
+                    .chain(clients.iter().map(|(role, _)| *role))
+                    .collect()
             } else {
                 Vec::new()
             },
@@ -2030,6 +2076,9 @@ where
                 }
             }
             heap.capture(&step.id).await;
+            if profiling.is_some() {
+                profile.absorb(workload.capture_clients(&step.id, &profiles).await);
+            }
             saving = Some(tokio::task::spawn_blocking(move || profiler.finish()));
         }
         match tokio::time::timeout(FINISH_GRACE, workload.finish()).await {
@@ -2853,6 +2902,7 @@ impl Record {
         {
             let _ = writeln!(out, "timing (schema {}): {method}\n", self.schema_version);
         }
+        self.render_comparison(&mut out);
         out.push_str(REPORT_HEADER);
         out.push('\n');
         out.push_str("|---|---|---|---|---|---|---|---|---|---|---|\n");
@@ -2985,6 +3035,104 @@ impl Record {
         out
     }
 
+    /// Writes the side-by-side summary the record's `compare` control
+    /// declares, ahead of the common table, so a reader compares like with
+    /// like without picking rows out of it. Measured steps are grouped by
+    /// the params that tell them apart, all but `by`; each group is one
+    /// table with one row per declared metric's median and one column per
+    /// `by` value, under the group's declared note. A record without the
+    /// control renders without the summary.
+    fn render_comparison(&self, out: &mut String) {
+        let Some(comparison) = self
+            .controls
+            .values
+            .get("compare")
+            .and_then(|value| serde_json::from_value::<Comparison>(value.clone()).ok())
+        else {
+            return;
+        };
+        let steps: Vec<&StepRecord> = self
+            .steps
+            .iter()
+            .filter(|step| !step.summary.is_empty())
+            .collect();
+        let keys: BTreeSet<&String> = steps
+            .iter()
+            .flat_map(|step| step.params.keys())
+            .filter(|key| **key != comparison.by)
+            .collect();
+        let varying: Vec<&String> = keys
+            .into_iter()
+            .filter(|key| {
+                let first = steps.first().and_then(|step| step.params.get(*key));
+                steps.iter().any(|step| step.params.get(*key) != first)
+            })
+            .collect();
+        let mut columns: Vec<&Value> = Vec::new();
+        let mut groups: Vec<(String, Vec<&StepRecord>)> = Vec::new();
+        for step in steps {
+            let Some(column) = step.params.get(&comparison.by) else {
+                continue;
+            };
+            if !columns.contains(&column) {
+                columns.push(column);
+            }
+            let label = varying
+                .iter()
+                .filter_map(|key| step.params.get(*key).map(|value| format!("{key}={value}")))
+                .collect::<Vec<_>>()
+                .join(" ");
+            match groups.iter_mut().find(|(known, _)| *known == label) {
+                Some((_, members)) => members.push(step),
+                None => groups.push((label, vec![step])),
+            }
+        }
+        if groups.is_empty() {
+            return;
+        }
+        let names: Vec<String> = columns
+            .iter()
+            .map(|column| {
+                column
+                    .as_str()
+                    .map_or_else(|| column.to_string(), str::to_owned)
+            })
+            .collect();
+        let _ = writeln!(
+            out,
+            "## By {}\n\nMedians of the repetitions. A histogram reading shows its bucket's upper bound; the table below has both bounds.\n",
+            comparison.by
+        );
+        for (label, members) in groups {
+            let _ = writeln!(out, "### {label}\n");
+            if let Some(note) = comparison.notes.get(&label) {
+                let _ = writeln!(out, "{note}\n");
+            }
+            let _ = writeln!(out, "| metric | {} |", names.join(" | "));
+            let _ = writeln!(out, "|---|{}", "---|".repeat(names.len()));
+            for metric in &comparison.metrics {
+                let cells: Vec<String> = columns
+                    .iter()
+                    .map(|column| {
+                        members
+                            .iter()
+                            .find(|step| step.params.get(&comparison.by) == Some(*column))
+                            .and_then(|step| step.summary.get(metric))
+                            .and_then(|summary| summary.median.value)
+                            .map_or_else(|| "—".to_owned(), number)
+                    })
+                    .collect();
+                let _ = writeln!(
+                    out,
+                    "| {metric} ({}) | {} |",
+                    self.unit(metric),
+                    cells.join(" | ")
+                );
+            }
+            out.push('\n');
+        }
+    }
+
     /// Writes the profile evidence to `out`, when profiling was requested:
     /// its mode and roles, whether it completed, its captures per role and
     /// each capture's path, its notes, and the limits of its scope. A
@@ -3003,14 +3151,23 @@ impl Record {
             },
         );
         let role = |capture: &str| {
-            if capture.contains("-driver-") {
-                Role::Driver
-            } else {
-                Role::Server
-            }
+            let file = Path::new(capture)
+                .file_name()
+                .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+            Role::ALL
+                .into_iter()
+                .find(|role| {
+                    let name = role.name();
+                    file.starts_with(&format!("cpu-{name}-"))
+                        || file.starts_with(&format!("heap-{name}-"))
+                })
+                .unwrap_or(Role::Server)
         };
-        let per_role: Vec<String> = [Role::Server, Role::Driver]
+        let per_role: Vec<String> = Role::ALL
             .into_iter()
+            .filter(|named| {
+                matches!(named, Role::Server | Role::Driver) || profile.roles.contains(named)
+            })
             .map(|named| {
                 let count = profile
                     .captures
@@ -3516,6 +3673,77 @@ mod tests {
             .iter()
             .map(|reason| reason.code.as_str())
             .collect()
+    }
+
+    /// A declared `compare` control puts each group of steps side by side,
+    /// one column per language and one row per metric, under the group's
+    /// note, ahead of the common table; a record without it has no summary.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the summary is missing, misplaced, or wrong.
+    #[tokio::test(start_paused = true)]
+    async fn report_compares_declared_steps_side_by_side() {
+        let directory = tempfile::tempdir().expect("artifacts");
+        let options = options(directory.path());
+        let mut declared = declaration();
+        declared.steps = vec![
+            Step::measured("op-1", json!({ "clients": 1, "language": "rust" })),
+            Step::measured("op-python-1", json!({ "clients": 1, "language": "python" })),
+            Step::measured("op-64", json!({ "clients": 64, "language": "rust" })),
+            Step::measured(
+                "op-python-64",
+                json!({ "clients": 64, "language": "python" }),
+            ),
+        ];
+        let plain = execute(
+            declared.clone(),
+            &mut Scripted::always(&good()),
+            [Some(quiet()), Some(quiet())],
+            &options,
+        )
+        .await;
+        assert!(!plain.render().contains("## By"));
+
+        declared.controls.insert(
+            "compare".to_owned(),
+            json!({
+                "by": "language",
+                "metrics": ["p99_ms", "rate"],
+                "notes": { "clients=64": "Overloaded: do not compare languages here." },
+            }),
+        );
+        let compared = execute(
+            declared,
+            &mut Scripted::always(&good()),
+            [Some(quiet()), Some(quiet())],
+            &options,
+        )
+        .await;
+        let report = compared.render();
+        let expected = "## By language
+
+Medians of the repetitions. A histogram reading shows its bucket's upper bound; the table below has both bounds.
+
+### clients=1
+
+| metric | rust | python |
+|---|---|---|
+| p99_ms (ms) | 0.3 | 0.3 |
+| rate (ops/s) | 100 | 100 |
+
+### clients=64
+
+Overloaded: do not compare languages here.
+
+| metric | rust | python |
+|---|---|---|
+| p99_ms (ms) | 0.3 | 0.3 |
+| rate (ops/s) | 100 | 100 |
+
+";
+        assert!(report.contains(expected), "{report}");
+        assert!(report.find(expected) < report.find(REPORT_HEADER));
     }
 
     /// V1: a complete declaration admits the workload and is recorded
@@ -5354,10 +5582,11 @@ mod tests {
                 "profiles/op-1/cpu-server-7.json.gz".to_owned(),
                 "profiles/op-1/cpu-driver-8.json.gz".to_owned(),
                 "profiles/heap-driver-op-1.pb.gz".to_owned(),
+                "profiles/verify-typescript-c1/cpu-python-9.json.gz".to_owned(),
             ],
             notes: vec!["the server heap profile was not served".to_owned()],
             mode: Some(ProfileMode::Both),
-            roles: vec![Role::Server, Role::Driver],
+            roles: vec![Role::Server, Role::Driver, Role::Python],
         };
         let console = record.render();
         let path = record.publish(root.path()).expect("publish");
@@ -5413,7 +5642,8 @@ mod tests {
         );
         assert!(!console.contains("driver: — unavailable"), "{console}");
         for line in [
-            "profile both of server and driver: incomplete (3 captures: server 1, driver 2); the server heap profile was not served",
+            "profile both of server and driver and python: incomplete (4 captures: server 1, driver 2, python 1); the server heap profile was not served",
+            "- python capture: profiles/verify-typescript-c1/cpu-python-9.json.gz",
             "- driver capture: profiles/op-1/cpu-driver-8.json.gz",
             "- server capture: profiles/op-1/cpu-server-7.json.gz",
             "neither is aligned to a repetition window",

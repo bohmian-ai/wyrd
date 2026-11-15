@@ -207,6 +207,8 @@ export interface ServerOptions {
   readonly scribeOutboxCapacity?: number;
   /** Configure the deployment's GitHub App against a loopback GitHub mock, reachable as `server.githubApp`. */
   readonly githubApp?: boolean;
+  /** Direct verification deadline from arrival in milliseconds; the production deadline by default. */
+  readonly verifyTimeoutMs?: number;
   /** Start a fresh server for every test instead of one per story file. */
   readonly perTest?: boolean;
 }
@@ -254,6 +256,7 @@ export function serverTest(options: ServerOptions = {}) {
           accessTtlSeconds: options.accessTtlSeconds,
           scribeOutboxCapacity: options.scribeOutboxCapacity,
           githubApp: options.githubApp,
+          verifyTimeoutMs: options.verifyTimeoutMs,
         });
         deploy(server);
         await use(server);

@@ -18,7 +18,6 @@ use wyrd_client::cards::Cards;
 use wyrd_loader::{build_declaration_input, load};
 use wyrd_server::state::LimitsConfig;
 use wyrd_server::verification::engines::EngineOutcome;
-use wyrd_server::verification::hosted::blocks::LaneAdmission;
 use wyrd_server::verification::hosted::{HostedLimits, LaneLimits};
 use wyrd_server::verification::runner::EngineScript;
 use wyrd_server::verification::telemetry::ExecutionMode;
@@ -586,24 +585,19 @@ async fn a_waiting_execution_finishes_after_a_restart() {
 /// A parked execution gives back its compute before its park is
 /// acknowledged.
 ///
-/// `ci-gate` here also runs an independent Python step. With one of each
-/// queued admission, the step runs in Python and a workspace, then the
-/// execution parks waiting for `ci`. While the park's write is held
-/// unacknowledged the execution is still `running`, yet every queued
-/// workspace, Python and model admission is free; once the park lands it
-/// waits, and publishing `ci` resumes it.
+/// `ci-gate` here also runs an independent Python step. With one queued
+/// model call, the step runs in Python and a workspace, then the execution
+/// parks waiting for `ci`. While the park's write is held unacknowledged the
+/// execution is still `running`, yet the queued share holds no scratch, no
+/// Python worker is checked out, and its model call is free; once the park
+/// lands it waits, and publishing `ci` resumes it.
 ///
 /// # Panics
-/// Panics when an admission is still held while the park is unacknowledged,
-/// or the execution does not wait and then pass.
+/// Panics when compute is still held while the park is unacknowledged, or
+/// the execution does not wait and then pass.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_parked_execution_releases_compute_before_its_park_is_acknowledged() {
-    const ONE: LaneLimits = LaneLimits {
-        workspaces: 1,
-        python_workers: 1,
-        python_waiters: 0,
-        model_calls: 1,
-    };
+    const ONE: LaneLimits = LaneLimits { model_calls: 1 };
     let deployment = Deployment::launch(|builder| {
         builder
             .with_verification_runtime_for_test()
@@ -639,18 +633,24 @@ async fn a_parked_execution_releases_compute_before_its_park_is_acknowledged() {
         .verification
         .blocks()
         .expect("blocks are hosted");
-    for admission in [
-        LaneAdmission::Workspaces,
-        LaneAdmission::Python,
-        LaneAdmission::ModelCalls,
-    ] {
-        let free = blocks.hold_for_test(ExecutionMode::Queued, admission);
-        assert_eq!(
-            free.num_permits(),
-            1,
-            "{admission:?} is released while the park is unacknowledged"
-        );
-    }
+    assert_eq!(
+        blocks.resources(ExecutionMode::Queued).scratch().used(),
+        0,
+        "the workspace's scratch is released while the park is unacknowledged"
+    );
+    let sandbox = blocks.sandbox(ExecutionMode::Queued);
+    assert_eq!(
+        BTreeSet::from_iter(sandbox.charged_worker_pids()),
+        BTreeSet::from_iter(sandbox.idle_worker_pids()),
+        "no Python worker is checked out while the park is unacknowledged"
+    );
+    assert_eq!(
+        blocks
+            .hold_model_calls_for_test(ExecutionMode::Queued)
+            .num_permits(),
+        1,
+        "the model call is released while the park is unacknowledged"
+    );
 
     stall.release();
     stall.wait_completed().await;

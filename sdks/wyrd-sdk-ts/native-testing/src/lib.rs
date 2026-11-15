@@ -18,7 +18,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_testing::Bootstrap;
 use wyrd_testing::github::GithubAppMock;
 use wyrd_testing::human_login::HumanSso;
-use wyrd_testing::server::{WyrdTestServer, WyrdTestServerError};
+use wyrd_testing::server::{OccupiedForTest, WyrdTestServer, WyrdTestServerError};
 
 pub mod cli;
 /// Test-tier napi projection of the loopback GitHub App and its browser.
@@ -26,10 +26,11 @@ pub mod github;
 
 /// In-process server handle used only by TypeScript integration tests.
 ///
-/// Journeys steer the server through exactly four test controls, each backed
+/// Journeys steer the server through exactly six test controls, each backed
 /// by the production code path: `flushBifrost`, `waitForBaseline`,
-/// `makeBindingDue`, and `holdPublications`. The remaining members start,
-/// address, or credential the server.
+/// `makeBindingDue`, `holdPublications`, and, for contended process memory,
+/// `occupyHostedMemory` and `waitForHostedWaiters`. The remaining members
+/// start, address, or credential the server.
 #[napi]
 pub struct NativeWyrdTestServer {
     /// Owned Rust harness dropped only after explicit asynchronous shutdown.
@@ -160,6 +161,43 @@ impl NativeWyrdTestServer {
             .map_err(|error| thrown(env, &error))
     }
 
+    /// Hold process memory so at most `leave` bytes stay free until the
+    /// returned hold is released, so a hosted verification whose session
+    /// does not fit waits and one whose request does not fit is refused.
+    ///
+    /// # Errors
+    ///
+    /// Throws a `WyrdError`-shaped error when the harness is closed or hosts
+    /// no Verifiers.
+    #[napi]
+    pub fn occupy_hosted_memory(&self, env: Env, leave: u32) -> Result<NativeHeldMemory> {
+        let _runtime = wyrd_runtime::runtime().enter();
+        self.control(|server| server.occupy_hosted_memory(u64::from(leave)))
+            .map(|held| NativeHeldMemory {
+                held: Mutex::new(Some(held)),
+            })
+            .map_err(|error| thrown(env, &error))
+    }
+
+    /// Return once exactly `count` hosted Python operations wait for process
+    /// memory, such as behind `occupyHostedMemory`, waiting at most
+    /// `timeoutMs`. A verify already called keeps running meanwhile: the
+    /// native call starts it before its promise is awaited.
+    ///
+    /// # Errors
+    ///
+    /// Throws a `WyrdError`-shaped error when the harness is closed, hosts no
+    /// Verifiers, or `timeoutMs` elapses first, with the last observed count.
+    #[napi]
+    pub fn wait_for_hosted_waiters(&self, env: Env, count: u32, timeout_ms: u32) -> Result<()> {
+        let timeout = Duration::from_millis(u64::from(timeout_ms));
+        self.control(|server| {
+            wyrd_runtime::runtime()
+                .block_on(server.wait_for_hosted_waiters(count as usize, timeout))
+        })
+        .map_err(|error| thrown(env, &error))
+    }
+
     /// Run one test control against the open harness, projecting every
     /// failure onto its catalogued [`WyrdError`].
     ///
@@ -168,10 +206,10 @@ impl NativeWyrdTestServer {
     /// Returns `WYRD_TESTING_500_HARNESS_START` when the harness lock is
     /// poisoned or the server is shut down, and the control's own catalogued
     /// error when `call` fails.
-    fn control(
+    fn control<T>(
         &self,
-        call: impl FnOnce(&WyrdTestServer) -> StdResult<(), WyrdTestServerError>,
-    ) -> StdResult<(), WyrdError> {
+        call: impl FnOnce(&WyrdTestServer) -> StdResult<T, WyrdTestServerError>,
+    ) -> StdResult<T, WyrdError> {
         let guard = self
             .server
             .lock()
@@ -648,6 +686,26 @@ pub struct HeldPublications {
     pub verifier: String,
 }
 
+/// Process memory a journey holds on its test server; `release` returns it,
+/// and so does garbage collection of the handle.
+#[napi]
+pub struct NativeHeldMemory {
+    /// The held memory until released.
+    held: Mutex<Option<OccupiedForTest>>,
+}
+
+#[napi]
+impl NativeHeldMemory {
+    /// Return the memory; releasing twice does nothing.
+    #[napi]
+    pub fn release(&self) {
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+}
+
 /// Test-only capabilities a story's server starts with; every field is
 /// optional and defaults to off.
 #[napi(object)]
@@ -668,6 +726,9 @@ pub struct NativeTestServerOptions {
     /// `true` configures the deployment's GitHub App against a fresh loopback
     /// GitHub mock, reachable as `githubApp`; omitted, no App is configured.
     pub github_app: Option<bool>,
+    /// Direct verification deadline from arrival in milliseconds, so a
+    /// journey reaches it quickly; omitted keeps the production deadline.
+    pub verify_timeout_ms: Option<u32>,
 }
 
 /// Starts a real bound Wyrd test server and mints an admin access token.
@@ -688,6 +749,7 @@ pub fn start_test_server(
         access_ttl_seconds: None,
         scribe_outbox_capacity: None,
         github_app: None,
+        verify_timeout_ms: None,
     });
     let provider_root = options
         .provider_base_url
@@ -704,12 +766,14 @@ pub fn start_test_server(
         options.access_ttl_seconds,
         options.scribe_outbox_capacity,
         options.github_app.unwrap_or(false),
+        options.verify_timeout_ms,
     )))
 }
 
 /// Starts the bound harness with the requested test-only capabilities.
 ///
-/// `scribe_outbox_capacity` replaces the Scribe outbox capacity when set;
+/// `scribe_outbox_capacity` replaces the Scribe outbox capacity and
+/// `verify_timeout_ms` the direct verification deadline when set;
 /// `github_app` configures the GitHub App against a fresh loopback mock.
 ///
 /// # Errors
@@ -721,6 +785,7 @@ async fn start_test_server_async(
     access_ttl_seconds: Option<u32>,
     scribe_outbox_capacity: Option<u32>,
     github_app: bool,
+    verify_timeout_ms: Option<u32>,
 ) -> napi::Result<NativeWyrdTestServer> {
     let mut builder = WyrdTestServer::builder();
     let github = github_app
@@ -729,6 +794,9 @@ async fn start_test_server_async(
         .map_err(reason)?;
     if let Some(mock) = &github {
         builder = builder.with_github_app_for_test(mock);
+    }
+    if let Some(millis) = verify_timeout_ms {
+        builder = builder.with_verify_timeout_for_test(Duration::from_millis(u64::from(millis)));
     }
     if let Some(capacity) = scribe_outbox_capacity {
         builder = builder.with_scribe_outbox_capacity_for_test(capacity as usize);

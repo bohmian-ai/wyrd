@@ -56,6 +56,7 @@ fn forge_runtime_resources(
             roles: [BifrostRole::Scribe, BifrostRole::Oracle, BifrostRole::Forge]
                 .into_iter()
                 .collect(),
+            process_memory_limit_bytes: None,
             server_memory_min_bytes: None,
             bifrost_memory_limit_bytes: None,
             scratch_limit_bytes: None,

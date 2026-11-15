@@ -34,6 +34,7 @@ use super::invocation::{
 use super::routes::usage_bound;
 use crate::components::auth::Caller;
 use crate::state::AppState;
+use crate::verification::telemetry::{Envelope, Envelopes};
 
 /// Provider label on errors raised by in-process gateway calls.
 const PROVIDER: &str = "wyrd_gateway";
@@ -55,6 +56,8 @@ pub(crate) struct ServerWyrdGatewayCaller {
     /// The verification lane label and its model-call permits each call
     /// holds while it runs; `None` admits calls without a lane bound.
     lane: Option<(&'static str, Arc<Semaphore>)>,
+    /// The execution's record of model-call time.
+    envelopes: Envelopes,
 }
 
 impl ServerWyrdGatewayCaller {
@@ -66,7 +69,15 @@ impl ServerWyrdGatewayCaller {
             caller,
             subject: None,
             lane: None,
+            envelopes: Envelopes::default(),
         }
+    }
+
+    /// Time every call as one [`Envelope::Model`] on `envelopes`, the
+    /// originating execution's record, while benchmarking.
+    pub(crate) fn timed(mut self, envelopes: Envelopes) -> Self {
+        self.envelopes = envelopes;
+        self
     }
 
     /// Attribute every call to `subject`, a Card and optional Run the
@@ -188,7 +199,14 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
             Some(deadline) => invocation.bounded(deadline),
             None => invocation,
         };
-        let outcome = invocation.run(&self.caller, request, cancellation).await;
+        // Only the gateway invocation is model time; a lane wait is not.
+        let outcome = self
+            .envelopes
+            .time(
+                Envelope::Model,
+                invocation.run(&self.caller, request, cancellation),
+            )
+            .await;
         if cancellation.is_cancelled() {
             return Err(ProviderError::timeout(PROVIDER));
         }

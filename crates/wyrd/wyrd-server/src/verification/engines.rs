@@ -155,6 +155,7 @@ mod tests {
             }))
             .expect("assert check decodes"),
             provenance: None,
+            tool_calls: Vec::new(),
         }
     }
 

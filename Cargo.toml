@@ -159,7 +159,7 @@ sha2 = "0.10"
 sha1 = "0.10"
 uuid = { version = "1", default-features = false, features = ["serde"] }
 crc32c = "0.6"
-rustix = { version = "1.1.4", features = ["fs"] }
+rustix = { version = "1.1.4", features = ["fs", "process"] }
 semver = { version = "1", features = ["serde"] }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 metrics = { version = "0.24", default-features = false }
@@ -239,6 +239,9 @@ typetag = "0.2.23"
 lru = "=0.12.5"
 # Safe macOS host and process readings for the release-server benchmark harness.
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+# Safe `getrusage(RUSAGE_CHILDREN)`: the CPU a `bench` server's reaped worker
+# children used, which no reading of live processes can recover.
+nix = { version = "0.31.3", default-features = false, features = ["resource"] }
 # Safe `proc_pid_rusage` wrapper: lifetime peak footprint of a macOS process.
 # =55.1.0 matches the managed iceberg-rust arrow-60 line. The four iceberg
 # crates share one immutable SCRIBE_ICEBERG_SHA so the analytical graph stays a
@@ -267,7 +270,7 @@ iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust", rev =
 # universe. The revision is literal and must never be a branch: the branch it was
 # published on can move, and a moved core would silently change selection,
 # grouping, delete application, and output identity underneath Forge.
-iceberg-compaction-core = { git = "https://github.com/bohmian-ai/iceberg-compaction", rev = "764fe2a8bbf2a8d1577ca27fec76751ac91c07ff" }
+iceberg-compaction-core = { git = "https://github.com/bohmian-ai/iceberg-compaction", rev = "21ceaf7172d7666e30e2f8527e70f22a7aea9741" }
 # Oracle's distributed query planner and worker runtime. Pinned to an immutable
 # revision over the one shared native DataFusion 55 universe. The Wyrd fork carries the Arrow 60 port; upstream is still on Arrow 59.
 datafusion-distributed = { git = "https://github.com/bohmian-ai/datafusion-distributed", rev = "bbbd1d9af4633499b736a98da62868ce32bc3d16" }

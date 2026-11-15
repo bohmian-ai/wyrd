@@ -13,8 +13,9 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyModule};
+use pyo3::types::{PyAny, PyDict, PyModule};
 use secrecy::{ExposeSecret, SecretString};
 use url::Url;
 use wyrd_runtime::Permission;
@@ -123,6 +124,8 @@ pub struct WyrdTestServer {
     /// GitHub mock the deployment's GitHub App is configured against; `None`
     /// configures no App.
     github: Option<NativeGithubAppMock>,
+    /// Direct verification deadline from arrival, replacing the default.
+    verify_timeout_seconds: Option<f64>,
     /// Bound HTTP base URL while entered.
     base_url: Option<String>,
     /// Bound gRPC endpoint while entered.
@@ -153,13 +156,16 @@ impl WyrdTestServer {
     /// live smoke lane asks for. `access_ttl_seconds` mints access tokens of that lifetime,
     /// verified with no clock-skew allowance, so a journey can outlive one.
     /// `scribe_outbox_capacity` replaces the Scribe outbox capacity.
-    /// `github` configures the deployment's GitHub App against that mock.
+    /// The keyword-only `deployment` options: `github` configures the
+    /// deployment's GitHub App against that mock; `verify_timeout_seconds`
+    /// ends each direct verification that long after its arrival.
     ///
     /// # Errors
     /// Raises the harness error when `provider_base_url` is not an absolute
-    /// URL, or when it is combined with `live_providers`.
+    /// URL, or when it is combined with `live_providers`, and `TypeError` for
+    /// an unknown or mistyped `deployment` option.
     #[new]
-    #[pyo3(signature = (mutate_env = true, verification_runtime = false, provider_base_url = None, live_providers = false, access_ttl_seconds = None, scribe_outbox_capacity = None, github = None))]
+    #[pyo3(signature = (mutate_env = true, verification_runtime = false, provider_base_url = None, live_providers = false, access_ttl_seconds = None, scribe_outbox_capacity = None, **deployment))]
     fn __new__(
         mutate_env: bool,
         verification_runtime: bool,
@@ -167,8 +173,26 @@ impl WyrdTestServer {
         live_providers: bool,
         access_ttl_seconds: Option<i64>,
         scribe_outbox_capacity: Option<usize>,
-        github: Option<PyRef<'_, GithubAppMock>>,
+        deployment: Option<&Bound<'_, PyDict>>,
     ) -> WyrdPyResult<Self> {
+        let mut github = None;
+        let mut verify_timeout_seconds = None;
+        for (key, value) in deployment.into_iter().flatten() {
+            match key.extract::<String>()?.as_str() {
+                "github" => {
+                    github = value
+                        .extract::<Option<PyRef<'_, GithubAppMock>>>()?
+                        .map(|mock| mock.inner.clone());
+                }
+                "verify_timeout_seconds" => verify_timeout_seconds = value.extract()?,
+                other => {
+                    return Err(PyTypeError::new_err(format!(
+                        "WyrdTestServer() got an unexpected keyword argument '{other}'"
+                    ))
+                    .into());
+                }
+            }
+        }
         if live_providers && provider_base_url.is_some() {
             return Err(harness_error(
                 "provider_base_url and live_providers are mutually exclusive",
@@ -187,7 +211,8 @@ impl WyrdTestServer {
             live_providers,
             access_ttl_seconds,
             scribe_outbox_capacity,
-            github: github.map(|mock| mock.inner.clone()),
+            github,
+            verify_timeout_seconds,
             base_url: None,
             grpc_url: None,
             api_key: None,
@@ -211,6 +236,11 @@ impl WyrdTestServer {
         let access_ttl_seconds = slf.access_ttl_seconds;
         let scribe_outbox_capacity = slf.scribe_outbox_capacity;
         let github = slf.github.clone();
+        let verify_timeout = slf
+            .verify_timeout_seconds
+            .map(Duration::try_from_secs_f64)
+            .transpose()
+            .map_err(|error| harness_error(format!("invalid verify_timeout_seconds: {error}")))?;
         let (server, api_key) = wyrd_runtime::runtime()
             .block_on(async {
                 let mut builder = TestServer::builder();
@@ -219,6 +249,9 @@ impl WyrdTestServer {
                 }
                 if let Some(capacity) = scribe_outbox_capacity {
                     builder = builder.with_scribe_outbox_capacity_for_test(capacity);
+                }
+                if let Some(timeout) = verify_timeout {
+                    builder = builder.with_verify_timeout_for_test(timeout);
                 }
                 if let Some(seconds) = access_ttl_seconds {
                     builder = builder
@@ -836,6 +869,43 @@ impl WyrdTestServer {
         });
         Ok(())
     }
+
+    /// Charge all process memory available now but `leave` bytes until the
+    /// returned hold is released, so a hosted verification whose session
+    /// does not fit waits and one whose request does not fit is refused.
+    ///
+    /// # Errors
+    /// Raises the harness error outside the context manager or when the
+    /// server hosts no Verifiers.
+    fn occupy_hosted_memory(&self, leave: u64) -> WyrdPyResult<HeldMemory> {
+        let server = self.started()?;
+        let _runtime = wyrd_runtime::runtime().enter();
+        let charge = server.occupy_hosted_memory(leave).map_err(harness_error)?;
+        Ok(HeldMemory {
+            charge: Mutex::new(Some(charge)),
+        })
+    }
+
+    /// Wait until exactly `count` hosted Python operations wait for process
+    /// memory; `timeout` is in seconds and the GIL is released meanwhile.
+    ///
+    /// # Errors
+    /// Raises the harness error when `timeout` elapses first, for a negative
+    /// or non-finite `timeout`, outside the context manager, or when the
+    /// server hosts no Verifiers.
+    fn wait_for_hosted_waiters(
+        &self,
+        py: Python<'_>,
+        count: usize,
+        timeout: f64,
+    ) -> WyrdPyResult<()> {
+        let server = self.started()?;
+        let timeout = Duration::try_from_secs_f64(timeout).map_err(harness_error)?;
+        py.detach(|| {
+            wyrd_runtime::runtime().block_on(server.wait_for_hosted_waiters(count, timeout))
+        })
+        .map_err(harness_error)
+    }
 }
 
 impl WyrdTestServer {
@@ -1141,6 +1211,44 @@ impl GithubBrowser {
     }
 }
 
+/// Process memory a journey holds charged on its test server.
+///
+/// A context manager: leaving the `with` block, or [`HeldMemory::release`],
+/// returns the bytes, and so does dropping the hold.
+#[pyclass(module = "wyrd._wyrd.testing")]
+pub struct HeldMemory {
+    /// The held charge until released.
+    charge: Mutex<Option<wyrd_testing::server::OccupiedForTest>>,
+}
+
+#[pymethods]
+impl HeldMemory {
+    /// Return the hold itself; the memory is already held.
+    const fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// Release the memory. Never suppresses an exception raised inside the
+    /// `with` block.
+    fn __exit__(
+        &self,
+        _exc_type: Option<Bound<'_, PyAny>>,
+        _exc_value: Option<Bound<'_, PyAny>>,
+        _traceback: Option<Bound<'_, PyAny>>,
+    ) -> bool {
+        self.release();
+        false
+    }
+
+    /// Release the memory; releasing twice is a no-op.
+    fn release(&self) {
+        self.charge
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+}
+
 /// Registers the testing classes on the `wyrd._wyrd.testing` submodule.
 ///
 /// # Errors
@@ -1149,5 +1257,6 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<WyrdTestServer>()?;
     module.add_class::<GithubAppMock>()?;
     module.add_class::<GithubBrowser>()?;
+    module.add_class::<HeldMemory>()?;
     module.add_class::<UnmigratedDatabase>()
 }

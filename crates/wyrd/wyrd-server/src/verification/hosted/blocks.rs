@@ -52,7 +52,8 @@ use crate::components::github::extraction::{PULL_REQUEST_EXTRACT_VERSION, PullRe
 use crate::components::github::service::GithubConnections;
 use crate::state::AppState;
 use crate::verification::state::RunState;
-use crate::verification::telemetry::ExecutionMode;
+use crate::verification::telemetry::{Envelopes, ExecutionMode};
+use wyrd_runtime::resources::ProcessResources;
 
 /// Most steps or checks one execution runs at once.
 // ponytail: fixed per-execution fan-out; the sandbox and workspace pools
@@ -61,9 +62,11 @@ const STEP_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(4).expect("4 is non-zer
 
 /// The hosted block capacity of one server process.
 pub struct HostedBlocks {
-    /// Capacity reserved for direct `verify` executions.
+    /// Capacity for direct `verify` executions: the process ledger less the
+    /// queued reservation.
     direct: Lane,
-    /// Capacity reserved for queued executions and their continuations.
+    /// Capacity for queued executions and their continuations: the queued
+    /// share reserved from the process ledger.
     queued: Lane,
     /// One permit per running direct execution.
     direct_executions: Arc<Semaphore>,
@@ -76,16 +79,19 @@ pub struct HostedBlocks {
 
 /// The block capacity one execution lane owns alone.
 struct Lane {
-    /// The lane's Python sandbox pool.
+    /// The lane's resources: CPU share, memory, and scratch ledgers.
+    resources: ProcessResources,
+    /// The lane's Python sandbox pool, charged to `resources`.
     sandbox: Arc<Sandbox>,
-    /// The lane's workspace permits.
+    /// The lane's workspaces, charged to `resources`.
     workspaces: Arc<Workspaces>,
     /// The lane's model-call permits.
     model_calls: Arc<Semaphore>,
 }
 
 impl Lane {
-    /// Start the lane sized by `lane` under `limits`.
+    /// Start the lane over `resources`, its workspaces under `scratch`, with
+    /// `lane`'s model-call permits.
     ///
     /// # Errors
     /// Returns [`Sandbox::start`]'s [`PoolError`].
@@ -93,26 +99,16 @@ impl Lane {
         worker: PathBuf,
         limits: HostedLimits,
         lane: LaneLimits,
+        resources: ProcessResources,
+        scratch: PathBuf,
     ) -> Result<Self, PoolError> {
         Ok(Self {
-            sandbox: Arc::new(Sandbox::start(worker, limits, lane).await?),
-            workspaces: Arc::new(Workspaces::new(limits, lane.workspaces)),
+            sandbox: Arc::new(Sandbox::start(worker, limits, &resources).await?),
+            workspaces: Arc::new(Workspaces::new(limits, &resources, scratch)),
             model_calls: Arc::new(Semaphore::new(lane.model_calls)),
+            resources,
         })
     }
-}
-
-/// One lane admission a test can saturate with
-/// [`HostedBlocks::hold_for_test`].
-#[cfg(feature = "test-support")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LaneAdmission {
-    /// Workspace permits.
-    Workspaces,
-    /// Python sandbox admission.
-    Python,
-    /// Model-call permits.
-    ModelCalls,
 }
 
 /// The per-execution inputs an engine is bound to.
@@ -136,6 +132,9 @@ pub struct Execution<'a> {
     /// The execution's block clock (`ExecutionTelemetry::clock`), on which
     /// the engine records every block's run interval.
     pub clock: BlockClock,
+    /// The execution's envelope record (`ExecutionTelemetry::envelopes`),
+    /// on which the hosted tools and Gateway caller time nested Agent work.
+    pub envelopes: Envelopes,
     /// The execution state whose accepted publications workspaces mount;
     /// `None` for an engine bound to no execution.
     pub execution: Option<Arc<RunState>>,
@@ -148,16 +147,38 @@ pub struct Execution<'a> {
 }
 
 impl HostedBlocks {
-    /// Start both lanes' sandbox pools over the Monty worker at `worker`
-    /// under `limits`, prewarming `limits.monty_min_workers` in each.
+    /// Start both lanes over the Monty worker at `worker` under `limits`:
+    /// the queued lane over `limits.queued_share` reserved from `process`,
+    /// the direct lane over the rest, each prewarming up to
+    /// `limits.monty_min_workers` and writing workspaces under `scratch`.
+    /// The reservation counts once in `process`, so neither lane can take
+    /// the other's memory or scratch.
     ///
     /// # Errors
-    /// Returns [`Sandbox::start`]'s [`PoolError`] when the limits cannot hold
-    /// the lanes' workers or a prewarmed worker cannot start.
-    pub async fn start(worker: PathBuf, limits: HostedLimits) -> Result<Self, PoolError> {
+    /// Returns [`PoolError::Spawn`] when `process` cannot hold the queued
+    /// reservation, and [`Sandbox::start`]'s [`PoolError`] when a lane's
+    /// memory holds no Python session or a prewarmed worker cannot start.
+    pub async fn start(
+        worker: PathBuf,
+        limits: HostedLimits,
+        process: &ProcessResources,
+        scratch: PathBuf,
+    ) -> Result<Self, PoolError> {
+        let queued = limits.queued_share.reserve(process).map_err(|refusal| {
+            PoolError::Spawn(format!(
+                "the queued verification share does not fit: {refusal}"
+            ))
+        })?;
         Ok(Self {
-            direct: Lane::start(worker.clone(), limits, limits.direct).await?,
-            queued: Lane::start(worker, limits, limits.queued).await?,
+            queued: Lane::start(
+                worker.clone(),
+                limits,
+                limits.queued,
+                queued,
+                scratch.clone(),
+            )
+            .await?,
+            direct: Lane::start(worker, limits, limits.direct, process.clone(), scratch).await?,
             direct_executions: Arc::new(Semaphore::new(limits.direct_executions)),
             limits,
             schemas: Arc::default(),
@@ -183,31 +204,28 @@ impl HostedBlocks {
         Arc::clone(&self.direct_executions).try_acquire_owned().ok()
     }
 
-    /// The Python sandbox pool of `mode`'s lane, so a test can hold one of
-    /// its admissions while an execution runs.
+    /// The Python sandbox pool of `mode`'s lane, so a test can occupy its
+    /// memory ([`Sandbox::occupy_for_test`]) or await its waiters.
     #[cfg(feature = "test-support")]
     #[must_use]
     pub const fn sandbox(&self, mode: ExecutionMode) -> &Arc<Sandbox> {
         &self.lane(mode).sandbox
     }
 
-    /// Every free permit of `admission` in `mode`'s lane, held until the
-    /// returned permit drops, so a test can saturate one lane resource.
+    /// The resources `mode`'s lane is charged to.
+    #[must_use]
+    pub const fn resources(&self, mode: ExecutionMode) -> &ProcessResources {
+        &self.lane(mode).resources
+    }
+
+    /// Every free model-call permit of `mode`'s lane, held until the
+    /// returned permit drops.
     ///
     /// # Panics
-    /// Panics when the admission is closed or taken concurrently.
+    /// Panics when a permit is taken concurrently.
     #[cfg(feature = "test-support")]
-    pub fn hold_for_test(
-        &self,
-        mode: ExecutionMode,
-        admission: LaneAdmission,
-    ) -> OwnedSemaphorePermit {
-        let lane = self.lane(mode);
-        match admission {
-            LaneAdmission::Workspaces => lane.workspaces.hold_for_test(),
-            LaneAdmission::Python => lane.sandbox.hold_for_test(),
-            LaneAdmission::ModelCalls => super::hold_all(&lane.model_calls),
-        }
+    pub fn hold_model_calls_for_test(&self, mode: ExecutionMode) -> OwnedSemaphorePermit {
+        super::hold_all(&self.lane(mode).model_calls)
     }
 
     /// Every free direct execution permit, held until the returned permit
@@ -253,7 +271,12 @@ impl HostedBlocks {
     pub fn engine(&self, state: &AppState, execution: Execution<'_>) -> VerificationEngine {
         let caller = execution.caller;
         let lane = self.lane(execution.mode);
-        let evidence = TenantEvidence::new(state.clone(), caller.clone(), self.limits);
+        let evidence = TenantEvidence::new(
+            state.clone(),
+            caller.clone(),
+            self.limits,
+            lane.resources.memory().clone(),
+        );
         let evidence = Arc::new(match &execution.execution {
             Some(state) => evidence.with_execution(Arc::clone(state)),
             None => evidence,
@@ -266,6 +289,7 @@ impl HostedBlocks {
             routes: execution.routes.clone(),
             execution: execution.execution,
             mode: execution.mode,
+            envelopes: execution.envelopes,
             evidence: Arc::clone(&evidence),
             workspaces: Arc::clone(&lane.workspaces),
             sandbox: Arc::clone(&lane.sandbox),
@@ -322,6 +346,9 @@ struct ExecutionBinding {
     execution: Option<Arc<RunState>>,
     /// The accepted execution mode, which names the lane of model calls.
     mode: ExecutionMode,
+    /// The execution's envelope record, on which tools and model calls are
+    /// timed.
+    envelopes: Envelopes,
     /// The execution's pinned evidence.
     evidence: Arc<TenantEvidence>,
     /// The lane's workspace permits.
@@ -365,7 +392,6 @@ impl ExecutionBinding {
             provenance: Some(CallProvenance::Extract {
                 version: PULL_REQUEST_EXTRACT_VERSION.to_owned(),
             }),
-            tool_calls: Vec::new(),
         })
     }
 
@@ -388,7 +414,8 @@ impl ExecutionBinding {
         .with_wyrd_gateway(Arc::new(
             ServerWyrdGatewayCaller::new(binding.state.clone(), binding.caller.clone())
                 .attributed(Some(binding.subject.clone()))
-                .admitted(binding.mode.as_str(), Arc::clone(&binding.model_calls)),
+                .admitted(binding.mode.as_str(), Arc::clone(&binding.model_calls))
+                .timed(binding.envelopes.clone()),
         ))
         .with_route_overrides(binding.routes.clone())
         .with_prepared_schemas(Arc::clone(&binding.schemas))
@@ -404,7 +431,8 @@ impl ExecutionBinding {
                 Arc::clone(&self.workspaces),
                 Arc::clone(&self.sandbox),
                 self.limits,
-            );
+            )
+            .timed(self.envelopes.clone());
             match &self.execution {
                 Some(run) => tools.with_execution(Arc::clone(run)),
                 None => tools,
@@ -530,7 +558,6 @@ mod tests {
             Ok(ActionOutput {
                 output: serde_json::json!({}),
                 provenance: None,
-                tool_calls: Vec::new(),
             })
         }
     }
@@ -610,7 +637,8 @@ mod tests {
     /// 100, and whose residual is the execution less that union; its
     /// engine phase lands as one `verification.direct.engine` part holding
     /// the run, and the time outside every phase as one
-    /// `verification.direct.outside` part; no production duration histogram
+    /// `verification.direct.outside` part with its before, between and after
+    /// split; no production duration histogram
     /// counts the execution a second time.
     ///
     /// # Panics
@@ -667,6 +695,9 @@ mod tests {
                 ("verification.direct", "completed", 1),
                 ("verification.direct.engine", "completed", 1),
                 ("verification.direct.outside", "completed", 1),
+                ("verification.direct.outside.after", "completed", 1),
+                ("verification.direct.outside.before", "completed", 1),
+                ("verification.direct.outside.between", "completed", 1),
             ]
         );
         let series = &interval.series[0];
@@ -754,7 +785,6 @@ mod pg_tests {
                     .take()
                     .unwrap_or(Value::Null),
                 provenance: None,
-                tool_calls: Vec::new(),
             })
         }
     }
@@ -813,6 +843,12 @@ mod pg_tests {
             .block_on(HostedBlocks::start(
                 PathBuf::from("/nonexistent/wyrd-server"),
                 limits,
+                &wyrd_runtime::resources::ProcessResources::new(
+                    NonZeroUsize::MIN,
+                    4 << 30,
+                    4 << 30,
+                ),
+                std::env::temp_dir(),
             ))
             .expect("an empty pool starts");
         let state = runtime.block_on(test_state());
@@ -857,6 +893,7 @@ mod pg_tests {
                         defer_unlanded_traces: false,
                         drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
                         clock: BlockClock::default(),
+                        envelopes: Envelopes::default(),
                         execution: None,
                         mode: ExecutionMode::Direct,
                         pull_request: None,
@@ -897,6 +934,7 @@ mod pg_tests {
                     state.clone(),
                     caller.clone(),
                     limits,
+                    wyrd_runtime::resources::ByteLedger::new(u64::MAX),
                 )));
                 runtime.block_on(engine.run(Arc::clone(&dependent), BTreeMap::new(), deadline()))
             });

@@ -1,13 +1,15 @@
 //! Direct and queued verification hold separate capacity, end to end:
-//! `capacity-desk` is verified by one Verifier per hosted admission (an
-//! execution slot, a workspace, a Python worker, a model call), so each can
-//! be saturated alone. With a queued admission held, a direct client
+//! `capacity-desk` is verified by one Verifier per hosted resource (an
+//! execution slot, workspace scratch, Python memory, a model call), so each
+//! can be saturated alone. With a queued resource held, a direct client
 //! `verify` that needs the same resource still completes, while queued work
-//! waits for its own lane and progresses once it is released; with a direct
-//! admission held, direct work is refused although the queued lane is free.
+//! waits for its own share and progresses once it is released; with a
+//! direct resource held, direct work is refused although the queued share
+//! is free.
 //!
-//! Every lane holds one of each admission and the runtime one queued
-//! execution slot. The local upstream answers each Agent by its prompt
+//! Every lane admits one model call and the runtime one queued execution
+//! slot; Python memory and workspace scratch are each lane's share of the
+//! process plan. The local upstream answers each Agent by its prompt
 //! marker. The server's own log events witness queued waits: a model call
 //! waiting for its lane, and an execution deferred by admission backpressure.
 
@@ -35,7 +37,7 @@ use wyrd_client::{Bifrost, Gateway, WyrdClient};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::verification::execution::{RequirementOutcome, VerificationResult};
 use wyrd_testing::logs::LogCapture;
-use wyrd_testing::server::{ExecutionMode, HostedLimits, LaneAdmission, LaneLimits, RuntimeLimits};
+use wyrd_testing::server::{ExecutionMode, HostedLimits, LaneLimits, RuntimeLimits};
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 use super::native_client;
@@ -52,13 +54,8 @@ const TIMED_OUT: &str = "WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT";
 /// The event the runner logs when a queued execution meets a full admission.
 const DEFERRED: &str = "verification execution deferred by admission backpressure";
 
-/// One admission of every kind per lane, so holding one saturates it.
-const ONE: LaneLimits = LaneLimits {
-    workspaces: 1,
-    python_workers: 1,
-    python_waiters: 0,
-    model_calls: 1,
-};
+/// One model call per lane, so holding one saturates it.
+const ONE: LaneLimits = LaneLimits { model_calls: 1 };
 
 /// A Chat Completions answer carrying the assistant `message`.
 fn completion(message: Value) -> ResponseTemplate {
@@ -110,8 +107,8 @@ fn api_key(bootstrap: Bootstrap) -> String {
     }
 }
 
-/// The capacity desk deployment: a server whose lanes each admit one of
-/// everything and whose runtime claims one queued execution at a time, with
+/// The capacity desk deployment: a server whose lanes each admit one model
+/// call and whose runtime claims one queued execution at a time, with
 /// metadata capture of every gateway call and `capacity-desk` registered
 /// and hydrated as a principal granted every tool.
 struct CapacityDesk {
@@ -259,18 +256,44 @@ impl CapacityDesk {
         }
     }
 
-    /// Hold every free `admission` of the `mode` lane until the returned
-    /// permit drops.
+    /// The server's hosted blocks.
     ///
     /// # Panics
-    /// Panics when the server hosts no blocks or the admission is in use.
-    fn hold(&self, mode: ExecutionMode, admission: LaneAdmission) -> OwnedSemaphorePermit {
+    /// Panics when the server hosts no blocks.
+    fn blocks(&self) -> &wyrd_server::verification::hosted::blocks::HostedBlocks {
         self.server
             .state()
             .verification
             .blocks()
             .expect("blocks are hosted")
-            .hold_for_test(mode, admission)
+    }
+
+    /// Hold every free model call of the `mode` lane until the returned
+    /// permit drops.
+    ///
+    /// # Panics
+    /// Panics when the server hosts no blocks or a permit is in use.
+    fn hold_model_calls(&self, mode: ExecutionMode) -> OwnedSemaphorePermit {
+        self.blocks().hold_model_calls_for_test(mode)
+    }
+
+    /// Hold all of the `mode` lane's free memory, so its Python operations
+    /// are refused, until the returned hold drops.
+    ///
+    /// # Panics
+    /// Panics when the server hosts no blocks.
+    fn hold_python(&self, mode: ExecutionMode) -> impl Sized {
+        self.blocks().sandbox(mode).occupy_for_test(0)
+    }
+
+    /// Hold all of the `mode` lane's free scratch, so its workspaces are
+    /// refused, until the returned charge drops.
+    ///
+    /// # Panics
+    /// Panics when the server hosts no blocks.
+    fn hold_scratch(&self, mode: ExecutionMode) -> impl Sized {
+        let scratch = self.blocks().resources(mode).scratch().clone();
+        scratch.charge_infallible(scratch.available())
     }
 
     /// Verify `question` with `verifier` now.
@@ -374,18 +397,18 @@ async fn settled(execution: &Execution) -> VerificationResult {
         .expect("the queued execution settles")
 }
 
-/// Each queued admission held at capacity leaves direct verification of the
+/// Each queued resource held at capacity leaves direct verification of the
 /// same resource free: with the queued model-call permit held, a queued
 /// Agent waits for its lane while holding the only queued execution slot, a
 /// direct Agent and a direct assert-only Verifier complete, and a second
 /// queued run stays pending; both queued runs complete once the permit is
-/// released. With queued Python or the queued workspace held, the direct code
+/// released. With queued Python memory or queued scratch held, the direct code
 /// or workspace Agent Verifier completes while its queued twin is deferred,
 /// then completes on release, its continuation staying on the queued lane
 /// while the direct one is held. Every model call, direct or queued, is
 /// recorded on the ordinary gateway path against the verified Service.
-/// Holding a direct admission refuses direct work with the stable
-/// unavailable code although the queued lane is free, and queued work of
+/// Holding a direct resource refuses direct work with the stable
+/// unavailable code although the queued share is free, and queued work of
 /// that resource still completes; a direct model call waits for its own
 /// lane rather than taking the free queued one, and a wait past the direct
 /// deadline is cancelled without leaking a permit.
@@ -399,7 +422,7 @@ async fn direct_verification_runs_while_queued_capacity_is_held() {
     let logs = LogCapture::install_global().expect("the journey owns the process subscriber");
     let desk = CapacityDesk::start().await;
 
-    let model_held = desk.hold(ExecutionMode::Queued, LaneAdmission::ModelCalls);
+    let model_held = desk.hold_model_calls(ExecutionMode::Queued);
     let queued_model = desk.submit("model-check", "QUEUED-MODEL").await;
     logged(&logs, &[MODEL_WAIT, "queued"]).await;
     let queued_answer = desk.submit("answer-check", "QUEUED-ANSWER").await;
@@ -426,7 +449,7 @@ async fn direct_verification_runs_while_queued_capacity_is_held() {
     passed(&settled(&queued_model).await, "answered");
     passed(&settled(&queued_answer).await, "answered");
 
-    let python_held = desk.hold(ExecutionMode::Queued, LaneAdmission::Python);
+    let python_held = desk.hold_python(ExecutionMode::Queued);
     let direct_python = desk
         .verify("python-check", "DIRECT-PYTHON")
         .await
@@ -434,12 +457,12 @@ async fn direct_verification_runs_while_queued_capacity_is_held() {
     passed(&direct_python, "measured");
     let queued_python = desk.submit("python-check", "QUEUED-PYTHON").await;
     logged(&logs, &[DEFERRED, &queued_python.id().to_string()]).await;
-    let direct_python_held = desk.hold(ExecutionMode::Direct, LaneAdmission::Python);
+    let direct_python_held = desk.hold_python(ExecutionMode::Direct);
     drop(python_held);
     passed(&settled(&queued_python).await, "measured");
     drop(direct_python_held);
 
-    let workspace_held = desk.hold(ExecutionMode::Queued, LaneAdmission::Workspaces);
+    let workspace_held = desk.hold_scratch(ExecutionMode::Queued);
     let direct_scratch = desk
         .verify("scratch-check", "DIRECT-SCRATCH")
         .await
@@ -447,7 +470,7 @@ async fn direct_verification_runs_while_queued_capacity_is_held() {
     passed(&direct_scratch, "written");
     let queued_scratch = desk.submit("scratch-check", "QUEUED-SCRATCH").await;
     logged(&logs, &[DEFERRED, &queued_scratch.id().to_string()]).await;
-    let direct_workspace_held = desk.hold(ExecutionMode::Direct, LaneAdmission::Workspaces);
+    let direct_workspace_held = desk.hold_scratch(ExecutionMode::Direct);
     drop(workspace_held);
     passed(&settled(&queued_scratch).await, "written");
     drop(direct_workspace_held);
@@ -471,31 +494,25 @@ async fn direct_verification_runs_while_queued_capacity_is_held() {
         "every lane-admitted call is attributed to the verified Service: {subjects:?}"
     );
 
-    for (admission, verifier, question, id) in [
-        (
-            LaneAdmission::Workspaces,
-            "scratch-check",
-            "FULL-SCRATCH",
-            "written",
-        ),
-        (
-            LaneAdmission::Python,
-            "python-check",
-            "FULL-PYTHON",
-            "measured",
-        ),
-    ] {
-        let held = desk.hold(ExecutionMode::Direct, admission);
-        let refused = desk
-            .verify(verifier, question)
-            .await
-            .expect_err("direct work never borrows queued capacity");
-        assert_eq!(refused.code(), UNAVAILABLE, "{admission:?}");
-        let queued = desk.submit(verifier, question).await;
-        passed(&settled(&queued).await, id);
-        drop(held);
-    }
-    let held = desk.hold(ExecutionMode::Direct, LaneAdmission::ModelCalls);
+    let held = desk.hold_scratch(ExecutionMode::Direct);
+    let refused = desk
+        .verify("scratch-check", "FULL-SCRATCH")
+        .await
+        .expect_err("direct work never borrows queued scratch");
+    assert_eq!(refused.code(), UNAVAILABLE, "scratch");
+    let queued = desk.submit("scratch-check", "FULL-SCRATCH").await;
+    passed(&settled(&queued).await, "written");
+    drop(held);
+    let held = desk.hold_python(ExecutionMode::Direct);
+    let refused = desk
+        .verify("python-check", "FULL-PYTHON")
+        .await
+        .expect_err("direct work never borrows queued memory");
+    assert_eq!(refused.code(), UNAVAILABLE, "python");
+    let queued = desk.submit("python-check", "FULL-PYTHON").await;
+    passed(&settled(&queued).await, "measured");
+    drop(held);
+    let held = desk.hold_model_calls(ExecutionMode::Direct);
     let (waited, ()) = tokio::join!(desk.verify("model-check", "FULL-MODEL"), async {
         logged(&logs, &[MODEL_WAIT, "direct"]).await;
         drop(held);
@@ -504,7 +521,7 @@ async fn direct_verification_runs_while_queued_capacity_is_held() {
         &waited.expect("the direct call proceeds once its own lane frees"),
         "answered",
     );
-    let held = desk.hold(ExecutionMode::Direct, LaneAdmission::ModelCalls);
+    let held = desk.hold_model_calls(ExecutionMode::Direct);
     let refused = desk
         .verify("model-check", "STUCK-MODEL")
         .await

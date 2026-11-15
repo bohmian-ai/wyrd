@@ -1,25 +1,36 @@
 //! Bounded per-call scratch workspaces for Agent calls and code.
 //!
-//! [`Workspaces`] admits at most its lane's
-//! [`LaneLimits::workspaces`](super::LaneLimits::workspaces) concurrent
-//! workspaces and refuses, rather than queues, the next one. [`Workspaces::open`] reads each declared file
-//! through [`TenantEvidence`], then materializes it under a fresh temporary
-//! directory: files and JSON under `inputs/`, uploaded evidence declared as
-//! an archive unpacked in place after [`zip_guard`] or the equivalent tar.gz
-//! checks, and an empty `work/`. Artifact files are staged unchanged. No
-//! file is parsed when mounted: `fs.read` and `fs.search` serve the actual
-//! UTF-8 lines of a file, and only `fs.extract` runs the extractor, on
-//! request, into a new `/work` file. Every `/inputs` file keeps the
-//! original slots it came from, so tool output stays citable against
+//! [`Workspaces`] has no workspace count. Each workspace charges the
+//! process scratch ledger for the bytes it holds on disk plus the one
+//! `/work` write being admitted, and process memory only for the bytes in
+//! flight while it stages; a charge that does not fit refuses the open busy
+//! rather than queueing it, and a write charge that does not fit refuses
+//! that write. [`Workspaces::open`] creates a fresh directory below the
+//! server's verification scratch root and stages each declared file into it
+//! through [`TenantEvidence::stage`], which streams the object from storage
+//! straight to disk and verifies it there, so evidence never passes through
+//! process memory whole. A verified file is then renamed into `inputs/`;
+//! uploaded evidence declared as an archive is unpacked from its staged file
+//! after [`zip_guard`] or the equivalent tar.gz checks, each entry streamed
+//! to its own file, and the staged archive removed. JSON inputs are written
+//! under `inputs/` too, and `work/` starts empty. Artifact files are staged
+//! unchanged. No file is parsed when mounted: `fs.read` and `fs.search`
+//! serve the actual UTF-8 lines of a file, and only `fs.extract` runs the
+//! extractor, on request, into a new `/work` file. Every `/inputs` file keeps
+//! the original slots it came from, so tool output stays citable against
 //! original evidence. A `steps.<id>.publications` reference mounts what the
-//! execution's step published: a named member at its destination, or the
-//! whole collection as `manifest.json` plus `content/` beneath it; derived
-//! files keep only their producer's original slots, so a generated opinion
-//! can never be cited as original evidence. Dropping the [`Workspace`] removes the directory and
-//! releases its admission, on success, failure, or cancellation alike.
+//! execution's step published, staged from its completed Files exactly as
+//! evidence is: a named member at its destination, or the whole collection
+//! as `manifest.json` plus `content/` beneath it; derived files keep only
+//! their producer's original slots, so a generated opinion can never be
+//! cited as original evidence. Dropping the [`Workspace`] empties or removes the
+//! directory and then returns its scratch charge, on success, failure, or
+//! cancellation alike; an opened workspace is emptied off the async worker
+//! and its directory reused by a later open, so steady-state opens create
+//! and remove no directory tree.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Cursor, Read};
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -27,10 +38,9 @@ use monty_pool::{MountSpec, MountSpecMode};
 use serde_json::{Value, json};
 use skald_spec::MediaFormat;
 use skald_tool::ToolError;
-use tempfile::TempDir;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use vala_verify::blocks::{BlockError, CallInput, CallValue};
+use vala_verify::blocks::{BlockError, CallInput, CallValue, tool_error};
 use wyrd_loader::{EXTRACT_VERSION, Extraction, lines, zip_guard};
+use wyrd_runtime::resources::{ByteCharge, ByteLedger, ProcessResources};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::verification::execution::{
@@ -38,86 +48,146 @@ use wyrd_spec::verification::execution::{
 };
 
 use super::evidence::TenantEvidence;
-use super::tools::{invocation, structured};
+use super::tools::{host_stop, invocation};
 use super::{HostedLimits, extract_refused};
 use wyrd_spec::verification::state::AcceptedPublication;
 
-/// One execution lane's admission of scratch workspaces.
+/// Process-wide workspace admission over the process memory and scratch
+/// ledgers.
 pub struct Workspaces {
-    /// One permit per concurrent workspace.
-    permits: Arc<Semaphore>,
+    /// Process memory, charged for staged bytes in flight.
+    memory: ByteLedger,
+    /// Where workspaces are written, charged to `scratch`.
+    scratch: ScratchRoot,
     /// Limits every workspace enforces.
     limits: HostedLimits,
+    /// Emptied workspace directories waiting for their next invocation.
+    free: FreeRoots,
+}
+
+/// Emptied workspace roots, each holding empty `inputs/`, `work/` and
+/// `staging/`, that the next [`Workspaces::open`] takes instead of making
+/// a directory tree. A root enters only after a blocking-pool thread
+/// emptied it, so no file from one invocation is ever seen by another.
+///
+/// ponytail: unbounded, but it never holds more roots than workspaces were
+/// open at once, each an empty directory; trim it if that peak matters.
+type FreeRoots = Arc<std::sync::Mutex<Vec<PathBuf>>>;
+
+/// A directory for workspaces and the ledger of the filesystem it is on.
+#[derive(Debug, Clone)]
+pub struct ScratchRoot {
+    /// Parent of every workspace directory.
+    pub dir: PathBuf,
+    /// The process scratch ledger of `dir`'s filesystem.
+    pub ledger: ByteLedger,
 }
 
 impl Workspaces {
-    /// Admission of at most `workspaces` concurrent workspaces, each
-    /// enforcing `limits`.
+    /// Workspaces under `root`, charged to `process` memory and scratch.
     #[must_use]
-    pub fn new(limits: HostedLimits, workspaces: usize) -> Self {
+    pub fn new(limits: HostedLimits, process: &ProcessResources, root: PathBuf) -> Self {
         Self {
-            permits: Arc::new(Semaphore::new(workspaces)),
+            memory: process.memory().clone(),
+            scratch: ScratchRoot {
+                dir: root,
+                ledger: process.scratch().clone(),
+            },
             limits,
+            free: FreeRoots::default(),
         }
-    }
-
-    /// Every workspace this lane has free, held until the returned permit
-    /// drops, so a test can saturate the lane.
-    ///
-    /// # Panics
-    /// Panics when admission is closed or taken concurrently.
-    #[cfg(feature = "test-support")]
-    pub fn hold_for_test(&self) -> OwnedSemaphorePermit {
-        super::hold_all(&self.permits)
     }
 
     /// Materialize `files`, keyed by `/inputs/...` path, for one invocation.
     ///
-    /// Admission never waits: with every workspace taken the open is refused
-    /// at once, so no waiter queue can grow toward execution deadlines and
-    /// the execution is deferred instead. Evidence is read and verified
-    /// first, then written on the blocking pool. An Artifact file keeps its
-    /// stored content type only as a hint for `fs.extract`; it is never
-    /// unpacked. A named publication must exist for its successful producer
-    /// attempt, so a missing one refuses the call before it runs.
+    /// Admission never waits: bytes that process memory or scratch cannot
+    /// hold refuse the open at once, so no waiter queue can grow toward
+    /// execution deadlines and the execution is deferred instead. Each file
+    /// is charged to scratch for its declared size before it is fetched,
+    /// then streamed into the workspace's private staging directory and
+    /// verified there; only once every file is staged are they placed under
+    /// `/inputs` on the blocking pool. An Artifact file keeps its stored
+    /// content type only as a hint for `fs.extract`; it is never unpacked.
     ///
     /// # Errors
-    /// Returns [`BlockError::Busy`] when every workspace is taken, the
-    /// evidence reader's errors, [`BlockError::Terminal`] for an invalid
-    /// path, a missing named publication, combined input bytes over the
-    /// limit, or any materialization refusal, and [`BlockError::Retryable`]
-    /// when the blocking task fails.
+    /// Returns [`BlockError::Busy`] when process memory or scratch cannot
+    /// hold the inputs, the evidence reader's errors, [`BlockError::Terminal`]
+    /// for an invalid path, combined input bytes over the limit, or any
+    /// materialization refusal, and [`BlockError::Retryable`] for a local IO
+    /// failure or a failed blocking task.
+    ///
+    /// Profiled as `debug` spans inside the engine phase:
+    /// `verification.workspace.open` for the whole open, a
+    /// `verification.workspace.stage` per streamed file, and
+    /// `verification.workspace.install` for the blocking placement pass.
+    #[tracing::instrument(
+        level = "debug",
+        name = "verification.workspace.open",
+        skip_all,
+        fields(inputs = files.len())
+    )]
     pub async fn open(
         &self,
         files: &BTreeMap<String, CallInput>,
         evidence: &TenantEvidence,
     ) -> Result<Workspace, BlockError> {
-        let permit =
-            Arc::clone(&self.permits)
-                .try_acquire_owned()
-                .map_err(|_| BlockError::Busy {
-                    reason: "every workspace is in use".to_owned(),
-                })?;
-        let mut mount = Mount::default();
+        let limits = self.limits;
+        // Created inline, a few directory creations, so a refusal below
+        // answers before the open first awaits.
+        let reused = self
+            .free
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop();
+        let mut workspace = match reused {
+            Some(root) => Workspace::empty(root, limits, Some(self.scratch.clone())),
+            None => Workspace::create(limits, Some(self.scratch.clone()))?,
+        };
+        workspace.memory = Some(self.memory.clone());
+        let mut pending = Vec::with_capacity(files.len());
+        let mut directories = Vec::new();
+        let mut total = 0_u64;
+        let mut count = |size: u64| {
+            total = total.saturating_add(size);
+            if total > limits.files_max_bytes {
+                return Err(terminal(format!(
+                    "workspace inputs exceed the {}-byte combined file limit",
+                    limits.files_max_bytes
+                )));
+            }
+            Ok(())
+        };
         for (path, input) in files {
             let sources = &input.sources;
             match &input.value {
-                CallValue::Json(value) => mount.json(path.clone(), value, sources),
-                CallValue::Evidence(InputDeclaration::Artifact {
-                    artifact,
-                    path: file,
-                }) => {
-                    let (bytes, format) = evidence.artifact(artifact, file.as_deref()).await?;
-                    mount.file(
-                        path.clone(),
-                        bytes,
-                        format.filter(|format| !format.is_archive()),
-                        sources,
+                CallValue::Json(value) => {
+                    let staged = workspace.staged(pending.len());
+                    pending.push(
+                        self.stage_json(&mut workspace, &mut count, path, value, sources, staged)
+                            .await?,
                     );
                 }
                 CallValue::Evidence(declaration) => {
-                    let (bytes, format) = evidence.read(declaration).await?;
-                    mount.file(path.clone(), bytes, Some(format), sources);
+                    let file = evidence.file(declaration).await?;
+                    // Uploaded evidence must sniff as its declared format;
+                    // an Artifact file is staged unchanged, never unpacked.
+                    let (sniff, format) = match declaration {
+                        InputDeclaration::Artifact { .. } => {
+                            (None, file.format.filter(|format| !format.is_archive()))
+                        }
+                        _ => (file.format, file.format),
+                    };
+                    count(file.size)?;
+                    workspace.reserve(file.size)?;
+                    let staged = workspace.staged(pending.len());
+                    evidence.stage(&file, sniff, &staged).await?;
+                    pending.push(Pending {
+                        path: path.clone(),
+                        staged,
+                        size: file.size,
+                        format,
+                        sources: sources.clone(),
+                    });
                 }
                 CallValue::Publication { producer, name } => {
                     let publication = evidence
@@ -134,9 +204,14 @@ impl Workspaces {
                                 name.as_str()
                             ))
                         })?;
-                    mount
-                        .publication(evidence, path, &publication, sources)
-                        .await?;
+                    self.stage_publication(
+                        &mut workspace,
+                        &mut count,
+                        evidence,
+                        (path, &publication, sources),
+                        (&mut pending, &mut directories),
+                    )
+                    .await?;
                 }
                 CallValue::Publications { step, collection } => {
                     let mut manifest = collection.clone();
@@ -153,14 +228,14 @@ impl Workspaces {
                             segment(&publication.publication.producer),
                             publication.publication.name.as_str()
                         );
-                        mount
-                            .publication(
-                                evidence,
-                                &format!("{path}/{relative}"),
-                                &publication,
-                                sources,
-                            )
-                            .await?;
+                        self.stage_publication(
+                            &mut workspace,
+                            &mut count,
+                            evidence,
+                            (&format!("{path}/{relative}"), &publication, sources),
+                            (&mut pending, &mut directories),
+                        )
+                        .await?;
                         let publication = publication.publication;
                         manifest.entries.push(CollectionEntry {
                             kind: publication.content.kind(),
@@ -172,21 +247,33 @@ impl Workspaces {
                         });
                     }
                     let manifest = serde_json::to_value(&manifest).unwrap_or(Value::Null);
-                    mount.json(format!("{path}/manifest.json"), &manifest, &BTreeSet::new());
-                    mount.directories.push(path.clone());
+                    let staged = workspace.staged(pending.len());
+                    pending.push(
+                        self.stage_json(
+                            &mut workspace,
+                            &mut count,
+                            &format!("{path}/manifest.json"),
+                            &manifest,
+                            &BTreeSet::new(),
+                            staged,
+                        )
+                        .await?,
+                    );
+                    directories.push(path.clone());
                 }
             }
-            if mount.bytes > self.limits.files_max_bytes {
-                return Err(terminal(format!(
-                    "workspace inputs exceed the {}-byte combined file limit",
-                    self.limits.files_max_bytes
-                )));
-            }
         }
-        let limits = self.limits;
-        tokio::task::spawn_blocking(move || {
-            let workspace = Workspace::materialize(mount.staged, limits, permit)?;
-            for directory in &mount.directories {
+        let install = tracing::debug_span!(
+            "verification.workspace.install",
+            inputs = pending.len(),
+            bytes = workspace.inputs_bytes
+        );
+        let mut workspace = blocking(move || {
+            let _install = install.entered();
+            for file in pending {
+                workspace.install(file)?;
+            }
+            for directory in &directories {
                 let host = workspace.host(directory).ok_or_else(|| {
                     terminal(format!("{directory} is not under /inputs or /work"))
                 })?;
@@ -194,84 +281,107 @@ impl Workspaces {
             }
             Ok(workspace)
         })
-        .await
-        .map_err(|error| BlockError::Retryable {
-            reason: format!("workspace materialization stopped: {error}"),
-        })?
-    }
-}
-
-/// The files and directories one open stages.
-#[derive(Default)]
-struct Mount {
-    /// Files to place.
-    staged: Vec<Staged>,
-    /// Directories to create, empty ones included.
-    directories: Vec<String>,
-    /// Combined bytes of the staged files.
-    bytes: u64,
-}
-
-impl Mount {
-    /// Stage `bytes` at `path`.
-    fn file(
-        &mut self,
-        path: String,
-        bytes: Vec<u8>,
-        format: Option<MediaFormat>,
-        sources: &BTreeSet<SlotName>,
-    ) {
-        self.bytes = self
-            .bytes
-            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
-        self.staged.push(Staged {
-            path,
-            bytes,
-            format,
-            sources: sources.clone(),
-        });
+        .await?;
+        // Only an opened workspace is recycled; a refused or cancelled open
+        // removes its partial directory and returns its charge at once.
+        workspace.free = Some(Arc::clone(&self.free));
+        Ok(workspace)
     }
 
-    /// Stage `value` as a UTF-8 JSON file at `path`.
-    fn json(&mut self, path: String, value: &Value, sources: &BTreeSet<SlotName>) {
-        let bytes = serde_json::to_vec_pretty(value).unwrap_or_default();
-        self.file(path, bytes, Some(MediaFormat::Json), sources);
-    }
-
-    /// Stage `publication` at `path`: a file there, a JSON file there, or a
-    /// directory there with its files and empty directories beneath it,
-    /// each file read through its completed File descriptor.
+    /// Stage `value` as a UTF-8 JSON file for `/inputs` path `path` at
+    /// `staged`, charging the encoded bytes to process memory while they are
+    /// written and to the workspace's scratch for as long as they stay.
     ///
     /// # Errors
-    /// Returns [`TenantEvidence::published`]'s errors.
-    async fn publication(
-        &mut self,
-        evidence: &TenantEvidence,
+    /// Returns [`BlockError::Busy`] when memory or scratch cannot hold the
+    /// file, `count`'s combined-limit refusal, and [`BlockError::Retryable`]
+    /// for a local IO failure.
+    async fn stage_json(
+        &self,
+        workspace: &mut Workspace,
+        count: &mut impl FnMut(u64) -> Result<(), BlockError>,
         path: &str,
-        stored: &AcceptedPublication,
+        value: &Value,
         sources: &BTreeSet<SlotName>,
+        staged: PathBuf,
+    ) -> Result<Pending, BlockError> {
+        let bytes = serde_json::to_vec_pretty(value).unwrap_or_default();
+        let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        let _charge = self.memory.try_charge(size).map_err(|_| BlockError::Busy {
+            reason: "process memory cannot hold the workspace inputs now".to_owned(),
+        })?;
+        count(size)?;
+        workspace.reserve(size)?;
+        tokio::fs::write(&staged, bytes).await.map_err(io)?;
+        Ok(Pending {
+            path: path.to_owned(),
+            staged,
+            size,
+            format: Some(MediaFormat::Json),
+            sources: sources.clone(),
+        })
+    }
+
+    /// Stage accepted publication `stored` at `/inputs` path `path`: a file
+    /// there, a JSON file there, or a directory there with its files and
+    /// empty directories beneath it. Each file streams from its completed
+    /// File descriptor into staging exactly as evidence does, charged to
+    /// scratch for its manifest size before it is fetched, so a publication
+    /// never passes through process memory whole.
+    ///
+    /// # Errors
+    /// Returns [`Self::stage_json`]'s and [`TenantEvidence::stage`]'s
+    /// errors, and [`TenantEvidence::published`]'s descriptor refusal.
+    async fn stage_publication(
+        &self,
+        workspace: &mut Workspace,
+        count: &mut impl FnMut(u64) -> Result<(), BlockError>,
+        evidence: &TenantEvidence,
+        (path, stored, sources): (&str, &AcceptedPublication, &BTreeSet<SlotName>),
+        (pending, directories): (&mut Vec<Pending>, &mut Vec<String>),
     ) -> Result<(), BlockError> {
-        match &stored.publication.content {
-            PublicationContent::Json { value } => self.json(path.to_owned(), value, sources),
-            PublicationContent::File { manifest } => {
-                for (file, object) in manifest.files.iter().zip(&stored.objects) {
-                    let bytes = evidence.published(file, object).await?;
-                    self.file(path.to_owned(), bytes, None, sources);
-                }
+        let manifest = match &stored.publication.content {
+            PublicationContent::Json { value } => {
+                let staged = workspace.staged(pending.len());
+                pending.push(
+                    self.stage_json(workspace, count, path, value, sources, staged)
+                        .await?,
+                );
+                return Ok(());
             }
+            PublicationContent::File { manifest } => manifest,
             PublicationContent::Directory { manifest } => {
-                self.directories.push(path.to_owned());
-                self.directories.extend(
+                directories.push(path.to_owned());
+                directories.extend(
                     manifest
                         .directories
                         .iter()
                         .map(|directory| format!("{path}/{directory}")),
                 );
-                for (file, object) in manifest.files.iter().zip(&stored.objects) {
-                    let bytes = evidence.published(file, object).await?;
-                    self.file(format!("{path}/{}", file.path), bytes, None, sources);
-                }
+                manifest
             }
+        };
+        let directory = matches!(
+            stored.publication.content,
+            PublicationContent::Directory { .. }
+        );
+        for (file, object) in manifest.files.iter().zip(&stored.objects) {
+            let stored = evidence.published(file, object)?;
+            count(stored.size)?;
+            workspace.reserve(stored.size)?;
+            let staged = workspace.staged(pending.len());
+            evidence.stage(&stored, None, &staged).await?;
+            pending.push(Pending {
+                path: if directory {
+                    format!("{path}/{}", file.path)
+                } else {
+                    path.to_owned()
+                },
+                staged,
+                size: stored.size,
+                format: None,
+                sources: sources.clone(),
+            });
         }
         Ok(())
     }
@@ -290,6 +400,41 @@ fn segment(producer: &Producer) -> String {
     format!("{item}{iteration}attempt-{}", producer.attempt)
 }
 
+/// Run materialization `work` on the blocking pool. The closure owns
+/// whatever workspace it touches, so cancelling the wait still removes it
+/// once the work ends.
+///
+/// # Errors
+/// Returns `work`'s error, or [`BlockError::Retryable`] when the blocking
+/// task fails.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, BlockError> + Send + 'static,
+) -> Result<T, BlockError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| BlockError::Retryable {
+            reason: format!("workspace materialization stopped: {error}"),
+        })?
+}
+
+/// The busy host stop for an `fs.extract` that process memory cannot hold.
+fn memory_busy() -> ToolError {
+    host_stop(BlockError::Busy {
+        reason: "process memory cannot hold the extraction now".to_owned(),
+    })
+}
+
+/// Why a `/work` write was refused before it ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum WriteRefusal {
+    /// The write would pass the workspace's `/work` or scratch limit.
+    #[error("the /work write limit is reached")]
+    Limit,
+    /// Process scratch, shared with every workspace and spill, is full.
+    #[error("process scratch has no room for the /work write now")]
+    Scratch,
+}
+
 /// One file to place under `/inputs`.
 pub struct Staged {
     /// Authored `/inputs/...` path.
@@ -302,6 +447,95 @@ pub struct Staged {
     pub sources: BTreeSet<SlotName>,
 }
 
+/// One verified file in the staging directory, waiting for its `/inputs`
+/// place.
+struct Pending {
+    /// Authored `/inputs/...` path.
+    path: String,
+    /// Its host path in the staging directory.
+    staged: PathBuf,
+    /// Its length, already charged to scratch.
+    size: u64,
+    /// Format, or `None` when unknown.
+    format: Option<MediaFormat>,
+    /// Original slots behind the file.
+    sources: BTreeSet<SlotName>,
+}
+
+impl Drop for Workspace {
+    /// Empties or removes the directory before the scratch charge returns,
+    /// so the charge never outlives the bytes. A workspace from
+    /// [`Workspaces::open`] is emptied on a blocking-pool thread and its
+    /// root goes back to the free list; one that cannot be emptied is
+    /// removed instead. Any other workspace is removed here. A failure is
+    /// logged and the charge still returns: nothing can retry it, and boot
+    /// clears the scratch root.
+    fn drop(&mut self) {
+        let root = std::mem::take(&mut self.root);
+        let scratch = self.scratch.take();
+        let Some(free) = self.free.take() else {
+            remove(&root);
+            return;
+        };
+        let recycle = move || match empty_root(&root) {
+            Ok(()) => {
+                drop(scratch);
+                free.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(root);
+            }
+            Err(error) => {
+                tracing::warn!(root = %root.display(), %error, "workspace could not be emptied for reuse");
+                remove(&root);
+                drop(scratch);
+            }
+        };
+        // ponytail: a runtime shutting down drops the task unrun; the charge
+        // returns with it and boot clears the directory it leaves.
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => drop(runtime.spawn_blocking(recycle)),
+            Err(_) => recycle(),
+        }
+    }
+}
+
+/// Removes a workspace root, logging a failure.
+fn remove(root: &Path) {
+    if let Err(error) = std::fs::remove_dir_all(root) {
+        tracing::warn!(root = %root.display(), %error, "workspace removal failed");
+    }
+}
+
+/// Empties `root`'s `inputs/`, `work/` and `staging/`, keeping the three
+/// directories, without following any link an invocation left.
+///
+/// # Errors
+/// Returns the IO error when one of the three is missing or not a
+/// directory, or an entry cannot be removed.
+fn empty_root(root: &Path) -> std::io::Result<()> {
+    for dir in WORKSPACE_DIRS {
+        let dir = root.join(dir);
+        if !std::fs::symlink_metadata(&dir)?.is_dir() {
+            return Err(std::io::Error::other(format!(
+                "{} is not a directory",
+                dir.display()
+            )));
+        }
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                std::fs::remove_dir_all(entry.path())?;
+            } else {
+                std::fs::remove_file(entry.path())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The directories every workspace root holds.
+const WORKSPACE_DIRS: [&str; 3] = ["inputs", "work", "staging"];
+
 /// One materialized `/inputs` file.
 struct Input {
     /// Original slots behind the file.
@@ -312,112 +546,200 @@ struct Input {
 
 /// One invocation's scratch directory.
 pub struct Workspace {
-    /// Root holding `inputs/` and `work/`; removed on drop.
-    root: TempDir,
+    /// Root holding `inputs/`, `work/`, and the unmounted `staging/`;
+    /// emptied for reuse or removed on drop.
+    root: PathBuf,
     /// Materialized `/inputs` files by virtual path.
     inputs: BTreeMap<String, Input>,
-    /// Bytes the materialized inputs take from the scratch limit.
+    /// Bytes the inputs, staged or placed, take from the scratch limit.
     inputs_bytes: u64,
     /// Held by one `/work` writer at a time, so each sees the space the
     /// others left; shared so blocking work can own its turn.
     writer: Arc<tokio::sync::Mutex<()>>,
     /// Limits in force.
     limits: HostedLimits,
-    /// Admission held until drop.
-    _permit: Option<OwnedSemaphorePermit>,
+    /// The scratch charge for the bytes on disk plus the `/work` write in
+    /// flight, or `None` for an uncharged workspace. Declared after `root`
+    /// so it returns only after the directory is removed.
+    scratch: Option<std::sync::Mutex<ByteCharge>>,
+    /// The process memory ledger `fs.extract` charges for the document it
+    /// reads and the output it builds, or `None` for an uncharged workspace.
+    memory: Option<ByteLedger>,
+    /// Where an emptied root returns on drop, or `None` to remove it.
+    free: Option<FreeRoots>,
 }
 
 impl Workspace {
-    /// Write `staged` into a fresh directory.
+    /// Write `staged` into a fresh directory under `scratch`, charging its
+    /// ledger before each byte is written, or, with `None`, under the system
+    /// temporary directory uncharged. Each file is written to the staging
+    /// directory and placed exactly as [`Workspaces::open`] places a
+    /// streamed one.
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for an invalid path, a duplicate
-    /// path, an unsafe or oversized archive, or scratch over the limit, and
-    /// [`BlockError::Retryable`] for a local IO failure.
+    /// path, an unsafe or oversized archive, or scratch over the limit,
+    /// [`BlockError::Busy`] when the scratch ledger cannot hold the inputs,
+    /// and [`BlockError::Retryable`] for a local IO failure.
     pub fn materialize(
         staged: Vec<Staged>,
         limits: HostedLimits,
-        permit: impl Into<Option<OwnedSemaphorePermit>>,
+        scratch: impl Into<Option<ScratchRoot>>,
     ) -> Result<Self, BlockError> {
-        let root = tempfile::tempdir().map_err(io)?;
-        std::fs::create_dir(root.path().join("inputs")).map_err(io)?;
-        std::fs::create_dir(root.path().join("work")).map_err(io)?;
-        let mut workspace = Self {
+        let mut workspace = Self::create(limits, scratch.into())?;
+        for (index, file) in staged.into_iter().enumerate() {
+            let size = u64::try_from(file.bytes.len()).unwrap_or(u64::MAX);
+            workspace.reserve(size)?;
+            let path = workspace.staged(index);
+            std::fs::write(&path, &file.bytes).map_err(io)?;
+            workspace.install(Pending {
+                path: file.path,
+                staged: path,
+                size,
+                format: file.format,
+                sources: file.sources,
+            })?;
+        }
+        Ok(workspace)
+    }
+
+    /// An empty workspace in a fresh directory under `scratch`, or, with
+    /// `None`, under the system temporary directory uncharged.
+    ///
+    /// # Errors
+    /// Returns [`BlockError::Retryable`] for a local IO failure.
+    fn create(limits: HostedLimits, scratch: Option<ScratchRoot>) -> Result<Self, BlockError> {
+        let root = match &scratch {
+            Some(scratch) => tempfile::tempdir_in(&scratch.dir),
+            None => tempfile::tempdir(),
+        }
+        .map_err(io)?;
+        for dir in WORKSPACE_DIRS {
+            std::fs::create_dir(root.path().join(dir)).map_err(io)?;
+        }
+        // From here the workspace's drop owns the removal.
+        Ok(Self::empty(root.keep(), limits, scratch))
+    }
+
+    /// A workspace over `root`, which already holds the empty
+    /// [`WORKSPACE_DIRS`].
+    fn empty(root: PathBuf, limits: HostedLimits, scratch: Option<ScratchRoot>) -> Self {
+        Self {
             root,
             inputs: BTreeMap::new(),
             inputs_bytes: 0,
             writer: Arc::new(tokio::sync::Mutex::new(())),
             limits,
-            _permit: permit.into(),
-        };
-        let mut scratch = 0_u64;
-        for file in staged {
-            relative(&file.path, "/inputs/")
-                .ok_or_else(|| terminal(format!("{} is not an /inputs path", file.path)))?;
-            match file.format {
-                Some(MediaFormat::Zip) => workspace.unzip(&file, &mut scratch)?,
-                Some(MediaFormat::TarGz) => workspace.untar(&file, &mut scratch)?,
-                _ => workspace.place(
-                    file.path,
-                    file.bytes,
-                    file.format,
-                    &file.sources,
-                    &mut scratch,
-                )?,
-            }
+            scratch: scratch.map(|scratch| std::sync::Mutex::new(scratch.ledger.empty_charge())),
+            memory: None,
+            free: None,
         }
-        workspace.inputs_bytes = scratch;
-        Ok(workspace)
     }
 
-    /// Write one file at virtual `path`, unparsed.
+    /// The staging path of the `index`th input, outside every mount.
+    fn staged(&self, index: usize) -> PathBuf {
+        self.root.join("staging").join(index.to_string())
+    }
+
+    /// Charge `bytes` more input to the workspace scratch limit and, for a
+    /// charged workspace, its scratch ledger, before they are written.
     ///
     /// # Errors
-    /// Returns [`BlockError::Terminal`] for a duplicate path or scratch over
-    /// the limit, and [`BlockError::Retryable`] for a local IO failure.
-    fn place(
-        &mut self,
-        path: String,
-        bytes: Vec<u8>,
-        format: Option<MediaFormat>,
-        sources: &BTreeSet<SlotName>,
-        scratch: &mut u64,
-    ) -> Result<(), BlockError> {
-        if self.inputs.contains_key(&path) {
-            return Err(terminal(format!("{path} is materialized twice")));
-        }
-        *scratch = scratch.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
-        if *scratch > self.limits.scratch_max_bytes {
+    /// Returns [`BlockError::Terminal`] past the workspace scratch limit and
+    /// [`BlockError::Busy`] when the scratch ledger cannot hold `bytes` now.
+    fn reserve(&mut self, bytes: u64) -> Result<(), BlockError> {
+        let held = self.inputs_bytes.saturating_add(bytes);
+        if held > self.limits.scratch_max_bytes {
             return Err(terminal(format!(
                 "the workspace exceeds the {}-byte scratch limit",
                 self.limits.scratch_max_bytes
             )));
         }
+        if let Some(charge) = &mut self.scratch {
+            charge
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .try_grow(bytes)
+                .map_err(|_| BlockError::Busy {
+                    reason: "process scratch cannot hold the workspace inputs now".to_owned(),
+                })?;
+        }
+        self.inputs_bytes = held;
+        Ok(())
+    }
+
+    /// Place staged `file` under its `/inputs` path: rename a plain file
+    /// into place, or unpack an archive from its staged file, then remove
+    /// that file and return its scratch.
+    ///
+    /// # Errors
+    /// Returns [`BlockError::Terminal`] for an invalid or duplicate path, an
+    /// unsafe or oversized archive, or scratch over the limit,
+    /// [`BlockError::Busy`] when the scratch ledger cannot hold an unpacked
+    /// entry, and [`BlockError::Retryable`] for a local IO failure.
+    fn install(&mut self, file: Pending) -> Result<(), BlockError> {
+        relative(&file.path, "/inputs/")
+            .ok_or_else(|| terminal(format!("{} is not an /inputs path", file.path)))?;
+        match file.format {
+            Some(MediaFormat::Zip) => self.unzip(&file)?,
+            Some(MediaFormat::TarGz) => self.untar(&file)?,
+            _ => {
+                let host = self.claim(&file.path, file.format, &file.sources)?;
+                return std::fs::rename(&file.staged, host).map_err(io);
+            }
+        }
+        std::fs::remove_file(&file.staged).map_err(io)?;
+        self.inputs_bytes = self.inputs_bytes.saturating_sub(file.size);
+        if let Some(charge) = &mut self.scratch {
+            charge
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .shrink(file.size);
+        }
+        Ok(())
+    }
+
+    /// Record virtual `/inputs` `path` and return its host path, with its
+    /// parent directories created.
+    ///
+    /// # Errors
+    /// Returns [`BlockError::Terminal`] for a duplicate or unsafe path, and
+    /// [`BlockError::Retryable`] for a local IO failure.
+    fn claim(
+        &mut self,
+        path: &str,
+        format: Option<MediaFormat>,
+        sources: &BTreeSet<SlotName>,
+    ) -> Result<PathBuf, BlockError> {
+        if self.inputs.contains_key(path) {
+            return Err(terminal(format!("{path} is materialized twice")));
+        }
         let host = self
-            .host(&path)
+            .host(path)
             .ok_or_else(|| terminal(format!("{path} is not under /inputs or /work")))?;
         if let Some(parent) = host.parent() {
             std::fs::create_dir_all(parent).map_err(io)?;
         }
-        std::fs::write(&host, &bytes).map_err(io)?;
         self.inputs.insert(
-            path,
+            path.to_owned(),
             Input {
                 sources: sources.clone(),
                 format,
             },
         );
-        Ok(())
+        Ok(host)
     }
 
-    /// Unpack a zip archive under its path after [`zip_guard`].
+    /// Unpack a staged zip archive under its path after [`zip_guard`].
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for a guarded limit, an entry that is
-    /// a link or escapes the archive, or a file over the file limit.
-    fn unzip(&mut self, file: &Staged, scratch: &mut u64) -> Result<(), BlockError> {
-        zip_guard(&file.bytes, &self.limits.extract()).map_err(extract_refused)?;
-        let mut archive = zip::ZipArchive::new(Cursor::new(file.bytes.as_slice()))
+    /// a link or escapes the archive, or a file over the file limit, and
+    /// [`Self::write_entry`]'s errors.
+    fn unzip(&mut self, file: &Pending) -> Result<(), BlockError> {
+        let open = || std::fs::File::open(&file.staged).map_err(io);
+        zip_guard(open()?, &self.limits.extract()).map_err(extract_refused)?;
+        let mut archive = zip::ZipArchive::new(open()?)
             .map_err(|error| terminal(format!("{}: {error}", file.path)))?;
         for index in 0..archive.len() {
             let mut entry = archive
@@ -432,28 +754,29 @@ impl Workspace {
             let name = entry.enclosed_name().ok_or_else(|| {
                 terminal(format!("{} has an entry outside the archive", file.path))
             })?;
-            let bytes = self.bounded(&mut entry, &file.path)?;
-            self.place_entry(file, &name, bytes, scratch)?;
+            self.write_entry(file, &name, &mut entry)?;
         }
         Ok(())
     }
 
-    /// Unpack a tar.gz archive under its path, admitting only regular files
-    /// and directories, under the entry, byte, and ratio limits.
+    /// Unpack a staged tar.gz archive under its path, admitting only regular
+    /// files and directories, under the entry, byte, and ratio limits.
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for an unreadable archive, a link or
-    /// special entry, an escaping path, or a limit.
-    fn untar(&mut self, file: &Staged, scratch: &mut u64) -> Result<(), BlockError> {
-        let compressed = u64::try_from(file.bytes.len()).unwrap_or(u64::MAX);
+    /// special entry, an escaping path, or a limit, and
+    /// [`Self::write_entry`]'s errors.
+    fn untar(&mut self, file: &Pending) -> Result<(), BlockError> {
         let budget = self
             .limits
             .archive_max_bytes
-            .min(compressed.saturating_mul(self.limits.archive_max_ratio));
+            .min(file.size.saturating_mul(self.limits.archive_max_ratio));
         let unreadable = |error: std::io::Error| terminal(format!("{}: {error}", file.path));
+        let staged = std::fs::File::open(&file.staged).map_err(io)?;
         // The decoder is capped, so a header understating sizes cannot
         // inflate the stream past the archive budget.
-        let mut decoder = flate2::read::GzDecoder::new(file.bytes.as_slice()).take(budget + 1);
+        let mut decoder =
+            flate2::read::GzDecoder::new(std::io::BufReader::new(staged)).take(budget + 1);
         let mut archive = tar::Archive::new(&mut decoder);
         let mut count = 0_usize;
         for entry in archive.entries().map_err(unreadable)? {
@@ -485,8 +808,7 @@ impl Workspace {
                     file.path
                 )));
             }
-            let bytes = self.bounded(&mut entry, &file.path)?;
-            self.place_entry(file, &name, bytes, scratch)?;
+            self.write_entry(file, &name, &mut entry)?;
         }
         if decoder.limit() == 0 {
             return Err(terminal(format!(
@@ -497,34 +819,18 @@ impl Workspace {
         Ok(())
     }
 
-    /// Read one archive entry, refusing it past the file limit.
+    /// Stream an archive entry to `<archive path>/<name>`, typed by
+    /// extension, charging scratch before each piece is written and refusing
+    /// the entry past the file limit.
     ///
     /// # Errors
-    /// Returns [`BlockError::Terminal`] for an unreadable or oversized entry.
-    fn bounded(&self, entry: &mut impl Read, archive: &str) -> Result<Vec<u8>, BlockError> {
-        let mut bytes = Vec::new();
-        entry
-            .take(self.limits.file_max_bytes + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|error| terminal(format!("{archive}: {error}")))?;
-        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > self.limits.file_max_bytes {
-            return Err(terminal(format!(
-                "{archive} has an entry over the file limit"
-            )));
-        }
-        Ok(bytes)
-    }
-
-    /// Place an archive entry at `<archive path>/<name>`, typed by extension.
-    ///
-    /// # Errors
-    /// Returns [`Self::place`]'s errors.
-    fn place_entry(
+    /// Returns [`BlockError::Terminal`] for an unreadable or oversized entry,
+    /// and [`Self::claim`]'s and [`Self::reserve`]'s errors.
+    fn write_entry(
         &mut self,
-        archive: &Staged,
+        archive: &Pending,
         name: &Path,
-        bytes: Vec<u8>,
-        scratch: &mut u64,
+        entry: &mut impl Read,
     ) -> Result<(), BlockError> {
         let name = name.to_string_lossy();
         let format = name
@@ -532,13 +838,32 @@ impl Workspace {
             .map(|_| MediaFormat::TarGz)
             .or_else(|| name.rsplit_once('.').and_then(|(_, ext)| ext.parse().ok()))
             .filter(|format: &MediaFormat| !format.is_archive());
-        self.place(
-            format!("{}/{name}", archive.path),
-            bytes,
+        let host = self.claim(
+            &format!("{}/{name}", archive.path),
             format,
             &archive.sources,
-            scratch,
-        )
+        )?;
+        let mut out = std::fs::File::create_new(host).map_err(io)?;
+        let mut buffer = vec![0_u8; 64 << 10];
+        let mut written = 0_u64;
+        loop {
+            let read = entry
+                .read(&mut buffer)
+                .map_err(|error| terminal(format!("{}: {error}", archive.path)))?;
+            if read == 0 {
+                return Ok(());
+            }
+            let read_bytes = u64::try_from(read).unwrap_or(u64::MAX);
+            written = written.saturating_add(read_bytes);
+            if written > self.limits.file_max_bytes {
+                return Err(terminal(format!(
+                    "{} has an entry over the file limit",
+                    archive.path
+                )));
+            }
+            self.reserve(read_bytes)?;
+            out.write_all(&buffer[..read]).map_err(io)?;
+        }
     }
 
     /// The host path of a virtual `/inputs` or `/work` path, or `None` for
@@ -547,19 +872,19 @@ impl Workspace {
         let (dir, rest) = relative(path, "/inputs/")
             .map(|rest| ("inputs", rest))
             .or_else(|| relative(path, "/work/").map(|rest| ("work", rest)))?;
-        Some(self.root.path().join(dir).join(rest))
+        Some(self.root.join(dir).join(rest))
     }
 
     /// The host directory mounted at `/inputs`.
     #[must_use]
     pub fn inputs_dir(&self) -> PathBuf {
-        self.root.path().join("inputs")
+        self.root.join("inputs")
     }
 
     /// The host directory mounted at `/work`.
     #[must_use]
     pub fn work_dir(&self) -> PathBuf {
-        self.root.path().join("work")
+        self.root.join("work")
     }
 
     /// Wait to be the only `/work` writer; dropping the guard lets the next
@@ -577,15 +902,23 @@ impl Workspace {
     /// regular file or directory with a UTF-8 name free of backslashes and
     /// control characters, no two relative paths may match under NFC plus
     /// Unicode case folding, and the tree must stay within the entry, depth,
-    /// and byte limits. Nothing is renamed, skipped, or truncated.
+    /// and byte limits. Nothing is renamed, skipped, or truncated. Every
+    /// byte read is charged to process memory first, and the returned charge
+    /// covers the frozen copy for as long as the caller keeps it. The read
+    /// runs on `work`, so the session settles it before its attempt does.
     ///
     /// # Errors
     /// Returns an [`invalid`] refusal: `publication_path` for a path outside
     /// `/work`, `workspace_missing` for a missing path, `regular_file` for a
     /// special file, `publication_tree` for an entry the tree rules refuse,
-    /// `work_budget` for content over the byte limit; and an invocation
-    /// failure for an unreadable entry.
-    pub async fn freeze(self: &Arc<Self>, path: &str) -> Result<Frozen, ToolError> {
+    /// `work_budget` for content over the byte limit; a busy host stop when
+    /// process memory cannot hold the copy now; and an invocation failure
+    /// for an unreadable entry.
+    pub async fn freeze(
+        self: &Arc<Self>,
+        path: &str,
+        work: &tokio_util::task::TaskTracker,
+    ) -> Result<(Frozen, Option<ByteCharge>), ToolError> {
         if relative(path, "/work/").is_none() {
             return Err(invalid(
                 "publication_path",
@@ -600,7 +933,7 @@ impl Workspace {
         let path = path.to_owned();
         // The blocking read owns the writer turn, so a cancelled caller
         // never lets a writer in while the read still runs.
-        tokio::task::spawn_blocking(move || {
+        work.spawn_blocking(move || {
             let _writer = writer;
             workspace.snapshot(&path)
         })
@@ -613,14 +946,24 @@ impl Workspace {
     ///
     /// # Errors
     /// Returns [`Self::freeze`]'s refusals and failures.
-    fn snapshot(&self, path: &str) -> Result<Frozen, ToolError> {
+    fn snapshot(&self, path: &str) -> Result<(Frozen, Option<ByteCharge>), ToolError> {
         let rest = relative(path, "/work/").ok_or_else(|| outside(path))?;
         let host = self.work_dir().join(rest);
+        let mut charge: Option<ByteCharge> = None;
+        let mut read = |host: &Path, bytes: u64| -> Result<Vec<u8>, ToolError> {
+            let more = self.charge_memory(bytes)?;
+            match (&mut charge, more) {
+                (Some(held), Some(more)) => held.merge(more),
+                (held, more) => *held = held.take().or(more),
+            }
+            std::fs::read(host).map_err(failed)
+        };
         if !host.symlink_metadata().map_err(|_| missing(path))?.is_dir() {
             let (host, _) = self.file(path)?;
             let name = rest.rsplit('/').next().unwrap_or(rest).to_owned();
-            let bytes = std::fs::read(&host).map_err(failed)?;
-            return Ok(Frozen::File { name, bytes });
+            let size = host.metadata().map_err(failed)?.len();
+            let bytes = read(&host, size)?;
+            return Ok((Frozen::File { name, bytes }, charge));
         }
         let mut tree = Tree::default();
         let mut pending = vec![(host, String::new(), 0_usize)];
@@ -660,7 +1003,7 @@ impl Workspace {
                             "a smaller file or directory",
                         ));
                     }
-                    let bytes = std::fs::read(entry.path()).map_err(failed)?;
+                    let bytes = read(&entry.path(), meta.len())?;
                     tree.files.push((relative, bytes));
                 } else {
                     return Err(tree_refused(
@@ -672,10 +1015,13 @@ impl Workspace {
         }
         tree.files.sort();
         tree.directories.sort();
-        Ok(Frozen::Directory {
-            files: tree.files,
-            directories: tree.directories,
-        })
+        Ok((
+            Frozen::Directory {
+                files: tree.files,
+                directories: tree.directories,
+            },
+            charge,
+        ))
     }
 
     /// The sandbox mounts: `/inputs` read-only and `/work` writable up to
@@ -707,12 +1053,67 @@ impl Workspace {
     /// The bytes `/work` may still grow by: the smaller of the `/work` write
     /// limit and the scratch left after inputs, less what `/work` holds now,
     /// measured from disk. Call it while holding [`Self::writer`].
-    fn work_room(&self) -> u64 {
-        let held: u64 = walkdir(&self.work_dir(), usize::MAX)
+    #[must_use]
+    pub fn work_room(&self) -> u64 {
+        self.room_beside(self.work_held())
+    }
+
+    /// Admit one `/work` write of `bytes`: refuse it past [`Self::work_room`],
+    /// and for a charged workspace set its scratch charge to its inputs,
+    /// what `/work` holds, and `bytes`, refusing the write when the process
+    /// scratch ledger cannot grant that. Call it while holding
+    /// [`Self::writer`] and before writing, so the charge always covers
+    /// what is on disk plus the one write in flight; a later admission
+    /// returns what the write did not use or a removed file freed.
+    ///
+    /// # Errors
+    /// Returns [`WriteRefusal`] naming the limit that refused the write.
+    pub fn admit_write(&self, bytes: u64) -> Result<(), WriteRefusal> {
+        let held = self.work_held();
+        if bytes > self.room_beside(held) {
+            return Err(WriteRefusal::Limit);
+        }
+        let Some(charge) = &self.scratch else {
+            return Ok(());
+        };
+        let mut charge = charge
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let want = self.inputs_bytes.saturating_add(held).saturating_add(bytes);
+        let charged = charge.bytes();
+        match want.checked_sub(charged) {
+            None => {
+                charge.shrink(charged - want);
+                Ok(())
+            }
+            Some(more) => charge.try_grow(more).map_err(|_| WriteRefusal::Scratch),
+        }
+    }
+
+    /// A process memory charge of `bytes`, or `None` for an uncharged
+    /// workspace.
+    ///
+    /// # Errors
+    /// Returns a busy host stop when process memory cannot hold `bytes`
+    /// now, so the Agent session stops rather than answering the model.
+    fn charge_memory(&self, bytes: u64) -> Result<Option<ByteCharge>, ToolError> {
+        self.memory
+            .as_ref()
+            .map(|memory| memory.try_charge(bytes).map_err(|_| memory_busy()))
+            .transpose()
+    }
+
+    /// Bytes `/work` holds on disk now.
+    fn work_held(&self) -> u64 {
+        walkdir(&self.work_dir(), usize::MAX)
             .0
             .iter()
             .map(|(_, size)| size)
-            .sum();
+            .sum()
+    }
+
+    /// The room `/work` has while it holds `held` bytes.
+    fn room_beside(&self, held: u64) -> u64 {
         self.limits
             .work_write_max_bytes
             .min(
@@ -998,6 +1399,8 @@ impl Workspace {
         if target.symlink_metadata().is_ok() {
             return Err(exists());
         }
+        let size = std::fs::metadata(&host).map_err(failed)?.len();
+        let mut held = self.charge_memory(size)?;
         let bytes = std::fs::read(&host).map_err(failed)?;
         let output = Extraction::new(&self.limits.extract())
             .run(&bytes, format)
@@ -1012,14 +1415,29 @@ impl Workspace {
             })?;
         let json = serde_json::to_vec_pretty(&output)
             .map_err(|error| invocation(format!("the extraction does not serialize: {error}")))?;
-        if u64::try_from(json.len()).unwrap_or(u64::MAX) > self.work_room() {
-            return Err(invalid(
-                "work_budget",
-                "output_path",
-                output_path,
-                format!("{output_path} would exceed the /work write budget"),
-                "fewer or smaller /work files",
-            ));
+        let written = u64::try_from(json.len()).unwrap_or(u64::MAX);
+        // ponytail: charges the serialized output, not the extracted value
+        // beside it, which the extraction limits bound; charge the value
+        // too if large extractions measurably overrun the ledger.
+        if let Some(held) = &mut held {
+            held.try_grow(written).map_err(|_| memory_busy())?;
+        }
+        match self.admit_write(written) {
+            Ok(()) => {}
+            Err(WriteRefusal::Scratch) => {
+                return Err(host_stop(BlockError::Busy {
+                    reason: WriteRefusal::Scratch.to_string(),
+                }));
+            }
+            Err(refusal @ WriteRefusal::Limit) => {
+                return Err(invalid(
+                    "work_budget",
+                    "output_path",
+                    output_path,
+                    format!("{output_path} cannot be written: {refusal}"),
+                    "fewer or smaller /work files",
+                ));
+            }
         }
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent).map_err(failed)?;
@@ -1032,7 +1450,7 @@ impl Workspace {
                 return Err(new_path(format!("{output_path} escapes /work")));
             }
         }
-        let mut staged = tempfile::NamedTempFile::new_in(self.root.path()).map_err(failed)?;
+        let mut staged = tempfile::NamedTempFile::new_in(&self.root).map_err(failed)?;
         std::io::Write::write_all(&mut staged, &json).map_err(failed)?;
         staged.persist_noclobber(&target).map_err(|error| {
             if error.error.kind() == std::io::ErrorKind::AlreadyExists {
@@ -1130,7 +1548,7 @@ impl Workspace {
         for directory in &missing_parents {
             std::fs::create_dir(directory).map_err(failed)?;
         }
-        let mut staged = tempfile::NamedTempFile::new_in(self.root.path()).map_err(failed)?;
+        let mut staged = tempfile::NamedTempFile::new_in(&self.root).map_err(failed)?;
         std::io::Write::write_all(&mut staged, content.as_bytes()).map_err(failed)?;
         staged
             .persist(&target)
@@ -1521,7 +1939,7 @@ fn failed(error: std::io::Error) -> ToolError {
 /// A tool call the model can repair: Validation naming the violated `rule`,
 /// the argument `field`, its `value`, and what was `expected`.
 fn invalid(rule: &str, field: &str, value: &str, message: String, expected: &str) -> ToolError {
-    structured(&WyrdError::Validation {
+    tool_error(&WyrdError::Validation {
         message,
         details: json!({"rule": rule, "field": field, "value": value, "expected": expected}),
     })

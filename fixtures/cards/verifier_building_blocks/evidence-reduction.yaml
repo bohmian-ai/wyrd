@@ -1,0 +1,100 @@
+# Twenty refund notes read by one Agent step and one Agent check, either
+# directly with one fs.read per note or through one code.run program that
+# lists, reads, and searches them with call_tool and returns only the notes
+# over the limit. `mode` (DIRECT or CODE) selects the scripted model's path;
+# the notes reach the Agents only through their workspace.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: evidence-reduction
+  version: 1.0.0
+spec:
+  description: No refund note exceeds the refund limit.
+  inputs:
+    mode: {type: json, schema: {type: string}}
+    notes: {type: json, schema: {type: object}}
+  steps:
+    - id: over-limit
+      action:
+        kind: agent
+        agent:
+          execution_route: {kind: wyrd_gateway, deployment: openai}
+          tool_names: [fs.list, fs.read, fs.search, code.run]
+          run_config: {max_iterations: 2}
+          prompt:
+            provider: openai
+            model: gpt-4o
+            messages:
+              - role: user
+                content: "REDUCE-STEP: {{mode}}. Name the notes over the refund limit."
+            response_format:
+              type: object
+              properties: {hits: {type: array, items: {type: string}}}
+              required: [hits]
+              additionalProperties: false
+        inputs: {mode: inputs.mode}
+        workspace:
+          /inputs/notes/n01.json: inputs.notes.n01
+          /inputs/notes/n02.json: inputs.notes.n02
+          /inputs/notes/n03.json: inputs.notes.n03
+          /inputs/notes/n04.json: inputs.notes.n04
+          /inputs/notes/n05.json: inputs.notes.n05
+          /inputs/notes/n06.json: inputs.notes.n06
+          /inputs/notes/n07.json: inputs.notes.n07
+          /inputs/notes/n08.json: inputs.notes.n08
+          /inputs/notes/n09.json: inputs.notes.n09
+          /inputs/notes/n10.json: inputs.notes.n10
+          /inputs/notes/n11.json: inputs.notes.n11
+          /inputs/notes/n12.json: inputs.notes.n12
+          /inputs/notes/n13.json: inputs.notes.n13
+          /inputs/notes/n14.json: inputs.notes.n14
+          /inputs/notes/n15.json: inputs.notes.n15
+          /inputs/notes/n16.json: inputs.notes.n16
+          /inputs/notes/n17.json: inputs.notes.n17
+          /inputs/notes/n18.json: inputs.notes.n18
+          /inputs/notes/n19.json: inputs.notes.n19
+          /inputs/notes/n20.json: inputs.notes.n20
+  requirements:
+    - id: within-limit
+      statement: No refund note exceeds the refund limit
+      check:
+        kind: agent
+        agent:
+          execution_route: {kind: wyrd_gateway, deployment: openai}
+          tool_names: [fs.list, fs.read, fs.search, code.run]
+          run_config: {max_iterations: 2}
+          prompt:
+            provider: openai
+            model: gpt-4o
+            messages:
+              - role: user
+                content: "REDUCE-CHECK: {{mode}}. Judge whether every note is within the refund limit, citing each note over it."
+            response_format:
+              kind: verdict
+              data:
+                type: object
+                properties: {hits: {type: array, items: {type: string}}}
+                required: [hits]
+                additionalProperties: false
+        inputs: {mode: inputs.mode}
+        workspace:
+          /inputs/notes/n01.json: inputs.notes.n01
+          /inputs/notes/n02.json: inputs.notes.n02
+          /inputs/notes/n03.json: inputs.notes.n03
+          /inputs/notes/n04.json: inputs.notes.n04
+          /inputs/notes/n05.json: inputs.notes.n05
+          /inputs/notes/n06.json: inputs.notes.n06
+          /inputs/notes/n07.json: inputs.notes.n07
+          /inputs/notes/n08.json: inputs.notes.n08
+          /inputs/notes/n09.json: inputs.notes.n09
+          /inputs/notes/n10.json: inputs.notes.n10
+          /inputs/notes/n11.json: inputs.notes.n11
+          /inputs/notes/n12.json: inputs.notes.n12
+          /inputs/notes/n13.json: inputs.notes.n13
+          /inputs/notes/n14.json: inputs.notes.n14
+          /inputs/notes/n15.json: inputs.notes.n15
+          /inputs/notes/n16.json: inputs.notes.n16
+          /inputs/notes/n17.json: inputs.notes.n17
+          /inputs/notes/n18.json: inputs.notes.n18
+          /inputs/notes/n19.json: inputs.notes.n19
+          /inputs/notes/n20.json: inputs.notes.n20

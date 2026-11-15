@@ -941,6 +941,7 @@ impl VerifierRunner {
                     defer_unlanded_traces: run.attempt < run.max_attempts,
                     drift,
                     clock: telemetry.clock(),
+                    envelopes: telemetry.envelopes(),
                     execution: Some(Arc::clone(state)),
                     mode: ExecutionMode::Queued,
                     pull_request: match &run.input {

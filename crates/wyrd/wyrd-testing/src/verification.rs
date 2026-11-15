@@ -786,7 +786,12 @@ impl VerificationFixture {
                 }
             }
             backend
-                .path(&call, &workspace, &format!("/work/{name}"))
+                .path(
+                    &call,
+                    &workspace,
+                    &format!("/work/{name}"),
+                    &tokio_util::task::TaskTracker::new(),
+                )
                 .await
                 .map_err(|e| refused(&e))?;
         }

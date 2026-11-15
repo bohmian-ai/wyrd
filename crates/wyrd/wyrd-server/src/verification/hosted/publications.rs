@@ -33,7 +33,7 @@ use wyrd_storage::service::{StorageCaller, put_file};
 use wyrd_storage::tenant_path;
 
 use super::HostedLimits;
-use super::tools::{invocation, structured};
+use super::tools::invocation;
 use super::workspace::{Frozen, Workspace};
 use crate::components::auth::Caller;
 use crate::components::storage::inventory::ObjectInventory;
@@ -43,6 +43,7 @@ use crate::state::AppState;
 use crate::verification::state::{
     PublicationAcceptance, PublicationBudget, PublicationCall, PublicationLimit, RunState,
 };
+use vala_verify::blocks::tool_error;
 
 /// Audit operation of a `/work` publication's File decision.
 const FILES: &str = "verification.publication.files";
@@ -101,7 +102,7 @@ impl<'a> Publications<'a> {
             .map_err(|error| invocation(format!("the value cannot serialize: {error}")))?
             .len();
         if size > limit {
-            return Err(structured(&WyrdError::Validation {
+            return Err(tool_error(&WyrdError::Validation {
                 message: format!(
                     "the value is {size} bytes, over the {limit}-byte publication limit; \
                      write it to a /work file and publish its path"
@@ -121,7 +122,8 @@ impl<'a> Publications<'a> {
     /// verification File operation does, then return the stored receipt
     /// when this call already committed it, otherwise freeze it, complete
     /// every file as a verification File, then commit its manifest. An
-    /// interrupted or refused publication commits nothing.
+    /// interrupted or refused publication commits nothing. The freeze runs on
+    /// `work`, the attempt's tracked host work.
     ///
     /// # Errors
     /// Returns the [`WyrdError::PermissionDeniedRbac`] refusal before any
@@ -134,6 +136,7 @@ impl<'a> Publications<'a> {
         call: &PublishCall,
         workspace: &Arc<Workspace>,
         path: &str,
+        work: &tokio_util::task::TaskTracker,
     ) -> Result<PublicationKind, ToolError> {
         VerificationControl::new(self.state)
             .authorize_evidence(
@@ -141,7 +144,7 @@ impl<'a> Publications<'a> {
                 FILES,
                 &format!("publication:{}", call.name.as_str()),
             )
-            .map_err(|error| structured(&error))?;
+            .map_err(|error| tool_error(&error))?;
         let arguments = serde_json::json!({ "name": call.name, "path": path });
         let probe = PublicationContent::File {
             manifest: PublicationManifest {
@@ -152,7 +155,9 @@ impl<'a> Publications<'a> {
         if let Some(receipt) = self.receipt(call, &arguments, probe)? {
             return receipt;
         }
-        let (files, directories, directory) = match workspace.freeze(path).await? {
+        // The frozen copy stays charged until every file is retained.
+        let (frozen, _charge) = workspace.freeze(path, work).await?;
+        let (files, directories, directory) = match frozen {
             Frozen::File { name, bytes } => (vec![(name, bytes)], Vec::new(), false),
             Frozen::Directory { files, directories } => (files, directories, true),
         };
@@ -332,7 +337,7 @@ fn over_limit(message: String, field: &str, expected: String) -> ToolError {
         "bytes" => "publication_bytes",
         _ => "publication_size",
     };
-    structured(&WyrdError::Validation {
+    tool_error(&WyrdError::Validation {
         message,
         details: serde_json::json!({
             "rule": rule, "field": field, "expected": expected,
@@ -347,7 +352,7 @@ fn over_limit(message: String, field: &str, expected: String) -> ToolError {
 fn answer(call: &PublishCall, held: PublicationAcceptance) -> Result<PublicationKind, ToolError> {
     match held {
         PublicationAcceptance::Replayed(kind) => Ok(kind),
-        PublicationAcceptance::Conflict => Err(structured(&WyrdError::Validation {
+        PublicationAcceptance::Conflict => Err(tool_error(&WyrdError::Validation {
             message: format!(
                 "the name {} is already published in this attempt, or this call already \
                  published another name or value; publish under another name in a new call",

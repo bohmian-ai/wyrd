@@ -119,6 +119,24 @@ for features in '' cloud; do
   fi
 done
 
+# Benchmark recording exists only in bench builds: no production server,
+# client, or SDK graph enables wyrd-benchmark's `bench` feature, which alone
+# compiles its registry, recorder, observation state, and heap sampler.
+bench_free() {
+  if cargo tree --locked -e features,normal,build --prefix none "$@" |
+    rg -q '^wyrd-benchmark feature "bench"'; then
+    echo "FAIL: cargo tree $* enables wyrd-benchmark/bench in a production graph"
+    exit 1
+  fi
+}
+for features in '' cloud; do
+  bench_free -p wyrd-server --features "$features"
+done
+bench_free -p wyrd-client
+bench_free -p wyrd-ai
+bench_free -p wyrd-sdk-python --features python
+bench_free -p wyrd-sdk-ts
+
 # Inline secrets exist only under wyrd-spec's test-utils feature.
 cargo nextest run --locked -p wyrd-spec --no-default-features --features server \
   --test security_inline_gate

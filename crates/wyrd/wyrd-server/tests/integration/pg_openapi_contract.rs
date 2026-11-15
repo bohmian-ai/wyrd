@@ -1914,6 +1914,98 @@ async fn verification_contract_publishes_fourteen_typed_operations_and_the_local
     server.shutdown().await.expect("server shuts down");
 }
 
+/// The served verification details declare the code-mode tool records the
+/// Rust contract writes: every step and detailed requirement may carry
+/// `tool_calls` of the one `ToolCallRecord` component, which is optional so
+/// historical results without it still conform, while the compact
+/// requirement result carries none; each record may name its `recipient`,
+/// optional because a historical record without one was model-directed, as
+/// exactly `model` or `code`; and digest, bytes, and error keep their meaning.
+///
+/// # Panics
+/// Panics when the server fails to start or stop, or when a record field,
+/// its optionality, or its schema shape differs.
+#[tokio::test]
+async fn verification_tool_records_match_served_contract() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let schemas = &document["components"]["schemas"];
+    let required = |name: &str| -> BTreeSet<String> {
+        schemas[name]["required"]
+            .as_array()
+            .map(|required| {
+                required
+                    .iter()
+                    .filter_map(|field| field.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    assert!(
+        schemas["RequirementResult"]["properties"]
+            .get("tool_calls")
+            .is_none(),
+        "the compact requirement result omits tool calls"
+    );
+    for owner in ["StepResult", "RequirementDetails"] {
+        let schema = &schemas[owner];
+        let arms: Vec<&Value> = std::iter::once(schema)
+            .chain(schema["allOf"].as_array().into_iter().flatten())
+            .collect();
+        let calls = arms
+            .iter()
+            .map(|arm| &arm["properties"]["tool_calls"])
+            .find(|calls| !calls.is_null())
+            .unwrap_or(&Value::Null);
+        assert_eq!(calls["type"], "array", "{owner}: {calls}");
+        assert_eq!(
+            calls["items"]["$ref"], "#/components/schemas/ToolCallRecord",
+            "{owner}: {calls}"
+        );
+        assert!(
+            arms.iter()
+                .filter_map(|arm| arm["required"].as_array())
+                .flatten()
+                .all(|field| field != "tool_calls"),
+            "{owner}: a historical result without tool calls conforms"
+        );
+    }
+    let record = &schemas["ToolCallRecord"];
+    let fields: BTreeSet<&str> = record["properties"]
+        .as_object()
+        .expect("record properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        fields,
+        BTreeSet::from([
+            "arguments",
+            "error",
+            "output_sha256",
+            "recipient",
+            "returned_bytes",
+            "tool"
+        ]),
+        "{record}"
+    );
+    assert_eq!(
+        required("ToolCallRecord"),
+        BTreeSet::from(["arguments", "returned_bytes", "tool"].map(str::to_owned)),
+        "a historical record without a recipient conforms: {record}"
+    );
+    assert_eq!(
+        resolve_schema(&document, &record["properties"]["recipient"])["enum"],
+        serde_json::json!(["model", "code"]),
+        "{record}"
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}
+
 /// The served verification contract carries grouping end to end: both
 /// invocation bodies accept an optional `group_id`, execution state echoes
 /// it beside the owner and the pinned source snapshot, and a binding's status

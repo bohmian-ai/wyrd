@@ -2313,6 +2313,21 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: Value,
     },
+    /// An Agent step or check requested a tool after spending its whole
+    /// invocation allowance of direct and Python-originated tool requests.
+    #[error("[WYRD_VERIFICATION_422_TOOL_BUDGET_EXCEEDED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_422_TOOL_BUDGET_EXCEEDED",
+        status = 422,
+        title = "Verification tool budget exceeded",
+        remediation = "Make fewer tool calls per Agent step or check, for example by reducing evidence inside one code.run program, or raise WYRD_VERIFICATION_AGENT_TOOL_MAX_CALLS on the server."
+    )]
+    VerificationToolBudgetExceeded {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload naming the limit.
+        details: Value,
+    },
     /// A direct execution exceeded its 60-second deadline.
     #[error("[WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT] {message}")]
     #[wyrd_error(
@@ -4271,6 +4286,7 @@ impl WyrdError {
             | Self::VerificationApprovalNotFound { message, details }
             | Self::VerificationApprovalNotPending { message, details }
             | Self::VerificationDependencyFailed { message, details }
+            | Self::VerificationToolBudgetExceeded { message, details }
             | Self::VerificationExecutionTimedOut { message, details }
             | Self::VerificationStagingFull { message, details }
             | Self::SpecInvalidOperator { message, details }

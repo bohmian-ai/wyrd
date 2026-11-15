@@ -21,7 +21,10 @@ pub use agent::{
     AGENT_PHASE_DURATION_SECONDS, AgentCardResolver, AgentExecutor, EvidenceReader,
     PromptCardResolver, block_error,
 };
-pub use tools::{AgentToolset, ToolSession, provider_tool_name};
+pub use tools::{
+    AgentToolset, CodeTool, Delivery, ToolBridge, ToolCalls, ToolCallsOwner, ToolLimits,
+    ToolSession, hold_permit, provider_tool_name, tool_error,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
@@ -37,7 +40,7 @@ use wyrd_spec::card::verifier::{Action, Check, PathSegment};
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::verification::execution::{
     CallProvenance, InputDeclaration, InvocationSettlement, Producer, PublicationCollection,
-    RequirementDetail, ToolCallRecord, Verdict,
+    RequirementDetail, Verdict,
 };
 use wyrd_spec::verification::state::{ApprovalOccurrence, ControlRecord};
 use wyrd_spec::verification::{PublicationName, TaskId};
@@ -232,6 +235,12 @@ pub struct BlockCall<'a, B> {
     /// The zero-based repeat iteration this call serves, when its step
     /// repeats.
     pub iteration_index: Option<u32>,
+    /// A handle on the logical invocation's tool-call records, request
+    /// allowance, and host-work settlement, shared by every attempt of one
+    /// step; the engine keeps their [`ToolCallsOwner`], settles the work
+    /// before retrying or producing a result, and reads the records into the
+    /// result whatever the attempt returns.
+    pub tool_calls: ToolCalls,
 }
 
 impl<B> BlockCall<'_, B> {
@@ -255,8 +264,6 @@ pub struct ActionOutput {
     pub output: Value,
     /// What executed the action.
     pub provenance: Option<CallProvenance>,
-    /// Tools an Agent action called, in call order.
-    pub tool_calls: Vec<ToolCallRecord>,
 }
 
 /// The judgment one requirement check produced.
@@ -439,7 +446,7 @@ pub fn verdict_from(
 
 #[cfg(test)]
 mod tests {
-    //! Executor seam calls and the tool-record handoff into step results.
+    //! Executor seam calls and Verdict decoding.
 
     use std::sync::Arc;
     use std::time::Duration;
@@ -464,7 +471,6 @@ mod tests {
                 Some(CallValue::Json(value)) => Ok(ActionOutput {
                     output: Value::clone(value),
                     provenance: None,
-                    tool_calls: Vec::new(),
                 }),
                 _ => Err(BlockError::Terminal {
                     reason: "from is not JSON".to_owned(),
@@ -499,45 +505,10 @@ mod tests {
             attempt: 1,
             item_index: None,
             iteration_index: None,
+            tool_calls: ToolCallsOwner::default().handle(),
         };
         let output = executor.execute(call).await.expect("output");
         assert_eq!(output.output, json!({"slides": []}));
-    }
-
-    /// A tool record an action returns is the record a step result carries:
-    /// its digest and returned byte count survive the result wire round trip.
-    ///
-    /// # Panics
-    /// Panics when the step result does not round-trip the record unchanged.
-    #[test]
-    fn action_tool_calls_carry_into_step_results() {
-        use wyrd_spec::card::agent::BuiltinTool;
-        use wyrd_spec::verification::execution::{StepResult, StepStatus};
-        let record: ToolCallRecord = serde_json::from_value(json!({
-            "tool": "fs.read", "arguments": {"path": "/inputs/a.pdf"},
-            "output_sha256": "c".repeat(64), "returned_bytes": 512
-        }))
-        .expect("record");
-        let output = ActionOutput {
-            output: json!({"cap": 24}),
-            provenance: None,
-            tool_calls: vec![record.clone()],
-        };
-        let step = StepResult {
-            id: TaskId::new("findings").expect("id"),
-            status: StepStatus::Succeeded,
-            output: Some(output.output),
-            attempts: 1,
-            duration_ms: 5,
-            reason: None,
-            provenance: output.provenance,
-            tool_calls: output.tool_calls,
-        };
-        let wire = serde_json::to_value(&step).expect("serialize");
-        let parsed: StepResult = serde_json::from_value(wire).expect("deserialize");
-        assert_eq!(parsed.tool_calls, vec![record]);
-        assert_eq!(parsed.tool_calls[0].tool, BuiltinTool::FsRead);
-        assert_eq!(parsed.tool_calls[0].returned_bytes, 512);
     }
 
     /// A declared data schema keeps its own reference root once embedded in

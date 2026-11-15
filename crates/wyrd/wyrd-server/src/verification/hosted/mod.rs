@@ -7,9 +7,9 @@
 //! own: each execution composes them with its accepted authority and pinned
 //! evidence, and every limit comes from [`HostedLimits`].
 
-use monty_types::memory_limit_with_headroom;
 use std::time::Duration;
 
+pub mod admission;
 pub mod blocks;
 pub mod evidence;
 pub mod publications;
@@ -87,6 +87,12 @@ pub struct HostedLimits {
     pub work_write_max_bytes: u64,
     /// Largest serialized tool result, in bytes.
     pub tool_result_max_bytes: usize,
+    /// Largest compact JSON argument object of one direct or nested tool
+    /// call, `code.run` source included, in bytes.
+    pub tool_argument_max_bytes: usize,
+    /// Most direct and nested tool requests of one logical Agent
+    /// invocation, across its retries.
+    pub agent_tool_max_calls: u32,
     /// Most concurrently running direct `verify` executions per process;
     /// queued executions are bounded by the runtime's own execution slots.
     pub direct_executions: usize,
@@ -94,16 +100,14 @@ pub struct HostedLimits {
     pub direct: LaneLimits,
     /// Capacity reserved for queued executions, continuations included.
     pub queued: LaneLimits,
-    /// Prewarmed Python worker processes of each lane.
+    /// The share of the process queued executions run in.
+    pub queued_share: QueuedShare,
+    /// Python worker processes each lane prewarms when its memory holds
+    /// them; a target, not a floor, since idle workers are reaped under
+    /// pressure.
     pub monty_min_workers: usize,
     /// Monty allocation budget per Python operation, in bytes.
     pub monty_memory_bytes: u64,
-    /// Memory ceiling of one worker process, in bytes; must hold the
-    /// operation budget plus Monty's allocator headroom.
-    pub monty_process_memory_bytes: u64,
-    /// Combined memory ceiling of every live worker process of both lanes,
-    /// in bytes.
-    pub monty_pool_memory_bytes: u64,
     /// One complete Python operation, from checkout wait to result.
     pub code_timeout: Duration,
     /// Cumulative Python-operation time within one Agent invocation.
@@ -124,47 +128,60 @@ impl HostedLimits {
             extract_text_max_bytes: self.extract_text_max_bytes,
         }
     }
-
-    /// Whether one operation's allocator ceiling (budget plus Monty's
-    /// headroom) fits the worker process ceiling.
-    #[must_use]
-    pub fn worker_fits(&self) -> bool {
-        memory_limit_with_headroom(usize::try_from(self.monty_memory_bytes).ok(), false)
-            .and_then(|ceiling| u64::try_from(ceiling).ok())
-            .is_some_and(|ceiling| ceiling <= self.monty_process_memory_bytes)
-    }
-
-    /// Whether the live workers of both lanes, each counted at its process
-    /// ceiling, fit the pool ceiling together; a combined count too large to
-    /// represent never fits.
-    #[must_use]
-    pub fn lanes_fit(&self) -> bool {
-        self.direct
-            .python_workers
-            .checked_add(self.queued.python_workers)
-            .and_then(|workers| u64::try_from(workers).ok())
-            .and_then(|workers| workers.checked_mul(self.monty_process_memory_bytes))
-            .is_some_and(|total| total <= self.monty_pool_memory_bytes)
-    }
 }
 
-/// The admission capacity one execution lane owns alone.
+/// The model-call admission one execution lane owns alone.
 ///
-/// Direct and queued executions each hold a lane; neither borrows the
-/// other's free capacity, so a saturated queue cannot starve direct `verify`
-/// and direct traffic cannot take what queued work was given. Shared CPU,
-/// Postgres, gateway, and provider capacity are not partitioned.
+/// Direct and queued executions each hold a lane; neither takes the other's
+/// model-call permits, so a saturated queue cannot starve direct `verify`
+/// of gateway calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LaneLimits {
-    /// Most concurrent workspaces.
-    pub workspaces: usize,
-    /// Most live Python worker processes.
-    pub python_workers: usize,
-    /// Most Python operations waiting for a worker.
-    pub python_waiters: usize,
     /// Most concurrent gateway model calls; a further call waits for one to
     /// finish before it reaches gateway admission.
     pub model_calls: usize,
+}
+
+/// The share of the process plan reserved for queued executions, each as a
+/// percentage of the whole.
+///
+/// Queued engine, model-call, blocking, and nested tool work runs on its own
+/// runtime with `cpu_percent` of the effective CPUs as worker threads, and
+/// its Python turns hold at most as many runnable permits. Its workspaces,
+/// Python sessions, and execution state charge a reservation of
+/// `memory_percent` of process memory and `scratch_percent` of scratch, which
+/// nothing else can take and which it can never exceed. Direct executions
+/// charge what remains of the process ledgers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueuedShare {
+    /// Effective CPUs, at least one.
+    pub cpu_percent: u8,
+    /// Process memory.
+    pub memory_percent: u8,
+    /// Process scratch.
+    pub scratch_percent: u8,
+}
+
+impl QueuedShare {
+    /// The queued plan reserved from `process` at these percentages: at
+    /// least one CPU, rounding bytes down.
+    ///
+    /// # Errors
+    /// Returns [`ProcessResources::reserve`]'s refusal when `process` has
+    /// already promised more than the remaining bytes.
+    pub fn reserve(
+        self,
+        process: &wyrd_runtime::resources::ProcessResources,
+    ) -> Result<wyrd_runtime::resources::ProcessResources, wyrd_runtime::resources::LedgerRefusal>
+    {
+        let share = |whole: u64, percent: u8| whole / 100 * u64::from(percent);
+        let cpus = process.effective_cpu().get() * usize::from(self.cpu_percent) / 100;
+        process.reserve(
+            std::num::NonZeroUsize::new(cpus).unwrap_or(std::num::NonZeroUsize::MIN),
+            share(process.memory().limit(), self.memory_percent),
+            share(process.scratch().limit(), self.scratch_percent),
+        )
+    }
 }
 
 impl Default for HostedLimits {
@@ -184,23 +201,18 @@ impl Default for HostedLimits {
             scratch_max_bytes: 250 * MIB,
             work_write_max_bytes: 50 * MIB,
             tool_result_max_bytes: 64 * 1024,
+            tool_argument_max_bytes: 64 * 1024,
+            agent_tool_max_calls: 128,
             direct_executions: 256,
-            direct: LaneLimits {
-                workspaces: 16,
-                python_workers: 4,
-                python_waiters: 16,
-                model_calls: 256,
-            },
-            queued: LaneLimits {
-                workspaces: 48,
-                python_workers: 12,
-                python_waiters: 48,
-                model_calls: 256,
+            direct: LaneLimits { model_calls: 256 },
+            queued: LaneLimits { model_calls: 256 },
+            queued_share: QueuedShare {
+                cpu_percent: 50,
+                memory_percent: 25,
+                scratch_percent: 50,
             },
             monty_min_workers: 1,
             monty_memory_bytes: 256 * MIB,
-            monty_process_memory_bytes: 384 * MIB,
-            monty_pool_memory_bytes: 8192 * MIB,
             code_timeout: Duration::from_secs(10),
             agent_code_budget: Duration::from_secs(60),
             verify_timeout: Duration::from_secs(60),
@@ -208,71 +220,48 @@ impl Default for HostedLimits {
     }
 }
 
-/// Memory ceilings bound both lanes' live workers on every platform.
+/// The queued share reserves its percentages of the process plan.
 #[cfg(test)]
 mod tests {
-    use super::HostedLimits;
+    use std::num::NonZeroUsize;
 
-    /// The default lanes hold sixteen 384 MiB workers in an 8 GiB pool, 64
-    /// workspaces, and 64 waiters, with one prewarmed worker per lane; 256
-    /// direct executions and 256 model calls in each lane. Workers past the
-    /// pool, a combined worker count too large to represent, a pool below the
-    /// lanes, or a process ceiling below the allocator ceiling refuses.
+    use wyrd_runtime::resources::ProcessResources;
+
+    use super::{HostedLimits, QueuedShare};
+
+    /// Defaults give queued work half the CPUs, a quarter of memory, and half
+    /// of scratch; a single-CPU process still runs it on one CPU, and a share
+    /// the process has already promised is refused.
     ///
     /// # Panics
-    /// Panics when a lane default or a memory ceiling is ignored.
+    /// Panics when a percentage is misapplied or an overcommitted share is
+    /// accepted.
     #[test]
-    fn lanes_split_the_memory_ceilings() {
-        let limits = HostedLimits::default();
-        assert!(limits.worker_fits() && limits.lanes_fit());
+    fn queued_share_reserves_its_percentages() {
+        let share = HostedLimits::default().queued_share;
+        let process = ProcessResources::new(NonZeroUsize::new(8).expect("8"), 400, 200);
+        let queued = share.reserve(&process).expect("fits an idle process");
         assert_eq!(
             (
-                limits.direct.python_workers + limits.queued.python_workers,
-                limits.direct.workspaces + limits.queued.workspaces,
-                limits.direct.python_waiters + limits.queued.python_waiters,
-                2 * limits.monty_min_workers,
+                queued.effective_cpu().get(),
+                queued.memory().limit(),
+                queued.scratch().limit()
             ),
-            (16, 64, 64, 2)
+            (4, 100, 100)
         );
+        assert_eq!(process.memory().used(), 100);
+        let single = ProcessResources::new(NonZeroUsize::MIN, 400, 200);
         assert_eq!(
-            (
-                (limits.direct.python_workers, limits.queued.python_workers),
-                (limits.direct.python_waiters, limits.queued.python_waiters),
-                (limits.direct.workspaces, limits.queued.workspaces),
-                limits.monty_pool_memory_bytes,
-                limits.monty_min_workers,
-            ),
-            ((4, 12), (16, 48), (16, 48), 8192 * 1024 * 1024, 1)
+            share.reserve(&single).expect("fits").effective_cpu().get(),
+            1
         );
-        assert_eq!(
-            (
-                limits.direct_executions,
-                limits.direct.model_calls,
-                limits.queued.model_calls,
-            ),
-            (256, 256, 256)
-        );
-        let mut wider = limits;
-        wider.queued.python_workers += 6;
-        assert!(!wider.lanes_fit(), "twenty-two workers exceed 8 GiB");
-        wider.queued.python_workers = usize::MAX;
+        let full = QueuedShare {
+            memory_percent: 100,
+            ..share
+        };
         assert!(
-            !wider.lanes_fit(),
-            "an unrepresentable worker count refuses"
-        );
-        assert!(
-            !HostedLimits {
-                monty_pool_memory_bytes: limits.monty_process_memory_bytes,
-                ..limits
-            }
-            .lanes_fit()
-        );
-        assert!(
-            !HostedLimits {
-                monty_process_memory_bytes: limits.monty_memory_bytes,
-                ..limits
-            }
-            .worker_fits()
+            full.reserve(&process).is_err(),
+            "a quarter is already reserved"
         );
     }
 }

@@ -22,6 +22,15 @@
 //! `heap-<role>-<step>.pb.gz`, of the memory the steps so far allocated and
 //! of what they still hold.
 //!
+//! A Python or TypeScript client process the driver starts is captured by
+//! the same samply invocation under its own role. The workload starts it
+//! with its runtime's perf map (Python's `-X perf`, Node's
+//! `--perf-basic-prof`), from which samply names interpreted and JIT frames
+//! beside the native ones. Its heap captures come from the process itself,
+//! saved by the workload ([`crate::experiment::Workload::capture_clients`]):
+//! its runtime's managed-heap tool and, from a `bench` native module, the
+//! same shared sampler's pprof of the module's native allocations.
+//!
 //! A profile is diagnostic evidence only. A missing profiler, a capture that
 //! fails to start, exits early, or leaves no file yields a [`ProfileNote`]
 //! naming why; it never changes a measurement, a criterion, or a verdict, and

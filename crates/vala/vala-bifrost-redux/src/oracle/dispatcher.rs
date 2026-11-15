@@ -2290,6 +2290,7 @@ mod tests {
             },
             crate::resources::BifrostResourcePolicy {
                 roles: std::collections::BTreeSet::from([crate::resources::BifrostRole::Oracle]),
+                process_memory_limit_bytes: None,
                 server_memory_min_bytes: None,
                 bifrost_memory_limit_bytes: None,
                 scratch_limit_bytes: None,

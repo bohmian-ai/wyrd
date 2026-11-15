@@ -6504,6 +6504,11 @@ export interface RequirementDetails {
    * Owning step of a step requirement.
    */
   readonly step?: TaskId | null;
+  /**
+   * Tools an Agent check called, direct and nested, in start order;
+   * empty for every other check and for historical results.
+   */
+  readonly tool_calls?: readonly ToolCallRecord[];
 }
 
 /**
@@ -7665,12 +7670,12 @@ export type TimeUnit = "Second" | "Millisecond" | "Microsecond" | "Nanosecond";
 export type TokenAudience = "wyrd" | "bifrost";
 
 /**
- * One tool call an Agent action made.
+ * One tool call an Agent step or check made, directly or from its Python.
  *
- * Records what the model received, never the raw tool output: the digest
- * and size describe the bounded output actually returned. A call that
- * returned no output, such as one that failed, has no digest and zero
- * returned bytes rather than a digest of nothing.
+ * Records what its recipient received, never the raw tool output: the
+ * digest and size describe the bounded output actually delivered. A call
+ * that delivered no output, such as one that failed or was cancelled, has
+ * no digest and zero returned bytes rather than a digest of nothing.
  */
 export interface ToolCallRecord {
   /**
@@ -7678,16 +7683,23 @@ export interface ToolCallRecord {
    */
   readonly arguments: JsonValue;
   /**
-   * Error the tool returned, when it failed.
+   * Error the tool returned, when it failed or was cancelled.
    */
   readonly error?: string | null;
   /**
-   * SHA-256 of the bounded output returned to the model; absent when the
-   * call returned none.
+   * SHA-256 of the bounded output delivered to the recipient; absent
+   * when the call delivered none.
    */
   readonly output_sha256?: Sha256Hex | null;
   /**
-   * Bytes of output returned to the model; zero when it returned none.
+   * Where the output went, or would have gone: the model for a direct
+   * call, Python for a call `code.run` made. Absent on historical
+   * records, which were all direct.
+   */
+  readonly recipient: ToolRecipient;
+  /**
+   * Bytes of output delivered to the recipient; zero when it delivered
+   * none.
    */
   readonly returned_bytes: number;
   /**
@@ -7695,6 +7707,11 @@ export interface ToolCallRecord {
    */
   readonly tool: BuiltinTool;
 }
+
+/**
+ * Who receives a tool call's output.
+ */
+export type ToolRecipient = "model" | "code";
 
 /**
  * Torch interface metadata.

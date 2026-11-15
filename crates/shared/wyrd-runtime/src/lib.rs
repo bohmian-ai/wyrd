@@ -16,6 +16,7 @@ pub mod principal;
 pub mod redaction;
 pub mod request_context;
 pub mod request_id;
+pub mod resources;
 
 pub use permission::{
     Action, BifrostPermissionScope, BifrostSchemaScope, BifrostTableScope, Permission,

@@ -5,9 +5,11 @@
 //! uploads pass through unbuffered: their handlers stream them under
 //! `limits.audio_upload_bytes`. Verification execute, enqueue, and evidence
 //! requests and local storage uploads pass through too: their handlers read
-//! under their own contract bound (a local upload under its declared size). Uses bounded buffering: `to_bytes` reads
-//! the full body into memory up to `max_bytes + 1`; the worst-case process
-//! footprint is `max_bytes * concurrency`.
+//! under their own contract bound (a local upload under its declared size).
+//! Every other body is buffered up to `max_bytes + 1` and charged before it is
+//! buffered: Scribe OTLP bodies to Bifrost transport admission, the rest to the
+//! process memory ledger. A body the owner cannot hold is refused with `503`,
+//! and the charge returns when the handler does.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -17,9 +19,9 @@ use axum::body::Body;
 use axum::http::Request;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Collected, LengthLimitError, Limited};
+use http_body_util::{BodyExt, LengthLimitError, Limited};
 use tower::{Layer, Service};
-use vala_bifrost_redux::resources::BifrostResourceError;
+use wyrd_runtime::resources::{ByteCharge, ByteLedger};
 use wyrd_spec::error::WyrdError;
 
 use crate::http::error::WyrdErrorResponse;
@@ -33,6 +35,8 @@ pub struct WyrdBodyLimitLayer {
     scribe_max_bytes: Option<usize>,
     /// Process-root transport reservation owner used only by Scribe routes.
     admission: Option<vala_bifrost_redux::gate::limits::BifrostTransportAdmission>,
+    /// Process memory ledger every other buffered body is charged to.
+    memory: ByteLedger,
 }
 
 impl WyrdBodyLimitLayer {
@@ -42,11 +46,13 @@ impl WyrdBodyLimitLayer {
         max_bytes: usize,
         scribe_max_bytes: Option<usize>,
         admission: Option<vala_bifrost_redux::gate::limits::BifrostTransportAdmission>,
+        memory: ByteLedger,
     ) -> Self {
         Self {
             max_bytes,
             scribe_max_bytes,
             admission,
+            memory,
         }
     }
 }
@@ -60,6 +66,7 @@ impl<S> Layer<S> for WyrdBodyLimitLayer {
             max_bytes: self.max_bytes,
             scribe_max_bytes: self.scribe_max_bytes,
             admission: self.admission.clone(),
+            memory: self.memory.clone(),
         }
     }
 }
@@ -75,6 +82,8 @@ pub struct WyrdBodyLimitService<S> {
     scribe_max_bytes: Option<usize>,
     /// Process-root transport reservation owner used only by Scribe routes.
     admission: Option<vala_bifrost_redux::gate::limits::BifrostTransportAdmission>,
+    /// Process memory ledger every other buffered body is charged to.
+    memory: ByteLedger,
 }
 
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
@@ -128,6 +137,7 @@ where
             self.max_bytes
         };
         let admission = scribe_route.then(|| self.admission.clone()).flatten();
+        let memory = self.memory.clone();
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
@@ -154,40 +164,42 @@ where
 
             // A declared length is charged before a byte is buffered; an
             // undeclared body is charged frame by frame as it is buffered.
-            let transport_lease = match (&admission, declared_bytes) {
-                (Some(admission), Some(bytes)) => match admission.try_acquire(bytes) {
-                    Ok(lease) => Some(lease),
-                    Err(error) => return Ok(transport_occupied(&error)),
+            let mut charge = match admission {
+                Some(admission) => BodyCharge::Transport {
+                    admission,
+                    leases: Vec::new(),
                 },
-                _ => None,
+                None => BodyCharge::Memory(memory.empty_charge()),
             };
+            let mut charged = declared_bytes.unwrap_or(0);
+            if let Err(reason) = charge.try_add(charged) {
+                return Ok(occupied(&reason));
+            }
 
             // Collect body into memory, capping at max_bytes + 1 via Limited.
             // Using http_body_util::Limited directly lets us distinguish
             // length-limit failures from stream/IO failures by error type.
             let (parts, body) = request.into_parts();
             let mut limited = Limited::new(body, max_bytes + 1);
-            let mut frame_leases = Vec::new();
-            let collected = match (&admission, declared_bytes) {
-                (Some(admission), None) => {
-                    let mut buffered = Vec::new();
-                    loop {
-                        match limited.frame().await {
-                            None => break Ok(Bytes::from(buffered)),
-                            Some(Err(error)) => break Err(error),
-                            Some(Ok(frame)) => {
-                                if let Some(data) = frame.data_ref() {
-                                    match admission.try_acquire(data.len()) {
-                                        Ok(lease) => frame_leases.push(lease),
-                                        Err(error) => return Ok(transport_occupied(&error)),
-                                    }
-                                    buffered.extend_from_slice(data);
+            let mut frames = Vec::new();
+            let mut buffered = 0;
+            let collected = loop {
+                match limited.frame().await {
+                    None => break Ok(join(frames)),
+                    Some(Err(error)) => break Err(error),
+                    Some(Ok(frame)) => {
+                        if let Ok(data) = frame.into_data() {
+                            buffered += data.len();
+                            if buffered > charged {
+                                if let Err(reason) = charge.try_add(buffered - charged) {
+                                    return Ok(occupied(&reason));
                                 }
+                                charged = buffered;
                             }
+                            frames.push(data);
                         }
                     }
                 }
-                _ => limited.collect().await.map(Collected::to_bytes),
             };
             match collected {
                 Ok(bytes) => {
@@ -202,7 +214,7 @@ where
                     }
                     let request = Request::from_parts(parts, Body::from(bytes));
                     let response = inner.call(request).await.map_err(Into::into);
-                    drop((transport_lease, frame_leases));
+                    drop(charge);
                     response
                 }
                 Err(error) if error.is::<LengthLimitError>() => {
@@ -230,11 +242,64 @@ where
     }
 }
 
-/// Maps a refused transport charge to the typed occupied-capacity response.
-fn transport_occupied(error: &BifrostResourceError) -> Response {
+/// The memory a buffered request body holds until its handler returns.
+///
+/// Scribe routes charge Bifrost transport admission, which draws on the
+/// process memory ledger through the shared Bifrost cap; every other route
+/// charges the process memory ledger directly. Dropping it returns every
+/// byte, on success, error, or cancellation.
+enum BodyCharge {
+    /// Exact transport leases for a Scribe body.
+    Transport {
+        /// The shared transport admission owner.
+        admission: vala_bifrost_redux::gate::limits::BifrostTransportAdmission,
+        /// One lease per charged span of the body.
+        leases: Vec<vala_bifrost_redux::gate::limits::BifrostTransportLease>,
+    },
+    /// One growing process memory charge for any other body.
+    Memory(ByteCharge),
+}
+
+impl BodyCharge {
+    /// Charge `bytes` more of the body before they are buffered.
+    ///
+    /// # Errors
+    ///
+    /// Returns the owner's refusal reason when it cannot hold them.
+    fn try_add(&mut self, bytes: usize) -> Result<(), String> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        match self {
+            Self::Transport { admission, leases } => {
+                leases.push(
+                    admission
+                        .try_acquire(bytes)
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            Self::Memory(charge) => charge
+                .try_grow(u64::try_from(bytes).unwrap_or(u64::MAX))
+                .map_err(|refusal| refusal.to_string())?,
+        }
+        Ok(())
+    }
+}
+
+/// Joins buffered frames, passing a single frame on without a copy.
+fn join(mut frames: Vec<Bytes>) -> Bytes {
+    match frames.len() {
+        0 => Bytes::new(),
+        1 => frames.pop().unwrap_or_default(),
+        _ => Bytes::from(frames.concat()),
+    }
+}
+
+/// Maps a refused body charge to the typed occupied-capacity response.
+fn occupied(reason: &str) -> Response {
     let error = WyrdError::ServiceUnavailable {
         message: "request body capacity is occupied".to_owned(),
-        details: serde_json::json!({ "reason": error.to_string() }),
+        details: serde_json::json!({ "reason": reason }),
     };
     WyrdErrorResponse::from(error).into_response()
 }
@@ -244,8 +309,9 @@ pub fn wyrd_body_limit(
     max_bytes: usize,
     scribe_max_bytes: Option<usize>,
     admission: Option<vala_bifrost_redux::gate::limits::BifrostTransportAdmission>,
+    memory: ByteLedger,
 ) -> WyrdBodyLimitLayer {
-    WyrdBodyLimitLayer::new(max_bytes, scribe_max_bytes, admission)
+    WyrdBodyLimitLayer::new(max_bytes, scribe_max_bytes, admission, memory)
 }
 
 #[cfg(test)]
@@ -259,6 +325,11 @@ mod tests {
         BIFROST_INGEST_REQUEST_LIMIT_BYTES, BifrostTransportAdmission,
     };
 
+    /// A process memory ledger no test body can fill.
+    fn unbounded() -> ByteLedger {
+        ByteLedger::new(u64::MAX / 4)
+    }
+
     /// Server edge and tonic peers can share the same exact transport owner.
     ///
     /// # Panics
@@ -271,6 +342,7 @@ mod tests {
             1024,
             Some(BIFROST_INGEST_REQUEST_LIMIT_BYTES),
             Some(admission.clone()),
+            unbounded(),
         );
         assert_eq!(layer.max_bytes, 1024);
         let first = admission
@@ -306,6 +378,7 @@ mod tests {
                 1024,
                 Some(BIFROST_INGEST_REQUEST_LIMIT_BYTES),
                 Some(admission.clone()),
+                unbounded(),
             ))
             .service(service_fn(move |_request: Request<Body>| {
                 observed.store(true, Ordering::Release);
@@ -347,6 +420,7 @@ mod tests {
                 1024,
                 Some(BIFROST_INGEST_REQUEST_LIMIT_BYTES),
                 Some(admission.clone()),
+                unbounded(),
             ))
             .service(service_fn(move |_request: Request<Body>| {
                 observed.store(true, Ordering::Release);
@@ -408,6 +482,65 @@ mod tests {
         drop(occupants);
     }
 
+    /// A generic buffered body charges process memory while its handler
+    /// runs and returns the charge with the response; a declared or
+    /// undeclared body the ledger cannot hold is refused busy before the
+    /// handler runs.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a charge, refusal, or release differs from that.
+    #[tokio::test]
+    async fn generic_bodies_charge_process_memory() {
+        let memory = ByteLedger::new(64);
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&observed);
+        let ledger = memory.clone();
+        let service = ServiceBuilder::new()
+            .layer(wyrd_body_limit(1024, None, None, memory.clone()))
+            .service(service_fn(move |_request: Request<Body>| {
+                seen.lock().expect("observations").push(ledger.used());
+                async { Ok::<_, Infallible>(Response::new(Body::empty())) }
+            }));
+        let declared = |bytes: usize| {
+            Request::builder()
+                .uri("/v1/cards")
+                .header(axum::http::header::CONTENT_LENGTH, bytes.to_string())
+                .body(Body::from(vec![0_u8; bytes]))
+                .expect("declared request")
+        };
+        let undeclared = |bytes: usize| {
+            Request::builder()
+                .version(axum::http::Version::HTTP_2)
+                .uri("/v1/cards")
+                .body(Body::from(vec![0_u8; bytes]))
+                .expect("undeclared request")
+        };
+
+        for request in [declared(40), undeclared(40)] {
+            let response = service.clone().oneshot(request).await.expect("response");
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            assert_eq!(memory.used(), 0, "the response returns the charge");
+        }
+        assert_eq!(
+            *observed.lock().expect("observations"),
+            [40, 40],
+            "the handler runs while the body is charged"
+        );
+
+        let occupant = memory.try_charge(30).expect("occupant");
+        for request in [declared(40), undeclared(40)] {
+            let response = service.clone().oneshot(request).await.expect("response");
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            );
+            assert_eq!(memory.used(), 30, "a refused body charges nothing");
+        }
+        assert_eq!(observed.lock().expect("observations").len(), 2);
+        drop(occupant);
+    }
+
     /// Only the three mounted Scribe HTTP routes receive the selected encoded
     /// request limit; unrelated protected routes retain the general 413 floor.
     #[tokio::test]
@@ -420,6 +553,7 @@ mod tests {
                 16,
                 Some(BIFROST_INGEST_REQUEST_LIMIT_BYTES),
                 Some(admission),
+                unbounded(),
             ))
             .service(service_fn(move |_request: Request<Body>| {
                 observed.store(true, Ordering::Release);
@@ -462,7 +596,7 @@ mod tests {
     #[tokio::test]
     async fn audio_uploads_pass_the_body_limit_unbuffered() {
         let service = ServiceBuilder::new()
-            .layer(wyrd_body_limit(16, None, None))
+            .layer(wyrd_body_limit(16, None, None, unbounded()))
             .service(service_fn(|_request: Request<Body>| async {
                 Ok::<_, Infallible>(Response::new(Body::empty()))
             }));

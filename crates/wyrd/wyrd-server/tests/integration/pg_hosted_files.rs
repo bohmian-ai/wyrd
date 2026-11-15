@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use skald_spec::{MediaFormat, MediaSource};
 use vala_verify::blocks::{
     ActionExecutor, BlockCall, BlockError, CallInput, CallValue, EvidenceReader, Position,
+    ToolCallsOwner,
 };
 use wyrd_server::verification::hosted::HostedLimits;
 use wyrd_server::verification::hosted::evidence::TenantEvidence;
@@ -65,6 +66,7 @@ impl Uploads {
             self.server.state().clone(),
             user(self.server.data_tenant_id(), []),
             HostedLimits::default(),
+            wyrd_runtime::resources::ByteLedger::new(u64::MAX),
         )
     }
 }
@@ -95,7 +97,7 @@ async fn evidence_reads_only_matching_files() {
         .await
         .expect("the uploaded file reads");
     assert_eq!(
-        (bytes.as_slice(), format),
+        (bytes.bytes.as_slice(), format),
         (&b"%PDF-1.5 body"[..], MediaFormat::Pdf)
     );
 
@@ -220,6 +222,7 @@ async fn extract_action_returns_locked_shape() {
         attempt: 1,
         item_index: None,
         iteration_index: None,
+        tool_calls: ToolCallsOwner::default().handle(),
     };
     let output = ActionExecutor::execute(
         &evidence,

@@ -757,6 +757,7 @@ mod tests {
             }))
             .expect("assert check decodes"),
             provenance: None,
+            tool_calls: Vec::new(),
         };
         ExecutedOutcome {
             verdict: VerificationVerdict::Failed,

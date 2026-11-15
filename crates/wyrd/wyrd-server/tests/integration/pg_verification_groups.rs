@@ -615,6 +615,7 @@ fn recorded(result: &VerificationResult) -> ExecutedOutcome {
                 result: requirement.clone(),
                 check: check.clone(),
                 provenance: None,
+                tool_calls: Vec::new(),
             })
             .collect(),
         steps: Vec::new(),

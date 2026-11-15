@@ -226,11 +226,19 @@ impl VerificationControl<'_> {
         // An Artifact is resolved under the publisher's authority and
         // admitted against each slot here, before anything is accepted.
         let artifacts = match &request.value {
-            InputDeclaration::Artifact { .. } => Some(TenantEvidence::new(
-                self.state.clone(),
-                caller.clone(),
-                *self.blocks()?.limits(),
-            )),
+            InputDeclaration::Artifact { .. } => {
+                let blocks = self.blocks()?;
+                // A request-path admission, charged to direct capacity.
+                Some(TenantEvidence::new(
+                    self.state.clone(),
+                    caller.clone(),
+                    *blocks.limits(),
+                    blocks
+                        .resources(crate::verification::telemetry::ExecutionMode::Direct)
+                        .memory()
+                        .clone(),
+                ))
+            }
             _ => None,
         };
         let (mut kept, mut refused) = (BTreeSet::new(), None);

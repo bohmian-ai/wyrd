@@ -34,7 +34,6 @@ mod levels;
 mod query;
 mod verification;
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -47,52 +46,7 @@ use crate::levels::{Context, Plan};
 /// or `both` starts it, so the driver's heap profiles follow the server's
 /// sampling contract.
 #[global_allocator]
-static GLOBAL: SampledSystem = SampledSystem;
-
-/// [`System`] plus the heap sampler's allocation and free hooks.
-struct SampledSystem;
-
-// SAFETY: every method forwards its arguments unchanged to `System` and
-// returns what `System` returned. No pointer is fabricated, aliased or freed
-// here, so this upholds exactly the invariants `System` upholds.
-#[expect(
-    unsafe_code,
-    reason = "a global allocator is unsafe; the sampling it adds is safe"
-)]
-unsafe impl GlobalAlloc for SampledSystem {
-    /// Allocates `layout` from the system and reports it.
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: `layout` comes from the caller and is forwarded unchanged.
-        let ptr = unsafe { System.alloc(layout) };
-        wyrd_benchmark::heap::allocated(ptr, layout.size());
-        ptr
-    }
-
-    /// Reports the free, then returns `ptr` to the system.
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        wyrd_benchmark::heap::freed(ptr);
-        // SAFETY: `ptr` came from our `alloc`/`realloc` with this same `layout`.
-        unsafe { System.dealloc(ptr, layout) };
-    }
-
-    /// Takes the system's pre-zeroed allocation and reports it.
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: `layout` comes from the caller and is forwarded unchanged.
-        let ptr = unsafe { System.alloc_zeroed(layout) };
-        wyrd_benchmark::heap::allocated(ptr, layout.size());
-        ptr
-    }
-
-    /// Reports the old block freed and the resized block allocated.
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        wyrd_benchmark::heap::freed(ptr);
-        // SAFETY: `ptr`/`layout` describe a live block from this allocator, and
-        // `new_size` is the caller's — all forwarded unchanged.
-        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
-        wyrd_benchmark::heap::allocated(new_ptr, new_size);
-        new_ptr
-    }
-}
+static GLOBAL: wyrd_benchmark::heap::SampledSystem = wyrd_benchmark::heap::SampledSystem;
 
 /// Where `results` writes the results page, under the repository root.
 const RESULTS: &str = "target/benchmarks/results.html";
@@ -905,19 +859,28 @@ mod tests {
             verification.refusals()
         );
         assert_eq!(verification.timing, timing);
-        assert_eq!(
-            steps(&verification, true),
-            sweep("direct-verify", "-", &verification::CLIENTS)
-        );
+        let languages: Vec<String> = ["", "python-", "typescript-"]
+            .iter()
+            .flat_map(|language| {
+                let mut steps = sweep(
+                    &format!("direct-verify-{language}"),
+                    "",
+                    &verification::CLIENTS,
+                );
+                steps.push(format!(
+                    "direct-verify-{language}r{}",
+                    verification::PACED_RATE
+                ));
+                steps
+            })
+            .collect();
+        assert_eq!(steps(&verification, true), languages);
         assert_eq!(
             applies(&verification, "overhead-p99"),
             ["direct-verify-c64"]
         );
-        assert_eq!(
-            applies(&verification, "no-errors"),
-            sweep("direct-verify", "-", &verification::CLIENTS)
-        );
-        assert_eq!(applies(&verification, "correct-verdicts").len(), 2);
+        assert_eq!(applies(&verification, "no-errors"), languages);
+        assert_eq!(applies(&verification, "correct-verdicts"), languages);
         for metric in [
             "verifications_per_s_per_vcpu",
             "verifications_per_cpu_s",
@@ -2276,6 +2239,18 @@ mod tests {
             &["completed", "cancelled"],
         ),
         ("verification.direct.outside", &["completed", "cancelled"]),
+        (
+            "verification.direct.outside.before",
+            &["completed", "cancelled"],
+        ),
+        (
+            "verification.direct.outside.between",
+            &["completed", "cancelled"],
+        ),
+        (
+            "verification.direct.outside.after",
+            &["completed", "cancelled"],
+        ),
     ];
 
     /// Every Gateway call outcome (`wyrd_gateway::outcome_name`).

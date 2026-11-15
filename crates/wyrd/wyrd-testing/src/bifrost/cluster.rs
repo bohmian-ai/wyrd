@@ -3012,18 +3012,9 @@ mod tests {
             .expect("restarted resource snapshot");
         assert_eq!(restarted_resources.plan, original_resources.plan);
         assert_eq!(restarted_resources.scribe_memory_used_bytes, 0);
-        // The footer and byte-range caches' whole budgets are charged once at
-        // composition, so a fresh node holds exactly those and nothing a query
-        // left behind.
-        let policy = server
-            .state()
-            .bifrost_storage()
-            .expect("restarted storage owner")
-            .policy();
-        assert_eq!(
-            u64::try_from(restarted_resources.governed_memory_used_bytes).expect("fits u64"),
-            policy.metadata_cache_bytes() + policy.data_cache_bytes()
-        );
+        // The footer and byte-range caches charge only the entries they hold,
+        // so a fresh node's empty caches withhold nothing.
+        assert_eq!(restarted_resources.governed_memory_used_bytes, 0);
         assert!(!restarted_resources.oracle_query_active);
         cluster.shutdown().await.expect("cluster shuts down");
     }

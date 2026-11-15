@@ -2337,6 +2337,7 @@ mod tests {
                 }))
                 .expect("assert check decodes"),
                 provenance: None,
+                tool_calls: Vec::new(),
             }],
             steps: Vec::new(),
             evidence: std::collections::BTreeMap::new(),
@@ -2691,6 +2692,7 @@ mod tests {
             }))
             .expect("assert check decodes"),
             provenance: None,
+            tool_calls: Vec::new(),
         };
         let mut state = wyrd_spec::verification::state::ExecutionState::fresh();
         state

@@ -572,6 +572,7 @@ fn failing_script(runs: usize) -> EngineScript {
             }))
             .expect("drift check decodes"),
             provenance: None,
+            tool_calls: Vec::new(),
         }],
         steps: Vec::new(),
         evidence: BTreeMap::new(),

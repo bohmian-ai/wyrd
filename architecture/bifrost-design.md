@@ -814,9 +814,10 @@ Each shard rotates its WAL and memtable together when the WAL reaches
 `WYRD_MAX_FILE_SIZE_IN_MEMORY` (MiB), or the generation reaches
 `WYRD_MAX_FILE_RETENTION_TIME` (seconds). Each trigger reads its own counter;
 no byte is charged to two triggers. WAL disk is provisioned rather than
-tracked: there is no global disk ledger, and an out-of-space write surfaces as
+tracked: WAL and Scribe staging are durable, not disposable scratch, and
+charge no process scratch ledger, and an out-of-space write surfaces as
 retryable `507` pressure. Memory stays under the global admission governor
-because it competes with queries.
+because it competes with queries and hosted verification.
 
 Shard owners, reconciliation, staging, assembly, and persistence run on one
 dedicated Scribe Tokio runtime separated from request serving. One non-cloneable
@@ -832,7 +833,13 @@ complete lifecycle vector fits. Idle capacity is work-conserving. Under
 contention, equal tenant and table soft shares stop an over-share incumbent
 from reacquiring capacity while acknowledged ownership drains. Bounded,
 expiring identity-only demand determines which waiting table receives released
-capacity; it reserves no bytes or slots.
+capacity; it reserves no bytes or slots. Scribe's bytes are charged to the
+shared Bifrost root, whose growth is charged to the process memory ledger
+([Admission and memory](#admission-and-memory)). When capabilities outside
+Bifrost hold the process memory a write needs, Scribe refuses it with
+retryable pressure (`bifrost_scribe_rejections_total{reason="process_memory"}`)
+instead of sealing, because a pressure seal cannot relieve memory Scribe
+does not hold.
 
 Admission completes before WAL or mailbox mutation. It either accepts
 immediately or returns typed retryable pressure. Already acknowledged ownership
@@ -1183,10 +1190,10 @@ admission window rather than replay state. A compromised cluster member is out
 of scope. Claims and body digests are verified before lazy plan decode, task
 cache lookup, provider creation, or source IO. Every worker replaces its
 process runtime with the exact query-admitted `RuntimeEnv`, `MemoryPool`, spill
-share, cancellation token, and deadline.
+cap, cancellation token, and deadline.
 
 A follower never outlives its leader. The leader's stream owns every grant a
-follower holds for its graph: slot unit, memory, scratch share, query runtime
+follower holds for its graph: slot unit, memory, spill charges, query runtime
 and spill directory, task cache entries, and structured tasks. A follower
 takes no capacity before it accepts that stream. It admits the graph when it
 accepts the leader's stream, beneath its own local capacity root, or refuses
@@ -1201,11 +1208,12 @@ timer to reclaim it.
 Exchange buffers draw from the same finite query-owned memory pool as the
 operators; they are not precharged into a predicted child allocation. Before
 dispatch, Oracle enforces its configured selected-worker limit, admitted
-tasks/partitions, Wyrd-owned admission queue and slots, and scratch allocation
-with checked count/range arithmetic. Dependency-owned exchange queues retain
+tasks/partitions, and Wyrd-owned admission queue and slots with checked
+count/range arithmetic. Dependency-owned exchange queues retain
 their pinned byte backpressure without a Wyrd item-count guarantee. Oracle does
 not claim to predict every dependency allocation or transient encoded-message
-byte. Follower spill is charged to the same query-owned scratch allocation.
+byte. Follower spill is capped by the follower's own query runtime and
+charged to its node's process scratch ledger.
 Memory-pool, transport, or scratch exhaustion is typed and releases all memory,
 scratch, slot, task, cache, and transport owners exactly once when the graph
 ends, without waiting for nested children still being torn down: a late
@@ -1270,34 +1278,39 @@ Slots admit; the actual grant sizes only the execution memory ceiling. A slot
 unit represents the 32 MiB working set used to derive local capacity; it is not
 itself charged as resident query memory. Concurrency is governed by slot units,
 actual cooperative reservation by the shared memory root, and spill by the
-separately leased scratch share. Every query charges exactly one unit on each
+bytes actually written, capped per query and charged to the process scratch
+ledger. Every query charges exactly one unit on each
 node it runs on, whatever its class: an Interactive query on its leader, and an
 Analytical query on its leader and on every participant whose leader stream it
 has accepted. The class decides only which capacity rules apply, never the
 charge, and a participant's charge therefore carries no demand of its own. A query-local memory ceiling
-is derived once at admission:
+and a per-query spill cap are derived once at admission:
 
 ```text
 grant = clamp(bifrost_budget / 2, 256 MiB, bifrost_budget)
-spill_share = scratch_limit / 2
+spill_cap = scratch_limit / 2
 ```
 
-The grant is not divided by concurrent load: concurrent queries compete in the
-shared root, which refuses growth once they fill it. It is a non-reserved
-per-query ceiling held for the query lifetime and never recomputed under
-running operators. Every leader
+Neither is divided by concurrent load: concurrent queries compete in the
+shared root, which refuses growth once they fill it, and in the process
+scratch ledger. Both are non-reserved per-query ceilings held for the query
+lifetime and never recomputed under running operators; an idle or unspilled
+query holds neither memory nor disk. Every leader
 and follower query receives a private view over one process-wide Oracle memory
 root, never an independently sized pool: the view refuses growth past that
 query's own ceiling, and the root's single tracked spill-fair pool, bounded by
 the shared Bifrost memory cap that Scribe, Forge, and in-flight transport also
 charge, arbitrates what all live queries hold together. No role holds a fixed
-share or a precharge, with one exception: when an Oracle-serving node sets up
-`DataFusion`'s Parquet footer cache and its Parquet byte-range cache at
-composition, it charges each cache's whole budget, `metadata_cache_bytes` and
-`data_cache_bytes`, to the Oracle memory root and holds it for the storage
-owner's life, because neither cache reports a per-entry charge; a zero budget
-sets up no cache and charges nothing. Each budget defaults to a twentieth of
-managed memory within 32 MiB..512 MiB and may never exceed an eighth of it.
+share or a precharge. An Oracle-serving node's Parquet footer cache and
+Parquet byte-range cache have byte ceilings, `metadata_cache_bytes` and
+`data_cache_bytes`, not reservations: each cached entry is charged to the
+Oracle memory root at its retained size while anyone holds it, so an empty
+cache withholds nothing, and an evicted footer or range a scan still holds
+stays charged until its last reference drops. An entry the root cannot cover
+is not cached, so cache growth never displaces active work. A zero ceiling
+sets up no cache. Each ceiling defaults to a twentieth of managed memory
+within 32 MiB..512 MiB; an explicit one lies within 1 MiB..1 GiB, and
+neither may exceed an eighth of managed memory.
 
 The byte-range cache keeps the exact byte ranges Oracle scans read from
 warehouse objects, which are written once under unique names and never
@@ -1305,42 +1318,65 @@ rewritten, so a cached range never goes stale; staged scratch objects are read
 uncached. A scan answered from the cache still counts the bytes in
 `bytes_scanned`, and before its first cached range of an object it confirms the
 object exists, so a pinned object that vanished still fails the attempt as a
-stale object rather than being answered from memory. Apart from that standing
-charge an idle role holds nothing, and every charge returns when its owner
-ends. Aggregate governed reservations therefore cannot sum above
+stale object rather than being answered from memory. An idle role holds
+nothing, and every charge returns when its owner ends. Aggregate governed reservations therefore cannot sum above
 the Bifrost cap.
 
-The cap comes from the detected process or pod memory limit. `wyrd-server`
-keeps at least 1 GiB of that limit outside governed Bifrost memory
-(`WYRD_SERVER_MEMORY_MIN_BYTES` raises the minimum); the cap defaults to the
-limit less that minimum, and `WYRD_BIFROST_MEMORY_LIMIT_BYTES` may only lower
-it. The minimum is accounting headroom, not preallocated memory and not a
-ceiling on other server work. A plan that cannot leave both the minimum and a
-positive Bifrost cap fails boot, so an 8-GiB pod defaults to a 7-GiB cap.
-Every Wyrd pod has at least 4 GiB of memory; boot refuses a detected limit
-below that floor, so the smallest supported pod has a 3-GiB cap and a
-1.5-GiB query grant.
+The cap composes under the process plan. Process memory is the host's
+physical memory as `sysinfo` reports it, the same way on every platform, and
+`WYRD_BIFROST_PROCESS_MEMORY_LIMIT_BYTES` may only lower it. `wyrd-server`
+keeps at least 1 GiB of that limit outside the process memory ledger
+(`WYRD_SERVER_MEMORY_MIN_BYTES` raises the minimum): the baseline for
+server and dependency allocations no ledger tracks, accounting headroom
+rather than preallocated memory. The process memory ledger is the limit less
+that minimum, and hosted verification and buffered request bodies charge the
+same ledger
+([Agents, tools, and workspaces](wyrd-design.md#agents-tools-and-workspaces)).
+The Bifrost cap defaults to the whole ledger, and
+`WYRD_BIFROST_MEMORY_LIMIT_BYTES` may only lower it. Governed Bifrost growth
+is charged to the ledger as it happens, so memory one capability does not
+hold is usable by the others; growth past what they leave free is refused
+like growth past the cap. A plan that cannot leave both the minimum and a
+positive Bifrost cap fails boot, so an 8-GiB host defaults to a 7-GiB ledger
+and cap. Every Wyrd pod has at least 4 GiB of memory; boot refuses a memory
+budget, detected host memory lowered by any process ceiling, below that floor, so the smallest supported pod has a 3-GiB cap
+and a 1.5-GiB query grant.
 
 Each process resolves one immutable resource configuration at startup, before
 any consumer starts, from its own observed CPU, memory, and scratch, never a
-peer's. `WYRD_BIFROST_EFFECTIVE_CPU` may only lower the observed CPU `C`.
-Scribe, Oracle, Forge, storage, and transport size themselves from that
-configuration or a capability derived from it; none probes the host. Omitted Scribe coordination, ingress, and persistence worker
+peer's. CPU `C` is `std::thread::available_parallelism`, and
+`WYRD_BIFROST_EFFECTIVE_CPU` may only lower it. Scratch is the data-root
+filesystem's available space less a 256 MiB free-space floor, and
+`WYRD_BIFROST_SCRATCH_LIMIT_BYTES` may only lower it; Oracle spill, Forge
+spill, and hosted verification workspaces all live on that filesystem and
+charge its one process scratch ledger. A ceiling above its observation
+leaves the observation. An unavailable observation, a zero ceiling,
+overflow, or a plan that cannot fit its baseline fails readiness; nothing
+guesses capacity. Processes sharing a host
+or filesystem must each be given non-overlapping memory and scratch ceilings:
+host memory and free space cannot assign disjoint budgets, and no process
+coordinates its plan with another. Scribe, Oracle, Forge, storage, transport,
+and hosted verification size themselves from that configuration or a
+capability derived from it; none probes the host. Omitted Scribe coordination, ingress, and persistence worker
 counts derive from `C` (`B = max(C - 2, 2)`: ingress `max(B / 3, 1)`,
 persistence `max(B - ingress, 1)`, coordination `max(C, 2)`); an explicit
 worker count keeps its value. The process Scribe outbox does not scale with
 `C`: it runs four slice writers and four ordered lanes per tenant, with eight
 concurrent frame deliveries per writer and 32 across the process. Queue capacities, database pools,
 WAL IO, and Scribe shard counts do not scale with `C` either. Startup logs the resolved
-configuration, its sources, explicit overrides, and queue limits. Usage and
-pressure counters stay live; only the configuration is fixed.
+configuration, its sources, explicit overrides, and queue limits, and
+`wyrd_process_resource_plan{resource}` publishes effective CPU, memory limit,
+managed memory, and scratch limit. Usage and pressure counters stay live;
+only the configuration is fixed. CPU has no ledger: the operating system
+shares it, Oracle slots and Scribe and Forge worker counts keep their own
+CPU-derived bounds, and only hosted Python turns are bounded by `C`.
 
 Only fallible cooperative reservation is hard-limited. Growth DataFusion does
 not let fail is still real memory, so it is charged to an explicit process
-headroom counter that makes later fallible growth refuse sooner. Dependency
-allocations outside cooperative reservation fall in the server minimum; the
-pool is the Bifrost safety boundary, not a guarantee against operating-system
-or cgroup OOM.
+headroom counter and to the process memory ledger, which makes later fallible
+growth refuse sooner. Dependency allocations outside cooperative reservation
+fall in the server minimum; the pool is the Bifrost safety boundary, not a
+guarantee against operating-system OOM.
 
 Query parallelism comes from CPU and scanned bytes, not memory. The node's
 effective CPU and the pinned input's locality cap it:
@@ -1388,17 +1424,23 @@ partition, and each row group is read exactly once.
 
 Operators and exchange consumers share that issued query ceiling without
 separate sublimits. Admission refuses before dispatch when checked graph counts
-or scratch demand exceed their finite configured limits. Allocation or
+exceed their finite configured limits. Allocation or
 transport refusal after admission is a typed query-resource failure and
 cancels the full query; it never borrows from another query's ceiling. A
-refusal names the requesting consumer and the pod's largest holders. Scratch
-space is separately reserved because spill consumes real disk.
+refusal names the requesting consumer and the pod's largest holders. Spill
+is charged separately because it consumes real disk.
 
 Every session that can spill, whether the leader, a leader-local live
 fragment, or a remote Oracle follower, spills only into its node's governed
-Oracle spill directory under its query's spill share; the leader and its live
-fragments share one runtime and therefore one share. A Scribe follower owns no
-Oracle spill directory and runs with spill disabled. Spill merges keep
+Oracle spill directory under its query's spill cap; the leader and its live
+fragments share one runtime and therefore one cap. Each byte is charged to
+the process scratch ledger before it is written, so Oracle, Forge, and hosted
+scratch together never exceed the scratch limit, and a write the ledger
+refuses fails the spill rather than the disk. A spill file's charge returns
+only after the file is deleted; a file that survives deletion stays charged
+for the process's life, and the next boot's prefix cleanup removes it. A
+Scribe follower owns no Oracle spill directory and runs with spill
+disabled. Spill merges keep
 `DataFusion`'s default fan-in: the per-query memory limit is the only memory
 bound, and a sort or merge that needs more non-spillable memory than that
 limit fails the query with the typed `QueryResourcesExhausted` error. Oracle
@@ -1693,8 +1735,12 @@ Each rewrite attempt runs `DataFusion` over a fresh view of the shared Bifrost
 memory root, so its reservations are charged against the same cap Scribe,
 Oracle, and transport charge, and return when the attempt's context drops.
 Spillable operators spill beneath the data root's `forge-spill` directory,
-which boot clears of stale files. A refused fallible growth fails only that
-attempt: nothing partial is published, and the durable task retries through
+which boot clears of stale files, under `DataFusion`'s default per-attempt
+spill cap. Each written byte is charged to the process scratch ledger Oracle
+spill and hosted workspaces share, exactly as Oracle spill is
+([Admission and memory](#admission-and-memory)), and returns when the
+attempt's files are deleted. A refused fallible growth or spill write fails
+only that attempt: nothing partial is published, and the durable task retries through
 its ordinary bounded backoff once memory is free. One plan executes within one
 worker; Forge does not split a compaction plan across pods.
 
@@ -1852,6 +1898,14 @@ use age.
   instead provide finite byte backpressure when Wyrd cannot configure its item
   count; architecture must name that exception rather than claim ownership it
   does not have.
+- One process plan bounds memory and disposable scratch for every capability
+  in the process. The Bifrost root's growth, Oracle and Forge spill bytes, and
+  cached entries are charges on the process memory and scratch ledgers that
+  hosted verification and request buffering also charge, so no byte is
+  promised twice and no capability holds an idle share beyond the server
+  minimum. A charge returns only when its owner has settled the bytes: a cache
+  entry when its last reference drops, a spill file when it is deleted. Pressure
+  and accounting are portable and read no cgroup or other platform interface.
 - Global resource owners account tenant and table attribution without creating
   an independent root pool per tenant.
 - Cancellation is structured: stop admission, cancel descendants, reconcile

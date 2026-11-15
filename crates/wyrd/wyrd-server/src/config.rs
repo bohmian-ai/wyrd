@@ -1152,6 +1152,7 @@ impl BifrostRuntimeConfig {
         let resources = &self.resources;
         vala_bifrost_redux::resources::BifrostResourcePolicy {
             roles,
+            process_memory_limit_bytes: resources.process_memory_limit_bytes,
             server_memory_min_bytes: resources.server_memory_min_bytes,
             bifrost_memory_limit_bytes: resources.memory_limit_bytes,
             scratch_limit_bytes: resources.scratch_limit_bytes,
@@ -1403,6 +1404,16 @@ impl BifrostStorageIoConfig {
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BifrostResourceConfig {
+    /// Optional ceiling on this process's memory, below detected host memory.
+    ///
+    /// Every capability's memory comes from one process ledger: this value
+    /// less [`Self::server_memory_min_bytes`]. Processes sharing a host or a
+    /// container allocation must each set a non-overlapping ceiling, because
+    /// host memory cannot assign them disjoint budgets. A value may only
+    /// lower the detected host memory.
+    /// `WYRD_BIFROST_PROCESS_MEMORY_LIMIT_BYTES` overrides it.
+    #[serde(default)]
+    pub process_memory_limit_bytes: Option<usize>,
     /// Optional lower cap on the one shared Bifrost memory budget.
     ///
     /// Unset, the cap is the detected process memory limit less
@@ -1420,7 +1431,7 @@ pub struct BifrostResourceConfig {
     /// Optional disposable scratch cap; filesystem availability may be tighter.
     #[serde(default)]
     pub scratch_limit_bytes: Option<u64>,
-    /// Optional effective CPU cap; process/cgroup affinity may be tighter.
+    /// Optional effective CPU cap; available parallelism may be tighter.
     #[serde(default)]
     pub effective_cpu: Option<usize>,
     /// Optional Oracle query slot-unit concurrency limit for this node.
@@ -1749,11 +1760,21 @@ pub struct VerificationConfig {
     /// `WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS` overrides it.
     #[serde(default)]
     pub execution_timeout_ms: Option<u64>,
-    /// What every Python worker process of both lanes together is counted
-    /// against at startup, in mebibytes; unset keeps the default.
-    /// `WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB` overrides it.
+    /// Percent of effective CPUs queued executions run on, from 1 to 99;
+    /// unset keeps the default. `WYRD_VERIFICATION_QUEUED_CPU_PERCENT`
+    /// overrides it.
     #[serde(default)]
-    pub monty_pool_memory_mib: Option<u64>,
+    pub queued_cpu_percent: Option<usize>,
+    /// Percent of process memory reserved for queued executions, from 1 to
+    /// 99; unset keeps the default. `WYRD_VERIFICATION_QUEUED_MEMORY_PERCENT`
+    /// overrides it.
+    #[serde(default)]
+    pub queued_memory_percent: Option<usize>,
+    /// Percent of process scratch reserved for queued executions, from 1 to
+    /// 99; unset keeps the default.
+    /// `WYRD_VERIFICATION_QUEUED_SCRATCH_PERCENT` overrides it.
+    #[serde(default)]
+    pub queued_scratch_percent: Option<usize>,
     /// Capacity `verify` calls hold apart from queued executions.
     /// `WYRD_VERIFICATION_DIRECT_*` overrides each value.
     #[serde(default)]
@@ -1777,15 +1798,6 @@ pub struct VerificationConfig {
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerificationLaneConfig {
-    /// Workspaces the lane holds open at once.
-    #[serde(default)]
-    pub workspaces: Option<usize>,
-    /// Python workers alive at once for the lane.
-    #[serde(default)]
-    pub python_workers: Option<usize>,
-    /// Python operations of the lane waiting for a worker.
-    #[serde(default)]
-    pub python_waiters: Option<usize>,
     /// Gateway model calls the lane makes at once.
     #[serde(default)]
     pub model_calls: Option<usize>,
@@ -1805,7 +1817,9 @@ impl Default for VerificationConfig {
             direct_executions: None,
             queued_executions: None,
             execution_timeout_ms: None,
-            monty_pool_memory_mib: None,
+            queued_cpu_percent: None,
+            queued_memory_percent: None,
+            queued_scratch_percent: None,
             direct: VerificationLaneConfig::default(),
             queued: VerificationLaneConfig::default(),
             limits: HostedLimits::default(),
@@ -1816,7 +1830,7 @@ impl Default for VerificationConfig {
 
 impl VerificationConfig {
     /// Resolve [`Self::limits`] and [`Self::runtime`]: the approved defaults,
-    /// then each execution capacity, the Python pool budget, and the queued
+    /// then each execution capacity, the queued share, and the queued
     /// deadline from its `WYRD_VERIFICATION_*` variable when set, else from
     /// the file; then every other `WYRD_VERIFICATION_*` Deployment limit;
     /// then refuse inconsistent merged limits, whatever their source.
@@ -1824,8 +1838,8 @@ impl VerificationConfig {
     /// Each value is checked only once it wins, so a valid variable repairs
     /// a stale file value. Each limit is a positive integer; `_MIB`/`_KIB`
     /// are binary units and `_ms`/`_MS` milliseconds. Admission counts must
-    /// fit a semaphore, each lane's Python workers plus waiters included, and
-    /// the queued deadline must be a timestamp from now. Unset values keep
+    /// fit a semaphore, each queued share percentage is below 100 so direct
+    /// work keeps reserved capacity, and the queued deadline must be a timestamp from now. Unset values keep
     /// the approved defaults.
     ///
     /// # Errors
@@ -1834,8 +1848,12 @@ impl VerificationConfig {
     /// [`ConfigError::BadEnvVar`] naming a variable that is empty, not a
     /// positive integer, overflows its unit, or exceeds its runtime
     /// representation, and [`ConfigError::Invalid`] naming the variables of
-    /// an inconsistent pair or an unrepresentable Python admission total.
-    fn resolve_limits(&mut self) -> Result<(), ConfigError> {
+    /// an inconsistent pair.
+    ///
+    /// # Panics
+    /// Never in practice: each queued share percentage is bounded to 99
+    /// before it narrows to `u8`.
+    pub fn resolve_limits(&mut self) -> Result<(), ConfigError> {
         /// One kibibyte.
         const KIB: u64 = 1024;
         /// One mebibyte.
@@ -1855,40 +1873,13 @@ impl VerificationConfig {
                 "WYRD_VERIFICATION_QUEUED",
             ),
         ] {
-            for (name, value, max, target) in [
-                (
-                    "workspaces",
-                    file.workspaces,
-                    Semaphore::MAX_PERMITS,
-                    &mut lane.workspaces,
-                ),
-                (
-                    "python_workers",
-                    file.python_workers,
-                    usize::MAX,
-                    &mut lane.python_workers,
-                ),
-                (
-                    "python_waiters",
-                    file.python_waiters,
-                    usize::MAX,
-                    &mut lane.python_waiters,
-                ),
-                (
-                    "model_calls",
-                    file.model_calls,
-                    Semaphore::MAX_PERMITS,
-                    &mut lane.model_calls,
-                ),
-            ] {
-                set_count(
-                    &format!("{table}.{name}"),
-                    value,
-                    &format!("{prefix}_{}", name.to_uppercase()),
-                    max,
-                    target,
-                )?;
-            }
+            set_count(
+                &format!("{table}.model_calls"),
+                file.model_calls,
+                &format!("{prefix}_MODEL_CALLS"),
+                Semaphore::MAX_PERMITS,
+                &mut lane.model_calls,
+            )?;
         }
         set_count(
             "verification.direct_executions",
@@ -1911,15 +1902,33 @@ impl VerificationConfig {
         )? {
             self.runtime.execution_timeout = timeout.deadline()?;
         }
-        if let Some(pool) = Selected::of(
-            "verification.monty_pool_memory_mib",
-            self.monty_pool_memory_mib,
-            "WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB",
-        )? {
-            limits.monty_pool_memory_bytes = pool
-                .value
-                .checked_mul(MIB)
-                .ok_or_else(|| pool.refuse("overflows the limit's range"))?;
+        let share = &mut limits.queued_share;
+        for (name, value, target) in [
+            (
+                "queued_cpu_percent",
+                self.queued_cpu_percent,
+                &mut share.cpu_percent,
+            ),
+            (
+                "queued_memory_percent",
+                self.queued_memory_percent,
+                &mut share.memory_percent,
+            ),
+            (
+                "queued_scratch_percent",
+                self.queued_scratch_percent,
+                &mut share.scratch_percent,
+            ),
+        ] {
+            let mut percent = usize::from(*target);
+            set_count(
+                &format!("verification.{name}"),
+                value,
+                &format!("WYRD_VERIFICATION_{}", name.to_uppercase()),
+                99,
+                &mut percent,
+            )?;
+            *target = u8::try_from(percent).expect("set_count bounds the percent to 99");
         }
         set_scaled(
             "WYRD_VERIFICATION_MONTY_MIN_WORKERS",
@@ -1930,11 +1939,6 @@ impl VerificationConfig {
             "WYRD_VERIFICATION_MONTY_MEMORY_MIB",
             MIB,
             &mut limits.monty_memory_bytes,
-        )?;
-        set_scaled(
-            "WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB",
-            MIB,
-            &mut limits.monty_process_memory_bytes,
         )?;
         set_millis(
             "WYRD_VERIFICATION_CODE_TIMEOUT_MS",
@@ -1999,40 +2003,18 @@ impl VerificationConfig {
             KIB,
             &mut limits.tool_result_max_bytes,
         )?;
+        set_scaled(
+            "WYRD_VERIFICATION_TOOL_ARGUMENT_MAX_KIB",
+            KIB,
+            &mut limits.tool_argument_max_bytes,
+        )?;
+        set_scaled(
+            "WYRD_VERIFICATION_AGENT_TOOL_MAX_CALLS",
+            1,
+            &mut limits.agent_tool_max_calls,
+        )?;
         set_millis("WYRD_VERIFICATION_TIMEOUT_MS", &mut limits.verify_timeout)?;
         let inconsistent = [
-            (
-                limits.monty_min_workers > limits.direct.python_workers,
-                "WYRD_VERIFICATION_MONTY_MIN_WORKERS exceeds \
-                 WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS",
-            ),
-            (
-                limits.monty_min_workers > limits.queued.python_workers,
-                "WYRD_VERIFICATION_MONTY_MIN_WORKERS exceeds \
-                 WYRD_VERIFICATION_QUEUED_PYTHON_WORKERS",
-            ),
-            (
-                limits.monty_memory_bytes >= limits.monty_process_memory_bytes,
-                "WYRD_VERIFICATION_MONTY_MEMORY_MIB must be below \
-                 WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB",
-            ),
-            (
-                limits.monty_pool_memory_bytes < limits.monty_process_memory_bytes,
-                "WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB is below \
-                 WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB",
-            ),
-            (
-                !limits.worker_fits(),
-                "WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB cannot hold \
-                 WYRD_VERIFICATION_MONTY_MEMORY_MIB plus Monty's allocator headroom",
-            ),
-            (
-                !limits.lanes_fit(),
-                "WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB cannot hold \
-                 WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS plus \
-                 WYRD_VERIFICATION_QUEUED_PYTHON_WORKERS at \
-                 WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB each",
-            ),
             (
                 limits.file_max_bytes > limits.files_max_bytes,
                 "WYRD_VERIFICATION_FILE_MAX_MIB exceeds WYRD_VERIFICATION_FILES_MAX_MIB",
@@ -2046,25 +2028,6 @@ impl VerificationConfig {
             return Err(ConfigError::Invalid {
                 message: message.to_owned(),
             });
-        }
-        // Each lane admits its workers plus its waiters through one semaphore.
-        for (lane, prefix) in [
-            (limits.direct, "WYRD_VERIFICATION_DIRECT"),
-            (limits.queued, "WYRD_VERIFICATION_QUEUED"),
-        ] {
-            if lane
-                .python_workers
-                .checked_add(lane.python_waiters)
-                .is_none_or(|admissions| admissions > Semaphore::MAX_PERMITS)
-            {
-                return Err(ConfigError::Invalid {
-                    message: format!(
-                        "{prefix}_PYTHON_WAITERS plus {prefix}_PYTHON_WORKERS exceed the {} \
-                         Python admissions a lane can hold",
-                        Semaphore::MAX_PERMITS
-                    ),
-                });
-            }
         }
         Ok(())
     }
@@ -3607,6 +3570,10 @@ impl WyrdServerConfig {
                 }
             };
         }
+        self.bifrost.resources.process_memory_limit_bytes = parse_optional_env(
+            "WYRD_BIFROST_PROCESS_MEMORY_LIMIT_BYTES",
+            self.bifrost.resources.process_memory_limit_bytes,
+        )?;
         self.bifrost.resources.memory_limit_bytes = parse_optional_env(
             "WYRD_BIFROST_MEMORY_LIMIT_BYTES",
             self.bifrost.resources.memory_limit_bytes,
@@ -4529,7 +4496,7 @@ mod tests {
     use chrono::{DateTime, Utc};
 
     use super::*;
-    use crate::verification::hosted::LaneLimits;
+    use crate::verification::hosted::{LaneLimits, QueuedShare};
     use vala_bifrost_redux::resources::{
         ORACLE_PARTITION_WORKING_MEMORY_BYTES, ResourcePlan, ScribeWorkers, oracle_worker_slots,
     };
@@ -4908,8 +4875,8 @@ maintenance_interval_secs = 45
         }
     }
 
-    /// The server TOML file sets each lane's execution capacities, the
-    /// direct and queued execution slots, the Python pool budget, and the
+    /// The server TOML file sets each lane's model-call capacity, the
+    /// direct and queued execution slots, the queued share, and the
     /// queued deadline; values it
     /// leaves out keep their defaults, and an environment variable overrides
     /// its file value alone, repairing a file value that is zero, overflows
@@ -4917,11 +4884,10 @@ maintenance_interval_secs = 45
     /// even over a valid file value. A winning zero, overflowing, or
     /// unrepresentable file value is refused naming its key: a count above
     /// the semaphore maximum, which itself applies, or a deadline past the
-    /// latest `DateTime<Utc>` from now, while one just inside applies. File
-    /// values meet the same merged checks as environment values: lane
-    /// workers too many or too large for the pool, workers plus waiters above
-    /// the semaphore maximum, or fewer than the prewarmed workers, refuse; a
-    /// negative count does not parse.
+    /// latest `DateTime<Utc>` from now, while one just inside applies. A
+    /// queued share percentage must be 1 to 99, so direct work always keeps
+    /// reserved capacity; a negative count and a removed per-lane Python or
+    /// workspace key do not parse.
     ///
     /// # Panics
     /// Panics when a file value is not resolved, the environment does not
@@ -4935,16 +4901,12 @@ maintenance_interval_secs = 45
             direct_executions = 7
             queued_executions = 9
             execution_timeout_ms = 7200000
-            monty_pool_memory_mib = 4096
+            queued_cpu_percent = 30
+            queued_memory_percent = 40
+            queued_scratch_percent = 20
             [verification.direct]
-            workspaces = 3
-            python_workers = 1
-            python_waiters = 5
             model_calls = 11
             [verification.queued]
-            workspaces = 13
-            python_workers = 4
-            python_waiters = 17
             model_calls = 19
         ";
         let _guard = ENV_LOCK.lock().expect("environment test lock");
@@ -4958,26 +4920,23 @@ maintenance_interval_secs = 45
                 config.limits.direct_executions,
                 config.runtime.execution_slots,
                 config.runtime.execution_timeout,
-                config.limits.monty_pool_memory_bytes,
             ),
-            (7, 9, Duration::from_hours(2), 4096 * 1024 * 1024)
+            (7, 9, Duration::from_hours(2))
         );
         assert_eq!(
             (config.limits.direct, config.limits.queued),
             (
-                LaneLimits {
-                    workspaces: 3,
-                    python_workers: 1,
-                    python_waiters: 5,
-                    model_calls: 11,
-                },
-                LaneLimits {
-                    workspaces: 13,
-                    python_workers: 4,
-                    python_waiters: 17,
-                    model_calls: 19,
-                }
+                LaneLimits { model_calls: 11 },
+                LaneLimits { model_calls: 19 }
             )
+        );
+        assert_eq!(
+            config.limits.queued_share,
+            QueuedShare {
+                cpu_percent: 30,
+                memory_percent: 40,
+                scratch_percent: 20,
+            }
         );
         assert_eq!(
             (config.limits.verify_timeout, config.runtime.lease),
@@ -4991,7 +4950,7 @@ maintenance_interval_secs = 45
             [
                 ("WYRD_VERIFICATION_DIRECT_EXECUTIONS", Some("2")),
                 ("WYRD_VERIFICATION_QUEUED_MODEL_CALLS", Some("23")),
-                ("WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB", Some("8192")),
+                ("WYRD_VERIFICATION_QUEUED_MEMORY_PERCENT", Some("10")),
             ],
             || {
                 let mut config = file(FILE).expect("the file parses");
@@ -5000,27 +4959,28 @@ maintenance_interval_secs = 45
                     (
                         config.limits.direct_executions,
                         config.limits.queued.model_calls,
-                        config.limits.queued.workspaces,
+                        config.limits.direct.model_calls,
                         config.runtime.execution_slots,
-                        config.limits.monty_pool_memory_bytes,
+                        config.limits.queued_share.memory_percent,
+                        config.limits.queued_share.cpu_percent,
                     ),
-                    (2, 23, 13, 9, 8192 * 1024 * 1024),
+                    (2, 23, 11, 9, 10, 30),
                     "the environment wins over the file, value by value"
                 );
             },
         );
         // A valid environment value repairs a stale file value that is zero,
-        // overflows its unit, or is no representable deadline.
+        // out of range, or is no representable deadline.
         let stale = "
             [verification]
             queued_executions = 0
-            monty_pool_memory_mib = 9223372036854775807
+            queued_cpu_percent = 100
             execution_timeout_ms = 9223372036854775807
         ";
         temp_env::with_vars(
             [
                 ("WYRD_VERIFICATION_QUEUED_EXECUTIONS", Some("9")),
-                ("WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB", Some("8192")),
+                ("WYRD_VERIFICATION_QUEUED_CPU_PERCENT", Some("60")),
                 ("WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS", Some("7200000")),
             ],
             || {
@@ -5031,10 +4991,10 @@ maintenance_interval_secs = 45
                 assert_eq!(
                     (
                         config.runtime.execution_slots,
-                        config.limits.monty_pool_memory_bytes,
+                        config.limits.queued_share.cpu_percent,
                         config.runtime.execution_timeout,
                     ),
-                    (9, 8192 * 1024 * 1024, Duration::from_hours(2))
+                    (9, 60, Duration::from_hours(2))
                 );
             },
         );
@@ -5048,6 +5008,11 @@ maintenance_interval_secs = 45
                 "WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS",
                 "18446744073709551615",
                 "[verification]\nexecution_timeout_ms = 7200000",
+            ),
+            (
+                "WYRD_VERIFICATION_QUEUED_SCRATCH_PERCENT",
+                "100",
+                "[verification]\nqueued_scratch_percent = 50",
             ),
         ] {
             temp_env::with_vars([(key, Some(value))], || {
@@ -5072,31 +5037,12 @@ maintenance_interval_secs = 45
                 "verification.direct.model_calls",
             ),
             (
-                "[verification.queued]\nworkspaces = 0",
-                "verification.queued.workspaces",
+                "[verification]\nqueued_memory_percent = 0",
+                "verification.queued_memory_percent",
             ),
             (
-                "[verification]\nmonty_pool_memory_mib = 0",
-                "verification.monty_pool_memory_mib",
-            ),
-            (
-                "[verification]\nmonty_pool_memory_mib = 9223372036854775807",
-                "verification.monty_pool_memory_mib",
-            ),
-            (
-                "[verification.queued]\npython_workers = 18",
-                "WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS plus",
-            ),
-            (
-                "[verification]\nmonty_pool_memory_mib = 1536\n\
-                 [verification.direct]\npython_workers = 1\n\
-                 [verification.queued]\npython_workers = 4",
-                "WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS plus",
-            ),
-            (
-                "[verification.direct]\npython_workers = 9223372036854775807\n\
-                 [verification.queued]\npython_workers = 9223372036854775807",
-                "WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS plus",
+                "[verification]\nqueued_memory_percent = 100",
+                "verification.queued_memory_percent",
             ),
         ] {
             let error = file(contents)
@@ -5143,14 +5089,6 @@ maintenance_interval_secs = 45
                 "verification.direct.model_calls",
             ),
             (
-                format!("[verification.queued]\nworkspaces = {}", permits + 1),
-                "verification.queued.workspaces",
-            ),
-            (
-                format!("[verification.direct]\npython_waiters = {permits}"),
-                "WYRD_VERIFICATION_DIRECT_PYTHON_WAITERS plus",
-            ),
-            (
                 "[verification]\nexecution_timeout_ms = 9223372036854775807".to_owned(),
                 "verification.execution_timeout_ms",
             ),
@@ -5165,29 +5103,21 @@ maintenance_interval_secs = 45
                 .expect_err("an unrepresentable file value refuses");
             assert!(error.to_string().contains(named), "{contents}: {error}");
         }
-        temp_env::with_vars([("WYRD_VERIFICATION_MONTY_MIN_WORKERS", Some("3"))], || {
-            let error = file("[verification.direct]\npython_workers = 2")
-                .expect("the file parses")
-                .resolve_limits()
-                .expect_err("fewer file workers than prewarmed ones refuse");
-            assert!(
-                error
-                    .to_string()
-                    .contains("WYRD_VERIFICATION_MONTY_MIN_WORKERS exceeds"),
-                "{error}"
-            );
-        });
         assert!(
-            file("[verification.queued]\nworkspaces = -1").is_err(),
+            file("[verification.queued]\nmodel_calls = -1").is_err(),
             "a negative count does not parse"
+        );
+        assert!(
+            file("[verification.queued]\npython_workers = 2").is_err(),
+            "the per-lane Python and workspace counts are gone"
         );
     }
 
     /// Unset Deployment limits keep the approved defaults; set ones apply
     /// in their binary units; malformed, zero, overflowing, inconsistent, and
     /// unrepresentable values refuse startup naming the variable: a count
-    /// above the semaphore maximum, a Python admission total that overflows,
-    /// and a queued deadline beyond signed milliseconds or the timestamp
+    /// above the semaphore maximum, a queued share percentage of 0 or 100 or
+    /// more, and a queued deadline beyond signed milliseconds or the timestamp
     /// range.
     ///
     /// # Panics
@@ -5199,22 +5129,24 @@ maintenance_interval_secs = 45
         config.resolve_limits().expect("defaults apply");
         assert_eq!(config.limits, HostedLimits::default());
         assert_eq!(config.runtime, RuntimeLimits::default());
+        assert_eq!(config.limits.agent_tool_max_calls, 128);
+        assert_eq!(config.limits.tool_argument_max_bytes, 64 * 1024);
+        assert_eq!(config.limits.tool_result_max_bytes, 64 * 1024);
         temp_env::with_vars(
             [
                 ("WYRD_VERIFICATION_FILE_MAX_MIB", Some("5")),
                 ("WYRD_VERIFICATION_TOOL_RESULT_MAX_KIB", Some("8")),
                 ("WYRD_VERIFICATION_TIMEOUT_MS", Some("1500")),
                 ("WYRD_VERIFICATION_DIRECT_EXECUTIONS", Some("3")),
-                ("WYRD_VERIFICATION_DIRECT_WORKSPACES", Some("5")),
-                ("WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS", Some("1")),
-                ("WYRD_VERIFICATION_DIRECT_PYTHON_WAITERS", Some("7")),
                 ("WYRD_VERIFICATION_DIRECT_MODEL_CALLS", Some("9")),
                 ("WYRD_VERIFICATION_QUEUED_EXECUTIONS", Some("11")),
-                ("WYRD_VERIFICATION_QUEUED_WORKSPACES", Some("13")),
-                ("WYRD_VERIFICATION_QUEUED_PYTHON_WORKERS", Some("4")),
-                ("WYRD_VERIFICATION_QUEUED_PYTHON_WAITERS", Some("17")),
                 ("WYRD_VERIFICATION_QUEUED_MODEL_CALLS", Some("19")),
+                ("WYRD_VERIFICATION_QUEUED_CPU_PERCENT", Some("75")),
+                ("WYRD_VERIFICATION_QUEUED_MEMORY_PERCENT", Some("33")),
+                ("WYRD_VERIFICATION_QUEUED_SCRATCH_PERCENT", Some("10")),
                 ("WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS", Some("7200000")),
+                ("WYRD_VERIFICATION_AGENT_TOOL_MAX_CALLS", Some("3")),
+                ("WYRD_VERIFICATION_TOOL_ARGUMENT_MAX_KIB", Some("2")),
             ],
             || {
                 let mut config = VerificationConfig::default();
@@ -5223,22 +5155,14 @@ maintenance_interval_secs = 45
                 assert_eq!(config.limits.tool_result_max_bytes, 8 * 1024);
                 assert_eq!(config.limits.verify_timeout, Duration::from_millis(1500));
                 assert_eq!(config.limits.direct_executions, 3);
+                assert_eq!(config.limits.direct, LaneLimits { model_calls: 9 });
+                assert_eq!(config.limits.queued, LaneLimits { model_calls: 19 });
                 assert_eq!(
-                    config.limits.direct,
-                    LaneLimits {
-                        workspaces: 5,
-                        python_workers: 1,
-                        python_waiters: 7,
-                        model_calls: 9,
-                    }
-                );
-                assert_eq!(
-                    config.limits.queued,
-                    LaneLimits {
-                        workspaces: 13,
-                        python_workers: 4,
-                        python_waiters: 17,
-                        model_calls: 19,
+                    config.limits.queued_share,
+                    QueuedShare {
+                        cpu_percent: 75,
+                        memory_percent: 33,
+                        scratch_percent: 10,
                     }
                 );
                 assert_eq!(config.runtime.execution_slots, 11);
@@ -5248,13 +5172,17 @@ maintenance_interval_secs = 45
                     RuntimeLimits::default().lease,
                     "only the queued slots and deadline are configurable"
                 );
+                assert_eq!(config.limits.agent_tool_max_calls, 3);
+                assert_eq!(config.limits.tool_argument_max_bytes, 2 * 1024);
             },
         );
         for (key, value) in [
-            ("WYRD_VERIFICATION_DIRECT_WORKSPACES", "0"),
             ("WYRD_VERIFICATION_QUEUED_MODEL_CALLS", "-2"),
             ("WYRD_VERIFICATION_QUEUED_EXECUTIONS", "many"),
             ("WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS", "0"),
+            ("WYRD_VERIFICATION_QUEUED_CPU_PERCENT", "0"),
+            ("WYRD_VERIFICATION_QUEUED_CPU_PERCENT", "100"),
+            ("WYRD_VERIFICATION_QUEUED_MEMORY_PERCENT", "fifty"),
             ("WYRD_VERIFICATION_CODE_TIMEOUT_MS", "ten"),
             ("WYRD_VERIFICATION_SCRATCH_MAX_MIB", "-1"),
             ("WYRD_VERIFICATION_FILES_MAX_MIB", "18446744073709551615"),
@@ -5266,8 +5194,17 @@ maintenance_interval_secs = 45
                 "WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS",
                 "9223372036854775807",
             ),
+            ("WYRD_VERIFICATION_AGENT_TOOL_MAX_CALLS", ""),
+            ("WYRD_VERIFICATION_AGENT_TOOL_MAX_CALLS", "0"),
+            ("WYRD_VERIFICATION_AGENT_TOOL_MAX_CALLS", "-1"),
+            ("WYRD_VERIFICATION_AGENT_TOOL_MAX_CALLS", "many"),
+            ("WYRD_VERIFICATION_AGENT_TOOL_MAX_CALLS", "4294967296"),
+            ("WYRD_VERIFICATION_TOOL_ARGUMENT_MAX_KIB", ""),
+            ("WYRD_VERIFICATION_TOOL_ARGUMENT_MAX_KIB", "0"),
+            ("WYRD_VERIFICATION_TOOL_ARGUMENT_MAX_KIB", "-64"),
+            ("WYRD_VERIFICATION_TOOL_ARGUMENT_MAX_KIB", "64k"),
             (
-                "WYRD_VERIFICATION_QUEUED_PYTHON_WAITERS",
+                "WYRD_VERIFICATION_TOOL_ARGUMENT_MAX_KIB",
                 "18446744073709551615",
             ),
         ] {
@@ -5283,7 +5220,7 @@ maintenance_interval_secs = 45
             "WYRD_VERIFICATION_DIRECT_EXECUTIONS",
             "WYRD_VERIFICATION_QUEUED_EXECUTIONS",
             "WYRD_VERIFICATION_QUEUED_MODEL_CALLS",
-            "WYRD_VERIFICATION_DIRECT_WORKSPACES",
+            "WYRD_VERIFICATION_DIRECT_MODEL_CALLS",
         ] {
             temp_env::with_vars([(key, Some(over.as_str()))], || {
                 let error = VerificationConfig::default()
@@ -5293,51 +5230,6 @@ maintenance_interval_secs = 45
             });
         }
         for (vars, named) in [
-            (
-                [
-                    ("WYRD_VERIFICATION_MONTY_MIN_WORKERS", "3"),
-                    ("WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS", "2"),
-                ],
-                "WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS",
-            ),
-            (
-                [
-                    ("WYRD_VERIFICATION_MONTY_MIN_WORKERS", "2"),
-                    ("WYRD_VERIFICATION_QUEUED_PYTHON_WORKERS", "1"),
-                ],
-                "WYRD_VERIFICATION_QUEUED_PYTHON_WORKERS",
-            ),
-            (
-                [
-                    ("WYRD_VERIFICATION_QUEUED_PYTHON_WORKERS", "4"),
-                    ("WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB", "2048"),
-                ],
-                "WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS plus",
-            ),
-            (
-                [
-                    ("WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS", "2"),
-                    (
-                        "WYRD_VERIFICATION_QUEUED_PYTHON_WORKERS",
-                        "18446744073709551615",
-                    ),
-                ],
-                "WYRD_VERIFICATION_DIRECT_PYTHON_WORKERS plus",
-            ),
-            (
-                [
-                    ("WYRD_VERIFICATION_MONTY_MEMORY_MIB", "384"),
-                    ("WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB", "384"),
-                ],
-                "WYRD_VERIFICATION_MONTY_MEMORY_MIB",
-            ),
-            (
-                [
-                    ("WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB", "100"),
-                    ("WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB", "384"),
-                ],
-                "WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB",
-            ),
             (
                 [
                     ("WYRD_VERIFICATION_FILE_MAX_MIB", "200"),

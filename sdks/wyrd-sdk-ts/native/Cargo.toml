@@ -11,6 +11,12 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+# The benchmark recorder and heap sampler of a local diagnostic build: the
+# `benchmark*` functions and a sampling global allocator. Only
+# `bench:build:sdks` enables it; no published addon does (`check:deps`).
+bench = ["wyrd-benchmark/bench"]
+
 [dependencies]
 arrow = { workspace = true }
 chrono = { workspace = true }
@@ -26,6 +32,7 @@ wyrd-client = { workspace = true, features = ["internal"] }
 wyrd-semver = { workspace = true }
 wyrd-spec = { workspace = true }
 wyrd-types = { workspace = true }
+wyrd-benchmark = { workspace = true }
 
 [build-dependencies]
 napi-build = { workspace = true }

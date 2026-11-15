@@ -462,7 +462,9 @@ impl<'a> VerificationControl<'a> {
     /// foreign-tenant Card is not found, and a Window (drift) Verifier is
     /// refused because only its schedule judges a window. The engine runs
     /// the hosted blocks as the caller, executed by the tenant SYSTEM
-    /// principal, under the Deployment `verify_timeout`. Permission blocks;
+    /// principal, under one deadline: the Deployment `verify_timeout` after
+    /// the request's `arrival`, bounding the target lookup, every capacity
+    /// wait, and the engine alike. Permission blocks;
     /// audit does not: the single allow or deny decision is staged on
     /// [`AppState::scribe_outbox`]. The pinned inputs (never queueing work)
     /// and the result are staged there too; nothing is written to Postgres
@@ -484,7 +486,8 @@ impl<'a> VerificationControl<'a> {
     /// conform to the Verifier's input slots,
     /// [`WyrdError::VerificationInputTooLarge`] for evidence past a slot or
     /// combined input-file limit,
-    /// [`WyrdError::VerificationExecutionTimedOut`] past the deadline,
+    /// [`WyrdError::VerificationExecutionTimedOut`] past the deadline, also
+    /// when a capacity wait is what reached it,
     /// [`WyrdError::ServiceUnavailable`] when this process hosts no Verifier
     /// blocks, every direct execution slot is in use, a block is refused its
     /// direct lane's capacity (a Python worker or a workspace), or evidence
@@ -504,10 +507,16 @@ impl<'a> VerificationControl<'a> {
         edge_timer: Option<&EdgeTimer>,
         arrival: Option<RequestArrival>,
     ) -> Result<VerificationResult, WyrdError> {
-        let telemetry =
-            ExecutionTelemetry::start(ExecutionMode::Direct, arrival.map(RequestArrival::instant));
+        let arrived = arrival.map_or_else(std::time::Instant::now, RequestArrival::instant);
+        let telemetry = ExecutionTelemetry::start(ExecutionMode::Direct, Some(arrived));
         let (label, result) = self
-            .run_direct(caller, request, edge_timer, &telemetry)
+            .run_direct(
+                caller,
+                request,
+                edge_timer,
+                &telemetry,
+                tokio::time::Instant::from_std(arrived),
+            )
             .await;
         tracing::Span::current().record("outcome", label);
         telemetry.finish(label, label != "completed");
@@ -515,7 +524,8 @@ impl<'a> VerificationControl<'a> {
     }
 
     /// The body of [`execute`](Self::execute), timed by `telemetry`: admit,
-    /// load, run the engine, and stage. Returns the outcome label the
+    /// load, run the engine, and stage, all within `verify_timeout` of
+    /// `arrived`. Returns the outcome label the
     /// profile is emitted under beside the result; a request refused before
     /// the engine ran is `refused`, or `unavailable` when this process hosts
     /// no Verifier blocks.
@@ -531,10 +541,22 @@ impl<'a> VerificationControl<'a> {
         mut request: VerificationRequest,
         edge_timer: Option<&EdgeTimer>,
         telemetry: &ExecutionTelemetry,
+        arrived: tokio::time::Instant,
     ) -> (&'static str, Result<VerificationResult, WyrdError>) {
         let blocks = match self.blocks() {
             Ok(blocks) => blocks,
             Err(error) => return ("unavailable", Err(error)),
+        };
+        let timeout = blocks.limits().verify_timeout;
+        let deadline = arrived + timeout;
+        let timed_out = || {
+            (
+                "timed_out",
+                Err(WyrdError::VerificationExecutionTimedOut {
+                    message: "the Verifier exceeded the direct execution deadline".to_owned(),
+                    details: serde_json::json!({ "deadline_seconds": timeout.as_secs() }),
+                }),
+            )
         };
         let execution_id = ExecutionId::new_v7();
         tracing::Span::current().record("execution_id", tracing::field::display(execution_id));
@@ -561,16 +583,19 @@ impl<'a> VerificationControl<'a> {
             Ok(staged) => staged,
             Err(error) => return ("refused", Err(error)),
         };
-        let target = match telemetry
-            .phase(
+        let target = match tokio::time::timeout_at(
+            deadline,
+            telemetry.phase(
                 Phase::Load,
                 self.resolve(caller, &request)
                     .instrument(tracing::debug_span!("verification.load")),
-            )
-            .await
+            ),
+        )
+        .await
         {
-            Ok(target) => target,
-            Err(error) => return ("refused", Err(error)),
+            Ok(Ok(target)) => target,
+            Ok(Err(error)) => return ("refused", Err(error)),
+            Err(_) => return timed_out(),
         };
         let Some(_admitted) = blocks.admit_direct() else {
             return (
@@ -595,17 +620,14 @@ impl<'a> VerificationControl<'a> {
         let executor = caller.clone().executed_by_system(system);
         let started_at = Utc::now();
         // The Verifier's own `limits.timeout_seconds` only lowers the
-        // server's direct deadline.
-        let timeout = target
+        // deadline fixed at arrival.
+        let deadline = target
             .spec
             .limits
             .as_ref()
             .and_then(|limits| limits.timeout_seconds)
             .map(|seconds| std::time::Duration::from_secs(u64::from(seconds)))
-            .map_or(blocks.limits().verify_timeout, |limit| {
-                limit.min(blocks.limits().verify_timeout)
-            });
-        let deadline = tokio::time::Instant::now() + timeout;
+            .map_or(deadline, |limit| deadline.min(arrived + limit));
         let owner = wyrd_runtime::owning_root(&caller.principal, &caller.delegation_chain);
         let engine = telemetry.time(Phase::Setup, || {
             blocks.engine(
@@ -623,6 +645,7 @@ impl<'a> VerificationControl<'a> {
                     defer_unlanded_traces: false,
                     drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
                     clock: telemetry.clock(),
+                    envelopes: telemetry.envelopes(),
                     execution: None,
                     mode: ExecutionMode::Direct,
                     pull_request: None,
@@ -642,14 +665,11 @@ impl<'a> VerificationControl<'a> {
             .await;
         let mut outcome = match ran {
             Ok(outcome) => outcome,
-            Err(EngineError::DeadlineExceeded) => {
-                return (
-                    "timed_out",
-                    Err(WyrdError::VerificationExecutionTimedOut {
-                        message: "the Verifier exceeded the direct execution deadline".to_owned(),
-                        details: serde_json::json!({ "deadline_seconds": timeout.as_secs() }),
-                    }),
-                );
+            Err(EngineError::DeadlineExceeded) => return timed_out(),
+            // A capacity wait bounded by the deadline that ends with it is
+            // the deadline's expiry, not a refusal the caller should retry.
+            Err(EngineError::Busy(_)) if tokio::time::Instant::now() >= deadline => {
+                return timed_out();
             }
             Err(EngineError::Plan(error)) => return ("errored", Err(error)),
             Err(EngineError::Busy(reason)) => {

@@ -36,7 +36,7 @@ use wyrd_testing::server::{ScribeReservation, WyrdTestServerBuilder};
 use wyrd_testing::verification::VerificationFixture;
 
 use crate::hosted_agent_tools::{
-    builder, calls, done, lines, messages, results, text, turn, workspaces,
+    builder, calls, done, lines, messages, model_calls, results, text, turn,
 };
 use crate::local_development::configure_gateway;
 use crate::support::{Deployment, declare, fixture, pull};
@@ -2552,14 +2552,13 @@ async fn mapped(desk: &Desk, result: &VerificationResult) -> Vec<(Option<u32>, u
     mapped
 }
 
-/// The deployment admits two Agent workspaces across every execution and
+/// The deployment admits two queued model calls across every execution and
 /// tenant. Tenant A's three section reviewers, each slow, take both; the
-/// third item is refused capacity, so the execution defers once the two
-/// running items settle and resumes with only the third, which never runs
-/// beside them. Tenant B's single item, submitted while A holds both
-/// workspaces, is deferred the same way and completes once capacity frees,
-/// and neither tenant spends an attempt or reads the other's work. An
-/// execution whose items hold both workspaces indefinitely is cancelled through the CLI
+/// third item waits for a call and runs only once one of the two settles,
+/// never beside them. Tenant B's single item, submitted while A holds both
+/// calls, waits the same way and completes once capacity frees, and neither
+/// tenant spends an extra attempt or reads the other's work. An execution
+/// whose items hold both calls indefinitely is cancelled through the CLI
 /// and releases them at once to tenant B, and a Verifier's
 /// `timeout_seconds` ends a stalled execution long before the deployment's
 /// five-minute deadline.
@@ -2576,7 +2575,7 @@ async fn admission_bounds_fanout_across_tenants() {
     hold_sections(&upstream, "a", HELD).await;
     hold_sections(&upstream, "c", STALLED).await;
     hold_sections(&upstream, "d", STALLED).await;
-    let builder = workspaces(&upstream, 2);
+    let builder = model_calls(&upstream, 2);
     let desk = Desk::start_with(upstream, builder).await;
     let other = desk.tenant("admission-other").await;
     let other_admin = other.client().expect("tenant B has a client").clone();
@@ -2639,7 +2638,7 @@ async fn admission_bounds_fanout_across_tenants() {
     assert_eq!(
         mapped(&desk, &a).await,
         [(Some(0), 1), (Some(1), 1), (Some(2), 1)],
-        "a refused item spends no attempt"
+        "a waiting item spends no extra attempt"
     );
     let b_publications = Execution::connect_with(b.execution_id, &other_admin)
         .await
@@ -2706,7 +2705,7 @@ async fn admission_bounds_fanout_across_tenants() {
         .expect("tenant B's execution handle connects")
         .wait(Duration::from_secs(60))
         .await
-        .expect("cancellation released the workspaces");
+        .expect("cancellation released the model calls");
     assert_eq!(
         requirement(&freed, "mapped").outcome,
         RequirementOutcome::Passed

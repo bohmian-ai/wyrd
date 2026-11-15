@@ -4,11 +4,12 @@ from typing import Any, Literal
 class WyrdTestServer:
     """Wyrd in-process test server context manager (testing feature only).
 
-    Journeys steer the server through exactly four test controls, each backed
+    Journeys steer the server through exactly six test controls, each backed
     by the production code path: ``flush_bifrost``, ``wait_for_baseline``,
-    ``make_binding_due``, and ``hold_publications``. Keys that need Roles come
-    from the credential fixtures, which stand in for the operator who grants
-    Roles in a deployment: ``bootstrap_service``,
+    ``make_binding_due``, ``hold_publications``, and, for contended process
+    memory, ``occupy_hosted_memory`` and ``wait_for_hosted_waiters``. Keys
+    that need Roles come from the credential fixtures, which stand in for the
+    operator who grants Roles in a deployment: ``bootstrap_service``,
     ``bootstrap_service_in_tenant``, and ``credential_registered_service``.
     Accounts without added Roles come from ``wyrd.auth.Principals``. The
     remaining members start or address the server.
@@ -41,6 +42,8 @@ class WyrdTestServer:
 
     ``github`` configures the deployment's GitHub App against a
     ``GithubAppMock``; without it the server has no GitHub App.
+    ``verify_timeout_seconds`` ends each direct verification that long after
+    its arrival, so a journey can reach the deadline quickly.
     """
 
     def __init__(
@@ -52,6 +55,7 @@ class WyrdTestServer:
         access_ttl_seconds: int | None = None,
         scribe_outbox_capacity: int | None = None,
         github: GithubAppMock | None = None,
+        verify_timeout_seconds: float | None = None,
     ) -> None:
         """Create an unstarted server; entering the ``with`` block boots it.
 
@@ -79,12 +83,50 @@ class WyrdTestServer:
             github: the GitHub mock the deployment's GitHub App is configured
                 against, with this server's bound address as its public URL;
                 omitted configures no GitHub App.
+            verify_timeout_seconds: the direct verification deadline from
+                arrival; omitted keeps the production deadline.
 
         Raises:
             WyrdError: ``WYRD_TESTING_500_HARNESS_START`` when
                 ``provider_base_url`` is not an absolute URL or is combined
                 with ``live_providers``.
 
+        """
+        ...
+
+    def occupy_hosted_memory(self, leave: int) -> HeldMemory:
+        """Hold all process memory available now but ``leave`` bytes.
+
+        While held, a hosted verification whose Python session does not fit
+        in ``leave`` waits for memory, and one whose request bytes do not fit
+        is refused as retryable ``503``.
+
+        Args:
+            leave: Bytes left free.
+
+        Returns:
+            The hold; leaving its ``with`` block or calling ``release``
+            returns the memory.
+
+        Raises:
+            WyrdError: The harness error outside the context manager or when
+                the server hosts no Verifiers.
+        """
+        ...
+
+    def wait_for_hosted_waiters(self, count: int, timeout: float) -> None:
+        """Return once exactly ``count`` hosted operations wait for memory.
+
+        Args:
+            count: The awaited number of operations parked for process
+                memory, such as behind ``occupy_hosted_memory``.
+            timeout: The longest wait, in seconds.
+
+        Raises:
+            WyrdError: The harness error when ``timeout`` elapses first, with
+                the last observed count, for a negative or non-finite
+                ``timeout``, outside the context manager, or when the server
+                hosts no Verifiers.
         """
         ...
 
@@ -468,6 +510,19 @@ class WyrdTestServer:
         """
         ...
 
+class HeldMemory:
+    """Process memory a journey holds on its test server.
+
+    A context manager over an already held charge: leaving the ``with`` block
+    or calling ``release`` returns the memory.
+    """
+
+    def __enter__(self) -> HeldMemory: ...
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool: ...
+    def release(self) -> None:
+        """Return the memory; releasing twice does nothing."""
+        ...
+
 class UnmigratedDatabase:
     """One isolated, empty Postgres database (testing feature only).
 
@@ -650,4 +705,4 @@ class GithubBrowser:
         """
         ...
 
-__all__ = ["GithubAppMock", "GithubBrowser", "UnmigratedDatabase", "WyrdTestServer"]
+__all__ = ["GithubAppMock", "GithubBrowser", "HeldMemory", "UnmigratedDatabase", "WyrdTestServer"]

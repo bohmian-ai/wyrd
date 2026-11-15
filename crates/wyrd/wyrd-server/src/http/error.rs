@@ -119,11 +119,13 @@ pub fn body_rejection(rejection: &JsonRejection) -> WyrdErrorResponse {
     })
 }
 
-/// Whether `error` is a transient refusal retryable after one second.
+/// Whether `error` is a transient refusal retryable after one second; a
+/// generic 503 is transient by definition (RFC 9110 §15.6.4).
 fn retryable_now(error: &WyrdError) -> bool {
     matches!(
         error,
         WyrdError::AuthVerifyUnavailable { .. }
+            | WyrdError::ServiceUnavailable { .. }
             | WyrdError::VerificationStagingFull { .. }
             | WyrdError::Vala {
                 error: wyrd_spec::vala::error::BifrostError::QueryAdmissionRejected
@@ -439,8 +441,9 @@ mod error_mapper_tests {
         assert_eq!(problem["details"]["data"]["status"], 503);
     }
 
-    /// Proves every retryable pressure error — auth verify, ingest busy,
-    /// verification staging, and query admission — carries `Retry-After: 1`,
+    /// Proves every retryable pressure error — auth verify, a generic 503
+    /// such as a process capacity refusal, ingest busy, verification
+    /// staging, and query admission — carries `Retry-After: 1`,
     /// while non-retryable Bifrost failures carry none.
     ///
     /// # Panics
@@ -455,6 +458,18 @@ mod error_mapper_tests {
         .into_response();
         assert_eq!(
             retryable
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        let unavailable = WyrdErrorResponse::from(WyrdError::ServiceUnavailable {
+            message: "the verification runtime has no capacity for this Verifier now".to_owned(),
+            details: serde_json::json!({ "reason": "process memory" }),
+        })
+        .into_response();
+        assert_eq!(
+            unavailable
                 .headers()
                 .get(axum::http::header::RETRY_AFTER)
                 .and_then(|value| value.to_str().ok()),

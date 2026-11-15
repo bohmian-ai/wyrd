@@ -27,6 +27,8 @@ if TYPE_CHECKING:
         RequirementDetails,
         RequirementResult,
         StepResult,
+        ToolCallRecord,
+        ToolRecipient,
         VerificationDetails,
         VerificationResultWire,
         VerificationVerdict,
@@ -44,6 +46,11 @@ def returned_records_are_typed(execution: Execution, result: VerificationResult)
     assert_type(described["outcome"]["requirements"][0]["check"], CheckWire)
     assert_type(described["outcome"]["steps"], list[StepResult])
     assert_type(described["outcome"]["evidence"], dict[str, InputDeclaration])
+    assert_type(
+        described["outcome"]["requirements"][0].get("tool_calls"), list[ToolCallRecord] | None
+    )
+    assert_type(described["outcome"]["steps"][0].get("tool_calls"), list[ToolCallRecord] | None)
+    assert_type(described["outcome"]["steps"][0]["tool_calls"][0]["recipient"], ToolRecipient)
     if "result" in state:
         assert_type(state["result"], VerificationResultWire)
         assert_type(state["result"]["outcome"]["verdict"], VerificationVerdict)
@@ -133,6 +140,22 @@ def the_actual_details_shape_is_accepted() -> VerificationDetails:
                         "kind": "agent",
                         "route": {"kind": "wyrd_gateway", "deployment": "default"},
                     },
+                    "tool_calls": [
+                        {
+                            "tool": "code.run",
+                            "arguments": {"source": "await call_tool('fs.read', {})"},
+                            "recipient": "model",
+                            "output_sha256": "cd",
+                            "returned_bytes": 4,
+                        },
+                        {
+                            "tool": "fs.read",
+                            "arguments": {},
+                            "recipient": "code",
+                            "returned_bytes": 0,
+                            "error": "WYRD_PERMISSION_403_DENIED_RBAC: denied",
+                        },
+                    ],
                 }
             ],
             "steps": [
@@ -142,7 +165,14 @@ def the_actual_details_shape_is_accepted() -> VerificationDetails:
                     "attempts": 1,
                     "duration_ms": 12,
                     "output": [1, {"free": "json"}],
-                    "tool_calls": [{"tool": "fs.read", "arguments": {}, "returned_bytes": 3}],
+                    "tool_calls": [
+                        {
+                            "tool": "fs.read",
+                            "arguments": {},
+                            "recipient": "model",
+                            "returned_bytes": 3,
+                        }
+                    ],
                 }
             ],
             "evidence": {
@@ -244,6 +274,12 @@ def unknown_fixed_keys_and_values_are_rejected() -> tuple[object, ...]:
         "attempts": "1",  # ty: ignore[invalid-argument-type]
         "duration_ms": 1,
     }
+    recipient: ToolCallRecord = {
+        "tool": "fs.read",
+        "arguments": {},
+        "recipient": "python",  # ty: ignore[invalid-argument-type]
+        "returned_bytes": 0,
+    }
     unknown_kind: CheckWire = {  # ty: ignore[invalid-assignment]
         "kind": "judge",
         "agent": "./judge.yaml",
@@ -260,7 +296,7 @@ def unknown_fixed_keys_and_values_are_rejected() -> tuple[object, ...]:
         "span_selector": 0,
         "operator": "equals",
     }
-    return status, misspelled, step, unknown_kind, foreign_key, wrong_type
+    return status, misspelled, step, recipient, unknown_kind, foreign_key, wrong_type
 
 
 def agent_routes_and_run_configs_are_closed() -> tuple[object, ...]:

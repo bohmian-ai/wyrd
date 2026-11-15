@@ -162,6 +162,7 @@ impl EvidenceInvestigation {
                     },
                     check: serde_json::from_value::<Check>(check)?,
                     provenance: None,
+                    tool_calls: Vec::new(),
                 }],
                 steps: Vec::new(),
                 evidence: std::collections::BTreeMap::new(),

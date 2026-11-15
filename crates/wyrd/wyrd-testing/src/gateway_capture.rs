@@ -424,6 +424,10 @@ pub struct Pacing {
 /// Monotonic send times [`PacedUpstream`] recorded, by call marker.
 type Sends = Arc<Mutex<HashMap<String, Vec<Instant>>>>;
 
+/// The buffered answer [`PacedUpstream::replying`] builds from one request
+/// body, or `None` to refuse it.
+pub type Reply = Arc<dyn Fn(&[u8]) -> Option<Bytes> + Send + Sync>;
+
 /// What every [`PacedUpstream`] connection shares.
 #[derive(Clone)]
 struct Paced {
@@ -432,6 +436,8 @@ struct Paced {
     /// The buffered answer's body, identical on every call, so it is built
     /// once.
     buffered: Bytes,
+    /// Builds each buffered answer from its request instead, when set.
+    reply: Option<Reply>,
     /// Frame send times of calls not yet taken.
     sends: Sends,
     /// Calls whose send times may be held at once; a later call is answered
@@ -445,7 +451,7 @@ struct Paced {
 /// It serves `POST /v1/chat/completions` under any path prefix. The call's
 /// marker is its first message's content, which the caller makes unique. A
 /// buffered call waits [`Pacing::buffered_delay`] and answers a sized
-/// completion; a `stream: true` call waits [`Pacing::stream_delay`], then
+/// completion, or what its [`Reply`] builds from the request; a `stream: true` call waits [`Pacing::stream_delay`], then
 /// writes [`GatewayCapture::chat_event_frames`] with the marker as its id,
 /// [`Pacing::chunk_interval`] apart. Just before handing each data event (or
 /// the buffered body) to the connection it records [`Instant::now`] under
@@ -488,6 +494,32 @@ impl PacedUpstream {
         bound: usize,
         completion: &Value,
     ) -> std::io::Result<Self> {
+        Self::serve(pacing, bound, Bytes::from(completion.to_string()), None).await
+    }
+
+    /// [`Self::start`], answering every buffered call with what `reply`
+    /// builds from its request body, so a scripted conversation answers each
+    /// turn from that request's own messages; a request `reply` refuses is
+    /// answered `400`. [`Pacing::buffered_bytes`] is unused.
+    ///
+    /// # Errors
+    /// Returns the bind failure.
+    pub async fn replying(pacing: Pacing, bound: usize, reply: Reply) -> std::io::Result<Self> {
+        Self::serve(pacing, bound, Bytes::new(), Some(reply)).await
+    }
+
+    /// Binds a loopback port and serves `pacing` with the buffered answer
+    /// `buffered`, or what `reply` builds, holding at most `bound` calls'
+    /// send times.
+    ///
+    /// # Errors
+    /// Returns the bind failure.
+    async fn serve(
+        pacing: Pacing,
+        bound: usize,
+        buffered: Bytes,
+        reply: Option<Reply>,
+    ) -> std::io::Result<Self> {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
         let address = listener.local_addr()?;
         let sends: Sends = Arc::default();
@@ -495,7 +527,8 @@ impl PacedUpstream {
             .route("/{*path}", post(answer))
             .with_state(Paced {
                 pacing,
-                buffered: Bytes::from(completion.to_string()),
+                buffered,
+                reply,
                 sends: Arc::clone(&sends),
                 bound,
             });
@@ -608,8 +641,16 @@ async fn answer(State(paced): State<Paced>, headers: HeaderMap, body: Bytes) -> 
     if stream != Some(Leaf::Bool(true)) {
         paused(pacing.buffered_delay, &mut observation).await;
         let started = observation.now();
+        let buffered = match &paced.reply {
+            None => Some(paced.buffered.clone()),
+            Some(reply) => reply(&body),
+        };
+        let Some(buffered) = buffered else {
+            observation.finish(wyrd_benchmark::ERROR);
+            return (axum::http::StatusCode::BAD_REQUEST, "no scripted answer").into_response();
+        };
         paced.record(&marker);
-        let answer = ([(CONTENT_TYPE, "application/json")], paced.buffered).into_response();
+        let answer = ([(CONTENT_TYPE, "application/json")], buffered).into_response();
         observation.since("answer", started);
         observation.finish(wyrd_benchmark::SUCCESS);
         return answer;

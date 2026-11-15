@@ -46,7 +46,7 @@ use wyrd_spec::verification::execution::ApprovalReceipt;
 use wyrd_spec::verification::execution::{
     CallProvenance, Citation, ExecutedOutcome, ExecutedRequirement, InputDeclaration,
     InvocationSettlement, Producer, ProducerInvocation, RequirementDetail, RequirementDetails,
-    RequirementOutcome, RequirementResult, Speculation, StepResult, StepStatus,
+    RequirementOutcome, RequirementResult, Speculation, StepResult, StepStatus, ToolCallRecord,
 };
 use wyrd_spec::verification::state::{ApprovalOccurrence, ControlRecord, ExecutionState};
 use wyrd_spec::verification::{ComparisonOperator, ContextCapture};
@@ -58,7 +58,7 @@ use super::scope::{
 };
 use super::{
     ActionExecutor, ActionOutput, BlockCall, BlockError, CallInput, CallValue, CheckExecutor,
-    CheckOutput, Checkpoints, EvidenceReader, Position,
+    CheckOutput, Checkpoints, EvidenceReader, Position, ToolCallsOwner,
 };
 use crate::assertion::capture_actual;
 use crate::assertion::{Compared, evaluate_item_mode, evaluate_single};
@@ -452,7 +452,6 @@ impl VerificationEngine {
         Ok(ActionOutput {
             output,
             provenance: None,
-            tool_calls: Vec::new(),
         })
     }
 
@@ -1789,7 +1788,10 @@ impl VerificationEngine {
     /// A step `timeout_seconds` earlier than the execution deadline bounds
     /// each attempt; otherwise the execution deadline governs and its expiry
     /// surfaces as [`EngineError::DeadlineExceeded`] instead of a step
-    /// failure.
+    /// failure. Host work an attempt started settles before the attempt is
+    /// retried or its result produced, including a timed-out attempt; the
+    /// outcome is captured first, so a result the attempt returned in time
+    /// keeps its classification however long its work takes to settle.
     ///
     /// Each attempt is timed into [`BLOCK_DURATION_SECONDS`] after the
     /// permit is held, inside a debug `verification.block` span.
@@ -1826,17 +1828,20 @@ impl VerificationEngine {
                 attempts,
                 duration: Duration::ZERO,
                 result: Err(ATTEMPTS_INTERRUPTED.to_owned()),
+                tool_calls: Vec::new(),
             });
         }
         let _permits = self.admit().await;
         let started = Instant::now();
         let agent = matches!(step.action, Action::Agent(_));
+        let tool_calls = ToolCallsOwner::resumed(attempts);
         loop {
             if agent && !self.spend() {
                 return Ok(Attempted {
                     attempts,
                     duration: started.elapsed(),
                     result: Err(BUDGET_SPENT.to_owned()),
+                    tool_calls: tool_calls.settled(),
                 });
             }
             attempts += 1;
@@ -1857,6 +1862,7 @@ impl VerificationEngine {
                 attempt: attempts,
                 item_index: instance.0,
                 iteration_index: instance.1,
+                tool_calls: tool_calls.handle(),
             };
             let timer = BlockTimer::start(&self.clock, "action", action_kind(&step.action));
             let result = if matches!(step.action, Action::Approval { .. }) {
@@ -1873,6 +1879,7 @@ impl VerificationEngine {
                     None => self.actions.execute(call).await,
                 }
             };
+            tool_calls.settle().await;
             timer.finish(result.is_ok());
             match result {
                 Err(BlockError::Busy { reason }) => {
@@ -1893,6 +1900,7 @@ impl VerificationEngine {
                         attempts,
                         duration: started.elapsed(),
                         result: result.map_err(|error| reason(&error)),
+                        tool_calls: tool_calls.settled(),
                     });
                 }
             }
@@ -1910,7 +1918,9 @@ impl VerificationEngine {
     /// [`BLOCK_DURATION_SECONDS`] inside a debug `verification.block` span; a
     /// check that could
     /// not judge (an uncomparable value, an unreadable trace, a failed or
-    /// refused executor) records `outcome="error"`.
+    /// refused executor) records `outcome="error"`. Host work an Agent or
+    /// code check started settles before its outcome is classified or its
+    /// records read.
     ///
     /// # Errors
     /// Returns [`EngineError::Busy`] when an Agent or code check is refused
@@ -1971,6 +1981,7 @@ impl VerificationEngine {
                 }
             }
             Check::Agent(_) | Check::Code(_) => {
+                let tool_calls = ToolCallsOwner::resumed(producer.attempt - 1);
                 let call = BlockCall {
                     id: &requirement.id,
                     position: step
@@ -1982,8 +1993,11 @@ impl VerificationEngine {
                     attempt: producer.attempt,
                     item_index: producer.item_index,
                     iteration_index: producer.iteration_index,
+                    tool_calls: tool_calls.handle(),
                 };
-                match self.checks.execute(call).await {
+                let result = self.checks.execute(call).await;
+                tool_calls.settle().await;
+                let (judged, ok) = match result {
                     Ok(output) => (Judged::cited(output, &sources, capture), true),
                     Err(BlockError::Busy { reason }) => {
                         timer.finish(false);
@@ -1994,7 +2008,14 @@ impl VerificationEngine {
                         return Err(EngineError::DefinitionUnavailable(reason));
                     }
                     Err(error) => (Ok(Judged::inconclusive(reason(&error))), false),
-                }
+                };
+                (
+                    judged.map(|judged| Judged {
+                        tool_calls: tool_calls.settled(),
+                        ..judged
+                    }),
+                    ok,
+                )
             }
             Check::Drift(drift) => (
                 Judged::checked(self.drift.judge(&requirement.id, drift), capture),
@@ -2669,6 +2690,8 @@ struct Attempted {
     duration: Duration,
     /// The output, or the final failure reason.
     result: Result<ActionOutput, String>,
+    /// Every attempt's tool calls in start order.
+    tool_calls: Vec<ToolCallRecord>,
 }
 
 impl Attempted {
@@ -2684,7 +2707,7 @@ impl Attempted {
                 duration_ms,
                 reason: None,
                 provenance: output.provenance,
-                tool_calls: output.tool_calls,
+                tool_calls: self.tool_calls,
             },
             Err(reason) => StepResult {
                 id: step.id.clone(),
@@ -2694,7 +2717,7 @@ impl Attempted {
                 duration_ms,
                 reason: Some(reason),
                 provenance: None,
-                tool_calls: Vec::new(),
+                tool_calls: self.tool_calls,
             },
         };
         own(result, sources, instance)
@@ -2718,6 +2741,8 @@ struct Judged {
     detail: Option<RequirementDetail>,
     /// What executed the check.
     provenance: Option<CallProvenance>,
+    /// Tools an Agent check called, in start order.
+    tool_calls: Vec<ToolCallRecord>,
 }
 
 impl Judged {
@@ -2749,6 +2774,7 @@ impl Judged {
             },
             check: requirement.check.clone(),
             provenance: self.provenance,
+            tool_calls: self.tool_calls,
         }
     }
 
@@ -2772,6 +2798,7 @@ impl Judged {
             data: None,
             detail: None,
             provenance: None,
+            tool_calls: Vec::new(),
         }
     }
 
@@ -2823,6 +2850,7 @@ impl Judged {
             data: output.verdict.data,
             detail: output.detail,
             provenance: output.provenance,
+            tool_calls: Vec::new(),
         })
     }
 

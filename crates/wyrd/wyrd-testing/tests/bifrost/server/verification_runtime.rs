@@ -148,6 +148,7 @@ fn drift_outcome(report: Option<DriftReport>) -> Result<ExecutedOutcome, ServerJ
                 "kind": "assert", "path": "inputs.x", "operator": "equals", "expected": true
             }))?,
             provenance: None,
+            tool_calls: Vec::new(),
         }],
         steps: Vec::new(),
         evidence: std::collections::BTreeMap::new(),

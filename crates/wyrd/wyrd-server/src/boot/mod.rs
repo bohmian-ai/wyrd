@@ -538,6 +538,24 @@ pub async fn compose_bifrost(
         .map_err(Box::new)?;
     let scribe_config = bifrost_config.scribe;
     let resource_plan = bifrost_resources.plan();
+    for (resource, value) in [
+        ("effective_cpu", resource_plan.effective_cpu as f64),
+        (
+            "memory_limit_bytes",
+            resource_plan.memory_limit_bytes as f64,
+        ),
+        (
+            "managed_memory_bytes",
+            resource_plan.managed_memory_bytes as f64,
+        ),
+        (
+            "scratch_limit_bytes",
+            resource_plan.scratch_limit_bytes as f64,
+        ),
+    ] {
+        metrics::gauge!(crate::app::metrics::PROCESS_RESOURCE_PLAN, "resource" => resource)
+            .set(value);
+    }
     let scribe_workers = resource_plan.scribe_workers;
     let pod_memory_limit = resource_plan.managed_memory_bytes;
     if roles.contains(&BifrostRuntimeRole::Scribe) {
@@ -1296,6 +1314,7 @@ impl AppState {
         if test_hooks.omit_token_verifier {
             auth.token_verifier = None;
         }
+        let process = dependencies.resources.process();
         let crate::state::ComposedBifrost {
             bifrost,
             coordination_runtime,
@@ -1336,9 +1355,14 @@ impl AppState {
             )?;
             let blocks = if config.verification.enabled && config.role.serves_api() {
                 Some(
-                    HostedBlocks::start(worker, config.verification.limits)
-                        .await
-                        .map_err(|error| ServerBootError::VerificationBlocks(error.to_string()))?,
+                    HostedBlocks::start(
+                        worker,
+                        config.verification.limits,
+                        &process,
+                        data_root.verification_scratch().to_path_buf(),
+                    )
+                    .await
+                    .map_err(|error| ServerBootError::VerificationBlocks(error.to_string()))?,
                 )
             } else {
                 None
@@ -1392,7 +1416,7 @@ impl AppState {
             rollback_roles(&state.bifrost).await;
             return Err(error);
         }
-        let workers = state.engine_workers(config);
+        let workers = state.engine_workers(config)?;
         Ok(BootedServer {
             state,
             coordination_runtime,
@@ -1424,7 +1448,19 @@ impl AppState {
     /// each owner's cache invalidation listener where its cache serves, and
     /// the verification runtime of an API-serving process with verification
     /// enabled, its drain grace clipped inside the server's shutdown budget.
-    fn engine_workers(&self, config: &WyrdServerConfig) -> Vec<EngineWorker> {
+    ///
+    /// The verification runtime runs on its own Tokio runtime with one worker
+    /// and one blocking thread per CPU of the queued share, so queued engine,
+    /// model-call, blocking, and nested tool work can never take more CPU
+    /// than that share from direct `verify` calls on the request runtime.
+    ///
+    /// # Errors
+    /// Returns [`ServerBootError::VerificationBlocks`] when the queued
+    /// runtime cannot start.
+    fn engine_workers(
+        &self,
+        config: &WyrdServerConfig,
+    ) -> Result<Vec<EngineWorker>, ServerBootError> {
         let postgres = self.postgres.wyrd();
         let shutdown = &self.shutdown_token;
         let mut workers: Vec<EngineWorker> = self
@@ -1433,7 +1469,7 @@ impl AppState {
             .into_iter()
             .collect();
         if !config.role.serves_api() {
-            return workers;
+            return Ok(workers);
         }
         workers.push(self.gateway.refresh_worker(postgres, shutdown.clone()));
         workers.extend(self.verification.refresh_worker(postgres, shutdown.clone()));
@@ -1443,6 +1479,7 @@ impl AppState {
         let held = false;
         if config.verification.enabled
             && !held
+            && let Some(blocks) = self.verification.blocks()
             && let Some(runtime) = VerificationRuntime::builder(self)
                 .limits(
                     config
@@ -1452,13 +1489,50 @@ impl AppState {
                 )
                 .build()
         {
-            let shutdown = shutdown.clone();
+            let cpus = blocks
+                .resources(crate::verification::telemetry::ExecutionMode::Queued)
+                .effective_cpu()
+                .get();
+            let queued = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(cpus)
+                .max_blocking_threads(cpus)
+                .thread_name("wyrd-verification-queued")
+                .enable_all()
+                .build()
+                .map_err(|error| {
+                    ServerBootError::VerificationBlocks(format!(
+                        "the queued verification runtime failed: {error}"
+                    ))
+                })?;
+            let ran = queued.spawn(runtime.run(shutdown.clone()));
+            let queued = QueuedRuntime(Some(queued));
             workers.push((
                 "verification_runtime",
-                Box::pin(async move { runtime.run(shutdown).await }),
+                Box::pin(async move {
+                    let _queued = queued;
+                    if let Err(error) = ran.await {
+                        tracing::error!(%error, "the queued verification runtime stopped");
+                    }
+                }),
             ));
         }
-        workers
+        Ok(workers)
+    }
+}
+
+/// Sole owner of the queued verification runtime, held by its engine worker.
+///
+/// Dropping it, after the worker's work settled or when the worker future is
+/// dropped, releases the runtime's threads without joining them, which an
+/// async frame cannot do.
+struct QueuedRuntime(Option<tokio::runtime::Runtime>);
+
+impl Drop for QueuedRuntime {
+    /// Shut the runtime down in the background.
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            runtime.shutdown_background();
+        }
     }
 }
 

@@ -16,11 +16,12 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[cfg(test)]
 use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
+use datafusion::execution::DiskManager;
 use datafusion::execution::memory_pool::MemoryLimit;
 use datafusion::execution::memory_pool::{
     FairSpillPool, MemoryConsumer, MemoryPool, MemoryReservation, TrackConsumersPool,
@@ -210,8 +211,6 @@ pub enum BifrostRole {
 pub enum ResourceSource {
     /// Explicit absolute operator override.
     Override,
-    /// Container memory limit reported by `sysinfo`, tighter than the host.
-    Container,
     /// Host or process-visible operating-system fallback.
     Host,
     /// Filesystem containing the disposable scratch root.
@@ -225,6 +224,11 @@ pub enum ResourceSource {
 pub struct BifrostResourcePolicy {
     /// Roles activated in this process.
     pub roles: BTreeSet<BifrostRole>,
+    /// Optional absolute process memory ceiling; it may only lower the
+    /// detected host memory. Co-located processes sharing one host receive
+    /// non-overlapping ceilings here, because host memory alone cannot
+    /// assign them disjoint budgets.
+    pub process_memory_limit_bytes: Option<usize>,
     /// Optional server headroom; `None` selects
     /// [`DEFAULT_SERVER_MEMORY_MIN_BYTES`], and a value below it is refused.
     pub server_memory_min_bytes: Option<usize>,
@@ -901,8 +905,11 @@ impl MemoryHolder {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ResourceState {
+    /// This root's one charge on the process memory ledger, always equal to
+    /// [`Self::governed_total`].
+    process_charge: wyrd_runtime::resources::ByteCharge,
     /// Held bytes attributed to each [`MemoryHolder`].
     held_bytes: [usize; MEMORY_HOLDER_COUNT],
     /// Infallible `DataFusion` overshoot above the cap, released on shrink.
@@ -923,6 +930,22 @@ struct ResourceState {
 }
 
 impl ResourceState {
+    /// An empty ledger whose charges are also promised from `process`.
+    fn charging(process: &wyrd_runtime::resources::ByteLedger) -> Self {
+        Self {
+            process_charge: process.empty_charge(),
+            held_bytes: [0; MEMORY_HOLDER_COUNT],
+            infallible_headroom_bytes: 0,
+            oracle_interactive_queries: 0,
+            oracle_analytical_queries: 0,
+            oracle_query_memory_used_bytes: 0,
+            scribe_category_bytes: [0; crate::scribe::memory::MEMORY_CATEGORY_COUNT],
+            scribe_shard_bytes: BTreeMap::new(),
+            oracle_capacity_epoch: 0,
+            poisoned: false,
+        }
+    }
+
     /// Returns the live Oracle slot units: one per query of either class.
     const fn oracle_active_queries(&self) -> u32 {
         self.oracle_interactive_queries
@@ -1010,13 +1033,14 @@ impl BifrostRuntimeResources {
 
     /// Detects resources while freezing an operator-selected transport message maximum.
     ///
-    /// Refuses a pod whose detected memory is below
-    /// [`MIN_POD_MEMORY_BYTES`], the hard deployment floor for any Wyrd pod.
+    /// Refuses a pod whose memory budget, the detected memory lowered by any
+    /// process ceiling, is below [`MIN_POD_MEMORY_BYTES`], the hard
+    /// deployment floor for any Wyrd pod.
     ///
     /// # Errors
     ///
     /// Returns [`BifrostResourceError::InvalidPlan`] when the policy names no
-    /// scratch root or the detected pod memory is below
+    /// scratch root or the pod memory budget is below
     /// [`MIN_POD_MEMORY_BYTES`], and [`BifrostResourceError`]
     /// when detection, root-policy validation, or the selected
     /// message-to-aggregate relationship is invalid.
@@ -1024,13 +1048,7 @@ impl BifrostRuntimeResources {
         policy: BifrostResourcePolicy,
         transport_message_limit_bytes: usize,
     ) -> Result<Self, BifrostResourceError> {
-        let fallback_memory = policy.bifrost_memory_limit_bytes.map(|cap| {
-            cap.saturating_add(
-                policy
-                    .server_memory_min_bytes
-                    .unwrap_or(DEFAULT_SERVER_MEMORY_MIN_BYTES),
-            )
-        });
+        let fallback_memory = policy.process_memory_limit_bytes;
         let scratch_root =
             policy
                 .scratch_root
@@ -1039,7 +1057,14 @@ impl BifrostRuntimeResources {
                     detail: "live resource detection requires a scratch root".to_owned(),
                 })?;
         let snapshot = detect_snapshot(scratch_root, fallback_memory)?;
-        require_pod_memory_floor(snapshot.memory_limit_bytes)?;
+        // The floor is on the assigned budget, which a ceiling may lower.
+        require_pod_memory_floor(
+            policy
+                .process_memory_limit_bytes
+                .map_or(snapshot.memory_limit_bytes, |ceiling| {
+                    ceiling.min(snapshot.memory_limit_bytes)
+                }),
+        )?;
         Self::from_snapshot_with_transport_message_limit(
             snapshot,
             policy,
@@ -1094,13 +1119,12 @@ impl BifrostRuntimeResources {
         let scratch_root = policy.scratch_root.take();
         let root = BifrostResourceGovernor::from_snapshot(snapshot, policy)?;
         let oracle_spill = match scratch_root {
-            Some(scratch_root) if root.plan().oracle_enabled => {
-                Some(Arc::new(OracleSpillRuntime::new(&scratch_root).map_err(
-                    |error| BifrostResourceError::Unavailable {
+            Some(scratch_root) if root.plan().oracle_enabled => Some(Arc::new(
+                OracleSpillRuntime::new(&scratch_root, root.inner.process.scratch().clone())
+                    .map_err(|error| BifrostResourceError::Unavailable {
                         detail: error.to_string(),
-                    },
-                )?))
-            }
+                    })?,
+            )),
             _ => None,
         };
         let transport = crate::gate::limits::BifrostTransportAdmission::new(
@@ -1155,6 +1179,7 @@ impl BifrostRuntimeResources {
             },
             BifrostResourcePolicy {
                 roles,
+                process_memory_limit_bytes: None,
                 server_memory_min_bytes: None,
                 bifrost_memory_limit_bytes: None,
                 scratch_limit_bytes: Some(scratch_limit_bytes),
@@ -1201,6 +1226,7 @@ impl BifrostRuntimeResources {
             }),
             forge: plan.forge_enabled.then(|| ForgeResources {
                 memory_root: Arc::clone(&self.memory_root),
+                scratch: self.governor.inner.process.scratch().clone(),
             }),
             governor: self.governor.clone(),
             transport: self.transport.clone(),
@@ -1211,6 +1237,13 @@ impl BifrostRuntimeResources {
     #[must_use]
     pub fn plan(&self) -> ResourcePlan {
         self.governor.plan()
+    }
+
+    /// The process memory and scratch ledgers this root also charges, for
+    /// the server to compose its other capabilities from.
+    #[must_use]
+    pub fn process(&self) -> wyrd_runtime::resources::ProcessResources {
+        self.governor.inner.process.clone()
     }
 
     /// Returns the resolved source for every resource dimension.
@@ -1279,6 +1312,13 @@ impl BifrostRoleResources {
     #[must_use]
     pub fn plan(&self) -> ResourcePlan {
         self.governor.plan()
+    }
+
+    /// The process memory and scratch ledgers every issued capability also
+    /// charges, for the server to compose its other capabilities from.
+    #[must_use]
+    pub fn process(&self) -> wyrd_runtime::resources::ProcessResources {
+        self.governor.inner.process.clone()
     }
 
     /// Returns which observation source resolved each bound in this plan.
@@ -1443,8 +1483,10 @@ impl ScribeResources {
             oracle_total_bytes: state.held(MemoryHolder::Oracle),
             oracle_limit_bytes: plan.managed_memory_bytes,
             categories: state.scribe_category_bytes,
-            cgroup_current_bytes: self.governor.cgroup_pressure().map(|(current, _)| current),
-            cgroup_limit_bytes: self.governor.inner.container_memory_limit,
+            process_used_bytes: usize::try_from(self.governor.inner.process.memory().used())
+                .unwrap_or(usize::MAX),
+            process_limit_bytes: usize::try_from(self.governor.inner.process.memory().limit())
+                .unwrap_or(usize::MAX),
             ingress_occupancy_bytes: state.held(MemoryHolder::Scribe),
             ingress_limit_bytes: self.ingress_limit_bytes(),
             ingress_high_water_bytes: 0,
@@ -1519,10 +1561,19 @@ impl ScribeResources {
         self.try_reserve_ingress(category, bytes)
     }
 
-    /// Reports live cgroup pressure through the root's throttled sampler.
+    /// Reports whether capabilities outside Bifrost hold process memory and
+    /// the process ledger has no room left for `bytes`: a Scribe pressure
+    /// seal cannot relieve memory other capabilities hold.
     #[must_use]
-    pub(crate) fn cgroup_tripwire_engaged(&self) -> bool {
-        matches!(self.governor.cgroup_pressure(), Some((current, limit)) if current.saturating_mul(100) >= limit.saturating_mul(90))
+    pub(crate) fn process_memory_exhausted(&self, bytes: usize) -> bool {
+        let process = self.governor.inner.process.memory();
+        let Ok(state) = self.governor.inner.state.lock() else {
+            return false;
+        };
+        let bifrost = u64::try_from(state.governed_total()).unwrap_or(u64::MAX);
+        drop(state);
+        process.used() > bifrost
+            && u64::try_from(bytes).map_or(true, |bytes| process.available() < bytes)
     }
     /// Returns the registered durable Scribe staging root.
     #[must_use]
@@ -1838,6 +1889,21 @@ impl OracleQueryMemoryHold {
 }
 
 impl OracleResources {
+    /// The Oracle capability of a test composition with 1 GiB of memory and
+    /// scratch, shared by the cache and spill unit tests.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the composition omits Oracle, which cannot happen for the
+    /// fixed role set it requests.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn for_test() -> Self {
+        BifrostRuntimeResources::composed_for_test(1 << 30, 1 << 30, [BifrostRole::Oracle])
+            .oracle()
+            .expect("the composed test roles include Oracle")
+    }
+
     /// Returns this pod's Oracle partition sizing.
     ///
     /// Planning caps a query by [`OraclePartitioning::target_partitions`],
@@ -2007,9 +2073,18 @@ impl OracleResources {
 pub struct ForgeResources {
     /// The pod's one governed pool every Forge rewrite grows through.
     memory_root: Arc<GovernedMemoryRoot>,
+    /// The process scratch ledger every written Forge spill byte is charged
+    /// to, shared with Oracle spill and hosted verification workspaces.
+    scratch: wyrd_runtime::resources::ByteLedger,
 }
 
 impl ForgeResources {
+    /// The process scratch ledger Forge spill is charged to.
+    #[must_use]
+    pub fn scratch(&self) -> &wyrd_runtime::resources::ByteLedger {
+        &self.scratch
+    }
+
     /// Issues one rewrite attempt's pool over the shared memory pool.
     ///
     /// The view's ceiling is the shared cap itself: Forge has no independent
@@ -2072,12 +2147,9 @@ struct ResourceGovernorInner {
     state: Mutex<ResourceState>,
     /// Lost-wakeup-safe notification paired with `ResourceState::oracle_capacity_epoch`.
     oracle_capacity_changed: Notify,
-    /// Container memory limit that bounds this process, read by the live
-    /// external-pressure tripwire; `None` when no container limit is tighter
-    /// than the host.
-    container_memory_limit: Option<usize>,
-    /// Live container usage cached for at most one second under the root owner.
-    cgroup_current: Mutex<Option<(Instant, Option<usize>)>>,
+    /// The process plan every non-Bifrost capability charges too; the
+    /// governor's whole governed total is one charge on its memory ledger.
+    process: wyrd_runtime::resources::ProcessResources,
     /// Lock-free first-poison signal observed by application supervision.
     health: BifrostResourceHealth,
 }
@@ -2192,7 +2264,11 @@ impl BifrostResourceGovernor {
                 detail: "no positive memory bound was detected".to_owned(),
             });
         }
-        let memory_limit_bytes = snapshot.memory_limit_bytes;
+        let memory_limit_bytes = cap_positive(
+            snapshot.memory_limit_bytes,
+            policy.process_memory_limit_bytes,
+            "process memory",
+        )?;
         let effective_cpu = cap_positive(snapshot.effective_cpu, policy.effective_cpu, "CPU")?;
         let scribe_workers = ScribeWorkers::resolve(effective_cpu, policy.scribe_workers);
         let oracle_query_slot_limit = policy.oracle_query_slot_limit;
@@ -2211,6 +2287,14 @@ impl BifrostResourceGovernor {
         )?;
         let (scratch_limit_bytes, available_after_floor) = scratch_budget(&snapshot, &policy)?;
         drop(policy.scratch_root);
+        // The process ledger is everything above the measured server
+        // baseline; the Bifrost cap equals it unless an operator lowered it.
+        let process = wyrd_runtime::resources::ProcessResources::new(
+            NonZeroUsize::new(effective_cpu).ok_or_else(accounting_overflow)?,
+            u64::try_from(memory_limit_bytes - server_memory_min_bytes)
+                .map_err(|_| accounting_overflow())?,
+            scratch_limit_bytes,
+        );
         let root = Self {
             inner: Arc::new(ResourceGovernorInner {
                 plan: ResourcePlan {
@@ -2227,7 +2311,14 @@ impl BifrostResourceGovernor {
                     scribe_workers,
                 },
                 sources: ResolvedResourceSources {
-                    memory: snapshot.memory_source,
+                    memory: if policy
+                        .process_memory_limit_bytes
+                        .is_some_and(|limit| limit <= snapshot.memory_limit_bytes)
+                    {
+                        ResourceSource::Override
+                    } else {
+                        snapshot.memory_source
+                    },
                     cpu: if policy
                         .effective_cpu
                         .is_some_and(|limit| limit <= snapshot.effective_cpu)
@@ -2245,10 +2336,9 @@ impl BifrostResourceGovernor {
                     },
                 },
                 oracle_class_split: OnceLock::new(),
-                state: Mutex::new(ResourceState::default()),
+                state: Mutex::new(ResourceState::charging(process.memory())),
                 oracle_capacity_changed: Notify::new(),
-                container_memory_limit: host_memory().ok().and_then(container_memory_limit),
-                cgroup_current: Mutex::new(None),
+                process,
                 health: BifrostResourceHealth::default(),
             }),
         };
@@ -2289,24 +2379,6 @@ impl BifrostResourceGovernor {
     #[must_use]
     pub(crate) fn sources(&self) -> ResolvedResourceSources {
         self.inner.sources
-    }
-
-    /// Returns throttled live container usage and its root-owned hard limit.
-    fn cgroup_pressure(&self) -> Option<(usize, usize)> {
-        let limit = self.inner.container_memory_limit?;
-        let current = if let Ok(cache) = self.inner.cgroup_current.lock()
-            && let Some((sampled_at, value)) = *cache
-            && sampled_at.elapsed() < Duration::from_secs(1)
-        {
-            value
-        } else {
-            let value = container_memory_used();
-            if let Ok(mut cache) = self.inner.cgroup_current.lock() {
-                *cache = Some((Instant::now(), value));
-            }
-            value
-        }?;
-        Some((current, limit))
     }
 
     /// Captures exact live shared-cap ownership and its attribution.
@@ -2740,6 +2812,15 @@ impl BifrostResourceGovernor {
             .held(holder)
             .checked_add(bytes)
             .ok_or_else(accounting_overflow)?;
+        state
+            .process_charge
+            .try_grow(u64::try_from(bytes).map_err(|_| accounting_overflow())?)
+            .map_err(|refusal| BifrostResourceError::Occupied {
+                detail: format!(
+                    "{} memory request exceeds process memory other capabilities share: {refusal}",
+                    holder.label()
+                ),
+            })?;
         state.held_bytes[holder as usize] = next;
         Ok(next)
     }
@@ -2778,6 +2859,7 @@ impl BifrostResourceGovernor {
             return Err(self.poison_locked(state, "shared memory release underflow"));
         };
         state.held_bytes[holder as usize] = next;
+        state.process_charge.shrink(bytes as u64);
         Ok(next)
     }
 
@@ -2848,7 +2930,8 @@ impl BifrostResourceGovernor {
         let free = self
             .plan()
             .managed_memory_bytes
-            .saturating_sub(state.governed_total());
+            .saturating_sub(state.governed_total())
+            .min(usize::try_from(self.inner.process.memory().available()).unwrap_or(usize::MAX));
         let governed = bytes.min(free).min(governed_ceiling);
         let headroom = bytes - governed;
         let next = state
@@ -2860,6 +2943,7 @@ impl BifrostResourceGovernor {
             .checked_add(headroom)
             .ok_or_else(accounting_overflow)?;
         state.held_bytes[holder as usize] = next;
+        state.process_charge.grow_infallible(bytes as u64);
         if holder == MemoryHolder::Oracle {
             state.oracle_query_memory_used_bytes = state
                 .oracle_query_memory_used_bytes
@@ -2902,6 +2986,7 @@ impl BifrostResourceGovernor {
         }
         let held = self.apply_release_locked(&mut state, holder, charge.governed_bytes)?;
         state.infallible_headroom_bytes -= charge.headroom_bytes;
+        state.process_charge.shrink(charge.headroom_bytes as u64);
         let oracle_used = (holder == MemoryHolder::Oracle).then(|| {
             state.oracle_query_memory_used_bytes -= charge.governed_bytes;
             state.oracle_memory_used()
@@ -2942,6 +3027,11 @@ impl BifrostResourceGovernor {
     pub(crate) fn transport_used_bytes(&self) -> usize {
         self.lock_state()
             .map_or(0, |state| state.held(MemoryHolder::Transport))
+    }
+
+    /// Returns the process memory ledger this governor's cap is charged to.
+    pub(crate) fn process_memory(&self) -> &wyrd_runtime::resources::ByteLedger {
+        self.inner.process.memory()
     }
 
     fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, ResourceState>, BifrostResourceError> {
@@ -4240,6 +4330,9 @@ pub struct OracleExecution {
     granted_memory_bytes: usize,
     /// Session shape derived from `granted_memory_bytes` and the grant's partitions.
     shape: OracleSessionShape,
+    /// The query's own spill disk manager, which owns its spill directories;
+    /// `None` when spill is disabled.
+    spill_disk: Option<Arc<DiskManager>>,
 }
 
 impl std::fmt::Debug for OracleExecution {
@@ -4270,8 +4363,11 @@ impl OracleExecution {
         target_partitions: usize,
         spill_limit_bytes: u64,
     ) -> Result<Self, BifrostResourceError> {
-        let runtime = build_query_runtime(spill, memory_pool, spill_limit_bytes)?;
-        Ok(Self::new(runtime, granted_memory_bytes, target_partitions))
+        let (runtime, spill_disk) = build_query_runtime(spill, memory_pool, spill_limit_bytes)?;
+        Ok(Self {
+            spill_disk,
+            ..Self::new(runtime, granted_memory_bytes, target_partitions)
+        })
     }
 
     /// Names an execution over an already-built runtime.
@@ -4288,6 +4384,7 @@ impl OracleExecution {
             runtime,
             granted_memory_bytes,
             shape: OracleSessionShape::new(target_partitions),
+            spill_disk: None,
         }
     }
 
@@ -4297,7 +4394,15 @@ impl OracleExecution {
         &self.runtime
     }
 
-    /// Removes the runtime's `DataFusion` spill directories now.
+    /// The query's `DataFusion` spill directories created so far.
+    fn spill_directories(&self) -> Vec<std::path::PathBuf> {
+        self.spill_disk
+            .as_ref()
+            .map(|disk| disk.temp_dir_paths())
+            .unwrap_or_default()
+    }
+
+    /// Removes the query's `DataFusion` spill directories now.
     ///
     /// `DataFusion` removes them only when the last `Arc<RuntimeEnv>` drops,
     /// and an upstream task context can hold the runtime after its query has
@@ -4307,7 +4412,7 @@ impl OracleExecution {
     /// already over; the runtime's own later cleanup ignores the missing path.
     /// Failures are logged, never raised, because this runs inside `Drop`.
     fn remove_spill_directories(&self) {
-        for path in self.runtime.disk_manager.temp_dir_paths() {
+        for path in self.spill_directories() {
             match std::fs::remove_dir_all(&path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -4459,17 +4564,14 @@ fn detect_snapshot(
         Ok(detected) => (detected, ResourceSource::Host),
         Err(_) => (
             memory_override.ok_or_else(|| BifrostResourceError::Unavailable {
-                detail: "host memory probe is unavailable; set WYRD_BIFROST_MEMORY_LIMIT_BYTES"
+                detail: "host memory probe is unavailable; set \
+                         WYRD_BIFROST_PROCESS_MEMORY_LIMIT_BYTES"
                     .to_owned(),
             })?,
             ResourceSource::Override,
         ),
     };
-    let (memory_limit_bytes, memory_source) = container_memory_limit(host_memory)
-        .map_or((host_memory, host_source), |limit| {
-            (limit, ResourceSource::Container)
-        });
-    // The standard library already lowers this to any container CPU quota.
+    let (memory_limit_bytes, memory_source) = (host_memory, host_source);
     let effective_cpu = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .map_err(|error| BifrostResourceError::Unavailable {
@@ -4519,25 +4621,6 @@ fn host_memory() -> Result<usize, BifrostResourceError> {
         })
 }
 
-/// Returns the container memory limit `sysinfo` reports for this process
-/// when it is tighter than `host` bytes, else `None`.
-///
-/// Boot sizes the managed memory plan from it, and the external-pressure
-/// tripwire compares [`container_memory_used`] against it.
-fn container_memory_limit(host: usize) -> Option<usize> {
-    let limits = System::new().cgroup_limits()?;
-    usize::try_from(limits.total_memory)
-        .ok()
-        .filter(|limit| *limit < host)
-}
-
-/// Returns the container's current memory use as `sysinfo` reports it, or
-/// `None` when no container limit is reported.
-fn container_memory_used() -> Option<usize> {
-    let limits = System::new().cgroup_limits()?;
-    usize::try_from(limits.total_memory.saturating_sub(limits.free_memory)).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4579,6 +4662,7 @@ mod tests {
         let roles: BTreeSet<BifrostRole> = roles.iter().copied().collect();
         BifrostResourcePolicy {
             roles,
+            process_memory_limit_bytes: None,
             server_memory_min_bytes: None,
             bifrost_memory_limit_bytes: None,
             scratch_limit_bytes: None,
@@ -5650,25 +5734,118 @@ mod tests {
         ));
     }
 
-    /// Portable source precedence selects the tightest injected host/container bounds.
+    /// Portable sources come from the host observation unless an operator
+    /// ceiling lowers it.
     #[test]
     fn resource_detector_resolves_portable_sources_in_order() {
         let mut injected = snapshot(2 * 1024 * MIB);
         injected.memory_limit_bytes = 1024 * MIB + DEFAULT_SERVER_MEMORY_MIN_BYTES;
-        injected.memory_source = ResourceSource::Container;
+        injected.memory_source = ResourceSource::Host;
         injected.effective_cpu = 3;
         injected.cpu_source = ResourceSource::Host;
         let runtime =
             BifrostRuntimeResources::from_snapshot(injected, policy(&[BifrostRole::Oracle]))
                 .expect("injected portable sources must produce a plan");
-        assert_eq!(runtime.sources().memory, ResourceSource::Container);
+        assert_eq!(runtime.sources().memory, ResourceSource::Host);
         assert_eq!(runtime.sources().cpu, ResourceSource::Host);
         assert_eq!(runtime.sources().scratch, ResourceSource::Filesystem);
     }
 
+    /// A process memory ceiling lowers the observed host memory and sizes the
+    /// process ledger, which Bifrost then borrows in full; a ceiling above
+    /// the observation cannot raise it.
+    ///
+    /// # Panics
+    /// Panics when the ceiling raises discovery or the ledger disagrees with
+    /// the plan.
+    #[test]
+    fn process_memory_ceiling_only_lowers_discovery() {
+        let observed = snapshot(4 * 1024 * MIB);
+        let mut lowered = policy(&[BifrostRole::Oracle]);
+        lowered.process_memory_limit_bytes = Some(3 * 1024 * MIB);
+        let runtime = BifrostRuntimeResources::from_snapshot(observed, lowered)
+            .expect("a lowering ceiling is a valid assignment");
+        assert_eq!(runtime.plan().memory_limit_bytes, 3 * 1024 * MIB);
+        assert_eq!(runtime.sources().memory, ResourceSource::Override);
+        let process = runtime.process();
+        assert_eq!(
+            process.memory().limit(),
+            u64::try_from(3 * 1024 * MIB - DEFAULT_SERVER_MEMORY_MIN_BYTES).unwrap()
+        );
+        assert_eq!(
+            usize::try_from(process.memory().limit()).unwrap(),
+            runtime.plan().managed_memory_bytes,
+            "an idle server lends Bifrost the whole process ledger"
+        );
+        assert_eq!(
+            process.scratch().limit(),
+            runtime.plan().scratch_limit_bytes
+        );
+        let mut raised = policy(&[BifrostRole::Oracle]);
+        raised.process_memory_limit_bytes = Some(64 * 1024 * MIB);
+        assert_eq!(
+            BifrostRuntimeResources::from_snapshot(observed, raised)
+                .expect("a ceiling above discovery leaves discovery")
+                .plan()
+                .memory_limit_bytes,
+            observed.memory_limit_bytes
+        );
+        let mut zero = policy(&[BifrostRole::Oracle]);
+        zero.process_memory_limit_bytes = Some(0);
+        assert!(matches!(
+            BifrostRuntimeResources::from_snapshot(observed, zero),
+            Err(BifrostResourceError::InvalidPlan { .. })
+        ));
+    }
+
+    /// Bifrost charges and the server's other capabilities draw on one
+    /// process ledger: Bifrost alone borrows all of it, a hosted charge then
+    /// refuses Bifrost growth, and returning either restores the other.
+    ///
+    /// # Panics
+    /// Panics when a Bifrost charge escapes the process ledger or a hosted
+    /// charge is not visible to Bifrost admission.
+    #[test]
+    fn bifrost_charges_share_the_process_ledger() {
+        let runtime = BifrostRuntimeResources::from_snapshot(
+            snapshot(256 * MIB),
+            policy(&[BifrostRole::Oracle]),
+        )
+        .expect("plan");
+        let process = runtime.process();
+        let limit = usize::try_from(process.memory().limit()).unwrap();
+        let governor = &runtime.governor;
+        governor
+            .try_charge_transport(limit)
+            .expect("an idle process lends Bifrost everything");
+        assert_eq!(process.memory().used(), process.memory().limit());
+        assert!(process.memory().try_charge(1).is_err());
+        governor.release_transport(limit).expect("release");
+        assert_eq!(process.memory().used(), 0);
+        let hosted = process
+            .memory()
+            .try_charge(u64::try_from(limit / 2).unwrap())
+            .expect("hosted borrows half");
+        assert!(matches!(
+            governor.try_charge_transport(limit),
+            Err(BifrostResourceError::Occupied { .. })
+        ));
+        governor
+            .try_charge_transport(limit - limit / 2)
+            .expect("the rest stays borrowable");
+        governor
+            .release_transport(limit - limit / 2)
+            .expect("release");
+        drop(hosted);
+        governor
+            .try_charge_transport(limit)
+            .expect("hosted bytes return to Bifrost");
+        governor.release_transport(limit).expect("release");
+    }
+
     /// Absolute overrides can tighten but never inflate detected resources.
     #[test]
-    fn resource_detector_uses_tightest_host_cgroup_and_override_bound() {
+    fn resource_detector_uses_tightest_host_and_override_bound() {
         let mut policy = policy(&[BifrostRole::Oracle]);
         policy.bifrost_memory_limit_bytes = Some(768 * MIB);
         policy.effective_cpu = Some(2);
@@ -5864,7 +6041,7 @@ mod tests {
             .disk_manager
             .create_tmp_file("oracle-query-spill")
             .expect("the first spill creates the spill directory");
-        let directories = holder.disk_manager.temp_dir_paths();
+        let directories = query.execution().spill_directories();
         assert!(
             !directories.is_empty() && directories.iter().all(|path| path.exists()),
             "a spilling query owns a live spill directory: {directories:?}"
@@ -5877,6 +6054,91 @@ mod tests {
         );
         drop(spill);
         drop(holder);
+    }
+
+    /// Caches and spill charge the process ledgers only for what they retain:
+    /// empty caches withhold nothing, a cached range charges its bytes, a
+    /// reference outliving its cache keeps them charged, and a query's spill
+    /// charges the process scratch ledger until its file is gone.
+    ///
+    /// # Panics
+    /// Panics when an idle cache holds a standing charge, a retained range is
+    /// uncharged, bytes return while referenced, or spill bypasses scratch.
+    #[test]
+    fn cache_and_spill_ownership_share_process_capacity() {
+        use std::io::Write as _;
+
+        let root = tempfile::tempdir().expect("test root");
+        let mut policy = policy(&[BifrostRole::Oracle]);
+        policy.scratch_root = Some(root.path().join("spill"));
+        let runtime = BifrostRuntimeResources::from_snapshot(snapshot(2 * 1024 * MIB), policy)
+            .expect("an Oracle plan with a scratch root");
+        let process = runtime.process();
+        let roles = runtime.compose_roles().expect("composition");
+        let oracle = roles.oracle().expect("Oracle capability");
+        let idle = process.memory().used();
+        let storage = crate::storage::BifrostStorage::new(
+            &wyrd_storage::BackendConfig::Local {
+                root: root.path().join("warehouse"),
+            },
+            crate::storage::BifrostStoragePolicy::resolve(
+                crate::storage::BifrostStorageConfig::default(),
+                2 * 1024 * MIB as u64,
+                true,
+            )
+            .expect("default storage policy"),
+        )
+        .expect("local store")
+        .with_oracle_caches(&oracle.metadata())
+        .expect("caches compose");
+        assert_eq!(
+            process.memory().used(),
+            idle,
+            "empty caches withhold no process memory"
+        );
+
+        let ranges = storage
+            .data_cache()
+            .expect("an Oracle node has a range cache");
+        let path = object_store::path::Path::from("tenant/spans/a.parquet");
+        ranges.put(&path, 0..MIB as u64, &vec![7; MIB]);
+        assert!(
+            process.memory().used() >= idle + MIB as u64,
+            "a cached range charges its retained bytes"
+        );
+        let held = ranges
+            .get(&path, &(0..MIB as u64))
+            .expect("the range is cached");
+        drop(storage);
+        assert!(
+            process.memory().used() >= idle + MIB as u64,
+            "a reference outliving its cache keeps the bytes charged"
+        );
+        drop(held);
+        assert_eq!(
+            process.memory().used(),
+            idle,
+            "the last reference returns them"
+        );
+
+        let scratch_idle = process.scratch().used();
+        let query = oracle
+            .try_acquire_query(analytical_query(8))
+            .expect("an idle Oracle admits one analytical query");
+        let file = query
+            .execution()
+            .runtime()
+            .disk_manager
+            .create_tmp_file("cache-and-spill")
+            .expect("the query spills");
+        file.open_writer()
+            .expect("spill writer")
+            .write_all(&[0; 4_096])
+            .expect("the spill fits");
+        assert_eq!(process.scratch().used(), scratch_idle + 4_096);
+        drop(file);
+        drop(query);
+        assert_eq!(process.scratch().used(), scratch_idle);
     }
 
     /// One composition issues every capability from the single retained root.
@@ -6235,7 +6497,13 @@ mod tests {
         assert_eq!(released.oracle_memory_used_bytes, 0);
     }
 
-    /// Live boot refuses any pod below the 4 GiB floor and accepts the floor itself.
+    /// Live boot refuses any pod below the 4 GiB floor and accepts the floor
+    /// itself, and the floor applies to the assigned budget: a process
+    /// ceiling below it is refused however much memory the host has.
+    ///
+    /// # Panics
+    /// Panics when a below-floor budget or ceiling boots, or the floor itself
+    /// is refused.
     #[test]
     fn pod_memory_below_the_floor_is_refused() {
         assert!(matches!(
@@ -6243,6 +6511,15 @@ mod tests {
             Err(BifrostResourceError::InvalidPlan { .. })
         ));
         assert!(require_pod_memory_floor(MIN_POD_MEMORY_BYTES).is_ok());
+
+        let scratch = tempfile::tempdir().expect("scratch root");
+        let mut ceiling = policy(&[BifrostRole::Oracle]);
+        ceiling.process_memory_limit_bytes = Some(MIN_POD_MEMORY_BYTES - 1);
+        ceiling.scratch_root = Some(scratch.path().to_path_buf());
+        assert!(matches!(
+            BifrostRuntimeResources::detect(ceiling),
+            Err(BifrostResourceError::InvalidPlan { .. })
+        ));
     }
 
     /// Every query receives half the budget, floored and capped.

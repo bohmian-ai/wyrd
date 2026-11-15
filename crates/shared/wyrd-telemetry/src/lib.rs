@@ -545,7 +545,10 @@ pub fn init_test_capture(
 /// operator verbosity records, so neither filter can add to a tenant copy
 /// either; the copy drops the attribute. Spans carry no busy/idle times, thread, or
 /// code location: each costs work on every span or every poll of an
-/// instrumented future, and no tenant copy keeps them.
+/// instrumented future, and no tenant copy keeps them. Entering a span does
+/// not attach its OpenTelemetry context either: parents and readers resolve
+/// it from the current `tracing` span, so attaching would only add a context
+/// push and pop to every poll.
 fn subscriber<W>(
     logs: EnvFilter,
     traces: EnvFilter,
@@ -574,6 +577,7 @@ where
                 .with_tracer(tracer)
                 .with_level(true)
                 .with_tracked_inactivity(false)
+                .with_context_activation(false)
                 .with_threads(false)
                 .with_location(false)
                 .with_filter(traces.or(tenant)),

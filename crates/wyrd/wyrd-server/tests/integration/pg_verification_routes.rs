@@ -1765,6 +1765,89 @@ async fn direct_execution_judges_inline_without_enqueueing() {
     server.shutdown().await.expect("test server shuts down");
 }
 
+/// A direct execution's one deadline, `verify_timeout` after its arrival,
+/// also bounds its wait for process memory: a request that waits it out
+/// behind occupied memory is 504 `WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT`
+/// at that deadline, never a retryable 503, and once memory frees the same
+/// request judges normally.
+///
+/// # Panics
+/// Panics when the server or seeding fails, the waiting request is not a
+/// timely 504, or the freed request does not pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_execution_waits_end_at_the_arrival_deadline() {
+    let limits = wyrd_server::verification::hosted::HostedLimits {
+        monty_min_workers: 0,
+        verify_timeout: Duration::from_secs(2),
+        ..wyrd_server::verification::hosted::HostedLimits::default()
+    };
+    let server = WyrdTestServer::builder()
+        .with_verification_limits_for_test(limits)
+        .start_in_process()
+        .await
+        .expect("test server starts");
+    let seed = server
+        .verification_fixture()
+        .await
+        .expect("verification fixture provisions");
+    let (service, _) = seed.service("dl-service").await.expect("Service registers");
+    let adder = seed
+        .verifier(
+            "dl-adder",
+            &json!({
+                "inputs": { "x": { "type": "json" } },
+                "steps": [{
+                    "id": "add",
+                    "action": { "kind": "code", "entrypoint": "f",
+                                "source": { "inline": "def f(x):\n    return x + 1" },
+                                "inputs": { "x": "inputs.x" } },
+                    "requirements": [{ "id": "add-ok", "statement": "The code answers.",
+                        "check": { "kind": "assert", "path": "steps.add.output",
+                                   "operator": "equals", "expected": 2 } }]
+                }]
+            }),
+        )
+        .await
+        .expect("adder registers");
+    let (_, jwt) = user(&server, "dl-writer", &["editor"]).await;
+    let body = json!({
+        "verifier_card_uid": adder,
+        "card_uid": service,
+        "inputs": { "x": { "kind": "json", "value": 1 } }
+    })
+    .to_string();
+    let sandbox = std::sync::Arc::clone(
+        server
+            .state()
+            .verification
+            .blocks()
+            .expect("blocks are hosted")
+            .sandbox(wyrd_server::verification::telemetry::ExecutionMode::Direct),
+    );
+    // Short of one session envelope, with room left for the Scribe work
+    // that shares process memory.
+    let held = sandbox.occupy_for_test(64 << 20);
+
+    let started = std::time::Instant::now();
+    let (status, response) = execute(&server, &jwt, body.clone()).await;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{response}");
+    assert_eq!(
+        response["code"],
+        "WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT"
+    );
+    assert!(
+        started.elapsed() < limits.verify_timeout + Duration::from_secs(3),
+        "the wait ends at the deadline: {:?}",
+        started.elapsed()
+    );
+
+    drop(held);
+    let (status, response) = execute(&server, &jwt, body).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["outcome"]["verdict"], "passed", "{response}");
+    server.shutdown().await.expect("test server shuts down");
+}
+
 /// Malformed, oversized, unknown, and non-Verifier executions and a Drift
 /// Verifier, which judges only scheduled windows, are refused with stable
 /// codes. A caller without `verifier:run`, holding only an unrelated `operators:invoke`, or

@@ -71,10 +71,8 @@ use wyrd_server::state::{
 };
 /// The runtime bounds [`WyrdTestServerBuilder::with_verification_runtime_limits_for_test`] takes.
 pub use wyrd_server::verification::RuntimeLimits;
-/// The lane resource a journey saturates through `HostedBlocks::hold_for_test`.
-pub use wyrd_server::verification::hosted::blocks::LaneAdmission;
 /// The hosted Verifier limits [`WyrdTestServerBuilder::with_verification_limits_for_test`] takes.
-pub use wyrd_server::verification::hosted::{HostedLimits, LaneLimits};
+pub use wyrd_server::verification::hosted::{HostedLimits, LaneLimits, QueuedShare};
 /// The execution lane a journey selects hosted capacity by.
 pub use wyrd_server::verification::telemetry::ExecutionMode;
 /// Reserved Scribe outbox slots a journey holds to fill the server's
@@ -729,6 +727,17 @@ impl Default for WyrdTestServerBuilder {
 
 /// Result of a fixture-path principal bootstrap.
 pub use crate::principal::Bootstrap;
+/// Process memory a test holds until it drops.
+pub use wyrd_server::verification::hosted::sandbox::OccupiedForTest;
+
+/// The hosted limits a test server starts with: the defaults with no
+/// prewarmed worker.
+fn test_verification_limits() -> HostedLimits {
+    HostedLimits {
+        monty_min_workers: 0,
+        ..HostedLimits::default()
+    }
+}
 
 /// Write key version 1 as an owner-only file in a fresh directory and return
 /// the file-sourced Operator key config over it.
@@ -805,6 +814,19 @@ pub enum WyrdTestServerError {
         /// fitted baseline at all.
         last: Option<Box<DriftBaselineStatus>>,
     },
+    /// The hosted memory queue did not reach the awaited length by the
+    /// caller's deadline.
+    #[error(
+        "{expected} hosted operations never waited for memory within {timeout:?}; last observed: {last}"
+    )]
+    HostedWaitersNotReached {
+        /// The awaited queue length.
+        expected: usize,
+        /// The deadline the caller allowed.
+        timeout: Duration,
+        /// The last queue length read.
+        last: usize,
+    },
 }
 
 impl From<WyrdTestServerError> for wyrd_spec::error::WyrdError {
@@ -816,10 +838,13 @@ impl From<WyrdTestServerError> for wyrd_spec::error::WyrdError {
             | WyrdTestServerError::Sql(_)
             | WyrdTestServerError::Http { .. }
             | WyrdTestServerError::Io(_)
-            | WyrdTestServerError::Unsupported(_) => wyrd_spec::error::WyrdError::HarnessStart {
-                message: msg,
-                details: serde_json::json!({}),
-            },
+            | WyrdTestServerError::Unsupported(_)
+            | WyrdTestServerError::HostedWaitersNotReached { .. } => {
+                wyrd_spec::error::WyrdError::HarnessStart {
+                    message: msg,
+                    details: serde_json::json!({}),
+                }
+            }
             WyrdTestServerError::Bind(_) | WyrdTestServerError::Join(_) => {
                 wyrd_spec::error::WyrdError::HarnessBound {
                     message: msg,
@@ -2941,6 +2966,70 @@ impl WyrdTestServer {
             .ok_or_else(|| WyrdTestServerError::Start("server has no Bifrost Scribe".to_owned()))
     }
 
+    /// Hold direct-lane process memory so at most `leave` bytes stay free, so a hosted
+    /// Python operation whose session envelope does not fit waits, and one
+    /// whose retained request bytes do not fit is refused, until the
+    /// returned hold drops.
+    ///
+    /// # Panics
+    /// Panics when called outside a Tokio runtime.
+    ///
+    /// # Errors
+    /// Returns an error when this server hosts no Verifier blocks.
+    pub fn occupy_hosted_memory(&self, leave: u64) -> Result<OccupiedForTest, WyrdTestServerError> {
+        Ok(self.hosted_sandbox()?.occupy_for_test(leave))
+    }
+
+    /// Wait until exactly `count` hosted Python operations wait for process
+    /// memory, such as a verification parked behind
+    /// [`Self::occupy_hosted_memory`], or one that left the queue.
+    ///
+    /// # Errors
+    /// Returns [`WyrdTestServerError::HostedWaitersNotReached`] with the last
+    /// count when `timeout` elapses first, and an error when this server
+    /// hosts no Verifier blocks.
+    pub async fn wait_for_hosted_waiters(
+        &self,
+        count: usize,
+        timeout: Duration,
+    ) -> Result<(), WyrdTestServerError> {
+        let sandbox = self.hosted_sandbox()?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            let last = sandbox.waiting().0;
+            if last == count {
+                return Ok(());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(WyrdTestServerError::HostedWaitersNotReached {
+                    expected: count,
+                    timeout,
+                    last,
+                });
+            }
+            // ponytail: admission publishes no queue-change signal, so this
+            // polls; add one if a test ever needs a tighter wake.
+            tokio::time::sleep(HOSTED_WAITERS_POLL_INTERVAL.min(deadline - now)).await;
+        }
+    }
+
+    /// The direct-lane hosted Python sandbox of this server's Verifier blocks.
+    ///
+    /// # Errors
+    /// Returns an error when this server hosts no Verifier blocks.
+    fn hosted_sandbox(
+        &self,
+    ) -> Result<&Arc<wyrd_server::verification::hosted::sandbox::Sandbox>, WyrdTestServerError>
+    {
+        self.inner
+            .state
+            .verification
+            .blocks()
+            .map(|blocks| blocks.sandbox(ExecutionMode::Direct))
+            .ok_or_else(|| WyrdTestServerError::Start("server hosts no Verifier blocks".to_owned()))
+    }
+
     /// Return the fixture tenant id.
     #[must_use]
     pub fn data_tenant_id(&self) -> DataTenantId {
@@ -4632,6 +4721,19 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// End each direct verification `timeout` after its arrival instead of
+    /// the default, keeping every other hosted limit already selected.
+    #[must_use]
+    pub fn with_verify_timeout_for_test(mut self, timeout: Duration) -> Self {
+        self.verification_limits = Some(HostedLimits {
+            verify_timeout: timeout,
+            ..self
+                .verification_limits
+                .unwrap_or_else(test_verification_limits)
+        });
+        self
+    }
+
     /// Start the hosted Verifier blocks over `worker` instead of the shipped
     /// same-profile `wyrd-server`, through the same startup input production
     /// fills with its own executable.
@@ -5384,10 +5486,9 @@ impl WyrdTestServerBuilder {
         // Hosted blocks always start, so direct verification runs; only an
         // opted-in server runs the queued runtime over them.
         config.verification.enabled = true;
-        config.verification.limits = self.verification_limits.unwrap_or(HostedLimits {
-            monty_min_workers: 0,
-            ..HostedLimits::default()
-        });
+        config.verification.limits = self
+            .verification_limits
+            .unwrap_or_else(test_verification_limits);
         if let Some(limits) = self.verification_runtime_limits.take() {
             config.verification.runtime = *limits;
         }
@@ -5582,6 +5683,9 @@ const FLUSH_BIFROST_BOUND: std::time::Duration = std::time::Duration::from_mins(
 
 /// Pause between baseline status reads in [`WyrdTestServer::wait_for_baseline`].
 const BASELINE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Pause between queue reads in [`WyrdTestServer::wait_for_hosted_waiters`].
+const HOSTED_WAITERS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Operator binding every test server declares for `Environment` gateway credentials.
 pub const TEST_GATEWAY_CREDENTIAL_BINDING: &str = "test-provider-key";
@@ -6212,6 +6316,7 @@ mod production_composition_tests {
                 roles: [vala_bifrost_redux::resources::BifrostRole::Oracle]
                     .into_iter()
                     .collect(),
+                process_memory_limit_bytes: None,
                 server_memory_min_bytes: None,
                 bifrost_memory_limit_bytes: None,
                 scratch_limit_bytes: None,
@@ -6343,20 +6448,24 @@ mod tests {
         "/../../../sdks/wyrd-sdk-ts/testing/native.d.cts"
     ));
 
-    /// The four Python controls the published stub sanctions.
-    const PYTHON_CONTROLS: [&str; 4] = [
+    /// The six Python controls REQ-195 sanctions.
+    const PYTHON_CONTROLS: [&str; 6] = [
         "flush_bifrost",
         "wait_for_baseline",
         "make_binding_due",
         "hold_publications",
+        "occupy_hosted_memory",
+        "wait_for_hosted_waiters",
     ];
 
-    /// The same four controls in TypeScript's camelCase projection.
-    const TYPESCRIPT_CONTROLS: [&str; 4] = [
+    /// The same six controls in TypeScript's camelCase projection.
+    const TYPESCRIPT_CONTROLS: [&str; 6] = [
         "flushBifrost",
         "waitForBaseline",
         "makeBindingDue",
         "holdPublications",
+        "occupyHostedMemory",
+        "waitForHostedWaiters",
     ];
 
     /// Python members that start, address, or credential the server and so
@@ -6470,22 +6579,24 @@ mod tests {
             .collect();
         assert!(
             hooks.is_empty(),
-            "{language} WyrdTestServer exposes test hooks outside the four sanctioned controls: {hooks:?}"
+            "{language} WyrdTestServer exposes test hooks outside the six sanctioned controls: {hooks:?}"
         );
     }
 
     /// Rust, Python, and TypeScript test servers expose `flush_bifrost`,
-    /// `wait_for_baseline`, `make_binding_due`, and `hold_publications`, and
-    /// the Python and
-    /// TypeScript projections expose no other hook that steers or inspects
-    /// server state.
+    /// `wait_for_baseline`, `make_binding_due`, `hold_publications`,
+    /// `occupy_hosted_memory`, and `wait_for_hosted_waiters`, and the Python
+    /// and TypeScript projections expose no other hook that steers or
+    /// inspects server state.
     #[test]
-    fn public_controls_are_the_four_sanctioned_operations() {
+    fn public_controls_are_the_six_sanctioned_operations() {
         let rust_controls = [
             std::any::type_name_of_val(&WyrdTestServer::flush_bifrost),
             std::any::type_name_of_val(&WyrdTestServer::wait_for_baseline),
             std::any::type_name_of_val(&WyrdTestServer::make_binding_due),
             std::any::type_name_of_val(&WyrdTestServer::hold_publications),
+            std::any::type_name_of_val(&WyrdTestServer::occupy_hosted_memory),
+            std::any::type_name_of_val(&WyrdTestServer::wait_for_hosted_waiters),
         ];
         for (path, control) in rust_controls.iter().zip(PYTHON_CONTROLS) {
             assert!(

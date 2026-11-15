@@ -19,33 +19,45 @@
 //! histograms are diagnostic.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use wyrd_testing::release_server::PEAK_SAMPLE_INTERVAL_MS;
 
 use async_trait::async_trait;
+use serde_json::json;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use wyrd_benchmark::{BenchmarkSnapshot, Distribution, IntervalValue};
+use wyrd_client::WyrdClient;
 use wyrd_client::state::WyrdState;
 use wyrd_client::transport::trace::with_benchmark_labels;
+use wyrd_client::verify::Execution;
+use wyrd_spec::card::agent::BuiltinTool;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::ExecutionId;
 use wyrd_spec::verification::VerificationVerdict;
+use wyrd_spec::verification::execution::{
+    RequirementOutcome, ToolRecipient, VerificationDetails, VerificationOutcome, VerificationResult,
+};
 use wyrd_testing::capacity::{
-    Expected, NANOS_PER_MS, Population, ResourceWindow, Window, driver_cpu_seconds, elapsed,
+    Expected, NANOS_PER_MS, Population, RESPONSE_BYTE_STATS, ResourceWindow, Window,
+    binary_identity, driver_cpu_seconds, elapsed, process_cpu_seconds, reaped_worker_cpu,
     release_binary,
 };
 use wyrd_testing::experiment::{
-    ExperimentError, Level, Phase, Reading, Repetition, Step, Workload,
+    ExperimentError, Level, Phase, Reading, Repetition, Role, Step, Workload,
 };
-use wyrd_testing::gateway_capture::{FIXTURE_ROOT, GatewayCapture, PacedUpstream, Pacing};
-use wyrd_testing::release_server::{LocalServer, Metrics};
+use wyrd_testing::gateway_capture::{FIXTURE_ROOT, PacedUpstream, Pacing, Reply};
+use wyrd_testing::profile::{ProfileMode, ProfileNote};
+use wyrd_testing::release_server::{LocalServer, Metrics, PeakSampler, SERVER_URL};
 
 use crate::gateway::run::{PHASE_SECONDS, WAIT_SECONDS, WAITS};
+use crate::verification::driver::{Call, ForeignDriver, Language, unsequenced};
 use crate::verification::workload::{
-    ASSERT_VERIFIER, JUDGE_SLOT, JUDGE_VERIFIER, Tenant, context, failing,
+    AGENTS, ASSERT_VERIFIER, Application, CANONICAL_VERIFIER, Conversations, JUDGE_SLOT,
+    JUDGE_VERIFIER, Tenant, canonical_context, context, failing,
 };
 use crate::verification::{
     ADMISSION_REFUSAL, APPLICATIONS, BACKLOG_LIMIT_SECONDS, CLIENTS, OVERHEAD_LIMIT_MS,
@@ -127,13 +139,18 @@ const BREAKDOWN: [(&str, &str); 10] = [
     ("wyrd_postgres_pool_acquire_seconds", "outcome"),
 ];
 
+/// One benchmark root: its boundary, whether it excludes waits, and its
+/// components.
+type Root = (&'static str, bool, &'static [&'static str]);
+
 /// The driver root of a direct `verify`'s one logical execution request,
 /// whose response body sizes each repetition reports.
 pub const HTTP_ROOT: &str = "client.http";
 
 /// The driver roots each direct `verify` records once, with their
 /// components: the SDK flow and its preparation, its one logical execution
-/// request, and that request's one attempt.
+/// request, and that request's one attempt. The benchmark's inputs hold no
+/// file, so no evidence plan or upload request precedes the execution.
 pub const DRIVER_ROOTS: [(&str, bool, &[&str]); 3] = [
     ("client.verify", false, &["prepare"]),
     (
@@ -144,12 +161,81 @@ pub const DRIVER_ROOTS: [(&str, bool, &[&str]); 3] = [
     ("client.http.attempt", false, &[]),
 ];
 
+/// The native binding's own root of each Python or TypeScript `verify`:
+/// argument conversion through the returned language object, around the
+/// shared client's `client.verify`.
+pub const SDK_VERIFY: &str = "sdk.verify";
+
+/// The roots each Python `verify` records once in its driver: the shared
+/// client's, inside the binding's `sdk.verify` with its input conversion,
+/// shared core, and output conversion, and that core's `sdk.verify.native`
+/// split into the caller's span read, the run with the GIL released, and
+/// the wait to hold the GIL again.
+pub const PYTHON_ROOTS: [Root; 5] = [
+    DRIVER_ROOTS[0],
+    DRIVER_ROOTS[1],
+    DRIVER_ROOTS[2],
+    (SDK_VERIFY, false, &["input", "core", "output"]),
+    ("sdk.verify.native", false, &["trace", "run", "attach"]),
+];
+
+/// The roots each TypeScript `verify` records once in its driver: the shared
+/// client's, inside the addon's `sdk.verify`, which also times the wait from
+/// the JavaScript call until its future first runs on the shared runtime.
+pub const TYPESCRIPT_ROOTS: [Root; 4] = [
+    DRIVER_ROOTS[0],
+    DRIVER_ROOTS[1],
+    DRIVER_ROOTS[2],
+    (SDK_VERIFY, false, &["dispatch", "input", "core", "output"]),
+];
+
+/// The client roots `language`'s calls record once each, in this process
+/// for Rust and in the language's driver otherwise.
+pub const fn client_roots(language: Language) -> &'static [Root] {
+    match language {
+        Language::Rust => &DRIVER_ROOTS,
+        Language::Python => &PYTHON_ROOTS,
+        Language::TypeScript => &TYPESCRIPT_ROOTS,
+    }
+}
+
 /// The driver root of the local provider's one answer per successful model
 /// verification, with its components; the provider runs in this process.
 pub const FIXTURE_ROOTS: [(&str, bool, &[&str]); 1] = [(FIXTURE_ROOT, false, &["parse", "answer"])];
 
 /// Why an assertion step has no local provider observations.
 const NO_PROVIDER: &str = "an assertion check calls no provider";
+
+/// Why a step other than the canonical one has no per-request ledger.
+const NOT_CANONICAL: &str = "only the canonical workload's Agents run code";
+
+/// The refusal a language driver's call counts as when it reported neither
+/// a stable error code nor an execution and outcome.
+const INCOMPLETE_REPORT: &str = "incomplete-driver-report";
+
+/// Acknowledged canonical executions per repetition whose details are read
+/// back after the window to prove their tool records.
+const DETAILS_SAMPLE: usize = 8;
+
+/// The refusal of a details read before the execution's records are visible.
+const NOT_VISIBLE: &str = "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND";
+
+/// The server's nested Agent envelopes of a direct execution: each
+/// diagnostic observation, its `verification.direct` part, and whether the
+/// judge Verifier's one tool-less Agent reaches it. They nest in the
+/// engine, overlap across concurrent Agents and each other, and are never
+/// summed or subtracted.
+pub(crate) const ENVELOPES: [(&str, &str, bool); 6] = [
+    ("server.workspace", "verification.direct.workspace", false),
+    ("server.tool", "verification.direct.tool", false),
+    ("server.sandbox", "verification.direct.sandbox", false),
+    ("server.capacity", "verification.direct.capacity", false),
+    ("server.runnable", "verification.direct.runnable", false),
+    ("server.model", "verification.direct.model", true),
+];
+
+/// Why a step's Verifier reaches no such envelope.
+const NO_ENVELOPE: &str = "this step's Verifier runs no Agent work of this kind";
 
 /// The Gateway phases an in-process Agent check's model call records once
 /// each: the native caller authenticates and parses nothing, and a buffered
@@ -180,6 +266,10 @@ enum Op {
     /// `observe.verify` of the judge Verifier: a direct execution whose one
     /// Agent check calls the local model through the Gateway.
     Judge,
+    /// `observe.verify` of the canonical Verifier: a direct execution of one
+    /// Assert and two Agent checks, each Agent running one `code.run`
+    /// between two model calls through the Gateway.
+    Canonical,
     /// `observe.submit`: staged for one queued execution.
     Submit,
 }
@@ -188,28 +278,160 @@ impl Op {
     /// The benchmark case the call declares.
     const fn case(self) -> &'static str {
         match self {
-            Self::Verify => DIRECT_CASE,
+            Self::Verify | Self::Canonical => DIRECT_CASE,
             Self::Judge => MODEL_CASE,
             Self::Submit => QUEUED_CASE,
         }
     }
 
-    /// The direct call `step` declares: [`Self::Judge`] for a `model` check,
-    /// else [`Self::Verify`].
+    /// The direct call `step` declares: [`Self::Judge`] for a `model`
+    /// check, [`Self::Canonical`] for a `canonical` one, else
+    /// [`Self::Verify`].
     fn direct(step: &Step) -> Self {
-        if step.text("check") == Some("model") {
-            Self::Judge
-        } else {
-            Self::Verify
+        match step.text("check") {
+            Some("model") => Self::Judge,
+            Some("canonical") => Self::Canonical,
+            _ => Self::Verify,
         }
+    }
+
+    /// Governed provider exchanges one acknowledged call makes.
+    const fn exchanges(self) -> u64 {
+        match self {
+            Self::Verify | Self::Submit => 0,
+            Self::Judge => 1,
+            Self::Canonical => 4,
+        }
+    }
+
+    /// The Verifier arrival `sequence` names and its inputs, built before
+    /// the call.
+    fn arrival(self, sequence: u64) -> (&'static str, serde_json::Value) {
+        match self {
+            Self::Verify | Self::Submit => (ASSERT_VERIFIER, context(sequence)),
+            Self::Judge => (JUDGE_VERIFIER, context(sequence)),
+            Self::Canonical => (CANONICAL_VERIFIER, canonical_context(sequence)),
+        }
+    }
+
+    /// Whether `outcome` is what arrival `sequence` expects: the assertion's
+    /// verdict, a judge's pass citing [`JUDGE_SLOT`], or
+    /// [`canonical_expected`].
+    fn expected(self, sequence: u64, outcome: &VerificationOutcome) -> bool {
+        let verdict = if failing(sequence) {
+            VerificationVerdict::Failed
+        } else {
+            VerificationVerdict::Passed
+        };
+        match self {
+            Self::Verify | Self::Submit => outcome.verdict == verdict,
+            Self::Judge => {
+                let cited = outcome.requirements.iter().any(|requirement| {
+                    requirement
+                        .citations
+                        .iter()
+                        .any(|citation| citation.slot.as_str() == JUDGE_SLOT)
+                });
+                outcome.verdict == VerificationVerdict::Passed && cited
+            }
+            Self::Canonical => canonical_expected(sequence, outcome),
+        }
+    }
+}
+
+/// Whether canonical arrival `sequence` judged exactly its three
+/// requirements: the Assert by the arrival's `d`, and each Agent passed,
+/// citing slot `context`, with its own name and the arrival's sequence as
+/// data; the verdict follows the Assert.
+fn canonical_expected(sequence: u64, outcome: &VerificationOutcome) -> bool {
+    let (verdict, asserted) = if failing(sequence) {
+        (VerificationVerdict::Failed, RequirementOutcome::Failed)
+    } else {
+        (VerificationVerdict::Passed, RequirementOutcome::Passed)
+    };
+    let requirements = &outcome.requirements;
+    let requirement = |id: &str| {
+        requirements
+            .iter()
+            .find(|requirement| requirement.id.as_str() == id)
+    };
+    let agents = AGENTS.iter().all(|agent| {
+        let data = json!({ "agent": agent, "sequence": sequence.to_string() });
+        requirement(agent).is_some_and(|requirement| {
+            requirement.outcome == RequirementOutcome::Passed
+                && requirement
+                    .citations
+                    .iter()
+                    .any(|citation| citation.slot.as_str() == "context")
+                && requirement.data.as_ref() == data.as_object()
+        })
+    });
+    requirements.len() == 3
+        && outcome.verdict == verdict
+        && requirement("asserted").is_some_and(|requirement| requirement.outcome == asserted)
+        && agents
+}
+
+/// One acknowledged call's two client samples, microseconds from
+/// immediately before the public call: until it returned its decoded
+/// result, and until that result's compact fields were materialized.
+/// Both hold all elapsed work in between; neither is ever reduced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Sample {
+    /// Until the call returned.
+    returned_us: u64,
+    /// Until its result was ready.
+    ready_us: u64,
+}
+
+impl Sample {
+    /// Awaits `call`, then `ready` over a successful result, timing both
+    /// from immediately before `call` is first polled: work built before
+    /// the call and judgment after `ready` are outside both samples. A
+    /// refusal converts nothing, so its result-ready sample equals its
+    /// call-return sample.
+    async fn take<T, E>(
+        call: impl Future<Output = Result<T, E>>,
+        ready: impl AsyncFnOnce(&T),
+    ) -> (Result<T, E>, Self) {
+        let sent = Instant::now();
+        let returned = call.await;
+        let returned_us = micros(sent);
+        if let Ok(result) = &returned {
+            ready(result).await;
+        }
+        (
+            returned,
+            Self {
+                returned_us,
+                ready_us: micros(sent),
+            },
+        )
+    }
+}
+
+/// Reads every compact field of `result` a caller judges, the verdict and
+/// each requirement's outcome, citations, and data, through the decoded
+/// view the Rust client returned, without copying or re-encoding it.
+fn materialize(result: &VerificationResult) {
+    std::hint::black_box(&result.outcome.verdict);
+    for requirement in &result.outcome.requirements {
+        std::hint::black_box((
+            &requirement.outcome,
+            &requirement.citations,
+            &requirement.data,
+        ));
     }
 }
 
 /// What a set of calls answered.
 #[derive(Debug, Default, Clone)]
 struct Measured {
-    /// Latency of every acknowledged call, microseconds.
+    /// Call-return latency of every acknowledged call, microseconds.
     latencies_us: Vec<u64>,
+    /// Result-ready latency of every acknowledged direct call, in the order
+    /// of `latencies_us`; empty where the step times only call return.
+    ready_us: Vec<u64>,
     /// Refused calls by stable code.
     errors: BTreeMap<String, u64>,
     /// Direct judgments whose verdict was not the expected one.
@@ -217,26 +439,117 @@ struct Measured {
     /// Acknowledged calls that answered at or after the window end, outside
     /// the measured CPU; still in `latencies_us`.
     late: u64,
+    /// The sequence of every acknowledged canonical call, for the
+    /// provider ledger's reconciliation.
+    sequences: Vec<u64>,
+    /// The first [`DETAILS_SAMPLE`] acknowledged canonical executions.
+    sampled: Vec<ExecutionId>,
+    /// In a paced window, each sent call's due slot after the window
+    /// opened and its start behind that slot, microseconds.
+    lateness_us: Vec<(u64, u64)>,
+    /// In a paced window, how long after its due slot each caller woke,
+    /// before preparing its call, microseconds, where the driver reports it.
+    woke_us: Vec<u64>,
+    /// The garbage collections the driver's runtime reported: start after
+    /// the window opened and duration, microseconds; `None` when the driver
+    /// reports none.
+    collections_us: Option<Vec<(u64, u64)>>,
 }
 
 impl Measured {
     /// Records one call acknowledged after `latency_us` with a right or wrong
     /// verdict, `late` when it answered after the window end, or refused with
-    /// its error.
-    fn record(&mut self, latency_us: u64, outcome: Result<bool, WyrdError>, late: bool) {
+    /// its stable code.
+    fn record(&mut self, latency_us: u64, outcome: Result<bool, &str>, late: bool) {
         match outcome {
             Ok(right) => {
                 self.latencies_us.push(latency_us);
                 self.wrong += u64::from(!right);
                 self.late += u64::from(late);
             }
-            Err(error) => *self.errors.entry(error.code().to_owned()).or_default() += 1,
+            Err(code) => *self.errors.entry(code.to_owned()).or_default() += 1,
+        }
+    }
+
+    /// Records direct arrival `sequence` of `op` answered after `sample`
+    /// with `returned`, judged against [`Op::expected`] after the timer
+    /// stopped; an acknowledgement keeps both samples, and a canonical one
+    /// also keeps its sequence and, while the sample has room, its
+    /// execution.
+    fn judged(
+        &mut self,
+        op: Op,
+        sequence: u64,
+        sample: Sample,
+        returned: Result<VerificationResult, WyrdError>,
+        late: bool,
+    ) {
+        match returned {
+            Ok(result) => self.acknowledged(
+                op,
+                sequence,
+                sample,
+                (result.execution_id, &result.outcome),
+                late,
+            ),
+            Err(error) => self.record(sample.returned_us, Err(error.code()), late),
+        }
+    }
+
+    /// Records direct arrival `sequence` of `op` acknowledged after
+    /// `sample` with `execution`'s outcome, as [`Self::judged`] does.
+    fn acknowledged(
+        &mut self,
+        op: Op,
+        sequence: u64,
+        sample: Sample,
+        (execution, outcome): (ExecutionId, &VerificationOutcome),
+        late: bool,
+    ) {
+        self.ready_us.push(sample.ready_us);
+        if op == Op::Canonical {
+            self.sequences.push(sequence);
+            if self.sampled.len() < DETAILS_SAMPLE {
+                self.sampled.push(execution);
+            }
+        }
+        self.record(sample.returned_us, Ok(op.expected(sequence, outcome)), late);
+    }
+
+    /// Records one call a language driver reported for `op`, as
+    /// [`Self::judged`] records a Rust one: its language-clock samples in
+    /// whole microseconds, rounded down, and its refusal code or judged
+    /// outcome. A report with neither counts as an [`INCOMPLETE_REPORT`]
+    /// refusal, never as an acknowledgement.
+    fn reported(&mut self, op: Op, call: Call) {
+        if let (Some(due), Some(lateness)) = (call.due_ns, call.lateness_ns) {
+            self.lateness_us.push((due / 1_000, lateness / 1_000));
+        }
+        if let Some(woke) = call.woke_ns {
+            self.woke_us.push(woke / 1_000);
+        }
+        let sample = Sample {
+            returned_us: call.returned_ns / 1_000,
+            ready_us: call.ready_ns / 1_000,
+        };
+        match (call.error, call.execution_id, call.outcome) {
+            (Some(code), _, _) => self.record(sample.returned_us, Err(&code), call.late),
+            (None, Some(execution), Some(outcome)) => {
+                self.acknowledged(op, call.sequence, sample, (execution, &outcome), call.late);
+            }
+            _ => self.record(sample.returned_us, Err(INCOMPLETE_REPORT), call.late),
         }
     }
 
     /// Folds another client's results into this one.
     fn merge(&mut self, other: Self) {
         self.latencies_us.extend(other.latencies_us);
+        self.ready_us.extend(other.ready_us);
+        self.sequences.extend(other.sequences);
+        self.lateness_us.extend(other.lateness_us);
+        self.woke_us.extend(other.woke_us);
+        let room = DETAILS_SAMPLE.saturating_sub(self.sampled.len());
+        self.sampled.extend(other.sampled.into_iter().take(room));
         self.wrong += other.wrong;
         self.late += other.late;
         for (code, count) in other.errors {
@@ -258,9 +571,34 @@ impl Measured {
             .sum()
     }
 
-    /// Diagnostic client roundtrip percentile `q`, milliseconds.
+    /// Client call-return percentile `q`, milliseconds.
     fn percentile(&self, q: f64) -> Reading {
         Reading::percentile(&self.latencies_us, q, 1e3)
+    }
+
+    /// Why the direct client samples cannot be timing evidence: an
+    /// acknowledged call without its result-ready sample, a sample the
+    /// microsecond clock could not represent, or a result ready before its
+    /// call returned. `None` when every acknowledged call has both samples.
+    fn integrity(&self) -> Option<String> {
+        if self.ready_us.len() != self.latencies_us.len() {
+            return Some(format!(
+                "{} acknowledged calls but {} result-ready samples: a total sample is missing",
+                self.latencies_us.len(),
+                self.ready_us.len()
+            ));
+        }
+        let pairs = || self.latencies_us.iter().zip(&self.ready_us);
+        if let Some(index) =
+            pairs().position(|(returned, ready)| *returned == u64::MAX || *ready == u64::MAX)
+        {
+            return Some(format!(
+                "client sample {index} is unrepresentable in microseconds"
+            ));
+        }
+        pairs()
+            .position(|(returned, ready)| ready < returned)
+            .map(|index| format!("client sample {index} was ready before it returned"))
     }
 }
 
@@ -277,16 +615,84 @@ pub struct Bench {
     states: Vec<WyrdState>,
     /// Whether the run has model steps, so it binds the judge Verifier.
     model: bool,
-    /// The local provider the judge's Gateway deployment calls, while a
-    /// model run is prepared.
-    provider: Option<PacedUpstream>,
+    /// The local provider L1's Gateway deployment calls, while prepared.
+    provider: Option<Provider>,
+    /// The provider's conversations and their per-arrival ledger.
+    conversations: Arc<Conversations>,
+    /// Each state's bundle and key, for the language drivers.
+    applications: Vec<Application>,
+    /// The Python and TypeScript drivers started so far, each before its
+    /// language's first window and kept until `finish`.
+    drivers: BTreeMap<Language, ForeignDriver>,
+    /// The run's `--profile` mode, which starts every language driver in
+    /// `prepare`, profiled, so each step's captures include it.
+    profile: Option<ProfileMode>,
+}
+
+/// Worker threads of the local provider's own runtime: about three times
+/// the ~1.3 cores the Rust c64 driver profile spends answering, so the
+/// provider does not queue on its own scheduler.
+const PROVIDER_WORKERS: usize = 4;
+
+/// The local provider and the runtime only it runs on.
+///
+/// The provider answers on its own worker threads, not the controller's, so
+/// Rust client tasks and provider answers never wait on one scheduler and
+/// every language population meets the same provider. It stays in the
+/// controller process, so its CPU is still driver CPU.
+struct Provider {
+    /// The provider, serving on `runtime`.
+    upstream: PacedUpstream,
+    /// The provider's runtime, until dropped.
+    runtime: Option<tokio::runtime::Runtime>,
+}
+
+impl Provider {
+    /// Starts the zero-delay provider answering through `reply` on a new
+    /// runtime of [`PROVIDER_WORKERS`] threads.
+    ///
+    /// # Errors
+    ///
+    /// Returns the runtime build, bind, or startup failure.
+    async fn start(reply: Reply) -> std::io::Result<Self> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(PROVIDER_WORKERS)
+            .thread_name("bench-provider")
+            .enable_all()
+            .build()?;
+        let instant = Pacing {
+            buffered_delay: Duration::ZERO,
+            buffered_bytes: 0,
+            stream_delay: Duration::ZERO,
+            chunks: 0,
+            chunk_interval: Duration::ZERO,
+        };
+        let upstream = runtime
+            .spawn(PacedUpstream::replying(instant, 0, reply))
+            .await
+            .map_err(std::io::Error::other)??;
+        Ok(Self {
+            upstream,
+            runtime: Some(runtime),
+        })
+    }
+}
+
+impl Drop for Provider {
+    /// Shuts the runtime down without blocking: the controller drops the
+    /// provider from async code, where a blocking runtime shutdown panics.
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
 }
 
 impl Bench {
     /// A workload at `level` keeping its files under `logs`, binding the
-    /// judge Verifier when `model`; nothing starts until
-    /// [`Workload::prepare`].
-    pub const fn new(level: Level, logs: PathBuf, model: bool) -> Self {
+    /// judge Verifier when `model`, its language drivers profiled under
+    /// `profile`; nothing starts until [`Workload::prepare`].
+    pub fn new(level: Level, logs: PathBuf, model: bool, profile: Option<ProfileMode>) -> Self {
         Self {
             level,
             logs,
@@ -294,6 +700,10 @@ impl Bench {
             states: Vec::new(),
             model,
             provider: None,
+            conversations: Arc::default(),
+            applications: Vec::new(),
+            drivers: BTreeMap::new(),
+            profile,
         }
     }
 
@@ -309,9 +719,9 @@ impl Bench {
     }
 
     /// Starts the release server through the guide and provisions the
-    /// tenant's applications for the level; a model run first starts the
-    /// instant local provider answering a passing Verdict that cites
-    /// [`JUDGE_SLOT`].
+    /// tenant's applications for the level; L1 first starts the instant
+    /// local provider answering every conversation through
+    /// [`Conversations::reply`].
     ///
     /// # Errors
     ///
@@ -319,17 +729,10 @@ impl Bench {
     /// failure.
     async fn start(&mut self) -> Result<(), ExperimentError> {
         std::fs::create_dir_all(&self.logs).map_err(ExperimentError::workload)?;
-        if self.model {
-            let instant = Pacing {
-                buffered_delay: Duration::ZERO,
-                buffered_bytes: 0,
-                stream_delay: Duration::ZERO,
-                chunks: 0,
-                chunk_interval: Duration::ZERO,
-            };
-            let verdict = GatewayCapture::verdict_completion(JUDGE_SLOT);
+        if self.level == Level::One {
+            let conversations = Arc::clone(&self.conversations);
             self.provider = Some(
-                PacedUpstream::answering(instant, 0, &verdict)
+                Provider::start(Arc::new(move |body: &[u8]| conversations.reply(body)))
                     .await
                     .map_err(ExperimentError::workload)?,
             );
@@ -350,34 +753,79 @@ impl Bench {
             setup,
             &self.logs.join("tenants"),
             applications,
-            self.provider.as_ref().map(PacedUpstream::uri).as_deref(),
+            self.provider
+                .as_ref()
+                .map(|provider| provider.upstream.uri())
+                .as_deref(),
+            self.model,
         ))
         .await
         .map_err(ExperimentError::workload)?;
         self.states = tenant.states;
+        self.applications = tenant.applications;
         self.server = Some(server);
+        Ok(())
+    }
+
+    /// Starts `language`'s driver before its first window, loading every
+    /// provisioned application through that language's public SDK; Rust
+    /// clients, and a language already started, need nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a workload error for a language driver asked for a check
+    /// other than the canonical one, or a driver that does not start.
+    async fn foreign(&mut self, language: Language, op: Op) -> Result<(), ExperimentError> {
+        if language == Language::Rust || self.drivers.contains_key(&language) {
+            return Ok(());
+        }
+        if op != Op::Canonical {
+            return Err(ExperimentError::workload(format!(
+                "the {} driver runs only the canonical check",
+                language.name()
+            )));
+        }
+        let driver = ForeignDriver::start(
+            language,
+            SERVER_URL,
+            CANONICAL_VERIFIER,
+            [canonical_context(0), canonical_context(1)],
+            &self.applications,
+            self.profile,
+            &self.logs,
+        )
+        .await?;
+        self.drivers.insert(language, driver);
         Ok(())
     }
 
     /// One L1 repetition: `step`'s clients each run closed-loop direct
     /// `verify` of the Verifier its check names ([`Op::direct`]) for
     /// `window`, labelled with `phase`, judged by each acknowledged call's
-    /// exact server timing. A model step also owes one local provider answer
-    /// per acknowledged call when none was refused. Work, seconds, and CPU
-    /// stop at the window's end; calls then in flight drain into the cohort
-    /// and count late.
+    /// exact server timing. A step whose Agents call the provider also owes
+    /// [`Op::exchanges`] local provider answers per acknowledged call when
+    /// none was refused, and a canonical step reconciles the provider's
+    /// per-arrival ledger and a sample of execution details as
+    /// `unreconciled`. Work, seconds, and CPU stop at the window's end;
+    /// calls then in flight drain into the cohort and count late.
     ///
     /// # Errors
     ///
     /// Returns a workload error for an undeclared client count or a failed
     /// scrape.
     async fn closed(
-        &self,
+        &mut self,
         step: &Step,
         phase: Phase,
         window: Duration,
     ) -> Result<Repetition, ExperimentError> {
-        let server = self.server()?;
+        let language = Language::of(step)?;
+        let op = Op::direct(step);
+        self.foreign(language, op).await?;
+        let server = self
+            .server
+            .as_ref()
+            .ok_or_else(|| ExperimentError::workload("the server is not running"))?;
         let clients = step
             .number("clients")
             .and_then(|clients| usize::try_from(clients).ok())
@@ -392,20 +840,79 @@ impl Bench {
         let before = timings(server).await?;
         let driver_before = wyrd_benchmark::snapshot();
         let first = scrape(server).await?;
-        let (opened, _) = Window::open(server)
+        drop(self.conversations.take());
+        let (opened, opening) = Window::open(server)
             .await
             .map_err(ExperimentError::workload)?;
-        let stop = Instant::now() + window;
-        let op = Op::direct(step);
-        let (measured, usage, _) = opened
-            .measure(
-                server,
-                stop.into_std(),
-                drive(&self.states[..clients], op, stop, phase.label()),
-            )
+        let mut foreign = self.drivers.get_mut(&language);
+        let pid = foreign
+            .as_ref()
+            .map_or_else(std::process::id, |driver| driver.pid);
+        let client_opened = process_cpu_seconds(pid);
+        let client_memory = PeakSampler::start(pid);
+        let opened_at = Instant::now();
+        let stop = opened_at + window;
+        let states = &self.states[..clients];
+        let rate = step.number("rate");
+        let pace = rate.map(|rate| Pace {
+            start: opened_at,
+            clients: clients as u64,
+            rate,
+        });
+        let work = async {
+            let calls = async {
+                match foreign.as_mut() {
+                    None => Ok((
+                        drive(states, op, stop, phase.label(), pace).await,
+                        None,
+                        None,
+                    )),
+                    Some(driver) => {
+                        let seconds = stop.saturating_duration_since(Instant::now());
+                        let window = driver.run(clients, seconds.as_secs_f64(), rate).await?;
+                        let unsequenced = unsequenced(&window.calls);
+                        let mut measured = Measured {
+                            collections_us: window.collections.map(|collections| {
+                                collections
+                                    .iter()
+                                    .map(|gc| (gc.start_ns / 1_000, gc.duration_ns / 1_000))
+                                    .collect()
+                            }),
+                            ..Measured::default()
+                        };
+                        for call in window.calls {
+                            measured.reported(op, call);
+                        }
+                        let timings = window
+                            .timings
+                            .map(|timings| (timings.before, timings.after));
+                        Ok((measured, unsequenced, timings))
+                    }
+                }
+            };
+            let at_stop = async {
+                tokio::time::sleep_until(stop).await;
+                process_cpu_seconds(pid)
+            };
+            tokio::join!(calls, at_stop)
+        };
+        let ((calls, client_stopped), usage, at_stop) = opened
+            .measure(server, stop.into_std(), work)
             .await
             .map_err(ExperimentError::workload)?;
+        let (measured, unsequenced, timings) = calls?;
+        let ledger = self.conversations.take();
         let last = scrape(server).await?;
+        let client_cpu = elapsed(client_opened, client_stopped);
+        // A language driver generates load beside this controller, so the
+        // driver budget holds both processes' CPU.
+        let driver_cpu = match foreign {
+            None => usage.driver_cpu_seconds,
+            Some(_) => usage
+                .driver_cpu_seconds
+                .zip(client_cpu)
+                .map(|(controller, child)| controller + child),
+        };
         let mut repetition = Repetition {
             seconds: usage.seconds,
             processes: vec![PROCESS.to_owned()],
@@ -413,8 +920,34 @@ impl Bench {
             peak_memory_bytes: usage.peak_memory_bytes,
             opening_memory_bytes: usage.opening_memory_bytes,
             memory_interval_ms: PEAK_SAMPLE_INTERVAL_MS,
-            driver_cpu_seconds: usage.driver_cpu_seconds,
+            driver_cpu_seconds: driver_cpu,
             ..Repetition::default()
+        };
+        set_workers(
+            &mut repetition,
+            usage.worker_cpu_seconds,
+            usage.worker_peak_memory_bytes,
+        );
+        set_worker_churn(
+            &mut repetition,
+            &worker_events(&opening),
+            &worker_events(&at_stop),
+        );
+        set_client_process(
+            &mut repetition,
+            foreign.as_deref(),
+            client_cpu,
+            client_memory,
+        );
+        if let Some(reason) = unsequenced {
+            repetition.invalid.push(format!("client calls: {reason}"));
+        }
+        // A language driver's public SDK declares no benchmark labels, so
+        // the server and the local provider record its calls unlabelled.
+        let cohort = if foreign.is_some() {
+            (wyrd_benchmark::UNLABELLED, wyrd_benchmark::UNLABELLED)
+        } else {
+            (op.case(), phase.label())
         };
         let acknowledged = measured.latencies_us.len() as u64;
         let population = Population::collect(
@@ -423,42 +956,50 @@ impl Bench {
             &[Expected {
                 boundary: DIRECT_TIMING,
                 outcome: COMPLETED,
-                case: op.case(),
-                phase: phase.label(),
+                case: cohort.0,
+                phase: cohort.1,
                 count: acknowledged,
             }],
         )
         .await;
         population.validate(&mut repetition, "measured");
-        let cohort = (op.case(), phase.label());
-        let mut roots = DRIVER_ROOTS.to_vec();
-        if op == Op::Judge && measured.errors.is_empty() {
-            roots.extend(FIXTURE_ROOTS);
+        let clean = measured.errors.is_empty();
+        let answers = acknowledged * op.exchanges();
+        let mut owed: Vec<(&[Root], u64)> = Vec::new();
+        if foreign.is_none() {
+            owed.push((&DRIVER_ROOTS, acknowledged));
         }
-        let owed: Vec<Expected<'_>> = roots
+        if answers > 0 && clean {
+            owed.push((&FIXTURE_ROOTS, answers));
+        }
+        let expected: Vec<Expected<'_>> = owed
             .iter()
-            .map(|(boundary, _, _)| Expected {
-                boundary,
-                outcome: wyrd_benchmark::SUCCESS,
-                case: cohort.0,
-                phase: cohort.1,
-                count: acknowledged,
+            .flat_map(|(roots, count)| {
+                roots.iter().map(|(boundary, _, _)| Expected {
+                    boundary,
+                    outcome: wyrd_benchmark::SUCCESS,
+                    case: cohort.0,
+                    phase: cohort.1,
+                    count: *count,
+                })
             })
             .collect();
-        let driver = Population::collect_driver(&driver_before, &owed).await;
+        let driver = Population::collect_driver(&driver_before, &expected).await;
         driver.validate(&mut repetition, "measured");
-        driver.diagnose_roots(
-            &mut repetition,
-            cohort,
-            &roots,
-            measured.errors.is_empty().then_some(acknowledged),
-        );
-        driver.response_bytes(
-            &mut repetition,
-            HTTP_ROOT,
-            cohort,
-            measured.errors.is_empty().then_some(acknowledged),
-        );
+        for (roots, count) in &owed {
+            driver.diagnose_roots(&mut repetition, cohort, roots, clean.then_some(*count));
+        }
+        if foreign.is_some() {
+            set_language_client(&mut repetition, language, timings, acknowledged, clean);
+        } else {
+            unreached_clients(&mut repetition, language);
+            driver.response_bytes(
+                &mut repetition,
+                HTTP_ROOT,
+                cohort,
+                measured.errors.is_empty().then_some(acknowledged),
+            );
+        }
         if op == Op::Verify {
             for (root, _, components) in FIXTURE_ROOTS {
                 let root = format!("driver.{root}");
@@ -468,7 +1009,25 @@ impl Bench {
                 }
             }
         }
-        set_gateway(&mut repetition, &population, op, measured.errors.is_empty());
+        set_gateway(&mut repetition, &population, op, clean);
+        if op == Op::Canonical {
+            let (mut unreconciled, mut problems) = ledger.unreconciled(&measured.sequences, clean);
+            let client = self.states[0].client().map_err(ExperimentError::workload)?;
+            let (unrecorded, missing) = recorded(client, &measured.sampled).await;
+            unreconciled += unrecorded;
+            problems.extend(missing);
+            repetition.set("unreconciled", Reading::count(unreconciled));
+            if !problems.is_empty() {
+                repetition
+                    .observations
+                    .push(format!("unreconciled canonical work: {problems:?}"));
+            }
+        } else {
+            repetition.set(
+                "unreconciled",
+                Reading::missing(format!("inapplicable: {NOT_CANONICAL}")),
+            );
+        }
         population.percentiles(
             &mut repetition,
             DIRECT_TIMING,
@@ -504,6 +1063,28 @@ impl Bench {
             Reading::count(population.others(DIRECT_TIMING, COMPLETED)),
         );
         set_client(&mut repetition, &measured);
+        set_ready(&mut repetition, &measured);
+        if let Some(pace) = pace {
+            let lateness: Vec<u64> = measured.lateness_us.iter().map(|(_, late)| *late).collect();
+            let scheduled = pace.scheduled(window);
+            let sent = measured.answered();
+            repetition.arrivals = Some(wyrd_testing::experiment::Arrivals {
+                scheduled,
+                sent,
+                completed: acknowledged,
+                missed: scheduled.saturating_sub(sent),
+                lateness_p99_us: Reading::percentile(&lateness, 0.99, 1.0).value,
+            });
+            set_late(&mut repetition, &measured);
+        }
+        repetition.set(
+            "server_concurrency",
+            server_concurrency(&population, usage.seconds),
+        );
+        if let Some(reason) = measured.integrity() {
+            repetition.invalid.push(format!("client timing: {reason}"));
+        }
+        set_envelopes(&mut repetition, &population, op);
         repetition.set(
             "verifications",
             Reading::count(acknowledged - measured.late),
@@ -552,7 +1133,7 @@ impl Bench {
         let first = scrape(server).await?;
         let start = Instant::now();
         let driver_before = driver_cpu_seconds();
-        let resources = ResourceWindow::open([server]);
+        let resources = ResourceWindow::open(server);
         let backlog_start = backlog(&first);
         let send = |op| {
             let states = Arc::clone(&states);
@@ -585,7 +1166,11 @@ impl Bench {
         let (direct, background) = sent;
         let (observed, resources, driver) = observed?;
         let drain = drain(server, start + window).await?;
-        let used = resources.finish([server], window.as_secs_f64());
+        let used = resources.finish(
+            server,
+            window.as_secs_f64(),
+            [reaped_worker_cpu(&first), observed.reaped],
+        );
 
         let tallies: [[Measured; 2]; 3] = std::array::from_fn(|stage| {
             std::array::from_fn(|slot| lock(&tallies[stage][slot]).clone())
@@ -608,13 +1193,23 @@ impl Bench {
         let mut repetition = Repetition {
             seconds: window.as_secs_f64(),
             processes: vec![PROCESS.to_owned()],
-            server_cpu_seconds: used.first().and_then(|used| used.cpu_seconds),
-            peak_memory_bytes: used.first().and_then(|used| used.peak_memory),
-            opening_memory_bytes: used.first().and_then(|used| used.opening_memory),
+            server_cpu_seconds: used.cpu_seconds,
+            peak_memory_bytes: used.peak_memory,
+            opening_memory_bytes: used.opening_memory,
             memory_interval_ms: PEAK_SAMPLE_INTERVAL_MS,
             driver_cpu_seconds: driver,
             ..Repetition::default()
         };
+        set_workers(
+            &mut repetition,
+            used.worker_cpu_seconds,
+            used.worker_peak_memory,
+        );
+        set_worker_churn(
+            &mut repetition,
+            &worker_events(&first),
+            &observed.worker_events,
+        );
         let mut lateness = direct.lateness_us.clone();
         lateness.extend(&background.lateness_us);
         let answered: u64 = tallies.iter().flatten().map(Measured::answered).sum();
@@ -759,7 +1354,13 @@ impl Workload for Bench {
     /// started server is kept even when provisioning fails, so
     /// [`Workload::finish`] stops it; nothing is retried.
     async fn prepare(&mut self) -> Result<(), ExperimentError> {
-        self.start().await
+        self.start().await?;
+        if self.level == Level::One && self.profile.is_some() {
+            for language in [Language::Python, Language::TypeScript] {
+                self.foreign(language, Op::Canonical).await?;
+            }
+        }
+        Ok(())
     }
 
     /// The server's PID, once it runs.
@@ -773,6 +1374,50 @@ impl Workload for Bench {
 
     fn heap_profile_url(&self) -> Option<String> {
         self.server.as_ref().map(LocalServer::heap_profile_url)
+    }
+
+    /// Each started language driver's role and PID.
+    fn clients(&self) -> Vec<(Role, u32)> {
+        self.drivers
+            .iter()
+            .map(|(language, driver)| (language.role(), driver.pid))
+            .collect()
+    }
+
+    /// Saves each language driver's heap capture of `step` as
+    /// `heap-<language>-<step>` plus each file's extension when the run
+    /// profiles the heap, noting a driver that cannot save one or whose
+    /// native module is no `bench` build, so only its managed heap is
+    /// sampled. Their CPU is the external profiler's capture of each driver
+    /// process, which reads the runtime's perf map.
+    async fn capture_clients(&mut self, step: &str, directory: &Path) -> ProfileNote {
+        let mut note = ProfileNote::default();
+        if !self.profile.is_some_and(ProfileMode::heap) || self.drivers.is_empty() {
+            return note;
+        }
+        if let Err(error) = std::fs::create_dir_all(directory) {
+            note.notes.push(format!(
+                "client captures after {step} failed: cannot create {}: {error}",
+                directory.display()
+            ));
+            return note;
+        }
+        for (language, driver) in &mut self.drivers {
+            let name = format!("heap-{}-{step}", language.name());
+            match driver.capture(&directory.join(&name)).await {
+                Ok(captured) => {
+                    if !captured.paths.iter().any(|path| path.ends_with(".pb.gz")) {
+                        note.notes.push(format!(
+                            "{name} holds the managed heap only: the {} native module is not a `bench` build, so nothing samples its allocations",
+                            language.name()
+                        ));
+                    }
+                    note.captures.extend(captured.paths);
+                }
+                Err(error) => note.notes.push(format!("{name} failed: {error}")),
+            }
+        }
+        note
     }
 
     /// Runs `step` for `window`: closed loop at L1, the whole open-loop
@@ -807,16 +1452,21 @@ impl Workload for Bench {
     /// outlives its stop grace (it is then killed), or its log cannot be
     /// copied. An unstarted workload finishes without error.
     async fn finish(&mut self) -> Result<(), ExperimentError> {
+        let mut stopped = Ok(());
+        for driver in std::mem::take(&mut self.drivers).into_values() {
+            stopped = stopped.and(driver.stop().await);
+        }
         self.states.clear();
         self.provider = None;
         let Some(server) = self.server.take() else {
-            return Ok(());
+            return stopped;
         };
         server
             .stop(&self.logs.join("server.log"))
             .await
             .map(|_| ())
             .map_err(ExperimentError::workload)
+            .and(stopped)
     }
 }
 
@@ -837,6 +1487,11 @@ struct Observed {
     /// The server's timing snapshot at each read, by its planned offset
     /// from the schedule's start, the start itself first.
     timings: Vec<(Duration, BenchmarkSnapshot)>,
+    /// The server's reaped worker CPU in the scrape started just after the
+    /// resource window froze.
+    reaped: Option<f64>,
+    /// The worker lifecycle event totals in that scrape ([`worker_events`]).
+    worker_events: BTreeMap<String, f64>,
 }
 
 /// A window's completed direct executions, placed by when they ended: by
@@ -923,7 +1578,7 @@ async fn observe(
         offset = (offset + POLL).min(schedule.window);
         tokio::time::sleep_until(start + offset).await;
         if offset >= schedule.window {
-            resources.freeze([server]);
+            resources.freeze(server);
             driver = elapsed(driver_before, driver_cpu_seconds());
         }
         let metrics = scrape(server).await?;
@@ -954,6 +1609,8 @@ async fn observe(
         stages,
         whole,
         timings: snapshots,
+        reaped: reaped_worker_cpu(&last_metrics),
+        worker_events: worker_events(&last_metrics),
     };
     Ok((observed, resources, driver))
 }
@@ -1000,7 +1657,7 @@ where
     let [_, _, recovery] = schedule.stages();
     for (index, stage) in schedule.stages().into_iter().enumerate() {
         let rate = match op {
-            Op::Verify | Op::Judge => stage.direct_rate,
+            Op::Verify | Op::Judge | Op::Canonical => stage.direct_rate,
             Op::Submit => stage.submit_rate,
         };
         for arrival in 0u32.. {
@@ -1033,7 +1690,11 @@ where
                 if op == Op::Verify && outcome.is_ok() {
                     admitted[phase].fetch_add(1, Ordering::Relaxed);
                 }
-                lock(&tallies[index][slot]).record(micros(called), outcome, late);
+                lock(&tallies[index][slot]).record(
+                    micros(called),
+                    outcome.as_ref().copied().map_err(WyrdError::code),
+                    late,
+                );
             });
             offered.sent += 1;
         }
@@ -1119,22 +1780,89 @@ async fn scrape(server: &LocalServer) -> Result<Metrics, ExperimentError> {
     server.metrics().await.map_err(ExperimentError::workload)
 }
 
-/// Runs one closed-loop client per state making direct `op` calls,
-/// labelled with `op`'s case and `phase`, admitted until `stop`, client `i`
-/// presenting application `i`'s key; a call answering at or after `stop` is
-/// late.
-async fn drive(states: &[WyrdState], op: Op, stop: Instant, phase: &'static str) -> Measured {
+/// A paced window's arrival slots: `clients` callers that together offer
+/// `rate` calls per second from `start`, client `i`'s `k`-th call due at
+/// slot `i + k * clients`, so the slots fall `1 / rate` seconds apart.
+#[derive(Debug, Clone, Copy)]
+struct Pace {
+    /// When slot zero is due.
+    start: Instant,
+    /// The callers sharing the slots.
+    clients: u64,
+    /// Calls per second the slots offer.
+    rate: u64,
+}
+
+impl Pace {
+    /// When client `index`'s `k`-th call is due.
+    fn due(self, index: u64, k: u64) -> Instant {
+        let slot = index + k * self.clients;
+        self.start + Duration::from_secs_f64(slot as f64 / self.rate as f64)
+    }
+
+    /// The slots due before `window` ends.
+    fn scheduled(self, window: Duration) -> u64 {
+        u64::try_from((window.as_nanos() * u128::from(self.rate)).div_ceil(1_000_000_000))
+            .unwrap_or(u64::MAX)
+    }
+}
+
+/// Runs one client per state making direct `op` calls, labelled with
+/// `op`'s case and `phase`, admitted until `stop`, client `i` presenting
+/// application `i`'s key; a call answering at or after `stop` is late. Each
+/// client calls back to back until `stop`, or under `pace` waits for each
+/// call's due slot and records how late it started; every slot due before
+/// `stop` is sent, however late, and a slot due at or after it never is. Each call's client time starts immediately before the public
+/// `verify` and stops when its decoded result or error returns: the Run and
+/// context are built before it and the result is judged after it.
+async fn drive(
+    states: &[WyrdState],
+    op: Op,
+    stop: Instant,
+    phase: &'static str,
+    pace: Option<Pace>,
+) -> Measured {
     let sequence = Arc::new(AtomicU64::new(0));
     let mut tasks = JoinSet::new();
-    for state in states {
+    for (index, state) in (0u64..).zip(states) {
         let (state, sequence) = (state.clone(), Arc::clone(&sequence));
         tasks.spawn(async move {
             let mut measured = Measured::default();
-            while Instant::now() < stop {
+            for k in 0u64.. {
+                if let Some(pace) = pace {
+                    let due = pace.due(index, k);
+                    if due >= stop {
+                        break;
+                    }
+                    tokio::time::sleep_until(due).await;
+                    let offset = due.saturating_duration_since(pace.start);
+                    let offset = u64::try_from(offset.as_micros()).unwrap_or(u64::MAX);
+                    let late = micros(due);
+                    measured.lateness_us.push((offset, late));
+                    measured.woke_us.push(late);
+                } else if Instant::now() >= stop {
+                    break;
+                }
                 let next = sequence.fetch_add(1, Ordering::Relaxed);
-                let sent = Instant::now();
-                let outcome = with_benchmark_labels(op.case(), phase, call(&state, op, next)).await;
-                measured.record(micros(sent), outcome, Instant::now() >= stop);
+                let run = match state.run_for_card("model") {
+                    Ok(run) => run,
+                    Err(error) => {
+                        measured.record(0, Err(error.code()), false);
+                        continue;
+                    }
+                };
+                let observe = run.observe();
+                let (verifier, inputs) = op.arrival(next);
+                // Boxed before the timer: building a future does no work,
+                // so only its allocation stays outside the samples.
+                let call = Box::pin(with_benchmark_labels(
+                    op.case(),
+                    phase,
+                    observe.verify(verifier, inputs),
+                ));
+                let (returned, sample) =
+                    Sample::take(call, async |result| materialize(result)).await;
+                measured.judged(op, next, sample, returned, Instant::now() >= stop);
             }
             measured
         });
@@ -1150,44 +1878,71 @@ async fn drive(states: &[WyrdState], op: Op, stop: Instant, phase: &'static str)
 }
 
 /// Makes arrival `sequence` as `op` through `state`, the Service's
-/// application lifetime.
+/// application lifetime, as one L2 arrival times it: Run, call, and
+/// judgment together.
 ///
 /// # Errors
 ///
 /// Returns the client's or server's refusal; a direct verdict other than the
-/// expected one is `Ok(false)`, not an error. A judged call expects a pass
-/// whose requirement cites [`JUDGE_SLOT`].
+/// expected one ([`Op::expected`]) is `Ok(false)`, not an error.
 async fn call(state: &WyrdState, op: Op, sequence: u64) -> Result<bool, WyrdError> {
     let run = state.run_for_card("model")?;
     let observe = run.observe();
+    let (verifier, inputs) = op.arrival(sequence);
     match op {
-        Op::Submit => observe
-            .submit(ASSERT_VERIFIER, context(sequence))
-            .await
-            .map(|_| true),
-        Op::Verify => {
-            let judged = observe.verify(ASSERT_VERIFIER, context(sequence)).await?;
-            let expected = if failing(sequence) {
-                VerificationVerdict::Failed
-            } else {
-                VerificationVerdict::Passed
-            };
-            Ok(judged.outcome.verdict == expected)
-        }
-        Op::Judge => {
-            let judged = observe.verify(JUDGE_VERIFIER, context(sequence)).await?;
-            let cited = judged.outcome.requirements.iter().any(|requirement| {
-                requirement
-                    .citations
-                    .iter()
-                    .any(|citation| citation.slot.as_str() == JUDGE_SLOT)
-            });
-            Ok(judged.outcome.verdict == VerificationVerdict::Passed && cited)
+        Op::Submit => observe.submit(verifier, inputs).await.map(|_| true),
+        Op::Verify | Op::Judge | Op::Canonical => {
+            Ok(op.expected(sequence, &observe.verify(verifier, inputs).await?.outcome))
         }
     }
 }
 
-/// Sets the diagnostic client percentiles from `measured`.
+/// Reads the details of each `sampled` canonical execution through
+/// `client` once its records are visible, waiting up to [`DRAIN_WAIT`],
+/// and counts each that is unreadable or whose Agent checks do not each
+/// record exactly one error-free model-recipient `code.run` with output,
+/// with the first problems named.
+async fn recorded(client: &WyrdClient, sampled: &[ExecutionId]) -> (u64, Vec<String>) {
+    let mut problems = Vec::new();
+    for id in sampled {
+        let deadline = Instant::now() + DRAIN_WAIT;
+        let details = async {
+            let execution = Execution::connect_with(*id, client).await?;
+            loop {
+                match execution.details().await {
+                    Err(error) if error.code() == NOT_VISIBLE && Instant::now() < deadline => {
+                        tokio::time::sleep(DRAIN_POLL).await;
+                    }
+                    read => return read,
+                }
+            }
+        };
+        match details.await {
+            Ok(details) => problems.extend(unrecorded(&details).map(|agent| {
+                format!("execution {id}: Agent `{agent}` lacks one clean `code.run` record")
+            })),
+            Err(error) => problems.push(format!("execution {id}: details unreadable: {error}")),
+        }
+    }
+    (problems.len() as u64, problems)
+}
+
+/// The canonical Agents whose requirement in `details` does not record
+/// exactly one error-free `code.run` the model received, with output.
+fn unrecorded(details: &VerificationDetails) -> impl Iterator<Item = &'static str> + '_ {
+    AGENTS.into_iter().filter(|agent| {
+        !details.outcome.requirements.iter().any(|requirement| {
+            requirement.result.id.as_str() == *agent
+                && matches!(&requirement.tool_calls[..], [record]
+                    if record.tool == BuiltinTool::CodeRun
+                        && record.recipient == ToolRecipient::Model
+                        && record.error.is_none()
+                        && record.output_sha256.is_some())
+        })
+    })
+}
+
+/// Sets the client call-return percentiles from `measured`.
 fn set_client(repetition: &mut Repetition, measured: &Measured) {
     for (id, q) in [
         ("client_p50_ms", 0.5),
@@ -1195,6 +1950,250 @@ fn set_client(repetition: &mut Repetition, measured: &Measured) {
         ("client_p99_ms", 0.99),
     ] {
         repetition.set(id, measured.percentile(q));
+    }
+}
+
+/// Sets the server's worker children's CPU seconds over the measured window
+/// and their sampled peak summed resident memory, apart from the parent-only
+/// server CPU and memory; an unavailable reading is missing with its reason,
+/// never zero.
+fn set_workers(repetition: &mut Repetition, cpu_seconds: Option<f64>, peak_memory: Option<u64>) {
+    repetition.set(
+        "worker_cpu_seconds",
+        cpu_seconds.map_or_else(
+            || {
+                Reading::missing(
+                    "worker CPU was unavailable: the server reported no reaped-worker CPU, or its live workers were unreadable, at an end of the window",
+                )
+            },
+            Reading::exact,
+        ),
+    );
+    repetition.set(
+        "worker_peak_memory_bytes",
+        peak_memory.map_or_else(
+            || Reading::missing("no worker process was sampled in the window"),
+            |bytes| Reading::exact(bytes as f64),
+        ),
+    );
+}
+
+/// Each worker lifecycle event a repetition records, as its reading id and
+/// the server's `event` label.
+const WORKER_EVENTS: [(&str, &str); 3] = [
+    ("worker_spawns", "spawn"),
+    ("worker_resets", "reset"),
+    ("worker_reaps", "reap"),
+];
+
+/// The server's cumulative worker lifecycle event totals in `scrape`, by
+/// `event`; an event that never happened is absent.
+fn worker_events(scrape: &Metrics) -> BTreeMap<String, f64> {
+    scrape.by_label(
+        wyrd_server::app::metrics::VERIFICATION_PYTHON_WORKER_EVENTS_TOTAL,
+        "event",
+    )
+}
+
+/// Sets the worker churn between the `opened` and `closed` event totals
+/// ([`worker_events`]): workers spawned, reset for reuse, and reaped inside
+/// the window. An event absent at both ends never happened, so it reads zero;
+/// a total that went backwards is missing.
+fn set_worker_churn(
+    repetition: &mut Repetition,
+    opened: &BTreeMap<String, f64>,
+    closed: &BTreeMap<String, f64>,
+) {
+    for (id, event) in WORKER_EVENTS {
+        let total = |events: &BTreeMap<String, f64>| events.get(event).copied().unwrap_or(0.0);
+        let count = total(closed) - total(opened);
+        repetition.set(
+            id,
+            if count >= 0.0 {
+                Reading::exact(count)
+            } else {
+                Reading::missing(format!("the worker `{event}` total went backwards"))
+            },
+        );
+    }
+}
+
+/// Sets the client process's CPU seconds over the measured window and its
+/// sampled peak resident memory from `memory`, and names the process: a
+/// language `driver`, separate from this controller and its local provider,
+/// or this process itself for Rust clients, whose readings then include the
+/// controller and provider work.
+fn set_client_process(
+    repetition: &mut Repetition,
+    driver: Option<&ForeignDriver>,
+    cpu_seconds: Option<f64>,
+    memory: PeakSampler,
+) {
+    repetition.set(
+        "client_cpu_seconds",
+        cpu_seconds.map_or_else(
+            || Reading::missing("the client process CPU was unreadable"),
+            Reading::exact,
+        ),
+    );
+    repetition.set(
+        "client_peak_memory_bytes",
+        memory.finish().map_or_else(
+            |error| Reading::missing(error.to_string()),
+            |memory| Reading::exact(memory.peak as f64),
+        ),
+    );
+    let observation = match driver {
+        None => format!(
+            "client process: rust `wyrd_client` tasks in this controller (pid {}), which also hosts the local provider, so client CPU and memory include both and equal the driver readings; binary {}",
+            std::process::id(),
+            std::env::current_exe()
+                .ok()
+                .and_then(|binary| binary_identity(&binary).ok())
+                .unwrap_or_default()
+        ),
+        Some(driver) => format!(
+            "client process: {} (pid {}), separate from this controller and its local provider, whose CPU is driver CPU; native module {}",
+            driver.identity,
+            driver.pid,
+            driver.identity["native"]
+                .as_str()
+                .and_then(|native| binary_identity(Path::new(native)).ok())
+                .unwrap_or_default()
+        ),
+    };
+    repetition.observations.push(observation);
+}
+
+/// Sets a `language` step's client breakdown from the recorder window its
+/// driver reported around its calls, `acknowledged` of them, `clean` when
+/// none was refused: every root of [`client_roots`] and its components
+/// under the language's role, and the execution response sizes. Every one is
+/// required evidence, so a dropped phase or root is invalid. A driver whose
+/// native module is no `bench` build reports no window: its readings stay
+/// missing and its attribution unfinished, while its total samples, timed
+/// on the language clock, stay complete. Every other language's client roots
+/// are not reached.
+fn set_language_client(
+    repetition: &mut Repetition,
+    language: Language,
+    timings: Option<(BenchmarkSnapshot, BenchmarkSnapshot)>,
+    acknowledged: u64,
+    clean: bool,
+) {
+    unreached_clients(repetition, language);
+    let roots = client_roots(language);
+    let role = language.role().name();
+    let Some((before, after)) = timings else {
+        let reason = format!(
+            "unrecorded: the {} driver reported no benchmark window; its native module is not a `bench` build",
+            language.name()
+        );
+        for (root, _, components) in roots {
+            repetition.diagnose(&format!("{role}.{root}"), Err(reason.clone()), false);
+            for component in *components {
+                repetition.diagnose(
+                    &format!("{role}.{root}.{component}"),
+                    Err(reason.clone()),
+                    false,
+                );
+            }
+        }
+        for (id, _) in RESPONSE_BYTE_STATS {
+            repetition.set(id, Reading::missing(reason.clone()));
+        }
+        repetition.observations.push(format!(
+            "attribution unfinished: {reason}; client totals are complete language-clock samples"
+        ));
+        return;
+    };
+    let cohort = (wyrd_benchmark::UNLABELLED, wyrd_benchmark::UNLABELLED);
+    let expected: Vec<Expected<'_>> = roots
+        .iter()
+        .map(|(boundary, _, _)| Expected {
+            boundary,
+            outcome: wyrd_benchmark::SUCCESS,
+            case: cohort.0,
+            phase: cohort.1,
+            count: acknowledged,
+        })
+        .collect();
+    let population = Population::reported(language.role(), &before, after, &expected);
+    population.validate(repetition, "measured");
+    let answered = clean.then_some(acknowledged);
+    population.diagnose_roots(repetition, cohort, roots, answered);
+    population.response_bytes(repetition, HTTP_ROOT, cohort, answered);
+}
+
+/// Marks the client roots of every language but `language` inapplicable:
+/// a step's clients call through one SDK, so no other is reached.
+fn unreached_clients(repetition: &mut Repetition, language: Language) {
+    let reason = format!("this step's clients call the {} SDK", language.name());
+    for other in Language::ALL.into_iter().filter(|other| *other != language) {
+        let role = other.role().name();
+        for (root, _, components) in client_roots(other) {
+            repetition.inapplicable(&format!("{role}.{root}"), &reason);
+            for component in *components {
+                repetition.inapplicable(&format!("{role}.{root}.{component}"), &reason);
+            }
+        }
+    }
+}
+
+/// The per-call materialization percentiles: each acknowledged call's
+/// result-ready sample less its own call-return sample.
+pub const MATERIALIZE_STATS: [(&str, f64); 2] = [
+    ("client_materialize_p50_ms", 0.5),
+    ("client_materialize_p99_ms", 0.99),
+];
+
+/// Sets the client result-ready percentiles from `measured`, and the
+/// per-call materialization percentiles.
+fn set_ready(repetition: &mut Repetition, measured: &Measured) {
+    for (id, q) in [
+        ("client_ready_p50_ms", 0.5),
+        ("client_ready_p95_ms", 0.95),
+        ("client_ready_p99_ms", 0.99),
+    ] {
+        repetition.set(id, Reading::percentile(&measured.ready_us, q, 1e3));
+    }
+    let materialized: Vec<u64> = measured
+        .latencies_us
+        .iter()
+        .zip(&measured.ready_us)
+        .map(|(returned, ready)| ready.saturating_sub(*returned))
+        .collect();
+    for (id, q) in MATERIALIZE_STATS {
+        repetition.set(id, Reading::percentile(&materialized, q, 1e3));
+    }
+}
+
+/// Sets each [`ENVELOPES`] diagnostic over the completed direct executions
+/// that reached it. An envelope `op`'s Verifier never reaches is
+/// inapplicable; one that covers fewer completed executions than reached
+/// it leaves attribution unfinished, an observation that never makes the
+/// whole-call timing invalid.
+fn set_envelopes(repetition: &mut Repetition, population: &Population, op: Op) {
+    let completed = population
+        .elapsed(DIRECT_TIMING, COMPLETED)
+        .map_or(0, |distribution| distribution.len());
+    for (observation, boundary, judged) in ENVELOPES {
+        if !(op == Op::Canonical || (op == Op::Judge && judged)) {
+            repetition.inapplicable(observation, NO_ENVELOPE);
+            continue;
+        }
+        let distribution = population
+            .elapsed(boundary, COMPLETED)
+            .ok_or_else(|| format!("no completed `{boundary}` time in the window"));
+        let covered = distribution
+            .as_ref()
+            .map_or(0, wyrd_benchmark::Distribution::len);
+        repetition.diagnose(observation, distribution, false);
+        if covered != completed {
+            repetition.observations.push(format!(
+                "attribution unfinished: `{boundary}` covers {covered} of {completed} completed executions"
+            ));
+        }
     }
 }
 
@@ -1213,6 +2212,20 @@ fn set_tails(repetition: &mut Repetition, population: &Population) {
                     Reading::bounded(certain as f64, possible as f64, 1.0)
                 }),
         );
+    }
+}
+
+/// The time-averaged count of completed direct executions in progress over
+/// a `seconds` window: their summed server elapsed time over the window, as
+/// the bounds of the histogram's bucketed total, or why there is none.
+fn server_concurrency(population: &Population, seconds: f64) -> Reading {
+    match population.elapsed(DIRECT_TIMING, COMPLETED) {
+        Some(distribution) if !distribution.is_empty() && seconds > 0.0 => {
+            let (low, high) = distribution.total_bounds();
+            Reading::bounded(low as f64, high as f64, seconds * 1e9)
+                .with_samples(distribution.len())
+        }
+        _ => Reading::missing("no completed direct execution in the window"),
     }
 }
 
@@ -1393,6 +2406,93 @@ fn lock(tally: &Mutex<Measured>) -> std::sync::MutexGuard<'_, Measured> {
     tally.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// The start lateness a paced arrival may show before it counts as late,
+/// microseconds: L1's send-lateness p99 limit.
+const LATE_US: u64 = 5_000;
+
+/// Records where a paced window's late arrivals fell and what was running
+/// when they were due. `arrivals_late` counts the arrivals that started more
+/// than [`LATE_US`] behind their slot, and `arrivals_late_{first,last}_ms`
+/// give the due times of the first and last of them after the window opened:
+/// bunched at the start, they point at the window's setup; spread across
+/// it, at a recurring pause. `arrivals_wake_p99_us` is how late callers
+/// woke, before preparing their calls, so start lateness well above it is
+/// the caller's own preparation. Where the driver reports its runtime's
+/// garbage collections, `driver_gc_collections` and `driver_gc_max_ms`
+/// describe them and `arrivals_late_in_gc` counts the late arrivals whose
+/// wait overlapped one. Diagnostic only: the send-lateness p99 judges.
+fn set_late(repetition: &mut Repetition, measured: &Measured) {
+    let late: Vec<(u64, u64)> = measured
+        .lateness_us
+        .iter()
+        .copied()
+        .filter(|(_, late)| *late > LATE_US)
+        .collect();
+    repetition.set(
+        "arrivals_wake_p99_us",
+        Reading::percentile(&measured.woke_us, 0.99, 1.0),
+    );
+    match &measured.collections_us {
+        None => {
+            for name in [
+                "driver_gc_collections",
+                "driver_gc_max_ms",
+                "arrivals_late_in_gc",
+            ] {
+                repetition.set(
+                    name,
+                    Reading::missing("this driver reports no garbage collections"),
+                );
+            }
+        }
+        Some(collections) => {
+            let overlaps = |(due, lateness): (u64, u64)| {
+                collections
+                    .iter()
+                    .any(|(start, duration)| *start < due + lateness && due < start + duration)
+            };
+            repetition.set(
+                "driver_gc_collections",
+                Reading::count(collections.len() as u64),
+            );
+            repetition.set(
+                "driver_gc_max_ms",
+                collections
+                    .iter()
+                    .map(|(_, duration)| *duration)
+                    .max()
+                    .map_or_else(
+                        || Reading::missing("no collection ran in the window"),
+                        |duration| Reading::exact(duration as f64 / 1_000.0),
+                    ),
+            );
+            repetition.set(
+                "arrivals_late_in_gc",
+                Reading::count(
+                    late.iter()
+                        .copied()
+                        .filter(|arrival| overlaps(*arrival))
+                        .count() as u64,
+                ),
+            );
+        }
+    }
+    let late: Vec<u64> = late.into_iter().map(|(due, _)| due).collect();
+    repetition.set("arrivals_late", Reading::count(late.len() as u64));
+    for (name, due) in [
+        ("arrivals_late_first_ms", late.iter().min()),
+        ("arrivals_late_last_ms", late.iter().max()),
+    ] {
+        repetition.set(
+            name,
+            due.map_or_else(
+                || Reading::missing("no arrival was late"),
+                |due| Reading::exact(*due as f64 / 1_000.0),
+            ),
+        );
+    }
+}
+
 /// Microseconds since `since`.
 fn micros(since: Instant) -> u64 {
     u64::try_from(since.elapsed().as_micros()).unwrap_or(u64::MAX)
@@ -1400,6 +2500,81 @@ fn micros(since: Instant) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    /// A paced window's slots fall `1 / rate` apart across its clients, each
+    /// client's calls `clients / rate` apart, and the window schedules every
+    /// slot due before it ends.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a slot is due at the wrong time or the count is wrong.
+    #[test]
+    fn paced_slots_spread_the_rate_across_clients() {
+        let start = tokio::time::Instant::now();
+        let pace = Pace {
+            start,
+            clients: 4,
+            rate: 1_000,
+        };
+        assert_eq!(pace.due(0, 0), start);
+        assert_eq!(pace.due(1, 0) - start, Duration::from_millis(1));
+        assert_eq!(pace.due(3, 0) - start, Duration::from_millis(3));
+        assert_eq!(pace.due(0, 1) - start, Duration::from_millis(4));
+        assert_eq!(pace.due(2, 5) - start, Duration::from_millis(22));
+        assert_eq!(pace.scheduled(Duration::from_secs(5)), 5_000);
+        assert_eq!(pace.scheduled(Duration::from_micros(2_500)), 3);
+    }
+
+    /// A paced window reports how many arrivals started more than 5 ms late,
+    /// when the first and last of them were due, and how many of them waited
+    /// through a reported garbage collection; a punctual window reports none
+    /// and no due times, and a driver reporting no collections leaves the
+    /// overlap unmeasured.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a late-arrival reading is wrong.
+    #[test]
+    fn late_arrivals_report_count_and_due_span() {
+        // (due after the window opened, start lateness), microseconds.
+        let measured = Measured {
+            lateness_us: vec![
+                (0, 13_000),
+                (1_000, 5_001),
+                (2_000, 5_000),
+                (3_000, 200),
+                (900_000, 7_000),
+            ],
+            // (start after the window opened, duration), microseconds. The
+            // first collection, 0.5-2.5 ms, overlaps the waits of the late
+            // arrivals due at 0 and 1 ms; the second, at 500 ms, overlaps
+            // none, so the late arrival due at 900 ms waited through none.
+            collections_us: Some(vec![(500, 2_000), (500_000, 300)]),
+            ..Measured::default()
+        };
+        let mut window = Repetition::default();
+        super::set_late(&mut window, &measured);
+        assert_eq!(window.reading("arrivals_late").value, Some(3.0));
+        assert_eq!(window.reading("arrivals_late_first_ms").value, Some(0.0));
+        assert_eq!(window.reading("arrivals_late_last_ms").value, Some(900.0));
+        assert_eq!(window.reading("driver_gc_collections").value, Some(2.0));
+        assert_eq!(window.reading("driver_gc_max_ms").value, Some(2.0));
+        assert_eq!(window.reading("arrivals_late_in_gc").value, Some(2.0));
+
+        let punctual = Measured {
+            lateness_us: vec![(0, 100), (1_000, 4_999)],
+            ..Measured::default()
+        };
+        let mut punctual_window = Repetition::default();
+        super::set_late(&mut punctual_window, &punctual);
+        assert_eq!(punctual_window.reading("arrivals_late").value, Some(0.0));
+        assert_eq!(
+            punctual_window.reading("arrivals_late_first_ms").value,
+            None
+        );
+        assert_eq!(punctual_window.reading("arrivals_late_last_ms").value, None);
+        assert_eq!(punctual_window.reading("arrivals_late_in_gc").value, None);
+    }
+
     use std::collections::BTreeMap;
 
     use std::time::Duration;
@@ -1407,8 +2582,543 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{ADMISSION_REFUSAL, Measured, Op, admission, arrivals};
+    use wyrd_spec::error::WyrdError;
+
+    use super::{ADMISSION_REFUSAL, Measured, Op, Pace, Repetition, Sample, admission, arrivals};
     use crate::verification::Schedule;
+
+    /// The answer the provider gave `conversations` for one turn of canonical
+    /// Agent `agent` on arrival `sequence`, with the tool result `tool` when
+    /// the turn follows a `code.run`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the provider refuses the turn or answers something other
+    /// than a completion.
+    fn turn(
+        conversations: &crate::verification::workload::Conversations,
+        agent: &str,
+        sequence: u64,
+        tool: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        let mut messages = vec![
+            serde_json::json!({ "role": "user", "content": format!("BENCH-AGENT {agent} {sequence}") }),
+        ];
+        messages.extend(tool);
+        let body = serde_json::json!({ "model": "gpt-4o", "messages": messages });
+        let answer = conversations
+            .reply(body.to_string().as_bytes())
+            .expect("the provider answers a chat request");
+        serde_json::from_slice::<serde_json::Value>(&answer).expect("a JSON completion")["choices"]
+            [0]["message"]
+            .clone()
+    }
+
+    /// The tool message carrying `printed` as the output of the provider's
+    /// `code.run` call `id`.
+    fn printed(id: &str, printed: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "role": "tool",
+            "tool_call_id": id,
+            "content": serde_json::json!({ "output": format!("{printed}\n"), "value": null }).to_string(),
+        })
+    }
+
+    /// A compact canonical result of arrival `sequence` judging the Assert
+    /// `asserted` and each Agent of `agents` passed with `data`, citing
+    /// `slot`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the shape no longer decodes as a result.
+    fn canonical(
+        sequence: u64,
+        asserted: &str,
+        agents: &[&str],
+        slot: &str,
+        data: impl Fn(&str) -> serde_json::Value,
+    ) -> wyrd_spec::verification::execution::VerificationResult {
+        let card = |kind: &str, name: &str| serde_json::json!({ "kind": kind, "name": name, "version": "1.0.0" });
+        let mut requirements = vec![serde_json::json!({
+            "id": "asserted", "statement": "d is yes.", "outcome": asserted,
+            "reason": "assert", "citations": [],
+        })];
+        requirements.extend(agents.iter().map(|agent| {
+            serde_json::json!({
+                "id": agent, "statement": "reads", "outcome": "passed", "reason": "read",
+                "citations": [{ "slot": slot, "locator": { "json_pointer": "/sequence" } }],
+                "data": data(agent),
+            })
+        }));
+        let verdict = if asserted == "passed" {
+            "passed"
+        } else {
+            "failed"
+        };
+        serde_json::from_value(serde_json::json!({
+            "execution_id": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+            "verifier": card("Verifier", "bench-canonical"),
+            "subject": card("Model", "bench-model"),
+            "outcome": { "verdict": verdict, "requirements": requirements },
+        }))
+        .unwrap_or_else(|error| panic!("arrival {sequence}: {error}"))
+    }
+
+    /// A canonical call's client samples hold all of its elapsed work: a
+    /// delay anywhere inside the public call (provider, sandbox, pool,
+    /// host, or decode) stays in the call-return and result-ready totals,
+    /// and deferred result conversion stays in result-ready only, while
+    /// fixture preparation before the call and judgment after it stay
+    /// outside both. A refusal is an error, never a sample, and a missing,
+    /// unrepresentable, or inverted sample makes the timing invalid rather
+    /// than being dropped or clamped.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a delay leaves its total, outside work enters one, or an
+    /// impossible sample passes the integrity check.
+    #[tokio::test(start_paused = true)]
+    async fn canonical_client_latency_includes_all_work() {
+        let delayed = |ms| tokio::time::sleep(Duration::from_millis(ms));
+        delayed(50).await;
+        let (returned, sample) = Sample::take(
+            async {
+                delayed(7).await;
+                Ok::<_, WyrdError>(3_u64)
+            },
+            async |_: &u64| delayed(3).await,
+        )
+        .await;
+        delayed(40).await;
+        assert_eq!(returned.ok(), Some(3));
+        assert_eq!(
+            sample,
+            Sample {
+                returned_us: 7_000,
+                ready_us: 10_000,
+            },
+            "the call's own delay is in both totals, deferred conversion only in result-ready, and preparation and judgment in neither"
+        );
+        let (refused, after) = Sample::take(
+            async {
+                delayed(4).await;
+                Err::<u64, _>(WyrdError::internal("refused"))
+            },
+            async |_: &u64| delayed(3).await,
+        )
+        .await;
+        assert!(refused.is_err());
+        assert_eq!(
+            after.ready_us, after.returned_us,
+            "a refusal converts nothing"
+        );
+
+        let mut measured = Measured::default();
+        let result = canonical(
+            0,
+            "failed",
+            &crate::verification::workload::AGENTS,
+            "context",
+            |agent| serde_json::json!({ "agent": agent, "sequence": "0" }),
+        );
+        measured.judged(Op::Canonical, 0, sample, Ok(result), false);
+        measured.judged(
+            Op::Canonical,
+            1,
+            after,
+            Err(WyrdError::internal("refused")),
+            false,
+        );
+        assert_eq!(measured.latencies_us, [7_000]);
+        assert_eq!(measured.ready_us, [10_000]);
+        assert_eq!(measured.answered(), 2);
+        assert_eq!(measured.integrity(), None);
+        for (broken, reason) in [
+            (
+                Measured {
+                    ready_us: Vec::new(),
+                    ..measured.clone()
+                },
+                "missing",
+            ),
+            (
+                Measured {
+                    latencies_us: vec![u64::MAX],
+                    ready_us: vec![u64::MAX],
+                    ..measured.clone()
+                },
+                "unrepresentable",
+            ),
+            (
+                Measured {
+                    ready_us: vec![6_000],
+                    ..measured.clone()
+                },
+                "before it returned",
+            ),
+        ] {
+            let found = broken
+                .integrity()
+                .unwrap_or_else(|| panic!("{reason} passes"));
+            assert!(found.contains(reason), "{reason}: {found}");
+        }
+    }
+
+    /// A profiled run's language drivers are its client roles, and each
+    /// step's heap captures say what they leave out: a driver whose native
+    /// module is no `bench` build saves its managed heap only, and a driver
+    /// that exits before answering is a failed capture rather than a missing
+    /// line.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a role, capture, or note is wrong.
+    #[tokio::test]
+    async fn client_captures_name_their_gaps() {
+        use wyrd_testing::experiment::{Level, Role, Workload};
+        use wyrd_testing::profile::ProfileMode;
+
+        use super::Bench;
+        use crate::verification::driver::{ForeignDriver, Language};
+
+        let script = |language: &str, native: bool| {
+            let stem = format!("heap-{language}-verify");
+            let mut paths = vec![format!("{stem}.managed")];
+            if native {
+                paths.push(format!("{stem}.pb.gz"));
+            }
+            let answer = serde_json::json!({ "heap": { "paths": paths } });
+            let mut command = tokio::process::Command::new("sh");
+            command.args([
+                "-c",
+                &format!("read config; echo '{{\"ready\":{{}}}}'; read heap; echo '{answer}'"),
+            ]);
+            command
+        };
+        let directory = tempfile::tempdir().expect("directory");
+        let mut bench = Bench::new(
+            Level::One,
+            directory.path().join("logs"),
+            false,
+            Some(ProfileMode::Both),
+        );
+        let mut start = async |language: Language, native| {
+            let driver =
+                ForeignDriver::spawn(script(language.name(), native), &serde_json::json!({}), 1)
+                    .await
+                    .expect("the driver starts");
+            let pid = driver.pid;
+            bench.drivers.insert(language, driver);
+            pid
+        };
+        let python = start(Language::Python, true).await;
+        let typescript = start(Language::TypeScript, false).await;
+        assert_eq!(
+            bench.clients(),
+            [(Role::Python, python), (Role::TypeScript, typescript)]
+        );
+
+        let note = bench.capture_clients("verify", directory.path()).await;
+        assert_eq!(
+            note.captures,
+            [
+                "heap-python-verify.managed",
+                "heap-python-verify.pb.gz",
+                "heap-typescript-verify.managed",
+            ]
+        );
+        assert_eq!(
+            note.notes,
+            [
+                "heap-typescript-verify holds the managed heap only: the typescript native module is not a `bench` build, so nothing samples its allocations",
+            ]
+        );
+
+        let note = bench.capture_clients("verify", directory.path()).await;
+        assert!(
+            note.captures.is_empty(),
+            "both drivers exited after their captures"
+        );
+        assert!(
+            note.notes.iter().all(|n| n.contains("failed")) && note.notes.len() == 2,
+            "{note:?}"
+        );
+    }
+
+    /// A language driver's reported calls keep the same populations as
+    /// Rust's: whole microseconds of its own clock for both samples, a
+    /// refusal counted by its stable code and never sampled, a late call
+    /// still sampled and counted late, an outcome judged after the window
+    /// exactly as a Rust result is, and a report with neither an outcome
+    /// nor a code refused rather than acknowledged; an inverted sample
+    /// still fails the integrity check.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a reported call lands in the wrong population or an
+    /// impossible sample passes.
+    #[test]
+    fn language_drivers_preserve_public_boundaries_and_counts() {
+        use crate::verification::workload::AGENTS;
+
+        let own = |sequence: u64| move |agent: &str| serde_json::json!({ "agent": agent, "sequence": sequence.to_string() });
+        let call = |sequence: u64,
+                    returned_ns,
+                    ready_ns,
+                    late,
+                    outcome: Option<serde_json::Value>,
+                    error: Option<&str>| {
+            serde_json::from_value::<super::Call>(serde_json::json!({
+                "sequence": sequence, "returned_ns": returned_ns, "ready_ns": ready_ns,
+                "late": late, "error": error,
+                "execution_id": outcome.as_ref().map(|_| "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"),
+                "outcome": outcome,
+            }))
+            .expect("a driver report")
+        };
+        let outcome = |sequence, asserted, agents: &[&str]| {
+            serde_json::to_value(
+                canonical(sequence, asserted, agents, "context", own(sequence)).outcome,
+            )
+            .expect("an outcome")
+        };
+        let mut measured = Measured::default();
+        measured.reported(
+            Op::Canonical,
+            call(
+                0,
+                4_999_999,
+                6_000_500,
+                false,
+                Some(outcome(0, "passed", &AGENTS)),
+                None,
+            ),
+        );
+        measured.reported(
+            Op::Canonical,
+            call(
+                1,
+                9_000_000,
+                12_000_000,
+                true,
+                Some(outcome(1, "failed", &AGENTS)),
+                None,
+            ),
+        );
+        measured.reported(
+            Op::Canonical,
+            call(
+                2,
+                8_000_000,
+                8_000_000,
+                false,
+                Some(outcome(2, "passed", &AGENTS[..1])),
+                None,
+            ),
+        );
+        measured.reported(
+            Op::Canonical,
+            call(
+                3,
+                700_000,
+                700_000,
+                false,
+                None,
+                Some("WYRD_SERVER_503_SERVICE_UNAVAILABLE"),
+            ),
+        );
+        measured.reported(Op::Canonical, call(4, 100_000, 100_000, false, None, None));
+
+        assert_eq!(
+            measured.latencies_us,
+            [4_999, 9_000, 8_000],
+            "whole microseconds, rounded down"
+        );
+        assert_eq!(measured.ready_us, [6_000, 12_000, 8_000]);
+        assert_eq!(measured.sequences, [0, 1, 2]);
+        assert_eq!(
+            measured.wrong, 1,
+            "an Agent missing from the outcome is wrong"
+        );
+        assert_eq!(measured.late, 1);
+        assert_eq!(
+            measured.errors,
+            BTreeMap::from([
+                ("WYRD_SERVER_503_SERVICE_UNAVAILABLE".to_owned(), 1),
+                (super::INCOMPLETE_REPORT.to_owned(), 1),
+            ])
+        );
+        assert_eq!(measured.answered(), 5);
+        assert_eq!(measured.integrity(), None);
+
+        measured.reported(
+            Op::Canonical,
+            call(
+                5,
+                3_000_000,
+                2_000_000,
+                false,
+                Some(outcome(5, "failed", &AGENTS)),
+                None,
+            ),
+        );
+        let found = measured.integrity().expect("an inverted sample fails");
+        assert!(found.contains("before it returned"), "{found}");
+    }
+
+    /// The canonical provider answers each Agent's first turn with one
+    /// `code.run` of its own program and its second with a passing cited
+    /// Verdict only for that conversation's own output, whatever order
+    /// interleaved clients send them in; the ledger reconciles exactly one
+    /// code turn and one own-output final turn per Agent per acknowledged
+    /// arrival and counts a missing Agent, missing code output, a repeated
+    /// turn, a mismatched conversation, and an unacknowledged one; and a
+    /// result missing an Agent, its citation, or its own data is wrong.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a turn, a reconciliation count, or a result judgment
+    /// differs.
+    #[test]
+    fn canonical_workload_requires_all_three_checks() {
+        use crate::verification::workload::{AGENTS, Conversations};
+
+        let conversations = Conversations::default();
+        let own = |agent: &str, sequence: u64| serde_json::json!({ "agent": agent, "sequence": sequence.to_string() });
+        for sequence in [1, 2] {
+            for agent in AGENTS {
+                let call = turn(&conversations, agent, sequence, None);
+                let [code] = call["tool_calls"]
+                    .as_array()
+                    .expect("one tool call")
+                    .as_slice()
+                else {
+                    panic!("{agent} {sequence}: one call: {call}");
+                };
+                assert_eq!(code["function"]["name"], "code_run");
+                let source: serde_json::Value = serde_json::from_str(
+                    code["function"]["arguments"].as_str().expect("arguments"),
+                )
+                .expect("JSON arguments");
+                let source = source["source"].as_str().expect("source");
+                assert!(
+                    source.contains("/inputs/context.json") && source.contains(agent),
+                    "{source}"
+                );
+            }
+        }
+        for (agent, sequence) in [("second", 2), ("first", 1), ("second", 1), ("first", 2)] {
+            let id = "call-code";
+            let answered = turn(
+                &conversations,
+                agent,
+                sequence,
+                Some(printed(id, &own(agent, sequence))),
+            );
+            let verdict: serde_json::Value =
+                serde_json::from_str(answered["content"].as_str().expect("a Verdict"))
+                    .expect("JSON");
+            assert_eq!(verdict["outcome"], "passed", "{agent} {sequence}");
+            assert_eq!(verdict["data"], own(agent, sequence));
+            assert_eq!(verdict["citations"][0]["slot"], "context");
+        }
+        let ledger = conversations.take();
+        assert_eq!(ledger.unreconciled(&[1, 2], true), (0, Vec::new()));
+        assert_eq!(
+            ledger.unreconciled(&[1, 2, 3], true).0,
+            1,
+            "arrival 3 never conversed"
+        );
+        assert_eq!(
+            ledger.unreconciled(&[1], true).0,
+            1,
+            "arrival 2 was never acknowledged"
+        );
+        assert_eq!(
+            ledger.unreconciled(&[1], false).0,
+            0,
+            "a refused arrival may have conversed"
+        );
+        assert_eq!(
+            ledger.unreconciled(&[1, 1], false).0,
+            1,
+            "an arrival acknowledged twice"
+        );
+
+        turn(&conversations, "first", 5, None);
+        turn(&conversations, "first", 5, None);
+        turn(&conversations, "second", 5, None);
+        let crossed = turn(
+            &conversations,
+            "second",
+            5,
+            Some(printed("call-code", &own("second", 6))),
+        );
+        let bare = turn(
+            &conversations,
+            "first",
+            5,
+            Some(
+                serde_json::json!({ "role": "tool", "tool_call_id": "call-code", "content": "{}" }),
+            ),
+        );
+        for answered in [crossed, bare] {
+            let verdict: serde_json::Value =
+                serde_json::from_str(answered["content"].as_str().expect("a Verdict"))
+                    .expect("JSON");
+            assert_eq!(verdict["outcome"], "failed", "{verdict}");
+        }
+        let (count, problems) = conversations.take().unreconciled(&[5], true);
+        assert_eq!(
+            count, 3,
+            "two mismatched finals and arrival 5's turns: {problems:?}"
+        );
+        let judge = turn(&conversations, "nobody", 7, None);
+        assert!(
+            judge["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("\"answer\"")),
+            "{judge}"
+        );
+
+        let canonical_op = Op::Canonical;
+        assert_eq!(canonical_op.exchanges(), 4);
+        assert!(canonical_op.expected(
+            0,
+            &canonical(0, "passed", &AGENTS, "context", |agent| own(agent, 0)).outcome
+        ));
+        assert!(canonical_op.expected(
+            1,
+            &canonical(1, "failed", &AGENTS, "context", |agent| own(agent, 1)).outcome
+        ));
+        for (name, wrong) in [
+            (
+                "missing Agent",
+                canonical(0, "passed", &AGENTS[..1], "context", |agent| own(agent, 0)),
+            ),
+            (
+                "wrong citation",
+                canonical(0, "passed", &AGENTS, "answer", |agent| own(agent, 0)),
+            ),
+            (
+                "mismatched conversation",
+                canonical(0, "passed", &AGENTS, "context", |agent| own(agent, 2)),
+            ),
+            (
+                "missing code output",
+                canonical(0, "passed", &AGENTS, "context", |_| serde_json::Value::Null),
+            ),
+            (
+                "wrong verdict",
+                canonical(1, "passed", &AGENTS, "context", |agent| own(agent, 1)),
+            ),
+        ] {
+            assert!(
+                !canonical_op.expected(u64::from(name == "wrong verdict"), &wrong.outcome),
+                "{name}"
+            );
+        }
+    }
 
     /// Diagnostic means, acknowledgements, and components come from the
     /// benchmark recorder's snapshots: the production submission, queue-wait,
@@ -1741,6 +3451,7 @@ mod tests {
             ]),
             wrong: 1,
             late: 0,
+            ..Measured::default()
         };
         assert_eq!(measured.answered(), 6);
         assert_eq!(measured.unexpected(Some(ADMISSION_REFUSAL)), 1);
@@ -1750,6 +3461,7 @@ mod tests {
             errors: BTreeMap::new(),
             wrong: 2,
             late: 1,
+            ..Measured::default()
         });
         measured.record(400, Ok(true), true);
         measured.record(50, Ok(true), false);
@@ -1757,6 +3469,91 @@ mod tests {
         assert_eq!((measured.late, measured.answered()), (2, 9));
         assert_eq!(measured.percentile(0.5).value, Some(0.2));
         assert_eq!(measured.unexpected(None), 4);
+    }
+
+    /// Worker CPU counts every worker child's CPU inside the window, whether
+    /// it exited, started, or ran throughout; a missing counter stays
+    /// unavailable; and the parent-only server CPU keeps its scope in new and
+    /// historical records.
+    #[test]
+    fn worker_process_resources_preserve_measurement_scope() {
+        use wyrd_testing::capacity::worker_cpu_seconds;
+        use wyrd_testing::experiment::Repetition;
+        use wyrd_testing::release_server::Metrics;
+
+        // Worker `a` used 2 s before the window and 0.5 s in it, then exited
+        // and was reaped; `b` started in the window and used 0.25 s; `c`
+        // used 1 s before and 0.75 s in it. Earlier reaped workers used 10 s.
+        let reaped = [Some(10.0), Some(10.0 + 2.5)];
+        let live = [Some(2_000_000 + 1_000_000), Some(250_000 + 1_750_000)];
+        assert_eq!(worker_cpu_seconds(reaped, live), Some(0.5 + 0.25 + 0.75));
+
+        for (reaped, live) in [
+            ([None, Some(12.5)], live),
+            ([Some(10.0), None], live),
+            (reaped, [None, Some(2_000_000)]),
+            (reaped, [Some(3_000_000), None]),
+            ([Some(12.5), Some(10.0)], live),
+        ] {
+            assert_eq!(
+                worker_cpu_seconds(reaped, live),
+                None,
+                "{reaped:?} {live:?}"
+            );
+        }
+
+        let mut measured = Repetition {
+            server_cpu_seconds: Some(2.0),
+            ..Repetition::default()
+        };
+        super::set_workers(&mut measured, Some(1.5), Some(64 << 20));
+        assert_eq!(measured.server_cpu_seconds, Some(2.0));
+        assert_eq!(measured.reading("worker_cpu_seconds").value, Some(1.5));
+        assert_eq!(
+            measured.reading("worker_peak_memory_bytes").value,
+            Some(f64::from(64 << 20))
+        );
+
+        let mut unavailable = Repetition::default();
+        super::set_workers(&mut unavailable, None, None);
+        for id in ["worker_cpu_seconds", "worker_peak_memory_bytes"] {
+            let reading = unavailable.reading(id);
+            assert_eq!(reading.value, None, "{id} is never zero");
+            assert!(reading.reason.is_some(), "{id} says why it is missing");
+        }
+
+        let mut historical = serde_json::to_value(Repetition {
+            server_cpu_seconds: Some(2.0),
+            ..Repetition::default()
+        })
+        .expect("a repetition serializes");
+        historical["metrics"] = serde_json::json!({});
+        let historical: Repetition =
+            serde_json::from_value(historical).expect("a parent-only record reads");
+        assert_eq!(historical.server_cpu_seconds, Some(2.0));
+        assert_eq!(historical.reading("worker_cpu_seconds").value, None);
+
+        let family = wyrd_server::app::metrics::VERIFICATION_PYTHON_WORKER_EVENTS_TOTAL;
+        let opened = super::worker_events(&Metrics::parse(&format!(
+            "{family}{{event=\"spawn\"}} 4\n{family}{{event=\"reset\"}} 10\n"
+        )));
+        let closed = super::worker_events(&Metrics::parse(&format!(
+            "{family}{{event=\"spawn\"}} 6\n{family}{{event=\"reset\"}} 25\n{family}{{event=\"reap\"}} 1\n"
+        )));
+        super::set_worker_churn(&mut measured, &opened, &closed);
+        for (id, count) in [
+            ("worker_spawns", 2.0),
+            ("worker_resets", 15.0),
+            ("worker_reaps", 1.0),
+        ] {
+            assert_eq!(measured.reading(id).value, Some(count), "{id}");
+        }
+        super::set_worker_churn(&mut measured, &closed, &opened);
+        assert_eq!(
+            measured.reading("worker_resets").value,
+            None,
+            "a reset total is never negative churn"
+        );
     }
 
     /// The measurement path calibrated against independent references on a
@@ -1916,7 +3713,7 @@ mod tests {
                 interrupt: CancellationToken::new(),
             };
             let mut workload = Calibration {
-                bench: Bench::new(Level::One, directory.path().join("logs"), false),
+                bench: Bench::new(Level::One, directory.path().join("logs"), false, None),
             };
             let record = run(
                 declaration.seal(),
@@ -2009,21 +3806,23 @@ mod tests {
                 Op::Verify,
                 Instant::now() + Duration::from_secs(1),
                 "warmup",
+                None,
             )
             .await;
             // A server without collection serves no snapshot to scrape, so
             // the control window reads only its resources, frozen at the
             // stop before in-flight calls drain, as `Window::measure` does.
-            let mut resources = ResourceWindow::open([server]);
+            let mut resources = ResourceWindow::open(server);
             let started = Instant::now();
             let stop = started + WINDOW;
             let (measured, seconds) = {
-                let mut work = std::pin::pin!(drive(states, Op::Verify, stop, "repetition-1"));
+                let mut work =
+                    std::pin::pin!(drive(states, Op::Verify, stop, "repetition-1", None));
                 let early = tokio::select! {
                     measured = &mut work => Some(measured),
                     () = tokio::time::sleep_until(stop) => None,
                 };
-                resources.freeze([server]);
+                resources.freeze(server);
                 let seconds = started.elapsed().as_secs_f64();
                 match early {
                     Some(measured) => (measured, seconds),
@@ -2031,9 +3830,8 @@ mod tests {
                 }
             };
             let control_cpu = resources
-                .finish([server], seconds)
-                .first()
-                .and_then(|used| used.cpu_seconds)
+                .finish(server, seconds, [None, None])
+                .cpu_seconds
                 .expect("control server CPU");
             assert!(measured.errors.is_empty(), "{:?}", measured.errors);
             let control = per_verification(
@@ -2105,5 +3903,138 @@ mod tests {
             );
             workload.bench.finish().await.expect("stop");
         }
+    }
+
+    /// A language step's client breakdown comes only from its driver's own
+    /// reported recorder window: a complete window diagnoses every shared
+    /// client and `sdk.verify` root and component with the response sizes;
+    /// a window missing one component, or with fewer roots than acknowledged
+    /// calls, is invalid; and a driver without a readout leaves every
+    /// language reading missing, attribution unfinished, never zero.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an incomplete readout renders as complete evidence.
+    #[test]
+    fn language_phase_breakdown_requires_complete_evidence() {
+        use wyrd_benchmark::{Cohort, Observation};
+        use wyrd_testing::experiment::Repetition;
+
+        use super::{Language, client_roots, set_language_client};
+
+        wyrd_benchmark::install().expect("the only recorder");
+        let call = |skipped: Option<&str>| {
+            for (root, _, components) in client_roots(Language::Python) {
+                let mut observation = Observation::start(root, || Cohort::NONE);
+                for component in *components {
+                    if Some(*component) != skipped {
+                        observation.component(component, Duration::from_micros(10));
+                    }
+                }
+                if *root == super::HTTP_ROOT {
+                    observation.bytes("response", 512);
+                }
+                observation.finish(wyrd_benchmark::SUCCESS);
+            }
+        };
+        let readout = |calls: &[Option<&str>]| {
+            let before = wyrd_benchmark::snapshot();
+            for skipped in calls {
+                call(*skipped);
+            }
+            (before, wyrd_benchmark::snapshot())
+        };
+        let id = |observation: &str| format!("diagnostic.python.{observation}.count");
+
+        let mut complete = Repetition::default();
+        set_language_client(
+            &mut complete,
+            Language::Python,
+            Some(readout(&[None, None])),
+            2,
+            true,
+        );
+        assert!(complete.invalid.is_empty(), "{:?}", complete.invalid);
+        for observation in [
+            "client.verify.prepare",
+            "client.http.auth",
+            "client.http.attempt",
+            "sdk.verify",
+            "sdk.verify.input",
+            "sdk.verify.core",
+            "sdk.verify.output",
+        ] {
+            assert_eq!(
+                complete.reading(&id(observation)).value,
+                Some(2.0),
+                "{observation}"
+            );
+        }
+        assert_eq!(complete.reading("response_bytes_count").value, Some(2.0));
+        assert!(
+            complete
+                .reading("diagnostic.typescript.sdk.verify.count")
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("inapplicable")),
+            "another language's clients are not reached"
+        );
+
+        let mut dropped = Repetition::default();
+        set_language_client(
+            &mut dropped,
+            Language::Python,
+            Some(readout(&[None, Some("core")])),
+            2,
+            true,
+        );
+        assert!(
+            dropped
+                .invalid
+                .iter()
+                .any(|reason| reason.contains("python.sdk.verify.core")),
+            "a dropped phase is invalid: {:?}",
+            dropped.invalid
+        );
+
+        let mut short = Repetition::default();
+        set_language_client(
+            &mut short,
+            Language::Python,
+            Some(readout(&[None])),
+            2,
+            true,
+        );
+        assert!(
+            short
+                .invalid
+                .iter()
+                .any(|reason| reason.contains("`sdk.verify`")),
+            "a root recorded for fewer calls is invalid: {:?}",
+            short.invalid
+        );
+
+        let mut unread = Repetition::default();
+        set_language_client(&mut unread, Language::Python, None, 2, true);
+        for observation in ["sdk.verify", "sdk.verify.core", "client.http"] {
+            let reading = unread.reading(&id(observation));
+            assert_eq!(reading.value, None, "{observation} never renders as zero");
+            assert!(
+                reading
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| !reason.starts_with("inapplicable")),
+                "{observation}: {reading:?}"
+            );
+        }
+        assert_eq!(unread.reading("response_bytes_count").value, None);
+        assert!(
+            unread
+                .observations
+                .iter()
+                .any(|observation| observation.starts_with("attribution unfinished")),
+            "{:?}",
+            unread.observations
+        );
     }
 }

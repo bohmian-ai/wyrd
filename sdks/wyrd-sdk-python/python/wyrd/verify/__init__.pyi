@@ -361,13 +361,16 @@ class RequirementDetails(RequirementResult[DataT], Generic[DataT]):
     """One requirement's judgment beside what produced it.
 
     ``check`` is the Verifier Card's check declaration as authored, never
-    compiled; ``provenance`` is the call that judged it, when one did.
+    compiled; ``provenance`` is the call that judged it, when one did;
+    ``tool_calls`` are the tools an Agent check called, direct and nested,
+    absent for every other check.
     """
 
     check: CheckWire
     provenance: NotRequired[CallProvenance]
     item_index: NotRequired[int | None]
     iteration_index: NotRequired[int | None]
+    tool_calls: NotRequired[list[ToolCallRecord]]
 
 BuiltinTool: TypeAlias = Literal[
     "cards.list",
@@ -384,11 +387,20 @@ BuiltinTool: TypeAlias = Literal[
     "publish",
 ]
 
+ToolRecipient: TypeAlias = Literal["model", "code"]
+
 class ToolCallRecord(TypedDict):
-    """One tool call an Agent action made; the raw output is never kept."""
+    """One tool call an Agent step or check made, directly or from its Python.
+
+    ``recipient`` is ``model`` for a call the model made and ``code`` for one
+    a ``code.run`` program awaited; ``output_sha256`` and ``returned_bytes``
+    describe the bounded output that recipient received. The raw output is
+    never kept.
+    """
 
     tool: BuiltinTool
     arguments: JsonValue
+    recipient: ToolRecipient
     output_sha256: NotRequired[str]
     returned_bytes: int
     error: NotRequired[str]

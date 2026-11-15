@@ -6,6 +6,8 @@
 #![deny(missing_docs)]
 
 pub mod authoring;
+#[cfg(feature = "bench")]
+pub mod benchmark;
 pub mod cards;
 pub mod cli;
 pub mod client;

@@ -26,10 +26,15 @@ use monty_types::format::StringRepr;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use skald_tool::{AgentTool, StructuredInvocationError, ToolError, ToolRegistry};
+use skald_tool::{AgentTool, ToolError, ToolRegistry};
+use tokio::sync::OwnedMutexGuard;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use vala_verify::blocks::{AgentToolset, BlockError, CallInput, ToolSession};
+use tokio_util::task::TaskTracker;
+use vala_verify::blocks::{
+    AgentToolset, BlockError, CallInput, CodeTool, ToolBridge, ToolLimits, ToolSession,
+    hold_permit, tool_error,
+};
 use wyrd_runtime::Permission;
 use wyrd_spec::card::agent::BuiltinTool;
 use wyrd_spec::error::WyrdError;
@@ -51,6 +56,7 @@ use crate::mcp::bifrost::{DescribeTableArguments, compact_entry};
 use crate::mcp::cards::GetCardArgs;
 use crate::query::collect::{BoundedQuery, QueryArguments};
 use crate::verification::state::RunState;
+use crate::verification::telemetry::{Envelope, Envelopes};
 
 /// Audit operation of every tool invocation decision.
 const OPERATION: &str = "verification.tool.invoke";
@@ -75,13 +81,15 @@ pub struct HostedTools {
     execution: Option<Arc<RunState>>,
     /// Limits in force.
     limits: HostedLimits,
+    /// The execution's record of workspace, tool, and sandbox time.
+    envelopes: Envelopes,
 }
 
 impl HostedTools {
     /// Tools running as `caller` over `evidence` for one execution; each
     /// action's Python budget starts full here and only ever shrinks.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         state: AppState,
         caller: Caller,
         evidence: Arc<TenantEvidence>,
@@ -98,6 +106,7 @@ impl HostedTools {
             code_budgets: Mutex::new(BTreeMap::new()),
             execution: None,
             limits,
+            envelopes: Envelopes::default(),
         }
     }
 
@@ -105,6 +114,14 @@ impl HostedTools {
     #[must_use]
     pub fn with_execution(mut self, execution: Arc<RunState>) -> Self {
         self.execution = Some(execution);
+        self
+    }
+
+    /// Time every workspace setup, tool call, and sandbox operation on
+    /// `envelopes`, the execution's record, while benchmarking.
+    #[must_use]
+    pub fn timed(mut self, envelopes: Envelopes) -> Self {
+        self.envelopes = envelopes;
         self
     }
 
@@ -158,7 +175,12 @@ impl AgentToolset for HostedTools {
         };
         let workspace = if tools.iter().any(|tool| tool.uses_workspace()) {
             Some(Arc::new(
-                self.workspaces.open(workspace, &self.evidence).await?,
+                self.envelopes
+                    .time(
+                        Envelope::Workspace,
+                        self.workspaces.open(workspace, &self.evidence),
+                    )
+                    .await?,
             ))
         } else {
             None
@@ -172,6 +194,8 @@ impl AgentToolset for HostedTools {
             code_budget: self.code_budget(id),
             publisher,
             limits: self.limits,
+            work: TaskTracker::new(),
+            envelopes: self.envelopes.clone(),
         });
         let registry = ToolRegistry::new();
         for &tool in tools {
@@ -187,11 +211,21 @@ impl AgentToolset for HostedTools {
                     reason: error.to_string(),
                 })?;
         }
+        let work = invocation.work.clone();
         Ok(ToolSession::new(
             registry,
-            self.limits.tool_result_max_bytes,
-            Box::new(invocation),
-        ))
+            ToolLimits {
+                max_result_bytes: self.limits.tool_result_max_bytes,
+                max_argument_bytes: self.limits.tool_argument_max_bytes,
+                max_calls: self.limits.agent_tool_max_calls,
+            },
+            Box::new(Arc::clone(&invocation)),
+        )
+        .with_settlement(async move {
+            work.close();
+            work.wait().await;
+        })
+        .with_code(invocation))
     }
 }
 
@@ -215,11 +249,17 @@ struct Invocation {
     publisher: Option<(Arc<RunState>, Producer)>,
     /// Limits in force.
     limits: HostedLimits,
+    /// Blocking work the attempt's calls started; the session waits for it
+    /// before releasing the workspace.
+    work: TaskTracker,
+    /// The execution's record of tool and sandbox time.
+    envelopes: Envelopes,
 }
 
 impl Invocation {
     /// Run `tool` with `args` as the accepted caller for provider tool call
-    /// `call_id`, when it is known.
+    /// `call_id`, when it is known, timed as one [`Envelope::Tool`];
+    /// `code.run` gets `bridge` for its nested `call_tool` requests.
     ///
     /// # Errors
     /// Returns the tool-invoke denial before anything runs, then argument,
@@ -229,6 +269,24 @@ impl Invocation {
         tool: BuiltinTool,
         call_id: Option<&str>,
         args: Value,
+        bridge: Option<&ToolBridge>,
+    ) -> Result<Value, ToolError> {
+        self.envelopes
+            .time(Envelope::Tool, self.dispatch(tool, call_id, args, bridge))
+            .await
+    }
+
+    /// Authorize `tool` for the accepted caller, then run it with `args`.
+    ///
+    /// # Errors
+    /// Returns the tool-invoke denial before anything runs, then argument,
+    /// domain authorization, and execution failures.
+    async fn dispatch(
+        &self,
+        tool: BuiltinTool,
+        call_id: Option<&str>,
+        args: Value,
+        bridge: Option<&ToolBridge>,
     ) -> Result<Value, ToolError> {
         audit::authorize(
             &self.state,
@@ -237,7 +295,7 @@ impl Invocation {
             OPERATION,
             tool.as_str(),
         )
-        .map_err(|error| structured(&error))?;
+        .map_err(|error| tool_error(&error))?;
         match tool {
             BuiltinTool::CardsList => {
                 let request: ListCardsRequest = parse(args)?;
@@ -251,7 +309,7 @@ impl Invocation {
                 let Empty {} = parse(args)?;
                 let tables = service::list_tables(&self.state, self.caller.clone())
                     .await
-                    .map_err(|error| structured(&error))?;
+                    .map_err(|error| tool_error(&error))?;
                 Ok(json!({"tables": tables.iter().map(compact_entry).collect::<Vec<_>>()}))
             }
             BuiltinTool::BifrostDescribeTable => {
@@ -270,24 +328,21 @@ impl Invocation {
                 let args: QueryArguments = parse(args)?;
                 args.validate()
                     .map_err(|invalid| ToolError::InvalidInput(invalid.reason.to_owned()))?;
-                // ponytail: never cancelled; the engine drops the call at its
-                // deadline and the query keeps its own `deadline_ms`.
+                // Dropping the call (deadline, cancellation, or a stopped
+                // session) cancels the query.
+                let cancel = CancellationToken::new();
+                let _cancel_on_drop = cancel.clone().drop_guard();
                 BoundedQuery::new(self.state.clone())
-                    .run(
-                        super::statement_caller(&self.caller),
-                        &args,
-                        &CancellationToken::new(),
-                    )
+                    .run(super::statement_caller(&self.caller), &args, &cancel)
                     .await
-                    .map_err(|error| structured(&error))
+                    .map_err(|error| tool_error(&error))
             }
             BuiltinTool::FsSearch => {
                 let workspace = Arc::clone(self.workspace()?);
                 let mut search: Search = parse(args)?;
                 search.path = search.path.filter(|path| !path.is_empty());
-                tokio::task::spawn_blocking(move || workspace.search(&search))
-                    .await
-                    .map_err(|error| invocation(error.to_string()))?
+                self.blocking(None, move || workspace.search(&search))
+                    .await?
             }
             BuiltinTool::FsList | BuiltinTool::FsRead | BuiltinTool::FsExtract => {
                 let workspace = Arc::clone(self.workspace()?);
@@ -296,31 +351,23 @@ impl Invocation {
                     BuiltinTool::FsExtract => Some(workspace.writer().await),
                     _ => None,
                 };
-                tokio::task::spawn_blocking(move || {
-                    let _writer = writer;
-                    match tool {
-                        BuiltinTool::FsList => workspace.list(&args.path),
-                        BuiltinTool::FsRead => workspace.read(&args.path, args.start),
-                        _ => workspace.extract(&args.path, &args.output_path),
-                    }
+                self.blocking(writer, move || match tool {
+                    BuiltinTool::FsList => workspace.list(&args.path),
+                    BuiltinTool::FsRead => workspace.read(&args.path, args.start),
+                    _ => workspace.extract(&args.path, &args.output_path),
                 })
-                .await
-                .map_err(|error| invocation(error.to_string()))?
+                .await?
             }
             BuiltinTool::FsWrite => {
                 let workspace = Arc::clone(self.workspace()?);
                 let WriteArgs { path, content } = parse(args)?;
                 let writer = workspace.writer().await;
-                tokio::task::spawn_blocking(move || {
-                    let _writer = writer;
-                    workspace.write(&path, &content)
-                })
-                .await
-                .map_err(|error| invocation(error.to_string()))?
+                self.blocking(Some(writer), move || workspace.write(&path, &content))
+                    .await?
             }
             BuiltinTool::CodeRun => {
                 let CodeArgs { source } = parse(args)?;
-                self.run(source).await
+                self.code(source, bridge).await
             }
             BuiltinTool::Publish => {
                 let call_id = call_id.ok_or_else(|| {
@@ -344,7 +391,7 @@ impl Invocation {
             .publisher
             .as_ref()
             .ok_or_else(|| invocation("this call cannot publish".to_owned()))?;
-        let name = PublicationName::new(args.name).map_err(|error| structured(&error))?;
+        let name = PublicationName::new(args.name).map_err(|error| tool_error(&error))?;
         let call = PublishCall {
             id: call_id.to_owned(),
             producer: producer.clone(),
@@ -352,10 +399,14 @@ impl Invocation {
         };
         let publications = Publications::new(&self.state, &self.caller, run, self.limits);
         let kind = match (args.path, args.value) {
-            (Some(path), None) => publications.path(&call, self.workspace()?, &path).await?,
+            (Some(path), None) => {
+                publications
+                    .path(&call, self.workspace()?, &path, &self.work)
+                    .await?
+            }
             (None, Some(value)) => publications.json(&call, value)?,
             _ => {
-                return Err(structured(&WyrdError::Validation {
+                return Err(tool_error(&WyrdError::Validation {
                     message: "publish needs exactly one source: a /work `path` or a JSON `value`"
                         .to_owned(),
                     details: json!({
@@ -368,47 +419,89 @@ impl Invocation {
         Ok(json!({"name": call.name, "kind": kind}))
     }
 
+    /// Run `work` on the blocking pool, holding `writer` and the calling
+    /// tool's concurrency permit until it ends.
+    ///
+    /// The work is tracked, so the session waits for it before releasing
+    /// the workspace: dropping the call ends only this wait, never the work,
+    /// and the writer and permit stay taken until the work settles.
+    ///
+    /// # Errors
+    /// Returns [`ToolError::Invocation`] when the blocking task panicked.
+    async fn blocking<T: Send + 'static>(
+        &self,
+        writer: Option<OwnedMutexGuard<()>>,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, ToolError> {
+        let permit = hold_permit();
+        self.work
+            .spawn_blocking(move || {
+                let _held = (writer, permit);
+                work()
+            })
+            .await
+            .map_err(|error| invocation(error.to_string()))
+    }
+
     /// Run `source` with `/inputs` read-only and `/work` writable, charging
     /// its time to the action's Python budget.
     ///
     /// Time is reserved before waiting for `/work` or a worker, so
     /// concurrent calls never share the same remainder; the [`Reservation`]
-    /// returns the unused part when the call ends or is cancelled. `/work`
-    /// writers run one at a time, each limited to the space
-    /// [`Workspace::mounts`] measures before it starts.
+    /// returns the unused part when the call ends or is cancelled. The
+    /// operation deadline also bounds the wait for `/work` and the mount
+    /// setup, which settles even when that deadline passes first. Each
+    /// `/work` write takes [`Workspace::writer`] only for itself, so a
+    /// program awaiting a nested `fs.extract` never holds the lock that
+    /// extraction needs, and every writer sees the space the others left.
     ///
     /// # Errors
-    /// Returns [`ToolError::Invocation`] when the budget is spent, a mount
-    /// cannot open, or the sandbox refuses or fails the code. A sandbox
-    /// capacity refusal keeps its [`BlockError::Busy`] as the typed cause, so
-    /// the Agent session stops the invocation busy rather than handing the
-    /// refusal to the model.
-    async fn run(&self, source: String) -> Result<Value, ToolError> {
+    /// Returns [`ToolError::Invocation`] when the budget is spent, the
+    /// deadline passes, a mount cannot open, or the sandbox refuses or
+    /// fails the code. Each keeps its [`BlockError`] as the typed cause, so
+    /// the Agent session stops the invocation with it, busy for a capacity
+    /// refusal, rather than handing the failure to the model.
+    async fn code(&self, source: String, bridge: Option<&ToolBridge>) -> Result<Value, ToolError> {
         let workspace = Arc::clone(self.workspace()?);
         let reservation = Reservation::take(&self.code_budget, self.limits.code_timeout)
-            .ok_or_else(|| invocation("this call's Python time budget is spent".to_owned()))?;
+            .ok_or_else(|| {
+                host_stop(BlockError::Terminal {
+                    reason: "this call's Python time budget is spent".to_owned(),
+                })
+            })?;
         let deadline = self
             .deadline
             .min(reservation.started + reservation.reserved);
-        let _writer = workspace.writer().await;
-        let mounts = {
+        let mounts = tokio::time::timeout_at(deadline, async {
+            let writer = workspace.writer().await;
             let workspace = Arc::clone(&workspace);
-            tokio::task::spawn_blocking(move || workspace.mounts())
+            self.blocking(Some(writer), move || workspace.mounts())
                 .await
-                .map_err(|error| invocation(error.to_string()))?
-                .map_err(|error| invocation(error.to_string()))?
-        };
+        })
+        .await
+        .map_err(|_| {
+            host_stop(BlockError::Terminal {
+                reason: "Python exceeded its time limit".to_owned(),
+            })
+        })??
+        .map_err(host_stop)?;
         let (value, output) = self
-            .sandbox
-            .exec(source, Vec::new(), mounts, deadline)
+            .envelopes
+            .time(
+                Envelope::Sandbox,
+                Box::pin(self.sandbox.exec(
+                    self.caller.data_tenant_id,
+                    source,
+                    Vec::new(),
+                    mounts,
+                    deadline,
+                    Some(&workspace),
+                    bridge,
+                    &self.envelopes,
+                )),
+            )
             .await
-            .map_err(|error| match error {
-                BlockError::Busy { .. } => ToolError::Invocation {
-                    detail: error.to_string(),
-                    cause: Some(Box::new(error)),
-                },
-                error => invocation(error.to_string()),
-            })?;
+            .map_err(host_stop)?;
         let (repr, whole) = repr(&value, self.limits.tool_result_max_bytes);
         Ok(json!({"value": repr, "value_truncated": !whole, "output": output}))
     }
@@ -552,7 +645,7 @@ impl AgentTool for Builtin {
     /// # Errors
     /// Returns [`Invocation::call`] failures.
     async fn invoke(&self, args: Value) -> Result<Value, ToolError> {
-        self.invocation.call(self.tool, None, args).await
+        self.invocation.call(self.tool, None, args, None).await
     }
 
     /// Authorize, then run the tool for provider tool call `call_id`.
@@ -560,7 +653,21 @@ impl AgentTool for Builtin {
     /// # Errors
     /// Returns [`Invocation::call`] failures.
     async fn invoke_call(&self, call_id: &str, args: Value) -> Result<Value, ToolError> {
-        self.invocation.call(self.tool, Some(call_id), args).await
+        self.invocation
+            .call(self.tool, Some(call_id), args, None)
+            .await
+    }
+}
+
+#[async_trait]
+impl CodeTool for Invocation {
+    /// Authorize, then run `code.run` with `bridge` serving its nested calls.
+    ///
+    /// # Errors
+    /// Returns [`Invocation::call`] failures.
+    async fn run(&self, args: Value, bridge: ToolBridge) -> Result<Value, ToolError> {
+        self.call(BuiltinTool::CodeRun, None, args, Some(&bridge))
+            .await
     }
 }
 
@@ -688,7 +795,11 @@ fn descriptor(tool: BuiltinTool) -> (String, Value) {
         BuiltinTool::CodeRun => (
             "Run sandboxed Python with /inputs read-only and /work writable; returns printed output \
              and the repr of the last expression, both cut at the result limit. No network, host \
-             files, or packages.",
+             files, or packages. `await call_tool(name, arguments)` runs another tool this Agent \
+             declares (dotted name such as 'fs.read', JSON object arguments) and returns its JSON \
+             result, so the program can filter results before you see them; nested calls share \
+             this Agent's tool budget, and a failed call raises RuntimeError carrying the JSON \
+             problem with its stable `code`.",
             json!({"type": "object", "properties": {"source": {"type": "string"}}, "required": ["source"], "additionalProperties": false}),
         ),
         BuiltinTool::Publish => (
@@ -733,24 +844,20 @@ fn parse<T: DeserializeOwned>(args: Value) -> Result<T, ToolError> {
 /// Serialize an owner's answer, keeping its error's stable problem.
 ///
 /// # Errors
-/// Returns the owner's error as [`structured`], or
+/// Returns the owner's error as [`tool_error`], or
 /// [`ToolError::OutputSerialization`].
 fn to_value<T: serde::Serialize>(result: Result<T, WyrdError>) -> Result<Value, ToolError> {
-    serde_json::to_value(result.map_err(|error| structured(&error))?)
+    serde_json::to_value(result.map_err(|error| tool_error(&error))?)
         .map_err(|error| ToolError::OutputSerialization(error.to_string()))
 }
 
-/// A Wyrd error as a structured tool failure with its stable code.
-pub(super) fn structured(error: &WyrdError) -> ToolError {
-    let problem = error.problem();
-    ToolError::StructuredInvocation(Box::new(StructuredInvocationError {
-        code: problem.code,
-        status: problem.status,
-        title: problem.title,
-        detail: problem.detail,
-        remediation: problem.remediation,
-        safe_details: Some(problem.details),
-    }))
+/// The tool failure of host failure `error`, kept as its typed cause so the
+/// Agent session stops the invocation with it.
+pub(super) fn host_stop(error: BlockError) -> ToolError {
+    ToolError::Invocation {
+        detail: error.to_string(),
+        cause: Some(Box::new(error)),
+    }
 }
 
 /// A plain tool failure with `detail`.

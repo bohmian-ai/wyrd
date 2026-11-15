@@ -202,7 +202,6 @@ impl ActionExecutor for Script {
         let output = |output: &Value| ActionOutput {
             output: output.clone(),
             provenance: None,
-            tool_calls: Vec::new(),
         };
         match self.actions.get(id.as_str()) {
             None => Ok(output(&json!({}))),

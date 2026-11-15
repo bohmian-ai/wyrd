@@ -175,8 +175,9 @@ for (const step of details.outcome.steps) {
 | `result.outcome.requirements[]` | Each verdict, its reason, the actual value, and citations into the original files |
 | `result.outcome.requirements[].data` | The custom data an `agent` or `code` check returned, when it declares a [custom data](/reference/verifier-card/#custom-data) schema; absent otherwise, or when the data failed its schema |
 | `details.outcome.evidence` | The exact inputs judged, by slot, with file digests |
-| `details.outcome.steps[]` | Whether each step `succeeded`, `failed`, or was `skipped`, how many attempts it took, and every tool it called with argument and output digests |
-| `details.outcome.requirements[]` | The same judgments, each with its check as written and its provenance: code hash, extraction version, Agent and Prompt versions, effective model route, drift window and baseline |
+| `details.outcome.steps[]` | Whether each step `succeeded`, `failed`, or was `skipped`, how many attempts it took, and every tool its Agent called with argument and output digests |
+| `details.outcome.requirements[]` | The same judgments, each with its check as written, its provenance (code hash, extraction version, Agent and Prompt versions, effective model route, drift window and baseline), and every tool an `agent` check called |
+| `tool_calls[].recipient` | On a step or an `agent` check's requirement in details: `model` for a call the model made, `code` for one a `code.run` program made with [`call_tool`](/reference/agent-tools-and-authorization/#tools-from-python) |
 
 Details are readable once the execution's records are stored; until then, and for an unknown execution, the read answers `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND`. Over MCP, use `verification.get_execution_details`.
 

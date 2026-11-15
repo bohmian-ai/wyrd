@@ -393,6 +393,21 @@ impl LocalServer {
         self.pid().map(PeakSampler::start)
     }
 
+    /// The CPU microseconds the server's live worker children have used, or
+    /// `None` once it was stopped. Exited workers are in the server's
+    /// [`PROCESS_REAPED_CHILDREN_CPU_SECONDS`] instead.
+    ///
+    /// [`PROCESS_REAPED_CHILDREN_CPU_SECONDS`]: wyrd_server::app::metrics::PROCESS_REAPED_CHILDREN_CPU_SECONDS
+    pub fn worker_cpu_usec(&self) -> Option<u64> {
+        self.pid().and_then(os::children_cpu_usec)
+    }
+
+    /// Starts sampling the summed resident memory of the server's worker
+    /// children for one window, or `None` once it was stopped.
+    pub fn worker_memory_peak(&self) -> Option<PeakSampler> {
+        self.pid().map(PeakSampler::children)
+    }
+
     /// The server's resident memory now, bytes, or `None` once it is gone
     /// or unreadable.
     pub fn resident_memory(&self) -> Option<u64> {
@@ -630,6 +645,14 @@ impl Metrics {
                 })
                 .collect(),
         )
+    }
+
+    /// The value of one `series`, named and labelled as Prometheus renders
+    /// it, or `None` when the server never emitted it, so an unread counter
+    /// never reads as zero.
+    #[must_use]
+    pub fn value(&self, series: &str) -> Option<f64> {
+        self.0.get(series).copied()
     }
 
     /// Sums every series of `family` whose labels contain each of `labels`;

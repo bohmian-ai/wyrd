@@ -731,6 +731,7 @@ fn drift_outcome(
             }))
             .expect("the fixture drift check decodes"),
             provenance: None,
+            tool_calls: Vec::new(),
         }],
         steps: Vec::new(),
         evidence: BTreeMap::new(),

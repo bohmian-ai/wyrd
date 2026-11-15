@@ -18,6 +18,11 @@
 //! A tool call carrying the caller's `traceparent` continues the caller's
 //! trace: the request span and the verification, judge, and gateway work it
 //! does descend from the caller's span.
+//!
+//! Under contended process memory `verification.execute` waits and then
+//! passes, is refused as retryable `503` when memory cannot hold the request,
+//! and ends in `504` at the one deadline from its arrival, while
+//! `verification.enqueue` defers its execution until memory frees.
 
 /// The Postgres-backed half of the verification journey.
 mod pg_tests {
@@ -5213,5 +5218,581 @@ mod pg_tests {
             assert_eq!(retained, case.retained, "{question}");
         }
         desk.shutdown().await
+    }
+
+    /// The Python a `NESTED` investigation runs through `code.run`: it reads
+    /// the policy desk's Card, then queries Bifrost; a denied query is caught
+    /// by its catalog code and repaired with a second Card read. It prints
+    /// `query <allowed or code> repaired <whether the second read matched>`.
+    const NESTED: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../fixtures/cards/verifier_building_blocks/programs/nested-investigation.py"
+    ));
+
+    /// The Python a `CODE` `evidence-reduction` Agent runs through
+    /// `code.run`: it lists the notes, reads each one, and searches the note
+    /// over the limit, then prints only the hits and the match count.
+    const REDUCE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../fixtures/cards/verifier_building_blocks/programs/reduce-notes.py"
+    ));
+
+    /// The one `evidence-reduction` note over the refund limit.
+    const OVER: &str = "n07";
+
+    /// A Chat Completions reply whose one assistant turn is `message`.
+    fn completion(message: JsonValue) -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-code", "object": "chat.completion", "created": 1,
+            "model": "gpt-4o",
+            "choices": [{ "index": 0, "finish_reason": "stop", "message": message }],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8 }
+        }))
+    }
+
+    /// Script turns whose prompt contains `marker`: the first calls only
+    /// `code.run` with `source`, and the one carrying its result answers
+    /// `content`.
+    async fn script_code(
+        upstream: &wiremock::MockServer,
+        marker: &str,
+        source: &str,
+        content: &str,
+    ) {
+        use wiremock::matchers::{body_string_contains, method, path};
+        wiremock::Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains(marker))
+            .and(body_string_contains(r#""role":"tool""#))
+            .respond_with(completion(
+                serde_json::json!({ "role": "assistant", "content": content }),
+            ))
+            .with_priority(1)
+            .mount(upstream)
+            .await;
+        let arguments = serde_json::json!({ "source": source }).to_string();
+        wiremock::Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains(marker))
+            .respond_with(completion(serde_json::json!({
+                "role": "assistant", "content": null,
+                "tool_calls": [{ "id": "call-code", "type": "function",
+                    "function": { "name": "code_run", "arguments": arguments } }],
+            })))
+            .with_priority(2)
+            .mount(upstream)
+            .await;
+    }
+
+    /// The twenty `evidence-reduction` notes as inline JSON evidence: 4 KiB
+    /// or more each, only [`OVER`] over the limit.
+    fn notes() -> JsonValue {
+        let notes: serde_json::Map<String, JsonValue> = (1..=20)
+            .map(|index| {
+                let name = format!("n{index:02}");
+                let mark = if name == OVER { "OVER-LIMIT" } else { "within" };
+                let text = format!(
+                    "{name} {mark}: {}",
+                    format!("refund {name} kept. ").repeat(300)
+                );
+                (name, JsonValue::from(text))
+            })
+            .collect();
+        serde_json::json!({ "kind": "json", "value": notes })
+    }
+
+    /// The entry of `list` whose `id` is `id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `list` is not an array holding `id`.
+    fn by_id<'a>(list: &'a JsonValue, id: &str) -> Result<&'a JsonValue, McpJourneyError> {
+        list.as_array()
+            .and_then(|list| list.iter().find(|each| each["id"] == id))
+            .ok_or_else(|| format!("{id} in {list}").into())
+    }
+
+    /// Each of `calls` as its recipient, tool, and whether it delivered
+    /// output, after asserting a delivering call has a digest and bytes and
+    /// a refused one has neither and names [`DENIED`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `calls` is not an array.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a record's digest, bytes, and error disagree.
+    fn records(calls: &JsonValue) -> Result<Vec<(String, String, bool)>, McpJourneyError> {
+        Ok(calls
+            .as_array()
+            .ok_or_else(|| format!("tool calls are an array: {calls}"))?
+            .iter()
+            .map(|call| {
+                let delivered = call.get("error").is_none();
+                if delivered {
+                    assert!(
+                        call["output_sha256"]
+                            .as_str()
+                            .is_some_and(|digest| digest.len() == 64)
+                            && call["returned_bytes"]
+                                .as_u64()
+                                .is_some_and(|bytes| bytes > 0),
+                        "{call}"
+                    );
+                } else {
+                    assert!(call["error"].to_string().contains(DENIED), "{call}");
+                    assert_eq!(
+                        (call.get("output_sha256"), &call["returned_bytes"]),
+                        (None, &serde_json::json!(0)),
+                        "{call}"
+                    );
+                }
+                (
+                    call["recipient"].as_str().unwrap_or_default().to_owned(),
+                    call["tool"].as_str().unwrap_or_default().to_owned(),
+                    delivered,
+                )
+            })
+            .collect())
+    }
+
+    /// Assert `outcome` judged the twenty notes through one model-visible
+    /// `code.run` per Agent: the step names the note over the limit, the check
+    /// fails citing that pinned note with the same hits as custom data, and
+    /// each Agent's records are one model-directed `code.run` followed by the
+    /// program's code-directed calls, every one delivering output.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the step, check, or records are missing.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a judgment, citation, data, or record differs.
+    fn assert_reduced(outcome: &JsonValue, described: &JsonValue) -> Result<(), McpJourneyError> {
+        let hits = serde_json::json!({ "hits": [OVER] });
+        assert_eq!(outcome["verdict"], "failed", "{outcome}");
+        assert!(
+            outcome.get("steps").is_none() && outcome.get("evidence").is_none(),
+            "the compact decision carries no records: {outcome}"
+        );
+        let prepared = by_id(&described["steps"], "over-limit")?;
+        assert_eq!(
+            (&prepared["status"], &prepared["output"]),
+            (&serde_json::json!("succeeded"), &hits),
+            "{prepared}"
+        );
+        let judged = by_id(&outcome["requirements"], "within-limit")?;
+        assert_eq!(judged["outcome"], "failed", "{judged}");
+        assert_eq!(
+            judged["citations"],
+            serde_json::json!([{ "slot": "notes", "locator": { "json_pointer": format!("/{OVER}") } }]),
+            "{judged}"
+        );
+        assert!(
+            described["evidence"].get("notes").is_some(),
+            "the citation names pinned evidence"
+        );
+        assert_eq!(judged["data"], hits, "{judged}");
+        let checked = by_id(&described["requirements"], "within-limit")?;
+        let nested = std::iter::once("fs.list")
+            .chain(std::iter::repeat_n("fs.read", 20))
+            .chain(std::iter::once("fs.search"));
+        let expected: Vec<(String, String, bool)> = std::iter::once(("model", "code.run"))
+            .chain(nested.map(|tool| ("code", tool)))
+            .map(|(recipient, tool)| (recipient.to_owned(), tool.to_owned(), true))
+            .collect();
+        for calls in [&prepared["tool_calls"], &checked["tool_calls"]] {
+            assert_eq!(records(calls)?, expected, "{calls}");
+        }
+        Ok(())
+    }
+
+    /// An agent runs Verifier code mode over MCP with the same authority and
+    /// records as every SDK: `verification.execute` judges `evidence-reduction`
+    /// through one model-visible `code.run` per Agent with code-directed
+    /// nested records, its check citing the pinned note with custom data;
+    /// `verification.enqueue` and `verification.get_execution` return the
+    /// same compact decision, while `verification.get_execution_details` and
+    /// the retained Bifrost output keep the same records. The details tool's
+    /// output schema declares the record's `recipient`. A principal lacking Bifrost reads
+    /// sees a nested query denied with the catalog code and no output, its
+    /// program repairing the call; the granted principal's rerun queries.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider, server, bootstrap, registration, deployment, MCP
+    /// transport, tool-call, or settle failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a tool is not offered or a judgment, record, schema,
+    /// readback, or model turn differs.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn code_mode_preserves_authority_and_records() -> Result<(), McpJourneyError> {
+        let upstream = wiremock::MockServer::start().await;
+        let verdict = serde_json::json!({
+            "outcome": "failed", "reason": "one note is over the limit",
+            "citations": [{ "slot": "notes", "locator": { "json_pointer": format!("/{OVER}") } }],
+            "data": { "hits": [OVER] },
+        });
+        for (marker, source, content) in [
+            (
+                "REDUCE-STEP: CODE",
+                REDUCE,
+                serde_json::json!({ "hits": [OVER] }).to_string(),
+            ),
+            ("REDUCE-CHECK: CODE", REDUCE, verdict.to_string()),
+            ("INVESTIGATE: NESTED", NESTED, r#"{"done":true}"#.to_owned()),
+        ] {
+            script_code(&upstream, marker, source, &content).await;
+        }
+        let server = Box::pin(
+            WyrdTestServer::builder()
+                .with_verification_runtime_for_test()
+                .with_gateway_provider_root_for_test(upstream.uri().parse()?)
+                .start_bound(),
+        )
+        .await?;
+        let admin = server
+            .bootstrap_service("mcp-code-admin", &["admin"])
+            .await?;
+        let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?).await?;
+        let desk = Box::pin(cards.declare_from_path(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../fixtures/cards/verifier_building_blocks/policy-desk.yaml"
+        ))))
+        .await?;
+        let uid = |name: &str| -> Result<String, McpJourneyError> {
+            desk.outcomes
+                .iter()
+                .find(|outcome| outcome.card_ref.name.as_str() == name)
+                .and_then(|outcome| outcome.card_ref.uid.as_ref())
+                .map(ToString::to_string)
+                .ok_or_else(|| format!("{name} is registered").into())
+        };
+        let subject = uid("policy-desk")?;
+        server
+            .deploy_gateway_model_for_test("gpt-4o", "mcp_code_invoker")
+            .await?;
+        let tools = [
+            Permission::card_read(),
+            Permission::verifier_run_any(),
+            Permission::tool_invoke_any(),
+        ];
+        server.seed_role("mcp_code_no_query", &tools).await?;
+        server
+            .seed_role(
+                "mcp_code_tools",
+                &[tools.as_slice(), &[Permission::bifrost_query_read()]].concat(),
+            )
+            .await?;
+        let granted = server
+            .bootstrap_service("mcp-code-granted", &["mcp_code_tools", "mcp_code_invoker"])
+            .await?;
+        let narrowed = server
+            .bootstrap_service(
+                "mcp-code-no-query",
+                &["mcp_code_no_query", "mcp_code_invoker"],
+            )
+            .await?;
+        let granted = connect(&server, &granted).await?;
+        let narrowed = connect(&server, &narrowed).await?;
+
+        let offered = granted.list_all_tools().await?;
+        for tool in [
+            EXECUTE,
+            ENQUEUE,
+            GET_EXECUTION,
+            GET_EXECUTION_DETAILS,
+            QUERY,
+        ] {
+            assert!(
+                offered.iter().any(|each| each.name == tool),
+                "{tool} is offered"
+            );
+        }
+        let schema = offered
+            .iter()
+            .find(|each| each.name == GET_EXECUTION_DETAILS)
+            .and_then(|each| each.output_schema.as_ref())
+            .map(|schema| JsonValue::Object(schema.as_ref().clone()))
+            .ok_or("verification.get_execution_details declares its output")?;
+        assert!(
+            schema.to_string().contains(r#""recipient""#)
+                && schema.to_string().contains(r#""code""#),
+            "the output schema declares each record's recipient: {schema}"
+        );
+
+        let request = serde_json::json!({
+            "verifier_card_uid": uid("evidence-reduction")?,
+            "card_uid": subject,
+            "inputs": { "mode": { "kind": "json", "value": "CODE" }, "notes": notes() },
+        });
+        let judged = structured(granted.call_tool(call(EXECUTE, request.clone())?).await?)?;
+        let judged_id = text(&judged, "/execution_id")?;
+        settle(&granted, judged_id).await?;
+        let described = details(&granted, judged_id).await?;
+        assert_reduced(&judged["outcome"], &described["outcome"])?;
+        let notes_reached = upstream
+            .received_requests()
+            .await
+            .ok_or("the upstream records requests")?
+            .iter()
+            .any(|each| String::from_utf8_lossy(&each.body).contains("kept."));
+        assert!(!notes_reached, "no note reaches the model");
+
+        let accepted = structured(granted.call_tool(call(ENQUEUE, request)?).await?)?;
+        let execution_id = text(&accepted, "/execution_id")?.to_owned();
+        let state = settle(&granted, &execution_id).await?;
+        let settled = &state["result"]["outcome"];
+        let described = details(&granted, &execution_id).await?;
+        let described = &described["outcome"];
+        assert_reduced(settled, described)?;
+        server.flush_bifrost().await?;
+        let retained = rows(
+            &granted,
+            format!(
+                "SELECT to_json(output) FROM bifrost.verification.execution_outputs \
+                 WHERE execution_id = '{execution_id}'"
+            ),
+        )
+        .await?;
+        let [row] = retained.as_array().ok_or("rows are an array")?.as_slice() else {
+            return Err(format!("one retained result: {retained}").into());
+        };
+        let output: JsonValue = serde_json::from_str(row[0].as_str().ok_or("JSON text")?)?;
+        assert_eq!(
+            (&output["requirements"], &output["steps"]),
+            (&described["requirements"], &described["steps"]),
+            "the retained output keeps every record"
+        );
+
+        for (caller, question, children, printed) in [
+            (
+                &narrowed,
+                "NESTED no_domain_grant",
+                &[
+                    ("cards.get", true),
+                    ("bifrost.query", false),
+                    ("cards.get", true),
+                ][..],
+                format!("query {DENIED} repaired True"),
+            ),
+            (
+                &granted,
+                "NESTED all_tools",
+                &[("cards.get", true), ("bifrost.query", true)][..],
+                "query allowed repaired False".to_owned(),
+            ),
+        ] {
+            let investigated = structured(
+                caller
+                    .call_tool(call(
+                        EXECUTE,
+                        serde_json::json!({
+                            "verifier_card_uid": uid("tool-review")?,
+                            "card_uid": subject,
+                            "inputs": { "question": { "kind": "json", "value": question } },
+                        }),
+                    )?)
+                    .await?,
+            )?;
+            // The records are read as `granted`: a principal without Bifrost
+            // reads sees no direct execution, its own included.
+            let investigated_id = text(&investigated, "/execution_id")?;
+            settle(&granted, investigated_id).await?;
+            let described = details(&granted, investigated_id).await?;
+            let step = by_id(&described["outcome"]["steps"], "investigate")?;
+            assert_eq!(step["status"], "succeeded", "{question}: {step}");
+            let expected: Vec<(String, String, bool)> =
+                std::iter::once(("model", "code.run", true))
+                    .chain(
+                        children
+                            .iter()
+                            .map(|(tool, allowed)| ("code", *tool, *allowed)),
+                    )
+                    .map(|(recipient, tool, allowed)| {
+                        (recipient.to_owned(), tool.to_owned(), allowed)
+                    })
+                    .collect();
+            assert_eq!(records(&step["tool_calls"])?, expected, "{question}");
+            let turn = upstream
+                .received_requests()
+                .await
+                .ok_or("the upstream records requests")?
+                .iter()
+                .map(|each| String::from_utf8_lossy(&each.body).into_owned())
+                .find(|body| body.contains(question) && body.contains(r#""role":"tool""#))
+                .ok_or("the model received the program's output")?;
+            assert!(turn.contains(&printed), "{question}: {turn}");
+            assert!(
+                !turn.contains("document-formats"),
+                "{question}: a nested Card read never reaches the model"
+            );
+        }
+        granted.cancel().await?;
+        narrowed.cancel().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// The direct deadline the capacity journey runs under.
+    const CAPACITY_TIMEOUT: Duration = Duration::from_secs(2);
+
+    /// Process memory left free while an operation should wait: short of one
+    /// session envelope, with room for the Scribe work that shares the ledger.
+    const SHORT_OF_A_SESSION: u64 = 64 << 20;
+
+    /// Bytes of the answer the refused execution sends: half the 1 MiB
+    /// `/mcp` body limit, so its buffered body and its retained bytes are
+    /// each about this size.
+    const REFUSED_ANSWER: usize = 512 << 10;
+
+    /// Process memory left free for the refused execution: room for its
+    /// buffered body, which the edge charges first, with a quarter MiB to
+    /// spare either way, but not for its retained bytes as well.
+    const BODY_BUT_NOT_RETAINED: u64 = 768 << 10;
+
+    /// The problem document of a server-side tool failure, which MCP returns
+    /// as a JSON-RPC error carrying it as data.
+    ///
+    /// # Errors
+    /// Returns the call's result or any other failure when it is not such an
+    /// error.
+    fn server_problem(
+        result: Result<rmcp::model::CallToolResult, rmcp::ServiceError>,
+    ) -> Result<JsonValue, McpJourneyError> {
+        match result {
+            Err(rmcp::ServiceError::McpError(error))
+                if error.code == rmcp::model::ErrorCode::INTERNAL_ERROR =>
+            {
+                error
+                    .data
+                    .ok_or_else(|| "a server error carries its problem".into())
+            }
+            other => Err(format!("expected a server error, got {other:?}").into()),
+        }
+    }
+
+    /// Wait until `count` hosted operations wait for process memory.
+    ///
+    /// # Errors
+    /// Returns the harness error, including when the count is not reached
+    /// within [`SETTLE`].
+    async fn await_waiters(server: &WyrdTestServer, count: usize) -> Result<(), McpJourneyError> {
+        Ok(server.wait_for_hosted_waiters(count, SETTLE).await?)
+    }
+
+    /// An agent's direct and queued executions of a hosted Python Verifier
+    /// under contended process memory: a direct execution waits and then
+    /// passes; one whose request memory cannot hold is refused as `503` with
+    /// its bounded reason; one whose wait outlives the deadline from its
+    /// arrival ends in `504` and leaves no waiter; a queued execution defers
+    /// and then passes.
+    ///
+    /// # Errors
+    ///
+    /// Returns server startup, bootstrap, registration, MCP transport, or
+    /// tool-call failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an outcome, refusal code, or the deadline window differs
+    /// from the expectation.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn execution_waits_and_refusals_follow_hosted_capacity() -> Result<(), McpJourneyError> {
+        let server = Box::pin(
+            WyrdTestServer::builder()
+                .with_verification_runtime_for_test()
+                .with_verify_timeout_for_test(CAPACITY_TIMEOUT)
+                .start_bound(),
+        )
+        .await?;
+        let admin = server
+            .bootstrap_service("mcp-capacity-admin", &["admin"])
+            .await?;
+        let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?).await?;
+        let desk = Box::pin(cards.declare_from_path(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../fixtures/cards/verification_capacity/capacity-desk.yaml"
+        ))))
+        .await?;
+        let uid = |name: &str| -> Result<String, McpJourneyError> {
+            desk.outcomes
+                .iter()
+                .find(|outcome| outcome.card_ref.name.as_str() == name)
+                .and_then(|outcome| outcome.card_ref.uid.as_ref())
+                .map(ToString::to_string)
+                .ok_or_else(|| format!("{name} is registered").into())
+        };
+        let (verifier, subject) = (uid("adds-one")?, uid("capacity-desk")?);
+        let request = |answer: JsonValue| {
+            serde_json::json!({
+                "verifier_card_uid": verifier,
+                "card_uid": subject,
+                "inputs": { "answer": { "kind": "json", "value": answer } },
+            })
+        };
+        let agent = connect(&server, &admin).await?;
+
+        // Refusals run before any worker exists: memory an idle worker's
+        // reap frees goes to the operation that reaped it.
+        // `/mcp` buffers its body against the same memory before the tool
+        // runs, so the hold leaves room for the body alone.
+        let full = server.occupy_hosted_memory(BODY_BUT_NOT_RETAINED)?;
+        let refused = server_problem(
+            agent
+                .call_tool(call(EXECUTE, request("2".repeat(REFUSED_ANSWER).into()))?)
+                .await,
+        )?;
+        drop(full);
+        assert_eq!(
+            refused["code"], "WYRD_SERVER_503_SERVICE_UNAVAILABLE",
+            "{refused}"
+        );
+        assert_eq!(
+            refused["details"]["reason"], "process memory cannot hold the Python operation now",
+            "{refused}"
+        );
+
+        let held = server.occupy_hosted_memory(SHORT_OF_A_SESSION)?;
+        let started = tokio::time::Instant::now();
+        let timed_out = server_problem(agent.call_tool(call(EXECUTE, request(2.into()))?).await)?;
+        let elapsed = started.elapsed();
+        assert_eq!(
+            timed_out["code"], "WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT",
+            "{timed_out}"
+        );
+        assert!(
+            elapsed >= CAPACITY_TIMEOUT && elapsed < 2 * CAPACITY_TIMEOUT,
+            "one wait ends at the deadline: {elapsed:?}"
+        );
+        await_waiters(&server, 0).await?;
+
+        // Under the same hold a direct execution waits and a queued one
+        // defers; both pass once the memory frees.
+        let accepted = structured(agent.call_tool(call(ENQUEUE, request(2.into()))?).await?)?;
+        let (judged, freed) =
+            tokio::join!(agent.call_tool(call(EXECUTE, request(2.into()))?), async {
+                let waited = await_waiters(&server, 2).await;
+                drop(held);
+                waited
+            });
+        freed?;
+        let judged = structured(judged?)?;
+        assert_eq!(judged["outcome"]["verdict"], "passed", "{judged}");
+        let settled = settle(&agent, text(&accepted, "/execution_id")?).await?;
+        assert_eq!(
+            settled["result"]["outcome"]["verdict"], "passed",
+            "{settled}"
+        );
+
+        agent.cancel().await?;
+        server.shutdown().await?;
+        Ok(())
     }
 }

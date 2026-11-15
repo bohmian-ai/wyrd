@@ -13,7 +13,9 @@ refund reader first calls ``fs.extract`` on its workspace copy of the policy and
 then answers a 100-dollar limit, the policy judge passes every answer with a
 citation unless the answer names a scripted case, and the ``tool-review``
 investigator calls the Card, Bifrost, and code tools at once and then
-finishes. Scripted answer texts also fail the reader's provider, schema, and
+finishes, or on ``NESTED`` makes its Card and Bifrost calls from one
+``code.run`` program; ``evidence-reduction`` reads twenty notes from one
+program per Agent. Scripted answer texts also fail the reader's provider, schema, and
 deadline and the code step and check; scoped and delegated principals
 exercise every tool grant.
 
@@ -27,12 +29,16 @@ selected mounts so each journey asserts exactly what the tools returned.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import secrets
+import subprocess
+import sys
 import time
+import tracemalloc
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import httpx
 import pytest
@@ -49,6 +55,8 @@ from wyrd.otel import span_exporter
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer, cli
 
+from ..benchmark_driver import BENCHMARK, capture_heap, materialize, readout, timed
+from .conftest import OVER
 from .support import (
     FIXTURES,
     Receiver,
@@ -63,9 +71,12 @@ from .support import (
 from .test_local_development import configure_gateway
 
 if TYPE_CHECKING:
-    from wyrd.verify import RequirementResult, StepResult
+    from wyrd.verify import RequirementResult, StepResult, ToolCallRecord
 
 pytestmark = pytest.mark.integration
+
+DataT = TypeVar("DataT")
+"""The custom data type a typed result carries."""
 
 WAIT_SECONDS = 90.0
 """How long a test waits for a queued execution."""
@@ -189,7 +200,7 @@ def review(
     return desk.run().observe.verify("policy-review", **inputs)
 
 
-def requirement(result: verify.VerificationResult, id: str) -> RequirementResult:
+def requirement(result: verify.VerificationResult[DataT], id: str) -> RequirementResult[DataT]:
     """The requirement ``id`` of ``result``."""
     [found] = [each for each in result.requirements if each["id"] == id]
     return found
@@ -318,6 +329,12 @@ def scored_calls(receiver: Receiver) -> int:
     return sum("SCORE:" in json.dumps(each.body) for each in receiver.to("/v1/chat/completions"))
 
 
+class Hits(BaseModel):
+    """The ``evidence-reduction`` check's custom data: the notes over the limit."""
+
+    hits: list[str]
+
+
 class Attribution(BaseModel):
     """One retained result's subject and actor."""
 
@@ -433,6 +450,139 @@ def test_refund_over_the_limit_fails_the_assertion(desk: WyrdState) -> None:
     assert result.verdict == "failed"
     over = requirement(result, "refund-within-limit")
     assert (over["outcome"], over["actual"]) == ("failed", False)
+
+
+READOUT = """
+import json, sys
+from pathlib import Path
+from tests.benchmark_driver import BENCHMARK, readout
+from wyrd import WyrdError, verify
+from wyrd.client import WyrdClient
+from wyrd.state import WyrdState
+
+bundle, policy = sys.argv[1:]
+BENCHMARK.install()
+observe = WyrdState.from_path(Path(bundle), WyrdClient(credential=sys.stdin.read())).run().observe
+before = readout()
+observe.verify("policy-review", answer={"text": "Refunds follow our policy.", "refund": 500}, policy=verify.File(policy))
+try:
+    observe.verify("no-such-verifier", {"d": "yes"})
+except WyrdError:
+    pass
+print(json.dumps([before, readout()]))
+"""
+
+
+def recorded(before: dict[str, Any], after: dict[str, Any], boundary: str, outcome: str) -> int:
+    """Observations of ``boundary`` with ``outcome`` that ``after`` holds beyond ``before``."""
+
+    def count(snapshot: dict[str, Any]) -> int:
+        return sum(
+            series["count"]
+            for series in snapshot["series"]
+            if (series["boundary"], series["outcome"]) == (boundary, outcome)
+        )
+
+    return count(after) - count(before)
+
+
+def components(snapshot: dict[str, Any], boundary: str) -> set[str]:
+    """The components ``snapshot`` records for ``boundary``."""
+    return {
+        metric["labels"]["component"]
+        for metric in snapshot["metrics"]
+        if metric["name"] == "wyrd_benchmark_component_seconds"
+        and metric["labels"]["boundary"] == boundary
+    }
+
+
+def test_benchmark_driver_preserves_public_call_boundary(
+    desk: WyrdState, policy_desk_bundle: Path, policy_desk_key: str
+) -> None:
+    ticks = itertools.count()
+    converted: list[int] = []
+
+    class Deferred:
+        """The real result, noting the tick its requirements convert at."""
+
+        def __init__(self, result: verify.VerificationResult) -> None:
+            self.result = result
+
+        @property
+        def verdict(self) -> str:
+            return self.result.verdict
+
+        @property
+        def requirements(self) -> list[RequirementResult]:
+            converted.append(next(ticks))
+            return self.result.requirements
+
+    result, outcome, returned, ready = timed(
+        lambda: cast("verify.VerificationResult", Deferred(review(desk, CONFORMING, 500))),
+        lambda: next(ticks),
+    )
+
+    assert (returned, converted, ready) == (1, [2], 3), (
+        "conversion is after the call returns and inside result-ready, once"
+    )
+    real = cast("Deferred", result).result
+    assert outcome == {"verdict": "failed", "requirements": real.requirements}
+    with pytest.raises(WyrdError) as refused:
+        timed(lambda: desk.run().observe.verify("no-such-verifier", {"d": "yes"}))
+    assert refused.value.code == "WYRD_SDK_404_UNKNOWN_VERIFIER"
+    assert materialize(real) == outcome, "materializing again reads the same view"
+
+    if BENCHMARK is None:
+        assert readout() is None, "a native module without bench reports no recorder window"
+        return
+    # This process's metrics recorder is the in-process test server's, so the
+    # measured calls run in a child interpreter loading the same module, as
+    # the benchmark's driver process does.
+    child = subprocess.run(
+        [sys.executable, "-c", READOUT, str(policy_desk_bundle), str(POLICY)],
+        input=policy_desk_key,
+        capture_output=True,
+        text=True,
+        check=True,
+        cwd=Path(__file__).parents[2],
+    )
+    before, after = json.loads(child.stdout)
+
+    assert before["process"] == after["process"]
+    for boundary in ("sdk.verify", "client.verify"):
+        assert recorded(before, after, boundary, "success") == 1, boundary
+    for boundary in ("client.http", "client.http.attempt"):
+        assert recorded(before, after, boundary, "success") == 2, (
+            f"{boundary}: the policy file's evidence plan, then the execution"
+        )
+    assert recorded(before, after, "sdk.verify", "error") == 1, (
+        "a refused call records its own outcome"
+    )
+    assert {"input", "core", "output"} <= components(after, "sdk.verify")
+    assert {"serialize", "auth", "send", "body", "decode"} <= components(after, "client.http")
+
+
+def test_benchmark_heap_capture_holds_real_conversion_work(desk: WyrdState, tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="not heap-profiled"):
+        capture_heap(tmp_path / "heap-python-untraced")
+    tracemalloc.start()
+    try:
+        outcome = materialize(review(desk, CONFORMING, 500))
+        heap = capture_heap(tmp_path / "heap-python-step")
+    finally:
+        tracemalloc.stop()
+
+    managed = tmp_path / "heap-python-step.tracemalloc"
+    native = [str(tmp_path / "heap-python-step.pb.gz")] if BENCHMARK is not None else []
+    assert heap == {"paths": [str(managed), *native]}
+    saved = tracemalloc.Snapshot.load(str(managed))
+    code = materialize.__code__
+    lines = {line for *_, line in code.co_lines()}
+    converted = saved.filter_traces([tracemalloc.Filter(True, code.co_filename)])
+    assert outcome["requirements"]
+    assert any(trace.traceback[0].lineno in lines for trace in converted.traces), (
+        "the native result's conversion into Python objects is traced at the driver's read"
+    )
 
 
 def test_judge_verdict_fails_the_agent_check(desk: WyrdState) -> None:
@@ -748,6 +898,119 @@ def test_delegated_tools_keep_the_narrower_authority(
     ]
 
 
+NOTES_CITED = [{"slot": "notes", "locator": {"json_pointer": f"/{OVER}"}}]
+"""The ``evidence-reduction`` check's one citation: the pinned note over the limit."""
+
+NESTED_READS = ["fs.list", *["fs.read"] * 20, "fs.search"]
+"""The tools the ``REDUCE`` program awaits, in start order."""
+
+
+def notes() -> dict[str, str]:
+    """The twenty ``evidence-reduction`` notes: 4 KiB or more each, only ``OVER`` over the limit."""
+    names = [f"n{index:02}" for index in range(1, 21)]
+    return {
+        name: f"{name} {'OVER-LIMIT' if name == OVER else 'within'}: "
+        + f"refund {name} kept. " * 300
+        for name in names
+    }
+
+
+def recipients(calls: list[ToolCallRecord]) -> list[tuple[str, str]]:
+    """Each of ``calls`` as its recipient and tool, in start order."""
+    return [(call["recipient"], call["tool"]) for call in calls]
+
+
+def assert_reduced(result: verify.VerificationResult[Any]) -> None:
+    """Assert ``result`` judged the notes through one model-visible ``code.run`` per Agent.
+
+    The step names the note over the limit; the check fails citing the pinned
+    note with the same hits as data. Each Agent's records are one
+    model-directed ``code.run`` and the program's code-directed calls, every
+    one returning output, read from the execution's details.
+    """
+    assert result.verdict == "failed", result.requirements
+    judged = requirement(result, "within-limit")
+    assert (judged["outcome"], judged["citations"]) == ("failed", NOTES_CITED), judged
+    data = judged["data"]
+    assert (data.hits if isinstance(data, Hits) else data["hits"]) == [OVER], data
+    described = details(result.execution_id)["outcome"]
+    assert "notes" in described["evidence"], "the citation names pinned evidence"
+    [prepared] = [each for each in described["steps"] if each["id"] == "over-limit"]
+    [checked] = [each for each in described["requirements"] if each["id"] == "within-limit"]
+    assert (prepared["status"], prepared.get("output")) == ("succeeded", {"hits": [OVER]})
+    expected = [("model", "code.run"), *(("code", tool) for tool in NESTED_READS)]
+    for calls in (prepared["tool_calls"], checked["tool_calls"]):
+        assert recipients(calls) == expected
+        for call in calls:
+            assert "error" not in call, call
+            assert len(call["output_sha256"]) == 64 and call["returned_bytes"] > 0, call
+        assert all(call["returned_bytes"] >= 4096 for call in calls if call["tool"] == "fs.read")
+
+
+def test_code_mode_reduces_evidence_and_preserves_citations(
+    policy_desk_bundle: Path, wyrd_server: WyrdTestServer, receiver: Receiver
+) -> None:
+    key = wyrd_server.scoped_api_key(
+        "code_reducer", [*VERIFIES, "tool:invoke", "cards:read", "bifrost_query:read"]
+    )
+    observe = WyrdState.from_path(policy_desk_bundle, WyrdClient(credential=key)).run().observe
+
+    assert_reduced(observe.verify("evidence-reduction", mode="CODE", notes=notes()))
+    turns = [json.dumps(each.body) for each in receiver.to("/v1/chat/completions")]
+    assert not any("REDUCE-" in turn and "kept." in turn for turn in turns), (
+        "no note reaches the model"
+    )
+    typed = observe.verify_typed("evidence-reduction", Hits, mode="CODE", notes=notes())
+    assert requirement(typed, "within-limit")["data"] == Hits(hits=[OVER])
+    assert_reduced(typed)
+    execution = observe.submit("evidence-reduction", mode="CODE", notes=notes())
+    assert isinstance(execution, verify.Execution)
+    waited = execution.wait(WAIT_SECONDS)
+    assert_reduced(waited)
+    assert_reduced(execution.wait_typed(WAIT_SECONDS, Hits))
+    assert execution.status()["result"]["outcome"]["requirements"] == waited.requirements
+    described = execution.details()["outcome"]
+    kept = retained(wyrd_server, waited.execution_id)
+    assert (kept["requirements"], kept["steps"]) == (described["requirements"], described["steps"])
+
+    denied = f"query {DENIED} repaired True"
+    for name, extra, children, printed in (
+        (
+            "NESTED no_domain_grant",
+            ["tool:invoke", "cards:read"],
+            [(TOOLS[0], True), (TOOLS[1], False), (TOOLS[0], True)],
+            denied,
+        ),
+        (
+            "NESTED all_tools",
+            ["tool:invoke", "cards:read", "bifrost_query:read"],
+            [(TOOLS[0], True), (TOOLS[1], True)],
+            "query allowed repaired False",
+        ),
+    ):
+        key = wyrd_server.scoped_api_key(name.lower().replace(" ", "_"), [*VERIFIES, *extra])
+        investigated = step(
+            investigate(policy_desk_bundle, WyrdClient(credential=key), name), "investigate"
+        )
+        assert investigated["status"] == "succeeded", (name, investigated)
+        calls = investigated["tool_calls"]
+        assert [(call["recipient"], call["tool"], "error" not in call) for call in calls] == [
+            ("model", TOOLS[2], True),
+            *(("code", tool, allowed) for tool, allowed in children),
+        ], name
+        for call in calls:
+            if "error" in call:
+                assert DENIED in call["error"], (name, call)
+                assert (call.get("output_sha256"), call["returned_bytes"]) == (None, 0), name
+        turn = next(
+            body
+            for body in (json.dumps(each.body) for each in receiver.to("/v1/chat/completions"))
+            if name in body and '"role": "tool"' in body
+        )
+        assert printed in turn, (name, turn)
+        assert "document-formats" not in turn, f"{name}: a nested Card read never reaches the model"
+
+
 def test_custom_verdict_data_survives_readback(
     desk: WyrdState, wyrd_server: WyrdTestServer
 ) -> None:
@@ -759,7 +1022,8 @@ def test_custom_verdict_data_survives_readback(
     assert status["result"]["outcome"]["requirements"] == waited.requirements
 
     assert (
-        retained(wyrd_server, waited.execution_id) == execution.details()["outcome"]["requirements"]
+        retained(wyrd_server, waited.execution_id)["requirements"]
+        == execution.details()["outcome"]["requirements"]
     )
 
     for marker, data in EXACT_DATA.items():
@@ -771,20 +1035,20 @@ def test_custom_verdict_data_survives_readback(
         status = execution.status()
         assert status["result"]["outcome"]["requirements"] == waited.requirements, marker
         assert (
-            retained(wyrd_server, waited.execution_id)
+            retained(wyrd_server, waited.execution_id)["requirements"]
             == execution.details()["outcome"]["requirements"]
         ), marker
 
 
-def retained(wyrd_server: WyrdTestServer, execution_id: str) -> object:
-    """The retained requirements of ``execution_id``, read back from Bifrost after publishing."""
+def retained(wyrd_server: WyrdTestServer, execution_id: str) -> dict[str, Any]:
+    """The retained output of ``execution_id``, read back from Bifrost after publishing."""
     wyrd_server.flush_bifrost()
     [row] = Bifrost(client=client_of(wyrd_server)).sql(
         "SELECT to_json(output) AS output FROM bifrost.verification.execution_outputs WHERE execution_id = $1",
         [execution_id],
         model=RetainedOutput,
     )
-    return json.loads(row.output)["requirements"]
+    return json.loads(row.output)
 
 
 def deep(containers: int) -> object:

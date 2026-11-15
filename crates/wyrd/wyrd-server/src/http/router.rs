@@ -333,6 +333,7 @@ where
                 .bifrost
                 .serves_api()
                 .then(|| state.bifrost.transport_admission()),
+            state.bifrost.transport_admission().process_memory().clone(),
         ));
     router
         // Wyrd's body limit above is the one request-size policy here; Axum's

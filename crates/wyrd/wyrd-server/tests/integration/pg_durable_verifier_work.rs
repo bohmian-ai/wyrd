@@ -36,14 +36,14 @@ use wyrd_server::verification::hosted::evidence::TenantEvidence;
 use wyrd_server::verification::hosted::publications::{Publications, PublishCall};
 use wyrd_server::verification::hosted::sandbox::Sandbox;
 use wyrd_server::verification::hosted::tools::HostedTools;
-use wyrd_server::verification::hosted::workspace::{Workspace, Workspaces};
+use wyrd_server::verification::hosted::workspace::Workspace;
 use wyrd_server::verification::inputs::InputResolver;
 use wyrd_server::verification::leases::{HeldLease, LeaseRenewal};
 use wyrd_server::verification::results::{ResultPayloadBuilder, ResultRun};
 use wyrd_server::verification::state::{
     Checkpoint, Decision, RunState, StateError, StateRow, revision_batch, stand_in_identity,
 };
-use wyrd_server::verification::telemetry::ExecutionMode;
+use wyrd_server::verification::telemetry::{Envelopes, ExecutionMode};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Attribution;
 use wyrd_spec::card::verifier::{Action, VerifierSpec};
@@ -66,7 +66,7 @@ use wyrd_testing::WyrdTestServer;
 use wyrd_testing::verification::VerificationFixture;
 
 use crate::pg_hosted_artifacts::{NoRegistry, answer, reviewer, saturable, user};
-use crate::sandbox_worker::worker;
+use crate::sandbox_worker::{roomy, worker, workspaces};
 
 /// One leased execution of a fresh in-process server, written through the
 /// Bifrost execution state its claim holds.
@@ -350,15 +350,20 @@ impl Leased {
             format: MediaFormat::Markdown,
             filename: None,
         };
-        let evidence = TenantEvidence::new(self.server.state().clone(), caller.clone(), limits);
+        let evidence = TenantEvidence::new(
+            self.server.state().clone(),
+            caller.clone(),
+            limits,
+            wyrd_runtime::resources::ByteLedger::new(u64::MAX),
+        );
         let read = async {
             loop {
                 self.server
                     .flush_bifrost()
                     .await
                     .expect("the File inventory publishes");
-                if let Ok((bytes, _)) = evidence.read(&file).await {
-                    return bytes;
+                if let Ok((loaded, _)) = evidence.read(&file).await {
+                    return loaded.bytes;
                 }
             }
         };
@@ -461,6 +466,7 @@ fn rule(error: &skald_tool::ToolError) -> Value {
 /// scratch write reaches the retained File, or a refusal leaves an entry.
 #[tokio::test(flavor = "multi_thread")]
 async fn file_and_json_publications_are_immutable() {
+    let work = tokio_util::task::TaskTracker::new();
     let leased = Leased::start().await;
     let limits = HostedLimits {
         work_write_max_bytes: 1024,
@@ -487,6 +493,7 @@ async fn file_and_json_publications_are_immutable() {
                 &call("c1", &producer, "report"),
                 &workspace,
                 "/work/notes/report one.md",
+                &work,
             )
             .await,
         publications.json(
@@ -545,7 +552,12 @@ async fn file_and_json_publications_are_immutable() {
     );
 
     let file = publications
-        .path(&call("c4", &producer, "big"), &workspace, "/work/big.bin")
+        .path(
+            &call("c4", &producer, "big"),
+            &workspace,
+            "/work/big.bin",
+            &work,
+        )
         .await
         .expect_err("an oversized file is refused");
     assert_eq!(rule(&file), "work_budget");
@@ -573,6 +585,7 @@ async fn file_and_json_publications_are_immutable() {
 /// or the retained File does not read back.
 #[tokio::test(flavor = "multi_thread")]
 async fn server_produced_files_open_no_upload_session() {
+    let work = tokio_util::task::TaskTracker::new();
     let leased = Leased::start().await;
     let limits = HostedLimits::default();
     let caller = leased.publisher([]);
@@ -592,6 +605,7 @@ async fn server_produced_files_open_no_upload_session() {
             &call("c1", &producer, "report"),
             &workspace,
             "/work/report.md",
+            &work,
         )
         .await
         .expect("the file publishes");
@@ -653,6 +667,7 @@ fn entries(workspace: &Workspace, relative: &str) -> usize {
 /// entry, or a snapshot mixes states.
 #[tokio::test(flavor = "multi_thread")]
 async fn directory_snapshot_is_complete_or_rejected() {
+    let work = tokio_util::task::TaskTracker::new();
     let leased = Leased::start().await;
     let limits = HostedLimits {
         work_write_max_bytes: 1024,
@@ -682,7 +697,8 @@ async fn directory_snapshot_is_complete_or_rejected() {
             .path(
                 &call("tree", &producer, "report"),
                 &workspace,
-                "/work/report"
+                "/work/report",
+                &work
             )
             .await
             .expect("the tree publishes"),
@@ -789,7 +805,7 @@ async fn directory_snapshot_is_complete_or_rejected() {
     ));
     for (case, path, reason, workspace) in cases {
         let error = publications
-            .path(&call(case, &producer, case), workspace, &path)
+            .path(&call(case, &producer, case), workspace, &path, &work)
             .await
             .expect_err(case);
         let detail = error.detail().unwrap_or_default().to_owned();
@@ -801,7 +817,7 @@ async fn directory_snapshot_is_complete_or_rejected() {
     put(&workspace, "held/one.txt", b"old");
     let writer = workspace.writer().await;
     let held = call("held", &producer, "held");
-    let publish = publications.path(&held, &workspace, "/work/held");
+    let publish = publications.path(&held, &workspace, "/work/held", &work);
     let edit = async {
         tokio::task::yield_now().await;
         put(&workspace, "held/one.txt", b"1");
@@ -846,6 +862,7 @@ async fn directory_snapshot_is_complete_or_rejected() {
 /// becomes readable.
 #[tokio::test(flavor = "multi_thread")]
 async fn publication_replay_preserves_attempt_identity() {
+    let work = tokio_util::task::TaskTracker::new();
     let leased = Leased::start().await;
     let limits = HostedLimits::default();
     let caller = leased.publisher([]);
@@ -872,7 +889,12 @@ async fn publication_replay_preserves_attempt_identity() {
             PublicationKind::Json
         );
         publications
-            .path(&call("f1", &first, "notes"), &workspace, "/work/notes.md")
+            .path(
+                &call("f1", &first, "notes"),
+                &workspace,
+                "/work/notes.md",
+                &work,
+            )
             .await
             .expect("the file call and its replay answer one receipt");
         leased.settled().await;
@@ -896,11 +918,21 @@ async fn publication_replay_preserves_attempt_identity() {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&evidence, std::fs::Permissions::from_mode(0o000)).expect("chmod");
         let gone = publications
-            .path(&call("f1", &first, "notes"), &workspace, "/work/notes.md")
+            .path(
+                &call("f1", &first, "notes"),
+                &workspace,
+                "/work/notes.md",
+                &work,
+            )
             .await;
         put(&workspace, "notes.md/now-a-directory.md", b"other");
         let replaced = publications
-            .path(&call("f1", &first, "notes"), &workspace, "/work/notes.md")
+            .path(
+                &call("f1", &first, "notes"),
+                &workspace,
+                "/work/notes.md",
+                &work,
+            )
             .await;
         std::fs::set_permissions(&evidence, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         assert_eq!(
@@ -944,7 +976,7 @@ async fn publication_replay_preserves_attempt_identity() {
         put(&workspace, "tree/new.md", b"never stored");
         std::fs::set_permissions(&evidence, std::fs::Permissions::from_mode(0o555)).expect("chmod");
         let failed = publications
-            .path(&call("t1", &first, "tree"), &workspace, "/work/tree")
+            .path(&call("t1", &first, "tree"), &workspace, "/work/tree", &work)
             .await;
         std::fs::set_permissions(&evidence, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         failed.expect_err("an upload that fails publishes nothing");
@@ -963,7 +995,12 @@ async fn publication_replay_preserves_attempt_identity() {
         "{stale}"
     );
     publications
-        .path(&call("f1", &first, "notes"), &workspace, "/work/notes.md")
+        .path(
+            &call("f1", &first, "notes"),
+            &workspace,
+            "/work/notes.md",
+            &work,
+        )
         .await
         .expect_err("a file replay under the stale lease is refused");
     publications
@@ -1002,6 +1039,7 @@ async fn publication_replay_preserves_attempt_identity() {
 /// reclaim changes the charge, or a mount needs the inventory.
 #[tokio::test(flavor = "multi_thread")]
 async fn publication_limits_survive_reclaim() {
+    let work = tokio_util::task::TaskTracker::new();
     let leased = Leased::start().await;
     let limits = HostedLimits {
         file_max_bytes: 8,
@@ -1028,7 +1066,8 @@ async fn publication_limits_survive_reclaim() {
             .path(
                 &call("edge", &producer, "edge"),
                 &workspace,
-                "/work/edge.bin"
+                "/work/edge.bin",
+                &work
             )
             .await
             .expect("a file at the file limit is accepted"),
@@ -1039,6 +1078,7 @@ async fn publication_limits_survive_reclaim() {
             &call("over", &producer, "over"),
             &workspace,
             "/work/over.bin",
+            &work,
         )
         .await
         .expect_err("a file over the file limit is refused");
@@ -1051,6 +1091,7 @@ async fn publication_limits_survive_reclaim() {
             &call("tail", &producer, "tail"),
             &workspace,
             "/work/tail.bin",
+            &work,
         )
         .await
         .expect_err("12 retained bytes plus 8 exceed 16");
@@ -1060,6 +1101,7 @@ async fn publication_limits_survive_reclaim() {
             &call("edge", &producer, "edge"),
             &workspace,
             "/work/edge.bin",
+            &work,
         )
         .await
         .expect("a replay is not charged again");
@@ -1086,8 +1128,13 @@ async fn publication_limits_survive_reclaim() {
         )),
         ..caller
     };
-    let evidence = TenantEvidence::new(leased.server.state().clone(), blind, limits)
-        .with_execution(Arc::clone(&leased.run));
+    let evidence = TenantEvidence::new(
+        leased.server.state().clone(),
+        blind,
+        limits,
+        wyrd_runtime::resources::ByteLedger::new(u64::MAX),
+    )
+    .with_execution(Arc::clone(&leased.run));
     evidence
         .read(&InputDeclaration::File {
             sha256: wyrd_spec::auth::Sha256Hex::digest(b"12345678"),
@@ -1097,7 +1144,7 @@ async fn publication_limits_survive_reclaim() {
         })
         .await
         .expect_err("the object inventory cannot be read by this caller");
-    let mounted = Workspaces::new(limits, limits.queued.workspaces)
+    let mounted = workspaces(limits)
         .open(
             &BTreeMap::from([(
                 "/inputs/edge".to_owned(),
@@ -1137,6 +1184,7 @@ async fn publication_limits_survive_reclaim() {
 /// differs.
 #[tokio::test(flavor = "multi_thread")]
 async fn publication_mounts_preserve_status_and_lineage() {
+    let work = tokio_util::task::TaskTracker::new();
     let leased = Leased::start().await;
     let limits = HostedLimits::default();
     let caller = leased.publisher([]);
@@ -1159,18 +1207,33 @@ async fn publication_mounts_preserve_status_and_lineage() {
     std::fs::create_dir_all(scratch.work_dir().join("report/empty")).expect("mkdir");
     put(&scratch, "partial.md", b"half a review");
     publications
-        .path(&call("d", &first, "draft"), &scratch, "/work/draft.md")
+        .path(
+            &call("d", &first, "draft"),
+            &scratch,
+            "/work/draft.md",
+            &work,
+        )
         .await
         .expect("the failed attempt publishes partial work");
     publications
-        .path(&call("r", &second, "report"), &scratch, "/work/report")
+        .path(
+            &call("r", &second, "report"),
+            &scratch,
+            "/work/report",
+            &work,
+        )
         .await
         .expect("the successful attempt publishes its report");
     publications
         .json(&call("a", &second, "assessment"), json!({"agrees": true}))
         .expect("the successful attempt publishes JSON");
     publications
-        .path(&call("p", &broken, "partial"), &scratch, "/work/partial.md")
+        .path(
+            &call("p", &broken, "partial"),
+            &scratch,
+            "/work/partial.md",
+            &work,
+        )
         .await
         .expect("the failed step publishes partial work");
     leased
@@ -1179,8 +1242,13 @@ async fn publication_mounts_preserve_status_and_lineage() {
         .await
         .expect("the File inventory publishes");
 
-    let evidence = TenantEvidence::new(leased.server.state().clone(), caller.clone(), limits)
-        .with_execution(Arc::clone(&leased.run));
+    let evidence = TenantEvidence::new(
+        leased.server.state().clone(),
+        caller.clone(),
+        limits,
+        wyrd_runtime::resources::ByteLedger::new(u64::MAX),
+    )
+    .with_execution(Arc::clone(&leased.run));
     let answer = BTreeSet::from([SlotName::new("answer").expect("slot")]);
     let named = |producer: &Producer, name: &str| CallInput {
         value: CallValue::Publication {
@@ -1253,7 +1321,7 @@ async fn publication_mounts_preserve_status_and_lineage() {
             ),
         ),
     ]);
-    let workspaces = Workspaces::new(limits, limits.queued.workspaces);
+    let workspaces = workspaces(limits);
     let mounted = workspaces
         .open(&files, &evidence)
         .await
@@ -1353,7 +1421,12 @@ async fn publication_mounts_preserve_status_and_lineage() {
             "{error}"
         );
     }
-    let direct = TenantEvidence::new(leased.server.state().clone(), caller, limits);
+    let direct = TenantEvidence::new(
+        leased.server.state().clone(),
+        caller,
+        limits,
+        wyrd_runtime::resources::ByteLedger::new(u64::MAX),
+    );
     let unbound = workspaces
         .open(
             &BTreeMap::from([("/inputs/x".to_owned(), named(&second, "report"))]),
@@ -1509,8 +1582,13 @@ fn agent_engine(
 ) -> VerificationEngine {
     let limits = saturable();
     let evidence = Arc::new(
-        TenantEvidence::new(leased.server.state().clone(), caller.clone(), limits)
-            .with_execution(Arc::clone(run)),
+        TenantEvidence::new(
+            leased.server.state().clone(),
+            caller.clone(),
+            limits,
+            wyrd_runtime::resources::ByteLedger::new(u64::MAX),
+        )
+        .with_execution(Arc::clone(run)),
     );
     let mut providers = ProviderRegistry::new();
     providers.register(Arc::clone(model));
@@ -1525,7 +1603,7 @@ fn agent_engine(
                 leased.server.state().clone(),
                 caller.clone(),
                 Arc::clone(&evidence),
-                Arc::new(Workspaces::new(limits, limits.queued.workspaces)),
+                Arc::new(workspaces(limits)),
                 Arc::clone(sandbox),
                 limits,
             )
@@ -1595,7 +1673,7 @@ fn notes() -> BTreeMap<SlotName, InputDeclaration> {
 }
 
 /// An attempt refused Python capacity after it retained a publication is
-/// spent, not forgotten. With the only sandbox admission held, `draft`
+/// spent, not forgotten. With the sandbox's process memory held, `draft`
 /// publishes `report` and then is refused at `code.run`; `once`, with no
 /// retry, does the same; `early` is refused at `code.run` before retaining
 /// anything. Each run defers busy. After a reclaim, `draft` runs attempt 2,
@@ -1612,15 +1690,14 @@ async fn retained_publications_keep_their_busy_attempt() {
     let limits = saturable();
     let caller = leased.publisher([Permission::tool_invoke_any()]);
     let sandbox = Arc::new(
-        Sandbox::start(worker(), limits, limits.queued)
+        Sandbox::start(worker(), limits, &roomy())
             .await
             .expect("pool starts"),
     );
-    let none = serde_json::Map::new();
+
     let far = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-    // One admitted operation holds the only worker admission while pending.
-    let mut held = Box::pin(sandbox.run("def f():\n    return 1", "f", &none, Vec::new(), far));
-    assert!(futures_util::FutureExt::now_or_never(&mut held).is_none());
+    // Holding all of this sandbox's process memory refuses each operation.
+    let held = sandbox.occupy_for_test(0);
     let model = MockProvider::new(ProviderName::OpenAi);
     let provider: Arc<dyn Provider> = Arc::new(model.clone());
     let evidence = BTreeMap::from([(
@@ -1772,19 +1849,19 @@ const KEPT: &[u8] = b"# Kept\n";
 /// drafter runs again, or the consumer reads other bytes.
 #[tokio::test(flavor = "multi_thread")]
 async fn agent_publications_reach_a_recovered_consumer() {
+    let work = tokio_util::task::TaskTracker::new();
     let leased = Leased::start().await;
     let limits = saturable();
     let caller = leased.publisher([Permission::tool_invoke_any()]);
     let sandbox = Arc::new(
-        Sandbox::start(worker(), limits, limits.queued)
+        Sandbox::start(worker(), limits, &roomy())
             .await
             .expect("pool starts"),
     );
-    let none = serde_json::Map::new();
+
     let far = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-    // One admitted operation holds the only worker admission while pending.
-    let mut held = Box::pin(sandbox.run("def f():\n    return 1", "f", &none, Vec::new(), far));
-    assert!(futures_util::FutureExt::now_or_never(&mut held).is_none());
+    // Holding all of this sandbox's process memory refuses each operation.
+    let held = sandbox.occupy_for_test(0);
     let model = MockProvider::new(ProviderName::OpenAi);
     let provider: Arc<dyn Provider> = Arc::new(model.clone());
     let spec = agent_steps(&[
@@ -1842,8 +1919,13 @@ async fn agent_publications_reach_a_recovered_consumer() {
         executed_by: Some(PrincipalId::new(uuid::Uuid::new_v4())),
         ..caller.clone()
     };
-    let evidence = TenantEvidence::new(leased.server.state().clone(), blind.clone(), limits)
-        .with_execution(Arc::clone(&current));
+    let evidence = TenantEvidence::new(
+        leased.server.state().clone(),
+        blind.clone(),
+        limits,
+        wyrd_runtime::resources::ByteLedger::new(u64::MAX),
+    )
+    .with_execution(Arc::clone(&current));
     let unread = evidence
         .read(&InputDeclaration::File {
             sha256: wyrd_spec::auth::Sha256Hex::digest(KEPT),
@@ -1886,6 +1968,7 @@ async fn agent_publications_reach_a_recovered_consumer() {
                 &call("call_1", &producer, "report"),
                 &empty,
                 "/work/report.md",
+                &work,
             )
             .await;
         std::fs::set_permissions(&objects, std::fs::Permissions::from_mode(0o755)).expect("chmod");
@@ -1942,7 +2025,7 @@ async fn agent_publications_reach_a_recovered_consumer() {
         attempts(&leased.accepted().await),
         [("draft".to_owned(), 1), ("consume".to_owned(), 1)]
     );
-    let mounted = Workspaces::new(limits, limits.queued.workspaces)
+    let mounted = workspaces(limits)
         .open(
             &BTreeMap::from([(
                 "/inputs/report.md".to_owned(),
@@ -2003,6 +2086,7 @@ async fn agent_publications_reach_a_recovered_consumer() {
 /// or entry.
 #[tokio::test(flavor = "multi_thread")]
 async fn publication_receipt_survives_a_lost_reply() {
+    let work = tokio_util::task::TaskTracker::new();
     let leased = Leased::start().await;
     let limits = HostedLimits::default();
     let caller = leased.publisher([]);
@@ -2023,7 +2107,7 @@ async fn publication_receipt_survives_a_lost_reply() {
     // of sending it, so the caller's wait ends only once publishing has.
     let responder = async {
         let first = Publications::new(leased.server.state(), &caller, &leased.run, limits)
-            .path(&publish, &workspace, "/work/report.md")
+            .path(&publish, &workspace, "/work/report.md", &work)
             .await;
         drop(reply);
         first
@@ -2072,7 +2156,7 @@ async fn publication_receipt_survives_a_lost_reply() {
         .join("evidence/sha256");
     std::fs::set_permissions(&objects, std::fs::Permissions::from_mode(0o000)).expect("chmod");
     let retried = Publications::new(leased.server.state(), &caller, &current, limits)
-        .path(&publish, &workspace, "/work/report.md")
+        .path(&publish, &workspace, "/work/report.md", &work)
         .await;
     std::fs::set_permissions(&objects, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     assert_eq!(
@@ -2169,7 +2253,7 @@ async fn dropped_agent_work_makes_no_later_call() {
     let limits = saturable();
     let caller = leased.publisher([Permission::tool_invoke_any()]);
     let sandbox = Arc::new(
-        Sandbox::start(worker(), limits, limits.queued)
+        Sandbox::start(worker(), limits, &roomy())
             .await
             .expect("pool starts"),
     );
@@ -2317,6 +2401,7 @@ async fn invocations_resume_from_bifrost() {
 /// descriptors.
 #[tokio::test(flavor = "multi_thread")]
 async fn publications_recover_exact_descriptors_from_run_state() {
+    let work = tokio_util::task::TaskTracker::new();
     let leased = Leased::start().await;
     let limits = HostedLimits::default();
     let caller = leased.publisher([]);
@@ -2340,6 +2425,7 @@ async fn publications_recover_exact_descriptors_from_run_state() {
             &call("p1", &producer, "report"),
             &workspace,
             "/work/report.md",
+            &work,
         )
         .await
         .expect("the file publishes");
@@ -2362,6 +2448,7 @@ async fn publications_recover_exact_descriptors_from_run_state() {
             &call("p1", &producer, "report"),
             &workspace,
             "/work/report.md",
+            &work,
         )
         .await
         .expect("the same call replays its receipt without scratch");
@@ -2376,8 +2463,13 @@ async fn publications_recover_exact_descriptors_from_run_state() {
             ("review".to_owned(), 1, "verdict".to_owned()),
         ]
     );
-    let evidence = TenantEvidence::new(leased.server.state().clone(), caller, limits)
-        .with_execution(Arc::clone(&current));
+    let evidence = TenantEvidence::new(
+        leased.server.state().clone(),
+        caller,
+        limits,
+        wyrd_runtime::resources::ByteLedger::new(u64::MAX),
+    )
+    .with_execution(Arc::clone(&current));
     let recovered = evidence.publications(&task);
     assert_eq!(recovered, accepted);
     leased
@@ -3145,9 +3237,14 @@ async fn concurrent_settlements_release_their_hosted_dependent() {
         .reclaim_on(outbox)
         .await
         .expect("the execution state claims");
-    let blocks = HostedBlocks::start(worker(), HostedLimits::default())
-        .await
-        .expect("the sandbox starts");
+    let blocks = HostedBlocks::start(
+        worker(),
+        HostedLimits::default(),
+        &roomy(),
+        std::env::temp_dir(),
+    )
+    .await
+    .expect("the sandbox starts");
     let code =
         |source: &str| json!({ "kind": "code", "entrypoint": "f", "source": { "inline": source } });
     let spec: VerifierSpec = serde_json::from_value(json!({
@@ -3185,6 +3282,7 @@ async fn concurrent_settlements_release_their_hosted_dependent() {
                     execution: Some(Arc::clone(state)),
                     mode: ExecutionMode::Queued,
                     pull_request: None,
+                    envelopes: Envelopes::default(),
                 },
             )
             .with_checkpoints(

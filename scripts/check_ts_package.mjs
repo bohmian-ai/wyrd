@@ -110,6 +110,12 @@ const rootAllowed = new Set([
 ]);
 const addonAllowed = new Set(["package.json", binary]);
 
+// A bench build exports the benchmark recorder and holds its registry,
+// whose histogram setup message no other code carries.
+if ((await readFile(sourceBinary)).includes("constant duration histogram bounds are valid")) {
+  throw new Error(`${binary} holds the benchmark registry: rebuild it with mise run ts:build`);
+}
+
 assertPublishedPaths(platformManifest, "platform addon manifest");
 assertNoWorkspaceMetadata(platformManifest, "platform addon manifest");
 const staging = await mkdtemp(join(tmpdir(), "wyrd-ts-pack-"));
@@ -159,6 +165,9 @@ try {
       );
       // The clean project installs no optional peer, so this proves the Agents SDK is optional.
       await new WyrdAgentsTraceProcessor().onTraceStart({ traceId: "trace_1", name: "workflow" });
+      const { createRequire } = await import("node:module");
+      const addon = createRequire(import.meta.url)("wyrd-ai-${targetPackage}");
+      if ("benchmarkSnapshot" in addon || "benchmarkInstall" in addon) throw new Error("the addon exports the benchmark recorder");
       const resolved = import.meta.resolve("wyrd-ai");
       if (resolved.includes(".ts")) throw new Error("published export resolves to TypeScript: " + resolved);
       console.log(resolved);

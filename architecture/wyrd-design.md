@@ -1116,7 +1116,9 @@ Server spans export twice from one tracer provider:
   a direct verification opens only the request span,
   `verification.execute`, the GenAI spans, `gateway.call`,
   `gateway.execute`, and `gateway.attempt`; its in-process phases
-  (`verification.handle`, `verification.load`, `verification.engine`, and
+  (`verification.handle`, `verification.load`, `verification.engine`, the
+  hosted workspace's `verification.workspace.open`, per-file
+  `verification.workspace.stage`, and `verification.workspace.install`, and
   the gateway's authorize, route, admit, translate, account, and capture
   spans) are `debug` spans, whose timing the phase metrics already carry.
 - A server span whose parent or one of whose links is a sampled client span
@@ -2158,11 +2160,12 @@ the exact `verifier` and `subject`, optional `deployment_environment`, and an
 Check configuration, provenance, steps, and evidence are absent, not null.
 `VerificationDetails` is the explicit descriptive read of what one completed
 execution ran: the same identity and judgments, each requirement's exact
-authored `check` and `provenance`, `steps` (`id`, `status`, `output`,
-`attempts`, `duration_ms`, `reason`, `provenance`, `tool_calls`), and pinned
-`evidence`. Checks decode as authored data: neither the server's readback nor
-client decoding compiles, renders, or executes a Prompt. SDKs expose it only
-as `Execution.details` and its typed sibling; no other read requests it.
+authored `check`, `provenance`, and an Agent check's `tool_calls`, `steps`
+(`id`, `status`, `output`, `attempts`, `duration_ms`, `reason`, `provenance`,
+`tool_calls`), and pinned `evidence`. Checks decode as authored data: neither
+the server's readback nor client decoding compiles, renders, or executes a
+Prompt. SDKs expose it only as `Execution.details` and its typed sibling; no
+other read requests it.
 Provenance records code hash and runtime, extraction version, Agent and Prompt
 versions, effective routes, drift baselines and windows, and input digests.
 `bifrost.verification.results` is the canonical payload-free result summary,
@@ -2288,26 +2291,146 @@ Every call first needs `{"resource":"tool","action":"invoke"}` with scope
 permission (for `bifrost.query`, read on every table it touches). Neither
 grant implies the other, and neither is inferred from `verifier:run` or the
 Agent declaration. Calls run under the execution's accepted authority; each
-decision is audited non-blocking; tool names, arguments, output digests, and
-byte counts are recorded.
+decision is audited non-blocking.
 
-`code` and `code.run` run in per-process pools of sandboxed Python worker
-processes with a separate unprivileged identity, empty credential
-environment, OS-enforced network denial, parent-serviced file access, no
-subprocesses or host packages, and a fresh interpreter session per operation.
-Pool, memory, file, archive, extraction, scratch, tool-result, and deadline
-limits are startup environment settings; slot limits only lower them.
+Inside an Agent's `code.run`, and nowhere else, Python may
+`await call_tool(name, arguments)`: `name` is a declared dotted built-in
+other than `code.run`, `fs.write`, and `publish`, `arguments` one JSON
+object. The server resolves,
+authorizes, executes, and records each nested call through the same path as
+a model's direct call, under the same accepted authority; Python cannot
+choose an identity, tenant, or credential. An unknown, undeclared, or
+excluded target is `WYRD_AGENT_404_TOOL_NOT_IN_AGENT` and invalid or
+oversized input is `WYRD_TOOL_422_INPUT`; neither dispatches or is recorded.
+A tool failure raises a catchable `RuntimeError` carrying the compact
+problem JSON; budget exhaustion, Busy, the deadline, and cancellation end
+the program and cannot be caught. Values cross as lossless JSON. Authored
+`code` actions and checks have no bridge.
 
-Direct `verify` and queued executions admit work from separate reserved
-capacity: each has its own execution slots, workspaces, Python pool, and
-model-call permits, sized by operator settings, with no borrowing between
-them. Direct admission refuses when its side is full; queued work waits, and
+One logical Agent invocation, across its authored retries, has one request
+allowance (`WYRD_VERIFICATION_AGENT_TOOL_MAX_CALLS`, default 128) counting
+direct calls, `code.run`, and nested requests, refused ones included, with no
+refund; the request after the last fails with
+`WYRD_VERIFICATION_422_TOOL_BUDGET_EXCEEDED`. Arguments are bounded by
+`WYRD_VERIFICATION_TOOL_ARGUMENT_MAX_KIB` (default 64). The Agent's
+`tool_concurrency_cap` (default 8) bounds active non-code calls of both
+origins together; `code.run` holds no permit its children need. A suspended
+program holds no `/work` lock: each Python write and each extraction
+serializes on its own, extraction never overwrites, and both share one
+`/work` write and scratch budget. Every call is recorded once, flat, in start
+order, with tool, arguments, `recipient` (`model` for a direct call, which
+includes the outer `code.run`, `code` for a nested one; absent historically
+means `model`), output digest, and delivered byte count; a call that
+returned nothing has no digest, zero bytes, and a safe error. Records
+survive failed and inconclusive results and retries. Nested results reach
+the model only through the program's own output.
+
+`code` and `code.run` run in two per-process pools of reusable Python worker
+processes hosting the Monty interpreter, one for direct and one for queued
+work, with a fresh interpreter session per
+operation: no Python globals, mounts, callbacks, output, accepted authority,
+or allocator budget crosses operations or tenants. A worker returns to the
+pool only after a completed program or a Python error and a confirmed reset;
+a crash, cancellation, timeout, stopped tool session, or failed reset
+discards it. Isolation is portable and identical on every supported platform:
+the interpreter has no network, subprocess, host-package, or host-file
+access; its allocator enforces the memory limit, which is not an
+operating-system RSS limit; files are reachable only
+through parent-serviced mounts; tool calls only through the parent's
+mediated bridge, which is not network access from the worker; and the parent
+enforces deadlines and reaps workers. The worker holds no credentials or
+server state. Memory, file, archive, extraction, scratch, tool-result,
+tool-argument, tool-request, and deadline limits are startup environment
+settings; slot limits only lower them. They are per-operation ceilings, not
+reserved capacity.
+
+Hosted capacity follows the process resource plan, not fixed counts.
+`wyrd-runtime` owns the neutral mechanism: one process memory ledger and one
+disposable-scratch ledger for the data-root filesystem, which Bifrost,
+request buffering, and hosted verification all charge, so no byte is
+promised twice; the queued verification share below is a reservation held in
+those same ledgers. The ledgers carry no policy;
+each capability decides what it charges and how it answers a refusal. The
+server composes them from the Bifrost plan
+([Admission and memory](bifrost-design.md#admission-and-memory)); Vala never
+imports server concepts, and `wyrd-spec` holds none of it. Each pool allows
+one runnable Python turn per effective CPU of its side.
+
+A Python operation charges its code and globals to process memory before it
+waits, and is refused at once when even those do not fit. It then waits, FIFO
+within its tenant and round robin across tenants on this replica, for one
+atomic grant of its session's peak envelope: twice the allocator ceiling of
+`WYRD_VERIFICATION_MONTY_MEMORY_MIB` (the worker heap and the parent's copy
+of the largest frame a worker can send), plus the worker's measured resident
+baseline and interpreter stack. A tenant's head that does not fit never
+blocks another tenant's head that does, a refilling tenant cannot pass one
+already waiting, and a grant larger than the whole ledger is refused rather
+than queued. There is no worker, workspace, or waiter count. While an operation waits, idle workers are reaped to return
+their charges. A worker keeps its session's envelope charged after the
+session ends, reset or discarded, because its allocator keeps freed pages;
+the next session on that worker takes the charge over rather than adding to
+it, and the charge returns only once the worker's process is gone.
+`WYRD_VERIFICATION_MONTY_MIN_WORKERS` (default 1) is each pool's prewarming
+target:
+warm workers that fit are charged like any worker and reaped like any idle
+one. A program holds a runnable turn only while Python runs; suspended on a
+host call, a nested tool call, or the `/work` writer, it releases the turn,
+keeps its envelope, and competes for a turn again when it resumes. Workspace
+inputs charge scratch at their declared size and stream to disk with memory
+charged per chunk, and each `/work` write charges scratch before it lands;
+those charges are refused at once, never waited for.
+
+A capacity refusal is Busy: the process, not the code, lacked capacity, so it
+never becomes a verdict or reaches the program. A direct execution has one
+deadline, `WYRD_VERIFICATION_TIMEOUT_MS` (default 60 s) after the request
+arrives, lowered by the Verifier's `limits.timeout_seconds`, covering capacity waits, target lookup, staging, checkout,
+execution, and resumption; nothing restarts it. Busy before that deadline
+answers `WYRD_SERVER_503_SERVICE_UNAVAILABLE` with HTTP `Retry-After: 1` and
+a `reason` detail; a wait the deadline ends answers
+`WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT`. HTTP and MCP return the same
+problem document, and SDKs project it without replaying a direct call. A
+queued execution refused capacity returns to the queue without spending an
+attempt. Cancellation removes a waiter and stops mediated work; a cancelled
+operation's envelope stays charged until its killed worker is gone.
+`POST /v1/verification/execute` and `POST /v1/verification/enqueue`, like
+`POST /v1/query`, bypass the protected edge's in-flight limit
+(`WYRD_HTTP_CONCURRENCY_LIMIT`, default 1,024) and pass their bodies
+unbuffered, because hosted admission bounds them by bytes. Every other route
+keeps that limit, and a buffered body is charged to process memory before it
+is buffered, with the same 503 and `Retry-After: 1` on refusal.
+
+Operational metrics use bounded labels only, never tenant or request:
+`wyrd_verification_hosted_operations{state}` and
+`wyrd_verification_hosted_bytes{state}` (`waiting`, `active`),
+`wyrd_verification_hosted_refusals_total{reason}` (`memory`, `expired`),
+`wyrd_verification_hosted_wait_seconds{outcome}` for queued waits,
+`wyrd_verification_python_workers{state}` (`runnable`, `suspended`), and
+`wyrd_verification_python_worker_events_total{event}` (`spawn`, `reset`,
+`reap`). The hosted wait is the `verification.direct.capacity` benchmark
+part, nested inside the Verifier's blocks so it never enters the server
+overhead residual; benchmark collection records worker CPU, memory, and
+churn apart from parent-only server CPU (`benchmarks/README.md`).
+
+Direct `verify` and queued executions admit work from separate capacity.
+Queued executions, continuations included, run on their own long-lived
+runtime with `WYRD_VERIFICATION_QUEUED_CPU_PERCENT` (default 50) of the
+effective CPUs, at least one, as worker and blocking threads, covering their
+engine, model-call, blocking, Python, and nested tool work, and on their own
+Python pool. Their workspaces, Python sessions, and execution state charge a
+reservation of `WYRD_VERIFICATION_QUEUED_MEMORY_PERCENT` (default 25) of
+process memory and `WYRD_VERIFICATION_QUEUED_SCRATCH_PERCENT` (default 50) of
+scratch, held in the one process ledger, which direct work never takes and
+queued work never exceeds. Each percentage is 1 to 99, so direct keeps
+reserved capacity: the server runtime, its own pool, and the rest of the
+ledgers. Each side also has its own execution slots and model-call permits.
+Direct may borrow idle queued capacity; this release does not. Queued work
+never borrows direct capacity. Direct admission refuses when its side is full; queued work waits, and
 a resumed or retried queued execution takes queued capacity again. A model
 call takes its side's permit before entering the ordinary gateway path, whose
 tenant and subject limits, budgets, and accounting still apply. Both sides
 run the one engine with the same authority, evidence, billing, cancellation,
-and platform behavior. The reservation covers these admissions only; CPU,
-Postgres, gateway, and provider capacity remain shared. A Verifier whose
+and platform behavior. Postgres, gateway, and provider capacity remain
+shared. A Verifier whose
 registration-derived `queue_only` is true is refused by `verify`
 before any step runs, never converted to a queued request. The queued
 execution deadline is the original ceiling of everything a queued execution

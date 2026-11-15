@@ -32,6 +32,7 @@ bigdecimal = { version = "0.4", features = ["serde"] }
 bit-set = { version = "0.8" }
 bit-vec = { version = "0.8" }
 bitflags = { version = "2", default-features = false, features = ["std"] }
+bohmian-code-review-pipeline = { git = "https://github.com/bohmian-ai/bohmian-code-review", rev = "9046d1035538df8dfb661f826b102316ee6d0b4e", default-features = false, features = ["testing"] }
 byteorder = { version = "1" }
 bytes = { version = "1" }
 chrono = { version = "0.4", features = ["serde"] }
@@ -63,6 +64,7 @@ hashbrown-3575ec1268b04181 = { package = "hashbrown", version = "0.15" }
 hashbrown-582f2526e08bb6a0 = { package = "hashbrown", version = "0.14", default-features = false, features = ["raw"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
 hex = { version = "0.4" }
+hmac = { version = "0.12", default-features = false, features = ["reset"] }
 httparse = { version = "1" }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "service"] }
@@ -74,6 +76,7 @@ lazy_static = { version = "1", default-features = false, features = ["spin_no_st
 lexical-parse-float = { version = "1", features = ["format"] }
 lexical-parse-integer = { version = "1", default-features = false, features = ["format", "std"] }
 lexical-util = { version = "1", default-features = false, features = ["format", "parse-floats", "parse-integers", "std", "write-floats", "write-integers"] }
+libc = { version = "0.2", features = ["extra_traits"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
 md-5 = { version = "0.11" }
 memchr = { version = "2" }
@@ -159,6 +162,7 @@ bigdecimal = { version = "0.4", features = ["serde"] }
 bit-set = { version = "0.8" }
 bit-vec = { version = "0.8" }
 bitflags = { version = "2", default-features = false, features = ["std"] }
+bohmian-code-review-pipeline = { git = "https://github.com/bohmian-ai/bohmian-code-review", rev = "9046d1035538df8dfb661f826b102316ee6d0b4e", default-features = false, features = ["testing"] }
 byteorder = { version = "1" }
 bytes = { version = "1" }
 cc = { version = "1", default-features = false, features = ["parallel"] }
@@ -191,6 +195,7 @@ hashbrown-3575ec1268b04181 = { package = "hashbrown", version = "0.15" }
 hashbrown-582f2526e08bb6a0 = { package = "hashbrown", version = "0.14", default-features = false, features = ["raw"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
 hex = { version = "0.4" }
+hmac = { version = "0.12", default-features = false, features = ["reset"] }
 httparse = { version = "1" }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "service"] }
@@ -202,6 +207,7 @@ lazy_static = { version = "1", default-features = false, features = ["spin_no_st
 lexical-parse-float = { version = "1", features = ["format"] }
 lexical-parse-integer = { version = "1", default-features = false, features = ["format", "std"] }
 lexical-util = { version = "1", default-features = false, features = ["format", "parse-floats", "parse-integers", "std", "write-floats", "write-integers"] }
+libc = { version = "0.2", features = ["extra_traits"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
 md-5 = { version = "0.11" }
 memchr = { version = "2" }
@@ -281,10 +287,10 @@ compression-codecs = { version = "0.4", default-features = false, features = ["b
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "tls12"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
-libc = { version = "0.2", features = ["extra_traits"] }
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std", "prctl"] }
+nix = { version = "0.31", default-features = false, features = ["resource"] }
 rustix = { version = "1", features = ["process", "pty", "termios", "time"] }
 simdutf8 = { version = "0.1", default-features = false, features = ["aarch64_neon", "public_imp"] }
 spin = { version = "0.9" }
@@ -301,10 +307,10 @@ compression-codecs = { version = "0.4", default-features = false, features = ["b
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "tls12"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
-libc = { version = "0.2", features = ["extra_traits"] }
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std", "prctl"] }
+nix = { version = "0.31", default-features = false, features = ["resource"] }
 rustix = { version = "1", features = ["process", "pty", "termios", "time"] }
 simdutf8 = { version = "0.1", default-features = false, features = ["aarch64_neon", "public_imp"] }
 spin = { version = "0.9" }
@@ -321,10 +327,10 @@ compression-codecs = { version = "0.4", default-features = false, features = ["b
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "tls12"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
-libc = { version = "0.2", features = ["extra_traits"] }
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std", "prctl"] }
+nix = { version = "0.31", default-features = false, features = ["resource"] }
 rustix = { version = "1", features = ["process", "pty", "termios", "time"] }
 simdutf8 = { version = "0.1", default-features = false, features = ["aarch64_neon", "public_imp"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
@@ -340,10 +346,10 @@ compression-codecs = { version = "0.4", default-features = false, features = ["b
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "tls12"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
-libc = { version = "0.2", features = ["extra_traits"] }
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std", "prctl"] }
+nix = { version = "0.31", default-features = false, features = ["resource"] }
 rustix = { version = "1", features = ["process", "pty", "termios", "time"] }
 simdutf8 = { version = "0.1", default-features = false, features = ["aarch64_neon", "public_imp"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
@@ -360,9 +366,9 @@ errno = { version = "0.3" }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "tls12"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
-libc = { version = "0.2", features = ["extra_traits"] }
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
+nix = { version = "0.31", default-features = false, features = ["resource"] }
 objc2 = { version = "0.6" }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFArray", "CFAttributedString", "CFBase", "CFCGTypes", "CFCalendar", "CFCharacterSet", "CFData", "CFDate", "CFDictionary", "CFError", "CFFileSecurity", "CFLocale", "CFMachPort", "CFMessagePort", "CFPlugInCOM", "CFRunLoop", "CFSet", "CFStream", "CFString", "CFURL", "CFUUID", "objc2", "std"] }
 rustix = { version = "1", features = ["process", "pty", "termios", "time"] }
@@ -382,9 +388,9 @@ errno = { version = "0.3" }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "tls12"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
-libc = { version = "0.2", features = ["extra_traits"] }
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
+nix = { version = "0.31", default-features = false, features = ["resource"] }
 objc2 = { version = "0.6" }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFArray", "CFAttributedString", "CFBase", "CFCGTypes", "CFCalendar", "CFCharacterSet", "CFData", "CFDate", "CFDictionary", "CFError", "CFFileSecurity", "CFLocale", "CFMachPort", "CFMessagePort", "CFPlugInCOM", "CFRunLoop", "CFSet", "CFStream", "CFString", "CFURL", "CFUUID", "objc2", "std"] }
 rustix = { version = "1", features = ["process", "pty", "termios", "time"] }

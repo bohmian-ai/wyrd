@@ -316,9 +316,8 @@ struct Checkpointed {
     /// or not; a released refusal spends none.
     attempts: HashMap<(TaskId, Instance), u32>,
     /// Tool requests unsettled attempts already spent per block and
-    /// instance; `None` once any of them was interrupted with an unknown
-    /// spend.
-    tool_calls_spent: HashMap<(TaskId, Instance), Option<u32>>,
+    /// instance, as last persisted.
+    tool_calls_spent: HashMap<(TaskId, Instance), u32>,
     /// Every recorded scheduling decision.
     controls: Vec<ControlRecord>,
 }
@@ -401,8 +400,9 @@ impl VerificationEngine {
     /// Record every block invocation of this queued execution in `store`,
     /// which already holds `state`: its invocation attempts and scheduling
     /// decisions. A settled invocation is restored instead of running again,
-    /// an unsettled attempt counts as spent, and a recorded decision is
-    /// reproduced instead of made again.
+    /// an unsettled attempt counts as spent and its invocation resumes from
+    /// its recorded tool spend, and a recorded decision is reproduced
+    /// instead of made again.
     #[must_use]
     pub fn with_checkpoints(mut self, store: Arc<dyn Checkpoints>, state: &ExecutionState) -> Self {
         let mut checkpointed = Checkpointed {
@@ -426,10 +426,8 @@ impl VerificationEngine {
                 checkpointed.settled.insert(key, settlement.clone());
                 continue;
             }
-            let spent = checkpointed.tool_calls_spent.entry(key).or_insert(Some(0));
-            *spent = spent
-                .zip(record.tool_calls_spent)
-                .map(|(seen, recorded)| seen.max(recorded));
+            let spent = checkpointed.tool_calls_spent.entry(key).or_default();
+            *spent = (*spent).max(record.tool_calls_spent);
         }
         self.checkpoints = Some(Arc::new(checkpointed));
         self
@@ -478,8 +476,7 @@ impl VerificationEngine {
     }
 
     /// The tool-call allowance of `task`'s `instance`, resumed from what
-    /// earlier runs of this execution spent: whole when an attempt was
-    /// interrupted with an unknown spend.
+    /// earlier runs of this execution recorded spending.
     fn resumed_tool_calls(&self, task: &TaskId, instance: Instance) -> ToolCallsOwner {
         ToolCallsOwner::resumed(
             self.checkpoints
@@ -490,8 +487,21 @@ impl VerificationEngine {
                         .get(&(task.clone(), instance))
                         .copied()
                 })
-                .unwrap_or(Some(0)),
+                .unwrap_or(0),
         )
+    }
+
+    /// Record `tool_calls`' spend under the begun attempt `producer` as
+    /// each request spends, when this run is checkpointed.
+    // ponytail: the count persists in background without a wait per call,
+    // so an interruption may re-spend the few requests not yet persisted;
+    // await each write if that bound must be exact.
+    fn record_spend(&self, tool_calls: &ToolCallsOwner, producer: &Producer) {
+        if let Some(checkpointed) = &self.checkpoints {
+            let store = Arc::clone(&checkpointed.store);
+            let producer = producer.clone();
+            tool_calls.record_with(Arc::new(move |spent| store.spent(&producer, spent)));
+        }
     }
 
     /// Attempts of `task`'s `instance` already recorded by earlier runs of
@@ -1872,6 +1882,7 @@ impl VerificationEngine {
             let producer = producer(&step.id, instance, attempts);
             self.note_step(&producer, attempts);
             self.begin(&producer).await?;
+            self.record_spend(&tool_calls, &producer);
             let timeout = step
                 .timeout_seconds
                 .map(|seconds| Instant::now() + Duration::from_secs(u64::from(seconds)))
@@ -2011,6 +2022,7 @@ impl VerificationEngine {
                     &producer.step_id,
                     (producer.item_index, producer.iteration_index),
                 );
+                self.record_spend(&tool_calls, producer);
                 let call = BlockCall {
                     id: &requirement.id,
                     position: step

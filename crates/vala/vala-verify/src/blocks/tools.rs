@@ -131,21 +131,25 @@ impl Default for ToolCallsOwner {
 }
 
 impl ToolCallsOwner {
-    /// The invocation as earlier runs of its execution left it: having spent
-    /// `spent` requests, or its whole allowance when `spent` is `None`.
-    ///
-    /// An attempt interrupted before it settled never reported its spend, so
-    /// it counts as having spent everything; a takeover never replenishes
-    /// the allowance an interrupted attempt may have used.
+    /// The invocation as earlier runs of its execution left it, having
+    /// spent `spent` requests.
     #[must_use]
-    pub fn resumed(spent: Option<u32>) -> Self {
+    pub fn resumed(spent: u32) -> Self {
         let owner = Self::default();
+        owner.calls.inner.spent.store(spent, Ordering::SeqCst);
         owner
+    }
+
+    /// Report the invocation's spent count to `recorder` after each request
+    /// spends one, replacing any earlier recorder, so each attempt reports
+    /// under its own record.
+    pub(crate) fn record_with(&self, recorder: Recorder) {
+        *self
             .calls
             .inner
-            .spent
-            .store(spent.unwrap_or(u32::MAX), Ordering::SeqCst);
-        owner
+            .recorder
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(recorder);
     }
 
     /// Requests the invocation has spent so far, restored spend included.
@@ -220,14 +224,18 @@ pub struct ToolCalls {
 /// The state behind [`ToolCallsOwner`] and its [`ToolCalls`] handles.
 #[derive(Default)]
 struct CallLog {
-    /// Requests spent; never refunded, and above any allowance once
-    /// [`ToolCallsOwner::resumed`] counts an interrupted attempt.
+    /// Requests spent; never refunded.
     spent: AtomicU32,
+    /// Where each new spent count is reported.
+    recorder: Mutex<Option<Recorder>>,
     /// Admitted calls in start order, each with whether it finished.
     records: Mutex<Vec<(ToolCallRecord, bool)>>,
     /// Settlements of attempts' sessions not yet awaited.
     settlements: Mutex<Vec<Settlement>>,
 }
+
+/// Receives an invocation's spent tool-request count after each request.
+pub(crate) type Recorder = Arc<dyn Fn(u32) + Send + Sync>;
 
 /// Resolves once the host work one session's calls started has ended.
 type Settlement = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -253,14 +261,28 @@ impl ToolCalls {
             .push(settlement);
     }
 
-    /// Spend one request of `limit`, or `false` once all are spent.
+    /// Spend one request of `limit` and report the new count to the
+    /// recorder, or return `false` once all are spent.
     pub(super) fn spend(&self, limit: u32) -> bool {
-        self.inner
+        let Ok(before) = self
+            .inner
             .spent
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |spent| {
                 (spent < limit).then(|| spent + 1)
             })
-            .is_ok()
+        else {
+            return false;
+        };
+        let recorder = self
+            .inner
+            .recorder
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(recorder) = recorder {
+            recorder(before + 1);
+        }
+        true
     }
 
     /// Record an admitted call's start, returning its slot.
@@ -1037,25 +1059,29 @@ impl std::io::Write for Capped {
 mod tests {
     use super::ToolCallsOwner;
 
-    /// An invocation with nothing spent spends its allowance afresh, one
-    /// with a known spend resumes from it, and one whose spend is unknown
-    /// starts with the whole allowance spent, so a takeover never
-    /// replenishes it.
+    /// An invocation with nothing spent spends its allowance afresh and one
+    /// with a recorded spend resumes from it; every admitted request reports
+    /// its new count to the latest recorder, and a refused one reports
+    /// nothing.
     ///
     /// # Panics
-    /// Panics when a resumed allowance admits a request past its limit or
-    /// refuses one within it.
+    /// Panics when a resumed allowance admits a request past its limit,
+    /// refuses one within it, or reports a count other than the spent one.
     #[test]
-    fn resumed_invocation_counts_an_interrupted_attempt_as_fully_spent() {
-        let fresh = ToolCallsOwner::resumed(Some(0)).handle();
+    fn resumed_invocation_continues_from_its_recorded_spend() {
+        let fresh = ToolCallsOwner::resumed(0).handle();
         assert!(fresh.spend(1));
         assert!(!fresh.spend(1), "the allowance holds one request");
-        let known = ToolCallsOwner::resumed(Some(2));
-        assert!(known.handle().spend(3), "two of three spent leaves one");
-        assert!(!known.handle().spend(3));
-        assert_eq!(known.spent(), 3);
-        let unknown = ToolCallsOwner::resumed(None).handle();
-        assert!(!unknown.spend(u32::MAX - 1));
-        assert!(!unknown.spend(128));
+        let known = ToolCallsOwner::resumed(2);
+        let reported = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&reported);
+        known.record_with(std::sync::Arc::new(move |spent| {
+            sink.lock().expect("sink").push(spent);
+        }));
+        assert!(known.handle().spend(4), "two of four spent leaves two");
+        assert!(known.handle().spend(4));
+        assert!(!known.handle().spend(4));
+        assert_eq!(known.spent(), 4);
+        assert_eq!(*reported.lock().expect("reports"), [3, 4]);
     }
 }

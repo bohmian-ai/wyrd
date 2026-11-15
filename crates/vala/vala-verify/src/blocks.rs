@@ -380,6 +380,15 @@ pub trait Checkpoints: Send + Sync {
     /// Returns a bounded reason when the record cannot commit.
     async fn forget(&self, producer: &Producer, tool_calls_spent: u32) -> Result<(), String>;
 
+    /// Record that the unsettled attempt `producer`'s invocation has spent
+    /// `tool_calls_spent` tool requests, called as each request spends one.
+    ///
+    /// Nothing waits for it to persist: a reclaimed invocation resumes from
+    /// the latest count the host persisted, so a request spent just before
+    /// an interruption may be spent again. A host that can no longer record
+    /// ignores it; its next commit reports the failure.
+    fn spent(&self, producer: &Producer, tool_calls_spent: u32);
+
     /// Commit `settled` as the outcome of the attempt `producer`.
     ///
     /// # Errors

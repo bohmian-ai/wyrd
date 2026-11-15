@@ -1014,7 +1014,7 @@ impl vala_verify::blocks::Checkpoints for RunState {
                 sequence: state.sequence,
                 producer: producer.clone(),
                 settlement: None,
-                tool_calls_spent: None,
+                tool_calls_spent: 0,
                 released: false,
             });
             Ok(true)
@@ -1040,16 +1040,34 @@ impl vala_verify::blocks::Checkpoints for RunState {
                 .iter()
                 .any(|accepted| &accepted.publication.producer == producer);
             let Some(record) = state.invocations.iter_mut().find(|record| {
-                &record.producer == producer
-                    && record.settlement.is_none()
-                    && record.tool_calls_spent.is_none()
+                &record.producer == producer && record.settlement.is_none() && !record.released
             }) else {
                 return Ok(false);
             };
-            record.tool_calls_spent = Some(tool_calls_spent);
+            record.tool_calls_spent = record.tool_calls_spent.max(tool_calls_spent);
             record.released = !retained;
             Ok(true)
         })
+    }
+
+    /// Raise the live record of the unsettled attempt `producer` to
+    /// `tool_calls_spent` requests; the background flush persists it.
+    ///
+    /// A broken writer records nothing; its next awaited change reports it.
+    fn spent(&self, producer: &Producer, tool_calls_spent: u32) {
+        let recorded = self.change(|state| {
+            let Some(record) = state.invocations.iter_mut().find(|record| {
+                &record.producer == producer && record.settlement.is_none() && !record.released
+            }) else {
+                return Ok(false);
+            };
+            let raised = record.tool_calls_spent < tool_calls_spent;
+            record.tool_calls_spent = record.tool_calls_spent.max(tool_calls_spent);
+            Ok(raised)
+        });
+        if let Err(reason) = recorded {
+            tracing::debug!(%reason, "a tool spend was not recorded");
+        }
     }
 
     /// Record `settled` in the live state as the settlement of the attempt

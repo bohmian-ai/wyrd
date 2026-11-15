@@ -1893,15 +1893,16 @@ async fn capacity_refusal_stops_the_execution_without_judging() {
     assert_eq!(step(&retried, "draft").attempts, 2);
 }
 
-/// A refused attempt's tool-call spend survives its deferral: the reclaimed
-/// attempt resumes from the two requests the refused one spent and is
-/// admitted only the remaining three of five, spending no retry, while an
-/// attempt interrupted with an unknown spend leaves the next attempt none
-/// and a fresh invocation all five.
+/// A tool-call spend survives its attempt: each request reports its count
+/// while the attempt runs, the reclaimed attempt after a refusal resumes
+/// from the two requests the refused one spent and is admitted only the
+/// remaining three of five, spending no retry, an attempt interrupted after
+/// recording three leaves the next attempt two, and a fresh invocation gets
+/// all five.
 ///
 /// # Panics
-/// Panics when a resumed allowance admits other than its remaining
-/// requests, or the refusal spends a retry.
+/// Panics when a spend is not reported, a resumed allowance admits other
+/// than its remaining requests, or the refusal spends a retry.
 #[tokio::test]
 async fn refused_attempts_keep_their_tool_spend() {
     let spec = verifier(json!({
@@ -1923,6 +1924,12 @@ async fn refused_attempts_keep_their_tool_spend() {
         run(&refused, &spec, json!({"answer": 1})).await,
         Err(EngineError::Busy(_))
     ));
+    let first = Producer::plain(&TaskId::new("draft").expect("task"), 1);
+    assert_eq!(
+        ledger.spends.lock().expect("ledger").get(&first),
+        Some(&2),
+        "each request reports its count while the attempt runs"
+    );
 
     let reclaimed = |state: &ExecutionState| {
         let script = spends();
@@ -1948,17 +1955,21 @@ async fn refused_attempts_keep_their_tool_spend() {
     let interrupted = ExecutionState {
         invocations: vec![InvocationRecord {
             sequence: 1,
-            producer: Producer::plain(&TaskId::new("draft").expect("task"), 1),
+            producer: first,
             settlement: None,
-            tool_calls_spent: None,
+            tool_calls_spent: 3,
             released: false,
         }],
         ..ExecutionState::default()
     };
-    let exhausted = run(&reclaimed(&interrupted), &spec, json!({"answer": 1}))
+    let recovered = run(&reclaimed(&interrupted), &spec, json!({"answer": 1}))
         .await
         .expect("outcome");
-    assert_eq!(step(&exhausted, "draft").output, Some(json!(0)));
+    assert_eq!(
+        step(&recovered, "draft").output,
+        Some(json!(2)),
+        "the retry after an interruption resumes from the recorded three"
+    );
 
     let fresh = run(
         &reclaimed(&ExecutionState::default()),
@@ -2676,6 +2687,8 @@ struct Ledger {
     attempts: Mutex<BTreeMap<Producer, Option<InvocationSettlement>>>,
     /// Every forgotten refused attempt and the tool requests it recorded.
     released: Mutex<Vec<(Producer, u32)>>,
+    /// The latest tool spend each unsettled attempt reported.
+    spends: Mutex<BTreeMap<Producer, u32>>,
     /// Every recorded scheduling decision, in order.
     controls: Mutex<Vec<ControlRecord>>,
     /// Every reached approval occurrence, in order.
@@ -2695,7 +2708,13 @@ impl Ledger {
                     sequence,
                     producer: producer.clone(),
                     settlement: settled.clone(),
-                    tool_calls_spent: None,
+                    tool_calls_spent: self
+                        .spends
+                        .lock()
+                        .expect("ledger")
+                        .get(producer)
+                        .copied()
+                        .unwrap_or_default(),
                     released: false,
                 })
                 .chain(
@@ -2707,7 +2726,7 @@ impl Ledger {
                             sequence: 0,
                             producer: producer.clone(),
                             settlement: None,
-                            tool_calls_spent: Some(*spent),
+                            tool_calls_spent: *spent,
                             released: true,
                         }),
                 )
@@ -2768,6 +2787,17 @@ impl Checkpoints for Ledger {
             .expect("ledger")
             .push((producer.clone(), tool_calls_spent));
         Ok(())
+    }
+
+    /// Keep the attempt's latest reported tool spend.
+    ///
+    /// # Panics
+    /// Panics when another call panicked while holding the lock.
+    fn spent(&self, producer: &Producer, tool_calls_spent: u32) {
+        self.spends
+            .lock()
+            .expect("ledger")
+            .insert(producer.clone(), tool_calls_spent);
     }
 
     /// Record the attempt's settlement.

@@ -1,6 +1,6 @@
 ---
 id: SPEC-github-verifier-pipelines
-revision: 14
+revision: 15
 status: approved
 ---
 
@@ -487,6 +487,7 @@ readiness. Implementation tasks derive from this approved revision.
 | 12 | approved 2026-11-15 | Maintainer integration decisions for porting code mode (TASK-012/013/014): REQ-015 replaces separate capacity without borrowing with queued runtime/pool isolation, a bounded queued CPU share and memory reservation, reserved direct capacity, direct-only borrowing of idle queued capacity and one ledger. Nested code-mode calls exclude fs.write and publish. Tool-call spend is restored from the attempt records used for max_agent_invocations; an unsettled attempt counts its whole allowance. Repository is the thirteenth Card kind. The sanctioned test-control set is the reconciled union, guard strictness unchanged. Monty stays on its crates.io release. Nothing else changes. |
 | 13 | approved 2026-11-15 | Maintainer rejected revision 12's queued reservation because it holds idle capacity, and approved deployment targets instead: REQ-015 replaces the queued runtime CPU share, memory/scratch reservation, reserved direct capacity and borrowing with the closed `combined`/`direct`/`worker`/`bifrost-ingest`/`bifrost-query`/`bifrost-maintenance` target set, per-use charging in `combined` with a queued concurrency cap, and isolation by separately provisioned `direct` and `worker` pods, each running Scribe and Oracle. Amends REQ-015/016, AC-010/012 and the live-custody paragraph. Recorded in [deployment targets](design/approved-deployment-targets.md). Nothing else changes. |
 | 14 | approved 2026-11-15 | Maintainer decision during TASK-012: an attempt refused process capacity or its definition after its host work settled records the tool requests its invocation spent, and a later attempt resumes from that count; only an attempt whose spend is unknown, because it was interrupted before settling, counts its whole allowance. Busy deferral is otherwise unchanged: a refused attempt that retained nothing still spends no retry. Amends revision 12's tool-call spend sentence. Nothing else changes. |
+| 15 | approved 2026-11-15 | Maintainer decision during TASK-012: an attempt records its invocation's tool-request count as each request spends, persisted in background with the execution state, and any later attempt, after a refusal or an interruption, resumes from the latest persisted count; requests spent after that count persisted may be spent again after an interruption. No attempt counts its whole allowance for an unknown spend. Amends revisions 12 and 14's tool-call spend sentences. Nothing else changes. |
 
 Subsequent explicit maintainer amendment: approval authoring has no separate
 expiration setting. Pending approvals and deferred waits share the execution's

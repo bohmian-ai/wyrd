@@ -2710,7 +2710,7 @@ mod tests {
                         result: Box::new(requirement.clone()),
                     },
                 ),
-                tool_calls_spent: None,
+                tool_calls_spent: 0,
                 released: false,
             });
         state.terminal = Some(wyrd_spec::verification::state::TerminalSelection {

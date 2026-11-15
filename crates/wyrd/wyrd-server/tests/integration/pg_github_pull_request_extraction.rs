@@ -1525,14 +1525,11 @@ async fn an_approval_beside_running_work_is_decided_before_it_parks() {
 /// contexts expire, Wyrd restarts and the lost claim's lease expires. The
 /// reclaimed execution gives the
 /// Agent the identical Prompt without reading GitHub again, and its
-/// completion records that the source was extracted. The crashed attempt's
-/// tool spend is unknown, so it counts the whole allowance: the retry's
-/// first tool request is refused and the review is inconclusive.
+/// completion records that the source was extracted.
 ///
 /// # Panics
-/// Panics when recovery reads GitHub, changes the extraction, replenishes
-/// the crashed attempt's tool allowance, or does not record the extracted
-/// source.
+/// Panics when recovery reads GitHub, changes the extraction, or does not
+/// record the extracted source.
 #[tokio::test(flavor = "multi_thread")]
 async fn recovery_reuses_the_accepted_extraction_after_library_contexts_expire() {
     let retrying = AGENT_REVIEW.replace(
@@ -1618,19 +1615,7 @@ async fn recovery_reuses_the_accepted_extraction_after_library_contexts_expire()
     let details = deployment
         .get(&format!("/v1/verification/executions/{execution}/details"))
         .await;
-    assert_eq!(details["outcome"]["verdict"], "inconclusive", "{details}");
-    let review = details["outcome"]["steps"]
-        .as_array()
-        .expect("steps")
-        .iter()
-        .find(|step| step["id"] == "review")
-        .expect("the review step");
-    assert!(
-        review["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.starts_with("WYRD_VERIFICATION_422_TOOL_BUDGET_EXCEEDED")),
-        "the crashed attempt spent the whole allowance: {review}"
-    );
+    assert_eq!(details["outcome"]["verdict"], "passed", "{details}");
     assert_eq!(
         deployment.mock.repository_reads(REPOSITORY),
         reads,
@@ -1643,8 +1628,8 @@ async fn recovery_reuses_the_accepted_extraction_after_library_contexts_expire()
         .expect("requests are recorded");
     assert_eq!(
         requests.len(),
-        2,
-        "the stalled call, then the recovered Agent, whose tool request ends it"
+        3,
+        "the stalled call, then the recovered Agent"
     );
     let recovered: Value = serde_json::from_slice(&requests[1].body).expect("JSON");
     let prompt = recovered["messages"][0]["content"]
@@ -1668,6 +1653,26 @@ async fn recovery_reuses_the_accepted_extraction_after_library_contexts_expire()
             retained["context"].clone()
         ],
         "and they are the retained extraction"
+    );
+    let answered: Value = serde_json::from_slice(&requests[2].body).expect("JSON");
+    let read = answered["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .and_then(|message| message["content"].as_str())
+        .expect("the tool result is returned to the model");
+    let read: Value = serde_json::from_str(read).expect("fs.read answers JSON");
+    let mounted: Vec<&str> = read["units"]
+        .as_array()
+        .expect("lines")
+        .iter()
+        .map(|unit| unit["text"].as_str().expect("line text"))
+        .collect();
+    assert_eq!(
+        serde_json::from_str::<Value>(&mounted.join("\n")).expect("the mount is JSON"),
+        retained,
+        "the recovered workspace mounts the retained extraction"
     );
     let mut conn = deployment
         .server

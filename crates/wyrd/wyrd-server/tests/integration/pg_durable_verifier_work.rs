@@ -2339,15 +2339,16 @@ fn outcome(verdict: VerificationVerdict) -> ExecutedOutcome {
 
 /// A reclaim resumes invocation attempts from the accepted Bifrost state.
 ///
-/// The first claim begins two attempts and a third that is refused capacity
-/// after spending three tool requests. The reclaim recovers exactly the two
-/// begun attempts, both still spent, so a retry of one starts its next
-/// attempt; the refused attempt spends no retry but keeps its three
-/// requests, unknown for the two still unsettled.
+/// The first claim begins two attempts, records two tool requests spent by
+/// one of them, and begins a third that is refused capacity after spending
+/// three. The reclaim recovers exactly the two begun attempts, both still
+/// spent, so a retry of one starts its next attempt; each keeps its recorded
+/// spend, and the refused attempt spends no retry but keeps its three
+/// requests.
 ///
 /// # Panics
 /// Panics when a revision is refused, the reclaim recovers other attempts,
-/// or the refused attempt's spend is lost.
+/// or a recorded spend is lost.
 #[tokio::test(flavor = "multi_thread")]
 async fn invocations_resume_from_bifrost() {
     let leased = Leased::start().await;
@@ -2359,6 +2360,7 @@ async fn invocations_resume_from_bifrost() {
             .await
             .expect("the attempt is accepted");
     }
+    leased.run.spent(&Producer::plain(&task("review"), 1), 2);
     leased
         .run
         .forget(&Producer::plain(&task("refused"), 1), 3)
@@ -2386,9 +2388,9 @@ async fn invocations_resume_from_bifrost() {
     assert_eq!(
         spent,
         [
-            ("review".to_owned(), None, false),
-            ("judge".to_owned(), None, false),
-            ("refused".to_owned(), Some(3), true)
+            ("review".to_owned(), 2, false),
+            ("judge".to_owned(), 0, false),
+            ("refused".to_owned(), 3, true)
         ]
     );
     current

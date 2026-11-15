@@ -102,7 +102,7 @@ A completed result is final. Spans that land after it are judged only by a new e
 
 ## Results
 
-Every result is stored in Bifrost, in `bifrost.verification.results`, with the exact Verifier and subject versions it judged. The inputs go to `bifrost.verification.execution_inputs`. Both are queryable with SQL.
+Every result is stored in Bifrost with the exact Verifier and subject versions it judged: its summary in `bifrost.verification.results`, its requirement outcomes and steps in `bifrost.verification.execution_outputs`, and its inputs in `bifrost.verification.execution_inputs`. Both are queryable with SQL.
 
 ## Operators
 

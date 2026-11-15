@@ -20,12 +20,14 @@ Write one statement per failure you care about, naming the context it applies to
 | Avoid | Write instead |
 | --- | --- |
 | The agent should be reliable. | The recipient is authorized to receive the report. |
-| The report should be safe to share. | A report shared externally names no bank account identifier. |
+| The report should be safe to share. | The destination restricts access to the report. |
 | The agent should follow company policy. | The company sharing policy permits this release. |
 
-Each statement on the right fails in one way, and a person reading a failed result knows what broke. `release-check` declares three such requirements, each with its own `id` and verdict:
+Each statement on the right fails in one way, and a person reading a failed result knows what broke. `release-check` declares these three, each with its own `id` and verdict:
 
 <CodeFromFile file="examples/finance-release/release-check.yaml" lang="yaml" title="release-check.yaml" range="14-31" />
+
+In the Quickstart the policy judge also catches a named bank account, because the policy forbids it; a separate `code` check would make that its own requirement, with its own verdict.
 
 **Limits:** a scoped requirement checks only what it states. Failures you did not write down pass unnoticed, so review the list when incidents or new uses appear.
 
@@ -51,14 +53,14 @@ Each piece of evidence becomes an input slot. If the evidence is not captured to
 
 Use the cheapest check that decides the requirement:
 
-| The rule is | Check | Finance example |
+| The rule is | Check | Example |
 | --- | --- | --- |
 | A field comparison | `assert` | `recipient.authorized` equals `true` |
 | About what the code did | `trace` | The authorization service was called before the send |
 | Deterministic, but no operator expresses it | `code` | The report text matches no account-number pattern |
 | A judgment about meaning or policy | `agent` | The policy permits this purpose |
 
-`assert`, `trace`, and `code` checks give the same verdict for the same evidence. An `agent` check can vary between runs, costs a model call, and sends its evidence to a provider. [Recipes](/build-and-verify/verify/verifier-recipes/) has a working Verifier for each kind.
+`assert`, `trace`, and `code` checks give the same verdict for the same pinned evidence. An `agent` check can vary between runs, costs a model call, and sends its evidence to a provider. [Recipes](/build-and-verify/verify/verifier-recipes/) has a working Verifier for each kind.
 
 Before relying on a model judge, run it on labeled cases:
 
@@ -66,9 +68,9 @@ Before relying on a model judge, run it on labeled cases:
 - Cases it clearly forbids, which must fail.
 - Ambiguous or incomplete cases, which should come back `inconclusive` rather than guess.
 
-The Quickstart's four releases are such a set: one permitted, one naming a bank account, two with purposes the policy does not allow. Rerun the set after any change to the judge's prompt, model, or policy, and keep the results.
+The Quickstart's four releases cover the first two kinds: one permitted, one naming a bank account, two with purposes the policy does not allow. Add an ambiguous case before relying on the judge. Rerun the set after any change to the judge's prompt, model, or policy, and keep the results.
 
-**Limits:** a judge that passes your cases can still fail on cases unlike them. Wyrd requires a passing judge to cite its evidence, but it does not measure the judge's accuracy. Call a judge calibrated only after you measure it against labeled outcomes from the domain it judges.
+**Limits:** a judge that passes your cases can still fail on cases unlike them. Wyrd requires a passing judge to cite its evidence, but it does not measure the judge's accuracy. Measure agreement with labeled outcomes from the domain it judges before relying on it.
 
 ## 4. Keep cases for pass, fail, and inconclusive
 
@@ -79,10 +81,10 @@ For every requirement, keep at least one case of each outcome and run them whene
 | Case | Expected | Finance example |
 | --- | --- | --- |
 | Meets the requirement | `passed` | The external-audit release |
-| Breaks it | `failed`, on that requirement only | Set `authorized` to `false`: only `recipient-authorized` fails |
+| Breaks it | `failed` on that requirement | Set `authorized` to `false`: `recipient-authorized` fails, whatever the judge decides |
 | Lacks the evidence | `inconclusive` | Omit the destination record: `destination-restricted` is `inconclusive` |
 
-A failure case that fails a different requirement than intended is a defect in the case or the check.
+A failure case that does not fail its intended requirement is a defect in the case or the check.
 
 **Limits:** cases test the Verifier you have, not the requirements you should have. They catch regressions, not omissions.
 
@@ -95,6 +97,14 @@ Change a requirement, a check, or a file the Verifier mounts by declaring it aga
 Rerun your cases against the new version and compare. Expected changes should be the only changes: in the policy update the regulator request moves from `failed` to `passed`, and the other three releases keep their verdicts.
 
 **Limits:** versions record what changed, not whether the change is right. A domain owner still approves the new expectation.
+
+## If it fails
+
+| You see | Fix |
+| --- | --- |
+| A requirement is `inconclusive` in every case | The slot its check reads is not supplied. Match your input names to the Verifier's `inputs` |
+| `WYRD_SPEC_400_VALIDATION` with rule `unknown_reference` | A check reads a slot or step that is not declared. Match the `id` it names |
+| A labeled case gets the wrong verdict from the judge | Fix the judge's prompt or the case, rerun the whole set, and keep both results |
 
 ## Next
 

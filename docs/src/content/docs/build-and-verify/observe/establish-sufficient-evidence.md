@@ -23,8 +23,6 @@ Pass the record the claim is about, not a description of it:
 | `follows-policy` | A summary of the policy in the prompt | The policy file, mounted at an exact version |
 | `destination-restricted` | The destination's name | The destination's access settings |
 
-In the finance example the recipient and destination records come from the application, and the policy comes from the Artifact the Verifier version names.
-
 **Limits:** a source record can itself be wrong or stale. Verification checks the evidence against the requirement; it does not audit the system that produced the record.
 
 ## 2. Require citations from judges
@@ -68,6 +66,14 @@ An agent's trace can show the steps it took. A missing span is weaker evidence t
 Conclude that a step was skipped only when the capture path records every executed step, and require a positive record of the step rather than the absence of a contrary one.
 
 **Limits:** even complete traces show what ran, not that it ran correctly. Pair a trace check with checks on the step's output.
+
+## If it fails
+
+| You see | Fix |
+| --- | --- |
+| A model judge's passes come back `inconclusive` | It passed without a valid citation. Ask for citations to the input in its prompt |
+| A `trace` check is `inconclusive` from `verify` | The spans had not landed. `submit` the Verifier instead, so the server retries |
+| A rising share of `inconclusive` results | A capture path stopped supplying a slot. Check what your application passes |
 
 ## Next
 

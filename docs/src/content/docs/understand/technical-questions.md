@@ -12,11 +12,11 @@ These are direct answers to the questions engineers ask before adopting Wyrd. Ea
 
 No. Wyrd returns a verdict; your application decides what to do with it. In the [finance API](/understand/real-time-verification/#a-verdict-before-the-response), the handler releases a report only when `result.passed` is true and holds it otherwise. If the handler ignored the verdict, nothing would stop the release.
 
-Enforcement lives in your code because the right response depends on the action: hold a report, rewrite a reply, ask a person, or log and continue. Scheduled verification can also notify through an [Operator](/understand/how-verification-works/#operators), which reports a failure but does not undo anything.
+Enforcement lives in your code because the right response depends on the action: hold a report, rewrite a reply, ask a person, or log and continue. Executions a binding's Trigger creates can also notify through an [Operator](/understand/how-verification-works/#operators), which reports a failure but does not undo anything.
 
 ## When should I use verify, submit, or a schedule?
 
-Use `verify` when the application must decide before it responds or acts. Use `submit` when the decision can wait, the check is too slow for the request, or the evidence lands after the call. Use a schedule when a population or time window needs checking whether or not a request arrives, as with drift. [Real-time verification](/understand/real-time-verification/#queued-and-scheduled-verification) compares the three; all three run the same Verifier.
+Use `verify` when the application must decide before it responds or acts. Use `submit` when the decision can wait, the check is too slow for the request, or the evidence lands after the call. Use a schedule to judge a time window of recorded samples, as with drift. [Real-time verification](/understand/real-time-verification/#queued-and-scheduled-verification) compares the three. `verify` and `submit` run the same Verifier; schedules judge drift Verifiers, which refuse `verify`.
 
 ## What happens when evidence is missing?
 
@@ -50,7 +50,7 @@ They keep their versions. Every result names the exact Verifier and subject vers
 
 ## Where is the evidence kept?
 
-Results go to `bifrost.verification.results` and the pinned inputs to `bifrost.verification.execution_inputs`, queryable with SQL. The server stores them after it answers, so a row appears shortly after the call returns. [Runs and evidence](/understand/runs-observations-and-evidence/) explains what is retained.
+Each result's summary goes to `bifrost.verification.results`, its requirement outcomes and steps to `bifrost.verification.execution_outputs`, and the pinned inputs to `bifrost.verification.execution_inputs`, all queryable with SQL. The server stores them after it answers, so a row appears shortly after the call returns. [Runs and evidence](/understand/runs-observations-and-evidence/) explains what is retained.
 
 ## Which languages are supported?
 

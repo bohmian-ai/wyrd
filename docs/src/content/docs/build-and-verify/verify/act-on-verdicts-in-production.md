@@ -19,7 +19,7 @@ The finance handler releases a report only when the verdict is `passed`:
 
 <CodeFromFile file="examples/finance-release/api.py" lang="python" title="api.py" region="handler" />
 
-Testing for failure instead, with `if not result.failed`, releases every inconclusive report: the ones whose evidence was missing or whose judge could not decide. Decide each outcome on purpose:
+Testing for failure instead, with `if not result.failed`, releases every inconclusive report: the ones whose evidence was missing or whose judge could not decide. Decide each outcome on purpose. With the default `decide: all`:
 
 | Outcome | Means | Finance API |
 | --- | --- | --- |
@@ -27,6 +27,7 @@ Testing for failure instead, with `if not result.failed`, releases every inconcl
 | `failed` | At least one requirement was judged broken | Hold, and show the failing requirement's reason |
 | `inconclusive` | No judgment was possible for some requirement | Hold for a person |
 | An error, such as invalid input or `WYRD_VERIFICATION_429_STAGING_FULL` | Nothing was judged | Hold; retry a staging refusal after `retry_after_seconds` |
+| `WYRD_SERVER_503_SERVICE_UNAVAILABLE` | No Python worker or workspace was free | Hold, or retry |
 | `WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT` | No verdict within the timeout | Hold, or `submit` and decide later |
 
 In Python, `verify` raises on an error or timeout, so the handler above returns an error to its caller and releases nothing. Catch the error when the caller needs a deliberate response instead.
@@ -37,11 +38,11 @@ In Python, `verify` raises on an error or timeout, so the handler above returns 
 
 **Prevents:** a request that waits on a judgment it cannot afford.
 
-A `verify` call is bounded by `WYRD_VERIFICATION_TIMEOUT_MS`, 60 seconds by default, and the SDK does not retry it. Your request almost certainly has a shorter budget. Keep checks that must decide before the response on the request path, and move the rest:
+A `verify` call is bounded by `WYRD_VERIFICATION_TIMEOUT_MS`, 60 seconds by default, and the SDK does not retry it. Keep checks that must decide before the response on the request path, and move the rest:
 
-- Assertions and code checks add no model call. A code check can wait for a free Python worker.
+- Assertions and code checks add no model call. A code check can wait for a free Python worker, and is refused with `WYRD_SERVER_503_SERVICE_UNAVAILABLE` when none is available.
 - A model judge adds at least one model call. Keep it on the request path only when its measured time fits, as the finance policy judge must because the release cannot happen without it.
-- A check that can be decided after the response belongs in `submit`, which returns once the inputs are staged.
+- Move checks that can be decided after the response into a separate Verifier, and `submit` it after you respond. `submit` returns once the inputs are staged.
 
 Measure the Verifier you deploy: time the `verify` call in your application on representative evidence, and read each step's `duration_ms` in the execution's details. [Where the time goes](/understand/real-time-verification/#where-the-time-goes) explains what the total includes.
 
@@ -51,7 +52,7 @@ Measure the Verifier you deploy: time the `verify` call in your application on r
 
 **Prevents:** sensitive evidence sent to a model provider without anyone choosing to send it.
 
-An `agent` check sends its prompt and the evidence the prompt includes to the provider, through your server's [LLM gateway](/connect/set-up-the-llm-gateway/). Files the Agent reads with a tool are sent too. In the finance example, the report, the recipient record, and the policy text all reach OpenAI.
+An `agent` check sends its prompt and the evidence the prompt includes to the provider, through your server's [LLM gateway](/connect/set-up-the-llm-gateway/). Files the Agent reads with a tool are sent too. In the finance example, the purpose, the report, the recipient record, and the policy text all reach OpenAI.
 
 - Pass a model check only the fields it needs. `follows-policy` takes the purpose, report, and recipient, not the destination.
 - Decide a requirement with an `assert` or `code` check when one can; those send nothing to a provider.
@@ -64,17 +65,17 @@ An `agent` check sends its prompt and the evidence the prompt includes to the pr
 
 **Prevents:** a verification bill that grows with traffic unnoticed.
 
-Each `agent` check costs at least one model call per verification, and more when it calls tools: the finance judge allows up to three tool turns. Assertions and code checks cost no model call. Turn on gateway recording to see each call's model and token usage:
-
-```bash
-wyrd gateway capture-policy put --file - <<'JSON'
-{"mode": "metadata", "payload_fields": []}
-JSON
-```
-
-This records the caller, model, outcome, and token usage without the prompt or reply. [LLM gateway](/connect/set-up-the-llm-gateway/#3-turn-on-recording) explains recording.
+Each `agent` check costs at least one model call per verification, and more when it calls tools: the finance judge allows up to three model calls (`max_iterations: 3`). Assertions and code checks cost no model call. Turn on metadata recording, as in [LLM gateway step 3](/connect/set-up-the-llm-gateway/#3-turn-on-recording), to see each call's model and token usage without the prompt or reply. The policy applies to every gateway call in the tenant.
 
 **Limits:** token counts measure what you spent, not whether the judge was worth it. Weigh cost against what a missed failure costs.
+
+## If it fails
+
+| You see | Fix |
+| --- | --- |
+| `WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT` on the request path | Move the slow check into a Verifier you `submit` after responding |
+| `WYRD_VERIFICATION_429_STAGING_FULL` | Retry after `retry_after_seconds`; hold the action meanwhile |
+| Inconclusive reports were released | Test for `passed`, not for the absence of `failed` |
 
 ## Next
 

@@ -108,7 +108,7 @@ The program uploads the policy with its extracted text and declares the Service,
 
 The judge's wording varies. The failed releases pass both assertions and fail `follows-policy`: the judge read the policy, found the bank account, and found that the policy permits sharing only for external audits.
 
-`verify` returns before your code acts, so the verdict is part of the request. Assertions add little time; the policy judge adds a model call, up to three tool turns, to that request. If the judge can't decide, the verdict is `inconclusive`, which is never a pass. [`submit`](/understand/how-verification-works/#verify-and-submit) queues the same check when the request can't wait.
+`verify` returns before your code acts, so the verdict is part of the request. Assertions add little time; the policy judge adds up to three model calls to that request. If the judge can't decide, the verdict is `inconclusive`, which is never a pass. [`submit`](/understand/how-verification-works/#verify-and-submit) queues the same check when the request can't wait.
 
 Run the program again. Nothing changed, so it declares nothing new.
 

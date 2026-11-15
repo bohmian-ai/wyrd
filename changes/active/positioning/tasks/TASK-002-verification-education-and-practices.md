@@ -447,6 +447,39 @@ Two fresh agents read only the rendered page sources.
   table, consistent `follows-policy` statement, queued trace retry count,
   hosted hint removed, code-check worker caveat.
 
+### Independent literature and editorial review
+
+A fresh reviewer, not shown this evidence section, rechecked the cited sources
+and the Wyrd authority and reported 7 Major and 21 Minor findings. Each Wyrd
+finding was confirmed against `architecture/wyrd-design.md` (schedule bindings
+require `samples` slots; Window Verifiers refuse `verify`; `max_iterations`
+shared with tool turns; no slot-level `required`; `group_end` dispatch;
+`pass_rate`), `cards-versions-and-relationships.md` (server-assigned versions)
+and `cache.rs`, then applied:
+
+- Scheduling scoped to drift Verifiers on the real-time page and FAQ.
+- Policy change described as a re-declaration, not automatic.
+- The requirements table and its bank-account example now match the
+  declared requirements.
+- "Calibrated" reserved for stated confidence measured against outcomes;
+  judges otherwise report accuracy or agreement.
+- Proofs described as holding for what was verified (model or code) under
+  stated assumptions; SMC as quantified confidence.
+- "During execution" reconciled between the foundation and real-time pages.
+- Runtime enforcement distinguished from detection; the oracle-problem and
+  LTL3 claims narrowed to their sources.
+- Cache reload, lost staged copies, `max_iterations`, Operators, storage
+  tables (also in `how-verification-works`), `decide: all` scope,
+  per-Verifier `submit`, 503 worker refusal, and provider-visible fields
+  corrected.
+- `## If it fails` added to the three guides; the duplicated gateway
+  procedure replaced with a link; the starting method recast in third person.
+
+Not applied: the reviewer's suggested new sources (Kim 2025, Panickssery
+2024, Huang 2024, Guo 2017, Ribeiro 2020, IEEE 1012, ISO/IEC/IEEE 15026). It
+named them from memory without opening them, so the affected sentences were
+narrowed to the existing citations instead.
+
 ### Commands
 
 | Command | Result |

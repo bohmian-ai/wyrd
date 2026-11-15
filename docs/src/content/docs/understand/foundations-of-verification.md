@@ -8,7 +8,7 @@ order: 1
 
 Verification asks whether a system's behavior meets requirements stated before the behavior is judged, and what evidence supports the answer. For AI applications it matters because a fluent answer or a strong benchmark score can look right while a requirement nobody checked is broken.
 
-This page explains verification as an engineering discipline. It needs no Wyrd account or vocabulary; product mechanics follow in [Real-time verification](/understand/real-time-verification/).
+It needs no Wyrd account or vocabulary; product mechanics follow in [Real-time verification](/understand/real-time-verification/).
 
 ## A plausible result is not evidence
 
@@ -49,7 +49,7 @@ Runtime verification checks whether an observed execution of a system satisfies 
 | During execution | The next step of a running workflow | Stop an agent before it calls a payment tool twice |
 | Afterward | Investigation, alerts, retraining, and the next release | Find every report sent last week that cited a superseded policy |
 
-Checking during execution (online) and checking a recorded trace later (offline) are both runtime verification ([Leucker and Schallhart, 2009](#sources)). A check that runs online is not automatically fast enough for a given application: whether a judgment arrives in time depends on the check, its evidence, and the application's deadline.
+Acting on a judgment, by holding or stopping, goes beyond detection; the literature calls it runtime enforcement or reflection. Checking during execution (online) and checking a recorded trace later (offline) are both runtime verification ([Leucker and Schallhart, 2009](#sources)). A check that runs online is not automatically fast enough for a given application: whether a judgment arrives in time depends on the check, its evidence, and the application's deadline.
 
 ## Related disciplines
 
@@ -77,11 +77,11 @@ Formal verification and runtime verification are often drawn as opposites: certa
 - Runtime monitors check formally specified properties. Temporal-logic monitors judge a finite trace as satisfying, violating, or inconclusive when the trace so far cannot settle the property ([Bauer, Leucker and Schallhart, 2011](#sources)).
 - Formal verification of agent decision-making predates language-model agents: [Dennis et al. (2016)](#sources) model-check the decision logic of agent programs that control hybrid autonomous systems. Recent proposals learn a probabilistic model of an LLM agent from observed runs and model-check it at runtime ([Koohestani, 2025](#sources), a proof-of-concept workshop paper).
 
-The real distinction is what a result rests on. A proof holds for every execution of a model, under the model's assumptions; if the deployed system departs from the model, the proof says nothing about the departure. A runtime judgment rests on finite observed evidence; it says what this execution did, not what every execution will do. Neither establishes that a system is correct in general.
+The real distinction is what a result rests on. A proof holds for every execution of what was verified, a model or the code itself, under stated assumptions about its environment, inputs, compiler, and hardware; where those assumptions fail, the proof says nothing. Statistical model checking gives quantified confidence, not a proof. A runtime judgment rests on finite observed evidence; it says what this execution did, not what every execution will do. Neither establishes that a system is correct in general.
 
 ## Verifying without a single right answer
 
-Many AI tasks have no reference output: two good summaries of a report can share no sentence. Distinguishing correct from incorrect behavior for a given input is the **test oracle problem** of software testing; without a full specification, it falls back to costly human judgment ([Barr et al., 2015](#sources)). It predates AI agents, and its known partial answers apply to them:
+Many AI tasks have no reference output: two good summaries of a report can share no sentence. Distinguishing correct from incorrect behavior for a given input is the **test oracle problem** of software testing; when no specification, derived oracle, or relation between runs is adequate, it falls back to costly human judgment ([Barr et al., 2015](#sources)). It predates AI agents, and its known partial answers apply to them:
 
 - **Scope the requirement.** "The summary is good" has no oracle. "The summary states the quarterly total that appears in the report" does.
 - **Check invariants and prohibited actions.** No summary may contain an account number; no workflow may send before authorization is recorded.
@@ -96,7 +96,7 @@ Uncertainty enters from three places, and each needs a different response:
 | The evidence | The authorization record was not captured | Return inconclusive instead of guessing |
 | The judge | A model judge is unsure whether the policy covers this purpose | Return inconclusive, or route to a person |
 
-An inconclusive judgment is a result, not a failure to produce one. Its reason should say which source caused it, so an operator can tell a capture gap from an unsure judge. Temporal-logic monitoring has formalized it for years ([Bauer, Leucker and Schallhart, 2011](#sources)), and an application has to decide what it does with one.
+An inconclusive judgment is a result, not a failure to produce one. Its reason should say which source caused it, so an operator can tell a capture gap from an unsure judge. Temporal-logic monitors formalize one case: a trace that so far cannot settle the property ([Bauer, Leucker and Schallhart, 2011](#sources)). Missing evidence and an unsure judge are further cases, and an application has to decide what it does with each.
 
 ## Failures that look like success
 
@@ -112,20 +112,20 @@ The absence of that record is not, on its own, proof the step was skipped. Trace
 
 ## Model judges
 
-Some requirements need judgment: whether a purpose is "an external audit" under a policy written in prose. A language model can apply that judgment. In one large study, strong model judges agreed with human preferences about as often as humans agreed with each other, and also showed position bias, verbosity bias, and weak grading of math and reasoning; a preference for their own answers appeared for some judges, but the study could not confirm it ([Zheng et al., 2023](#sources)). Checking a response's completeness and consistency, then verifying it with a tool such as a Python interpreter, outperformed baseline verifiers on mathematical, logical, and commonsense reasoning tasks in [Han, Buntine and Shareghi (2025)](#sources). Neither result shows that a judge is reliable on a new domain or policy.
+Some requirements need judgment: whether a purpose is "an external audit" under a policy written in prose. A language model can apply that judgment. In one large study, strong model judges agreed with human preferences about as often as humans agreed with each other, and also showed position bias, verbosity bias, and weak grading of math and reasoning; a preference for their own answers appeared for some judges, but the study could not confirm it ([Zheng et al., 2023](#sources)). Combining consistency checks with tool-based verification outperformed baseline verifiers on reasoning tasks in [Han, Buntine and Shareghi (2025)](#sources). Neither result shows that a judge is reliable on a new domain or policy.
 
-Treat a model judge as a check that needs its own verification:
+A model judge is a check that needs its own verification:
 
-- Build labeled cases: releases the policy clearly permits, clearly forbids, and leaves ambiguous. Run the judge on them before trusting it, and again after any change to its prompt, model, or policy.
-- Require citations to the evidence it relied on, so a person can audit a judgment.
-- Agreement between two models, or one model with itself, is not independent evidence. Models can share blind spots. An economic argument holds that human verification bandwidth becomes the binding constraint as automated output grows, and that using AI to verify AI propagates those correlated blind spots ([Catalini, Hui and Wu, 2026](#sources), a preprint).
-- Report a judge as calibrated only after measuring it against labeled outcomes in the domain where it runs.
+- Labeled cases show how it behaves: releases the policy clearly permits, clearly forbids, and leaves ambiguous, run before the judge is trusted and again after any change to its prompt, model, or policy.
+- Citations to the evidence it relied on let a person audit a judgment.
+- Agreement between two models, or one model with itself, is not independent evidence: a shared blind spot produces agreement too. An economic argument holds that human verification bandwidth becomes the binding constraint as automated output grows, and that using AI to verify AI propagates those correlated blind spots ([Catalini, Hui and Wu, 2026](#sources), a preprint).
+- A judge's accuracy, or its agreement with domain experts, is known only after it is measured against labeled outcomes in the domain where it runs. Calibration is a further claim: that a judge's stated confidence matches how often it is right ([Ovadia et al., 2019](#sources) measure it for classifiers), which needs a confidence to measure.
 
 ## Two hard problems
 
 Practical verification depends on two things, and solving one does not solve the other.
 
-**Infrastructure.** Evidence has to be captured as the system runs, checks have to execute inside the application's time budget, every judgment has to name the exact versions it judged, and the evidence has to be retained for investigation. Capture has to cost the application little enough to stay on, and a judgment without versions cannot be reproduced.
+**Infrastructure.** Evidence has to be captured as the system runs, checks have to execute inside the application's time budget, every judgment has to name the exact versions it judged, and the evidence has to be retained for investigation. Capture has to cost the application little enough to stay on.
 
 **Requirements.** Requirements describe the world the system acts in, not only the system. Requirements engineering separates knowledge of the environment, the requirements themselves, and the specification the machine implements ([Zave and Jackson, 1997](#sources)). Production ML adds tests for data, models, infrastructure, and monitoring, because a model's prediction behavior is difficult to specify in advance ([Breck et al., 2017](#sources)).
 
@@ -133,12 +133,16 @@ Coding agents and model judges can help with both: drafting capture and check co
 
 ## A starting method
 
-1. **Pick one consequential decision and its failures.** "Send a customer report to an external party" fails by leaking an identifier, reaching an unauthorized recipient, or violating policy.
-2. **Write each failure as a scoped requirement.** One statement per failure, naming the context: "a report shared externally names no bank account identifier".
-3. **Name the evidence each requirement needs.** The report text; the authorization record; the policy version and stated purpose. If the evidence is not captured today, capturing it is the first task.
-4. **Choose the cheapest check that decides it, and test the check.** A field comparison for authorization; a pattern or code check for identifiers; a model judge with citations for the policy. Run each check on known passing, failing, and ambiguous cases before relying on it.
-5. **Decide the response before you need it.** Passed sends. Failed holds. Inconclusive holds or goes to a person. An error in the check is not a pass.
-6. **Keep the evidence and revise.** Retain each judgment with the evidence and versions it used. When the policy, model, or data changes, rerun the labeled cases, publish a new requirement version, and keep old judgments attributed to the versions they used.
+A team can start with one decision and grow from there:
+
+1. **One consequential decision and its failures.** "Send a customer report to an external party" fails by leaking an identifier, reaching an unauthorized recipient, or violating policy.
+2. **One scoped requirement per failure,** naming its context: "a report shared externally names no bank account identifier".
+3. **The evidence each requirement needs:** the report text, the authorization record, the policy version and stated purpose. Evidence that is not captured yet is the first gap to close.
+4. **The cheapest check that decides each requirement,** tested on known passing, failing, and ambiguous cases: a field comparison for authorization, a pattern or code check for identifiers, a model judge with citations for the policy.
+5. **A response chosen in advance.** Passed sends. Failed holds. Inconclusive holds or goes to a person. An error in the check is not a pass.
+6. **Retained evidence and revision.** Each judgment is kept with the evidence and versions it used. When the policy, model, or data changes, the labeled cases run again, the requirement gets a new version, and old judgments stay attributed to the versions they used.
+
+The practice guides below turn each step into concrete work.
 
 ## Sources
 

@@ -30,8 +30,8 @@ One closed `WYRD_TARGET` set. The old values `all`, `server`, `oracle`,
 | Target | Public serving | Direct `verify` | Queued enqueue / webhook | Queued claim | Bifrost roles |
 |---|---|---:|---:|---:|---|
 | `combined` (default) | all routes | yes | yes | yes | Scribe, Oracle, Forge coordinator and worker |
-| `direct` | direct and shared control routes | yes | no | no | none |
-| `worker` | queued ingress, status and control | no | yes | yes | none |
+| `direct` | direct and shared control routes | yes | no | no | Scribe, Oracle |
+| `worker` | queued ingress, status and control | no | yes | yes | Scribe, Oracle |
 | `bifrost-ingest` | Bifrost ingest | no | no | no | Scribe |
 | `bifrost-query` | Bifrost query | no | no | no | Oracle |
 | `bifrost-maintenance` | none | no | no | no | Forge coordinator and worker |
@@ -48,9 +48,14 @@ One closed `WYRD_TARGET` set. The old values `all`, `server`, `oracle`,
   `verify`.
 - **Refusals**: wrong-target work is refused before admission or any side
   effect, identically over HTTP and MCP. Nothing is forwarded.
-- **Readiness** follows the target's capabilities. Public serving, Verifier
-  capabilities and Bifrost roles are decoupled, so a target with no Bifrost
-  role boots and stages outbox writes to a peer Scribe.
+- **Bifrost on Verifier pods**: Verifiers write evidence through Scribe and
+  read traces, drift windows, deferred inputs and delivery records through
+  Oracle, so `direct` and `worker` run both in-process, as the old `server`
+  target did, without Forge. Forge's coordinator does promotion and
+  maintenance I/O, so it stays on `combined` or `bifrost-maintenance`; a
+  split deployment runs at least one `bifrost-maintenance` pod. Several
+  coordinators are safe: Postgres election fences them.
+- **Readiness** follows the target's owners and Verifier capabilities.
 - **Unchanged**: original deadlines, Busy deferral, fenced takeover across pods
   and graceful drain.
 
@@ -78,8 +83,7 @@ Real SDK, HTTP and MCP journeys show:
 - every target accepts exactly its permitted work, and refused work creates no
   execution or admission side effect;
 - an idle `combined` queued runtime holds no reservation;
-- a `worker` pod completes webhook, deferred-input and approval journeys
-  through a remote Scribe;
+- a `worker` pod completes webhook, deferred-input and approval journeys;
 - a `worker` crash or shutdown allows takeover without resetting deadlines;
 - a `direct` pod never claims queued executions.
 

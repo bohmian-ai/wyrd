@@ -289,9 +289,12 @@ Operators isolate direct work by running `direct` and `worker` targets on
 separately provisioned pods: `direct` executes only synchronous `verify`;
 `worker` admits queued submissions, webhooks, deferred inputs, approvals and
 queued-only controls and is the only non-`combined` target that claims queued
-executions. `bifrost-ingest`, `bifrost-query` and `bifrost-maintenance` run
-only Scribe, Oracle and Forge (coordinator and worker) respectively and serve
-no Verifier work. A target refuses work it does not accept before admission or
+executions. Both run Scribe and Oracle on the pod and neither Forge role.
+`combined` runs Scribe, Oracle and both Forge roles. `bifrost-ingest`,
+`bifrost-query` and `bifrost-maintenance` run only Scribe, Oracle and Forge
+(coordinator and worker) respectively and serve no Verifier work. A split
+deployment requires peer mode and at least one Forge coordinator and worker;
+every Scribe requires durable per-pod storage and stable identity. A target refuses work it does not accept before admission or
 any side effect, identically over HTTP and MCP, and never forwards it.
 Readiness follows the target's capabilities. Original deadlines, Busy deferral,
 fenced takeover and graceful drain are unchanged. Direct c64 latency and
@@ -482,7 +485,7 @@ readiness. Implementation tasks derive from this approved revision.
 | 10 | approved 2026-11-13 | User decision during TASK-009: the GitHub delivery outcome has no typed Rust client, SDK or CLI projection; it is read through existing HTTP/MCP execution inspection. Amends REQ-016 and AC-011 and task 009 surfaces. Nothing else changes. |
 | 11 | approved 2026-11-14 | User decisions after the TASK-009 review: cancellation is its own delivery, recorded once per revision apart from that revision's outcome (FIND-009-8; amends REQ-014 and the bifrost-design one-outcome-per-revision rule). Deferred as accepted limits: report source is the first retained pull_request extraction output and an extraction-shaped decoy is not distinguished (FIND-009-2); access and generation are rechecked before each write attempt, not again after its lookup (FIND-009-6); startup recovery waiting on a provider cooldown may hold shutdown until the drain deadline (FIND-009-9). Nothing else changes. |
 | 12 | approved 2026-11-15 | Maintainer integration decisions for porting code mode (TASK-012/013/014): REQ-015 replaces separate capacity without borrowing with queued runtime/pool isolation, a bounded queued CPU share and memory reservation, reserved direct capacity, direct-only borrowing of idle queued capacity and one ledger. Nested code-mode calls exclude fs.write and publish. Tool-call spend is restored from the attempt records used for max_agent_invocations; an unsettled attempt counts its whole allowance. Repository is the thirteenth Card kind. The sanctioned test-control set is the reconciled union, guard strictness unchanged. Monty stays on its crates.io release. Nothing else changes. |
-| 13 | approved 2026-11-15 | Maintainer rejected revision 12's queued reservation because it holds idle capacity, and approved deployment targets instead: REQ-015 replaces the queued runtime CPU share, memory/scratch reservation, reserved direct capacity and borrowing with the closed `combined`/`direct`/`worker`/`bifrost-ingest`/`bifrost-query`/`bifrost-maintenance` target set, per-use charging in `combined` with a queued concurrency cap, and isolation by separately provisioned `direct` and `worker` pods. Amends REQ-015/016, AC-010/012 and the live-custody paragraph. Recorded in [deployment targets](design/approved-deployment-targets.md). Nothing else changes. |
+| 13 | approved 2026-11-15 | Maintainer rejected revision 12's queued reservation because it holds idle capacity, and approved deployment targets instead: REQ-015 replaces the queued runtime CPU share, memory/scratch reservation, reserved direct capacity and borrowing with the closed `combined`/`direct`/`worker`/`bifrost-ingest`/`bifrost-query`/`bifrost-maintenance` target set, per-use charging in `combined` with a queued concurrency cap, and isolation by separately provisioned `direct` and `worker` pods, each running Scribe and Oracle. Amends REQ-015/016, AC-010/012 and the live-custody paragraph. Recorded in [deployment targets](design/approved-deployment-targets.md). Nothing else changes. |
 
 Subsequent explicit maintainer amendment: approval authoring has no separate
 expiration setting. Pending approvals and deferred waits share the execution's

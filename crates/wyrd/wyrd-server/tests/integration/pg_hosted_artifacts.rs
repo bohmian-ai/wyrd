@@ -545,7 +545,13 @@ async fn workspaces_stream_evidence_to_disk() {
         size,
         "the file is charged to scratch"
     );
+    let returned = process.scratch().changed();
+    let mut returned = std::pin::pin!(returned);
+    returned.as_mut().enable();
     drop(workspace);
+    tokio::time::timeout(Duration::from_secs(10), returned)
+        .await
+        .expect("the charge returns once the directory is emptied");
     assert_eq!(process.scratch().used(), 0);
 
     let mut tampered = document.clone();
@@ -1398,8 +1404,10 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
     );
 
     let scratch = process.scratch();
-    let taken = scratch.charge_infallible(scratch.available());
-    // A waiting open would never finish while `taken` is held.
+    // The whole limit, not what is free now: the step above returns its
+    // workspace's charge only once its directory is emptied in the
+    // background. A waiting open would never finish while `taken` is held.
+    let taken = scratch.charge_infallible(scratch.limit());
     busy(step(&["fs.read"]).await, "an Agent's workspace");
 
     drop(taken);

@@ -3,7 +3,7 @@ title: Bifrost
 description: Wyrd's analytical warehouse, the two ways to write to it, and when a written row becomes queryable.
 pillar: wyrd
 section: Understand
-order: 5
+order: 6
 ---
 
 Bifrost is the analytical warehouse inside every Wyrd server. Observations, verdicts, traces, audit records, and caller-owned rows all land in it as tables that read-only SQL can query:

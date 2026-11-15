@@ -3,10 +3,12 @@ title: How verification works
 description: Inputs, steps, requirements, and decide; Agent workspaces; verify versus submit; executions, verdicts, results, and Operators.
 pillar: wyrd
 section: Understand
-order: 2
+order: 3
 ---
 
 A Verifier checks declared requirements against evidence and returns a verdict: `passed`, `failed`, or `inconclusive`. A binding attaches the Verifier to the Card it checks, and the server records every verdict with the exact versions it judged.
+
+This page covers the parts and their behavior. [Real-time verification](/understand/real-time-verification/) shows where a verdict fits in an application's request.
 
 ## The parts of a Verifier
 

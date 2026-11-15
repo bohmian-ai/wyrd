@@ -36,7 +36,7 @@ Every workflow uses the same parts. Cards declare exact versions of what you shi
 
 **Problem.** A request must be checked before your application acts on it, or checked in the background without delaying it.
 
-**Workflow.** `verify` returns the verdict to the caller, so your code can act on it before it responds. `submit` queues the check and returns an execution that any process can wait on. [verify and submit](/understand/how-verification-works/#verify-and-submit) explains both. An `agent` check adds a model call to the wait; an `assert` check needs none.
+**Workflow.** `verify` returns the verdict to the caller, so your code can act on it before it responds. `submit` queues the check and returns an execution that any process can wait on. [Real-time verification](/understand/real-time-verification/) explains both and when each fits. An `agent` check adds a model call to the wait; an `assert` check needs none.
 
 ## Observability
 

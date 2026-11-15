@@ -3,7 +3,7 @@ title: Runs and evidence
 description: How Wyrd records what a declared service actually does, and ties each observation to the version that ran.
 pillar: wyrd
 section: Understand
-order: 3
+order: 4
 ---
 
 An observation is a record of what a declared service actually did. Each one is tied to the exact Card version and the run that produced it.

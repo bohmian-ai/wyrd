@@ -6,16 +6,17 @@ spec: SPEC-positioning
 spec_revision: 4
 requirements: [REQ-007, REQ-008, REQ-010, REQ-011, REQ-013, REQ-014, REQ-015, REQ-016, INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, AC-006, AC-007, AC-009, AC-010, AC-012, AC-013, AC-014, AC-015]
 depends_on: [TASK-001]
+approved_design: ../design/verification-foundations.md
 ---
 
 # Establish verification concepts, practices and adoption answers
 
 ## Outcome and Value
 
-A reader researching verification finds useful explanations and practical
-standards, then reaches the runnable Wyrd example. The site becomes a reference
-for understanding requirements, evidence and judgments as well as an API guide.
-For example, “the agent should be reliable” becomes a scoped requirement with
+A reader researching verification learns how requirements and evidence can
+inform a decision while an application is still running, then reaches the
+runnable Wyrd example. The site becomes a reference for runtime verification,
+requirements, evidence and judgments as well as an API guide. For example, “the agent should be reliable” becomes a scoped requirement with
 observable evidence, a suitable check and cases that distinguish pass, failure
 and insufficient evidence.
 
@@ -52,7 +53,9 @@ remaining runnable tutorial implementations, and Task 4 owns shared discovery
 logic. Keep copyable examples source-backed and tested. Link only to published
 procedures, then close reciprocal tutorial links as Task 3 publishes them.
 
-### Foundational guide: verification beyond a tool
+### Locked foundational guide: verification beyond a tool
+
+The maintainer approved this guide and the research direction below.
 
 Publish a dedicated starting page under Understand, with a descriptive title
 such as “Foundations of verification”. This is a substantive, cited introduction
@@ -97,7 +100,9 @@ The guide must teach:
   judges are fallible; self-consistency and another model's agreement are not
   independent proof. Explain calibration only where actually measured.
 
-Cite primary research and authoritative definitions beside the claims they
+Prioritize peer-reviewed foundational work and primary research over recent
+preprints for core definitions; use authoritative engineering guidance where
+appropriate and label its source type. Cite sources beside the claims they
 support, with a concise bibliography. Distinguish established results, reported
 experiments, proposals/proofs of concept, philosophical arguments and economic
 models. Include methods/limitations where relevant; do not use a paper about
@@ -109,13 +114,71 @@ list or marketing claims. Link onward to practices, then optionally to Wyrd.
 See the [foundations research brief](../design/verification-foundations.md) for
 the maintainer's motivation, supplied references and their intended roles.
 
+### Locked real-time-first teaching and product explanation
+
+Runtime verification is central to the learning path, not an execution-mode
+footnote after background evaluation. Teach when evidence becomes useful for
+a decision alongside what requirements and evidence mean. The foundations guide
+remains useful without Wyrd: introduce checking observed executions and the
+choice of judging before an action, during execution, or afterward early in
+the explanation. Keep the established relationship to formal methods and finite
+observations accurate; runtime verification includes online and offline work,
+and not every runtime check satisfies an application's real-time needs.
+
+Make `/wyrd/understand/real-time-verification/` the main bridge from that
+foundation to Wyrd. Its opening and principal example follow this order:
+request → declared requirements and evidence → Wyrd verification → verdict →
+application decision → response. Explain the opportunity to release, hold or
+seek review before the action/response is committed. Queued submission and
+scheduled checks follow as additional uses of the same engine, with different
+decision timing; they do not replace or overshadow the real-time request path.
+The product explanation leads with an engine built for real-time verification
+that can also run asynchronously, preserving the approved public headline.
+
+Connect the two difficulties explicitly:
+
+- Reliable verification infrastructure must fit the application's latency
+  budget while capturing evidence and preserving attributable results.
+- Checks need explicit, adequate requirements: what is checked, what evidence
+  it needs, how it judges, and how incomplete evidence/errors affect a decision.
+
+Explain Wyrd's declared, versioned Verifier contracts in that context: named
+inputs/schema constraints, identified requirements/statements/checks,
+requirement outcomes, overall decision rule and exact version attribution.
+These are Wyrd's consistent public contracts, not a claim of universal industry
+standardization, complete requirements discovery or mathematical proof.
+Use the existing How verification works/Verifier reference owners for detail.
+
+Give the real-time explanation a concise, source-backed infrastructure section.
+Distinguish engine/coordination overhead, evidence preparation/read time and
+check/tool/provider execution, including possible admission/cache-miss waits.
+Explain process-cache reuse and staging retained results/evidence through the
+existing outbox, so returning a verdict does not wait for Bifrost publication.
+Retain the documented durability/backpressure/error boundaries; do not promise
+that every read is local or that every request is free of I/O/admission costs.
+The application chooses suitable checks and handles its response deadline,
+timeouts and non-pass outcomes. Model-assisted checks can dominate total time;
+synchronous invocation alone is not proof a verifier fits its latency budget.
+Real-time here means a judgment available for the current application decision,
+not a hard-real-time scheduling or universal bounded-latency guarantee.
+
+Cite peer-reviewed foundations for general lessons and architecture/current
+source for Wyrd mechanics. Numeric overhead/end-to-end/provider latency claims
+need applicable measured evidence with workload, check mix, concurrency,
+hardware, cache conditions and percentiles; otherwise omit the number. An
+illustrative animation, scripted provider or historical benchmark target is
+not a measurement. No new benchmark experiment or backend optimization is
+required or authorized by this prose-only task. Avoid unsupported claims that
+most other tools lack runtime checks or requirement contracts.
+
 ## Approach
 
 1. Extend Task 1's content disposition with a canonical owner and reader
    question for the foundation, each practice and the FAQ. Record this
    educational/practice/FAQ portion of the approved ownership transfer in
    the older docsite packet, preserving its unrelated obligations.
-2. Publish the dedicated cited foundations guide, real-time explanation and technical
+2. Publish the dedicated cited foundations guide with runtime decision timing
+   introduced early, the real-time-first category explanation and the technical
    FAQ as the educational part of the initial release set.
 3. Complete practical guidance for requirements/checks, evidence, evolution
    and production decisions, reusing existing examples and references.
@@ -137,7 +200,7 @@ The required content coverage is explicit; page count is not a target:
 | Reader job | Coverage to establish |
 |---|---|
 | Understand verification | Requirement → evidence → judgment → application/team decision; relation to validation, evaluation, monitoring, guardrails and formal verification; useful without adopting Wyrd. |
-| Understand real-time verification | Finance request flow; synchronous verify, queued submit and scheduled checks; timeout, missing-evidence and native error boundaries. Live and during-execution are equivalent descriptions. |
+| Understand real-time verification | Lead with finance request → declared requirements/evidence → verdict → application decision → response; explain the latency budget, versioned contracts, engine/evidence/provider costs and deferred retention. Then explain queued/scheduled alternatives and timeout/missing-evidence/error boundaries. Live and during-execution are equivalent descriptions. |
 | Write useful requirements and evolve standards | Scoped observable statements, evidence needed, check selection, examples/counterexamples, deterministic versus model judgment, reliability/regression limits, reuse/version changes and historical attribution. |
 | Establish adequate evidence | Provenance, original citations, exact versions, completeness and partial/missing evidence. No universal inference from missing traces. |
 | Integrate production decisions | Passed/failed/inconclusive/errors, timeout handling, provider data/tool exposure, cost/latency tradeoffs without invented measurements; accurate reference links. |
@@ -155,7 +218,7 @@ just because the initial set is ready.
 
 | Obligations | Required observation |
 |---|---|
-| REQ-010; AC-009; INV-001–005 | A dedicated cited foundations page stands alone without Wyrd adoption: it explains uncertain systems, formal/runtime overlap, adjacent disciplines, leakage/drift and plausible-but-invalid behavior, evidence sufficiency and a practical starting method. Separate real-time/product coverage explains native semantics. Research claims are attributed and qualified; copyable code stays tested. No new product guarantee is invented. |
+| REQ-010; AC-009; INV-001–005 | A dedicated cited foundations page stands alone without Wyrd adoption: it explains uncertain systems, formal/runtime overlap, adjacent disciplines, leakage/drift and plausible-but-invalid behavior, evidence sufficiency and a practical starting method. The foundation introduces runtime decision timing early; the real-time/product page leads with verdict-before-decision, explicit versioned contracts, latency components and deferred publication, then queued/scheduled alternatives. Research claims are attributed and qualified; copyable code stays tested. No new product guarantee is invented. |
 | REQ-011; AC-010; INV-002–005 | Every required practice has its prevented failure, concrete good/bad examples and limits; evidence completeness, check/model reliability, version evolution and production decisions are covered. |
 | REQ-013; AC-012; INV-002–005 | The technical FAQ directly answers every required topic, links to its canonical owner and avoids unsupported enforcement, hosted or model-quality promises. |
 | REQ-007–008, REQ-014; AC-006–007, AC-013; INV-004–006 | The learning route and content disposition lead to distinct published pages with natural query wording, reciprocal links and no duplicate procedures. This task supplies its query/content mapping to Task 4. |
@@ -170,6 +233,18 @@ Inspected owners, their consumers, and the missing behavior:
   `CodeFromFile` quickstart is changed by Task 1. Extend/link this owner for
   mechanics while adding a distinct foundational definition and the required
   real-time category page. Do not duplicate its reference inventories.
+- **Real-time mechanics:** `architecture/wyrd-design.md` owns declared
+  Verifier inputs/requirements/decision rules, direct `verify` versus queued
+  `submit`, exact result attribution and process outbox capture. The existing
+  `Observe::verify` / `Observe::submit` in
+  `crates/shared/wyrd-client/src/observe/mod.rs` expose those two flows;
+  `how-verification-works.md` currently leads with Verifier parts and only
+  later compares them. Gap: a reader-first decision/latency explanation,
+  not another invocation mode or contract. Reuse and link these owners;
+  validate outbox/publication details against `architecture/bifrost-design.md`.
+  `benchmarks/README.md` distinguishes benchmark workloads and percentiles;
+  use applicable actual records for numeric claims or omit numbers rather
+  than rerun performance work under a content task.
 - **Practice owners:** `author-a-verifier.md` teaches assertion → code →
   Agent checks, and `verifier-recipes.md` groups assertions, traces, model
   judges, multi-step, files, sessions and drift. Their consumer path already
@@ -216,9 +291,18 @@ should distinguish a proof from an evidence-supported judgment, explain why a
 plausible output or high ML score is insufficient, identify what leakage/drift
 checks need beyond an answer, and outline a scoped verification workflow.
 Review each material empirical/definition/historical claim against its cited
-source, recording unsupported claims removed or qualified. Then the reader should explain a
+source in a compact claim-to-source ledger (section, evidence type and limits),
+recording unsupported claims removed or qualified. Then the reader should explain a
 verifiable requirement, distinguish evidence gaps from failure, find the
 relevant practice and reach the actual runnable next step. Record gaps/repairs.
+The same reader should explain why receiving a verdict before an API response
+changes what the application can do, identify the declared requirement/evidence
+contract, separate engine overhead from evidence/check/provider time, and say
+what does not wait for publication. Ask when queued or scheduled verification
+is preferable. A page that merely lists three invocation modes, implies a
+universal latency bound, or omits the application's decision boundary fails
+this proof. Record the reader's answers and the source basis for architecture
+and timing claims; this is comprehension evidence, not a backend benchmark.
 Task 4 performs final built HTML/query/index integration, and integrated review
 runs the complete docs gate once. No backend tests or benchmarks are required
 for this prose-only write set.

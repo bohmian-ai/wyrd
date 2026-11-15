@@ -87,6 +87,8 @@ describe('landing finance figure', () => {
     expect(lines).toHaveLength(12);
     expect(lines[0]).toBe('from wyrd import WyrdState');
     expect(lines.slice(5, 7)).toEqual(['@api.post("/reports/send")', 'def send_report(release: Release):']);
+    // The call band sits on the verify line.
+    expect(lines[8]).toContain('run.observe.verify(');
     for (const line of lines.filter(Boolean)) expect(api).toContain(line);
     for (const name of ['Recipient authorized', 'Sharing policy · PDF', 'Destination private', 'GATEWAY', 'BIFROST'])
       expect(body).toContain(name);

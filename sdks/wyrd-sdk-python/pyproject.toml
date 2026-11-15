@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "wyrd-ai"
-version = "0.4.1"
+version = "0.4.2"
 description = "Python SDK for Wyrd, the real-time verification system built for your applications."
 readme = { text = "Python SDK for Wyrd, the real-time verification system built for your applications. Start with the Quickstart: https://docs.bohmian.ai/wyrd/get-started/quickstart/", content-type = "text/markdown" }
 requires-python = ">=3.11"

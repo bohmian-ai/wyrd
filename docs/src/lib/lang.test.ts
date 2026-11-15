@@ -14,9 +14,9 @@ describe('shared language choice', () => {
     vi.resetModules();
   });
 
-  it('offers Python, Rust, and TypeScript in that order', async () => {
+  it('offers Python, Rust, TypeScript, and YAML in that order', async () => {
     const { LANGS } = await import('./lang.svelte');
-    expect(LANGS.map((l) => l.id)).toEqual(['python', 'rust', 'typescript']);
+    expect(LANGS.map((l) => l.id)).toEqual(['python', 'rust', 'typescript', 'yaml']);
   });
 
   it('persists a TypeScript choice for every later block and visit', async () => {

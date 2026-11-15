@@ -19,7 +19,7 @@ You need the server and the `quickstart` directory from [Set up Wyrd](/get-start
 The Python program uses Pydantic models. Add them with the `pydantic` extra:
 
 ```bash
-uv add "wyrd-ai[pydantic]==0.4.1"
+uv add "wyrd-ai[pydantic]==0.4.2"
 ```
 
 Without Pydantic, map each input slot to its own schema, `inputs={"answer": {"type": "string"}}`. `Table` takes the row's whole object schema, and `write` takes a dictionary row.

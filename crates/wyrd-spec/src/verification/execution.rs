@@ -572,6 +572,8 @@ impl VerificationExecutionState {
     }
 }
 
+/// Verdict predicates, read from [`VerificationOutcome::verdict`]: exactly
+/// one of them holds for any result, and none can fail.
 impl<T> VerificationResult<T> {
     /// Whether the verdict is `passed`: the only verdict that releases what
     /// was verified. Same as comparing [`VerificationOutcome::verdict`].

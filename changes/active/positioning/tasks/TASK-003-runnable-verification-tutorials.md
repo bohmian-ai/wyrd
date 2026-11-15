@@ -71,12 +71,21 @@ and claim completion.
 bound Verifier and receives the result before choosing its response/action.
 A passing request proceeds; a violation, inconclusive result and typed error
 use the documented hold/review response. The guide adds request-lifecycle
-integration to the finance quickstart instead of copying its entire procedure.
+integration to the finance quickstart instead of copying its entire procedure. Lead with the current decision boundary:
+verification finishes before the release/hold response or consequential action
+is committed. Explain explicit requirement/evidence contracts and why evidence
+retention is separate from the returned verdict. Present queued/scheduled
+workflows as alternatives when a later judgment fits the decision, not as
+prerequisites for the real-time path. Separate engine overhead, evidence work
+and check/provider execution when discussing budgets; no numeric latency bound
+is established by a scripted-provider journey.
 
 **RED.** Add the planned live-request example journeys in the existing owners
 listed in [live-request proof](#live-request-proof). Drive the actual small
-application entry point and inspect the decision and result. Fail for missing
-request/decision behavior, not compilation, missing assets or provider setup.
+application entry point and inspect the decision and result. Prove the
+response/consequential action occurs only after the verdict, and that
+non-pass/error paths never release, using observed ordering rather than
+fragile elapsed-time thresholds. Fail for missing request/decision behavior, not compilation, missing assets or provider setup.
 Already-correct portions may be verification-only with concrete observations.
 
 **GREEN.** Extend the existing example integration and SDK calls minimally;

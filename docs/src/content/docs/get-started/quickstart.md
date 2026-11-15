@@ -1,6 +1,6 @@
 ---
 title: Run your first verification
-description: Verify a finance report against three requirements, including a model that reads a sharing policy, in one call, and release it only when the verdict passes. Python, Rust, or TypeScript.
+description: Verify a finance report against three requirements, including a model that reads a sharing policy PDF, in one call, and release it only when the verdict passes. Python, Rust, or TypeScript.
 pillar: wyrd
 section: Get started
 order: 3
@@ -13,10 +13,10 @@ You build one Service, `finance-release`, verified by one Verifier, `release-che
 | Requirement | How it is judged |
 | --- | --- |
 | `recipient-authorized` | An assertion on the recipient record your application supplies |
-| `follows-policy` | A model reads the company sharing policy and judges the report |
+| `follows-policy` | A model reads the company sharing policy PDF and judges the report and its purpose |
 | `destination-restricted` | An assertion on the destination record your application supplies |
 
-One call judges all three. The reports, recipients, and destinations are synthetic, and nothing is sent anywhere: the program prints each verdict.
+One call judges all three. The reports, recipients, and destinations are synthetic, and nothing is sent anywhere: the program prints each decision.
 
 ## Prerequisites
 
@@ -46,7 +46,13 @@ The key stays on the server. [LLM gateway](/connect/set-up-the-llm-gateway/) exp
 
 ## 2. Declare and verify
 
-Save the declaration and the program in `quickstart`, and run the program. The declaration builds the Service, the Verifier, and the judge Agent; the program declares them and verifies two releases. The second report names a bank account:
+Download the sharing policy into `quickstart`:
+
+```bash
+curl -LO https://raw.githubusercontent.com/bohmian-ai/wyrd/v0.4.2/examples/finance-release/company-sharing-policy.pdf
+```
+
+Save the declaration and the program beside it, and run the program. The declaration builds the Service, the Verifier, and the judge Agent; the program declares them and verifies four releases. One report names a bank account, and two are shared for purposes other than an external audit:
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
@@ -54,7 +60,7 @@ Save the declaration and the program in `quickstart`, and run the program. The d
 The program declares its inputs as Pydantic models. Add Pydantic with the SDK's extra:
 
 ```bash
-uv add "wyrd-ai[pydantic]==0.4.1"
+uv add "wyrd-ai[pydantic]==0.4.2"
 ```
 
 <CodeFromFile file="examples/finance-release/finance_service.py" lang="python" title="finance_service.py" />
@@ -79,6 +85,12 @@ cargo run
 </LangTab>
 <LangTab lang="typescript">
 
+The program declares its inputs as a Zod schema. Add Zod:
+
+```bash
+pnpm add zod
+```
+
 <CodeFromFile file="examples/finance-release/finance_service.ts" lang="typescript" title="finance_service.ts" />
 
 <CodeFromFile file="examples/finance-release/finance_release.ts" lang="typescript" title="finance_release.ts" />
@@ -90,22 +102,19 @@ node finance_release.ts
 </LangTab>
 </LangTabs>
 
-The program saves the policy as `company-sharing-policy.md`, uploads it, and declares the Service, the Verifier, and the judge Agent. Then it verifies each release with one call and prints its verdict:
+The program uploads the policy with its extracted text and declares the Service, the Verifier, and the judge Agent. Then it verifies each release with one call and prints the verdict, with the reason for each requirement that did not pass:
 
-```text
-passed: Synthetic customer report: quarterly total $120.
-failed: Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001.
-```
+<CodeFromFile file="examples/finance-release/output.txt" lang="text" title="output" />
 
-The second release passes both assertions and fails `follows-policy`: the judge read the policy and found the bank account.
+The judge's wording varies. The failed releases pass both assertions and fail `follows-policy`: the judge read the policy, found the bank account, and found that the policy permits sharing only for external audits.
 
-Only a `passed` verdict releases a report. Wyrd never sends or blocks anything itself; your code decides.
+`verify` returns before your code acts, so the verdict is part of the request. Assertions add little time; the policy judge adds a model call, up to three tool turns, to that request. If the judge can't decide, the verdict is `inconclusive`, which is never a pass. [`submit`](/understand/how-verification-works/#verify-and-submit) queues the same check when the request can't wait.
 
 Run the program again. Nothing changed, so it declares nothing new.
 
 ## 3. Check the other requirements
 
-In `finance_release`, set the recipient's `authorized` to `false` and run again. Both releases fail `recipient-authorized`. Set the destination's `restricted` to `false` instead, and `destination-restricted` fails. Each requirement is judged on its own.
+In the program (`src/main.rs` in Rust), set the recipient's `authorized` to `false` and run again. Every release fails `recipient-authorized`. Set the destination's `restricted` to `false` instead, and `destination-restricted` fails. Each requirement is judged on its own.
 
 ## 4. Confirm the stored verdicts
 
@@ -127,9 +136,28 @@ wyrd query --server http://127.0.0.1:8080 --file stored-verdicts.sql
 
 It prints one JSON row per stored verdict, newest first. The server publishes rows shortly after the program ends: if a verdict is missing, repeat the query for up to a minute.
 
+Each row names its `execution_id`. To see the exact policy file a verdict used, read that execution's details: `Execution.details()` in the SDK, or [`verification.get_execution_details`](/reference/mcp-tools/) over MCP. They name the Verifier version and the policy Artifact version its judge read.
+
 ## 5. Update the policy
 
-Edit `company-sharing-policy.md` and run the program again. The server registers the edited file as a new policy version, and with it new versions `release-check@0.1.1` and `finance-release@0.1.1`. `release-check@0.1.0` still mounts the policy it judged against.
+The revised policy also permits sharing for regulator requests. Download it over the original, and run the program again:
+
+```bash
+curl -L -o company-sharing-policy.pdf https://raw.githubusercontent.com/bohmian-ai/wyrd/v0.4.2/examples/finance-release/company-sharing-policy-revised.pdf
+```
+
+The server registers the changed file as a new policy version, and with it `release-check@0.1.1` and `finance-release@0.1.1`. The regulator request now passes:
+
+```text
+external audit · Synthetic customer report: quarterly total $120. → passed
+external audit · Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001. → failed
+  follows-policy: the report names a bank account identifier, which the policy forbids
+marketing partnership · Synthetic customer report: quarterly total $120. → failed
+  follows-policy: the policy does not permit sharing for this purpose
+regulator request · Synthetic customer report: quarterly total $120. → passed
+```
+
+The judge's wording varies. `release-check@0.1.0` still mounts the original policy, and the details of each execution it ran name that file.
 
 ## If it fails
 
@@ -137,6 +165,7 @@ Edit `company-sharing-policy.md` and run the program again. The server registers
 | --- | --- |
 | `WYRD_GATEWAY_404_MODEL_UNAVAILABLE` | Create the `openai` deployment as in step 1 |
 | `WYRD_CLIENT_401_NO_CREDENTIALS` | Use the same `WYRD_CONFIG_HOME` as the server terminal |
+| `WYRD_LOADER_400_INVALID_ENVELOPE` | Run from the directory that holds `company-sharing-policy.pdf` |
 
 ## Next
 

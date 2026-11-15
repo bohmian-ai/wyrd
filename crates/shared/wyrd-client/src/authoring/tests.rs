@@ -1952,13 +1952,18 @@ tables:
 /// or the Verifier refuses it.
 #[test]
 fn model_slot_carries_the_derived_schema() {
+    /// A nested type, so the schema carries a definition.
     #[derive(serde::Serialize, schemars::JsonSchema)]
     struct Report {
+        /// The report text.
         text: String,
     }
+    /// The slot's model: one nested field and one scalar field.
     #[derive(serde::Serialize, schemars::JsonSchema)]
     struct Release {
+        /// The nested report.
         report: Report,
+        /// The asserted scalar.
         authorized: bool,
     }
 
@@ -1994,13 +1999,18 @@ fn model_slot_carries_the_derived_schema() {
 /// stays a reference, or the Verifier refuses the slots.
 #[test]
 fn fields_of_declares_one_slot_per_field() {
+    /// A nested type, so the schema carries a definition.
     #[derive(serde::Serialize, schemars::JsonSchema)]
     struct Report {
+        /// The report text.
         text: String,
     }
+    /// The slot's model: one nested field and one scalar field.
     #[derive(serde::Serialize, schemars::JsonSchema)]
     struct Release {
+        /// The nested report.
         report: Report,
+        /// The asserted scalar.
         authorized: bool,
     }
 

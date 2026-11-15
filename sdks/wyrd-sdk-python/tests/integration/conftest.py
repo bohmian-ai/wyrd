@@ -273,13 +273,16 @@ FINANCE_POLICY_JUDGE = "Decide whether the company sharing policy permits sharin
 """The finance release example judge's prompt, which the local model answers as the sharing-policy judge."""
 
 
-def sharing_verdict(messages: list[dict]) -> str:
+def sharing_verdict(messages: list[dict], *, by_purpose: bool) -> str:
     """The sharing-policy judge's Verdict once ``messages`` carry its ``fs.read`` result.
 
     It is inconclusive for a release naming ``PROVIDER-UNCERTAIN``, fails one
     naming ``BANK-ACCOUNT-DEMO-001``, and otherwise passes; a decided Verdict
     cites the report text and the policy line permitting ``external-audit``.
-    It answers no Verdict when the read carries no such line.
+    It answers no Verdict when the read carries no such line. When
+    ``by_purpose``, as for the finance release judge, it passes only an
+    ``external audit`` purpose, or a ``regulator request`` when that policy
+    line also permits regulators.
     """
     release = json.dumps([each["content"] for each in messages if each.get("role") == "user"])
     [read] = [each for each in messages if each.get("role") == "tool"]
@@ -304,13 +307,22 @@ def sharing_verdict(messages: list[dict]) -> str:
     elif "BANK-ACCOUNT-DEMO-001" in release:
         verdict = {
             "outcome": "failed",
-            "reason": "the report names a bank account identifier",
+            "reason": "the report names a bank account identifier, which the policy forbids",
+            "citations": citations,
+        }
+    elif by_purpose and not (
+        "external audit" in release
+        or ("regulator request" in release and "regulator" in lines[0]["text"])
+    ):
+        verdict = {
+            "outcome": "failed",
+            "reason": "the policy does not permit sharing for this purpose",
             "citations": citations,
         }
     else:
         verdict = {
             "outcome": "passed",
-            "reason": "an external audit may receive this report",
+            "reason": "the policy permits sharing for this purpose",
             "citations": citations,
         }
     return json.dumps(verdict)
@@ -384,7 +396,12 @@ def completion(body: dict) -> tuple[int, dict]:
     returned = any(message.get("role") == "tool" for message in body.get("messages", []))
     if "POLICY JUDGE" in text or FINANCE_POLICY_JUDGE in text:
         message = (
-            {"role": "assistant", "content": sharing_verdict(body["messages"])}
+            {
+                "role": "assistant",
+                "content": sharing_verdict(
+                    body["messages"], by_purpose=FINANCE_POLICY_JUDGE in text
+                ),
+            }
             if returned
             else read_sharing_policy(text)
         )

@@ -1,8 +1,8 @@
 // The docs Quickstart's TypeScript program, `examples/finance-release`, run
-// as a reader runs it: from an empty directory, where it saves the policy, against a server whose `openai` gateway
-// deployment forwards the policy judge to a local model that reads the policy first.
+// as a reader runs it: from a directory holding only the downloaded policy PDF, against a server whose `openai`
+// gateway deployment forwards the policy judge to a local model that reads the policy extraction first.
 import { execFile } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { copyFileSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -24,20 +24,25 @@ const JUDGE = "Decide whether the company sharing policy permits sharing this re
 
 /** A permitted release's evidence. */
 const PERMITTED = {
+  purpose: "external audit",
   report: { text: "Synthetic customer report: quarterly total $120." },
   recipient: { email: "auditor@example.test", authorized: true },
   destination: { url: "https://auditor.example.test/reports", restricted: true },
 };
 
+/** What the program prints under the original policy, as the docs show it. */
+const FIRST_RUN = readFileSync(join(EXAMPLE, "output.txt"), "utf8");
+
 const test = serverTest({
   provider: (request: ReceivedRequest): Reply =>
-    request.body.includes(JUDGE) ? sharingPolicyJudge(request) : { status: 404 },
+    request.body.includes(JUDGE) ? sharingPolicyJudge(request, true) : { status: 404 },
   verificationRuntime: true,
 }).extend<{ reader: string }>({
   reader: [
     async ({ server: _ }, use) => {
       await configureGateway(WyrdClient.connect());
       const reader = mkdtempSync(join(tmpdir(), "wyrd-ts-finance-reader-"));
+      copyFileSync(join(EXAMPLE, "company-sharing-policy.pdf"), join(reader, "company-sharing-policy.pdf"));
       await use(reader);
     },
     { scope: "file" },
@@ -62,21 +67,24 @@ function verdictRequests(provider: { readonly received: readonly ReceivedRequest
 
 test("runs the finance release Quickstart from a reader's directory", async ({ reader, provider }) => {
   const first = await run(reader);
-  expect(first).toBe(
-    "passed: Synthetic customer report: quarterly total $120.\n" +
-      "failed: Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001.\n",
-  );
+  expect(first).toBe(FIRST_RUN);
   expect(await run(reader), "the rerun declares nothing new").toBe(first);
   const verdicts = verdictRequests(provider);
-  expect(verdicts).toHaveLength(4);
+  expect(verdicts).toHaveLength(8);
   expect(
-    verdicts.every((body) => body.includes("external-audit")),
-    "each verdict follows a read of the policy",
+    verdicts.every(
+      (body) => body.includes("external-audit") && body.includes("/inputs/company-sharing-policy.pdf.json"),
+    ),
+    "each verdict follows a read of the policy extraction",
+  ).toBe(true);
+  expect(
+    verdicts.some((body) => body.includes("marketing partnership")),
+    "the judge sees each release's purpose",
   ).toBe(true);
 });
 
 test("judges each finance requirement on its own", async ({ reader }) => {
-  // The declared Service, loaded from the reader's directory, where it saved its policy.
+  // The declared Service, loaded from the reader's directory, which holds its policy.
   process.chdir(reader);
   const { service } = await import(join(EXAMPLE, "finance_service.ts"));
   const state = await WyrdState.declare(service);

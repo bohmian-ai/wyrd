@@ -1,6 +1,6 @@
 ---
 title: Set up Wyrd
-description: Install the Wyrd 0.4.1 CLI and SDK for Python, Rust, or TypeScript, start a local server with your coding agent or by hand, and check it with a verification that needs no model.
+description: Install the Wyrd 0.4.2 CLI and SDK for Python, Rust, or TypeScript, start a local server with your coding agent or by hand, and check it with a verification that needs no model.
 pillar: wyrd
 section: Get started
 order: 2
@@ -23,7 +23,7 @@ Install Wyrd, then set up the rest with your coding agent or by hand. Either way
 
 ```bash
 uv init quickstart && cd quickstart
-uv add "wyrd-ai==0.4.1"
+uv add "wyrd-ai==0.4.2"
 ```
 
 Run the CLI as `uv run wyrd`.
@@ -32,9 +32,9 @@ Run the CLI as `uv run wyrd`.
 <LangTab lang="rust">
 
 ```bash
-cargo install wyrd-cli --version 0.4.1 --locked
+cargo install wyrd-cli --version 0.4.2 --locked
 cargo new quickstart && cd quickstart
-cargo add wyrd-ai@0.4.1 tokio serde schemars --features tokio/full,serde/derive
+cargo add wyrd-ai@0.4.2 tokio serde schemars --features tokio/full,serde/derive
 ```
 
 </LangTab>
@@ -43,7 +43,7 @@ cargo add wyrd-ai@0.4.1 tokio serde schemars --features tokio/full,serde/derive
 ```bash
 mkdir quickstart && cd quickstart
 pnpm init && pnpm pkg set type=module
-pnpm add wyrd-ai@0.4.1 zod
+pnpm add wyrd-ai@0.4.2
 ```
 
 Run the CLI as `pnpm wyrd`.
@@ -191,4 +191,4 @@ A `failed` verdict is a result, not an error: the second answer promises a guara
 
 ## Next
 
-[Run your first verification](/get-started/quickstart/) verifies a finance report against a policy PDF and decides whether to release it.
+[Run your first verification](/get-started/quickstart/) verifies a finance report against a policy PDF and releases it only when it passes.

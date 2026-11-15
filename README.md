@@ -1,5 +1,5 @@
 <p align="center">
-  <a href="https://docs.bohmian.ai/wyrd/"><img src=".github/assets/wyrd-banner.jpg" alt="Wyrd: Declare. Observe. Verify." width="100%"></a>
+  <a href="https://docs.bohmian.ai/wyrd/"><img src=".github/assets/wyrd-banner.jpg" alt="Wyrd: Declare. Observe. Verify. The only real-time verification system built for your applications." width="100%"></a>
 </p>
 
 <p align="center">
@@ -26,14 +26,16 @@ Wyrd gives you open-source building blocks for your own verification systems. **
 
 Live verification puts the verdict before the decision. Your application asks Wyrd whether what it is about to do meets your requirements, gets an evidence-backed verdict for each one, and decides what happens next. The same verdicts are available from queued and continuous checks.
 
-## Example
+## Get started
 
-An application shares synthetic customer reports with outside auditors. Before it sends one, it checks three requirements: the recipient is authorized, the company sharing policy permits the release, and the destination restricts access. A model judges the policy; the other two are assertions on records the application supplies.
+One finance Service and one Verifier: declare what a report release must satisfy, verify four releases, and read the verdicts.
+
+### 1. Declare
+
+The Service binds one Verifier. The Verifier declares the release it takes and three requirements: two assertions on records your application supplies, and an Agent that reads the company sharing policy PDF and judges the report and its purpose.
 
 <!-- example: examples/finance-release/finance_service.py -->
 ```python
-from pathlib import Path
-
 from pydantic import BaseModel
 from wyrd.verify import (
     Agent,
@@ -66,22 +68,15 @@ class Destination(BaseModel):
 
 
 class Release(BaseModel):
+    purpose: str
     report: Report
     recipient: Recipient
     destination: Destination
 
 
-# The company sharing policy. The program saves it beside itself the first
-# time; edit the file and run again to publish a new policy version.
-POLICY = """# Company sharing policy
-
-Reports may be shared outside the company only for external-audit purposes.
-A shared report must never contain a bank account identifier such as BANK-ACCOUNT-DEMO-001.
-"""
-policy_file = Path("company-sharing-policy.md")
-if not policy_file.exists():
-    policy_file.write_text(POLICY)
-policy = Artifact.from_path("company-sharing-policy", policy_file)
+# The company sharing policy, uploaded from this directory with its text
+# extracted so the judge can read it.
+policy = Artifact.from_path("company-sharing-policy", "company-sharing-policy.pdf").extract(True)
 
 # `policy-judge`: a model that reads the policy with `fs.read` and returns a
 # verdict on the report. Its model calls go through the `openai` gateway
@@ -91,9 +86,10 @@ policy_judge = Agent(
     prompt=Prompt.openai_chat(
         "gpt-4o",
         messages=(
-            "Read /inputs/policy.md with fs.read. Decide whether the company sharing "
-            "policy permits sharing this report with this recipient, citing the report "
-            "and the policy line you apply. Report: {{report}} Recipient: {{recipient}}"
+            "Read /inputs/company-sharing-policy.pdf.json with fs.read. Decide whether the company sharing "
+            "policy permits sharing this report with this recipient for this purpose, "
+            "citing the report and the policy line you apply. Purpose: {{purpose}} "
+            "Report: {{report}} Recipient: {{recipient}}"
         ),
         response_format=ResponseFormat.verdict(),
     ),
@@ -104,8 +100,8 @@ policy_judge = Agent(
 
 follows_policy = (
     Check.agent(policy_judge)
-    .inputs({"report": "inputs.report", "recipient": "inputs.recipient"})
-    .add_workspace("/inputs/policy.md", policy.file("company-sharing-policy.md"))
+    .inputs({"purpose": "inputs.purpose", "report": "inputs.report", "recipient": "inputs.recipient"})
+    .add_workspace("/inputs/company-sharing-policy.pdf.json", policy.file("extracted/company-sharing-policy.pdf.json"))
 )
 
 release_check = Verifier(
@@ -131,38 +127,102 @@ release_check = Verifier(
 )
 
 service = Service("finance-release", verified_by=[release_check])
-
 ```
 
-The application verifies each release with one call:
+<details>
+<summary>The same Verifier in YAML</summary>
+
+<!-- example: examples/finance-release/release-check.yaml -->
+```yaml
+# The release-check Verifier that finance_service.py declares in code. Upload
+# the policy with its extracted text first:
+#   wyrd artifact upload company-sharing-policy.pdf --name company-sharing-policy --version 0.1.0 --extract
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: release-check
+spec:
+  inputs:
+    purpose: {type: json}
+    report: {type: json}
+    recipient: {type: json}
+    destination: {type: json}
+  requirements:
+    - id: recipient-authorized
+      statement: The recipient is authorized to receive the report.
+      check: {kind: assert, path: inputs.recipient.authorized, operator: equals, expected: true}
+    - id: follows-policy
+      statement: The company sharing policy permits this release.
+      check:
+        kind: agent
+        agent: ./policy-judge.yaml
+        inputs: {purpose: inputs.purpose, report: inputs.report, recipient: inputs.recipient}
+        workspace:
+          /inputs/company-sharing-policy.pdf.json:
+            artifact:
+              card: {kind: Artifact, name: company-sharing-policy, version: 0.1.0}
+              path: extracted/company-sharing-policy.pdf.json
+    - id: destination-restricted
+      statement: The destination restricts access to the report.
+      check: {kind: assert, path: inputs.destination.restricted, operator: equals, expected: true}
+```
+
+</details>
+
+### 2. Observe
+
+Start a Run and send each release the application is about to make. `verify` waits for the verdict; [`submit`](https://docs.bohmian.ai/wyrd/understand/how-verification-works/#verify-and-submit) queues the check and returns at once.
 
 <!-- example: examples/finance-release/finance_release.py -->
 ```python
 from wyrd import WyrdState
+from wyrd.verify import VerificationResult
 
 from finance_service import Destination, Recipient, Release, Report, service
 
 # Upload the policy, declare every Card, and get a ready state.
 state = WyrdState.declare(service)
-run = state.run()
 
-recipient = Recipient(email="auditor@example.test", authorized=True)
-destination = Destination(url="https://auditor.example.test/reports", restricted=True)
-for text in (
-    "Synthetic customer report: quarterly total $120.",
-    "Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001.",
-):
-    release = Release(report=Report(text=text), recipient=recipient, destination=destination)
-    result = run.observe.verify("release-check", release)
-    print(f"{result.verdict}: {text}")
 
-state.shutdown()
+def verify_release(release: Release) -> VerificationResult:
+    with state.run() as run:
+        return run.observe.verify("release-check", release)
+
+
+if __name__ == "__main__":
+    recipient = Recipient(email="auditor@example.test", authorized=True)
+    destination = Destination(url="https://auditor.example.test/reports", restricted=True)
+    for purpose, text in (
+        ("external audit", "Synthetic customer report: quarterly total $120."),
+        ("external audit", "Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001."),
+        ("marketing partnership", "Synthetic customer report: quarterly total $120."),
+        ("regulator request", "Synthetic customer report: quarterly total $120."),
+    ):
+        release = Release(purpose=purpose, report=Report(text=text), recipient=recipient, destination=destination)
+        result = verify_release(release)
+        print(f"{purpose} · {text} → {result.verdict}")
+        for requirement in result.requirements:
+            if requirement["outcome"] != "passed":
+                print(f"  {requirement['id']}: {requirement['reason']}")
+    state.shutdown()
 ```
 
+### 3. Verify
+
+Only the first release passes. Each failed release names the requirement that failed and the reason. A failed check is a result, not an exception.
+
+<!-- example: examples/finance-release/output.txt -->
 ```text
-passed: Synthetic customer report: quarterly total $120.
-failed: Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001.
+external audit · Synthetic customer report: quarterly total $120. → passed
+external audit · Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001. → failed
+  follows-policy: the report names a bank account identifier, which the policy forbids
+marketing partnership · Synthetic customer report: quarterly total $120. → failed
+  follows-policy: the policy does not permit sharing for this purpose
+regulator request · Synthetic customer report: quarterly total $120. → failed
+  follows-policy: the policy does not permit sharing for this purpose
 ```
+
+The judge's wording varies. `verify` returns before your code acts, so the verdict is part of the request. Assertions add little time; the policy judge adds a model call, up to three tool turns, to that request. If the judge can't decide, the verdict is `inconclusive`, which is never a pass.
 
 The full example is in [`examples/finance-release`](https://github.com/bohmian-ai/wyrd/tree/main/examples/finance-release) for Python, Rust, and TypeScript. [Run your first verification](https://docs.bohmian.ai/wyrd/get-started/quickstart/) runs it against your own server and model.
 
@@ -171,11 +231,10 @@ The full example is in [`examples/finance-release`](https://github.com/bohmian-a
 The same primitives build other verification. Start from a use case:
 
 <p align="center">
+  <a href="https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/#runtime-verification"><img src="https://img.shields.io/badge/Runtime%20verification-555555" alt="Use case: Runtime verification"></a>
   <a href="https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/#policy-verification"><img src="https://img.shields.io/badge/Policy%20verification-555555" alt="Use case: Policy verification"></a>
   <a href="https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/#agent-evaluation"><img src="https://img.shields.io/badge/Agent%20evaluation-555555" alt="Use case: Agent evaluation"></a>
   <a href="https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/#long-horizon-workflows"><img src="https://img.shields.io/badge/Long--horizon%20workflows-555555" alt="Use case: Long-horizon workflows"></a>
-  <a href="https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/#runtime-verification"><img src="https://img.shields.io/badge/Runtime%20verification-555555" alt="Use case: Runtime verification"></a>
-  <a href="https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/#observability"><img src="https://img.shields.io/badge/Observability-555555" alt="Use case: Observability"></a>
   <a href="https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/#drift-monitoring"><img src="https://img.shields.io/badge/Drift%20monitoring-555555" alt="Use case: Drift monitoring"></a>
 </p>
 
@@ -189,7 +248,7 @@ The same primitives build other verification. Start from a use case:
 </picture>
 
 1. **Declare.** Describe what you ship in YAML and bind Verifiers to it, from CI with `wyrd declare` or from your code. Each declaration has a version, so a changed prompt is a new version.
-2. **Observe.** Your app sends Bifrost, Wyrd's data plane, everything it produces as it runs: telemetry, its own data, and the evidence it submits to verify. Bifrost keeps all of it queryable with SQL beside every verdict.
+2. **Observe.** Your app sends Bifrost, Wyrd's data plane, the telemetry, data, and evidence you choose to record. Bifrost keeps all of it queryable with SQL beside every verdict.
 3. **Verify.** Your app sends a result to a Verifier and gets a verdict for each requirement, with a reason.
 
 The Python, Rust, and TypeScript SDKs, the CLI, MCP, and HTTP all call one server, so a verdict reads the same from each. [Architecture](https://docs.bohmian.ai/wyrd/understand/architecture/) shows what a team deployment runs.
@@ -215,14 +274,14 @@ You need PostgreSQL 16 and one of Python 3.11, Rust 1.95, or Node.js 22.18, on m
 
 ```bash
 # Python
-uv add "wyrd-ai==0.4.1"
+uv add "wyrd-ai==0.4.2"
 
 # Rust
-cargo install wyrd-cli --version 0.4.1 --locked
-cargo add wyrd-ai@0.4.1 tokio serde schemars --features tokio/full,serde/derive
+cargo install wyrd-cli --version 0.4.2 --locked
+cargo add wyrd-ai@0.4.2 tokio serde schemars --features tokio/full,serde/derive
 
 # TypeScript
-pnpm add wyrd-ai@0.4.1 zod
+pnpm add wyrd-ai@0.4.2
 ```
 
 Start a local server with `wyrd init` (`uv run wyrd init` or `pnpm wyrd init`), or let your coding agent do it with `wyrd init guided`. [Set up Wyrd](https://docs.bohmian.ai/wyrd/get-started/setup/) has the details.
@@ -240,10 +299,11 @@ Keep them. Add Wyrd where they stop.
 | LiteLLM, Portkey | Model routing, inline guardrails | Tying every call to an account, a release, and a verdict |
 | Datadog, Grafana, Honeycomb | Infrastructure monitoring and alerts | Pass/fail verdicts on the same OpenTelemetry data |
 | Credo AI, watsonx.governance | AI inventory, policy programs | Proof from production for each control |
+| Guardrails AI, NeMo Guardrails | Predefined input/output filters | Your own requirements, judged with your evidence and files, returned to your code to decide |
 
 ## Where Wyrd stops
 
-Wyrd verifies your system; your code runs it. Your app owns its code, models, and data, and decides what to do with a verdict. Wyrd is not an application runtime, model host, training framework, or general-purpose code executor.
+Wyrd verifies your system; your code runs it. Your app owns its code, models, and data, and decides what to do with a verdict. Wyrd is not an application runtime, model host, training framework, or general-purpose code executor. Wyrd returns verdicts; it never blocks, retries, or reroutes your application. Your code decides.
 
 ## Contributing
 

@@ -1,6 +1,6 @@
 ---
 id: SPEC-positioning
-revision: 4
+revision: 5
 status: approved
 ---
 
@@ -77,7 +77,8 @@ Current architecture and repository rules own product truth. The completed
 [SDK ergonomics](../../completed/2026/sdk-authoring-ergonomics.md) changes supply
 existing authoring, declaration and language projections. Reuse their complete
 workflows, the finance examples, existing tutorial drafts and journey support.
-No runtime, SDK contract, evidence-storage or security change is authorized.
+No runtime, evidence-storage or security change is authorized. The only SDK
+contract changes are the additions INV-001 names.
 
 Approval of revision 3 transfers the following overlapping documentation work
 from `SPEC-docsite-incremental-reset` revision 9 to this change:
@@ -346,6 +347,13 @@ Track qualified discovery and successful trials, not stars or traffic alone.
   cache, public API, Card kind, durable data contract, dependency, migration,
   authorization, tenancy or platform behavior. Reuse existing owners; missing
   behavior requires a specification decision, not an implementation workaround.
+  Revision 5 approves exactly these SDK additions: typed input models (Rust
+  `InputSlot::fields_of`, `InputSlot::model`, and `InputSlot::fields`, the
+  schema projection Python model inputs share, TypeScript schema-source
+  inputs, one model instance projected onto its slots) and verdict predicates
+  (Python `passed`/`failed`/`inconclusive`, Rust
+  `is_passed`/`is_failed`/`is_inconclusive`, TypeScript `VerdictPredicates`).
+  Every path that builds a TypeScript result attaches the predicates.
 - **INV-002 — Be precise about evidence.** Use synthetic data and clearly
   label supplied recipient/destination facts. No claim of live third-party
   authorization inspection, autonomous transmission, PII redaction or universal
@@ -419,13 +427,17 @@ release that ships it. Unavailable account metrics are explicit handoff gaps, no
 choices or permission to omit required content.
 
 The maintainer approved revision 3 on 2026-11-12 and revision 4 on
-2026-11-13. Approval covers the complete positioning and documentation rollout,
+2026-11-13, and revision 5 on 2026-11-15. Approval covers the complete positioning and documentation rollout,
 bounded ownership transfer, invariants and acceptance evidence. Implementation
-tasks must reference revision 4; the old revision-2 scope must
+tasks must reference revision 5; the old revision-2 scope must
 not be executed as its plan. Spec approval does not approve implementation
 tasks or grant implementation readiness.
 
 ## Revision history
+
+- Revision 5 — Maintainer decision on 2026-11-15 (TASK-001 review D2): keep
+  the typed input models and verdict predicates as approved SDK additions
+  under INV-001. The PDF policy workflow from revision 4 stands.
 
 - Revision 4 — Maintainer correction on 2026-11-13: the documentation
   publishes with this change. Removed the live-provider walkthrough and

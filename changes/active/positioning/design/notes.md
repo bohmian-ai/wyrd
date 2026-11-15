@@ -4,7 +4,7 @@ Status: finalized
 
 ## Problem
 
-The finalized rollout direction and approved spec revision 3 remain in force.
+The finalized rollout direction and current approved spec revision 4 remain in force.
 The maintainer has also locked the below-hero finance animation as an addition
 to Task 1. Use the final left-to-right composition, with conventional Python
 formatting, real-time verification primary and Gateway/Bifrost secondary.
@@ -435,3 +435,43 @@ method with primary citations. See the [research brief](verification-foundations
 The guide must remain useful without adopting Wyrd; product mechanics and
 integration follow through links. This makes REQ-010/011 explicit without
 changing runtime scope or adding a top-level navigation section.
+
+The maintainer requested broader research prioritizing core peer-reviewed
+sources. The [foundations research brief](verification-foundations.md) now
+contains an annotated scholarly set spanning runtime verification, the test
+oracle problem, metamorphic checks, statistical model checking, leakage, drift,
+uncertainty, model judges, interactive agent evaluation and production ML
+requirements, plus labeled NASA engineering guidance. It records access/reading
+limits and maps sources to the teaching sequence. Task 2 prioritizes these
+foundations and requires claim-to-source validation. No public guide is written
+or product claim established by the bibliography alone.
+
+The maintainer approved and locked the dedicated foundations guide, core
+scholarly reading direction, teaching sequence and claim-to-source requirements.
+Task 2 records this approval and links the locked research brief. Preserve the
+tool-independent teaching purpose and separate product integration. Further
+claim-specific reading is publication work, not an open direction decision.
+Implementation remains pending.
+
+## Locked real-time-first emphasis across the tasks
+
+The maintainer approved a planning correction: runtime/real-time verification
+is central, not an afterthought after background evaluation. Tasks 1–4 now
+carry the same reader journey: declared requirements and evidence → verdict
+while the application can still decide → response, with separate retained
+evidence publication. The tool-independent foundation introduces runtime
+decision timing early; the real-time category page explains Wyrd's engine and
+contracts, then queued/scheduled alternatives.
+
+Explain low-latency infrastructure and adequate requirements as two connected
+challenges. Distinguish engine, evidence and check/provider costs, respect
+admission/error/visibility boundaries, and avoid hard-real-time guarantees or
+unsupported numeric/competitor claims. Existing proof gains comprehension and
+observed ordering checks rather than benchmark work. Approved spec revision 4,
+existing routes, fixed headline and runtime contracts are unchanged.
+
+A bounded independent comprehension pass over approved revision 4 and all four
+tasks found the real-time-first amendment consistent, with coherent dependencies
+and no material decision left open. All 37 mapped spec obligations remain
+owned; task revision/scenario structure and whitespace checks passed. This is
+planning evidence only, not implementation or performance qualification.

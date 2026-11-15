@@ -22,17 +22,15 @@ Page: /wyrd/get-started/introduction/
 
 Every system has its own requirements, workflows, and definitions of correct behavior. Turning them into repeatable checks usually means stitching together evaluation frameworks, observability tools, custom scripts, and data pipelines.
 
-Wyrd is the only real-time verification system built for your applications: open-source building blocks for your own verification systems. **Declare** requirements. **Observe** real behavior. **Verify** live, during execution, or continuously over time.
+Wyrd gives you open-source building blocks for your own verification systems. **Declare** requirements. **Observe** real behavior. **Verify** live, during execution, or continuously over time.
 
 Live verification puts the verdict before the decision. Your application asks Wyrd whether what it is about to do meets your requirements, gets an evidence-backed verdict for each one, and decides what happens next. The same verdicts are available from queued and continuous checks.
 
 ## An example
 
-An application shares synthetic customer reports with outside auditors. Before it sends one, it checks three requirements in one Verifier. A model reads the company sharing policy and judges the report; the other two are assertions on records the application supplies:
+An application shares synthetic customer reports with outside auditors. Before it sends one, it checks three requirements in one Verifier. A model reads the company sharing policy PDF and judges the report and its purpose; the other two are assertions on records the application supplies:
 
 ```python title="finance_service.py"
-from pathlib import Path
-
 from pydantic import BaseModel
 from wyrd.verify import (
     Agent,
@@ -61,21 +59,14 @@ class Destination(BaseModel):
     restricted: bool
 
 class Release(BaseModel):
+    purpose: str
     report: Report
     recipient: Recipient
     destination: Destination
 
-# The company sharing policy. The program saves it beside itself the first
-# time; edit the file and run again to publish a new policy version.
-POLICY = """# Company sharing policy
-
-Reports may be shared outside the company only for external-audit purposes.
-A shared report must never contain a bank account identifier such as BANK-ACCOUNT-DEMO-001.
-"""
-policy_file = Path("company-sharing-policy.md")
-if not policy_file.exists():
-    policy_file.write_text(POLICY)
-policy = Artifact.from_path("company-sharing-policy", policy_file)
+# The company sharing policy, uploaded from this directory with its text
+# extracted so the judge can read it.
+policy = Artifact.from_path("company-sharing-policy", "company-sharing-policy.pdf").extract(True)
 
 # `policy-judge`: a model that reads the policy with `fs.read` and returns a
 # verdict on the report. Its model calls go through the `openai` gateway
@@ -85,9 +76,10 @@ policy_judge = Agent(
     prompt=Prompt.openai_chat(
         "gpt-4o",
         messages=(
-            "Read /inputs/policy.md with fs.read. Decide whether the company sharing "
-            "policy permits sharing this report with this recipient, citing the report "
-            "and the policy line you apply. Report: {{report}} Recipient: {{recipient}}"
+            "Read /inputs/company-sharing-policy.pdf.json with fs.read. Decide whether the company sharing "
+            "policy permits sharing this report with this recipient for this purpose, "
+            "citing the report and the policy line you apply. Purpose: {{purpose}} "
+            "Report: {{report}} Recipient: {{recipient}}"
         ),
         response_format=ResponseFormat.verdict(),
     ),
@@ -98,8 +90,8 @@ policy_judge = Agent(
 
 follows_policy = (
     Check.agent(policy_judge)
-    .inputs({"report": "inputs.report", "recipient": "inputs.recipient"})
-    .add_workspace("/inputs/policy.md", policy.file("company-sharing-policy.md"))
+    .inputs({"purpose": "inputs.purpose", "report": "inputs.report", "recipient": "inputs.recipient"})
+    .add_workspace("/inputs/company-sharing-policy.pdf.json", policy.file("extracted/company-sharing-policy.pdf.json"))
 )
 
 release_check = Verifier(
@@ -128,37 +120,52 @@ service = Service("finance-release", verified_by=[release_check])
 
 ```
 
-The application verifies each release with one call:
+The application verifies each release with one call and releases it only on `passed`:
 
 ```python title="finance_release.py"
 from wyrd import WyrdState
+from wyrd.verify import VerificationResult
 
 from finance_service import Destination, Recipient, Release, Report, service
 
 # Upload the policy, declare every Card, and get a ready state.
 state = WyrdState.declare(service)
-run = state.run()
 
-recipient = Recipient(email="auditor@example.test", authorized=True)
-destination = Destination(url="https://auditor.example.test/reports", restricted=True)
-for text in (
-    "Synthetic customer report: quarterly total $120.",
-    "Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001.",
-):
-    release = Release(report=Report(text=text), recipient=recipient, destination=destination)
-    result = run.observe.verify("release-check", release)
-    print(f"{result.verdict}: {text}")
+def verify_release(release: Release) -> VerificationResult:
+    with state.run() as run:
+        return run.observe.verify("release-check", release)
 
-state.shutdown()
+if __name__ == "__main__":
+    recipient = Recipient(email="auditor@example.test", authorized=True)
+    destination = Destination(url="https://auditor.example.test/reports", restricted=True)
+    for purpose, text in (
+        ("external audit", "Synthetic customer report: quarterly total $120."),
+        ("external audit", "Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001."),
+        ("marketing partnership", "Synthetic customer report: quarterly total $120."),
+        ("regulator request", "Synthetic customer report: quarterly total $120."),
+    ):
+        release = Release(purpose=purpose, report=Report(text=text), recipient=recipient, destination=destination)
+        result = verify_release(release)
+        print(f"{purpose} · {text} → {result.verdict}")
+        for requirement in result.requirements:
+            if requirement["outcome"] != "passed":
+                print(f"  {requirement['id']}: {requirement['reason']}")
+    state.shutdown()
 
 ```
 
-```text
-passed: Synthetic customer report: quarterly total $120.
-failed: Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001.
+```text title="output"
+external audit · Synthetic customer report: quarterly total $120. → passed
+external audit · Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001. → failed
+  follows-policy: the report names a bank account identifier, which the policy forbids
+marketing partnership · Synthetic customer report: quarterly total $120. → failed
+  follows-policy: the policy does not permit sharing for this purpose
+regulator request · Synthetic customer report: quarterly total $120. → failed
+  follows-policy: the policy does not permit sharing for this purpose
+
 ```
 
-The second report names a bank account, which the policy forbids. [Run your first verification](/wyrd/get-started/quickstart/) runs the full program in Python, Rust, or TypeScript. A Verifier can also run Python, judge a whole session, or compare samples with a baseline on a schedule; [What can I build?](/wyrd/get-started/what-can-i-build/) matches each to a problem.
+The judge's wording varies. The policy forbids bank account identifiers and permits sharing only for external audits. [Run your first verification](/wyrd/get-started/quickstart/) runs the full program in Python, Rust, or TypeScript. A Verifier can also run Python, judge a whole session, or compare samples with a baseline on a schedule; [What can I build?](/wyrd/get-started/what-can-i-build/) matches each to a problem.
 
 ## How Wyrd fits your stack
 
@@ -183,10 +190,11 @@ Keep them. Add Wyrd where they stop.
 | LiteLLM, Portkey | Model routing, inline guardrails | Tying every call to an account, a release, and a verdict |
 | Datadog, Grafana, Honeycomb | Infrastructure monitoring and alerts | Pass/fail verdicts on the same OpenTelemetry data |
 | Credo AI, watsonx.governance | AI inventory, policy programs | Proof from production for each control |
+| Guardrails AI, NeMo Guardrails | Predefined input/output filters | Your own requirements, judged with your evidence and files, returned to your code to decide |
 
 ## Where Wyrd stops
 
-Wyrd verifies your system; your code runs it. Your app owns its code, models, and data, runs and deploys them, and decides what to do with a verdict. Wyrd is not an application runtime, model host, training framework, or general-purpose code executor.
+Wyrd verifies your system; your code runs it. Your app owns its code, models, and data, runs and deploys them, and decides what to do with a verdict. Wyrd is not an application runtime, model host, training framework, or general-purpose code executor. Wyrd returns verdicts; it never blocks, retries, or reroutes your application. Your code decides.
 
 ## Next
 
@@ -196,7 +204,7 @@ Wyrd verifies your system; your code runs it. Your app owns its code, models, an
 
 Page: /wyrd/get-started/setup/
 
-> Install the Wyrd 0.4.1 CLI and SDK for Python, Rust, or TypeScript, start a local server with your coding agent or by hand, and check it with a verification that needs no model.
+> Install the Wyrd 0.4.2 CLI and SDK for Python, Rust, or TypeScript, start a local server with your coding agent or by hand, and check it with a verification that needs no model.
 
 Install Wyrd, then set up the rest with your coding agent or by hand. Either way you end with a local server running and your code connected to it.
 
@@ -214,7 +222,7 @@ Install Wyrd, then set up the rest with your coding agent or by hand. Either way
 
 ```bash
 uv init quickstart && cd quickstart
-uv add "wyrd-ai==0.4.1"
+uv add "wyrd-ai==0.4.2"
 ```
 
 Run the CLI as `uv run wyrd`.
@@ -222,9 +230,9 @@ Run the CLI as `uv run wyrd`.
 **Rust**
 
 ```bash
-cargo install wyrd-cli --version 0.4.1 --locked
+cargo install wyrd-cli --version 0.4.2 --locked
 cargo new quickstart && cd quickstart
-cargo add wyrd-ai@0.4.1 tokio serde schemars --features tokio/full,serde/derive
+cargo add wyrd-ai@0.4.2 tokio serde schemars --features tokio/full,serde/derive
 ```
 
 **TypeScript**
@@ -232,7 +240,7 @@ cargo add wyrd-ai@0.4.1 tokio serde schemars --features tokio/full,serde/derive
 ```bash
 mkdir quickstart && cd quickstart
 pnpm init && pnpm pkg set type=module
-pnpm add wyrd-ai@0.4.1 zod
+pnpm add wyrd-ai@0.4.2
 ```
 
 Run the CLI as `pnpm wyrd`.
@@ -457,13 +465,13 @@ A `failed` verdict is a result, not an error: the second answer promises a guara
 
 ## Next
 
-[Run your first verification](/wyrd/get-started/quickstart/) verifies a finance report against a policy PDF and decides whether to release it.
+[Run your first verification](/wyrd/get-started/quickstart/) verifies a finance report against a policy PDF and releases it only when it passes.
 
 # Run your first verification
 
 Page: /wyrd/get-started/quickstart/
 
-> Verify a finance report against three requirements, including a model that reads a sharing policy, in one call, and release it only when the verdict passes. Python, Rust, or TypeScript.
+> Verify a finance report against three requirements, including a model that reads a sharing policy PDF, in one call, and release it only when the verdict passes. Python, Rust, or TypeScript.
 
 Your application is about to send a customer report to an outside auditor. Before it does, it asks Wyrd one question: does this release meet the requirements? Wyrd returns a verdict, and your code releases the report or holds it for review.
 
@@ -472,10 +480,10 @@ You build one Service, `finance-release`, verified by one Verifier, `release-che
 | Requirement | How it is judged |
 | --- | --- |
 | `recipient-authorized` | An assertion on the recipient record your application supplies |
-| `follows-policy` | A model reads the company sharing policy and judges the report |
+| `follows-policy` | A model reads the company sharing policy PDF and judges the report and its purpose |
 | `destination-restricted` | An assertion on the destination record your application supplies |
 
-One call judges all three. The reports, recipients, and destinations are synthetic, and nothing is sent anywhere: the program prints each verdict.
+One call judges all three. The reports, recipients, and destinations are synthetic, and nothing is sent anywhere: the program prints each decision.
 
 ## Prerequisites
 
@@ -503,19 +511,23 @@ The key stays on the server. [LLM gateway](/wyrd/connect/set-up-the-llm-gateway/
 
 ## 2. Declare and verify
 
-Save the declaration and the program in `quickstart`, and run the program. The declaration builds the Service, the Verifier, and the judge Agent; the program declares them and verifies two releases. The second report names a bank account:
+Download the sharing policy into `quickstart`:
+
+```bash
+curl -LO https://raw.githubusercontent.com/bohmian-ai/wyrd/v0.4.2/examples/finance-release/company-sharing-policy.pdf
+```
+
+Save the declaration and the program beside it, and run the program. The declaration builds the Service, the Verifier, and the judge Agent; the program declares them and verifies four releases. One report names a bank account, and two are shared for purposes other than an external audit:
 
 **Python**
 
 The program declares its inputs as Pydantic models. Add Pydantic with the SDK's extra:
 
 ```bash
-uv add "wyrd-ai[pydantic]==0.4.1"
+uv add "wyrd-ai[pydantic]==0.4.2"
 ```
 
 ```python title="finance_service.py"
-from pathlib import Path
-
 from pydantic import BaseModel
 from wyrd.verify import (
     Agent,
@@ -544,21 +556,14 @@ class Destination(BaseModel):
     restricted: bool
 
 class Release(BaseModel):
+    purpose: str
     report: Report
     recipient: Recipient
     destination: Destination
 
-# The company sharing policy. The program saves it beside itself the first
-# time; edit the file and run again to publish a new policy version.
-POLICY = """# Company sharing policy
-
-Reports may be shared outside the company only for external-audit purposes.
-A shared report must never contain a bank account identifier such as BANK-ACCOUNT-DEMO-001.
-"""
-policy_file = Path("company-sharing-policy.md")
-if not policy_file.exists():
-    policy_file.write_text(POLICY)
-policy = Artifact.from_path("company-sharing-policy", policy_file)
+# The company sharing policy, uploaded from this directory with its text
+# extracted so the judge can read it.
+policy = Artifact.from_path("company-sharing-policy", "company-sharing-policy.pdf").extract(True)
 
 # `policy-judge`: a model that reads the policy with `fs.read` and returns a
 # verdict on the report. Its model calls go through the `openai` gateway
@@ -568,9 +573,10 @@ policy_judge = Agent(
     prompt=Prompt.openai_chat(
         "gpt-4o",
         messages=(
-            "Read /inputs/policy.md with fs.read. Decide whether the company sharing "
-            "policy permits sharing this report with this recipient, citing the report "
-            "and the policy line you apply. Report: {{report}} Recipient: {{recipient}}"
+            "Read /inputs/company-sharing-policy.pdf.json with fs.read. Decide whether the company sharing "
+            "policy permits sharing this report with this recipient for this purpose, "
+            "citing the report and the policy line you apply. Purpose: {{purpose}} "
+            "Report: {{report}} Recipient: {{recipient}}"
         ),
         response_format=ResponseFormat.verdict(),
     ),
@@ -581,8 +587,8 @@ policy_judge = Agent(
 
 follows_policy = (
     Check.agent(policy_judge)
-    .inputs({"report": "inputs.report", "recipient": "inputs.recipient"})
-    .add_workspace("/inputs/policy.md", policy.file("company-sharing-policy.md"))
+    .inputs({"purpose": "inputs.purpose", "report": "inputs.report", "recipient": "inputs.recipient"})
+    .add_workspace("/inputs/company-sharing-policy.pdf.json", policy.file("extracted/company-sharing-policy.pdf.json"))
 )
 
 release_check = Verifier(
@@ -613,24 +619,33 @@ service = Service("finance-release", verified_by=[release_check])
 
 ```python title="finance_release.py"
 from wyrd import WyrdState
+from wyrd.verify import VerificationResult
 
 from finance_service import Destination, Recipient, Release, Report, service
 
 # Upload the policy, declare every Card, and get a ready state.
 state = WyrdState.declare(service)
-run = state.run()
 
-recipient = Recipient(email="auditor@example.test", authorized=True)
-destination = Destination(url="https://auditor.example.test/reports", restricted=True)
-for text in (
-    "Synthetic customer report: quarterly total $120.",
-    "Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001.",
-):
-    release = Release(report=Report(text=text), recipient=recipient, destination=destination)
-    result = run.observe.verify("release-check", release)
-    print(f"{result.verdict}: {text}")
+def verify_release(release: Release) -> VerificationResult:
+    with state.run() as run:
+        return run.observe.verify("release-check", release)
 
-state.shutdown()
+if __name__ == "__main__":
+    recipient = Recipient(email="auditor@example.test", authorized=True)
+    destination = Destination(url="https://auditor.example.test/reports", restricted=True)
+    for purpose, text in (
+        ("external audit", "Synthetic customer report: quarterly total $120."),
+        ("external audit", "Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001."),
+        ("marketing partnership", "Synthetic customer report: quarterly total $120."),
+        ("regulator request", "Synthetic customer report: quarterly total $120."),
+    ):
+        release = Release(purpose=purpose, report=Report(text=text), recipient=recipient, destination=destination)
+        result = verify_release(release)
+        print(f"{purpose} · {text} → {result.verdict}")
+        for requirement in result.requirements:
+            if requirement["outcome"] != "passed":
+                print(f"  {requirement['id']}: {requirement['reason']}")
+    state.shutdown()
 
 ```
 
@@ -642,7 +657,6 @@ uv run finance_release.py
 
 ```rust title="src/finance_service.rs"
 use std::error::Error;
-use std::path::Path;
 
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -655,52 +669,54 @@ use wyrd_ai::verify::{
 /// The report to send.
 #[derive(Serialize, JsonSchema)]
 pub struct Report {
+    /// The synthetic report text the policy judge reads.
     pub text: String,
 }
 
 /// Who receives the report.
 #[derive(Serialize, JsonSchema)]
 pub struct Recipient {
+    /// The recipient's address, shown to the policy judge.
     pub email: String,
+    /// Whether the application's records authorize this recipient;
+    /// `recipient-authorized` requires `true`.
     pub authorized: bool,
 }
 
 /// Where the report goes.
 #[derive(Serialize, JsonSchema)]
 pub struct Destination {
+    /// The destination's address.
     pub url: String,
+    /// Whether the destination restricts access; `destination-restricted`
+    /// requires `true`.
     pub restricted: bool,
 }
 
-/// One proposed report release: the `release-check` input.
+/// One proposed report release: the `release-check` input. Each field is
+/// one input slot.
 #[derive(Serialize, JsonSchema)]
 pub struct Release {
+    /// Why the report is shared; the policy judge checks it against the
+    /// policy's permitted purposes.
+    pub purpose: String,
+    /// The report to send.
     pub report: Report,
+    /// Who receives it.
     pub recipient: Recipient,
+    /// Where it goes.
     pub destination: Destination,
 }
-
-/// The company sharing policy the judge applies.
-const POLICY: &str = "# Company sharing policy
-
-Reports may be shared outside the company only for external-audit purposes.
-A shared report must never contain a bank account identifier such as BANK-ACCOUNT-DEMO-001.
-";
 
 /// The `finance-release` Service, verified by `release-check`.
 ///
 /// # Errors
-/// Returns a refused policy write, or the policy judge's Prompt or route
-/// refusal.
+/// Returns the policy judge's Prompt or route refusal.
 pub fn service() -> Result<Service, Box<dyn Error>> {
-    // The company sharing policy. The program saves it beside itself the
-    // first time; edit the file and run again to publish a new policy
-    // version.
-    let policy_file = Path::new("company-sharing-policy.md");
-    if !policy_file.exists() {
-        std::fs::write(policy_file, POLICY)?;
-    }
-    let policy = Artifact::from_path("company-sharing-policy", None, policy_file);
+    // The company sharing policy, uploaded from this directory with its
+    // text extracted so the judge can read it.
+    let policy = Artifact::from_path("company-sharing-policy", None, "company-sharing-policy.pdf")
+        .extract(true);
     Ok(Service::new("finance-release", None).verified_by([release_check(&policy)?]))
 }
 
@@ -711,12 +727,13 @@ pub fn service() -> Result<Service, Box<dyn Error>> {
 /// Returns the policy judge's Prompt or route refusal.
 fn release_check(policy: &Artifact) -> Result<Verifier, Box<dyn Error>> {
     let mut follows_policy = Check::agent(policy_judge()?).inputs([
+        ("purpose", "inputs.purpose"),
         ("report", "inputs.report"),
         ("recipient", "inputs.recipient"),
     ]);
     follows_policy.add_workspace(
-        "/inputs/policy.md",
-        policy.file("company-sharing-policy.md"),
+        "/inputs/company-sharing-policy.pdf.json",
+        policy.file("extracted/company-sharing-policy.pdf.json"),
     );
 
     Ok(Verifier::new("release-check", None)
@@ -759,9 +776,10 @@ fn policy_judge() -> Result<Agent, Box<dyn Error>> {
         "gpt-4o",
         OpenAiChatOptions {
             messages: vec![
-                "Read /inputs/policy.md with fs.read. Decide whether the company sharing \
-                 policy permits sharing this report with this recipient, citing the report \
-                 and the policy line you apply. Report: {{report}} Recipient: {{recipient}}"
+                "Read /inputs/company-sharing-policy.pdf.json with fs.read. Decide whether the company sharing \
+                 policy permits sharing this report with this recipient for this purpose, \
+                 citing the report and the policy line you apply. Purpose: {{purpose}} \
+                 Report: {{report}} Recipient: {{recipient}}"
                     .into(),
             ],
             response_format: Some(ResponseFormat::verdict(None)),
@@ -783,8 +801,8 @@ fn policy_judge() -> Result<Agent, Box<dyn Error>> {
 ```
 
 ```rust title="src/main.rs"
-//! Verify two proposed report releases against the `finance-release`
-//! Service that `finance_service.rs` declares.
+//! Verify four proposed report releases against the `finance-release`
+//! Service that `finance_service.rs` declares, and print each verdict.
 
 mod finance_service;
 
@@ -792,26 +810,52 @@ use std::error::Error;
 
 use wyrd_ai::serde_json;
 use wyrd_ai::state::WyrdState;
+use wyrd_ai::{RequirementOutcome, VerificationResult};
 
 use finance_service::{Destination, Recipient, Release, Report};
 
-/// Declare the finance release, then verify two releases and print each
-/// verdict.
+/// Verify one release against `release-check` in a new Run.
+///
+/// # Errors
+/// Returns the server's refusal of the check, such as a missing permission.
+async fn verify_release(
+    state: &WyrdState,
+    release: Release,
+) -> Result<VerificationResult, Box<dyn Error>> {
+    let input = serde_json::to_value(release)?;
+    Ok(state.run().observe().verify("release-check", input).await?)
+}
+
+/// Declare the finance release, then verify four releases and print each
+/// verdict with the reason for every requirement that did not pass.
 ///
 /// # Errors
 /// Returns the ambient client's configuration or credential error, the
-/// declaration's refusal, or a refused verification.
+/// declaration's refusal, or a refused check.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     // Upload the policy, declare every Card, and get a ready state.
     let state = WyrdState::declare(&finance_service::service()?).await?;
-    let run = state.run();
-
-    for text in [
-        "Synthetic customer report: quarterly total $120.",
-        "Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001.",
+    for (purpose, text) in [
+        (
+            "external audit",
+            "Synthetic customer report: quarterly total $120.",
+        ),
+        (
+            "external audit",
+            "Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001.",
+        ),
+        (
+            "marketing partnership",
+            "Synthetic customer report: quarterly total $120.",
+        ),
+        (
+            "regulator request",
+            "Synthetic customer report: quarterly total $120.",
+        ),
     ] {
         let release = Release {
+            purpose: purpose.into(),
             report: Report { text: text.into() },
             recipient: Recipient {
                 email: "auditor@example.test".into(),
@@ -822,11 +866,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 restricted: true,
             },
         };
-        let result = run
-            .observe()
-            .verify("release-check", serde_json::to_value(release)?)
-            .await?;
-        println!("{}: {text}", result.outcome.verdict);
+        let result = verify_release(&state, release).await?;
+        println!("{purpose} · {text} → {}", result.outcome.verdict);
+        for requirement in &result.outcome.requirements {
+            if requirement.outcome != RequirementOutcome::Passed {
+                println!("  {}: {}", requirement.id.as_str(), requirement.reason);
+            }
+        }
     }
     Ok(())
 }
@@ -839,9 +885,13 @@ cargo run
 
 **TypeScript**
 
-```typescript title="finance_service.ts"
-import { existsSync, writeFileSync } from "node:fs";
+The program declares its inputs as a Zod schema. Add Zod:
 
+```bash
+pnpm add zod
+```
+
+```typescript title="finance_service.ts"
 import { verify } from "wyrd-ai";
 import { z } from "zod";
 
@@ -849,24 +899,16 @@ const { Agent, Artifact, Check, Prompt, Requirement, Service, Verifier } = verif
 
 // One proposed report release: the `release-check` input.
 export const Release = z.object({
+  purpose: z.string(),
   report: z.object({ text: z.string() }),
   recipient: z.object({ email: z.string(), authorized: z.boolean() }),
   destination: z.object({ url: z.string(), restricted: z.boolean() }),
 });
 export type Release = z.infer<typeof Release>;
 
-// The company sharing policy. The program saves it beside itself the first
-// time; edit the file and run again to publish a new policy version.
-const POLICY = `# Company sharing policy
-
-Reports may be shared outside the company only for external-audit purposes.
-A shared report must never contain a bank account identifier such as BANK-ACCOUNT-DEMO-001.
-`;
-const policyFile = "company-sharing-policy.md";
-if (!existsSync(policyFile)) {
-  writeFileSync(policyFile, POLICY);
-}
-const policy = Artifact.fromPath("company-sharing-policy", policyFile);
+// The company sharing policy, uploaded from this directory with its text
+// extracted so the judge can read it.
+const policy = Artifact.fromPath("company-sharing-policy", "company-sharing-policy.pdf").extract(true);
 
 // `policy-judge`: a model that reads the policy with `fs.read` and returns a
 // verdict on the report. Its model calls go through the `openai` gateway
@@ -874,9 +916,10 @@ const policy = Artifact.fromPath("company-sharing-policy", policyFile);
 const policyJudge = new Agent("policy-judge", {
   prompt: Prompt.openaiChat("gpt-4o", {
     messages:
-      "Read /inputs/policy.md with fs.read. Decide whether the company sharing " +
-      "policy permits sharing this report with this recipient, citing the report " +
-      "and the policy line you apply. Report: {{report}} Recipient: {{recipient}}",
+      "Read /inputs/company-sharing-policy.pdf.json with fs.read. Decide whether the company sharing " +
+      "policy permits sharing this report with this recipient for this purpose, " +
+      "citing the report and the policy line you apply. Purpose: {{purpose}} " +
+      "Report: {{report}} Recipient: {{recipient}}",
     responseFormat: { type: "verdict" },
   }),
   execution_route: { kind: "wyrd_gateway", deployment: "openai" },
@@ -885,8 +928,8 @@ const policyJudge = new Agent("policy-judge", {
 });
 
 const followsPolicy = Check.agent(policyJudge)
-  .inputs({ report: "inputs.report", recipient: "inputs.recipient" })
-  .addWorkspace("/inputs/policy.md", policy.file("company-sharing-policy.md"));
+  .inputs({ purpose: "inputs.purpose", report: "inputs.report", recipient: "inputs.recipient" })
+  .addWorkspace("/inputs/company-sharing-policy.pdf.json", policy.file("extracted/company-sharing-policy.pdf.json"));
 
 const releaseCheck = new Verifier("release-check", {
   inputs: Release,
@@ -910,25 +953,34 @@ export const service = new Service("finance-release", { verified_by: [releaseChe
 ```
 
 ```typescript title="finance_release.ts"
-import { WyrdState } from "wyrd-ai";
+import { type VerificationResult, WyrdState } from "wyrd-ai";
 
 import { type Release, service } from "./finance_service.ts";
 
 // Upload the policy, declare every Card, and get a ready state.
 const state = await WyrdState.declare(service);
-const run = state.run();
+
+async function verifyRelease(release: Release): Promise<VerificationResult> {
+  return state.run().observe.verify("release-check", release);
+}
 
 const recipient = { email: "auditor@example.test", authorized: true };
 const destination = { url: "https://auditor.example.test/reports", restricted: true };
-for (const text of [
-  "Synthetic customer report: quarterly total $120.",
-  "Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001.",
+for (const [purpose, text] of [
+  ["external audit", "Synthetic customer report: quarterly total $120."],
+  ["external audit", "Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001."],
+  ["marketing partnership", "Synthetic customer report: quarterly total $120."],
+  ["regulator request", "Synthetic customer report: quarterly total $120."],
 ]) {
-  const release: Release = { report: { text }, recipient, destination };
-  const result = await run.observe.verify("release-check", release);
-  console.log(`${result.outcome.verdict}: ${text}`);
+  const release: Release = { purpose, report: { text }, recipient, destination };
+  const result = await verifyRelease(release);
+  console.log(`${purpose} · ${text} → ${result.outcome.verdict}`);
+  for (const requirement of result.outcome.requirements) {
+    if (requirement.outcome !== "passed") {
+      console.log(`  ${requirement.id}: ${requirement.reason}`);
+    }
+  }
 }
-
 await state.shutdown();
 
 ```
@@ -937,22 +989,28 @@ await state.shutdown();
 node finance_release.ts
 ```
 
-The program saves the policy as `company-sharing-policy.md`, uploads it, and declares the Service, the Verifier, and the judge Agent. Then it verifies each release with one call and prints its verdict:
+The program uploads the policy with its extracted text and declares the Service, the Verifier, and the judge Agent. Then it verifies each release with one call and prints the verdict, with the reason for each requirement that did not pass:
 
-```text
-passed: Synthetic customer report: quarterly total $120.
-failed: Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001.
+```text title="output"
+external audit · Synthetic customer report: quarterly total $120. → passed
+external audit · Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001. → failed
+  follows-policy: the report names a bank account identifier, which the policy forbids
+marketing partnership · Synthetic customer report: quarterly total $120. → failed
+  follows-policy: the policy does not permit sharing for this purpose
+regulator request · Synthetic customer report: quarterly total $120. → failed
+  follows-policy: the policy does not permit sharing for this purpose
+
 ```
 
-The second release passes both assertions and fails `follows-policy`: the judge read the policy and found the bank account.
+The judge's wording varies. The failed releases pass both assertions and fail `follows-policy`: the judge read the policy, found the bank account, and found that the policy permits sharing only for external audits.
 
-Only a `passed` verdict releases a report. Wyrd never sends or blocks anything itself; your code decides.
+`verify` returns before your code acts, so the verdict is part of the request. Assertions add little time; the policy judge adds a model call, up to three tool turns, to that request. If the judge can't decide, the verdict is `inconclusive`, which is never a pass. [`submit`](/wyrd/understand/how-verification-works/#verify-and-submit) queues the same check when the request can't wait.
 
 Run the program again. Nothing changed, so it declares nothing new.
 
 ## 3. Check the other requirements
 
-In `finance_release`, set the recipient's `authorized` to `false` and run again. Both releases fail `recipient-authorized`. Set the destination's `restricted` to `false` instead, and `destination-restricted` fails. Each requirement is judged on its own.
+In the program (`src/main.rs` in Rust), set the recipient's `authorized` to `false` and run again. Every release fails `recipient-authorized`. Set the destination's `restricted` to `false` instead, and `destination-restricted` fails. Each requirement is judged on its own.
 
 ## 4. Confirm the stored verdicts
 
@@ -966,7 +1024,7 @@ Save this query as `stored-verdicts.sql`, with `<uid>` replaced by the Service's
 
 ```sql title="stored-verdicts.sql"
 -- Replace <uid> with the Service's metadata.uid from wyrd get.
-SELECT result_id, run_id, subject_card_uid, verdict FROM bifrost.verification.results WHERE subject_card_uid = '<uid>' ORDER BY ended_at DESC LIMIT 20
+SELECT result_id, execution_id, run_id, subject_card_uid, verifier_card_uid, verdict FROM bifrost.verification.results WHERE subject_card_uid = '<uid>' ORDER BY ended_at DESC LIMIT 20
 
 ```
 
@@ -978,9 +1036,28 @@ wyrd query --server http://127.0.0.1:8080 --file stored-verdicts.sql
 
 It prints one JSON row per stored verdict, newest first. The server publishes rows shortly after the program ends: if a verdict is missing, repeat the query for up to a minute.
 
+Each row names its `execution_id`. To see the exact policy file a verdict used, read that execution's details: `Execution.details()` in the SDK, or [`verification.get_execution_details`](/wyrd/reference/mcp-tools/) over MCP. They name the Verifier version and the policy Artifact version its judge read.
+
 ## 5. Update the policy
 
-Edit `company-sharing-policy.md` and run the program again. The server registers the edited file as a new policy version, and with it new versions `release-check@0.1.1` and `finance-release@0.1.1`. `release-check@0.1.0` still mounts the policy it judged against.
+The revised policy also permits sharing for regulator requests. Download it over the original, and run the program again:
+
+```bash
+curl -L -o company-sharing-policy.pdf https://raw.githubusercontent.com/bohmian-ai/wyrd/v0.4.2/examples/finance-release/company-sharing-policy-revised.pdf
+```
+
+The server registers the changed file as a new policy version, and with it `release-check@0.1.1` and `finance-release@0.1.1`. The regulator request now passes:
+
+```text
+external audit · Synthetic customer report: quarterly total $120. → passed
+external audit · Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001. → failed
+  follows-policy: the report names a bank account identifier, which the policy forbids
+marketing partnership · Synthetic customer report: quarterly total $120. → failed
+  follows-policy: the policy does not permit sharing for this purpose
+regulator request · Synthetic customer report: quarterly total $120. → passed
+```
+
+The judge's wording varies. `release-check@0.1.0` still mounts the original policy, and the details of each execution it ran name that file.
 
 ## If it fails
 
@@ -988,6 +1065,7 @@ Edit `company-sharing-policy.md` and run the program again. The server registers
 | --- | --- |
 | `WYRD_GATEWAY_404_MODEL_UNAVAILABLE` | Create the `openai` deployment as in step 1 |
 | `WYRD_CLIENT_401_NO_CREDENTIALS` | Use the same `WYRD_CONFIG_HOME` as the server terminal |
+| `WYRD_LOADER_400_INVALID_ENVELOPE` | Run from the directory that holds `company-sharing-policy.pdf` |
 
 ## Next
 
@@ -1476,7 +1554,7 @@ You need the server and the `quickstart` directory from [Set up Wyrd](/wyrd/get-
 The Python program uses Pydantic models. Add them with the `pydantic` extra:
 
 ```bash
-uv add "wyrd-ai[pydantic]==0.4.1"
+uv add "wyrd-ai[pydantic]==0.4.2"
 ```
 
 Without Pydantic, map each input slot to its own schema, `inputs={"answer": {"type": "string"}}`. `Table` takes the row's whole object schema, and `write` takes a dictionary row.
@@ -2051,9 +2129,10 @@ policy_judge = Agent(
     prompt=Prompt.openai_chat(
         "gpt-4o",
         messages=(
-            "Read /inputs/policy.md with fs.read. Decide whether the company sharing "
-            "policy permits sharing this report with this recipient, citing the report "
-            "and the policy line you apply. Report: {{report}} Recipient: {{recipient}}"
+            "Read /inputs/company-sharing-policy.pdf.json with fs.read. Decide whether the company sharing "
+            "policy permits sharing this report with this recipient for this purpose, "
+            "citing the report and the policy line you apply. Purpose: {{purpose}} "
+            "Report: {{report}} Recipient: {{recipient}}"
         ),
         response_format=ResponseFormat.verdict(),
     ),
@@ -2089,7 +2168,7 @@ Wrap each request your app handles in a Run. Everything inside it (the model cal
 You need the support-desk Service from [Write a Verifier](/wyrd/build-and-verify/verify/author-a-verifier/) and a running server from [Set up Wyrd](/wyrd/get-started/setup/). Install the SDK with its telemetry and gateway extras, and the OpenAI client:
 
 ```bash
-uv add "wyrd-ai[otel,gateway]==0.4.1" openai
+uv add "wyrd-ai[otel,gateway]==0.4.2" openai
 ```
 
 ## 1. Connect at startup
@@ -3085,7 +3164,7 @@ Calls made before this step are never recorded.
 ## 4. Make a request
 
 ```bash
-uv add "wyrd-ai[gateway]==0.4.1" openai
+uv add "wyrd-ai[gateway]==0.4.2" openai
 ```
 
 ```python title="call.py"
@@ -3177,7 +3256,7 @@ Add `WyrdMiddleware` to any ASGI app, such as FastAPI, Starlette, Django, or Lit
 ## Install
 
 ```bash
-uv add "wyrd-ai[otel]==0.4.1" uvicorn
+uv add "wyrd-ai[otel]==0.4.2" uvicorn
 ```
 
 Add your framework too, such as `uv add fastapi`. Then pull the Service into the app's directory, at build or deploy time rather than when the app starts:

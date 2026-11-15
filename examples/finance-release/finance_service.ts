@@ -1,5 +1,3 @@
-import { existsSync, writeFileSync } from "node:fs";
-
 import { verify } from "wyrd-ai";
 import { z } from "zod";
 
@@ -7,24 +5,16 @@ const { Agent, Artifact, Check, Prompt, Requirement, Service, Verifier } = verif
 
 // One proposed report release: the `release-check` input.
 export const Release = z.object({
+  purpose: z.string(),
   report: z.object({ text: z.string() }),
   recipient: z.object({ email: z.string(), authorized: z.boolean() }),
   destination: z.object({ url: z.string(), restricted: z.boolean() }),
 });
 export type Release = z.infer<typeof Release>;
 
-// The company sharing policy. The program saves it beside itself the first
-// time; edit the file and run again to publish a new policy version.
-const POLICY = `# Company sharing policy
-
-Reports may be shared outside the company only for external-audit purposes.
-A shared report must never contain a bank account identifier such as BANK-ACCOUNT-DEMO-001.
-`;
-const policyFile = "company-sharing-policy.md";
-if (!existsSync(policyFile)) {
-  writeFileSync(policyFile, POLICY);
-}
-const policy = Artifact.fromPath("company-sharing-policy", policyFile);
+// The company sharing policy, uploaded from this directory with its text
+// extracted so the judge can read it.
+const policy = Artifact.fromPath("company-sharing-policy", "company-sharing-policy.pdf").extract(true);
 
 // `policy-judge`: a model that reads the policy with `fs.read` and returns a
 // verdict on the report. Its model calls go through the `openai` gateway
@@ -32,9 +22,10 @@ const policy = Artifact.fromPath("company-sharing-policy", policyFile);
 const policyJudge = new Agent("policy-judge", {
   prompt: Prompt.openaiChat("gpt-4o", {
     messages:
-      "Read /inputs/policy.md with fs.read. Decide whether the company sharing " +
-      "policy permits sharing this report with this recipient, citing the report " +
-      "and the policy line you apply. Report: {{report}} Recipient: {{recipient}}",
+      "Read /inputs/company-sharing-policy.pdf.json with fs.read. Decide whether the company sharing " +
+      "policy permits sharing this report with this recipient for this purpose, " +
+      "citing the report and the policy line you apply. Purpose: {{purpose}} " +
+      "Report: {{report}} Recipient: {{recipient}}",
     responseFormat: { type: "verdict" },
   }),
   execution_route: { kind: "wyrd_gateway", deployment: "openai" },
@@ -43,8 +34,8 @@ const policyJudge = new Agent("policy-judge", {
 });
 
 const followsPolicy = Check.agent(policyJudge)
-  .inputs({ report: "inputs.report", recipient: "inputs.recipient" })
-  .addWorkspace("/inputs/policy.md", policy.file("company-sharing-policy.md"));
+  .inputs({ purpose: "inputs.purpose", report: "inputs.report", recipient: "inputs.recipient" })
+  .addWorkspace("/inputs/company-sharing-policy.pdf.json", policy.file("extracted/company-sharing-policy.pdf.json"));
 
 const releaseCheck = new Verifier("release-check", {
   inputs: Release,

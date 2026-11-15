@@ -48,13 +48,13 @@
   <div class="scroll" role="group" aria-label="Diagram" aria-describedby="flow-hint">
     <svg viewBox="0 0 960 256" role="img" aria-label="Your finance API calls Wyrd to verify a report before releasing it" aria-describedby="flow-desc">
       <g transform="translate(0 14)">
-        <rect class="frame" x="10" y="4" width="420" height="166" rx="2" />
-        <text class="cap mid" x="220" y="19">YOUR FINANCE API</text>
-        <path class="rule" d="M10 26 H430 M36 32 V164" />
+        <rect class="frame" x="10" y="4" width="440" height="166" rx="2" />
+        <text class="cap mid" x="230" y="19">YOUR FINANCE API</text>
+        <path class="rule" d="M10 26 H450 M36 32 V164" />
         <rect class="stripe" x="37" y="118" width="2" height="11" />
-        <rect class="band" class:on={at('0-3')} x="37" y="118" width="392" height="11" />
-        <rect class="band" class:on={at('4') && pass} x="37" y="140" width="392" height="11" />
-        <rect class="band" class:on={at('4') && !pass} x="37" y="151" width="392" height="11" />
+        <rect class="band" class:on={at('0-3')} x="37" y="118" width="412" height="11" />
+        <rect class="band" class:on={at('4') && pass} x="37" y="140" width="412" height="11" />
+        <rect class="band" class:on={at('4') && !pass} x="37" y="151" width="412" height="11" />
         <g class="ln">
           {#each code as _, i (i)}<text x="30" y={38 + 11 * i}>{i + 1}</text>{/each}
         </g>
@@ -63,19 +63,19 @@
             <text x="44" y={38 + 11 * i}>{#each line as token, j (j)}<tspan style:fill={token.color}>{token.content}</tspan>{/each}</text>
           {/each}
         </g>
-        <rect class="fill call" class:on={at('0-4')} x="386" y="120" width="26" height="6" rx="2" />
-        <rect class="slot" x="386" y="120" width="26" height="6" rx="2" />
-        <text class="mark" class:on={at('4')} x="418" y="126">{pass ? '✓' : '✕'}</text>
+        <rect class="fill call" class:on={at('0-4')} x="406" y="120" width="26" height="6" rx="2" />
+        <rect class="slot" x="406" y="120" width="26" height="6" rx="2" />
+        <text class="mark" class:on={at('4')} x="438" y="126">{pass ? '✓' : '✕'}</text>
         {#if pass}
-          <text class="mark out end" class:on={at('4')} x="424" y="148">→ Release</text>
+          <text class="mark out end" class:on={at('4')} x="444" y="148">→ Release</text>
         {:else}
-          <text class="mark out end" class:on={at('4')} x="424" y="159">‖ Hold</text>
+          <text class="mark out end" class:on={at('4')} x="444" y="159">‖ Hold</text>
         {/if}
       </g>
 
-      <path class="link" d="M433 137 H500" />
-      <circle class="port" cx="430" cy="137" r="2.5" />
-      <text class="cap out mid" class:on={at('3-4')} x="466" y="155">{pass ? '✓ PASSED' : '✕ FAILED'}</text>
+      <path class="link" d="M453 137 H500" />
+      <circle class="port" cx="450" cy="137" r="2.5" />
+      <text class="cap out mid" class:on={at('3-4')} x="476" y="155">{pass ? '✓ PASSED' : '✕ FAILED'}</text>
 
       <g transform="translate(500 38)">
         <rect class="frame wyrd" x="0" y="0" width="280" height="146" rx="2" />
@@ -104,8 +104,8 @@
       <text class="cap bif" x="24" y="241">BIFROST</text>
       <text class="name" x="96" y="241">Records · traces · app data</text>
 
-      <circle class="dot call" class:on={at('0')} r="3.5" style="--x0:430px;--y0:137px;--x1:500px;--y1:137px" />
-      <circle class="dot" class:ok={pass} class:bad={!pass} class:on={at('3')} r="3.5" style="--x0:500px;--y0:137px;--x1:430px;--y1:137px" />
+      <circle class="dot call" class:on={at('0')} r="3.5" style="--x0:450px;--y0:137px;--x1:500px;--y1:137px" />
+      <circle class="dot" class:ok={pass} class:bad={!pass} class:on={at('3')} r="3.5" style="--x0:500px;--y0:137px;--x1:450px;--y1:137px" />
       <circle class="dot gw" class:on={at('1')} r="2.5" style="--x0:780px;--y0:117px;--x1:870px;--y1:117px" />
       <circle class="dot gw" class:on={at('2')} r="2.5" style="--x0:870px;--y0:117px;--x1:780px;--y1:117px" />
       {#each [[40, 0.35], [40, 0.8], [740, 0.5], [740, 0.95]] as [x, delay], i (i)}

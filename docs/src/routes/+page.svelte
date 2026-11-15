@@ -49,7 +49,7 @@
 <section class="cover dark-field" aria-label="Wyrd">
   <CoverScene />
   <div class="wrap hero">
-    <p class="eyebrow">Open-source verification infrastructure for AI systems · v{__WYRD_VERSION__}</p>
+    <p class="eyebrow">Wyrd · Open-source real-time verification for your applications · v{__WYRD_VERSION__}</p>
     <h1><span class="d">Declare.</span><br /><span class="o">Observe.</span><br />Verify.</h1>
     <p class="tagline">The only real-time verification system built for your applications.</p>
     <p class="lede">You built the system. How do you know it's behaving correctly?</p>
@@ -90,7 +90,7 @@
       <div>
         <p class="eyebrow">Get started</p>
         <h2 id="qs-h">From intent to evidence.</h2>
-        <p class="sub">One finance Service and one Verifier, one step per tab: declare what a report release must satisfy, verify two releases, and read the verdict.</p>
+        <p class="sub">One finance Service and one Verifier: declare what a report release must satisfy, verify four releases, and read the verdicts.</p>
       </div>
       <nav class="links" aria-label="Get started">
         {#each startPages as item (item.path)}
@@ -101,15 +101,15 @@
       <div class="loop">
         <Tabs>
           <Tab label="01 Declare">
-            <p class="step">The Service binds one Verifier. The Verifier declares the release it takes and three requirements: two assertions on records your application supplies, and an Agent that judges the report against the company sharing policy.</p>
-            <LangTabs langs={['python', 'rust', 'typescript']}>
+            <p class="step">The Service binds one Verifier. The Verifier declares the release it takes and three requirements: two assertions on records your application supplies, and an Agent that reads the company sharing policy PDF and judges the report and its purpose.</p>
+            <LangTabs langs={['python', 'rust', 'typescript', 'yaml']}>
               {#each data.declare as o (o.lang)}
                 <LangTab lang={o.lang}><CodeBlock lang={o.lang} title={o.title} html={o.html} /></LangTab>
               {/each}
             </LangTabs>
           </Tab>
           <Tab label="02 Observe">
-            <p class="step">Declare, start a Run, and verify two releases. <code>verify</code> waits for the verdict; <code>submit</code> queues the check and returns at once.</p>
+            <p class="step">Start a Run and send each release the application is about to make. <code>verify</code> waits for the verdict; <code>submit</code> queues the check and returns at once.</p>
             <LangTabs langs={['python', 'rust', 'typescript']}>
               {#each data.observe as o (o.lang)}
                 <LangTab lang={o.lang}><CodeBlock lang={o.lang} title={o.title} html={o.html} /></LangTab>
@@ -117,8 +117,8 @@
             </LangTabs>
           </Tab>
           <Tab label="03 Verify">
-            <p class="step">The second report names a bank account. Its verdict names each requirement, its outcome, and the reason. A failed check is a result, not an exception.</p>
-            <CodeBlock lang="json" {...data.verify} />
+            <p class="step">Only the first release passes. Each failed release names the requirement that failed and the reason. A failed check is a result, not an exception.</p>
+            <CodeBlock lang="text" {...data.verify} />
           </Tab>
         </Tabs>
       </div>

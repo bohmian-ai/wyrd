@@ -25,6 +25,16 @@ Replace their bank-account assertion with destination controls; the policy
 Agent must read the policy PDF extraction and judge the prohibited identifier.
 Add the TypeScript equivalent and explicit release/hold handling.
 
+Lead the README/homepage explanation with an engine built for real-time
+verification that also supports queued/background workflows. The finance API
+receives a verdict against declared requirements before choosing its response;
+this decision timing is the principal value, not merely another invocation
+option. Keep the fixed headline and tool-independent learning links. Make the
+requirement/evidence contract visible and explain that retained evidence is
+published separately. Use Task 2's canonical explanation for latency mechanics;
+fast animation pacing is illustrative, not a numeric speed claim. Neither
+synchronous invocation nor a model judge guarantees every request deadline.
+
 ## What Changes and What Must Stay True
 
 Own public positioning, Introduction/Setup/Quickstart, the existing finance
@@ -250,7 +260,7 @@ and prior finance/onboarding proof green.
 | REQ-002–004; AC-001–003; INV-001–003 | Scenarios 1–2 execute each actual program against a real server, expose the three branches and policy read, and release only on passed. Negative/error paths hold without new runtime behavior. |
 | REQ-005; AC-004; INV-003 | Scenario 3 proves real policy reuse, changed selected versions and unchanged historical selection through public inspection. |
 | REQ-006; AC-005; INV-002, INV-004–005 | Rendered setup and Quickstart embed the actual programs, provider setup and captured output, and the actual-program journeys reproduce the example, output and follow-on; no-model instructions are corrected and install pins name the release that ships this change. |
-| REQ-001, REQ-007; AC-006; INV-004 | Entry pages use the fixed claim/question, concise Python proof with other-language links and usable CTA/learning links before infrastructure. Brand, routes and keyboard/mobile behavior remain intact. |
+| REQ-001, REQ-007; AC-006; INV-004 | Entry pages use the fixed claim/question, concise Python proof with other-language links and usable CTA/learning links before infrastructure. The opening explains verdict-before-response and foregrounds real-time verification while retaining background options. Brand, routes and keyboard/mobile behavior remain intact. |
 | REQ-007; AC-006; INV-001, INV-004–006 | Scenario 4 and the locked design addition establish an explicit embedded API example, primary real-time verification, secondary Gateway/Bifrost, response-before-capture ordering, conventional Python formatting, the four distinct lower-page workflows, static accessibility and responsive motion controls. |
 | REQ-008; AC-007; INV-001, INV-004–006 | Public-surface dispositions, bounded overlap handoff, editorial/package alignment and coupled source/generated consumers agree. No marketing rewrite of technical authorities. |
 

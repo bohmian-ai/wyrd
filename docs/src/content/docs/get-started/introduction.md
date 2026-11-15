@@ -10,26 +10,23 @@ order: 1
 
 Every system has its own requirements, workflows, and definitions of correct behavior. Turning them into repeatable checks usually means stitching together evaluation frameworks, observability tools, custom scripts, and data pipelines.
 
-Wyrd is the only real-time verification system built for your applications: open-source building blocks for your own verification systems. **Declare** requirements. **Observe** real behavior. **Verify** live, during execution, or continuously over time.
+Wyrd gives you open-source building blocks for your own verification systems. **Declare** requirements. **Observe** real behavior. **Verify** live, during execution, or continuously over time.
 
 Live verification puts the verdict before the decision. Your application asks Wyrd whether what it is about to do meets your requirements, gets an evidence-backed verdict for each one, and decides what happens next. The same verdicts are available from queued and continuous checks.
 
 ## An example
 
-An application shares synthetic customer reports with outside auditors. Before it sends one, it checks three requirements in one Verifier. A model reads the company sharing policy and judges the report; the other two are assertions on records the application supplies:
+An application shares synthetic customer reports with outside auditors. Before it sends one, it checks three requirements in one Verifier. A model reads the company sharing policy PDF and judges the report and its purpose; the other two are assertions on records the application supplies:
 
 <CodeFromFile file="examples/finance-release/finance_service.py" lang="python" title="finance_service.py" />
 
-The application verifies each release with one call:
+The application verifies each release with one call and releases it only on `passed`:
 
 <CodeFromFile file="examples/finance-release/finance_release.py" lang="python" title="finance_release.py" />
 
-```text
-passed: Synthetic customer report: quarterly total $120.
-failed: Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001.
-```
+<CodeFromFile file="examples/finance-release/output.txt" lang="text" title="output" />
 
-The second report names a bank account, which the policy forbids. [Run your first verification](/get-started/quickstart/) runs the full program in Python, Rust, or TypeScript. A Verifier can also run Python, judge a whole session, or compare samples with a baseline on a schedule; [What can I build?](/get-started/what-can-i-build/) matches each to a problem.
+The judge's wording varies. The policy forbids bank account identifiers and permits sharing only for external audits. [Run your first verification](/get-started/quickstart/) runs the full program in Python, Rust, or TypeScript. A Verifier can also run Python, judge a whole session, or compare samples with a baseline on a schedule; [What can I build?](/get-started/what-can-i-build/) matches each to a problem.
 
 ## How Wyrd fits your stack
 
@@ -54,10 +51,11 @@ Keep them. Add Wyrd where they stop.
 | LiteLLM, Portkey | Model routing, inline guardrails | Tying every call to an account, a release, and a verdict |
 | Datadog, Grafana, Honeycomb | Infrastructure monitoring and alerts | Pass/fail verdicts on the same OpenTelemetry data |
 | Credo AI, watsonx.governance | AI inventory, policy programs | Proof from production for each control |
+| Guardrails AI, NeMo Guardrails | Predefined input/output filters | Your own requirements, judged with your evidence and files, returned to your code to decide |
 
 ## Where Wyrd stops
 
-Wyrd verifies your system; your code runs it. Your app owns its code, models, and data, runs and deploys them, and decides what to do with a verdict. Wyrd is not an application runtime, model host, training framework, or general-purpose code executor.
+Wyrd verifies your system; your code runs it. Your app owns its code, models, and data, runs and deploys them, and decides what to do with a verdict. Wyrd is not an application runtime, model host, training framework, or general-purpose code executor. Wyrd returns verdicts; it never blocks, retries, or reroutes your application. Your code decides.
 
 ## Next
 

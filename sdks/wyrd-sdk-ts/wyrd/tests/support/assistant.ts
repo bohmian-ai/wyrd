@@ -53,8 +53,13 @@ function readPolicy(body: string): ReturnType<typeof toolCall>[] {
   return [toolCall("call-policy", "fs.read", { path })];
 }
 
-/** The sharing-policy judge's Verdict once `body` carries its `fs.read` result; no Verdict when the read has no `external-audit` line. */
-function sharingVerdict(body: string): string {
+/**
+ * The sharing-policy judge's Verdict once `body` carries its `fs.read` result;
+ * no Verdict when the read has no `external-audit` line. When `byPurpose`, as
+ * for the finance release judge, it passes only an `external audit` purpose,
+ * or a `regulator request` when that policy line also permits regulators.
+ */
+function sharingVerdict(body: string, byPurpose: boolean): string {
   const messages = (JSON.parse(body) as { messages: { role: string; content: string | null }[] }).messages;
   const release = JSON.stringify(messages.filter(({ role }) => role === "user").map(({ content }) => content));
   let output: { sources?: string[]; units?: { text: string; locator: unknown }[] };
@@ -77,9 +82,22 @@ function sharingVerdict(body: string): string {
     });
   }
   if (release.includes("BANK-ACCOUNT-DEMO-001")) {
-    return JSON.stringify({ outcome: "failed", reason: "the report names a bank account identifier", citations });
+    return JSON.stringify({
+      outcome: "failed",
+      reason: "the report names a bank account identifier, which the policy forbids",
+      citations,
+    });
   }
-  return JSON.stringify({ outcome: "passed", reason: "an external audit may receive this report", citations });
+  const permitted =
+    release.includes("external audit") || (release.includes("regulator request") && line.text.includes("regulator"));
+  if (byPurpose && !permitted) {
+    return JSON.stringify({
+      outcome: "failed",
+      reason: "the policy does not permit sharing for this purpose",
+      citations,
+    });
+  }
+  return JSON.stringify({ outcome: "passed", reason: "the policy permits sharing for this purpose", citations });
 }
 
 /**
@@ -87,11 +105,12 @@ function sharingVerdict(body: string): string {
  * `fs.read` first, then is inconclusive for a release naming
  * `PROVIDER-UNCERTAIN`, fails one naming `BANK-ACCOUNT-DEMO-001`, and
  * otherwise passes, citing the report text and the policy line permitting
- * `external-audit`.
+ * `external-audit`. With `byPurpose`, it also fails a purpose the policy does
+ * not permit.
  */
-export function sharingPolicyJudge(request: ReceivedRequest): Reply {
+export function sharingPolicyJudge(request: ReceivedRequest, byPurpose = false): Reply {
   return /"role"\s*:\s*"tool"/.test(request.body)
-    ? judgeReply(sharingVerdict(request.body))
+    ? judgeReply(sharingVerdict(request.body, byPurpose))
     : toolTurn(readPolicy(request.body));
 }
 

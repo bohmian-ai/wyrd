@@ -46,6 +46,16 @@ static/manual proof for content intent and external handoff. Existing correct
 behavior uses verification-only evidence. Audit crawl controls and record
 hosting restrictions; do not modify production accounts or hosting policy.
 
+Preserve the real-time-first learning hierarchy from Tasks 1–3 in navigation,
+page descriptions, initial HTML and readable agent output. A person or agent
+asking why Wyrd is built for real-time verification should reach the canonical
+request → requirements/evidence → verdict → application decision → response
+explanation, including latency components and asynchronous evidence retention.
+Do not flatten it into a generic background evaluation feature list. Queued
+and scheduled workflows remain discoverable additional uses. Keep fixed titles,
+substantive content and natural wording; no new ranking guarantee or synonym
+page is needed.
+
 ## Approach
 
 1. Assemble the final published-page and query-intent map from Tasks 1–3.
@@ -140,7 +150,7 @@ correct rendering unchanged and record its proof.
 |---|---|
 | REQ-009; AC-008; INV-004–006 | Scenarios 1–3 establish purpose-specific metadata, canonicals, semantic HTML, complete code/prose, valid links and consistent publication/draft sets. Build, link and accessibility checks pass without new discovery infrastructure. |
 | REQ-007–008; AC-006–007; INV-001, INV-004 | Final corpus dispositions and rendered entry paths agree with actual published content; six-section navigation, current brand and keyboard/mobile use remain intact. No duplicate finance or concept procedure. |
-| REQ-014; AC-013; INV-004–006 | Every agreed query family maps to substantive canonical coverage. Representative human/agent questions reach the right explanation, prerequisites and executable next step through public pages/indexes, not source archaeology. No keyword quota or live rank is substituted for this proof. |
+| REQ-014; AC-013; INV-004–006 | Every agreed query family maps to substantive canonical coverage. Representative human/agent questions reach the right explanation, prerequisites and executable next step through public pages/indexes, not source archaeology. Include why a verdict before the response matters, how declared contracts guide the check, and how engine/evidence/provider latency differ from later publication. No keyword quota or live rank is substituted for this proof. |
 | REQ-015; AC-014; INV-005–006 | Source attribution/credits/dates are truthful. Handoff identifies responsible maintainers for content, discovery checks, distribution and feedback without external posting or account changes. |
 | REQ-016; AC-015; INV-005–006 | Evidence distinguishes the initial release set from completion of every required practice/tutorial. The handoff includes baseline/day-14/day-30 equal-window measurement, available data or explicit access gaps and responsible follow-up ownership. |
 

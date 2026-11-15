@@ -12,16 +12,11 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-from pydantic import BaseModel
 # ANCHOR: import
 from wyrd import WyrdState
 # ANCHOR_END: import
 
-
-class Release(BaseModel):
-    report: dict[str, object]
-    recipient: dict[str, object]
-    destination: dict[str, object]
+from finance_service import Release
 
 
 @asynccontextmanager
@@ -40,8 +35,8 @@ state = WyrdState.from_path(".wyrd-bundle")
 @api.post("/reports/send")
 def send_report(release: Release):
     with state.run() as run:
-        r = run.observe.verify("release-check", release)
-    if r.passed:
+        result = run.observe.verify("release-check", release)
+    if result.passed:
         return release_report(release)
     return hold_for_review(release)
 # ANCHOR_END: handler

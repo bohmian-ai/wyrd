@@ -1,5 +1,3 @@
-from pathlib import Path
-
 from pydantic import BaseModel
 from wyrd.verify import (
     Agent,
@@ -32,22 +30,15 @@ class Destination(BaseModel):
 
 
 class Release(BaseModel):
+    purpose: str
     report: Report
     recipient: Recipient
     destination: Destination
 
 
-# The company sharing policy. The program saves it beside itself the first
-# time; edit the file and run again to publish a new policy version.
-POLICY = """# Company sharing policy
-
-Reports may be shared outside the company only for external-audit purposes.
-A shared report must never contain a bank account identifier such as BANK-ACCOUNT-DEMO-001.
-"""
-policy_file = Path("company-sharing-policy.md")
-if not policy_file.exists():
-    policy_file.write_text(POLICY)
-policy = Artifact.from_path("company-sharing-policy", policy_file)
+# The company sharing policy, uploaded from this directory with its text
+# extracted so the judge can read it.
+policy = Artifact.from_path("company-sharing-policy", "company-sharing-policy.pdf").extract(True)
 
 # ANCHOR: run-config
 # `policy-judge`: a model that reads the policy with `fs.read` and returns a
@@ -58,9 +49,10 @@ policy_judge = Agent(
     prompt=Prompt.openai_chat(
         "gpt-4o",
         messages=(
-            "Read /inputs/policy.md with fs.read. Decide whether the company sharing "
-            "policy permits sharing this report with this recipient, citing the report "
-            "and the policy line you apply. Report: {{report}} Recipient: {{recipient}}"
+            "Read /inputs/company-sharing-policy.pdf.json with fs.read. Decide whether the company sharing "
+            "policy permits sharing this report with this recipient for this purpose, "
+            "citing the report and the policy line you apply. Purpose: {{purpose}} "
+            "Report: {{report}} Recipient: {{recipient}}"
         ),
         response_format=ResponseFormat.verdict(),
     ),
@@ -72,10 +64,11 @@ policy_judge = Agent(
 
 follows_policy = (
     Check.agent(policy_judge)
-    .inputs({"report": "inputs.report", "recipient": "inputs.recipient"})
-    .add_workspace("/inputs/policy.md", policy.file("company-sharing-policy.md"))
+    .inputs({"purpose": "inputs.purpose", "report": "inputs.report", "recipient": "inputs.recipient"})
+    .add_workspace("/inputs/company-sharing-policy.pdf.json", policy.file("extracted/company-sharing-policy.pdf.json"))
 )
 
+# ANCHOR: verifier
 release_check = Verifier(
     "release-check",
     inputs=Release,
@@ -99,6 +92,6 @@ release_check = Verifier(
     ],
     # ANCHOR_END: requirements
 )
+# ANCHOR_END: verifier
 
 service = Service("finance-release", verified_by=[release_check])
-

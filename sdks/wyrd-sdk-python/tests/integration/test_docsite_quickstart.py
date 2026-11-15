@@ -1,11 +1,13 @@
 """The docsite Quickstart, run as a reader runs it.
 
-``examples/finance-release`` holds ``finance_service.py``, which saves the
-company sharing policy and declares the ``finance-release`` Service with its
-three-requirement ``release-check`` Verifier, and ``finance_release.py``, which
-verifies two proposed releases against it. The journey copies the files to an
-empty directory and runs the program against a real server whose gateway
-forwards the policy judge to a local model that reads the policy first.
+``examples/finance-release`` holds ``finance_service.py``, which uploads the
+company sharing policy PDF with its extraction and declares the
+``finance-release`` Service with its three-requirement ``release-check``
+Verifier, and ``finance_release.py``, which verifies four proposed releases
+against it and releases only the ones that pass. The journey copies the files
+and the downloaded PDF to an empty directory and runs the program against a
+real server whose gateway forwards the policy judge to a local model that
+reads the policy extraction first.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 from wyrd import WyrdError
+from wyrd.cards import Cards
 from wyrd.client import WyrdClient
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
@@ -37,11 +40,15 @@ pytestmark = pytest.mark.integration
 EXAMPLE = Path(__file__).resolve().parents[4] / "examples/finance-release"
 
 PERMITTED: dict[str, Any] = {
+    "purpose": "external audit",
     "report": {"text": "Synthetic customer report: quarterly total $120."},
     "recipient": {"email": "auditor@example.test", "authorized": True},
     "destination": {"url": "https://auditor.example.test/reports", "restricted": True},
 }
 """A permitted release's evidence."""
+
+FIRST_RUN = (EXAMPLE / "output.txt").read_text()
+"""What the Quickstart program prints under the original policy, as the docs show it."""
 
 
 def run_quickstart(directory: Path) -> tuple[dict, str]:
@@ -56,10 +63,10 @@ def run_quickstart(directory: Path) -> tuple[dict, str]:
 
 @pytest.fixture
 def reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """An empty directory holding only the Quickstart's files, as the working directory."""
+    """A directory holding only the Quickstart's files and policy PDF, as the working directory."""
     reader = tmp_path / "quickstart"
     reader.mkdir()
-    for name in ("finance_service.py", "finance_release.py"):
+    for name in ("finance_service.py", "finance_release.py", "company-sharing-policy.pdf"):
         shutil.copy(EXAMPLE / name, reader)
     monkeypatch.chdir(reader)
     monkeypatch.syspath_prepend(str(reader))
@@ -106,19 +113,21 @@ def test_docsite_quickstart_verifies_and_repeats(
             "finance-release",
             "0.1.0",
         )
-    assert printed[0] == (
-        "passed: Synthetic customer report: quarterly total $120.\n"
-        "failed: Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001.\n"
-    )
+    assert printed[0] == FIRST_RUN
     assert printed[1] == printed[0], "the rerun declares nothing new"
     judged = [
         each.body
         for each in model.to("/v1/chat/completions")
         if any(message.get("role") == "tool" for message in each.body["messages"])
     ]
-    assert len(judged) == 4, "one policy judgment per release"
-    assert all("external-audit" in json.dumps(body) for body in judged), (
-        "each verdict follows a read of the policy extraction"
+    assert len(judged) == 8, "one policy judgment per release"
+    assert all(
+        "external-audit" in json.dumps(body)
+        and "/inputs/company-sharing-policy.pdf.json" in json.dumps(body)
+        for body in judged
+    ), "each verdict follows a read of the policy extraction"
+    assert any("marketing partnership" in json.dumps(body) for body in judged), (
+        "the judge sees each release's purpose"
     )
 
     # Each requirement is judged on its own, and exactly one verdict predicate holds.
@@ -141,6 +150,44 @@ def test_docsite_quickstart_verifies_and_repeats(
         (False, True, False),
         (False, False, True),
     ]
+
+
+def test_yaml_release_check_judges_like_the_code(
+    reader: Path, server: WyrdTestServer, model: Receiver
+) -> None:
+    # The landing page's YAML tab: the same Verifier, declared from files
+    # after the policy upload its header names.
+    for name in ("finance-release.yaml", "release-check.yaml", "policy-judge.yaml"):
+        shutil.copy(EXAMPLE / name, reader)
+    Cards().upload_artifact(
+        reader / "company-sharing-policy.pdf",
+        {"name": "company-sharing-policy", "version": "0.1.0"},
+        extract=True,
+    )
+    state = WyrdState.declare(reader / "finance-release.yaml")
+    releases = [
+        PERMITTED,
+        {
+            **PERMITTED,
+            "report": {"text": "Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001."},
+        },
+        {**PERMITTED, "purpose": "marketing partnership"},
+        {**PERMITTED, "purpose": "regulator request"},
+    ]
+    with state.run() as run:
+        results = [run.observe.verify("release-check", release) for release in releases]
+    state.shutdown()
+
+    assert [r.verdict for r in results] == ["passed", "failed", "failed", "failed"]
+    assert [
+        r["reason"] for result in results for r in result.requirements if r["outcome"] != "passed"
+    ] == [
+        "the report names a bank account identifier, which the policy forbids",
+        "the policy does not permit sharing for this purpose",
+        "the policy does not permit sharing for this purpose",
+    ]
+    judged = [each.body for each in model.to("/v1/chat/completions")]
+    assert any("/inputs/company-sharing-policy.pdf.json" in json.dumps(body) for body in judged)
 
 
 def test_docsite_quickstart_refuses_insufficient_authority(
@@ -168,14 +215,14 @@ def test_docsite_quickstart_refuses_changed_content_and_broken_references(
     reader: Path, server: WyrdTestServer
 ) -> None:
     run_quickstart(reader)
-    policy = reader / "company-sharing-policy.md"
-    policy.write_text(policy.read_text() + "Revision 2.\n")
+    policy = reader / "company-sharing-policy.pdf"
+    shutil.copy(EXAMPLE / "company-sharing-policy-revised.pdf", policy)
 
     # The registered policy version keeps its content; a new one is a new version.
     with pytest.raises(WyrdError) as drifted:
         WyrdState.declare(Artifact.from_path("company-sharing-policy", "0.1.0", policy))
     with pytest.raises(WyrdError) as missing:
-        WyrdState.declare(Artifact.from_path("company-sharing-policy", reader / "missing.md"))
+        WyrdState.declare(Artifact.from_path("company-sharing-policy", reader / "missing.pdf"))
 
     assert drifted.value.code == "WYRD_REGISTRY_409_SPEC_DRIFT"
     assert missing.value.code == "WYRD_LOADER_400_INVALID_ENVELOPE"

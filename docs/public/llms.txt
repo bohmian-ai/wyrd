@@ -17,8 +17,8 @@ Set up a local server, run one verification, then choose what to build, in this 
 ## Get started
 
 - [What Wyrd does](/wyrd/get-started/introduction/): The only real-time verification system built for your applications. Your application asks Wyrd whether an action meets your requirements, and acts on the verdict.
-- [Set up Wyrd](/wyrd/get-started/setup/): Install the Wyrd 0.4.1 CLI and SDK for Python, Rust, or TypeScript, start a local server with your coding agent or by hand, and check it with a verification that needs no model.
-- [Run your first verification](/wyrd/get-started/quickstart/): Verify a finance report against three requirements, including a model that reads a sharing policy, in one call, and release it only when the verdict passes. Python, Rust, or TypeScript.
+- [Set up Wyrd](/wyrd/get-started/setup/): Install the Wyrd 0.4.2 CLI and SDK for Python, Rust, or TypeScript, start a local server with your coding agent or by hand, and check it with a verification that needs no model.
+- [Run your first verification](/wyrd/get-started/quickstart/): Verify a finance report against three requirements, including a model that reads a sharing policy PDF, in one call, and release it only when the verdict passes. Python, Rust, or TypeScript.
 - [What can I build?](/wyrd/get-started/what-can-i-build/): Example verification workflows built from Wyrd's primitives - policy documents, agent evaluation, long-running workflows, runtime checks, observability, and drift.
 - [Use with your coding agent](/wyrd/get-started/use-with-your-coding-agent/): Give your coding agent the Wyrd docs through llms.txt and Wyrd's tools through MCP with wyrd mcp install.
 

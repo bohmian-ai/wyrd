@@ -229,6 +229,13 @@ def client_of(
     )
 
 
+def queued(state: WyrdState, verifier: str, data: object) -> verify.VerificationResult:
+    """Submit ``data`` to the queued-only ``verifier`` in a new Run of ``state`` and wait for its result."""
+    execution = state.run().observe.submit(verifier, data)
+    assert isinstance(execution, verify.Execution), execution
+    return execution.wait(60.0)
+
+
 def details(execution_id: str, client: WyrdClient | None = None) -> VerificationDetails:
     """What execution ``execution_id`` ran, read as ``client``, by default the ambient administrator, once its result is visible."""
     execution = verify.Execution.connect(execution_id, client)

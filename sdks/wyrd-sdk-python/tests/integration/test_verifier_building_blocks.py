@@ -343,9 +343,10 @@ class Attribution(BaseModel):
 
 
 def grants(tool_scope: str | dict[str, object]) -> list[str | dict[str, object]]:
-    """Verify, invoke the gateway, read Cards and Bifrost, and call the tools ``tool_scope`` covers."""
+    """Run and read Verifiers, invoke the gateway, read Cards and Bifrost, and call the tools ``tool_scope`` covers."""
     return [
         {"resource": "verifier", "action": "run", "scope": "all"},
+        {"resource": "verifier", "action": "read", "scope": "all"},
         {"resource": "gateway", "action": "invoke", "scope": "all"},
         {"resource": "tool", "action": "invoke", "scope": tool_scope},
         {"resource": "cards", "action": "read", "scope": "all"},
@@ -951,7 +952,8 @@ def test_code_mode_reduces_evidence_and_preserves_citations(
     policy_desk_bundle: Path, wyrd_server: WyrdTestServer, receiver: Receiver
 ) -> None:
     key = wyrd_server.scoped_api_key(
-        "code_reducer", [*VERIFIES, "tool:invoke", "cards:read", "bifrost_query:read"]
+        "code_reducer",
+        [*VERIFIES, "verifier:read", "tool:invoke", "cards:read", "bifrost_query:read"],
     )
     observe = WyrdState.from_path(policy_desk_bundle, WyrdClient(credential=key)).run().observe
 

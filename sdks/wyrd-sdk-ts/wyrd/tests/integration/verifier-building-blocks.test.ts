@@ -1011,6 +1011,7 @@ async function assertReduced(result: VerificationResult<unknown>): Promise<void>
 test("code_mode_reduces_evidence_and_preserves_citations", async ({ server, provider, desk }) => {
   const credential = server.scopedApiKey("code_reducer", [
     ...VERIFIES,
+    "verifier:read",
     "tool:invoke",
     "cards:read",
     "bifrost_query:read",

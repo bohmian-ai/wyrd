@@ -38,6 +38,7 @@ from .support import (
     declare,
     prompt_of,
     pull,
+    queued,
     read_text,
     tool_results,
 )
@@ -137,7 +138,7 @@ def test_conditions_and_collections_preserve_missing_evidence(
     desk: WyrdState, receiver: Receiver, wyrd_server: WyrdTestServer
 ) -> None:
     for question, statuses, called, collections, reason in CASES:
-        result = desk.run().observe.verify("specialist-review", question)
+        result = queued(desk, "specialist-review", question)
         assert [step(result, id)["status"] for id in ("plan", "security", "style", "quote")] == (
             statuses
         ), question
@@ -155,7 +156,7 @@ def test_conditions_and_collections_preserve_missing_evidence(
             entries = [entry["name"] for entry in manifest["entries"]]
             assert (manifest["status"], entries) == (status, names), (question, collection)
 
-    unjudged = desk.run().observe.verify("specialists-only", "NEITHER-ONLY")
+    unjudged = queued(desk, "specialists-only", "NEITHER-ONLY")
     assert (
         step(unjudged, "security")["status"],
         requirement(unjudged, "secured")["outcome"],
@@ -318,7 +319,7 @@ def test_document_pipeline_uses_array_repeat_and_publications(
     desk: WyrdState, receiver: Receiver, wyrd_server: WyrdTestServer
 ) -> None:
     document = verify.File(FIXTURES / "cards/verifier_orchestration/samples/field-report.json")
-    result = desk.run().observe.verify("document-pipeline", document)
+    result = queued(desk, "document-pipeline", document)
 
     sections = step(result, "sections")
     assert (sections["status"], sections.get("output")) == ("succeeded", [{"done": True}] * 3)

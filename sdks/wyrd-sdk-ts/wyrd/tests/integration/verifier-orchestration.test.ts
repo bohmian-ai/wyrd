@@ -30,7 +30,7 @@ import {
 import { judgeReply, toolCall, toolTurn } from "../support/assistant.js";
 import type { ReceivedRequest, Reply } from "../support/http-receiver.js";
 import { configureGateway } from "../support/local-development.js";
-import { details, fixture, serverTest } from "../support/server.js";
+import { details, fixture, queued, serverTest } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 300_000 });
 
@@ -250,6 +250,7 @@ async function step(result: VerificationResult, id: string): Promise<CardTypes.S
 /** The grants of a principal that verifies, invokes the gateway, and may call every tool. */
 const EVERY_TOOL = [
   { resource: "verifier", action: "run", scope: "all" },
+  { resource: "verifier", action: "read", scope: "all" },
   { resource: "gateway", action: "invoke", scope: "all" },
   { resource: "tool", action: "invoke", scope: "all" },
   { resource: "cards", action: "read", scope: "all" },
@@ -383,7 +384,7 @@ test("conditions_and_collections_preserve_missing_evidence", async ({ provider, 
     });
 
   for (const { question, statuses, called, collections, securityReason, quoteReason } of cases) {
-    const result = await state.run().observe.verify("specialist-review", question);
+    const result = await queued(state, "specialist-review", question);
 
     expect(
       await Promise.all(["plan", "security", "style", "quote"].map(async (id) => (await step(result, id)).status)),
@@ -422,7 +423,7 @@ test("conditions_and_collections_preserve_missing_evidence", async ({ provider, 
     }
   }
 
-  const unjudged = await state.run().observe.verify("specialists-only", "NEITHER-ONLY");
+  const unjudged = await queued(state, "specialists-only", "NEITHER-ONLY");
   expect([
     (await step(unjudged, "security")).status,
     requirement(unjudged, "secured").outcome,
@@ -675,12 +676,11 @@ test("speculative_disposition_controls_consumer_admission", async ({ provider, s
  * evidence, and the cited judgment points into the uploaded document.
  */
 test("document_pipeline_uses_array_repeat_and_publications", async ({ provider, state }) => {
-  const result = await state
-    .run()
-    .observe.verify(
-      "document-pipeline",
-      verify.File.path(fixture("cards/verifier_orchestration/samples/field-report.json")),
-    );
+  const result = await queued(
+    state,
+    "document-pipeline",
+    verify.File.path(fixture("cards/verifier_orchestration/samples/field-report.json")),
+  );
   const requests = (marker: string): string[] =>
     provider.received.map(text).filter((prompt) => prompt.includes(marker));
 

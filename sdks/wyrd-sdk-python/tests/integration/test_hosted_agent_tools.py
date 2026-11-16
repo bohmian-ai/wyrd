@@ -30,6 +30,7 @@ from .support import (
     client_of,
     declare,
     pull,
+    queued,
     read_text,
     tool_results,
 )
@@ -60,10 +61,10 @@ def verify_as(
     tool_scope: str | dict[str, object],
     question: str,
 ) -> verify.VerificationResult:
-    """Verify ``question`` with ``report-pipeline`` now, as a new key ``name`` granted ``tool_scope`` tools."""
+    """Run ``question`` through the queued-only ``report-pipeline``, as a new key ``name`` granted ``tool_scope`` tools."""
     key = server.scoped_api_key(name, grants(tool_scope))
     state = WyrdState.from_path(bundle, WyrdClient(credential=key))
-    return state.run().observe.verify("report-pipeline", question)
+    return queued(state, "report-pipeline", question)
 
 
 def requests(receiver: Receiver, prompt: str) -> list[dict[str, Any]]:

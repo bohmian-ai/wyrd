@@ -14,8 +14,11 @@ import {
   type VerificationDetails,
   type VerificationExecutionState,
   type VerificationResult,
+  type VerifierInput,
+  type VerifierInputs,
   WyrdClient,
   type WorkloadKind,
+  type WyrdState,
 } from "wyrd-ai";
 import { type NativeWyrdTestServer, startTestServer } from "@wyrd/testing";
 import { test as base, vi } from "vitest";
@@ -121,6 +124,22 @@ export async function binding(cards: Cards, owner: CardRef): Promise<string> {
     throw new Error(`${owner.name} declares no verification binding`);
   }
   return id;
+}
+
+/**
+ * Submit `inputs` to the queued-only `verifier` in a new Run of `state` and
+ * wait for its result.
+ */
+export async function queued(
+  state: WyrdState,
+  verifier: string,
+  inputs: VerifierInput | VerifierInputs,
+): Promise<VerificationResult> {
+  const submitted = await state.run().observe.submit(verifier, inputs);
+  if (submitted.kind !== "queued") {
+    throw new Error(`${verifier} queues an execution`);
+  }
+  return submitted.execution.wait({ timeoutMs: 60_000 });
 }
 
 /**

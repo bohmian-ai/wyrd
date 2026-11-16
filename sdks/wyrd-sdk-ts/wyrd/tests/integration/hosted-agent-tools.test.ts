@@ -30,7 +30,7 @@ import {
 import { judgeReply, toolCall, toolTurn } from "../support/assistant.js";
 import type { ReceivedRequest, Reply } from "../support/http-receiver.js";
 import { configureGateway } from "../support/local-development.js";
-import { details, fixture, serverTest } from "../support/server.js";
+import { details, fixture, queued, serverTest } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 180_000 });
 
@@ -225,6 +225,7 @@ async function step(result: VerificationResult, id: string): Promise<CardTypes.S
 function grants(toolScope: unknown): unknown[] {
   return [
     { resource: "verifier", action: "run", scope: "all" },
+    { resource: "verifier", action: "read", scope: "all" },
     { resource: "gateway", action: "invoke", scope: "all" },
     { resource: "tool", action: "invoke", scope: toolScope },
     { resource: "cards", action: "read", scope: "all" },
@@ -272,7 +273,7 @@ test("agent_publishes_file_directory_and_json", async ({ server, provider, bundl
   const verifyAs = (name: string, toolScope: unknown, question: string): Promise<VerificationResult> => {
     const credential = server.scopedApiKey(name, grants(toolScope));
     const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential }) });
-    return state.run().observe.verify("report-pipeline", question);
+    return queued(state, "report-pipeline", question);
   };
 
   const result = await verifyAs("every_tool", "all", "FULL-RUN");

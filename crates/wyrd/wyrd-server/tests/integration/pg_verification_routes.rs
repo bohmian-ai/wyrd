@@ -3302,6 +3302,94 @@ async fn direct_target_runs_only_direct_work() {
     server.shutdown().await.expect("direct server shuts down");
 }
 
+/// `bifrost-ingest` and `bifrost-query` serve public listeners but no
+/// Verifier work: `verify`, enqueue and cancel on HTTP and MCP, and the
+/// GitHub webhook, all answer `WYRD_VERIFICATION_421_WRONG_TARGET` before
+/// authorization, leaving no execution and, on `bifrost-query`, which can
+/// read the audit log, no audited decision. `bifrost-maintenance` binds no public listener, so it has nothing to
+/// refuse.
+///
+/// # Panics
+/// Panics when a server or seeding fails, or any Verifier call is not
+/// refused without side effects.
+#[tokio::test(flavor = "multi_thread")]
+async fn bifrost_targets_refuse_all_verifier_work() {
+    for target in [
+        wyrd_server::config::ServerTarget::BifrostIngest,
+        wyrd_server::config::ServerTarget::BifrostQuery,
+    ] {
+        let name = target.name();
+        let server = WyrdTestServer::builder()
+            .with_bifrost_target_for_test(target)
+            .with_verification_runtime_for_test()
+            .start_bound()
+            .await
+            .expect("Bifrost server starts");
+        assert!(
+            !server.state().verification.health.is_composed(),
+            "{name} never claims queued executions"
+        );
+        let seed = server
+            .verification_fixture()
+            .await
+            .expect("verification fixture provisions");
+        let (caller, jwt) = user(&server, &format!("vt-{name}"), &["editor"]).await;
+        // The refusal precedes any Card lookup, so no Card need exist.
+        let body = json!({
+            "verifier_card_uid": Uuid::now_v7(),
+            "card_uid": Uuid::now_v7(),
+            "inputs": { "answer": { "kind": "json", "value": 1 } }
+        });
+        let unknown = Uuid::now_v7();
+        let cancel = format!("/v1/verification/executions/{unknown}/cancel");
+
+        assert_wrong_target_http(name, &execute(&server, &jwt, body.to_string()).await);
+        assert_wrong_target_http(name, &enqueue(&server, &jwt, &body, None).await);
+        assert_wrong_target_http(
+            name,
+            &post(&server, &jwt, &cancel, "{}".to_owned(), None).await,
+        );
+        for (tool, arguments) in [
+            ("verification.execute", body.clone()),
+            ("verification.enqueue", body.clone()),
+            ("verification.cancel", json!({"execution_id": unknown})),
+        ] {
+            assert_wrong_target_mcp(name, &mcp_call(&server, &jwt, tool, &arguments).await);
+        }
+        let webhook = server
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/integrations/github/webhook")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("webhook request builds"),
+            )
+            .await
+            .expect("webhook responds");
+        assert_wrong_target_http(name, &decoded(webhook).await);
+
+        assert!(
+            seed.executions().await.expect("executions read").is_empty(),
+            "{name}: no refused call ran or queued"
+        );
+        // Audit reads need Oracle, which `bifrost-ingest` does not run.
+        let audited: &[&str] = if target == wyrd_server::config::ServerTarget::BifrostQuery {
+            &["verification.execute", "verification.enqueue"]
+        } else {
+            &[]
+        };
+        for operation in audited {
+            assert_eq!(
+                decisions(&server, operation, caller).await,
+                Vec::<(String, String)>::new(),
+                "{name}: refusal precedes authorization for {operation}"
+            );
+        }
+        server.shutdown().await.expect("Bifrost server shuts down");
+    }
+}
+
 /// A `worker` server admits and runs queued work over HTTP and MCP and
 /// refuses synchronous `verify` on both surfaces with
 /// `WYRD_VERIFICATION_421_WRONG_TARGET` before authorization, leaving no

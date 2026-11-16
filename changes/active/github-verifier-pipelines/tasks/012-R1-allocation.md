@@ -301,11 +301,34 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
      Test: `oracle::tests::laned_batches_poll_each_batch_on_a_lane`. RED (stub
      passthrough): batch 0 ran with context `None`. GREEN.
    - Forge: `ForgeResources` carries the process workload manager.
-     `ForgeManagedRewrite::rewrite_plan` admits a `Workload::Bifrost`
-     operation for the binding's tenant, racing the attempt's cancellation
-     (which yields `Shutdown`), then runs the core rewrite laned.
-     Test: `forge::managed_rewrite::managed_rewrite_waits_out_critical_pressure`.
-     RED: the rewrite finished under critical pressure. GREEN.
+     `ForgeManagedRewrite::rewrite_plan` polls admission of a
+     `Workload::Bifrost` operation for the binding's tenant once. When
+     pressure does not admit it, the attempt fails with the existing
+     retryable `ForgeError::Capacity`, before any output exists. Otherwise
+     the core rewrite runs laned.
+     Test: `forge::managed_rewrite::managed_rewrite_is_refused_under_critical_pressure`.
+     The first version waited for admission. RED: the rewrite finished under
+     critical pressure. GREEN.
+   - Diagnosis, Forge journey hang:
+     - **Symptom:** `live_rewrite::failed_memory_attempt_retries_without_partial_publication`
+       (`mise run test:bifrost:journey:forge`) ran past 300 s. Run alone,
+       it was killed at a 200 s timeout.
+     - **Evidence:** the trace shows both plans started, then nothing until
+       shutdown failed them. The test fills the shared root
+       (`occupy_root_for_test`, which charges the process ledger) and frees
+       it only after a rewrite fails.
+     - **Cause:** the first version's unbounded wait in `admit`. Critical
+       pressure kept the rewrite from ever running, so the memory refusal
+       the test waits on could never happen.
+     - **Fix site:** Forge's call site. Oracle, gateway and hosted callers
+       already bound admission themselves, so `admit` stays as it is. Forge
+       turns "not admitted now" into its existing retryable capacity
+       refusal.
+     - **Diagnostician (Codex, read-only):** independently found the same
+       circular wait and the other callers' bounds. It proposed a fallible
+       `admit`; that was not taken, because each caller already owns its
+       bound.
+     - GREEN: the journey passes in 11.9 s.
    - Regressions:
      - `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p vala-bifrost-redux --test integration -P journey --run-ignored=all"`:
        75 passed.

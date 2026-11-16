@@ -2056,20 +2056,21 @@ async fn standard_variant_layouts_round_trip_per_file() {
     );
 }
 
-/// Critical process pressure pauses a Forge rewrite before its execution
-/// starts, and the same attempt completes once pressure recovers.
+/// Critical process pressure refuses a Forge rewrite before its execution
+/// starts, and a later attempt rewrites once pressure recovers.
 ///
 /// A worker reporting more allocator commitment than the process ceiling
 /// turns every sample critical without filling the byte ledger the fixture's
-/// stores need. The rewrite is still pending well after it would otherwise
-/// have finished; after two recovering samples it finishes with real output.
+/// stores need. The attempt under pressure is refused as retryable capacity
+/// and writes nothing; after two recovering samples a fresh attempt
+/// finishes with real output.
 ///
 /// # Panics
 ///
-/// Panics when the rewrite finishes under critical pressure, or fails or
-/// produces nothing after recovery.
+/// Panics when the attempt under critical pressure is not refused as
+/// capacity, or the attempt after recovery fails or produces nothing.
 #[tokio::test]
-async fn managed_rewrite_waits_out_critical_pressure() {
+async fn managed_rewrite_is_refused_under_critical_pressure() {
     use wyrd_runtime::resources::PressureState;
 
     let fixture = PromotedRewriteFixture::start("rewrite_pressure").await;
@@ -2078,19 +2079,33 @@ async fn managed_rewrite_waits_out_critical_pressure() {
     overcommitted.set(u64::MAX);
     assert_eq!(workloads.sample(0).state, PressureState::Critical);
 
-    let mut run = std::pin::pin!(rewrite_whole_attempt(&fixture));
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_secs(2), run.as_mut())
-            .await
-            .is_err(),
-        "the rewrite waits while pressure is critical"
+    let forge = fixture.forge(
+        fixture.fixture.catalog.iceberg_catalog(),
+        CountingObjectStore::new(&fixture.fixture.storage) as Arc<dyn ForgeObjectStore>,
     );
+    let refused = fixture
+        .run_attempt(
+            &forge,
+            uuid::Uuid::now_v7(),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+    assert!(
+        matches!(refused.failure, Some(ForgeError::Capacity { .. })),
+        "critical pressure refuses the rewrite as capacity: {:?}",
+        refused.failure
+    );
+    assert!(
+        refused.handoffs.is_empty(),
+        "the refused attempt rewrites nothing"
+    );
+
     overcommitted.set(0);
     workloads.sample(0);
     workloads.sample(0);
-    let run = run.await;
+    let run = rewrite_whole_attempt(&fixture).await;
     assert!(
         !run.handoffs.is_empty(),
-        "the attempt rewrites once pressure recovers"
+        "an attempt after recovery rewrites"
     );
 }

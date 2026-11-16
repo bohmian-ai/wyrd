@@ -18,6 +18,7 @@ use crate::parquet::variant_residual::{VariantWriter, variant_residual_share};
 use std::path::Path;
 use std::sync::Arc;
 
+use futures_util::FutureExt as _;
 use iceberg::Catalog;
 use iceberg::table::Table;
 use iceberg_compaction_core::compaction::CompactionPlan;
@@ -117,8 +118,6 @@ pub struct ForgeManagedRewrite {
     observer: Arc<ForgeRewriteObserver>,
     /// The one context every plan of this attempt executes under.
     context: Arc<ManagedExecutionContext>,
-    /// The attempt's cancellation, which ends a plan's wait for admission.
-    cancel: CancellationToken,
 }
 
 impl std::fmt::Debug for ForgeManagedRewrite {
@@ -159,7 +158,6 @@ impl ForgeManagedRewrite {
             attempt_id,
             observer,
             context,
-            cancel: cancel.clone(),
         })
     }
 
@@ -253,8 +251,9 @@ impl ForgeManagedRewrite {
     ///
     /// # Errors
     ///
-    /// Returns [`ForgeError::Shutdown`] when the attempt was cancelled while
-    /// the plan waited out process pressure or before the core finished, [`ForgeError::Catalog`] for a core execution failure,
+    /// Returns [`ForgeError::Capacity`] when process pressure refuses the
+    /// rewrite before it starts, [`ForgeError::Shutdown`] when the attempt
+    /// was cancelled before the core finished, [`ForgeError::Catalog`] for a core execution failure,
     /// and [`ForgeError::Invariant`] when the core produced an object this
     /// attempt cannot attribute to itself or a handoff that contradicts itself.
     /// Any of those raised after an object may exist arrives wrapped in
@@ -315,16 +314,19 @@ impl ForgeManagedRewrite {
             &mut equality_deletes,
         );
         let output_view = forge_output_view(table, &policy.data_location)?;
-        // Process pressure pauses the rewrite before it executes; it then
-        // runs as Bifrost work of its tenant on the shared CPU lanes, which
-        // the partitions DataFusion spawns inherit.
+        // Process pressure refuses a new rewrite before it executes, as
+        // retryable capacity like Forge's other local admission: the
+        // durable task retries later rather than holding a worker slot.
+        // An admitted rewrite runs as Bifrost work of its tenant on the
+        // shared CPU lanes, which the partitions DataFusion spawns inherit.
         let workloads = self.core.resources.workloads();
-        let operation = tokio::select! {
-            biased;
-            () = self.cancel.cancelled() => {
-                return Err(self.attach_possible_outputs(ForgeError::Shutdown));
-            }
-            operation = workloads.admit(Workload::Bifrost, Some(self.binding.tenant), None) => operation,
+        let Some(operation) = workloads
+            .admit(Workload::Bifrost, Some(self.binding.tenant), None)
+            .now_or_never()
+        else {
+            return Err(self.attach_possible_outputs(ForgeError::Capacity {
+                detail: "process memory pressure pauses new Forge rewrites".to_owned(),
+            }));
         };
         let rewrite = workloads.lanes().laned(
             operation.context(),

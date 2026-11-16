@@ -5,7 +5,7 @@ status: proposed
 spec: SPEC-verification-workflow-ui
 spec_revision: 3
 requirements: [REQ-002, REQ-004, REQ-005, REQ-006, REQ-007, REQ-009, REQ-014, AC-002, AC-003, AC-005, AC-008, AC-009]
-depends_on: [TASK-001]
+depends_on: [TASK-001, TASK-001A]
 ---
 
 # Exact execution, publications, session and drift inspection
@@ -19,7 +19,8 @@ exact producer selection. Session and drift use the same inspector. Cancel
 uses the existing action. TASK-003 supplies discovery later; no list or PR
 admission is required to open an existing execution.
 
-Consume TASK-001's graph and existing backend operations recorded in the
+Consume TASK-001's graph and TASK-001A's merged backend baseline, with existing
+operations recorded in the
 [finalized read map](../design/contract-alignment-research.md). Record their
 integrated revision and real host proof. This is UI work: components, Bifrost
 queries, typed UI adapters, navigation and tests. No server fields/endpoints,

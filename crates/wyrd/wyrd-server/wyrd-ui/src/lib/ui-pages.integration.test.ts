@@ -1203,6 +1203,13 @@ test('an exact execution page keeps its selection through refresh, downloads a r
   await expect.poll(query).toEqual({ ...selection, details: '1' });
   await expect.poll(() => page.locator('[data-part="Completed details"]').textContent()).toContain('Details are recorded when the execution completes');
 
+  // Back returns to the earlier selection with its preview, and Forward to the later one.
+  await page.goBack();
+  await expect.poll(query).toEqual(selection);
+  await expect.poll(() => page.locator('[data-preview="tree"]').count()).toBe(1);
+  await page.goForward();
+  await expect.poll(query).toEqual({ ...selection, details: '1' });
+
   // Another tenant's session finds no such execution; a viewer's cancel is refused and nothing changes.
   const other = await signIn(ui.browser, ui.base, TENANT, ui.adminKey);
   expect(await serverHtml(other, at(TENANT))).toContain('WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND');

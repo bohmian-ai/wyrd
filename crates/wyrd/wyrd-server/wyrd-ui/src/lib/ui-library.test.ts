@@ -2261,6 +2261,22 @@ test('verifier graph projects and lays out the declared topology', () => {
   expect(gated.edges).toEqual([{ source: 'step:a', target: 'step:b' }, { source: 'input:doc', target: 'step:b' }]);
   expect(gated.steps[1].chips).toEqual(['when', '↻ ≤ 1 retry']);
 
+  // A pull request extract and an approval read no inputs; an any-succeeded join depends on each predecessor and says so.
+  const review = definitionGraph({
+    steps: [
+      { id: 'source', action: { kind: 'extract', extractor: 'pull_request' } },
+      { id: 'lint', action: code, depends_on: ['source'] },
+      { id: 'tests', action: code, depends_on: ['source'] },
+      { id: 'approve', action: { kind: 'approval', message: 'Ship it?' }, depends_on: { any_succeeded: ['lint', 'tests'] } }
+    ]
+  } as never);
+  expect(review.steps.map((step) => [step.id, step.detail, step.needs, step.chips])).toEqual([
+    ['source', 'pull_request extractor', [], []],
+    ['lint', 'f()', ['source'], []],
+    ['tests', 'f()', ['source'], []],
+    ['approve', 'Ship it?', ['lint', 'tests'], ['any succeeded']]
+  ]);
+
   // Session-shaped: group sources are inputs feeding the judgment; drift-shaped: samples feed the drift check. No steps.
   const session = definitionGraph(specOf('session-quality@1.0.0'));
   expect(session.inputs).toEqual([

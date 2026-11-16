@@ -72,7 +72,9 @@ type Reference = readonly [reference: string, argument?: string];
 function reads(block: CardTypes.Action | CardTypes.Check): Reference[] {
   switch (block.kind) {
     case 'extract':
-      return [[block.from]];
+      return block.from ? [[block.from]] : [];
+    case 'approval':
+      return [];
     case 'trace':
     case 'drift':
       return [[block.on]];
@@ -101,8 +103,9 @@ function inputDetail(slot: CardTypes.InputSlot): Pick<DefinitionInput, 'kind' | 
 }
 
 function stepDetail(action: CardTypes.Action): string {
-  if (action.kind === 'extract') return `from ${action.from}`;
+  if (action.kind === 'extract') return action.from ? `from ${action.from}` : `${action.extractor} extractor`;
   if (action.kind === 'code') return `${action.entrypoint}()`;
+  if (action.kind === 'approval') return action.message;
   const agent = action.agent;
   if (typeof agent === 'string') return agent;
   return 'name' in agent && 'version' in agent ? `${agent.name}@${agent.version}` : 'inline Agent';
@@ -142,7 +145,8 @@ export function definitionGraph(spec: VerifierSpec): DefinitionGraph {
   for (const step of steps) {
     const key = `step:${step.id}`;
     follow([...reads(step.action), ...(step.when ? [[step.when.path] as const] : []), ...(step.requirements ?? []).flatMap((each) => reads(each.check))], key);
-    for (const id of step.depends_on ?? []) link(`step:${id}`, key);
+    const dependsOn = step.depends_on ?? [];
+    for (const id of 'any_succeeded' in dependsOn ? dependsOn.any_succeeded : dependsOn) link(`step:${id}`, key);
   }
   for (const each of spec.requirements ?? []) follow(reads(each.check), `req:${each.id}`);
   const all = [...edges.values()];
@@ -154,7 +158,7 @@ export function definitionGraph(spec: VerifierSpec): DefinitionGraph {
       kind: step.action.kind,
       detail: stepDetail(step.action),
       needs: all.filter((edge) => edge.target === `step:${step.id}` && edge.source.startsWith('step:')).map((edge) => edge.source.slice(5)),
-      chips: [...(step.when ? ['when'] : []), ...(step.retries ? [`↻ ≤ ${step.retries} ${step.retries === 1 ? 'retry' : 'retries'}`] : [])],
+      chips: [...(step.when ? ['when'] : []), ...(step.depends_on && 'any_succeeded' in step.depends_on ? ['any succeeded'] : []), ...(step.retries ? [`↻ ≤ ${step.retries} ${step.retries === 1 ? 'retry' : 'retries'}`] : [])],
       requirements: (step.requirements ?? []).map((each) => requirement(each, step.id))
     })),
     requirements: (spec.requirements ?? []).map((each) => requirement(each)),

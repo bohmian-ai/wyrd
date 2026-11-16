@@ -514,7 +514,8 @@
                   "Audit",
                   "Verifier",
                   "Trigger",
-                  "Operator"
+                  "Operator",
+                  "Repository"
                 ]
               },
               "name": {
@@ -607,7 +608,8 @@
                       "Audit",
                       "Verifier",
                       "Trigger",
-                      "Operator"
+                      "Operator",
+                      "Repository"
                     ]
                   },
                   "name": {
@@ -688,7 +690,8 @@
                       "Audit",
                       "Verifier",
                       "Trigger",
-                      "Operator"
+                      "Operator",
+                      "Repository"
                     ]
                   },
                   "name": {
@@ -752,7 +755,8 @@
               "Audit",
               "Verifier",
               "Trigger",
-              "Operator"
+              "Operator",
+              "Repository"
             ]
           },
           "status": {
@@ -809,7 +813,8 @@
                   "Audit",
                   "Verifier",
                   "Trigger",
-                  "Operator"
+                  "Operator",
+                  "Repository"
                 ]
               },
               "status": {
@@ -874,7 +879,8 @@
                       "Audit",
                       "Verifier",
                       "Trigger",
-                      "Operator"
+                      "Operator",
+                      "Repository"
                     ]
                   },
                   "name": {
@@ -937,7 +943,8 @@
                   "Audit",
                   "Verifier",
                   "Trigger",
-                  "Operator"
+                  "Operator",
+                  "Repository"
                 ]
               },
               "name": {
@@ -1007,7 +1014,8 @@
                   "Audit",
                   "Verifier",
                   "Trigger",
-                  "Operator"
+                  "Operator",
+                  "Repository"
                 ]
               },
               "name": {
@@ -1075,7 +1083,8 @@
                       "Audit",
                       "Verifier",
                       "Trigger",
-                      "Operator"
+                      "Operator",
+                      "Repository"
                     ]
                   },
                   "name": {
@@ -1138,7 +1147,8 @@
                   "Audit",
                   "Verifier",
                   "Trigger",
-                  "Operator"
+                  "Operator",
+                  "Repository"
                 ]
               },
               "name": {
@@ -1370,7 +1380,8 @@
                       "Audit",
                       "Verifier",
                       "Trigger",
-                      "Operator"
+                      "Operator",
+                      "Repository"
                     ]
                   },
                   "name": {
@@ -1621,7 +1632,8 @@
                       "Audit",
                       "Verifier",
                       "Trigger",
-                      "Operator"
+                      "Operator",
+                      "Repository"
                     ]
                   },
                   "name": {

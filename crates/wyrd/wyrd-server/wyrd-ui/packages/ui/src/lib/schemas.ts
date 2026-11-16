@@ -25,7 +25,8 @@ export const CARD_KINDS = [
   'Audit',
   'Verifier',
   'Trigger',
-  'Operator'
+  'Operator',
+  'Repository'
 ] as const satisfies readonly CardKind[];
 const everyKind: Exclude<CardKind, 'Policy' | 'Source'> extends (typeof CARD_KINDS)[number] ? true : never = true;
 void everyKind;

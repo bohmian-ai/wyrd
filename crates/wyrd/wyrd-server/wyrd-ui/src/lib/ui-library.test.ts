@@ -3061,3 +3061,18 @@ test('execution inspector shows a recorded actual value, a discarded output, a c
   expect(preview.querySelector('pre')?.textContent).toHaveLength(65_536);
   expect(preview).toHaveTextContent('Preview stops at 64.0 KiB; 4.4 KiB more is retained.');
 });
+
+test('a drift judgment shows its declared baseline and says when its window and history are refused', async () => {
+  // The baseline facts are the exact Verifier's declaration: signal and condition, as registered.
+  const shown = render(VerificationExecution, await loadExecution({ executionId: EXECUTIONS.drift, node: 'req:latency-stable' }, { executor: fixtureRecording().executor }));
+  const declared = () => shown.container.querySelector('[data-drift] [data-declared]') as HTMLElement;
+  expect(declared()).toHaveTextContent('Declared baseline and condition');
+  expect(declared().querySelector('pre')?.textContent).toBe('signal:\n  kind: feature\n  name: latency_ms\ncondition:\n  kind: window\n  size: 100');
+
+  // Refused retained context is said in place; the recorded features and the declaration stay readable.
+  const refusing = fixtureRecording((request) => (request.op === 'bifrost.query' ? { ok: false, problem: denied } : undefined));
+  await shown.rerender(await loadExecution({ executionId: EXECUTIONS.drift, node: 'req:latency-stable' }, { executor: refusing.executor }));
+  expect(shown.container.querySelector('[data-drift] [data-part="Window and history"]')).toHaveTextContent(denied.title);
+  expect(within(shown.container).getByRole('region', { name: 'Drift features' }).querySelectorAll('tbody tr')).toHaveLength(3);
+  expect(declared()).toHaveTextContent('latency_ms');
+});

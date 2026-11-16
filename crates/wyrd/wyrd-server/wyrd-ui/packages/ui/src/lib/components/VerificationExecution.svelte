@@ -97,6 +97,9 @@
     return { text: whole.slice(0, PREVIEW), cut: Math.max(0, whole.length - PREVIEW) };
   }
 
+  /** The check a requirement declares in the exact Verifier this execution ran, whole-Verifier or attached to a step. */
+  const declaredCheck = (id: string) => [...(definition?.spec.requirements ?? []), ...(definition?.spec.steps ?? []).flatMap((step) => step.requirements ?? [])].find((each) => each.id === id)?.check;
+
   const act = (name: string) => actions[name];
   const off = (name: string) => !onaction || act(name)?.state === 'pending' || act(name)?.state === 'unavailable';
 </script>
@@ -122,7 +125,8 @@
   {#if text}<div class="fact"><dt>{label}</dt><dd>{text}</dd></div>{/if}
 {/snippet}
 
-{#snippet drift(report: CardTypes.DriftReport)}
+{#snippet drift(report: CardTypes.DriftReport, requirement: string)}
+  {@const check = declaredCheck(requirement)}
   {@const context = loaded?.drift}
   {@const history = context?.state === 'populated' ? context.data.history : []}
   {@const features = Object.values(report.features).sort((a, b) => Number(b.verdict === 'Drift') - Number(a.verdict === 'Drift') || a.feature.localeCompare(b.feature))}
@@ -136,6 +140,10 @@
       {/if}
     </dl>
     {#if context}{@render refused(context, 'Window and history')}{/if}
+    <!-- The baseline is what the exact Verifier declares; a current Card status is never read for it. -->
+    {#if check?.kind === 'drift'}
+      <div data-declared>{@render value('Declared baseline and condition', fmtYaml({ signal: check.signal, ...(check.profile ? { profile: check.profile } : {}), condition: check.condition }).trim())}</div>
+    {/if}
     <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
     <div class="scroll" role="region" aria-label="Drift features" tabindex="0">
       <table>
@@ -396,7 +404,7 @@
                   </ul>
                 </div>
               {/if}
-              {#if each.detail?.drift}{@render drift(each.detail.drift)}{/if}
+              {#if each.detail?.drift}{@render drift(each.detail.drift, each.id)}{/if}
             </div>
           {:else}
             <p class="hint">{settled(status.status) ? 'No judgment of this requirement was recorded.' : 'Not judged yet.'}</p>

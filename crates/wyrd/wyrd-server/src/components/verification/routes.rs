@@ -201,7 +201,7 @@ async fn evidence(
           body = WyrdProblem),
         (status = 413, description = "The body or value exceeds a bound \
           (WYRD_VERIFICATION_413_INPUT_TOO_LARGE)", body = WyrdProblem),
-        (status = 421, description = "This server's WYRD_TARGET does not run queued Verifier \
+        (status = 421, description = "This server's deployment target does not run queued Verifier \
           work (WYRD_VERIFICATION_421_WRONG_TARGET)", body = WyrdProblem),
         (status = 503, description = "Acceptance cannot be decided or acknowledged now; publish \
           again (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE, \
@@ -254,7 +254,7 @@ async fn publish_evidence(
           (WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT)", body = WyrdProblem),
         (status = 413, description = "The body or inputs exceed a bound \
           (WYRD_VERIFICATION_413_INPUT_TOO_LARGE)", body = WyrdProblem),
-        (status = 421, description = "This server's WYRD_TARGET does not run queued Verifier \
+        (status = 421, description = "This server's deployment target does not run queued Verifier \
           work (WYRD_VERIFICATION_421_WRONG_TARGET)", body = WyrdProblem),
         (status = 503, description = "This process hosts no Verifier queue, or the submission \
           was not admitted and may be retried under its key \
@@ -650,7 +650,7 @@ async fn publication_content(
           Verifier (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such queued execution in the caller's tenant \
           (WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND)", body = WyrdProblem),
-        (status = 421, description = "This server's WYRD_TARGET does not run queued Verifier \
+        (status = 421, description = "This server's deployment target does not run queued Verifier \
           work (WYRD_VERIFICATION_421_WRONG_TARGET)", body = WyrdProblem),
         (status = 503, description = "The registry is unavailable, or no verifier is \
           configured for the access token (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
@@ -714,7 +714,7 @@ async fn cancel_execution(
         (status = 409, description = "The occurrence was already decided differently, or its \
           execution ended, expired, or was superseded \
           (WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING)", body = WyrdProblem),
-        (status = 421, description = "This server's WYRD_TARGET does not run queued Verifier \
+        (status = 421, description = "This server's deployment target does not run queued Verifier \
           work (WYRD_VERIFICATION_421_WRONG_TARGET)", body = WyrdProblem),
         (status = 503, description = "The decision cannot be read or acknowledged now; decide \
           again (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE, \
@@ -822,7 +822,7 @@ async fn get_execution_details(
           (WYRD_VERIFICATION_413_INPUT_TOO_LARGE)", body = WyrdProblem),
         (status = 422, description = "The Verifier judges a scheduled window and runs only on \
           its binding schedule (WYRD_VERIFICATION_422_INPUT_UNSUPPORTED)", body = WyrdProblem),
-        (status = 421, description = "This server's WYRD_TARGET does not run direct Verifier \
+        (status = 421, description = "This server's deployment target does not run direct Verifier \
           work (WYRD_VERIFICATION_421_WRONG_TARGET)", body = WyrdProblem),
         (status = 503, description = "The registry is unavailable, no verifier is configured \
           for the access token, or this process hosts no Verifier execution \

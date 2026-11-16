@@ -2352,8 +2352,7 @@ Hosted capacity follows the process resource plan, not fixed counts.
 `wyrd-runtime` owns the neutral mechanism: one process memory ledger and one
 disposable-scratch ledger for the data-root filesystem, which Bifrost,
 request buffering, and hosted verification all charge, so no byte is
-promised twice; the queued verification share below is a reservation held in
-those same ledgers. The ledgers carry no policy;
+promised twice. The ledgers carry no policy;
 each capability decides what it charges and how it answers a refusal. The
 server composes them from the Bifrost plan
 ([Admission and memory](bifrost-design.md#admission-and-memory)); Vala never

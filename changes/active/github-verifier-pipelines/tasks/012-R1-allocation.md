@@ -113,6 +113,20 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
    split/merge/release behavior uses its regression tests, without fabricated
    RED. New attribution/ownership behavior must fail before its implementation.
 
+   Evidence: `resources::tests::attribution_follows_custody_and_counts_shared_buffers_once`
+   (attribution follows custody, split/merge/transfer counts shared bytes once,
+   last release zeroes the owner). RED before `ByteCharge::attribute`: failed at
+   `resources.rs:379` (attributed 0, expected 100). GREEN with command R1.
+   Existing split/merge/release regressions:
+   `process_grants_follow_use_without_double_promises` and
+   `release_wakes_a_registered_waiter`, both GREEN with R1 and not re-REDed.
+   Pending: proof that refused buffers are disposed and that disk cleanup keeps
+   its charge until confirmed deletion. Both are owned by the Bifrost workspace
+   regression in scenario 5. Status: FAIL until that proof is recorded.
+
+   R1: `mise exec -- cargo nextest run --locked -p wyrd-runtime --lib -E 'test(/resources::/)'`
+   (15 passed).
+
 2. **Small work and real worker observations — REQ-019,020; AC-015,016.** Drive
    real hosted Monty and media paths from server integration owners. Small work
    no longer holds configured maxima, future parent frames or multiplied media
@@ -122,6 +136,17 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
    exit. Independent samples arrive during a held turn; stale/cancelled owners
    never become zero usage. Old envelopes/multipliers and absent live telemetry
    make the changed observations RED. Keep local heap/time/payload refusals.
+
+   Seam (2026-11-16): crates.io `monty-pool`/`monty-proto` 1.1.0 cannot carry
+   worker telemetry. `Checkout::turn_io` and the raw turn loop read worker
+   frames only inside a turn. `ChildEvent.kind` is a closed oneof in which any
+   non-`Print` kind ends the turn. `Print` text is sandbox-controlled output,
+   so it cannot carry trusted samples. Idle workers, and workers suspended
+   between turns, are never read. Monty has no memory event or field. The
+   maintainer chose to vendor `monty-proto` and `monty-pool` under
+   `crates/patches/` via `[patch.crates-io]`, following the precedent of
+   `monty-type-checking`. The patch adds one bounded telemetry event, read
+   outside turns.
 
 3. **Capacity, sharing and pressure transitions — REQ-020,021; AC-016.** Runtime
    tests use the agreed P/H/M and q=max(L/M,A/P), unequal demand/local caps and
@@ -133,6 +158,15 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
    acknowledged/mandatory work is ineligible. Missing controller behavior is
    RED; do not manufacture runtime heap-precision claims from counters.
 
+   Evidence (`resources::workload::tests::`):
+   - `borrowing_contention_and_recovery_follow_samples`: q=max(L/M,A/P), borrowing, 0.95/1.0, two-sample recovery, no overlap addition.
+   - `local_caps_redistribute_and_tenants_share_equally`: unequal caps, new contender, tenants.
+   - `untracked_allocator_pressure_pauses_all_growth`.
+   - `critical_pressure_reclaims_then_cancels_one_victim_per_sample`: reclaim first, one victim per sample, uncancellable ineligible.
+   - `paused_admission_starts_after_recovery`.
+
+   RED: all 5 failed on behavior assertions against the stub controller. GREEN: R1. TDD: PASS.
+
 4. **CPU lanes and tenant service — REQ-019,022; AC-017.** Runtime unit tests
    submit controlled jobs from multiple tenants/workloads. Show C managed lanes,
    all-lane borrowing while peers are idle, least normalized busy service at
@@ -142,6 +176,21 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
    lane is held while awaiting memory or downstream admission. Current separate
    semaphores/no common service accounting make the new behavior RED. Do not
    assert strict time slices or instant interruption of a long native phase.
+
+   Evidence (`resources::lanes::tests::`):
+   - `idle_peers_lend_every_lane_and_least_service_goes_next`
+   - `running_leases_count_as_service` (mutation-checked: dropping running service makes it fail)
+   - `idle_time_earns_no_credit`
+   - `tenants_share_their_workload_by_service`
+   - `nested_polls_inherit_and_pending_returns_the_lane`
+   - `cancelled_waiters_return_lanes_exactly_once` (also checks that idle tenants are forgotten)
+   - `blocking_jobs_wait_for_a_lane_and_nest`
+
+   RED: 6 failed on assertions; the blocking test hung on the stub. GREEN: R1.
+
+   TDD: VIOLATED for the cancellation sub-case. The withdraw logic preceded its test, so that test passed on first run.
+
+   "No lane while awaiting memory/downstream admission": `WorkloadManager::admit` takes no lane, and `Laned` releases on Pending. Integration proof is due in scenario 5.
 
 5. **Actual execution hooks — REQ-022,024; AC-017.** Bifrost integration tests
    run parallel query/repartition/sort/spill and Forge work through production

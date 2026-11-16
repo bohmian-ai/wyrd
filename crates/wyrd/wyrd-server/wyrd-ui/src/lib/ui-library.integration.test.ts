@@ -1183,6 +1183,29 @@ judged('a judged execution shows its judgments, accepted inputs, completed detai
   expect(pinned.members?.map((member) => member.execution_id)).toEqual(session.group?.sources.turns.execution_ids);
   expect(pinned.status.result?.outcome.verdict).toBe('passed');
 
+  // A second drift window of the same binding: its history holds both windows, oldest first, ending at the viewed one; the first window's own history is unchanged.
+  const sampler = WyrdState.fromPath(assistant.bundle, { client: WyrdClient.connect({ credential: assistant.key }) });
+  await sampler.startBifrost();
+  for (let sample = 0; sample < 100; sample += 1) await sampler.run('model').observe.submit('latency-drift', { latency: 99 });
+  await sampler.shutdown();
+  server.flushBifrost();
+  server.makeBindingDue(schedule);
+  const windows = async () => {
+    server.flushBifrost();
+    const [read] = await nodeExecutor(client).run([{ op: 'bifrost.query', sql: 'SELECT execution_id FROM bifrost.verification.results WHERE binding_id = $1 ORDER BY ended_at', params: [schedule], max_rows: 10 }]);
+    return read.ok ? read.value.rows.map(([id]) => String(id)) : [];
+  };
+  await vi.waitFor(async () => expect(await windows()).toHaveLength(2), { timeout: 90_000, interval: 1_000 });
+  const [, second] = await windows();
+  for (const [surface, executor] of [['node', nodeExecutor(client)], ['mcp', (await mcpOver(server.baseUrl, client)).executor]] as const) {
+    const points = async (executionId: string) => {
+      const loaded = data(await loadExecution({ executionId }, { executor }), surface).drift;
+      return loaded?.state === 'populated' ? loaded.data.history.map((point) => point.execution_id) : [];
+    };
+    expect(await points(second), surface).toEqual([drifted, second]);
+    expect(await points(drifted), surface).toEqual([drifted]);
+  }
+
   // Another tenant reads none of them, by ID alone, through either host.
   const outsider = WyrdClient.connect({ credential: server.bootstrapServiceInTenant(server.seedTenant('ui-judged-foreign'), ['admin'], 'ui-judged-admin') });
   // A principal that may read executions only: the recorded state loads, and the Card and query reads are each denied apart.

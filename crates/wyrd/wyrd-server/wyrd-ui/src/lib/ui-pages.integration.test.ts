@@ -1404,8 +1404,8 @@ judged('session, drift and cited judgments open as pages: members in recorded or
   const cards = await Cards.connect();
   const token = await WyrdClient.connect().accessToken();
   /** The one binding of `owner` whose status carries `field`: a schedule or a session end. */
-  const bindingWith = async (owner: { kind: string; name: string; version: string }, field: string) => {
-    for (const id of (await cards.get(owner as never)).status?.verification?.binding_ids ?? []) {
+  const bindingWith = async (owner: Exclude<Parameters<Cards['get']>[0], string>, field: string) => {
+    for (const id of (await cards.get(owner)).status?.verification?.binding_ids ?? []) {
       const response = await fetch(`${server.baseUrl}/v1/verification/bindings/${id}`, { headers: { 'x-wyrd-access-token': `Bearer ${token}` } });
       if (((await response.json()) as Record<string, unknown>)[field]) return id;
     }

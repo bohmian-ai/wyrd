@@ -64,9 +64,12 @@ impl AdmissionRefusal {
 /// and ends once the last clone drops.
 #[derive(Debug, Clone)]
 pub struct HostedAdmission {
+    /// The shared ledger and queue; the serving task holds only a weak
+    /// reference, so dropping the last clone ends it.
     inner: Arc<Inner>,
 }
 
+/// The state every [`HostedAdmission`] clone and its serving task share.
 #[derive(Debug)]
 struct Inner {
     /// The process memory ledger every grant is promised from.
@@ -75,6 +78,9 @@ struct Inner {
     queue: Mutex<Queue>,
 }
 
+/// Waiting requests grouped per tenant and served round-robin, so one
+/// tenant's backlog never starves another's; `waiting_bytes` is always the
+/// sum of every queued waiter's bytes.
 #[derive(Debug, Default)]
 struct Queue {
     /// Tenants with waiters, in service order.
@@ -87,6 +93,7 @@ struct Queue {
     waiting_bytes: u64,
 }
 
+/// One queued grant request; it holds no charge until it is served.
 #[derive(Debug)]
 struct Waiter {
     /// Identity for cancellation.
@@ -118,6 +125,10 @@ impl Waiter {
 
 impl HostedAdmission {
     /// Admission over the process `memory` ledger.
+    ///
+    /// # Panics
+    /// Panics when called outside a Tokio runtime, because it spawns the
+    /// task that serves waiters as the ledger releases bytes.
     #[must_use]
     pub fn new(memory: ByteLedger) -> Self {
         let inner = Arc::new(Inner {
@@ -333,8 +344,11 @@ impl Queue {
 
 /// A queued request; dropping it leaves the line.
 struct Waiting<'a> {
+    /// The admission whose queue holds the waiter.
     inner: &'a Inner,
+    /// The tenant line the waiter is in.
     tenant: DataTenantId,
+    /// The waiter's identity in that line, used to remove exactly it.
     id: u64,
 }
 

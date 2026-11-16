@@ -36,13 +36,21 @@ pub struct LedgerRefusal {
 /// its bytes when dropped and then wakes [`Self::changed`] waiters.
 #[derive(Debug, Clone)]
 pub struct ByteLedger {
+    /// The shared budget; every clone and every charge points here.
     inner: Arc<LedgerInner>,
 }
 
+/// The state behind every clone of one [`ByteLedger`].
+///
+/// `used` may exceed `limit` only through infallible charges; fallible
+/// charges never take it past `limit`.
 #[derive(Debug)]
 struct LedgerInner {
+    /// The whole budget in bytes, fixed at construction.
     limit: u64,
+    /// Bytes promised by live charges, including infallible overshoot.
     used: AtomicU64,
+    /// Woken on every release so refused callers can retry.
     changed: Notify,
 }
 
@@ -123,7 +131,11 @@ impl ByteLedger {
         self.inner.changed.notified()
     }
 
-    /// Adds `bytes` when they fit the limit.
+    /// Adds `bytes` when they fit the limit, atomically and all or nothing.
+    ///
+    /// # Errors
+    /// Returns [`LedgerRefusal`], leaving `used` unchanged, when `bytes`
+    /// would overflow or take `used` past the limit.
     fn try_add(&self, bytes: u64) -> Result<(), LedgerRefusal> {
         let limit = self.inner.limit;
         self.inner
@@ -153,7 +165,9 @@ impl ByteLedger {
 /// Bytes promised from one [`ByteLedger`], returned when dropped.
 #[derive(Debug)]
 pub struct ByteCharge {
+    /// The ledger these bytes are promised from and returned to.
     ledger: ByteLedger,
+    /// Bytes this charge currently owns; dropped charges return exactly this.
     bytes: u64,
 }
 
@@ -229,8 +243,11 @@ impl Drop for ByteCharge {
 /// filesystem.
 #[derive(Debug, Clone)]
 pub struct ProcessResources {
+    /// CPUs the process may run on, resolved once at startup.
     effective_cpu: NonZeroUsize,
+    /// The one process memory ledger every capability charges.
     memory: ByteLedger,
+    /// The one disposable-scratch ledger for the data-root filesystem.
     scratch: ByteLedger,
 }
 

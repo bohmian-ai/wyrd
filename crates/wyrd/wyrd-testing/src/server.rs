@@ -6580,6 +6580,11 @@ mod tests {
     /// `occupy_hosted_memory`, and `wait_for_hosted_waiters`, and the Python
     /// and TypeScript projections expose no other hook that steers or
     /// inspects server state.
+    ///
+    /// # Panics
+    /// Panics when a Rust control is not the named `WyrdTestServer` method, or
+    /// a Python or TypeScript projection misses one of the six controls or
+    /// exposes any member beyond them and its setup surface.
     #[test]
     fn public_controls_are_the_six_sanctioned_operations() {
         let rust_controls = [

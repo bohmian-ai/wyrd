@@ -295,6 +295,10 @@ impl ServerTarget {
     }
 
     /// Builds the shared wrong-target refusal for `work`.
+    ///
+    /// # Errors
+    /// Returns [`wyrd_spec::error::WyrdError::VerificationWrongTarget`],
+    /// naming this target, `work` and `operation`, when `runs` is false.
     fn require(
         self,
         runs: bool,
@@ -4536,6 +4540,10 @@ mod tests {
 
     /// Proves each closed target parses from its one spelling and derives its
     /// Bifrost owners and Verifier work; removed targets have no alias.
+    ///
+    /// # Panics
+    /// Panics when a closed target fails to parse, derives the wrong owners or
+    /// work, or a removed target name still parses.
     #[test]
     fn targets_derive_bifrost_owners_and_verifier_work() {
         use BifrostRuntimeRole::{ForgeCoordinator, ForgeWorker, Oracle, Scribe};
@@ -4576,6 +4584,10 @@ mod tests {
 
     /// Proves each target refuses the Verifier work it does not run with the
     /// one stable wrong-target error naming the target.
+    ///
+    /// # Panics
+    /// Panics when a target refuses work it runs, accepts work it does not
+    /// run, or refuses with another error, status or target name.
     #[test]
     fn targets_refuse_verifier_work_they_do_not_run() {
         let code = |result: Result<(), wyrd_spec::error::WyrdError>| {

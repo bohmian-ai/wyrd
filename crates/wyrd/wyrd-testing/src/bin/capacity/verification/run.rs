@@ -3475,6 +3475,10 @@ mod tests {
     /// it exited, started, or ran throughout; a missing counter stays
     /// unavailable; and the parent-only server CPU keeps its scope in new and
     /// historical records.
+    ///
+    /// # Panics
+    /// Panics when worker CPU is attributed outside the window, a missing
+    /// counter is reported as a value, or a record loses its server CPU scope.
     #[test]
     fn worker_process_resources_preserve_measurement_scope() {
         use wyrd_testing::capacity::worker_cpu_seconds;

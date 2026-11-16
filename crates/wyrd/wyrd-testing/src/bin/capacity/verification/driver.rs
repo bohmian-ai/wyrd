@@ -518,6 +518,13 @@ mod tests {
         );
     }
 
+    /// Proves a step's `language` variable selects its driver, defaulting to
+    /// Rust and refusing an unsupported language, and that each language runs
+    /// under its own process role.
+    ///
+    /// # Panics
+    /// Panics when a step selects the wrong language or role, or an
+    /// unsupported language is accepted.
     #[test]
     fn steps_select_their_language() {
         let step = |variables| Step::measured("step", variables);
@@ -535,6 +542,13 @@ mod tests {
         assert_eq!(Language::Rust.role().name(), "driver");
     }
 
+    /// Proves a foreign driver reports its identity first, refuses windows
+    /// with no client or more clients than applications, and then reports
+    /// every call of an accepted window.
+    ///
+    /// # Panics
+    /// Panics when the scripted driver fails to start, reports the wrong
+    /// identity or calls, or accepts an invalid window.
     #[tokio::test]
     async fn drivers_report_identity_then_every_call() {
         let mut driver = ForeignDriver::spawn(scripted(), &json!({}), 64)

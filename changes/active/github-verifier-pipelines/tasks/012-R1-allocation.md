@@ -349,6 +349,8 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
      Regressions: under the same wrapper, `--lib` 942 passed and
      `--test integration` 75 passed.
    - `mise run test:bifrost:journey:oracle`: 65 passed.
+   - At `b7fbc3897`: `mise run test:bifrost:journey:scribe` 45 passed
+     (1 skipped); `mise run test:bifrost:journey:forge` 24 passed.
    - Release before IO (REQ-022): `CpuLanes::off_lane(io)` returns the lane
      a `run_blocking` job holds for the IO, then queues for a lane again as
      the same work. An unwinding job takes no new lane. Scribe staging runs

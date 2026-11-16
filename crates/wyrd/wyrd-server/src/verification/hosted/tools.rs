@@ -489,7 +489,7 @@ impl Invocation {
             .envelopes
             .time(
                 Envelope::Sandbox,
-                Box::pin(self.sandbox.exec(
+                self.sandbox.exec(
                     self.caller.data_tenant_id,
                     source,
                     Vec::new(),
@@ -498,7 +498,7 @@ impl Invocation {
                     Some(&workspace),
                     bridge,
                     &self.envelopes,
-                )),
+                ),
             )
             .await
             .map_err(host_stop)?;

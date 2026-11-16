@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -27,7 +28,7 @@ use futures_util::StreamExt as _;
 use futures_util::future::BoxFuture;
 use futures_util::stream::FuturesUnordered;
 use monty_pool::{
-    MountSpec, Pool, PoolConfig, PoolError, ReplConfig, ResumeValue, TurnEvent, WorkerTelemetry,
+    MountSpec, Pool, PoolConfig, PoolError, ReplConfig, ResumeValue, TurnEvent, WorkerMemory,
     on_print_sync,
 };
 use monty_types::unstable::{self, MontyNode};
@@ -309,17 +310,18 @@ impl Sandbox {
             INPUTS_GLOBAL.to_owned(),
             MontyObject::string(Value::Object(inputs.clone()).to_string()),
         )];
-        let (value, output) = Box::pin(self.exec(
-            tenant,
-            code,
-            arguments,
-            mounts,
-            deadline,
-            None,
-            None,
-            &Envelopes::default(),
-        ))
-        .await?;
+        let (value, output) = self
+            .exec(
+                tenant,
+                code,
+                arguments,
+                mounts,
+                deadline,
+                None,
+                None,
+                &Envelopes::default(),
+            )
+            .await?;
         let text = String::try_from(&value)
             .map_err(|_| terminal("the entrypoint result is not JSON text".to_owned()))?;
         Ok(CodeRun {
@@ -367,11 +369,39 @@ impl Sandbox {
     /// the writer itself. With `bridge`, the program can
     /// `await call_tool(name, arguments)`; its calls run while the program
     /// is suspended, and a stopped session ends it.
+    ///
+    /// The execution's state machine is boxed here, once, so no caller embeds
+    /// it in its own future or stack frame.
     #[expect(
         clippy::too_many_arguments,
         reason = "one operation's tenant, program, inputs, mounts, deadline, and mediation"
     )]
     pub async fn exec(
+        &self,
+        tenant: DataTenantId,
+        code: String,
+        globals: Vec<(String, MontyObject)>,
+        mounts: Vec<MountSpec>,
+        deadline: Instant,
+        workspace: Option<&Arc<Workspace>>,
+        bridge: Option<&ToolBridge>,
+        envelopes: &Envelopes,
+    ) -> Result<(MontyObject, String), BlockError> {
+        Box::pin(self.execute(
+            tenant, code, globals, mounts, deadline, workspace, bridge, envelopes,
+        ))
+        .await
+    }
+
+    /// The body of [`Self::exec`], which boxes it.
+    ///
+    /// # Errors
+    /// As [`Self::exec`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one operation's tenant, program, inputs, mounts, deadline, and mediation"
+    )]
+    async fn execute(
         &self,
         tenant: DataTenantId,
         code: String,
@@ -449,7 +479,7 @@ impl Sandbox {
             .map_err(|error| failed(&error))?;
         let lease = self
             .workers
-            .lease(checkout.pid(), checkout.telemetry(), &operation);
+            .lease(checkout.pid(), checkout.memory(), &operation);
         let session = Raised::new(VERIFICATION_PYTHON_WORKERS, "suspended", 1.0);
         let budget = self.limits.tool_result_max_bytes;
         let mut output = String::new();
@@ -467,7 +497,7 @@ impl Sandbox {
                     self.workloads.lanes(),
                     context,
                     envelopes,
-                    checkout.feed(code, globals, mounts, true, &mut on_print),
+                    Box::pin(checkout.feed(code, globals, mounts, true, &mut on_print)),
                     &mut calls,
                     &mut answered,
                 )
@@ -509,13 +539,13 @@ impl Sandbox {
                                             self.workloads.lanes(),
                                             context,
                                             envelopes,
-                                            checkout.resume(
+                                            Box::pin(checkout.resume(
                                                 ResumeValue::Error(MontyException::new(
                                                     ExcType::OSError,
                                                     Some(refusal.to_string()),
                                                 )),
                                                 &mut on_print,
-                                            ),
+                                            )),
                                             &mut calls,
                                             &mut answered,
                                         )
@@ -530,7 +560,7 @@ impl Sandbox {
                                 self.workloads.lanes(),
                                 context,
                                 envelopes,
-                                checkout.resume_from_mounts(&mut on_print),
+                                Box::pin(checkout.resume_from_mounts(&mut on_print)),
                                 &mut calls,
                                 &mut answered,
                             )
@@ -542,7 +572,9 @@ impl Sandbox {
                                         self.workloads.lanes(),
                                         context,
                                         envelopes,
-                                        checkout.resume(ResumeValue::NotHandled, &mut on_print),
+                                        Box::pin(
+                                            checkout.resume(ResumeValue::NotHandled, &mut on_print),
+                                        ),
                                         &mut calls,
                                         &mut answered,
                                     )
@@ -559,13 +591,13 @@ impl Sandbox {
                                 self.workloads.lanes(),
                                 context,
                                 envelopes,
-                                checkout.resume_name_lookup(
+                                Box::pin(checkout.resume_name_lookup(
                                     MontyObject::function(
                                         CALL_TOOL,
                                         Some(CALL_TOOL_DOC.to_owned()),
                                     ),
                                     &mut on_print,
-                                ),
+                                )),
                                 &mut calls,
                                 &mut answered,
                             )
@@ -576,7 +608,9 @@ impl Sandbox {
                                 self.workloads.lanes(),
                                 context,
                                 envelopes,
-                                checkout.resume_name_lookup(None::<MontyObject>, &mut on_print),
+                                Box::pin(
+                                    checkout.resume_name_lookup(None::<MontyObject>, &mut on_print),
+                                ),
                                 &mut calls,
                                 &mut answered,
                             )
@@ -596,7 +630,7 @@ impl Sandbox {
                                 self.workloads.lanes(),
                                 context,
                                 envelopes,
-                                checkout.resume(ResumeValue::Future, &mut on_print),
+                                Box::pin(checkout.resume(ResumeValue::Future, &mut on_print)),
                                 &mut calls,
                                 &mut answered,
                             )
@@ -607,7 +641,7 @@ impl Sandbox {
                                 self.workloads.lanes(),
                                 context,
                                 envelopes,
-                                checkout.resume(ResumeValue::NotFound, &mut on_print),
+                                Box::pin(checkout.resume(ResumeValue::NotFound, &mut on_print)),
                                 &mut calls,
                                 &mut answered,
                             )
@@ -642,7 +676,7 @@ impl Sandbox {
                                 self.workloads.lanes(),
                                 context,
                                 envelopes,
-                                checkout.resume_futures(results, &mut on_print),
+                                Box::pin(checkout.resume_futures(results, &mut on_print)),
                                 &mut calls,
                                 &mut answered,
                             )
@@ -718,7 +752,7 @@ struct Workers {
 /// One live worker's telemetry and the charges that follow it.
 struct Tracked {
     /// The worker's latest sample.
-    telemetry: Arc<WorkerTelemetry>,
+    telemetry: Arc<WorkerMemory>,
     /// Its reported live bytes, charged to process memory.
     charge: ByteCharge,
     /// Its reported allocator commitment.
@@ -765,7 +799,7 @@ impl Workers {
 
     /// Track worker `pid` reporting through `telemetry`, counting a spawn
     /// the first time it is seen.
-    fn track(&self, pid: u32, telemetry: Arc<WorkerTelemetry>) {
+    fn track(&self, pid: u32, telemetry: Arc<WorkerMemory>) {
         if let std::collections::hash_map::Entry::Vacant(slot) = self.lock().entry(pid) {
             let mut charge = self.memory.empty_charge();
             charge.attribute(&self.idle);
@@ -780,7 +814,7 @@ impl Workers {
 
     /// Track every idle worker in `pool`, such as prewarmed ones.
     fn track_idle(&self, pool: &Pool) {
-        for (pid, telemetry) in pool.idle_worker_telemetry() {
+        for (pid, telemetry) in pool.idle_worker_memory() {
             self.track(pid, telemetry);
         }
     }
@@ -790,7 +824,7 @@ impl Workers {
     fn lease(
         &self,
         pid: Option<u32>,
-        telemetry: Option<Arc<WorkerTelemetry>>,
+        telemetry: Option<Arc<WorkerMemory>>,
         operation: &Operation,
     ) -> Lease<'_> {
         if let (Some(pid), Some(telemetry)) = (pid, telemetry) {
@@ -887,12 +921,14 @@ impl Drop for Lease<'_> {
 /// lane is timed as `envelopes`' [`Envelope::Runnable`].
 ///
 /// The worker process runs the turn, so the lane is held across the turn's
-/// awaits rather than per poll; host calls polled meanwhile hold none.
+/// awaits rather than per poll; host calls polled meanwhile hold none. The
+/// turn arrives boxed: a Monty checkout turn is too large to embed in every
+/// caller's future.
 async fn run_turn<T>(
     lanes: &CpuLanes,
     context: WorkContext,
     envelopes: &Envelopes,
-    turn: impl Future<Output = T>,
+    turn: Pin<Box<impl Future<Output = T>>>,
     calls: &mut Calls<'_>,
     answered: &mut Vec<Answered>,
 ) -> T {

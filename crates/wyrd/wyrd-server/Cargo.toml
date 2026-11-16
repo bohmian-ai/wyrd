@@ -98,7 +98,7 @@ tar = { workspace = true }
 unicase = { workspace = true }
 unicode-normalization = { workspace = true }
 monty-pool = { workspace = true }
-monty-proto = { workspace = true, features = ["worker"] }
+monty-proto = { workspace = true, features = ["worker-core"] }
 monty-types = { workspace = true }
 thiserror = { workspace = true }
 zeroize = { workspace = true }

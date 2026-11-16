@@ -20,16 +20,17 @@
 //! builds link none and keep their own.
 //!
 //! A second thread reports the worker's live and committed bytes every
-//! [`TELEMETRY_INTERVAL`] as one `Telemetry` frame, independent of the
+//! [`TELEMETRY_INTERVAL`] as one `MemorySample` frame, independent of the
 //! interpreter's turns. Frames from both threads are written whole under the
 //! stdout lock, so they never interleave; the reporter reuses one buffer, so
 //! sampling allocates nothing and no allocator hook does IPC.
 //!
 //! The serve loop mirrors `monty-runtime`'s `subprocess` shell over
-//! [`monty_proto::worker::Child`]. A worker serves one session at a time; a
+//! [`monty_proto::worker::Worker`]. A worker serves one session at a time; a
 //! `Reset` between sessions drops the session's interpreter, globals, and
-//! budget, and [`apply_memory_limit`] re-arms the next session's ceiling, so
-//! no interpreter state crosses invocations.
+//! budget, and [`apply_budget`] arms each session's ceiling before its first
+//! request runs and re-arms it after every request, so no interpreter state
+//! crosses invocations.
 
 use std::fmt;
 use std::io::{self, Write};
@@ -38,7 +39,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use monty_proto::worker::{Child, EventSink, HandleOutcome, fatal_error_event, protocol_violation};
+use monty_proto::worker::{
+    EventSink, HandleOutcome, SessionBudget, Worker, fatal_error_event, protocol_violation,
+};
 use monty_proto::{FrameError, FrameReader, encode_framed_into, pb, write_frame};
 use monty_types::{BASELINE_MEMORY, LIVE_MEMORY, OOM_EXIT_CODE, memory_limit_with_headroom};
 
@@ -176,20 +179,23 @@ fn run(committed: fn() -> u64) -> ExitCode {
 fn serve() -> ExitCode {
     install_panic_hook();
     let mut reader = FrameReader::new(io::stdin().lock());
-    let mut child = Child::default();
+    let mut worker = Worker::default();
     let mut sink = StdoutSink;
+    // set the baseline on the pristine worker: a session's first request is
+    // decoded before its ceiling is armed and must not count as overhead
+    apply_budget(worker.session_budget());
     loop {
-        match reader.read::<pb::ParentRequest>() {
+        match reader.read::<pb::ClientRequest>() {
             Ok(Some(request)) => {
-                let outcome = child.handle(request, &mut sink);
-                apply_memory_limit(&child);
+                let outcome = worker.handle(request, &mut sink);
+                apply_budget(worker.session_budget());
                 match outcome {
                     Ok(HandleOutcome::Continue) => {}
                     Ok(HandleOutcome::Shutdown) => return ExitCode::SUCCESS,
                     Ok(HandleOutcome::Fatal) => return ExitCode::from(4),
                     Err(FrameError::FrameTooLarge { len, max }) => {
                         fatal(
-                            &child,
+                            &worker,
                             &mut sink,
                             &format!("response frame of {len} bytes exceeds {max} bytes"),
                         );
@@ -209,7 +215,7 @@ fn serve() -> ExitCode {
             }
             Err(error) => {
                 fatal(
-                    &child,
+                    &worker,
                     &mut sink,
                     &format!("malformed request frame: {error}"),
                 );
@@ -232,12 +238,12 @@ fn report(committed: fn() -> u64) {
     let mut frame = Vec::with_capacity(TELEMETRY_FRAME_CAPACITY);
     loop {
         thread::sleep(TELEMETRY_INTERVAL);
-        let event = pb::ChildEvent {
-            kind: Some(pb::child_event::Kind::Telemetry(pb::Telemetry {
+        let event = pb::WorkerEvent {
+            kind: Some(pb::worker_event::Kind::MemorySample(pb::MemorySample {
                 live_bytes: u64::try_from(LIVE_MEMORY.load(Ordering::Relaxed)).unwrap_or(u64::MAX),
                 committed_bytes: committed(),
             })),
-            ..pb::ChildEvent::default()
+            ..pb::WorkerEvent::default()
         };
         if encode_framed_into(&event, &mut frame).is_err() {
             return;
@@ -257,12 +263,11 @@ fn report(committed: fn() -> u64) {
 /// allocates.
 const TELEMETRY_FRAME_CAPACITY: usize = 64;
 
-/// Arm the hard ceiling of the session the child now holds, relative to the
-/// worker's baseline, as `monty-alloc`'s `set_hard_limit` does. Re-applied
-/// after every request, since a session can also arrive through a restored
-/// dump or end through a reset.
-fn apply_memory_limit(child: &Child) {
-    let budget = child.session_budget();
+/// Arm the hard ceiling for the session `budget` describes, relative to the
+/// worker's baseline, as `monty-alloc`'s `set_hard_limit` does. Applied at
+/// start-up, when a session opens, and after every request, since a session
+/// can also arrive through a restored dump or end through a reset.
+fn apply_budget(budget: SessionBudget) {
     let live = LIVE_MEMORY.load(Ordering::Relaxed);
     // `fetch_min` both reads and lowers the baseline: the first arming sets
     // it, and a later leaner moment can only improve it.
@@ -272,7 +277,7 @@ fn apply_memory_limit(child: &Child) {
     HARD_LIMIT.store(hard_limit, Ordering::Relaxed);
 }
 
-/// Writes framed child events to stdout.
+/// Writes framed worker events to stdout.
 struct StdoutSink;
 
 impl EventSink for StdoutSink {
@@ -281,15 +286,21 @@ impl EventSink for StdoutSink {
     ///
     /// # Errors
     /// Returns the framing or write failure.
-    fn send(&mut self, event: &pb::ChildEvent) -> Result<(), FrameError> {
+    fn send(&mut self, event: &pb::WorkerEvent) -> Result<(), FrameError> {
         write_frame(&mut io::stdout().lock(), event)
+    }
+
+    /// Arm the ceiling of a session opened by its first request before that
+    /// request runs.
+    fn session_opened(&mut self, budget: SessionBudget) {
+        apply_budget(budget);
     }
 }
 
 /// Emit a best-effort `FatalError` before exiting.
-fn fatal(child: &Child, sink: &mut impl EventSink, message: &str) {
+fn fatal(worker: &Worker, sink: &mut impl EventSink, message: &str) {
     eprintln!("wyrd-server monty worker fatal error: {message}");
-    let _ = sink.send(&child.fatal_event(message));
+    let _ = sink.send(&worker.fatal_event(message));
 }
 
 /// Emit a best-effort `FatalError` frame on panic before the default hook.

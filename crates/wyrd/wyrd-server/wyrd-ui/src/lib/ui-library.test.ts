@@ -3096,6 +3096,8 @@ test('an unavailable read, a refused progress read and context not yet retained 
   expect(partial.container.querySelector('[data-part="Recorded progress"]')).toHaveTextContent(unavailable.code);
   expect(partial.container.querySelector('[data-part="Retained outputs"], [data-part="Verifier definition"]')).toBeNull();
   expect(partial.container.querySelector('[data-execution-status]')).not.toBeNull();
+  expect(partial.container.querySelector('[data-node]')).not.toBeNull();
+  expect(partial.container).toHaveTextContent(/All retained outputs \(\d+/);
   partial.unmount();
 
   // A Verifier not yet visible in retained metadata is said where the graph would be.

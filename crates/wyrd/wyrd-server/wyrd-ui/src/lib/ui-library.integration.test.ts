@@ -952,6 +952,10 @@ test('an unfinished execution shows recorded progress and retained outputs throu
   const settled = JSON.parse(text) as Awaited<ReturnType<typeof loadExecution>>;
   expect(settled).toMatchObject({ result: { state: 'populated', data: { status: { status: 'cancelled' }, publication: { state: 'populated', data: { kind: 'directory' } } } } });
   expect(data(settled, 'app').publications).toMatchObject({ state: 'populated', data: { items: [{}, {}, {}, {}] } });
+  // Recorded progress stays readable after the cancel, through Node and the custom app alike.
+  const afterCancel = data(await loadExecution({ executionId }, { executor: nodeExecutor(client) }), 'node after cancel');
+  expect(afterCancel.invocations.state).toBe('populated');
+  expect(data(settled, 'app').invocations).toEqual(afterCancel.invocations);
 
   // An execution the app's credential cannot find is the server's refusal, not an empty panel.
   const missing = await loadExamplePanel({
@@ -1326,7 +1330,7 @@ traced('a session judgment cites an exact trace: the citation leads to its pinne
       expect(waterfall.result.state, surface).toBe('populated');
       // A trace list over a later day does not hold this trace; the citation still opens it.
       const listed = await loadRecordTable({ signal: 'traces' }, { executor, range: { from: '2026-10-20T00:00:00Z', to: '2026-10-21T00:00:00Z' } });
-      expect(listed.result.state, surface).not.toBe('denied');
+      expect(['populated', 'empty'], surface).toContain(listed.result.state);
       expect(JSON.stringify(listed.result), surface).not.toContain(SESSION_TRACE);
     }
 

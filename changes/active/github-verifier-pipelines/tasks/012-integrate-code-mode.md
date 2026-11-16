@@ -233,6 +233,21 @@ unavailable and rerun; a vanished target path is not closure. No source
 modification of external reviewed libraries, payload-sizing redesign or nested
 publication identity extension belongs here.
 
+## Maintainer scope direction
+
+The maintainer struck these proof cases from this task. The port did not
+change the behavior they cover, so they need no new test here:
+
+- nested tool calls in fanout and repeat on Python, TypeScript and MCP (the
+  Rust journey remains);
+- readiness, hosted blocks and gateway following the target, and the
+  Kubernetes manifests;
+- a crashed-`worker` pod journey (takeover stays proven at the claim seam);
+- rejection of an extra test control in Rust and in loaded native exports;
+- MCP extraction and delivery inspection;
+- no SQL on a warm direct execution;
+- replica-local budgets (TASK-014's two-replica qualification).
+
 ## Obligations
 
 | ID | Promise (contract source) | Planned proof |
@@ -307,14 +322,12 @@ Out of this task:
 Maintainer: OBL-9's direct c64 comparison beside saturated workers, OBL-14's
 benchmark records, and the TASK-013/014 handoff, all on an immutable candidate.
 
-Tests to write: OBL-4 nested calls in fanout and repeat on every surface, and
-the nonblocking tool-permission audit; OBL-6 charges surviving cache
-eviction; OBL-7 frozen-copy and encoding custody; OBL-9 crashed-worker
-takeover, `bifrost-*` refusal over HTTP and MCP, readiness, hosted blocks and
-gateway following the target, and the Kubernetes manifests; OBL-11 rejecting
-an extra control in Rust and in loaded native exports; OBL-12 MCP extraction
-and delivery inspection; compute freed before the queued ACK; no SQL on a
-warm direct execution; replica-local budgets.
+Tests to write, after the maintainer's scope direction: OBL-4 nested calls
+in fanout and repeat (Rust journey) and the nonblocking tool-permission
+audit; OBL-6 charges surviving cache eviction; OBL-7 frozen-copy and
+encoding custody; compute freed before the queued ACK. OBL-9's `bifrost-*`
+refusal over HTTP and MCP is written:
+`pg_verification_routes::bifrost_targets_refuse_all_verifier_work`.
 
 ### Diagnoses
 

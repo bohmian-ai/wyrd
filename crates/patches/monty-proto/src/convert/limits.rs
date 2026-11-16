@@ -1,0 +1,54 @@
+//! `ResourceLimits` ↔ `pb::ResourceLimits` conversions.
+//!
+//! Wire fields are `u64`; the Rust struct uses `usize`, so proto → Rust
+//! saturates to `usize::MAX` on 32-bit hosts. Absent wire fields mean
+//! "unlimited", except recursion depth and `max_suspensions`, which fall back
+//! to monty's standard defaults — matching `ResourceLimits::default()` so an
+//! empty message is safe. `max_suspensions` is preserved across dumps for
+//! parent-side enforcement.
+
+use std::time::Duration;
+
+use monty_types::{DEFAULT_MAX_RECURSION_DEPTH, DEFAULT_MAX_SUSPENSIONS, ResourceLimits};
+
+use crate::pb;
+
+impl From<&ResourceLimits> for pb::ResourceLimits {
+    fn from(limits: &ResourceLimits) -> Self {
+        Self {
+            max_feed_duration_micros: micros_field(limits.max_feed_duration),
+            max_turn_duration_micros: micros_field(limits.max_turn_duration),
+            max_memory_bytes: limits.max_memory.map(|v| v as u64),
+            gc_interval: limits.gc_interval.map(|v| v as u64),
+            max_recursion_depth: Some(limits.max_recursion_depth as u64),
+            max_suspensions: Some(limits.max_suspensions as u64),
+            max_total_sleep_micros: limits
+                .max_total_sleep
+                .map(|d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX)),
+        }
+    }
+}
+
+impl From<pb::ResourceLimits> for ResourceLimits {
+    fn from(limits: pb::ResourceLimits) -> Self {
+        Self {
+            max_feed_duration: limits.max_feed_duration_micros.map(Duration::from_micros),
+            max_turn_duration: limits.max_turn_duration_micros.map(Duration::from_micros),
+            max_memory: usize_field(limits.max_memory_bytes),
+            gc_interval: usize_field(limits.gc_interval),
+            max_recursion_depth: usize_field(limits.max_recursion_depth).unwrap_or(DEFAULT_MAX_RECURSION_DEPTH),
+            max_suspensions: usize_field(limits.max_suspensions).unwrap_or(DEFAULT_MAX_SUSPENSIONS),
+            max_total_sleep: limits.max_total_sleep_micros.map(Duration::from_micros),
+        }
+    }
+}
+
+/// Widens an optional [`Duration`] to wire microseconds, saturating at `u64::MAX`.
+pub(crate) fn micros_field(value: Option<Duration>) -> Option<u64> {
+    value.map(|d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
+}
+
+/// Narrows an optional wire `u64` to `usize`, saturating to `usize::MAX` on 32-bit hosts.
+pub(crate) fn usize_field(value: Option<u64>) -> Option<usize> {
+    value.map(|v| usize::try_from(v).unwrap_or(usize::MAX))
+}

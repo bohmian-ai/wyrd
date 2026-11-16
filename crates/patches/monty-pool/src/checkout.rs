@@ -1,0 +1,2257 @@
+//! A checked-out worker: one REPL session, driven turn by turn.
+
+#[cfg(feature = "telemetry")]
+use std::time::Instant;
+use std::{
+    borrow::Cow,
+    fmt,
+    future::{Future, ready},
+    mem,
+    path::Path,
+    pin::Pin,
+    process::ExitStatus,
+    sync::Arc,
+    time::Duration,
+};
+
+use monty_fs::{MountCallOutcome, MountMode, MountRoot, MountTable, OverlayState};
+use monty_proto::{
+    FrameError, PROTOCOL_VERSION, ext_result_to_proto, future_results_to_proto, named_values_to_proto,
+    os_call_from_proto, pb, validate_requirement,
+};
+use monty_types::{
+    AssertMessageAnnotations, CallArgs, DEFAULT_MAX_SUSPENSIONS, ExcType, ExtFunctionResult, MONTY_VERSION,
+    MontyException, MontyObject, MontyUuid, NameLookupResult, NamedValues, OsFunctionCall, OsPolicy, PrintStream,
+    ResourceLimits, SleepMode, SourceRange, TypeCheckingConfig, validate_cwd,
+};
+#[cfg(feature = "telemetry")]
+use opentelemetry::trace::{FutureExt, TraceContextExt};
+use tokio::{task::spawn_blocking, time::timeout};
+
+#[cfg(feature = "telemetry")]
+use crate::telemetry::{TelemetryContext, metrics::outcome};
+use crate::{
+    CrashCause, PoolConfig, PoolError,
+    pool::{CapacityGuard, PoolInner},
+    worker::Worker,
+};
+
+/// Arguments for the REPL session a checkout creates — mirrors
+/// `MontyRepl`'s constructor surface.
+#[derive(Debug, Clone)]
+pub struct ReplConfig {
+    /// Script name used in tracebacks and type-check diagnostics, and the
+    /// basis of the sandbox's `__file__`: its final path component placed
+    /// under the working directory a feed starts in (`/main.py` at the root).
+    pub script_name: String,
+    /// Sandbox resource limits enforced inside the worker. `None` means
+    /// unlimited (except monty's standard recursion-depth default).
+    pub limits: Option<ResourceLimits>,
+    /// Type-check every fed snippet before executing it.
+    pub type_check: bool,
+    /// Stub declarations made available to type checking.
+    pub type_check_stubs: Option<String>,
+    /// How the worker renders typing diagnostics. Chosen here rather than on
+    /// the raised error because the structured diagnostics never leave the
+    /// worker — only the rendered text crosses the wire.
+    pub type_check_config: TypeCheckingConfig,
+    /// Give failed `assert` statements pytest-style introspected messages
+    /// (see `limitations/assert.md`). On by default with a 120-byte
+    /// operand-repr truncation; `MaxBytes` customizes the truncation.
+    pub assert_message_annotations: AssertMessageAnnotations,
+    /// How long the worker may hold buffered `print()` output before sending
+    /// it, batching a burst of prints into one `Print` event instead of one
+    /// each. `None` takes the worker's default
+    /// ([`crate::DEFAULT_PRINT_FLUSH_INTERVAL`]); `Duration::ZERO` restores line
+    /// buffering, delivering each completed line on its own.
+    ///
+    /// Output is always flushed before a suspension or a turn ends, so this
+    /// only sets how long live output may lag — never what arrives, or in
+    /// what order. The wire carries whole milliseconds, so a positive interval
+    /// below 1 ms is sent as 1 ms rather than rounding down into the
+    /// line-buffering sentinel.
+    pub print_flush_interval: Option<Duration>,
+    /// Session clock, initial random state and sleep policy; defaults use the worker's clock and entropy.
+    /// `CallHost` delegates to the caller's OS handler through [`TurnEvent::OsCall`].
+    /// `System` sleeps set `system_sleep` for the caller to await directly; `Zero` sleeps return immediately.
+    pub os_policy: OsPolicy,
+    /// Whether a serving relay may store the session; subprocess workers ignore it.
+    pub persistence: Persistence,
+    /// The serving relay's profile to run the session under; `None` takes the
+    /// relay's default. Subprocess workers ignore it.
+    pub profile: Option<String>,
+}
+
+/// How a serving relay (`monty-server`) treats a session's state.
+///
+/// A storing relay mints a session ID ([`Checkout::session_id`]) that resumes the
+/// session from any process. Local subprocess workers never store anything.
+// non_exhaustive: a relay may grow new storage policies
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Persistence {
+    /// Whatever the relay does by default.
+    #[default]
+    ServerDefault,
+    /// Never stored by the relay on its own: no session ID and never parked.
+    Ephemeral,
+    /// Parked on idle, drain or disconnect, and resumable by its session ID.
+    Stored,
+}
+
+impl From<Persistence> for pb::Persistence {
+    fn from(persistence: Persistence) -> Self {
+        match persistence {
+            Persistence::ServerDefault => Self::Unspecified,
+            Persistence::Ephemeral => Self::Ephemeral,
+            Persistence::Stored => Self::Stored,
+        }
+    }
+}
+
+impl Default for ReplConfig {
+    fn default() -> Self {
+        Self {
+            script_name: "main.py".to_owned(),
+            limits: None,
+            type_check: false,
+            type_check_stubs: None,
+            type_check_config: TypeCheckingConfig::default(),
+            assert_message_annotations: AssertMessageAnnotations::default(),
+            print_flush_interval: None,
+            os_policy: OsPolicy::default(),
+            persistence: Persistence::default(),
+            profile: None,
+        }
+    }
+}
+
+/// Host-side context for one checkout, as opposed to the [`ReplConfig`] the
+/// worker is sent.
+// non_exhaustive: options may be added without breaking callers
+#[derive(Default)]
+#[non_exhaustive]
+pub struct CheckoutOptions {
+    /// Distributed trace context captured by a host adapter. Its span also
+    /// goes out as `traceparent`/`tracestate` on a WebSocket dial, so a remote
+    /// worker's own spans join the host's trace.
+    #[cfg(feature = "telemetry")]
+    pub telemetry: Option<TelemetryContext>,
+    /// Extra headers for this checkout's WebSocket upgrade request; the
+    /// subprocess transport makes no request and ignores them. Duplicate
+    /// names are last-wins, even against the default `user-agent`
+    /// (`monty-pool/<version>`), the `traceparent` from `telemetry`, `host`
+    /// and the other handshake headers, and a malformed name or value fails
+    /// the dial.
+    pub connect_headers: Vec<(String, String)>,
+}
+
+impl CheckoutOptions {
+    /// Sets the distributed trace context, if the host captured one.
+    #[cfg(feature = "telemetry")]
+    #[must_use]
+    pub fn with_telemetry(mut self, telemetry: Option<TelemetryContext>) -> Self {
+        self.telemetry = telemetry;
+        self
+    }
+
+    /// Sets the headers for this checkout's WebSocket upgrade request.
+    #[must_use]
+    pub fn with_connect_headers(mut self, connect_headers: Vec<(String, String)>) -> Self {
+        self.connect_headers = connect_headers;
+        self
+    }
+}
+
+/// Names each connect header, never its value: monty never interprets the
+/// values, but a caller may send e.g. a token for a proxy/relay in front of
+/// the worker, and options get logged.
+impl fmt::Debug for CheckoutOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let header_names: Vec<&str> = self.connect_headers.iter().map(|(name, _)| name.as_str()).collect();
+        f.debug_struct("CheckoutOptions")
+            .field("connect_headers", &header_names)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A host directory mounted into the sandbox for one feed. Mounts are handled
+/// entirely on the parent: the checkout services covered filesystem OS calls
+/// from the host path itself (so mounts work even when the worker runs on a
+/// remote machine). Every OS call still surfaces as a [`TurnEvent::OsCall`];
+/// mounts are consulted only when the caller asks, via
+/// [`Checkout::resume_from_mounts`].
+#[derive(Debug, Clone)]
+pub struct MountSpec {
+    /// The host directory, opened when this spec was built and shared by every
+    /// feed that reuses it. The path is never resolved again, so sandbox code
+    /// cannot make it name a different directory between feeds.
+    root: MountRoot,
+    /// Access mode.
+    pub mode: MountSpecMode,
+    /// Cap on total bytes written through this mount.
+    pub write_bytes_limit: Option<u64>,
+    /// Aggregate budget for retained overlay data and transient results.
+    pub memory_usage_limit: u64,
+}
+
+impl MountSpec {
+    /// Opens `host_path` and creates mount configuration with the default
+    /// 100 MB memory budget and no cumulative write limit.
+    ///
+    /// Build this once and reuse it; each call resolves the path afresh. The
+    /// open is blocking filesystem I/O, so an async caller opening a directory
+    /// that may stall (NFS, FUSE) should either build the spec before entering
+    /// the runtime or open the [`MountRoot`] under `spawn_blocking` and pass it
+    /// to [`Self::from_root`]. Feeds never reopen it, so this cost is paid once
+    /// per mount rather than once per feed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PoolError::Runtime`] if the virtual path is not absolute, or
+    /// the host path cannot be opened as a directory.
+    pub fn new(virtual_path: &str, host_path: impl AsRef<Path>, mode: MountSpecMode) -> Result<Self, PoolError> {
+        let root = MountRoot::open(virtual_path, host_path).map_err(|err| PoolError::Runtime(err.into_exception()))?;
+        Ok(Self::from_root(root, mode))
+    }
+
+    /// Creates mount configuration from an already-opened [`MountRoot`], for
+    /// hosts that open it themselves to map failures their own way.
+    #[must_use]
+    pub fn from_root(root: MountRoot, mode: MountSpecMode) -> Self {
+        Self {
+            root,
+            mode,
+            write_bytes_limit: None,
+            memory_usage_limit: monty_fs::DEFAULT_MEMORY_USAGE_LIMIT,
+        }
+    }
+
+    /// Returns the normalized virtual path this mount answers on.
+    #[must_use]
+    pub fn virtual_path(&self) -> &str {
+        self.root.virtual_path()
+    }
+
+    /// Returns the host directory path. Diagnostics only — operations run
+    /// against the descriptor, not this path.
+    #[must_use]
+    pub fn host_path(&self) -> &Path {
+        self.root.host_path()
+    }
+}
+
+/// Access mode for a [`MountSpec`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountSpecMode {
+    /// Reads only; writes raise `PermissionError` in the sandbox.
+    ReadOnly,
+    /// Files written by sandboxed code persist on the host and are untrusted;
+    /// the host must not execute them, including indirectly via a Python
+    /// `import` when the directory is on `sys.path`. [`Self::Overlay`] keeps
+    /// writes in memory instead.
+    ReadWrite,
+    /// Copy-on-write overlay in parent memory; writes are discarded when the
+    /// feed ends.
+    Overlay,
+}
+
+/// How a protocol turn ended: a suspension that needs an answer from the
+/// caller, or completion of the fed snippet.
+#[derive(Debug)]
+pub enum TurnEvent {
+    /// The sandbox called an external function — answer with
+    /// [`Checkout::resume`]. When `object_id` is set this is a method call on
+    /// a host-backed object, routed by uuid — a class instance, or a class
+    /// type (a classmethod call, or construction of a host class, which is
+    /// spelled `__call__`); the receiver is NOT included in `args`.
+    FunctionCall {
+        function_name: String,
+        /// One arena holding every positional and keyword argument.
+        args: CallArgs,
+        call_id: u32,
+        object_id: Option<MontyUuid>,
+        /// Coroutine results may be awaited and returned via [`Checkout::resume_futures`].
+        allow_eager_await: bool,
+        /// Where the call expression is in the source.
+        position: SourceRange,
+    },
+    /// The sandbox performed an OS operation (e.g. `"Path.read_text"`).
+    /// Answer it from this feed's mounts with
+    /// [`Checkout::resume_from_mounts`], or directly with
+    /// [`Checkout::resume`]. A caller with no handler should resume with
+    /// [`ResumeValue::NotHandled`]; the sandbox then raises the call's own
+    /// no-handler default.
+    OsCall {
+        function_name: String,
+        /// One arena holding every positional and keyword argument.
+        args: CallArgs,
+        call_id: u32,
+        /// As on [`FunctionCall`](Self::FunctionCall): the caller may await
+        /// the wait and answer with [`Checkout::resume_futures`]. Only set on
+        /// a call `OsFunctionCall::accepts_future` allows a future for.
+        allow_eager_await: bool,
+        /// Wait this duration, then return `MontyObject::none()` (as a future for `asyncio.sleep`).
+        /// The parent caps the untrusted worker's delay and charges `max_total_sleep` before returning it.
+        /// `None` delegates to the caller's OS handler.
+        system_sleep: Option<Duration>,
+        /// Where the call expression is in the source.
+        position: SourceRange,
+    },
+    /// The sandbox read an undefined name, or — when `object_id` is set — a
+    /// lazy attribute on the host-backed object with that uuid (a class
+    /// instance, or a class type) — answer with
+    /// [`Checkout::resume_name_lookup`]. An `Undefined` (or `None`) answer
+    /// raises `NameError` for plain lookups, `AttributeError` for attribute
+    /// lookups; an `Error` answer raises the host's exception in the sandbox.
+    NameLookup {
+        name: String,
+        object_id: Option<MontyUuid>,
+        /// Where the name (or attribute access) is in the source.
+        position: SourceRange,
+    },
+    /// Every sandbox task is blocked on external futures — answer with
+    /// [`Checkout::resume_futures`].
+    ResolveFutures {
+        pending_call_ids: Vec<u32>,
+        /// Where the main task's blocked `await` is in the source.
+        position: SourceRange,
+    },
+    /// The fed snippet completed with this value; the session is ready for
+    /// the next [`Checkout::feed`].
+    Complete(MontyObject),
+}
+
+/// The caller's answer to a [`TurnEvent::FunctionCall`] or
+/// [`TurnEvent::OsCall`].
+#[derive(Debug)]
+pub enum ResumeValue {
+    /// The call returned this value.
+    Return(MontyObject),
+    /// The call raised this exception.
+    Error(MontyException),
+    /// The call is asynchronous: register an external future and continue
+    /// other tasks; resolve later via [`Checkout::resume_futures`].
+    Future,
+    /// No handler exists for the called name — the sandbox raises
+    /// `NameError`.
+    NotFound,
+    /// No handler accepted this OS call — the sandbox raises the call's own
+    /// no-handler default (`PermissionError` naming the path for filesystem
+    /// calls, `RuntimeError` for the rest). Only valid answering a
+    /// [`TurnEvent::OsCall`].
+    NotHandled,
+}
+
+/// The (boxed) future an [`OnPrint`] callback returns for one fragment; the
+/// turn awaits it before reading on, so a slow sink backpressures the worker.
+pub type PrintFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// Callback receiving sandbox `print()` output streamed during a turn.
+///
+/// The callback returns a future so genuinely async sinks (a JS callback, a
+/// socket) can be awaited per fragment; synchronous sinks wrap themselves
+/// with [`on_print_sync`]. The future must be `'static`, so it captures owned
+/// copies of whatever it needs (including the text, if consumed async).
+pub type OnPrint<'a> = &'a mut (dyn FnMut(PrintStream, &str) -> PrintFuture + Send);
+
+/// Callback for the events a [`Checkout::turn_raw`] streams before the
+/// turn-ender — `Print`s today. Returns a future for the same reason
+/// [`OnPrint`] does: a slow sink backpressures the worker.
+pub type OnRawEvent<'a> = &'a mut (dyn FnMut(&pb::ChildEvent) -> PrintFuture + Send);
+
+/// Adapts a synchronous print sink to the [`OnPrint`] callback shape.
+///
+/// ```rust,no_run
+/// # use monty_pool::on_print_sync;
+/// let mut on_print = on_print_sync(|_stream, text| print!("{text}"));
+/// // session.feed("print('hi')", vec![], vec![], false, &mut on_print).await?;
+/// ```
+pub fn on_print_sync<F>(mut sink: F) -> impl FnMut(PrintStream, &str) -> PrintFuture + Send
+where
+    F: FnMut(PrintStream, &str) + Send,
+{
+    move |stream, text| {
+        sink(stream, text);
+        Box::pin(ready(()))
+    }
+}
+
+/// One worker dedicated to one REPL session.
+///
+/// Obtained from [`crate::Pool::checkout`]. [`Checkout::finish`] returns the
+/// worker to the pool; dropping without finishing kills the worker instead —
+/// mid-execution state cannot be trusted back into the pool.
+///
+/// # Cancellation
+///
+/// Turn futures (`feed`, `resume*`, `dump`, ...) are **not** resumable after
+/// being dropped mid-flight: the request may already be on the wire (or a
+/// mount's host I/O abandoned mid-service), so the protocol state is
+/// unknowable. The checkout notices on its next call,
+/// discards the worker, and fails with [`PoolError::Protocol`]; `finish` on
+/// such a session likewise discards the worker rather than returning it.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent turn, abort, cwd and send flags"
+)]
+pub struct Checkout {
+    /// `None` after `finish()` or after the worker was discarded on error.
+    worker: Option<Worker>,
+    pool: Arc<PoolInner>,
+    /// The suspension awaiting an answer, when mid-feed.
+    pending: Option<Pending>,
+    /// Set while a turn's I/O is in flight; still set on the next call only
+    /// if the previous turn future was cancelled mid-I/O (see the type docs).
+    turn_in_flight: bool,
+    /// Set between sending `AbortFeed` and its reply. The child answers an
+    /// abort with `Error` (or a crash announcement), never a suspension, so
+    /// anything else is a protocol violation rather than a turn to service.
+    abort_in_flight: bool,
+    /// Parent-enforced limits and the session's consumption of them.
+    budget: SessionBudget,
+    /// The budget in force before an in-flight `Load`, put back by
+    /// [`Checkout::abort_if_over_budget`] unless the child's first reply confirms the
+    /// dump was adopted (an `Ok`, or the re-announced suspension) — so a
+    /// refused `Load` cannot reset the suspension count, and an abort of the
+    /// re-announced suspension does not discard the dump's limit.
+    pending_load_budget: Option<SessionBudget>,
+    /// The deadline armed for the most recent turn, surfaced by
+    /// [`PoolError::Timeout`] when it fires.
+    armed_deadline: Option<Duration>,
+    /// The script name a `restore` adopted, captured from the worker's `Load`
+    /// reply (the name travels inside the opaque dump, so the parent learns it
+    /// only by the worker echoing it). Reset at the start of each `restore` and
+    /// taken by `restore` to return; unset for non-restore turns.
+    restored_script_name: Option<String>,
+    /// The session ID a storing relay minted, from its reply to `Configure` or `Load`.
+    session_id: Option<Vec<u8>>,
+    /// How to redial the relay after a `Shutdown`; `None` unless auto-resume applies.
+    redial: Option<Box<Redial>>,
+    /// Parent-side mount table for the in-flight feed, built from the
+    /// [`MountSpec`]s passed to [`Checkout::feed`] / [`Checkout::restore`].
+    /// Consulted only by [`Checkout::resume_from_mounts`]. Dropped when the
+    /// feed ends so overlay writes never leak into the next feed.
+    feed_mounts: Option<MountTable>,
+    /// Whether the session's working directory has been established (a feed
+    /// chose it, or a restored dump carried it). Until then a feed without an
+    /// explicit `cwd` sends the mount-derived default; afterwards it sends
+    /// nothing and the worker keeps the directory, `os.chdir` included.
+    cwd_set: bool,
+    /// Whether the latest request reached the worker. An oversize frame is
+    /// rejected before any bytes are written, so state the request would have
+    /// set on the worker (the working directory) stays as it was.
+    request_sent: bool,
+    /// When the session started, for `monty.pool.session.duration`. Taken by
+    /// `finish`, terminal worker loss, or `Drop`, so it is recorded once.
+    #[cfg(feature = "telemetry")]
+    started: Option<Instant>,
+}
+
+/// Parent-enforced limits from `Configure` or the first reply after `Load`.
+/// Restoring resets suspension and sleep totals, but keeps their limits as ceilings:
+/// untrusted worker replies can only tighten them. Duration budgets backstop the
+/// child's enforcement, so restoring adopts the dump's duration limits.
+#[derive(Clone, Copy)]
+struct SessionBudget {
+    /// The session's `max_feed_duration`, when configured.
+    feed_budget: Option<Duration>,
+    /// The session's `max_turn_duration`, when configured.
+    turn_budget: Option<Duration>,
+    /// Worker-reported sandbox time consumed by the feed in progress, and
+    /// monotonic, so a compromised worker cannot rewind the parent's view of
+    /// how much of the feed budget is spent. The legitimate drop to zero is
+    /// [`begin_feed`](Self::begin_feed), driven by the `Feed` request going
+    /// out, so a worker reporting less than it did mid-feed cannot loosen its
+    /// own feed backstop.
+    reported_feed_execution: Duration,
+    /// The session's `max_suspensions` in force (the configured one, else
+    /// [`DEFAULT_MAX_SUSPENSIONS`]).
+    suspension_limit: u64,
+    /// Suspensions this checkout has received from the worker.
+    suspensions_seen: u64,
+    /// Configured `max_total_sleep`, tightened by worker replies.
+    sleep_limit: Option<Duration>,
+    /// Parent-enforced ceiling on each system sleep, even from a compromised worker.
+    /// Uses the configured maximum, or the default for other modes because a restored dump may sleep.
+    system_sleep_max: Duration,
+    /// Capped system sleep accepted so far; `charge_sleep` refuses a sleep that would exceed `sleep_limit`.
+    sleep_used: Duration,
+}
+
+impl SessionBudget {
+    /// Creates a fresh budget from `Configure` limits.
+    fn from_config(repl: &ReplConfig) -> Self {
+        let limits = repl.limits.as_ref();
+        Self {
+            feed_budget: limits.and_then(|limits| limits.max_feed_duration),
+            turn_budget: limits.and_then(|limits| limits.max_turn_duration),
+            reported_feed_execution: Duration::ZERO,
+            suspension_limit: limits.map_or(DEFAULT_MAX_SUSPENSIONS as u64, |limits| limits.max_suspensions as u64),
+            suspensions_seen: 0,
+            sleep_limit: limits.and_then(|limits| limits.max_total_sleep),
+            sleep_used: Duration::ZERO,
+            system_sleep_max: match repl.os_policy.sleep {
+                SleepMode::System(max) => max,
+                SleepMode::CallHost | SleepMode::Zero => SleepMode::DEFAULT_MAX,
+            },
+        }
+    }
+
+    /// Clears `Configure` state before adopting a dump's budget. The
+    /// suspension and sleep limits stay: they are the ceilings on the dump's.
+    fn forget(&mut self) {
+        *self = Self {
+            feed_budget: None,
+            turn_budget: None,
+            reported_feed_execution: Duration::ZERO,
+            suspension_limit: self.suspension_limit,
+            suspensions_seen: 0,
+            sleep_limit: self.sleep_limit,
+            sleep_used: Duration::ZERO,
+            system_sleep_max: self.system_sleep_max,
+        };
+    }
+
+    /// Adopts unknown limits and records consumption, counting suspensions in the parent.
+    /// Untrusted replies can only increase reported time and tighten suspension or sleep limits.
+    /// Ordinary replies echo limits; a `Load` reply reports the dump's.
+    fn update_from(&mut self, event: &pb::ChildEvent) {
+        self.reported_feed_execution = self
+            .reported_feed_execution
+            .max(Duration::from_micros(event.feed_execution_micros));
+        if self.feed_budget.is_none() {
+            self.feed_budget = event.max_feed_duration_micros.map(Duration::from_micros);
+        }
+        if self.turn_budget.is_none() {
+            self.turn_budget = event.max_turn_duration_micros.map(Duration::from_micros);
+        }
+        if let Some(reported) = event.max_total_sleep_micros.map(Duration::from_micros) {
+            self.sleep_limit = Some(self.sleep_limit.map_or(reported, |limit| limit.min(reported)));
+        }
+        if let Some(reported) = event.max_suspensions {
+            self.suspension_limit = self.suspension_limit.min(reported);
+        }
+        if is_suspension(event) {
+            self.suspensions_seen += 1;
+        }
+    }
+
+    /// Clears the feed clock as a feed request goes out; see
+    /// [`reported_feed_execution`](Self::reported_feed_execution).
+    fn begin_feed(&mut self) {
+        self.reported_feed_execution = Duration::ZERO;
+    }
+
+    /// Reports when this event exceeds the suspension limit.
+    fn over_suspension_limit(&self, event: &pb::ChildEvent) -> Option<u64> {
+        (is_suspension(event) && self.suspensions_seen > self.suspension_limit).then_some(self.suspension_limit)
+    }
+
+    /// Charges a capped system sleep; other events, including `CallHost` sleeps, are free.
+    /// Returns `Some((limit, total))` without charging if the caller must refuse the sleep.
+    /// Invalid worker delays count as the ceiling.
+    fn charge_sleep(&mut self, event: &pb::ChildEvent) -> Option<(Duration, Duration)> {
+        let seconds = match &event.kind {
+            Some(pb::child_event::Kind::OsCall(call)) => match call.call {
+                Some(pb::os_call::Call::SystemSleep(pb::os_call::Sleep { seconds })) => seconds,
+                Some(pb::os_call::Call::AsyncSystemSleep(pb::os_call::AsyncSleep { delay })) => delay,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let delay = self.cap_system_sleep(Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX));
+        let total = self.sleep_used.saturating_add(delay);
+        match self.sleep_limit {
+            Some(limit) if total > limit => Some((limit, total)),
+            _ => {
+                self.sleep_used = total;
+                None
+            }
+        }
+    }
+
+    fn cap_system_sleep(&self, delay: Duration) -> Duration {
+        delay.min(self.system_sleep_max)
+    }
+
+    /// Returns the tighter of the two duration backstops: what each configured
+    /// budget has left, plus that budget's grace. The turn budget has all of
+    /// its limit left, since the child resets that clock on the request being
+    /// sent.
+    ///
+    /// The child normally raises `TimeoutError` inside the grace; this catches
+    /// one that stops checking its clock. A `None` grace means no backstop —
+    /// the host would rather wait than lose the worker.
+    fn backstop_deadline(&self, graces: DurationGraces) -> Option<Duration> {
+        [
+            remaining_deadline(self.feed_budget, self.reported_feed_execution, graces.feed),
+            remaining_deadline(self.turn_budget, Duration::ZERO, graces.turn),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+}
+
+/// The grace period configured for each of the two duration backstops.
+///
+/// Bundled so [`SessionBudget::backstop_deadline`] takes one argument rather
+/// than two same-typed `Option<Duration>`s in an order nothing enforces.
+#[derive(Clone, Copy)]
+struct DurationGraces {
+    feed: Option<Duration>,
+    turn: Option<Duration>,
+}
+
+impl DurationGraces {
+    /// Reads both graces off a pool config.
+    fn from_config(config: &PoolConfig) -> Self {
+        Self {
+            feed: config.feed_duration_limit_grace,
+            turn: config.turn_duration_limit_grace,
+        }
+    }
+}
+
+/// One budget's backstop deadline: what it has left, plus its grace. `None`
+/// when the budget or its grace is unset — either way there is nothing to
+/// backstop.
+fn remaining_deadline(budget: Option<Duration>, consumed: Duration, grace: Option<Duration>) -> Option<Duration> {
+    Some(budget?.saturating_sub(consumed).saturating_add(grace?))
+}
+
+/// Recognizes the requests that run sandbox code, whose turns are bounded by
+/// the duration backstops as well as `request_timeout`.
+fn is_execution_turn(request: &pb::ParentRequest) -> bool {
+    matches!(
+        request.kind,
+        Some(
+            pb::parent_request::Kind::Feed(_)
+                | pb::parent_request::Kind::ResumeCall(_)
+                | pb::parent_request::Kind::ResumeNameLookup(_)
+                | pb::parent_request::Kind::ResumeFutures(_)
+        )
+    )
+}
+
+/// Recognizes turn-ending events that await a host answer.
+fn is_suspension(event: &pb::ChildEvent) -> bool {
+    matches!(
+        event.kind,
+        Some(
+            pb::child_event::Kind::FunctionCall(_)
+                | pb::child_event::Kind::OsCall(_)
+                | pb::child_event::Kind::NameLookup(_)
+                | pb::child_event::Kind::ResolveFutures(_)
+        )
+    )
+}
+
+/// Recognizes the turn-enders a child may answer `AbortFeed` with: the
+/// uncatchable exception's `Error`, or the announcement that it died.
+fn is_abort_reply(event: &pb::ChildEvent) -> bool {
+    matches!(
+        event.kind,
+        Some(
+            pb::child_event::Kind::Error(_) | pb::child_event::Kind::FatalError(_) | pb::child_event::Kind::Shutdown(_)
+        )
+    )
+}
+
+/// The exception a feed is aborted with once it suspends past `max_suspensions`.
+fn suspension_limit_exceeded(limit: u64) -> MontyException {
+    MontyException::new(
+        ExcType::RuntimeError,
+        Some(format!("suspension limit {limit} exceeded")),
+    )
+}
+
+/// Uncatchable feed error; `total` includes the refused sleep.
+/// The documented message uses `Duration` debug formatting (`1.5s > 1s`).
+fn sleep_limit_exceeded(limit: Duration, total: Duration) -> MontyException {
+    MontyException::new(
+        ExcType::TimeoutError,
+        Some(format!("sleep limit exceeded: {total:?} > {limit:?}")),
+    )
+}
+
+/// Which kind of suspension is awaiting an answer.
+enum Pending {
+    /// FunctionCall or OsCall; carries the call id and name (the name feeds
+    /// `ResumeValue::NotFound`'s NameError).
+    Call {
+        call_id: u32,
+        function_name: String,
+        /// The typed OS call, retained so [`Checkout::resume_from_mounts`] can
+        /// offer it to this feed's mount table after the caller has seen it.
+        /// `None` for an external function call, which also gates
+        /// [`ResumeValue::NotHandled`] — only an OS call can resolve that way.
+        os_call: Option<Box<OsFunctionCall>>,
+        /// Accept a settled coroutine for this call via `ResumeFutures`.
+        allow_eager_await: bool,
+    },
+    /// The lookup's name and receiver, kept only to recognise it re-announced after a shutdown.
+    NameLookup { name: String, object_id: Option<MontyUuid> },
+    /// The ids awaited, kept only to recognise them re-announced after a shutdown.
+    Futures { pending_call_ids: Vec<u32> },
+}
+
+/// A suspension's identity, compared when a resumed session re-announces it:
+/// the call id and name, the looked-up name and receiver, or the awaited ids.
+#[derive(Debug, PartialEq, Eq)]
+enum PendingKey {
+    Call { call_id: u32, function_name: String },
+    NameLookup { name: String, object_id: Option<MontyUuid> },
+    Futures { pending_call_ids: Vec<u32> },
+}
+
+impl PendingKey {
+    fn of(pending: &Pending) -> Self {
+        match pending {
+            Pending::Call {
+                call_id, function_name, ..
+            } => Self::Call {
+                call_id: *call_id,
+                function_name: function_name.clone(),
+            },
+            Pending::NameLookup { name, object_id } => Self::NameLookup {
+                name: name.clone(),
+                object_id: *object_id,
+            },
+            Pending::Futures { pending_call_ids } => Self::Futures {
+                pending_call_ids: pending_call_ids.clone(),
+            },
+        }
+    }
+}
+
+/// What a WebSocket checkout keeps to redial its relay and reload the session
+/// after a `Shutdown` (see [`PoolConfig::auto_resume`]).
+pub(crate) struct Redial {
+    /// Re-sent as the new worker's `Configure`.
+    pub(crate) repl: ReplConfig,
+    /// The upgrade headers the checkout first dialed with.
+    pub(crate) connect_headers: Vec<(String, String)>,
+    /// Parents the new worker's session span as the first one was.
+    #[cfg(feature = "telemetry")]
+    pub(crate) telemetry: Option<TelemetryContext>,
+}
+
+impl Checkout {
+    /// Sends `Configure` on a fresh worker (the worker materializes the repl
+    /// lazily on the first feed, or restores one via `load_snapshot` instead).
+    ///
+    /// `redial` is kept for [`PoolConfig::auto_resume`]; `None` disables it.
+    pub(crate) async fn create(
+        worker: Worker,
+        pool: Arc<PoolInner>,
+        repl: &ReplConfig,
+        redial: Option<Redial>,
+    ) -> Result<Self, PoolError> {
+        let request = configure_request(repl);
+        let mut this = Self {
+            worker: Some(worker),
+            pool,
+            pending: None,
+            turn_in_flight: false,
+            abort_in_flight: false,
+            budget: SessionBudget::from_config(repl),
+            pending_load_budget: None,
+            armed_deadline: None,
+            restored_script_name: None,
+            session_id: None,
+            redial: redial.map(Box::new),
+            feed_mounts: None,
+            cwd_set: false,
+            request_sent: false,
+            #[cfg(feature = "telemetry")]
+            started: Some(Instant::now()),
+        };
+        let mut no_print = on_print_sync(|_, _| {});
+        let deadline = this.pool.config.request_timeout;
+        match this.request_turn(&request, deadline, &mut no_print).await? {
+            ControlEvent::Ok => Ok(this),
+            other => Err(this.protocol_violation(format!("unexpected reply to Configure: {other:?}"))),
+        }
+    }
+
+    /// Restores a dumped session into this checkout's freshly configured (but
+    /// not-yet-fed) worker, returning the re-announced suspension event when the
+    /// dump was taken mid-feed (`None` for an idle, between-feeds dump).
+    ///
+    /// This is the low-level restore both `session.load_session` (idle dumps) and
+    /// `session.load_snapshot` (suspended dumps) drive: the caller inspects the
+    /// returned `Option` to tell which kind of dump it was and reject a
+    /// mismatch. Only valid before the worker has been fed (the child rejects a
+    /// `Load` once a repl exists).
+    ///
+    /// `mounts` re-establish a suspended feed's mounts, which are never part of
+    /// the dump (they are host configuration the parent services itself). Pass
+    /// the same mounts the original feed used, so the resumed feed's covered
+    /// calls can still be answered by [`Checkout::resume_from_mounts`]. A dump
+    /// taken mid-OS-call re-announces the call in full, so the returned event
+    /// is that same [`TurnEvent::OsCall`] — restoring never answers it here.
+    /// The session's resource budget is taken from the dump, so the prior
+    /// `Configure` limits are dropped here and re-adopted from the worker's
+    /// reply — except that this checkout's configured `max_suspensions` stays
+    /// as a ceiling on the re-adopted one; the count restarts at zero.
+    ///
+    /// Returns the re-announced suspension (`Some` — a suspended dump) or `None`
+    /// (an idle dump), paired with the worker's adopted script name (the dump's,
+    /// not the `Configure` one), which the parent surfaces in restored snapshots.
+    ///
+    /// # Snapshot trust
+    /// The caller must verify the dump's provenance and integrity before restoring it.
+    /// Invalid snapshots have no correctness or availability guarantees.
+    /// Successful loading is not authentication or validation.
+    ///
+    /// Against a relay that stores sessions, `state` may instead be a session ID
+    /// it minted. Loading one always starts a new session, with its own
+    /// [`Checkout::session_id`], from the state last stored under that ID.
+    pub async fn restore(
+        &mut self,
+        state: Vec<u8>,
+        mounts: Vec<MountSpec>,
+        on_print: OnPrint<'_>,
+    ) -> Result<(Option<TurnEvent>, Option<String>), PoolError> {
+        self.ensure_ready()?;
+        let feed_mounts = Self::build_feed_mounts(mounts)?;
+        // the dump carries its own limits/consumed time/script name — forget
+        // what the worker's Configure established and re-adopt from the reply
+        // (see `pending_load_budget` for when the old budget comes back)
+        self.pending = None;
+        self.begin_load();
+        self.restored_script_name = None;
+        // a load names a new session; a storing relay's reply supplies its ID
+        let session_id = self.session_id.take();
+        self.feed_mounts = feed_mounts;
+        let request = request(pb::parent_request::Kind::Load(pb::Load { state: state.into() }));
+        let outcome = self
+            .request_turn(&request, self.pool.config.request_timeout, on_print)
+            .await;
+        self.end_load();
+        // A `Runtime` error that named no session leaves the worker's as it
+        // was — a frame-size rejection before the send, or a load the worker
+        // refused — so it keeps the ID it had, which a storing relay still
+        // holds it under. (An aborted over-budget load named the new one.)
+        if matches!(outcome, Err(PoolError::Runtime(_))) && self.session_id.is_none() {
+            self.session_id = session_id;
+        }
+        let event = match outcome? {
+            ControlEvent::Ok => None,
+            ControlEvent::Turn(event) => Some(event),
+            other @ ControlEvent::Dump(_) => {
+                return Err(self.protocol_violation(format!("unexpected reply to Load: {other:?}")));
+            }
+        };
+        // The adopted dump carries the session's working directory too.
+        self.cwd_set = true;
+        Ok((event, self.restored_script_name.take()))
+    }
+
+    /// Executes one snippet against the session. Inputs become sandbox
+    /// globals; mounts apply to this feed only and are serviced by the parent
+    /// (specs with overlapping host directories fail here, before any frame is
+    /// sent, as a session-preserving [`PoolError::Runtime`]). The session's
+    /// first feed sets the sandbox working directory to its first mount's
+    /// virtual path, or `/` without mounts; later feeds keep the directory
+    /// (`os.chdir` included) unless [`Checkout::feed_with_cwd`] switches it.
+    /// Returns the first suspension (or completion); `print()` output streams
+    /// to `on_print` throughout.
+    ///
+    /// # Errors
+    /// [`PoolError::Runtime`] / [`PoolError::Typing`] leave the session
+    /// usable; all other errors mean the worker was discarded.
+    pub async fn feed(
+        &mut self,
+        code: impl Into<String>,
+        inputs: impl Into<NamedValues>,
+        mounts: Vec<MountSpec>,
+        skip_type_check: bool,
+        on_print: OnPrint<'_>,
+    ) -> Result<TurnEvent, PoolError> {
+        self.feed_with_cwd(code, inputs, mounts, None, skip_type_check, on_print)
+            .await
+    }
+
+    /// [`Checkout::feed`] with an explicit switch of the sandbox working
+    /// directory before the feed: an absolute POSIX virtual path that
+    /// `os.getcwd()` reports and relative paths resolve against. `None` keeps
+    /// the session's current directory, which the first feed defaults to its
+    /// first mount (else `/`).
+    ///
+    /// # Errors
+    /// A relative or NUL-containing `cwd` is a session-preserving
+    /// [`PoolError::Runtime`] (`ValueError`), raised before any frame is sent.
+    pub async fn feed_with_cwd(
+        &mut self,
+        code: impl Into<String>,
+        inputs: impl Into<NamedValues>,
+        mounts: Vec<MountSpec>,
+        cwd: Option<&str>,
+        skip_type_check: bool,
+        on_print: OnPrint<'_>,
+    ) -> Result<TurnEvent, PoolError> {
+        self.ensure_ready()?;
+        if self.pending.is_some() {
+            return Err(PoolError::Protocol(
+                "feed called while a suspension is awaiting an answer".into(),
+            ));
+        }
+        let cwd = match cwd {
+            Some(cwd) => checked_cwd(cwd)?,
+            // An empty wire cwd keeps the worker's current directory.
+            None if self.cwd_set => String::new(),
+            None => mounts
+                .first()
+                .map_or_else(|| "/".to_owned(), |mount| mount.virtual_path().to_owned()),
+        };
+        self.feed_mounts = Self::build_feed_mounts(mounts)?;
+        let (inputs, values) = named_values_to_proto(inputs.into());
+        // The child resets its feed clock on this request, so the last feed's
+        // reported total must not shorten this feed's backstop.
+        self.budget.begin_feed();
+        let request = request(pb::parent_request::Kind::Feed(pb::Feed {
+            code: code.into(),
+            inputs,
+            values: Some(values),
+            skip_type_check,
+            cwd,
+        }));
+        let outcome = self.expect_turn(&request, on_print).await;
+        // The worker adopts the directory after type checking and before it
+        // parses or runs the snippet, so once the request reached it every
+        // reply but a typing rejection (a `SyntaxError` included) means it
+        // took effect; a lost worker takes the session with it.
+        if self.request_sent && !matches!(outcome, Err(PoolError::Typing(_))) {
+            self.cwd_set = true;
+        }
+        outcome
+    }
+
+    /// Answers a [`TurnEvent::FunctionCall`] or [`TurnEvent::OsCall`].
+    pub async fn resume(&mut self, value: ResumeValue, on_print: OnPrint<'_>) -> Result<TurnEvent, PoolError> {
+        self.ensure_ready()?;
+        let Some(Pending::Call {
+            call_id,
+            function_name,
+            os_call,
+            ..
+        }) = &self.pending
+        else {
+            return Err(PoolError::Protocol("no suspended call to resume".into()));
+        };
+        let (call_id, function_name, is_os_call) = (*call_id, function_name.clone(), os_call.is_some());
+        if matches!(value, ResumeValue::NotHandled) && !is_os_call {
+            return Err(PoolError::Protocol(
+                "NotHandled is only valid answering an OS call".into(),
+            ));
+        }
+        let (result, values) = match value {
+            ResumeValue::Return(value) => ext_result_to_proto(ExtFunctionResult::Return(value)),
+            ResumeValue::Error(exc) => ext_result_to_proto(ExtFunctionResult::Error(exc)),
+            ResumeValue::Future => ext_result_to_proto(ExtFunctionResult::Future(call_id)),
+            ResumeValue::NotFound => ext_result_to_proto(ExtFunctionResult::NotFound(function_name)),
+            ResumeValue::NotHandled => (
+                pb::ExtFunctionResult {
+                    kind: Some(pb::ext_function_result::Kind::NotHandled(pb::Unit {})),
+                },
+                None,
+            ),
+        };
+        let request = request(pb::parent_request::Kind::ResumeCall(pb::ResumeCall {
+            call_id,
+            result: Some(result),
+            values,
+        }));
+        // `pending` is deliberately NOT cleared here: an oversize answer is
+        // rejected by `Worker::send` before any bytes reach the child, and
+        // `request_turn` surfaces it with the suspension still answerable.
+        // Every turn-ending reply overwrites `pending` anyway.
+        self.expect_turn(&request, on_print).await
+    }
+
+    /// Answers a pending [`TurnEvent::OsCall`] from this feed's mounts, when
+    /// they cover it.
+    ///
+    /// `Ok(None)` means no mount covers the call (or the feed has none): the
+    /// suspension is left intact for the caller to answer itself, typically via
+    /// its own `os` handler and then [`Checkout::resume`]. `Ok(Some(event))`
+    /// means a mount serviced the call — including servicing it into an error
+    /// such as `PermissionError` — and the feed ran on to `event`.
+    ///
+    /// This is how mounts are reached now that every OS call surfaces: an
+    /// auto-answering driver tries mounts first and falls back to its handler,
+    /// while a caller driving suspensions by hand can ignore mounts entirely.
+    /// Path containment inside covered calls is enforced by the [`MountTable`].
+    ///
+    /// Covered calls perform real host filesystem I/O, serviced on tokio's
+    /// blocking pool so a stalled volume cannot pin a runtime worker. Dropping
+    /// this future mid-servicing abandons the feed's mount state and is
+    /// treated exactly like a cancellation mid-turn: the worker is discarded
+    /// on the next call.
+    pub async fn resume_from_mounts(&mut self, on_print: OnPrint<'_>) -> Result<Option<TurnEvent>, PoolError> {
+        self.ensure_ready()?;
+        let Some(Pending::Call { os_call, .. }) = &mut self.pending else {
+            return Err(PoolError::Protocol("no suspended call to resume".into()));
+        };
+        let Some(call) = os_call.take() else {
+            return Err(PoolError::Protocol(
+                "resume_from_mounts is only valid answering an OS call".into(),
+            ));
+        };
+        // The call is *moved* into the table so a covered write's payload
+        // reaches overlay storage without a copy; an uncovered call comes back
+        // unchanged and is put back for the caller to answer.
+        let outcome = match self.feed_mounts.take() {
+            Some(mut mounts) => {
+                // Table and call move into the blocking task and back out.
+                // `turn_in_flight` spans the await: a caller cancelling here
+                // abandons both, condemning the worker via the same mechanism
+                // as a cancellation mid-turn-I/O (see `request_turn`).
+                self.turn_in_flight = true;
+                let (mounts, outcome) = self
+                    .run_blocking(move || {
+                        let outcome = mounts.handle_os_call(*call);
+                        (mounts, outcome)
+                    })
+                    .await?;
+                self.feed_mounts = Some(mounts);
+                self.turn_in_flight = false;
+                outcome
+            }
+            None => MountCallOutcome::NotHandled(*call),
+        };
+        match outcome {
+            MountCallOutcome::Handled(result) => {
+                let value = match result {
+                    Ok(obj) => ResumeValue::Return(obj),
+                    Err(err) => ResumeValue::Error(err.into_exception()),
+                };
+                match self.resume(value, &mut *on_print).await {
+                    // The result never reached the child (too large or too deep
+                    // to encode), so the call is still suspended — answer it
+                    // with that error instead, letting the sandbox raise a
+                    // catchable exception rather than stranding the feed. Only
+                    // a rejection before the frame is written leaves `pending`
+                    // set, so this cannot catch a genuine sandbox exception.
+                    Err(PoolError::Runtime(exc)) if self.pending.is_some() => {
+                        self.resume(ResumeValue::Error(exc), on_print).await.map(Some)
+                    }
+                    other => other.map(Some),
+                }
+            }
+            MountCallOutcome::NotHandled(call) => {
+                let Some(Pending::Call { os_call, .. }) = &mut self.pending else {
+                    unreachable!("checked above");
+                };
+                *os_call = Some(Box::new(call));
+                Ok(None)
+            }
+        }
+    }
+
+    /// Answers a [`TurnEvent::NameLookup`] with a [`NameLookupResult`] (or a
+    /// `MontyObject`, an `Option<MontyObject>` where `None` is `Undefined`, or
+    /// a `MontyException` for `Error`): a value resolves the name; `Undefined`
+    /// makes the sandbox raise `NameError` for a plain lookup, or
+    /// `AttributeError` when the lookup carried an `object_id` (a lazy
+    /// attribute on a host-backed object — a class instance or class type);
+    /// `Error` raises the host's exception in the sandbox, bypassing
+    /// `hasattr()` / `getattr()` defaults the way a raising property does.
+    pub async fn resume_name_lookup(
+        &mut self,
+        result: impl Into<NameLookupResult>,
+        on_print: OnPrint<'_>,
+    ) -> Result<TurnEvent, PoolError> {
+        self.ensure_ready()?;
+        if !matches!(self.pending, Some(Pending::NameLookup { .. })) {
+            return Err(PoolError::Protocol("no suspended name lookup to resume".into()));
+        }
+        let request = request(pb::parent_request::Kind::ResumeNameLookup(result.into().into()));
+        // `pending` left set — see the comment in [`Self::resume`]
+        self.expect_turn(&request, on_print).await
+    }
+
+    /// Answers a [`TurnEvent::ResolveFutures`] with results for some or all
+    /// pending call ids. Each result must be `Return` or `Error` — a future
+    /// cannot resolve to another future or to "not found".
+    /// Also accepts exactly one matching result for a call with `allow_eager_await` set.
+    pub async fn resume_futures(
+        &mut self,
+        results: Vec<(u32, ResumeValue)>,
+        on_print: OnPrint<'_>,
+    ) -> Result<TurnEvent, PoolError> {
+        self.ensure_ready()?;
+        match &self.pending {
+            Some(Pending::Call {
+                call_id,
+                allow_eager_await: true,
+                ..
+            }) => {
+                if results.len() != 1 || results[0].0 != *call_id {
+                    return Err(PoolError::Protocol(
+                        "eager result must match the suspended call id".into(),
+                    ));
+                }
+            }
+            Some(Pending::Futures { .. }) => {}
+            _ => return Err(PoolError::Protocol("no suspended futures to resume".into())),
+        }
+        let results = results
+            .into_iter()
+            .map(|(call_id, value)| {
+                let result = match value {
+                    ResumeValue::Return(value) => ExtFunctionResult::Return(value),
+                    ResumeValue::Error(exc) => ExtFunctionResult::Error(exc),
+                    ResumeValue::Future | ResumeValue::NotFound | ResumeValue::NotHandled => {
+                        return Err(PoolError::Protocol(
+                            format!("future {call_id} must resolve to Return or Error").into(),
+                        ));
+                    }
+                };
+                Ok((call_id, result))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let request = request(pb::parent_request::Kind::ResumeFutures(future_results_to_proto(
+            results,
+        )));
+        // `pending` left set — see the comment in [`Self::resume`]
+        self.expect_turn(&request, on_print).await
+    }
+
+    /// Installs third-party Python packages into the session, making them
+    /// importable by subsequent feeds. Session-scoped and repeatable; an empty
+    /// `requirements` list is a no-op.
+    ///
+    /// Only an embedded-CPython worker honors this. The
+    /// `monty` sandbox worker has no host interpreter to install for and a uv
+    /// install failure both surface as [`PoolError::Runtime`] (the latter
+    /// carrying uv's stderr); the session stays usable in either case. Bounded
+    /// by the pool's `request_timeout`, so raise it for large dependency sets.
+    ///
+    /// Each requirement is validated here, at the pool boundary, before any
+    /// frame is sent: a string that uv would parse as an option rather than a
+    /// package specifier is rejected with [`PoolError::Runtime`] (a
+    /// `ValueError`). See [`validate_requirement`] for the rationale.
+    pub async fn install_dependencies(&mut self, requirements: Vec<String>) -> Result<(), PoolError> {
+        self.ensure_ready()?;
+        if self.pending.is_some() {
+            return Err(PoolError::Protocol(
+                "install_dependencies called while a suspension is awaiting an answer".into(),
+            ));
+        }
+        // Installing nothing trivially succeeds on any worker — including the
+        // sandbox worker, which would otherwise reject the request outright.
+        if requirements.is_empty() {
+            return Ok(());
+        }
+        for requirement in &requirements {
+            validate_requirement(requirement).map_err(invalid_requirement)?;
+        }
+        let request = request(pb::parent_request::Kind::InstallDependencies(pb::InstallDependencies {
+            requirements: requirements.into(),
+        }));
+        let mut no_print = on_print_sync(|_, _| {});
+        let deadline = self.pool.config.request_timeout;
+        match self.request_turn(&request, deadline, &mut no_print).await? {
+            ControlEvent::Ok => Ok(()),
+            other => Err(self.protocol_violation(format!("unexpected reply to InstallDependencies: {other:?}"))),
+        }
+    }
+
+    /// Serializes the session (idle or suspended) into opaque bytes that
+    /// [`Checkout::restore`] can restore — including into a
+    /// different worker after this one crashes. The session stays live.
+    pub async fn dump(&mut self) -> Result<Vec<u8>, PoolError> {
+        let request = request(pb::parent_request::Kind::Dump(pb::Dump {}));
+        let mut no_print = on_print_sync(|_, _| {});
+        let deadline = self.pool.config.request_timeout;
+        match self.request_turn(&request, deadline, &mut no_print).await? {
+            ControlEvent::Dump(state) => Ok(state),
+            other => Err(self.protocol_violation(format!("unexpected reply to Dump: {other:?}"))),
+        }
+    }
+
+    /// Ends the session and returns the worker to the pool.
+    ///
+    /// Consumes the checkout. On error the worker is discarded (and the
+    /// error reported), but the pool remains healthy either way.
+    pub async fn finish(mut self) -> Result<(), PoolError> {
+        let result = self.finish_session().await;
+        #[cfg(feature = "telemetry")]
+        self.record_finish(outcome(result.is_ok()));
+        result
+    }
+
+    /// The body of [`Self::finish`], split out so the session's outcome is
+    /// recorded on the error paths too — a `?` here would otherwise leave the
+    /// drop below to report the session as abandoned.
+    async fn finish_session(&mut self) -> Result<(), PoolError> {
+        // A websocket worker is single-use — the pool discards it after every
+        // checkout — so there is no point round-tripping a `Reset` to ready it
+        // for reuse. Closing the connection (Close frame, then socket) is what
+        // ends the session; the child reads it as a clean EOF and exits. Only
+        // subprocess workers are reset and returned to the idle pool for the
+        // next checkout.
+        if self.pool.config.transport.is_websocket() {
+            if let Some(mut worker) = self.worker.take() {
+                // guard, not a trailing release: the worker is already out of
+                // `self`, so a caller dropping this future mid-goodbye would
+                // leave `Checkout::drop` with nothing to release. Disarmed
+                // before `release_worker`, which releases the slot itself.
+                let capacity = CapacityGuard::new(&self.pool);
+                worker.close_transport().await;
+                capacity.disarm();
+                self.pool.release_worker(worker);
+            }
+            return Ok(());
+        }
+        let request = request(pb::parent_request::Kind::Reset(pb::Reset {}));
+        let mut no_print = on_print_sync(|_, _| {});
+        let deadline = self.pool.config.request_timeout;
+        match self.request_turn(&request, deadline, &mut no_print).await? {
+            ControlEvent::Ok => {
+                if let Some(mut worker) = self.worker.take() {
+                    worker.checkouts_served += 1;
+                    self.pool.release_worker(worker);
+                }
+                Ok(())
+            }
+            other => Err(self.protocol_violation(format!("unexpected reply to Reset: {other:?}"))),
+        }
+    }
+
+    /// Records the session's lifetime, once, when it ends.
+    #[cfg(feature = "telemetry")]
+    fn record_finish(&mut self, outcome: &'static str) {
+        if let (Some(started), Some(metrics)) = (self.started.take(), &self.pool.config.metrics) {
+            metrics.session_duration(started.elapsed(), outcome);
+        }
+    }
+
+    /// Stable identity within this pool, independent of PID reuse or transport.
+    /// Returns `None` after the worker has been released or discarded.
+    #[must_use]
+    pub fn worker_id(&self) -> Option<u64> {
+        self.worker.as_ref().map(|worker| worker.id)
+    }
+
+    /// OS process id of the worker, when it is a local subprocess (`None` for a
+    /// remote WebSocket worker, or a finished checkout). Diagnostics/tests.
+    pub fn pid(&self) -> Option<u32> {
+        self.worker.as_ref().and_then(Worker::pid)
+    }
+
+    /// The opaque session ID a storing relay minted, which [`Checkout::restore`]
+    /// resumes from any process. `None` for local workers and ephemeral sessions.
+    #[must_use]
+    pub fn session_id(&self) -> Option<&[u8]> {
+        self.session_id.as_deref()
+    }
+
+    /// Sends a request and requires the reply to be a [`TurnEvent`].
+    ///
+    /// This is the entry point for *execution* turns (feed/resume — the
+    /// turns where the sandbox runs code), so the deadline includes
+    /// [`Self::backstop_deadline`] on top of the configured request timeout.
+    async fn expect_turn(
+        &mut self,
+        request: &pb::ParentRequest,
+        on_print: OnPrint<'_>,
+    ) -> Result<TurnEvent, PoolError> {
+        let deadline = min_deadline(self.pool.config.request_timeout, self.backstop_deadline());
+        match self.request_turn(request, deadline, on_print).await? {
+            ControlEvent::Turn(event) => Ok(event),
+            other => Err(self.protocol_violation(format!("expected a turn event, got {other:?}"))),
+        }
+    }
+
+    /// The duration backstop deadline; see [`SessionBudget::backstop_deadline`].
+    fn backstop_deadline(&self) -> Option<Duration> {
+        self.budget
+            .backstop_deadline(DurationGraces::from_config(&self.pool.config))
+    }
+
+    /// Snapshots the budget and forgets it ahead of a `Load`, so the reply can
+    /// re-adopt the dump's.
+    fn begin_load(&mut self) {
+        self.pending_load_budget = Some(self.budget);
+        self.budget.forget();
+    }
+
+    /// Puts the pre-`Load` budget back if no reply ever decided its fate (the
+    /// pre-send frame-size rejection, or a worker that died first).
+    fn end_load(&mut self) {
+        if let Some(budget) = self.pending_load_budget.take() {
+            self.budget = budget;
+        }
+    }
+
+    /// Records consumption and aborts feeds exceeding suspension or system sleep limits.
+    /// Returns `true` after `AbortFeed`; the caller must read an error or crash next to avoid an abort loop.
+    /// Invalid suspension payloads are protocol violations, even when over budget.
+    /// The first non-print `Load` reply settles the budget: `Ok` or a suspension adopts the dump;
+    /// any other reply restores the live session's budget.
+    async fn abort_if_over_budget(&mut self, event: &mut pb::ChildEvent) -> Result<bool, PoolError> {
+        let is_print = matches!(event.kind, Some(pb::child_event::Kind::Print(_)));
+        if !is_print && mem::take(&mut self.abort_in_flight) && !is_abort_reply(event) {
+            return Err(self.protocol_violation("worker answered AbortFeed with something other than an Error"));
+        }
+        if !is_print
+            && let Some(saved) = self.pending_load_budget.take()
+            && !(matches!(event.kind, Some(pb::child_event::Kind::Ok(_))) || is_suspension(event))
+        {
+            self.budget = saved;
+        }
+        self.budget.update_from(event);
+        let exceeded = self
+            .budget
+            .over_suspension_limit(event)
+            .map(suspension_limit_exceeded)
+            .or_else(|| {
+                self.budget
+                    .charge_sleep(event)
+                    .map(|(limit, total)| sleep_limit_exceeded(limit, total))
+            });
+        let Some(exception) = exceeded else {
+            return Ok(false);
+        };
+        // an aborted event is dropped by the caller, so validation consumes the
+        // call rather than cloning a worker-sized arena
+        if let Some(pb::child_event::Kind::OsCall(call)) = &mut event.kind
+            && let Err(err) = os_call_from_proto(mem::take(call))
+        {
+            return Err(self.protocol_violation(format!("invalid OS call payload: {err}")));
+        }
+        let abort = request(pb::parent_request::Kind::AbortFeed(pb::AbortFeed {
+            exception: Some((&exception).into()),
+        }));
+        let Some(worker) = self.worker.as_mut() else {
+            return Err(PoolError::Finished);
+        };
+        match worker.send(&abort).await {
+            Ok(()) => {
+                self.abort_in_flight = true;
+                Ok(true)
+            }
+            Err(_) => Err(self.poison("aborting a feed").await),
+        }
+    }
+
+    /// The core protocol turn, bounded by `deadline`: when it expires the turn
+    /// I/O is abandoned (safe — `Worker::recv` is cancel-safe, partial-frame
+    /// state stays in the worker) and the worker is killed and discarded.
+    ///
+    /// Also enforces the cancellation contract (see the type docs): a caller
+    /// that dropped a previous turn future mid-I/O left the protocol state
+    /// unknowable, so the worker is discarded on the next call.
+    ///
+    /// A `Shutdown` naming what to load is resumed on a new worker (see
+    /// [`PoolConfig::auto_resume`]); any other ends the session.
+    async fn request_turn(
+        &mut self,
+        request: &pb::ParentRequest,
+        deadline: Option<Duration>,
+        on_print: OnPrint<'_>,
+    ) -> Result<ControlEvent, PoolError> {
+        self.ensure_ready()?;
+        self.turn_in_flight = true;
+        self.armed_deadline = deadline;
+        let outcome = match deadline {
+            Some(limit) => match timeout(limit, self.turn_io(request, &mut *on_print)).await {
+                Ok(outcome) => outcome,
+                Err(_elapsed) => Err(self.poison_timeout().await),
+            },
+            None => self.turn_io(request, &mut *on_print).await,
+        };
+        self.turn_in_flight = false;
+        match outcome {
+            // boxed: it recurses into this turn, and its state machine must not
+            // enlarge every turn's future for a path taken once per shutdown.
+            // The other arm hands the turn's result straight back: every move
+            // of it here is a copy of the generator's state on the hot path.
+            Err(PoolError::Shutdown { dump }) => Box::pin(self.after_shutdown(dump, request, deadline, on_print)).await,
+            outcome => outcome,
+        }
+    }
+
+    /// Answers a `Shutdown`: resumes the session when the relay named what to
+    /// load and auto-resume applies, else ends it. The worker is already released.
+    async fn after_shutdown(
+        &mut self,
+        dump: Option<Vec<u8>>,
+        request: &pb::ParentRequest,
+        deadline: Option<Duration>,
+        on_print: OnPrint<'_>,
+    ) -> Result<ControlEvent, PoolError> {
+        let outcome = match dump {
+            Some(state) if self.can_resume(request) => {
+                self.resume_after_shutdown(state, request, deadline, on_print).await
+            }
+            dump => Err(PoolError::Shutdown { dump }),
+        };
+        if matches!(outcome, Err(PoolError::Shutdown { .. })) {
+            #[cfg(feature = "telemetry")]
+            self.record_finish("error");
+            self.discard_worker();
+        }
+        outcome
+    }
+
+    /// Whether a `Shutdown` answering `request` may be resumed: auto-resume applies,
+    /// the relay named the session, and `request` is not session setup or teardown.
+    /// The caller also requires the shutdown to carry what to load: a relay with no
+    /// state to load sends none, and a session cannot resume from nothing.
+    #[cold]
+    fn can_resume(&self, request: &pb::ParentRequest) -> bool {
+        self.redial.is_some()
+            && self.session_id.is_some()
+            && !matches!(
+                request.kind,
+                Some(
+                    pb::parent_request::Kind::Configure(_)
+                        | pb::parent_request::Kind::Load(_)
+                        | pb::parent_request::Kind::Reset(_)
+                        | pb::parent_request::Kind::Shutdown(_)
+                )
+            )
+    }
+
+    /// Reloads the session a relay shut down from `state`, what the relay said
+    /// restores it, on a new worker and re-sends `request`, which the relay
+    /// reported it did not run. Resumes at most once per request: `redial` is
+    /// taken for the duration, so the turns this makes cannot resume again. Any
+    /// failure reloading returns the original `Shutdown`, its cause the metric's outcome.
+    async fn resume_after_shutdown(
+        &mut self,
+        state: Vec<u8>,
+        request: &pb::ParentRequest,
+        deadline: Option<Duration>,
+        on_print: OnPrint<'_>,
+    ) -> Result<ControlEvent, PoolError> {
+        let redial = self.redial.take().expect("checked by can_resume");
+        let reloaded = self.reload_session(&redial, &state).await;
+        #[cfg(feature = "telemetry")]
+        if let Some(metrics) = &self.pool.config.metrics {
+            metrics.session_resumed(reloaded.as_ref().map_or_else(resume_failure, |()| "ok"));
+        }
+        let outcome = match reloaded {
+            Ok(()) => {
+                // as `feed_with_cwd`: the child restarts its feed clock on a
+                // `Feed`, and the `Load` reply reported the dump's last feed
+                if matches!(request.kind, Some(pb::parent_request::Kind::Feed(_))) {
+                    self.budget.begin_feed();
+                }
+                // the `Load` reply may have tightened the budget, so an
+                // execution turn's backstop is re-derived as `expect_turn` did
+                let deadline = if is_execution_turn(request) {
+                    min_deadline(self.pool.config.request_timeout, self.backstop_deadline())
+                } else {
+                    deadline
+                };
+                self.request_turn(request, deadline, on_print).await
+            }
+            Err(_) => Err(PoolError::Shutdown { dump: Some(state) }),
+        };
+        self.redial = Some(redial);
+        outcome
+    }
+
+    /// Dials a new worker, re-creates the session and loads `state` (a session
+    /// ID against a storing relay), which starts a new session under a new ID.
+    /// The reply must match the state at the shutdown: `Ok` when idle, or the
+    /// same pending suspension re-announced when mid-feed. The session's budget
+    /// is kept, not re-adopted as `restore` does: it is the same session, so the
+    /// reply can only tighten its limits, and a shutdown grants nothing.
+    async fn reload_session(&mut self, redial: &Redial, state: &[u8]) -> Result<(), PoolError> {
+        let configure = configure_request(&redial.repl);
+        let worker = self.pool.acquire_worker(&redial.connect_headers).await?;
+        #[cfg(feature = "telemetry")]
+        let worker = worker.with_adapter_context(redial.telemetry.clone());
+        self.worker = Some(worker);
+        let expected = self.pending.as_ref().map(PendingKey::of);
+        let timeout = self.pool.config.request_timeout;
+        let mut no_print = on_print_sync(|_, _| {});
+        match self.request_turn(&configure, timeout, &mut no_print).await? {
+            ControlEvent::Ok => {}
+            other => return Err(self.protocol_violation(format!("unexpected reply to Configure: {other:?}"))),
+        }
+        // a re-announced suspension counts and charges itself again on arrival,
+        // as after `restore`: let it through on zeroed totals, then put the
+        // session's true totals back
+        let (suspensions_seen, sleep_used) = (self.budget.suspensions_seen, self.budget.sleep_used);
+        self.budget.suspensions_seen = 0;
+        self.budget.sleep_used = Duration::ZERO;
+        let load = request(pb::parent_request::Kind::Load(pb::Load {
+            state: state.to_vec().into(),
+        }));
+        let reply = self.request_turn(&load, timeout, &mut no_print).await;
+        // the session's script name is the one it already had
+        self.restored_script_name = None;
+        let matches = match reply? {
+            ControlEvent::Ok => expected.is_none(),
+            ControlEvent::Turn(_) => expected.is_some() && expected == self.pending.as_ref().map(PendingKey::of),
+            ControlEvent::Dump(_) => false,
+        };
+        self.budget.suspensions_seen = suspensions_seen;
+        self.budget.sleep_used = sleep_used;
+        if matches {
+            #[cfg(feature = "telemetry")]
+            if let Some(worker) = &mut self.worker {
+                worker.mark_resumed();
+            }
+            Ok(())
+        } else {
+            Err(self.protocol_violation("the resumed session does not match the one shut down"))
+        }
+    }
+
+    /// Sends `request` and returns the child's turn-ending event, as protobuf —
+    /// no conversion to [`TurnEvent`].
+    ///
+    /// For callers that already speak the wire (a relay bridging a remote
+    /// client): rebuilding a `ChildEvent` frame from a [`TurnEvent`] means
+    /// hand-inverting the whole protocol, so this hands back what the child
+    /// actually sent. `on_event` sees each streamed `Print` before the
+    /// turn-ender.
+    ///
+    /// **Bypasses this checkout's session bookkeeping** (`pending`,
+    /// `feed_mounts`, `restored_script_name`, `session_id`) — never interleave
+    /// with `feed`/`resume`/`restore`: the driver reads what a reply names from
+    /// the frame it forwards. Worker lifecycle, poisoning and parent-side
+    /// limits work as on the typed path; a raw `Load` re-adopts its budget like
+    /// [`Checkout::restore`]. A `FatalError`
+    /// (or WebSocket `ShutdownDump`) turn-ender is returned so the driver can
+    /// forward it, but discards the worker first — later calls report
+    /// [`PoolError::Finished`]; a raw driver is never auto-resumed.
+    ///
+    /// # Security
+    /// `request` is typically a remote client's, so it is treated as hostile:
+    /// `Configure`/`Reset`/`Shutdown` are refused here (a client could
+    /// otherwise `Reset` away the operator-chosen resource limits and
+    /// re-`Configure` its own). A `Load`'s bytes DO reach the worker's
+    /// deserialiser — the driver must verify a dump is one it issued
+    /// (monty-server loads only records it stored and signed) before passing
+    /// it in.
+    ///
+    /// # Errors
+    /// As [`Checkout::feed`]: a dead worker, a protocol violation, or a turn
+    /// that outlived `request_timeout` or the remaining feed/turn budget.
+    pub async fn turn_raw(
+        &mut self,
+        request: &pb::ParentRequest,
+        on_event: OnRawEvent<'_>,
+    ) -> Result<pb::ChildEvent, PoolError> {
+        self.ensure_ready()?;
+        // A raw client could otherwise `Reset` the child back to its default
+        // (unlimited) session budget and re-`Configure` with its own limits.
+        // Caller misuse, so the worker stays usable.
+        if matches!(
+            request.kind,
+            None | Some(
+                pb::parent_request::Kind::Configure(_)
+                    | pb::parent_request::Kind::Reset(_)
+                    | pb::parent_request::Kind::Shutdown(_)
+            )
+        ) {
+            return Err(PoolError::Protocol(
+                "lifecycle requests (Configure/Reset/Shutdown) cannot be driven through turn_raw".into(),
+            ));
+        }
+        // As `restore`: forget the Configure-time budget and re-adopt the
+        // dump's from the reply's budget fields (see `pending_load_budget`).
+        let is_load = matches!(request.kind, Some(pb::parent_request::Kind::Load(_)));
+        if is_load {
+            self.begin_load();
+        }
+        // A raw `Feed` restarts the child's feed clock exactly as `feed` does,
+        // so the parent's must follow it rather than carry the last feed's
+        // total into this feed's backstop.
+        if matches!(request.kind, Some(pb::parent_request::Kind::Feed(_))) {
+            self.budget.begin_feed();
+        }
+        self.turn_in_flight = true;
+        // as `expect_turn`: `request_timeout` alone would drop the duration
+        // backstops, leaving a wedged child bounded by a timeout that may be unset
+        let deadline = min_deadline(self.pool.config.request_timeout, self.backstop_deadline());
+        self.armed_deadline = deadline;
+        let outcome = match deadline {
+            Some(limit) => match timeout(limit, self.turn_io_raw(request, on_event)).await {
+                Ok(outcome) => outcome,
+                Err(_elapsed) => Err(self.poison_timeout().await),
+            },
+            None => self.turn_io_raw(request, on_event).await,
+        };
+        self.turn_in_flight = false;
+        if is_load {
+            self.end_load();
+        }
+        outcome
+    }
+
+    /// The body of [`Self::turn_raw`]: send, stream, return the turn-ender.
+    ///
+    /// Mirrors `turn_io`'s failure handling, but events are returned rather
+    /// than classified — including `FatalError`/`Shutdown`, which discard the
+    /// worker yet still hand the frame back.
+    async fn turn_io_raw(
+        &mut self,
+        request: &pb::ParentRequest,
+        on_event: OnRawEvent<'_>,
+    ) -> Result<pb::ChildEvent, PoolError> {
+        self.send_request(request).await?;
+        loop {
+            let mut event = match self.worker.as_mut().expect("checked by send_request").recv().await {
+                Ok(event) => event,
+                Err(FrameError::Decode(err)) => {
+                    return Err(self.protocol_violation(format!("invalid payload from worker: {err}")));
+                }
+                Err(_) => return Err(self.poison("waiting for a reply").await),
+            };
+            if self.abort_if_over_budget(&mut event).await? {
+                continue;
+            }
+            // strict alternation: zero or more `Print`s, then exactly one
+            // turn-ender — so anything that is not a print ends the turn
+            if matches!(event.kind, Some(pb::child_event::Kind::Print(_))) {
+                on_event(&event).await;
+            } else if matches!(event.kind, Some(pb::child_event::Kind::FatalError(_))) {
+                // the far end is gone (see `fatal_error`): discard the worker
+                // as the typed path does, but still hand back the child's own
+                // account of its death for the driver to forward
+                self.reap_announced_exit().await;
+                return Ok(event);
+            } else if matches!(event.kind, Some(pb::child_event::Kind::Shutdown(_))) {
+                return if self.pool.config.transport.is_websocket() {
+                    // the serving relay is gone: discard as `turn_io` does,
+                    // handing the frame (and its dump) back to forward
+                    self.discard_worker();
+                    Ok(event)
+                } else {
+                    // Only a serving relay sends this, never a child — and a
+                    // raw driver's relay signs dumps on the way past, so
+                    // accepting one would have it vouch for bytes its child
+                    // minted.
+                    Err(self.protocol_violation("subprocess worker sent a ShutdownDump"))
+                };
+            } else if event.kind.is_none() {
+                // every proto field is optional, so a hostile worker can send
+                // an event with no kind set; it ends no turn and must not
+                // reach the driver's client as one
+                return Err(self.protocol_violation("worker sent an event with no kind"));
+            } else {
+                return Ok(event);
+            }
+        }
+    }
+
+    /// Fails fast when the checkout cannot start protocol work: the worker is
+    /// gone (`Finished`), or a previous turn / mount servicing was cancelled
+    /// mid-flight — the worker can no longer be trusted, so it is discarded
+    /// here. Every public operation must hit this before its own validation,
+    /// so cancellation surfaces as the contract's error, not a state check.
+    fn ensure_ready(&mut self) -> Result<(), PoolError> {
+        if self.worker.is_none() {
+            Err(PoolError::Finished)
+        } else if self.turn_in_flight {
+            self.discard_worker();
+            Err(PoolError::Protocol(
+                "a previous protocol turn was cancelled mid-flight; the worker was discarded".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The innermost telemetry context for host callbacks answering this checkout.
+    #[cfg(feature = "telemetry")]
+    pub fn callback_context(&self) -> opentelemetry::Context {
+        self.worker
+            .as_ref()
+            .map_or_else(opentelemetry::Context::new, Worker::callback_context)
+    }
+
+    /// One request/reply exchange: send the request, stream prints, classify
+    /// the turn-ending event. All failure paths discard the worker except
+    /// `Runtime` / `Typing`, which are sandbox-level outcomes.
+    async fn turn_io(&mut self, request: &pb::ParentRequest, on_print: OnPrint<'_>) -> Result<ControlEvent, PoolError> {
+        self.send_request(request).await?;
+        loop {
+            let mut event = match self.worker.as_mut().expect("checked by send_request").recv().await {
+                Ok(event) => event,
+                // a decode failure means the frame arrived intact but its
+                // payload was garbage (including values that fail semantic
+                // validation, which happens during decode) — the worker
+                // misbehaved, it didn't die
+                Err(FrameError::Decode(err)) => {
+                    return Err(self.protocol_violation(format!("invalid payload from worker: {err}")));
+                }
+                Err(_) => return Err(self.poison("waiting for a reply").await),
+            };
+            // Only a storing relay sets this, on its reply to `Configure` or
+            // `Load`. Taken before the budget check: a re-announced suspension
+            // over budget is aborted and dropped, but the session it names lives on.
+            if let Some(session_id) = event.session_id.take() {
+                self.session_id = Some(session_id.into_inner());
+            }
+            // a suspension past `max_suspensions` is aborted here and never
+            // reaches the caller; the abort's reply is the next event
+            if self.abort_if_over_budget(&mut event).await? {
+                continue;
+            }
+            // Only a `Load` reply carries this; it lets `restore` report the
+            // dump's script name without parsing the opaque dump bytes.
+            if let Some(name) = &event.restored_script_name {
+                self.restored_script_name = Some(name.clone());
+            }
+            match event.kind {
+                Some(pb::child_event::Kind::Print(print)) => {
+                    #[cfg(feature = "telemetry")]
+                    let context = self.callback_context();
+                    // One event can carry several runs: hand each to the host
+                    // in order, so the callback shape stays per-stream.
+                    for segment in &print.segments {
+                        let stream = match segment.stream() {
+                            pb::PrintStream::Stderr => PrintStream::Stderr,
+                            pb::PrintStream::Stdout | pb::PrintStream::Unspecified => PrintStream::Stdout,
+                        };
+                        let future = {
+                            #[cfg(feature = "telemetry")]
+                            let _context = context.has_active_span().then(|| context.clone().attach());
+                            on_print(stream, &segment.text)
+                        };
+                        #[cfg(feature = "telemetry")]
+                        if context.has_active_span() {
+                            future.with_context(context.clone()).await;
+                        } else {
+                            future.await;
+                        }
+                        #[cfg(not(feature = "telemetry"))]
+                        future.await;
+                    }
+                }
+                Some(pb::child_event::Kind::FunctionCall(mut call)) => {
+                    let position = suspension_position(call.position.take());
+                    self.pending = Some(Pending::Call {
+                        call_id: call.call_id,
+                        function_name: call.function_name.clone(),
+                        os_call: None,
+                        allow_eager_await: call.allow_eager_await,
+                    });
+                    return self.convert_turn(|| {
+                        Ok(TurnEvent::FunctionCall {
+                            function_name: call.function_name.clone(),
+                            call_id: call.call_id,
+                            object_id: call.object_id,
+                            allow_eager_await: call.allow_eager_await,
+                            args: call.into_call_args()?,
+                            position,
+                        })
+                    });
+                }
+                Some(pb::child_event::Kind::OsCall(mut call)) => {
+                    // Every announcement (fresh or re-announced after
+                    // `restore`) decodes into a typed `OsFunctionCall`; a
+                    // payload the child could never legitimately produce is a
+                    // protocol violation.
+                    let position = suspension_position(call.position.take());
+                    let mut allow_eager_await = call.allow_eager_await;
+                    let (call_id, function_call) = match os_call_from_proto(call) {
+                        Ok(call) => call,
+                        Err(err) => {
+                            return Err(self.protocol_violation(format!("invalid OS call payload: {err}")));
+                        }
+                    };
+                    // The caller can answer any OS call or use `resume_from_mounts`.
+                    // Retain the raw typed call for mount validation; `to_args`
+                    // normalizes only the clone presented to callbacks.
+                    let function_name = function_call.name().to_owned();
+                    // The child is untrusted: an eager bit on a call no future
+                    // may answer is dropped rather than exposed.
+                    allow_eager_await = allow_eager_await && OsFunctionCall::accepts_future(function_call.name());
+                    // Enforce the parent's ceiling even if the worker ignored its own.
+                    let system_sleep = match function_call {
+                        OsFunctionCall::SystemSleep(delay) | OsFunctionCall::AsyncSystemSleep(delay) => {
+                            Some(self.budget.cap_system_sleep(delay))
+                        }
+                        _ => None,
+                    };
+                    let args = function_call.clone().to_args();
+                    self.pending = Some(Pending::Call {
+                        call_id,
+                        function_name: function_name.clone(),
+                        os_call: Some(Box::new(function_call)),
+                        allow_eager_await,
+                    });
+                    return Ok(ControlEvent::Turn(TurnEvent::OsCall {
+                        function_name,
+                        args,
+                        call_id,
+                        allow_eager_await,
+                        system_sleep,
+                        position,
+                    }));
+                }
+                Some(pb::child_event::Kind::NameLookup(lookup)) => {
+                    // Frames from the child are untrusted — a malformed uuid
+                    // is a protocol violation, not a panic.
+                    let position = suspension_position(lookup.position);
+                    let object_id = match lookup.object_id {
+                        None => None,
+                        Some(uuid) => match MontyUuid::try_from_slice(&uuid.data) {
+                            Some(uuid) => Some(uuid),
+                            None => {
+                                return Err(self.protocol_violation("NameLookup.object_id is not a 16-byte uuid"));
+                            }
+                        },
+                    };
+                    self.pending = Some(Pending::NameLookup {
+                        name: lookup.name.clone(),
+                        object_id,
+                    });
+                    return Ok(ControlEvent::Turn(TurnEvent::NameLookup {
+                        name: lookup.name,
+                        object_id,
+                        position,
+                    }));
+                }
+                Some(pb::child_event::Kind::ResolveFutures(futures)) => {
+                    let position = suspension_position(futures.position);
+                    let pending_call_ids = futures.pending_call_ids.into_inner();
+                    self.pending = Some(Pending::Futures {
+                        pending_call_ids: pending_call_ids.clone(),
+                    });
+                    return Ok(ControlEvent::Turn(TurnEvent::ResolveFutures {
+                        pending_call_ids,
+                        position,
+                    }));
+                }
+                Some(pb::child_event::Kind::Complete(complete)) => {
+                    self.pending = None;
+                    // the feed is over — drop its mounts so overlay writes
+                    // cannot leak into the next feed
+                    self.feed_mounts = None;
+                    return self.convert_turn(|| Ok(TurnEvent::Complete(MontyObject::try_from(complete)?)));
+                }
+                Some(pb::child_event::Kind::Error(error)) => {
+                    // an error reply to `Dump` (e.g. an oversize dump) does not
+                    // end the in-flight feed — the child stays suspended and
+                    // resumable, so keep the pending call and mounts
+                    if !matches!(request.kind, Some(pb::parent_request::Kind::Dump(_))) {
+                        self.pending = None;
+                        self.feed_mounts = None;
+                    }
+                    let Some(exception) = error.exception else {
+                        return Err(self.protocol_violation("error event with no exception"));
+                    };
+                    return match MontyException::try_from(exception) {
+                        Ok(exc) => Err(PoolError::Runtime(exc)),
+                        Err(err) => Err(self.protocol_violation(format!("invalid exception payload: {err}"))),
+                    };
+                }
+                Some(pb::child_event::Kind::TypingError(typing)) => {
+                    self.pending = None;
+                    self.feed_mounts = None;
+                    return Err(PoolError::Typing(typing.diagnostics));
+                }
+                Some(pb::child_event::Kind::Ok(_)) => return Ok(ControlEvent::Ok),
+                Some(pb::child_event::Kind::DumpResult(dump)) => {
+                    return Ok(ControlEvent::Dump(dump.state.into_inner()));
+                }
+                Some(pb::child_event::Kind::FatalError(fatal)) => {
+                    return Err(self.fatal_error(&fatal.message).await);
+                }
+                Some(pb::child_event::Kind::Shutdown(shutdown)) => {
+                    // Only a serving relay sends this, never a child — so a
+                    // local subprocess claiming to shut down is a protocol
+                    // violation, not a shutdown. Accepting it would let the
+                    // child hand back a dump it minted itself, which the
+                    // caller would then restore as trusted session state.
+                    if !self.pool.config.transport.is_websocket() {
+                        return Err(self.protocol_violation("subprocess worker sent a ShutdownDump"));
+                    }
+                    // The serving side is shutting down and dropped this
+                    // request unexecuted; its worker is gone.
+                    //
+                    // NOTE(sign-dump): `dump` is server-minted and travels
+                    // back through this client into `Checkout::restore`; if
+                    // host-side dump signing lands it must pass the same
+                    // verification there as any other dump.
+                    //
+                    // The session state stays for `request_turn` to resume or discard.
+                    self.release_worker();
+                    return Err(PoolError::Shutdown {
+                        dump: shutdown.dump.map(Into::into),
+                    });
+                }
+                None => {
+                    return Err(self.protocol_violation("unexpected event"));
+                }
+            }
+        }
+    }
+
+    /// Sends `request`, recording in `request_sent` whether it reached the
+    /// worker. An oversize frame is rejected *before* any bytes are written,
+    /// so the worker never saw the request and is still synced — surface a
+    /// clean, catchable error instead of discarding a healthy worker as if it
+    /// had crashed. For a `resume*` request this also leaves `pending` set
+    /// (nothing overwrites it on this path), so the suspension stays
+    /// answerable with a smaller value. Every other send failure is a real
+    /// I/O break (dead worker / closed pipe).
+    async fn send_request(&mut self, request: &pb::ParentRequest) -> Result<(), PoolError> {
+        self.request_sent = false;
+        let Some(worker) = self.worker.as_mut() else {
+            return Err(PoolError::Finished);
+        };
+        match worker.send(request).await {
+            Ok(()) => {
+                self.request_sent = true;
+                Ok(())
+            }
+            Err(FrameError::FrameTooLarge { len, max }) => Err(PoolError::Runtime(MontyException::new(
+                ExcType::RuntimeError,
+                Some(format!(
+                    "request frame of {len} bytes exceeds the maximum of {max} bytes"
+                )),
+            ))),
+            Err(_) => Err(self.poison("sending a request").await),
+        }
+    }
+
+    /// Runs a fallible payload conversion; conversion failures mean the
+    /// worker sent garbage, which discards it.
+    fn convert_turn(
+        &mut self,
+        convert: impl FnOnce() -> Result<TurnEvent, monty_proto::ProtoConvertError>,
+    ) -> Result<ControlEvent, PoolError> {
+        match convert() {
+            Ok(event) => Ok(ControlEvent::Turn(event)),
+            Err(err) => Err(self.protocol_violation(format!("invalid payload from worker: {err}"))),
+        }
+    }
+
+    /// Builds this feed's mount table, or `None` for the common mount-less
+    /// feed. Runs inline: the specs' directories were opened when the caller
+    /// built them, so nothing here touches the host filesystem. Fails
+    /// (session-preserving) when two specs' host directories overlap.
+    fn build_feed_mounts(mounts: Vec<MountSpec>) -> Result<Option<MountTable>, PoolError> {
+        (!mounts.is_empty()).then(|| build_mount_table(mounts)).transpose()
+    }
+
+    /// Runs blocking host mount work on tokio's blocking pool, so a stalled
+    /// filesystem (NFS, FUSE) occupies a blocking thread instead of a runtime
+    /// worker shared with other sessions' turns and timers. A blocking-task
+    /// failure (panic / runtime shutdown) discards the worker — callers'
+    /// error contracts promise that any non-`Runtime`/`Typing` error means
+    /// exactly that.
+    async fn run_blocking<T: Send + 'static>(
+        &mut self,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, PoolError> {
+        match spawn_blocking(work).await {
+            Ok(value) => Ok(value),
+            Err(err) => Err(self.protocol_violation(format!("blocking mount task failed: {err}"))),
+        }
+    }
+
+    /// Discards the worker after it violated the protocol on an intact stream
+    /// (unexpected event kind, undecodable payload). Unlike [`Self::poison`]
+    /// this is not a crash — the worker answered, just wrongly — so it maps
+    /// to [`PoolError::Protocol`] rather than `Crashed`/`Timeout`.
+    fn protocol_violation(&mut self, context: impl Into<Cow<'static, str>>) -> PoolError {
+        self.discard_worker();
+        PoolError::Protocol(context.into())
+    }
+
+    /// Discards the worker after it announced a `FatalError`.
+    ///
+    /// The frame arrives on an intact stream, but it means the far end is
+    /// *gone*: a child writes it and exits immediately (version skew, frame
+    /// desync, panic), and a serving relay uses it to report that it could not
+    /// start a worker at all. That is a crash with a reason attached rather
+    /// than a protocol disagreement, so it is reported as one — a caller that
+    /// handles crashes by starting a new session needs no extra arm, and the
+    /// worker's own account lands in [`CrashCause::Announced`].
+    async fn fatal_error(&mut self, message: &str) -> PoolError {
+        let status = self.reap_announced_exit().await;
+        self.pending = None;
+        self.feed_mounts = None;
+        PoolError::Crashed {
+            status,
+            cause: CrashCause::Announced {
+                reason: message.to_owned(),
+            },
+        }
+    }
+
+    /// Takes and reaps the worker behind a `FatalError` frame, returning its
+    /// exit status when one was observed. Shared by [`Self::fatal_error`] and
+    /// the raw path, which discards the worker but returns the frame itself.
+    async fn reap_announced_exit(&mut self) -> Option<ExitStatus> {
+        match self.worker.take() {
+            // the child exits right after the frame, so give it a moment to do
+            // so before killing: that is what surfaces e.g. the non-zero status
+            // of a version-skew exit, which a SIGKILL would replace with the
+            // signal and lose
+            Some(mut worker) => {
+                #[cfg(feature = "telemetry")]
+                self.record_finish("error");
+                // guard, not a trailing release: a caller dropping this future
+                // mid-reap must still release the slot and count the death
+                let _capacity = CapacityGuard::terminating(&self.pool, "fatal");
+                let status = worker.reap_or_kill(FATAL_EXIT_GRACE).await;
+                drop(worker);
+                status
+            }
+            None => None,
+        }
+    }
+
+    /// Discards the worker after an I/O failure and classifies it as an
+    /// out-of-memory kill, a crash, or — on the WebSocket transport, where the
+    /// worker is a remote process this client cannot reap — a disconnect.
+    /// Deadline expiry goes through [`Self::poison_timeout`] instead.
+    async fn poison(&mut self, context: &str) -> PoolError {
+        let Some(mut worker) = self.worker.take() else {
+            return PoolError::Finished;
+        };
+        #[cfg(feature = "telemetry")]
+        self.record_finish("error");
+        self.pending = None;
+        self.feed_mounts = None;
+        let websocket = self.pool.config.transport.is_websocket();
+        // guard, not a trailing release: a caller dropping this future
+        // mid-reap must still release the slot and count the death. Its reason
+        // is what the classification below would have said without an exit
+        // status, so a cancelled reap of an out-of-memory worker is the one
+        // case counted as a plain crash.
+        let mut capacity = CapacityGuard::terminating(&self.pool, if websocket { "disconnected" } else { "crash" });
+        // A worker that exits deliberately (an allocation refused, see
+        // `OOM_EXIT_CODE`) is racing us: SIGKILLing it mid-exit would replace
+        // its code with `signal: 9` and lose the classification. Give it the
+        // same grace `fatal_error` does — a dead child reaps on the first poll,
+        // and only a wedged-alive one pays for it, on an already-failed turn.
+        // A deadline expiry never lands here (see `poison_timeout`), so nothing
+        // is waiting on this grace that should have been killed outright.
+        let status = worker.reap_or_kill(FATAL_EXIT_GRACE).await;
+        drop(worker);
+        if websocket {
+            PoolError::Disconnected {
+                context: context.to_owned(),
+            }
+        } else if status.and_then(|status| status.code()) == Some(monty_types::OOM_EXIT_CODE) {
+            // the worker is gone, unlike every other `Runtime` error — the
+            // checkout is already finished, so later calls report `Finished`
+            capacity.set_reason("oom");
+            PoolError::Runtime(MontyException::new(
+                ExcType::MemoryError,
+                Some("the worker exceeded its memory limit and was terminated".to_owned()),
+            ))
+        } else {
+            PoolError::Crashed {
+                status,
+                cause: CrashCause::Vanished {
+                    context: context.to_owned(),
+                },
+            }
+        }
+    }
+
+    /// Discards the worker after the turn deadline expired: the turn's I/O
+    /// future has already been dropped (safe — `Worker::recv` is cancel-safe),
+    /// so this only kills, reaps, and classifies.
+    async fn poison_timeout(&mut self) -> PoolError {
+        if let Some(mut worker) = self.worker.take() {
+            #[cfg(feature = "telemetry")]
+            self.record_finish("error");
+            // guard, not a trailing release: a caller dropping this future
+            // mid-reap must still release the slot and count the death
+            let _capacity = CapacityGuard::terminating(&self.pool, "turn_timeout");
+            let _ = worker.kill_and_reap().await;
+            drop(worker);
+        }
+        self.pending = None;
+        self.feed_mounts = None;
+        PoolError::Timeout {
+            timeout: self.armed_deadline.unwrap_or(Duration::ZERO),
+        }
+    }
+
+    /// Discards the worker without crash classification, for turn-enders
+    /// that are not crashes: protocol violations (the worker answered, just
+    /// wrongly) and server `Shutdown` replies. Fatal errors instead go
+    /// through [`Self::fatal_error`], which reaps and classifies.
+    fn discard_worker(&mut self) {
+        #[cfg(feature = "telemetry")]
+        if self.worker.is_some() {
+            self.record_finish("error");
+        }
+        self.release_worker();
+        self.pending = None;
+        self.feed_mounts = None;
+        self.turn_in_flight = false;
+        self.abort_in_flight = false;
+    }
+
+    /// Drops the worker and frees its pool slot, leaving the session state to
+    /// the caller: a session the relay shut down may yet resume on another worker.
+    fn release_worker(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            drop(worker);
+            self.pool.count_termination("discarded");
+            self.pool.release_capacity();
+        }
+    }
+}
+
+impl Drop for Checkout {
+    fn drop(&mut self) {
+        // a checkout abandoned mid-session cannot be trusted back into the
+        // pool: kill the worker and free its capacity
+        if let Some(worker) = self.worker.take() {
+            drop(worker);
+            self.pool.count_termination("abandoned");
+            self.pool.release_capacity();
+        }
+        #[cfg(feature = "telemetry")]
+        self.record_finish("abandoned");
+    }
+}
+
+/// Builds the `Configure` that creates `repl`'s session on a fresh worker.
+fn configure_request(repl: &ReplConfig) -> pb::ParentRequest {
+    request(pb::parent_request::Kind::Configure(pb::Configure {
+        script_name: repl.script_name.clone(),
+        limits: repl.limits.as_ref().map(Into::into),
+        type_check: repl.type_check,
+        type_check_stubs: repl.type_check_stubs.clone(),
+        type_check_format: pb::TypeCheckFormat::from(repl.type_check_config.format).into(),
+        type_check_color: repl.type_check_config.color,
+        assert_message_annotations: Some(repl.assert_message_annotations.max_bytes()),
+        // What the child actually checks: it rejects a version outside the
+        // range it serves with a `FatalError`. Relevant whenever the worker
+        // is not the binary this crate ships — a system-packaged `monty`,
+        // or a remote worker reached over a socket.
+        protocol_version: PROTOCOL_VERSION,
+        // Diagnostic only, so a rejection can report both builds.
+        monty_version: MONTY_VERSION.to_owned(),
+        print_flush_interval_ms: repl.print_flush_interval.map(flush_interval_ms),
+        os_policy: Some((&repl.os_policy).into()),
+        persistence: pb::Persistence::from(repl.persistence).into(),
+        profile: repl.profile.clone(),
+    }))
+}
+
+/// The `monty.pool.session.resumed` outcome for a failed reload: `exhausted`
+/// (no pool capacity), `disconnected` (the new connection failed), `refused`
+/// (the relay rejected the load), `shutdown` (the new relay is shutting down
+/// too), `mismatch` (the reloaded state is not the one shut down) or `timeout`.
+#[cfg(feature = "telemetry")]
+fn resume_failure(err: &PoolError) -> &'static str {
+    match err {
+        PoolError::Exhausted => "exhausted",
+        PoolError::Disconnected { .. } | PoolError::Spawn(_) => "disconnected",
+        PoolError::Crashed { .. } | PoolError::Runtime(_) | PoolError::Typing(_) => "refused",
+        PoolError::Shutdown { .. } => "shutdown",
+        PoolError::Protocol(_) => "mismatch",
+        PoolError::Timeout { .. } => "timeout",
+        PoolError::Finished => "error",
+    }
+}
+
+/// Encodes a print flush interval as whole milliseconds for the wire.
+///
+/// Zero is the explicit line-buffering sentinel, so a *positive* interval must
+/// never round down into it — anything under a millisecond is sent as 1 ms.
+/// Saturates at the top: an interval past `u32::MAX` milliseconds is absurd
+/// rather than meaningful, and the turn-end flush bounds it anyway.
+fn flush_interval_ms(interval: Duration) -> u32 {
+    if interval.is_zero() {
+        0
+    } else {
+        u32::try_from(interval.as_millis()).unwrap_or(u32::MAX).max(1)
+    }
+}
+
+/// Internal classification of a turn-ending event: real turn events for the
+/// caller, plus the control acks (`Ok` / `DumpResult`) used by the checkout
+/// lifecycle itself.
+#[derive(Debug)]
+enum ControlEvent {
+    Turn(TurnEvent),
+    Ok,
+    Dump(Vec<u8>),
+}
+
+/// How long a child that announced a `FatalError` is given to exit on its own
+/// before it is killed. It writes the frame and exits immediately, so this is
+/// a scheduling allowance rather than a real wait — and it is only ever spent
+/// on a turn that has already failed.
+const FATAL_EXIT_GRACE: Duration = Duration::from_millis(100);
+
+/// Wraps a request kind in a `ParentRequest`.
+///
+/// The one place the pool builds a request, so `ParentRequest`'s
+/// message-level fields are decided here rather than at every callsite.
+/// `trace_parent` is left unset: the pool does not propagate a tracing
+/// context yet, and an absent one just means the child starts its own trace.
+pub(crate) fn request(kind: pb::parent_request::Kind) -> pb::ParentRequest {
+    pb::ParentRequest {
+        kind: Some(kind),
+        trace_parent: None,
+    }
+}
+
+/// Converts a shared requirement-validation failure into a session-preserving
+/// Python `ValueError`.
+fn invalid_requirement(message: String) -> PoolError {
+    PoolError::Runtime(MontyException::new(ExcType::ValueError, Some(message)))
+}
+
+/// The tighter of two optional deadlines (`None` means no deadline).
+fn min_deadline(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (deadline, None) | (None, deadline) => deadline,
+    }
+}
+/// Checks an explicit working directory with [`validate_cwd`], raising its
+/// message as a session-preserving `ValueError`.
+fn checked_cwd(cwd: &str) -> Result<String, PoolError> {
+    validate_cwd(cwd).map_err(|message| PoolError::Runtime(MontyException::new(ExcType::ValueError, Some(message))))
+}
+
+/// Builds the parent-side [`MountTable`] for one feed from its (non-empty)
+/// specs. Free of filesystem I/O: each spec already carries its opened
+/// directory, so this only pairs those descriptors with a per-feed mode. Specs
+/// that overlap (see [`MountTable::push_mount`]) are rejected here — as a
+/// session-preserving [`PoolError::Runtime`], since specs are built
+/// independently and only meet at feed time.
+fn build_mount_table(mounts: Vec<MountSpec>) -> Result<MountTable, PoolError> {
+    let mut table = MountTable::new();
+    for mount in mounts {
+        let mode = match mount.mode {
+            MountSpecMode::ReadOnly => MountMode::ReadOnly,
+            MountSpecMode::ReadWrite => MountMode::ReadWrite,
+            // Overlay state is created fresh per feed: writes live only as
+            // long as the feed and are discarded with it.
+            MountSpecMode::Overlay => MountMode::OverlayMemory(OverlayState::new()),
+        };
+        // No filesystem access: the root was opened when the spec was built.
+        let mount = monty_fs::Mount::with_root(mount.root, mode, mount.write_bytes_limit)
+            .with_memory_usage_limit(mount.memory_usage_limit);
+        table
+            .push_mount(mount)
+            .map_err(|err| PoolError::Runtime(err.into_exception()))?;
+    }
+    Ok(table)
+}
+
+/// Decodes a suspension event's position, wire or already decoded. A child that
+/// predates the field sends none, which reads as [`SourceRange::unknown`] rather than an error.
+fn suspension_position(position: Option<impl Into<SourceRange>>) -> SourceRange {
+    position.map_or_else(SourceRange::unknown, Into::into)
+}

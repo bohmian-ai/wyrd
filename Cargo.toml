@@ -13,6 +13,9 @@ members = [
     "sdks/wyrd-sdk-ts/native",
     "sdks/wyrd-sdk-ts/native-testing",
 ]
+# Vendored crates.io Monty crates carrying Wyrd's worker-telemetry patch; they
+# keep their upstream manifests and lints rather than joining the workspace.
+exclude = ["crates/patches/monty-proto", "crates/patches/monty-pool"]
 default-members = [
     "crates/wyrd/wyrd-server",
     "crates/wyrd/wyrd-cli",
@@ -285,6 +288,10 @@ datafusion-distributed = { git = "https://github.com/bohmian-ai/datafusion-distr
 # Monty worker, hard-depends on the ty/ruff type checker; Wyrd never type checks,
 # so a stand-in with the same API refuses every check and keeps the checker out.
 monty-type-checking = { path = "crates/patches/monty-type-checking" }
+# Monty 1.1.0 with one bounded worker telemetry event that the parent reads
+# outside turns, including from idle workers; see each crate's PATCH.md.
+monty-proto = { path = "crates/patches/monty-proto" }
+monty-pool = { path = "crates/patches/monty-pool" }
 datafusion = { git = "https://github.com/bohmian-ai/datafusion", rev = "5f4b1713af4f0394c7c564b6bc6de42e92640186" }
 datafusion-common = { git = "https://github.com/bohmian-ai/datafusion", rev = "5f4b1713af4f0394c7c564b6bc6de42e92640186" }
 datafusion-datasource = { git = "https://github.com/bohmian-ai/datafusion", rev = "5f4b1713af4f0394c7c564b6bc6de42e92640186" }

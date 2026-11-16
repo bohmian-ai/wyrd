@@ -5224,8 +5224,6 @@ dependencies = [
 [[package]]
 name = "monty-pool"
 version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dce5d1666e27e0fcdad9e0f1aec467d5cd7f595b8f1f270e4f7a1d4ea6867b14"
 dependencies = [
  "futures-util",
  "monty-fs",
@@ -5239,8 +5237,6 @@ dependencies = [
 [[package]]
 name = "monty-proto"
 version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f62ede58a8426cfcd96ef1a8222579980c771f54ee63b5c20dabcfa7d3d72f85"
 dependencies = [
  "monty",
  "monty-type-checking",

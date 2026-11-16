@@ -271,6 +271,32 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
    ceiling behavior unchanged; already-correct behavior needs regression/static
    proof, not a forced production rewrite. Missed integration is a task failure.
 
+   Partial evidence: inherited lanes.
+   - `wyrd_runtime::resources::Inherited` captures the laned work running on
+     a thread, its lanes and context, so spawned work runs laned as the same
+     work.
+     Test: `resources::lanes::tests::spawned_work_inherits_the_parents_lanes`,
+     where a spawned future and a spawned blocking job both queue while the
+     only lane is held, then run as the parent. RED: the stub inherited
+     nothing. GREEN: `mise exec -- cargo nextest run --locked -p wyrd-runtime --lib -E 'test(/resources::lanes::/) | test(/resources::workload::/) | test(/^resources::tests::/)'`
+     (16 passed).
+     The first GREEN run failed on a race in the test itself: one
+     `yield_now` did not let the blocking thread queue. The test now waits
+     for both waiters.
+   - DataFusion's process `JoinSetTracer` (`oracle/telemetry.rs`), shared by
+     Oracle and Forge, runs spawned futures and blocking closures on the
+     spawner's inherited lanes.
+     Test: `oracle::telemetry::tests::spawned_query_partitions_run_on_the_spawners_lanes`,
+     a 4-partition aggregate run inside laned Bifrost work, with a UDF probe
+     on the spawned partition task. RED, run against the prior tracer, which
+     was written first: `[None]`. TDD is VIOLATED by that order, though the
+     RED was shown. GREEN: `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(/oracle::telemetry::/)'`
+     (5 passed, 3 runs).
+   - Cost: one `Arc` clone per laned poll, to record it with scenario 7.
+   - Open: Oracle query execution, Forge compaction and Scribe CPU pools do
+     not yet run laned under an admitted `Workload::Bifrost` operation, so in
+     production nothing is inherited yet. Status: FAIL.
+
 6. **Connected public journey and bounded drain — REQ-019–024; AC-018.** Extend
    existing Rust-client/WyrdTestServer/Postgres journey owners with verification
    invoking Agent media/code/model work while standalone gateway traffic and

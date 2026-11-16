@@ -25,7 +25,7 @@ use tokio::sync::futures::Notified;
 mod lanes;
 mod workload;
 
-pub use lanes::{CpuLanes, LaneLease, Laned};
+pub use lanes::{CpuLanes, Inherited, LaneLease, Laned};
 use workload::OperationShared;
 pub use workload::{
     CommitObservation, Operation, OperationId, Pressure, PressureState, SAMPLE_INTERVAL,

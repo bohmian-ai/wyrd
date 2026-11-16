@@ -14,7 +14,7 @@
 //! service floor, so idle time earns no credit. Nothing is preempted: a long
 //! phase delays others until it returns its lane.
 
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
@@ -29,8 +29,8 @@ use wyrd_spec::ids::DataTenantId;
 use super::workload::{WorkContext, Workload};
 
 thread_local! {
-    /// The context of the work running on this thread's held lane, if any.
-    static RUNNING: Cell<Option<WorkContext>> = const { Cell::new(None) };
+    /// The work running on this thread's held lane, and its lanes, if any.
+    static RUNNING: RefCell<Option<Inherited>> = const { RefCell::new(None) };
 }
 
 impl WorkContext {
@@ -40,7 +40,38 @@ impl WorkContext {
     /// attribution.
     #[must_use]
     pub fn current() -> Option<Self> {
-        RUNNING.get()
+        RUNNING.with_borrow(|running| running.as_ref().map(|running| running.context))
+    }
+}
+
+/// The laned work running on this thread, captured by a spawn hook so the
+/// work it spawns runs on the same lanes as the same work: polled through
+/// [`Self::laned`], or run blocking through [`Self::run_blocking`].
+#[derive(Debug, Clone)]
+pub struct Inherited {
+    /// The lanes the parent runs on.
+    lanes: CpuLanes,
+    /// The parent's work context.
+    context: WorkContext,
+}
+
+impl Inherited {
+    /// The laned work running on this thread, if any.
+    #[must_use]
+    pub fn current() -> Option<Self> {
+        RUNNING.with_borrow(Clone::clone)
+    }
+
+    /// Wraps spawned `future` so each poll runs on a lane as the parent's
+    /// work; see [`CpuLanes::laned`].
+    pub fn laned<F: Future>(self, future: F) -> Laned<F> {
+        self.lanes.laned(self.context, future)
+    }
+
+    /// Runs spawned blocking `job` on a lane as the parent's work; see
+    /// [`CpuLanes::run_blocking`].
+    pub fn run_blocking<T>(&self, job: impl FnOnce() -> T) -> T {
+        self.lanes.run_blocking(self.context, job)
     }
 }
 
@@ -205,11 +236,11 @@ impl CpuLanes {
     /// Call only from a dedicated CPU or blocking worker, never a Tokio async
     /// worker.
     pub fn run_blocking<T>(&self, context: WorkContext, job: impl FnOnce() -> T) -> T {
-        if RUNNING.get().is_some() {
+        if RUNNING.with_borrow(Option::is_some) {
             return job();
         }
         let _lease = self.acquire_blocking(context);
-        let _running = Scope::enter(context);
+        let _running = Scope::enter(self, context);
         job()
     }
 
@@ -483,22 +514,26 @@ impl LaneState {
 
 /// Marks the current thread as running laned work for one context.
 struct Scope {
-    /// The context running before this scope.
-    previous: Option<WorkContext>,
+    /// The work running before this scope.
+    previous: Option<Inherited>,
 }
 
 impl Scope {
-    /// Marks the current thread as running `context`'s work.
-    fn enter(context: WorkContext) -> Self {
+    /// Marks the current thread as running `context`'s work on `lanes`.
+    fn enter(lanes: &CpuLanes, context: WorkContext) -> Self {
+        let running = Inherited {
+            lanes: lanes.clone(),
+            context,
+        };
         Self {
-            previous: RUNNING.replace(Some(context)),
+            previous: RUNNING.replace(Some(running)),
         }
     }
 }
 
 impl Drop for Scope {
     fn drop(&mut self) {
-        RUNNING.set(self.previous);
+        RUNNING.set(self.previous.take());
     }
 }
 
@@ -592,7 +627,7 @@ impl<F: Future> Future for Laned<F> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
         let this = &mut *self;
-        if RUNNING.get().is_some() {
+        if RUNNING.with_borrow(Option::is_some) {
             return this.future.as_mut().poll(cx);
         }
         let Poll::Ready(id) = poll_lane(&this.lanes, this.context, &mut this.waiter, cx) else {
@@ -602,7 +637,7 @@ impl<F: Future> Future for Laned<F> {
             lanes: this.lanes.clone(),
             id,
         };
-        let _running = Scope::enter(this.context);
+        let _running = Scope::enter(&this.lanes, this.context);
         this.future.as_mut().poll(cx)
     }
 }
@@ -799,6 +834,42 @@ mod tests {
             .expect("the free lane runs other work");
         assert_eq!(ran, Some(Workload::Gateway));
         drop(held);
+    }
+
+    /// Work spawned from laned work inherits its context and its lanes: a
+    /// spawned future and a spawned blocking job each wait for a lane while
+    /// every lane is held, then run as the parent's work.
+    ///
+    /// # Panics
+    /// Panics when spawned work runs without a lane or as other work.
+    #[tokio::test]
+    async fn spawned_work_inherits_the_parents_lanes() {
+        let lanes = CpuLanes::new(1);
+        let bifrost = context(Workload::Bifrost, None);
+        let inherited = lanes
+            .laned(bifrost, async { Inherited::current() })
+            .await
+            .expect("laned work is inherited");
+        assert!(
+            Inherited::current().is_none(),
+            "unlaned code inherits nothing"
+        );
+
+        let held = lanes.acquire(context(Workload::Gateway, None)).await;
+        let spawned = tokio::spawn(inherited.clone().laned(async { WorkContext::current() }));
+        let blocking =
+            tokio::task::spawn_blocking(move || inherited.run_blocking(WorkContext::current));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while lanes.waiting() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both spawned jobs queue for a lane");
+        assert!(!spawned.is_finished(), "spawned work waits for a lane");
+        drop(held);
+        assert_eq!(spawned.await.expect("spawned future"), Some(bifrost));
+        assert_eq!(blocking.await.expect("spawned job"), Some(bifrost));
     }
 
     /// Cancelling a waiter, before or after it is granted, returns nothing

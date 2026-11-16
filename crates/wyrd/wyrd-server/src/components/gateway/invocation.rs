@@ -28,6 +28,7 @@ use wyrd_gateway::{
 };
 use wyrd_runtime::outbox::Reservation;
 use wyrd_runtime::principal::CardAttribution;
+use wyrd_runtime::resources::{Operation, Workload};
 use wyrd_runtime::{Permission, PermissionDenyReason, Principal};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, GatewayAccess};
@@ -222,6 +223,9 @@ pub struct GatewayInvocation<'a> {
     /// Deadline the caller fixed before waiting for its own admission; `None`
     /// starts the call's relative timeout once it is routed.
     bound: Option<Instant>,
+    /// The workload the call is admitted as: [`Workload::Gateway`] for a
+    /// standalone call, the initiating workload for a nested one.
+    workload: Workload,
 }
 
 /// Everything admission fixed for one call, owned so execution and accounting
@@ -265,6 +269,10 @@ struct AdmittedCall {
     /// no free slot, whose capture is then staged unreserved. Dropping it
     /// unused returns the slot.
     capture_slot: Option<Reservation<ScribeSink>>,
+    /// The call's admitted process operation, live until the call settles:
+    /// its demand under pressure and the owner of the bytes it retains.
+    /// Pressure may cancel the call through `cancel` while it runs.
+    _operation: Operation,
 }
 
 impl AdmittedCall {
@@ -291,7 +299,17 @@ impl<'a> GatewayInvocation<'a> {
             state,
             arrival: None,
             bound: None,
+            workload: Workload::Gateway,
         }
+    }
+
+    /// Admits the call this handle runs as `workload` work, the workload
+    /// that initiated it, such as a verification's Agent model call, so it
+    /// shares capacity as part of that work rather than as gateway traffic.
+    #[must_use]
+    pub(crate) const fn nested(mut self, workload: Workload) -> Self {
+        self.workload = workload;
+        self
     }
 
     /// Bounds the call this handle runs by `deadline`, an instant its caller
@@ -489,14 +507,17 @@ impl<'a> GatewayInvocation<'a> {
         let received = Instant::now();
         let (ingress, stream) = (request.ingress, request.stream);
         let telemetry = CallTelemetry::new(request.operation, stream, self.arrival);
-        let (call, plan, admission) = match self.admit_call(caller, request, &telemetry).await {
+        let call_cancel = cancel.child_token();
+        let admitted = self
+            .admit_call(caller, request, &telemetry, &call_cancel)
+            .await;
+        let (call, plan, admission) = match admitted {
             Ok(admitted) => admitted,
             Err(failure) => {
                 telemetry.answered(self.unsettled(&failure.error, cancel), Duration::ZERO);
                 return Err(failure);
             }
         };
-        let call_cancel = cancel.child_token();
         let cancel_on_drop = call_cancel.clone().drop_guard();
         let (head, answer) = oneshot::channel();
         let spawned = Instant::now();
@@ -560,13 +581,18 @@ impl<'a> GatewayInvocation<'a> {
     /// model in [`Self::route`], is staged on the process audit outbox and is
     /// not a request-path round trip.
     ///
+    /// Before any reservation the call is admitted as a process operation of
+    /// its workload and tenant, waiting while process pressure pauses that
+    /// work; pressure may later cancel the call through `cancel`.
+    ///
     /// # Errors
     /// Returns `ServiceUnavailable` while the server drains or before the
     /// tenant's snapshot is cached (queueing its background load),
     /// `GatewayInvalidRequest` for an invalid fallback override or
     /// out-of-range timeout, the mapped permission denial of the requested
     /// model, `GatewayDeadlineExceeded` when a [bound](Self::bounded) passes
-    /// before [`Self::admit`] starts, and every error of [`Self::route`],
+    /// before [`Self::admit`] starts or process pressure stays paused past
+    /// the call's deadline, and every error of [`Self::route`],
     /// [`Self::capture_slot`], and [`Self::admit`]. Every one is undispatched.
     ///
     /// The snapshot, authorize, route, and admit phases are recorded on
@@ -576,6 +602,7 @@ impl<'a> GatewayInvocation<'a> {
         caller: &Caller,
         mut request: GatewayCallRequest,
         telemetry: &CallTelemetry,
+        cancel: &CancellationToken,
     ) -> Result<(AdmittedCall, CallPlan, Admission), CallFailure> {
         let call_id = GatewayCallId::new_v7();
         tracing::Span::current().record("call_id", tracing::field::display(call_id.as_uuid()));
@@ -651,6 +678,18 @@ impl<'a> GatewayInvocation<'a> {
             .bound
             .unwrap_or_else(|| Instant::now() + request.timeout);
         let started = std::time::Instant::now();
+        // Process pressure pauses the call before it holds any reservation;
+        // it registers as demand of its workload and tenant meanwhile.
+        let operation = tokio::time::timeout_at(
+            deadline,
+            self.state.resources.workloads().admit(
+                self.workload,
+                Some(tenant),
+                Some(cancel.clone()),
+            ),
+        )
+        .await
+        .map_err(|_| expired(call_id))?;
         let capture_slot = if snapshot.capture.mode == GatewayCaptureMode::Disabled {
             None
         } else if self.bound.is_some() {
@@ -678,6 +717,7 @@ impl<'a> GatewayInvocation<'a> {
             subject,
             trace,
             capture_slot,
+            _operation: operation,
         };
         // Only a bound caller's deadline can pass before the ledger is charged.
         if self.bound.is_some_and(|bound| bound <= Instant::now()) {

@@ -2289,6 +2289,9 @@ pub struct AppStateInner {
     pub auth: ServerAuth,
     /// The governed gateway: configuration, engine, caches, and call tasks.
     pub gateway: Gateway,
+    /// The process resource plan every owner composes from: the one memory
+    /// ledger and the workload manager that admits and shares work.
+    pub resources: wyrd_runtime::resources::ProcessResources,
     /// The verification runtime's process capabilities.
     pub verification: Verification,
     /// The `/mcp` surface's in-flight work.

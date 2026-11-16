@@ -284,6 +284,21 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
    Existing public methods/wire shapes stay unchanged; do not invent SDK APIs.
    Current disconnected admission must make the new connected observation RED.
 
+   Partial evidence: gateway admission.
+   - `GatewayInvocation::admit_call` admits every call as a process
+     `Operation` through `AppStateInner::resources`, the boot-composed plan,
+     before any capture or quota reservation. The wait is bounded by the
+     call's deadline. The victim token is the call's cancellation.
+   - Standalone calls are `Workload::Gateway`. `ServerWyrdGatewayCaller`
+     (Agent model calls) admits as `Workload::Verification` via `.nested`.
+   - Test: `components::gateway::pg_invocation_tests::critical_pressure_pauses_gateway_calls_until_recovery`.
+     RED: "the paused call never dispatched" (it dispatched). GREEN, plus all
+     gateway unit tests (79 passed):
+     `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --features test-support --lib -E 'test(/components::gateway::/)'"`.
+   - Open: attributing retained request, response and capture bytes to the
+     operation, proving nested attribution, and the connected journey.
+     Status: FAIL.
+
 7. **Functional closure and performance — REQ-024; AC-018.** Run affected
    functional lanes, then full clean L1 verification, gateway and all three
    Bifrost experiments against compatible clean records in benchmarks/history.

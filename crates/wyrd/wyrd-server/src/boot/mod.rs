@@ -1415,6 +1415,7 @@ impl AppState {
             bifrost,
             auth,
             gateway,
+            resources: process.clone(),
             verification,
             mcp: Mcp::default(),
             github,
@@ -1428,7 +1429,7 @@ impl AppState {
             return Err(error);
         }
         let mut workers = state.engine_workers(config);
-        let workloads = process.workloads().clone();
+        let workloads = state.resources.workloads().clone();
         let stop = state.shutdown_token.clone();
         workers.push((
             "process_pressure",

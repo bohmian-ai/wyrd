@@ -6837,3 +6837,55 @@ async fn lane_wait_spends_the_agent_call_budget() {
         "the expired call stays timed out: {outcomes:?}"
     );
 }
+
+/// Critical process pressure pauses a standalone gateway call before any
+/// quota or capture reservation: it waits as gateway work of its tenant, is
+/// refused at its own deadline without dispatching, and runs once pressure
+/// recovers.
+///
+/// # Panics
+/// Panics when the Postgres fixture or setup fails, the paused call
+/// dispatches or is not refused as expired, or the call does not run after
+/// recovery.
+#[tokio::test]
+async fn critical_pressure_pauses_gateway_calls_until_recovery() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let dispatch = Scripted::shared();
+    let state = replica(&fixture, dispatch.clone()).await;
+    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
+    let caller = invoker(tenant, 1, [open_access()]);
+    let workloads = state.resources.workloads().clone();
+    let overcommitted = workloads.observe_commitment();
+    overcommitted.set(u64::MAX);
+    assert_eq!(
+        workloads.sample(0).state,
+        wyrd_runtime::resources::PressureState::Critical
+    );
+
+    let refused = GatewayInvocation::new(&state)
+        .invoke(
+            &caller,
+            request("dep-a/a", None, Duration::from_millis(300)),
+        )
+        .await
+        .expect_err("a call cannot start under critical pressure");
+    assert!(
+        matches!(refused, WyrdError::GatewayDeadlineExceeded { .. }),
+        "{refused:?}"
+    );
+    assert!(
+        dispatch.seen().is_empty(),
+        "the paused call never dispatched"
+    );
+
+    overcommitted.set(0);
+    workloads.sample(0);
+    workloads.sample(0);
+    dispatch.push(Step::Return(completed(1, 1)));
+    GatewayInvocation::new(&state)
+        .invoke(&caller, request("dep-a/a", None, Duration::from_secs(10)))
+        .await
+        .expect("the call runs once pressure recovers");
+    assert_eq!(dispatch.seen(), ["dep-a"]);
+}

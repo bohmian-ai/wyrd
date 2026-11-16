@@ -156,7 +156,8 @@ async function readDrift(id: string, requirement: string, one: (request: WireReq
  * page and the publication page are read independently, and the selection
  * adds only what it names: completed details when asked for and the
  * execution has a result, one publication, one source slot's members, the
- * accepted inputs, or one drift requirement's recorded context.
+ * accepted inputs, or one drift requirement's recorded context. The returned
+ * input carries the selection actually shown.
  */
 export async function loadExecution(input: ExecutionInput, context: Context): Promise<VerificationExecutionProps> {
   const one = async (request: WireRequest) => (await context.executor.run([request], context.signal))[0] as WireResult;
@@ -164,6 +165,9 @@ export async function loadExecution(input: ExecutionInput, context: Context): Pr
   const status = await one({ op: 'verification.get_execution', execution_id: id });
   if (!status.ok) return { input, result: failed(status.problem) };
   const state = status.value as VerificationExecutionState;
+  // A judged execution opens on its first failed requirement until the reader selects something, or nothing.
+  const first = input.node === undefined ? state.result?.outcome.requirements.find((each) => each.outcome === 'failed') : undefined;
+  if (first) input = { ...input, node: `req:${first.id}` };
   const [type, node] = (input.node ?? '').split(/:(.*)/s);
   const slot = type === 'input' ? state.group?.sources[node] : undefined;
   const drifted = type === 'req' && state.result?.outcome.requirements.some((each) => each.id === node && each.detail?.drift);

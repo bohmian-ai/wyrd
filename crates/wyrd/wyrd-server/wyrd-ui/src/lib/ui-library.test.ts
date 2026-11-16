@@ -2757,7 +2757,7 @@ test('execution loader reads each part once and keeps refusals apart', async () 
     }
   ]);
   expect(context).toMatchObject({ state: 'populated', data: { window_start: '2026-10-20T10:00:00Z', window_end: '2026-10-20T11:00:00Z' } });
-  expect((context as { data: { history: { execution_id: string; scores: object }[] } }).data.history.map((point) => [point.execution_id, point.scores])).toEqual([
+  expect((context?.state === 'populated' ? context.data.history : []).map((point) => [point.execution_id, point.scores])).toEqual([
     ['exec_drift_3', { latency_ms: 0.08, tokens: 0.04, cost: null }],
     ['exec_drift_2', { latency_ms: 0.12, tokens: 0.04, cost: null }],
     ['exec_drift_1', { latency_ms: 0.22, tokens: 0.04, cost: null }],
@@ -2828,6 +2828,15 @@ test('execution inspector shows recorded state, judgments and outputs as separat
   const positions = () => [...shown.container.querySelectorAll<HTMLElement>('.svelte-flow__node')].map((each) => each.style.transform);
   const viewport = () => (shown.container.querySelector('.svelte-flow__viewport') as HTMLElement).style.transform;
   const sent = () => onaction.mock.lastCall?.[0];
+
+  // A judged execution opens on its first failed requirement; the loader says which selection it shows.
+  expect(settled.input).toEqual({ executionId: 'exec_settled', node: 'req:policy-followed' });
+  expect(node('req:policy-followed')).toHaveAttribute('aria-pressed', 'true');
+  expect((await load({ executionId: EXECUTIONS.settled, node: 'none' })).input.node).toBe('none');
+  expect((await load({ executionId: EXECUTIONS.running })).input.node).toBeUndefined();
+  await fireEvent.click(shown.container.querySelector('.svelte-flow__pane') as Element);
+  expect(sent()).toEqual({ name: 'execution.select', input: { node: 'none' } });
+  expect(within(shown.container).getByRole('region', { name: 'Inspector' })).toBeInTheDocument();
 
   // Lifecycle status and verdict are separate facts, each a word; the count is what the result records.
   const head = within(shown.container).getByRole('region', { name: 'Execution' });

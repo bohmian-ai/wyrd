@@ -145,7 +145,7 @@ export const ProducerSchema = z
 
 /** What an execution view shows beyond the execution itself; every field is shareable selection state. */
 const executionSelection = {
-  /** The selected graph node: `input:`, `step:` or `req:` plus its id, or `outputs` for every retained output. */
+  /** The selected graph node: `input:`, `step:` or `req:` plus its id; `outputs` for every retained output; `none` for no selection. Absent, a judged execution selects its first failed requirement. */
   node: z.string().min(1).max(300).optional(),
   /** The selected invocation attempt of the selected step. */
   producer: ProducerSchema.optional(),
@@ -592,6 +592,7 @@ export const components = {
         input: z.object({ step_id: z.string().min(1), name: z.string().min(1), producer: ProducerSchema, path: z.string().min(1).optional() }).strict(),
         completion: 'host-navigation'
       },
+      'record.open': { description: 'Open the exact trace an input names, read with the viewer\'s current permissions.', input: spanRef, completion: 'host-navigation' },
       'card.open': openCard
     }
   },

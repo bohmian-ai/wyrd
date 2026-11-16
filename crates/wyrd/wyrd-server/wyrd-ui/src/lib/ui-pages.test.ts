@@ -482,15 +482,18 @@ test('every histogram series apart is labelled from the series index, plotted id
 
 import { fireEvent, render, waitFor, within } from '@testing-library/svelte';
 import { vi } from 'vitest';
-import { goto } from '$app/navigation';
-import { fixtureExecutor, SERVICE, stateExecutors, VERIFIER, verifiers } from '$lib/ui-fixtures';
+import { goto, invalidateAll } from '$app/navigation';
+import { EXECUTIONS, fixtureExecutor, SERVICE, stateExecutors, VERIFIER, verifiers } from '$lib/ui-fixtures';
+import { readExecution, writeExecution } from '$lib/verify-host';
+import { load as loadExecutionPage } from '../routes/t/[tenantKey]/verify/executions/[executionId]/+page.server';
+import ExecutionPage from '../routes/t/[tenantKey]/verify/executions/[executionId]/+page.svelte';
 import { load as loadCardDetail } from '../routes/t/[tenantKey]/cards/detail/+page.server';
 import CardDetail from '../routes/t/[tenantKey]/cards/detail/+page.svelte';
 
 // The page's reads run through the fixture executor here; the real BFF path is the integration journey's.
 const host = vi.hoisted(() => ({ executor: undefined as Executor | undefined }));
 vi.mock('wyrd-ai-ui/node', () => ({ nodeExecutor: () => host.executor }));
-vi.mock('$app/navigation', () => ({ goto: vi.fn(async () => {}) }));
+vi.mock('$app/navigation', () => ({ goto: vi.fn(async () => {}), invalidateAll: vi.fn(async () => {}) }));
 
 test('an exact Verifier Card page shows its definition, versions and where it runs', async () => {
   const requests: WireRequest[] = [];
@@ -557,5 +560,122 @@ test('an exact Verifier Card page shows its definition, versions and where it ru
   const missing = await open('?kind=Verifier&name=ticket-policy&version=9.9.9');
   expect(missing.container).toHaveTextContent('WYRD_REGISTRY_404_CARD_NOT_FOUND');
   expect(missing.container.querySelector('[data-node]')).toBeNull();
+  expect(requests).toHaveLength(1);
+});
+
+test('an exact execution page keeps its selection in the URL and cancels once through the host', async () => {
+  const requests: WireRequest[] = [];
+  const open = async (path: string, executor: Executor = fixtureExecutor) => {
+    host.executor = { run: (batch, signal) => (requests.push(...batch), executor.run(batch, signal)) };
+    requests.length = 0;
+    const url = new URL(`http://ui.test/t/acme/verify/executions/${path}`);
+    const executionId = url.pathname.split('/').pop() as string;
+    const data = await loadExecutionPage({ locals: { browserSession: { client: () => ({}), api: vi.fn() } }, params: { tenantKey: 'acme', executionId }, url, request: new Request(url) } as never);
+    return render(ExecutionPage, { data: { ...data, tenant: { key: 'acme', name: 'Acme' } } } as never);
+  };
+  const here = '/t/acme/verify/executions/exec_settled';
+
+  // The URL round-trips the exact selection: node, nullable item and iteration, one-based attempt, output, details and cursors.
+  const selection = { node: 'step:polish', producer: { item_index: 2, iteration_index: null, attempt: 3 }, output: 'draft v2/notes.md', details: true, invocations: 'c+1/=', publications: 'c 2' };
+  const search = writeExecution(selection);
+  expect(search).toBe('?node=step%3Apolish&item=2&attempt=3&output=draft+v2%2Fnotes.md&details=1&invocations=c%2B1%2F%3D&publications=c+2');
+  expect(readExecution('exec_1', new URLSearchParams(search))).toEqual({ executionId: 'exec_1', ...selection });
+  expect(readExecution('exec_1', new URLSearchParams())).toEqual({ executionId: 'exec_1' });
+  expect(writeExecution({})).toBe('');
+
+  // Opening the exact URL shows that execution with the URL's attempt and output selected; no list is read to get there.
+  const page = await open('exec_settled?node=step%3Ascore&attempt=2&output=units');
+  await waitFor(() => expect(page.container.querySelector('[data-node="step:score"]')).toHaveAttribute('aria-pressed', 'true'));
+  expect(page.container).toHaveTextContent('Verify/Executions/exec_settled');
+  expect(page.container.querySelector('[data-producer]')).toHaveAttribute('data-producer', 'attempt 2');
+  expect(page.container.querySelector('[data-preview="units"] pre')?.textContent).toBe('{\n  "units": 3\n}');
+  expect(requests.find((request) => request.op === 'verification.get_publication')).toEqual({ op: 'verification.get_publication', execution_id: 'exec_settled', step_id: 'score', name: 'units', attempt: 2, item_index: null, iteration_index: null });
+  expect(requests.some((request) => request.op === 'cards.list')).toBe(false);
+
+  // Every selection is a navigation to its own URL; opening a member, the Verifier or a file follows exact identities.
+  await fireEvent.click(within(page.getByRole('radiogroup', { name: 'Invocations of score' })).getByRole('radio', { name: /attempt 1/ }));
+  expect(goto).toHaveBeenLastCalledWith(`${here}?node=step%3Ascore&attempt=1`, { keepFocus: true, noScroll: true });
+  await fireEvent.click(page.container.querySelector('[data-node="req:policy-followed"]') as Element);
+  expect(goto).toHaveBeenLastCalledWith(`${here}?node=req%3Apolicy-followed`, expect.anything());
+  await fireEvent.click(page.getByRole('button', { name: 'Load completed details' }));
+  expect(goto).toHaveBeenLastCalledWith(`${here}?node=req%3Apolicy-followed&details=1`, expect.anything());
+  await fireEvent.click(page.getByRole('button', { name: 'ticket-policy@1.1.0' }));
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/cards/detail?kind=Verifier&name=ticket-policy&version=1.1.0&uid=card_verifier_ticket-policy_1.1.0', expect.anything());
+
+  // Refresh rereads in place; Copy link copies the address that holds the selection.
+  await fireEvent.click(page.getByRole('button', { name: 'Refresh' }));
+  expect(invalidateAll).toHaveBeenCalledTimes(1);
+  const writeText = vi.fn(async () => {});
+  Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+  await fireEvent.click(page.getByRole('button', { name: /Copy link/ }));
+  expect(writeText).toHaveBeenCalledWith(window.location.href);
+  await waitFor(() => expect(page.container).toHaveTextContent('Link copied'));
+  page.unmount();
+
+  // An older navigation finishing does not clear the newer one's pending state, and the newer selection stays shown.
+  const settle: (() => void)[] = [];
+  vi.mocked(goto).mockImplementation(() => new Promise<void>((resolve) => settle.push(resolve)));
+  const racing = await open('exec_settled?node=step%3Ascore');
+  await waitFor(() => expect(racing.container.querySelector('[data-node="step:score"]')).toBeInTheDocument());
+  await fireEvent.click(racing.container.querySelector('[data-node="step:classify"]') as Element);
+  await fireEvent.click(racing.container.querySelector('[data-node="step:summarise"]') as Element);
+  settle[0]();
+  await new Promise((resolve) => setTimeout(resolve));
+  expect(racing.container.querySelector('[data-node="step:summarise"]')).toHaveAttribute('aria-pressed', 'true');
+  expect(racing.getByRole('region', { name: 'Step summarise' })).toBeInTheDocument();
+  // Until its own answer arrives, the newer selection shows no output body that was read for another one.
+  expect(racing.container.querySelector('[data-preview]')).toBeNull();
+  settle[1]();
+  vi.mocked(goto).mockImplementation(async () => {});
+  racing.unmount();
+
+  // Session members and downloads leave through exact URLs.
+  const session = await open('exec_session?node=input%3Aoutcomes');
+  await fireEvent.click(await session.findByRole('button', { name: 'exec_m2' }));
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/verify/executions/exec_m2', { keepFocus: true, noScroll: false });
+  session.unmount();
+  const opened = vi.spyOn(window, 'open').mockReturnValue(null);
+  const files = await open('exec_settled?node=step%3Asummarise&attempt=1&output=tree');
+  await fireEvent.click(within(await files.findByRole('region', { name: 'Files of tree' })).getAllByRole('button', { name: 'Download' })[1]);
+  expect(opened).toHaveBeenLastCalledWith(`${here}/download?step=summarise&name=tree&attempt=1&path=nested%2Fb.md`, '_self');
+  opened.mockRestore();
+  files.unmount();
+
+  // Cancel is one host request: pending disables the control, the answer is the recorded status, and status is read back.
+  const answers: ((response: Response) => void)[] = [];
+  const fetched = vi.spyOn(globalThis, 'fetch').mockImplementation(() => new Promise<Response>((resolve) => answers.push(resolve)));
+  vi.mocked(invalidateAll).mockClear();
+  const running = await open('exec_running');
+  const cancel = () => running.getByRole('button', { name: /Cancel execution/ });
+  await fireEvent.click(cancel());
+  await waitFor(() => expect(cancel()).toBeDisabled());
+  await fireEvent.click(cancel());
+  expect(fetched.mock.calls).toEqual([['/t/acme/verify/executions/exec_running/cancel', { method: 'POST' }]]);
+  expect(invalidateAll).not.toHaveBeenCalled();
+  // A completion that won the race answers its own terminal status; the page reports that, not "cancelled".
+  answers[0](Response.json({ execution_id: 'exec_running', status: 'completed' }));
+  await waitFor(() => expect(running.container).toHaveTextContent('Recorded status: completed'));
+  expect(invalidateAll).toHaveBeenCalledTimes(1);
+  // A refused cancel is shown as denied with the server's code, and the readable execution stays.
+  await fireEvent.click(cancel());
+  answers[1](Response.json({ code: 'WYRD_PERMISSION_403_DENIED_RBAC', title: 'Permission denied', status: 403 }, { status: 403 }));
+  await waitFor(() => expect(running.container).toHaveTextContent('WYRD_PERMISSION_403_DENIED_RBAC'));
+  expect(running.container.querySelector('[data-execution-status]')).toHaveAttribute('data-execution-status', 'running');
+  expect(invalidateAll).toHaveBeenCalledTimes(2);
+  fetched.mockRestore();
+  running.unmount();
+
+  // An unknown execution shows the server's problem and nothing else; a malformed selection is refused before any read.
+  const unknown = await open('exec_nowhere?node=step%3Ascore&attempt=1&output=units');
+  expect(unknown.container).toHaveTextContent('WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND');
+  expect(unknown.container.querySelector('[data-node], [data-execution-status]')).toBeNull();
+  expect(unknown.container.textContent).not.toMatch(/running/i);
+  expect(requests).toEqual([{ op: 'verification.get_execution', execution_id: 'exec_nowhere' }]);
+  unknown.unmount();
+  const malformed = await open('exec_settled?attempt=0');
+  expect(malformed.container).toHaveTextContent('WYRD_SPEC_400_VALIDATION');
+  expect(requests).toEqual([]);
+  const refused = await open('exec_settled', stateExecutors.denied);
+  expect(refused.container).toHaveTextContent('WYRD_AUTH_403_FORBIDDEN');
   expect(requests).toHaveLength(1);
 });

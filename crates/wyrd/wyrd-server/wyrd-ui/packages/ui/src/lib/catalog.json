@@ -1963,6 +1963,29 @@
           "completion": "host-navigation"
         },
         {
+          "name": "record.open",
+          "description": "Open the exact trace an input names, read with the viewer's current permissions.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "trace_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$"
+              },
+              "span_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{16}$"
+              }
+            },
+            "required": [
+              "trace_id"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
           "name": "card.open",
           "description": "Open this exact Card version.",
           "input": {

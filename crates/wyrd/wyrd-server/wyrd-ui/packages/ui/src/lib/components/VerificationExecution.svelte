@@ -26,7 +26,18 @@
 
   // The host owns selection through `input`; a choice shows at once and holds until the host answers with new props.
   let chosen = $state.raw<{ readonly from: ExecutionInput; readonly value: Selection }>();
-  const selection = $derived<Selection>(chosen?.from === input ? chosen.value : { node: input.node, producer: input.producer, output: input.output, details: input.details });
+  // While the host is still answering a selection, an older answer arriving does not replace the newer choice.
+  const selection = $derived<Selection>(
+    chosen && (chosen.from === input || actions['execution.select']?.state === 'pending') ? chosen.value : { node: input.node, producer: input.producer, output: input.output, details: input.details }
+  );
+  /** Whether the loaded selection-specific parts (output body, members, accepted input, drift context) belong to the selection shown. */
+  const current = $derived(
+    selection.node === input.node &&
+      selection.output === input.output &&
+      !selection.producer === !input.producer &&
+      (!selection.producer || !input.producer || sameProducer({ step_id: '', ...selection.producer }, input.producer))
+  );
+  const loaded = $derived(current && result.state === 'populated' ? result.data : undefined);
   function select(next: Selection) {
     const value = Object.fromEntries(Object.entries({ details: selection.details, ...next }).filter(([, each]) => each !== undefined && each !== false)) as Selection;
     chosen = { from: input, value };
@@ -112,7 +123,7 @@
 {/snippet}
 
 {#snippet drift(report: CardTypes.DriftReport)}
-  {@const context = data?.drift}
+  {@const context = loaded?.drift}
   {@const history = context?.state === 'populated' ? context.data.history : []}
   {@const features = Object.values(report.features).sort((a, b) => Number(b.verdict === 'Drift') - Number(a.verdict === 'Drift') || a.feature.localeCompare(b.feature))}
   <div class="field" data-drift>
@@ -247,7 +258,7 @@
 
     {#if definition && states}
       {#key fmtCardRef(definition.ref)}
-        <VerifierGraph graph={definition.graph} {states} bind:selected={() => (selection.node && selection.node !== 'outputs' ? selection.node : ''), (key) => select(key ? { node: key } : {})} />
+        <VerifierGraph graph={definition.graph} {states} bind:selected={() => (selection.node?.includes(':') ? selection.node : ''), (key) => select({ node: key || 'none' })} />
       {/key}
     {:else}
       <Panel title="Graph" note="The Verifier this execution ran">
@@ -335,7 +346,7 @@
                 <p class="hint">This invocation retained no output.</p>
               {/if}
             </div>
-            {#if data.publication && selection.output}{@render publication(data.publication, id)}{/if}
+            {#if loaded?.publication && selection.output}{@render publication(loaded.publication, id)}{/if}
           {:else if data.invocations.state === 'populated'}
             <p class="hint">{settled(status.status) ? 'No invocation of this step was recorded.' : 'No invocation of this step is recorded yet.'}</p>
           {/if}
@@ -388,9 +399,9 @@
               </div>
             {/each}
           {/if}
-        {:else if data.members}
+        {:else if loaded?.members}
           <ol class="members flush" aria-label="Members of {id}">
-            {#each data.members as member (member.execution_id)}
+            {#each loaded.members as member (member.execution_id)}
               <li>
                 <button type="button" class="open" disabled={off('execution.open')} onclick={() => onaction?.({ name: 'execution.open', input: { execution_id: member.execution_id } })}>{member.execution_id}</button>
                 {#if member.status?.state === 'populated'}
@@ -405,13 +416,14 @@
             {/each}
           </ol>
           <ActionNote state={act('execution.open')} />
-        {:else if data.inputs}
-          {@render refused(data.inputs, 'Accepted input')}
-          {#if data.inputs.state === 'populated'}
-            {@const accepted = data.inputs.data}
+        {:else if loaded?.inputs}
+          {@render refused(loaded.inputs, 'Accepted input')}
+          {#if loaded.inputs.state === 'populated'}
+            {@const accepted = loaded.inputs.data}
             {@render value('Accepted', accepted ?? null)}
-            {#if typeof accepted === 'string' && /^[0-9a-f]{32}$/.test(accepted)}
-              <button type="button" class="open" disabled={off('record.open')} onclick={() => onaction?.({ name: 'record.open', input: { trace_id: accepted } })}>Open this trace</button>
+            {#if accepted && typeof accepted === 'object' && 'trace_id' in accepted && typeof accepted.trace_id === 'string'}
+              {@const trace = accepted.trace_id}
+              <button type="button" class="open" disabled={off('record.open')} onclick={() => onaction?.({ name: 'record.open', input: { trace_id: trace } })}>Open trace {fmtShortId(trace)}</button>
               <ActionNote state={act('record.open')} />
             {/if}
           {/if}

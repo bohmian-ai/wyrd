@@ -2915,6 +2915,7 @@ test('execution inspector shows recorded state, judgments and outputs as separat
   expect(requirement().querySelector('[data-outcome]')).toHaveAttribute('data-outcome', 'failed');
   expect(requirement()).toHaveTextContent('policy-followed did not hold');
   expect(requirement()).toHaveTextContent('ticket kind: lines start: 4 end: 9');
+  expect(requirement().querySelector('.judgment')).toHaveTextContent('Data { "label": "refund" }');
   expect(requirement().querySelector('[data-details]')).toBeNull();
   await fireEvent.click(within(shown.container).getByRole('button', { name: 'Load completed details' }));
   expect(sent()).toEqual({ name: 'execution.select', input: { node: 'req:policy-followed', details: true } });
@@ -3031,4 +3032,32 @@ test('a retained text file previews as inert text within the bound, and says whe
   await shown.rerender(await loadExecution(file('report'), { executor: refusing.executor }));
   expect(shown.container.querySelector('[data-part="File text"]')).toHaveTextContent(denied.title);
   expect(within(shown.container).getByRole('region', { name: 'Files of report' })).toBeInTheDocument();
+});
+
+test('execution inspector shows a recorded actual value, a discarded output, a cut preview and the next page of outputs', async () => {
+  const onaction = vi.fn();
+  const big = 'x'.repeat(70_000);
+  const executor = fixtureRecording((request) => {
+    if (request.op === 'verification.list_publications')
+      return { ok: true, value: { items: [{ name: 'text', kind: 'json', producer: { step_id: 'read-photo', item_index: null, iteration_index: null, attempt: 1 }, speculation: 'discarded' }], next_cursor: 'outputs/1' } };
+    if (request.op === 'verification.get_publication') return { ok: true, value: { kind: 'json', name: 'text', value: big, producer: { step_id: 'read-photo', item_index: null, iteration_index: null, attempt: 1 } } };
+    return undefined;
+  }).executor;
+  const load = (input: Parameters<typeof loadExecution>[0]) => loadExecution(input, { executor });
+
+  // The compared value of a judgment is shown as recorded.
+  const shown = render(VerificationExecution, { ...(await load({ executionId: EXECUTIONS.settled, node: 'req:classified' })), onaction });
+  expect(within(shown.container).getByRole('region', { name: 'Requirement classified' }).querySelector('.judgment')).toHaveTextContent('Actual refund');
+
+  // A discarded speculative output says so, and the page of outputs continues through the host with the server's cursor.
+  await shown.rerender({ ...(await load({ executionId: EXECUTIONS.settled, node: 'outputs' })), onaction });
+  expect(within(shown.container).getByRole('region', { name: 'Retained outputs' })).toHaveTextContent('discarded');
+  await fireEvent.click(within(shown.container).getByRole('button', { name: 'Next page of outputs' }));
+  expect(onaction).toHaveBeenLastCalledWith({ name: 'execution.page', input: { publications: 'outputs/1' } });
+
+  // A JSON value over the preview bound is cut, and says how much more is retained.
+  await shown.rerender({ ...(await load({ executionId: EXECUTIONS.settled, node: 'step:read-photo', producer: { attempt: 1 }, output: 'text' })), onaction });
+  const preview = shown.container.querySelector('[data-preview="text"]') as HTMLElement;
+  expect(preview.querySelector('pre')?.textContent).toHaveLength(65_536);
+  expect(preview).toHaveTextContent('Preview stops at 64.0 KiB; 4.4 KiB more is retained.');
 });

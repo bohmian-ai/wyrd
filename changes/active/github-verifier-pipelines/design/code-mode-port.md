@@ -156,13 +156,13 @@ this; their older threshold no longer applies.
 | Row | Disposition | Owner now |
 |---|---|---|
 | R3-PLAN | carried: process plan unchanged by the port | TASK-012 evidence |
-| R3-MEM | pending: revision 13 removes the queued reservation from the one ledger | TASK-012 OBL-7/OBL-9 |
+| R3-MEM | changed: one process ledger with no queued reservation (revision 13, `35fd76607`); every hosted charge is held only while in use | TASK-012 OBL-7/OBL-9 |
 | R3-CACHE | carried | unverified on the port; TASK-012 lanes |
 | R3-SPILL | carried | unverified on the port; TASK-012 lanes |
 | R3-REPLICA | pending | TASK-014 two-replica record |
-| R3-CPU | changed: queued work also has a bounded CPU share on its own runtime | TASK-012 OBL-9; TASK-014 |
-| R3-ADMIT | pending: tenant-fair waits kept; revision 13 isolates by deployment target | TASK-012 OBL-9; TASK-014 |
-| R3-WORKER | carried, per lane | TASK-012 OBL-6 |
+| R3-CPU | changed: one runnable-turn bound of the effective CPUs shared by direct and queued work in `combined`; isolation is by `direct` and `worker` pods (revision 13) | TASK-012 OBL-9; TASK-014 |
+| R3-ADMIT | changed: tenant-fair waits kept; revision 13 isolates by deployment target | TASK-012 OBL-9; TASK-014 |
+| R3-WORKER | carried: one sandbox pool per process | TASK-012 OBL-6 |
 | R3-DEADLINE | changed: arrival deadline also lowered by the Verifier's `limits.timeout_seconds` | TASK-012 OBL-8 |
 | R3-EDGE | carried | TASK-012 OBL-8 |
 | R3-TEL | carried | unverified on the port |
@@ -171,4 +171,53 @@ this; their older threshold no longer applies.
 | R3-SUSTAIN | pending, amended to 100 tenants | TASK-014 |
 | R3-DIAG | pending | TASK-014 artifact analysis |
 | R3-LEDGER | pending | TASK-014 |
-| R3-DOCS | changed: reconciled to revision 12 in `bb78916eb` | TASK-012 OBL-2 |
+| R3-DOCS | changed: reconciled to revision 12 in `bb78916eb`, then to revisions 13–15 in `456546fbb`, `b2afb89a8`, `b78edf183` and `9755b9c2a` | TASK-012 OBL-2 |
+
+### Other inherited rows
+
+| Inherited | Disposition |
+|---|---|
+| A's spec revision 9 functional and security requirements | carried; amended by pipeline revisions 12–15 for capacity, nested exclusions and tool spend |
+| A's REQ-027/029 idle-capacity borrowing | superseded by revision 13: one shared owner per process, isolation by deployment target |
+| A's REQ-033 and AC-034 | amended to 100 tenants (above); qualification is TASK-014's |
+| A's TASK-001 and TASK-002 | carried with their recorded review history; no verdict changed |
+| A's TASK-003-R2 | superseded, unchanged |
+| A's TASK-003-R3 | open; rows above |
+| `capacity-diagnosis.md` | carried; it cites source locations and public references only and names no local diagnostic artifact, so none is retained or marked unavailable |
+| `verifier-review-pipelines` revision 24 | historical; not reactivated |
+| `resource-scaling` revision 5 | one shared packet kept; its measurements are not treated as current |
+| `verified-change-contract` REQ-195 | reconciled to the six-control union in `bb78916eb` |
+| `software-factory` and A's payload-sizing packet | outside the port |
+
+## Conflict coverage
+
+The merge plan's inventory (37 textual paths, 38 textually clean shared files,
+17 semantic conflicts) was resolved on the composed tree; textual cleanliness
+was not taken as acceptance. Each semantic conflict's resolution and proof:
+
+| # | Conflict | Resolution | Proof |
+|---|---|---|---|
+| 1 | capacity guarantees | one shared owner per process; isolation by deployment target (revision 13: `5b358f452`, `35fd76607`, `b2afb89a8`) | TASK-012 OBL-9 |
+| 2 | nested bridge broadening | nested calls exclude `code.run`, `fs.write`, `publish` (revision 12) | `blocks_agent::nested_calls_refuse_writable_tools_and_model_calls_keep_their_call_id`, `pg_hosted_artifacts::code_bridge_preserves_declared_tool_boundaries` |
+| 3 | provider `call_id` | forwarded through the one recorder | same tests; `hosted_agent_tools::agent_publish_retries_use_host_identity` |
+| 4 | queued state outside the ledger | live state, frozen copies and custody charged to the one ledger | TASK-012 OBL-7 |
+| 5 | publication buffers | mounts and snapshots stream through the charged workspace | `pg_durable_verifier_work::publication_mounts_preserve_status_and_lineage`, `pg_hosted_artifacts::workspaces_stream_evidence_to_disk` |
+| 6 | `fs.write` accounting | admitted through the scratch ledger (`68b4fb9b3`); replacement credited, refusal leaves content | `workspace::tests::writes_charge_process_scratch`, `hosted_agent_tools::tool_limits_release_capacity_and_preserve_provenance` |
+| 7 | borrowed block futures | `walk.rs` kept; host work settles before retry, result or release | TASK-012 OBL-3 |
+| 8 | tool-budget recovery | spend recorded as spent and resumed (revisions 14–15) | TASK-012 OBL-5 |
+| 9 | direct deadline restart | arrival deadline lowered by the authored timeout | `pg_verification_routes::direct_execution_waits_end_at_the_arrival_deadline`, `pg_verification_runtime::target_loading_spends_the_claimed_deadline` |
+| 10 | capture bypass, batching | bound calls never wait for capture; direct results destination-batched; queued ACKs fenced | `gateway::pg_invocation_tests::capturing_call_waits_for_a_capture_slot_and_refuses_at_its_deadline`, `scribe_outbox::tests::direct_results_deliver_as_destination_batches`, `pg_verification_runtime::queued_origins_require_their_own_input_ack` |
+| 11 | direct vs queued inspection | direct keeps no run state; inspection only over HTTP and MCP | `pg_durable_verifier_work::only_queued_verification_keeps_run_state` |
+| 12 | mode-aware target cache | direct and queued entries separate, invalidated together | `verification::cache::tests::*` |
+| 13 | authorization | RBAC-only verification, `verifier:approve`; nested tools keep their own grants | `pg_verification_routes::direct_execution_is_authorized_by_rbac_alone`, `hosted::tools::pg_tests::tool_and_domain_grants_are_both_required` |
+| 14 | dependencies | the plan recommended keeping A's Monty fork; revision 12 overrides it: crates.io Monty, fork patches and fork-only sandbox code excluded | `check:deps`, `Cargo.toml` |
+| 15 | generated outputs | regenerated from final sources (`2aecc1fee`, `dfa919edc`) | `codegen:check`, `ts:napi:check` |
+| 16 | contributor contracts | Repository is kind 13 everywhere, the contents entry included | `architecture/wyrd-design.md:26` |
+| 17 | test-control guards | six-control union in REQ-195, guidance, Rust, Python and TypeScript | `wyrd-testing` `server::tests::public_controls_are_the_six_sanctioned_operations` |
+
+The 37 textual paths follow the plan's resolution column. Rows 1, 11, 12,
+14, 15, 24 and 27–29 took the capacity choice of conflict 1; rows 2–6, 16 and
+17 conflicts 2, 3, 7 and 8; row 7 conflict 11; rows 9–10 conflicts 9, 10 and
+13; rows 13 and 18–20 conflicts 5 and 6; row 21 conflict 4; rows 25, 31 and 34
+conflict 17; rows 26, 35 and 36 were regenerated (conflict 15). Rows 8, 22, 23,
+30, 32, 33 and 37 keep both sides' tests, exports and options.

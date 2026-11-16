@@ -334,6 +334,8 @@ struct ManagerInner {
     next: AtomicU64,
     /// Every operation that may still hold attributed bytes.
     registry: Arc<Registry>,
+    /// The managed CPU lanes.
+    lanes: super::CpuLanes,
     /// The latest commitment of every live managed worker.
     commitments: Mutex<Vec<Weak<AtomicU64>>>,
     /// Pressure state, soft targets, local caps and reclamation hooks.
@@ -395,10 +397,11 @@ pub struct WorkloadManager {
 
 impl WorkloadManager {
     /// A manager over `memory` (usage `L`, budget `M`) inside a process
-    /// ceiling of `ceiling` bytes (`P`, at least `M`).
-    pub(crate) fn new(memory: super::ByteLedger, ceiling: u64) -> Self {
+    /// ceiling of `ceiling` bytes (`P`, at least `M`), with `cpu` lanes.
+    pub(crate) fn new(memory: super::ByteLedger, ceiling: u64, cpu: usize) -> Self {
         Self {
             inner: Arc::new(ManagerInner {
+                lanes: super::CpuLanes::new(cpu),
                 ceiling: ceiling.max(memory.limit()),
                 memory,
                 next: AtomicU64::new(0),
@@ -445,6 +448,12 @@ impl WorkloadManager {
     #[must_use]
     pub fn workload_bytes(&self, workload: Workload) -> u64 {
         self.inner.registry.usage[workload.index()].load(Ordering::Acquire)
+    }
+
+    /// The managed CPU lanes every workload's major CPU phases share.
+    #[must_use]
+    pub fn lanes(&self) -> &super::CpuLanes {
+        &self.inner.lanes
     }
 
     /// Bounds `workload`'s soft target by an existing local ceiling.
@@ -688,7 +697,7 @@ mod tests {
     /// `M = 1000` managed bytes inside a `P = 1100` ceiling (`H = 100`).
     fn manager() -> (ByteLedger, WorkloadManager) {
         let memory = ByteLedger::new(1_000);
-        (memory.clone(), WorkloadManager::new(memory, 1_100))
+        (memory.clone(), WorkloadManager::new(memory, 1_100, 1))
     }
 
     /// A fresh tenant for attribution tests.

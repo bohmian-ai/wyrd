@@ -18,8 +18,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Notify;
 use tokio::sync::futures::Notified;
 
+mod lanes;
 mod workload;
 
+pub use lanes::{CpuLanes, LaneLease, Laned};
 use workload::OperationShared;
 pub use workload::{
     CommitObservation, Operation, OperationId, Pressure, PressureState, WorkContext, Workload,
@@ -323,7 +325,7 @@ impl ProcessResources {
         let memory = ByteLedger::new(memory_bytes);
         Self {
             effective_cpu,
-            workloads: WorkloadManager::new(memory.clone(), ceiling_bytes),
+            workloads: WorkloadManager::new(memory.clone(), ceiling_bytes, effective_cpu.get()),
             memory,
             scratch: ByteLedger::new(scratch_bytes),
         }

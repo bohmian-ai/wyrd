@@ -24,24 +24,20 @@ Load only references applicable to the changed surface. Follow CodeGraph
 instructions and inspect the nearest owner, callers, consumers, tests,
 manifests, generated projections, and `mise.toml`.
 
-Before editing, record an `## Obligations` ledger in the task or remediation
-file covering its distinct required outcomes and material invariants. Reuse
-approved requirement and acceptance IDs where possible; add a local ID only
-for a distinct promise without a suitable reference. Describe each promise once,
-citing its contract source and planned proof. Group related scenarios and
-surface variants beneath it, keeping every required negative, concurrency,
-tenancy, and lifecycle case visible. Split a row only for an independently
-meaningful outcome, invariant, or failure condition; do not target a row count.
+Use the task's existing acceptance list as the working checklist and evidence
+record. Do not append a separate obligations ledger, invent another ID family,
+or restate the contract. For an older task, annotate its existing proof rows or
+bullets in place; no packet rewrite is required. Keep required negative,
+concurrency, tenancy and lifecycle cases visible. Add a missing required case
+only with its contract reference, without expanding approved scope.
 
-The ledger records the existing contract: it cannot add requirements or prescribe
-private implementation structure. An obligation does not imply a separate test,
-helper, implementation step, or production mechanism. One test may prove several
-obligations, and one obligation may need several forms of evidence. Test names
-are mechanics; a matching selector proves only the assertions the test contains.
+One test may prove several acceptance observations, and one observation may
+need several forms of evidence. Cite shared proof once and refer to it from
+the relevant entries. A test selector proves only the assertions it contains.
 
 A conversation summary is not the contract. After any context compaction, and
-again before recording evidence, re-read the task file and reconcile the ledger
-against it.
+again before recording evidence, re-read the task file and reconcile the
+checklist against it.
 
 A bounded direct instruction may be implemented without a change packet when
 the caller explicitly requests it and no expensive-to-reverse decision remains.
@@ -73,7 +69,9 @@ approved behavior or a material boundary routes to `$wyrd-spec` instead.
 
 For non-trivial behavior, work one observable scenario at a time:
 
-1. add or select the smallest test that fails for the missing behavior;
+1. add or select the next scenario's smallest test, run its exact focused
+   command, and record the expected missing-behavior failure before writing
+   production code for that scenario; setup or compilation failures are not RED;
 2. implement enough production behavior to pass it;
 3. refactor only when needed for the task or repository rules; and
 4. continue until the acceptance criteria are covered.
@@ -124,11 +122,11 @@ obligation ID, and route it as `SPEC_REVISION_REQUIRED` or `BLOCKED`; do not
 continue as though the obligation were settled or met. An obligation the
 standard way cannot satisfy is open, not a known limit.
 
-## Delegate by obligation
+## Delegate by acceptance scenario
 
-A subagent receives the verbatim task text and ledger IDs of the obligations it
+A subagent receives the verbatim task text and the acceptance entries it
 owns, plus the repository rules for its write set, never a paraphrase. It
-returns per-obligation evidence; verify the assertions or inspect the cited
+returns evidence for those entries; verify the assertions or inspect the cited
 non-runtime proof, as appropriate, before accepting its work.
 
 ## Verify and record evidence
@@ -140,18 +138,18 @@ final tracked and untracked diff audit. Do not run full user-journey suites or
 broad aggregates for a task or remediation; they run once at change review. Derive corrected commands when task text is stale, without
 substituting weaker proof.
 
-Record RED for each new or changed behavioral scenario: the selected test and
-its missing-behavior failure. Production code written before its failing test
-is a process exception to record, not a pass. Already-correct behavior may use
-existing proof; documentation and structural constraints do not need artificial
+Update the existing acceptance entries in place with concise proof locations,
+RED and GREEN results, and behavioral verification status. Record each exact
+command once; entries may refer to it. Do not append a second evidence table or
+an implementation narrative. Already-correct behavior may use existing proof;
+documentation and structural constraints need appropriate proof, not artificial
 RED failures.
 
-Append compact evidence to the task or remediation task, one row per ledger
-obligation:
-
-| Obligation and required cases | Implementation evidence | Proof location | Verification evidence | Result |
-|---|---|---|---|---|
-| `<ID: observation>` | `<location>` | `<file:line>` | `<test or check>` | `PASS | FAIL` |
+Report behavioral verification and TDD compliance separately. If production code
+preceded its failing test, record the affected scenarios as a TDD process
+violation and resume test-first work for remaining scenarios. Later mutation
+checks may establish assertion strength but cannot establish test-first
+execution. Do not undo correct code or manufacture historical RED evidence.
 
 Use evidence appropriate to the claim: runtime assertions at the required test
 tier for behavior, cited source/diff inspection for structural constraints,
@@ -167,17 +165,20 @@ Also confirm that every non-goal remained excluded and no unrelated file was
 changed. Record commands and material limits without narrating implementation.
 
 Before returning `IMPLEMENTED`, spawn a fresh read-only checker with only the
-task file, the ledger, and the diff, never your summary. It answers: which
-rows duplicate promises, lack a contract source, or prescribe private mechanics;
-which required outcomes or cases are missing; and which lack appropriate proof?
-Correct the ledger without changing the contract, then resolve or mark `FAIL`
+task file and the diff, never your summary. It answers: which acceptance entries
+lack a contract source; which required outcomes or cases are missing; which
+lack appropriate proof; and whether the recorded TDD compliance is supported.
+Correct the evidence without changing the contract, then resolve or mark `FAIL`
 every unproven required outcome or case.
 
 Return `IMPLEMENTED` only when every obligation is `PASS`. Otherwise return
 `BLOCKED` with the open obligation IDs, or `SPEC_REVISION_REQUIRED` when closing
 one needs an expensive-to-reverse decision. A goal, stop hook, or completion
 pressure never justifies a `PASS`. Return the status with the task path,
-verification status, material risk, and diff or commit reference. Create a
-commit only when requested. `IMPLEMENTED` routes the immutable cumulative
+behavioral verification status, TDD compliance (`PASS`, `VIOLATED`, or
+`NOT_APPLICABLE`), material risk, and diff or commit reference. `IMPLEMENTED`
+reports verified behavior; it does not erase a TDD violation, which must remain
+visible to independent task review. Create a commit only when requested.
+`IMPLEMENTED` routes the immutable cumulative
 candidate to `$wyrd-task-review`; only that independent review can complete the
 task. Implementation does not approve, merge, push, or deploy it.

@@ -1751,6 +1751,65 @@ async fn cancellation_and_deadline_settle_without_a_verdict() {
     runtime.stop().await;
 }
 
+/// An execution whose engine reaches its deadline while host work it
+/// started still runs stays `running` until that work settles, then settles
+/// `timed_out` without a verdict.
+///
+/// # Panics
+/// Panics when the run settles before its host work, reaches another state,
+/// or writes a result.
+#[tokio::test]
+async fn deadline_terminal_waits_for_started_host_work() {
+    let harness = Harness::start().await;
+    let script = EngineScript::default();
+    let runtime = harness.spawn(
+        &RuntimeLimits {
+            execution_timeout: Duration::from_millis(500),
+            ..Harness::limits()
+        },
+        &script,
+    );
+    script.hold();
+    script.hold_host_work();
+    script.push(EngineOutcome::Completed(unscored_report()));
+    let run = harness.submit().await;
+    wait_until("the engine to start", || script.entered() == 1).await;
+    let started: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT statement_timestamp()")
+        .fetch_one(&harness.assertion)
+        .await
+        .expect("the database clock reads");
+    let waited = tokio::time::Instant::now() + WAIT;
+    loop {
+        let passed: bool =
+            sqlx::query_scalar("SELECT $1 + INTERVAL '1 second' < statement_timestamp()")
+                .bind(started)
+                .fetch_one(&harness.assertion)
+                .await
+                .expect("the database clock reads");
+        if passed {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < waited,
+            "timed out waiting past the execution deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let row = harness.seed.execution(run).await.expect("execution reads");
+    assert_eq!(
+        (row.status.as_str(), row.result_id),
+        ("running", None),
+        "the deadline outcome waits for started host work"
+    );
+    script.release_host_work();
+    let row = harness.wait_execution(run, status("timed_out")).await;
+    assert_eq!(row.error_code.as_deref(), Some("execution_timed_out"));
+    assert_eq!(row.result_id, None);
+    script.release();
+    assert!(harness.writes().await.is_empty());
+    runtime.stop().await;
+}
+
 /// Target loading spends the claimed deadline: a run whose Verifier read
 /// waits past its remaining time times out without dispatching its engine.
 ///

@@ -58,7 +58,7 @@ use super::scope::{
 };
 use super::{
     ActionExecutor, ActionOutput, BlockCall, BlockError, CallInput, CallValue, CheckExecutor,
-    CheckOutput, Checkpoints, EvidenceReader, Position, ToolCallsOwner,
+    CheckOutput, Checkpoints, EvidenceReader, HostWork, Position, ToolCallsOwner,
 };
 use crate::assertion::capture_actual;
 use crate::assertion::{Compared, evaluate_item_mode, evaluate_single};
@@ -293,6 +293,9 @@ pub struct VerificationEngine {
     /// The highest attempt the current run began per block and instance;
     /// [`Self::run`] starts each run with none.
     begun: Begun,
+    /// Host work of invocations dropped mid-attempt, settled before a
+    /// discarded step's disposition or a deadline result is recorded.
+    host_work: HostWork,
 }
 
 /// The accepted decision of each decided approval occurrence, keyed by its
@@ -386,6 +389,7 @@ impl VerificationEngine {
             run_permits: None,
             begun: Begun::default(),
             decisions: Arc::default(),
+            host_work: HostWork::default(),
         }
     }
 
@@ -476,9 +480,10 @@ impl VerificationEngine {
     }
 
     /// The tool-call allowance of `task`'s `instance`, resumed from what
-    /// earlier runs of this execution recorded spending.
+    /// earlier runs of this execution recorded spending, leaving its host
+    /// work to this run's [`HostWork`] if it is dropped unsettled.
     fn resumed_tool_calls(&self, task: &TaskId, instance: Instance) -> ToolCallsOwner {
-        ToolCallsOwner::resumed(
+        let owner = ToolCallsOwner::resumed(
             self.checkpoints
                 .as_ref()
                 .and_then(|checkpointed| {
@@ -488,7 +493,8 @@ impl VerificationEngine {
                         .copied()
                 })
                 .unwrap_or(0),
-        )
+        );
+        owner.adopted_by(&self.host_work)
     }
 
     /// Record `tool_calls`' spend under the begun attempt `producer` as
@@ -768,6 +774,15 @@ impl VerificationEngine {
         self
     }
 
+    /// Leave host work of invocations dropped mid-attempt to `work`, so a
+    /// host that drops [`Self::run`] itself, as at its own deadline, can
+    /// settle that work before it records a result.
+    #[must_use]
+    pub fn with_host_work(mut self, work: HostWork) -> Self {
+        self.host_work = work;
+        self
+    }
+
     /// Use `drift` as the scheduled evidence of `drift` checks.
     #[must_use]
     pub fn with_drift(mut self, drift: DriftChecks) -> Self {
@@ -816,8 +831,10 @@ impl VerificationEngine {
     ///
     /// # Cancellation
     /// Dropping the future, or the deadline expiring, aborts every running
-    /// action and check; executors release their resources on drop and no
-    /// partial result is returned.
+    /// action and check and no partial result is returned. Host work they
+    /// started is left to the engine's [`HostWork`]: an expired deadline
+    /// settles it before returning, and a host dropping this future settles
+    /// the work it supplied through [`Self::with_host_work`].
     pub async fn run(
         &self,
         spec: Arc<VerifierSpec>,
@@ -837,7 +854,7 @@ impl VerificationEngine {
             .map(|(name, _)| name.clone())
             .collect();
         let limits = spec.limits.as_ref();
-        let (ledger, evidence) = timeout_at(deadline, async {
+        let driven = timeout_at(deadline, async {
             let (evidence, attached) = self.attach(&spec, evidence).await?;
             let evidence = Arc::new(evidence);
             if let Some(reader) = &self.evidence {
@@ -863,8 +880,14 @@ impl VerificationEngine {
             let ledger = attempt.drive(&spec, &evidence, &waiting, deadline).await?;
             Ok::<_, EngineError>((ledger, evidence))
         })
-        .await
-        .map_err(|_| EngineError::DeadlineExceeded)??;
+        .await;
+        let Ok(driven) = driven else {
+            // The timed drive dropped every running block; host work they
+            // started settles before the deadline result is returned.
+            self.host_work.settle().await;
+            return Err(EngineError::DeadlineExceeded);
+        };
+        let (ledger, evidence) = driven?;
         // Every block has settled, so each settlement has one owner left and
         // moves into the outcome, its shared step output uncopied.
         let (index, settlements) = ledger.into_parts();
@@ -1102,6 +1125,9 @@ impl VerificationEngine {
                     tasks.push(
                         Node::Disposition(index),
                         Box::pin(async move {
+                            // A cancelled block's started host work settles
+                            // before its disposition is recorded.
+                            engine.host_work.settle().await;
                             engine.control(&control).await?;
                             Ok(Arc::new(Done::Step(Box::new(decided))))
                         }),

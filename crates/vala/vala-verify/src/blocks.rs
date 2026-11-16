@@ -22,7 +22,7 @@ pub use agent::{
     PromptCardResolver, block_error,
 };
 pub use tools::{
-    AgentToolset, CodeTool, Delivery, ToolBridge, ToolCalls, ToolCallsOwner, ToolLimits,
+    AgentToolset, CodeTool, Delivery, HostWork, ToolBridge, ToolCalls, ToolCallsOwner, ToolLimits,
     ToolSession, hold_permit, provider_tool_name, tool_error,
 };
 

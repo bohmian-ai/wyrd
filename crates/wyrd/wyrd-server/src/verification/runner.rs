@@ -44,7 +44,7 @@ use tracing::Instrument as _;
 use tracing::field::Empty;
 use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_verify::blocks::{Checkpoints, Decisions, DriftChecks, EngineError};
+use vala_verify::blocks::{Checkpoints, Decisions, DriftChecks, EngineError, HostWork};
 use wyrd_runtime::AcceptedAuthority;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, PrincipalId};
@@ -552,12 +552,8 @@ impl VerifierRunner {
             let outcome = if deadline <= tokio::time::Instant::now() {
                 timed_out()
             } else {
-                tokio::time::timeout_at(
-                    deadline,
-                    self.compute(tenant, run, &verifier.spec, system, &state, telemetry),
-                )
-                .await
-                .unwrap_or_else(|_| timed_out())
+                self.compute(tenant, run, &verifier.spec, system, &state, telemetry)
+                    .await
             };
             match outcome {
                 EngineOutcome::Completed(outcome) => Offer::Selected(outcome, started_at),
@@ -725,8 +721,12 @@ impl VerifierRunner {
     }
 
     /// Prepare the claimed execution's frozen input, then run the engine
-    /// over it, both in its `engine` phase. Under `test-support` a scripted
-    /// outcome, when queued, replaces both.
+    /// over it, both in its `engine` phase, until `state`'s deadline. Under
+    /// `test-support` a scripted outcome, when queued, replaces both.
+    ///
+    /// Reaching the deadline drops the engine with its running blocks and
+    /// times the attempt out, but only once the host work those blocks
+    /// started has settled, so no outcome is accepted while it still runs.
     async fn compute(
         &self,
         tenant: DataTenantId,
@@ -736,10 +736,11 @@ impl VerifierRunner {
         state: &Arc<RunState>,
         telemetry: &ExecutionTelemetry,
     ) -> EngineOutcome {
+        let work = HostWork::default();
         let engine = async {
             #[cfg(feature = "test-support")]
             if let Some(script) = &self.script
-                && let Some(outcome) = script.next().await
+                && let Some(outcome) = script.next(&work).await
             {
                 return outcome;
             }
@@ -752,18 +753,23 @@ impl VerifierRunner {
             };
             match prepared {
                 Ok(prepared) => {
-                    self.dispatch(tenant, run, spec, system, state, telemetry, prepared)
+                    self.dispatch(tenant, run, spec, system, state, telemetry, &work, prepared)
                         .await
                 }
                 Err(outcome) => outcome,
             }
         };
-        telemetry
-            .phase(
+        let outcome = tokio::time::timeout_at(
+            state.deadline(),
+            telemetry.phase(
                 Phase::Engine,
                 engine.instrument(tracing::info_span!("verification.engine")),
-            )
-            .await
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| timed_out());
+        work.settle().await;
+        outcome
     }
 
     /// Read the claimed execution's frozen input before its engine runs.
@@ -908,7 +914,7 @@ impl VerifierRunner {
     /// decided, read again on every claim so a lost wake loses nothing.
     #[expect(
         clippy::too_many_arguments,
-        reason = "one claimed attempt's tenant, claim, Verifier, principal, state, telemetry, and input"
+        reason = "one claimed attempt's tenant, claim, Verifier, principal, state, telemetry, host work, and input"
     )]
     async fn dispatch(
         &self,
@@ -918,6 +924,7 @@ impl VerifierRunner {
         system: PrincipalId,
         state: &Arc<RunState>,
         telemetry: &ExecutionTelemetry,
+        work: &HostWork,
         (drift, evidence, routes, run_id): Prepared,
     ) -> EngineOutcome {
         let caller = Caller::accepted(&run.authority, system);
@@ -962,7 +969,8 @@ impl VerifierRunner {
         };
         let engine = engine
             .with_checkpoints(Arc::clone(state) as Arc<dyn Checkpoints>, &recorded)
-            .with_approvals(decisions);
+            .with_approvals(decisions)
+            .with_host_work(work.clone());
         match engine
             .run(Arc::clone(spec), evidence, state.deadline())
             .await
@@ -1977,6 +1985,9 @@ pub struct EngineScript {
     held: Arc<Sender<bool>>,
     /// Executions that have taken a scripted outcome.
     entered: Arc<AtomicUsize>,
+    /// Whether each scripted execution leaves host work running that
+    /// settles only once released.
+    host_work: Arc<Sender<bool>>,
 }
 
 #[cfg(feature = "test-support")]
@@ -1987,6 +1998,7 @@ impl Default for EngineScript {
             outcomes: Arc::default(),
             held: Arc::new(Sender::new(false)),
             entered: Arc::default(),
+            host_work: Arc::new(Sender::new(false)),
         }
     }
 }
@@ -2025,22 +2037,41 @@ impl EngineScript {
         self.held.send_replace(false);
     }
 
+    /// Make each later scripted execution start host work that outlives it
+    /// until [`release_host_work`](Self::release_host_work), as a block
+    /// dropped mid-call would.
+    pub fn hold_host_work(&self) {
+        self.host_work.send_replace(true);
+    }
+
+    /// Let held host work end.
+    pub fn release_host_work(&self) {
+        self.host_work.send_replace(false);
+    }
+
     /// Executions that have taken a scripted outcome so far.
     #[must_use]
     pub fn entered(&self) -> usize {
         self.entered.load(Ordering::SeqCst)
     }
 
-    /// Pop the next outcome, waiting while held unless it was queued unheld.
+    /// Pop the next outcome, waiting while held unless it was queued unheld,
+    /// leaving held host work to `work` while host work is held.
     ///
     /// # Panics
     /// Panics when the script lock is poisoned.
-    async fn next(&self) -> Option<EngineOutcome> {
+    async fn next(&self, work: &HostWork) -> Option<EngineOutcome> {
         let (outcome, obeys_hold) = self
             .outcomes
             .lock()
             .expect("engine script lock")
             .pop_front()?;
+        if *self.host_work.borrow() {
+            let mut held = self.host_work.subscribe();
+            work.adopt(async move {
+                let _ = held.wait_for(|held| !held).await;
+            });
+        }
         self.entered.fetch_add(1, Ordering::SeqCst);
         if obeys_hold {
             let mut held = self.held.subscribe();

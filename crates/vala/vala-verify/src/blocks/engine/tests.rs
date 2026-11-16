@@ -22,6 +22,7 @@ use wyrd_spec::verification::execution::{
 
 use super::*;
 use crate::InMemoryTraceSource;
+use crate::blocks::{ToolLimits, ToolSession};
 use wyrd_spec::verification::state::InvocationRecord;
 
 /// One finished one-second span named `name` in `trace`.
@@ -85,6 +86,10 @@ enum Behavior {
     Together(Arc<Barrier>, Value),
     /// Never finish; notify when the call is dropped.
     Hang(Arc<Notify>),
+    /// Start host work that outlives the call, registering its settlement
+    /// with the invocation, then never finish; the work ends once its
+    /// release is signalled and then records `settled`.
+    Settling(Arc<HeldWork>),
     /// Panic with this message.
     Panic(&'static str),
     /// Refuse capacity on the first attempt of an item in `busy`; else
@@ -122,6 +127,22 @@ fn label<B>(call: &BlockCall<'_, B>) -> String {
         .map(|iteration| format!("#{iteration}"))
         .unwrap_or_default();
     format!("{}{item}{iteration}", call.id.as_str())
+}
+
+/// Host work a [`Behavior::Settling`] call starts and the test ends.
+#[derive(Default)]
+struct HeldWork {
+    /// Signalled by the test to end the work.
+    release: Notify,
+    /// Set once the work has ended.
+    settled: std::sync::atomic::AtomicBool,
+}
+
+impl HeldWork {
+    /// Whether the work has ended.
+    fn settled(&self) -> bool {
+        self.settled.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 /// Notifies when the hanging call that owns it is dropped.
@@ -224,6 +245,25 @@ impl ActionExecutor for Script {
             }
             Some(Behavior::Hang(dropped)) => {
                 let _signal = DropSignal(Arc::clone(dropped));
+                std::future::pending().await
+            }
+            Some(Behavior::Settling(work)) => {
+                let work = Arc::clone(work);
+                let session = ToolSession::new(
+                    skald_tool::ToolRegistry::new(),
+                    ToolLimits {
+                        max_result_bytes: 1024,
+                        max_argument_bytes: 1024,
+                        max_calls: 1,
+                    },
+                    Box::new(()),
+                )
+                .with_settlement(async move {
+                    work.release.notified().await;
+                    work.settled
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                });
+                session.register_with(&call.tool_calls);
                 std::future::pending().await
             }
             Some(Behavior::Panic(message)) => panic!("{message}"),
@@ -1449,6 +1489,100 @@ async fn execution_deadline_cancels_running_work() {
     tokio::time::timeout(Duration::from_secs(1), dropped.notified())
         .await
         .expect("the hung action is dropped on cancellation");
+}
+
+/// An expiring execution deadline drops a running action but returns its
+/// deadline result only after the host work the action started settles.
+///
+/// # Panics
+/// Panics when the result outruns the held work or is not the deadline.
+#[tokio::test(start_paused = true)]
+async fn execution_deadline_waits_for_started_host_work() {
+    let work = Arc::new(HeldWork::default());
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "steps": [{"id": "held", "action": code_action(json!({"x": "inputs.answer"}))}]
+    }));
+    let script = Arc::new(Script {
+        actions: HashMap::from([("held", Behavior::Settling(Arc::clone(&work)))]),
+        ..Script::default()
+    });
+    let engine = engine(&script, InMemoryTraceSource::new(), 1);
+    let running = run(&engine, &spec, json!({"answer": 1}));
+    tokio::pin!(running);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(120), &mut running)
+            .await
+            .is_err(),
+        "the deadline result waits for the started host work"
+    );
+    assert!(!work.settled());
+    work.release.notify_one();
+    let result = running.await;
+    assert!(work.settled(), "the result follows settlement");
+    assert!(
+        matches!(result, Err(EngineError::DeadlineExceeded)),
+        "{result:?}"
+    );
+}
+
+/// A speculative step discarded while running stops at once, but its
+/// disposition is recorded only after the host work it started settles, and
+/// its output stays withheld.
+///
+/// # Panics
+/// Panics when the disposition outruns the held work or the step's content
+/// is admitted.
+#[tokio::test(start_paused = true)]
+async fn discarded_speculation_records_after_its_host_work_settles() {
+    let work = Arc::new(HeldWork::default());
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "steps": [
+            {"id": "compare", "action": code_action(json!({"x": "inputs.answer"}))},
+            {"id": "dropped", "speculative": true,
+             "when": {"path": "steps.compare.output.x", "operator": "equals", "expected": 2},
+             "action": code_action(json!({"y": "inputs.answer"}))}
+        ]
+    }));
+    let script = Arc::new(Script {
+        actions: HashMap::from([
+            ("compare", echo(&[5])),
+            ("dropped", Behavior::Settling(Arc::clone(&work))),
+        ]),
+        ..Script::default()
+    });
+    let ledger = Arc::new(Ledger::default());
+    let engine = engine(&script, InMemoryTraceSource::new(), 4).with_checkpoints(
+        Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+        &ExecutionState::default(),
+    );
+    let disposed = || {
+        ledger
+            .controls
+            .lock()
+            .expect("ledger")
+            .iter()
+            .any(|control| matches!(control, ControlRecord::Disposition { .. }))
+    };
+    let running = run(&engine, &spec, json!({"answer": 1}));
+    tokio::pin!(running);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(30), &mut running)
+            .await
+            .is_err(),
+        "the run waits for the discarded step's host work"
+    );
+    assert!(
+        script.calls().contains(&"done:compare".to_owned()),
+        "the guard was decided: {:?}",
+        script.calls()
+    );
+    assert!(!disposed(), "no disposition before settlement");
+    work.release.notify_one();
+    let outcome = running.await.expect("outcome");
+    assert!(work.settled() && disposed());
+    assert_eq!(step(&outcome, "dropped").output, None);
 }
 
 /// Agent and code passes need a citation of evidence the call could reach;

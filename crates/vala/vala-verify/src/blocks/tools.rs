@@ -113,10 +113,18 @@ pub trait CodeTool: Send + Sync {
 /// [`Self::settled`] into the produced result whatever the outcome. It is the
 /// only way to await or read that state, so an executor cannot take the
 /// cleanup its caller must finish.
+///
+/// When the owner itself is dropped before settling, as when its run
+/// discards a speculative step or reaches its deadline, the host work still
+/// owed moves to the [`HostWork`] it was [adopted by](Self::adopted_by), so
+/// the run's owner can settle it before it records what follows.
 #[derive(Debug)]
 pub struct ToolCallsOwner {
     /// The state its handles share.
     calls: ToolCalls,
+    /// Where settlements still owed go when the owner is dropped; `None`
+    /// drops them with it.
+    orphans: Option<HostWork>,
 }
 
 impl Default for ToolCallsOwner {
@@ -126,6 +134,74 @@ impl Default for ToolCallsOwner {
             calls: ToolCalls {
                 inner: Arc::default(),
             },
+            orphans: None,
+        }
+    }
+}
+
+impl Drop for ToolCallsOwner {
+    /// Hands every settlement not yet awaited to the adopting [`HostWork`].
+    fn drop(&mut self) {
+        if let Some(orphans) = &self.orphans {
+            let owed = std::mem::take(&mut *self.calls.inner.settlements());
+            for settlement in owed {
+                orphans.adopt(settlement);
+            }
+        }
+    }
+}
+
+/// Host work that outlived the invocation that started it.
+///
+/// One run owns one, shared by its clones: every [`ToolCallsOwner`] the run
+/// creates is [adopted](ToolCallsOwner::adopted_by) by it, so an invocation
+/// dropped mid-attempt still leaves its started work owed here.
+/// [`Self::settle`] waits for that work, which the run awaits before it
+/// records a discarded step's disposition or its own deadline result.
+#[derive(Clone, Default)]
+pub struct HostWork {
+    /// Settlements of dropped invocations not yet awaited.
+    pending: Arc<Mutex<Vec<Settlement>>>,
+}
+
+impl fmt::Debug for HostWork {
+    /// The number of settlements owed, never their futures.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HostWork")
+            .field("pending", &self.pending().len())
+            .finish()
+    }
+}
+
+impl HostWork {
+    /// Locks the owed settlements; a poisoned lock is recovered, because
+    /// every holder only pushes or pops whole settlements under it.
+    fn pending(&self) -> std::sync::MutexGuard<'_, Vec<Settlement>> {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Leave `settlement`, which resolves once some started host work has
+    /// ended, for the next [`Self::settle`].
+    pub fn adopt(&self, settlement: impl Future<Output = ()> + Send + 'static) {
+        self.pending().push(Box::pin(settlement));
+    }
+
+    /// Wait until the host work of every invocation dropped so far, and of
+    /// any dropped while waiting, has ended.
+    pub async fn settle(&self) {
+        drain(&self.pending).await;
+    }
+}
+
+/// Await and remove each settlement in `pending`, including ones added while
+/// waiting, never holding the lock across an await.
+async fn drain(pending: &Mutex<Vec<Settlement>>) {
+    loop {
+        let next = pending.lock().unwrap_or_else(PoisonError::into_inner).pop();
+        match next {
+            Some(settlement) => settlement.await,
+            None => return,
         }
     }
 }
@@ -138,6 +214,13 @@ impl ToolCallsOwner {
         let owner = Self::default();
         owner.calls.inner.spent.store(spent, Ordering::SeqCst);
         owner
+    }
+
+    /// Leave host work still owed when this owner is dropped to `work`.
+    #[must_use]
+    pub fn adopted_by(mut self, work: &HostWork) -> Self {
+        self.orphans = Some(work.clone());
+        self
     }
 
     /// Report the invocation's spent count to `recorder` after each request
@@ -194,19 +277,7 @@ impl ToolCallsOwner {
     /// waits after the attempt that owned the session was dropped, as when
     /// the engine timed it out.
     pub async fn settle(&self) {
-        loop {
-            let pending = self
-                .calls
-                .inner
-                .settlements
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .pop();
-            match pending {
-                Some(settlement) => settlement.await,
-                None => return,
-            }
-        }
+        drain(&self.calls.inner.settlements).await;
     }
 }
 
@@ -251,14 +322,20 @@ impl fmt::Debug for ToolCalls {
     }
 }
 
+impl CallLog {
+    /// Locks the settlements not yet awaited; a poisoned lock is recovered,
+    /// because every holder only pushes or pops whole settlements under it.
+    fn settlements(&self) -> std::sync::MutexGuard<'_, Vec<Settlement>> {
+        self.settlements
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 impl ToolCalls {
     /// Keep `settlement` for the owner's next [`ToolCallsOwner::settle`].
     fn defer(&self, settlement: Settlement) {
-        self.inner
-            .settlements
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(settlement);
+        self.inner.settlements().push(settlement);
     }
 
     /// Spend one request of `limit` and report the new count to the

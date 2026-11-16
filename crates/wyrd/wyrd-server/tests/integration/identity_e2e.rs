@@ -3036,19 +3036,30 @@ async fn tenant_connection_rotation_journey() {
     );
     let (status, begun) = begin_test(&replica_a, token, 3).await;
     assert_eq!(status, StatusCode::OK, "the test begins: {begun}");
+    let pool = replica_a
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let database_now = "SELECT statement_timestamp()";
+    let before: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(database_now)
+        .fetch_one(&pool)
+        .await
+        .expect("database clock reads");
     assert_test_completion(&finish_test_sign_in(&replica_a, &begun).await);
+    let after: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(database_now)
+        .fetch_one(&pool)
+        .await
+        .expect("database clock reads");
     let (_, tested) = call_json(&replica_a, token, Method::GET, CONNECTIONS, None).await;
     assert_eq!(tested["candidate"]["tested_revision"], 3);
     let tested_until: chrono::DateTime<chrono::Utc> =
         serde_json::from_value(tested["candidate"]["tested_until"].clone())
             .expect("tested_until is a timestamp");
-    // Postgres stamps the deadline on its own clock, so allow a few seconds
-    // of skew against the test host's clock on either side.
-    let window = tested_until - chrono::Utc::now();
+    let lasts = ChronoDuration::minutes(15);
     assert!(
-        window > ChronoDuration::minutes(14)
-            && window <= ChronoDuration::minutes(15) + ChronoDuration::seconds(5),
-        "the stamp lasts fifteen minutes: {window}"
+        before + lasts <= tested_until && tested_until <= after + lasts,
+        "the stamp lasts fifteen minutes from the test on PostgreSQL's clock: \
+         {before} + 15m <= {tested_until} <= {after} + 15m"
     );
     let non_admin = replica_a
         .bootstrap_service_in_tenant(tenant, "rotation-editor", &["editor"])

@@ -161,3 +161,4 @@ Focused selectors, recorded before each first run:
 - P `the Verify dashboard reads one population and keeps its investigation in the URL`
 - P `an exact Verifier Card page shows its definition, versions and where it runs` (existing; now expects the Results in Verify link)
 - UI `Verify lists executions with and without a recorded result as one authorized population through every host`
+- PI `the Verify dashboard filters, groups, brushes, pages, opens an execution and returns to the same list`

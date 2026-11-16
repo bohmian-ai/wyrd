@@ -197,7 +197,7 @@
       group.members.push(row);
       grouped.set(key, group);
     }
-    const captions = [...grouped.values()].map(({ value }) => text(input.groupBy ?? '', value));
+    const captions = [...grouped.values()].map(({ value }) => labels[String(value)] ?? text(input.groupBy ?? '', value));
     return [...grouped].map(([key, { value, members }], index) => {
       const caption = captions[index];
       return { key, members, caption: captions.indexOf(caption) === captions.lastIndexOf(caption) ? caption : `${caption} (${JSON.stringify(value)})` };

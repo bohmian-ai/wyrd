@@ -314,6 +314,10 @@
     gap: 16px;
     align-items: start;
   }
+  /* Eight columns: tighter cells keep Status and Verdict in view on a wide screen; narrower, the table scrolls sideways. */
+  [data-panel='list'] :global(:is(th, td)) {
+    padding-inline: 8px;
+  }
   @media (max-width: 720px) {
     .top,
     .board {

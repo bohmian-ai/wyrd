@@ -1508,6 +1508,173 @@ judged('session, drift and cited judgments open as pages: members in recorded or
   }
 });
 
+judged('the Verify dashboard filters, groups, brushes, pages, opens an execution and returns to the same list', async ({ server, assistant, state }) => {
+  const cards = await Cards.connect();
+  const submit = async (verifier: string, answer: string) => {
+    const submitted = await state.run('agent').observe.submit(verifier, { answer });
+    if (submitted.kind !== 'queued') throw new Error(`${verifier} queues an execution`);
+    await submitted.execution.wait({ timeoutMs: 60_000 });
+    return submitted.execution.id;
+  };
+  // One failed and one passed Run execution, one still running, and 53 direct turns: three of one conversation, fifty of none.
+  const refused = await submit('answer-check', 'no');
+  await submit('answer-judged', 'yes');
+  const running = server.holdPublications('ui-verify-browser').executionId;
+  const support = await cards.declareFromPath(fixture('cards/verify_in_real_time/support.yaml'));
+  const bundle = mkdtempSync(join(tmpdir(), 'wyrd-ui-verify-page-'));
+  await cards.pull(support.root, bundle);
+  const { key } = await runtimeAccount({ kind: 'Service', name: support.root.name });
+  const desk = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: key }) });
+  await desk.startBifrost();
+  for (let turn = 1; turn <= 53; turn += 1)
+    await desk.run('agent').observe.verify('turn-check', { turn, answer: `answer ${turn}` }, { positional: true, ...(turn <= 3 ? { group_id: 'ui-verify-conversation' } : {}) });
+  await desk.shutdown();
+  // The ended conversation is judged once as its own group execution: 57 accepted executions in all.
+  await vi.waitFor(
+    async () => {
+      server.flushBifrost();
+      const [read] = await nodeExecutor(WyrdClient.connect()).run([{ op: 'bifrost.query', sql: 'SELECT count(DISTINCT execution_id) FROM bifrost.verification.execution_inputs', params: [], max_rows: 1 }]);
+      expect(read.ok && Number(read.value.rows[0][0])).toBe(57);
+    },
+    { timeout: 90_000, interval: 1_000 }
+  );
+
+  const tenant = 'test-tenant-1';
+  buildUi();
+  const bff = await startBff(server.baseUrl);
+  const browser = await chromium.launch();
+  try {
+    const page = await signIn(browser, bff.url, tenant, server.apiKey);
+    const list = `${bff.url}/t/${tenant}/verify`;
+    const query = () => Object.fromEntries(new URL(page.url()).searchParams);
+    const rows = page.locator('[aria-label="executions rows"] tbody tr:not(.group)');
+    const rail = page.getByRole('navigation', { name: 'Filter executions' });
+    const where = page.getByLabel('WHERE: read-only projection of the active filters');
+
+    // Verify is a destination of the tenant shell; it opens on the newest page of every accepted execution.
+    await page.getByRole('navigation', { name: 'Destinations' }).getByRole('link', { name: 'Verify' }).click();
+    await page.waitForURL(list);
+    await expect.poll(() => rows.count()).toBe(50);
+    expect(await where.textContent()).toContain('select facet values to filter');
+    for (const title of ['Executions by verdict', 'Executions by Verifier']) expect(await page.getByRole('region', { name: title }).locator('svg.plot').count()).toBe(1);
+    // The Verifier is named from its Card; the running execution claims no status it has not recorded, and no verdict.
+    expect(await rail.getByRole('button', { name: /answer-check 1\.0\.0/ }).count()).toBe(1);
+    expect(await rail.getByRole('button', { name: /not recorded/ }).textContent()).toContain('1');
+    await captureExecution(page, 'verify-dashboard');
+
+    // Paging keeps the population: the second page holds the rest, and the address holds the cursor.
+    await page.getByRole('button', { name: /Older/ }).click();
+    await expect.poll(() => 'after' in query()).toBe(true);
+    await expect.poll(() => rows.count()).toBe(7);
+
+    // Open a row and come back: the same page of the same list, at the same scroll position.
+    await page.setViewportSize({ width: 1280, height: 420 });
+    await rows.last().scrollIntoViewIfNeeded();
+    const before = { url: page.url(), first: await rows.first().textContent(), scroll: await page.evaluate(() => window.scrollY) };
+    await rows.last().click();
+    await page.waitForURL(/\/verify\/executions\//);
+    await expect.poll(() => page.locator('[data-execution-status]').getAttribute('data-execution-status')).toBe('completed');
+    await page.goBack();
+    await page.waitForURL(before.url);
+    await expect.poll(() => rows.count()).toBe(7);
+    expect(await rows.first().textContent()).toBe(before.first);
+    await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(before.scroll);
+    await page.setViewportSize({ width: 1280, height: 720 });
+
+    // Status and verdict filters combine; the WHERE box projects them and the list starts at its first page.
+    await rail.getByRole('button', { name: /failed/ }).click();
+    await expect.poll(() => rows.count()).toBe(1);
+    expect(query()).not.toHaveProperty('after');
+    await rail.getByRole('button', { name: /completed/ }).click();
+    await expect.poll(async () => (await where.textContent())?.trim()).toBe("verdict = 'failed' AND status = 'completed'");
+    expect(await rows.count()).toBe(1);
+    expect(await rows.first().textContent()).toContain('answer-check 1.0.0');
+    // The failed execution opens as its exact page; Back restores both filters.
+    await rows.first().click();
+    await page.waitForURL(`${list}/executions/${refused}`);
+    await expect.poll(() => page.locator('[data-verdict]').getAttribute('data-verdict')).toBe('failed');
+    await page.goBack();
+    await expect.poll(async () => (await where.textContent())?.trim()).toBe("verdict = 'failed' AND status = 'completed'");
+    await page.getByRole('link', { name: 'Clear' }).click();
+    await page.waitForURL(list);
+    await expect.poll(() => rows.count()).toBe(50);
+
+    // The unfinished execution is found by having no terminal record, and its own page says what it is doing now.
+    await rail.getByRole('button', { name: /not recorded/ }).click();
+    await expect.poll(() => rows.count()).toBe(1);
+    expect(await rows.first().textContent()).toContain('no verdict');
+    await rows.first().click();
+    await page.waitForURL(`${list}/executions/${running}`);
+    await expect.poll(() => page.locator('[data-execution-status]').getAttribute('data-execution-status')).toBe('running');
+    await page.goBack();
+    await expect.poll(() => rows.count()).toBe(1);
+    await page.getByRole('link', { name: 'Clear' }).click();
+    await page.waitForURL(list);
+
+    // Grouping arranges the same rows under their session; it adds no row and no judgment.
+    await page.getByRole('combobox', { name: 'Group by' }).selectOption('group_id');
+    await expect.poll(query).toMatchObject({ group: 'group_id' });
+    await expect.poll(() => page.locator('[aria-label="executions rows"] tr.group').count()).toBeGreaterThan(0);
+    expect(await rows.count()).toBe(50);
+
+    // Either chart brushes the range every panel reads; Reset zoom returns to the preset.
+    for (const title of ['Executions by verdict', 'Executions by Verifier']) {
+      const box = (await page.getByRole('region', { name: title }).locator('svg.plot').boundingBox()) as NonNullable<Awaited<ReturnType<ReturnType<Page['locator']>['boundingBox']>>>;
+      await page.mouse.move(box.x + box.width * 0.5, box.y + box.height / 2);
+      await page.mouse.down();
+      await page.mouse.move(box.x + box.width * 0.99, box.y + box.height / 2, { steps: 5 });
+      await page.mouse.up();
+      await expect.poll(() => 'from' in query() && 'to' in query()).toBe(true);
+      // The brushed window is the applied range of the whole dashboard, and the grouping is kept.
+      const { from, to, group } = query();
+      expect([Date.parse(to) > Date.parse(from), group]).toEqual([true, 'group_id']);
+      await expect.poll(() => page.locator('[data-panel="charts"] .zoomed').textContent()).toBe(`${from.slice(0, 19)}Z → ${to.slice(0, 19)}Z`);
+      await page.getByRole('button', { name: 'Reset zoom' }).click();
+      await expect.poll(() => 'from' in query()).toBe(false);
+      await expect.poll(() => rows.count()).toBe(50);
+    }
+
+    // A slow load that a newer choice supersedes never replaces it: the newer selection is what stays shown.
+    let release = () => {};
+    const slow = new Promise<void>((resolve) => (release = resolve));
+    let waiting = 0;
+    const filtered = (target: URL) => target.pathname.endsWith('__data.json') && (target.searchParams.get('where') ?? '').includes('failed');
+    await page.route(filtered, async (route) => {
+      waiting += 1;
+      await slow;
+      // The browser has already abandoned the superseded request by the time it is released.
+      await route.continue().catch(() => {});
+    });
+    await rail.getByRole('button', { name: /failed/ }).click();
+    await expect.poll(() => waiting).toBe(1);
+    await page.getByRole('combobox', { name: 'Group by' }).selectOption('verifier_card_uid');
+    await expect.poll(query).toEqual({ group: 'verifier_card_uid' });
+    release();
+    await page.unroute(filtered);
+    await expect.poll(() => page.locator('[aria-label="executions rows"] tr.group').first().textContent()).toContain('Verifier = ');
+    expect(query()).toEqual({ group: 'verifier_card_uid' });
+    expect(await rows.count()).toBe(50);
+    expect(await where.textContent()).toContain('select facet values to filter');
+
+    // The narrow layout keeps every control and the table reachable.
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect.poll(() => rows.count()).toBe(50);
+    expect(await page.getByRole('button', { name: 'Live' }).isVisible()).toBe(true);
+    await captureExecution(page, 'verify-dashboard');
+    await page.setViewportSize({ width: 1280, height: 720 });
+
+    // Results in Verify on the exact Verifier Card page opens the list for that Verifier version only.
+    await page.goto(`${bff.url}/t/${tenant}/cards/detail?kind=Verifier&name=answer-check&version=1.0.0`);
+    await page.getByRole('link', { name: 'Results in Verify' }).click();
+    await expect.poll(async () => (await where.textContent())?.trim()).toBe(`verifier_card_uid = '${assistant.answerCheck.uid}'`);
+    await expect.poll(() => rows.count()).toBe(1);
+    expect(await rows.first().textContent()).toContain('answer-check 1.0.0');
+  } finally {
+    await browser.close();
+    bff.stop();
+  }
+});
+
 /**
  * The environment of a development command with its config home at `config`.
  * The development environment starts its own server, so this file's test

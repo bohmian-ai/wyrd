@@ -484,12 +484,14 @@ test('every histogram series apart is labelled from the series index, plotted id
 import { fireEvent, render, waitFor, within } from '@testing-library/svelte';
 import { vi } from 'vitest';
 import { goto, invalidateAll } from '$app/navigation';
-import { EXECUTIONS, fixtureExecutor, SERVICE, stateExecutors, VERIFIER, verifiers } from '$lib/ui-fixtures';
+import { EXECUTIONS, fixtureExecutor, SERVICE, stateExecutors, VERIFIER, VERIFIER_UIDS, verifiers } from '$lib/ui-fixtures';
 import { readExecution, writeExecution } from '$lib/verify-host';
 import { load as loadExecutionPage } from '../routes/t/[tenantKey]/verify/executions/[executionId]/+page.server';
 import ExecutionPage from '../routes/t/[tenantKey]/verify/executions/[executionId]/+page.svelte';
 import { load as loadCardDetail } from '../routes/t/[tenantKey]/cards/detail/+page.server';
 import CardDetail from '../routes/t/[tenantKey]/cards/detail/+page.svelte';
+import { load as loadVerify } from '../routes/t/[tenantKey]/verify/+page.server';
+import VerifyPage from '../routes/t/[tenantKey]/verify/+page.svelte';
 
 // The page's reads run through the fixture executor here; the real BFF path is the integration journey's.
 const host = vi.hoisted(() => ({ executor: undefined as Executor | undefined }));
@@ -519,10 +521,12 @@ test('an exact Verifier Card page shows its definition, versions and where it ru
   expect(page.container.querySelectorAll('[data-node]')).toHaveLength(9);
   expect(page.getByRole('region', { name: 'Runs on' })).toHaveTextContent('component agent · schedule 0 * * * * Europe/Berlin');
   expect(page.getByRole('region', { name: 'Relationships' })).toBeInTheDocument();
-  // The newest version carries no older-version note, and no Results link ships before the Verify list exists.
+  // The newest version carries no older-version note; Results in Verify opens the list filtered to this exact Verifier version.
   expect(page.queryByText(/You are viewing/)).toBeNull();
-  expect(page.container.textContent).not.toMatch(/Results in Verify/);
-  expect(page.container.querySelector('a[href*="verify"]')).toBeNull();
+  expect(page.getByRole('link', { name: 'Results in Verify' })).toHaveAttribute(
+    'href',
+    `/t/acme/verify?${new URLSearchParams({ where: JSON.stringify([{ column: 'verifier_card_uid', value: verifiers['ticket-policy@1.1.0'].metadata.uid }]) })}`
+  );
   // Only exact Card reads: the header gates the rest, and nothing reads executions or telemetry.
   expect(new Set(requests.map((request) => request.op))).toEqual(new Set(['cards.get_by_ref', 'cards.list']));
   expect(requests.filter((request) => request.op === 'cards.get_by_ref').every((request) => 'version' in request.card_ref && /^\d/.test(request.card_ref.version))).toBe(true);
@@ -737,4 +741,93 @@ test('executions list, facets and charts read one population in bounded shared q
   expect(validatePanel('RecordTable', { signal: 'executions', where_sql: 'status = 1' })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
   expect(validatePanel('FacetRail', { signal: 'executions', facets: ['status'], where_sql: 'status = 1' })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
   expect(validatePanel('RecordTable', { signal: 'executions', where: [{ column: 'inputs', value: 'x' }] })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+});
+
+test('the Verify dashboard reads one population and keeps its investigation in the URL', async () => {
+  const requests: WireRequest[] = [];
+  const open = async (search: string, executor: Executor = fixtureExecutor) => {
+    host.executor = { run: (batch, signal) => (requests.push(...batch), executor.run(batch, signal)) };
+    requests.length = 0;
+    const url = new URL(`http://ui.test/t/acme/verify${search}`);
+    const data = await loadVerify({ locals: { browserSession: { client: () => ({}) } }, url, request: new Request(url), depends: () => {} } as never);
+    return render(VerifyPage, { data: { ...data, tenant: { key: 'acme', name: 'Acme' } } } as never);
+  };
+  const search = (state: Record<string, unknown>) => `?${new URLSearchParams(Object.entries(state).map(([key, value]) => [key, typeof value === 'string' ? value : JSON.stringify(value)]))}`;
+  const queries = () => requests.filter((request) => request.op === 'bifrost.query') as Extract<WireRequest, { op: 'bifrost.query' }>[];
+
+  // The dashboard: two charts, counted facets and the execution rows, with Verifiers named from one bounded Card list.
+  const page = await open('');
+  await waitFor(() => expect(page.getByRole('region', { name: 'executions rows' })).toBeInTheDocument());
+  expect(page.getByRole('region', { name: 'Executions by verdict' })).toHaveTextContent('no verdict');
+  expect(page.getByRole('region', { name: 'Executions by Verifier' })).toHaveTextContent('ticket-policy 1.1.0');
+  const rail = within(page.getByRole('navigation', { name: 'Filter executions' }));
+  expect(rail.getByRole('button', { name: /no verdict/ })).toHaveTextContent('2');
+  expect(rail.getByRole('button', { name: /latency-drift 1.0.0/ })).toHaveTextContent('2');
+  const table = within(page.getByRole('region', { name: 'executions rows' }));
+  expect(table.getAllByRole('row')).toHaveLength(6);
+  expect(table.getAllByText('ticket-policy 1.1.0')).toHaveLength(3);
+  expect(page.getByLabelText('WHERE: read-only projection of the active filters')).toHaveTextContent('select facet values to filter');
+  // Bounded shared reads only: every query is one batch read of the executions population, and no row is hydrated.
+  expect(new Set(requests.map((request) => request.op))).toEqual(new Set(['bifrost.query', 'cards.list']));
+  expect(requests.filter((request) => request.op === 'cards.list')).toEqual([{ op: 'cards.list', kind: 'Verifier', limit: 200 }]);
+  expect(queries()).toHaveLength(9);
+  expect(queries().every((query) => query.sql.includes(') AS executions WHERE recorded_at >= $1::timestamptz AND recorded_at < $2::timestamptz'))).toBe(true);
+  expect(new Set(queries().map((query) => JSON.stringify(query.params?.slice(0, 2)))).size).toBe(1);
+
+  // A facet value, a brush, grouping, Live and paging are navigations: the URL holds the investigation.
+  await fireEvent.click(rail.getByRole('button', { name: /failed/ }));
+  expect(goto).toHaveBeenLastCalledWith(`/t/acme/verify${search({ where: [{ column: 'verdict', value: 'failed' }] })}`, { keepFocus: true, noScroll: true });
+  await fireEvent.change(page.getByRole('combobox', { name: 'Group by' }), { target: { value: 'group_id' } });
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/verify?group=group_id', expect.anything());
+  await fireEvent.click(page.getByRole('button', { name: 'Live' }));
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/verify?live=1', expect.anything());
+  for (const title of ['Executions by verdict', 'Executions by Verifier']) {
+    const plot = page.getByRole('region', { name: title }).querySelector('svg.plot') as SVGSVGElement;
+    plot.getBoundingClientRect = () => ({ left: 0, width: 600, top: 0, height: 56, right: 600, bottom: 56, x: 0, y: 0, toJSON: () => ({}) });
+    await fireEvent.pointerDown(plot, { clientX: 100, pointerId: 1 });
+    await fireEvent.pointerMove(plot, { clientX: 400, pointerId: 1 });
+    await fireEvent.pointerUp(plot, { clientX: 400, pointerId: 1 });
+    const brushed = new URL(`http://ui.test${vi.mocked(goto).mock.lastCall?.[0]}`).searchParams;
+    expect(Date.parse(brushed.get('to') as string)).toBeGreaterThan(Date.parse(brushed.get('from') as string));
+  }
+  // A row opens its exact execution page as an ordinary navigation, so Back returns to this URL and scroll position.
+  await fireEvent.click(table.getAllByRole('row')[1]);
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/verify/executions/exec_failed');
+  page.unmount();
+
+  // Status and verdict combine: the WHERE projection names both, and rows, facets and both charts bind the same clauses.
+  const where = [{ column: 'status', value: 'completed' }, { column: 'verdict', value: 'failed' }];
+  const filtered = await open(search({ where, from: '2026-10-20T10:00:00.000Z', to: '2026-10-20T12:00:00.000Z', group: 'verifier_card_uid' }));
+  await waitFor(() => expect(filtered.getByRole('region', { name: 'executions rows' })).toBeInTheDocument());
+  expect(filtered.getByLabelText('WHERE: read-only projection of the active filters')).toHaveTextContent(`status = 'completed' AND verdict = 'failed'`);
+  expect(queries()).toHaveLength(9);
+  expect(queries().every((query) => query.sql.includes('status = $') && query.sql.includes('verdict = $') && query.params?.includes('completed') && query.params?.includes('failed'))).toBe(true);
+  expect(queries().every((query) => query.params?.[0] === '2026-10-20T10:00:00.000Z' && query.params?.[1] === '2026-10-20T12:00:00.000Z')).toBe(true);
+  // Reset zoom returns to the preset; Clear drops the filters; both keep the grouping.
+  await fireEvent.click(filtered.getByRole('button', { name: 'Reset zoom' }));
+  expect(goto).toHaveBeenLastCalledWith(`/t/acme/verify${search({ where, group: 'verifier_card_uid' })}`, expect.anything());
+  expect(filtered.getByRole('link', { name: 'Clear' })).toHaveAttribute('href', `/t/acme/verify${search({ from: '2026-10-20T10:00:00.000Z', to: '2026-10-20T12:00:00.000Z', group: 'verifier_card_uid' })}`);
+  filtered.unmount();
+  // Another value adds a clause, as in Observe, and the changed list starts at its first page again.
+  const paged = await open(search({ where, after: ['2026-10-20T11:58:02.412000Z', 'exec_failed'] }));
+  await waitFor(() => expect(paged.getByRole('region', { name: 'executions rows' })).toBeInTheDocument());
+  await fireEvent.click(within(paged.getByRole('navigation', { name: 'Filter executions' })).getByRole('button', { name: /cancelled/ }));
+  expect(goto).toHaveBeenLastCalledWith(`/t/acme/verify${search({ where: [...where, { column: 'status', value: 'cancelled' }] })}`, expect.anything());
+  paged.unmount();
+
+  // An incompatible combination is an empty list, said plainly; a refusal is shown as the refusal, never as empty.
+  const empty = await open(search({ where: [{ column: 'status', value: 'cancelled' }, { column: 'verdict', value: 'passed' }] }), stateExecutors.empty);
+  await waitFor(() => expect(empty.container).toHaveTextContent('No execution matches these filters in this window.'));
+  empty.unmount();
+  const denied = await open('', stateExecutors.denied);
+  await waitFor(() => expect(denied.container).toHaveTextContent('WYRD_AUTH_403_FORBIDDEN'));
+  expect(denied.container).not.toHaveTextContent('No execution matches');
+  denied.unmount();
+  // A malformed range or an unknown filter column issues no read.
+  for (const bad of ['?from=yesterday&to=today', search({ where: [{ column: 'secret', value: 1 }] })]) {
+    const refused = await open(bad);
+    expect(refused.container).toHaveTextContent('WYRD_SPEC_400_VALIDATION');
+    expect(requests).toEqual([]);
+    refused.unmount();
+  }
 });

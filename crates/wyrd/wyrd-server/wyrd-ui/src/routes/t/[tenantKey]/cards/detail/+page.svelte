@@ -51,6 +51,9 @@
     return newest !== undefined && newest !== data.cardRef?.version ? newest : undefined;
   });
 
+  /** The exact Verifier version shown, by the Card UID its executions record. */
+  const verifierUid = $derived(data.verifier && data.header?.result.state === 'populated' ? data.header.result.data.card.metadata.uid : undefined);
+
   /** Navigating to another version clears this version's content until the new one loads. */
   const switching = $derived.by(() => {
     const to = navigating.to?.url;
@@ -103,7 +106,7 @@
   </div>
 {:else if data.header}
   <section class="hero">
-    <CardHeader {...data.header} {actions} onaction={onaction('CardHeader')} primary={agent ? openAgent : undefined} />
+    <CardHeader {...data.header} {actions} onaction={onaction('CardHeader')} primary={agent ? openAgent : verifierUid ? resultsInVerify : undefined} />
   </section>
   {#if data.files}
     <div class="content"><ArtifactTable {...data.files} /></div>
@@ -150,6 +153,10 @@
   {/if}
 {/if}
 
+{#snippet resultsInVerify()}
+  <a class="results" href="{base}/verify?{new URLSearchParams({ where: JSON.stringify([{ column: 'verifier_card_uid', value: verifierUid }]) })}">Results in Verify</a>
+{/snippet}
+
 {#snippet openAgent()}
   {#if agent}
     <ActionButton
@@ -162,6 +169,20 @@
 {/snippet}
 
 <style>
+  /* The primary action's look, as a link: it navigates, so it is an anchor. */
+  .results {
+    display: inline-flex;
+    align-items: center;
+    height: 32px;
+    padding: 0 12px;
+    border: 1px solid var(--declare);
+    border-radius: var(--r);
+    background: var(--declare);
+    color: var(--declare-ink);
+    font: 600 13px var(--font-sans);
+    text-decoration: none;
+    white-space: nowrap;
+  }
   .bar {
     display: flex;
     align-items: center;

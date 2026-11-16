@@ -153,3 +153,10 @@ at `b05da5597`. Candidate: `b05da5597..HEAD` on
 `crates/wyrd/wyrd-server/wyrd-ui/`; `U` is `src/lib/ui-library.test.ts`, `P`
 `src/lib/ui-pages.test.ts`, `UI` `src/lib/ui-library.integration.test.ts`, `PI`
 `src/lib/ui-pages.integration.test.ts`.
+
+Focused selectors, recorded before each first run:
+
+- P `executions list, facets and charts read one population in bounded shared queries`
+- U `an executions list keeps status and verdict apart, names Verifiers the host read, and opens one exact execution`
+- P `the Verify dashboard reads one population and keeps its investigation in the URL`
+- P `an exact Verifier Card page shows its definition, versions and where it runs` (existing; now expects the Results in Verify link)

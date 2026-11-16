@@ -34,7 +34,7 @@
     ],
     [
       { label: 'Observe', href: `${base}/observe`, icon: ICONS.observe },
-      { label: 'Verify', icon: ICONS.verify },
+      { label: 'Verify', href: `${base}/verify`, icon: ICONS.verify },
       { label: 'Query', href: `${base}/query`, icon: ICONS.query }
     ]
   ]);

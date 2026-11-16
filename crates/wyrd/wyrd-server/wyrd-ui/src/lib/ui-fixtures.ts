@@ -357,6 +357,13 @@ export const costs = result([col('value', 'Decimal128(38, 12)'), col('currency')
 
 /** The fixture answering one Observe read, chosen by its fixed SQL shape. */
 export function observeAnswer(sql: string): QueryResult | undefined {
+  if (sql.includes(') AS executions')) {
+    if (sql.startsWith('SELECT status ')) return { ...facet, rows: [['completed', 3], ['cancelled', 1], ['not recorded', 1]] };
+    if (sql.startsWith('SELECT verdict ')) return { ...facet, rows: [[null, 2], ['failed', 1], ['inconclusive', 1], ['passed', 1]] };
+    if (sql.startsWith('SELECT verifier_card_uid ')) return { ...facet, rows: [[VERIFIER_UIDS.policy, 3], [VERIFIER_UIDS.drift, 2]] };
+    if (sql.includes(' AS n FROM')) return facet;
+    return sql.includes(' AS verdict, ') ? executionsByVerdict : sql.includes(' AS verifier, ') ? executionsByVerifier : executions;
+  }
   if (sql === AUTHORED_SQL) return authored;
   if (sql.includes("AS parent_span_id FROM bifrost.traces.spans")) return spans;
   if (sql.includes("encode(span_id, 'hex') AS span_id FROM bifrost.traces.spans")) return traces;
@@ -462,6 +469,7 @@ export const executionDetails = {
 const executionMissing = { code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND', title: 'Execution not found', status: 404 };
 /** Retained metadata rows the execution loader reads, by the SQL's distinguishing text. */
 function executionAnswer(sql: string, params: readonly unknown[]): QueryResult | undefined {
+  if (sql.includes(') AS executions')) return undefined;
   const id = String(params[0]);
   if (sql.startsWith('SELECT verifier_card_uid')) return result([col('verifier_card_uid')], executionStatus[id] ? [[verifiers['ticket-policy@1.1.0'].metadata.uid]] : []);
   if (sql.startsWith('SELECT to_json(inputs)')) return result([col('inputs')], [[JSON.stringify({ ticket: { answer: 'Refund issued' }, photo: null })]]);
@@ -532,6 +540,17 @@ export const fixtureExecutor: Executor = {
               return { ok: true, value: { items: [summary('1.0.0', 'active', 'Prompt', PROMPT.name), summary('1.1.0', 'active', 'Prompt', PROMPT.name)], next_cursor: null } };
             if (request.kind === 'Verifier' && request.name === VERIFIER.name)
               return { ok: true, value: { items: [summary('1.0.0', 'active', 'Verifier', VERIFIER.name), summary('1.1.0', 'active', 'Verifier', VERIFIER.name)], next_cursor: null } };
+            if (request.kind === 'Verifier' && request.name == null)
+              return {
+                ok: true,
+                value: {
+                  items: [
+                    { ...(summary('1.1.0', 'active', 'Verifier', 'ticket-policy') as object), card_uid: VERIFIER_UIDS.policy },
+                    { ...(summary('1.0.0', 'active', 'Verifier', 'latency-drift') as object), card_uid: VERIFIER_UIDS.drift }
+                  ],
+                  next_cursor: null
+                }
+              };
             if (request.kind === 'Verifier' && typeof request.name === 'string') return { ok: true, value: { items: [summary('1.0.0', 'active', 'Verifier', request.name)], next_cursor: null } };
             if (request.name === NATIVE.name) return { ok: true, value: { items: [summary('1.0.0', 'active', 'Prompt', NATIVE.name)], next_cursor: null } };
             if (request.name !== undefined) return { ok: true, value: { items: [summary('1.4.2'), summary('1.4.1', 'deprecated')], next_cursor: null } };

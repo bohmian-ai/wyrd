@@ -322,11 +322,16 @@ Out of this task:
 Maintainer: OBL-9's direct c64 comparison beside saturated workers, OBL-14's
 benchmark records, and the TASK-013/014 handoff, all on an immutable candidate.
 
-Tests to write, after the maintainer's scope direction: OBL-4 nested calls
-in fanout and repeat (Rust journey); OBL-6 charges surviving cache eviction; OBL-7 frozen-copy and
-encoding custody; compute freed before the queued ACK. OBL-9's `bifrost-*`
-refusal over HTTP and MCP is written:
-`pg_verification_routes::bifrost_targets_refuse_all_verifier_work`.
+Tests to write, after the maintainer's scope direction: OBL-6 charges
+surviving cache eviction; OBL-7 frozen-copy and encoding custody (under
+review). Written: OBL-9's `bifrost-*` refusal over HTTP and MCP,
+`pg_verification_routes::bifrost_targets_refuse_all_verifier_work`; OBL-4's
+nested calls, `verifier_building_blocks::nested_tools_run_inside_fanout_and_repeat`;
+compute freed before the queued ACK, for a park
+(`pg_deferred_evidence::a_parked_execution_releases_compute_before_its_park_is_acknowledged`)
+and for a terminal
+(`pg_deferred_evidence::a_finished_execution_releases_compute_before_its_terminal_is_acknowledged`,
+spec.md:344).
 
 ### Diagnoses
 

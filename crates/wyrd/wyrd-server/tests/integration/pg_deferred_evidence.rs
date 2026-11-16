@@ -658,6 +658,82 @@ async fn a_parked_execution_releases_compute_before_its_park_is_acknowledged() {
     assert_eq!(served["result"]["outcome"]["verdict"], "passed", "{served}");
 }
 
+/// A finished execution gives back its compute before its terminal state is
+/// acknowledged.
+///
+/// `ci-gate` here has no deferred input: one Python step and an assertion on
+/// its output. While its state writes are held unacknowledged the execution
+/// selects its terminal and stays `running`, yet holds no scratch, no Python
+/// worker is checked out, and its model call is free; once the writes land
+/// it completes and passes.
+///
+/// # Panics
+/// Panics when compute is not released while the terminal is
+/// unacknowledged, the execution completes before it is acknowledged, or it
+/// does not then pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_finished_execution_releases_compute_before_its_terminal_is_acknowledged() {
+    let deployment = Deployment::launch(|builder| {
+        builder
+            .with_verification_runtime_for_test()
+            .with_verification_runtime_limits_for_test(limits(Duration::from_mins(5)))
+            .with_verification_limits_for_test(HostedLimits {
+                monty_min_workers: 0,
+                model_calls: 1,
+                ..HostedLimits::default()
+            })
+    })
+    .await;
+    let measured = "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: ci-gate\n  version: 1.0.0\nspec:\n  description: Python ran.\n  steps:\n    - id: measure\n      action:\n        kind: code\n        entrypoint: measure\n        source:\n          inline: |\n            def measure():\n                return {\"measured\": True}\n  requirements:\n    - id: measured\n      statement: Python ran\n      check: {kind: assert, path: steps.measure.output.measured, operator: equals, expected: true}\n";
+    deployment
+        .declare_files(
+            &[("ci-gate.yaml", measured.to_owned())],
+            &gated("1.1.0"),
+            "gate-finished",
+        )
+        .await;
+    let stall = deployment
+        .server
+        .stall_next_bifrost_write_into("bifrost.verification.execution_events")
+        .expect("Scribe stalls");
+    let finished = deployment.open(8, C1).await;
+    stall.wait_entered().await;
+    let blocks = deployment
+        .server
+        .state()
+        .verification
+        .blocks()
+        .expect("blocks are hosted");
+    let sandbox = blocks.sandbox();
+    // With no warm worker, an idle one proves the step ran in Python and
+    // its worker came back.
+    let released = || {
+        !sandbox.idle_worker_pids().is_empty()
+            && blocks.resources().scratch().used() == 0
+            && BTreeSet::from_iter(sandbox.charged_worker_pids())
+                == BTreeSet::from_iter(sandbox.idle_worker_pids())
+            && blocks.hold_model_calls_for_test().num_permits() == 1
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !released() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "compute is still held while the terminal is unacknowledged"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        deployment.status(finished).await["status"],
+        "running",
+        "the execution is not complete before its terminal is acknowledged"
+    );
+
+    stall.release();
+    stall.wait_completed().await;
+    let served = deployment.until(finished, "completed").await;
+    assert_eq!(served["result"]["outcome"]["verdict"], "passed", "{served}");
+}
+
 /// A resumed execution keeps its admission deadline.
 ///
 /// `ci-gate` here also defers `lint`. Halfway to the deadline `ci` is

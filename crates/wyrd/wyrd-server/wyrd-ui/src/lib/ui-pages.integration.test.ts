@@ -1256,6 +1256,16 @@ async function traceTotal(page: Page): Promise<number> {
   return Number(count?.replaceAll(',', '') ?? NaN);
 }
 
+/**
+ * The environment of a development command with its config home at `config`.
+ * The development environment starts its own server, so this file's test
+ * server address and key, stubbed on the process by earlier tests, are left out.
+ */
+function devEnv(config: string) {
+  const { WYRD_SERVER_URL: _url, WYRD_GRPC_URL: _grpc, WYRD_API_KEY: _key, ...ambient } = process.env;
+  return { ...ambient, WYRD_CONFIG_HOME: config };
+}
+
 /** Starts `mise run dev:full` in its own process group, writing to a log file in `config`. */
 function devFull(config: string, env: Record<string, string> = {}) {
   // Output goes to a file, never a pipe this process must drain: a blocked test would stall every service writing to it.
@@ -1263,7 +1273,7 @@ function devFull(config: string, env: Record<string, string> = {}) {
   const out = openSync(log, 'w');
   const child = spawn('mise', ['run', 'dev:full', '--requests', '20', '--concurrency', '2'], {
     cwd: REPO,
-    env: { ...process.env, WYRD_CONFIG_HOME: config, ...env },
+    env: { ...devEnv(config), ...env },
     detached: true,
     stdio: ['ignore', out, out]
   });
@@ -1353,7 +1363,7 @@ base('development environment lifecycle', { timeout: 2_400_000 }, async () => {
     await page.goto(`${observe}?last=1h`);
     await expect.poll(() => traceTotal(page), { timeout: 60_000 }).toBeGreaterThan(0);
     const before = await traceTotal(page);
-    execFileSync('mise', ['run', 'dev:batch', '--requests', '4', '--concurrency', '2'], { cwd: REPO, env: { ...process.env, WYRD_CONFIG_HOME: config }, stdio: 'inherit' });
+    execFileSync('mise', ['run', 'dev:batch', '--requests', '4', '--concurrency', '2'], { cwd: REPO, env: devEnv(config), stdio: 'inherit' });
     // Each reload is read only once its overview has loaded.
     await vi.waitFor(
       async () => {

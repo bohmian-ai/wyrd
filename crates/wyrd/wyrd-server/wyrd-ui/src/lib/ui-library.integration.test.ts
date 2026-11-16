@@ -86,7 +86,9 @@ async function appBridgeView(doc: unknown, answer: (name: string, args: Record<s
   bridge.oncalltool = async (params) => {
     const args = (params.arguments ?? {}) as Record<string, unknown>;
     calls.push({ name: params.name, arguments: args });
-    return { content: [], structuredContent: (await answer(params.name, args)) as Record<string, unknown> };
+    // An answer that is already a whole tool result (it has `content`) is relayed as is, so a tool's refusal reaches the page as one.
+    const answered = (await answer(params.name, args)) as Record<string, unknown>;
+    return Array.isArray(answered.content) ? (answered as never) : { content: [], structuredContent: answered };
   };
   const initialized = new Promise<void>((resolve) => (bridge.oninitialized = () => resolve()));
   await bridge.connect(new PostMessageTransport(view, view));
@@ -947,6 +949,12 @@ test('an unfinished execution shows recorded progress and retained outputs throu
   expect(settled).toMatchObject({ result: { state: 'populated', data: { status: { status: 'cancelled' }, publication: { state: 'populated', data: { kind: 'directory' } } } } });
   expect(data(settled, 'app').publications).toMatchObject({ state: 'populated', data: { items: [{}, {}, {}, {}] } });
 
+  // An execution the app's credential cannot find is the server's refusal, not an empty panel.
+  const missing = await loadExamplePanel({
+    request: new Request('http://app.test/view/load', { method: 'POST', body: JSON.stringify({ component: 'VerificationExecution', input: { executionId: '0192f0a0-0000-7000-8000-000000000000' }, range: RANGE }) })
+  } as never);
+  expect(await missing.json()).toMatchObject({ result: { state: 'error', problem: { code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND' } } });
+
   // The built HTML draws that execution through host tools/call alone, each answered by the real MCP server.
   const host = new Client({ name: 'wyrd-ui-artifact-host', version: '1.0.0' }, { versionNegotiation: { mode: 'auto' } });
   await host.connect(new StreamableHTTPClientTransport(new URL('/mcp', server.baseUrl), { fetch: client.httpAuth }));
@@ -963,6 +971,13 @@ test('an unfinished execution shows recorded progress and retained outputs throu
     expect(new Set(app.calls.map((call) => call.name))).toEqual(
       new Set(['verification.get_execution', 'bifrost.query', 'cards.get', 'verification.list_invocations', 'verification.list_publications', 'verification.get_publication'])
     );
+    // The same artifact shows the MCP server's refusal of an unknown execution and asks for nothing else.
+    const refusing = await appBridgeView(
+      { version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels: [{ id: 'execution', component: 'VerificationExecution', input: { executionId: '0192f0a0-0000-7000-8000-000000000000' } }] },
+      async (name, args) => (await host.callTool({ name, arguments: args })) as object
+    );
+    await vi.waitFor(() => expect(refusing.document.querySelector('[data-panel="execution"]')?.textContent).toContain('WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND'));
+    expect(refusing.calls.map((call) => call.name)).toEqual(['verification.get_execution']);
   } finally {
     await host.close();
   }
@@ -1077,6 +1092,16 @@ judged('a judged execution shows its judgments, accepted inputs, completed detai
   const late = await client.httpAuth(`${server.baseUrl}/v1/verification/executions/${refused}/cancel`, { method: 'POST' });
   expect([late.status, await late.json()]).toEqual([200, { execution_id: refused, status: 'completed' }]);
   expect(data(await loadExecution({ executionId: refused }, { executor: nodeExecutor(client) }), 'late').status.result?.outcome.verdict).toBe('failed');
+
+  // A turn observed after the session was judged joins no recorded membership: the judged execution keeps its three pinned members and verdict.
+  const later = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: key }) });
+  await later.startBifrost();
+  await later.run('agent').observe.verify('turn-check', { turn: 4, answer: 'answer 4' }, { positional: true, group_id: 'ui-conversation' });
+  await later.shutdown();
+  server.flushBifrost();
+  const pinned = data(await loadExecution({ executionId: session.execution_id, node: 'input:turns' }, { executor: nodeExecutor(client) }), 'later turn');
+  expect(pinned.members?.map((member) => member.execution_id)).toEqual(session.group?.sources.turns.execution_ids);
+  expect(pinned.status.result?.outcome.verdict).toBe('passed');
 
   // Another tenant reads none of them, by ID alone.
   const foreign = nodeExecutor(WyrdClient.connect({ credential: server.bootstrapServiceInTenant(server.seedTenant('ui-judged-foreign'), ['admin'], 'ui-judged-admin') }));

@@ -293,9 +293,35 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
      RED was shown. GREEN: `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(/oracle::telemetry::/)'`
      (5 passed, 3 runs).
    - Cost: one `Arc` clone per laned poll, to record it with scenario 7.
-   - Open: Oracle query execution, Forge compaction and Scribe CPU pools do
-     not yet run laned under an admitted `Workload::Bifrost` operation, so in
-     production nothing is inherited yet. Status: FAIL.
+   - Oracle: `execute_retained_root` admits a `Workload::Bifrost` operation
+     for the query's tenant, bounded by the query deadline, which surfaces as
+     `QueryTimeout`. Both interactive and analytical batch streams go through
+     `laned_batches`, which polls each batch on a lane and keeps the operation
+     live with the stream. Spawned partitions inherit through the tracer.
+     Test: `oracle::tests::laned_batches_poll_each_batch_on_a_lane`. RED (stub
+     passthrough): batch 0 ran with context `None`. GREEN.
+   - Forge: `ForgeResources` carries the process workload manager.
+     `ForgeManagedRewrite::rewrite_plan` admits a `Workload::Bifrost`
+     operation for the binding's tenant, racing the attempt's cancellation
+     (which yields `Shutdown`), then runs the core rewrite laned.
+     Test: `forge::managed_rewrite::managed_rewrite_waits_out_critical_pressure`.
+     RED: the rewrite finished under critical pressure. GREEN.
+   - Regressions:
+     - `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p vala-bifrost-redux --test integration -P journey --run-ignored=all"`:
+       75 passed.
+     - The same wrapper with `--lib`: 940 passed. Run without the wrapper,
+       19 Postgres-fixture tests fail on the unset
+       `WYRD_TEST_DATABASE_ADMIN_URL`; that is an environment limit, not a
+       regression.
+   - Not victims: Oracle and Forge operations pass no cancellation token, so
+     pressure never picks them as victims. Queries keep their own deadline
+     and cancel paths; rewrites drain through attempt cancellation.
+   - Open:
+     - Scribe's Rayon CPU pools do not run on the shared lanes.
+     - No proof yet that held Bifrost jobs release lanes to competing
+       eligible work across workloads.
+     - The `test:bifrost:journey:oracle` run is pending.
+     Status: FAIL.
 
 6. **Connected public journey and bounded drain — REQ-019–024; AC-018.** Extend
    existing Rust-client/WyrdTestServer/Postgres journey owners with verification

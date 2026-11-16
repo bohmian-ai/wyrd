@@ -1227,6 +1227,7 @@ impl BifrostRuntimeResources {
             forge: plan.forge_enabled.then(|| ForgeResources {
                 memory_root: Arc::clone(&self.memory_root),
                 scratch: self.governor.inner.process.scratch().clone(),
+                workloads: self.governor.inner.process.workloads().clone(),
             }),
             governor: self.governor.clone(),
             transport: self.transport.clone(),
@@ -1889,6 +1890,12 @@ impl OracleQueryMemoryHold {
 }
 
 impl OracleResources {
+    /// The process workload manager every query is admitted through and
+    /// whose CPU lanes it executes on.
+    pub(crate) fn workloads(&self) -> &wyrd_runtime::resources::WorkloadManager {
+        self.governor.inner.process.workloads()
+    }
+
     /// The Oracle capability of a test composition with 1 GiB of memory and
     /// scratch, shared by the cache and spill unit tests.
     ///
@@ -2076,9 +2083,19 @@ pub struct ForgeResources {
     /// The process scratch ledger every written Forge spill byte is charged
     /// to, shared with Oracle spill and hosted verification workspaces.
     scratch: wyrd_runtime::resources::ByteLedger,
+    /// The process workload manager every rewrite is admitted through and
+    /// whose CPU lanes it executes on.
+    workloads: wyrd_runtime::resources::WorkloadManager,
 }
 
 impl ForgeResources {
+    /// The process workload manager every rewrite is admitted through and
+    /// whose CPU lanes it executes on.
+    #[must_use]
+    pub const fn workloads(&self) -> &wyrd_runtime::resources::WorkloadManager {
+        &self.workloads
+    }
+
     /// The process scratch ledger Forge spill is charged to.
     #[must_use]
     pub fn scratch(&self) -> &wyrd_runtime::resources::ByteLedger {

@@ -2055,3 +2055,42 @@ async fn standard_variant_layouts_round_trip_per_file() {
         "the twice-compacted read returns the logical rows"
     );
 }
+
+/// Critical process pressure pauses a Forge rewrite before its execution
+/// starts, and the same attempt completes once pressure recovers.
+///
+/// A worker reporting more allocator commitment than the process ceiling
+/// turns every sample critical without filling the byte ledger the fixture's
+/// stores need. The rewrite is still pending well after it would otherwise
+/// have finished; after two recovering samples it finishes with real output.
+///
+/// # Panics
+///
+/// Panics when the rewrite finishes under critical pressure, or fails or
+/// produces nothing after recovery.
+#[tokio::test]
+async fn managed_rewrite_waits_out_critical_pressure() {
+    use wyrd_runtime::resources::PressureState;
+
+    let fixture = PromotedRewriteFixture::start("rewrite_pressure").await;
+    let workloads = fixture.fixture.forge_resources.workloads().clone();
+    let overcommitted = workloads.observe_commitment();
+    overcommitted.set(u64::MAX);
+    assert_eq!(workloads.sample(0).state, PressureState::Critical);
+
+    let mut run = std::pin::pin!(rewrite_whole_attempt(&fixture));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), run.as_mut())
+            .await
+            .is_err(),
+        "the rewrite waits while pressure is critical"
+    );
+    overcommitted.set(0);
+    workloads.sample(0);
+    workloads.sample(0);
+    let run = run.await;
+    assert!(
+        !run.handoffs.is_empty(),
+        "the attempt rewrites once pressure recovers"
+    );
+}

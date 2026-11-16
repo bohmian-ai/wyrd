@@ -1491,9 +1491,11 @@ judged('session, drift and cited judgments open as pages: members in recorded or
  * The environment of a development command with its config home at `config`.
  * The development environment starts its own server, so this file's test
  * server address and key, stubbed on the process by earlier tests, are left out.
+ * So is the test runner's own marker: with it set, the development UI would
+ * resolve Svelte as a test does and share this run's dependency cache.
  */
 function devEnv(config: string) {
-  const { WYRD_SERVER_URL: _url, WYRD_GRPC_URL: _grpc, WYRD_API_KEY: _key, ...ambient } = process.env;
+  const { WYRD_SERVER_URL: _url, WYRD_GRPC_URL: _grpc, WYRD_API_KEY: _key, VITEST: _vitest, ...ambient } = process.env;
   return { ...ambient, WYRD_CONFIG_HOME: config };
 }
 
@@ -1617,6 +1619,22 @@ base('development environment lifecycle', { timeout: 2_400_000 }, async () => {
     expect(await page.getByRole('region', { name: /^Changes from/ }).textContent()).toContain('v1.0.0 → v1.1.0');
     await page.goto('http://127.0.0.1:3000/t/dev/cards/detail?kind=Model&name=support-model&version=1.0.0&tab=files');
     await expect.poll(() => page.getByRole('region', { name: 'Files', exact: true }).textContent()).toContain('support-model.bin');
+
+    // The running app answers one question and queues a real `follows-policy` check; that execution opens by its exact URL with recorded state, its Verifier and its graph.
+    const asked = await fetch('http://127.0.0.1:8000/ask', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ question: 'When will my order ship?', order_id: 'A-1001' }) });
+    const reply = (await asked.json()) as { submit?: { execution_id: string } };
+    expect(reply.submit?.execution_id, `the app answered ${asked.status}`).toEqual(expect.any(String));
+    const reviewed = reply.submit?.execution_id as string;
+    await page.goto(`http://127.0.0.1:3000/t/dev/verify/executions/${reviewed}`);
+    await expect.poll(() => page.locator('[data-execution-status]').getAttribute('data-execution-status'), { timeout: 60_000 }).toMatch(/^(queued|running|completed)$/);
+    expect(await page.locator('main').textContent()).toContain(reviewed);
+    // Its Verifier is named once retained metadata is visible, so the page is reread until then.
+    const reread = async () => {
+      await page.reload();
+      return page.locator('main').textContent();
+    };
+    await expect.poll(reread, { timeout: 120_000, interval: 3_000 }).toContain('follows-policy@');
+    await expect.poll(() => page.getByRole('region', { name: 'Graph', exact: true }).locator('[data-node]').count()).toBeGreaterThan(0);
 
     // Sign-out ends the session.
     await page.locator('details.identity summary').click();

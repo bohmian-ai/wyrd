@@ -288,6 +288,34 @@ publication replaying its receipt, compute freed before queued ACK, no
 warm-cache direct SQL or starvation, tenant-fair admission and replica-local
 budgets, the TASK-013/014 handoff). They are open.
 
+### Open-item decisions
+
+An independent read-only review decided each open item from the spec, this
+task and AGENTS.
+
+Cited (assertions read):
+- Least-privilege recovery: `pg_hosted_artifacts::recovered_authority_bounds_every_agent_tool` (:873; denied-table and undeclared-tool assertions :1059–1125).
+- Authored-code isolation: `sandbox_worker::sandbox_reaches_only_its_mounts` (:233); journey `verifier_building_blocks::forbidden_code_access_cannot_pass_dependent_work` (:943).
+- Model publication replays its receipt: `hosted_agent_tools::agent_publish_retries_use_host_identity` (:1124; :1140–1207).
+- No starvation: `hosted::admission::tests::a_non_fitting_head_does_not_block_another_tenant` (:490); `pg_verification_runtime::a_flooding_tenant_does_not_delay_another_tenants_run` (:1966). Sustained 100-tenant qualification is TASK-014's.
+- Tenant-fair admission: `hosted::admission::tests::admission_rotates_tenants_and_accounts_waiting_bytes` (:402).
+
+Out of this task:
+- AC-014: the spec assigns it to task 018 (spec.md:440).
+- A second wheel-content check for OBL-11: `check:py-wheel-no-testing` (mise.toml:1101–1135) already rejects testing and benchmark machinery in the production wheel; AGENTS forbids a duplicate check.
+
+Maintainer: OBL-9's direct c64 comparison beside saturated workers, OBL-14's
+benchmark records, and the TASK-013/014 handoff, all on an immutable candidate.
+
+Tests to write: OBL-4 nested calls in fanout and repeat on every surface, and
+the nonblocking tool-permission audit; OBL-6 charges surviving cache
+eviction; OBL-7 frozen-copy and encoding custody; OBL-9 crashed-worker
+takeover, `bifrost-*` refusal over HTTP and MCP, readiness, hosted blocks and
+gateway following the target, and the Kubernetes manifests; OBL-11 rejecting
+an extra control in Rust and in loaded native exports; OBL-12 MCP extraction
+and delivery inspection; compute freed before the queued ACK; no SQL on a
+warm direct execution; replica-local budgets.
+
 ### Diagnoses
 
 - **Symptom:** `pg_verification_runtime::queued_origins_require_their_own_input_ack`

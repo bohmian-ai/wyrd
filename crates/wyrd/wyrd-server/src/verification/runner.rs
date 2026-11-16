@@ -1586,11 +1586,11 @@ impl VerifierRunner {
 /// [`state_failure`], and a lost lease settles nothing.
 ///
 /// The decision is a copy of the live state's, charged to process memory
-/// before it was made and kept charged through the persistence wait. The
-/// result write is charged the decision's size from the same ledger before
-/// it is built and then fitted to the write's own weight, so the decision
-/// is released only once its result's bytes are promised, and [`deliver`]
-/// hands that promise to the outbox.
+/// before it was made and kept charged through the persistence wait. Once
+/// the result write is built from it, the charge grows by the write's weight
+/// while both live, then shrinks to that weight when the decision drops, and
+/// [`deliver`] hands it to the outbox; the write is never charged ahead of
+/// its build.
 ///
 /// # Panics
 /// Panics when `state` charges another ledger than `outbox`, as
@@ -1618,23 +1618,24 @@ async fn conclude(
     if let Err(transition) = persisted(state, lease, execution_id).await {
         return transition;
     }
-    let (decided, charge) = decided.into_parts();
+    let (decided, mut charge) = decided.into_parts();
     match decided {
         Decision::Failed(failure) => {
             Transition::Terminate(terminal_status(failure.status), failure.error)
         }
         Decision::Selected(selected) => {
-            let mut promise = charge
-                .as_ref()
-                .map(|charge| charge.ledger().charge_infallible(charge.bytes()));
-            let built = result(frozen, &selected, system);
-            drop((selected, charge));
-            match built {
+            match result(frozen, &selected, system) {
                 Ok((transition, write)) => {
-                    if let Some(promise) = &mut promise {
-                        fit(promise, <ScribeSink as OutboxSink>::weight(&write) as u64);
+                    let weight = <ScribeSink as OutboxSink>::weight(&write) as u64;
+                    // the built write is charged while the decision still lives
+                    if let Some(charge) = &mut charge {
+                        charge.grow_infallible(weight);
                     }
-                    deliver(tenant, transition, write, promise, lease, outbox).await
+                    drop(selected);
+                    if let Some(charge) = &mut charge {
+                        fit(charge, weight);
+                    }
+                    deliver(tenant, transition, write, charge, lease, outbox).await
                 }
                 Err(transition) => transition,
             }

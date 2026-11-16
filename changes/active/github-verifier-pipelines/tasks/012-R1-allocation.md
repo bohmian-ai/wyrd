@@ -156,7 +156,38 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
    `memory_samples_inside_a_turn_are_recorded_not_answers` and
    `idle_memory_listing_reaps_workers_that_died` (RED: the dead worker was
    never replaced). They run with `cargo test -p monty-pool --test pool_test`
-   in the fork: 125 passed.
+   in the fork: 126 passed, with a fourth commit added later,
+   `evicted_idle_workers_are_replaced_by_fresh_ones` (`Pool::evict_idle`).
+
+   Evidence:
+   - Worker telemetry, reuse/reset, held turn, staleness, exit and prewarm
+     reclaim: `mise exec -- cargo nextest run --locked -p wyrd-server --test integration -E 'test(/sandbox_worker::/)'`
+     (13 passed). The cases are `stale_worker_telemetry_stops_new_work_without_freeing_usage`,
+     `sandbox_reuses_processes_with_fresh_tenant_sessions`,
+     `suspended_sessions_release_runnable_capacity`,
+     `failed_workers_settle_before_capacity_returns` and
+     `prewarmed_workers_are_charged_and_reaped_under_pressure`. The last one
+     was RED, timing out on "the pool prewarms fresh workers again", while
+     reclaim closed the pool. It is GREEN with `evict_idle`.
+   - Media copies: `bound_media_holds_only_its_guard_through_the_call`
+     asserts one read and a peak equal to the encoded length. vala-verify:
+     114 passed.
+   - Checkpoint precharge: `verification::state::tests::live_state_stays_charged_through_acknowledged_revisions`.
+     RED: 7276 vs 4064 under the 4× precharge. GREEN; state and outbox unit
+     tests: 39 passed.
+   - Result precharge: `runner.rs::conclude` no longer charges a second
+     copy of the decision before building the result write. Once the write
+     exists, the decision's charge grows by its weight while both live, then
+     fits to the write when the decision drops. This is a source/diff proof
+     only, with no RED, so TDD is VIOLATED for this sub-case. Regressions:
+     `pg_verification_runtime::{completion_waits_for_the_durable_result,
+     lost_result_ack_replays_the_identical_sealed_batch_and_scribe_deduplicates,
+     reclaimed_attempt_after_a_failed_settlement_redelivers_the_selected_result,
+     result_redelivery_is_idempotent_after_restart}` plus the three named
+     custody/deadline/replica regressions: 7/7 passed, per selector, with
+     managed Postgres.
+   - Deferral under pressure: `pg_hosted_artifacts::busy_queued_execution_is_deferred_until_capacity_frees`
+     passed (see D3).
 
    Diagnoses. Each was made by a fresh Codex diagnostician given only the
    failing command, its trace and the diff.

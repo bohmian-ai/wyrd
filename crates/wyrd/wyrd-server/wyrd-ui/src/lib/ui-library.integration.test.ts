@@ -10,7 +10,9 @@ import { join } from 'node:path';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { AppBridge, PostMessageTransport } from '@modelcontextprotocol/ext-apps/app-bridge';
 import type { Cookies } from '@sveltejs/kit';
+import { render } from '@testing-library/svelte';
 import { expect, vi } from 'vitest';
+import { TraceWaterfall } from 'wyrd-ai-ui';
 import { z } from 'zod';
 import { Bifrost, Cards, Principals, TableConfig, WyrdClient, WyrdState } from 'wyrd-ai';
 import {
@@ -890,7 +892,8 @@ test('an unfinished execution shows recorded progress and retained outputs throu
 
   // A principal that may query but not read executions is denied after one read; nothing dependent is asked.
   const runs: WireRequest[][] = [];
-  const queryOnly = nodeExecutor(WyrdClient.connect({ credential: server.scopedApiKey('ui_execution_denied', ['bifrost_query:read']) }));
+  const restrictedKey = server.scopedApiKey('ui_execution_denied', ['bifrost_query:read']);
+  const queryOnly = nodeExecutor(WyrdClient.connect({ credential: restrictedKey }));
   const denied: { executor: Executor } = { executor: { run: ((requests, signal) => (runs.push([...requests]), queryOnly.run(requests, signal))) as Executor['run'] } };
   expect((await loadExecution(tree, denied)).result).toMatchObject({ state: 'denied', problem: { code: DENIED } });
   expect(runs.map((requests) => requests.map((request) => request.op))).toEqual([['verification.get_execution']]);
@@ -1004,6 +1007,60 @@ test('an unfinished execution shows recorded progress and retained outputs throu
   } finally {
     await outsider.close();
   }
+
+  // The restricted principal is refused the same way through the remaining hosts: denied, never empty, and nothing asked after the one read.
+  const refusal = { result: { state: 'denied', problem: { code: DENIED } } };
+  expect(await panel(await session('test-tenant-1', restrictedKey))).toMatchObject(refusal);
+  vi.stubEnv('WYRD_API_KEY', restrictedKey);
+  const appDenied = await loadExamplePanel({
+    request: new Request('http://app.test/view/load', { method: 'POST', body: JSON.stringify({ component: 'VerificationExecution', input: tree, range: RANGE }) })
+  } as never);
+  vi.stubEnv('WYRD_API_KEY', server.apiKey);
+  expect(await appDenied.json()).toMatchObject(refusal);
+  const restricted = new Client({ name: 'wyrd-ui-artifact-restricted', version: '1.0.0' }, { versionNegotiation: { mode: 'auto' } });
+  await restricted.connect(new StreamableHTTPClientTransport(new URL('/mcp', server.baseUrl), { fetch: WyrdClient.connect({ credential: restrictedKey }).httpAuth }));
+  try {
+    const asked: string[][] = [];
+    const tools = mcpExecutor({ callServerTool: (params, options) => restricted.callTool(params, options) });
+    const counted: Executor = { run: ((requests, signal) => (asked.push(requests.map((request) => request.op)), tools.run(requests, signal))) as Executor['run'] };
+    expect(await loadExecution(tree, { executor: counted })).toMatchObject(refusal);
+    expect(asked).toEqual([['verification.get_execution']]);
+    const drawn = await appBridgeView(
+      { version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels: [{ id: 'execution', component: 'VerificationExecution', input: tree }] },
+      async (name, args) => (await restricted.callTool({ name, arguments: args })) as object
+    );
+    await vi.waitFor(() => expect(drawn.document.querySelector('[data-panel="execution"]')?.textContent).toContain(DENIED));
+    expect(drawn.calls.map((call) => call.name)).toEqual(['verification.get_execution']);
+  } finally {
+    await restricted.close();
+  }
+
+  // A server that cannot be reached is a problem through every host: never an empty panel, never recorded state.
+  const DOWN = 'http://127.0.0.1:9';
+  const unreachable = (surface: string, loaded: unknown) => {
+    expect(loaded, surface).toMatchObject({ result: { state: 'error', problem: { code: expect.stringMatching(/^WYRD_/) } } });
+    // Unreachable is not "no such execution".
+    expect(JSON.stringify(loaded), surface).not.toContain('WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND');
+  };
+  unreachable('node', await loadExecution(tree, { executor: nodeExecutor(WyrdClient.connect({ serverUrl: DOWN, credential: server.apiKey })) }));
+  const gone = await mcpOver(server.baseUrl, client);
+  await gone.close();
+  unreachable('mcp', await loadExecution(tree, { executor: gone.executor }));
+  env.WYRD_SERVER_URL = DOWN;
+  unreachable('bff', await panel(own));
+  env.WYRD_SERVER_URL = server.baseUrl;
+  vi.stubEnv('WYRD_SERVER_URL', DOWN);
+  const appDown = await loadExamplePanel({
+    request: new Request('http://app.test/view/load', { method: 'POST', body: JSON.stringify({ component: 'VerificationExecution', input: tree, range: RANGE }) })
+  } as never);
+  vi.stubEnv('WYRD_SERVER_URL', server.baseUrl);
+  unreachable('app', await appDown.json());
+  const dark = await appBridgeView({ version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels: [{ id: 'execution', component: 'VerificationExecution', input: tree }] }, async () => {
+    throw new Error('the host cannot reach its server');
+  });
+  await vi.waitFor(() => expect(dark.document.querySelector('[data-panel="execution"]')?.textContent).toMatch(/WYRD_[A-Z0-9_]+/));
+  expect(dark.document.querySelector('[data-panel="execution"]')?.textContent).not.toContain('WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND');
+  expect(dark.document.querySelector('[data-execution-status]')).toBeNull();
 });
 
 /** A fresh server that runs Verifiers, with the assistant Service registered. */
@@ -1244,6 +1301,10 @@ traced('a session judgment cites an exact trace: the citation leads to its pinne
       // That exact trace is read by its ID alone, with no list range or filter.
       const waterfall = await loadTraceWaterfall({ traceId: SESSION_TRACE }, { executor });
       expect(waterfall.result.state, surface).toBe('populated');
+      // A trace list over a later day does not hold this trace; the citation still opens it.
+      const listed = await loadRecordTable({ signal: 'traces' }, { executor, range: { from: '2026-10-20T00:00:00Z', to: '2026-10-21T00:00:00Z' } });
+      expect(listed.result.state, surface).not.toBe('denied');
+      expect(JSON.stringify(listed.result), surface).not.toContain(SESSION_TRACE);
     }
 
     // A span that arrives after the judgment joins the trace and revises neither the judgment nor the membership.
@@ -1252,14 +1313,28 @@ traced('a session judgment cites an exact trace: the citation leads to its pinne
       resourceSpans: [{ resource: { attributes: [] }, scopeSpans: [{ scope: { name: 'wyrd-ui-journey' }, spans: [{ traceId: SESSION_TRACE, spanId: 'a1b2c3d4e5f60718', name: 'late-test-run', kind: 1, startTimeUnixNano: late, endTimeUnixNano: late, status: { code: 0 }, attributes: [] }] }] }]
     });
     server.flushBifrost();
-    const grown = await loadTraceWaterfall({ traceId: SESSION_TRACE }, { executor: nodeExecutor(client) });
-    expect(JSON.stringify(grown.result)).toContain('late-test-run');
-    expect(await recorded(nodeExecutor(client), 'after a later span')).toEqual(before);
+    for (const [surface, executor] of [['node', nodeExecutor(client)], ['mcp', mcp.executor]] as const) {
+      const grown = await loadTraceWaterfall({ traceId: SESSION_TRACE }, { executor });
+      expect(JSON.stringify(grown.result), surface).toContain('late-test-run');
+      expect(await recorded(executor, surface)).toEqual(before);
+    }
 
-    // A principal that may read executions but not traces still sees the citation; the trace itself is refused to it.
-    const narrow = nodeExecutor(WyrdClient.connect({ credential: server.scopedApiKey('ui_traced_narrow', ['verifier:read']) }));
-    expect((await recorded(narrow, 'narrow')).requirements).toEqual(before.requirements);
-    expect((await loadTraceWaterfall({ traceId: SESSION_TRACE }, { executor: narrow })).result).toMatchObject({ state: 'denied', problem: { code: DENIED } });
+    // A principal that may read executions but not traces still sees the citation; the trace itself is refused to it, and the refusal is drawn.
+    const narrowClient = WyrdClient.connect({ credential: server.scopedApiKey('ui_traced_narrow', ['verifier:read']) });
+    const narrowMcp = await mcpOver(server.baseUrl, narrowClient);
+    try {
+      for (const [surface, narrow] of [['node', nodeExecutor(narrowClient)], ['mcp', narrowMcp.executor]] as const) {
+        expect((await recorded(narrow, surface)).requirements, surface).toEqual(before.requirements);
+        const refused = await loadTraceWaterfall({ traceId: SESSION_TRACE }, { executor: narrow });
+        expect(refused.result, surface).toMatchObject({ state: 'denied', problem: { code: DENIED } });
+        const drawn = render(TraceWaterfall, refused);
+        expect(drawn.container.textContent, surface).toContain(DENIED);
+        expect(drawn.container.textContent, surface).not.toContain('edit-file');
+        drawn.unmount();
+      }
+    } finally {
+      await narrowMcp.close();
+    }
     // Another tenant finds neither the session nor the trace.
     const outsider = nodeExecutor(WyrdClient.connect({ credential: server.bootstrapServiceInTenant(server.seedTenant('ui-traced-foreign'), ['admin'], 'ui-traced-admin') }));
     expect((await loadExecution({ executionId: session.execution_id }, { executor: outsider })).result).toMatchObject({ state: 'error', problem: { code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND' } });

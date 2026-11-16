@@ -295,6 +295,7 @@ and the journey repairs below). Selector prefixes: **E**
 | OBL-12 pipeline journeys and negatives, supersession/access fences, provider retry | preserved; 9edfa4fa7 etc. repair stale journey expectations only | J `github_connection::connections_associate_only_after_github_confirms_them`, `repository_declaration::pull_requests_admit_pinned_executions_and_supersede_them`; SI `pg_github_pull_requests::*`, `pg_github_pull_request_extraction::*`, `pg_deferred_evidence::*`, `pg_approvals::*`, `pg_github_delivery::*` | SI combined seam selector, `test:rust-sdk:journey` | **FAIL**: only Rust SDK and server journeys are cited; no Python, TypeScript or MCP pipeline-journey evidence across shipped surfaces |
 | OBL-13 inherited packet carried with dispositions, R2 superseded, R3 open, 100-tenant amendment, no FAIL made PASS | c33e9a137 | code-mode-port.md §Inherited packet, §100-tenant amendment, §TASK-003-R3 obligations (stale R3 rows updated to revision 13), §Other inherited rows | content review | PASS |
 | OBL-14 immutable candidate `bench:l1:{verification,gateway,bifrost}` records | none | none | not run: needs the maintainer's immutable candidate on a quiet host | **FAIL** |
+| AC-014 fresh isolated migration comparison: only permitted deltas beyond main, no generic execution payload schema, grants/RLS/cancellation kept | `git diff --name-status main...HEAD -- '*migrations*'`: nine added migrations (verifier cancel notify, GitHub installations, gateway usage contributions/overlap, Repository Cards, selection occurrence, code-review cache, pull-request admission, pull-request source extracted), none of main's modified or deleted; each of the six new tables enables and forces RLS with `tenant_isolation` and `operator_access` policies; no execution-state or terminal-delivery table or column | fresh repository Postgres | `db:migrate:all:inner` twice (idempotent, Wyrd and Vala); `check:tenant-isolation`; `test:sql` 235 + 7 + 88 + 3 passed, including the cancel-notify responsiveness tests | PASS |
 
 Missing from the ledger (independent checker): AC-014 (fresh isolated
 migration comparison, grants and RLS kept) and several cases of the task's
@@ -316,7 +317,6 @@ Cited (assertions read):
 - Tenant-fair admission: `hosted::admission::tests::admission_rotates_tenants_and_accounts_waiting_bytes` (:402).
 
 Out of this task:
-- AC-014: the spec assigns it to task 018 (spec.md:440).
 - A second wheel-content check for OBL-11: `check:py-wheel-no-testing` (mise.toml:1101–1135) already rejects testing and benchmark machinery in the production wheel; AGENTS forbids a duplicate check.
 
 Maintainer: OBL-9's direct c64 comparison beside saturated workers, OBL-14's

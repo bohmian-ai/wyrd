@@ -2903,3 +2903,96 @@ async fn grpc_query(
     }
     Err("the gRPC stream ended without a terminal frame".to_owned())
 }
+
+/// A public query executes on the process CPU lanes shared with gateway and
+/// verification work: while other work holds every lane the query's batches
+/// wait as Bifrost work, and the query finishes once one lane is released.
+///
+/// # Panics
+///
+/// Panics when the journey breaks; see [`prove_query_waits_for_a_shared_lane`].
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn public_query_waits_for_a_shared_cpu_lane() {
+    prove_query_waits_for_a_shared_lane()
+        .await
+        .expect("a query shares the process CPU lanes");
+}
+
+/// Holds every process lane as gateway work, runs one public query, and
+/// releases a lane.
+///
+/// # Errors
+///
+/// Returns a client or ingest error, and a descriptive error when the query
+/// finishes while every lane is held, never queues for a lane, or does not
+/// finish once one is released.
+async fn prove_query_waits_for_a_shared_lane() -> Result<(), JourneyError> {
+    use wyrd_runtime::resources::Workload;
+
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed()).await?;
+    let server = cluster
+        .server(0)
+        .ok_or("the one-pod cluster runs one server")?;
+    let tenant = cluster.data_tenant_id();
+    let table = unique_table("oracle_shared_lanes");
+    let fqn = format!("bifrost.bifrost.{table}");
+    register_table(server, tenant, &table).await?;
+    let reader = writer(server, "shared-lane-reader").await?;
+    reader
+        .write(&fqn, &journey_schema(), [journey_row(1, "row-1")])
+        .await?;
+    server.flush_bifrost().await?;
+    cluster.refresh_oracle_snapshots().await?;
+
+    let workloads = server.state().resources.workloads().clone();
+    let gateway = workloads.begin(Workload::Gateway, None, None);
+    let mut held = Vec::new();
+    while workloads.lanes().free() > 0 {
+        held.push(workloads.lanes().acquire(gateway.context()).await);
+    }
+    let waiting_before = workloads.lanes().waiting();
+    let mut query = tokio::spawn({
+        let client = reader.client().clone();
+        let sql = format!("SELECT id FROM {fqn}");
+        async move {
+            let mut stream = wyrd_client::Bifrost::query_only(&client)
+                .query(&BifrostQueryRequest {
+                    sql,
+                    deadline_ms: Some(60_000),
+                    params: Vec::new(),
+                })
+                .await?;
+            let mut rows = 0;
+            while let Some(batch) = stream.next_batch().await? {
+                rows += batch.num_rows();
+            }
+            Ok::<_, wyrd_client::bifrost::BifrostClientError>(rows)
+        }
+    });
+    let queued = tokio::time::timeout(Duration::from_secs(30), async {
+        while workloads.lanes().waiting() <= waiting_before {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if queued.is_err() {
+        return Err("the query never queued for a CPU lane".into());
+    }
+    if tokio::time::timeout(Duration::from_millis(500), &mut query)
+        .await
+        .is_ok()
+    {
+        return Err("the query finished while other work held every CPU lane".into());
+    }
+    held.pop();
+    let rows = tokio::time::timeout(Duration::from_secs(30), query)
+        .await
+        .map_err(|_| "the query did not finish once a CPU lane was released")???;
+    if rows != 1 {
+        return Err(format!("the query returned {rows} rows, not 1").into());
+    }
+    drop(held);
+    cluster.shutdown().await?;
+    Ok(())
+}

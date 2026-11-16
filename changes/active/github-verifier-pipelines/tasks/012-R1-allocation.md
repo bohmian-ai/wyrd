@@ -349,6 +349,15 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
      Regressions: under the same wrapper, `--lib` 942 passed and
      `--test integration` 75 passed.
    - `mise run test:bifrost:journey:oracle`: 65 passed.
+   - Cross-workload, production execution:
+     `wyrd-testing --test oracle capacity::public_query_waits_for_a_shared_cpu_lane`
+     (`mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all -E 'test(=capacity::public_query_waits_for_a_shared_cpu_lane)'"`).
+     The test holds every process lane as gateway work and runs a public
+     query through the SDK. The query queues and stays unfinished; once one
+     lane is released, it returns its row. PASS.
+     TDD: VIOLATED, because the test was written after the Oracle wiring.
+     Mutation check: with `laned_batches` as a passthrough, it fails with
+     "the query finished while other work held every CPU lane".
    - At `b7fbc3897`: `mise run test:bifrost:journey:scribe` 45 passed
      (1 skipped); `mise run test:bifrost:journey:forge` 24 passed.
    - Release before IO (REQ-022): `CpuLanes::off_lane(io)` returns the lane
@@ -368,8 +377,11 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
        across local IO.
      - Scribe lanes are unattributed (`tenant: None`), because persistence
        jobs mix tenants.
-     - No proof yet that held Bifrost jobs release lanes to competing
-       eligible work across workloads, through production execution.
+     - Production proof covers only one direction: Bifrost waiting on held
+       gateway lanes, and getting a released lane. No production test holds
+       a Bifrost job and shows verification or gateway work taking its
+       lane. Lane-level fairness and release are proved by the
+       `resources::lanes` unit tests.
      Status: FAIL.
 
 6. **Connected public journey and bounded drain — REQ-019–024; AC-018.** Extend

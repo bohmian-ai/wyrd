@@ -52,6 +52,9 @@ const MODEL_WAIT: &str = "the model call waits for its lane's admission";
 /// The stable code of a direct verification past its deadline.
 const TIMED_OUT: &str = "WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT";
 
+/// The event new work logs when process pressure keeps it waiting.
+const PRESSURE_WAIT: &str = "new work waits for process pressure to admit it";
+
 /// The event the runner logs when a queued execution meets a full admission.
 const DEFERRED: &str = "verification execution deferred by admission backpressure";
 
@@ -114,6 +117,8 @@ struct CapacityDesk {
     server: WyrdTestServer,
     /// The administrator's client.
     admin: WyrdClient,
+    /// The administrator's API key, for standalone gateway calls.
+    admin_key: String,
     /// The scripted model upstream; kept alive for the server.
     _upstream: MockServer,
     /// The hydrated bundle's directory; kept alive for `state`.
@@ -160,16 +165,13 @@ impl CapacityDesk {
         )
         .await
         .expect("the server starts");
-        let admin = native_client(
-            &server,
-            &api_key(
-                server
-                    .bootstrap_service("capacity_admin", &["admin"])
-                    .await
-                    .expect("the administrator bootstraps"),
-            ),
-        )
-        .expect("the admin client builds");
+        let admin_key = api_key(
+            server
+                .bootstrap_service("capacity_admin", &["admin"])
+                .await
+                .expect("the administrator bootstraps"),
+        );
+        let admin = native_client(&server, &admin_key).expect("the admin client builds");
         CredentialWriter::new(admin.clone())
             .put_credential(&ProviderCredentialWrite {
                 name: ProviderCredentialName::new("openai-key").expect("credential name"),
@@ -246,6 +248,7 @@ impl CapacityDesk {
         Self {
             server,
             admin,
+            admin_key,
             _upstream: upstream,
             _bundle: bundle,
             root,
@@ -380,6 +383,30 @@ async fn logged(logs: &LogCapture, parts: &[&str]) {
         .any(|line| parts.iter().all(|part| line.contains(part)))
     {
         assert!(Instant::now() < deadline, "never logged {parts:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// How many times `workload` work has logged waiting for pressure.
+fn pressure_waits(logs: &LogCapture, workload: &str) -> usize {
+    let field = format!("workload={workload}");
+    logs.text()
+        .lines()
+        .filter(|line| line.contains(PRESSURE_WAIT) && line.contains(&field))
+        .count()
+}
+
+/// Wait until `workload` work has logged waiting for pressure `count` times.
+///
+/// # Panics
+/// Panics when it has not within a minute.
+async fn waited(logs: &LogCapture, workload: &str, count: usize) {
+    let deadline = Instant::now() + Duration::from_mins(1);
+    while pressure_waits(logs, workload) < count {
+        assert!(
+            Instant::now() < deadline,
+            "{workload} work never waited for pressure {count} times"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -532,5 +559,116 @@ async fn direct_verification_runs_while_queued_capacity_is_held() {
         .expect_err("a full direct execution ceiling refuses");
     assert_eq!(refused.code(), UNAVAILABLE);
     drop(held);
+    desk.server.shutdown().await.expect("the server stops");
+}
+
+/// Verification, standalone gateway traffic and Bifrost work on one server
+/// share process pressure: while pressure is critical a standalone chat
+/// completion and a public query each reach admission and wait there, as
+/// gateway and Bifrost work, a queued Agent run waits in its input read, and
+/// once it
+/// recovers all three complete. The Agent's nested model call is recorded
+/// against the verified Service and the standalone call against no subject,
+/// and no workload keeps bytes once everything settles.
+///
+/// # Panics
+/// Panics when work finishes under critical pressure, does not finish after
+/// recovery, is attributed to the wrong subject, or leaves bytes charged.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn connected_work_waits_out_pressure_with_its_own_attribution() {
+    use wyrd_runtime::resources::{PressureState, Workload};
+
+    let logs = LogCapture::install_global().expect("the journey owns the process subscriber");
+    let desk = CapacityDesk::start().await;
+    let workloads = desk.server.state().resources.workloads().clone();
+    let overcommitted = workloads.observe_commitment();
+    overcommitted.set(u64::MAX);
+    assert_eq!(workloads.sample(0).state, PressureState::Critical);
+
+    let standalone = tokio::spawn({
+        let url = format!(
+            "{}/v1/chat/completions",
+            desk.server.base_url().expect("the server is bound")
+        );
+        let key = desk.admin_key.clone();
+        async move {
+            reqwest::Client::new()
+                .post(url)
+                .bearer_auth(key)
+                .json(&json!({
+                    "model": "openai/gpt-4o",
+                    "messages": [{"role": "user", "content": "STANDALONE"}],
+                }))
+                .send()
+                .await
+                .expect("the standalone call sends")
+                .status()
+                .as_u16()
+        }
+    });
+    let query = tokio::spawn({
+        let admin = desk.admin.clone();
+        async move {
+            Bifrost::connect_with(&admin, BifrostOptions::default())
+                .await
+                .expect("Bifrost connects")
+                .sql_as::<Value>("SELECT count(*) AS calls FROM bifrost.gateway.calls", &[])
+                .await
+                .expect("the query runs")
+        }
+    });
+    waited(&logs, "Gateway", 1).await;
+    waited(&logs, "Bifrost", 1).await;
+    let bifrost_waits = pressure_waits(&logs, "Bifrost");
+    let queued = desk.submit("model-check", "PRESSURE-MODEL").await;
+    // The queued run reads its submitted input through Bifrost first, and
+    // that read is what pressure stops.
+    waited(&logs, "Bifrost", bifrost_waits + 1).await;
+    assert!(!standalone.is_finished(), "the standalone call waits");
+    assert!(!query.is_finished(), "the query waits");
+    let status = queued.status().await.expect("the status reads").status;
+    assert!(
+        matches!(
+            status,
+            VerificationExecutionStatus::Pending | VerificationExecutionStatus::Running
+        ),
+        "the queued Agent waits unsettled: {status:?}"
+    );
+
+    overcommitted.set(0);
+    workloads.sample(0);
+    workloads.sample(0);
+    assert_eq!(standalone.await.expect("the standalone call"), 200);
+    assert_eq!(query.await.expect("the query").len(), 1);
+    passed(&settled(&queued).await, "answered");
+
+    let subjects = desk.call_subjects().await;
+    let root = desk
+        .root
+        .uid
+        .as_ref()
+        .expect("the declared root carries its UID")
+        .to_string();
+    assert_eq!(
+        subjects
+            .iter()
+            .filter(|subject| subject.as_deref() == Some(root.as_str()))
+            .count(),
+        1,
+        "the nested call is the verified Service's: {subjects:?}"
+    );
+    assert_eq!(
+        subjects.iter().filter(|subject| subject.is_none()).count(),
+        1,
+        "the standalone call has no subject: {subjects:?}"
+    );
+    for workload in Workload::ALL {
+        assert_eq!(
+            workloads.workload_bytes(workload),
+            0,
+            "{workload:?} keeps no bytes once its work settles"
+        );
+    }
     desk.server.shutdown().await.expect("the server stops");
 }

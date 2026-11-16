@@ -575,6 +575,7 @@ impl WorkloadManager {
     /// is critical. Admission grants no bytes: owners still charge what they
     /// materialize. Callers bound the wait with their own deadline; dropping
     /// the future withdraws the demand.
+    /// An operation that has to wait logs that once, at debug level.
     pub async fn admit(
         &self,
         workload: Workload,
@@ -582,11 +583,20 @@ impl WorkloadManager {
         cancel: Option<CancellationToken>,
     ) -> Operation {
         let operation = self.begin(workload, tenant, cancel);
+        let mut waited = false;
         loop {
             let mut changed = std::pin::pin!(self.inner.registry.changed.notified());
             changed.as_mut().enable();
             if !self.paused(workload, tenant) {
                 return operation;
+            }
+            if !waited {
+                waited = true;
+                tracing::debug!(
+                    ?workload,
+                    ?tenant,
+                    "new work waits for process pressure to admit it"
+                );
             }
             changed.await;
         }

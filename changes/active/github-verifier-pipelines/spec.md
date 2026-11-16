@@ -1,10 +1,16 @@
 ---
 id: SPEC-github-verifier-pipelines
-revision: 15
+revision: 16
 status: approved
 ---
 
 # GitHub Verifier pipelines
+
+Approved amendment: [revision 16 — shared workload management](spec-revisions/16-shared-workload-management.md)
+is incorporated into this specification. The maintainer explicitly approved it
+on 2026-11-16. Its REQ-019–024 and AC-015–018 govern TASK-012-R1-allocation,
+required before TASK-013, and supersede conflicting earlier resource-policy
+text as specified in the amendment. Other pipeline behavior is unchanged.
 
 A connected repository declares its review policy once. Pull requests then run
 that policy through Wyrd's existing verification queue and engine, with exact
@@ -363,8 +369,10 @@ verification-originated calls, without weaker authorization or changes to
 standalone gateway behavior. Server-produced publication files retain validated
 object IO and exact descriptors but use background inventory persistence rather
 than external client upload-session SQL/inventory ACK on engine publication.
-External upload completion contracts remain unchanged. Bifrost implementation,
-query semantics, catalog and durable-write/WAL/fence contracts remain unchanged;
+External upload completion contracts remain unchanged. Bifrost memory/workspace
+policy, query semantics, catalog and durable-write/WAL/fence contracts remain
+unchanged; revision 16 permits only the specified shared pressure/CPU-dispatch
+integration into its existing owners;
 Agent access continues through Agent tools, with no new Verifier query surface.
 
 A crash can lose unaccepted progress/results and direct requests do not resume.
@@ -393,6 +401,14 @@ responsiveness and approved GitHub/PR, Task 004 metadata and resource-scaling
 schema. No replacement generic execution tables/columns or SQL payload mirror.
 This authorizes cleanup of unreleased branch-only migrations, never rewriting
 released/applied deployment history or resetting a user database.
+
+### Shared workload management
+
+The approved [revision-16 amendment](spec-revisions/16-shared-workload-management.md)
+defines REQ-019–024 and AC-015–018 as part of this specification. It covers
+consumption-based ownership, parent/worker observation, borrowing and pressure,
+non-preemptive CPU admission, existing limits/custody and qualification. Its
+selected scope and limits apply without introducing stronger CPU/RSS guarantees.
 
 ## Durability and security invariants
 
@@ -436,7 +452,7 @@ without production GitHub credentials.
 | AC-011 | Fresh reader follows CLI/SDK docs and uses execution, evidence and approval inspection; reads a pull_request extraction and the delivery outcome through execution inspection over HTTP and MCP | Complete journey without UI or hidden manual orchestration; schemas/errors match served operations | 016 |
 | AC-012 | Hold Scribe/outbox and background SQL replies while direct/queued graphs advance; fill terminal tracking, then restore persistence; crash/reclaim before/after acceptance and race cancellation/takeover | Engine progresses from memory, compute permits free, tracking bounded with room for running claims, new claims back off, direct remains admissible; restored persistence yields the same terminal evidence then batched fenced settlement; only unpersisted work may repeat | 011,015,017 |
 | AC-013 | Matched full immutable resource-scaling/candidate verification benchmarks with healthy evidence reconciliation | Existing latency/L2 targets met and RS throughput/CPU/memory baseline preserved; no invented tolerance or exit-zero-only performance claim | 018 |
-| AC-014 | Fresh isolated migration comparison and affected consumer/SQL tests | Only permitted GitHub/PR/Task 004 deltas beyond main plus RS; no generic execution payload schema, preserved grants/RLS/cancellation responsiveness and no Bifrost runtime redesign | 018 |
+| AC-014 | Fresh isolated migration comparison and affected consumer/SQL tests | Only permitted GitHub/PR/Task 004 deltas beyond main plus RS; no generic execution payload schema, preserved grants/RLS/cancellation responsiveness and no Bifrost memory/workspace/durability redesign; only revision 16's shared pressure/CPU integration is permitted | 018,024 |
 
 ## Authority reconciliation and approval
 
@@ -468,6 +484,11 @@ tasks include those owner updates; approval does not claim they have already
 landed. Neither spec approval nor a comprehension pass proves implementation
 readiness. Implementation tasks derive from this approved revision.
 
+The maintainer explicitly approved the shared workload-management specification
+amendment on 2026-11-16. Revision 16 incorporates that contract and schedules
+TASK-012-R1-allocation before TASK-013. This approval records selected behavior,
+not implementation completion or benchmark evidence.
+
 ## Revision history
 
 | Revision | Status | Change |
@@ -487,6 +508,7 @@ readiness. Implementation tasks derive from this approved revision.
 | 13 | approved 2026-11-15 | Maintainer rejected revision 12's queued reservation because it holds idle capacity, and approved deployment targets instead: REQ-015 replaces the queued runtime CPU share, memory/scratch reservation, reserved direct capacity and borrowing with the closed `combined`/`direct`/`worker`/`bifrost-ingest`/`bifrost-query`/`bifrost-maintenance` target set, per-use charging in `combined` with a queued concurrency cap, and isolation by separately provisioned `direct` and `worker` pods, each running Scribe and Oracle. Amends REQ-015/016, AC-010/012 and the live-custody paragraph. Recorded in [deployment targets](design/approved-deployment-targets.md). Nothing else changes. |
 | 14 | approved 2026-11-15 | Maintainer decision during TASK-012: an attempt refused process capacity or its definition after its host work settled records the tool requests its invocation spent, and a later attempt resumes from that count; only an attempt whose spend is unknown, because it was interrupted before settling, counts its whole allowance. Busy deferral is otherwise unchanged: a refused attempt that retained nothing still spends no retry. Amends revision 12's tool-call spend sentence. Nothing else changes. |
 | 15 | approved 2026-11-15 | Maintainer decision during TASK-012: an attempt records its invocation's tool-request count as each request spends, persisted in background with the execution state, and any later attempt, after a refusal or an interruption, resumes from the latest persisted count; requests spent after that count persisted may be spent again after an interruption. No attempt counts its whole allowance for an unknown spend. Amends revisions 12 and 14's tool-call spend sentences. Nothing else changes. |
+| 16 | approved 2026-11-16 | Maintainer explicitly approved the [shared workload management amendment](spec-revisions/16-shared-workload-management.md): consumption-based verification/gateway accounting, live worker observation, growable soft shares, shared pressure and non-preemptive CPU admission; preserves Bifrost memory/workspace policy and durable contracts. TASK-012-R1 precedes TASK-013. |
 
 Subsequent explicit maintainer amendment: approval authoring has no separate
 expiration setting. Pending approvals and deferred waits share the execution's

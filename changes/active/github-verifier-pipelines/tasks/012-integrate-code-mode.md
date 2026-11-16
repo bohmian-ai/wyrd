@@ -10,6 +10,12 @@ depends_on: []
 
 # Integrate code mode without losing dynamic pipelines
 
+Allocation follow-up: the maintainer requested
+[TASK-012-R1-allocation](012-R1-allocation.md) after this composed implementation
+and before TASK-013. It owns the agreed workload-manager amendment and its own
+functional/L1 proof. This task's port scope, historical evidence and no-benchmark
+boundary are unchanged.
+
 A developer can use generated Python to gather evidence through declared tools
 inside B's existing dynamic Verifier pipelines. Steps, fanout, repeats,
 speculation, approvals, deferred inputs, queued recovery and GitHub delivery
@@ -23,9 +29,10 @@ This task derives from approved GitHub pipeline spec revision 13 and contracts,
 code-mode spec revision 9 as amended by pipeline revisions 12 and 13, and the settled
 maintainer directions recorded in TASK-013 and TASK-014. Revision 12 decides
 nested exclusions, crates.io Monty, capacity isolation, recovery spend and the
-contributor-contract reconciliation. The current directions also replace A's
-200-tenant requirement with 100 tenants and assign two-replica proof to
-TASK-014. Revision 13 replaces revision 12's capacity isolation with deployment
+contributor-contract reconciliation. The original directions replaced A's
+200-tenant requirement with 100 tenants; the task correction below updates its
+proof and downstream ownership. Revision 13 replaces revision 12's capacity
+isolation with deployment
 targets ([decision](../design/approved-deployment-targets.md)). Reconcile those contracts at their owners before affected
 implementation. The present planning handoff changes only tasks and their index.
 
@@ -63,6 +70,26 @@ Use its file table as a coverage inventory, not an instruction to replace whole
 files. Preserve the local modified task index and untracked TASK-011 exactly
 apart from separately authorized index additions. Exclude A's untracked
 payload-sizing packet and unrelated software-factory work.
+
+## Task correction — isolation proof split (2026-11-16)
+
+The maintainer requested this planning correction under approved revision 15;
+it changes downstream proof placement, not TASK-012's port or recorded verdicts.
+The existing L2 `competing` run already exercises direct and queued traffic on
+one `combined` server. TASK-013 adds only its same-rate direct-only control,
+standard comparison output and full clean L2 baseline, preserving the existing
+L1 direct-only baseline. Its deterministic Postgres integration test owns
+100-tenant first-round fairness, completion, empty queued/leased state and return
+to the starting process memory charge. TASK-014 consumes those outputs and owns
+direct-throughput optimization and post-optimization L1/L2 qualification;
+long-run memory plateau remains an L2 observation.
+
+The earlier assignments of sustained 100-tenant qualification and a two-real-
+process repeat to TASK-014 are superseded. Existing shared-Postgres replica
+claiming is the integration proof cited with its focused command in TASK-013/014.
+See [port record](../design/code-mode-port.md#isolation-proof-and-throughput-qualification)
+for inherited row dispositions. This correction does not grant PASS to any
+inherited row and adds no benchmark or implementation work to TASK-012.
 
 ## Existing owners and required composition
 
@@ -172,7 +199,7 @@ unsanctioned control, blocking wait semantics and production exclusion.
 | Pipeline REQ-001–014/016, AC-001–009/011 and INV-001–007; conflicts 9–13,16 | Retain connect→Repository→PR admission→pinned extraction→review→approval/deferred evidence→same execution→report/Check/comment journeys and negative flows across shipped surfaces. Source supersession/access loss fences continuation and delivery; provider retry never recomputes verification. No newly added SDK/CLI inspection where HTTP/MCP alone is sanctioned. |
 | REQ-015/017–018, AC-010/012/014; code-mode resource requirements and AC-028–034; conflicts 1,4–6,10,12,14 | Pressure on publication mounts, scratch replacement, queued snapshots and held persistence remains fully charged and bounded; compute frees before queued ACK without losing custody. Each target accepts exactly its work and refuses the rest before any side effect over HTTP and MCP; `combined` holds no idle queued reservation; a `worker` completes webhook, deferred-input and approval journeys and its crash allows takeover without resetting deadlines; a `direct` pod never claims queued work. No warm-cache direct SQL/state, queued-only cache bypass, lost write, starvation or premature release. |
 | REQ-195 and both packets' projection/isolation obligations; conflicts 14–17 | Exact six-control guard rejects any additional hook in all projections. Dependencies resolve against crates.io Monty with no fork patch; regenerated consumers compile, historical records decode, production packages exclude testing/benchmark machinery. |
-| Diagnosis sections 5/7 and inherited TASK-003/R1/R3 obligations | Retain A's tracked packet and referenced evidence in B's change tracking with source identities and an explicit carried/changed/pending disposition for every inherited row. Keep TASK-003-R2 superseded and TASK-003-R3 open. TASK-013 owns the Rust-only 100-tenant mixed comparison; TASK-014 owns sustained 100-tenant saturation/recovery, remaining qualification, artifact analysis and two-real-replica evidence. Record the 100-tenant amendment against inherited REQ-033/AC-034 and R3 V6 rather than retaining their older threshold; no historical FAIL/UNVERIFIED becomes PASS by importing it. Preserve the shared resource-scaling packet, historical deprecated verifier-review packet and B's intentional execution/inspection distinctions. Reconcile packet coverage/status only against actual evidence, never invent review verdicts. |
+| Diagnosis sections 5/7 and inherited TASK-003/R1/R3 obligations | Retain A's tracked packet and referenced evidence in B's change tracking with source identities and an explicit carried/changed/pending disposition for every inherited row. Keep TASK-003-R2 superseded and TASK-003-R3 open. Under the task correction above, TASK-013 owns deterministic 100-tenant fairness/drain/ledger proof and the existing L2 competing experiment's direct-only control and baseline; TASK-014 owns direct optimization, remaining qualification, artifact analysis and post-optimization L2 comparison. Replica claiming uses the existing shared-Postgres integration proof, without a two-process capacity run. Record the 100-tenant amendment against inherited REQ-033/AC-034 and R3 V6 rather than retaining their older threshold; no historical FAIL/UNVERIFIED becomes PASS by importing it. Preserve the shared resource-scaling packet, historical deprecated verifier-review packet and B's intentional execution/inspection distinctions. Reconcile packet coverage/status only against actual evidence, never invent review verdicts. |
 
 Use diagnosis section 6's functional coverage on the composed tree, subject to
 this task's superseding decisions and scoped verification below: real SDK →
@@ -211,7 +238,7 @@ implementation commands, not planning-run actions.
 
 Use existing functional pressure journeys for the port's isolation boundary.
 This task runs no benchmark: the approved benchmarks are the code-mode
-worktree's existing ones, TASK-013's mixed run and TASK-014's qualification,
+worktree's existing ones, TASK-013's L2 comparison and TASK-014's qualification,
 which also owns AC-010's direct c64 comparison on one `combined` server
 while queued work saturates it, and AC-013.
 
@@ -236,7 +263,7 @@ change the behavior they cover, so they need no new test here:
 - rejection of an extra test control in Rust and in loaded native exports;
 - MCP extraction and delivery inspection;
 - no SQL on a warm direct execution;
-- replica-local budgets (TASK-014's two-replica qualification).
+- replica-local budgets (existing shared-Postgres claim proof; see the task correction above).
 
 ## Obligations
 
@@ -298,7 +325,7 @@ Cited (assertions read):
 - Least-privilege recovery: `pg_hosted_artifacts::recovered_authority_bounds_every_agent_tool` (:873; denied-table and undeclared-tool assertions :1059–1125).
 - Authored-code isolation: `sandbox_worker::sandbox_reaches_only_its_mounts` (:233); journey `verifier_building_blocks::forbidden_code_access_cannot_pass_dependent_work` (:943).
 - Model publication replays its receipt: `hosted_agent_tools::agent_publish_retries_use_host_identity` (:1124; :1140–1207).
-- No starvation: `hosted::admission::tests::a_non_fitting_head_does_not_block_another_tenant` (:490); `pg_verification_runtime::a_flooding_tenant_does_not_delay_another_tenants_run` (:1966). Sustained 100-tenant qualification is TASK-014's.
+- No starvation: `hosted::admission::tests::a_non_fitting_head_does_not_block_another_tenant` (:490); `pg_verification_runtime::a_flooding_tenant_does_not_delay_another_tenants_run` (:1966). TASK-013 scales the queue test to 100 tenants and adds drain/ledger assertions under the task correction above.
 - Tenant-fair admission: `hosted::admission::tests::admission_rotates_tenants_and_accounts_waiting_bytes` (:402).
 
 Out of this task:

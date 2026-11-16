@@ -1,5 +1,12 @@
 # Public contracts — approved revision 7
 
+The approved [allocation amendment, revision 16](spec-revisions/16-shared-workload-management.md)
+changes internal resource policy, observation and CPU admission, not these wire
+shapes, receipt meanings or distributed quotas. It permits only the stated
+Bifrost pressure/CPU integration, preserving its memory/workspace and durability
+contracts. The maintainer explicitly approved it on 2026-11-16; existing public
+wire shapes remain unchanged.
+
 These shapes make [spec.md](spec.md) reviewable. Existing CardRef, File,
 execution, receipt, typed permission and problem+json contracts remain canonical.
 The user approved these shapes with specification revision 3 on 2026-11-10.

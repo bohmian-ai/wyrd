@@ -1004,12 +1004,12 @@ test('authenticated card browsing and prompt comparison', async ({ ui }) => {
   expect(await page.getByRole('button', { name: /Open in Observe/ }).count()).toBe(0);
   expect(await page.getByRole('button', { name: `Open ${agent.name}`, exact: true }).isEnabled()).toBe(true);
 
-  // Choosing another version replaces the whole reference; that version has no Agent and compares against 1.1.0.
+  // Choosing another version replaces the whole reference; that version has no Agent and, being the first, nothing to compare from.
   await page.getByLabel('Version').selectOption('1.0.0');
   await expect.poll(() => new URL(page.url()).searchParams.get('version')).toBe('1.0.0');
   expect(new URL(page.url()).searchParams.get('uid')).toBeNull();
   await expect.poll(() => page.getByRole('region', { name: 'Used by', exact: true }).textContent()).toContain('No registered Agent uses this Prompt version.');
-  expect(await changes.textContent()).toContain('v1.1.0 → v1.0.0');
+  expect(await page.getByRole('region', { name: 'Changes between versions', exact: true }).textContent()).toContain('Version 1.0.0 is the first registered version.');
   expect(await definition.textContent()).not.toContain('Cite the policy section');
 
   // Tabs keep the exact reference: Versions, YAML, then Files.
@@ -1022,6 +1022,8 @@ test('authenticated card browsing and prompt comparison', async ({ ui }) => {
 
   // The Agent's relationships open the exact Prompt it uses.
   await page.goto(`${ui.base}/t/${TENANT}/cards/detail?kind=Agent&name=${agent.name}&version=1.0.0`);
+  // The Agent's own page shows the exact Prompt it runs, so reading it needs no second page.
+  await expect.poll(() => page.getByRole('region', { name: `Prompt ${prompt.name}@1.1.0`, exact: true }).textContent()).toContain('Cite the policy section you rely on.');
   const related = page.getByRole('region', { name: 'Relationships', exact: true });
   await related.getByRole('button', { name: `references Prompt/${prompt.name}@1.1.0#${prompt.uid}` }).click();
   await expect.poll(() => new URL(page.url()).searchParams.get('uid')).toBe(prompt.uid);

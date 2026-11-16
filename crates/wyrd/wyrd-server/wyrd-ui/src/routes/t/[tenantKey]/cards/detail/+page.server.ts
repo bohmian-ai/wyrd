@@ -25,7 +25,8 @@ import type { PageServerLoad } from './$types';
  * the exact kind, name and version; a missing or invalid one is a validation
  * problem with no read, never a latest-version lookup. The header's Card
  * read gates every other panel, so a denied or missing Card issues no
- * dependent read; only the selected tab's panels load.
+ * dependent read; only the selected tab's panels load. An Agent's overview
+ * also reads each exact Prompt it references.
  */
 export const load: PageServerLoad = async ({ locals, url, request }) => {
   const query = Object.fromEntries(['kind', 'name', 'version', 'uid'].flatMap((key) => (url.searchParams.has(key) ? [[key, url.searchParams.get(key)]] : [])));
@@ -53,6 +54,12 @@ export const load: PageServerLoad = async ({ locals, url, request }) => {
   if (cardRef.kind === 'Verifier') {
     const [definition, runsOn] = (await Promise.all([panel('VerifierDefinition', one), panel('RunsOn', one)])) as [VerifierDefinitionProps, RunsOnProps];
     return { cardRef, tab, compare, header, facts, relationships, verifier: { definition, runsOn } };
+  }
+  if (cardRef.kind === 'Agent') {
+    // An Agent's behaviour is its Prompts, so each exact Prompt it references is shown with it.
+    const refs = relationships.result.state === 'populated' ? relationships.result.data.outbound.filter((each) => each.ref.kind === 'Prompt') : [];
+    const prompts = (await Promise.all(refs.map((each) => panel('PromptMessages', { cardRef: each.ref })))) as PromptMessagesProps[];
+    return { cardRef, tab, compare, header, facts, relationships, prompts };
   }
   if (cardRef.kind !== 'Prompt') return { cardRef, tab, compare, header, facts, relationships };
   const [messages, variables, usedBy, diff] = (await Promise.all([

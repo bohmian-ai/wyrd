@@ -149,3 +149,54 @@ export function codeTokens(text: string): CodeToken[] {
   if (at < text.length) tokens.push({ kind: 'text', text: text.slice(at) });
   return tokens;
 }
+
+/** One line of one side of a comparison: unchanged, changed on this side, or a count of unchanged lines left out. */
+export interface DiffLine {
+  kind: 'same' | 'changed' | 'gap';
+  text: string;
+}
+
+/** The most line pairs `diffLines` matches: about 500 lines a side. */
+const DIFF_CELLS = 250_000;
+
+/**
+ * Two texts → each side's lines, marking the lines the other side lacks.
+ * Unchanged runs longer than three lines keep one line of context at each
+ * end and say how many lines are left out, the same on both sides. Texts
+ * too long to match line by line come back whole, every line changed.
+ */
+export function diffLines(from: string, to: string): { from: DiffLine[]; to: DiffLine[] } {
+  const a = from.split('\n');
+  const b = to.split('\n');
+  // ponytail: quadratic longest-common-subsequence table, so texts past the bound are shown whole as changed; switch to Myers if large texts need line matching.
+  if (a.length * b.length > DIFF_CELLS) return { from: a.map((text) => ({ kind: 'changed', text })), to: b.map((text) => ({ kind: 'changed', text })) };
+  const common = Array.from({ length: a.length + 1 }, () => new Array<number>(b.length + 1).fill(0));
+  for (let i = a.length - 1; i >= 0; i -= 1)
+    for (let j = b.length - 1; j >= 0; j -= 1) common[i][j] = a[i] === b[j] ? common[i + 1][j + 1] + 1 : Math.max(common[i + 1][j], common[i][j + 1]);
+  const sides = { from: [] as DiffLine[], to: [] as DiffLine[] };
+  let same: string[] = [];
+  const flush = () => {
+    const kept: DiffLine[] =
+      same.length > 3
+        ? [{ kind: 'same', text: same[0] }, { kind: 'gap', text: `${same.length - 2} unchanged lines` }, { kind: 'same', text: same[same.length - 1] }]
+        : same.map((text) => ({ kind: 'same', text }));
+    sides.from.push(...kept);
+    sides.to.push(...kept);
+    same = [];
+  };
+  let i = 0;
+  let j = 0;
+  while (i < a.length || j < b.length) {
+    if (i < a.length && j < b.length && a[i] === b[j]) {
+      same.push(a[i]);
+      i += 1;
+      j += 1;
+      continue;
+    }
+    flush();
+    if (j >= b.length || (i < a.length && common[i + 1][j] >= common[i][j + 1])) sides.from.push({ kind: 'changed', text: a[i++] });
+    else sides.to.push({ kind: 'changed', text: b[j++] });
+  }
+  flush();
+  return sides;
+}

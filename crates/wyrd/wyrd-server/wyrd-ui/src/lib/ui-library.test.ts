@@ -63,6 +63,7 @@ import {
   VerificationExecution,
   fmtYaml,
   codeTokens,
+  diffLines,
   Chart,
   Drawer,
   DurationBar,
@@ -2264,6 +2265,22 @@ test('prompt definitions and comparisons preserve authored forms', async () => {
   expect(changes.map((change) => change.field)).toEqual(['system', 'messages[0]', 'response_format', 'variables']);
   expect(changes.find((change) => change.field === 'response_format')).toEqual({ field: 'response_format', to: 'verdict' });
   expect(changes.find((change) => change.field === 'variables')).toEqual({ field: 'variables', from: ['ticket'], to: ['ticket', 'tone'] });
+  // The first version has nothing before it: no backwards comparison, only the choice of another version.
+  const first = await loadVersionDiff({ cardRef: { ...PROMPT, version: '1.0.0' } }, { executor: fixtureExecutor });
+  expect(first.result).toMatchObject({ state: 'empty', data: { versions: ['1.1.0', '1.0.0'], changes: [] }, reason: 'Version 1.0.0 is the first registered version. Choose a version to compare it with.' });
+  expect(within(render(VersionDiff, first).container).getByLabelText('Compare with')).toHaveTextContent('compare with v1.1.0');
+  // Each side marks only its own changed lines; a long unchanged run is counted, not drawn.
+  const kept = ['a', 'b', 'c', 'd', 'e'].join('\n');
+  expect(diffLines(`${kept}\nold\nz`, `${kept}\nnew\nz`)).toEqual({
+    from: [{ kind: 'same', text: 'a' }, { kind: 'gap', text: '3 unchanged lines' }, { kind: 'same', text: 'e' }, { kind: 'changed', text: 'old' }, { kind: 'same', text: 'z' }],
+    to: [{ kind: 'same', text: 'a' }, { kind: 'gap', text: '3 unchanged lines' }, { kind: 'same', text: 'e' }, { kind: 'changed', text: 'new' }, { kind: 'same', text: 'z' }]
+  });
+  // Texts too long to match line by line are shown whole rather than computed.
+  const long = Array.from({ length: 600 }, (_, index) => `line ${index}`).join('\n');
+  expect(diffLines(long, long).from.every((line) => line.kind === 'changed')).toBe(true);
+  const drawn = render(VersionDiff, diff).container;
+  expect(drawn.querySelector('section[aria-label="response_format"] [data-side="from"]')).toHaveTextContent('not set');
+  expect(drawn.querySelector('section[aria-label="response_format"] [data-side="to"] [data-line="changed"]')).toHaveTextContent('+ verdict');
   // Any two versions: the older one compared against the newer, in either direction.
   expect((await loadVersionDiff({ cardRef: { ...PROMPT, version: '1.0.0' }, otherVersion: '1.1.0' }, { executor: fixtureExecutor })).result).toMatchObject({ data: { other: '1.1.0' } });
   expect(validatePanel('VersionDiff', { cardRef: PROMPT, otherVersion: PROMPT.version })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });

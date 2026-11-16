@@ -1,6 +1,7 @@
 <!--
   One exact Card version: breadcrumb, header, then the selected tab. Every Card has
-  Overview (facts and relationships), Files and YAML; a Prompt adds its
+  Overview (facts and relationships), Files and YAML; an Agent shows each
+  exact Prompt it references; a Prompt adds its
   authored definition, variables, using Agents and version comparison; a
   Verifier's overview is its declared graph and where that version runs. The
   URL holds the exact reference, tab and comparison, so every navigation
@@ -119,6 +120,12 @@
           <UsedBy {...data.prompt.usedBy} {actions} onaction={onaction('UsedBy')} />
           <VersionDiff {...data.prompt.diff} {actions} onaction={onaction('VersionDiff')} />
         {:else}
+          {#each data.prompts ?? [] as prompt (`${prompt.input.cardRef.name}@${prompt.input.cardRef.version}`)}
+            <section class="referenced" aria-label="Prompt {prompt.input.cardRef.name}@{prompt.input.cardRef.version}">
+              <a href="{base}/cards/detail{writeDetail(prompt.input.cardRef)}">{prompt.input.cardRef.name}@{prompt.input.cardRef.version}</a>
+              <PromptMessages {...prompt} />
+            </section>
+          {/each}
           <CardFacts {...data.facts} />
         {/if}
       </div>
@@ -187,6 +194,15 @@
   }
   aside {
     gap: 16px;
+  }
+  .referenced {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .referenced a {
+    color: var(--declare);
+    font: 12px var(--font-mono);
   }
   .note {
     margin: 0;

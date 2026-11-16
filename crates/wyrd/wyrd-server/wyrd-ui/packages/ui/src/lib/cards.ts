@@ -348,7 +348,8 @@ export function diffPrompts(
 /**
  * Load a comparison: the Prompt, its versions, then the other version (the
  * one listed below it unless `otherVersion` names one). A refused Prompt read
- * issues no further read; a Prompt with one version is empty.
+ * issues no further read; a Prompt with one version, or the first of several
+ * with no other named, is empty: nothing came before it.
  */
 export async function loadVersionDiff(input: VersionDiffInput, context: Context): Promise<VersionDiffProps> {
   const read = await readPrompt(input.cardRef, context);
@@ -357,7 +358,9 @@ export async function loadVersionDiff(input: VersionDiffInput, context: Context)
   if (listed.state !== 'populated') return { input, result: listed };
   const versions = listed.data.items.map((item) => item.version);
   const others = versions.filter((version) => version !== input.cardRef.version);
-  const other = input.otherVersion ?? others.find((version) => compareVersions(input.cardRef.version, version) < 0) ?? others[0];
+  const other = input.otherVersion ?? others.find((version) => compareVersions(input.cardRef.version, version) < 0);
+  if (other === undefined && others.length > 0)
+    return { input, result: { state: 'empty', data: { versions, changes: [] }, reason: `Version ${input.cardRef.version} is the first registered version. Choose a version to compare it with.` } };
   if (other === undefined)
     return { input, result: { state: 'empty', data: { versions, changes: [] }, reason: `Only version ${input.cardRef.version} is registered.` } };
   const otherRead = await readPrompt({ kind: 'Prompt', name: read.data.metadata.name, version: other }, context);

@@ -255,6 +255,7 @@ function scopeText(input: StatStripInput): string {
 
 /** Why a signal list is empty, naming the table, its event-time column and the WHERE that would have to match. */
 function emptyList(signal: Signal, where: readonly Filter[] = []): string {
+  if (signal === 'executions') return 'No execution matches these filters in this window.';
   const what = signal === 'traces' ? 'root spans' : 'rows';
   const matching = where.length ? ` matching ${where.map((filter) => filter.column).join(', ')}` : '';
   return `No ${what} in ${SIGNALS[signal].table} with ${SIGNALS[signal].time} in this range${matching}.`;
@@ -299,7 +300,8 @@ export const KEY_COLUMNS: Record<Signal, readonly string[]> = {
   traces: ['trace_id', 'span_id', 'duration_nano'],
   spans: ['trace_id', 'span_id', 'parent_span_id'],
   logs: ['trace_id', 'span_id', 'observed_time_unix_nano', 'wyrd_request_id', 'severity_number'],
-  metrics: []
+  metrics: [],
+  executions: ['execution_id']
 };
 
 /** The columns a signal list shows. */
@@ -338,7 +340,7 @@ function orderKeys(signal: Signal, input: Extract<RecordTableInput, { signal: Si
  */
 function beyond(binds: Binds, keys: readonly OrderKey[], values: readonly QueryParam[], backward: boolean): string {
   const placeholders = keys.map(({ column }, index) =>
-    values[index] === null ? '' : column.endsWith('_unix_nano') ? `${binds.bind(values[index])}::timestamptz` : binds.bind(values[index])
+    values[index] === null ? '' : isInstant(column) ? `${binds.bind(values[index])}::timestamptz` : binds.bind(values[index])
   );
   let rest = '';
   for (let index = keys.length - 1; index >= 0; index -= 1) {
@@ -1070,6 +1072,42 @@ export async function loadLogTimeline(input: { readonly where?: readonly Filter[
   return { input: chart, executed: plan, result: read.ok ? shapeChart(chart, read.value) : failed(read.problem) };
 }
 
+/** Verify's two charts: executions per bucket by recorded verdict, and by Verifier. */
+export interface ExecutionChartsProps {
+  readonly verdicts: ChartProps;
+  readonly verifiers: ChartProps;
+}
+
+/** The series of an execution with no recorded verdict: a neutral bucket, never a verdict. */
+export const NO_VERDICT = 'no verdict';
+
+/** Executions per bucket and `series` under the list's own range and WHERE. */
+function executionsBy(series: string, input: { readonly where?: readonly Filter[] }, range: AbsoluteRange): Executed {
+  const { table, time } = SIGNALS.executions;
+  const binds = Binds.over(time, range);
+  const bin = `date_bin(${binds.bind(bucketFor(range))}::interval, ${time})`;
+  binds.where(input.where);
+  return { sql: `SELECT ${bin} AS at, ${series}, count(*) AS executions FROM ${table} WHERE ${binds.sql} GROUP BY 1, 2 ORDER BY at`, params: binds.params };
+}
+
+/** Load both Verify charts in one batch over the population the list and facets read. */
+export async function loadExecutionCharts(input: { readonly where?: readonly Filter[]; readonly range?: Range }, context: LoadContext): Promise<ExecutionChartsProps> {
+  const chart = (title: string, series: string, sql: string, range?: AbsoluteRange): ChartInput => ({ type: 'timeseries', title, sql, x: 'at', y: ['executions'], series, ...(range ? { range } : {}) });
+  const range = rangeOf(input.range, context);
+  if ('code' in range) {
+    const result = { state: 'error', problem: range } as const;
+    return { verdicts: { input: chart('Executions by verdict', 'verdict', '-'), result }, verifiers: { input: chart('Executions by Verifier', 'verifier', '-'), result } };
+  }
+  const plans = [executionsBy(`coalesce(verdict, '${NO_VERDICT}') AS verdict`, input, range), executionsBy('verifier_card_uid AS verifier', input, range)];
+  const reads = await context.executor.run(plans.map((plan) => query(plan.sql, plan.params)), context.signal);
+  const props = (title: string, series: string, index: number): ChartProps => {
+    const read = reads[index];
+    const shaped = chart(title, series, plans[index].sql, range);
+    return { input: shaped, executed: plans[index], result: read.ok ? shapeChart(shaped, read.value) : failed(read.problem) };
+  };
+  return { verdicts: props('Executions by verdict', 'verdict', 0), verifiers: props('Executions by Verifier', 'verifier', 1) };
+}
+
 /** How far a trace's spans may start outside its root's own start and end: clock skew between services, and work that outlives the root. */
 const TRACE_SLACK_MS = 3_600_000;
 
@@ -1223,8 +1261,29 @@ const LABELS: Readonly<Record<string, string>> = {
   workload_card_uid: 'Workload',
   subject_card_uid: 'Card',
   gen_ai_request_model: 'Model',
-  gen_ai_operation_name: 'Operation'
+  gen_ai_operation_name: 'Operation',
+  recorded_at: 'Time',
+  ended_at: 'Ended',
+  verifier_card_uid: 'Verifier',
+  subject_name: 'Card name',
+  subject_kind: 'Card kind',
+  subject_version: 'Card version',
+  run_id: 'Run',
+  group_id: 'Session',
+  binding_id: 'Binding',
+  origin: 'Origin',
+  status: 'Status',
+  verdict: 'Verdict',
+  execution_id: 'Execution',
+  result_id: 'Result',
+  service_version: 'Service version',
+  deployment_environment: 'Environment'
 };
+
+/** Whether `column` holds an instant: a signal table's nanosecond time, or a verification table's `_at` timestamp. */
+export function isInstant(column: string): boolean {
+  return column.endsWith('_unix_nano') || column.endsWith('_at');
+}
 
 /** A column's heading; the column name itself stays available as its title for writing WHERE. */
 export function columnLabel(column: string): string {
@@ -1253,7 +1312,7 @@ export const STATUS_NAMES: Readonly<Record<number, string>> = { 0: 'unset', 1: '
 export function cellText(column: string, value: unknown): string {
   if (value === null || value === undefined) return '∅';
   if (column === 'duration_nano') return fmtDuration(Math.round(Number(value) / 1e6));
-  const instant = column.endsWith('_unix_nano') && typeof value === 'string' && /^\d{4}-(\d\d-\d\d)T(\d\d:\d\d:\d\d)(\.\d{1,3})?/.exec(value);
+  const instant = isInstant(column) && typeof value === 'string' && /^\d{4}-(\d\d-\d\d)T(\d\d:\d\d:\d\d)(\.\d{1,3})?/.exec(value);
   if (instant) return `${instant[1]} ${instant[2]}${instant[3] ?? ''}`;
   return typeof value === 'object' ? JSON.stringify(value) : String(value);
 }

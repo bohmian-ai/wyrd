@@ -197,7 +197,35 @@ const SPAN_FILTERS = [
 ] as const;
 
 /**
- * The Observe signals and their canonical tables. `traces` lists root spans,
+ * One row per accepted Verifier execution of every origin, as retained: its
+ * input record, the terminal facts of its latest recorded state, and the
+ * result that state selected (a direct execution's only one). `status` is
+ * `completed`, a `cancelled`, `timed_out` or `errored` the runner recorded,
+ * else `not recorded`: no terminal state is retained. That covers work still
+ * pending, running, retrying or waiting and also an end only the queue holds,
+ * such as a cancel of work no runner had claimed; one execution's own status
+ * read tells them apart.
+ */
+// Every read of this population binds its range first, so `$1` here is the range start. An execution's
+// states and result are recorded after its input, so the joins read from that start on, with an hour of
+// slack for clocks, and never the tenant's whole history.
+// ponytail: states and results stay unbounded above, since work accepted in the range may end any time later.
+const SINCE = "$1::timestamptz - INTERVAL '1 hour'";
+const EXECUTIONS =
+  '(SELECT i.execution_id, i.recorded_at, i.verifier_card_uid, i.binding_id, i.group_id, i.origin, i.run_id, ' +
+  'i.subject_kind, i.subject_name, i.subject_version, i.subject_card_uid, i.workload_card_uid, i.service_name, i.service_version, i.deployment_environment, ' +
+  'r.result_id, r.verdict, r.ended_at, ' +
+  "CASE WHEN s.result_id IS NOT NULL OR (i.origin = 'direct' AND r.result_id IS NOT NULL) THEN 'completed' WHEN s.failure IS NOT NULL THEN s.failure ELSE 'not recorded' END AS status " +
+  'FROM bifrost.verification.execution_inputs i ' +
+  "LEFT JOIN (SELECT e.execution_id, e.value -> 'terminal' ->> 'result_id' AS result_id, e.value -> 'failure' ->> 'status' AS failure " +
+  'FROM bifrost.verification.execution_events e ' +
+  `JOIN (SELECT execution_id, max(sequence) AS sequence FROM bifrost.verification.execution_events WHERE occurred_at >= ${SINCE} GROUP BY execution_id) l ` +
+  `ON l.execution_id = e.execution_id AND l.sequence = e.sequence WHERE e.occurred_at >= ${SINCE}) s ON s.execution_id = i.execution_id ` +
+  `LEFT JOIN bifrost.verification.results r ON r.execution_id = i.execution_id AND r.ended_at >= ${SINCE} AND (i.origin = 'direct' OR r.result_id = s.result_id)) AS executions`;
+
+/**
+ * The Observe signals and their canonical tables, and Verify's `executions`:
+ * one row per accepted Verifier execution, read from {@link EXECUTIONS}. `traces` lists root spans,
  * one row per trace; `spans` lists every span. `filters` are the scalar,
  * non-payload columns a WHERE clause or facet may name; `columns` are a
  * list's defaults and `more` the other columns it may show, such as metric
@@ -236,12 +264,22 @@ export const SIGNALS = {
       'exponential_scale', 'exponential_zero_count', 'exponential_zero_threshold', 'positive_buckets', 'negative_buckets',
       'summary_count', 'summary_sum', 'quantile_values', 'exemplars'
     ]
+  },
+  executions: {
+    table: EXECUTIONS,
+    time: 'recorded_at',
+    columns: ['recorded_at', 'verifier_card_uid', 'subject_name', 'run_id', 'group_id', 'service_name', 'status', 'verdict'],
+    filters: [
+      'status', 'verdict', 'verifier_card_uid', 'service_name', 'subject_name', 'run_id', 'group_id', 'origin', 'binding_id', 'subject_kind', 'subject_version',
+      'subject_card_uid', 'workload_card_uid', 'service_version', 'deployment_environment', 'execution_id', 'result_id'
+    ],
+    more: ['ended_at']
   }
 } as const;
 
 /** An Observe signal. */
 export type Signal = keyof typeof SIGNALS;
-const SignalSchema = z.enum(['traces', 'spans', 'logs', 'metrics']);
+const SignalSchema = z.enum(['traces', 'spans', 'logs', 'metrics', 'executions']);
 
 /** Columns a list of `signal` may show: its defaults, every filter column, then its other columns. */
 export function signalColumns(signal: Signal): readonly string[] {
@@ -253,7 +291,8 @@ export const TIES: Record<Signal, readonly string[]> = {
   traces: ['trace_id', 'span_id'],
   spans: ['trace_id', 'span_id'],
   logs: ['observed_time_unix_nano', 'wyrd_request_id'],
-  metrics: []
+  metrics: [],
+  executions: ['execution_id']
 };
 
 /** Columns a list of `signal` sorts by on the server: its default and filter columns but its ids. */
@@ -294,6 +333,12 @@ const where = z.array(FilterSchema).max(32);
  */
 const whereSql = z.string().max(8192);
 
+/** Refuse a predicate over `executions`: its rows are derived, so no table validates one. */
+function noPredicate(input: { readonly signal: Signal; readonly where_sql?: string }, context: z.RefinementCtx) {
+  if (input.signal === 'executions' && input.where_sql?.trim())
+    context.addIssue({ code: 'custom', path: ['where_sql'], message: 'executions filter by where clauses only' });
+}
+
 /** Refuse a column the signal does not offer, naming the field. */
 function knownColumns(signal: Signal, names: readonly string[], allowed: readonly string[], path: PropertyKey[], context: z.RefinementCtx) {
   names.forEach((name, index) => {
@@ -316,6 +361,7 @@ export const FacetRailInputSchema = z
   })
   .strict()
   .superRefine((input, context) => {
+    noPredicate(input, context);
     knownColumns(input.signal, input.facets, SIGNALS[input.signal].filters, ['facets'], context);
     knownColumns(input.signal, (input.where ?? []).map((each) => each.column), SIGNALS[input.signal].filters, ['where'], context);
   });
@@ -346,6 +392,7 @@ export const RecordTableInputSchema = z.union([
     })
     .strict()
     .superRefine((input, context) => {
+      noPredicate(input, context);
       const columns = signalColumns(input.signal);
       if (input.sort) knownColumns(input.signal, [input.sort.column], sortColumns(input.signal), ['sort', 'column'], context);
       if (input.after && input.before) context.addIssue({ code: 'custom', path: ['before'], message: 'a page reads after or before one row, not both' });

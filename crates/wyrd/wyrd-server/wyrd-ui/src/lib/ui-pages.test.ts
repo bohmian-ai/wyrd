@@ -1,5 +1,6 @@
 import { expect, test } from 'vitest';
 import {
+  loadExecutionCharts,
   loadFacetRail,
   loadMetric,
   loadMetricNames,
@@ -685,4 +686,55 @@ test('an exact execution page keeps its selection in the URL and cancels once th
   const refused = await open('exec_settled', stateExecutors.denied);
   expect(refused.container).toHaveTextContent('WYRD_AUTH_403_FORBIDDEN');
   expect(requests).toHaveLength(1);
+});
+
+test('executions list, facets and charts read one population in bounded shared queries', async () => {
+  const where = [{ column: 'status', value: 'completed' }, { column: 'verdict', value: null }];
+  const context = () => {
+    const recorded = recording(() => ({ ok: true, value: EMPTY }) as never);
+    return { ...recorded, context: { executor: recorded.executor, range: RANGE } };
+  };
+  const sql = (request: WireRequest) => (request as { sql: string }).sql;
+
+  // One row per accepted execution: the input record, its latest recorded state and the result that state selected.
+  const list = context();
+  const table = await loadRecordTable({ signal: 'executions', where }, list.context);
+  expect(list.calls).toHaveLength(1);
+  const population = sql(list.calls[0]).slice(sql(list.calls[0]).indexOf(' FROM ('), sql(list.calls[0]).indexOf(' ORDER BY '));
+  expect(population).toContain('FROM bifrost.verification.execution_inputs i');
+  expect(population).toContain('max(sequence)');
+  // A status is only what is retained: completed, a failure the runner recorded, else not recorded. Nothing reads the queue.
+  expect(population).toContain("WHEN s.failure IS NOT NULL THEN s.failure ELSE 'not recorded' END AS status");
+  // The selected result is the recorded one, or a direct execution's only one; never the latest row.
+  expect(population).toContain("(i.origin = 'direct' OR r.result_id = s.result_id)");
+  // States and results are read from the range start on, never the tenant's whole history.
+  expect(population.match(/(occurred_at|ended_at) >= \$1::timestamptz - INTERVAL '1 hour'/g)).toHaveLength(3);
+  expect(population).toContain('WHERE recorded_at >= $1::timestamptz AND recorded_at < $2::timestamptz AND status = $3 AND verdict IS NULL');
+  expect(table.executed?.params).toEqual([RANGE.from, RANGE.to, 'completed']);
+  expect(sql(list.calls[0])).toMatch(/ORDER BY recorded_at DESC, execution_id ASC LIMIT 51$/);
+  expect(table.result).toMatchObject({ state: 'empty', reason: 'No execution matches these filters in this window.' });
+
+  // Facets and both charts read that same population and WHERE, each as one bounded aggregate.
+  const rail = context();
+  await loadFacetRail({ signal: 'executions', facets: ['status', 'verdict', 'verifier_card_uid'], where }, rail.context);
+  const charts = context();
+  const drawn = await loadExecutionCharts({ where }, charts.context);
+  expect([...rail.calls, ...charts.calls]).toHaveLength(5);
+  for (const request of [...rail.calls, ...charts.calls]) {
+    expect(request.op).toBe('bifrost.query');
+    expect(sql(request)).toContain(population.replace(/\$3/g, sql(request).includes('date_bin($3') ? '$4' : '$3'));
+  }
+  // No verdict is its own neutral series, never a verdict; the other chart keys each Verifier by its UID.
+  expect(sql(charts.calls[0])).toContain("coalesce(verdict, 'no verdict') AS verdict, count(*) AS executions");
+  expect(sql(charts.calls[1])).toContain('verifier_card_uid AS verifier, count(*) AS executions');
+  expect(drawn.verdicts.input).toMatchObject({ type: 'timeseries', x: 'at', y: ['executions'], series: 'verdict', range: RANGE });
+  expect(drawn.verifiers.input).toMatchObject({ series: 'verifier' });
+
+  // A page cursor compares the recorded instant as a timestamp; a predicate is refused, because no table validates it.
+  expect(listQuery({ signal: 'executions', after: ['2026-10-20T01:00:00Z', 'e1'] }, RANGE).sql).toContain(
+    '(recorded_at < $3::timestamptz OR (recorded_at = $3::timestamptz AND (execution_id > $4)))'
+  );
+  expect(validatePanel('RecordTable', { signal: 'executions', where_sql: 'status = 1' })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  expect(validatePanel('FacetRail', { signal: 'executions', facets: ['status'], where_sql: 'status = 1' })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  expect(validatePanel('RecordTable', { signal: 'executions', where: [{ column: 'inputs', value: 'x' }] })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
 });

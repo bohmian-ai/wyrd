@@ -2194,7 +2194,8 @@
               "traces",
               "spans",
               "logs",
-              "metrics"
+              "metrics",
+              "executions"
             ]
           },
           "where": {
@@ -2304,7 +2305,8 @@
                   "traces",
                   "spans",
                   "logs",
-                  "metrics"
+                  "metrics",
+                  "executions"
                 ]
               },
               "column": {
@@ -2348,7 +2350,8 @@
                   "traces",
                   "spans",
                   "logs",
-                  "metrics"
+                  "metrics",
+                  "executions"
                 ]
               },
               "where": {
@@ -2903,7 +2906,8 @@
                   "traces",
                   "spans",
                   "logs",
-                  "metrics"
+                  "metrics",
+                  "executions"
                 ]
               },
               "column": {

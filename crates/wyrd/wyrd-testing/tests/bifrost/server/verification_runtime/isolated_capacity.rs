@@ -273,14 +273,15 @@ impl CapacityDesk {
         self.blocks().hold_model_calls_for_test()
     }
 
-    /// Hold free process memory short of one Python session, so every
-    /// Python operation is refused, until the returned hold drops. The
-    /// 64 MiB left is room for the Scribe writes that share process memory.
+    /// Hold free process memory down to `leave` bytes, short of one Python
+    /// session, so every Python operation is refused, until the returned
+    /// hold drops. A queued submission needs room left for the Scribe write
+    /// that stages it, since Scribe shares process memory.
     ///
     /// # Panics
     /// Panics when the server hosts no blocks.
-    fn hold_python(&self) -> impl Sized {
-        self.blocks().sandbox().occupy_for_test(64 << 20)
+    fn hold_python(&self, leave: u64) -> impl Sized {
+        self.blocks().sandbox().occupy_for_test(leave)
     }
 
     /// Hold all free process scratch, so every workspace is refused, until
@@ -403,7 +404,7 @@ async fn settled(execution: &Execution) -> VerificationResult {
 /// queued code or workspace run is deferred and completes on release, while
 /// direct work of that resource is refused with the stable unavailable code.
 /// Every model call is recorded on the ordinary gateway path against the
-/// verified Service. A direct model call waits for the shared permit like a
+/// verified Service, the deferred attempt's call included. A direct model call waits for the shared permit like a
 /// queued one, and a wait past the direct deadline is cancelled without
 /// leaking a permit.
 ///
@@ -448,7 +449,7 @@ async fn direct_verification_runs_while_queued_capacity_is_held() {
         0,
         "an idle server reserves no scratch for either mode"
     );
-    let held = desk.hold_python();
+    let held = desk.hold_python(64 << 20);
     let queued_python = desk.submit("python-check", "QUEUED-PYTHON").await;
     logged(&logs, &[DEFERRED, &queued_python.id().to_string()]).await;
     drop(held);
@@ -469,8 +470,9 @@ async fn direct_verification_runs_while_queued_capacity_is_held() {
         .to_string();
     assert_eq!(
         subjects.len(),
-        4,
-        "two model runs and one two-turn writer run: {subjects:?}"
+        5,
+        "two model runs, the deferred writer's one turn, and its two-turn \
+         retry: {subjects:?}"
     );
     assert!(
         subjects
@@ -486,7 +488,7 @@ async fn direct_verification_runs_while_queued_capacity_is_held() {
         .expect_err("direct work needs free process scratch");
     assert_eq!(refused.code(), UNAVAILABLE, "scratch");
     drop(held);
-    let held = desk.hold_python();
+    let held = desk.hold_python(0);
     let refused = desk
         .verify("python-check", "FULL-PYTHON")
         .await

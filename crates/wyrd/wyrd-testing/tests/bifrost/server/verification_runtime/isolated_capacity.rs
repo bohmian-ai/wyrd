@@ -273,13 +273,14 @@ impl CapacityDesk {
         self.blocks().hold_model_calls_for_test()
     }
 
-    /// Hold all free process memory, so every Python operation is refused,
-    /// until the returned hold drops.
+    /// Hold free process memory short of one Python session, so every
+    /// Python operation is refused, until the returned hold drops. The
+    /// 64 MiB left is room for the Scribe writes that share process memory.
     ///
     /// # Panics
     /// Panics when the server hosts no blocks.
     fn hold_python(&self) -> impl Sized {
-        self.blocks().sandbox().occupy_for_test(0)
+        self.blocks().sandbox().occupy_for_test(64 << 20)
     }
 
     /// Hold all free process scratch, so every workspace is refused, until

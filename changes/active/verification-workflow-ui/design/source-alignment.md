@@ -1,22 +1,23 @@
 # Source alignment and existing-read boundaries
 
-Updated 2026-11-12 for the user-agreed UI-only revision. The selected approach is
+Updated 2026-11-16 with the TASK-001A integrated revision. The selected approach is
 in [notes](notes.md#reopened-ui-only-contract-alignment-2026-11-12) and the
 [field-to-existing-read map](contract-alignment-research.md). This is inspected
-source and planning evidence, not runtime verification or branch integration.
+source and planning evidence; the TASK-001A revision below is the integrated baseline.
 
 ## Source revisions
 
-- UI source: `9c38fdfc3`; existing shared graph/catalog/loaders/executors and Card
-  routes. TASK-001's completion and prior review proof remain historical evidence.
-- Resource-scaling: `443a79337`; compact results and explicit details, with full
-  retained outputs/inputs still in Bifrost.
-- Integrated backend inspected at `54aa8f4a9` in the
-  `github-verifier-pipelines-task-004` worktree includes that contract split and
-  existing status/invocation/publication/file/cancel reads. This does not establish
-  their integration into this UI checkout.
-- Approved backend contract revision 7 describes nonblocking computation versus
-  background retention; its proposed implementation task is not delivery proof.
+- Integrated baseline: TASK-001A merge `d118ee49f` of upstream
+  `task/github-verifier-pipelines/TASK-012-integrate-code-mode` at `f6fac677c`
+  into this branch at `a6a482306`, with compatibility repair `0d337a006`. This
+  checkout now contains the resource-scaling compact/details split and the
+  existing status/details/invocation/publication/file/cancel/approval routes;
+  the exact owners and upstream proof are in
+  [TASK-001A evidence](../tasks/TASK-001A-merge-verifier-pipelines.md#upstream-inputs-for-task-002-in-the-integrated-baseline).
+- Earlier inspection inputs (UI `9c38fdfc3`, resource-scaling `443a79337`,
+  backend `54aa8f4a9`) are superseded by that baseline.
+- Upstream TASK-012-R1 was still open at merge; uncommitted work in its worktree
+  is not part of this baseline.
 
 These replace the older 2026-11-10 research revisions as planning inputs. A
 worktree name or task status never substitutes for the actual integrated inputs.

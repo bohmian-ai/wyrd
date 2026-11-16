@@ -17,6 +17,7 @@ import {
   loadCardFacts,
   loadCardHeader,
   loadCardInventory,
+  loadExecution,
   loadPromptMessages,
   loadPromptVariables,
   loadRelationshipList,
@@ -43,6 +44,8 @@ import { browserSessions } from '$lib/server/auth/browser-sessions';
 import { AGENT, PROMPT, agent as agentCard, card, inventory, notFound, observeAnswer, prompts, registered, series, summary, timeseries } from '$lib/ui-fixtures';
 import { exportOtlp, nanos, seedSignals } from '$lib/ui-signals.integration';
 import { POST as loadPanel } from '../routes/t/[tenantKey]/ui/load/+server';
+import { POST as cancelExecution } from '../routes/t/[tenantKey]/verify/executions/[executionId]/cancel/+server';
+import { GET as downloadPublication } from '../routes/t/[tenantKey]/verify/executions/[executionId]/download/+server';
 import { declared, fixture, serverTest, type DeclaredRef } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/server';
 import { load as loadExamplePage } from '../../../../../../examples/ui-app/src/routes/+page.server';
 import { POST as loadExamplePanel } from '../../../../../../examples/ui-app/src/routes/view/load/+server';
@@ -58,7 +61,7 @@ const ARTIFACT = 'packages/ui/dist/wyrd-view.html';
  * `tools/call` with `answer`, deliver `doc` as the tool result, and return
  * the iframe's document and the tool calls it made.
  */
-async function appBridgeView(doc: unknown, answer: (name: string, args: Record<string, unknown>) => object) {
+async function appBridgeView(doc: unknown, answer: (name: string, args: Record<string, unknown>) => object | Promise<object>) {
   const iframe = document.createElement('iframe');
   document.body.append(iframe);
   const view = iframe.contentWindow as Window & typeof globalThis;
@@ -80,7 +83,7 @@ async function appBridgeView(doc: unknown, answer: (name: string, args: Record<s
   bridge.oncalltool = async (params) => {
     const args = (params.arguments ?? {}) as Record<string, unknown>;
     calls.push({ name: params.name, arguments: args });
-    return { content: [], structuredContent: answer(params.name, args) as Record<string, unknown> };
+    return { content: [], structuredContent: (await answer(params.name, args)) as Record<string, unknown> };
   };
   const initialized = new Promise<void>((resolve) => (bridge.oninitialized = () => resolve()));
   await bridge.connect(new PostMessageTransport(view, view));
@@ -818,4 +821,140 @@ test('an exact Verifier definition and where it runs load through every authoriz
   expect(drawn.querySelectorAll('[data-edge]')).toHaveLength(13);
   // Both panels read the Verifier; the view issues that identical read once, then the owner's.
   expect(app.calls.map((call) => call.name)).toEqual(['cards.get', 'cards.get', 'cards.get']);
+});
+
+test('an unfinished execution shows recorded progress and retained outputs through every authorized host, and cancels once', async ({ server, seeded: _seeded }) => {
+  const { executionId, verifier } = server.holdPublications('ui-held');
+  server.flushBifrost();
+  const attempt = { item_index: null, iteration_index: null, attempt: 1 };
+  const tree = { executionId, node: 'step:draft', producer: attempt, output: 'tree' };
+  /** The populated data of one load, or the refusal as a failure. */
+  const data = (loaded: Awaited<ReturnType<typeof loadExecution>>, surface: string) => {
+    if (loaded.result.state !== 'populated') throw new Error(`${surface}: ${JSON.stringify(loaded.result)}`);
+    return loaded.result.data;
+  };
+
+  const client = WyrdClient.connect();
+  const mcp = await mcpOver(server.baseUrl, client);
+  try {
+    for (const [surface, executor] of [['node', nodeExecutor(client)], ['mcp', mcp.executor]] as const) {
+      const context = { executor };
+      // Running, with no result: the Verifier it ran is found by its recorded UID, never by name.
+      const open = data(await loadExecution({ executionId, details: true }, context), surface);
+      expect([open.status.status, open.status.result], surface).toEqual(['running', undefined]);
+      expect(open.definition, surface).toMatchObject({ state: 'populated', data: { ref: { kind: 'Verifier', uid: verifier }, graph: { requirements: [{ kind: 'drift' }] } } });
+      expect(open.publications.state === 'populated' && open.publications.data.items.map((item) => [item.producer.step_id, item.name, item.kind]), surface).toEqual([
+        ['review', 'verdict', 'json'],
+        ['review', 'nothing', 'json'],
+        ['draft', 'report', 'file'],
+        ['draft', 'tree', 'directory']
+      ]);
+      expect(open.invocations.state, surface).toBe('populated');
+      // No result yet: completed details are not read and say why.
+      expect(open.details, surface).toEqual({ state: 'empty', reason: 'Details are recorded when the execution completes with a visible result.' });
+      expect(open.publication, surface).toBeUndefined();
+
+      // One exact intermediate publication of one producer attempt, and a recorded null kept apart from no output.
+      const selected = data(await loadExecution(tree, context), surface);
+      expect(selected.publication, surface).toMatchObject({
+        state: 'populated',
+        data: { name: 'tree', kind: 'directory', producer: { step_id: 'draft', attempt: 1 }, manifest: { files: [{ path: 'a.md' }, { path: 'nested/b.md' }], directories: ['nested'] } }
+      });
+      expect(data(await loadExecution({ ...tree, node: 'step:review', output: 'nothing' }, context), surface).publication, surface).toMatchObject({ state: 'populated', data: { kind: 'json', value: null } });
+      // Another attempt and an unknown output are refusals of that part only.
+      for (const missing of [{ ...tree, producer: { ...attempt, attempt: 2 } }, { ...tree, output: 'absent' }]) {
+        const loaded = data(await loadExecution(missing, context), surface);
+        expect(loaded.publication, surface).toMatchObject({ state: 'error', problem: { status: 404 } });
+        expect(loaded.publications.state, surface).toBe('populated');
+      }
+      // An execution that does not exist ends the load at its first read.
+      expect((await loadExecution({ executionId: '0192f0a0-0000-7000-8000-000000000000' }, context)).result, surface).toMatchObject({
+        state: 'error',
+        problem: { code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND' }
+      });
+    }
+  } finally {
+    await mcp.close();
+  }
+
+  // A principal that may query but not read executions is denied after one read; nothing dependent is asked.
+  const runs: WireRequest[][] = [];
+  const queryOnly = nodeExecutor(WyrdClient.connect({ credential: server.scopedApiKey('ui_execution_denied', ['bifrost_query:read']) }));
+  const denied: { executor: Executor } = { executor: { run: ((requests, signal) => (runs.push([...requests]), queryOnly.run(requests, signal))) as Executor['run'] } };
+  expect((await loadExecution(tree, denied)).result).toMatchObject({ state: 'denied', problem: { code: DENIED } });
+  expect(runs.map((requests) => requests.map((request) => request.op))).toEqual([['verification.get_execution']]);
+
+  // BFF: this tenant's browser session loads the same props; another tenant's finds no such execution.
+  env.WYRD_SERVER_URL = server.baseUrl;
+  const session = async (tenant: string, key: string) => {
+    const url = new URL(`http://ui.test/t/${tenant}/ui/load`);
+    const cookies = jar();
+    await browserSessions.signInWithApiKey(tenant, key, url, cookies);
+    return { url, browserSession: await browserSessions.read(tenant, url, cookies) };
+  };
+  const panel = async ({ url, browserSession }: Awaited<ReturnType<typeof session>>) =>
+    (
+      await loadPanel({
+        locals: { browserSession },
+        request: new Request(url, { method: 'POST', body: JSON.stringify({ component: 'VerificationExecution', input: tree, range: RANGE }), headers: { 'content-type': 'application/json' } })
+      } as never)
+    ).json();
+  const own = await session('test-tenant-1', server.apiKey);
+  const viewer = await session('test-tenant-1', server.bootstrapService(['viewer'], 'ui-execution-viewer'));
+  const foreign = await session('ui-execution-foreign', server.bootstrapServiceInTenant(server.seedTenant('ui-execution-foreign'), ['admin'], 'ui-execution-admin'));
+  expect(await panel(own)).toMatchObject({
+    result: { state: 'populated', data: { status: { status: 'running' }, definition: { state: 'populated', data: { ref: { uid: verifier } } }, publication: { state: 'populated', data: { kind: 'directory' } } } }
+  });
+  expect(await panel(foreign)).toMatchObject({ result: { state: 'error', problem: { code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND' } } });
+
+  // The host download leaves as an attachment the browser may not sniff; another tenant's session gets the server's refusal.
+  const event = (from: Awaited<ReturnType<typeof session>>, path: string) =>
+    ({ locals: { browserSession: from.browserSession }, params: { tenantKey: 'test-tenant-1', executionId }, url: new URL(`http://ui.test/x/${path}`) }) as never;
+  const file = await downloadPublication(event(own, 'download?step=draft&name=tree&attempt=1&path=nested/b.md'));
+  expect([file.status, file.headers.get('content-type'), file.headers.get('content-disposition'), file.headers.get('x-content-type-options'), await file.text()]).toEqual([
+    200,
+    'application/octet-stream',
+    "attachment; filename*=UTF-8''b.md",
+    'nosniff',
+    'beta'
+  ]);
+  expect((await downloadPublication(event(foreign, 'download?step=draft&name=report&attempt=1'))).status).toBe(404);
+  // A JSON value is not a file: the existing operation refuses it and the host relays that.
+  expect((await downloadPublication(event(own, 'download?step=review&name=verdict&attempt=1'))).status).toBe(400);
+
+  // Cancel: a viewer and another tenant are refused and the execution keeps running; the owner's cancel is recorded once and a repeat keeps it.
+  expect(await (await cancelExecution(event(viewer, 'cancel'))).json()).toMatchObject({ code: DENIED, status: 403 });
+  expect(await (await cancelExecution(event(foreign, 'cancel'))).json()).toMatchObject({ code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND', status: 404 });
+  expect(await panel(own)).toMatchObject({ result: { data: { status: { status: 'running' } } } });
+  for (const _ of [1, 2]) expect(await (await cancelExecution(event(own, 'cancel'))).json()).toEqual({ execution_id: executionId, status: 'cancelled' });
+
+  // Custom app, after settlement: the same execution, cancelled with no result, still lists what it retained.
+  const response = await loadExamplePanel({
+    request: new Request('http://app.test/view/load', { method: 'POST', body: JSON.stringify({ component: 'VerificationExecution', input: tree, range: RANGE }) })
+  } as never);
+  const text = await response.text();
+  expect(text).not.toContain(server.apiKey);
+  const settled = JSON.parse(text) as Awaited<ReturnType<typeof loadExecution>>;
+  expect(settled).toMatchObject({ result: { state: 'populated', data: { status: { status: 'cancelled' }, publication: { state: 'populated', data: { kind: 'directory' } } } } });
+  expect(data(settled, 'app').publications).toMatchObject({ state: 'populated', data: { items: [{}, {}, {}, {}] } });
+
+  // The built HTML draws that execution through host tools/call alone, each answered by the real MCP server.
+  const host = new Client({ name: 'wyrd-ui-artifact-host', version: '1.0.0' }, { versionNegotiation: { mode: 'auto' } });
+  await host.connect(new StreamableHTTPClientTransport(new URL('/mcp', server.baseUrl), { fetch: client.httpAuth }));
+  try {
+    const app = await appBridgeView(
+      { version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels: [{ id: 'execution', component: 'VerificationExecution', input: tree }] },
+      async (name, args) => ((await host.callTool({ name, arguments: args })).structuredContent ?? {}) as object
+    );
+    const drawn = () => app.document.querySelector('[data-panel="execution"]') as Element;
+    await vi.waitFor(() => expect(drawn().querySelector('[data-execution-status]')?.getAttribute('data-execution-status')).toBe('cancelled'));
+    await vi.waitFor(() => expect(drawn().querySelector('[data-node]')).not.toBeNull());
+    expect(drawn().querySelector('[data-preview]')?.textContent).toContain('nested/b.md');
+    expect(drawn().textContent).not.toMatch(/passed|failed/);
+    expect(new Set(app.calls.map((call) => call.name))).toEqual(
+      new Set(['verification.get_execution', 'bifrost.query', 'cards.get', 'verification.list_invocations', 'verification.list_publications', 'verification.get_publication'])
+    );
+  } finally {
+    await host.close();
+  }
 });

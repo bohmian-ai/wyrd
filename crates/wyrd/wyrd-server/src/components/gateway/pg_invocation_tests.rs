@@ -6889,3 +6889,56 @@ async fn critical_pressure_pauses_gateway_calls_until_recovery() {
         .expect("the call runs once pressure recovers");
     assert_eq!(dispatch.seen(), ["dep-a"]);
 }
+
+/// A buffered answer's bytes count against the workload that made the call
+/// while its response is held, and return when it drops: a standalone call's
+/// as gateway work, a nested Agent call's as the initiating verification
+/// work, never both.
+///
+/// # Panics
+/// Panics when the Postgres fixture or setup fails, a call fails, or the
+/// answer's bytes are uncounted, counted against the wrong workload, or kept
+/// after the response drops.
+#[tokio::test]
+async fn buffered_answers_count_against_the_calling_workload() {
+    use wyrd_runtime::resources::Workload;
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let dispatch = Scripted::shared();
+    let state = replica(&fixture, dispatch.clone()).await;
+    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
+    let caller = invoker(tenant, 1, [open_access()]);
+    let workloads = state.resources.workloads().clone();
+    let bytes = |response: &super::GatewayCallResponse| match &response.body {
+        ResponseBody::Json(answer) => answer.get().len() as u64,
+        other => panic!("expected a buffered JSON answer: {other:?}"),
+    };
+
+    dispatch.push(Step::Return(completed(1, 1)));
+    let standalone = GatewayInvocation::new(&state)
+        .invoke(&caller, request("dep-a/a", None, Duration::from_secs(10)))
+        .await
+        .expect("the standalone call completes");
+    assert!(bytes(&standalone) > 0);
+    assert_eq!(
+        workloads.workload_bytes(Workload::Gateway),
+        bytes(&standalone)
+    );
+    assert_eq!(workloads.workload_bytes(Workload::Verification), 0);
+    drop(standalone);
+    assert_eq!(workloads.workload_bytes(Workload::Gateway), 0);
+
+    dispatch.push(Step::Return(completed(1, 1)));
+    let nested = GatewayInvocation::new(&state)
+        .nested(Workload::Verification)
+        .invoke(&caller, request("dep-a/a", None, Duration::from_secs(10)))
+        .await
+        .expect("the nested call completes");
+    assert_eq!(
+        workloads.workload_bytes(Workload::Verification),
+        bytes(&nested)
+    );
+    assert_eq!(workloads.workload_bytes(Workload::Gateway), 0);
+    drop(nested);
+    assert_eq!(workloads.workload_bytes(Workload::Verification), 0);
+}

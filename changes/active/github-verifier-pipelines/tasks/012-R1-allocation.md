@@ -295,8 +295,22 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
      RED: "the paused call never dispatched" (it dispatched). GREEN, plus all
      gateway unit tests (79 passed):
      `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --features test-support --lib -E 'test(/components::gateway::/)'"`.
-   - Open: attributing retained request, response and capture bytes to the
-     operation, proving nested attribution, and the connected journey.
+   - Buffered answers: `respond` charges a buffered JSON or media answer's
+     exact length, which already exists, and attributes it to the call's
+     operation. The charge rides on `GatewayCallResponse` until it drops.
+     Streams stay bounded by their frame channel. Capture payloads are
+     charged by the outbox when staged.
+     Test: `components::gateway::pg_invocation_tests::buffered_answers_count_against_the_calling_workload`
+     proves standalone bytes count as gateway work and nested bytes as
+     verification work, never both, and both return on drop. RED: left 0,
+     right 22. GREEN (80 passed, same command).
+   - Open:
+     - Request bodies are charged by `WyrdBodyLimit` only while the HTTP
+       handler runs, unattributed. Streaming calls keep the body past the
+       handler, and nested call bodies are uncharged.
+     - A relayed answer's charge returns when it becomes the HTTP body, not
+       when the body is sent.
+     - The connected journey.
      Status: FAIL.
 
 7. **Functional closure and performance — REQ-024; AC-018.** Run affected

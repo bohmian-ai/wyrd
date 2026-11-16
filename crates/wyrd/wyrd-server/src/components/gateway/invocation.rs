@@ -28,7 +28,7 @@ use wyrd_gateway::{
 };
 use wyrd_runtime::outbox::Reservation;
 use wyrd_runtime::principal::CardAttribution;
-use wyrd_runtime::resources::{Operation, Workload};
+use wyrd_runtime::resources::{ByteCharge, ByteLedger, Operation, Workload};
 use wyrd_runtime::{Permission, PermissionDenyReason, Principal};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, GatewayAccess};
@@ -175,6 +175,10 @@ pub struct GatewayCallResponse {
     /// Operation response bytes or event stream, or the refusal rendered in
     /// the caller's dialect.
     pub body: ResponseBody,
+    /// The process memory charge of a buffered `body`, attributed to the
+    /// call's operation and returned when the response drops; `None` for a
+    /// stream, whose frames are bounded by their channel.
+    pub(crate) _custody: Option<ByteCharge>,
 }
 
 /// A governed call that ended in an error, with whether a provider may have
@@ -272,10 +276,24 @@ struct AdmittedCall {
     /// The call's admitted process operation, live until the call settles:
     /// its demand under pressure and the owner of the bytes it retains.
     /// Pressure may cancel the call through `cancel` while it runs.
-    _operation: Operation,
+    operation: Operation,
 }
 
 impl AdmittedCall {
+    /// Charges `memory` for a buffered `body` the call materialized and
+    /// attributes the charge to the call's operation. The bytes exist, so
+    /// the charge cannot be refused; a stream is not charged.
+    fn custody(&self, memory: &ByteLedger, body: &ResponseBody) -> Option<ByteCharge> {
+        let bytes = match body {
+            ResponseBody::Json(answer) => answer.get().len(),
+            ResponseBody::Media(answer) => answer.bytes.len(),
+            ResponseBody::Events(_) | ResponseBody::MediaStream { .. } => return None,
+        };
+        let mut charge = memory.charge_infallible(u64::try_from(bytes).unwrap_or(u64::MAX));
+        charge.attribute(&self.operation);
+        Some(charge)
+    }
+
     /// Borrows the ledger's view of this call.
     fn ledger(&self) -> LedgerCall<'_> {
         LedgerCall {
@@ -717,7 +735,7 @@ impl<'a> GatewayInvocation<'a> {
             subject,
             trace,
             capture_slot,
-            _operation: operation,
+            operation,
         };
         // Only a bound caller's deadline can pass before the ledger is charged.
         if self.bound.is_some_and(|bound| bound <= Instant::now()) {
@@ -838,6 +856,7 @@ impl<'a> GatewayInvocation<'a> {
     fn respond(
         call: &AdmittedCall,
         execution: CallExecution,
+        memory: &ByteLedger,
     ) -> Result<GatewayCallResponse, WyrdError> {
         let call_id = call.call_id;
         let (last_model, deployment) = execution
@@ -858,17 +877,23 @@ impl<'a> GatewayInvocation<'a> {
                     resolved,
                     deployment,
                     status: 200,
+                    _custody: call.custody(memory, &body),
                     body,
                 })
             }
-            (GatewayCallOutcome::Failed, _, _, Some(refusal)) => Ok(GatewayCallResponse {
-                call_id,
-                resolved: last_model.unwrap_or_else(|| call.requested.clone()),
-                requested: call.requested.clone(),
-                deployment,
-                status: refusal.status,
-                body: ResponseBody::Json(to_raw_value(&refusal.body).map_err(unavailable)?.into()),
-            }),
+            (GatewayCallOutcome::Failed, _, _, Some(refusal)) => {
+                let body =
+                    ResponseBody::Json(to_raw_value(&refusal.body).map_err(unavailable)?.into());
+                Ok(GatewayCallResponse {
+                    call_id,
+                    resolved: last_model.unwrap_or_else(|| call.requested.clone()),
+                    requested: call.requested.clone(),
+                    deployment,
+                    status: refusal.status,
+                    _custody: call.custody(memory, &body),
+                    body,
+                })
+            }
             (GatewayCallOutcome::TimedOut, ..) => Err(WyrdError::GatewayDeadlineExceeded {
                 message: "the gateway call exceeded its deadline".to_owned(),
                 details: json!({ "call_id": call_id }),
@@ -1430,7 +1455,7 @@ impl CallTask {
                 let started = std::time::Instant::now();
                 GatewayLedger::settle(&mut self.admission, &mut accounted);
                 self.telemetry.since(Phase::Account, started);
-                GatewayInvocation::respond(&self.call, execution)
+                GatewayInvocation::respond(&self.call, execution, self.state.resources.memory())
             }
             Err(error) => Err(error),
         };
@@ -1478,7 +1503,11 @@ impl CallTask {
         let attempt_span = std::mem::replace(&mut execution.attempt_span, tracing::Span::none());
         record_first_byte(operation, self.received);
         head.send(Answer {
-            result: GatewayInvocation::respond(&self.call, execution),
+            result: GatewayInvocation::respond(
+                &self.call,
+                execution,
+                self.state.resources.memory(),
+            ),
             dispatched,
             outcome: opened,
             upstream: timing.until_headers(),

@@ -41,8 +41,10 @@ export interface DefinitionStep {
   readonly detail: string;
   /** Ids of the steps this one waits for, in declaration order. */
   readonly needs: readonly string[];
-  /** Declared gate and repetition, as short labels. */
+  /** Declared gate, fan-out, repetition and speculation, as short labels. */
   readonly chips: readonly string[];
+  /** The exact Card the action names, when it names one. */
+  readonly ref?: CardRef;
   readonly requirements: readonly DefinitionRequirement[];
 }
 
@@ -111,6 +113,26 @@ function stepDetail(action: CardTypes.Action): string {
   return 'name' in agent && 'version' in agent ? `${agent.name}@${agent.version}` : 'inline Agent';
 }
 
+/** The exact Card a step's action references. */
+function stepRef(action: CardTypes.Action): CardRef | undefined {
+  if (action.kind !== 'agent' || typeof action.agent === 'string') return undefined;
+  return 'name' in action.agent && 'version' in action.agent ? (action.agent as CardRef) : undefined;
+}
+
+const plural = (count: number, word: string) => `${count} ${word}${count === 1 ? '' : 's'}`;
+
+/** A step's declared controls, as the short labels its node carries. */
+function stepChips(step: CardTypes.Step): string[] {
+  const chips: string[] = [];
+  if (step.when) chips.push('when');
+  if (step.depends_on && 'any_succeeded' in step.depends_on) chips.push('any succeeded');
+  if (step.foreach) chips.push(typeof step.foreach.count === 'number' ? `× ${plural(step.foreach.count, 'item')}` : `× ≤ ${plural(step.foreach.max_items ?? 0, 'item')}`);
+  if (step.repeat) chips.push(`↻ ≤ ${plural(step.repeat.max_iterations, 'iteration')}`);
+  if (step.retries) chips.push(`↻ ≤ ${step.retries} ${step.retries === 1 ? 'retry' : 'retries'}`);
+  if (step.speculative) chips.push('speculative');
+  return chips;
+}
+
 const requirement = (declared: Requirement, step?: string): DefinitionRequirement => ({
   key: `req:${declared.id}`,
   id: declared.id,
@@ -144,7 +166,7 @@ export function definitionGraph(spec: VerifierSpec): DefinitionGraph {
   };
   for (const step of steps) {
     const key = `step:${step.id}`;
-    follow([...reads(step.action), ...(step.when ? [[step.when.path] as const] : []), ...(step.requirements ?? []).flatMap((each) => reads(each.check))], key);
+    follow([...(typeof step.foreach?.items === 'string' ? [[step.foreach.items] as const] : []), ...reads(step.action), ...(step.when ? [[step.when.path] as const] : []), ...(step.requirements ?? []).flatMap((each) => reads(each.check))], key);
     const dependsOn = step.depends_on ?? [];
     for (const id of 'any_succeeded' in dependsOn ? dependsOn.any_succeeded : dependsOn) link(`step:${id}`, key);
   }
@@ -158,7 +180,8 @@ export function definitionGraph(spec: VerifierSpec): DefinitionGraph {
       kind: step.action.kind,
       detail: stepDetail(step.action),
       needs: all.filter((edge) => edge.target === `step:${step.id}` && edge.source.startsWith('step:')).map((edge) => edge.source.slice(5)),
-      chips: [...(step.when ? ['when'] : []), ...(step.depends_on && 'any_succeeded' in step.depends_on ? ['any succeeded'] : []), ...(step.retries ? [`↻ ≤ ${step.retries} ${step.retries === 1 ? 'retry' : 'retries'}`] : [])],
+      chips: stepChips(step),
+      ...(stepRef(step.action) ? { ref: stepRef(step.action) } : {}),
       requirements: (step.requirements ?? []).map((each) => requirement(each, step.id))
     })),
     requirements: (spec.requirements ?? []).map((each) => requirement(each)),

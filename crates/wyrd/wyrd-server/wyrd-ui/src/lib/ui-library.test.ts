@@ -2331,6 +2331,49 @@ test('verifier graph projects and lays out the declared topology', () => {
   expect(Math.max(...layoutDefinition(long).nodes.map((node) => node.width))).toBeLessThanOrEqual(340);
 });
 
+test('verifier graph projects fan-out, repetition and speculative controls on one node per step', () => {
+  const agentStep = (id: string, extra: object) => ({ id, action: { kind: 'agent', agent: AGENT, inputs: { section: 'item' } }, ...extra });
+  const graph = definitionGraph({
+    inputs: { document: { type: 'json' } },
+    steps: [
+      { id: 'read', action: { kind: 'extract', from: 'inputs.document' } },
+      agentStep('sections', { foreach: { items: 'steps.read.output.value.sections', max_items: 5 } }),
+      agentStep('polish', { foreach: { items: 'steps.read.output.value.sections', max_items: 5, concurrency: 2 }, repeat: { max_iterations: 3, until: { path: 'iteration.output.score', operator: 'greater_than_or_equals', expected: 1 } } }),
+      agentStep('votes', { foreach: { count: 3 } }),
+      agentStep('extra', { speculative: true, depends_on: { any_succeeded: ['read'] }, when: { path: 'steps.votes.output.agree', operator: 'equals', expected: false } }),
+      { id: 'summarize', action: { kind: 'agent', agent: './summarizer.yaml', workspace: { '/inputs/accounts': 'steps.sections.publications' } }, repeat: { max_iterations: 1, until: { path: 'iteration.output.done', operator: 'is_truthy' } } }
+    ]
+  } as never);
+  // One node per authored step, however many items or iterations it declares.
+  expect(graph.steps.map((step) => step.id)).toEqual(['read', 'sections', 'polish', 'votes', 'extra', 'summarize']);
+  expect(graph.steps.map((step) => step.chips)).toEqual([
+    [],
+    ['× ≤ 5 items'],
+    ['× ≤ 5 items', '↻ ≤ 3 iterations'],
+    ['× 3 items'],
+    ['when', 'any succeeded', 'speculative'],
+    ['↻ ≤ 1 iteration']
+  ]);
+  // The fanned-out array is a dependency like any other reference; a repeat's own iteration is not.
+  expect(graph.edges).toEqual([
+    { source: 'input:document', target: 'step:read' },
+    { source: 'step:read', target: 'step:sections', label: 'value' },
+    { source: 'step:read', target: 'step:polish', label: 'value' },
+    { source: 'step:votes', target: 'step:extra', label: 'agree' },
+    { source: 'step:read', target: 'step:extra' },
+    { source: 'step:sections', target: 'step:summarize' }
+  ]);
+  // An exact Card a step names is kept as its external reference; a sibling path stays text.
+  expect(graph.steps.map((step) => step.ref)).toEqual([undefined, AGENT, AGENT, AGENT, AGENT, undefined]);
+  expect(graph.steps[5].detail).toBe('./summarizer.yaml');
+  // Layout still gives every step one box and no overlap.
+  const laid = layoutDefinition(graph);
+  expect(laid.nodes.filter((node) => node.key.startsWith('step:'))).toHaveLength(6);
+  for (const a of laid.nodes)
+    for (const b of laid.nodes)
+      if (a.key < b.key) expect(a.x + a.width <= b.x || b.x + b.width <= a.x || a.y + a.height <= b.y || b.y + b.height <= a.y, `${a.key} overlaps ${b.key}`).toBe(true);
+});
+
 test('verifier graph is read-only, selectable and keyboard and zoom operable', async () => {
   const graph = definitionGraph(specOf('ticket-policy@1.1.0'));
   const shown = render(VerifierGraph, { graph });

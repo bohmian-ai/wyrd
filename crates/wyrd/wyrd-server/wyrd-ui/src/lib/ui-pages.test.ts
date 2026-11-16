@@ -822,6 +822,8 @@ test('the Verify dashboard reads one population and keeps its investigation in t
   const denied = await open('', stateExecutors.denied);
   await waitFor(() => expect(denied.container).toHaveTextContent('WYRD_AUTH_403_FORBIDDEN'));
   expect(denied.container).not.toHaveTextContent('No execution matches');
+  // The refusals end the load: the one batch of independent reads, and nothing after it.
+  expect(requests).toHaveLength(10);
   denied.unmount();
   // A malformed range or an unknown filter column issues no read.
   for (const bad of ['?from=yesterday&to=today', search({ where: [{ column: 'secret', value: 1 }] })]) {

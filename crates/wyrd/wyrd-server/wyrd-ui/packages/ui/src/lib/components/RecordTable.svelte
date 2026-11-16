@@ -71,8 +71,8 @@
   /** The tone of each retained execution status and recorded verdict; a status with no terminal record carries none. */
   const EXECUTION_TONES: Readonly<Record<string, Tone>> = { completed: 'neutral', cancelled: 'warn', timed_out: 'danger', errored: 'danger', passed: 'ok', failed: 'danger', inconclusive: 'warn' };
   const UNSETTLED = 'No terminal state is retained. Open the execution for its current status.';
-  /** Execution columns that hold a UUID: shown shortened, or as the name the host read for it. */
-  const isId = (column: string) => signal === 'executions' && (column.endsWith('_id') || column.endsWith('_uid'));
+  /** Execution columns that hold a UUID: shown shortened, or as the name the host read for it. A session id is the caller's own text and is shown whole. */
+  const isId = (column: string) => signal === 'executions' && column !== 'group_id' && (column.endsWith('_id') || column.endsWith('_uid'));
   const signal = $derived('signal' in input ? input.signal : undefined);
   const nouns = $derived(signal ? NOUNS[signal] : (['row', 'rows'] as const));
   const noun = $derived(nouns[1]);
@@ -168,7 +168,7 @@
     if (!rows) return;
     const column = sortKey(heading);
     const value = rows.rows.map((row) => row[columnIndex(rows, column)]).find((each) => each !== null);
-    const next = { column, desc: order?.column === column ? !order.desc : isInstant(column) || typeof value === 'number' };
+    const next = { column, desc: order?.column === column ? !order.desc : (signal !== undefined && isInstant(column)) || typeof value === 'number' };
     if (signal) onaction?.({ name: 'record.sort', input: next });
     else local = next;
   }

@@ -1572,6 +1572,7 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
     await page.setViewportSize({ width: 1280, height: 420 });
     await rows.last().scrollIntoViewIfNeeded();
     const before = { url: page.url(), first: await rows.first().textContent(), scroll: await page.evaluate(() => window.scrollY) };
+    expect(before.scroll).toBeGreaterThan(0);
     await rows.last().click();
     await page.waitForURL(/\/verify\/executions\//);
     await expect.poll(() => page.locator('[data-execution-status]').getAttribute('data-execution-status')).toBe('completed');

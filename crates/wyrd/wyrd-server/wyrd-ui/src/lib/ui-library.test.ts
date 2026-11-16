@@ -3188,6 +3188,8 @@ test('an executions list keeps status and verdict apart, names Verifiers the hos
   expect(cells(1).slice(6)).toEqual(['completed', '✕failed']);
   expect(cells(4).slice(6)).toEqual(['!cancelled', 'no verdict']);
   expect(cells(5).slice(6)).toEqual(['not recorded', 'no verdict']);
+  // A session id is the caller's text, shown whole.
+  expect(cells(2)[4]).toBe('conversation-7');
   // Completed before its result row is visible: the recorded status, and no verdict borrowed from anywhere.
   expect(cells(6).slice(6)).toEqual(['completed', 'no verdict']);
   expect(list.getByText('not recorded').closest('[title]')).toHaveAttribute('title', 'No terminal state is retained. Open the execution for its current status.');

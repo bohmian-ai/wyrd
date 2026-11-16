@@ -140,10 +140,10 @@ Read from current source (`crates/vala/vala-bifrost-redux/src/tables/verificatio
 | Recorded terminal facts | latest accepted revision (`max(sequence)`) of `bifrost.verification.execution_events`: `value.terminal.result_id` (completed, with the selected result) and `value.failure.status` (`cancelled`, `timed_out`, `errored`); a direct execution writes no event and is complete once its result row is visible | Supplied. |
 | Selected result and verdict | `bifrost.verification.results` joined on the recorded `result_id` (the only row of a direct execution) | Supplied. A completed execution whose result row is not yet visible reads as completed with no recorded verdict. |
 | Counts and charts | aggregates of the same derived rows under the same binds | Supplied by `bifrost.query`. |
-| `pending`, `running`, `retrying`, `waiting` apart | PostgreSQL queue row and approval decisions, served only by per-execution `verification.get_execution` | **External dependency.** No bounded list read supplies it and per-row hydration is excluded. Discovery states the retained fact `unfinished`; the sub-status column and filter values stay proposed until a bounded authorized list projection of queue lifecycle exists. |
+| `pending`, `running`, `retrying`, `waiting` apart, and an end no runner recorded | PostgreSQL queue row and approval decisions, served only by per-execution `verification.get_execution` | **External dependency.** No bounded list read supplies it and per-row hydration is excluded. Checked against a real server: an execution cancelled through the API while held stayed without any retained terminal event for 30 s while its own read said `cancelled`. Discovery therefore states the retained fact `not recorded` (no terminal state retained) and the execution page states the current status. The sub-status column and filter values stay proposed until a bounded authorized list projection of queue lifecycle exists. |
 | Exact-Verifier restriction before pagination and counts | `bifrost.query` authorizes by tenant and table object (`bifrost_query:read` on all, schema or table); it has no per-Verifier row rule. `verifier:read` scoped to one Verifier governs only the dedicated execution reads. | **External dependency.** A principal without the table grant is denied the whole read; one with it reads every execution row of its tenant, and opening another Verifier's row is then refused by `verifier:read`. A Verifier-scoped discovery population needs a server-enforced row scope; nothing here emulates it with WHERE. |
 | Repository, pull request and review-set membership | TASK-005 admission association | **Not delivered.** No column, facet or group is fabricated; they stay proposed. |
-| Failed requirement | `bifrost.verification.execution_outputs.output` (Variant holding the result's `requirements`) | To be settled against a real server during implementation: used only if one bounded aggregate supplies it without reading result bodies per row; otherwise recorded here as an external dependency. |
+| Failed requirement | `bifrost.verification.execution_outputs.output` (Variant holding the result's `requirements` array) | **External dependency.** Read from source only: the failed ids live inside each result body, so a facet needs every selected body unnested per row, which the task excludes. No failed-requirement column, facet or filter ships; it stays proposed until a retained per-requirement outcome column or projection exists. |
 
 ## Execution evidence
 
@@ -162,3 +162,38 @@ Focused selectors, recorded before each first run:
 - P `an exact Verifier Card page shows its definition, versions and where it runs` (existing; now expects the Results in Verify link)
 - UI `Verify lists executions with and without a recorded result as one authorized population through every host`
 - PI `the Verify dashboard filters, groups, brushes, pages, opens an execution and returns to the same list`
+
+Commands (from the repository root unless noted):
+
+- C1 `mise exec -- pnpm test src/lib/ui-library.test.ts src/lib/ui-pages.test.ts` in `crates/wyrd/wyrd-server/wyrd-ui`: 43 passed.
+- C2 `mise exec -- scripts/postgres/with-test-postgres.sh -- env WYRD_UI_INTEGRATION=1 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.integration.test.ts -t "Authorized Observe across hosts|exact Verifier definition|Verify lists executions"`: 3 passed.
+- C3 the same wrapper with `src/lib/ui-pages.integration.test.ts -t "the Verify dashboard filters"`: 1 passed; also `-t "authenticated traces and spans"` and `-t "Verifier Card page draws|observe boards match|execution page keeps its selection"`: passed after their two superseded assertions were updated (below).
+- C4 `mise run ui:check` (check, catalog and contract gate, all unit files): exit 0, 74 tests. `mise run codegen:check`: exit 0. `pnpm build`: exit 0. `git diff --check`: clean.
+
+RED then GREEN, per scenario:
+
+- P population loader: RED `TypeError: Cannot read properties of undefined (reading 'table')` (no `executions` signal); GREEN in `855d5a7c9`.
+- U executions list: RED `TypeError: Cannot read properties of undefined (reading '1')` (RecordTable had no executions noun, pills, labels or open intent); GREEN in `396b447fa`.
+- P Verify dashboard: the first run failed on the missing route module, which is a setup failure and not a behavioural RED; GREEN in `c9ba57dc0`. Two expectations were corrected while going green because the test was wrong, not the page: the bound range is `$1::timestamptz`, and a second value of one column adds a clause as in Observe.
+
+TDD compliance: **VIOLATED** for the two integration scenarios. UI and PI were written after the loaders and page they exercise, so neither has a RED; an unrecorded exploratory query against a real server also preceded UI and was removed before commit. The unit scenarios were test-first except the route-module case above.
+
+Mechanics deviations:
+
+- WHERE on Verify is the read-only projection of the typed clauses, as the mock draws it; the executions signal refuses `where_sql`, because a free predicate over the derived rows is not one of its checked filter columns.
+- The page reads its URL state from the server load (`data.state`), like the execution page.
+- Verifier names come from one bounded `cards.list` (kind Verifier, 200) on the host; a refused or longer list shows exact UIDs.
+- Existing assertions that Verify was unavailable were replaced by the delivered behaviour: P and PI Verifier Card page (now a Results in Verify link), PI traces journey (Verify is a nav link).
+- At 1280 px the eight columns exceed the list and Status/Verdict scroll sideways; the mock pins them. Left for the fidelity review.
+
+| ID | Status | Proof |
+|---|---|---|
+| REQ-001 | **FAIL (open)** | Delivered and proven: layout, read-only WHERE, range, Live, two linked charts with a neutral `no verdict` series, counted facets, grouping, separate Status and Verdict, combined and incompatible filters, one population across pages (P population test; P dashboard test; UI totals of three facets, two charts and paged rows equal on Node and MCP; PI). Open: `pending`/`running`/`retrying`/`waiting` and unrecorded ends read as `not recorded`; no failed-requirement filter; no repository or pull request context (TASK-005); Status/Verdict not pinned at 1280 px. |
+| REQ-002 | PASS | PI: rows open `/verify/executions/{id}` for a completed and a running execution; Back restores the page cursor, filters and `window.scrollY`; Results in Verify filters by the exact `verifier_card_uid` (P, PI). U: execution id, Verifier, run and session stay separate cells. |
+| REQ-003 | **FAIL (open)** | Proven: only `bifrost.query` operations build rows, counts and charts (UI op set on Node and MCP; built artifact tool calls; P: nine queries and one `cards.list`), bounded by `LIMIT` and the range, typed binds, selected result joined on the recorded `result_id` (P SQL assertion), completed rows equal to `verification.get_execution` (UI). No server, SDK or wire file is in the diff. Open: rows carry no queue lifecycle, and the exact-Verifier row scope is not enforced by the query authority; both are the external dependencies recorded above. |
+| REQ-014 | PASS | Chart, FacetRail and RecordTable with the existing loaders and catalog (C4 gate); the same inputs through Node, MCP, BFF `ui/load`, the custom app and the built artifact (UI); a superseded slow load does not replace the newer selection (PI); each panel of a principal without the query permission is denied on its own (UI). |
+| AC-001 | PASS | UI creates failed and passed Run executions, a scheduled drift window, three session turns with their group execution, a running and a cancelled-while-held execution, and asserts rows, facets and charts; PI filters, groups, brushes both charts, pages, opens and returns. No pull request execution exists to list (TASK-005 not delivered). |
+| AC-008 | **FAIL (open)** | Proven: another tenant reads empty rows, facets and charts (Node) and an empty BFF panel; `verifier:read` alone is denied whole, not empty; an unreachable server is an error on Node and in the built artifact (UI). Open: a Verifier-scoped viewer cannot be expressed (external dependency); denied and unreachable were not repeated through MCP, BFF and the custom app for this list; result-visibility lag is proven only at component level (U row `exec_lagging`), not produced on a real server. |
+| AC-009 | **FAIL (open)** | Gallery cases added for the executions list, grouped list and facets. Screenshots were captured by PI at 1280 and 390 px, light and dark, into a scratch directory and are not retained in the packet. `mise run dev:full` was not run; no mock comparison record and no human acceptance exist. |
+
+Status: `BLOCKED`. Open: REQ-001, REQ-003, AC-008, AC-009.

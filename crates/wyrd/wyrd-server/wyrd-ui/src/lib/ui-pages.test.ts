@@ -764,8 +764,8 @@ test('the Verify dashboard reads one population and keeps its investigation in t
   expect(rail.getByRole('button', { name: /no verdict/ })).toHaveTextContent('2');
   expect(rail.getByRole('button', { name: /latency-drift 1.0.0/ })).toHaveTextContent('2');
   const table = within(page.getByRole('region', { name: 'executions rows' }));
-  expect(table.getAllByRole('row')).toHaveLength(6);
-  expect(table.getAllByText('ticket-policy 1.1.0')).toHaveLength(3);
+  expect(table.getAllByRole('row')).toHaveLength(7);
+  expect(table.getAllByText('ticket-policy 1.1.0')).toHaveLength(4);
   expect(page.getByLabelText('WHERE: read-only projection of the active filters')).toHaveTextContent('select facet values to filter');
   // Bounded shared reads only: every query is one batch read of the executions population, and no row is hydrated.
   expect(new Set(requests.map((request) => request.op))).toEqual(new Set(['bifrost.query', 'cards.list']));

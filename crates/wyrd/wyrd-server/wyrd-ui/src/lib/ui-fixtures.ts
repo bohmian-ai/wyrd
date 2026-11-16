@@ -316,7 +316,7 @@ export const LOG = { time_unix_nano: '2026-10-20T11:58:02.410000000+00:00', obse
 /** Verifier Card UIDs the execution rows name, and the names a host read for them. */
 export const VERIFIER_UIDS = { policy: '01a1e602-c0e3-7880-ad65-f29c521418cb', drift: '01a1e602-cb7f-7c63-bc0c-f6b307a7147e' } as const;
 export const verifierLabels = { [VERIFIER_UIDS.policy]: 'ticket-policy 1.1.0', [VERIFIER_UIDS.drift]: 'latency-drift 1.0.0' };
-/** Executions, as the Verify list reads them: shown columns, then execution_id. Completed with each verdict, a recorded cancel, and no terminal record. */
+/** Executions, as the Verify list reads them: shown columns, then execution_id. Completed with each verdict, a recorded cancel, no terminal record, and completed before its result row is visible. */
 export const executions = result(
   [col('recorded_at', 'Timestamp(µs, "+00:00")'), col('verifier_card_uid'), col('subject_name'), col('run_id'), col('group_id'), col('service_name'), col('status'), col('verdict'), col('execution_id')],
   [
@@ -324,7 +324,8 @@ export const executions = result(
     ['2026-10-20T11:57:41.000000Z', VERIFIER_UIDS.policy, 'support-agent', '01a1e602-c7e4-7396-97d9-a8f9dfc2cde9', 'conversation-7', 'support-api', 'completed', 'passed', 'exec_passed'],
     ['2026-10-20T11:40:00.000000Z', VERIFIER_UIDS.drift, 'latency-model', null, null, null, 'completed', 'inconclusive', 'exec_inconclusive'],
     ['2026-10-20T11:31:10.000000Z', VERIFIER_UIDS.drift, 'latency-model', null, null, null, 'cancelled', null, 'exec_cancelled'],
-    ['2026-10-20T11:30:00.000000Z', VERIFIER_UIDS.policy, 'support-agent', null, null, 'support-api', 'not recorded', null, 'exec_open']
+    ['2026-10-20T11:30:00.000000Z', VERIFIER_UIDS.policy, 'support-agent', null, null, 'support-api', 'not recorded', null, 'exec_open'],
+    ['2026-10-20T11:29:00.000000Z', VERIFIER_UIDS.policy, 'support-agent', null, null, 'support-api', 'completed', null, 'exec_lagging']
   ]
 );
 /** Executions per bucket by verdict and by Verifier, as the two Verify charts read them. */

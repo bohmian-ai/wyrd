@@ -1,15 +1,19 @@
-//! Process-wide memory and scratch ownership shared by every capability.
+//! Process-wide memory, scratch and CPU ownership shared by every capability.
 //!
-//! One [`ProcessResources`] exists per process. Its [`ByteLedger`]s are the
-//! only promises of process memory and of disposable scratch space: Bifrost,
-//! hosted verification, recording, and request buffering all charge the same
-//! two ledgers, so no capability holds an idle share and no byte is promised
-//! twice. A charge is ownership, not allocation: it is taken before the bytes
-//! exist and returned only once their owner has settled them.
+//! One [`ProcessResources`] exists per process. Its [`ByteLedger`]s record
+//! the process memory and disposable scratch that owners actually retain:
+//! Bifrost, hosted verification, recording, gateway buffering and the outbox
+//! all charge the same two ledgers, so no capability holds an idle share and
+//! no byte is counted twice. Outside Bifrost's declared workspace
+//! reservations, a substantial buffer is charged when it is materialized or
+//! retained, never for predicted future copies; the charge moves with the
+//! buffer and returns only once its owner settles it.
 //!
-//! The ledgers carry no policy. Each capability decides what it charges and
-//! how it reacts to a refusal (spill, wait, or fail cooperatively); CPU is
-//! shared by the operating system scheduler and is not ledgered here.
+//! The [`WorkloadManager`] attributes charges to operations, samples memory
+//! pressure across the parent and its managed workers, pauses new work above
+//! its soft share under contention, and admits major CPU phases to the shared
+//! [`CpuLanes`]. Each capability still decides how it reacts to a refusal
+//! (spill, wait, or fail cooperatively) and keeps its own local limits.
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -331,7 +335,7 @@ impl ProcessResources {
         }
     }
 
-    /// CPUs the process may run on, the bound on hosted runnable Python turns.
+    /// CPUs the process may run on: the number of managed CPU lanes.
     #[must_use]
     pub const fn effective_cpu(&self) -> NonZeroUsize {
         self.effective_cpu

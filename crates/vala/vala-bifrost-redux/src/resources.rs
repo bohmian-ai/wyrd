@@ -1365,6 +1365,12 @@ pub struct ScribeResources {
 }
 
 impl ScribeResources {
+    /// The process workload manager whose CPU lanes Scribe's CPU pools
+    /// run their jobs on.
+    pub(crate) fn workloads(&self) -> &wyrd_runtime::resources::WorkloadManager {
+        self.governor.inner.process.workloads()
+    }
+
     /// Returns the process's advisory cache of learned Variant layouts.
     pub(crate) fn variant_layouts(&self) -> &Arc<crate::scribe::layout_cache::VariantLayoutCache> {
         &self.variant_layouts

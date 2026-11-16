@@ -316,11 +316,25 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
    - Not victims: Oracle and Forge operations pass no cancellation token, so
      pressure never picks them as victims. Queries keep their own deadline
      and cancel paths; rewrites drain through attempt cancellation.
+   - Scribe: `Scribe::build` joins the ingress and persistence CPU pools to
+     the process lanes through `ScribeResources::workloads`. Each Rayon job
+     runs through `on_lane`, which begins a non-cancellable Bifrost
+     operation and calls `CpuLanes::run_blocking`. The WAL IO pool is not
+     laned. Tests:
+     `scribe::execution_lanes::tests::{ingress,persistence}_jobs_run_on_the_shared_cpu_lanes`.
+     RED (pools ignore the lanes): no job queued for the held lane. GREEN.
+     Regressions: under the same wrapper, `--lib` 942 passed and
+     `--test integration` 75 passed.
+   - `mise run test:bifrost:journey:oracle`: 65 passed.
    - Open:
-     - Scribe's Rayon CPU pools do not run on the shared lanes.
+     - Persistence `StageMember` fsyncs its local runs inside the laned job,
+       so the lane is held across local IO, the same as DataFusion spill
+       writes inside a laned poll. REQ-022 says to release before IO.
+       Splitting encode from write in the stager needs a decision.
+     - Scribe lanes are unattributed (`tenant: None`), because persistence
+       jobs mix tenants.
      - No proof yet that held Bifrost jobs release lanes to competing
-       eligible work across workloads.
-     - The `test:bifrost:journey:oracle` run is pending.
+       eligible work across workloads, through production execution.
      Status: FAIL.
 
 6. **Connected public journey and bounded drain — REQ-019–024; AC-018.** Extend

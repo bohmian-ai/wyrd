@@ -166,7 +166,7 @@ this; their older threshold no longer applies.
 | R3-DEADLINE | changed: arrival deadline also lowered by the Verifier's `limits.timeout_seconds` | TASK-012 OBL-8 |
 | R3-EDGE | carried | TASK-012 OBL-8 |
 | R3-TEL | carried | unverified on the port |
-| R3-BENCH | carried | TASK-012 OBL-14 |
+| R3-BENCH | carried | TASK-012 OBL-10 (harness delivered); TASK-013/014 run it |
 | R3-QUAL | pending; its recorded FAIL stands | TASK-013 baseline, TASK-014 qualification |
 | R3-SUSTAIN | pending, amended to 100 tenants | TASK-014 |
 | R3-DIAG | pending | TASK-014 artifact analysis |

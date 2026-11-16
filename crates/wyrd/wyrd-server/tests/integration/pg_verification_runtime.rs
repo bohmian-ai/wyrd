@@ -3464,6 +3464,15 @@ async fn queued_origins_require_their_own_input_ack() {
     let harness = Harness::start().await;
     let (binding, armed) = harness.due_schedule("owner").await;
     assert!(armed.is_some(), "activation armed the schedule cursor");
+    // Registered before the stall: its storage row shares the held tenant's
+    // outbox lanes and would otherwise wait behind the stalled write.
+    let (verifier, subject, _, jwt) = traced_tenant(
+        &harness.server,
+        harness.server.pg_fixture().data_tenant_id(),
+        "direct-caller",
+        Registration::Declared,
+    )
+    .await;
     harness.server.flush_bifrost().await.expect("setup settles");
     let scheduler = harness.scheduler();
     let stop = CancellationToken::new();
@@ -3497,14 +3506,14 @@ async fn queued_origins_require_their_own_input_ack() {
         .seed_additional_tenant_with_uuid(elsewhere, "queued-elsewhere")
         .await
         .expect("second tenant seeds");
-    let (queued, subject, _, caller) = traced_tenant(
+    let (queued, queued_subject, _, caller) = traced_tenant(
         &harness.server,
         elsewhere,
         "queued-caller",
         Registration::Declared,
     )
     .await;
-    let other = enqueue(&harness.server, &caller, (&queued, &subject)).await;
+    let other = enqueue(&harness.server, &caller, (&queued, &queued_subject)).await;
     let reader = VerificationFixture::provision(harness.server.state(), elsewhere)
         .await
         .expect("tenant provisions");
@@ -3523,13 +3532,6 @@ async fn queued_origins_require_their_own_input_ack() {
         again.is_empty(),
         "the outstanding occurrence is not prepared again: {again:?}"
     );
-    let (verifier, subject, _, jwt) = traced_tenant(
-        &harness.server,
-        harness.server.pg_fixture().data_tenant_id(),
-        "direct-caller",
-        Registration::Declared,
-    )
-    .await;
     let (direct, ()) = tokio::join!(
         traced_execute(
             &harness.server,

@@ -290,6 +290,19 @@ budgets, the TASK-013/014 handoff). They are open.
 
 ### Diagnoses
 
+- **Symptom:** `pg_verification_runtime::queued_origins_require_their_own_input_ack`
+  failed about half its runs, alone or in the seam lane, with
+  `writer unavailable for table: bifrost.storage.objects` at Card registration.
+  **Evidence:** the test holds a scheduled input write open on outbox lane 0
+  (`submissions.rs:170`); the direct caller's inventory row routes by path hash
+  over four lanes (`scribe_outbox.rs:2052`) and `ObjectInventory::record`
+  times out at half the limit (`inventory.rs:220`). **Cause:** the test
+  registered the direct caller in the stalled tenant while the stall was held.
+  **Fix site:** the test: register before the stall, and name the second
+  tenant's subject apart so it no longer shadows the direct one (two
+  diagnosticians; 8/8 stress runs pass). Other stall users checked; none wait
+  on a write in the held tenant.
+
 - **Scribe outage journey.** The recovered-span proof needed a Verifier
   execute on a query-only pod. Fix: a traced card read on the query pod
   (e9cd7e78c), approved.

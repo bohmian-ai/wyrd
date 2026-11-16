@@ -11,9 +11,9 @@
 //! and the publications read back through the public execution surface.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use wiremock::matchers::{body_string_contains, method, path};
@@ -2499,15 +2499,45 @@ async fn speculative_recovery_cannot_resurrect_content() {
 }
 
 /// A mock that answers every section-reviewer turn for a section starting
-/// with `prefix` as the script does, after `delay`.
-async fn hold_sections(upstream: &MockServer, prefix: &str, delay: Duration) {
+/// with `prefix` as the script does, after `delay`. Returns the instant
+/// each of those turns arrived, in arrival order.
+async fn hold_sections(
+    upstream: &MockServer,
+    prefix: &str,
+    delay: Duration,
+) -> Arc<Mutex<Vec<Instant>>> {
     let script = Arc::new(Script::default());
+    let arrivals = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&arrivals);
     Mock::given(method("POST"))
         .and(body_string_contains(format!("SECTION: {prefix}")))
-        .respond_with(move |request: &Request| reply(request, &script).set_delay(delay))
+        .respond_with(move |request: &Request| {
+            recorded
+                .lock()
+                .expect("no arrival recorder panics")
+                .push(Instant::now());
+            reply(request, &script).set_delay(delay)
+        })
         .with_priority(1)
         .mount(upstream)
         .await;
+    arrivals
+}
+
+/// The most model calls in flight at once among calls that each arrived at
+/// one of `arrivals` and stayed in flight for at least `held`: a call is in
+/// flight from its arrival until its delayed answer is sent.
+fn most_in_flight(arrivals: &[Instant], held: Duration) -> usize {
+    arrivals
+        .iter()
+        .map(|at| {
+            arrivals
+                .iter()
+                .filter(|other| *other <= at && *at < **other + held)
+                .count()
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// The arrival position of every section-reviewer request for each
@@ -2552,27 +2582,27 @@ async fn mapped(desk: &Desk, result: &VerificationResult) -> Vec<(Option<u32>, u
     mapped
 }
 
-/// The deployment admits two queued model calls across every execution and
-/// tenant. Tenant A's three section reviewers, each slow, take both; the
-/// third item waits for a call and runs only once one of the two settles,
-/// never beside them. Tenant B's single item, submitted while A holds both
-/// calls, waits the same way and completes once capacity frees, and neither
-/// tenant spends an extra attempt or reads the other's work. An execution
+/// The deployment admits two model calls at once across every execution
+/// and tenant. Tenant A's three section reviewers, each call slow, fill
+/// both; tenant B's single item, submitted while A holds both calls, waits
+/// its turn. No third call is ever in flight, every item completes, and
+/// neither tenant spends an extra attempt or reads the other's work. An execution
 /// whose items hold both calls indefinitely is cancelled through the CLI
 /// and releases them at once to tenant B, and a Verifier's
 /// `timeout_seconds` ends a stalled execution long before the deployment's
 /// five-minute deadline.
 ///
 /// # Panics
-/// Panics when a submission is refused or does not settle, an item runs
-/// beside the items holding the ceiling, an attempt is spent or work leaks
+/// Panics when a submission is refused or does not settle, a third model
+/// call runs beside two others, an attempt is spent or work leaks
 /// across tenants, cancellation keeps capacity, or the Verifier timeout is
 /// not applied.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn admission_bounds_fanout_across_tenants() {
     let upstream = upstream().await;
-    hold_sections(&upstream, "a", HELD).await;
+    let tenant_a = hold_sections(&upstream, "a", HELD).await;
+    let tenant_b = hold_sections(&upstream, "b", HELD).await;
     hold_sections(&upstream, "c", STALLED).await;
     hold_sections(&upstream, "d", STALLED).await;
     let builder = model_calls(&upstream, 2);
@@ -2614,15 +2644,14 @@ async fn admission_bounds_fanout_across_tenants() {
         [2, 2, 2, 2],
         "every section runs its two turns exactly once: {turns:?}"
     );
-    let (held, deferred): (Vec<_>, Vec<_>) = ["a0", "a1", "a2"]
+    let arrivals: Vec<_> = [&tenant_a, &tenant_b]
         .iter()
-        .map(|section| &turns[*section])
-        .partition(|at| at[0] < 2);
-    let released = held.iter().map(|at| at[1]).max().expect("two held items");
-    assert_eq!(deferred.len(), 1, "{turns:?}");
-    assert!(
-        deferred[0][0] > released && turns["b0"][0] > released,
-        "nothing starts beside the two items holding the ceiling: {turns:?}"
+        .flat_map(|arrivals| arrivals.lock().expect("no arrival recorder panics").clone())
+        .collect();
+    assert_eq!(
+        most_in_flight(&arrivals, HELD),
+        2,
+        "the model calls fill the ceiling and never pass it: {turns:?}"
     );
     for result in [&a, &b] {
         assert_eq!(

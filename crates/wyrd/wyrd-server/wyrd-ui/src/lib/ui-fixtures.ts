@@ -422,6 +422,8 @@ const bodies: Record<string, object> = {
   text: { kind: 'json', value: { text: '<script>alert(1)</script> refund requested' } },
   units: { kind: 'json', value: { units: 3 } },
   report: { kind: 'file', manifest: { directories: [], files: [{ path: 'report', sha256: SHA, size_bytes: 9 }] } },
+  binary: { kind: 'file', manifest: { directories: [], files: [{ path: 'binary', sha256: SHA, size_bytes: 12 }] } },
+  big: { kind: 'file', manifest: { directories: [], files: [{ path: 'big', sha256: SHA, size_bytes: 70_000 }] } },
   tree: { kind: 'directory', manifest: { directories: ['nested'], files: [{ path: 'a.md', sha256: SHA, size_bytes: 4 }, { path: 'nested/b.md', sha256: SHA, size_bytes: 2048 }] } }
 };
 /** The completed records of `exec_settled`. */
@@ -528,6 +530,8 @@ export const fixtureExecutor: Executor = {
             return bodies[request.name]
               ? { ok: true, value: { ...bodies[request.name], name: request.name, producer: { step_id: request.step_id, attempt: request.attempt, item_index: request.item_index ?? null, iteration_index: request.iteration_index ?? null } } }
               : { ok: false, problem: { code: 'WYRD_VERIFICATION_404_PUBLICATION_NOT_FOUND', title: 'Publication not found', status: 404 } };
+          case 'verification.read_publication_text':
+            return { ok: true, value: { text: request.name === 'report' ? '# Report\n<img src=x onerror=alert(1)>' : null, truncated: false } };
           case 'bifrost.query': {
             const recorded = executionAnswer(request.sql, request.params ?? []);
             if (recorded) return { ok: true, value: recorded };

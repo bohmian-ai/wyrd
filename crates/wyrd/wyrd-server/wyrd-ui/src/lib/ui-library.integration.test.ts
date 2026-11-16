@@ -865,6 +865,11 @@ test('an unfinished execution shows recorded progress and retained outputs throu
         data: { name: 'tree', kind: 'directory', producer: { step_id: 'draft', attempt: 1 }, manifest: { files: [{ path: 'a.md' }, { path: 'nested/b.md' }], directories: ['nested'] } }
       });
       expect(data(await loadExecution({ ...tree, node: 'step:review', output: 'nothing' }, context), surface).publication, surface).toMatchObject({ state: 'populated', data: { kind: 'json', value: null } });
+      // A retained text file previews as text where the host can read file content; an MCP host has no such tool and says so, keeping the manifest.
+      const report = data(await loadExecution({ ...tree, output: 'report' }, context), surface);
+      expect(report.publication, surface).toMatchObject({ state: 'populated', data: { kind: 'file', manifest: { files: [{ path: 'report', size_bytes: 9 }] } } });
+      if (surface === 'node') expect(report.text, surface).toEqual({ state: 'populated', data: { text: '# Report\n', truncated: false } });
+      else expect(report.text?.state, surface).toBe('error');
       // Another attempt and an unknown output are refusals of that part only.
       for (const missing of [{ ...tree, producer: { ...attempt, attempt: 2 } }, { ...tree, output: 'absent' }]) {
         const loaded = data(await loadExecution(missing, context), surface);
@@ -1067,6 +1072,11 @@ judged('a judged execution shows its judgments, accepted inputs, completed detai
   } finally {
     await mcp.close();
   }
+
+  // Cancel after completion: the terminal state wins, and the judged result stays readable.
+  const late = await client.httpAuth(`${server.baseUrl}/v1/verification/executions/${refused}/cancel`, { method: 'POST' });
+  expect([late.status, await late.json()]).toEqual([200, { execution_id: refused, status: 'completed' }]);
+  expect(data(await loadExecution({ executionId: refused }, { executor: nodeExecutor(client) }), 'late').status.result?.outcome.verdict).toBe('failed');
 
   // Another tenant reads none of them, by ID alone.
   const foreign = nodeExecutor(WyrdClient.connect({ credential: server.bootstrapServiceInTenant(server.seedTenant('ui-judged-foreign'), ['admin'], 'ui-judged-admin') }));

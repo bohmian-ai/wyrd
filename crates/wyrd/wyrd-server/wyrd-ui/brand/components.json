@@ -394,7 +394,7 @@
         "Status, definition, recorded progress, retained outputs, completed details and the selected output are separate parts: a refused or not-yet-visible part says so in place and never hides a readable one.",
         "Recorded values only: no outcome, threshold, score or state is recomputed, and a missing judgment reads as not judged, never as passed or running.",
         "A step lists every recorded invocation by item, iteration and one-based attempt; an output belongs to the invocation that produced it and is never a step's primary result.",
-        "Previews are inert: JSON and text are escaped and bounded, a directory is its manifest, and file bytes leave only through the host's publication.download.",
+        "Previews are inert: JSON and the text of one retained file within the preview bound are shown as escaped, bounded text (Markdown as its source), a directory is its manifest, a larger or non-text file says so, and file bytes otherwise leave only through the host's publication.download.",
         "Completed details load only when asked for; Cancel is offered until the execution settles and runs as the host's execution.cancel.",
         "States: populated, denied, error, loading. Selection, paging, opening a member or the Verifier Card, and cancelling are host actions."
       ]

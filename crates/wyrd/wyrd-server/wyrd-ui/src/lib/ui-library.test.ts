@@ -2996,3 +2996,39 @@ test('execution inspector shows recorded state, judgments and outputs as separat
   }
   expect(render(VerificationExecution, { input: { executionId: 'exec_x' }, result: { state: 'loading' } }).container).toHaveTextContent('Loading execution exec_x');
 });
+
+test('a retained text file previews as inert text within the bound, and says when it cannot', async () => {
+  const file = (output: string) => ({ executionId: EXECUTIONS.settled, node: 'step:summarise', producer: { attempt: 1 }, output });
+  // A single file within the bound is read once, after its manifest, for the exact producer attempt.
+  const recording = fixtureRecording();
+  const report = await loadExecution(file('report'), { executor: recording.executor });
+  expect(recording.calls.at(-1)?.request).toEqual({ op: 'verification.read_publication_text', execution_id: 'exec_settled', step_id: 'summarise', name: 'report', attempt: 1, max_bytes: 65_536 });
+  expect(partOf(report).text).toEqual({ state: 'populated', data: { text: '# Report\n<img src=x onerror=alert(1)>', truncated: false } });
+  const shown = render(VerificationExecution, report);
+  const preview = () => shown.container.querySelector('[data-preview] [data-text]') as HTMLElement;
+  expect(preview().querySelector('pre')?.textContent).toBe('# Report\n<img src=x onerror=alert(1)>');
+  expect(shown.container.querySelector('[data-preview] img, [data-preview] h1, [data-preview] a')).toBeNull();
+
+  // Bytes that are not text are never shown; the file still leaves through the host.
+  await shown.rerender(await loadExecution(file('binary'), { executor: fixtureRecording().executor }));
+  expect(preview()).toHaveTextContent('This file is not UTF-8 text. Download it to read it.');
+  expect(preview().querySelector('pre')).toBeNull();
+  expect(within(shown.container).getByRole('button', { name: 'Download' })).toBeInTheDocument();
+
+  // A file over the bound is not read at all, and says so; a directory and a JSON value read no file text.
+  const big = fixtureRecording();
+  await shown.rerender(await loadExecution(file('big'), { executor: big.executor }));
+  expect(reads(big.calls)).not.toContain('verification.read_publication_text');
+  expect(preview()).toHaveTextContent('This file is larger than the 64.0 KiB preview bound. Download it to read it.');
+  for (const output of ['tree', 'units']) {
+    const other = fixtureRecording();
+    expect(partOf(await loadExecution(file(output), { executor: other.executor })).text).toBeUndefined();
+    expect(reads(other.calls)).not.toContain('verification.read_publication_text');
+  }
+
+  // A host that cannot read file content shows that refusal beside the manifest, which stays readable.
+  const refusing = fixtureRecording((request) => (request.op === 'verification.read_publication_text' ? { ok: false, problem: denied } : undefined));
+  await shown.rerender(await loadExecution(file('report'), { executor: refusing.executor }));
+  expect(shown.container.querySelector('[data-part="File text"]')).toHaveTextContent(denied.title);
+  expect(within(shown.container).getByRole('region', { name: 'Files of report' })).toBeInTheDocument();
+});

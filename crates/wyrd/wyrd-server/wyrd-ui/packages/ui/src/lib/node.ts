@@ -103,6 +103,22 @@ export function nodeExecutor(client: WyrdClient, get: (path: string) => Promise<
           iteration_index: request.iteration_index,
           path: request.path
         });
+      case 'verification.read_publication_text': {
+        const { op: _, execution_id, step_id, name, max_bytes, ...selector } = request;
+        const { plan } = await (await execution(execution_id)).download(step_id, name, selector);
+        // A server-relative plan is read as this principal; a storage URL carries its own grant.
+        const response = plan.get_url.startsWith('/v1/') ? await get(plan.get_url.slice('/v1'.length)) : await fetch(plan.get_url, { signal });
+        if (!response.ok) throw new Refused(await refusal(response));
+        // ponytail: the whole body is buffered; loaders ask only for files within the preview bound. Stream and stop at max_bytes if that changes.
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        const truncated = bytes.length > max_bytes;
+        try {
+          const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, max_bytes), { stream: truncated });
+          return { text: text.includes('\0') ? null : text, truncated };
+        } catch {
+          return { text: null, truncated };
+        }
+      }
     }
   }
 

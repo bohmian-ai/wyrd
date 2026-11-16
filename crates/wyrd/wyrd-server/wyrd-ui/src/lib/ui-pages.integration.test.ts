@@ -1189,6 +1189,15 @@ test('an exact execution page keeps its selection through refresh, downloads a r
   expect([download.suggestedFilename(), readFileSync(await download.path(), 'utf8')]).toEqual(['b.md', 'beta']);
   expect(query()).toEqual(selection);
 
+  // A retained text file previews as inert text beside its manifest.
+  await page.getByRole('button', { name: 'Preview' }).first().click();
+  await expect.poll(query).toEqual({ ...selection, output: 'report' });
+  await expect.poll(() => page.locator('[data-preview="report"] [data-text] pre').textContent()).toBe('# Report\n');
+  expect(await page.locator('[data-preview="report"] h1').count()).toBe(0);
+  await capture('text');
+  await page.getByRole('button', { name: 'Preview' }).nth(1).click();
+  await expect.poll(query).toEqual(selection);
+
   // Completed details are not available before a result, and say so.
   await page.getByRole('button', { name: 'Load completed details' }).click();
   await expect.poll(query).toEqual({ ...selection, details: '1' });

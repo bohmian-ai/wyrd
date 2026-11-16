@@ -5,7 +5,8 @@
  * and refused on its own; nothing is recomputed, awaited or resubmitted.
  */
 import type { CardTypes, VerificationExecutionState } from 'wyrd-ai';
-import { failed, wyrdProblem, type CardRef, type Executor, type Loaded, type Problem, type QueryResult, type WireRequest, type WireResult } from './contract.js';
+import { failed, wyrdProblem, type CardRef, type Executor, type Loaded, type Problem, type PublicationText, type QueryResult, type WireRequest, type WireResult } from './contract.js';
+import { fmtBytes } from './format.js';
 import type { ExecutionInput } from './schemas.js';
 import { definitionGraph, type DefinitionGraph } from './verifier.js';
 
@@ -58,6 +59,8 @@ export interface ExecutionData {
   readonly details?: Part<CardTypes.VerificationDetails>;
   /** The selected publication's body or manifest. */
   readonly publication?: Part<CardTypes.Publication>;
+  /** The selected file publication's text, when it is one file within the preview bound. */
+  readonly text?: Part<PublicationText>;
   /** The pinned members of the selected session source slot. */
   readonly members?: readonly SessionMember[];
   /** The accepted input declarations, read when an input is selected. */
@@ -78,6 +81,8 @@ export const EXECUTION_PAGE = 200;
 export const MEMBER_READS = 50;
 /** The most earlier results a drift history reads. */
 export const DRIFT_HISTORY = 30;
+/** The most bytes of one retained file read for a text preview. */
+export const TEXT_PREVIEW = 65_536;
 
 const TERMINAL: readonly VerificationExecutionState['status'][] = ['completed', 'cancelled', 'timed_out', 'errored'];
 /** Whether the execution has reached a terminal lifecycle status. */
@@ -151,6 +156,22 @@ async function readDrift(id: string, requirement: string, one: (request: WireReq
 }
 
 /**
+ * Read one publication of one producer attempt, then the text of a single
+ * retained file within {@link TEXT_PREVIEW}. A larger file is never read; a
+ * directory is only its manifest.
+ */
+async function readPublication(
+  selector: { readonly execution_id: string; readonly step_id: string; readonly name: string } & CardTypes.PublicationSelector,
+  one: (request: WireRequest) => Promise<WireResult>
+): Promise<{ publication: Part<CardTypes.Publication>; text?: Part<PublicationText> }> {
+  const publication = part<CardTypes.Publication>(await one({ op: 'verification.get_publication', ...selector }));
+  if (publication.state !== 'populated' || publication.data.kind !== 'file' || publication.data.manifest.files.length !== 1) return { publication };
+  if (publication.data.manifest.files[0].size_bytes > TEXT_PREVIEW)
+    return { publication, text: { state: 'empty', reason: `This file is larger than the ${fmtBytes(TEXT_PREVIEW)} preview bound. Download it to read it.` } };
+  return { publication, text: part<PublicationText>(await one({ op: 'verification.read_publication_text', ...selector, max_bytes: TEXT_PREVIEW })) };
+}
+
+/**
  * Load one exact execution. A refused or missing status ends the load with
  * that outcome and no further read. Otherwise the definition, the invocation
  * page and the publication page are read independently, and the selection
@@ -172,7 +193,7 @@ export async function loadExecution(input: ExecutionInput, context: Context): Pr
   const slot = type === 'input' ? state.group?.sources[node] : undefined;
   const drifted = type === 'req' && state.result?.outcome.requirements.some((each) => each.id === node && each.detail?.drift);
 
-  const [definition, invocations, publications, details, publication, members, inputs, drift] = await Promise.all([
+  const [definition, invocations, publications, details, selected, members, inputs, drift] = await Promise.all([
     readDefinition(state, one),
     one({ op: 'verification.list_invocations', execution_id: id, limit: EXECUTION_PAGE, ...(input.invocations ? { cursor: input.invocations } : {}) }).then((read) => part<CardTypes.InvocationPage>(read)),
     one({ op: 'verification.list_publications', execution_id: id, limit: EXECUTION_PAGE, ...(input.publications ? { cursor: input.publications } : {}) }).then((read) => part<CardTypes.PublicationPage>(read)),
@@ -181,9 +202,7 @@ export async function loadExecution(input: ExecutionInput, context: Context): Pr
       : !state.result
         ? ({ state: 'empty', reason: 'Details are recorded when the execution completes with a visible result.' } as const)
         : one({ op: 'verification.get_execution_details', execution_id: id }).then((read) => part<CardTypes.VerificationDetails>(read)),
-    type === 'step' && input.producer && input.output
-      ? one({ op: 'verification.get_publication', execution_id: id, step_id: node, name: input.output, ...input.producer }).then((read) => part<CardTypes.Publication>(read))
-      : undefined,
+    type === 'step' && input.producer && input.output ? readPublication({ execution_id: id, step_id: node, name: input.output, ...input.producer }, one) : undefined,
     slot
       ? context.executor
           .run(slot.execution_ids.slice(0, MEMBER_READS).map((member) => ({ op: 'verification.get_execution', execution_id: member }) as const), context.signal)
@@ -205,7 +224,7 @@ export async function loadExecution(input: ExecutionInput, context: Context): Pr
     input,
     result: {
       state: 'populated',
-      data: { status: state, definition, invocations, publications, ...(details && { details }), ...(publication && { publication }), ...(members && { members }), ...(inputs && { inputs }), ...(drift && { drift }) }
+      data: { status: state, definition, invocations, publications, ...(details && { details }), ...selected, ...(members && { members }), ...(inputs && { inputs }), ...(drift && { drift }) }
     }
   };
 }

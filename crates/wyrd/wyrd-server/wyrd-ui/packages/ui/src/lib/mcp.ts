@@ -19,8 +19,9 @@ function tool(request: WireRequest): { name: string; arguments: Record<string, u
     case 'verification.list_publications':
     case 'verification.get_publication':
     case 'cards.list':
-    // No MCP tool lists a Card's files yet; the host's refusal of the call is the read's outcome.
+    // No MCP tool lists a Card's files or reads a retained file's text yet; the host's refusal of the call is the read's outcome.
     case 'cards.list_artifacts':
+    case 'verification.read_publication_text':
     case 'bifrost.query':
     case 'bifrost.list_tables':
     case 'bifrost.describe_table':

@@ -180,7 +180,6 @@
       {#if body.kind === 'json'}
         {@render value('JSON', body.value)}
       {:else}
-        <!-- ponytail: a manifest lists what is retained; file bytes stay with the host download, so nothing here renders or executes content. -->
         <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
         <div class="scroll" role="region" aria-label="Files of {body.name}" tabindex="0">
           <table>
@@ -207,6 +206,19 @@
           </table>
         </div>
         <ActionNote state={act('publication.download')} />
+        {#if loaded?.text}
+          <!-- Text is shown as text: Markdown is its source, and markup never becomes elements. -->
+          <div data-text>
+            {@render refused(loaded.text, 'File text')}
+            {#if loaded.text.state === 'populated'}
+              {#if loaded.text.data.text === null}
+                <p class="hint">This file is not UTF-8 text. Download it to read it.</p>
+              {:else}
+                {@render value('Text', loaded.text.data.text)}
+              {/if}
+            {/if}
+          </div>
+        {/if}
       {/if}
     {/if}
   </div>

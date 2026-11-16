@@ -69,7 +69,15 @@ export type WireRequest =
   | { readonly op: 'verification.get_execution_details'; readonly execution_id: string }
   | ({ readonly op: 'verification.list_invocations'; readonly execution_id: string } & CardTypes.ExecutionPageQuery)
   | ({ readonly op: 'verification.list_publications'; readonly execution_id: string } & CardTypes.ExecutionPageQuery)
-  | ({ readonly op: 'verification.get_publication'; readonly execution_id: string; readonly step_id: string; readonly name: string } & CardTypes.PublicationSelector);
+  | ({ readonly op: 'verification.get_publication'; readonly execution_id: string; readonly step_id: string; readonly name: string } & CardTypes.PublicationSelector)
+  | ({ readonly op: 'verification.read_publication_text'; readonly execution_id: string; readonly step_id: string; readonly name: string; readonly max_bytes: number } & CardTypes.PublicationSelector);
+
+/** The leading bytes of one retained publication file as text; `text` is null when they are not UTF-8 text. */
+export interface PublicationText {
+  readonly text: string | null;
+  /** Whether the file holds more than the bytes asked for. */
+  readonly truncated: boolean;
+}
 
 /** A complete bounded query result: positional rows, returned only after a valid terminal. */
 export type QueryResult = BoundedQueryResult;
@@ -97,6 +105,7 @@ export interface WireResponses {
   'verification.list_invocations': CardTypes.InvocationPage;
   'verification.list_publications': CardTypes.PublicationPage;
   'verification.get_publication': CardTypes.Publication;
+  'verification.read_publication_text': PublicationText;
 }
 
 /** One read's outcome: its response, or the structured refusal or failure. */

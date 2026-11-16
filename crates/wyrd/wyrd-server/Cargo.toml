@@ -30,6 +30,8 @@ path = "src/main.rs"
 bohmian-code-review-pipeline = { workspace = true }
 wyrd-benchmark = { workspace = true }
 mimalloc = { workspace = true }
+# The binary's allocator commitment for process pressure sampling.
+libmimalloc-sys = { workspace = true, features = ["extended"] }
 # `bench` only: the snapshot route's reaped-worker CPU reading.
 nix = { workspace = true, optional = true }
 async-stream = { workspace = true }

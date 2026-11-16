@@ -168,6 +168,8 @@ hex = { version = "0.4", default-features = false, features = ["alloc"] }
 metrics = { version = "0.24", default-features = false }
 # Global allocator for server binaries only; libraries never set one.
 mimalloc = "0.1.50"
+# mimalloc's own aggregate process statistics, read by server binaries only.
+libmimalloc-sys = "0.1.49"
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
 mini-moka = { version = "0.10", features = ["sync"] }
 proptest = "1"

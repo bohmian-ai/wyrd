@@ -1244,6 +1244,13 @@ impl Checkout {
         self.worker.as_ref().and_then(Worker::pid)
     }
 
+    /// The latest resource sample this checkout's worker reported, shared
+    /// with the worker for its whole life. `None` once finished.
+    #[must_use]
+    pub fn telemetry(&self) -> Option<Arc<crate::WorkerTelemetry>> {
+        self.worker.as_ref().map(|worker| Arc::clone(worker.telemetry()))
+    }
+
     /// The opaque session ID a storing relay minted, which [`Checkout::restore`]
     /// resumes from any process. `None` for local workers and ephemeral sessions.
     #[must_use]
@@ -1886,6 +1893,8 @@ impl Checkout {
                         dump: shutdown.dump.map(Into::into),
                     });
                 }
+                // `Worker::recv` records telemetry and never returns it
+                Some(pb::child_event::Kind::Telemetry(_)) => {}
                 None => {
                     return Err(self.protocol_violation("unexpected event"));
                 }

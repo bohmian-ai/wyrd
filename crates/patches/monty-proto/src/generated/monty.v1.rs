@@ -999,7 +999,10 @@ pub struct ChildEvent {
     /// support persistence.
     #[prost(bytes = "vec", optional, tag = "28")]
     pub session_id: ::core::option::Option<crate::budgeted_prost::alloc::vec::Vec<u8>>,
-    #[prost(oneof = "child_event::Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12")]
+    #[prost(
+        oneof = "child_event::Kind",
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13"
+    )]
     pub kind: ::core::option::Option<child_event::Kind>,
 }
 /// Nested message and enum types in `ChildEvent`.
@@ -1031,6 +1034,8 @@ pub mod child_event {
         FatalError(super::FatalError),
         #[prost(message, tag = "12")]
         Shutdown(super::ShutdownDump),
+        #[prost(message, tag = "13")]
+        Telemetry(super::Telemetry),
     }
 }
 /// One run of print() output on a single stream, as one `Print` event may
@@ -1042,6 +1047,20 @@ pub struct PrintSegment {
     pub stream: i32,
     #[prost(string, tag = "2")]
     pub text: crate::budgeted_prost::alloc::string::String,
+}
+/// Worker resource telemetry, sent on the worker's own schedule outside the
+/// request/reply alternation. It never ends a turn and may arrive at any time,
+/// including while the worker is idle between checkouts; a parent keeps the
+/// latest one. Only the worker host writes it, never sandbox code.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, crate::budgeted_prost::Message)]
+#[prost(prost_path = "crate::budgeted_prost")]
+pub struct Telemetry {
+    /// Bytes the worker's allocator currently has live.
+    #[prost(uint64, tag = "1")]
+    pub live_bytes: u64,
+    /// Bytes the worker process's allocator has committed from the OS.
+    #[prost(uint64, tag = "2")]
+    pub committed_bytes: u64,
 }
 /// Streamed sandbox print() output. Zero or more of these precede each
 /// turn-ending event, and each carries the runs the worker had buffered, in

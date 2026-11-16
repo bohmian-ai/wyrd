@@ -2981,8 +2981,8 @@ impl WyrdTestServer {
     }
 
     /// Wait until exactly `count` hosted Python operations wait for process
-    /// memory, such as a verification parked behind
-    /// [`Self::occupy_hosted_memory`], or one that left the queue.
+    /// admission, such as a verification paused by the pressure
+    /// [`Self::occupy_hosted_memory`] causes, or one that stopped waiting.
     ///
     /// # Errors
     /// Returns [`WyrdTestServerError::HostedWaitersNotReached`] with the last
@@ -2996,7 +2996,7 @@ impl WyrdTestServer {
         let sandbox = self.hosted_sandbox()?;
         let deadline = Instant::now() + timeout;
         loop {
-            let last = sandbox.waiting().0;
+            let last = sandbox.waiting();
             if last == count {
                 return Ok(());
             }
@@ -3008,7 +3008,7 @@ impl WyrdTestServer {
                     last,
                 });
             }
-            // ponytail: admission publishes no queue-change signal, so this
+            // ponytail: the sandbox publishes no waiter-change signal, so this
             // polls; add one if a test ever needs a tighter wake.
             tokio::time::sleep(HOSTED_WAITERS_POLL_INTERVAL.min(deadline - now)).await;
         }
@@ -5512,6 +5512,9 @@ impl WyrdTestServerBuilder {
         } = Box::pin(AppState::start(
             &config,
             StartInputs {
+                // The test process's allocator is not observed; the ledger
+                // is its only pressure reading.
+                parent_committed: || 0,
                 dependencies: BifrostExternalDependencies {
                     postgres,
                     storage,

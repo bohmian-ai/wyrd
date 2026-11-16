@@ -2,8 +2,8 @@
 //!
 //! [`Sandbox`] owns one process-wide Monty pool of `wyrd-server
 //! subprocess` worker processes (see [`super::worker`] for
-//! the in-worker isolation). Each [`Sandbox::run`] waits its tenant's turn in
-//! [`HostedAdmission`] for the session's peak memory envelope, checks out a
+//! the in-worker isolation). Each [`Sandbox::run`] is admitted by the process
+//! [`WorkloadManager`] as its tenant's verification work, checks out a
 //! worker within the operation's deadline, feeds the source plus one
 //! entrypoint call, answers every suspension (mounted file calls from the
 //! call's mounts, everything else refused), and finishes the session. A
@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -26,24 +27,28 @@ use futures_util::StreamExt as _;
 use futures_util::future::BoxFuture;
 use futures_util::stream::FuturesUnordered;
 use monty_pool::{
-    MountSpec, Pool, PoolConfig, PoolError, ReplConfig, ResumeValue, TurnEvent, on_print_sync,
+    MountSpec, Pool, PoolConfig, PoolError, ReplConfig, ResumeValue, TurnEvent, WorkerTelemetry,
+    on_print_sync,
 };
 use monty_types::unstable::{self, MontyNode};
 use monty_types::{
     CallArgs, ExcType, MontyException, MontyObject, NamedValues, ObjectRef, ResourceLimits,
-    memory_limit_with_headroom,
 };
 use serde_json::{Map, Value};
 use skald_spec::{PreparedSchemas, SharedSchema};
 use skald_tool::ToolError;
-use tokio::sync::Semaphore;
+use tokio::sync::Notify;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use vala_verify::blocks::{
     ActionExecutor, ActionOutput, BlockCall, BlockError, CallInput, CallValue, CheckExecutor,
     CheckOutput, Delivery, EvidenceReader, ToolBridge, verdict_from,
 };
-use wyrd_runtime::resources::{ByteCharge, ProcessResources};
+use wyrd_runtime::resources::{
+    ByteCharge, ByteLedger, CommitObservation, CpuLanes, Operation, ProcessResources, WorkContext,
+    Workload, WorkloadManager,
+};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::card::verifier::{Action, Check, CodeCall, CodeSource};
@@ -52,13 +57,12 @@ use wyrd_spec::ids::SlotName;
 use wyrd_spec::verification::execution::CallProvenance;
 
 use super::HostedLimits;
-use super::admission::{AdmissionRefusal, HostedAdmission};
 use super::evidence::TenantEvidence;
-use super::worker::WORKER_STACK_SIZE;
 use super::workspace::{Workspace, WriteRefusal};
 use crate::app::metrics::{
-    VERIFICATION_HOSTED_BYTES, VERIFICATION_HOSTED_OPERATIONS,
-    VERIFICATION_PYTHON_WORKER_EVENTS_TOTAL, VERIFICATION_PYTHON_WORKERS,
+    VERIFICATION_HOSTED_BYTES, VERIFICATION_HOSTED_OPERATIONS, VERIFICATION_HOSTED_REFUSALS_TOTAL,
+    VERIFICATION_HOSTED_WAIT_SECONDS, VERIFICATION_PYTHON_WORKER_EVENTS_TOTAL,
+    VERIFICATION_PYTHON_WORKERS,
 };
 use crate::verification::telemetry::{Envelope, Envelopes};
 
@@ -74,126 +78,109 @@ pub struct CodeRun {
     pub output: String,
 }
 
-/// A worker's resident memory outside its counted heap: the interpreter
-/// binary's touched pages and Monty's session state at rest.
-///
-/// Measured as the resident set of an idle `wyrd-server subprocess` worker
-/// after a reset, rounded up; see the sandbox worker integration tests.
+/// The smallest footprint a worker process has, used only to keep the pool's
+/// own process count finite: the idle binary's touched pages, rounded up.
+/// Workers are charged what they report, never this.
 const WORKER_BASELINE_BYTES: u64 = 16 * 1024 * 1024;
 
-/// How often worker charges are checked against the processes still alive.
+/// How often worker charges follow their telemetry and dead processes are
+/// reaped; matches the workers' reporting interval.
 const REAP_INTERVAL: Duration = Duration::from_millis(100);
+
+/// A worker whose latest telemetry is older than this stops new work: no new
+/// session starts, on it or on a new worker, until it reports again.
+const STALE_TELEMETRY: Duration = Duration::from_millis(500);
 
 /// The process-wide Python worker pool.
 pub struct Sandbox {
     /// Hardened worker processes.
     pool: Arc<Pool>,
-    /// Fair admission of session envelopes over process memory.
-    admission: HostedAdmission,
-    /// The resident charge of every live worker process.
+    /// The process memory ledger operations and workers charge.
+    memory: ByteLedger,
+    /// Process admission, pressure and CPU lanes shared with every workload.
+    workloads: WorkloadManager,
+    /// The observed charge of every live worker process.
     workers: Arc<Workers>,
-    /// One permit per effective CPU, held only while Python runs a turn.
-    runnable: Semaphore,
     /// Every operation admitted and not yet settled; closed at shutdown.
     operations: TaskTracker,
-    /// The allocator ceiling plus the parent's copy of the largest frame a
-    /// session can send, charged per session and kept by its worker until
-    /// the worker's process is gone.
-    session_bytes: u64,
+    /// Operations waiting for process admission now.
+    waiting: AtomicUsize,
     /// Limits in force.
     limits: HostedLimits,
 }
 
 impl Sandbox {
-    /// Start the pool over the worker binary at `worker`, prewarming up to
-    /// `monty_min_workers` that fit in `process` memory.
+    /// Start the pool over the worker binary at `worker`, prewarming
+    /// `monty_min_workers`.
     ///
-    /// Memory is bounded portably: each worker's global allocator stops its
-    /// whole heap at the operation budget plus Monty's headroom. A session
-    /// charges that ceiling twice, once for the worker heap and once for the
-    /// parent's copy of the largest frame the worker can send, plus the
-    /// worker's resident baseline and interpreter stack. A worker keeps that
-    /// whole envelope charged until its process is gone, idle or not: its
-    /// allocator keeps freed pages after a reset, so a reset returns no
-    /// memory. The next session on the worker takes the charge over rather
-    /// than adding to it, and idle workers are reaped whenever an operation
-    /// waits for memory. There is no worker or waiter count: process memory,
-    /// shared with every other capability, is the only bound.
+    /// Memory is bounded portably and charged as it is used: each worker's
+    /// global allocator stops its heap at the operation budget plus Monty's
+    /// headroom, and each worker reports its live and committed bytes every
+    /// 100 ms, idle or not. A worker's charge follows its latest report until
+    /// its process is gone; a reset worker keeps what it still reports, never
+    /// a session envelope. An operation charges the inputs it retains; frames
+    /// in flight show in the process's allocator commitment. When pressure
+    /// turns critical, idle workers are reaped.
     ///
     /// # Errors
-    /// Returns [`PoolError::Spawn`] when process memory cannot hold one
-    /// session's envelope with room for its request, or a prewarmed worker
-    /// cannot start.
+    /// Returns [`PoolError::Spawn`] when a prewarmed worker cannot start.
     pub async fn start(
         worker: PathBuf,
         limits: HostedLimits,
         process: &ProcessResources,
     ) -> Result<Self, PoolError> {
-        let memory = process.memory();
-        let resident = resident_bytes();
-        let session_bytes = session_bytes(&limits)
-            .filter(|session| session.saturating_add(resident) < memory.limit())
-            .ok_or_else(|| {
-                PoolError::Spawn("process memory cannot hold one Python session".into())
-            })?;
+        let memory = process.memory().clone();
+        let workloads = process.workloads().clone();
         let mut config = PoolConfig::subprocess(worker);
-        config.min_processes = limits
-            .monty_min_workers
-            .min(usize::try_from(memory.available() / resident).unwrap_or(usize::MAX));
-        // Admission charges every worker before it can spawn, so this cap
-        // never binds; it only keeps the pool's own count finite.
-        config.max_processes = usize::try_from(memory.limit() / resident)
+        config.min_processes = limits.monty_min_workers;
+        // Pressure and telemetry bound how many workers start; this cap only
+        // keeps the pool's own count finite.
+        config.max_processes = usize::try_from(memory.limit() / WORKER_BASELINE_BYTES)
             .unwrap_or(usize::MAX)
             .max(1);
         config.max_checkouts_per_worker = None;
         let pool = Arc::new(Pool::new(config).await?);
         let workers = Arc::new(Workers {
-            resident,
-            charges: Mutex::default(),
+            idle: workloads.begin(Workload::Verification, None, None),
+            memory: memory.clone(),
+            workloads: workloads.clone(),
+            tracked: Mutex::default(),
+            observed: Notify::new(),
         });
-        for pid in pool.idle_worker_pids() {
-            worker_event("spawn");
-            workers.adopt(pid, memory.charge_infallible(resident));
-        }
-        let admission = HostedAdmission::new(memory.clone());
-        tokio::spawn(reap(
-            Arc::downgrade(&workers),
-            Arc::downgrade(&pool),
-            admission.clone(),
-        ));
+        workers.track_idle(&pool);
+        let idle = Arc::downgrade(&pool);
+        workloads.on_reclaim(move || {
+            if let (Some(pool), Ok(runtime)) =
+                (idle.upgrade(), tokio::runtime::Handle::try_current())
+            {
+                runtime.spawn(async move { pool.close().await });
+            }
+        });
+        tokio::spawn(reap(Arc::downgrade(&workers), Arc::downgrade(&pool)));
         Ok(Self {
             pool,
-            admission,
+            memory,
+            workloads,
             workers,
-            runnable: Semaphore::new(process.effective_cpu().get()),
             operations: TaskTracker::new(),
-            session_bytes,
+            waiting: AtomicUsize::new(0),
             limits,
         })
     }
 
-    /// The bytes one operation charges under `limits` when it spawns a
-    /// worker: its session envelope plus the new worker's resident bytes.
-    /// `None` when they overflow.
-    #[must_use]
-    pub fn envelope_bytes(limits: &HostedLimits) -> Option<u64> {
-        session_bytes(limits)?.checked_add(resident_bytes())
-    }
-
     /// Hold process memory so at most `leave` bytes stay free until the
-    /// returned hold drops, so an operation whose waiting bytes or envelope
-    /// do not fit in `leave` is refused or waits.
+    /// returned hold drops, raising the pressure the process samples and
+    /// refusing retained inputs that do not fit in `leave`.
     ///
     /// Memory other owners release while the hold lives is absorbed into it
-    /// soon after, so the free bytes return to `leave`. Memory an operation
-    /// frees for itself, such as an idle worker it reaps, it can take first.
+    /// soon after, so the free bytes return to `leave`.
     ///
     /// # Panics
     /// Panics when called outside a Tokio runtime.
     #[cfg(feature = "test-support")]
     #[must_use]
     pub fn occupy_for_test(&self, leave: u64) -> OccupiedForTest {
-        let memory = self.admission.memory().clone();
+        let memory = self.memory.clone();
         let charge = Arc::new(std::sync::Mutex::new(Some(
             memory.charge_infallible(memory.available().saturating_sub(leave)),
         )));
@@ -220,20 +207,22 @@ impl Sandbox {
         OccupiedForTest { charge, pin }
     }
 
-    /// Python turns that may run at once: the process's effective CPUs.
+    /// CPU lanes free now: of the process's effective CPUs, those no turn or
+    /// other workload holds.
     #[must_use]
     pub fn runnable_turns(&self) -> usize {
-        self.runnable.available_permits()
+        self.workloads.lanes().free()
     }
 
-    /// Python operations waiting for process memory now, and the bytes they
-    /// ask for.
+    /// Python operations waiting for process admission now: paused by
+    /// pressure or by stale worker telemetry.
     #[must_use]
-    pub fn waiting(&self) -> (usize, u64) {
-        self.admission.waiting()
+    pub fn waiting(&self) -> usize {
+        self.waiting.load(Ordering::Relaxed)
     }
 
-    /// Bytes every live worker process holds charged while it lives.
+    /// Bytes every live worker process is charged: its latest reported live
+    /// bytes, until its process is gone.
     #[must_use]
     pub fn worker_bytes(&self) -> u64 {
         self.workers.bytes()
@@ -245,6 +234,13 @@ impl Sandbox {
     #[must_use]
     pub fn idle_worker_pids(&self) -> Vec<u32> {
         self.pool.idle_worker_pids()
+    }
+
+    /// Workers whose latest telemetry is older than the staleness bound.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn stale_workers(&self) -> usize {
+        self.workers.stale()
     }
 
     /// PIDs of every worker still charged, idle, checked out, or awaiting
@@ -341,26 +337,28 @@ impl Sandbox {
     /// only paths the code can reach; every other OS call, host function, or
     /// undefined name is refused inside the sandbox.
     ///
-    /// The code, its globals, and the session envelope are charged to
-    /// process memory: the retained inputs before waiting, then the envelope
-    /// through [`HostedAdmission::acquire`] in `tenant`'s turn. Idle workers
-    /// are reaped first when the envelope does not fit. Python holds one
-    /// runnable turn, bounded by effective CPUs, only while it runs; a
-    /// program suspended on host calls or a `/work` writer holds none, but
-    /// keeps its envelope. After a completed program or a Python error the
-    /// session is finished, and the worker is reused only when that reset
-    /// succeeds; every other end kills the worker, whose charge returns only
-    /// once its process is gone.
+    /// The operation is admitted as `tenant`'s verification work, waiting while
+    /// process pressure pauses it, then charges the code and globals it
+    /// retains. No new session starts while any worker's telemetry is stale.
+    /// The worker's observed bytes are attributed to the operation while it
+    /// holds the worker. Python holds one CPU lane only while a turn runs; a
+    /// program suspended on host calls or a `/work` writer holds none. Under
+    /// critical pressure the operation may be cancelled as a victim. After a
+    /// completed program or a Python error the session is finished, and the
+    /// worker is reused only when that reset succeeds; every other end kills
+    /// the worker, whose charge returns only once its process is gone.
     ///
-    /// Memory refusal and a wait that ends unserved are [`BlockError::Busy`]:
-    /// the process, not the code, lacked capacity, so the engine defers the
-    /// whole execution instead of judging it.
+    /// Pressure, memory refusal, stale telemetry, and a wait that ends
+    /// unserved are [`BlockError::Busy`]: the process, not the code, lacked
+    /// capacity, so the engine defers the whole execution instead of judging
+    /// it.
     ///
     /// # Errors
     /// Returns [`BlockError::Busy`] when the sandbox is shutting down, process
-    /// memory refuses the operation or does not free in time, or no worker
-    /// starts in time, [`BlockError::Retryable`] when the pool fails, and
-    /// [`BlockError::Terminal`] for a Python error (including memory
+    /// pressure or stale telemetry outlasts the deadline, process memory
+    /// cannot hold the retained inputs, no worker starts in time, or pressure
+    /// cancels the operation, [`BlockError::Retryable`] when the pool fails,
+    /// and [`BlockError::Terminal`] for a Python error (including memory
     /// exhaustion), a crashed or killed worker, or a timeout while running.
     ///
     /// With `workspace`, each Python file write waits for
@@ -393,33 +391,50 @@ impl Sandbox {
             bytes + name.len() + value.as_ref().as_str().map_or(0, str::len)
         });
         let retained = u64::try_from(retained).unwrap_or(u64::MAX);
-        let held = self.admission.hold(retained).map_err(admission_refused)?;
-        let envelope = self.session_bytes + self.workers.resident;
-        let mut envelope = envelopes
+        let victim = CancellationToken::new();
+        let waited = Instant::now();
+        let operation = envelopes
             .time(Envelope::Capacity, async {
-                // ponytail: a new session charges a fresh envelope before
-                // checkout tells which worker it gets, so reusing an idle
-                // worker needs two envelopes free; below that the idle worker
-                // is reaped. Charge reuse against the idle worker's envelope
-                // if warm reuse under tight memory matters.
-                if self.admission.memory().available() < envelope && self.pool.idle_workers() > 0 {
-                    // ponytail: reaps every idle worker, not just enough of
-                    // them; reap one at a time if warm-set churn under
-                    // pressure matters.
-                    self.pool.close().await;
-                }
-                self.admission
-                    .acquire(tenant, held, envelope, deadline)
+                self.waiting.fetch_add(1, Ordering::Relaxed);
+                let _waiting = Waiting(&self.waiting);
+                let operation = tokio::time::timeout_at(
+                    deadline,
+                    self.workloads.admit(
+                        Workload::Verification,
+                        Some(tenant),
+                        Some(victim.clone()),
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    refused(
+                        "expired",
+                        waited,
+                        "process memory pressure did not ease before the deadline",
+                    )
+                })?;
+                tokio::time::timeout_at(deadline, self.workers.fresh())
                     .await
+                    .map_err(|_| {
+                        refused("expired", waited, "a Python worker's telemetry is stale")
+                    })?;
+                Ok::<_, BlockError>(operation)
             })
-            .await
-            .map_err(admission_refused)?;
-        // The request's own bytes end with the operation; only the envelope
-        // stays with the worker.
-        let _retained = envelope.split(retained);
+            .await?;
+        metrics::histogram!(VERIFICATION_HOSTED_WAIT_SECONDS, "outcome" => "granted")
+            .record(waited.elapsed().as_secs_f64());
+        let mut held = self.memory.try_charge(retained).map_err(|_| {
+            refused(
+                "memory",
+                waited,
+                "process memory cannot hold the Python operation now",
+            )
+        })?;
+        held.attribute(&operation);
+        let context = operation.context();
         let _active = (
             Raised::new(VERIFICATION_HOSTED_OPERATIONS, "active", 1.0),
-            Raised::new(VERIFICATION_HOSTED_BYTES, "active", envelope.bytes() as f64),
+            Raised::new(VERIFICATION_HOSTED_BYTES, "active", held.bytes() as f64),
         );
         let repl = ReplConfig {
             limits: Some(ResourceLimits {
@@ -432,7 +447,9 @@ impl Sandbox {
             .await
             .map_err(|_| busy("no Python worker was ready before the deadline".to_owned()))?
             .map_err(|error| failed(&error))?;
-        let lease = self.workers.lease(checkout.pid(), envelope);
+        let lease = self
+            .workers
+            .lease(checkout.pid(), checkout.telemetry(), &operation);
         let session = Raised::new(VERIFICATION_PYTHON_WORKERS, "suspended", 1.0);
         let budget = self.limits.tool_result_max_bytes;
         let mut output = String::new();
@@ -443,182 +460,200 @@ impl Sandbox {
         // Python, such as process scratch with no room for a `/work` write.
         let mut stopped = None;
         let ran = tokio::time::timeout_at(deadline, async {
-            let mut calls = Calls::new();
-            let mut answered = Vec::new();
-            let mut event = run_turn(
-                &self.runnable,
-                envelopes,
-                checkout.feed(code, globals, mounts, true, &mut on_print),
-                &mut calls,
-                &mut answered,
-            )
-            .await?;
-            loop {
-                event = match event {
-                    TurnEvent::Complete(value) => return Ok(Some(value)),
-                    TurnEvent::OsCall {
-                        function_name,
-                        args,
-                        ..
-                    } => {
-                        let writing = workspace.zip(written(&function_name, &args));
-                        let _writer = match writing {
-                            Some((workspace, bytes)) => {
-                                let writer =
-                                    drive(workspace.writer(), &mut calls, &mut answered).await;
-                                let admitted = {
-                                    let workspace = Arc::clone(workspace);
-                                    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
-                                    drive(
-                                        tokio::task::spawn_blocking(move || {
-                                            workspace.admit_write(bytes)
-                                        }),
-                                        &mut calls,
-                                        &mut answered,
-                                    )
-                                    .await
-                                    .map_err(|error| {
-                                        PoolError::Protocol(error.to_string().into())
-                                    })?
-                                };
-                                if let Err(WriteRefusal::Scratch) = admitted {
-                                    stopped = Some(busy(WriteRefusal::Scratch.to_string()));
-                                    return Ok(None);
+            let program = async {
+                let mut calls = Calls::new();
+                let mut answered = Vec::new();
+                let mut event = run_turn(
+                    self.workloads.lanes(),
+                    context,
+                    envelopes,
+                    checkout.feed(code, globals, mounts, true, &mut on_print),
+                    &mut calls,
+                    &mut answered,
+                )
+                .await?;
+                loop {
+                    event = match event {
+                        TurnEvent::Complete(value) => return Ok(Some(value)),
+                        TurnEvent::OsCall {
+                            function_name,
+                            args,
+                            ..
+                        } => {
+                            let writing = workspace.zip(written(&function_name, &args));
+                            let _writer = match writing {
+                                Some((workspace, bytes)) => {
+                                    let writer =
+                                        drive(workspace.writer(), &mut calls, &mut answered).await;
+                                    let admitted = {
+                                        let workspace = Arc::clone(workspace);
+                                        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+                                        drive(
+                                            tokio::task::spawn_blocking(move || {
+                                                workspace.admit_write(bytes)
+                                            }),
+                                            &mut calls,
+                                            &mut answered,
+                                        )
+                                        .await
+                                        .map_err(
+                                            |error| PoolError::Protocol(error.to_string().into()),
+                                        )?
+                                    };
+                                    if let Err(WriteRefusal::Scratch) = admitted {
+                                        stopped = Some(busy(WriteRefusal::Scratch.to_string()));
+                                        return Ok(None);
+                                    }
+                                    if let Err(refusal) = admitted {
+                                        event = run_turn(
+                                            self.workloads.lanes(),
+                                            context,
+                                            envelopes,
+                                            checkout.resume(
+                                                ResumeValue::Error(MontyException::new(
+                                                    ExcType::OSError,
+                                                    Some(refusal.to_string()),
+                                                )),
+                                                &mut on_print,
+                                            ),
+                                            &mut calls,
+                                            &mut answered,
+                                        )
+                                        .await?;
+                                        continue;
+                                    }
+                                    Some(writer)
                                 }
-                                if let Err(refusal) = admitted {
-                                    event = run_turn(
-                                        &self.runnable,
-                                        envelopes,
-                                        checkout.resume(
-                                            ResumeValue::Error(MontyException::new(
-                                                ExcType::OSError,
-                                                Some(refusal.to_string()),
-                                            )),
-                                            &mut on_print,
-                                        ),
-                                        &mut calls,
-                                        &mut answered,
-                                    )
-                                    .await?;
-                                    continue;
-                                }
-                                Some(writer)
-                            }
-                            None => None,
-                        };
-                        let mounted = run_turn(
-                            &self.runnable,
-                            envelopes,
-                            checkout.resume_from_mounts(&mut on_print),
-                            &mut calls,
-                            &mut answered,
-                        )
-                        .await?;
-                        match mounted {
-                            Some(event) => event,
-                            None => {
-                                run_turn(
-                                    &self.runnable,
-                                    envelopes,
-                                    checkout.resume(ResumeValue::NotHandled, &mut on_print),
-                                    &mut calls,
-                                    &mut answered,
-                                )
-                                .await?
-                            }
-                        }
-                    }
-                    TurnEvent::NameLookup {
-                        name,
-                        object_id: None,
-                        ..
-                    } if bridge.is_some() && name == CALL_TOOL => {
-                        run_turn(
-                            &self.runnable,
-                            envelopes,
-                            checkout.resume_name_lookup(
-                                MontyObject::function(CALL_TOOL, Some(CALL_TOOL_DOC.to_owned())),
-                                &mut on_print,
-                            ),
-                            &mut calls,
-                            &mut answered,
-                        )
-                        .await?
-                    }
-                    TurnEvent::NameLookup { .. } => {
-                        run_turn(
-                            &self.runnable,
-                            envelopes,
-                            checkout.resume_name_lookup(None::<MontyObject>, &mut on_print),
-                            &mut calls,
-                            &mut answered,
-                        )
-                        .await?
-                    }
-                    TurnEvent::FunctionCall {
-                        function_name,
-                        args,
-                        call_id,
-                        object_id: None,
-                        ..
-                    } if function_name == CALL_TOOL
-                        && let Some(bridge) = bridge =>
-                    {
-                        calls.push(request(bridge, &args, call_id));
-                        run_turn(
-                            &self.runnable,
-                            envelopes,
-                            checkout.resume(ResumeValue::Future, &mut on_print),
-                            &mut calls,
-                            &mut answered,
-                        )
-                        .await?
-                    }
-                    TurnEvent::FunctionCall { .. } => {
-                        run_turn(
-                            &self.runnable,
-                            envelopes,
-                            checkout.resume(ResumeValue::NotFound, &mut on_print),
-                            &mut calls,
-                            &mut answered,
-                        )
-                        .await?
-                    }
-                    TurnEvent::ResolveFutures { .. } => {
-                        if answered.is_empty() {
-                            let next = calls.next().await.ok_or_else(|| {
-                                PoolError::Protocol("Python awaits no pending host call".into())
-                            })?;
-                            answered.push(next);
-                        }
-                        while let Some(Some(next)) = calls.next().now_or_never() {
-                            answered.push(next);
-                        }
-                        let mut results = Vec::with_capacity(answered.len());
-                        let mut deliveries = Vec::new();
-                        for (call_id, result) in answered.drain(..) {
-                            let Some((delivery, value)) = answer(bridge, result) else {
-                                return Ok(None);
+                                None => None,
                             };
-                            deliveries.extend(delivery);
-                            results.push((call_id, value));
+                            let mounted = run_turn(
+                                self.workloads.lanes(),
+                                context,
+                                envelopes,
+                                checkout.resume_from_mounts(&mut on_print),
+                                &mut calls,
+                                &mut answered,
+                            )
+                            .await?;
+                            match mounted {
+                                Some(event) => event,
+                                None => {
+                                    run_turn(
+                                        self.workloads.lanes(),
+                                        context,
+                                        envelopes,
+                                        checkout.resume(ResumeValue::NotHandled, &mut on_print),
+                                        &mut calls,
+                                        &mut answered,
+                                    )
+                                    .await?
+                                }
+                            }
                         }
-                        // Python receives these values with this resumption;
-                        // one settled earlier but never resumed is dropped
-                        // undelivered with the operation.
-                        for delivery in deliveries {
-                            delivery.deliver();
+                        TurnEvent::NameLookup {
+                            name,
+                            object_id: None,
+                            ..
+                        } if bridge.is_some() && name == CALL_TOOL => {
+                            run_turn(
+                                self.workloads.lanes(),
+                                context,
+                                envelopes,
+                                checkout.resume_name_lookup(
+                                    MontyObject::function(
+                                        CALL_TOOL,
+                                        Some(CALL_TOOL_DOC.to_owned()),
+                                    ),
+                                    &mut on_print,
+                                ),
+                                &mut calls,
+                                &mut answered,
+                            )
+                            .await?
                         }
-                        run_turn(
-                            &self.runnable,
-                            envelopes,
-                            checkout.resume_futures(results, &mut on_print),
-                            &mut calls,
-                            &mut answered,
-                        )
-                        .await?
-                    }
-                };
+                        TurnEvent::NameLookup { .. } => {
+                            run_turn(
+                                self.workloads.lanes(),
+                                context,
+                                envelopes,
+                                checkout.resume_name_lookup(None::<MontyObject>, &mut on_print),
+                                &mut calls,
+                                &mut answered,
+                            )
+                            .await?
+                        }
+                        TurnEvent::FunctionCall {
+                            function_name,
+                            args,
+                            call_id,
+                            object_id: None,
+                            ..
+                        } if function_name == CALL_TOOL
+                            && let Some(bridge) = bridge =>
+                        {
+                            calls.push(request(bridge, &args, call_id));
+                            run_turn(
+                                self.workloads.lanes(),
+                                context,
+                                envelopes,
+                                checkout.resume(ResumeValue::Future, &mut on_print),
+                                &mut calls,
+                                &mut answered,
+                            )
+                            .await?
+                        }
+                        TurnEvent::FunctionCall { .. } => {
+                            run_turn(
+                                self.workloads.lanes(),
+                                context,
+                                envelopes,
+                                checkout.resume(ResumeValue::NotFound, &mut on_print),
+                                &mut calls,
+                                &mut answered,
+                            )
+                            .await?
+                        }
+                        TurnEvent::ResolveFutures { .. } => {
+                            if answered.is_empty() {
+                                let next = calls.next().await.ok_or_else(|| {
+                                    PoolError::Protocol("Python awaits no pending host call".into())
+                                })?;
+                                answered.push(next);
+                            }
+                            while let Some(Some(next)) = calls.next().now_or_never() {
+                                answered.push(next);
+                            }
+                            let mut results = Vec::with_capacity(answered.len());
+                            let mut deliveries = Vec::new();
+                            for (call_id, result) in answered.drain(..) {
+                                let Some((delivery, value)) = answer(bridge, result) else {
+                                    return Ok(None);
+                                };
+                                deliveries.extend(delivery);
+                                results.push((call_id, value));
+                            }
+                            // Python receives these values with this resumption;
+                            // one settled earlier but never resumed is dropped
+                            // undelivered with the operation.
+                            for delivery in deliveries {
+                                delivery.deliver();
+                            }
+                            run_turn(
+                                self.workloads.lanes(),
+                                context,
+                                envelopes,
+                                checkout.resume_futures(results, &mut on_print),
+                                &mut calls,
+                                &mut answered,
+                            )
+                            .await?
+                        }
+                    };
+                }
+            };
+            tokio::select! {
+                ran = program => ran,
+                () = victim.cancelled() => Ok(None),
             }
         })
         .await;
@@ -627,9 +662,8 @@ impl Sandbox {
             ran,
             Ok(Ok(Some(_)) | Err(PoolError::Runtime(_) | PoolError::Typing(_)))
         );
-        // The worker keeps its envelope from here on, reset or discarded.
-        // Record it before a reset returns the worker to the pool, so a
-        // concurrent checkout's lease replaces it rather than adding to it.
+        // The worker's charge stays with it, reset or discarded; return its
+        // attribution before a reset hands the worker to another checkout.
         drop(lease);
         drop(session);
         if resettable && checkout.finish().await.is_ok() {
@@ -639,93 +673,157 @@ impl Sandbox {
             .map_err(|_| terminal("Python exceeded its time limit".to_owned()))?
             .map_err(|error| failed(&error))?
             .ok_or_else(|| {
-                stopped.unwrap_or_else(|| terminal("the tool session stopped".to_owned()))
+                stopped.unwrap_or_else(|| {
+                    if victim.is_cancelled() {
+                        busy("process memory pressure cancelled the Python operation".to_owned())
+                    } else {
+                        terminal("the tool session stopped".to_owned())
+                    }
+                })
             })?;
         Ok((value, output))
     }
 }
 
-/// Bytes a live worker holds while it lives: its baseline plus its
-/// interpreter thread's stack.
-fn resident_bytes() -> u64 {
-    WORKER_BASELINE_BYTES + u64::try_from(WORKER_STACK_SIZE).unwrap_or(u64::MAX)
+/// One operation counted in [`Sandbox::waiting`] until dropped.
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
-/// One session's envelope beyond the worker's resident bytes: the
-/// allocator ceiling of `limits`' budget for the worker heap, and the same
-/// again for the parent's copy of the largest frame the worker can send.
-fn session_bytes(limits: &HostedLimits) -> Option<u64> {
-    let budget = usize::try_from(limits.monty_memory_bytes).ok()?;
-    let ceiling = u64::try_from(memory_limit_with_headroom(Some(budget), false)?).ok()?;
-    ceiling.checked_mul(2)
-}
-
-/// The charges of every live worker process, by PID.
+/// The observed charges of every live worker process, by PID.
 ///
-/// A prewarmed worker holds its resident bytes here; a worker that has
-/// served a session holds that session's whole envelope, idle, checked out,
-/// killed, or failed. Each charge returns only when [`reap`] finds the
-/// process gone, never when the pool merely frees the worker's slot.
+/// Each worker's charge follows its latest telemetry; idle, its bytes are
+/// attributed to the sandbox's idle operation, and while an operation holds
+/// it, to that operation. A worker that stops reporting keeps its last charge.
+/// Each charge returns only when [`reap`] finds the process gone, never when
+/// the pool merely frees the worker's slot.
 struct Workers {
-    /// Bytes one live worker holds while it lives.
-    resident: u64,
-    /// Charges by worker PID.
-    charges: Mutex<HashMap<u32, ByteCharge>>,
+    /// The attribution of idle workers' bytes: verification work of no tenant.
+    idle: Operation,
+    /// The process memory ledger worker charges come from.
+    memory: ByteLedger,
+    /// Where each worker's allocator commitment is reported.
+    workloads: WorkloadManager,
+    /// Tracked workers by PID.
+    tracked: Mutex<HashMap<u32, Tracked>>,
+    /// Signalled after every observation, waking operations waiting for
+    /// stale telemetry to recover.
+    observed: Notify,
+}
+
+/// One live worker's telemetry and the charges that follow it.
+struct Tracked {
+    /// The worker's latest sample.
+    telemetry: Arc<WorkerTelemetry>,
+    /// Its reported live bytes, charged to process memory.
+    charge: ByteCharge,
+    /// Its reported allocator commitment.
+    committed: CommitObservation,
 }
 
 impl Workers {
-    /// The charges, recovered after a panic elsewhere: every critical
+    /// The tracked workers, recovered after a panic elsewhere: every critical
     /// section leaves the map consistent.
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u32, ByteCharge>> {
-        self.charges
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u32, Tracked>> {
+        self.tracked
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Bytes every live worker holds.
+    /// Bytes every live worker is charged.
     fn bytes(&self) -> u64 {
-        self.lock().values().map(ByteCharge::bytes).sum()
+        self.lock()
+            .values()
+            .map(|tracked| tracked.charge.bytes())
+            .sum()
     }
 
-    /// Record `charge` as worker `pid`'s resident bytes, or merge it into
-    /// the charge the worker already holds.
-    fn adopt(&self, pid: u32, charge: ByteCharge) {
-        match self.lock().entry(pid) {
-            std::collections::hash_map::Entry::Occupied(mut held) => held.get_mut().merge(charge),
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                slot.insert(charge);
+    /// Workers whose latest telemetry is older than [`STALE_TELEMETRY`].
+    fn stale(&self) -> usize {
+        self.lock()
+            .values()
+            .filter(|tracked| tracked.telemetry.age() > STALE_TELEMETRY)
+            .count()
+    }
+
+    /// Wait until no worker's telemetry is stale.
+    async fn fresh(&self) {
+        loop {
+            let observed = self.observed.notified();
+            tokio::pin!(observed);
+            observed.as_mut().enable();
+            if self.stale() == 0 {
+                return;
             }
+            observed.await;
         }
     }
 
-    /// Bind a session `envelope` to the worker `pid` it checked out.
-    ///
-    /// The envelope covers the worker's resident bytes and everything a
-    /// session can leave behind, so it replaces whatever the worker held
-    /// from prewarming or an earlier session rather than adding to it.
-    fn lease(&self, pid: Option<u32>, mut envelope: ByteCharge) -> Lease<'_> {
-        if let Some(pid) = pid
-            && let Some(resident) = envelope.split(self.resident)
-            && self.lock().insert(pid, resident).is_none()
-        {
+    /// Track worker `pid` reporting through `telemetry`, counting a spawn
+    /// the first time it is seen.
+    fn track(&self, pid: u32, telemetry: Arc<WorkerTelemetry>) {
+        if let std::collections::hash_map::Entry::Vacant(slot) = self.lock().entry(pid) {
+            let mut charge = self.memory.empty_charge();
+            charge.attribute(&self.idle);
+            slot.insert(Tracked {
+                telemetry,
+                charge,
+                committed: self.workloads.observe_commitment(),
+            });
             worker_event("spawn");
         }
-        Lease {
-            workers: self,
-            pid,
-            envelope: Some(envelope),
+    }
+
+    /// Track every idle worker in `pool`, such as prewarmed ones.
+    fn track_idle(&self, pool: &Pool) {
+        for (pid, telemetry) in pool.idle_worker_telemetry() {
+            self.track(pid, telemetry);
         }
     }
 
-    /// Drop the charge of every worker whose process no longer exists.
-    fn sweep(&self) {
-        self.lock().retain(|pid, _| {
+    /// Attribute worker `pid`'s charge to `operation` until the returned
+    /// lease drops, tracking the worker first when it is new.
+    fn lease(
+        &self,
+        pid: Option<u32>,
+        telemetry: Option<Arc<WorkerTelemetry>>,
+        operation: &Operation,
+    ) -> Lease<'_> {
+        if let (Some(pid), Some(telemetry)) = (pid, telemetry) {
+            self.track(pid, telemetry);
+            if let Some(tracked) = self.lock().get_mut(&pid) {
+                tracked.charge.attribute(operation);
+            }
+        }
+        Lease { workers: self, pid }
+    }
+
+    /// Bring every charge to its worker's latest report and drop the
+    /// charge of every worker whose process no longer exists.
+    ///
+    /// Live bytes a worker reports are observed, not requested, so they are
+    /// charged even past the ledger's limit; pressure then answers them.
+    fn observe(&self) {
+        self.lock().retain(|pid, tracked| {
+            let live = tracked.telemetry.live_bytes();
+            let charged = tracked.charge.bytes();
+            if live > charged {
+                tracked.charge.grow_infallible(live - charged);
+            } else {
+                tracked.charge.shrink(charged - live);
+            }
+            tracked.committed.set(tracked.telemetry.committed_bytes());
             let alive = alive(*pid);
             if !alive {
                 worker_event("reap");
             }
             alive
         });
+        self.observed.notify_waiters();
     }
 }
 
@@ -743,15 +841,13 @@ fn alive(pid: u32) -> bool {
     rustix::process::test_kill_process(pid) != Err(rustix::io::Errno::SRCH)
 }
 
-/// Until the sandbox is gone, return the charges of workers whose
-/// processes are gone, and reap the idle workers while an operation waits
-/// for memory they hold.
+/// Until the sandbox is gone, track idle workers, bring worker charges to
+/// their telemetry, and return the charges of workers whose processes are
+/// gone.
 ///
 /// ponytail: polls every [`REAP_INTERVAL`]; the pool reaps its children
-/// without telling its embedder, so there is no exit event to wait on. It
-/// reaps every idle worker under pressure, not just enough of them; reap one
-/// at a time if warm-set churn under pressure matters.
-async fn reap(workers: Weak<Workers>, pool: Weak<Pool>, admission: HostedAdmission) {
+/// without telling its embedder, so there is no exit event to wait on.
+async fn reap(workers: Weak<Workers>, pool: Weak<Pool>) {
     let mut ticks = tokio::time::interval(REAP_INTERVAL);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -759,40 +855,42 @@ async fn reap(workers: Weak<Workers>, pool: Weak<Pool>, admission: HostedAdmissi
         let (Some(workers), Some(pool)) = (workers.upgrade(), pool.upgrade()) else {
             return;
         };
-        if admission.waiting().0 > 0 && pool.idle_workers() > 0 {
-            pool.close().await;
-        }
-        workers.sweep();
+        workers.track_idle(&pool);
+        workers.observe();
     }
 }
 
-/// One session's envelope while it holds a worker.
+/// One operation's hold on a worker's attribution.
 ///
 /// Dropping it, after a reset or when the operation fails or is cancelled,
-/// leaves the envelope charged to the worker until its process is gone or a
-/// later session takes the charge over.
+/// returns the worker's charge to the idle attribution; the charge itself
+/// stays with the worker until its process is gone.
 struct Lease<'a> {
     /// The worker charges.
     workers: &'a Workers,
     /// The worker's PID, when the pool reported one.
     pid: Option<u32>,
-    /// The session envelope, beyond the worker's resident bytes.
-    envelope: Option<ByteCharge>,
 }
 
 impl Drop for Lease<'_> {
     fn drop(&mut self) {
-        if let (Some(pid), Some(envelope)) = (self.pid, self.envelope.take()) {
-            self.workers.adopt(pid, envelope);
+        if let Some(pid) = self.pid
+            && let Some(tracked) = self.workers.lock().get_mut(&pid)
+        {
+            tracked.charge.attribute(&self.workers.idle);
         }
     }
 }
 
-/// Await one Python turn while holding a runnable permit, polling the
+/// Await one Python turn while holding a CPU lane for `context`, polling the
 /// outstanding `calls` through [`drive`] the whole time; the wait for the
-/// permit is timed as `envelopes`' [`Envelope::Runnable`].
+/// lane is timed as `envelopes`' [`Envelope::Runnable`].
+///
+/// The worker process runs the turn, so the lane is held across the turn's
+/// awaits rather than per poll; host calls polled meanwhile hold none.
 async fn run_turn<T>(
-    runnable: &Semaphore,
+    lanes: &CpuLanes,
+    context: WorkContext,
     envelopes: &Envelopes,
     turn: impl Future<Output = T>,
     calls: &mut Calls<'_>,
@@ -800,7 +898,9 @@ async fn run_turn<T>(
 ) -> T {
     drive(
         async {
-            let _running = envelopes.time(Envelope::Runnable, runnable.acquire()).await;
+            let _running = envelopes
+                .time(Envelope::Runnable, lanes.acquire(context))
+                .await;
             let _turn = (
                 Raised::new(VERIFICATION_PYTHON_WORKERS, "runnable", 1.0),
                 Raised::new(VERIFICATION_PYTHON_WORKERS, "suspended", -1.0),
@@ -871,16 +971,16 @@ impl Drop for OccupiedForTest {
     }
 }
 
-/// The busy refusal for an admission that did not grant memory.
-fn admission_refused(refusal: AdmissionRefusal) -> BlockError {
-    match refusal {
-        AdmissionRefusal::Memory(_) => {
-            busy("process memory cannot hold the Python operation now".to_owned())
-        }
-        AdmissionRefusal::Expired => {
-            busy("process memory did not free before the deadline".to_owned())
-        }
+/// The busy refusal of an operation the process could not admit, counted
+/// under `reason` (`memory` refused at once, `expired` past its deadline); an
+/// expired wait since `waited` is also recorded.
+fn refused(reason: &'static str, waited: Instant, message: &str) -> BlockError {
+    metrics::counter!(VERIFICATION_HOSTED_REFUSALS_TOTAL, "reason" => reason).increment(1);
+    if reason == "expired" {
+        metrics::histogram!(VERIFICATION_HOSTED_WAIT_SECONDS, "outcome" => "expired")
+            .record(waited.elapsed().as_secs_f64());
     }
+    busy(message.to_owned())
 }
 
 /// The bytes a Python file-write OS call adds, or `None` for every other

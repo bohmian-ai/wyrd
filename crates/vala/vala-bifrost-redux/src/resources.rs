@@ -2287,10 +2287,13 @@ impl BifrostResourceGovernor {
         )?;
         let (scratch_limit_bytes, available_after_floor) = scratch_budget(&snapshot, &policy)?;
         drop(policy.scratch_root);
-        // The process ledger is everything above the measured server
-        // baseline; the Bifrost cap equals it unless an operator lowered it.
-        let process = wyrd_runtime::resources::ProcessResources::new(
+        // The process ceiling is the detected memory limit; the process
+        // ledger is everything above the measured server baseline, which is
+        // the headroom pressure never charges. The Bifrost cap equals the
+        // ledger unless an operator lowered it.
+        let process = wyrd_runtime::resources::ProcessResources::with_ceiling(
             NonZeroUsize::new(effective_cpu).ok_or_else(accounting_overflow)?,
+            u64::try_from(memory_limit_bytes).map_err(|_| accounting_overflow())?,
             u64::try_from(memory_limit_bytes - server_memory_min_bytes)
                 .map_err(|_| accounting_overflow())?,
             scratch_limit_bytes,

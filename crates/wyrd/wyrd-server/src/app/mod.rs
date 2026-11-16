@@ -34,7 +34,9 @@ pub enum BootExit {
 ///
 /// `mode` is `None` to use the configured default (`config.serve.mode`), or
 /// `Some(_)` to override it (the binary passes the `--mode` flag through here).
-pub async fn run(mode: Option<ServeMode>) -> Result<(), BootExit> {
+/// `parent_committed` reads this process's allocator commitment for the
+/// pressure sampler.
+pub async fn run(mode: Option<ServeMode>, parent_committed: fn() -> u64) -> Result<(), BootExit> {
     let config = WyrdServerConfig::load().map_err(|e| BootExit::Config(Box::new(e)))?;
     production_guards(&config);
 
@@ -60,7 +62,7 @@ pub async fn run(mode: Option<ServeMode>) -> Result<(), BootExit> {
     // `BoundServer::run` performs and the supervised Forge worker, and are
     // released only once serving has returned. Their drops are non-blocking,
     // which is required because this frame is inside `#[tokio::main]`.
-    let inputs = StartInputs::production(&config)
+    let inputs = StartInputs::production(&config, parent_committed)
         .await
         .map_err(|e| BootExit::Other(Box::new(e)))?;
     let BootedServer {

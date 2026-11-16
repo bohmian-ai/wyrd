@@ -345,6 +345,9 @@ struct ManagerInner {
 /// A reclamation hook run when pressure turns critical.
 type Reclaim = Arc<dyn Fn() + Send + Sync>;
 
+/// How often the process samples pressure: the controller's clock.
+pub const SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Contention entry threshold of `q` and the admission operating target as a
 /// fraction of `M`.
 const CONTENDED: f64 = 0.95;
@@ -534,6 +537,21 @@ impl WorkloadManager {
         record(&pressure, usage);
         self.inner.registry.changed.notify_waiters();
         pressure
+    }
+
+    /// Samples pressure every [`SAMPLE_INTERVAL`] with the parent commitment
+    /// `parent_committed` reads, until the returned future is dropped.
+    ///
+    /// The process's one sampler: the binary that can observe its allocator
+    /// supplies the reading, and an embedder that cannot passes zero, leaving
+    /// the ledger as the only observation.
+    pub async fn sample_every(&self, parent_committed: impl Fn() -> u64) {
+        let mut ticks = tokio::time::interval(SAMPLE_INTERVAL);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticks.tick().await;
+            self.sample(parent_committed());
+        }
     }
 
     /// The latest pressure observation.

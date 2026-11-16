@@ -179,6 +179,16 @@ impl Pool {
             .filter_map(Worker::pid)
             .collect()
     }
+
+    /// PIDs of the idle workers with each one's latest resource sample.
+    #[must_use]
+    pub fn idle_worker_telemetry(&self) -> Vec<(u32, Arc<crate::WorkerTelemetry>)> {
+        lock_ignore_poison(&self.inner.state)
+            .idle
+            .iter()
+            .filter_map(|worker| Some((worker.pid()?, Arc::clone(worker.telemetry()))))
+            .collect()
+    }
 }
 
 /// How long [`Pool::close`] waits for a worker to exit on its own after the

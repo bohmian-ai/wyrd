@@ -763,6 +763,7 @@ message ChildEvent {
     Ok ok = 10;
     FatalError fatal_error = 11;
     ShutdownDump shutdown = 12;
+    Telemetry telemetry = 13;
   }
 
   // Cumulative execution time consumed by the session's sandbox code, in
@@ -821,6 +822,17 @@ enum PrintStream {
 message PrintSegment {
   PrintStream stream = 1;
   string text = 2;
+}
+
+// Worker resource telemetry, sent on the worker's own schedule outside the
+// request/reply alternation. It never ends a turn and may arrive at any time,
+// including while the worker is idle between checkouts; a parent keeps the
+// latest one. Only the worker host writes it, never sandbox code.
+message Telemetry {
+  // Bytes the worker's allocator currently has live.
+  uint64 live_bytes = 1;
+  // Bytes the worker process's allocator has committed from the OS.
+  uint64 committed_bytes = 2;
 }
 
 // Streamed sandbox print() output. Zero or more of these precede each

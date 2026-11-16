@@ -22,6 +22,7 @@ pub use crate::{
         ResumeValue, TurnEvent, on_print_sync,
     },
     pool::Pool,
+    worker::WorkerTelemetry,
 };
 
 /// How the pool reaches its workers.

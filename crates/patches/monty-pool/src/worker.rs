@@ -22,7 +22,10 @@ use std::{
     env,
     path::PathBuf,
     process::{ExitStatus, Stdio},
-    sync::Once,
+    sync::{
+        Arc, Mutex, Once, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -39,7 +42,7 @@ use tokio::{
     runtime::{Handle, RuntimeFlavor},
     sync::mpsc,
     task::{JoinHandle, block_in_place},
-    time::timeout,
+    time::{Instant, timeout},
 };
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
@@ -55,6 +58,62 @@ use tokio_tungstenite::{
 use crate::telemetry::{TelemetryContext, metrics::TurnMetrics, tracing::Recorder};
 use crate::{MontyTransport, PoolConfig, PoolError};
 
+/// The latest resource sample a worker reported over the protocol.
+///
+/// The worker sends a `Telemetry` frame on its own schedule, outside the
+/// request/reply alternation; the worker's reader records each one as it
+/// arrives, including while the worker is idle in the pool, so the sample
+/// never waits for a turn to end. A worker that stops reporting keeps its last
+/// sample, and [`Self::age`] says how old that is. Shared with the host through
+/// [`crate::Checkout::telemetry`] and [`crate::Pool::idle_worker_telemetry`].
+#[derive(Debug)]
+pub struct WorkerTelemetry {
+    /// Bytes the worker's allocator last reported live.
+    live_bytes: AtomicU64,
+    /// Bytes the worker's allocator last reported committed from the OS.
+    committed_bytes: AtomicU64,
+    /// When the last sample arrived, or when the worker started before its
+    /// first sample.
+    received: Mutex<Instant>,
+}
+
+impl WorkerTelemetry {
+    /// A worker starting now, with no sample yet.
+    fn new() -> Self {
+        Self {
+            live_bytes: AtomicU64::new(0),
+            committed_bytes: AtomicU64::new(0),
+            received: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// Record `sample` as the latest, received now.
+    fn record(&self, sample: &pb::Telemetry) {
+        self.live_bytes.store(sample.live_bytes, Ordering::Relaxed);
+        self.committed_bytes.store(sample.committed_bytes, Ordering::Relaxed);
+        *self.received.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now();
+    }
+
+    /// Bytes the worker's allocator last reported live; zero before its first sample.
+    #[must_use]
+    pub fn live_bytes(&self) -> u64 {
+        self.live_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Bytes the worker's allocator last reported committed; zero before its first sample.
+    #[must_use]
+    pub fn committed_bytes(&self) -> u64 {
+        self.committed_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Time since the last sample arrived, or since the worker started when
+    /// none has.
+    #[must_use]
+    pub fn age(&self) -> Duration {
+        self.received.lock().unwrap_or_else(PoisonError::into_inner).elapsed()
+    }
+}
+
 /// The async WebSocket stream type for a remote worker.
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -67,6 +126,8 @@ pub(crate) struct Worker {
     pub(crate) id: u64,
     /// Checkouts this worker has served, for `max_checkouts_per_worker`.
     pub(crate) checkouts_served: u32,
+    /// The latest resource sample the worker reported.
+    telemetry: Arc<WorkerTelemetry>,
     /// Records an adapter checkout's protocol turns, created only while needed.
     #[cfg(feature = "telemetry")]
     recorder: Option<Box<Recorder>>,
@@ -86,13 +147,27 @@ enum WorkerKind {
 }
 
 /// A local `monty subprocess` child: the process handle (kill-on-drop), its
-/// framed stdin, and the cancel-safe stdout frame reader.
+/// framed stdin, and the events its stdout reader task forwards.
+///
+/// The reader polls stdout continuously, so `Telemetry` frames the child sends
+/// while idle are recorded rather than left to fill the pipe; every other event
+/// is forwarded to `recv` in order.
 struct SubprocessWorker {
     child: Child,
     stdin: ChildStdin,
-    recv: FrameRecv,
+    /// Decoded events (or the terminal error) forwarded by the reader task.
+    events: mpsc::Receiver<Result<Option<(pb::ChildEvent, usize)>, FrameError>>,
+    /// The task owning the stdout reader; aborted on drop.
+    reader: JoinHandle<()>,
     /// Reused encode buffer for outgoing frames (see [`Worker::send`]).
     send_buf: Vec<u8>,
+}
+
+/// Stops the stdout reader with the worker, whose child is killed on drop.
+impl Drop for SubprocessWorker {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
 }
 
 /// A remote child reached over a WebSocket. One binary message per protocol
@@ -206,15 +281,24 @@ impl Worker {
 
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
+        let telemetry = Arc::new(WorkerTelemetry::new());
+        let (tx, events) = mpsc::channel(SUBPROCESS_EVENT_CHANNEL_DEPTH);
+        let reader = tokio::spawn(read_subprocess_events(
+            FrameRecv::new(stdout),
+            tx,
+            Arc::clone(&telemetry),
+        ));
         Ok(Self {
             id: 0,
             kind: WorkerKind::Subprocess(Box::new(SubprocessWorker {
                 child,
                 stdin,
-                recv: FrameRecv::new(stdout),
+                events,
+                reader,
                 send_buf: Vec::with_capacity(SEND_BUF_CAPACITY),
             })),
             checkouts_served: 0,
+            telemetry,
             #[cfg(feature = "telemetry")]
             recorder: None,
             #[cfg(feature = "telemetry")]
@@ -274,6 +358,7 @@ impl Worker {
                 reader,
             })),
             checkouts_served: 0,
+            telemetry: Arc::new(WorkerTelemetry::new()),
             #[cfg(feature = "telemetry")]
             recorder: None,
             #[cfg(feature = "telemetry")]
@@ -364,32 +449,47 @@ impl Worker {
         }
     }
 
+    /// The latest resource sample this worker reported.
+    pub(crate) fn telemetry(&self) -> &Arc<WorkerTelemetry> {
+        &self.telemetry
+    }
+
     /// Receives one event. EOF/close is an error here because within a
-    /// checkout the child must never close its side first.
+    /// checkout the child must never close its side first. `Telemetry` events
+    /// are recorded on [`Self::telemetry`] and never returned.
     ///
-    /// Cancel-safe: partial-frame state persists in the worker (see the
-    /// module docs), which is what lets `Checkout` race a turn against its
+    /// Cancel-safe: both transports read through a reader task's channel (see
+    /// the module docs), which is what lets `Checkout` race a turn against its
     /// deadline.
     pub(crate) async fn recv(&mut self) -> Result<pb::ChildEvent, FrameError> {
-        let (event, len) = match &mut self.kind {
-            WorkerKind::Subprocess(w) => match w.recv.recv().await? {
-                Some(framed) => Ok(framed),
-                None => Err(FrameError::Truncated), // clean EOF mid-checkout is still a vanished peer
-            },
-            WorkerKind::WebSocket(w) => {
-                // frames come from the reader task; a channel recv is
-                // cancel-safe, preserving the deadline race. A torn-down worker
-                // or closed channel is `Truncated` — a `PoolError::Disconnected`.
-                if w.sink.is_none() {
-                    return Err(FrameError::Truncated);
-                }
-                match w.events.recv().await {
-                    Some(Ok(data)) => decode_event(&data).map(|event| (event, data.len())),
+        let (event, len) = loop {
+            let (event, len) = match &mut self.kind {
+                // the reader task records telemetry and forwards the rest
+                WorkerKind::Subprocess(w) => match w.events.recv().await {
+                    Some(Ok(Some(framed))) => Ok(framed),
                     Some(Err(err)) => Err(err),
-                    None => Err(FrameError::Truncated),
+                    // clean EOF mid-checkout is still a vanished peer
+                    Some(Ok(None)) | None => Err(FrameError::Truncated),
+                },
+                WorkerKind::WebSocket(w) => {
+                    // frames come from the reader task; a channel recv is
+                    // cancel-safe, preserving the deadline race. A torn-down worker
+                    // or closed channel is `Truncated` — a `PoolError::Disconnected`.
+                    if w.sink.is_none() {
+                        return Err(FrameError::Truncated);
+                    }
+                    match w.events.recv().await {
+                        Some(Ok(data)) => decode_event(&data).map(|event| (event, data.len())),
+                        Some(Err(err)) => Err(err),
+                        None => Err(FrameError::Truncated),
+                    }
                 }
+            }?;
+            match &event.kind {
+                Some(pb::child_event::Kind::Telemetry(sample)) => self.telemetry.record(sample),
+                _ => break (event, len),
             }
-        }?;
+        };
         // only after a complete decode, so a `recv` future dropped mid-frame
         // (deadline race) records nothing — cancel-safety intact
         #[cfg(feature = "telemetry")]
@@ -591,6 +691,39 @@ fn decode_event(body: &[u8]) -> Result<pb::ChildEvent, FrameError> {
         decode_frame(body)
     } else {
         block_in_place(|| decode_frame(body))
+    }
+}
+
+/// Depth of the subprocess reader → `recv` channel: one decoded event, as the
+/// strict alternation never has more than one outstanding.
+const SUBPROCESS_EVENT_CHANNEL_DEPTH: usize = 1;
+
+/// The subprocess reader task: reads stdout continuously so the child's
+/// `Telemetry` frames are recorded even while the worker is idle, and forwards
+/// every other event — or the terminal EOF/error — to `recv`.
+///
+/// A forwarded event waits in the channel until a turn reads it; the strict
+/// alternation means none is outstanding while the worker is idle, so idle
+/// telemetry keeps flowing. One that is (a misbehaving child) stops the reads,
+/// and its telemetry then ages rather than being lost silently.
+async fn read_subprocess_events(
+    mut frames: FrameRecv,
+    events: mpsc::Sender<Result<Option<(pb::ChildEvent, usize)>, FrameError>>,
+    telemetry: Arc<WorkerTelemetry>,
+) {
+    loop {
+        let result = frames.recv().await;
+        if let Ok(Some((event, _))) = &result
+            && let Some(pb::child_event::Kind::Telemetry(sample)) = &event.kind
+        {
+            telemetry.record(sample);
+            continue;
+        }
+        let stop = !matches!(result, Ok(Some(_)));
+        // an Err from send means the receiver dropped: the worker is gone
+        if events.send(result).await.is_err() || stop {
+            return;
+        }
     }
 }
 

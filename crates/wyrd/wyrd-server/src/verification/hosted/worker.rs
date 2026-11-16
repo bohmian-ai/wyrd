@@ -19,6 +19,12 @@
 //! allocator itself, so embedders such as the Python and TypeScript SDK
 //! builds link none and keep their own.
 //!
+//! A second thread reports the worker's live and committed bytes every
+//! [`TELEMETRY_INTERVAL`] as one `Telemetry` frame, independent of the
+//! interpreter's turns. Frames from both threads are written whole under the
+//! stdout lock, so they never interleave; the reporter reuses one buffer, so
+//! sampling allocates nothing and no allocator hook does IPC.
+//!
 //! The serve loop mirrors `monty-runtime`'s `subprocess` shell over
 //! [`monty_proto::worker::Child`]. A worker serves one session at a time; a
 //! `Reset` between sessions drops the session's interpreter, globals, and
@@ -30,9 +36,10 @@ use std::io::{self, Write};
 use std::process::{self, ExitCode};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
+use std::time::Duration;
 
 use monty_proto::worker::{Child, EventSink, HandleOutcome, fatal_error_event, protocol_violation};
-use monty_proto::{FrameError, FrameReader, pb, write_frame};
+use monty_proto::{FrameError, FrameReader, encode_framed_into, pb, write_frame};
 use monty_types::{BASELINE_MEMORY, LIVE_MEMORY, OOM_EXIT_CODE, memory_limit_with_headroom};
 
 /// The argument the Monty pool spawns a worker with.
@@ -50,6 +57,9 @@ static HARD_LIMIT: AtomicUsize = AtomicUsize::new(usize::MAX);
 /// Native stack of the interpreter thread; Monty's recursion limit needs
 /// more than the platform default on some hosts.
 pub(crate) const WORKER_STACK_SIZE: usize = 16 * 1024 * 1024;
+
+/// How often a worker reports its live and committed bytes to the parent.
+pub const TELEMETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 /// `sysexits.h` protocol error: the frame stream desynchronized.
 const EX_PROTOCOL: u8 = 76;
@@ -128,19 +138,30 @@ fn out_of_memory(reason: fmt::Arguments<'_>) -> ! {
 /// argument is [`SUBPROCESS_ARG`], and `None` for every other invocation so
 /// the caller continues as the server. The binary calls this first in
 /// `main`, before any runtime, CLI, or telemetry exists, so a worker process
-/// holds only the interpreter thread and its own heap count.
+/// holds only the interpreter and telemetry threads and its own heap count.
+/// `committed` reads the binary's allocator commitment, which only the binary
+/// can observe.
 #[must_use]
-pub fn dispatch() -> Option<ExitCode> {
+pub fn dispatch(committed: fn() -> u64) -> Option<ExitCode> {
     std::env::args_os()
         .skip(1)
         .eq([std::ffi::OsString::from(SUBPROCESS_ARG)])
-        .then(run)
+        .then(|| run(committed))
 }
 
-/// Run this process as a Monty pool worker: start counting the heap, then
-/// serve the protocol on a dedicated interpreter thread until it ends.
-fn run() -> ExitCode {
+/// Run this process as a Monty pool worker: start counting the heap and
+/// reporting telemetry, then serve the protocol on a dedicated interpreter
+/// thread until it ends.
+fn run(committed: fn() -> u64) -> ExitCode {
     COUNTING.store(true, Ordering::Relaxed);
+    if thread::Builder::new()
+        .name("monty-telemetry".to_owned())
+        .stack_size(TELEMETRY_STACK_SIZE)
+        .spawn(move || report(committed))
+        .is_err()
+    {
+        return ExitCode::from(EX_CONFIG);
+    }
     thread::Builder::new()
         .name("monty-worker".to_owned())
         .stack_size(WORKER_STACK_SIZE)
@@ -198,6 +219,44 @@ fn serve() -> ExitCode {
     }
 }
 
+/// Native stack of the telemetry thread, which only encodes one small frame.
+const TELEMETRY_STACK_SIZE: usize = 64 * 1024;
+
+/// Report the live and committed bytes every [`TELEMETRY_INTERVAL`] until
+/// stdout closes, which happens only as the process ends.
+///
+/// Each sample reads the counters when it is written, so a write delayed by a
+/// large frame on the interpreter thread coalesces into one current sample
+/// rather than queueing stale ones.
+fn report(committed: fn() -> u64) {
+    let mut frame = Vec::with_capacity(TELEMETRY_FRAME_CAPACITY);
+    loop {
+        thread::sleep(TELEMETRY_INTERVAL);
+        let event = pb::ChildEvent {
+            kind: Some(pb::child_event::Kind::Telemetry(pb::Telemetry {
+                live_bytes: u64::try_from(LIVE_MEMORY.load(Ordering::Relaxed)).unwrap_or(u64::MAX),
+                committed_bytes: committed(),
+            })),
+            ..pb::ChildEvent::default()
+        };
+        if encode_framed_into(&event, &mut frame).is_err() {
+            return;
+        }
+        let mut stdout = io::stdout().lock();
+        if stdout
+            .write_all(&frame)
+            .and_then(|()| stdout.flush())
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// Room for one encoded telemetry frame, reserved once so sampling never
+/// allocates.
+const TELEMETRY_FRAME_CAPACITY: usize = 64;
+
 /// Arm the hard ceiling of the session the child now holds, relative to the
 /// worker's baseline, as `monty-alloc`'s `set_hard_limit` does. Re-applied
 /// after every request, since a session can also arrive through a restored
@@ -217,12 +276,13 @@ fn apply_memory_limit(child: &Child) {
 struct StdoutSink;
 
 impl EventSink for StdoutSink {
-    /// Frame `event` onto stdout.
+    /// Frame `event` onto stdout under its lock, so a telemetry frame never
+    /// lands inside it.
     ///
     /// # Errors
     /// Returns the framing or write failure.
     fn send(&mut self, event: &pb::ChildEvent) -> Result<(), FrameError> {
-        write_frame(&mut io::stdout(), event)
+        write_frame(&mut io::stdout().lock(), event)
     }
 }
 
@@ -237,7 +297,7 @@ fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = write_frame(
-            &mut io::stdout(),
+            &mut io::stdout().lock(),
             &fatal_error_event(&format!("worker panicked: {info}")),
         );
         default_hook(info);

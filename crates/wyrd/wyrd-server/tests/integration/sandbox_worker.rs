@@ -13,7 +13,7 @@ use monty_pool::{MountSpec, MountSpecMode};
 use serde_json::{Map, Value, json};
 use tokio::time::Instant;
 use vala_verify::blocks::BlockError;
-use wyrd_runtime::resources::{ByteLedger, ProcessResources};
+use wyrd_runtime::resources::{ByteLedger, PressureState, ProcessResources};
 use wyrd_server::verification::hosted::HostedLimits;
 use wyrd_server::verification::hosted::sandbox::{CodeRun, Sandbox};
 use wyrd_server::verification::hosted::workspace::{ScratchRoot, Staged, Workspace, Workspaces};
@@ -49,13 +49,21 @@ pub(crate) fn worker() -> PathBuf {
         .clone()
 }
 
-/// Process resources of `memory` bytes on four CPUs with ample scratch.
+/// Process resources of `memory` bytes on four CPUs with ample scratch,
+/// sampled for pressure as the server samples them, with no parent allocator
+/// reading.
+///
+/// # Panics
+/// Panics when called outside a Tokio runtime.
 pub(crate) fn process(memory: u64) -> ProcessResources {
-    ProcessResources::new(
+    let process = ProcessResources::new(
         NonZeroUsize::new(4).expect("4 is non-zero"),
         memory,
         16 << 30,
-    )
+    );
+    let workloads = process.workloads().clone();
+    tokio::spawn(async move { workloads.sample_every(|| 0).await });
+    process
 }
 
 /// Process resources with room for many concurrent operations.
@@ -489,8 +497,8 @@ async fn python_writes_beyond_process_scratch_stop_busy() {
     assert_eq!(scratch.used(), 4);
 }
 
-/// Memory and time breaches end only the offending operation; the sandbox
-/// keeps serving, and limits that cannot hold one worker refuse to start.
+/// Memory and time breaches end only the offending operation, and the
+/// sandbox keeps serving.
 ///
 /// The two ceilings are independent and neither takes precedence, so each
 /// breach runs where only its own ceiling can be reached first: memory under
@@ -498,8 +506,7 @@ async fn python_writes_beyond_process_scratch_stop_busy() {
 /// deadline with code that allocates nothing.
 ///
 /// # Panics
-/// Panics when a breach succeeds, poisons the pool, or impossible limits
-/// start.
+/// Panics when a breach succeeds or poisons the pool.
 #[tokio::test]
 async fn sandbox_contains_runaway_code() {
     let sandbox = start(HostedLimits {
@@ -558,75 +565,57 @@ async fn sandbox_contains_runaway_code() {
             .value,
         json!(1)
     );
-
-    let limits = HostedLimits::default();
-    let envelope = Sandbox::envelope_bytes(&limits).expect("the envelope fits u64");
-    assert!(
-        Sandbox::start(worker(), limits, &process(envelope))
-            .await
-            .is_err(),
-        "process memory below one session's envelope refuses to start"
-    );
 }
 
-/// With process memory for one operation, a waiter whose deadline passes,
-/// and one whose waiting bytes find no memory at all, are busy; then of two
-/// concurrent operations the second waits, the idle worker is reaped for it,
-/// and it runs. Busy is the process-capacity refusal the engine
-/// defers rather than retries or judges.
+/// Critical process pressure pauses new operations: one whose deadline
+/// passes is busy, the process-capacity refusal the engine defers rather
+/// than retries or judges, and once pressure recovers the next one runs.
 ///
 /// # Panics
-/// Panics when an operation that fits is refused, or a refusal is not busy.
+/// Panics when an operation starts under critical pressure, its refusal is
+/// not busy, or work does not resume after recovery.
 #[tokio::test]
-async fn sandbox_waits_for_process_memory() {
+async fn sandbox_pauses_under_process_pressure() {
     let limits = HostedLimits {
         monty_min_workers: 0,
         code_timeout: Duration::from_secs(5),
         ..HostedLimits::default()
     };
-    let one = Sandbox::envelope_bytes(&limits).expect("the envelope fits u64");
-    let sandbox = Sandbox::start(worker(), limits, &process(one + 4096))
+    let process = process(256 << 20);
+    let workloads = process.workloads().clone();
+    let sandbox = Sandbox::start(worker(), limits, &process)
         .await
         .expect("pool starts");
-    let none = Map::new();
-    let occupied = sandbox.occupy_for_test(4096);
-    let soon = Instant::now() + Duration::from_millis(100);
+    let occupied = sandbox.occupy_for_test(0);
+    until("the full ledger turns pressure critical", || {
+        (workloads.pressure().state == PressureState::Critical).then_some(())
+    })
+    .await;
+    let soon = Instant::now() + Duration::from_millis(300);
     match sandbox
         .run(
             DataTenantId::new_v7(),
             "def f():\n    return 1",
             "f",
-            &none,
+            &Map::new(),
             Vec::new(),
             soon,
         )
         .await
     {
-        Err(BlockError::Busy { reason }) => assert!(reason.contains("deadline"), "{reason}"),
-        other => panic!("expected a busy deadline refusal, got {other:?}"),
+        Err(BlockError::Busy { reason }) => assert!(reason.contains("pressure"), "{reason}"),
+        other => panic!("expected a busy pressure refusal, got {other:?}"),
     }
-    drop(occupied);
-    let occupied = sandbox.occupy_for_test(0);
-    match run(&sandbox, "def f():\n    return 1", "f", json!({})).await {
-        Err(BlockError::Busy { reason }) => assert!(reason.contains("cannot hold"), "{reason}"),
-        other => panic!("expected a busy memory refusal, got {other:?}"),
-    }
-    drop(occupied);
-
-    let count =
-        "def f(n):\n    total = 0\n    for i in range(n):\n        total += i\n    return total";
-    let (first, second) = tokio::join!(
-        run(&sandbox, count, "f", json!({"n": 100_000})),
-        run(&sandbox, count, "f", json!({"n": 10})),
-    );
     assert_eq!(
-        first.expect("the first runs").value,
-        json!(4_999_950_000_u64)
+        sandbox.waiting(),
+        0,
+        "the refused operation stopped waiting"
     );
-    assert_eq!(
-        second.expect("the second waits, then runs").value,
-        json!(45)
-    );
+    drop(occupied);
+    let ran = run(&sandbox, "def f():\n    return 1", "f", json!({}))
+        .await
+        .expect("the operation runs once pressure recovers");
+    assert_eq!(ran.value, json!(1));
 }
 
 /// Shutdown reaps every worker by its deadline and closes admission, and
@@ -687,20 +676,122 @@ fn exists(pid: u32) -> bool {
         .success()
 }
 
-/// The resident set of process `pid` in bytes, from `ps`.
+/// The most an idle worker reports after a reset: a small fraction of the
+/// default 256 MiB session budget, which a session envelope always exceeded.
+const IDLE_WORKER_BYTES: u64 = 64 << 20;
+
+/// Poll `ready` until it yields, failing with `what` after ten seconds.
 ///
 /// # Panics
-/// Panics when `ps` cannot run or reports no size.
-fn resident_set(pid: u32) -> u64 {
-    let out = Command::new("ps")
-        .args(["-o", "rss=", "-p", &pid.to_string()])
-        .output()
-        .expect("ps runs");
-    String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .parse::<u64>()
-        .expect("ps reports the resident set in KiB")
-        * 1024
+/// Panics when `ready` never yields.
+async fn until<T>(what: &str, mut ready: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(value) = ready() {
+            return value;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting: {what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Send `signal` (such as `-STOP`) to process `pid` with `kill`.
+///
+/// # Panics
+/// Panics when `kill` cannot run or fails.
+fn signal(pid: u32, signal: &str) {
+    assert!(
+        Command::new("kill")
+            .args([signal, &pid.to_string()])
+            .status()
+            .expect("kill runs")
+            .success(),
+        "kill {signal} {pid}"
+    );
+}
+
+/// A worker that stops reporting keeps its last observed bytes and stops new
+/// work once its sample is older than 500 ms; when it reports again the same
+/// worker serves, and once it is killed its charge returns only after the
+/// process is gone.
+///
+/// # Panics
+/// Panics when a stale worker's charge drops, new work runs while it is
+/// stale, recovery does not reuse it, or its charge returns early or never.
+#[tokio::test]
+async fn stale_worker_telemetry_stops_new_work_without_freeing_usage() {
+    let process = roomy();
+    let memory = process.memory().clone();
+    let sandbox = Sandbox::start(
+        worker(),
+        HostedLimits {
+            monty_min_workers: 0,
+            ..HostedLimits::default()
+        },
+        &process,
+    )
+    .await
+    .expect("pool starts");
+    let one = "def f():\n    return 1";
+    run(&sandbox, one, "f", json!({}))
+        .await
+        .expect("the first operation runs");
+    let pid = sandbox.idle_worker_pids()[0];
+    let observed = until("the idle worker reports", || {
+        let bytes = sandbox.worker_bytes();
+        (bytes > 0).then_some(bytes)
+    })
+    .await;
+
+    signal(pid, "-STOP");
+    until("the stopped worker turns stale", || {
+        (sandbox.stale_workers() == 1).then_some(())
+    })
+    .await;
+    assert_eq!(
+        sandbox.worker_bytes(),
+        observed,
+        "a stale worker keeps its last usage"
+    );
+    assert_eq!(memory.used(), observed);
+    let soon = Instant::now() + Duration::from_millis(300);
+    let waited = sandbox
+        .run(
+            DataTenantId::new_v7(),
+            one,
+            "f",
+            &Map::new(),
+            Vec::new(),
+            soon,
+        )
+        .await;
+    match waited {
+        Err(BlockError::Busy { reason }) => assert!(reason.contains("telemetry"), "{reason}"),
+        other => panic!("new work waits for stale telemetry, got {other:?}"),
+    }
+    assert_eq!(
+        sandbox.idle_worker_pids(),
+        [pid],
+        "no worker started meanwhile"
+    );
+
+    signal(pid, "-CONT");
+    run(&sandbox, one, "f", json!({}))
+        .await
+        .expect("work resumes once it reports");
+    assert_eq!(
+        sandbox.idle_worker_pids(),
+        [pid],
+        "the recovered worker served"
+    );
+
+    signal(pid, "-KILL");
+    settle(&sandbox, 0).await;
+    assert_eq!(
+        memory.used(),
+        0,
+        "the charge returned once the process was gone"
+    );
 }
 
 /// Wait until every charged worker that is gone has had its charge returned
@@ -736,15 +827,14 @@ async fn settle(sandbox: &Sandbox, charged: usize) {
 /// One healthy worker serves tenant A, then tenant B, then A again. Each
 /// session starts fresh: B sees none of A's globals, mounts, or output, and
 /// a Python error in B still resets the worker for reuse. Between sessions
-/// the idle worker keeps one session envelope charged, never more, and that
-/// charge covers its resident set after a session that allocated most of its
-/// budget.
+/// the idle worker charges the bytes it reports, not a session envelope: after
+/// a session that allocated most of its budget and reset, that is a small
+/// fraction of the budget.
 ///
 /// # Panics
 /// Panics when the process is not reused, a session sees another's state,
-/// an idle worker's charge grows across sessions, or its resident set exceeds
-/// its charge, or the worker telemetry does not count one spawn and a reset
-/// per session.
+/// the idle worker's charge is not its observed bytes, or the worker metrics
+/// do not count one spawn and a reset per session.
 #[tokio::test]
 async fn sandbox_reuses_processes_with_fresh_tenant_sessions() {
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
@@ -791,17 +881,11 @@ async fn sandbox_reuses_processes_with_fresh_tenant_sessions() {
     );
     let pids = sandbox.idle_worker_pids();
     assert_eq!(pids.len(), 1, "A's worker returns to the pool");
-    let envelope = Sandbox::envelope_bytes(&limits).expect("the envelope fits u64");
-    assert_eq!(
-        (memory.used(), sandbox.worker_bytes()),
-        (envelope, envelope),
-        "the idle worker keeps its session envelope"
-    );
-    let rss = resident_set(pids[0]);
-    assert!(
-        rss <= envelope,
-        "the reset worker's resident set {rss} exceeds its {envelope}-byte charge"
-    );
+    until("the reset worker charges only its observed bytes", || {
+        let idle = sandbox.worker_bytes();
+        (idle > 0 && idle < IDLE_WORKER_BYTES && memory.used() == idle).then_some(())
+    })
+    .await;
 
     for probe in ["secret", "blob", "open('/inputs/secret.txt').read()"] {
         let failed = exec(b, probe, Vec::new()).await;
@@ -832,8 +916,8 @@ async fn sandbox_reuses_processes_with_fresh_tenant_sessions() {
     );
     assert_eq!(
         memory.used(),
-        envelope,
-        "later sessions take the charge over"
+        sandbox.worker_bytes(),
+        "later sessions leave only the worker's observed bytes"
     );
     let rendered = metrics.render();
     let event = |event: &str| {
@@ -852,14 +936,15 @@ async fn sandbox_reuses_processes_with_fresh_tenant_sessions() {
     }
 }
 
-/// A program suspended on the `/work` writer gives up its runnable turn but
-/// keeps its envelope: with one effective CPU, another operation runs to
-/// completion meanwhile, and the suspended one finishes once the writer frees.
+/// A program suspended on the `/work` writer gives up its CPU lane while its
+/// worker keeps reporting: with one effective CPU, another operation runs to
+/// completion meanwhile, the suspended worker's samples show the blob it holds
+/// although its turn never ended, and it finishes once the writer frees.
 ///
 /// # Panics
-/// Panics when the suspended program blocks the other operation, releases
-/// its envelope while suspended, or does not finish, or the telemetry does
-/// not show one active, suspended operation holding its envelope.
+/// Panics when the suspended program blocks the other operation, its worker's
+/// held bytes never appear while suspended, or it does not finish, or the
+/// metrics do not show one active, suspended operation.
 #[tokio::test]
 async fn suspended_sessions_release_runnable_capacity() {
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
@@ -881,7 +966,7 @@ async fn suspended_sessions_release_runnable_capacity() {
     let envelopes = Envelopes::default();
     let suspended = sandbox.exec(
         DataTenantId::new_v7(),
-        "from pathlib import Path\nPath('/work/a.txt').write_text('done')\n'written'".to_owned(),
+        "from pathlib import Path\nblob = 'x' * (100 * 1024 * 1024)\nPath('/work/a.txt').write_text('done')\nlen(blob)".to_owned(),
         Vec::new(),
         mounts,
         far(),
@@ -890,13 +975,12 @@ async fn suspended_sessions_release_runnable_capacity() {
         &envelopes,
     );
     tokio::pin!(suspended);
-    let envelope = Sandbox::envelope_bytes(&limits).expect("the envelope fits u64");
     // Active, suspended, and holding no turn: with nothing else running, only
     // a program parked on the held writer shows this.
-    let parked = [1, envelope, 0, 1];
     let settled = || {
         let rendered = metrics.render();
-        SETTLED.map(|series| sample(&rendered, series)) == parked
+        let [active, _, runnable, suspended] = SETTLED.map(|series| sample(&rendered, series));
+        (active, runnable, suspended) == (1, 0, 1)
     };
     let deadline = Instant::now() + Duration::from_secs(10);
     while !settled() {
@@ -910,16 +994,20 @@ async fn suspended_sessions_release_runnable_capacity() {
             () = tokio::time::sleep(Duration::from_millis(20)) => {}
         }
     }
+    until(
+        "the suspended worker reports its blob while its turn is held",
+        || {
+            (sandbox.worker_bytes() >= 100 << 20 && memory.used() >= sandbox.worker_bytes())
+                .then_some(())
+        },
+    )
+    .await;
     let other = run(&sandbox, "def f():\n    return 7", "f", json!({})).await;
     assert_eq!(other.expect("the other operation runs").value, json!(7));
-    assert!(
-        memory.used() >= envelope,
-        "the suspended program keeps its envelope while suspended"
-    );
     assert!(settled(), "{}", metrics.render());
     drop(writer);
     let (value, _) = suspended.await.expect("the program finishes");
-    assert_eq!(value.py_repr(), "'written'");
+    assert_eq!(value.py_repr(), "104857600");
     assert_eq!(sandbox.runnable_turns(), 1);
     let rendered = metrics.render();
     for series in SETTLED {
@@ -990,35 +1078,39 @@ async fn failed_workers_settle_before_capacity_returns() {
     }
 }
 
-/// Prewarmed workers are charged like any worker, and when an operation's
-/// envelope does not fit beside them they are reaped so it runs, leaving
-/// fewer than `monty_min_workers`.
+/// Prewarmed workers are charged what they report, like any worker, and
+/// critical pressure reclaims them before any operation is cancelled,
+/// leaving fewer than `monty_min_workers`; work then still runs.
 ///
 /// # Panics
-/// Panics when prewarmed workers are uncharged, block the operation, or
-/// survive the pressure.
+/// Panics when prewarmed workers are uncharged, survive the pressure, or
+/// block later work.
 #[tokio::test]
 async fn prewarmed_workers_are_charged_and_reaped_under_pressure() {
     let limits = HostedLimits {
         monty_min_workers: 2,
         ..HostedLimits::default()
     };
-    let envelope = Sandbox::envelope_bytes(&limits).expect("the envelope fits u64");
-    let process = process(envelope + 1024);
+    let process = process(1 << 30);
     let memory = process.memory().clone();
     let sandbox = Sandbox::start(worker(), limits, &process)
         .await
         .expect("pool starts");
     let warm = sandbox.idle_worker_pids();
-    assert_eq!(warm.len(), 2, "both prewarmed workers fit");
-    assert_eq!(memory.used(), sandbox.worker_bytes());
-    assert!(memory.used() > 0, "prewarmed workers are charged");
+    assert_eq!(warm.len(), 2, "both prewarmed workers start");
+    until("prewarmed workers are charged what they report", || {
+        let bytes = sandbox.worker_bytes();
+        (bytes > 0 && memory.used() == bytes).then_some(())
+    })
+    .await;
 
+    let occupied = sandbox.occupy_for_test(0);
+    settle(&sandbox, 0).await;
+    drop(occupied);
     let ran = run(&sandbox, "def f():\n    return 1", "f", json!({}))
         .await
-        .expect("the operation runs once idle workers are reaped");
+        .expect("work runs after the reclaim");
     assert_eq!(ran.value, json!(1));
-    settle(&sandbox, 1).await;
     for pid in warm {
         assert!(
             !exists(pid),

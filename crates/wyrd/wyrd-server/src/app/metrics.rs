@@ -158,24 +158,22 @@ pub const PROCESS_RESOURCE_PLAN: &str = "wyrd_process_resource_plan";
 /// by each `bench` snapshot, so a benchmark window counts workers that exit
 /// inside it. Live workers are read from the OS by the benchmark itself.
 pub const PROCESS_REAPED_CHILDREN_CPU_SECONDS: &str = "wyrd_process_reaped_children_cpu_seconds";
-/// Hosted Python operations, by `state`: `waiting` for process memory, or
-/// `active` from their grant until they end.
+/// Hosted Python operations `active` from their admission until they end.
 pub const VERIFICATION_HOSTED_OPERATIONS: &str = "wyrd_verification_hosted_operations";
-/// The bytes of [`VERIFICATION_HOSTED_OPERATIONS`], by `state`: the grants
-/// waiters ask for, or the session envelopes active operations hold.
+/// The inputs active [`VERIFICATION_HOSTED_OPERATIONS`] retain, in bytes.
 pub const VERIFICATION_HOSTED_BYTES: &str = "wyrd_verification_hosted_bytes";
-/// Hosted Python operations refused process memory, by `reason`: `memory`
-/// (refused at once) or `expired` (the deadline passed while it waited).
+/// Hosted Python operations refused by the process, by `reason`: `memory`
+/// (its retained inputs did not fit) or `expired` (the deadline passed while
+/// pressure or stale worker telemetry held it).
 pub const VERIFICATION_HOSTED_REFUSALS_TOTAL: &str = "wyrd_verification_hosted_refusals_total";
-/// How long one hosted Python operation queued for process memory, by
-/// `outcome` (`granted`, `expired`); an operation granted at once records
-/// none, and a cancelled one records nothing.
+/// How long one hosted Python operation waited for process admission, by
+/// `outcome` (`granted`, `expired`); a cancelled one records nothing.
 pub const VERIFICATION_HOSTED_WAIT_SECONDS: &str = "wyrd_verification_hosted_wait_seconds";
 /// Checked-out Python workers, by `state`: `runnable` while a turn runs,
-/// `suspended` while the program waits on its host or for a runnable turn.
+/// `suspended` while the program waits on its host or for a CPU lane.
 pub const VERIFICATION_PYTHON_WORKERS: &str = "wyrd_verification_python_workers";
 /// Python worker lifecycle events, by `event`: `spawn` (a new worker
-/// process charged), `reset` (a worker returned for reuse), and `reap` (a
+/// process tracked), `reset` (a worker returned for reuse), and `reap` (a
 /// gone worker's charge returned).
 pub const VERIFICATION_PYTHON_WORKER_EVENTS_TOTAL: &str =
     "wyrd_verification_python_worker_events_total";

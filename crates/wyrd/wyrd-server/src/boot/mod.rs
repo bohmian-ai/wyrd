@@ -1218,6 +1218,10 @@ pub struct StartInputs {
     /// The `wyrd-server` executable the hosted Python sandbox spawns as its
     /// worker.
     pub worker: PathBuf,
+    /// Reads this process's allocator commitment for the pressure sampler;
+    /// only the binary owning the global allocator can supply it, and an
+    /// embedder that cannot returns zero.
+    pub parent_committed: fn() -> u64,
     /// Deterministic Bifrost controls of a test server.
     #[cfg(feature = "test-support")]
     pub bifrost_test_controls: Option<crate::state::BifrostTestControls>,
@@ -1230,14 +1234,17 @@ impl StartInputs {
     /// The production inputs for `config`: dependencies from the
     /// environment's DSNs and storage settings, the configured key material,
     /// default auth settings and RBAC, and this executable as the sandbox
-    /// worker.
+    /// worker, whose allocator commitment `parent_committed` reads.
     ///
     /// # Errors
     /// Returns [`ServerBootError`] when the database URLs, storage, catalog,
     /// resource detection, data root, sealing or signing key, or peer TLS
     /// bundle is invalid or unavailable, or this executable's path is not
     /// available.
-    pub async fn production(config: &WyrdServerConfig) -> Result<Self, ServerBootError> {
+    pub async fn production(
+        config: &WyrdServerConfig,
+        parent_committed: fn() -> u64,
+    ) -> Result<Self, ServerBootError> {
         let dsns = ResolvedDsns::from_env()?;
         let dependencies =
             build_bifrost_external_dependencies(&dsns, &config.bifrost, &config.forge, config.role)
@@ -1255,6 +1262,7 @@ impl StartInputs {
                     "cannot locate this executable: {error}"
                 ))
             })?,
+            parent_committed,
             #[cfg(feature = "test-support")]
             bifrost_test_controls: None,
             #[cfg(feature = "test-support")]
@@ -1293,6 +1301,7 @@ impl AppState {
             permission_check,
             peer_tls,
             worker,
+            parent_committed,
             #[cfg(feature = "test-support")]
             bifrost_test_controls,
             #[cfg(feature = "test-support")]
@@ -1418,7 +1427,16 @@ impl AppState {
             rollback_roles(&state.bifrost).await;
             return Err(error);
         }
-        let workers = state.engine_workers(config);
+        let mut workers = state.engine_workers(config);
+        let workloads = process.workloads().clone();
+        let stop = state.shutdown_token.clone();
+        workers.push((
+            "process_pressure",
+            Box::pin(async move {
+                stop.run_until_cancelled(workloads.sample_every(parent_committed))
+                    .await;
+            }),
+        ));
         Ok(BootedServer {
             state,
             coordination_runtime,

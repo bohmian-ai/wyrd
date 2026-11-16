@@ -9,7 +9,6 @@
 
 use std::time::Duration;
 
-pub mod admission;
 pub mod blocks;
 pub mod evidence;
 pub mod publications;

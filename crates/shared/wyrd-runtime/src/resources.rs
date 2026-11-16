@@ -28,8 +28,8 @@ mod workload;
 pub use lanes::{CpuLanes, LaneLease, Laned};
 use workload::OperationShared;
 pub use workload::{
-    CommitObservation, Operation, OperationId, Pressure, PressureState, WorkContext, Workload,
-    WorkloadManager,
+    CommitObservation, Operation, OperationId, Pressure, PressureState, SAMPLE_INTERVAL,
+    WorkContext, Workload, WorkloadManager,
 };
 
 /// A charge that does not fit the ledger's remaining bytes.

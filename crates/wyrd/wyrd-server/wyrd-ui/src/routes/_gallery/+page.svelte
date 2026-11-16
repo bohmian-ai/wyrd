@@ -183,6 +183,7 @@
         { label: 'traces · a value in WHERE', input: { signal: 'traces', facets: ['workload_card_uid', 'subject_card_uid', 'service_name', 'status_code'], where: [{ column: 'service_name', value: 'agent-api' }] } },
         { label: 'spans · more values than shown', input: { signal: 'spans', facets: ['name', 'service_name', 'status_code'] } },
         { label: 'logs', input: { signal: 'logs', facets: ['severity_text', 'workload_card_uid', 'service_name'] } },
+        { label: 'executions · no recorded verdict is counted apart', input: { signal: 'executions', facets: ['status', 'verdict', 'verifier_card_uid'] } },
         ...states({ signal: 'traces', facets: ['service_name'] }),
         { label: 'narrow', input: { signal: 'spans', facets: ['name', 'status_code'] }, narrow: true }
       ]
@@ -197,6 +198,8 @@
         { label: 'spans · grouped by duration: two values that read "1ms" stay apart', input: { signal: 'spans', groupBy: 'duration_nano' } },
         { label: 'logs · 120 read, paged, wrap and columns', input: { signal: 'logs', limit: 120 } },
         { label: 'metrics · null is not zero', input: { signal: 'metrics' } },
+        { label: 'executions · status and verdict apart, no terminal record', input: { signal: 'executions' } },
+        { label: 'executions · grouped by session', input: { signal: 'executions', groupBy: 'group_id' } },
         { label: 'authored SQL · aliases keep their returned meaning', input: { sql: AUTHORED_SQL } },
         ...states({ signal: 'logs' }),
         { label: 'narrow', input: { signal: 'spans' }, narrow: true }

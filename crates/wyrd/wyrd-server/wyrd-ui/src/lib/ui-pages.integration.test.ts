@@ -135,12 +135,12 @@ test('authenticated traces and spans', async ({ ui }) => {
   const observe = `${ui.base}/t/${TENANT}/observe`;
   const signals = page.getByRole('navigation', { name: 'Signal' });
 
-  // The rail links Observe; Traces is the default signal; undelivered destinations stay visible and disabled.
+  // The rail links Observe and Verify; Traces is the default signal; the undelivered Ask stays visible and disabled.
   const rail = page.getByRole('navigation', { name: 'Destinations' });
   await rail.getByRole('link', { name: 'Observe' }).click();
   await page.waitForURL(observe);
   await expect.poll(() => signals.getByRole('link', { name: 'Traces' }).getAttribute('aria-current')).toBe('page');
-  expect(await rail.locator('[aria-disabled="true"]', { hasText: 'Verify' }).count()).toBe(1);
+  expect(await rail.getByRole('link', { name: 'Verify' }).getAttribute('href')).toBe(`/t/${TENANT}/verify`);
   expect(await page.getByRole('button', { name: /Find or ask/ }).isDisabled()).toBe(true);
 
   // The first HTML response already carries this tenant's evidence: no script runs the initial reads.
@@ -1079,7 +1079,8 @@ test('an exact Verifier Card page draws its declared graph and where it runs', a
   expect(await graph.locator('[data-edge]').count()).toBe(13);
   expect(await node('step:refund-rules').textContent()).toContain('needs policy-text');
   expect(await graph.textContent()).not.toMatch(/passed|failed|running/i);
-  expect(await page.getByRole('link', { name: /Results/ }).count()).toBe(0);
+  // The page itself shows no result; its one link to them opens Verify filtered to this exact Verifier version.
+  expect(await page.getByRole('link', { name: 'Results in Verify' }).getAttribute('href')).toMatch(/\/verify\?where=.*verifier_card_uid/);
 
   // Selecting a step shows its declaration; arrow keys move the selection and focus with it.
   await node('step:refund-rules').click();
@@ -1619,7 +1620,8 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
 
     // Either chart brushes the range every panel reads; Reset zoom returns to the preset.
     for (const title of ['Executions by verdict', 'Executions by Verifier']) {
-      const box = (await page.getByRole('region', { name: title }).locator('svg.plot').boundingBox()) as NonNullable<Awaited<ReturnType<ReturnType<Page['locator']>['boundingBox']>>>;
+      const box = await page.getByRole('region', { name: title }).locator('svg.plot').boundingBox();
+      if (!box) throw new Error(`${title} draws no plot to brush`);
       await page.mouse.move(box.x + box.width * 0.5, box.y + box.height / 2);
       await page.mouse.down();
       await page.mouse.move(box.x + box.width * 0.99, box.y + box.height / 2, { steps: 5 });

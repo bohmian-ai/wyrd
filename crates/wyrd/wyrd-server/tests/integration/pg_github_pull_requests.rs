@@ -104,14 +104,16 @@ impl Deployment {
         .await
     }
 
-    /// Start the deployment as [`Self::start`] does, running queued work
-    /// under `limits`.
+    /// Start the deployment as [`Self::start`] does, on a `worker` target
+    /// running queued work under `limits`, so the webhook, deferred-input
+    /// and approval journeys on it complete without the `combined` target.
     ///
     /// # Panics
     /// Panics when a step fails.
     pub(crate) async fn start_limited(limits: RuntimeLimits) -> Self {
         Self::launch(|builder| {
             builder
+                .with_bifrost_target_for_test(wyrd_server::config::ServerTarget::Worker)
                 .with_verification_runtime_for_test()
                 .with_verification_runtime_limits_for_test(limits)
         })

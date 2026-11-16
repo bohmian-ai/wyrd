@@ -1,19 +1,9 @@
-//! Verification runtime journey on a role-separated cluster.
+//! Verification runtime journeys on `combined` nodes.
 //!
-//! The runner lives on an Oracle-only node with no local Scribe, so the only
-//! way its result can reach Bifrost is the gateway capture writer's peer
-//! ingest RPC to the Scribe node. The journey schedules one
-//! binding-created run, lets the runtime execute and publish a non-empty Drift
-//! result, and reads the summary and its output row back through the
-//! server's own query entry, asserting every identity they carry. A second
-//! journey runs the production Drift engine on the Scribe-only node, which
-//! hosts no Oracle, so its observation read must be forwarded to a peer
-//! Oracle under the tenant's tokenless SYSTEM read authority and audited
-//! there. A third
-//! journey proves every built-in typed payload — verification outputs,
-//! gateway payloads, and audit detail — reads back as the producer's
-//! native JSON. A fourth journey sends raw Arrow IPC with malformed Variant
-//! columns to built-ins and proves each is refused before any ACK.
+//! Among them, one journey proves every built-in typed payload —
+//! verification outputs, gateway payloads, and audit detail — reads back as
+//! the producer's native JSON, and another sends raw Arrow IPC with malformed
+//! Variant columns to built-ins and proves each is refused before any ACK.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
@@ -83,7 +73,7 @@ use wyrd_testing::verification::{ExecutionRow, VerificationFixture};
 use wyrd_testing::{Bootstrap, WyrdTestServer, WyrdTestServerBuilder};
 use wyrd_types::variant::{variant_field, variant_storage_type};
 
-use super::query::{ServerJourneyError, audit_rows, scheduled_context};
+use super::query::{ServerJourneyError, scheduled_context};
 
 /// Direct verification keeps running while queued capacity is held.
 mod isolated_capacity;
@@ -180,211 +170,6 @@ async fn first_settled(
     }
 }
 
-/// A runner on a node without local Scribe publishes a binding-created Drift
-/// result through the Scribe outbox's peer ingest RPC and completes
-/// the run. Its summary and output rows are queryable through the
-/// Oracle and carry the exact tenant SYSTEM principal, Verifier, subject,
-/// owner, binding, run, result, and one shared event time, with the owner
-/// Service and subject described by name and version by the peer that
-/// admitted them.
-///
-/// # Errors
-/// Returns cluster, seeding, runtime, publication, or query errors, or a
-/// description of the first identity that does not match.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires the serialized Postgres-backed journey lane"]
-async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
--> Result<(), ServerJourneyError> {
-    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::role_separated()).await?;
-    let tenant = cluster.data_tenant_id();
-    let oracle = cluster.server(0).ok_or("missing Oracle node")?;
-    let scribe = cluster
-        .servers()
-        .find(|server| server.bifrost_scribe().is_some())
-        .ok_or("the cluster composed no Scribe")?;
-    if oracle.state().bifrost_ingest().is_some() {
-        return Err("the runner node must have no local ingest".into());
-    }
-
-    let seed = VerificationFixture::provision(oracle.state(), tenant).await?;
-    let (subject, _) = seed.service("remote-subject").await?;
-    let (owner, owner_principal) = seed.service("remote-owner").await?;
-    let verifier = seed.drift_verifier("remote-drift").await?;
-    let binding = seed
-        .bind_schedule(&owner, &subject, &verifier, "0 * * * *", Vec::new())
-        .await?;
-    // Activation arms the cursor at the next hour's boundary; the occurrence
-    // is brought due in the database, which owns the schedule clock.
-    seed.activate(owner_principal, &owner).await?;
-    seed.make_binding_due(binding).await?;
-    let script = EngineScript::default();
-    script.push(EngineOutcome::Completed(drift_outcome(Some(
-        two_feature_report()?,
-    ))?));
-    let runtime = VerificationRuntime::builder(oracle.state())
-        .engine_script(script)
-        .build()
-        .ok_or("the runtime did not compose")?;
-    if !runtime.composes(RuntimeCapability::Runner) {
-        return Err("a node reaching a peer Scribe did not compose the runner".into());
-    }
-    let stop = CancellationToken::new();
-    let task = tokio::spawn(runtime.run(stop.clone()));
-
-    let (_, row) = first_settled(&seed, &["pending", "running"]).await?;
-    stop.cancel();
-    tokio::time::timeout(WAIT, task).await??;
-    let ("completed", Some(result)) = (row.status.as_str(), row.result_id) else {
-        return Err(format!("the run settled {row:?}").into());
-    };
-
-    // The runner stages its result on its own outbox after settling the run;
-    // it reaches the peer Scribe only once that outbox drains.
-    let unwritten = oracle
-        .state()
-        .bifrost
-        .scribe_outbox()
-        .settle(std::time::Instant::now() + WAIT)
-        .await;
-    if unwritten != 0 {
-        return Err(format!("{unwritten} results never reached the peer Scribe").into());
-    }
-    scribe.flush_bifrost().await?;
-    cluster.refresh_oracle_snapshots().await?;
-    let system = seed.system_principal();
-    let identity = |alias: &str| {
-        format!(
-            "{alias}{RUN_ID} IS NULL AND {alias}result_id = '{result}' \
-             AND {alias}{ACT_PRINCIPAL_ID} = '{system}' AND {alias}verifier_card_uid = '{verifier}' \
-             AND {alias}{SUBJECT_CARD_UID} = '{subject}' AND {alias}{WORKLOAD_CARD_UID} = '{owner}' \
-             AND {alias}binding_id = '{binding}' AND {alias}service_name = 'remote-owner' \
-             AND {alias}service_version = '1.0.0' AND {alias}subject_kind = 'Service' \
-             AND {alias}subject_name = 'remote-subject' AND {alias}subject_version = '1.0.0'"
-        )
-    };
-    let checks = [
-        (
-            format!(
-                "SELECT result_id FROM bifrost.verification.results WHERE result_id = '{result}'"
-            ),
-            1,
-            "one published summary for the run",
-        ),
-        (
-            format!(
-                "SELECT result_id FROM bifrost.verification.results WHERE {}",
-                identity("")
-            ),
-            1,
-            "the summary carries every exact identity",
-        ),
-        (
-            format!(
-                "SELECT result_id FROM bifrost.verification.execution_outputs WHERE result_id = '{result}'"
-            ),
-            1,
-            "one published output row for the run",
-        ),
-        (
-            format!(
-                "SELECT o.result_id FROM bifrost.verification.execution_outputs o \
-                 JOIN bifrost.verification.results r \
-                   ON o.result_id = r.result_id AND o.execution_id = r.execution_id \
-                  AND o.{ACT_PRINCIPAL_ID} = r.{ACT_PRINCIPAL_ID} AND o.{SUBJECT_CARD_UID} = r.{SUBJECT_CARD_UID} \
-                 WHERE {} AND o.{RUN_ID} IS NULL AND o.{WORKLOAD_CARD_UID} = '{owner}' \
-                   AND o.service_name = 'remote-owner' AND o.service_version = '1.0.0' \
-                   AND o.subject_kind = 'Service' AND o.subject_name = 'remote-subject' \
-                   AND o.subject_version = '1.0.0'",
-                identity("r.")
-            ),
-            1,
-            "the output carries its summary's identities and joins it on result, execution, writer, and subject",
-        ),
-    ];
-    for (sql, expected, what) in checks {
-        let rows = query_rows(oracle, tenant, sql).await?;
-        if rows != expected {
-            return Err(format!("{what}: expected {expected} rows, read {rows}").into());
-        }
-    }
-    Ok(())
-}
-
-/// A runner on a pod without a local Oracle completes a real scheduled Drift
-/// execution.
-///
-/// The Scribe-only node composes the runtime over its own Scribe. A due
-/// monthly binding's Custom Verifier reads its `score` samples under the
-/// binding owner's recovered authority with SYSTEM as actor; its three reads
-/// (the frozen population selection, the input record, and the window) are
-/// forwarded to a peer Oracle, which records one audited read decision for
-/// each, and the execution completes with a published result on its first attempt.
-/// The registered table is empty for the subject, so the result is
-/// inconclusive.
-///
-/// # Errors
-/// Returns cluster, seeding, runtime, or audit errors, or a description of
-/// the first expectation that does not hold.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires the serialized Postgres-backed journey lane"]
-async fn drift_runner_without_local_oracle_reads_through_a_peer() -> Result<(), ServerJourneyError>
-{
-    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::role_separated()).await?;
-    // The Oracles boot before the Scribe joins, so their membership must
-    // include it before a read can see the decision still in its live tail.
-    cluster.refresh_oracle_snapshots().await?;
-    let tenant = cluster.data_tenant_id();
-    let scribe = cluster
-        .servers()
-        .find(|server| server.bifrost_scribe().is_some())
-        .ok_or("the cluster composed no Scribe")?;
-    if scribe.state().bifrost.oracle().is_some() {
-        return Err("the runner node must host no Oracle".into());
-    }
-
-    let seed = VerificationFixture::provision(scribe.state(), tenant).await?;
-    let (subject, _) = seed.service("forwarded-subject").await?;
-    let (owner, owner_principal) = seed.service("forwarded-owner").await?;
-    let verifier = seed
-        .custom_drift_verifier("forwarded-drift", "score", 1.0, 0.5)
-        .await?;
-    scribe
-        .ensure_builtin_table_for_test(tenant, "drift", "observations")
-        .await?;
-    let binding = seed
-        .bind_schedule(&owner, &subject, &verifier, MONTHLY, Vec::new())
-        .await?;
-    seed.activate(owner_principal, &owner).await?;
-    seed.make_binding_due(binding).await?;
-    // The runner node hosts no Oracle, so the peer that serves the read
-    // stages its decision; the cluster barrier drains every Oracle first.
-    cluster.await_audit_retained().await?;
-    let reads = audit_rows(scribe, tenant, "bifrost.query.read_decision").await?;
-
-    let runtime = VerificationRuntime::builder(scribe.state())
-        .build()
-        .ok_or("the runtime did not compose")?;
-    let stop = CancellationToken::new();
-    let task = tokio::spawn(runtime.run(stop.clone()));
-    let (_, row) = first_settled(&seed, &["pending", "running", "retrying"]).await?;
-    stop.cancel();
-    tokio::time::timeout(WAIT, task).await??;
-    if row.status != "completed" || row.result_id.is_none() || row.attempts != 1 {
-        return Err(format!("the forwarded Drift run settled {row:?}").into());
-    }
-    cluster.await_audit_retained().await?;
-    let after = audit_rows(scribe, tenant, "bifrost.query.read_decision").await?;
-    if after != reads + 3 {
-        return Err(format!(
-            "expected three audited peer reads, counted {}",
-            after - reads
-        )
-        .into());
-    }
-    cluster.shutdown().await?;
-    Ok(())
-}
-
 /// A monthly schedule whose current window opens at the start of the month.
 ///
 /// The window closes at the Postgres instant the binding is made due, so an
@@ -423,8 +208,8 @@ fn observed_in_current_month(now: DateTime<Utc>) -> Result<DateTime<Utc>, Server
 /// one Drift observation of itself (two tall feature rows) through the public
 /// Bifrost facade. Two Custom Drift Verifiers, one that drifts on the
 /// observed mean and one that does not, are bound to that subject. The
-/// production runtime on the Oracle-only node executes both runs and
-/// publishes through a peer Scribe. The observation table then holds
+/// production runtime on a `combined` node executes both runs and publishes
+/// through its Scribe outbox. The observation table then holds
 /// exactly the two client rows, attributed to the client principal and the
 /// subject Card with no Verifier or binding column and no per-binding copy,
 /// while each binding's single result is selected by its `binding_id` alone
@@ -441,13 +226,13 @@ fn observed_in_current_month(now: DateTime<Utc>) -> Result<DateTime<Utc>, Server
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the serialized Postgres-backed journey lane"]
 async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourneyError> {
-    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::role_separated()).await?;
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::for_targets(&[
+        wyrd_server::config::ServerTarget::Combined,
+    ]))
+    .await?;
     let tenant = cluster.data_tenant_id();
-    let oracle = cluster.server(0).ok_or("missing Oracle node")?;
-    let scribe = cluster
-        .servers()
-        .find(|server| server.bifrost_scribe().is_some())
-        .ok_or("the cluster composed no Scribe")?;
+    let oracle = cluster.server(0).ok_or("missing combined node")?;
+    let scribe = oracle;
     let seed = VerificationFixture::provision(oracle.state(), tenant).await?;
     let subject_ref = scribe
         .bootstrap_service_in_tenant(tenant, "shared-subject", &[])
@@ -545,7 +330,7 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
     stop.cancel();
     tokio::time::timeout(WAIT, task).await??;
     // Each run stages its result on the Oracle node's outbox after settling;
-    // the results reach the peer Scribe only once that outbox drains.
+    // the results reach Scribe only once that outbox drains.
     let unwritten = oracle
         .state()
         .bifrost
@@ -553,7 +338,7 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
         .settle(std::time::Instant::now() + WAIT)
         .await;
     if unwritten != 0 {
-        return Err(format!("{unwritten} results never reached the peer Scribe").into());
+        return Err(format!("{unwritten} results never reached Scribe").into());
     }
     scribe.flush_bifrost().await?;
     cluster.refresh_oracle_snapshots().await?;
@@ -8270,10 +8055,8 @@ async fn custom_query_preserves_evidence_and_limits() -> Result<(), ServerJourne
 
 /// Queued SDK verification keeps its evidence under every outbox geometry.
 ///
-/// A combined node at the four-CPU baseline and at sixteen CPUs, and a split
-/// Oracle/Scribe pair at sixteen CPUs whose producer has no local Scribe, each
-/// take more independent queued executions than the process has outbox
-/// lanes. A caller without the runner role is refused before anything is
+/// A combined node at the four-CPU baseline and at sixteen CPUs each take
+/// more independent queued executions than the process has outbox lanes. A caller without the runner role is refused before anything is
 /// queued. Each
 /// accepted execution reaches the queue only once Scribe acknowledged it,
 /// completes through the real runtime, and publishes exactly one passing
@@ -8291,10 +8074,6 @@ async fn scaled_outboxes_preserve_sdk_evidence() -> Result<(), ServerJourneyErro
     for (targets, cpu) in [
         (&[ServerTarget::Combined][..], 4),
         (&[ServerTarget::Combined][..], 16),
-        (
-            &[ServerTarget::BifrostQuery, ServerTarget::BifrostIngest][..],
-            16,
-        ),
     ] {
         let mut spec = BifrostClusterSpec::for_targets(targets);
         for node in &mut spec.nodes {

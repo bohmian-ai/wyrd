@@ -253,4 +253,15 @@ After the second check each named case was closed with an assertion (commits `ed
 
 Third independent check (read-only, at `e1ee6e440`): nine of ten PASS rows proven; REQ-009 lacked an assertion that progress stays readable after cancel, now added. It also noted that line numbers cited in older rows have drifted (test names are the stable reference), that the BFF and custom app record no call list, and that the MCP and artifact unreachable cases are a closed session and a failing host call.
 
+### Mock comparison prepared for the maintainer (AC-009)
+
+`PI` now also captures the session, drift (1280 and 390), cited-judgment and refused-drift pages in both themes when `WYRD_UI_CAPTURE_DIR` is set; the approved mock's session, ordinary and drift pages were captured at 1280 and 390 for the same comparison. Differences seen at 1280 dark, not judged here:
+
+- **Header:** the mock leads with the Verifier name and version as the page title, with Card, Service and trigger in one line; the page leads with an Execution panel naming the execution id, with the Verifier as a linked field.
+- **Session:** the mock draws each member run as a graph node with its verdict; the page draws the declared inputs as graph nodes and lists the members, in recorded order, in the inspector.
+- **Drift:** the mock shows Previous/Next window navigation above the graph and a score-history line with a dashed threshold per feature; before `Load completed details` the page shows the feature table (verdict, score, threshold, earlier result) and the declared baseline as YAML, and window and history only after details load.
+- **Judgment:** the mock lays out Expects/Check/Judged/Reason/Actual as a labelled list; the page uses Outcome/Statement/Reason columns.
+
+These are observations for the maintainer's decision; none is recorded as accepted or as a defect.
+
 Status: `BLOCKED`. Open: AC-009 (the maintainer will compare the pages with the approved mock and record acceptance; nothing else is open).

@@ -1149,12 +1149,7 @@ test('an exact execution page keeps its selection through refresh, downloads a r
   const page = await signIn(ui.browser, ui.base, tenant, server.apiKey);
   const status = () => page.locator('[data-execution-status]').getAttribute('data-execution-status');
   const query = () => Object.fromEntries(new URL(page.url()).searchParams);
-  const capture = async (name: string) => {
-    for (const mode of ['light', 'dark'] as const) {
-      await page.evaluate((next) => ((document.querySelector('.app-root') as HTMLElement).dataset.mode = next), mode);
-      if (process.env.WYRD_UI_CAPTURE_DIR) await page.screenshot({ path: join(process.env.WYRD_UI_CAPTURE_DIR, `execution-${name}-${mode}-${page.viewportSize()?.width}.png`), fullPage: true });
-    }
-  };
+  const capture = (name: string) => captureExecution(page, name);
 
   await page.goto(at(tenant));
   await expect.poll(status).toBe('running');
@@ -1316,9 +1311,17 @@ async function traceTotal(page: Page): Promise<number> {
   return Number(count?.replaceAll(',', '') ?? NaN);
 }
 
-/** A fresh server that runs Verifiers, with the assistant Service registered. */
+/** Draw an execution page in both themes and, when a capture directory is set, keep a full-page screenshot of each. */
+async function captureExecution(page: Page, name: string) {
+  for (const mode of ['light', 'dark'] as const) {
+    await page.evaluate((next) => ((document.querySelector('.app-root') as HTMLElement).dataset.mode = next), mode);
+    if (process.env.WYRD_UI_CAPTURE_DIR) await page.screenshot({ path: join(process.env.WYRD_UI_CAPTURE_DIR, `execution-${name}-${mode}-${page.viewportSize()?.width}.png`), fullPage: true });
+  }
+}
+
 /** How many requests the judging provider has received in this file. */
 let judgeRequests = 0;
+/** A fresh server that runs Verifiers, with the assistant Service registered. */
 const judged = assistantTest({ perTest: true, judge: () => ((judgeRequests += 1), judgeReply(AGREES)) });
 
 judged('a completed execution page shows the recorded judgment, loads details only when asked, and stays completed', async ({ server, state }) => {
@@ -1452,6 +1455,7 @@ judged('session, drift and cited judgments open as pages: members in recorded or
     const listed = page.getByRole('list', { name: 'Members of turns' }).getByRole('button');
     await expect.poll(() => listed.allTextContents()).toEqual(members);
     expect(await page.locator('[data-verdict]').getAttribute('data-verdict')).toBe('passed');
+    await captureExecution(page, 'session');
     // Opening a member is its own exact page; Back returns to the session with the same source selected and the same members.
     await listed.nth(1).click();
     await expect.poll(path).toBe(new URL(at(members[1])).pathname);
@@ -1469,18 +1473,24 @@ judged('session, drift and cited judgments open as pages: members in recorded or
     expect(await drift.locator('[data-declared]').textContent()).toContain('Declared baseline and condition');
     expect(await page.getByRole('region', { name: 'Drift features' }).locator('tbody tr').first().textContent()).toContain('latency');
     expect(await page.locator('[data-verdict]').getAttribute('data-verdict')).toBe('failed');
+    await captureExecution(page, 'drift');
+    await page.setViewportSize({ width: 390, height: 800 });
+    await captureExecution(page, 'drift');
+    await page.setViewportSize({ width: 1280, height: 720 });
 
     // A cited judgment names the slot and position it cites.
     await page.goto(at(submitted.execution.id, '?node=req%3Aagrees'));
     const agrees = page.getByRole('region', { name: 'Requirement agrees', exact: true });
     await expect.poll(() => agrees.locator('[data-outcome]').getAttribute('data-outcome')).toBe('passed');
     expect(await agrees.locator('li .mono').allTextContents()).toEqual(['answer']);
+    await captureExecution(page, 'judged');
 
     // A principal that may read executions but not query evidence sees the drift judgment, and its window and history as refused.
     const narrow = await signIn(browser, bff.url, tenant, server.scopedApiKey('ui_page_narrow', ['verifier:read']));
     await narrow.goto(at(drifted));
     await expect.poll(() => narrow.locator('[data-drift] [data-part="Window and history"]').textContent()).toContain('WYRD_PERMISSION_403_DENIED_RBAC');
     expect(await narrow.getByRole('region', { name: 'Drift features' }).locator('tbody tr').count()).toBeGreaterThan(0);
+    await captureExecution(narrow, 'drift-refused');
   } finally {
     await browser.close();
     bff.stop();

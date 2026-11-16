@@ -19,7 +19,7 @@ use tokio::time::Instant;
 use vala_verify::blocks::{
     AGENT_PHASE_DURATION_SECONDS, ActionExecutor, AgentCardResolver, AgentExecutor, AgentToolset,
     BlockCall, BlockError, CallInput, CallValue, CheckExecutor, EvidenceReader, Position,
-    PromptCardResolver, ToolCallsOwner, ToolLimits, ToolSession, bound_media_bytes,
+    PromptCardResolver, ToolCallsOwner, ToolLimits, ToolSession,
 };
 use wyrd_benchmark::MetricValue;
 use wyrd_spec::auth::Sha256Hex;
@@ -532,7 +532,6 @@ impl EvidenceReader for PinnedDeck {
     async fn media(
         &self,
         _evidence: &InputDeclaration,
-        _copies: u64,
     ) -> Result<(skald_spec::MediaRef, Box<dyn std::any::Any + Send + Sync>), BlockError> {
         Err(BlockError::Terminal {
             reason: "no media".to_owned(),
@@ -3330,7 +3329,6 @@ impl EvidenceReader for HeldMedia {
     async fn media(
         &self,
         _evidence: &InputDeclaration,
-        _copies: u64,
     ) -> Result<(MediaRef, Box<dyn std::any::Any + Send + Sync>), BlockError> {
         Ok((
             MediaRef::image_base64("image/png", "iVBORw0KGgo="),
@@ -3520,23 +3518,15 @@ impl Drop for Promise {
 }
 
 /// Evidence whose media is one `raw`-byte PNG, charged like the host's
-/// reader: the read bytes, their encoding, and the requested copies of it,
-/// promised from `memory` before the encoding exists.
+/// reader: the returned guard holds the encoding, charged from `memory`
+/// before the encoding exists.
 struct ChargedMedia {
     /// The budget the media is charged to.
     memory: Arc<Memory>,
     /// Raw media bytes.
     raw: usize,
-    /// The copies each read was asked to hold.
-    copies: std::sync::Mutex<Vec<u64>>,
-}
-
-impl ChargedMedia {
-    /// The bytes one read holding `copies` copies promises.
-    fn demand(&self, copies: u64) -> u64 {
-        let encoded = (self.raw.div_ceil(3) * 4) as u64;
-        self.raw as u64 + encoded + bound_media_bytes("image/png", encoded, copies)
-    }
+    /// How many times the media was read.
+    reads: std::sync::atomic::AtomicUsize,
 }
 
 #[async_trait]
@@ -3544,19 +3534,15 @@ impl EvidenceReader for ChargedMedia {
     /// The PNG with its charge, or `Busy` when `memory` cannot hold it.
     ///
     /// # Errors
-    /// Returns [`BlockError::Busy`] when the budget refuses the demand.
-    ///
-    /// # Panics
-    /// Panics when the copy log's lock is poisoned.
+    /// Returns [`BlockError::Busy`] when the budget refuses the encoding.
     async fn media(
         &self,
         _evidence: &InputDeclaration,
-        copies: u64,
     ) -> Result<(MediaRef, Box<dyn std::any::Any + Send + Sync>), BlockError> {
-        self.copies.lock().expect("unpoisoned").push(copies);
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let promise = self
             .memory
-            .charge(self.demand(copies))
+            .charge((self.raw.div_ceil(3) * 4) as u64)
             .ok_or_else(|| BlockError::Busy {
                 reason: "no memory for the media".to_owned(),
             })?;
@@ -3633,19 +3619,19 @@ impl Provider for MeteredMedia {
     }
 }
 
-/// Bound media is charged its resident provider copies before it is
-/// encoded, six per placeholder occurrence: memory between the read and
-/// encoding and that peak refuses before the provider sees anything and
-/// holds nothing, and with enough memory the held call keeps the whole
-/// charge, refusing a sibling the old read-and-encoding promise, until it
-/// completes or is cancelled, for one occurrence and for repeated ones.
+/// Bound media is read once per input and charged only the guard its reader
+/// returns, however often its placeholder occurs: no provider copies are
+/// promised. Memory short of that guard refuses before the provider sees
+/// anything and holds nothing, and with enough memory the held call keeps
+/// the guard, refusing a sibling the read and encoding, until it completes
+/// or is cancelled.
 ///
 /// # Panics
-/// Panics when a refusal reaches the provider or keeps a charge, the held
-/// call is charged other than its peak, a sibling reuses its bytes, or the
-/// charge outlives the call.
+/// Panics when a refusal reaches the provider or keeps a charge, binding
+/// reads the media other than once, the held call is charged other than the
+/// guard, a sibling reuses its bytes, or the charge outlives the call.
 #[tokio::test]
-async fn bound_media_charges_its_resident_copies() {
+async fn bound_media_holds_only_its_guard_through_the_call() {
     let raw = 48 * 1024;
     let encoded = (raw / 3 * 4) as u64;
     for (messages, occurrences) in [
@@ -3680,8 +3666,7 @@ async fn bound_media_charges_its_resident_copies() {
                 sources: BTreeSet::new(),
             },
         )]);
-        let copies = 6 * occurrences;
-        let peak = raw as u64 + encoded + bound_media_bytes("image/png", encoded, copies);
+        let peak = encoded;
 
         for (capacity, pend) in [
             (peak - 1, false),
@@ -3705,7 +3690,7 @@ async fn bound_media_charges_its_resident_copies() {
             let reader = Arc::new(ChargedMedia {
                 memory: Arc::clone(&memory),
                 raw,
-                copies: std::sync::Mutex::default(),
+                reads: std::sync::atomic::AtomicUsize::new(0),
             });
             let executor = AgentExecutor::new(
                 Arc::new(providers),
@@ -3724,9 +3709,9 @@ async fn bound_media_charges_its_resident_copies() {
             };
 
             assert_eq!(
-                *reader.copies.lock().expect("unpoisoned"),
-                [copies],
-                "binding asks for six copies per occurrence ({occurrences})"
+                reader.reads.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "binding reads the media once for {occurrences} occurrence(s)"
             );
             let seen = provider.seen.lock().expect("unpoisoned").clone();
             if capacity < peak {

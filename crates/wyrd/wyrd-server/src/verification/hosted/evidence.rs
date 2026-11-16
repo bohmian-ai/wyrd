@@ -756,20 +756,18 @@ impl EvidenceReader for TenantEvidence {
     }
 
     /// Read `evidence` as inline provider-native media, returned with the
-    /// process memory charge for the read bytes, their encoding, and the
-    /// `copies` provider-shaped copies of it the call keeps resident, which
-    /// the Agent call holds while its provider request carries the media.
-    /// The encoding and its copies are charged before the bytes are
-    /// encoded.
+    /// process memory charge for its encoding, which the Agent call holds
+    /// while its provider request carries the media. The encoding is charged
+    /// before the bytes are encoded, beside the read bytes, whose charge
+    /// returns once they are dropped.
     ///
     /// # Errors
     /// Returns [`Self::read`]'s errors, [`BlockError::Terminal`] for a
     /// format with no native media kind, and [`BlockError::Busy`] when
-    /// process memory cannot hold the encoding and its copies now.
+    /// process memory cannot hold the read bytes and their encoding now.
     async fn media(
         &self,
         evidence: &InputDeclaration,
-        copies: u64,
     ) -> Result<(MediaRef, Box<dyn std::any::Any + Send + Sync>), BlockError> {
         let (Loaded { bytes, mut charge }, format) = self.read(evidence).await?;
         let kind = format.native_kind().ok_or_else(|| BlockError::Terminal {
@@ -779,19 +777,18 @@ impl EvidenceReader for TenantEvidence {
         })?;
         let encoded = u64::try_from(base64::encoded_len(bytes.len(), true).unwrap_or(usize::MAX))
             .unwrap_or(u64::MAX);
-        let resident = encoded.saturating_add(vala_verify::blocks::bound_media_bytes(
-            format.mime(),
-            encoded,
-            copies,
-        ));
-        charge.try_grow(resident).map_err(|_| BlockError::Busy {
+        charge.try_grow(encoded).map_err(|_| BlockError::Busy {
             reason: "process memory cannot hold the encoded evidence media now".to_owned(),
         })?;
+        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let read = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        drop(bytes);
+        charge.shrink(read);
         let media = MediaRef {
             kind,
             source: MediaSource::Base64 {
                 mime_type: format.mime().to_owned(),
-                data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                data,
             },
         };
         Ok((media, Box::new(charge)))

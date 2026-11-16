@@ -278,7 +278,7 @@ async fn artifact_evidence_and_code_reach_every_consumer() {
         (NOTES, skald_spec::MediaFormat::Text)
     );
     evidence
-        .media(&declaration, 1)
+        .media(&declaration)
         .await
         .expect("text is native media");
     let cited = Citation {
@@ -658,7 +658,7 @@ async fn evidence_metadata_is_resolved_once() {
         ["check.py", "notes.txt"]
     );
     evidence
-        .media(&registered.file("notes.txt"), 1)
+        .media(&registered.file("notes.txt"))
         .await
         .expect("text is native media");
     let cited = Citation {

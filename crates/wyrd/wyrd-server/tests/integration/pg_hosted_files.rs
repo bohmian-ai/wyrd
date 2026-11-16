@@ -178,7 +178,7 @@ async fn evidence_binds_native_media_only() {
         memory.clone(),
     );
     let (media, charge) = evidence
-        .media(&file(pdf, 8, MediaFormat::Pdf), 6)
+        .media(&file(pdf, 8, MediaFormat::Pdf))
         .await
         .expect("pdf is native");
     assert_eq!(
@@ -204,7 +204,7 @@ async fn evidence_binds_native_media_only() {
     );
     assert!(
         matches!(
-            refusing.media(&file(pdf, 8, MediaFormat::Pdf), 6).await,
+            refusing.media(&file(pdf, 8, MediaFormat::Pdf)).await,
             Err(BlockError::Busy { .. })
         ),
         "memory short of the read bytes and their encoding refuses before encoding"
@@ -212,7 +212,7 @@ async fn evidence_binds_native_media_only() {
     assert_eq!(short.used(), 0, "a refusal holds nothing");
     assert!(
         evidence
-            .media(&file(csv, 3, MediaFormat::Csv), 1)
+            .media(&file(csv, 3, MediaFormat::Csv))
             .await
             .is_err()
     );

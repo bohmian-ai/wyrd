@@ -649,7 +649,9 @@ impl PublishDesk {
 }
 
 /// A verification-capable server whose gateway deploys on `upstream`, with
-/// `/work` writes capped at [`WORK`] and no warm Monty workers.
+/// `/work` writes capped at [`WORK`], tool arguments large enough to fill
+/// it, so the publication and `/work` limits are the ones reached, and no
+/// warm Monty workers.
 ///
 /// # Panics
 /// Panics when the upstream's URL does not parse.
@@ -671,6 +673,7 @@ pub(crate) fn model_calls(
         .with_verification_limits_for_test(HostedLimits {
             monty_min_workers: 0,
             work_write_max_bytes: WORK as u64,
+            tool_argument_max_bytes: 2 * WORK,
             model_calls,
             ..limits
         })

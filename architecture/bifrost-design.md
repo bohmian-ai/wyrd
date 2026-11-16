@@ -1330,8 +1330,7 @@ keeps at least 1 GiB of that limit outside the process memory ledger
 server and dependency allocations no ledger tracks, accounting headroom
 rather than preallocated memory. The process memory ledger is the limit less
 that minimum, and hosted verification and buffered request bodies charge the
-same ledger; queued verification holds a reservation in it, which direct
-verification never takes
+same ledger while they use it
 ([Agents, tools, and workspaces](wyrd-design.md#agents-tools-and-workspaces)).
 The Bifrost cap defaults to the whole ledger, and
 `WYRD_BIFROST_MEMORY_LIMIT_BYTES` may only lower it. Governed Bifrost growth
@@ -1904,8 +1903,7 @@ use age.
   cached entries are charges on the process memory and scratch ledgers that
   hosted verification and request buffering also charge, so no byte is
   promised twice and no capability holds an idle share beyond the server
-  minimum and the queued verification reservation, which is counted once
-  in those same ledgers. A charge returns only when its owner has settled the bytes: a cache
+  minimum. A charge returns only when its owner has settled the bytes: a cache
   entry when its last reference drops, a spill file when it is deleted. Pressure
   and accounting are portable and read no cgroup or other platform interface.
 - Global resource owners account tenant and table attribution without creating

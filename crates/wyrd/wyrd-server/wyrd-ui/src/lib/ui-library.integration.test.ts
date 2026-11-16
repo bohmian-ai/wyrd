@@ -4,13 +4,15 @@
  * `@wyrd/testing` over repository Postgres, through the SDK, the MCP endpoint,
  * and the BFF's real browser session. Nothing here mocks the server.
  */
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { AppBridge, PostMessageTransport } from '@modelcontextprotocol/ext-apps/app-bridge';
 import type { Cookies } from '@sveltejs/kit';
 import { expect, vi } from 'vitest';
 import { z } from 'zod';
-import { Bifrost, Cards, TableConfig, WyrdClient } from 'wyrd-ai';
+import { Bifrost, Cards, TableConfig, WyrdClient, WyrdState } from 'wyrd-ai';
 import {
   CardRefSchema,
   loadArtifactTable,
@@ -46,7 +48,8 @@ import { exportOtlp, nanos, seedSignals } from '$lib/ui-signals.integration';
 import { POST as loadPanel } from '../routes/t/[tenantKey]/ui/load/+server';
 import { POST as cancelExecution } from '../routes/t/[tenantKey]/verify/executions/[executionId]/cancel/+server';
 import { GET as downloadPublication } from '../routes/t/[tenantKey]/verify/executions/[executionId]/download/+server';
-import { declared, fixture, serverTest, type DeclaredRef } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/server';
+import { assistantTest } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/assistant';
+import { declared, fixture, groupExecution, runtimeAccount, scheduledResult, serverTest, type DeclaredRef } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/server';
 import { load as loadExamplePage } from '../../../../../../examples/ui-app/src/routes/+page.server';
 import { POST as loadExamplePanel } from '../../../../../../examples/ui-app/src/routes/view/load/+server';
 import { dashboard } from '../../../../../../examples/ui-app/src/panels';
@@ -823,16 +826,17 @@ test('an exact Verifier definition and where it runs load through every authoriz
   expect(app.calls.map((call) => call.name)).toEqual(['cards.get', 'cards.get', 'cards.get']);
 });
 
+/** The populated data of one execution load, or its refusal as a failure. */
+function data(loaded: Awaited<ReturnType<typeof loadExecution>>, surface: string) {
+  if (loaded.result.state !== 'populated') throw new Error(`${surface}: ${JSON.stringify(loaded.result)}`);
+  return loaded.result.data;
+}
+
 test('an unfinished execution shows recorded progress and retained outputs through every authorized host, and cancels once', async ({ server, seeded: _seeded }) => {
   const { executionId, verifier } = server.holdPublications('ui-held');
   server.flushBifrost();
   const attempt = { item_index: null, iteration_index: null, attempt: 1 };
   const tree = { executionId, node: 'step:draft', producer: attempt, output: 'tree' };
-  /** The populated data of one load, or the refusal as a failure. */
-  const data = (loaded: Awaited<ReturnType<typeof loadExecution>>, surface: string) => {
-    if (loaded.result.state !== 'populated') throw new Error(`${surface}: ${JSON.stringify(loaded.result)}`);
-    return loaded.result.data;
-  };
 
   const client = WyrdClient.connect();
   const mcp = await mcpOver(server.baseUrl, client);
@@ -957,4 +961,125 @@ test('an unfinished execution shows recorded progress and retained outputs throu
   } finally {
     await host.close();
   }
+});
+
+/** A fresh server that runs Verifiers, with the assistant Service registered. */
+const judged = assistantTest({ perTest: true });
+
+judged('a judged execution shows its judgments, accepted inputs, completed details, drift and session through the Node and MCP hosts', async ({ server, assistant, state }) => {
+  const cards = await Cards.connect();
+  const token = await WyrdClient.connect().accessToken();
+  /** The one binding of `owner` whose status carries `field`: a schedule or a session end. */
+  const bindingWith = async (owner: Exact, field: string) => {
+    for (const id of (await cards.get(owner)).status?.verification?.binding_ids ?? []) {
+      const response = await fetch(`${server.baseUrl}/v1/verification/bindings/${id}`, { headers: { 'x-wyrd-access-token': `Bearer ${token}` } });
+      if (((await response.json()) as Record<string, unknown>)[field]) return id;
+    }
+    throw new Error(`${owner.name} has no binding with ${field}`);
+  };
+  const submit = async (verifier: string, answer: string) => {
+    const submitted = await state.run('agent').observe.submit(verifier, { answer });
+    if (submitted.kind !== 'queued') throw new Error(`${verifier} queues an execution`);
+    await submitted.execution.wait({ timeoutMs: 60_000 });
+    return submitted.execution.id;
+  };
+  // Two Run executions: a failed assertion and a judged answer that cites its input.
+  const refused = await submit('answer-check', 'no');
+  const agreed = await submit('answer-judged', 'yes');
+
+  // A scheduled drift window far from its fitted baseline.
+  const latency = (await cards.get({ kind: 'Verifier', name: 'latency-drift', version: '1.0.0' })).metadata.uid as string;
+  server.waitForBaseline(latency, 90_000);
+  await state.startBifrost();
+  const model = state.run('model');
+  for (let sample = 0; sample < 100; sample += 1) await model.observe.submit('latency-drift', { latency: 99 });
+  await state.shutdown();
+  server.flushBifrost();
+  const schedule = await bindingWith(exact(assistant.service), 'next_run_at');
+  server.makeBindingDue(schedule);
+  const drifted = (await scheduledResult(server, schedule, 90_000)).execution_id;
+
+  // A session: three turns of one conversation, judged together when it ends.
+  const support = await cards.declareFromPath(fixture('cards/verify_in_real_time/support.yaml'));
+  const bundle = mkdtempSync(join(tmpdir(), 'wyrd-ui-session-'));
+  await cards.pull(support.root, bundle);
+  const { key } = await runtimeAccount({ kind: 'Service', name: support.root.name });
+  const desk = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: key }) });
+  await desk.startBifrost();
+  const conversation = desk.run('agent');
+  for (const turn of [1, 2, 3]) await conversation.observe.verify('turn-check', { turn, answer: `answer ${turn}` }, { positional: true, group_id: 'ui-conversation' });
+  await desk.shutdown();
+  const session = await groupExecution(server, await bindingWith(exact(declared(support)), 'group_end'), 90_000);
+  server.flushBifrost();
+
+  const client = WyrdClient.connect();
+  const mcp = await mcpOver(server.baseUrl, client);
+  try {
+    for (const [surface, executor] of [['node', nodeExecutor(client)], ['mcp', mcp.executor]] as const) {
+      const context = { executor };
+      // A failed execution opens on its first failed requirement, with the judgment the server recorded.
+      const failed = await loadExecution({ executionId: refused, details: true }, context);
+      expect(failed.input.node, surface).toBe('req:says-yes');
+      const open = data(failed, surface);
+      expect(open.status, surface).toMatchObject({
+        status: 'completed',
+        result: { verifier: { name: 'answer-check', uid: assistant.answerCheck.uid }, outcome: { verdict: 'failed', requirements: [{ id: 'says-yes', outcome: 'failed', reason: 'operator Equals returned false', actual: 'no' }] } }
+      });
+      expect(open.definition, surface).toMatchObject({ state: 'populated', data: { ref: { uid: assistant.answerCheck.uid }, graph: { edges: [{ source: 'input:answer', target: 'req:says-yes' }] } } });
+      expect(open.invocations, surface).toMatchObject({
+        state: 'populated',
+        data: { items: [{ producer: { step_id: 'says-yes', attempt: 1 }, state: 'requirement', outcome: 'failed' }], history: { pending: 0, failed: 0 } }
+      });
+      expect(open.publications, surface).toMatchObject({ state: 'populated', data: { items: [] } });
+      expect(open.details, surface).toMatchObject({ state: 'populated', data: { execution_id: refused, outcome: { requirements: [{ id: 'says-yes' }] } } });
+      // Details are read only when asked for; the accepted input is read for its selected node only.
+      const input = data(await loadExecution({ executionId: refused, node: 'input:answer' }, context), surface);
+      expect([input.details, input.inputs], surface).toEqual([undefined, { state: 'populated', data: { kind: 'json', value: 'no' } }]);
+      expect(open.inputs, surface).toBeUndefined();
+
+      // A judged requirement keeps its reason and the citation into the input it judged.
+      const cited = data(await loadExecution({ executionId: agreed, node: 'req:agrees' }, context), surface);
+      expect(cited.status.result?.outcome, surface).toMatchObject({
+        verdict: 'passed',
+        requirements: [{ id: 'agrees', outcome: 'passed', reason: 'it agrees', citations: [{ slot: 'answer', locator: { json_pointer: '' } }] }]
+      });
+
+      // Drift: the report of this execution, with its binding's retained history ending at this window.
+      const drift = data(await loadExecution({ executionId: drifted }, context), surface);
+      expect(drift.status.result, surface).toMatchObject({ verifier: { name: 'latency-drift' }, outcome: { verdict: 'failed', requirements: [{ id: 'latency-stable', outcome: 'failed' }] } });
+      expect(drift.status.result?.outcome.requirements[0]?.detail?.drift.features.latency?.score ?? 0, surface).toBeGreaterThan(0.25);
+      const history = drift.drift?.state === 'populated' ? drift.drift.data.history : [];
+      expect(history.map((point) => point.execution_id), surface).toEqual([drifted]);
+      expect(history[0]?.scores.latency ?? 0, surface).toBeGreaterThan(0.25);
+      expect(drift.drift?.state === 'populated' && drift.drift.data.window_end, surface).toEqual(expect.any(String));
+      // A requirement that is not drift reads no drift history.
+      expect(open.drift, surface).toBeUndefined();
+
+      // Session: the group execution names its owner and its members, each read as its own exact execution.
+      const group = data(await loadExecution({ executionId: session.execution_id, node: 'input:turns' }, context), surface);
+      expect(group.status, surface).toMatchObject({ group_id: 'ui-conversation', owner_card_uid: declared(support).uid, result: { outcome: { verdict: 'passed' } } });
+      expect(group.members?.map((member) => [member.execution_id, member.status?.state === 'populated' && member.status.data.status]), surface).toEqual(
+        (session.group?.sources.turns.execution_ids ?? []).map((id) => [id, 'completed'])
+      );
+      expect(group.members, surface).toHaveLength(3);
+      expect(group.inputs, surface).toBeUndefined();
+    }
+  } finally {
+    await mcp.close();
+  }
+
+  // Another tenant reads none of them, by ID alone.
+  const foreign = nodeExecutor(WyrdClient.connect({ credential: server.bootstrapServiceInTenant(server.seedTenant('ui-judged-foreign'), ['admin'], 'ui-judged-admin') }));
+  for (const executionId of [refused, drifted, session.execution_id])
+    expect((await loadExecution({ executionId }, { executor: foreign })).result).toMatchObject({ state: 'error', problem: { code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND' } });
+
+  // A principal that may read executions only: the recorded state loads, and the Card and query reads are each denied apart.
+  const narrow = nodeExecutor(WyrdClient.connect({ credential: server.scopedApiKey('ui_judged_narrow', ['verifier:read']) }));
+  const partial = data(await loadExecution({ executionId: refused, node: 'input:answer' }, { executor: narrow }), 'narrow');
+  expect(partial.status.result?.outcome.verdict).toBe('failed');
+  expect(partial.invocations.state).toBe('populated');
+  expect([partial.definition, partial.inputs]).toMatchObject([
+    { state: 'denied', problem: { code: DENIED } },
+    { state: 'denied', problem: { code: DENIED } }
+  ]);
 });

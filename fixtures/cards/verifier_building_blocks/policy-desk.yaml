@@ -3,7 +3,8 @@
 # each of the nine extractable formats, one whose Agent calls the
 # built-in Card, Bifrost, and code tools, one whose checks return custom
 # Verdict data, one that judges a whole trace across workloads, and one
-# that reduces twenty notes directly or through one Python program.
+# that reduces twenty notes directly or through one Python program, and one
+# whose Python programs call tools inside array and repeated work.
 apiVersion: wyrd/v1
 kind: Service
 metadata:
@@ -17,3 +18,4 @@ spec:
     - verifier: ./scored-review.yaml
     - verifier: ./whole-trace.yaml
     - verifier: ./evidence-reduction.yaml
+    - verifier: ./nested-sweep.yaml

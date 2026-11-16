@@ -1895,6 +1895,151 @@ async fn code_mode_reduces_evidence_and_preserves_citations() {
     desk.deployment.shutdown().await;
 }
 
+/// The Python every `nested-sweep` Agent runs through `code.run`: it lists
+/// its workspace, reads the file the listing found, and prints the note.
+const SWEEP: &str = "listing = await call_tool('fs.list', {'path': '/inputs'})
+read = await call_tool('fs.read', {'path': listing['files'][0]['path']})
+print(read['units'][0]['text'])";
+
+/// The two `nested-sweep` batch notes and its lead note.
+const SWEPT: [&str; 2] = ["alpha-note", "beta-note"];
+
+/// The `nested-sweep` lead note.
+const LEAD: &str = "lead-note";
+
+/// Script `nested-sweep`: each item and round first runs [`SWEEP`] through
+/// one `code.run`; once it has the program's result, an item answers read
+/// and a round answers read only from round 1, so the repeat runs twice.
+async fn script_sweep(upstream: &MockServer) {
+    let code = [tool_call(
+        "call-sweep",
+        TOOLS[2],
+        &json!({ "source": SWEEP }),
+    )];
+    for (marker, read) in [
+        ("NESTED-ITEM: 0", true),
+        ("NESTED-ITEM: 1", true),
+        ("NESTED-ROUND: 0", false),
+        ("NESTED-ROUND: 1", true),
+    ] {
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains(marker))
+            .and(body_string_contains(r#""role":"tool""#))
+            .respond_with(completion(
+                json!({ "role": "assistant", "content": json!({"read": read}).to_string() }),
+            ))
+            .with_priority(1)
+            .mount(upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains(marker))
+            .respond_with(completion(
+                json!({ "role": "assistant", "content": null, "tool_calls": code }),
+            ))
+            .with_priority(2)
+            .mount(upstream)
+            .await;
+    }
+}
+
+/// The body of the tool-result request whose prompt contains `marker`.
+///
+/// # Panics
+/// Panics when the upstream received no such request.
+async fn tool_turn(upstream: &MockServer, marker: &str) -> String {
+    upstream
+        .received_requests()
+        .await
+        .expect("the upstream records requests")
+        .iter()
+        .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+        .find(|body| body.contains(marker) && body.contains(r#""role":"tool""#))
+        .unwrap_or_else(|| panic!("{marker}: the model received the program's result"))
+}
+
+/// An ML engineer's Python programs call tools inside array and repeated
+/// work: each batch item's program lists and then reads its own note, and
+/// only that note reaches its model; each round of the repeat reads the lead
+/// note, the second round ending the repeat; every nested call succeeds,
+/// recorded for `code` behind its model-visible `code.run` in item order.
+///
+/// # Panics
+/// Panics when a step, record, or delivered note differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn nested_tools_run_inside_fanout_and_repeat() {
+    let desk = PolicyDesk::start().await;
+    script_sweep(&desk.upstream).await;
+    let permissions = [&VERIFIES[..], &["tool:invoke"]].concat();
+    let key = desk.deployment.scoped_key("sweeper", &permissions).await;
+    let result = desk
+        .state_as(desk.deployment.client(&key))
+        .run()
+        .observe()
+        .verify(
+            "nested-sweep",
+            Inputs::named([
+                ("batch", Input::from(json!(SWEPT))),
+                ("lead", Input::from(json!(LEAD))),
+            ]),
+        )
+        .await
+        .expect("the sweep runs");
+
+    assert_eq!(
+        result.outcome.verdict,
+        VerificationVerdict::Passed,
+        "{result:?}"
+    );
+    let details = desk.deployment.details(result.execution_id).await;
+    let items = &detailed_step(&details, "per-note");
+    assert_eq!(items.status, StepStatus::Succeeded, "{items:?}");
+    assert_eq!(items.output, Some(json!([{"read": true}, {"read": true}])));
+    let rounds = &detailed_step(&details, "rounds");
+    assert_eq!(rounds.status, StepStatus::Succeeded, "{rounds:?}");
+    assert_eq!(rounds.output, Some(json!({"read": true})));
+    for (step, runs) in [(items, 2), (rounds, 1)] {
+        let records = &step.tool_calls;
+        assert!(
+            records.iter().all(|record| record.error.is_none()),
+            "{records:?}"
+        );
+        assert_eq!(
+            tools_for(records, ToolRecipient::Model),
+            vec![json!(TOOLS[2]); runs]
+        );
+        assert_eq!(
+            tools_for(records, ToolRecipient::Code),
+            (0..runs)
+                .flat_map(|_| [json!("fs.list"), json!("fs.read")])
+                .collect::<Vec<_>>(),
+            "{:?}: each program lists, then reads what it found",
+            step.id
+        );
+    }
+    let digests = leaves(&items.tool_calls);
+    assert_ne!(digests[0].1, digests[1].1, "each item read its own note");
+
+    for (index, note) in SWEPT.iter().enumerate() {
+        let turn = tool_turn(&desk.upstream, &format!("NESTED-ITEM: {index}")).await;
+        let other = SWEPT[1 - index];
+        assert!(
+            turn.contains(note) && !turn.contains(other),
+            "item {index} receives only its own note: {turn}"
+        );
+    }
+    for round in 0..2 {
+        let turn = tool_turn(&desk.upstream, &format!("NESTED-ROUND: {round}")).await;
+        assert!(
+            turn.contains(LEAD),
+            "round {round} reads the lead note: {turn}"
+        );
+    }
+    desk.deployment.shutdown().await;
+}
+
 /// A released Bifrost query's resources: no admission or peer slot and no
 /// reserved memory.
 const RELEASED: wyrd_testing::server::BifrostQueryResourceSnapshot =

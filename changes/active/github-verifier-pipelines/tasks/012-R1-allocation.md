@@ -142,11 +142,21 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
    frames only inside a turn. `ChildEvent.kind` is a closed oneof in which any
    non-`Print` kind ends the turn. `Print` text is sandbox-controlled output,
    so it cannot carry trusted samples. Idle workers, and workers suspended
-   between turns, are never read. Monty has no memory event or field. The
-   maintainer chose to vendor `monty-proto` and `monty-pool` under
-   `crates/patches/` via `[patch.crates-io]`, following the precedent of
-   `monty-type-checking`. The patch adds one bounded telemetry event, read
-   outside turns.
+   between turns, are never read. Monty has no memory event or field, and
+   1.6.0 still has none. The maintainer first chose vendoring, then replaced
+   it with a fork (2026-11-16): `bohmian-ai/monty` branch `wyrd-1.6`, cut from
+   v1.6.0 and pinned by rev in `[patch.crates-io]` for every Monty crate in
+   the graph. It carries three commits:
+   - a `worker-core` build without the ty/ruff type checker, replacing the
+     `monty-type-checking` stand-in;
+   - a `MemorySample` worker event that the pool's per-worker reader task
+     records outside turns, idle or busy;
+   - reaping of dead idle workers when memory is listed.
+   Fork tests: `idle_workers_report_memory_without_a_checkout`,
+   `memory_samples_inside_a_turn_are_recorded_not_answers` and
+   `idle_memory_listing_reaps_workers_that_died` (RED: the dead worker was
+   never replaced). They run with `cargo test -p monty-pool --test pool_test`
+   in the fork: 125 passed.
 
 3. **Capacity, sharing and pressure transitions — REQ-020,021; AC-016.** Runtime
    tests use the agreed P/H/M and q=max(L/M,A/P), unequal demand/local caps and

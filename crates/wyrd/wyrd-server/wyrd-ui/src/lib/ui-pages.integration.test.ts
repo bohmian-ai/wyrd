@@ -11,8 +11,11 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { chromium, type Browser, type Page } from 'playwright';
 import { test as base, expect, vi } from 'vitest';
+import { assistantTest } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/assistant';
 import { declared, fixture, runtimeAccount, serverTest } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/server';
 import { Cards, Principals, WyrdClient } from 'wyrd-ai';
+import { loadExecution } from 'wyrd-ai-ui/loaders';
+import { nodeExecutor } from 'wyrd-ai-ui/node';
 import { exportOtlp, nanos, seedSignals } from '$lib/ui-signals.integration';
 
 vi.setConfig({ testTimeout: 300_000 });
@@ -94,11 +97,14 @@ async function humanSignIn(browser: Browser, base: string, tenantKey: string, co
   return page;
 }
 
+/** Builds the production BFF that `startBff` runs. */
+const buildUi = () => execFileSync('pnpm', ['exec', 'vite', 'build'], { stdio: 'inherit', env: { ...process.env, VITEST: '' } });
+
 /** The built BFF, a browser, and a tenant holding one trace; the default tenant holds another. */
 const test = serverTest().extend<{ ui: { base: string; browser: Browser; tenant: string; adminKey: string; readerKey: string; serverUrl: string } }>({
   ui: [
     async ({ server }, use) => {
-      execFileSync('pnpm', ['exec', 'vite', 'build'], { stdio: 'inherit', env: { ...process.env, VITEST: '' } });
+      buildUi();
       const tenant = server.seedTenant(TENANT);
       const adminKey = server.bootstrapServiceInTenant(tenant, ['admin'], 'ui-browser-admin');
       const readerKey = server.bootstrapServiceInTenant(tenant, [], 'ui-browser-unprivileged');
@@ -1262,6 +1268,68 @@ async function traceTotal(page: Page): Promise<number> {
   const count = details.map((text) => /^(\d[\d,]*) traces?$/.exec(text)?.[1]).find(Boolean);
   return Number(count?.replaceAll(',', '') ?? NaN);
 }
+
+/** A fresh server that runs Verifiers, with the assistant Service registered. */
+const judged = assistantTest({ perTest: true });
+
+judged('a completed execution page shows the recorded judgment, loads details only when asked, and stays completed', async ({ server, state }) => {
+  // A real Run verification that fails its assertion.
+  const submitted = await state.run('agent').observe.submit('answer-check', { answer: 'no' });
+  if (submitted.kind !== 'queued') throw new Error('answer-check queues an execution');
+  await submitted.execution.wait({ timeoutMs: 60_000 });
+  server.flushBifrost();
+  const executionId = submitted.execution.id;
+  const tenant = 'test-tenant-1';
+  buildUi();
+  const bff = await startBff(server.baseUrl);
+  const browser = await chromium.launch();
+  try {
+    const page = await signIn(browser, bff.url, tenant, server.apiKey);
+    const url = `${bff.url}/t/${tenant}/verify/executions/${executionId}`;
+    const query = () => Object.fromEntries(new URL(page.url()).searchParams);
+    await page.goto(url);
+
+    // Lifecycle and verdict are separate facts, and a settled execution offers no cancel.
+    await expect.poll(() => page.locator('[data-execution-status]').getAttribute('data-execution-status')).toBe('completed');
+    expect(await page.locator('[data-verdict]').getAttribute('data-verdict')).toBe('failed');
+    expect(await page.getByRole('button', { name: 'Cancel execution' }).count()).toBe(0);
+
+    // The page shows the identities and judgment the shared loader reads for the same execution.
+    const loaded = await loadExecution({ executionId }, { executor: nodeExecutor(WyrdClient.connect()) });
+    if (loaded.result.state !== 'populated' || loaded.result.data.definition.state !== 'populated') throw new Error('the execution and its Verifier load');
+    const { status, definition } = loaded.result.data;
+    const judgment = status.result?.outcome.requirements.find((each) => each.id === 'says-yes');
+    expect(loaded.input.node).toBe('req:says-yes');
+    const main = page.locator('main');
+    expect(await main.textContent()).toContain(executionId);
+    expect(await main.textContent()).toContain(`${definition.data.ref.name}@${definition.data.ref.version}`);
+    const requirement = page.getByRole('region', { name: 'Requirement says-yes', exact: true });
+    expect(await requirement.locator('[data-outcome]').getAttribute('data-outcome')).toBe(judgment?.outcome);
+    expect(await requirement.textContent()).toContain(judgment?.reason);
+
+    // Completed details are read only when asked for; the compact judgment was readable before them.
+    expect(await page.locator('[data-details]').count()).toBe(0);
+    await page.getByRole('button', { name: 'Load completed details' }).click();
+    await expect.poll(query).toMatchObject({ details: '1' });
+    await expect.poll(() => page.locator('[data-details]').count()).toBeGreaterThan(0);
+    expect(await requirement.locator('[data-outcome]').getAttribute('data-outcome')).toBe('failed');
+
+    // A cancel that arrives after completion changes nothing: the terminal state and its judgment stand on reopen.
+    const late = await page.request.post(`${url}/cancel`, { headers: { origin: bff.url } });
+    expect(await late.json()).toEqual({ execution_id: executionId, status: 'completed' });
+    await page.goto(url);
+    await expect.poll(() => page.locator('[data-execution-status]').getAttribute('data-execution-status')).toBe('completed');
+    expect(await page.locator('[data-verdict]').getAttribute('data-verdict')).toBe('failed');
+
+    // Inspecting created no work: the tenant still holds exactly the one execution it submitted.
+    server.flushBifrost();
+    const [executions] = await nodeExecutor(WyrdClient.connect()).run([{ op: 'bifrost.query', sql: 'SELECT DISTINCT execution_id FROM bifrost.verification.execution_inputs', params: [], max_rows: 10 }]);
+    expect(executions).toMatchObject({ ok: true, value: { rows: [[executionId]] } });
+  } finally {
+    await browser.close();
+    bff.stop();
+  }
+});
 
 /**
  * The environment of a development command with its config home at `config`.

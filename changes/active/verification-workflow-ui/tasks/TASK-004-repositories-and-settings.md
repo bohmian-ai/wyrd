@@ -20,7 +20,21 @@ Neither viewing a version nor connecting the App declares or selects policy.
 Requires delivered connection/read/disconnect and redacted access operations,
 plus native Repository declaration/selected policy/exact binding operations and
 their owning authority amendments. Record the actual integrated capability and
-contract revision, not another packet's task status. TASK-001 supplies definition
+contract revision, not another packet's task status.
+
+TASK-001A's integrated baseline (`cd204b404`) contains these server owners;
+record their real journey proof at activation:
+
+| Need | Existing owner |
+|---|---|
+| Connect, read, disconnect, setup and callback | `/v1/integrations/github/connect`, `/v1/integrations/github` (GET, DELETE), `/setup`, `/callback` in `wyrd-server/src/components/github/routes.rs` |
+| Redacted connection and accessible repositories | `GithubConnectionView` (`wyrd-spec/src/github_connection.rs:99`): host, App, state, installation and `repositories` |
+| Selected policy and access on a Card | `Status.repository` / `RepositoryStatus` (`wyrd-spec/src/envelope.rs:497`): `selected`, `selected_version`, `full_name` |
+| `Repository` Card kind | `AGENTS.md` (13 kinds) and the registry's normal Card reads |
+
+Accessible-but-undeclared rows come from `GithubConnectionView.repositories`
+joined to Repository Cards by stable provider identity; selection comes from the
+server-derived Card status, never browser inference. TASK-001 supplies definition
 rendering and TASK-003 supplies filtered Verify. Missing backend capabilities
 remain external dependencies; this task adds only UI presentation/adapters.
 

@@ -23,6 +23,12 @@ identity. Require delivered normal SDK/MCP projections and real provider
 reconciliation proof. Backend owns report conventions, provider writes, retry
 and recovery; this task consumes them and adds no retry controller or action.
 
+In TASK-001A's integrated baseline (`cd204b404`) delivery is the execution
+status field `github_delivery` (`GithubDelivery`,
+`wyrd-spec/src/verification/execution.rs:421`), present only for `pull_request`
+executions, read through the existing status operation; there is no separate
+delivery read. Upstream task 009 is marked complete; record its proof at activation.
+
 ## Flow and proof
 
 Extend the existing shared execution/context loader props and supported host

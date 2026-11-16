@@ -55,11 +55,14 @@ retained CardRef where available or the existing UID-capable host operation.
 Until identity/definition is visible or authorized, explain that availability
 without erasing readable execution state or inventing a different declaration.
 
-Adapt the shared graph projection to integrated Step contracts: dependency
-lists and any_succeeded, foreach, repeat and speculative controls. Include their
-declared external references and annotations while retaining one node per
-authored step. Runtime state never owns layout. Preserve the existing exact
-Verifier Card view with no runtime coloring; TASK-001 stays complete.
+Adapt the shared graph projection to integrated Step contracts: foreach, repeat
+and speculative controls. TASK-001A's compatibility repair already projects
+dependency lists and `any_succeeded` joins (an edge to each predecessor plus an
+`any succeeded` chip), approval steps (their message) and pull request extracts
+(no input read); extend that projection, not a second one. Include declared
+external references and annotations while retaining one node per authored step.
+Runtime state never owns layout. Preserve the existing exact Verifier Card view
+with no runtime coloring; TASK-001 stays complete.
 
 ## Interaction and failure behavior
 

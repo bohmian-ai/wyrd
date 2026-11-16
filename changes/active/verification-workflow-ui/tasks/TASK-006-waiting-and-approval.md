@@ -22,6 +22,16 @@ approve scope, decision receipts/errors and same-execution continuation. Their
 backend implementation is outside this task. Record actual integrated operations
 and real dependency proof; this UI does not wait for unrelated provider delivery.
 
+TASK-001A's integrated baseline (`cd204b404`) contains: execution status
+`waiting` (pending input slots) and `approvals` (`ApprovalOccurrenceState`, every
+occurrence pending or decided) at `wyrd-spec/src/verification/execution.rs:412,416`;
+the decision route `verification/routes.rs:691`; and TS `Execution.decide()`
+(`sdks/wyrd-sdk-ts/wyrd/src/index.ts:2793`). The upstream approval task (008) has
+recorded passing evidence but was not yet reviewed at merge; confirm its accepted
+revision at activation. Its authorization correction makes `verifier:approve` on
+the exact Verifier the only permission to decide; a viewer without it gets the
+existing refusal.
+
 ## Flow and existing owner
 
 Extend 002's typed props/loaders and shared inspector with generated pending

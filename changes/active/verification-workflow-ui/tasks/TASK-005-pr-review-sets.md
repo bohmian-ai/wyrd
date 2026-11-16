@@ -52,7 +52,11 @@ member summaries; TASK-002 supplies per-member detail on opening. Do not add a
 server read, table, Card kind, SDK wire projection or membership ledger, or infer
 membership from timestamps, display names, SHA alone or session group text.
 A per-execution PR generation is input evidence, not proof that an existing
-operation supplies full set membership/history. Record that external capability
+operation supplies full set membership/history. In TASK-001A's integrated
+baseline (`cd204b404`) execution status carries `pull_request`
+(`PullRequestActivation`, `wyrd-spec/src/verification/execution.rs:548`:
+repository, number, base/head, delivery and admission `generation`), but no
+review-set list/history read or same-commit request exists. Record that external capability
 before activation; if absent, retain the dependency instead of implementing it
 here. These constraints preserve exact membership and authorization.
 

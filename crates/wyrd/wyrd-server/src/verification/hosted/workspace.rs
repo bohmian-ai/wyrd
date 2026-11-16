@@ -50,6 +50,7 @@ use wyrd_spec::verification::execution::{
 use super::evidence::TenantEvidence;
 use super::tools::{host_stop, invocation};
 use super::{HostedLimits, extract_refused};
+use crate::verification::state::Charged;
 use wyrd_spec::verification::state::AcceptedPublication;
 
 /// Process-wide workspace admission over the process memory and scratch
@@ -190,9 +191,9 @@ impl Workspaces {
                     });
                 }
                 CallValue::Publication { producer, name } => {
-                    let publication = evidence
-                        .publications(&producer.step_id)
-                        .into_iter()
+                    let read = evidence.publications(&producer.step_id);
+                    let publication = read
+                        .iter()
                         .find(|stored| {
                             &stored.publication.producer == producer
                                 && &stored.publication.name == name
@@ -208,7 +209,7 @@ impl Workspaces {
                         &mut workspace,
                         &mut count,
                         evidence,
-                        (path, &publication, sources),
+                        (path, publication, sources),
                         (&mut pending, &mut directories),
                     )
                     .await?;
@@ -220,8 +221,9 @@ impl Workspaces {
                     let admitted = if collection.speculation.admits() {
                         evidence.publications(step)
                     } else {
-                        Vec::new()
+                        Charged::uncharged(Vec::new())
                     };
+                    let (admitted, _read) = admitted.into_parts();
                     for publication in admitted {
                         let relative = format!(
                             "content/{}/{}",

@@ -56,7 +56,7 @@ use wyrd_spec::ids::{ApprovalId, CardUid, ExecutionId, SlotName, VerificationRes
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::ids::RunId;
 use wyrd_spec::verification::execution::{ExecutedOutcome, InputDeclaration};
-use wyrd_spec::verification::state::{ExecutionIdentity, ExecutionState, TerminalSelection};
+use wyrd_spec::verification::state::{ExecutionIdentity, RecordedApproval, TerminalSelection};
 use wyrd_spec::verification::{DriftWindow, VerificationError, VerificationVerdict};
 use wyrd_spec::verification::{TaskId, VerificationExecutionStatus, VerifierReadiness};
 use wyrd_sql::queries::auth::service_accounts::system_principal_id;
@@ -537,7 +537,7 @@ impl VerifierRunner {
             Ok(state) => Arc::new(state),
             Err(transition) => return transition,
         };
-        let offer = if let Some(decision) = Decision::of(&state.snapshot()) {
+        let offer = if let Some(decision) = state.decision() {
             Offer::Accepted(decision)
         } else if run.exhausted {
             Offer::Failed(
@@ -593,7 +593,7 @@ impl VerifierRunner {
                     // nothing; such an execution continues at once.
                     let decided = !parked.is_empty()
                         && self
-                            .decisions(tenant, run, system, &state.snapshot())
+                            .decisions(tenant, run, system, &state.approvals())
                             .await
                             .is_ok_and(|decided| {
                                 parked.iter().any(|key| decided.contains_key(key))
@@ -962,13 +962,16 @@ impl VerifierRunner {
                 },
             )
         });
-        let recorded = state.snapshot();
-        let decisions = match self.decisions(tenant, run, system, &recorded).await {
+        let approvals = state.approvals();
+        let decisions = match self.decisions(tenant, run, system, &approvals).await {
             Ok(decisions) => decisions,
             Err(outcome) => return outcome,
         };
+        // The restoration copy stays charged while the engine runs.
+        let (engine, _restored) = state
+            .restore(engine, Arc::clone(state) as Arc<dyn Checkpoints>)
+            .into_parts();
         let engine = engine
-            .with_checkpoints(Arc::clone(state) as Arc<dyn Checkpoints>, &recorded)
             .with_approvals(decisions)
             .with_host_work(work.clone());
         match engine
@@ -980,8 +983,8 @@ impl VerifierRunner {
         }
     }
 
-    /// The accepted decision of each approval occurrence `recorded` holds,
-    /// keyed by its step, fanout item, and repeat iteration.
+    /// The accepted decision of each recorded approval occurrence in
+    /// `recorded`, keyed by its step, fanout item, and repeat iteration.
     ///
     /// # Errors
     /// Returns [`EngineOutcome::Deferred`] when a decision cannot be read
@@ -991,9 +994,9 @@ impl VerifierRunner {
         tenant: DataTenantId,
         run: &ClaimedExecution,
         system: PrincipalId,
-        recorded: &ExecutionState,
+        recorded: &[RecordedApproval],
     ) -> Result<Decisions, EngineOutcome> {
-        if recorded.approvals.is_empty() {
+        if recorded.is_empty() {
             return Ok(Decisions::new());
         }
         let unavailable = |error: &dyn std::fmt::Display| {
@@ -1008,7 +1011,6 @@ impl VerifierRunner {
             .await
             .map_err(|error| unavailable(&error))?;
         let ids: Vec<ApprovalId> = recorded
-            .approvals
             .iter()
             .map(|recorded| recorded.approval_id)
             .collect();
@@ -1021,7 +1023,6 @@ impl VerifierRunner {
             .await
             .map_err(|error| unavailable(&error))?;
         Ok(recorded
-            .approvals
             .iter()
             .filter_map(|recorded| {
                 let occurrence = &recorded.occurrence;

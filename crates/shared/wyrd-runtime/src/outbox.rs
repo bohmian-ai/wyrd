@@ -383,6 +383,21 @@ impl<S: OutboxSink> Outbox<S> {
         &self.sink
     }
 
+    /// The process memory ledger admitted items are charged to, when the
+    /// outbox was started by [`Self::charging`], so a producer can charge
+    /// an item before building it and hand the charge to
+    /// [`Reservation::stage_charged`].
+    #[must_use]
+    pub fn memory(&self) -> Option<crate::resources::ByteLedger> {
+        self.admission.memory.as_ref().map(|memory| {
+            memory
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .ledger()
+                .clone()
+        })
+    }
+
     /// Queues one item for `tenant` without waiting and never fails.
     ///
     /// The item is admitted and counted pending before it is sent, so the
@@ -420,7 +435,7 @@ impl<S: OutboxSink> Outbox<S> {
             self.shed(tenant);
             return;
         }
-        admission.charge(bytes);
+        admission.charge(bytes, None);
         self.enqueue(sender, tenant, item, Load::one(false, bytes));
     }
 
@@ -580,7 +595,11 @@ impl<S: OutboxSink> Outbox<S> {
     /// refuses new reservations once that share's bytes reach their limit.
     /// Once shutdown has begun the item is released from its slot, counted
     /// lost with [`LossReason::Shutdown`], and logged.
-    fn send_reserved(&self, tenant: DataTenantId, item: S::Item) {
+    ///
+    /// `held` is memory the producer already charged for the item; the
+    /// outbox takes it over as part of the item's charge rather than
+    /// charging those bytes again.
+    fn send_reserved(&self, tenant: DataTenantId, item: S::Item, held: Option<ByteCharge>) {
         let bytes = S::weight(&item);
         let queue = self.queue.read().unwrap_or_else(PoisonError::into_inner);
         let Some(sender) = queue.as_ref() else {
@@ -592,7 +611,7 @@ impl<S: OutboxSink> Outbox<S> {
         self.admission
             .reserved_bytes
             .fetch_add(bytes, Ordering::AcqRel);
-        self.admission.charge(bytes);
+        self.admission.charge(bytes, held);
         self.enqueue(sender, tenant, item, Load::one(true, bytes));
     }
 
@@ -736,13 +755,27 @@ impl<S: OutboxSink> Reservation<S> {
     /// With no slot left, the item is staged like [`Outbox::stage`]. Once
     /// shutdown has begun the item is counted lost, as any late stage is.
     pub fn stage(&self, tenant: DataTenantId, item: impl Into<S::Item>) {
+        self.stage_held(tenant, item.into(), None);
+    }
+
+    /// Stages one item as [`Self::stage`] does, handing the outbox `held`,
+    /// memory the producer charged for the item before building it. On a
+    /// reserved slot the outbox takes `held` over as part of the item's
+    /// charge, so the item's bytes stay charged once, without a gap or a
+    /// second promise; `held` is returned to the ledger otherwise.
+    pub fn stage_charged(&self, tenant: DataTenantId, item: impl Into<S::Item>, held: ByteCharge) {
+        self.stage_held(tenant, item.into(), Some(held));
+    }
+
+    /// Spends a slot on `item` and its `held` charge, or stages it unreserved.
+    fn stage_held(&self, tenant: DataTenantId, item: S::Item, held: Option<ByteCharge>) {
         let spent = self
             .slots
             .try_update(Ordering::AcqRel, Ordering::Acquire, |slots| {
                 slots.checked_sub(1)
             });
         if spent.is_ok() {
-            self.outbox.send_reserved(tenant, item.into());
+            self.outbox.send_reserved(tenant, item, held);
         } else {
             self.outbox.stage(tenant, item);
         }
@@ -806,13 +839,28 @@ struct Admission {
 }
 
 impl Admission {
-    /// Charges `bytes` just admitted to the process memory ledger, if any.
-    fn charge(&self, bytes: usize) {
-        if let Some(memory) = &self.memory {
-            memory
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .grow_infallible(bytes as u64);
+    /// Charges `bytes` just admitted to the process memory ledger, if any,
+    /// taking over `held`, bytes of the item already charged to that
+    /// ledger, so they are not charged twice.
+    ///
+    /// # Panics
+    /// Panics when `held` is promised from another ledger than the
+    /// outbox's, which [`ByteCharge::merge`] refuses.
+    fn charge(&self, bytes: usize, held: Option<ByteCharge>) {
+        let Some(memory) = &self.memory else {
+            return;
+        };
+        let mut memory = memory.lock().unwrap_or_else(PoisonError::into_inner);
+        let bytes = bytes as u64;
+        let given = held.map_or(0, |held| {
+            let given = held.bytes();
+            memory.merge(held);
+            given
+        });
+        if given < bytes {
+            memory.grow_infallible(bytes - given);
+        } else {
+            memory.shrink(given - bytes);
         }
     }
 
@@ -2510,6 +2558,41 @@ mod tests {
             .expect("reserved bytes are free")
             .stage(tenant, 50_u32);
         assert_eq!(memory.used(), 110, "only admitted items are charged");
+
+        state.lock().expect("unpoisoned").hanging.clear();
+        hang.notify_one();
+        assert_eq!(outbox.settle(within(10)).await, 0);
+        assert_eq!(memory.used(), 0, "written items return their bytes");
+    }
+
+    /// A reserved item staged with memory its producer charged before
+    /// building it is charged once: the outbox takes that charge over as
+    /// part of the item's weight, and the write returns all of it.
+    ///
+    /// # Panics
+    /// Panics when the item is charged twice or keeps bytes once written.
+    #[tokio::test(flavor = "current_thread")]
+    async fn charged_items_are_taken_over_without_a_second_charge() {
+        let memory = crate::resources::ByteLedger::new(1_000);
+        let sink = MemorySink::default();
+        let (hang, state) = (Arc::clone(&sink.hang), Arc::clone(&sink.state));
+        let outbox = Outbox::charging(
+            sink,
+            4,
+            OutboxLimits {
+                items: 1_024,
+                bytes: 400,
+            },
+            &memory,
+        );
+        let tenant = DataTenantId::new_v7();
+        state.lock().expect("unpoisoned").hanging.insert(tenant);
+
+        let slots = outbox.reserve(2).expect("reserved");
+        slots.stage_charged(tenant, 50_u32, memory.charge_infallible(30));
+        assert_eq!(memory.used(), 50, "a smaller charge is topped up once");
+        slots.stage_charged(tenant, 20_u32, memory.charge_infallible(35));
+        assert_eq!(memory.used(), 70, "a larger charge is trimmed to weight");
 
         state.lock().expect("unpoisoned").hanging.clear();
         hang.notify_one();

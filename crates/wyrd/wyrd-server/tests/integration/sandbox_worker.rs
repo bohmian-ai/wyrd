@@ -492,13 +492,18 @@ async fn python_writes_beyond_process_scratch_stop_busy() {
 /// Memory and time breaches end only the offending operation; the sandbox
 /// keeps serving, and limits that cannot hold one worker refuse to start.
 ///
+/// The two ceilings are independent and neither takes precedence, so each
+/// breach runs where only its own ceiling can be reached first: memory under
+/// a small allocation budget and the default deadline, time under a short
+/// deadline with code that allocates nothing.
+///
 /// # Panics
 /// Panics when a breach succeeds, poisons the pool, or impossible limits
 /// start.
 #[tokio::test]
 async fn sandbox_contains_runaway_code() {
     let sandbox = start(HostedLimits {
-        code_timeout: Duration::from_secs(1),
+        monty_memory_bytes: 16 * 1024 * 1024,
         ..HostedLimits::default()
     })
     .await;
@@ -524,6 +529,18 @@ async fn sandbox_contains_runaway_code() {
         .await,
     );
     assert!(reason.contains("MemoryError"), "{reason}");
+    assert_eq!(
+        run(&sandbox, "def f():\n    return 1", "f", json!({}))
+            .await
+            .expect("still serves after memory breaches")
+            .value,
+        json!(1)
+    );
+    let sandbox = start(HostedLimits {
+        code_timeout: Duration::from_secs(1),
+        ..HostedLimits::default()
+    })
+    .await;
     let reason = terminal(
         run(
             &sandbox,
@@ -537,7 +554,7 @@ async fn sandbox_contains_runaway_code() {
     assert_eq!(
         run(&sandbox, "def f():\n    return 1", "f", json!({}))
             .await
-            .expect("still serves")
+            .expect("still serves after a time breach")
             .value,
         json!(1)
     );

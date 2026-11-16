@@ -79,10 +79,10 @@ that baseline and proves its own reads through the production UI path.
 
 | ID | Promise | Contract source | Planned proof |
 |---|---|---|---|
-| `M-1` | Merged HEAD contains the recorded upstream revision and the destination start revision, with no unresolved conflicts | Verification and handoff | `git merge-base --is-ancestor` for both; `git diff --check`; conflict-marker scan |
+| `M-1` | The source branch and full SHA and the destination's starting SHA are recorded; merged HEAD contains both fixed revisions with no unresolved conflicts | Outcome and inputs; Verification and handoff | `git merge-base --is-ancestor` for both; `git diff --check`; conflict-marker scan |
 | `M-2` | Conflicts resolve at existing owners, preserving upstream server/SDK behavior and authority amendments, this packet's UI-only scope and TASK-001's definition viewer; generated bindings rebuilt from owners | Work and boundary | conflict resolution log; `codegen:check` |
-| `M-3` | No new endpoint, server behavior, migration, authorization rule or execution UI beyond the two inputs; only compatibility repairs | Work and boundary | diff audit of merge result against both parents |
-| `REQ-005/AC-008` | Existing UI compiles, builds and keeps exact Verifier definition reads, including refusals, through authorized hosts and the real browser page | Verification and handoff | `build:server`, `ts:build:testing`, `ui:check`, UI build, the two named integration tests |
+| `M-3` | No new endpoint, server behavior, migration, authorization rule or execution UI beyond the two inputs; only compatibility repairs, with owner format/lint | Work and boundary; Verification and handoff | combined diff of the merge against both parents; repair diff; fmt/clippy/svelte-check |
+| `REQ-005/AC-008` | Server and Node addons rebuild; existing UI compiles, builds and keeps exact Verifier definition reads, including refusals, through authorized hosts and the real browser page, with runners revalidated against the merged `mise.toml` and test assertions and real-server dependencies unchanged | Verification and handoff | `build:server`, `ts:build:testing`, `ui:check`, UI build, the two named integration tests |
 | `REQ-014` | TASK-002's upstream inputs (status/details/invocation/publication/file/cancel, Card/Bifrost) are identified in the integrated baseline and source alignment is refreshed to the actual revision | Verification and handoff | execution evidence; `design/source-alignment.md` |
 
 ## Execution evidence
@@ -98,8 +98,9 @@ that baseline and proves its own reads through the production UI path.
 
 Deviation from the task's settled-upstream assumption: at execution the upstream
 worktree still had uncommitted TASK-012-R1 gateway edits, and `f6fac677c` landed
-while its revision was being recorded. The maintainer chose to merge the committed
-`f6fac677c` as the fixed revision; the uncommitted R1 work is excluded and the
+while its revision was being recorded. Routed to the maintainer as a blocking input
+decision before any merge; they chose the committed `f6fac677c` as the fixed
+revision; the uncommitted R1 work is excluded and the
 upstream remediation remains open in its own packet.
 
 Two untracked files predating this task (`wyrd-ui/.g.mjs`, a screenshot harness,
@@ -123,7 +124,8 @@ extracts as reading no inputs, links an any-succeeded join to every predecessor
 with an `any succeeded` chip, and `CARD_KINDS` lists `Repository`, which the
 existing every-registrable-kind type guard requires; `catalog.json` regenerated
 by `scripts/catalog.ts`. This is the minimum for the existing viewer to compile
-and stay truthful; TASK-002 still owns runtime presentation of new step forms.
+and stay truthful: without the approval message and `any succeeded` chip the
+definition would show an empty step and an all-of join it does not declare; TASK-002 still owns runtime presentation of new step forms.
 RED: the added `verifier graph projects and lays out the declared topology` case
 failed against the pre-repair build (`reads is not a function or its return value
 is not iterable`); GREEN after the repair.
@@ -171,6 +173,6 @@ Recorded from upstream's own routes and journey tests; not re-reviewed here.
 |---|---|---|---|---|
 | `M-1`: both inputs in HEAD; no unresolved conflicts | merge `d118ee49f` | `git merge-base --is-ancestor` for `f6fac677c` and `a6a482306` | both ancestors; marker scan and `git diff --check` clean | PASS |
 | `M-2`: conflicts at owners; upstream behavior, this packet's scope and TASK-001 viewer preserved; generated bindings from owners | conflict table above | `envelope.rs:475–505`, `cards/service.rs:424–425,490–491` | workspace `cargo check`; `codegen:regen`/`codegen:check`; TASK-001 integration tests | PASS |
-| `M-3`: no new endpoint, server behavior, migration, authorization rule or execution UI; only compatibility repairs | `0d337a006` touches only `verifier.ts`, `schemas.ts`, `catalog.json`, one unit test | `git diff d118ee49f 0d337a006 --stat` | diff audit | PASS |
-| `REQ-005/AC-008`: existing UI compiles, builds, keeps exact Verifier definition reads and refusals through authorized hosts and the browser page | `0d337a006` | `src/lib/ui-library.test.ts` (any-succeeded case) | `ui:check`, UI build, both named integration tests | PASS |
-| `REQ-014`: TASK-002's upstream inputs identified; source alignment refreshed to the integrated revision | tables above | `design/source-alignment.md` | content review | PASS |
+| `M-3`: no new endpoint, server behavior, migration, authorization rule or execution UI; only compatibility repairs, formatted and linted | merge combined diff (`git diff-tree --cc d118ee49f`) differs from both parents only in the four resolved files and clean auto-merges of files both sides edited (`TESTING.md`, `architecture/wyrd-design.md`, `wyrd-spec` prompt `mod.rs`/`spec.rs`, `fixtures/README.md`, `mise.toml`); `0d337a006` touches only `verifier.ts`, `schemas.ts`, generated `catalog.json` and one unit test, adding no server code | `git diff d118ee49f 0d337a006 --stat` | diff audit; `cargo fmt --check`, clippy, `svelte-check`; `codegen:check` covers `catalog.json` | PASS |
+| `REQ-005/AC-008`: addons rebuild; existing UI compiles, builds, keeps exact Verifier definition reads and refusals through authorized hosts and the browser page; runners and test assertions unchanged | `0d337a006` | `src/lib/ui-library.test.ts` (any-succeeded case); refusals asserted in the library journey: missing version `WYRD_REGISTRY_404_CARD_NOT_FOUND`, wrong kind `WYRD_SPEC_400_VALIDATION`, card-permissionless principal denied | `build:server`, `ts:build:testing`, `ui:check`, UI build, both named integration tests; no integration test file changed in `a6a482306..HEAD` | PASS |
+| `REQ-014`: TASK-002's upstream inputs identified; source alignment refreshed to the integrated revision | upstream inputs table with server route, client method and upstream test locations, spot-checked by an independent reader | `design/source-alignment.md` § Source revisions | documentation content review (no runtime claim; TASK-002 proves its own reads) | PASS |

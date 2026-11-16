@@ -997,9 +997,16 @@ test('authenticated card browsing and prompt comparison', async ({ ui }) => {
   await expect.poll(() => definition.textContent()).toContain('Cite the policy section you rely on.');
   expect(await page.getByRole('region', { name: 'Variables', exact: true }).textContent()).toMatch(/ticket.*tone/);
   expect(await page.getByRole('region', { name: 'Used by', exact: true }).textContent()).toContain(`${agent.name}@1.0.0`);
+  // The overview names what changed in one line; the comparison itself is the Versions tab, a unified diff.
+  expect(await page.getByRole('note', { name: 'Changes', exact: true }).textContent()).toMatch(/Changed from v1\.0\.0: .*response_format/);
+  expect(await page.getByRole('region', { name: /^Changes from/ }).count()).toBe(0);
+  await page.getByRole('link', { name: 'Compare versions' }).click();
+  await expect.poll(() => new URL(page.url()).searchParams.get('tab')).toBe('versions');
   const changes = page.getByRole('region', { name: /^Changes from/ });
-  expect(await changes.textContent()).toContain('v1.0.0 → v1.1.0');
-  expect(await changes.getByRole('region', { name: 'response_format', exact: true }).getByLabel('v1.1.0').textContent()).toContain('verdict');
+  await expect.poll(() => changes.textContent()).toContain('v1.0.0 → v1.1.0');
+  expect(await changes.getByRole('group', { name: 'response_format', exact: true }).locator('[data-line="added"]').textContent()).toContain('+ verdict');
+  await page.getByRole('navigation', { name: `${prompt.name} sections` }).getByRole('button', { name: 'Overview' }).click();
+  await expect.poll(() => new URL(page.url()).searchParams.get('tab')).toBeNull();
   // A Prompt records no telemetry: its primary action opens the Agent using it.
   expect(await page.getByRole('button', { name: /Open in Observe/ }).count()).toBe(0);
   expect(await page.getByRole('button', { name: `Open ${agent.name}`, exact: true }).isEnabled()).toBe(true);
@@ -1009,10 +1016,12 @@ test('authenticated card browsing and prompt comparison', async ({ ui }) => {
   await expect.poll(() => new URL(page.url()).searchParams.get('version')).toBe('1.0.0');
   expect(new URL(page.url()).searchParams.get('uid')).toBeNull();
   await expect.poll(() => page.getByRole('region', { name: 'Used by', exact: true }).textContent()).toContain('No registered Agent uses this Prompt version.');
-  expect(await page.getByRole('region', { name: 'Changes between versions', exact: true }).textContent()).toContain('Version 1.0.0 is the first registered version.');
+  expect(await page.getByRole('note', { name: 'Changes', exact: true }).count()).toBe(0);
   expect(await definition.textContent()).not.toContain('Cite the policy section');
 
-  // Tabs keep the exact reference: Versions, YAML, then Files.
+  // Tabs keep the exact reference: Versions, YAML, then Files. The first version has nothing to compare from.
+  await page.getByRole('navigation', { name: `${prompt.name} sections` }).getByRole('button', { name: /^Versions/ }).click();
+  await expect.poll(() => page.getByRole('region', { name: 'Changes between versions', exact: true }).textContent()).toContain('Version 1.0.0 is the first registered version.');
   await page.getByRole('navigation', { name: `${prompt.name} sections` }).getByRole('button', { name: 'YAML' }).click();
   await expect.poll(() => new URL(page.url()).searchParams.get('tab')).toBe('yaml');
   await expect.poll(() => page.getByRole('region', { name: 'YAML', exact: true }).textContent()).toContain('version: "1.0.0"');
@@ -1628,7 +1637,7 @@ base('development environment lifecycle', { timeout: 2_400_000 }, async () => {
     await cards.getByRole('button', { name: 'Open Prompt/support-reply@1.1.0' }).click();
     await page.waitForURL((url) => url.pathname === '/t/dev/cards/detail' && url.searchParams.get('version') === '1.1.0');
     await expect.poll(() => page.getByRole('region', { name: 'Used by', exact: true }).textContent()).toContain('reply-agent@1.0.0');
-    expect(await page.getByRole('region', { name: /^Changes from/ }).textContent()).toContain('v1.0.0 → v1.1.0');
+    expect(await page.getByRole('note', { name: 'Changes', exact: true }).textContent()).toContain('Changed from v1.0.0');
     await page.goto('http://127.0.0.1:3000/t/dev/cards/detail?kind=Model&name=support-model&version=1.0.0&tab=files');
     await expect.poll(() => page.getByRole('region', { name: 'Files', exact: true }).textContent()).toContain('support-model.bin');
 

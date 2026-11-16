@@ -2,7 +2,8 @@
   One exact Card version: breadcrumb, header, then the selected tab. Every Card has
   Overview (facts and relationships), Files and YAML; an Agent shows each
   exact Prompt it references; a Prompt adds its
-  authored definition, variables, using Agents and version comparison; a
+  authored definition, variables, using Agents and one line naming what
+  changed from the version before, with the comparison on its own tab; a
   Verifier's overview is its declared graph and where that version runs. The
   URL holds the exact reference, tab and comparison, so every navigation
   keeps the selected version until the reader picks another.
@@ -36,6 +37,12 @@
   let actions = $state<Record<string, ActionState>>({});
   /** A Prompt records no telemetry; its primary action opens the first Agent that uses it. */
   const agent = $derived(data.prompt?.usedBy.result.state === 'populated' ? data.prompt.usedBy.result.data[0]?.ref : undefined);
+
+  /** What this Prompt version changed from the one before it; the comparison itself is the Versions tab. */
+  const changed = $derived.by(() => {
+    const diff = data.prompt?.diff.result;
+    return diff?.state === 'populated' && diff.data.other ? { other: diff.data.other, fields: diff.data.changes.map((change) => change.field) } : undefined;
+  });
 
   /** The newest listed version of a Verifier, when the reader is viewing an older one. */
   const newer = $derived.by(() => {
@@ -118,7 +125,12 @@
           <PromptMessages {...data.prompt.messages} />
           <PromptVariables {...data.prompt.variables} />
           <UsedBy {...data.prompt.usedBy} {actions} onaction={onaction('UsedBy')} />
-          <VersionDiff {...data.prompt.diff} {actions} onaction={onaction('VersionDiff')} />
+          {#if changed}
+            <p class="note" role="note" aria-label="Changes">
+              Changed from v{changed.other}: {changed.fields.join(', ')}.
+              <a href="{base}/cards/detail{writeDetail(data.cardRef!, { tab: 'versions' })}">Compare versions</a>
+            </p>
+          {/if}
         {:else}
           {#each data.prompts ?? [] as prompt (`${prompt.input.cardRef.name}@${prompt.input.cardRef.version}`)}
             <section class="referenced" aria-label="Prompt {prompt.input.cardRef.name}@{prompt.input.cardRef.version}">
@@ -203,6 +215,9 @@
   .referenced a {
     color: var(--declare);
     font: 12px var(--font-mono);
+  }
+  .note a {
+    color: var(--declare);
   }
   .note {
     margin: 0;

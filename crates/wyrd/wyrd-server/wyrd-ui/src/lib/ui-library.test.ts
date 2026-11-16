@@ -2209,6 +2209,16 @@ test('prompt definitions and comparisons preserve authored forms', async () => {
   expect(within(shown.container).getByRole('region', { name: 'Message 1' })).toHaveTextContent('1 · user');
   expect(within(shown.container).getByRole('region', { name: 'System' }).querySelector('.bubble')?.textContent?.trim()).toBe('You answer support tickets.\nCite the policy section you rely on.');
   expect(shown.container).toHaveTextContent('response · verdict');
+  // A response schema is reference material: a closed row naming its fields, opened on request, never one long line.
+  const authored = (portable.result as Extract<typeof portable.result, { state: 'populated' }>).data;
+  const schema = { type: 'object', properties: { outcome: { type: 'string' }, citations: { type: 'array' } }, required: ['outcome'] };
+  const structured = render(PromptMessages, { ...portable, result: { state: 'populated', data: { ...authored, response_format: schema } } });
+  expect(structured.container.querySelector('.chips')).toHaveTextContent('response · JSON schema');
+  expect(structured.container.querySelector('.chips')).not.toHaveTextContent('required');
+  const row = structured.container.querySelector('details[aria-label="Response format"]') as HTMLDetailsElement;
+  expect(row.open).toBe(false);
+  expect(row.querySelector('summary')).toHaveTextContent('Response format · JSON schema · outcome, citations');
+  expect(row.querySelector('pre')?.textContent).toBe(JSON.stringify(schema, null, 2));
   // Placeholders are marked as authored, never rewritten.
   expect([...shown.container.querySelectorAll('.var')].map((part) => part.textContent)).toEqual(['{{ticket}}', '{{tone}}']);
   const native = await loadPromptMessages({ cardRef: NATIVE }, { executor: reads.executor });
@@ -2269,22 +2279,33 @@ test('prompt definitions and comparisons preserve authored forms', async () => {
   const first = await loadVersionDiff({ cardRef: { ...PROMPT, version: '1.0.0' } }, { executor: fixtureExecutor });
   expect(first.result).toMatchObject({ state: 'empty', data: { versions: ['1.1.0', '1.0.0'], changes: [] }, reason: 'Version 1.0.0 is the first registered version. Choose a version to compare it with.' });
   expect(within(render(VersionDiff, first).container).getByLabelText('Compare with')).toHaveTextContent('compare with v1.1.0');
-  // Each side marks only its own changed lines; a long unchanged run is counted, not drawn.
+  // One unified list: removed lines above added ones; a long unchanged run is counted, not drawn.
   const kept = ['a', 'b', 'c', 'd', 'e'].join('\n');
-  expect(diffLines(`${kept}\nold\nz`, `${kept}\nnew\nz`)).toEqual({
-    from: [{ kind: 'same', text: 'a' }, { kind: 'gap', text: '3 unchanged lines' }, { kind: 'same', text: 'e' }, { kind: 'changed', text: 'old' }, { kind: 'same', text: 'z' }],
-    to: [{ kind: 'same', text: 'a' }, { kind: 'gap', text: '3 unchanged lines' }, { kind: 'same', text: 'e' }, { kind: 'changed', text: 'new' }, { kind: 'same', text: 'z' }]
-  });
+  expect(diffLines(`${kept}\nold\nz`, `${kept}\nnew\nz`)).toEqual([
+    { kind: 'same', text: 'a' },
+    { kind: 'gap', text: '3 unchanged lines' },
+    { kind: 'same', text: 'e' },
+    { kind: 'removed', text: 'old' },
+    { kind: 'added', text: 'new' },
+    { kind: 'same', text: 'z' }
+  ]);
+  // A field present on one side only is all added or all removed.
+  expect(diffLines(undefined, 'verdict')).toEqual([{ kind: 'added', text: 'verdict' }]);
+  expect(diffLines('a\nb', undefined).map((line) => line.kind)).toEqual(['removed', 'removed']);
   // A differing middle too long to match line by line is shown whole rather than computed; shared ends stay unchanged.
   const oversized = (side: string) => ['first', ...Array.from({ length: 600 }, (_, index) => `${side} ${index}`), 'last'].join('\n');
-  const whole = diffLines(oversized('old'), oversized('new'));
-  expect(whole.from.map((line) => line.kind)).toEqual(['same', ...Array.from({ length: 600 }, () => 'changed'), 'same']);
-  expect(whole.to[1]).toEqual({ kind: 'changed', text: 'new 0' });
+  const whole = diffLines(oversized('old'), oversized('new')).map((line) => line.kind);
+  expect(whole).toEqual(['same', ...Array.from({ length: 600 }, () => 'removed'), ...Array.from({ length: 600 }, () => 'added'), 'same']);
   // Identical texts have no changed line, whatever their length.
-  expect(diffLines(oversized('old'), oversized('old')).from.map((line) => line.kind)).toEqual(['same', 'gap', 'same']);
+  expect(diffLines(oversized('old'), oversized('old')).map((line) => line.kind)).toEqual(['same', 'gap', 'same']);
+  // Each changed field is a section counting its lines; a small change is open, a large one starts closed.
   const drawn = render(VersionDiff, diff).container;
-  expect(drawn.querySelector('section[aria-label="response_format"] [data-side="from"]')).toHaveTextContent('not set');
-  expect(drawn.querySelector('section[aria-label="response_format"] [data-side="to"] [data-line="changed"]')).toHaveTextContent('+ verdict');
+  const format = drawn.querySelector('details[aria-label="response_format"]') as HTMLDetailsElement;
+  expect(format.open).toBe(true);
+  expect(format.querySelector('summary')).toHaveTextContent('response_format +1');
+  expect(format.querySelector('[data-line="added"]')).toHaveTextContent('+ verdict');
+  const large = { ...diff, result: { state: 'populated' as const, data: { versions: ['1.1.0', '1.0.0'], other: '1.0.0', changes: [{ field: 'response_format', to: oversized('new') }] } } };
+  expect((render(VersionDiff, large).container.querySelector('details') as HTMLDetailsElement).open).toBe(false);
   // Any two versions: the older one compared against the newer, in either direction.
   expect((await loadVersionDiff({ cardRef: { ...PROMPT, version: '1.0.0' }, otherVersion: '1.1.0' }, { executor: fixtureExecutor })).result).toMatchObject({ data: { other: '1.1.0' } });
   expect(validatePanel('VersionDiff', { cardRef: PROMPT, otherVersion: PROMPT.version })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
@@ -2294,7 +2315,7 @@ test('prompt definitions and comparisons preserve authored forms', async () => {
   expect(single.result).toMatchObject({ state: 'empty', reason: 'Only version 1.0.0 is registered.' });
   expect(render(VersionDiff, single).container).toHaveTextContent('Only version 1.0.0 is registered. Registering a new version shows its message, variable and response-format diff here.');
   const picker = render(VersionDiff, { ...diff, onaction });
-  expect(within(picker.container).getByRole('region', { name: 'system' }).querySelectorAll('pre')).toHaveLength(2);
+  expect(within(picker.container).getByRole('group', { name: 'system' }).querySelectorAll('pre')).toHaveLength(1);
   await fireEvent.change(within(picker.container).getByRole('combobox'), { target: { value: '1.0.0' } });
   expect(onaction).toHaveBeenLastCalledWith({ name: 'prompt.compare', input: { other_version: '1.0.0' } });
   expect(validateIntent('VersionDiff', onaction.mock.lastCall?.[0])).toEqual({ name: 'prompt.compare', input: { other_version: '1.0.0' } });

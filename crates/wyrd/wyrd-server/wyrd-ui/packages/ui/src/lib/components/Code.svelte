@@ -1,7 +1,9 @@
 <!--
   A block of JSON or YAML, coloured by syntax role with the brand's code
   tokens. The code field is dark in both modes. Colour is decoration only:
-  the text is unchanged, selectable and copyable.
+  the text is unchanged, selectable and copyable. A long block keeps a
+  bounded height and scrolls, so machine text never pushes the page's own
+  content out of view.
 -->
 <script lang="ts">
   import { codeTokens } from '../format.js';
@@ -14,7 +16,8 @@
   let { text }: Props = $props();
 </script>
 
-<pre class="code">{#each codeTokens(text) as token, index (index)}{#if token.kind === 'text'}{token.text}{:else}<span data-token={token.kind}>{token.text}</span>{/if}{/each}</pre>
+<!-- svelte-ignore a11y_no_noninteractive_tabindex -- a scrolling block must be reachable by keyboard -->
+<pre class="code" tabindex="0">{#each codeTokens(text) as token, index (index)}{#if token.kind === 'text'}{token.text}{:else}<span data-token={token.kind}>{token.text}</span>{/if}{/each}</pre>
 
 <style>
   pre.code {
@@ -27,6 +30,12 @@
     font: 12px/1.55 var(--font-mono);
     white-space: pre-wrap;
     overflow-wrap: anywhere;
+    max-height: 20em;
+    overflow-y: auto;
+  }
+  pre.code:focus-visible {
+    outline: 2px solid var(--declare);
+    outline-offset: 2px;
   }
   [data-token='key'] {
     color: var(--code-keyword);

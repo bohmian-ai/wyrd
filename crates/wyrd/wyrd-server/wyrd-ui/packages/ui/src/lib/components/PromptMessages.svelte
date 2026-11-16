@@ -2,7 +2,7 @@
   An exact Prompt as authored, which is exactly what the provider receives:
   provider, model and response format, then portable system text and
   numbered turns, or the native format's body unchanged, extension fields
-  included.
+  included. A response schema is a closed row naming its fields, opened on request.
 -->
 <script lang="ts">
   import type { PromptMessagesProps } from '../cards.js';
@@ -14,9 +14,11 @@
   let { input, result }: PromptMessagesProps = $props();
 
   const spec = $derived(result.state === 'populated' ? result.data : undefined);
-  const responseFormat = $derived(
-    spec?.response_format == null ? undefined : typeof spec.response_format === 'string' ? spec.response_format : JSON.stringify(spec.response_format)
-  );
+  /** A named response format fits the chip; a schema is reference material, closed until asked for. */
+  const schema = $derived(spec?.response_format != null && typeof spec.response_format !== 'string' ? spec.response_format : undefined);
+  const responseFormat = $derived(schema ? 'JSON schema' : (spec?.response_format as string | null | undefined));
+  /** The schema's top-level field names, so the closed row says what the response holds. */
+  const fields = $derived(Object.keys((schema as { properties?: object } | undefined)?.properties ?? {}).join(', '));
   /** Splits text so odd parts are `{{placeholder}}` spans; display only, the server derives the variables. */
   const PLACEHOLDER = /(\{\{[^{}]*\}\})/;
   /** One content block as text; media keeps its literal source or `${media:name}` binding. */
@@ -46,6 +48,12 @@
       {/each}
       {#if !spec.system}<p class="none">No system message.</p>{/if}
     {/if}
+    {#if schema}
+      <details aria-label="Response format">
+        <summary>Response format · JSON schema{fields ? ` · ${fields}` : ''}</summary>
+        <Code text={JSON.stringify(schema, null, 2)} />
+      </details>
+    {/if}
     {#if spec.settings && Object.keys(spec.settings).length > 0}
       <section aria-label="Settings">
         <h4>Settings</h4>
@@ -70,6 +78,26 @@
 {/snippet}
 
 <style>
+  details {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  summary {
+    color: var(--muted);
+    font: 12px var(--font-mono);
+    cursor: pointer;
+  }
+  summary:hover {
+    color: var(--text);
+  }
+  summary:focus-visible {
+    outline: 2px solid var(--declare);
+    outline-offset: 2px;
+  }
+  details[open] summary {
+    margin-bottom: 6px;
+  }
   .chips {
     display: flex;
     flex-wrap: wrap;
@@ -82,7 +110,7 @@
     padding: 3px 9px;
     background: var(--surface-2);
     font: 12px var(--font-mono);
-    white-space: nowrap;
+    overflow-wrap: anywhere;
   }
   section {
     display: flex;

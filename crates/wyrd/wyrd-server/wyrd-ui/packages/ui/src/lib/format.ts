@@ -150,9 +150,9 @@ export function codeTokens(text: string): CodeToken[] {
   return tokens;
 }
 
-/** One line of one side of a comparison: unchanged, changed on this side, or a count of unchanged lines left out. */
+/** One line of a unified comparison: unchanged, removed, added, or a count of unchanged lines left out. */
 export interface DiffLine {
-  kind: 'same' | 'changed' | 'gap';
+  kind: 'same' | 'removed' | 'added' | 'gap';
   text: string;
 }
 
@@ -160,15 +160,16 @@ export interface DiffLine {
 const DIFF_CELLS = 250_000;
 
 /**
- * Two texts → each side's lines, marking the lines the other side lacks.
- * Unchanged runs longer than three lines keep one line of context at each
- * end and say how many lines are left out, the same on both sides. Lines
- * shared at the start and end are always unchanged; a differing middle too
- * long to match line by line comes back whole, every line changed.
+ * Two texts → one unified list of lines: within each change the removed
+ * lines, then the added ones. An absent text has no lines. Unchanged runs
+ * longer than three lines keep one line of context at each end and say how
+ * many lines are left out. Lines shared at the start and end are always
+ * unchanged; a differing middle too long to match line by line comes back
+ * whole, removed then added.
  */
-export function diffLines(from: string, to: string): { from: DiffLine[]; to: DiffLine[] } {
-  const a = from.split('\n');
-  const b = to.split('\n');
+export function diffLines(from: string | undefined, to: string | undefined): DiffLine[] {
+  const a = from === undefined ? [] : from.split('\n');
+  const b = to === undefined ? [] : to.split('\n');
   // Lines shared at the start and end need no matching; only the middle is compared.
   let head = 0;
   while (head < a.length && head < b.length && a[head] === b[head]) head += 1;
@@ -176,7 +177,7 @@ export function diffLines(from: string, to: string): { from: DiffLine[]; to: Dif
   while (tail < a.length - head && tail < b.length - head && a[a.length - 1 - tail] === b[b.length - 1 - tail]) tail += 1;
   const endA = a.length - tail;
   const endB = b.length - tail;
-  // ponytail: quadratic longest-common-subsequence table, so a middle past the bound is shown whole as changed; switch to Myers if large texts need line matching.
+  // ponytail: quadratic longest-common-subsequence table, so a middle past the bound is not matched; switch to Myers if large texts need line matching.
   const matched = (endA - head) * (endB - head) <= DIFF_CELLS;
   const common = matched ? Array.from({ length: endA - head + 1 }, () => new Array<number>(endB - head + 1).fill(0)) : [];
   if (matched)
@@ -184,31 +185,37 @@ export function diffLines(from: string, to: string): { from: DiffLine[]; to: Dif
       for (let j = endB - 1; j >= head; j -= 1)
         common[i - head][j - head] = a[i] === b[j] ? common[i - head + 1][j - head + 1] + 1 : Math.max(common[i - head + 1][j - head], common[i - head][j - head + 1]);
 
-  const sides = { from: [] as DiffLine[], to: [] as DiffLine[] };
-  let same: string[] = a.slice(0, head);
-  const flush = () => {
-    const kept: DiffLine[] =
-      same.length > 3
-        ? [{ kind: 'same', text: same[0] }, { kind: 'gap', text: `${same.length - 2} unchanged lines` }, { kind: 'same', text: same[same.length - 1] }]
-        : same.map((text) => ({ kind: 'same', text }));
-    sides.from.push(...kept);
-    sides.to.push(...kept);
+  const lines: DiffLine[] = [];
+  let same = a.slice(0, head);
+  let removed: string[] = [];
+  let added: string[] = [];
+  const flushSame = () => {
+    if (same.length > 3) lines.push({ kind: 'same', text: same[0] }, { kind: 'gap', text: `${same.length - 2} unchanged lines` }, { kind: 'same', text: same[same.length - 1] });
+    else for (const text of same) lines.push({ kind: 'same', text });
     same = [];
+  };
+  const flushChange = () => {
+    for (const text of removed) lines.push({ kind: 'removed', text });
+    for (const text of added) lines.push({ kind: 'added', text });
+    removed = [];
+    added = [];
   };
   let i = head;
   let j = head;
   while (i < endA || j < endB) {
     if (matched && i < endA && j < endB && a[i] === b[j]) {
+      flushChange();
       same.push(a[i]);
       i += 1;
       j += 1;
       continue;
     }
-    flush();
-    if (j >= endB || (i < endA && (!matched || common[i - head + 1][j - head] >= common[i - head][j - head + 1]))) sides.from.push({ kind: 'changed', text: a[i++] });
-    else sides.to.push({ kind: 'changed', text: b[j++] });
+    flushSame();
+    if (j >= endB || (i < endA && (!matched || common[i - head + 1][j - head] >= common[i - head][j - head + 1]))) removed.push(a[i++]);
+    else added.push(b[j++]);
   }
+  flushChange();
   same = same.concat(a.slice(endA));
-  flush();
-  return sides;
+  flushSame();
+  return lines;
 }

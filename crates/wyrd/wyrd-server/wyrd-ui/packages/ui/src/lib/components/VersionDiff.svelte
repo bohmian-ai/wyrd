@@ -1,8 +1,9 @@
 <!--
   The authored differences between two registered versions of one Prompt,
-  from the other version to the selected one: each changed field side by
-  side under its version, removed lines marked on the left and added lines
-  on the right. Choosing the other version is a host action.
+  from the other version to the selected one, as a unified diff: each
+  changed field is a section counting its added and removed lines, removed
+  lines above added ones. A large change starts closed. Choosing the other
+  version is a host action.
 -->
 <script lang="ts">
   import type { ActionProps } from '../contract.js';
@@ -17,15 +18,17 @@
   const state = $derived(actions['prompt.compare']);
   const data = $derived(result.state === 'populated' || result.state === 'empty' ? result.data : undefined);
   const others = $derived(data?.versions.filter((version) => version !== input.cardRef.version) ?? []);
-  const show = (value: unknown) => (typeof value === 'string' ? value : fmtYaml(value));
-  /** One field's two sides; a side the field is absent from has no lines. */
-  const sides = (change: { from?: unknown; to?: unknown }) => {
-    if (change.from === undefined || change.to === undefined) {
-      const lines = (value: unknown) => (value === undefined ? [] : show(value).split('\n').map((text) => ({ kind: 'changed' as const, text })));
-      return { from: lines(change.from), to: lines(change.to) };
-    }
-    return diffLines(show(change.from), show(change.to));
-  };
+  const show = (value: unknown) => (value === undefined ? undefined : typeof value === 'string' ? value : fmtYaml(value));
+  /** Changed lines above which a field starts closed. */
+  const OPEN_LINES = 12;
+  const fields = $derived(
+    (result.state === 'populated' ? result.data.changes : []).map((change) => {
+      const lines = diffLines(show(change.from), show(change.to));
+      const count = (kind: string) => lines.filter((line) => line.kind === kind).length;
+      return { field: change.field, lines, added: count('added'), removed: count('removed') };
+    })
+  );
+  const MARK = { same: ' ', gap: ' ', removed: '−', added: '+' } as const;
 </script>
 
 <Panel
@@ -52,15 +55,16 @@
     {/if}
   {/snippet}
   {#if result.state === 'populated'}
-    {#each result.data.changes as change (change.field)}
-      {@const lines = sides(change)}
-      <section aria-label={change.field}>
-        <h4>{change.field}</h4>
-        <div class="sides">
-          {@render side('from', `v${result.data.other}`, lines.from)}
-          {@render side('to', `v${input.cardRef.version}`, lines.to)}
-        </div>
-      </section>
+    {#each fields as each (each.field)}
+      <details aria-label={each.field} open={each.added + each.removed <= OPEN_LINES}>
+        <summary>
+          <span class="field">{each.field}</span>
+          {#if each.added}<span data-count="added">+{each.added}</span>{/if}
+          {#if each.removed}<span data-count="removed">−{each.removed}</span>{/if}
+        </summary>
+        <pre>{#each each.lines as line, index (index)}<span data-line={line.kind}>{MARK[line.kind]} {line.text}
+</span>{/each}</pre>
+      </details>
     {/each}
   {:else if result.state === 'empty'}
     <EmptyState
@@ -75,43 +79,37 @@
   {/if}
 </Panel>
 
-{#snippet side(which: 'from' | 'to', version: string, lines: ReturnType<typeof sides>['from'])}
-  <div class="side">
-    <span class="version">{version}</span>
-    <pre data-side={which} aria-label={version}>{#each lines as line, index (index)}<span data-line={line.kind}>{line.kind === 'changed' ? (which === 'from' ? '− ' : '+ ') : '  '}{line.text}
-</span>{:else}<span data-line="gap">not set</span>{/each}</pre>
-  </div>
-{/snippet}
-
 <style>
-  section {
+  summary {
     display: flex;
-    flex-direction: column;
-    gap: 4px;
+    align-items: baseline;
+    gap: 10px;
+    padding: 2px 0 6px;
+    font: 12px var(--font-mono);
+    cursor: pointer;
   }
-  h4 {
-    margin: 0;
+  /* A flex summary drops the native marker, so the open state is drawn here. */
+  summary::before {
+    content: '▸';
     color: var(--muted);
-    font: 11px var(--font-mono);
-    letter-spacing: 0.06em;
   }
-  .sides {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-    gap: 8px;
+  details[open] > summary::before {
+    content: '▾';
   }
-  .side {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    min-width: 0;
+  summary:focus-visible {
+    outline: 2px solid var(--declare);
+    outline-offset: 2px;
   }
-  .version {
-    color: var(--muted);
-    font: 11px var(--font-mono);
+  .field {
+    color: var(--text);
   }
-  pre {
-    flex: 1;
+  [data-count='added'],
+  [data-line='added'] {
+    color: var(--ok);
+  }
+  [data-count='removed'],
+  [data-line='removed'] {
+    color: var(--danger);
   }
   [data-line] {
     display: block;
@@ -125,14 +123,12 @@
   [data-line='gap'] {
     font-style: italic;
   }
-  [data-side='from'] [data-line='changed'] {
+  [data-line='removed'] {
     border-left-color: var(--danger);
     background: var(--danger-soft);
-    color: var(--danger);
   }
-  [data-side='to'] [data-line='changed'] {
+  [data-line='added'] {
     border-left-color: var(--ok);
-    color: var(--ok);
   }
   select {
     height: 28px;

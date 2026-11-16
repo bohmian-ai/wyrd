@@ -818,7 +818,8 @@ fn busy_stop(result: &Result<Value, ToolError>, what: &str) -> bool {
 
 /// `fs.extract` charges process memory for the document it reads and the
 /// output it builds while it runs, and process scratch for its output; a
-/// charge either ledger cannot grant stops the call busy before it writes,
+/// charge either ledger cannot grant, including memory for the encoded
+/// output of a document that fits, stops the call busy before it writes,
 /// and every charge but the written output's scratch returns when it ends.
 ///
 /// # Panics
@@ -848,6 +849,15 @@ fn extraction_charges_process_memory_and_scratch() {
     let refused = workspace.extract("/inputs/a.txt", "/work/a.json");
     assert!(busy_stop(&refused, "memory"), "{refused:?}");
     assert_eq!(memory.used(), 0);
+
+    let (workspace, memory, _) = open(size + 1, 1 << 20);
+    let refused = workspace.extract("/inputs/a.txt", "/work/a.json");
+    assert!(
+        busy_stop(&refused, "memory"),
+        "memory that holds the document but not its encoded output: {refused:?}"
+    );
+    assert_eq!(memory.used(), 0);
+    assert!(!workspace.work_dir().join("a.json").exists());
 
     let (workspace, memory, scratch) = open(1 << 20, size + 1);
     let refused = workspace.extract("/inputs/a.txt", "/work/a.json");

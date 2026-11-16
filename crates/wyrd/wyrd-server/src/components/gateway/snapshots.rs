@@ -14,11 +14,12 @@
 //! A snapshot serves only while this node hears every change: like the
 //! Verifier target cache, the listener's absence or any lost connection
 //! forgets everything and queues every forgotten tenant for reload. A call
-//! finding no snapshot never loads one itself: it queues its tenant and is
-//! refused with the retryable 503, because an unknown policy cannot be
-//! assumed to carry no quotas. A reload that does not install stays queued
-//! until one does, and a failed one forgets the tenant's snapshot meanwhile;
-//! see [`GatewaySnapshots::install`]. A notification is delivered after its commit,
+//! finding no snapshot loads it from Postgres and caches it, and every call
+//! missing the same tenant at once shares that one load; see
+//! [`GatewaySnapshots::load_through`]. Only a miss reads Postgres; a hit is
+//! served from memory. A reload that does not install stays queued until one
+//! does, and a failed one forgets the tenant's snapshot meanwhile; see
+//! [`GatewaySnapshots::install`]. A notification is delivered after its commit,
 //! so a call racing an administrative write can still route on the previous
 //! snapshot for that delivery and reload latency, as a call admitted just
 //! before the write would.
@@ -28,7 +29,7 @@
 //! because every Wyrd-owned buffer is bounded. A tenant whose reload the full
 //! queue cannot hold stops serving until a later cache miss queues it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -45,6 +46,10 @@ use crate::config::GatewayConfig;
 
 /// Postgres channel the snapshot triggers notify on.
 pub(crate) const SNAPSHOT_CHANNEL: &str = "wyrd_gateway_snapshot";
+
+/// One tenant's in-flight miss load, whose result every call that missed
+/// the tenant meanwhile shares.
+type Load = Arc<tokio::sync::OnceCell<Result<Arc<GatewayTenantSnapshot>, WyrdError>>>;
 
 /// Most tenants whose snapshots one process retains.
 const CACHE_TENANTS: NonZeroUsize = NonZeroUsize::new(4_096).expect("4096 is non-zero");
@@ -99,6 +104,9 @@ pub struct GatewaySnapshots {
     wake: Notify,
     /// Whether the listener is live, for waiters.
     live: watch::Sender<bool>,
+    /// The miss load in flight for each tenant, removed once it ends; held
+    /// only to find or remove a load, never across one.
+    loads: Mutex<HashMap<DataTenantId, Load>>,
 }
 
 impl Default for GatewaySnapshots {
@@ -108,6 +116,7 @@ impl Default for GatewaySnapshots {
             entries: Mutex::default(),
             wake: Notify::new(),
             live: watch::Sender::new(false),
+            loads: Mutex::default(),
         }
     }
 }
@@ -128,19 +137,51 @@ impl GatewaySnapshots {
         entries.snapshots.get(&tenant).map(Arc::clone)
     }
 
-    /// The snapshot cached for `tenant`, or `None` after queueing the
-    /// tenant for a background reload.
-    pub(crate) fn admitted(&self, tenant: DataTenantId) -> Option<Arc<GatewayTenantSnapshot>> {
-        let mut entries = self.entries();
-        if entries.live
-            && let Some(snapshot) = entries.snapshots.get(&tenant)
-        {
-            return Some(Arc::clone(snapshot));
+    /// The snapshot `tenant`'s calls route on: the cached one, else one
+    /// loaded from `postgres` with `config`'s bindings and cached while
+    /// listening.
+    ///
+    /// Calls missing the same tenant at once share one load and its result,
+    /// so a cold cache reads each tenant once rather than once per call. A
+    /// failed load is shared by the calls waiting on it and not kept, so the
+    /// next miss loads again. A load that raced an invalidation is returned
+    /// but not cached, as [`Self::insert`] decides.
+    ///
+    /// # Errors
+    /// Returns the load's error, such as `ServiceUnavailable` when storage
+    /// fails.
+    pub(crate) async fn load_through(
+        &self,
+        postgres: &wyrd_sql::WyrdPostgres,
+        config: &GatewayConfig,
+        tenant: DataTenantId,
+    ) -> Result<Arc<GatewayTenantSnapshot>, WyrdError> {
+        if let Some(snapshot) = self.cached(tenant) {
+            return Ok(snapshot);
         }
-        entries.queue(tenant);
-        drop(entries);
-        self.wake.notify_one();
-        None
+        let load = Arc::clone(
+            self.loads
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(tenant)
+                .or_default(),
+        );
+        let loaded = load
+            .get_or_init(|| async {
+                let generation = self.fill_generation();
+                let snapshot = load_snapshot(postgres, config, tenant).await?;
+                Ok(self.insert(tenant, generation, snapshot).0)
+            })
+            .await
+            .clone();
+        let mut loads = self.loads.lock().unwrap_or_else(PoisonError::into_inner);
+        if loads
+            .get(&tenant)
+            .is_some_and(|current| Arc::ptr_eq(current, &load))
+        {
+            loads.remove(&tenant);
+        }
+        loaded
     }
 
     /// Takes every tenant waiting for a reload, waiting until one is queued.
@@ -181,9 +222,9 @@ impl GatewaySnapshots {
     /// A load raced by any invalidation is not cached and queues `tenant`
     /// again, since the invalidation may have named another tenant. A failed
     /// load also forgets `tenant`'s snapshot, which a reload only replaces
-    /// once it may be stale, so calls are refused through the cache-miss 503
-    /// rather than served an obsolete policy while storage fails; other
-    /// tenants keep serving. Returns whether the snapshot was cached.
+    /// once it may be stale, so its calls load through and fail with storage
+    /// rather than being served an obsolete policy; other tenants keep
+    /// serving. Returns whether the snapshot was cached.
     ///
     /// # Errors
     /// Returns the failed load's error after logging it.
@@ -356,8 +397,8 @@ mod tests {
     /// Snapshots serve only while listening and only for their tenant; a
     /// tenant notification queues that tenant's reload while its snapshot
     /// keeps serving, a malformed one queues every tenant, a lost listener
-    /// forgets and queues everything, a miss is queued rather than loaded,
-    /// and a load that raced an invalidation is not cached.
+    /// forgets and queues everything, and a load that raced an invalidation
+    /// is not cached.
     #[tokio::test]
     async fn snapshots_serve_only_while_listening_and_reload_in_background() {
         let cache = GatewaySnapshots::default();
@@ -386,10 +427,6 @@ mod tests {
         let mut both = vec![tenant, other];
         both.sort();
         assert_eq!(queued, both, "a malformed payload queues every tenant");
-
-        let missing = DataTenantId::new_v7();
-        assert!(cache.admitted(missing).is_none(), "a miss never loads");
-        assert_eq!(cache.reloads().await, vec![missing], "a miss is queued");
 
         cache.reset(false);
         cache.reset(true);
@@ -484,8 +521,6 @@ mod tests {
         assert!(cache.cached(healthy).is_some(), "healthy keeps serving");
         assert_eq!(cache.reloads().await.len(), CACHE_TENANTS.get());
 
-        assert!(cache.admitted(a).is_none(), "a miss queues a again");
-        assert_eq!(cache.reloads().await, vec![a]);
         let retry = cache.fill_generation().expect("listening");
         assert_eq!(cache.install(a, retry, Ok(snapshot())).ok(), Some(true));
         assert!(cache.cached(a).is_some(), "a recovers to current policy");

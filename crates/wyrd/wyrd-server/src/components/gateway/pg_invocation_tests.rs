@@ -499,7 +499,7 @@ fn served(state: &AppState, tenant: DataTenantId) -> Arc<wyrd_gateway::GatewayTe
     state
         .gateway
         .snapshots()
-        .admitted(tenant)
+        .cached(tenant)
         .expect("tenant snapshot served")
 }
 
@@ -518,7 +518,7 @@ async fn reloaded(
         while state
             .gateway
             .snapshots()
-            .admitted(tenant)
+            .cached(tenant)
             .is_none_or(|snapshot| Arc::ptr_eq(&snapshot, before))
         {
             tokio::task::yield_now().await;

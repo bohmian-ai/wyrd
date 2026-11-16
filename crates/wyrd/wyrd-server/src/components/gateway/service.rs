@@ -618,24 +618,24 @@ impl<'a> GatewayAdministration<'a> {
     /// The immutable snapshot of the tenant configuration.
     ///
     /// Served from the process [`GatewaySnapshots`](super::snapshots::GatewaySnapshots)
-    /// cache with no IO while it holds the tenant; otherwise loaded by
-    /// [`Self::load`] and cached. Model listing and Batches use it; call
-    /// admission never loads and instead reads the cache alone. It performs
-    /// no authorization: callers use it only after verifying the caller.
+    /// cache with no IO while it holds the tenant; otherwise loaded once,
+    /// shared by every call missing the tenant at once, and cached. Call
+    /// admission, model listing and Batches all use it. It performs no
+    /// authorization: callers use it only after verifying the caller.
     ///
     /// # Errors
-    /// Returns the errors of [`Self::load`].
+    /// Returns the load's error from
+    /// [`GatewaySnapshots::load_through`](super::snapshots::GatewaySnapshots::load_through),
+    /// such as `ServiceUnavailable` when storage fails.
     pub async fn snapshot(
         &self,
         tenant: DataTenantId,
     ) -> Result<Arc<GatewayTenantSnapshot>, WyrdError> {
-        let snapshots = self.state.gateway.snapshots();
-        if let Some(snapshot) = snapshots.cached(tenant) {
-            return Ok(snapshot);
-        }
-        let generation = snapshots.fill_generation();
-        let snapshot = load_snapshot(self.postgres.wyrd(), self.config, tenant).await?;
-        Ok(snapshots.insert(tenant, generation, snapshot).0)
+        self.state
+            .gateway
+            .snapshots()
+            .load_through(self.postgres.wyrd(), self.config, tenant)
+            .await
     }
 
     /// Makes `tenant`'s committed configuration and a shared usage view

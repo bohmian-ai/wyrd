@@ -600,15 +600,9 @@ impl<'a> GatewayInvocation<'a> {
         let tenant = caller.data_tenant_id;
         let prepared = async {
             let started = std::time::Instant::now();
-            let snapshot = self
-                .state
-                .gateway
-                .snapshots()
-                .admitted(tenant)
-                .ok_or_else(|| WyrdError::ServiceUnavailable {
-                    message: "gateway configuration is loading; retry shortly".to_owned(),
-                    details: json!({}),
-                })?;
+            let snapshot = GatewayAdministration::new(self.state)
+                .snapshot(tenant)
+                .await?;
             telemetry.since(Phase::Snapshot, started);
             let started = std::time::Instant::now();
             self.decide(caller, OPERATION, &request.model, &snapshot)

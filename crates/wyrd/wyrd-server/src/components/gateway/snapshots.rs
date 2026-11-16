@@ -650,6 +650,9 @@ mod tests {
 
     /// The participants holding `tenant`'s in-flight load, or zero when
     /// none is in flight.
+    ///
+    /// # Panics
+    /// Panics when a participant panicked while holding the loads lock.
     fn participants(cache: &GatewaySnapshots, tenant: DataTenantId) -> usize {
         cache
             .loads

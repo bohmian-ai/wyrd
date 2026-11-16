@@ -120,9 +120,23 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
    Existing split/merge/release regressions:
    `process_grants_follow_use_without_double_promises` and
    `release_wakes_a_registered_waiter`, both GREEN with R1 and not re-REDed.
-   Pending: proof that refused buffers are disposed and that disk cleanup keeps
-   its charge until confirmed deletion. Both are owned by the Bifrost workspace
-   regression in scenario 5. Status: FAIL until that proof is recorded.
+   Refused buffers are disposed, and disk cleanup keeps its charge until the
+   deletion is confirmed. Both are existing behavior, proved by their owners'
+   regressions, all GREEN and not re-REDed:
+   - Hosted workspace:
+     `mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --lib -E 'test(/verification::hosted::workspace::tests::(archives_unpack_beside_their_staged_file|abandoned_cleanup_keeps_its_scratch_charge|surviving_workspace_keeps_its_scratch_charge|extraction_charges_process_memory_and_scratch|admitted_writes_charge_process_scratch)$/)'`:
+     5 passed.
+     - Refused extraction and unpack charge nothing and leave no output
+       file.
+     - An abandoned or surviving cleanup keeps its scratch charge, and a
+       confirmed one returns it.
+   - Bifrost spill: `oracle::spill::tests::spillers_share_the_process_scratch_ledger`
+     passed. A refused write charges nothing, a deleted file returns its
+     bytes, and a file whose deletion failed keeps them charged.
+   - Bifrost graph cleanup:
+     `oracle::analytical::tests::a_failed_graph_cleanup_keeps_its_query_admission_charged`
+     passed.
+   Status: PASS.
 
    R1: `mise exec -- cargo nextest run --locked -p wyrd-runtime --lib -E 'test(/resources::/)'`
    (15 passed).

@@ -1471,7 +1471,7 @@ impl Workspace {
     /// path and byte count written.
     ///
     /// Run it on the blocking pool while holding [`Self::writer`], so the
-    /// `/work` budget it checks stays true. Every existing parent must be a
+    /// `/work` budget and scratch charge it admits stay true. Every existing parent must be a
     /// real directory and an existing target a regular file, so a write never
     /// follows a link out of `/work`. The budget counts a replaced file once;
     /// a refused write creates nothing, and the new bytes land by rename, so
@@ -1482,7 +1482,9 @@ impl Workspace {
     /// `/work` (`/inputs` included), `write_parent` for a parent that is not
     /// a directory, `regular_file` for a target that is a directory, link, or
     /// special file, and `work_budget` for content over the `/work` budget. A
-    /// local IO failure is an [`invocation`] failure.
+    /// local IO failure is an [`invocation`] failure. A write process scratch
+    /// cannot hold now is a busy host stop, so the session stops rather than
+    /// answering the model.
     pub fn write(&self, path: &str, content: &str) -> Result<Value, ToolError> {
         let rest = relative(path, "/work/").ok_or_else(|| {
             invalid(
@@ -1536,14 +1538,24 @@ impl Workspace {
             Err(error) => return Err(failed(error)),
         };
         let bytes = u64::try_from(content.len()).unwrap_or(u64::MAX);
-        if bytes > self.work_room().saturating_add(replaced) {
-            return Err(invalid(
-                "work_budget",
-                "content",
-                path,
-                format!("{path} would exceed the /work write budget"),
-                "fewer or smaller /work files",
-            ));
+        // The admission already holds the replaced file, so it is asked only
+        // for what the write adds.
+        match self.admit_write(bytes.saturating_sub(replaced)) {
+            Ok(()) => {}
+            Err(WriteRefusal::Scratch) => {
+                return Err(host_stop(BlockError::Busy {
+                    reason: WriteRefusal::Scratch.to_string(),
+                }));
+            }
+            Err(WriteRefusal::Limit) => {
+                return Err(invalid(
+                    "work_budget",
+                    "content",
+                    path,
+                    format!("{path} would exceed the /work write budget"),
+                    "fewer or smaller /work files",
+                ));
+            }
         }
         for directory in &missing_parents {
             std::fs::create_dir(directory).map_err(failed)?;

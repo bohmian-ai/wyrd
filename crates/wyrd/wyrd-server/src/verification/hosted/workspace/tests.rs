@@ -931,6 +931,41 @@ fn admitted_writes_charge_process_scratch() {
     assert_eq!(ledger.used(), 200, "a dropped workspace returns its charge");
 }
 
+/// `fs.write` charges process scratch for what it adds to `/work`: a write
+/// the shared ledger cannot hold stops the call busy and writes nothing,
+/// and a replacement is charged only for the bytes it grows by.
+///
+/// # Panics
+/// Panics when a write passes a full ledger or charges a replaced file
+/// twice.
+#[test]
+fn writes_charge_process_scratch() {
+    let ledger = ByteLedger::new(300);
+    let workspace = Workspace::materialize(
+        vec![staged("/inputs/a.txt", vec![b'x'; 100], MediaFormat::Text)],
+        HostedLimits::default(),
+        ScratchRoot {
+            dir: std::env::temp_dir(),
+            ledger: ledger.clone(),
+        },
+    )
+    .expect("materializes");
+
+    workspace
+        .write("/work/w.txt", &"y".repeat(150))
+        .expect("writes");
+    assert_eq!(ledger.used(), 250, "the written bytes are charged");
+    workspace
+        .write("/work/w.txt", &"y".repeat(200))
+        .expect("a replacement that fits writes");
+    assert_eq!(ledger.used(), 300, "a replaced file is charged once");
+
+    let refused = workspace.write("/work/more.txt", "z");
+    assert!(busy_stop(&refused, "scratch"), "{refused:?}");
+    assert!(!workspace.work_dir().join("more.txt").exists());
+    assert_eq!(ledger.used(), 300, "a refused write adds no charge");
+}
+
 /// An archive unpacks from its staged file, so while it unpacks scratch
 /// holds the compressed archive and its entries together: a ledger that
 /// fits less than both refuses it busy and keeps nothing, and once it is

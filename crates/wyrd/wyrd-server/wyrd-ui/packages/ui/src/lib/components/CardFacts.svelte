@@ -5,6 +5,7 @@
 <script lang="ts">
   import type { CardFactsProps } from '../cards.js';
   import { fmtInstant, fmtShortId, fmtYaml, parseInstant } from '../format.js';
+  import Code from './Code.svelte';
   import EmptyState from './EmptyState.svelte';
   import Panel from './Panel.svelte';
 
@@ -31,7 +32,7 @@
 
 {#if card && input.yaml}
   <Panel title="YAML" note="the Card as the server returned it">
-    <pre>{fmtYaml(card)}</pre>
+    <Code text={fmtYaml(card)} />
   </Panel>
 {:else if card}
   <Panel title="Metadata" note="server-managed">

@@ -7,6 +7,7 @@
 <script lang="ts">
   import type { PromptMessagesProps } from '../cards.js';
   import { fmtYaml } from '../format.js';
+  import Code from './Code.svelte';
   import EmptyState from './EmptyState.svelte';
   import Panel from './Panel.svelte';
 
@@ -34,7 +35,7 @@
     {#if spec.body}
       <section aria-label="Native body">
         <h4>Native body · unchanged</h4>
-        <pre>{fmtYaml(spec.body)}</pre>
+        <Code text={fmtYaml(spec.body)} />
       </section>
     {:else}
       {#if spec.system}
@@ -48,7 +49,7 @@
     {#if spec.settings && Object.keys(spec.settings).length > 0}
       <section aria-label="Settings">
         <h4>Settings</h4>
-        <pre>{fmtYaml(spec.settings)}</pre>
+        <Code text={fmtYaml(spec.settings)} />
       </section>
     {/if}
   </Panel>

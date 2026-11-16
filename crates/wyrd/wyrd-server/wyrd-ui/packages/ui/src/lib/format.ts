@@ -122,3 +122,30 @@ export function fmtYaml(value: unknown, indent = ''): string {
   }
   return `${indent}${inline(value)}`;
 }
+
+/** One run of JSON or YAML text and the syntax role it is coloured by. */
+export interface CodeToken {
+  kind: 'key' | 'string' | 'number' | 'literal' | 'punct' | 'text';
+  text: string;
+}
+
+// ponytail: one pattern for both JSON and block YAML as `fmtYaml` writes it; a real parser only if another syntax is shown.
+const CODE =
+  /(?<key>"(?:[^"\\\n]|\\.)*"(?=\s*:)|(?<=^[ \t]*(?:- )*)[A-Za-z_][\w./-]*(?=:(?:\s|$)))|(?<string>"(?:[^"\\\n]|\\.)*"|'[^'\n]*')|(?<number>(?<![\w.@-])-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?(?![\w.@:-]))|(?<literal>\b(?:true|false|null)\b)|(?<punct>[{}[\]]|[:,](?=\s|$)|(?<=^[ \t]*)- )/gm;
+
+/**
+ * JSON or YAML text → runs by syntax role, for colouring. The runs joined
+ * are exactly the text given: nothing is added, dropped or reordered.
+ */
+export function codeTokens(text: string): CodeToken[] {
+  const tokens: CodeToken[] = [];
+  let at = 0;
+  for (const match of text.matchAll(CODE)) {
+    if (match.index > at) tokens.push({ kind: 'text', text: text.slice(at, match.index) });
+    const [kind] = Object.entries(match.groups ?? {}).find(([, value]) => value !== undefined) as [CodeToken['kind'], string];
+    tokens.push({ kind, text: match[0] });
+    at = match.index + match[0].length;
+  }
+  if (at < text.length) tokens.push({ kind: 'text', text: text.slice(at) });
+  return tokens;
+}

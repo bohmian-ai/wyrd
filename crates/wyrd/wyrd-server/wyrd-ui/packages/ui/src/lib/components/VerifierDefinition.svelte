@@ -6,6 +6,7 @@
 <script lang="ts">
   import type { VerifierDefinitionData, VerifierDefinitionProps } from '../verifier.js';
   import { fmtYaml } from '../format.js';
+  import Code from './Code.svelte';
   import EmptyState from './EmptyState.svelte';
   import Panel from './Panel.svelte';
   import VerifierGraph from './VerifierGraph.svelte';
@@ -41,7 +42,7 @@
     {/key}
     <Panel title={shown?.title ?? 'Declaration'} note={shown?.where}>
       {#if shown}
-        <pre>{shown.yaml}</pre>
+        <Code text={shown.yaml} />
       {:else}
         <p class="hint">Select an input, step or requirement in the graph to read its declaration.</p>
       {/if}

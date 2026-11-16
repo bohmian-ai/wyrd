@@ -62,6 +62,7 @@ import {
   VerifierGraph,
   VerificationExecution,
   fmtYaml,
+  codeTokens,
   Chart,
   Drawer,
   DurationBar,
@@ -2155,6 +2156,7 @@ test('exact card detail preserves relationships files and action outcomes', asyn
   expect(shown.container).toHaveTextContent('team=support');
   const yaml = render(CardFacts, { ...facts, input: { cardRef: PROMPT, yaml: true } });
   expect(yaml.container.querySelector('pre')?.textContent).toBe(fmtYaml(prompts['1.1.0']));
+  expect(yaml.container.querySelector('pre [data-token="key"]')).toHaveTextContent('apiVersion');
   expect(fmtYaml({ apiVersion: 'wyrd/v1', spec: { system: 'a\nb', count: 1, empty: [], tags: ['x', 'true'] } })).toBe(
     ['apiVersion: wyrd/v1', 'spec:', '  system: |-', '    a', '    b', '  count: 1', '  empty: []', '  tags:', '    - x', '    - "true"'].join('\n')
   );
@@ -3110,4 +3112,20 @@ test('an unavailable read, a refused progress read and context not yet retained 
   const drift = render(VerificationExecution, await loadExecution({ executionId: EXECUTIONS.drift, node: 'req:latency-stable' }, { executor: unseen.executor }));
   expect(drift.container.querySelector('[data-drift] [data-part="Window and history"]')).toHaveTextContent('The retained result of this execution is not yet visible. Refresh to read it again.');
   expect(within(drift.container).getByRole('region', { name: 'Drift features' }).querySelectorAll('tbody tr')).toHaveLength(3);
+});
+
+test('JSON and YAML blocks are coloured by syntax role without changing their text', () => {
+  const json = JSON.stringify({ kind: 'json', value: { item: 'tent', price: 150, late: false, ref: 'policy@1.0.0' } }, null, 2);
+  const yaml = fmtYaml({ signal: { kind: 'Distribution', features: ['latency'] }, threshold: 0.25, started: '2026-11-16T00:00:00Z' });
+  for (const text of [json, yaml]) expect(codeTokens(text).map((token) => token.text).join('')).toBe(text);
+
+  const of = (text: string, kind: string) => codeTokens(text).filter((token) => token.kind === kind).map((token) => token.text);
+  expect(of(json, 'key')).toEqual(['"kind"', '"value"', '"item"', '"price"', '"late"', '"ref"']);
+  expect(of(json, 'string')).toEqual(['"json"', '"tent"', '"policy@1.0.0"']);
+  expect(of(json, 'number')).toEqual(['150']);
+  expect(of(json, 'literal')).toEqual(['false']);
+  expect(of(yaml, 'key')).toEqual(['signal', 'kind', 'features', 'threshold', 'started']);
+  // A version or a timestamp is not a number.
+  expect(of(yaml, 'number')).toEqual(['0.25']);
+
 });

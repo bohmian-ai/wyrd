@@ -11,6 +11,7 @@
   import { attemptsOf, executionStates, sameProducer, settled, type Part, type VerificationExecutionProps } from '../execution.js';
   import { fmtBytes, fmtCardRef, fmtDuration, fmtShortId, fmtYaml } from '../format.js';
   import type { ExecutionInput } from '../schemas.js';
+  import Code from './Code.svelte';
   import ActionButton from './ActionButton.svelte';
   import ActionNote from './ActionNote.svelte';
   import EmptyState from './EmptyState.svelte';
@@ -112,11 +113,11 @@
   {/if}
 {/snippet}
 
-{#snippet value(label: string, content: unknown)}
+{#snippet value(label: string, content: unknown, code = typeof content !== 'string')}
   {@const shown = bounded(content)}
   <div class="field">
     <span class="label">{label}</span>
-    <pre>{shown.text}</pre>
+    {#if code}<Code text={shown.text} />{:else}<pre>{shown.text}</pre>{/if}
     {#if shown.cut}<p class="hint">Preview stops at {fmtBytes(PREVIEW)}; {fmtBytes(shown.cut)} more is retained.</p>{/if}
   </div>
 {/snippet}
@@ -142,7 +143,7 @@
     {#if context}{@render refused(context, 'Window and history')}{/if}
     <!-- The baseline is what the exact Verifier declares; a current Card status is never read for it. -->
     {#if check?.kind === 'drift'}
-      <div data-declared>{@render value('Declared baseline and condition', fmtYaml({ signal: check.signal, ...(check.profile ? { profile: check.profile } : {}), condition: check.condition }).trim())}</div>
+      <div data-declared>{@render value('Declared baseline and condition', fmtYaml({ signal: check.signal, ...(check.profile ? { profile: check.profile } : {}), condition: check.condition }).trim(), true)}</div>
     {/if}
     <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
     <div class="scroll" role="region" aria-label="Drift features" tabindex="0">
@@ -381,7 +382,7 @@
                   {@render fact('Reason', step.reason)}
                   {@render fact('Tool calls', step.tool_calls?.length ? String(step.tool_calls.length) : undefined)}
                 </dl>
-                {#if step.provenance}{@render value('Executed by', fmtYaml(step.provenance))}{/if}
+                {#if step.provenance}{@render value('Executed by', fmtYaml(step.provenance), true)}{/if}
               </div>
             {/each}
           {/if}
@@ -413,8 +414,8 @@
             {#each completed.requirements.filter((each) => each.id === id) as each, index (index)}
               <div class="field" data-details>
                 <span class="label">Completed record</span>
-                {@render value('Check', fmtYaml(each.check))}
-                {#if each.provenance}{@render value('Executed by', fmtYaml(each.provenance))}{/if}
+                {@render value('Check', fmtYaml(each.check), true)}
+                {#if each.provenance}{@render value('Executed by', fmtYaml(each.provenance), true)}{/if}
                 {#if each.tool_calls?.length}{@render value('Tool calls', each.tool_calls)}{/if}
               </div>
             {/each}
@@ -451,7 +452,7 @@
         {#if block !== undefined}
           <details>
             <summary>Declaration</summary>
-            <pre>{fmtYaml(block)}</pre>
+            <Code text={fmtYaml(block)} />
           </details>
         {/if}
       </Panel>

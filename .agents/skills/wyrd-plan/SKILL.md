@@ -62,7 +62,7 @@ Use the smallest structure that conveys:
 - the existing owner, missing behavior and implementation approach carried
   forward from the design;
 - inputs and their actual sources, outputs and their consumers;
-- acceptance observations mapped once to the approved obligations;
+- an ordered acceptance scenario list mapped once to the approved obligations;
 - credible verification at the required test tier; and
 - any real dependency or material blocker.
 
@@ -78,11 +78,19 @@ An input comes from existing repository behavior or an identified predecessor
 task's output. State which output a dependency supplies; do not add placeholder
 tasks for capabilities that already exist or fabricate inputs to hide a gap.
 
-Describe verification as a concrete trigger and expected observation. Group
-equivalent cases where useful. TDD remains an execution discipline: do not
-script `RED`, `GREEN` or `REFACTOR` blocks or predict a refactoring. For static
-or already-correct behavior, name the appropriate proof without manufacturing
-tests or production changes.
+Order behavioral acceptance scenarios for test-first implementation. Start with
+the smallest observable behavior, then add the required variants and failure
+cases. For each scenario, state the trigger, expected observation, and what
+missing behavior should make its test fail before production changes. Group
+equivalent cases without hiding required negative, concurrency, tenancy or
+lifecycle coverage. Each scenario is one test-first cycle, not a separate task.
+Do not prescribe private implementation steps or predict refactoring. For
+static or already-correct behavior, name the appropriate proof without
+manufacturing tests or production changes.
+
+This list is also the implementation evidence record: the implementer adds
+proof references and results in place. Do not create a second obligations
+ledger or repeat the scenarios in a separate verification table.
 
 Proof must exercise the task's actual inputs and demonstrate its promised
 outputs. At connected boundaries, establish that the downstream consumer uses
@@ -103,8 +111,9 @@ fixtures and use of already-approved dependencies remain implementation-owned.
 
 Confirm coverage of approved obligations and the agreed flow without adding
 new ones. Respect exclusions, check each input's source and dependency output,
-and ensure the combined proof connects the delivered flow. Stop elaborating
-when the outcome, affected owner, material constraints and credible verification
+and ensure the combined proof connects the delivered flow. Check that the first
+behavioral scenario can drive implementation before later scenarios are added.
+Stop elaborating when the outcome, affected owner, material constraints and credible verification
 are clear. A conceivable failure mode alone does not authorize another requirement.
 
 Complete the shared independent comprehension pass over the spec and tasks.

@@ -220,10 +220,18 @@ standard-required check from task drift: for OIDC ID tokens and JWT bearer
 assertions, compare the complete applicable OIDC Core, RFC 7523, and RFC 8725
 rules without duplicating signature/JWKS verification or inventing a profile.
 
-Build an explicit matrix. Seed it from the implementation's `## Obligations`
-ledger, then add any obligation the task requires that the ledger omits; an
+Build an explicit review matrix from the task's acceptance observations and
+their implementation evidence; no separate implementation ledger is required.
+For older packets, existing obligations ledgers remain usable evidence. Add any
+obligation the task requires that the acceptance record omits; an
 omitted obligation is `MISSING` unless the diff proves it. A test name alone is
 not verification evidence; cite the assertion.
+
+Report behavioral verification and TDD compliance separately. Check that RED
+records show the expected missing-behavior failure before production changes.
+Later mutation checks prove assertion strength, not test-first execution. Keep
+recorded TDD violations visible in the verdict; do not invent a code remediation
+or historical RED to repair an execution order that already occurred.
 
 | Requirement, acceptance criterion, constraint, or non-goal | Implementation evidence | Verification evidence | Result |
 |---|---|---|---|

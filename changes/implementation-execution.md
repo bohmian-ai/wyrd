@@ -49,8 +49,9 @@ instructions remain valid outside that workflow when they are already
 decision-complete and the caller explicitly requests implementation. Do not use
 that exception to bypass an approved spec or unresolved material design.
 
-Keep the checklist live until every actionable requirement and required proof
-is complete.
+Use the task's existing acceptance entries as the live checklist and evidence
+record until every required outcome and proof is complete. Do not create a
+second obligations ledger or evidence table.
 
 Do not require the task to predict helpers, private methods, local module
 structure, exact control flow, already-approved dependency APIs, test fixture
@@ -115,15 +116,11 @@ The execution record may append or correct:
 - equivalent verification commands;
 - progress, failures, and evidence.
 
-Record:
-
-```text
-date/attempt
-classification: local | bounded correction
-discovery and repository evidence
-requirement, claim, or command affected
-action and verification result
-```
+Update the existing acceptance entries with proof references and results.
+Record shared commands once. Add a short note for a material failure, bounded
+correction or deviation: affected criterion, repository evidence, action and
+verification result. Do not narrate routine implementation or repeat the
+contract, file list or test inventory already visible in the task and diff.
 
 Do not rewrite the objective, requirement or decision IDs, required behavior,
 public or persisted contracts, security semantics, material architecture or
@@ -274,50 +271,11 @@ material decision or genuinely unavailable authority. Difficulty, elapsed
 time, partial progress, context compaction, a recoverable command failure,
 missing repository-managed setup, or a convenient handoff point do not qualify.
 
-Use this report:
+Return the status, task path, implemented outcome, behavioral verification,
+TDD compliance (`PASS`, `VIOLATED`, or `NOT_APPLICABLE`), material risk or blocker,
+and diff or commit reference. Link to the task's acceptance evidence rather
+than reproducing it. Omit empty sections.
 
-```markdown
-## Task Result
-
-Status: IMPLEMENTED | BLOCKED
-
-### Summary
-<Implemented outcome>
-
-### Acceptance Criteria
-
-| Criterion | Implementation evidence | Verification evidence | Result |
-|---|---|---|---|
-| AC1 | <source> | <test or check> | PASS | FAIL | UNVERIFIED |
-
-### Non-goals
-- <non-goal>: EXCLUDED | VIOLATED — <diff evidence>
-
-### Files Changed
-- `path` — <requirement or acceptance criterion>
-
-### Tests Added or Updated
-- <test> — <behavior proved>
-
-### Verification
-Commands executed sequentially:
-1. `command` — PASS | FAIL
-
-Features enabled:
-- `crate`: default | `<exact features>`
-
-### Execution Updates
-- None | <local or bounded correction, evidence, and result>
-
-### Material Deviations
-- None | <approved deviation and impact>
-
-### Blocking Work
-- None | <blocked item and exact authority required>
-
-### Risks and Notes
-- None | <non-blocking evidence>
-
-### Diff or Commit
-- <reference when available>
-```
+A TDD violation remains visible even when all behavioral criteria pass. Follow
+[TDD execution](spec-driven-development.md#tdd-execution) for disclosure and
+remaining work; a later mutation check does not establish test-first execution.

@@ -316,7 +316,7 @@ remediates: []
 - outcome, scope, existing owner and missing behavior;
 - the agreed approach and relevant design references;
 - inputs and their actual sources, outputs and their consumers;
-- acceptance observations mapped once to approved obligations;
+- an ordered acceptance scenario list mapped once to approved obligations;
 - credible verification at the required test tier, with the test owner and
   existing runner; exact commands for existing tests named in the task;
 - applicable owner lanes, boundary and format/lint checks;
@@ -330,11 +330,21 @@ output a dependency supplies; do not add placeholder tasks for existing
 capabilities or fabricate inputs to hide a missing connection.
 
 Use the smallest readable structure and enough of the agreed approach to
-execute without rediscovering the solution. No step count, empty sections or
-scripted Behavior/RED/GREEN/REFACTOR blocks are required. TDD remains an
-execution discipline. Describe the trigger and expected observation, leaving
-exact new test names, private mechanics and useful refactoring to implementation.
-Static or already-correct behavior needs appropriate proof, not manufactured tests.
+execute without rediscovering the solution. Order behavioral acceptance
+scenarios for test-first implementation, beginning with the smallest observable
+behavior and then adding required variants and failure cases. Each scenario
+states its trigger, expected observation, and the missing behavior that should
+make its test fail before production changes. A scenario is one test-first
+cycle, not a separate task. Leave exact new test names, private mechanics and
+useful refactoring to implementation. Static or already-correct behavior needs
+appropriate proof, not manufactured tests.
+
+Maintain one acceptance list through planning and implementation. Implementers
+add proof references and results to its existing entries, preserving required
+cases without repeating the contract in an obligations ledger or a second
+evidence table. Older packets may use their existing proof rows or bullets
+without a rewrite. Record shared proof and commands once and reference them
+from the entries they cover.
 
 Proof exercises actual inputs and demonstrates the promised outputs. At
 connected boundaries it establishes that the downstream consumer uses the
@@ -386,7 +396,8 @@ Execute one scenario at a time:
 
 1. **RED** — add or select one test, run its exact focused command, and confirm
    it fails for the expected missing behavior rather than setup, compilation,
-   or an unrelated defect.
+   or an unrelated defect. Record the exact command and expected failure before
+   writing production code for that scenario.
 2. **GREEN** — implement the minimum cohesive behavior that satisfies the new
    test, then run the new test and the relevant previously green tests.
 3. **REFACTOR** — improve the implementation when the passing behavior exposes
@@ -396,12 +407,21 @@ Execute one scenario at a time:
    codegen-, format-, lint-, and boundary checks required by `AGENTS.md` for the
    touched surface.
 
-Record the expected RED failure, GREEN result, and final verification. A
-pre-existing regression test may supply RED. When executable behavior already
+Record the expected RED failure, GREEN result, and final verification against
+the existing acceptance entries. A pre-existing regression test may supply RED.
+When executable behavior already
 exists, report a verification-only or no-op result instead of manufacturing
 production churn. Documentation, generated-artifact, and static obligations
 may use a credible non-runtime proof; do not add meaningless tests solely to
 imitate TDD.
+
+Report behavioral verification separately from TDD compliance (`PASS`,
+`VIOLATED`, or `NOT_APPLICABLE`). Production written before its failing test is
+a process violation; disclose the affected scenarios and resume test-first work
+for the remaining scenarios. Later mutation checks may prove assertion
+strength, but cannot establish test-first execution. Do not undo correct code
+or manufacture historical RED evidence. Verified behavior does not erase the
+violation; preserve it in the implementation handoff and task-review verdict.
 
 ## Review and remediation
 

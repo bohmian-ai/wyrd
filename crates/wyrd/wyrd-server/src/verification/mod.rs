@@ -610,6 +610,41 @@ impl VerificationRuntimeBuilder<'_> {
     }
 }
 
+/// Bytes `value` encodes to as JSON, pretty-printed when `pretty`, counted
+/// as it streams into a sink that keeps none of them, so a caller can charge
+/// an encoding before building it. A value that fails to encode counts what
+/// was written before the error, which its encoder then refuses.
+pub(crate) fn encoded_len(value: &impl serde::Serialize, pretty: bool) -> u64 {
+    /// A sink counting the bytes written to it.
+    struct Counted(u64);
+    impl std::io::Write for Counted {
+        /// Count `bytes`, saturating, and keep none of them.
+        ///
+        /// # Errors
+        /// Never fails: every byte is accepted.
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+            Ok(bytes.len())
+        }
+        /// Nothing is buffered, so there is nothing to flush.
+        ///
+        /// # Errors
+        /// Never fails.
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counted = Counted(0);
+    let _ = if pretty {
+        serde_json::to_writer_pretty(&mut counted, value)
+    } else {
+        serde_json::to_writer(&mut counted, value)
+    };
+    counted.0
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;

@@ -305,13 +305,15 @@ impl Workspaces {
         sources: &BTreeSet<SlotName>,
         staged: PathBuf,
     ) -> Result<Pending, BlockError> {
-        let bytes = serde_json::to_vec_pretty(value).unwrap_or_default();
-        let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        // The encoding is counted and admitted before it is built, so a
+        // refusal never allocates it.
+        let size = crate::verification::encoded_len(value, true);
         let _charge = self.memory.try_charge(size).map_err(|_| BlockError::Busy {
             reason: "process memory cannot hold the workspace inputs now".to_owned(),
         })?;
         count(size)?;
         workspace.reserve(size)?;
+        let bytes = serde_json::to_vec_pretty(value).unwrap_or_default();
         tokio::fs::write(&staged, bytes).await.map_err(io)?;
         Ok(Pending {
             path: path.to_owned(),
@@ -467,31 +469,44 @@ impl Drop for Workspace {
     /// so the charge never outlives the bytes. A workspace from
     /// [`Workspaces::open`] is emptied on a blocking-pool thread and its
     /// root goes back to the free list; one that cannot be emptied is
-    /// removed instead. Any other workspace is removed here. A failure is
-    /// logged and the charge still returns: nothing can retry it, and boot
-    /// clears the scratch root.
+    /// removed instead. Any other workspace, such as a refused or cancelled
+    /// open's partial one, is removed here.
+    ///
+    /// The charge returns only once the directory is confirmed emptied or
+    /// removed. When neither succeeds, or the cleanup is dropped unrun as a
+    /// runtime shuts down, the bytes may still be on disk, so the whole
+    /// charge stays promised for the rest of the process, as a surviving
+    /// spill file's does; boot clears the scratch root.
     fn drop(&mut self) {
         let root = std::mem::take(&mut self.root);
-        let scratch = self.scratch.take();
+        let scratch = Custody {
+            charge: self.scratch.take().map(|charge| {
+                charge
+                    .into_inner()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            }),
+            root: root.clone(),
+        };
         let Some(free) = self.free.take() else {
-            remove(&root);
+            if remove(&root) {
+                scratch.release();
+            }
             return;
         };
         let recycle = move || match empty_root(&root) {
             Ok(()) => {
-                drop(scratch);
+                scratch.release();
                 free.lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push(root);
             }
             Err(error) => {
                 tracing::warn!(root = %root.display(), %error, "workspace could not be emptied for reuse");
-                remove(&root);
-                drop(scratch);
+                if remove(&root) {
+                    scratch.release();
+                }
             }
         };
-        // ponytail: a runtime shutting down drops the task unrun; the charge
-        // returns with it and boot clears the directory it leaves.
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => drop(runtime.spawn_blocking(recycle)),
             Err(_) => recycle(),
@@ -499,10 +514,56 @@ impl Drop for Workspace {
     }
 }
 
-/// Removes a workspace root, logging a failure.
-fn remove(root: &Path) {
-    if let Err(error) = std::fs::remove_dir_all(root) {
-        tracing::warn!(root = %root.display(), %error, "workspace removal failed");
+/// A workspace's scratch charge while its directory is being cleaned up.
+///
+/// [`Self::release`] returns it once the bytes are confirmed gone; dropped
+/// any other way, because cleanup failed or never ran, it keeps the charge
+/// promised for the rest of the process.
+struct Custody {
+    /// The workspace's whole scratch charge, or `None` when uncharged.
+    charge: Option<ByteCharge>,
+    /// The root whose bytes the charge covers, for the log.
+    root: PathBuf,
+}
+
+impl Custody {
+    /// Return the charge: the directory no longer holds its bytes.
+    fn release(mut self) {
+        drop(self.charge.take());
+    }
+}
+
+impl Drop for Custody {
+    /// Keep an unreleased charge for the rest of the process.
+    fn drop(&mut self) {
+        if let Some(charge) = self.charge.take() {
+            let error = std::io::Error::other("the workspace cleanup did not confirm deletion");
+            retain(charge, &self.root, &error);
+        }
+    }
+}
+
+/// Keep `charge` promised for the rest of the process for `path`, which
+/// survived deletion with `error`, so its bytes are never offered as free.
+fn retain(charge: ByteCharge, path: &Path, error: &std::io::Error) {
+    tracing::error!(
+        path = %path.display(),
+        retained_bytes = charge.bytes(),
+        %error,
+        "workspace scratch survived deletion; its bytes stay charged"
+    );
+    std::mem::forget(charge);
+}
+
+/// Removes a workspace root, logging a failure; whether it is gone.
+fn remove(root: &Path) -> bool {
+    match std::fs::remove_dir_all(root) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            tracing::warn!(root = %root.display(), %error, "workspace removal failed");
+            false
+        }
     }
 }
 
@@ -1413,12 +1474,11 @@ impl Workspace {
                     "a well-formed document within the extraction limits",
                 )
             })?;
-        let json = serde_json::to_vec_pretty(&output)
-            .map_err(|error| invocation(format!("the extraction does not serialize: {error}")))?;
-        let written = u64::try_from(json.len()).unwrap_or(u64::MAX);
-        // ponytail: charges the serialized output, not the extracted value
-        // beside it, which the extraction limits bound; charge the value
-        // too if large extractions measurably overrun the ledger.
+        // The encoding streams from the extracted value into its staged
+        // file, so it is never held in memory whole. Its exact counted
+        // length is admitted to scratch before it is written, and stands in
+        // for the extracted value's own size in memory while it streams.
+        let written = crate::verification::encoded_len(&output, true);
         if let Some(held) = &mut held {
             held.try_grow(written).map_err(|_| memory_busy())?;
         }
@@ -1451,7 +1511,13 @@ impl Workspace {
             }
         }
         let mut staged = tempfile::NamedTempFile::new_in(&self.root).map_err(failed)?;
-        std::io::Write::write_all(&mut staged, &json).map_err(failed)?;
+        {
+            let mut writer = std::io::BufWriter::new(staged.as_file_mut());
+            serde_json::to_writer_pretty(&mut writer, &output).map_err(|error| {
+                invocation(format!("the extraction does not serialize: {error}"))
+            })?;
+            std::io::Write::flush(&mut writer).map_err(failed)?;
+        }
         staged.persist_noclobber(&target).map_err(|error| {
             if error.error.kind() == std::io::ErrorKind::AlreadyExists {
                 exists()
@@ -1538,8 +1604,27 @@ impl Workspace {
             Err(error) => return Err(failed(error)),
         };
         let bytes = u64::try_from(content.len()).unwrap_or(u64::MAX);
-        // The admission already holds the replaced file, so it is asked only
-        // for what the write adds.
+        // The new content is written to a temporary file beside the file it
+        // replaces and renamed over it, so for that moment both are on disk.
+        // The admission below holds the replaced file and asks only for what
+        // the write adds; the rest of the copy is charged here first, so a
+        // refusal leaves the original untouched.
+        let ledger = self.scratch.as_ref().map(|charge| {
+            charge
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .ledger()
+                .clone()
+        });
+        let _copy = ledger
+            .as_ref()
+            .map(|ledger| ledger.try_charge(bytes.min(replaced)))
+            .transpose()
+            .map_err(|_| {
+                host_stop(BlockError::Busy {
+                    reason: WriteRefusal::Scratch.to_string(),
+                })
+            })?;
         match self.admit_write(bytes.saturating_sub(replaced)) {
             Ok(()) => {}
             Err(WriteRefusal::Scratch) => {
@@ -1561,10 +1646,23 @@ impl Workspace {
             std::fs::create_dir(directory).map_err(failed)?;
         }
         let mut staged = tempfile::NamedTempFile::new_in(&self.root).map_err(failed)?;
-        std::io::Write::write_all(&mut staged, content.as_bytes()).map_err(failed)?;
-        staged
-            .persist(&target)
-            .map_err(|error| failed(error.error))?;
+        let persisted = match std::io::Write::write_all(&mut staged, content.as_bytes()) {
+            Ok(()) => staged
+                .persist(&target)
+                .map_err(|error| (error.file, error.error)),
+            Err(error) => Err((staged, error)),
+        };
+        if let Err((staged, error)) = persisted {
+            let left = staged.path().to_owned();
+            if let Err(cleanup) = staged.close() {
+                // Nothing on disk accounts for a surviving temporary file,
+                // so its largest size stays charged.
+                if let Some(ledger) = &ledger {
+                    retain(ledger.charge_infallible(bytes), &left, &cleanup);
+                }
+            }
+            return Err(failed(error));
+        }
         Ok(json!({"path": path, "bytes": bytes}))
     }
 

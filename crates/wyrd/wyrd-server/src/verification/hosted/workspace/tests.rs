@@ -933,14 +933,18 @@ fn admitted_writes_charge_process_scratch() {
 
 /// `fs.write` charges process scratch for what it adds to `/work`: a write
 /// the shared ledger cannot hold stops the call busy and writes nothing,
-/// and a replacement is charged only for the bytes it grows by.
+/// and a replacement is charged only for the bytes it grows by once it
+/// lands. While it lands, its temporary copy sits beside the file it
+/// replaces, so that copy is charged too: a replacement whose final size
+/// fits but whose copy does not stops busy and keeps the original.
 ///
 /// # Panics
-/// Panics when a write passes a full ledger or charges a replaced file
-/// twice.
+/// Panics when a write passes a full ledger, a replacement's copy goes
+/// uncharged or its final bytes are charged twice, or a refused write
+/// changes `/work`.
 #[test]
 fn writes_charge_process_scratch() {
-    let ledger = ByteLedger::new(300);
+    let ledger = ByteLedger::new(450);
     let workspace = Workspace::materialize(
         vec![staged("/inputs/a.txt", vec![b'x'; 100], MediaFormat::Text)],
         HostedLimits::default(),
@@ -950,6 +954,7 @@ fn writes_charge_process_scratch() {
         },
     )
     .expect("materializes");
+    let written = workspace.work_dir().join("w.txt");
 
     workspace
         .write("/work/w.txt", &"y".repeat(150))
@@ -957,13 +962,97 @@ fn writes_charge_process_scratch() {
     assert_eq!(ledger.used(), 250, "the written bytes are charged");
     workspace
         .write("/work/w.txt", &"y".repeat(200))
-        .expect("a replacement that fits writes");
+        .expect("a replacement whose copy fits writes");
     assert_eq!(ledger.used(), 300, "a replaced file is charged once");
 
-    let refused = workspace.write("/work/more.txt", "z");
+    let refused = workspace.write("/work/w.txt", &"z".repeat(200));
+    assert!(busy_stop(&refused, "scratch"), "{refused:?}");
+    assert_eq!(
+        std::fs::read_to_string(&written).expect("original"),
+        "y".repeat(200),
+        "a replacement whose copy does not fit keeps the original"
+    );
+    assert_eq!(ledger.used(), 300, "a refused replacement adds no charge");
+
+    let refused = workspace.write("/work/more.txt", &"z".repeat(151));
     assert!(busy_stop(&refused, "scratch"), "{refused:?}");
     assert!(!workspace.work_dir().join("more.txt").exists());
     assert_eq!(ledger.used(), 300, "a refused write adds no charge");
+}
+
+/// A workspace whose directory cannot be removed keeps its whole scratch
+/// charge, so a sibling is never promised bytes still on disk; one that is
+/// removed returns its charge once.
+///
+/// # Panics
+/// Panics when a surviving directory returns its charge, or a removed one
+/// keeps it.
+#[test]
+fn surviving_workspace_keeps_its_scratch_charge() {
+    let ledger = ByteLedger::new(1_000);
+    let open = || {
+        Workspace::materialize(
+            vec![staged("/inputs/a.txt", vec![b'x'; 100], MediaFormat::Text)],
+            HostedLimits::default(),
+            ScratchRoot {
+                dir: std::env::temp_dir(),
+                ledger: ledger.clone(),
+            },
+        )
+        .expect("materializes")
+    };
+
+    let removed = open();
+    assert_eq!(ledger.used(), 100);
+    drop(removed);
+    assert_eq!(ledger.used(), 0, "a removed workspace returns its charge");
+
+    let surviving = open();
+    let locked = surviving.work_dir().join("locked");
+    std::fs::create_dir(&locked).expect("a code-made directory");
+    std::fs::write(locked.join("kept.txt"), b"k").expect("a code-made file");
+    let unlocked = std::fs::metadata(&locked).expect("locked").permissions();
+    let mut readonly = unlocked.clone();
+    readonly.set_readonly(true);
+    std::fs::set_permissions(&locked, readonly).expect("locks the directory");
+    let root = surviving.root.clone();
+    drop(surviving);
+    assert!(
+        locked.join("kept.txt").exists(),
+        "the file survived removal"
+    );
+    assert_eq!(ledger.used(), 100, "surviving bytes stay charged");
+    assert!(
+        ledger.try_charge(901).is_err(),
+        "a sibling cannot be promised the surviving bytes"
+    );
+
+    std::fs::set_permissions(&locked, unlocked).expect("unlocks the directory");
+    std::fs::remove_dir_all(root).expect("removes the test directory");
+}
+
+/// A cleanup dropped before it runs, as when a runtime shuts down, keeps
+/// its workspace's charge, since nothing confirmed the bytes are gone; a
+/// released one returns it.
+///
+/// # Panics
+/// Panics when an unrun cleanup returns its charge or a released one keeps
+/// it.
+#[test]
+fn abandoned_cleanup_keeps_its_scratch_charge() {
+    let ledger = ByteLedger::new(1_000);
+    let released = Custody {
+        charge: Some(ledger.try_charge(10).expect("fits")),
+        root: PathBuf::from("released"),
+    };
+    released.release();
+    assert_eq!(ledger.used(), 0, "a confirmed cleanup returns its charge");
+    let abandoned = Custody {
+        charge: Some(ledger.try_charge(10).expect("fits")),
+        root: PathBuf::from("abandoned"),
+    };
+    drop(abandoned);
+    assert_eq!(ledger.used(), 10, "an unconfirmed cleanup keeps its charge");
 }
 
 /// An archive unpacks from its staged file, so while it unpacks scratch

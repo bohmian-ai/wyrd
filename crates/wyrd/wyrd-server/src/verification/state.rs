@@ -490,33 +490,12 @@ impl Checkpoint {
     /// row its preparation does later on the outbox's encoding pool.
     // ponytail: a counting pass over the state per revision; charge per-entry deltas if large states make it costly.
     fn charge(state: &ExecutionState) -> usize {
-        /// A sink counting the bytes written to it.
-        struct Counted(usize);
-        impl std::io::Write for Counted {
-            /// Count `bytes`, saturating, and keep none of them.
-            ///
-            /// # Errors
-            /// Never fails: every byte is accepted.
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0 = self.0.saturating_add(bytes.len());
-                Ok(bytes.len())
-            }
-            /// Nothing is buffered, so there is nothing to flush.
-            ///
-            /// # Errors
-            /// Never fails.
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let mut counted = Counted(0);
         // A state that does not encode is refused by its preparation; what
         // was counted before the error still bounds its memory.
-        let _ = serde_json::to_writer(&mut counted, state);
+        let counted = usize::try_from(super::encoded_len(state, false)).unwrap_or(usize::MAX);
         let objects: usize = state.publications.iter().map(|p| p.objects.len()).sum();
         let entries = 1 + state.invocations.len() + state.publications.len() + objects;
         counted
-            .0
             .saturating_mul(Self::COPIES)
             .saturating_add(Self::ENTRY_BYTES.saturating_mul(entries))
     }

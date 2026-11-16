@@ -158,8 +158,9 @@ async fn evidence_refuses_tampered_body() {
 }
 
 /// Native media is base64 with the format's MIME type and comes with a
-/// guard holding the process memory its bytes and encoding take until it
-/// drops; non-native formats are refused.
+/// guard holding the process memory its bytes, encoding, and requested
+/// provider-shaped copies take until it drops; memory short of the copies
+/// refuses before anything is held, and non-native formats are refused.
 ///
 /// # Panics
 /// Panics when media binding or its charge differs.
@@ -176,7 +177,7 @@ async fn evidence_binds_native_media_only() {
         memory.clone(),
     );
     let (media, charge) = evidence
-        .media(&file(pdf, 8, MediaFormat::Pdf))
+        .media(&file(pdf, 8, MediaFormat::Pdf), 6)
         .await
         .expect("pdf is native");
     assert_eq!(
@@ -186,16 +187,32 @@ async fn evidence_binds_native_media_only() {
             data: "JVBERi0xLjU=".to_owned(),
         }
     );
+    let copy = 12 + "data:application/pdf;base64,".len() as u64;
     assert_eq!(
         memory.used(),
-        8 + 12,
-        "the returned guard holds the read bytes and their encoding"
+        8 + 12 + 6 * copy,
+        "the returned guard holds the read bytes, their encoding, and its copies"
     );
     drop(charge);
     assert_eq!(memory.used(), 0, "dropping the guard returns the charge");
+    let short = wyrd_runtime::resources::ByteLedger::new(8 + 12 + 6 * copy - 1);
+    let refusing = TenantEvidence::new(
+        uploads.server.state().clone(),
+        user(uploads.server.data_tenant_id(), []),
+        HostedLimits::default(),
+        short.clone(),
+    );
+    assert!(
+        matches!(
+            refusing.media(&file(pdf, 8, MediaFormat::Pdf), 6).await,
+            Err(BlockError::Busy { .. })
+        ),
+        "memory short of the copies refuses before encoding"
+    );
+    assert_eq!(short.used(), 0, "a refusal holds nothing");
     assert!(
         evidence
-            .media(&file(csv, 3, MediaFormat::Csv))
+            .media(&file(csv, 3, MediaFormat::Csv), 1)
             .await
             .is_err()
     );

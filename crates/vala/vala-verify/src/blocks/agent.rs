@@ -91,6 +91,62 @@ pub trait PromptCardResolver: Send + Sync {
     async fn resolve(&self, prompt_ref: &CardRef) -> Result<Prompt, BlockError>;
 }
 
+/// Provider-shaped copies of one bound media placeholder occurrence an
+/// Agent call keeps resident at once at its peak.
+///
+/// The bound Prompt carries one, shared by the call and its loop rather
+/// than copied. Rendering clones it into the request template, and the
+/// loop's seed messages clone it again. Rebuilding a request from the
+/// conversation adds one more for Chat Completions, and two for Responses,
+/// whose previous input lives until the new items replace it. A tool
+/// session's `before_model` hook clones the template once more.
+const RESIDENT_MEDIA_COPIES: u64 = 6;
+
+/// Bytes one provider-shaped copy of `encoded` base64 bytes of `mime_type`
+/// media takes, times `copies`: the encoding plus the
+/// `data:<mime>;base64,` prefix an OpenAI data URL adds, which bounds the
+/// providers that carry the encoding bare.
+#[must_use]
+pub fn bound_media_bytes(mime_type: &str, encoded: u64, copies: u64) -> u64 {
+    let prefix = "data:;base64,".len() + mime_type.len();
+    encoded.saturating_add(prefix as u64).saturating_mul(copies)
+}
+
+/// How many isolated `${media:name}` parts `request` holds, by name, which
+/// is how many times binding copies each name's media into it.
+///
+/// Read from the request before any media is bound, so the count costs a
+/// copy of the template only.
+///
+/// # Errors
+/// Returns [`BlockError::Terminal`] when the request cannot be read as
+/// JSON.
+fn media_occurrences(request: &impl serde::Serialize) -> Result<BTreeMap<String, u64>, BlockError> {
+    /// Count every string in `value` that is exactly one media
+    /// placeholder, surrounding whitespace aside, into `counts`.
+    fn walk(value: &Value, counts: &mut BTreeMap<String, u64>) {
+        match value {
+            Value::String(text) => {
+                let text = text.trim();
+                if let Some(found) = skald_spec::prompt::media_placeholder_regex().captures(text)
+                    && found.get(0).is_some_and(|whole| whole.len() == text.len())
+                {
+                    *counts.entry(found[1].to_owned()).or_default() += 1;
+                }
+            }
+            Value::Array(values) => values.iter().for_each(|value| walk(value, counts)),
+            Value::Object(fields) => fields.values().for_each(|value| walk(value, counts)),
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        }
+    }
+    let request = serde_json::to_value(request).map_err(|error| BlockError::Terminal {
+        reason: format!("the Prompt request cannot be read: {error}"),
+    })?;
+    let mut counts = BTreeMap::new();
+    walk(&request, &mut counts);
+    Ok(counts)
+}
+
 /// Reads pinned original evidence as provider-native media.
 ///
 /// The host owns storage and tenancy; it returns only content whose length,
@@ -103,14 +159,22 @@ pub trait EvidenceReader: Send + Sync {
     /// memory charge. The Agent call keeps the guard until the bound Prompt
     /// that carries the media is dropped, on completion or cancellation.
     ///
+    /// Besides the read bytes and the returned encoding, the guard must
+    /// hold `copies` provider-shaped copies of the encoding, each
+    /// [`bound_media_bytes`] long, which the call's binding, rendering, and
+    /// Agent loop keep resident at once at their peak; the host charges
+    /// them before it encodes, so a refusal precedes every copy.
+    ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for missing, unauthorized,
     /// mismatched, oversized, or non-native evidence,
-    /// [`BlockError::Busy`] when the host cannot hold the media now, and
-    /// [`BlockError::Retryable`] for a transient storage failure.
+    /// [`BlockError::Busy`] when the host cannot hold the media and its
+    /// copies now, and [`BlockError::Retryable`] for a transient storage
+    /// failure.
     async fn media(
         &self,
         evidence: &InputDeclaration,
+        copies: u64,
     ) -> Result<(MediaRef, Box<dyn Any + Send + Sync>), BlockError>;
 
     /// The subset of `citations` whose slot is in `reachable` and whose
@@ -313,6 +377,9 @@ impl AgentExecutor {
     /// Input keys must equal the Prompt's text and media placeholders. JSON
     /// strings render raw and other JSON as JSON text; evidence binds as
     /// provider-native media, which Skald checks against the placeholder kind.
+    /// Each media input's reader is asked to hold [`RESIDENT_MEDIA_COPIES`]
+    /// copies per occurrence of its placeholder, counted from the request
+    /// before any media is bound, so the charge precedes every copy.
     /// Non-empty `slots` narrow the copy's Verdict citation slots, so the
     /// provider and the Agent's validation admit only the reachable ones;
     /// the prepared schemas reuse an earlier narrowing to the same slots.
@@ -338,6 +405,11 @@ impl AgentExecutor {
         if placeholders != inputs.keys().map(String::as_str).collect() {
             return Err(terminal("Agent inputs must match the Prompt placeholders"));
         }
+        let occurrences = if bound.media_variables.is_empty() {
+            BTreeMap::new()
+        } else {
+            media_occurrences(&bound.request)?
+        };
         let mut vars = Vec::new();
         let mut media_guards = Vec::new();
         for (name, input) in inputs {
@@ -349,7 +421,13 @@ impl AgentExecutor {
                         .evidence
                         .as_ref()
                         .ok_or_else(|| terminal("media inputs need an evidence reader"))?;
-                    let (media, guard) = reader.media(evidence).await?;
+                    let copies = occurrences
+                        .get(name)
+                        .copied()
+                        .unwrap_or(1)
+                        .max(1)
+                        .saturating_mul(RESIDENT_MEDIA_COPIES);
+                    let (media, guard) = reader.media(evidence, copies).await?;
                     media_guards.push(guard);
                     bound
                         .bind_media_mut(name, &media)

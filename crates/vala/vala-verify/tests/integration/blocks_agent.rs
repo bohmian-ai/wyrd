@@ -19,7 +19,7 @@ use tokio::time::Instant;
 use vala_verify::blocks::{
     AGENT_PHASE_DURATION_SECONDS, ActionExecutor, AgentCardResolver, AgentExecutor, AgentToolset,
     BlockCall, BlockError, CallInput, CallValue, CheckExecutor, EvidenceReader, Position,
-    PromptCardResolver, ToolCallsOwner, ToolLimits, ToolSession,
+    PromptCardResolver, ToolCallsOwner, ToolLimits, ToolSession, bound_media_bytes,
 };
 use wyrd_benchmark::MetricValue;
 use wyrd_spec::auth::Sha256Hex;
@@ -532,6 +532,7 @@ impl EvidenceReader for PinnedDeck {
     async fn media(
         &self,
         _evidence: &InputDeclaration,
+        _copies: u64,
     ) -> Result<(skald_spec::MediaRef, Box<dyn std::any::Any + Send + Sync>), BlockError> {
         Err(BlockError::Terminal {
             reason: "no media".to_owned(),
@@ -3329,6 +3330,7 @@ impl EvidenceReader for HeldMedia {
     async fn media(
         &self,
         _evidence: &InputDeclaration,
+        _copies: u64,
     ) -> Result<(MediaRef, Box<dyn std::any::Any + Send + Sync>), BlockError> {
         Ok((
             MediaRef::image_base64("image/png", "iVBORw0KGgo="),
@@ -3466,5 +3468,279 @@ async fn bound_media_stays_held_until_the_agent_call_ends() {
             idle,
             "the guard is released once the call ends (pend: {pend})"
         );
+    }
+}
+
+/// A byte budget shared by a media reader and its sibling promises.
+#[derive(Default)]
+struct Memory {
+    /// Most bytes it promises at once.
+    capacity: u64,
+    /// Bytes promised now.
+    used: std::sync::atomic::AtomicU64,
+}
+
+impl Memory {
+    /// Promise `bytes`, or `None` when they would pass the capacity.
+    fn charge(self: &Arc<Self>, bytes: u64) -> Option<Promise> {
+        self.used
+            .try_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |used| {
+                    used.checked_add(bytes)
+                        .filter(|total| *total <= self.capacity)
+                },
+            )
+            .ok()?;
+        Some(Promise(Arc::clone(self), bytes))
+    }
+
+    /// Bytes promised now.
+    fn used(&self) -> u64 {
+        self.used.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Bytes promised from a [`Memory`] until dropped.
+struct Promise(Arc<Memory>, u64);
+
+impl Drop for Promise {
+    /// Returns the promised bytes.
+    fn drop(&mut self) {
+        self.0
+            .used
+            .fetch_sub(self.1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Evidence whose media is one `raw`-byte PNG, charged like the host's
+/// reader: the read bytes, their encoding, and the requested copies of it,
+/// promised from `memory` before the encoding exists.
+struct ChargedMedia {
+    /// The budget the media is charged to.
+    memory: Arc<Memory>,
+    /// Raw media bytes.
+    raw: usize,
+    /// The copies each read was asked to hold.
+    copies: std::sync::Mutex<Vec<u64>>,
+}
+
+impl ChargedMedia {
+    /// The bytes one read holding `copies` copies promises.
+    fn demand(&self, copies: u64) -> u64 {
+        let encoded = (self.raw.div_ceil(3) * 4) as u64;
+        self.raw as u64 + encoded + bound_media_bytes("image/png", encoded, copies)
+    }
+}
+
+#[async_trait]
+impl EvidenceReader for ChargedMedia {
+    /// The PNG with its charge, or `Busy` when `memory` cannot hold it.
+    ///
+    /// # Errors
+    /// Returns [`BlockError::Busy`] when the budget refuses the demand.
+    ///
+    /// # Panics
+    /// Panics when the copy log's lock is poisoned.
+    async fn media(
+        &self,
+        _evidence: &InputDeclaration,
+        copies: u64,
+    ) -> Result<(MediaRef, Box<dyn std::any::Any + Send + Sync>), BlockError> {
+        self.copies.lock().expect("unpoisoned").push(copies);
+        let promise = self
+            .memory
+            .charge(self.demand(copies))
+            .ok_or_else(|| BlockError::Busy {
+                reason: "no memory for the media".to_owned(),
+            })?;
+        let data = "A".repeat(self.raw.div_ceil(3) * 4);
+        Ok((
+            MediaRef::image_base64("image/png", &data),
+            Box::new(promise),
+        ))
+    }
+
+    /// No citations.
+    ///
+    /// # Errors
+    /// Never fails.
+    async fn cited(
+        &self,
+        _reachable: &BTreeSet<SlotName>,
+        _citations: Vec<Citation>,
+    ) -> Result<Vec<Citation>, BlockError> {
+        Ok(Vec::new())
+    }
+}
+
+/// A provider that, while a request is pending, records the bytes
+/// promised from `memory` and whether a sibling could still be promised
+/// `sibling` bytes, then answers from its queue or, with `pend`, never.
+#[derive(Clone)]
+struct MeteredMedia {
+    /// The scripted answers.
+    mock: MockProvider,
+    /// The shared budget.
+    memory: Arc<Memory>,
+    /// The sibling promise tried during the request.
+    sibling: u64,
+    /// `(promised, sibling admitted)` at each request.
+    seen: Arc<std::sync::Mutex<Vec<(u64, bool)>>>,
+    /// Never answer.
+    pend: bool,
+}
+
+#[async_trait]
+impl Provider for MeteredMedia {
+    /// Record the promised bytes and the sibling's admission, then answer
+    /// or pend.
+    ///
+    /// # Errors
+    /// Returns the mock's error for an empty queue.
+    ///
+    /// # Panics
+    /// Panics when the log's lock is poisoned.
+    async fn send(&self, request: &ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        let sibling = self.memory.charge(self.sibling).is_some();
+        self.seen
+            .lock()
+            .expect("unpoisoned")
+            .push((self.memory.used(), sibling));
+        if self.pend {
+            std::future::pending::<()>().await;
+        }
+        self.mock.send(request).await
+    }
+
+    /// Streams are not used.
+    ///
+    /// # Errors
+    /// Always the mock's empty-stream error.
+    async fn stream(&self, request: &ProviderRequest) -> Result<ProviderStream, ProviderError> {
+        self.mock.stream(request).await
+    }
+
+    /// The mocked provider name.
+    fn name(&self) -> ProviderName {
+        self.mock.name()
+    }
+}
+
+/// Bound media is charged its resident provider copies before it is
+/// encoded, six per placeholder occurrence: memory between the read and
+/// encoding and that peak refuses before the provider sees anything and
+/// holds nothing, and with enough memory the held call keeps the whole
+/// charge, refusing a sibling the old read-and-encoding promise, until it
+/// completes or is cancelled, for one occurrence and for repeated ones.
+///
+/// # Panics
+/// Panics when a refusal reaches the provider or keeps a charge, the held
+/// call is charged other than its peak, a sibling reuses its bytes, or the
+/// charge outlives the call.
+#[tokio::test]
+async fn bound_media_charges_its_resident_copies() {
+    let raw = 48 * 1024;
+    let encoded = (raw / 3 * 4) as u64;
+    for (messages, occurrences) in [
+        (vec!["Describe ${media:shot}".to_owned()], 1_u64),
+        (
+            vec![
+                "Describe ${media:shot}".to_owned(),
+                "Then compare ${media:shot}".to_owned(),
+            ],
+            2,
+        ),
+    ] {
+        let prompt = || {
+            openai_chat(
+                "gpt-test",
+                OpenAiChatOptions {
+                    messages: messages.clone(),
+                    ..OpenAiChatOptions::default()
+                },
+            )
+            .expect("static prompt is valid")
+        };
+        let inputs = BTreeMap::from([(
+            "shot".to_owned(),
+            CallInput {
+                value: CallValue::Evidence(InputDeclaration::File {
+                    sha256: Sha256Hex::digest(b"png"),
+                    size_bytes: raw as u64,
+                    format: skald_spec::MediaFormat::Png,
+                    filename: None,
+                }),
+                sources: BTreeSet::new(),
+            },
+        )]);
+        let copies = 6 * occurrences;
+        let peak = raw as u64 + encoded + bound_media_bytes("image/png", encoded, copies);
+
+        for (capacity, pend) in [
+            (peak - 1, false),
+            (peak + raw as u64, false),
+            (peak + raw as u64, true),
+        ] {
+            let memory = Arc::new(Memory {
+                capacity,
+                ..Memory::default()
+            });
+            let provider = MeteredMedia {
+                mock: MockProvider::new(ProviderName::OpenAi),
+                memory: Arc::clone(&memory),
+                sibling: raw as u64 + encoded,
+                seen: Arc::default(),
+                pend,
+            };
+            provider.mock.push_response(openai_text_response("a cat"));
+            let mut providers = ProviderRegistry::new();
+            providers.register(Arc::new(provider.clone()));
+            let reader = Arc::new(ChargedMedia {
+                memory: Arc::clone(&memory),
+                raw,
+                copies: std::sync::Mutex::default(),
+            });
+            let executor = AgentExecutor::new(
+                Arc::new(providers),
+                Arc::new(NoRegistry),
+                Arc::new(NoRegistry),
+            )
+            .with_evidence(Arc::clone(&reader) as Arc<dyn EvidenceReader>);
+            let call = agent(prompt(), &[]);
+            let run = step(&executor, &call, inputs.clone());
+            let result = if pend {
+                let cancelled = tokio::time::timeout(Duration::from_millis(200), run).await;
+                assert!(cancelled.is_err(), "the pending provider never answers");
+                None
+            } else {
+                Some(run.await)
+            };
+
+            assert_eq!(
+                *reader.copies.lock().expect("unpoisoned"),
+                [copies],
+                "binding asks for six copies per occurrence ({occurrences})"
+            );
+            let seen = provider.seen.lock().expect("unpoisoned").clone();
+            if capacity < peak {
+                assert!(
+                    matches!(result, Some(Err(BlockError::Busy { .. }))),
+                    "{result:?}"
+                );
+                assert!(seen.is_empty(), "a refusal precedes the provider call");
+            } else {
+                if let Some(result) = result {
+                    result.expect("the media step runs");
+                }
+                assert_eq!(
+                    seen,
+                    [(peak, false)],
+                    "the held call keeps its peak and refuses the sibling (pend: {pend})"
+                );
+            }
+            assert_eq!(memory.used(), 0, "the call's end returns the charge");
+        }
     }
 }

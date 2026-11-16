@@ -19,7 +19,7 @@ mod tools;
 
 pub use agent::{
     AGENT_PHASE_DURATION_SECONDS, AgentCardResolver, AgentExecutor, EvidenceReader,
-    PromptCardResolver, block_error,
+    PromptCardResolver, block_error, bound_media_bytes,
 };
 pub use tools::{
     AgentToolset, CodeTool, Delivery, HostWork, ToolBridge, ToolCalls, ToolCallsOwner, ToolLimits,

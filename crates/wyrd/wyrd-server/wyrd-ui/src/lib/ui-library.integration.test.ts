@@ -12,7 +12,7 @@ import { AppBridge, PostMessageTransport } from '@modelcontextprotocol/ext-apps/
 import type { Cookies } from '@sveltejs/kit';
 import { expect, vi } from 'vitest';
 import { z } from 'zod';
-import { Bifrost, Cards, TableConfig, WyrdClient, WyrdState } from 'wyrd-ai';
+import { Bifrost, Cards, Principals, TableConfig, WyrdClient, WyrdState } from 'wyrd-ai';
 import {
   CardRefSchema,
   loadArtifactTable,
@@ -48,7 +48,7 @@ import { exportOtlp, nanos, seedSignals } from '$lib/ui-signals.integration';
 import { POST as loadPanel } from '../routes/t/[tenantKey]/ui/load/+server';
 import { POST as cancelExecution } from '../routes/t/[tenantKey]/verify/executions/[executionId]/cancel/+server';
 import { GET as downloadPublication } from '../routes/t/[tenantKey]/verify/executions/[executionId]/download/+server';
-import { assistantTest } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/assistant';
+import { AGREES, assistantTest, judgeReply, toolCall, toolTurn } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/assistant';
 import { declared, fixture, groupExecution, runtimeAccount, scheduledResult, serverTest, type DeclaredRef } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/server';
 import { load as loadExamplePage } from '../../../../../../examples/ui-app/src/routes/+page.server';
 import { POST as loadExamplePanel } from '../../../../../../examples/ui-app/src/routes/view/load/+server';
@@ -1146,5 +1146,125 @@ judged('a judged execution shows its judgments, accepted inputs, completed detai
   } finally {
     await foreignMcp.close();
     await narrowMcp.close();
+  }
+});
+
+/** The `coding-verifier` statement every request of its `spans-reviewed` check carries. */
+const LIVE_REVIEW = 'spans were reviewed live';
+/** What a Chat Completions request carrying tool results contains. */
+const TOOL_TURN = /"role"\s*:\s*"tool"/;
+/** The trace the coding session's first turn names. */
+const SESSION_TRACE = '7d3efb1b173fecfa5cf1d7a7e9c2a441';
+
+/**
+ * A server whose judge reviews a session's spans: it reads the span names of
+ * the trace its answer names through `bifrost.query`, then passes citing the
+ * first trace of the session; every other judge agrees.
+ */
+const traced = assistantTest({
+  perTest: true,
+  judge: (request) => {
+    if (!request.body.includes(LIVE_REVIEW)) return judgeReply(AGREES);
+    if (TOOL_TURN.test(request.body)) return judgeReply('{"outcome":"passed","reason":"the spans were read","citations":[{"slot":"traces","locator":{"json_pointer":"/0"}}]}');
+    const [traceId] = request.body.match(/[0-9a-f]{32}/) ?? [];
+    return toolTurn([toolCall('call-spans', 'bifrost.query', { sql: `SELECT name FROM bifrost.traces.spans WHERE trace_id = decode('${traceId}', 'hex') ORDER BY name`, max_rows: 10 })]);
+  }
+});
+
+traced('a session judgment cites an exact trace: the citation leads to its pinned member and trace, a later span revises nothing, and trace reads keep their own permission', async ({ server, assistant: _ }) => {
+  // A coding session of three turns; the first names a retained trace.
+  await seedSignals(server, server.apiKey, { trace: SESSION_TRACE, service: 'coding-agent' });
+  const cards = await Cards.connect();
+  const coding = await cards.declareFromPath(fixture('cards/verify_in_real_time/coding.yaml'));
+  const bundle = mkdtempSync(join(tmpdir(), 'wyrd-ui-coding-'));
+  await cards.pull(coding.root, bundle);
+  const { principalId, key } = await runtimeAccount({ kind: 'Service', name: coding.root.name });
+  // The judge reads spans as the Service, which needs the tool and query grants.
+  server.scopedApiKey('ui_live_reader', ['tool:invoke', 'bifrost_query:read']);
+  await (await Principals.connect()).grantRole(principalId, 'ui_live_reader');
+  const token = await WyrdClient.connect().accessToken();
+  /** The binding of `owner` that judges a session when it ends. */
+  const sessionBinding = async (owner: Exact) => {
+    for (const id of (await cards.get(owner)).status?.verification?.binding_ids ?? []) {
+      const response = await fetch(`${server.baseUrl}/v1/verification/bindings/${id}`, { headers: { 'x-wyrd-access-token': `Bearer ${token}` } });
+      if (((await response.json()) as { group_end?: unknown }).group_end) return id;
+    }
+    throw new Error(`${owner.name} has no session binding`);
+  };
+  const desk = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: key }) });
+  await desk.startBifrost();
+  const run = desk.run('agent');
+  const calls = [{ call: 'prompt', tests: 'passed' }, { call: 'edit', tests: 'failed' }, { call: 'test', tests: 'passed' }];
+  for (const [index, call] of calls.entries()) await run.observe.verify('coding-turn', index === 0 ? { call, trace: SESSION_TRACE } : { call }, { group_id: 'ui-coding' });
+  await desk.shutdown();
+  const session = await groupExecution(server, await sessionBinding(exact(declared(coding))), 90_000);
+
+  // Another Service ends a session under the same group id: the two stay apart by owner.
+  const support = await cards.declareFromPath(fixture('cards/verify_in_real_time/support.yaml'));
+  const supportBundle = mkdtempSync(join(tmpdir(), 'wyrd-ui-coding-support-'));
+  await cards.pull(support.root, supportBundle);
+  const helpdesk = WyrdState.fromPath(supportBundle, { client: WyrdClient.connect({ credential: (await runtimeAccount({ kind: 'Service', name: support.root.name })).key }) });
+  await helpdesk.startBifrost();
+  for (const turn of [1, 2, 3]) await helpdesk.run('agent').observe.verify('turn-check', { turn, answer: `answer ${turn}` }, { positional: true, group_id: 'ui-coding' });
+  await helpdesk.shutdown();
+  const other = await groupExecution(server, await sessionBinding(exact(declared(support))), 90_000);
+  server.flushBifrost();
+  const members = session.group?.sources.traces.execution_ids ?? [];
+  expect(members).toHaveLength(3);
+  // Same group id, two owners: each judged execution names its own Service and pins only its own members.
+  expect([session.group_id, other.group_id]).toEqual(['ui-coding', 'ui-coding']);
+  expect([session.owner_card_uid, other.owner_card_uid]).toEqual([declared(coding).uid, declared(support).uid]);
+  const otherMembers = other.group?.sources.turns.execution_ids ?? [];
+  expect(otherMembers).toHaveLength(3);
+  expect(members.filter((id) => otherMembers.includes(id))).toEqual([]);
+
+  const client = WyrdClient.connect();
+  const mcp = await mcpOver(server.baseUrl, client);
+  /** The session's judgments and pinned members, as one host reads them. */
+  const recorded = async (executor: Executor, surface: string) => {
+    const judgment = data(await loadExecution({ executionId: session.execution_id, node: 'req:spans-reviewed' }, { executor }), surface);
+    const sources = data(await loadExecution({ executionId: session.execution_id, node: 'input:traces' }, { executor }), surface);
+    return { verdict: judgment.status.result?.outcome.verdict, requirements: judgment.status.result?.outcome.requirements, members: sources.members?.map((member) => member.execution_id) };
+  };
+  try {
+    const before = await recorded(nodeExecutor(client), 'node');
+    for (const [surface, executor] of [['node', nodeExecutor(client)], ['mcp', mcp.executor]] as const) {
+      // The judgment cites the first trace of the session by its exact slot and locator; membership is the recorded snapshot.
+      const read = await recorded(executor, surface);
+      expect(read, surface).toEqual(before);
+      expect(read.verdict, surface).toBe('failed');
+      expect(read.requirements?.find((each) => each.id === 'spans-reviewed'), surface).toMatchObject({ outcome: 'passed', citations: [{ slot: 'traces', locator: { json_pointer: '/0' } }] });
+      expect(read.members, surface).toEqual(members);
+      // The other owner's session, read by the same host, lists only its own members under its own owner.
+      const theirs = data(await loadExecution({ executionId: other.execution_id, node: 'input:turns' }, { executor }), surface);
+      expect([theirs.status.owner_card_uid, theirs.members?.map((member) => member.execution_id)], surface).toEqual([declared(support).uid, otherMembers]);
+      // The cited position is the first pinned member, whose accepted input names the exact trace.
+      const cited = data(await loadExecution({ executionId: members[0], node: 'input:trace' }, { executor }), surface);
+      expect(JSON.stringify(cited.inputs), surface).toContain(SESSION_TRACE);
+      // That exact trace is read by its ID alone, with no list range or filter.
+      const waterfall = await loadTraceWaterfall({ traceId: SESSION_TRACE }, { executor });
+      expect(waterfall.result.state, surface).toBe('populated');
+    }
+
+    // A span that arrives after the judgment joins the trace and revises neither the judgment nor the membership.
+    const late = nanos(new Date().toISOString());
+    await exportOtlp(server, server.apiKey, '/v1/traces', {
+      resourceSpans: [{ resource: { attributes: [] }, scopeSpans: [{ scope: { name: 'wyrd-ui-journey' }, spans: [{ traceId: SESSION_TRACE, spanId: 'a1b2c3d4e5f60718', name: 'late-test-run', kind: 1, startTimeUnixNano: late, endTimeUnixNano: late, status: { code: 0 }, attributes: [] }] }] }]
+    });
+    server.flushBifrost();
+    const grown = await loadTraceWaterfall({ traceId: SESSION_TRACE }, { executor: nodeExecutor(client) });
+    expect(JSON.stringify(grown.result)).toContain('late-test-run');
+    expect(await recorded(nodeExecutor(client), 'after a later span')).toEqual(before);
+
+    // A principal that may read executions but not traces still sees the citation; the trace itself is refused to it.
+    const narrow = nodeExecutor(WyrdClient.connect({ credential: server.scopedApiKey('ui_traced_narrow', ['verifier:read']) }));
+    expect((await recorded(narrow, 'narrow')).requirements).toEqual(before.requirements);
+    expect((await loadTraceWaterfall({ traceId: SESSION_TRACE }, { executor: narrow })).result).toMatchObject({ state: 'denied', problem: { code: DENIED } });
+    // Another tenant finds neither the session nor the trace.
+    const outsider = nodeExecutor(WyrdClient.connect({ credential: server.bootstrapServiceInTenant(server.seedTenant('ui-traced-foreign'), ['admin'], 'ui-traced-admin') }));
+    expect((await loadExecution({ executionId: session.execution_id }, { executor: outsider })).result).toMatchObject({ state: 'error', problem: { code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND' } });
+    expect((await loadTraceWaterfall({ traceId: SESSION_TRACE }, { executor: outsider })).result.state).toBe('empty');
+  } finally {
+    await mcp.close();
   }
 });

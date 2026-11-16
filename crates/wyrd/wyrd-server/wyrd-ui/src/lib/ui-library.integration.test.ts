@@ -1373,29 +1373,59 @@ judged('Verify lists executions with and without a recorded result as one author
   const foreignCharts = await loadExecutionCharts({}, outsider);
   expect([foreignCharts.verdicts.result.state, foreignCharts.verifiers.result.state]).toEqual(['empty', 'empty']);
   // `verifier:read` alone opens exact executions but grants no discovery read: every panel is denied whole.
-  const narrow = { executor: nodeExecutor(WyrdClient.connect({ credential: server.scopedApiKey('ui_verify_narrow', ['verifier:read']) })), range };
+  const narrowKey = server.scopedApiKey('ui_verify_narrow', ['verifier:read']);
+  const narrow = { executor: nodeExecutor(WyrdClient.connect({ credential: narrowKey })), range };
   const refusedCharts = await loadExecutionCharts({}, narrow);
   for (const loaded of [await loadRecordTable({ signal: 'executions' }, narrow), await loadFacetRail({ signal: 'executions', facets: ['status'] }, narrow), refusedCharts.verdicts, refusedCharts.verifiers])
     expect(loaded.result).toMatchObject({ state: 'denied', problem: { code: DENIED } });
 
   // BFF and custom app: the same rows for this tenant's session, nothing for another tenant's.
   env.WYRD_SERVER_URL = server.baseUrl;
-  const body = JSON.stringify({ component: 'RecordTable', input: { signal: 'executions', where: [{ column: 'verdict', value: 'failed' }] }, range });
-  const bff = async (tenant: string, credential: string) => {
+  const failedBody = JSON.stringify({ component: 'RecordTable', input: { signal: 'executions', where: [{ column: 'verdict', value: 'failed' }] }, range });
+  const app = async (body = failedBody) => JSON.parse(await (await loadExamplePanel({ request: new Request('http://app.test/view/load', { method: 'POST', body }) } as never)).text());
+  const signedIn = async (tenant: string, credential: string) => {
     const url = new URL(`http://ui.test/t/${tenant}/ui/load`);
     const cookies = jar();
     await browserSessions.signInWithApiKey(tenant, credential, url, cookies);
-    const browserSession = await browserSessions.read(tenant, url, cookies);
-    return (await loadPanel({ locals: { browserSession }, request: new Request(url, { method: 'POST', body, headers: { 'content-type': 'application/json' } }) } as never)).json();
+    return { url, browserSession: await browserSessions.read(tenant, url, cookies) };
   };
+  const bff = async ({ url, browserSession }: Awaited<ReturnType<typeof signedIn>>, body = failedBody) =>
+    (await loadPanel({ locals: { browserSession }, request: new Request(url, { method: 'POST', body, headers: { 'content-type': 'application/json' } }) } as never)).json();
+  const own = await signedIn('test-tenant-1', server.apiKey);
   const failedIds = [refused, drifted].sort();
   const idsOf = (loaded: { result: { state: string; data?: { rows: QueryResult } } }) => (loaded.result.state === 'populated' && loaded.result.data ? named(loaded.result.data.rows).map((each) => each.execution_id).sort() : loaded.result.state);
-  expect(idsOf(await bff('test-tenant-1', server.apiKey))).toEqual(failedIds);
-  expect(idsOf(await bff('ui-verify-foreign', foreignKey))).toBe('empty');
-  const app = await loadExamplePanel({ request: new Request('http://app.test/view/load', { method: 'POST', body }) } as never);
-  const text = await app.text();
-  expect(text).not.toContain(server.apiKey);
-  expect(idsOf(JSON.parse(text))).toEqual(failedIds);
+  expect(idsOf(await bff(own))).toEqual(failedIds);
+  expect(idsOf(await bff(await signedIn('ui-verify-foreign', foreignKey)))).toBe('empty');
+  const answered = await app();
+  expect(JSON.stringify(answered)).not.toContain(server.apiKey);
+  expect(idsOf(answered)).toEqual(failedIds);
+
+  // Each chart is a plain Chart panel over the same population: the BFF and the custom app count every execution the pages hold.
+  const charts = await loadExecutionCharts({}, { executor: nodeExecutor(client), range });
+  const everything = (await all({}, nodeExecutor(client))).length;
+  for (const chart of [charts.verdicts, charts.verifiers]) {
+    const chartBody = JSON.stringify({ component: 'Chart', input: chart.input, range });
+    for (const loaded of [await bff(own, chartBody), await app(chartBody)]) {
+      expect(loaded.result.state, JSON.stringify(loaded.result)).toBe('populated');
+      expect(total(loaded.result.data)).toBe(everything);
+    }
+  }
+
+  // The refusal and the other tenant's empty list read the same through MCP, the BFF and the custom app.
+  const refusal = { result: { state: 'denied', problem: { code: DENIED } } };
+  const [narrowMcp, foreignMcp] = [await mcpOver(server.baseUrl, WyrdClient.connect({ credential: narrowKey })), await mcpOver(server.baseUrl, WyrdClient.connect({ credential: foreignKey }))];
+  try {
+    expect(await loadRecordTable({ signal: 'executions' }, { executor: narrowMcp.executor, range })).toMatchObject(refusal);
+    expect((await loadRecordTable({ signal: 'executions' }, { executor: foreignMcp.executor, range })).result.state).toBe('empty');
+  } finally {
+    await narrowMcp.close();
+    await foreignMcp.close();
+  }
+  expect(await bff(await signedIn('test-tenant-1', narrowKey))).toMatchObject(refusal);
+  vi.stubEnv('WYRD_API_KEY', narrowKey);
+  const appDenied = await app();
+  vi.stubEnv('WYRD_API_KEY', server.apiKey);
+  expect(appDenied).toMatchObject(refusal);
 
   // The built HTML draws the list and its facets through host tools/call alone, each answered by the real MCP server.
   const host = new Client({ name: 'wyrd-ui-artifact-host', version: '1.0.0' }, { versionNegotiation: { mode: 'auto' } });
@@ -1406,7 +1436,8 @@ judged('Verify lists executions with and without a recorded result as one author
     range,
     panels: [
       { id: 'list', component: 'RecordTable', input: { signal: 'executions', where: [{ column: 'verdict', value: null }] } },
-      { id: 'facets', component: 'FacetRail', input: { signal: 'executions', facets: ['status', 'verdict'] } }
+      { id: 'facets', component: 'FacetRail', input: { signal: 'executions', facets: ['status', 'verdict'] } },
+      { id: 'verdicts', component: 'Chart', input: charts.verdicts.input }
     ]
   };
   try {
@@ -1417,13 +1448,25 @@ judged('Verify lists executions with and without a recorded result as one author
     expect(list().textContent).toContain('no verdict');
     expect(list().textContent).not.toMatch(/passed|failed/);
     await vi.waitFor(() => expect(built.document.querySelector('[data-panel="facets"]')?.textContent).toContain('completed'));
+    await vi.waitFor(() => expect(built.document.querySelector('[data-panel="verdicts"] .legend')?.textContent).toContain('no verdict'));
     expect(new Set(built.calls.map((call) => call.name))).toEqual(new Set(['bifrost.query']));
   } finally {
     await host.close();
   }
   // A server that cannot be reached is a problem, never an empty list.
-  const down = await loadRecordTable({ signal: 'executions' }, { executor: nodeExecutor(WyrdClient.connect({ serverUrl: 'http://127.0.0.1:9', credential: server.apiKey })), range });
-  expect(down.result).toMatchObject({ state: 'error', problem: { code: expect.stringMatching(/^WYRD_/) } });
+  const DOWN = 'http://127.0.0.1:9';
+  const unreachable = { result: { state: 'error', problem: { code: expect.stringMatching(/^WYRD_/) } } };
+  expect(await loadRecordTable({ signal: 'executions' }, { executor: nodeExecutor(WyrdClient.connect({ serverUrl: DOWN, credential: server.apiKey })), range })).toMatchObject(unreachable);
+  const gone = await mcpOver(server.baseUrl, client);
+  await gone.close();
+  expect(await loadRecordTable({ signal: 'executions' }, { executor: gone.executor, range })).toMatchObject(unreachable);
+  env.WYRD_SERVER_URL = DOWN;
+  expect(await bff(own)).toMatchObject(unreachable);
+  env.WYRD_SERVER_URL = server.baseUrl;
+  vi.stubEnv('WYRD_SERVER_URL', DOWN);
+  const appDown = await app();
+  vi.stubEnv('WYRD_SERVER_URL', server.baseUrl);
+  expect(appDown).toMatchObject(unreachable);
   const dark = await appBridgeView(doc, async () => {
     throw new Error('the host cannot reach its server');
   });

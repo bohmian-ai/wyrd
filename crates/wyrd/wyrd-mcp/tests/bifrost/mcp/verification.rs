@@ -5480,6 +5480,7 @@ mod pg_tests {
         let tools = [
             Permission::card_read(),
             Permission::verifier_run_any(),
+            Permission::verifier_read_any(),
             Permission::tool_invoke_any(),
         ];
         server.seed_role("mcp_code_no_query", &tools).await?;

@@ -3040,7 +3040,6 @@ async fn canonical_signal_rows_survive_publication_recovery_and_compaction()
         ServerTarget::BifrostIngest,
         ServerTarget::BifrostQuery,
         ServerTarget::BifrostMaintenance,
-        ServerTarget::Direct,
     ]);
     let scribe_node = spec
         .nodes
@@ -3432,8 +3431,8 @@ const REWRITE_ROW_GROUP_BYTES: u64 = 768 * 1024;
 /// - **page index** — the custom key lookup skips rows of its retained
 ///   multi-page row group in both Iceberg cuts.
 ///
-/// The topology is one Scribe node, one Oracle node, one Forge worker, and a
-/// delayed Server node carrying the only Forge coordinator. The hot cut is
+/// The topology is one Scribe node, one Oracle node, and a delayed
+/// maintenance node carrying the only Forge coordinator and worker. The hot cut is
 /// proven before the coordinator exists. Its boot pass then promotes the
 /// owed Scribe debt; compaction becomes due only after the table interval, so
 /// the promoted cut is proven before any rewrite can run. Advancing the
@@ -3457,7 +3456,6 @@ async fn iceberg_filtering_mechanisms_cover_all_table_kinds() -> Result<(), Jour
         ServerTarget::BifrostIngest,
         ServerTarget::BifrostQuery,
         ServerTarget::BifrostMaintenance,
-        ServerTarget::Direct,
     ]);
     let coordinator = spec
         .nodes
@@ -3650,7 +3648,6 @@ async fn bloom_policy_versions_answer_exactly_through_compaction() -> Result<(),
         ServerTarget::BifrostIngest,
         ServerTarget::BifrostQuery,
         ServerTarget::BifrostMaintenance,
-        ServerTarget::Direct,
     ]);
     let coordinator = spec
         .nodes

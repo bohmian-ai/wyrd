@@ -3076,3 +3076,36 @@ test('a drift judgment shows its declared baseline and says when its window and 
   expect(within(shown.container).getByRole('region', { name: 'Drift features' }).querySelectorAll('tbody tr')).toHaveLength(3);
   expect(declared()).toHaveTextContent('latency_ms');
 });
+
+test('an unavailable read, a refused progress read and context not yet retained each say so in place', async () => {
+  const unavailable = { code: 'WYRD_SERVER_503_UNAVAILABLE', title: 'Service unavailable', status: 503 };
+  const unknown = { code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND', title: 'Execution not found', status: 404 };
+  // An unavailable execution read shows the server's own problem, which is not the unknown-execution one.
+  const down = render(VerificationExecution, await loadExecution({ executionId: EXECUTIONS.settled }, { executor: recording(() => ({ ok: false, problem: unavailable })).executor }));
+  expect(down.container).toHaveTextContent(unavailable.code);
+  expect(down.container).not.toHaveTextContent(unknown.title);
+  down.unmount();
+  const missing = render(VerificationExecution, await loadExecution({ executionId: EXECUTIONS.settled }, { executor: recording(() => ({ ok: false, problem: unknown })).executor }));
+  expect(missing.container).toHaveTextContent(unknown.code);
+  expect(missing.container).not.toHaveTextContent(unavailable.title);
+  missing.unmount();
+
+  // Progress alone unavailable: its part names the problem; the recorded state, the graph and the outputs stay readable.
+  const noProgress = fixtureRecording((request) => (request.op === 'verification.list_invocations' ? { ok: false, problem: unavailable } : undefined));
+  const partial = render(VerificationExecution, await loadExecution({ executionId: EXECUTIONS.settled }, { executor: noProgress.executor }));
+  expect(partial.container.querySelector('[data-part="Recorded progress"]')).toHaveTextContent(unavailable.code);
+  expect(partial.container.querySelector('[data-part="Retained outputs"], [data-part="Verifier definition"]')).toBeNull();
+  expect(partial.container.querySelector('[data-execution-status]')).not.toBeNull();
+  partial.unmount();
+
+  // A Verifier not yet visible in retained metadata is said where the graph would be.
+  const unseen = fixtureRecording((request) => (request.op === 'bifrost.query' ? { ok: true, value: { columns: [], rows: [], terminal: terminal(0) } } : undefined));
+  const early = render(VerificationExecution, await loadExecution({ executionId: EXECUTIONS.running }, { executor: unseen.executor }));
+  expect(early.container.querySelector('[data-part="Verifier definition"]')).toHaveTextContent('not yet visible in retained metadata');
+  early.unmount();
+
+  // A drift judgment whose retained result has no row yet says so; nothing is drawn as an empty history.
+  const drift = render(VerificationExecution, await loadExecution({ executionId: EXECUTIONS.drift, node: 'req:latency-stable' }, { executor: unseen.executor }));
+  expect(drift.container.querySelector('[data-drift] [data-part="Window and history"]')).toHaveTextContent('The retained result of this execution is not yet visible. Refresh to read it again.');
+  expect(within(drift.container).getByRole('region', { name: 'Drift features' }).querySelectorAll('tbody tr')).toHaveLength(3);
+});

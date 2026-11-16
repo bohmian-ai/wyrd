@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { chromium, type Browser, type Page } from 'playwright';
 import { test as base, expect, vi } from 'vitest';
-import { assistantTest } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/assistant';
+import { AGREES, assistantTest, judgeReply } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/assistant';
 import { declared, fixture, runtimeAccount, serverTest } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/server';
 import { Cards, Principals, WyrdClient } from 'wyrd-ai';
 import { loadExecution } from 'wyrd-ai-ui/loaders';
@@ -1170,6 +1170,13 @@ test('an exact execution page keeps its selection through refresh, downloads a r
   await expect.poll(query).toEqual({ node: 'outputs' });
   const outputs = page.getByRole('region', { name: 'Retained outputs', exact: true });
   expect(await outputs.locator('tbody tr').count()).toBe(4);
+  // The page lists the same recorded identities the shared loader reads: status, and each output with its producer.
+  const loaded = await loadExecution({ executionId, node: 'outputs' }, { executor: nodeExecutor(WyrdClient.connect()) });
+  if (loaded.result.state !== 'populated' || loaded.result.data.publications.state !== 'populated') throw new Error('the execution and its outputs load');
+  expect(await status()).toBe(loaded.result.data.status.status);
+  expect(await outputs.locator('tbody tr').evaluateAll((rows) => rows.map((row) => [...row.querySelectorAll('td')].slice(0, 2).map((cell) => cell.textContent?.trim())))).toEqual(
+    loaded.result.data.publications.data.items.map((each) => [each.name, each.producer.step_id])
+  );
   await outputs.getByRole('button', { name: 'tree', exact: true }).click();
   const selection = { node: 'step:draft', attempt: '1', output: 'tree' };
   await expect.poll(query).toEqual(selection);
@@ -1189,6 +1196,46 @@ test('an exact execution page keeps its selection through refresh, downloads a r
   await page.reload();
   await expect.poll(() => preview.textContent()).toContain('nested/b.md');
   expect(query()).toEqual(selection);
+  await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
+  await page.getByRole('button', { name: /Copy link/ }).click();
+  await expect.poll(() => page.locator('main').textContent()).toContain('Link copied');
+  const copied = await page.evaluate(() => navigator.clipboard.readText());
+  expect(copied).toBe(page.url());
+  const pasted = await page.context().newPage();
+  await pasted.goto(copied);
+  await expect.poll(() => pasted.locator('[data-preview="tree"]').textContent()).toContain('nested/b.md');
+  expect(await pasted.locator('[data-producer]').getAttribute('data-producer')).toBe('attempt 1');
+  await pasted.close();
+
+  // A slow answer for an older selection never replaces a newer one: the older read is held until the newer is shown.
+  let release = () => {};
+  const held = new Promise<void>((resolve) => (release = resolve));
+  let late = 0;
+  let delivered = () => {};
+  const answered = new Promise<void>((resolve) => (delivered = resolve));
+  const older = (url: URL) => url.pathname.endsWith('__data.json') && url.searchParams.get('node') === 'outputs';
+  await page.route(older, async (route) => {
+    late += 1;
+    const response = await route.fetch();
+    await held;
+    // A navigation the page already replaced may have dropped this request; either way the older answer is finished.
+    await route.fulfill({ response }).catch(() => {});
+    delivered();
+  });
+  await page.getByRole('button', { name: /^All retained outputs \(4\)/ }).click();
+  await expect.poll(() => late).toBe(1);
+  const newer = graph.locator('[data-node="req:drift"]');
+  await newer.click();
+  await expect.poll(query).toEqual({ node: 'req:drift' });
+  await expect.poll(() => newer.getAttribute('aria-pressed')).toBe('true');
+  release();
+  await answered;
+  await page.evaluate(() => new Promise(requestAnimationFrame));
+  expect([query(), await newer.getAttribute('aria-pressed')]).toEqual([{ node: 'req:drift' }, 'true']);
+  expect(await page.getByRole('region', { name: 'Retained outputs', exact: true }).count()).toBe(0);
+  await page.unroute(older);
+  await page.goto(`${at(tenant)}?${new URLSearchParams(selection)}`);
+  await expect.poll(() => preview.textContent()).toContain('nested/b.md');
 
   // A retained file leaves through the host as a download; the page stays where it is.
   const [download] = await Promise.all([page.waitForEvent('download'), preview.locator('tr', { hasText: 'nested/b.md' }).getByRole('button', { name: 'Download' }).click()]);
@@ -1270,7 +1317,9 @@ async function traceTotal(page: Page): Promise<number> {
 }
 
 /** A fresh server that runs Verifiers, with the assistant Service registered. */
-const judged = assistantTest({ perTest: true });
+/** How many requests the judging provider has received in this file. */
+let judgeRequests = 0;
+const judged = assistantTest({ perTest: true, judge: () => ((judgeRequests += 1), judgeReply(AGREES)) });
 
 judged('a completed execution page shows the recorded judgment, loads details only when asked, and stays completed', async ({ server, state }) => {
   // A real Run verification that fails its assertion.
@@ -1280,6 +1329,7 @@ judged('a completed execution page shows the recorded judgment, loads details on
   server.flushBifrost();
   const executionId = submitted.execution.id;
   const tenant = 'test-tenant-1';
+  const judgedBefore = judgeRequests;
   buildUi();
   const bff = await startBff(server.baseUrl);
   const browser = await chromium.launch();
@@ -1309,9 +1359,26 @@ judged('a completed execution page shows the recorded judgment, loads details on
 
     // Completed details are read only when asked for; the compact judgment was readable before them.
     expect(await page.locator('[data-details]').count()).toBe(0);
+    // While the details read is slow, the compact judgment and the graph stay readable and no details are drawn.
+    let release = () => {};
+    const slow = new Promise<void>((resolve) => (release = resolve));
+    let waiting = 0;
+    const details = (target: URL) => target.pathname.endsWith('__data.json') && target.searchParams.get('details') === '1';
+    await page.route(details, async (route) => {
+      waiting += 1;
+      await slow;
+      await route.continue();
+    });
     await page.getByRole('button', { name: 'Load completed details' }).click();
+    await expect.poll(() => waiting).toBe(1);
+    expect(await page.locator('[data-details]').count()).toBe(0);
+    expect(await requirement.locator('[data-outcome]').getAttribute('data-outcome')).toBe(judgment?.outcome);
+    expect(await requirement.textContent()).toContain(judgment?.reason);
+    expect(await page.getByRole('region', { name: 'Graph', exact: true }).locator('[data-node]').count()).toBeGreaterThan(0);
+    release();
     await expect.poll(query).toMatchObject({ details: '1' });
     await expect.poll(() => page.locator('[data-details]').count()).toBeGreaterThan(0);
+    await page.unroute(details);
     expect(await requirement.locator('[data-outcome]').getAttribute('data-outcome')).toBe('failed');
 
     // A cancel that arrives after completion changes nothing: the terminal state and its judgment stand on reopen.
@@ -1325,6 +1392,8 @@ judged('a completed execution page shows the recorded judgment, loads details on
     server.flushBifrost();
     const [executions] = await nodeExecutor(WyrdClient.connect()).run([{ op: 'bifrost.query', sql: 'SELECT DISTINCT execution_id FROM bifrost.verification.execution_inputs', params: [], max_rows: 10 }]);
     expect(executions).toMatchObject({ ok: true, value: { rows: [[executionId]] } });
+    // Nor did it ask a provider anything: the judging provider received no request while the page was inspected.
+    expect(judgeRequests).toBe(judgedBefore);
   } finally {
     await browser.close();
     bff.stop();

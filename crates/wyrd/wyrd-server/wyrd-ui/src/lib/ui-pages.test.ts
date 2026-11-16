@@ -580,6 +580,13 @@ test('an exact execution page keeps its selection in the URL and cancels once th
   const search = writeExecution(selection);
   expect(search).toBe('?node=step%3Apolish&item=2&attempt=3&output=draft+v2%2Fnotes.md&details=1&invocations=c%2B1%2F%3D&publications=c+2');
   expect(readExecution('exec_1', new URLSearchParams(search))).toEqual({ executionId: 'exec_1', ...selection });
+  // A repeat iteration is part of the producer: it round-trips, and the page reads the output of that exact iteration.
+  const repeated = { node: 'step:score', producer: { item_index: null, iteration_index: 1, attempt: 2 }, output: 'units' };
+  expect(writeExecution(repeated)).toBe('?node=step%3Ascore&iteration=1&attempt=2&output=units');
+  expect(readExecution('exec_1', new URLSearchParams(writeExecution(repeated)))).toEqual({ executionId: 'exec_1', ...repeated });
+  const iterated = await open(`exec_settled${writeExecution(repeated)}`);
+  expect(requests.find((request) => request.op === 'verification.get_publication')).toEqual({ op: 'verification.get_publication', execution_id: 'exec_settled', step_id: 'score', name: 'units', attempt: 2, item_index: null, iteration_index: 1 });
+  iterated.unmount();
   expect(readExecution('exec_1', new URLSearchParams())).toEqual({ executionId: 'exec_1' });
   expect(writeExecution({})).toBe('');
 

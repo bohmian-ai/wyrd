@@ -12,7 +12,7 @@
   import { onMount, setContext } from 'svelte';
   import type { NodeState } from '../execution.js';
   import type { DefinitionGraph } from '../verifier.js';
-  import { HEAD, layoutDefinition, needsText } from '../verifier-layout.js';
+  import { HEAD, STATE_ROOM, layoutDefinition, needsText } from '../verifier-layout.js';
   import Panel from './Panel.svelte';
   import VerifierGraphEdge from './VerifierGraphEdge.svelte';
   import VerifierGraphNode, { SELECTION, type GraphNodeData, type GraphSelection } from './VerifierGraphNode.svelte';
@@ -30,7 +30,7 @@
 
   // Laid out once: the arrays below are never replaced, so nothing re-flows after mount.
   // svelte-ignore state_referenced_locally
-  const laid = layoutDefinition(graph);
+  const laid = layoutDefinition(graph, states ? STATE_ROOM : 0);
   const fixed = { draggable: false, connectable: false, selectable: false, deletable: false, focusable: false };
   // svelte-ignore state_referenced_locally
   const declared = new Map<string, GraphNodeData>([

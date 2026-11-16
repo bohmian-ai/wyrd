@@ -69,13 +69,16 @@ const CLEAR = 12; // clearance a corridor keeps from nodes and other horizontal 
 /** What a step says it waits for. */
 export const needsText = (step: DefinitionStep) => (step.needs.length ? `needs ${step.needs.join(', ')}` : 'no step dependencies');
 
-const stepWidth = (step: DefinitionStep) =>
+/** Room one recorded state takes beside a node id: a glyph and the longest state word. */
+export const STATE_ROOM = mono('◌ not finished', 11) + 8;
+
+const stepWidth = (step: DefinitionStep, room: number) =>
   Math.max(
-    mono(step.id, 13) + 6 + tag(step.kind, 10.4),
+    mono(step.id, 13) + 6 + tag(step.kind, 10.4) + room,
     mono(step.detail, 11),
     mono(needsText(step), 11),
     step.chips.reduce((sum, chip) => sum + tag(chip, 10) + 6, 0),
-    ...step.requirements.map((each) => 18 + mono(each.id, 12) + 12)
+    ...step.requirements.map((each) => 18 + mono(each.id, 12) + 12 + room)
   ) + PAD;
 
 interface Box {
@@ -147,20 +150,21 @@ function* permutations<T>(list: T[]): Generator<T[]> {
  * Lay a declared graph out once. Dagre ranks and spaces parallel steps; a
  * single chain of steps stacks vertically. Edges run orthogonally through
  * lanes in the gaps between columns, one port per lane, and an edge that
- * skips a column travels a corridor that clears every node.
+ * skips a column travels a corridor that clears every node. `room` widens
+ * each id row by that much, for a graph that also shows recorded state.
  */
-export function layoutDefinition(graph: DefinitionGraph): LaidDefinition {
+export function layoutDefinition(graph: DefinitionGraph, room = 0): LaidDefinition {
   const boxes = new Map<string, Box>();
   const add = (id: string, type: Box['type'], w: number, h: number, main = h) =>
     boxes.set(id, { id, type, w: Math.ceil(Math.min(MAX_W, Math.max(w, MIN_W))), h, main, col: 0, x: 0, y: 0, want: 0 });
   const box = (id: string) => boxes.get(id) as Box;
-  for (const input of graph.inputs) add(input.key, 'input', Math.max(mono(input.id, 13) + 6 + tag(input.kind, 11), sans(input.detail, 12)) + PAD, NODE_H);
+  for (const input of graph.inputs) add(input.key, 'input', Math.max(mono(input.id, 13) + 6 + tag(input.kind, 11) + room, sans(input.detail, 12)) + PAD, NODE_H);
   for (const step of graph.steps) {
     const main = STEP_H + (step.chips.length ? CHIP_ROW : 0);
-    add(step.key, 'step', stepWidth(step), main + REQ_ROW * step.requirements.length, main);
+    add(step.key, 'step', stepWidth(step, room), main + REQ_ROW * step.requirements.length, main);
   }
   for (const each of graph.requirements)
-    add(each.key, 'req', Math.max(18 + mono(each.id, 13) + 6 + tag(each.kind, 10.4), sans(each.statement, 12)) + PAD, NODE_H);
+    add(each.key, 'req', Math.max(18 + mono(each.id, 13) + 6 + tag(each.kind, 10.4) + room, sans(each.statement, 12)) + PAD, NODE_H);
 
   const steps = graph.steps.map((step) => step.key);
   const isStep = (id: string) => id.startsWith('step:');

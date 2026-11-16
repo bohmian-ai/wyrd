@@ -122,7 +122,7 @@ import { nodeExecutor } from 'wyrd-ai-ui/node';
 import { Bifrost, WyrdError, verify, type WyrdClient } from 'wyrd-ai';
 import catalog from 'wyrd-ai-ui/catalog.json';
 import { place as placeAll, rowsHeight } from '../../packages/ui/src/lib/layout';
-import { layoutDefinition } from '../../packages/ui/src/lib/verifier-layout';
+import { STATE_ROOM, layoutDefinition } from '../../packages/ui/src/lib/verifier-layout';
 import { CARD_TABS, PROMPT_TABS, readInventory, writeDetail, writeInventory } from '$lib/cards-host';
 import { load as loadCardDetail } from '../routes/t/[tenantKey]/cards/detail/+page.server';
 import {
@@ -2846,11 +2846,12 @@ test('execution inspector shows recorded state, judgments and outputs as separat
   expect(head).toHaveTextContent('ticket-policy@1.1.0');
   expect(within(head).queryByRole('button', { name: /Cancel execution/ })).toBeNull();
 
-  // The same layout as the definition, each node marked with a word and glyph; runtime state moves nothing.
-  const plain = render(VerifierGraph, { graph: definitionGraph(specOf('ticket-policy@1.1.0')) });
-  await waitFor(() => expect(plain.container.querySelector('.svelte-flow__node')).toBeInTheDocument());
-  expect(positions()).toEqual([...plain.container.querySelectorAll<HTMLElement>('.svelte-flow__node')].map((each) => each.style.transform));
-  plain.unmount();
+  // The declared nodes, each with room for its recorded word and glyph beside the id; the definition alone is laid out narrower.
+  const declaredGraph = definitionGraph(specOf('ticket-policy@1.1.0'));
+  const [bare, roomy] = [layoutDefinition(declaredGraph), layoutDefinition(declaredGraph, STATE_ROOM)];
+  expect(roomy.nodes.map((each) => [each.key, each.height])).toEqual(bare.nodes.map((each) => [each.key, each.height]));
+  for (const [index, each] of roomy.nodes.entries()) expect(each.width - bare.nodes[index].width, each.key).toBeGreaterThanOrEqual(0);
+  expect(roomy.width).toBeGreaterThan(bare.width);
   expect(node('step:score').querySelector('[data-status]')).toHaveTextContent('✓ succeeded');
   expect(node('req:policy-followed').querySelector('[data-status]')).toHaveTextContent('✕ failed');
   expect(shown.container).toHaveTextContent('Declared dependencies, marked with recorded state.');

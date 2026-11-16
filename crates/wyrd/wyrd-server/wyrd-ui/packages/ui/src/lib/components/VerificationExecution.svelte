@@ -508,6 +508,10 @@
     min-width: 0;
     overflow-x: auto;
   }
+  /* Dense rows scroll sideways in their labelled region rather than break mid-word. */
+  .scroll :is(th, td) {
+    white-space: nowrap;
+  }
   .tool,
   .attempts button {
     height: 28px;

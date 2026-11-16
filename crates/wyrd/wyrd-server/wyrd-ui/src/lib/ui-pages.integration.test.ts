@@ -1134,6 +1134,100 @@ test('an exact Verifier Card page draws its declared graph and where it runs', a
   expect(await serverHtml(viewer, `${detail}?kind=Verifier&name=${review.name}&version=${review.version}`)).toContain('WYRD_PERMISSION_403_DENIED_RBAC');
 });
 
+test('an exact execution page keeps its selection through refresh, downloads a retained file and cancels once', async ({ server, ui }) => {
+  // The fixture tenant's unfinished execution: four retained outputs, no result.
+  const tenant = 'test-tenant-1';
+  const { executionId } = server.holdPublications('ui-page-held');
+  server.flushBifrost();
+  const at = (base: string) => `${ui.base}/t/${base}/verify/executions/${executionId}`;
+  const page = await signIn(ui.browser, ui.base, tenant, server.apiKey);
+  const status = () => page.locator('[data-execution-status]').getAttribute('data-execution-status');
+  const query = () => Object.fromEntries(new URL(page.url()).searchParams);
+  const capture = async (name: string) => {
+    for (const mode of ['light', 'dark'] as const) {
+      await page.evaluate((next) => ((document.querySelector('.app-root') as HTMLElement).dataset.mode = next), mode);
+      if (process.env.WYRD_UI_CAPTURE_DIR) await page.screenshot({ path: join(process.env.WYRD_UI_CAPTURE_DIR, `execution-${name}-${mode}-${page.viewportSize()?.width}.png`), fullPage: true });
+    }
+  };
+
+  await page.goto(at(tenant));
+  await expect.poll(status).toBe('running');
+  const graph = page.getByRole('region', { name: 'Graph', exact: true });
+  await expect.poll(() => graph.locator('[data-node]').count()).toBe(2);
+  // Unfinished: recorded state only, and no verdict anywhere on the page.
+  expect(await page.locator('[data-verdict]').getAttribute('data-verdict')).toBe('');
+  expect(await page.locator('main').textContent()).not.toMatch(/\b(passed|failed)\b/);
+  await capture('running');
+
+  // Every retained output, then one exact intermediate publication of one producer attempt; the URL holds the selection.
+  await page.getByRole('button', { name: /^All retained outputs \(4\)/ }).click();
+  await expect.poll(query).toEqual({ node: 'outputs' });
+  const outputs = page.getByRole('region', { name: 'Retained outputs', exact: true });
+  expect(await outputs.locator('tbody tr').count()).toBe(4);
+  await outputs.getByRole('button', { name: 'tree', exact: true }).click();
+  const selection = { node: 'step:draft', attempt: '1', output: 'tree' };
+  await expect.poll(query).toEqual(selection);
+  const preview = page.locator('[data-preview="tree"]');
+  await expect.poll(() => preview.textContent()).toContain('nested/b.md');
+  await capture('publication');
+
+  // Refresh rereads recorded state and moves nothing: same zoom, same node positions, same selection.
+  await graph.getByRole('button', { name: 'Zoom in' }).click();
+  const zoom = await graph.locator('[data-zoom]').textContent();
+  const placed = () => graph.locator('[data-node]').evaluateAll((nodes) => nodes.map((node) => JSON.stringify(node.getBoundingClientRect())));
+  const before = await placed();
+  await page.getByRole('button', { name: 'Refresh' }).click();
+  await expect.poll(() => page.getByRole('button', { name: 'Refresh' }).isEnabled()).toBe(true);
+  expect([await graph.locator('[data-zoom]').textContent(), await placed(), query()]).toEqual([zoom, before, selection]);
+  // A reload and a copied link restore the same producer attempt and output from the URL alone.
+  await page.reload();
+  await expect.poll(() => preview.textContent()).toContain('nested/b.md');
+  expect(query()).toEqual(selection);
+
+  // A retained file leaves through the host as a download; the page stays where it is.
+  const [download] = await Promise.all([page.waitForEvent('download'), preview.locator('tr', { hasText: 'nested/b.md' }).getByRole('button', { name: 'Download' }).click()]);
+  expect([download.suggestedFilename(), readFileSync(await download.path(), 'utf8')]).toEqual(['b.md', 'beta']);
+  expect(query()).toEqual(selection);
+
+  // Completed details are not available before a result, and say so.
+  await page.getByRole('button', { name: 'Load completed details' }).click();
+  await expect.poll(query).toEqual({ ...selection, details: '1' });
+  await expect.poll(() => page.locator('[data-part="Completed details"]').textContent()).toContain('Details are recorded when the execution completes');
+
+  // Another tenant's session finds no such execution; a viewer's cancel is refused and nothing changes.
+  const other = await signIn(ui.browser, ui.base, TENANT, ui.adminKey);
+  expect(await serverHtml(other, at(TENANT))).toContain('WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND');
+  const viewer = await signIn(ui.browser, ui.base, tenant, server.bootstrapService(['viewer'], 'ui-page-viewer'));
+  await viewer.goto(at(tenant));
+  await viewer.getByRole('button', { name: 'Cancel execution' }).click();
+  await expect.poll(() => viewer.locator('main').textContent()).toContain('WYRD_PERMISSION_403_DENIED_RBAC');
+  expect(await viewer.locator('[data-execution-status]').getAttribute('data-execution-status')).toBe('running');
+
+  // Cancel: one request, then the recorded status; the selection and the retained outputs stay.
+  const cancels: string[] = [];
+  page.on('request', (request) => request.url().endsWith('/cancel') && cancels.push(request.method()));
+  await page.getByRole('button', { name: 'Cancel execution' }).dblclick();
+  await expect.poll(status).toBe('cancelled');
+  await expect.poll(() => page.locator('main').textContent()).toContain('Recorded status: cancelled');
+  expect(cancels).toEqual(['POST']);
+  expect(query()).toEqual({ ...selection, details: '1' });
+  await expect.poll(() => preview.textContent()).toContain('nested/b.md');
+  await capture('cancelled');
+
+  // Reopened after settlement, on a phone-width screen: cancelled, no verdict, the same outputs.
+  await page.setViewportSize({ width: 390, height: 800 });
+  await page.goto(`${at(tenant)}?node=outputs`);
+  await expect.poll(status).toBe('cancelled');
+  expect(await outputs.locator('tbody tr').count()).toBe(4);
+  expect(await page.locator('[data-verdict]').textContent()).toContain('no verdict recorded');
+  expect(await page.getByRole('button', { name: 'Cancel execution' }).count()).toBe(0);
+  await capture('settled');
+  await page.setViewportSize({ width: 1280, height: 720 });
+
+  // An execution that does not exist is a stable problem, never an empty page.
+  expect(await serverHtml(page, `${ui.base}/t/${tenant}/verify/executions/0192f0a0-0000-7000-8000-000000000000`)).toContain('WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND');
+});
+
 /** The repository root, where `mise run dev:full` runs. */
 const REPO = resolve(import.meta.dirname, '../../../../../..');
 

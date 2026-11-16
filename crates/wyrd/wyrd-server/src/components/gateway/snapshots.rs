@@ -51,6 +51,77 @@ pub(crate) const SNAPSHOT_CHANNEL: &str = "wyrd_gateway_snapshot";
 /// the tenant meanwhile shares.
 type Load = Arc<tokio::sync::OnceCell<Result<Arc<GatewayTenantSnapshot>, WyrdError>>>;
 
+/// One call's participation in its tenant's in-flight miss load.
+///
+/// Every clone of a [`Load`] except the map's own belongs to a
+/// participant and is taken or dropped only under the map's lock, so the
+/// participant that drops the last of them sees it and removes the map
+/// entry; a cancelled last caller therefore leaves no entry behind.
+struct Participant<'a> {
+    /// The in-flight loads by tenant.
+    loads: &'a Mutex<HashMap<DataTenantId, Load>>,
+    /// The tenant whose load this call shares.
+    tenant: DataTenantId,
+    /// This call's share of the load, taken when the participant ends.
+    load: Option<Load>,
+}
+
+impl<'a> Participant<'a> {
+    /// Joins `tenant`'s in-flight load in `loads`, starting a new one when
+    /// none is in flight.
+    fn join(loads: &'a Mutex<HashMap<DataTenantId, Load>>, tenant: DataTenantId) -> Self {
+        let mut map = loads.lock().unwrap_or_else(PoisonError::into_inner);
+        let load = Arc::clone(map.entry(tenant).or_default());
+        Self {
+            loads,
+            tenant,
+            load: Some(load),
+        }
+    }
+
+    /// The shared load.
+    ///
+    /// # Panics
+    /// Panics if called after the participant ended, which its owner
+    /// cannot do because ending consumes it.
+    fn load(&self) -> &Load {
+        self.load
+            .as_ref()
+            .expect("a participant holds its load until it ends")
+    }
+
+    /// Ends a participant whose load completed, removing the load's entry
+    /// even while peers still hold it, so a later miss starts afresh
+    /// rather than sharing an ended result such as a failure.
+    fn finish(mut self) {
+        self.leave(true);
+    }
+
+    /// Releases this participant's share under the map's lock, removing
+    /// the tenant's entry when it is still this load and either `ended` or
+    /// no other participant holds it; a replacement load is never removed.
+    fn leave(&mut self, ended: bool) {
+        let Some(load) = self.load.take() else {
+            return;
+        };
+        let mut map = self.loads.lock().unwrap_or_else(PoisonError::into_inner);
+        if map.get(&self.tenant).is_some_and(|current| {
+            Arc::ptr_eq(current, &load) && (ended || Arc::strong_count(&load) == 2)
+        }) {
+            map.remove(&self.tenant);
+        }
+        drop(load);
+    }
+}
+
+impl Drop for Participant<'_> {
+    /// Leaves the load as a participant that stopped waiting before it
+    /// ended, such as a cancelled call.
+    fn drop(&mut self) {
+        self.leave(false);
+    }
+}
+
 /// Most tenants whose snapshots one process retains.
 const CACHE_TENANTS: NonZeroUsize = NonZeroUsize::new(4_096).expect("4096 is non-zero");
 
@@ -104,8 +175,9 @@ pub struct GatewaySnapshots {
     wake: Notify,
     /// Whether the listener is live, for waiters.
     live: watch::Sender<bool>,
-    /// The miss load in flight for each tenant, removed once it ends; held
-    /// only to find or remove a load, never across one.
+    /// The miss load in flight for each tenant, removed once it ends or
+    /// its last participant stops waiting; see [`Participant`]. Held only
+    /// to join or leave a load, never across one.
     loads: Mutex<HashMap<DataTenantId, Load>>,
 }
 
@@ -159,28 +231,37 @@ impl GatewaySnapshots {
         if let Some(snapshot) = self.cached(tenant) {
             return Ok(snapshot);
         }
-        let load = Arc::clone(
-            self.loads
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .entry(tenant)
-                .or_default(),
-        );
-        let loaded = load
+        self.share(tenant, load_snapshot(postgres, config, tenant))
+            .await
+    }
+
+    /// Runs `load` as `tenant`'s one miss load unless a load for it is
+    /// already in flight, whose result this call then shares, and caches a
+    /// loaded snapshot as [`Self::insert`] decides.
+    ///
+    /// The in-flight entry lives only while a call participates in it: it
+    /// is removed once its load ends, and when its last participant stops
+    /// waiting first, as a cancelled call does. A cancelled participant
+    /// with live peers leaves the entry, and the initialization of a
+    /// cancelled initializer passes to a remaining peer.
+    ///
+    /// # Errors
+    /// Returns the shared load's error.
+    async fn share(
+        &self,
+        tenant: DataTenantId,
+        load: impl Future<Output = Result<GatewayTenantSnapshot, WyrdError>>,
+    ) -> Result<Arc<GatewayTenantSnapshot>, WyrdError> {
+        let participant = Participant::join(&self.loads, tenant);
+        let loaded = participant
+            .load()
             .get_or_init(|| async {
                 let generation = self.fill_generation();
-                let snapshot = load_snapshot(postgres, config, tenant).await?;
-                Ok(self.insert(tenant, generation, snapshot).0)
+                Ok(self.insert(tenant, generation, load.await?).0)
             })
             .await
             .clone();
-        let mut loads = self.loads.lock().unwrap_or_else(PoisonError::into_inner);
-        if loads
-            .get(&tenant)
-            .is_some_and(|current| Arc::ptr_eq(current, &load))
-        {
-            loads.remove(&tenant);
-        }
+        participant.finish();
         loaded
     }
 
@@ -371,7 +452,9 @@ mod tests {
     use std::collections::BTreeSet;
     use std::num::NonZeroU64;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use tokio::sync::oneshot;
     use wyrd_gateway::GatewayTenantSnapshot;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::error::WyrdError;
@@ -399,6 +482,11 @@ mod tests {
     /// keeps serving, a malformed one queues every tenant, a lost listener
     /// forgets and queues everything, and a load that raced an invalidation
     /// is not cached.
+    ///
+    /// # Panics
+    /// Panics when a snapshot serves while not listening or for another
+    /// tenant, a notification queues the wrong tenants, a lost listener
+    /// keeps serving, or a raced load is cached.
     #[tokio::test]
     async fn snapshots_serve_only_while_listening_and_reload_in_background() {
         let cache = GatewaySnapshots::default();
@@ -524,6 +612,136 @@ mod tests {
         let retry = cache.fill_generation().expect("listening");
         assert_eq!(cache.install(a, retry, Ok(snapshot())).ok(), Some(true));
         assert!(cache.cached(a).is_some(), "a recovers to current policy");
+    }
+
+    /// Yields until `ready` holds, letting spawned calls make progress.
+    async fn until(ready: impl Fn() -> bool) {
+        while !ready() {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A miss load counted in `started` once it runs, which completes with
+    /// a snapshot only when its returned sender fires.
+    fn held(
+        started: &Arc<AtomicUsize>,
+    ) -> (
+        oneshot::Sender<()>,
+        impl Future<Output = Result<GatewayTenantSnapshot, WyrdError>> + Send + 'static,
+    ) {
+        let (release, released) = oneshot::channel();
+        let started = Arc::clone(started);
+        (release, async move {
+            started.fetch_add(1, Ordering::SeqCst);
+            let _ = released.await;
+            Ok(snapshot())
+        })
+    }
+
+    /// Spawns one call sharing `tenant`'s miss load through `load`.
+    fn call(
+        cache: &Arc<GatewaySnapshots>,
+        tenant: DataTenantId,
+        load: impl Future<Output = Result<GatewayTenantSnapshot, WyrdError>> + Send + 'static,
+    ) -> tokio::task::JoinHandle<Result<Arc<GatewayTenantSnapshot>, WyrdError>> {
+        let cache = Arc::clone(cache);
+        tokio::spawn(async move { cache.share(tenant, load).await })
+    }
+
+    /// The participants holding `tenant`'s in-flight load, or zero when
+    /// none is in flight.
+    fn participants(cache: &GatewaySnapshots, tenant: DataTenantId) -> usize {
+        cache
+            .loads
+            .lock()
+            .expect("loads lock")
+            .get(&tenant)
+            .map_or(0, |load| Arc::strong_count(load) - 1)
+    }
+
+    /// A cancelled miss caller leaves its peers sharing one load, the last
+    /// participant's cancellation retires only that tenant's entry, cancelled
+    /// tenants never accumulate entries, and a failed load is not kept so a
+    /// retry loads again and then serves warm.
+    ///
+    /// # Panics
+    /// Panics when peers stop sharing one load, a cancelled last caller or
+    /// an ended load leaves an entry, another tenant's entry is removed, or
+    /// a failure is served to a later miss.
+    #[tokio::test]
+    async fn miss_loads_retire_with_their_last_caller() {
+        let cache = Arc::new(GatewaySnapshots::default());
+        cache.reset(true);
+        let started = Arc::new(AtomicUsize::new(0));
+        let (tenant, other) = (DataTenantId::new_v7(), DataTenantId::new_v7());
+
+        let (_other_release, other_load) = held(&started);
+        let other_call = call(&cache, other, other_load);
+        let (_first_release, first_load) = held(&started);
+        let first = call(&cache, tenant, first_load);
+        until(|| started.load(Ordering::SeqCst) == 2).await;
+        let (second_release, second_load) = held(&started);
+        let second = call(&cache, tenant, second_load);
+        until(|| participants(&cache, tenant) == 2).await;
+
+        first.abort();
+        assert!(first.await.is_err_and(|error| error.is_cancelled()));
+        until(|| started.load(Ordering::SeqCst) == 3).await;
+        assert_eq!(
+            participants(&cache, tenant),
+            1,
+            "the survivor keeps the load"
+        );
+        let (_unused, third_load) = held(&started);
+        let third = call(&cache, tenant, third_load);
+        until(|| participants(&cache, tenant) == 2).await;
+        second_release.send(()).expect("the survivor loads");
+        let (second, third) = (
+            second.await.expect("joined").expect("loaded"),
+            third.await.expect("joined").expect("loaded"),
+        );
+        assert!(Arc::ptr_eq(&second, &third), "peers share one result");
+        assert_eq!(started.load(Ordering::SeqCst), 3, "the joiner did not load");
+        assert_eq!(participants(&cache, tenant), 0, "an ended load retires");
+        assert!(cache.cached(tenant).is_some(), "the load serves warm");
+
+        for _ in 0..8 {
+            let cancelled = DataTenantId::new_v7();
+            let before = started.load(Ordering::SeqCst);
+            let (_release, load) = held(&started);
+            let last = call(&cache, cancelled, load);
+            until(|| started.load(Ordering::SeqCst) == before + 1).await;
+            last.abort();
+            assert!(last.await.is_err_and(|error| error.is_cancelled()));
+            assert_eq!(
+                participants(&cache, cancelled),
+                0,
+                "the last caller retires"
+            );
+        }
+        assert_eq!(
+            cache.loads.lock().expect("loads lock").len(),
+            1,
+            "only the other tenant's live load remains"
+        );
+        assert_eq!(participants(&cache, other), 1, "other tenants keep theirs");
+        other_call.abort();
+        assert!(other_call.await.is_err_and(|error| error.is_cancelled()));
+
+        let failing = DataTenantId::new_v7();
+        let failure = cache
+            .share(failing, async {
+                Err(WyrdError::ServiceUnavailable {
+                    message: "storage is down".to_owned(),
+                    details: serde_json::json!({}),
+                })
+            })
+            .await;
+        assert!(failure.is_err());
+        assert_eq!(participants(&cache, failing), 0, "a failed load retires");
+        assert!(cache.share(failing, async { Ok(snapshot()) }).await.is_ok());
+        assert!(cache.cached(failing).is_some(), "the retry serves warm");
+        assert!(cache.loads.lock().expect("loads lock").is_empty());
     }
 
     /// The cache retains at most [`CACHE_TENANTS`] tenants, evicting the

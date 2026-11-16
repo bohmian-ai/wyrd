@@ -286,12 +286,12 @@ datafusion-distributed = { git = "https://github.com/bohmian-ai/datafusion-distr
 # worker without the ty/ruff type checker, and worker hosts report memory in a
 # `MemorySample` event that the pool reads outside turns, including from idle
 # workers. Every Monty crate comes from this rev so the graph holds one copy.
-monty = { git = "https://github.com/bohmian-ai/monty", rev = "d09b19fee24379374b6e826eabe33aaa80eb0d26" }
-monty-fs = { git = "https://github.com/bohmian-ai/monty", rev = "d09b19fee24379374b6e826eabe33aaa80eb0d26" }
-monty-macros = { git = "https://github.com/bohmian-ai/monty", rev = "d09b19fee24379374b6e826eabe33aaa80eb0d26" }
-monty-pool = { git = "https://github.com/bohmian-ai/monty", rev = "d09b19fee24379374b6e826eabe33aaa80eb0d26" }
-monty-proto = { git = "https://github.com/bohmian-ai/monty", rev = "d09b19fee24379374b6e826eabe33aaa80eb0d26" }
-monty-types = { git = "https://github.com/bohmian-ai/monty", rev = "d09b19fee24379374b6e826eabe33aaa80eb0d26" }
+monty = { git = "https://github.com/bohmian-ai/monty", rev = "e54ecafaad8323d88ded7ca2a73ede62d30cf441" }
+monty-fs = { git = "https://github.com/bohmian-ai/monty", rev = "e54ecafaad8323d88ded7ca2a73ede62d30cf441" }
+monty-macros = { git = "https://github.com/bohmian-ai/monty", rev = "e54ecafaad8323d88ded7ca2a73ede62d30cf441" }
+monty-pool = { git = "https://github.com/bohmian-ai/monty", rev = "e54ecafaad8323d88ded7ca2a73ede62d30cf441" }
+monty-proto = { git = "https://github.com/bohmian-ai/monty", rev = "e54ecafaad8323d88ded7ca2a73ede62d30cf441" }
+monty-types = { git = "https://github.com/bohmian-ai/monty", rev = "e54ecafaad8323d88ded7ca2a73ede62d30cf441" }
 datafusion = { git = "https://github.com/bohmian-ai/datafusion", rev = "5f4b1713af4f0394c7c564b6bc6de42e92640186" }
 datafusion-common = { git = "https://github.com/bohmian-ai/datafusion", rev = "5f4b1713af4f0394c7c564b6bc6de42e92640186" }
 datafusion-datasource = { git = "https://github.com/bohmian-ai/datafusion", rev = "5f4b1713af4f0394c7c564b6bc6de42e92640186" }

@@ -121,7 +121,8 @@ impl Sandbox {
     /// its process is gone; a reset worker keeps what it still reports, never
     /// a session envelope. An operation charges the inputs it retains; frames
     /// in flight show in the process's allocator commitment. When pressure
-    /// turns critical, idle workers are reaped.
+    /// turns critical, idle workers are evicted, dropping the heaps they
+    /// grew, and the pool prewarms fresh ones back to `monty_min_workers`.
     ///
     /// # Errors
     /// Returns [`PoolError::Spawn`] when a prewarmed worker cannot start.
@@ -154,7 +155,7 @@ impl Sandbox {
             if let (Some(pool), Ok(runtime)) =
                 (idle.upgrade(), tokio::runtime::Handle::try_current())
             {
-                runtime.spawn(async move { pool.close().await });
+                runtime.spawn(async move { pool.evict_idle().await });
             }
         });
         tokio::spawn(reap(Arc::downgrade(&workers), Arc::downgrade(&pool)));

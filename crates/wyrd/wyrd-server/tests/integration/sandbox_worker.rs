@@ -1079,12 +1079,13 @@ async fn failed_workers_settle_before_capacity_returns() {
 }
 
 /// Prewarmed workers are charged what they report, like any worker, and
-/// critical pressure reclaims them before any operation is cancelled,
-/// leaving fewer than `monty_min_workers`; work then still runs.
+/// critical pressure reclaims them before any operation is cancelled; the
+/// pool then prewarms fresh workers back to `monty_min_workers`, and work
+/// still runs.
 ///
 /// # Panics
-/// Panics when prewarmed workers are uncharged, survive the pressure, or
-/// block later work.
+/// Panics when prewarmed workers are uncharged, survive the pressure, are
+/// never replaced, or block later work.
 #[tokio::test]
 async fn prewarmed_workers_are_charged_and_reaped_under_pressure() {
     let limits = HostedLimits {
@@ -1105,16 +1106,21 @@ async fn prewarmed_workers_are_charged_and_reaped_under_pressure() {
     .await;
 
     let occupied = sandbox.occupy_for_test(0);
-    settle(&sandbox, 0).await;
+    until("the prewarmed workers are reaped and uncharged", || {
+        let charged = sandbox.charged_worker_pids();
+        warm.iter()
+            .all(|pid| !exists(*pid) && !charged.contains(pid))
+            .then_some(())
+    })
+    .await;
     drop(occupied);
     let ran = run(&sandbox, "def f():\n    return 1", "f", json!({}))
         .await
         .expect("work runs after the reclaim");
     assert_eq!(ran.value, json!(1));
-    for pid in warm {
-        assert!(
-            !exists(pid),
-            "prewarmed worker {pid} was reaped under pressure"
-        );
-    }
+    until("the pool prewarms fresh workers again", || {
+        let idle = sandbox.idle_worker_pids();
+        (idle.len() == 2 && idle.iter().all(|pid| !warm.contains(pid))).then_some(())
+    })
+    .await;
 }

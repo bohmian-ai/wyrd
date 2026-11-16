@@ -8,6 +8,7 @@ import type {
   ArtifactInventoryResponse,
   BoundedQueryResult,
   CardRef,
+  CardTypes,
   CardSummary,
   ListCardsRequest,
   ListCardsResponse,
@@ -62,7 +63,13 @@ export type WireRequest =
   | { readonly op: 'bifrost.list_tables' }
   | { readonly op: 'bifrost.describe_table'; readonly namespace: string; readonly name: string }
   | { readonly op: 'bifrost.validate_predicate'; readonly namespace: string; readonly name: string; readonly expression: string }
-  | { readonly op: 'verification.get_execution'; readonly execution_id: string };
+  | { readonly op: 'verification.get_execution'; readonly execution_id: string }
+  /** One Card by kind and server-minted UID: the existing `cards/by-uid` read, for an execution that retains only its Verifier's UID. */
+  | { readonly op: 'cards.get_by_uid'; readonly kind: CardRef['kind']; readonly card_uid: string }
+  | { readonly op: 'verification.get_execution_details'; readonly execution_id: string }
+  | ({ readonly op: 'verification.list_invocations'; readonly execution_id: string } & CardTypes.ExecutionPageQuery)
+  | ({ readonly op: 'verification.list_publications'; readonly execution_id: string } & CardTypes.ExecutionPageQuery)
+  | ({ readonly op: 'verification.get_publication'; readonly execution_id: string; readonly step_id: string; readonly name: string } & CardTypes.PublicationSelector);
 
 /** A complete bounded query result: positional rows, returned only after a valid terminal. */
 export type QueryResult = BoundedQueryResult;
@@ -85,6 +92,11 @@ export interface WireResponses {
   'bifrost.describe_table': TableDescriptionWire;
   'bifrost.validate_predicate': { readonly expression: string };
   'verification.get_execution': VerificationExecutionState;
+  'cards.get_by_uid': RegisteredCard;
+  'verification.get_execution_details': CardTypes.VerificationDetails;
+  'verification.list_invocations': CardTypes.InvocationPage;
+  'verification.list_publications': CardTypes.PublicationPage;
+  'verification.get_publication': CardTypes.Publication;
 }
 
 /** One read's outcome: its response, or the structured refusal or failure. */

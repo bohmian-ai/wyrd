@@ -116,7 +116,7 @@ import { POST as bffLoad } from '../routes/t/[tenantKey]/ui/load/+server';
 import { POST as exampleLoad } from '../../../../../../examples/ui-app/src/routes/view/load/+server';
 import { mcpExecutor } from 'wyrd-ai-ui/mcp';
 import { nodeExecutor } from 'wyrd-ai-ui/node';
-import { Bifrost, WyrdError, type WyrdClient } from 'wyrd-ai';
+import { Bifrost, WyrdError, verify, type WyrdClient } from 'wyrd-ai';
 import catalog from 'wyrd-ai-ui/catalog.json';
 import { place as placeAll, rowsHeight } from '../../packages/ui/src/lib/layout';
 import { layoutDefinition } from '../../packages/ui/src/lib/verifier-layout';
@@ -715,6 +715,68 @@ test('Node executor reconnects after a failed connect', async () => {
   } finally {
     connect.mockRestore();
   }
+});
+
+test('execution reads run as the existing SDK, HTTP and MCP operations', async () => {
+  const producer = { step_id: 'draft', attempt: 2, item_index: 1, iteration_index: null };
+  const requests = [
+    { op: 'cards.get_by_uid', kind: 'Verifier', card_uid: 'card_1' },
+    { op: 'verification.get_execution_details', execution_id: 'exec_1' },
+    { op: 'verification.list_invocations', execution_id: 'exec_1', cursor: 'next', limit: 50 },
+    { op: 'verification.list_publications', execution_id: 'exec_1' },
+    { op: 'verification.get_publication', execution_id: 'exec_1', name: 'tree', ...producer }
+  ] as const satisfies readonly WireRequest[];
+
+  // Node: the SDK's execution handle for execution reads; the Card UID read is the existing HTTP operation through the host's authenticated GET.
+  const handle = {
+    details: vi.fn(async () => 'details'),
+    invocations: vi.fn(async () => 'invocations'),
+    publications: vi.fn(async () => 'publications'),
+    publication: vi.fn(async () => 'publication')
+  };
+  const connect = vi.spyOn(verify.Execution, 'connect').mockResolvedValue(handle as never);
+  const get = vi.fn(async (path: string) => (path.endsWith('card_1') ? Response.json({ card: registered }) : Response.json(notFound, { status: 404 })));
+  try {
+    const client = {} as WyrdClient;
+    expect(await nodeExecutor(client, get).run(requests)).toEqual([
+      { ok: true, value: registered },
+      { ok: true, value: 'details' },
+      { ok: true, value: 'invocations' },
+      { ok: true, value: 'publications' },
+      { ok: true, value: 'publication' }
+    ]);
+    expect(get).toHaveBeenCalledWith('/cards/by-uid/Verifier/card_1');
+    expect(connect).toHaveBeenCalledWith('exec_1', { client });
+    expect(handle.invocations).toHaveBeenCalledWith({ cursor: 'next', limit: 50 });
+    expect(handle.publications).toHaveBeenCalledWith({ cursor: undefined, limit: undefined });
+    expect(handle.publication).toHaveBeenCalledWith('draft', 'tree', { attempt: 2, item_index: 1, iteration_index: null, path: undefined });
+    // A refused UID read keeps the server's problem; a UID is never interpolated as a path.
+    expect((await nodeExecutor(client, get).run([{ op: 'cards.get_by_uid', kind: 'Verifier', card_uid: '../x y' }]))[0]).toEqual({ ok: false, problem: { code: notFound.code, title: notFound.title, status: 404, detail: undefined } });
+    expect(get).toHaveBeenLastCalledWith('/cards/by-uid/Verifier/..%2Fx%20y');
+    // Without a host GET the client's own authenticated fetch reads the same route.
+    const httpAuth = vi.fn(async () => Response.json({ card: registered }));
+    expect((await nodeExecutor({ serverUrl: 'http://wyrd.test', httpAuth } as never).run([requests[0]]))[0]).toEqual({ ok: true, value: registered });
+    expect(httpAuth).toHaveBeenCalledWith('http://wyrd.test/v1/cards/by-uid/Verifier/card_1');
+  } finally {
+    connect.mockRestore();
+  }
+
+  // MCP: each read is the existing tool of the same meaning; cards.get takes kind and UID.
+  const app = { callServerTool: vi.fn(async ({ name }: { name: string }) => ({ content: [], structuredContent: name === 'cards.get' ? { card: registered } : { tool: name } })) };
+  expect(await mcpExecutor(app as never).run(requests)).toEqual([
+    { ok: true, value: registered },
+    { ok: true, value: { tool: 'verification.get_execution_details' } },
+    { ok: true, value: { tool: 'verification.list_invocations' } },
+    { ok: true, value: { tool: 'verification.list_publications' } },
+    { ok: true, value: { tool: 'verification.get_publication' } }
+  ]);
+  expect(app.callServerTool.mock.calls.map(([call]) => call)).toEqual([
+    { name: 'cards.get', arguments: { kind: 'Verifier', card_uid: 'card_1' } },
+    { name: 'verification.get_execution_details', arguments: { execution_id: 'exec_1' } },
+    { name: 'verification.list_invocations', arguments: { execution_id: 'exec_1', cursor: 'next', limit: 50 } },
+    { name: 'verification.list_publications', arguments: { execution_id: 'exec_1' } },
+    { name: 'verification.get_publication', arguments: { execution_id: 'exec_1', name: 'tree', ...producer } }
+  ]);
 });
 
 test('Canonical UI problem projections', async () => {

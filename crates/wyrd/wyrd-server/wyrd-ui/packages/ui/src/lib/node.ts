@@ -3,10 +3,18 @@
  * principal or forwarded browser session. Server-only; the client holds the credential.
  */
 import { Bifrost, Cards, WyrdError, verify, type WyrdClient } from 'wyrd-ai';
-import type { Executor, Problem, WireRequest, WireResult } from './contract.js';
+import { wyrdProblem, type Executor, type Problem, type WireRequest, type WireResult } from './contract.js';
 
-/** Project an SDK failure onto a stable problem; anything else is rethrown. */
+/** A `/v1` response that refused the read, carrying its problem. */
+class Refused extends Error {
+  constructor(readonly problem: Problem) {
+    super(problem.code);
+  }
+}
+
+/** Project an SDK failure or a refused response onto a stable problem; anything else is rethrown. */
 function problem(error: unknown): Problem {
+  if (error instanceof Refused) return error.problem;
   if (error instanceof WyrdError) return { code: error.code, title: error.title, status: error.status, detail: error.detail };
   throw error;
 }
@@ -21,10 +29,24 @@ function retained<T>(connect: () => Promise<T>): () => Promise<T> {
     }));
 }
 
-/** Build an executor over one SDK client. */
-export function nodeExecutor(client: WyrdClient): Executor {
+/** The stable problem a refused `/v1` response carries, or an upstream failure when it carries none. */
+async function refusal(response: Response): Promise<Problem> {
+  const body = (await response.json().catch(() => null)) as Partial<Problem> | null;
+  if (typeof body?.code === 'string') return { code: body.code, title: body.title ?? response.statusText, status: response.status, detail: body.detail };
+  return wyrdProblem('upstream', `The server answered ${response.status}`);
+}
+
+/**
+ * Build an executor over one SDK client.
+ *
+ * `get` reads one `/v1` path as the same principal, for the reads the SDK has
+ * no method for. A host whose client forwards a browser session passes its
+ * session's own GET; absent, the client's authenticated fetch is used.
+ */
+export function nodeExecutor(client: WyrdClient, get: (path: string) => Promise<Response> = (path) => client.httpAuth(`${client.serverUrl}/v1${path}`)): Executor {
   const cards = retained(() => Cards.connect({ client }));
   const bifrost = retained(() => Bifrost.connect({ client }));
+  const execution = (id: string) => verify.Execution.connect(id, { client });
 
   async function read(request: WireRequest, signal?: AbortSignal): Promise<unknown> {
     switch (request.op) {
@@ -62,7 +84,25 @@ export function nodeExecutor(client: WyrdClient): Executor {
       case 'bifrost.validate_predicate':
         return { expression: await (await bifrost()).validatePredicate(request.namespace, request.name, request.expression) };
       case 'verification.get_execution':
-        return (await verify.Execution.connect(request.execution_id, { client })).status();
+        return (await execution(request.execution_id)).status();
+      case 'cards.get_by_uid': {
+        const response = await get(`/cards/by-uid/${request.kind}/${encodeURIComponent(request.card_uid)}`);
+        if (!response.ok) throw new Refused(await refusal(response));
+        return ((await response.json()) as { card: unknown }).card;
+      }
+      case 'verification.get_execution_details':
+        return (await execution(request.execution_id)).details();
+      case 'verification.list_invocations':
+        return (await execution(request.execution_id)).invocations({ cursor: request.cursor, limit: request.limit });
+      case 'verification.list_publications':
+        return (await execution(request.execution_id)).publications({ cursor: request.cursor, limit: request.limit });
+      case 'verification.get_publication':
+        return (await execution(request.execution_id)).publication(request.step_id, request.name, {
+          attempt: request.attempt,
+          item_index: request.item_index,
+          iteration_index: request.iteration_index,
+          path: request.path
+        });
     }
   }
 

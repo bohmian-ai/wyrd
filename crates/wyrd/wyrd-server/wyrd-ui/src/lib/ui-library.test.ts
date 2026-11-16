@@ -2275,9 +2275,13 @@ test('prompt definitions and comparisons preserve authored forms', async () => {
     from: [{ kind: 'same', text: 'a' }, { kind: 'gap', text: '3 unchanged lines' }, { kind: 'same', text: 'e' }, { kind: 'changed', text: 'old' }, { kind: 'same', text: 'z' }],
     to: [{ kind: 'same', text: 'a' }, { kind: 'gap', text: '3 unchanged lines' }, { kind: 'same', text: 'e' }, { kind: 'changed', text: 'new' }, { kind: 'same', text: 'z' }]
   });
-  // Texts too long to match line by line are shown whole rather than computed.
-  const long = Array.from({ length: 600 }, (_, index) => `line ${index}`).join('\n');
-  expect(diffLines(long, long).from.every((line) => line.kind === 'changed')).toBe(true);
+  // A differing middle too long to match line by line is shown whole rather than computed; shared ends stay unchanged.
+  const oversized = (side: string) => ['first', ...Array.from({ length: 600 }, (_, index) => `${side} ${index}`), 'last'].join('\n');
+  const whole = diffLines(oversized('old'), oversized('new'));
+  expect(whole.from.map((line) => line.kind)).toEqual(['same', ...Array.from({ length: 600 }, () => 'changed'), 'same']);
+  expect(whole.to[1]).toEqual({ kind: 'changed', text: 'new 0' });
+  // Identical texts have no changed line, whatever their length.
+  expect(diffLines(oversized('old'), oversized('old')).from.map((line) => line.kind)).toEqual(['same', 'gap', 'same']);
   const drawn = render(VersionDiff, diff).container;
   expect(drawn.querySelector('section[aria-label="response_format"] [data-side="from"]')).toHaveTextContent('not set');
   expect(drawn.querySelector('section[aria-label="response_format"] [data-side="to"] [data-line="changed"]')).toHaveTextContent('+ verdict');

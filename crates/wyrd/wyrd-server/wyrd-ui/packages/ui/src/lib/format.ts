@@ -156,25 +156,36 @@ export interface DiffLine {
   text: string;
 }
 
-/** The most line pairs `diffLines` matches: about 500 lines a side. */
+/** The most differing line pairs `diffLines` matches: about 500 lines a side. */
 const DIFF_CELLS = 250_000;
 
 /**
  * Two texts → each side's lines, marking the lines the other side lacks.
  * Unchanged runs longer than three lines keep one line of context at each
- * end and say how many lines are left out, the same on both sides. Texts
- * too long to match line by line come back whole, every line changed.
+ * end and say how many lines are left out, the same on both sides. Lines
+ * shared at the start and end are always unchanged; a differing middle too
+ * long to match line by line comes back whole, every line changed.
  */
 export function diffLines(from: string, to: string): { from: DiffLine[]; to: DiffLine[] } {
   const a = from.split('\n');
   const b = to.split('\n');
-  // ponytail: quadratic longest-common-subsequence table, so texts past the bound are shown whole as changed; switch to Myers if large texts need line matching.
-  if (a.length * b.length > DIFF_CELLS) return { from: a.map((text) => ({ kind: 'changed', text })), to: b.map((text) => ({ kind: 'changed', text })) };
-  const common = Array.from({ length: a.length + 1 }, () => new Array<number>(b.length + 1).fill(0));
-  for (let i = a.length - 1; i >= 0; i -= 1)
-    for (let j = b.length - 1; j >= 0; j -= 1) common[i][j] = a[i] === b[j] ? common[i + 1][j + 1] + 1 : Math.max(common[i + 1][j], common[i][j + 1]);
+  // Lines shared at the start and end need no matching; only the middle is compared.
+  let head = 0;
+  while (head < a.length && head < b.length && a[head] === b[head]) head += 1;
+  let tail = 0;
+  while (tail < a.length - head && tail < b.length - head && a[a.length - 1 - tail] === b[b.length - 1 - tail]) tail += 1;
+  const endA = a.length - tail;
+  const endB = b.length - tail;
+  // ponytail: quadratic longest-common-subsequence table, so a middle past the bound is shown whole as changed; switch to Myers if large texts need line matching.
+  const matched = (endA - head) * (endB - head) <= DIFF_CELLS;
+  const common = matched ? Array.from({ length: endA - head + 1 }, () => new Array<number>(endB - head + 1).fill(0)) : [];
+  if (matched)
+    for (let i = endA - 1; i >= head; i -= 1)
+      for (let j = endB - 1; j >= head; j -= 1)
+        common[i - head][j - head] = a[i] === b[j] ? common[i - head + 1][j - head + 1] + 1 : Math.max(common[i - head + 1][j - head], common[i - head][j - head + 1]);
+
   const sides = { from: [] as DiffLine[], to: [] as DiffLine[] };
-  let same: string[] = [];
+  let same: string[] = a.slice(0, head);
   const flush = () => {
     const kept: DiffLine[] =
       same.length > 3
@@ -184,19 +195,20 @@ export function diffLines(from: string, to: string): { from: DiffLine[]; to: Dif
     sides.to.push(...kept);
     same = [];
   };
-  let i = 0;
-  let j = 0;
-  while (i < a.length || j < b.length) {
-    if (i < a.length && j < b.length && a[i] === b[j]) {
+  let i = head;
+  let j = head;
+  while (i < endA || j < endB) {
+    if (matched && i < endA && j < endB && a[i] === b[j]) {
       same.push(a[i]);
       i += 1;
       j += 1;
       continue;
     }
     flush();
-    if (j >= b.length || (i < a.length && common[i + 1][j] >= common[i][j + 1])) sides.from.push({ kind: 'changed', text: a[i++] });
+    if (j >= endB || (i < endA && (!matched || common[i - head + 1][j - head] >= common[i - head][j - head + 1]))) sides.from.push({ kind: 'changed', text: a[i++] });
     else sides.to.push({ kind: 'changed', text: b[j++] });
   }
+  same.push(...a.slice(endA));
   flush();
   return sides;
 }

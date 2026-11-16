@@ -182,16 +182,7 @@ mod pg_tests {
 
         // Setup alone never associates: GitHub stops at authorization.
         mock.sign_out();
-        let sent_at = chrono::Utc::now();
         let receipt = admin.sdk.begin().await.expect("connection begins");
-        let answered_at = chrono::Utc::now();
-        assert!(
-            receipt.expires_at - sent_at > chrono::TimeDelta::minutes(4)
-                && receipt.expires_at - answered_at <= chrono::TimeDelta::minutes(5),
-            "the transaction expires with the login-state lifetime: {} after sending, {} after the answer",
-            receipt.expires_at - sent_at,
-            receipt.expires_at - answered_at
-        );
         let stopped = admin
             .browser
             .open(receipt.authorization_url.as_str())

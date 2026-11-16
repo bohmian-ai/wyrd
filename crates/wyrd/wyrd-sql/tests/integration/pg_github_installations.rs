@@ -574,11 +574,13 @@ mod pg_tests {
     /// GitHub connection transactions share login state but never its flow:
     /// the OIDC callback cannot consume one, the GitHub callback cannot
     /// consume an OIDC login, and a GitHub transaction binds and completes
-    /// only for its beginning principal's browser, in its tenant, once.
+    /// only for its beginning principal's browser, in its tenant, once. A
+    /// transaction expires `ttl` after PostgreSQL records it, on
+    /// PostgreSQL's clock.
     ///
     /// # Panics
-    /// Panics when a cross-flow, foreign, or replayed transition succeeds or
-    /// a valid one fails.
+    /// Panics when a cross-flow, foreign, or replayed transition succeeds, a
+    /// valid one fails, or the expiry is not `ttl` past the insert.
     #[tokio::test]
     async fn github_transactions_are_flow_principal_and_browser_bound() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -595,11 +597,23 @@ mod pg_tests {
 
         let github = Sha256Hex::digest(b"github-state");
         let mut conn = fixture.tenant_conn_for(tenant_a).await.expect("conn opens");
-        assert!(
+        let database_now = "SELECT statement_timestamp()";
+        let before: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(database_now)
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("database clock reads");
+        let expires_at =
             insert_github_login_state(&mut conn, &github, &github_state(actor, fresh(), None), ttl)
                 .await
                 .expect("inserts")
-                .is_some()
+                .expect("a fresh state inserts");
+        let after: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(database_now)
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("database clock reads");
+        assert!(
+            before + ttl <= expires_at && expires_at <= after + ttl,
+            "{expires_at} is not {ttl:?} past the insert, between {before} and {after}"
         );
         let oidc = Sha256Hex::digest(b"oidc-state");
         assert!(

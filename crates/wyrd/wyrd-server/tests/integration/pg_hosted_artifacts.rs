@@ -1476,7 +1476,7 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
 /// A queued execution that process memory cannot admit returns to the
 /// queue with its attempt refunded and runs once memory frees.
 ///
-/// The test fills process memory so pressure turns critical. The queued
+/// An overcommitted worker turns process pressure critical. The queued
 /// execution waits out its code timeout, is refused busy, and is
 /// deferred rather than failed, retried, or judged; once the memory frees,
 /// it completes on its first counted attempt with its real verdict.
@@ -1539,9 +1539,10 @@ async fn busy_queued_execution_is_deferred_until_capacity_frees() {
             .expect("blocks are hosted")
             .sandbox(),
     );
-    // Full process memory keeps pressure critical, pausing the queued
-    // operation until its code timeout, when it defers.
-    let held = sandbox.occupy_for_test(0);
+    // An overcommitted worker keeps pressure critical, pausing the queued
+    // operation until its code timeout, when it defers; the byte ledger
+    // keeps room for the run's input read and result.
+    let held = sandbox.overcommit_for_test();
     let deferred = seed
         .submit(&adder, &subject, one())
         .await

@@ -158,6 +158,34 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
    never replaced). They run with `cargo test -p monty-pool --test pool_test`
    in the fork: 125 passed.
 
+   Diagnoses. Each was made by a fresh Codex diagnostician given only the
+   failing command, its trace and the diff.
+   - **D1. Symptom:** `sandbox_worker::workspace_writes_share_one_budget`
+     aborted with a stack overflow after the Monty 1.6 bump.
+     **Evidence:** debug frames of 696 KiB (test poll), 652 KiB (sandbox
+     program) and 172 KiB (its timeout); the test passes with
+     `RUST_MIN_STACK` of 2.5 MiB. **Cause:** `Sandbox::exec`'s state machine,
+     embedding the larger 1.6 checkout turns, was stored by value in every
+     caller. **Fix site:** `Sandbox::exec` boxes its body once, and
+     `run_turn` takes boxed turns; the two call-site boxes were removed.
+   - **D2. Symptom:** `stale_worker_telemetry_stops_new_work_without_freeing_usage`
+     failed with "worker charges never settled" after SIGKILL.
+     **Evidence:** the pool retained the killed idle worker unreaped, the
+     sandbox treated the zombie pid as alive, and only checkout reaped dead
+     workers, while checkout was blocked by that worker's stale telemetry.
+     **Fix site:** the fork's `Pool::idle_worker_memory` reaps dead idle
+     workers through acquisition's own accounting.
+   - **D3. Symptom:** `pg_hosted_artifacts::busy_queued_execution_is_deferred_until_capacity_frees`
+     was never deferred. **Evidence:** the trace shows Scribe refusing
+     `execution_inputs` as saturated, the ledger 5,881 bytes over its 2 GiB
+     limit, and a runner retry instead of a deferral. **Cause:** the fixture
+     filled the whole shared ledger, starving the run's input read before it
+     reached Python. **Fix site:** the test-support fixture.
+     `Sandbox::overcommit_for_test` reports an overcommitted worker through
+     `WorkloadManager::observe_commitment`, keeping pressure critical with
+     ledger room left. Raw-ledger occupation stays for the isolated refusal
+     tests.
+
 3. **Capacity, sharing and pressure transitions — REQ-020,021; AC-016.** Runtime
    tests use the agreed P/H/M and q=max(L/M,A/P), unequal demand/local caps and
    multiple tenants. One workload borrows idle capacity without charged floors;

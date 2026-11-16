@@ -208,6 +208,18 @@ impl Sandbox {
         OccupiedForTest { charge, pin }
     }
 
+    /// Report one worker committing more memory than the process ceiling
+    /// until the returned observation drops, so every pressure sample is
+    /// critical while the byte ledger keeps its room for the stores and
+    /// queries a run needs before and after Python.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn overcommit_for_test(&self) -> wyrd_runtime::resources::CommitObservation {
+        let observation = self.workloads.observe_commitment();
+        observation.set(u64::MAX);
+        observation
+    }
+
     /// CPU lanes free now: of the process's effective CPUs, those no turn or
     /// other workload holds.
     #[must_use]

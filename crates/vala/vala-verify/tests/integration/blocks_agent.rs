@@ -529,7 +529,10 @@ impl EvidenceReader for PinnedDeck {
     ///
     /// # Errors
     /// Always [`BlockError::Terminal`].
-    async fn media(&self, _evidence: &InputDeclaration) -> Result<MediaRef, BlockError> {
+    async fn media(
+        &self,
+        _evidence: &InputDeclaration,
+    ) -> Result<(skald_spec::MediaRef, Box<dyn std::any::Any + Send + Sync>), BlockError> {
         Err(BlockError::Terminal {
             reason: "no media".to_owned(),
         })
@@ -3308,4 +3311,160 @@ async fn nested_calls_refuse_writable_tools_and_model_calls_keep_their_call_id()
         Some(Sha256Hex::digest(refused.to_string().as_bytes())),
         "code saw both writable tools refused"
     );
+}
+
+/// Evidence whose media is one PNG image, guarded by a clone of `held` so
+/// a test can see whether the guard is still alive.
+struct HeldMedia {
+    /// Cloned into every guard the reader returns.
+    held: Arc<()>,
+}
+
+#[async_trait]
+impl EvidenceReader for HeldMedia {
+    /// One PNG image, guarded by a clone of `held`.
+    ///
+    /// # Errors
+    /// Never fails.
+    async fn media(
+        &self,
+        _evidence: &InputDeclaration,
+    ) -> Result<(MediaRef, Box<dyn std::any::Any + Send + Sync>), BlockError> {
+        Ok((
+            MediaRef::image_base64("image/png", "iVBORw0KGgo="),
+            Box::new(Arc::clone(&self.held)),
+        ))
+    }
+
+    /// No citations.
+    ///
+    /// # Errors
+    /// Never fails.
+    async fn cited(
+        &self,
+        _reachable: &BTreeSet<SlotName>,
+        _citations: Vec<Citation>,
+    ) -> Result<Vec<Citation>, BlockError> {
+        Ok(Vec::new())
+    }
+}
+
+/// A provider that records how many holders `held` has when a request
+/// arrives, then answers from its queue or, when `pend` is set, never.
+#[derive(Clone)]
+struct WatchingMedia {
+    /// The scripted answers.
+    mock: MockProvider,
+    /// The reader's guard target.
+    held: Arc<()>,
+    /// Holders of `held` seen at each request.
+    seen: Arc<std::sync::Mutex<Vec<usize>>>,
+    /// Never answer.
+    pend: bool,
+}
+
+#[async_trait]
+impl Provider for WatchingMedia {
+    /// Record the holders of `held`, then answer or pend.
+    ///
+    /// # Errors
+    /// Returns the mock's error for an empty queue.
+    ///
+    /// # Panics
+    /// Panics when the log's lock is poisoned.
+    async fn send(&self, request: &ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        self.seen
+            .lock()
+            .expect("unpoisoned")
+            .push(Arc::strong_count(&self.held));
+        if self.pend {
+            std::future::pending::<()>().await;
+        }
+        self.mock.send(request).await
+    }
+
+    /// Streams are not used.
+    ///
+    /// # Errors
+    /// Always the mock's empty-stream error.
+    async fn stream(&self, request: &ProviderRequest) -> Result<ProviderStream, ProviderError> {
+        self.mock.stream(request).await
+    }
+
+    /// The mocked provider name.
+    fn name(&self) -> ProviderName {
+        self.mock.name()
+    }
+}
+
+/// The media an Agent binds stays held by its evidence reader's guard
+/// while the provider request carries it, and the guard is released once
+/// the call completes or is cancelled mid-request.
+///
+/// # Panics
+/// Panics when the provider sees the guard released, or the guard outlives
+/// the finished or cancelled call.
+#[tokio::test]
+async fn bound_media_stays_held_until_the_agent_call_ends() {
+    for pend in [false, true] {
+        let held = Arc::new(());
+        let provider = WatchingMedia {
+            mock: MockProvider::new(ProviderName::OpenAi),
+            held: Arc::clone(&held),
+            seen: Arc::default(),
+            pend,
+        };
+        provider.mock.push_response(openai_text_response("a cat"));
+        let mut providers = ProviderRegistry::new();
+        providers.register(Arc::new(provider.clone()));
+        let executor = AgentExecutor::new(
+            Arc::new(providers),
+            Arc::new(NoRegistry),
+            Arc::new(NoRegistry),
+        )
+        .with_evidence(Arc::new(HeldMedia {
+            held: Arc::clone(&held),
+        }));
+        let prompt = openai_chat(
+            "gpt-test",
+            OpenAiChatOptions {
+                messages: vec!["Describe ${media:shot}".to_owned()],
+                ..OpenAiChatOptions::default()
+            },
+        )
+        .expect("static prompt is valid");
+        let inputs = BTreeMap::from([(
+            "shot".to_owned(),
+            CallInput {
+                value: CallValue::Evidence(InputDeclaration::File {
+                    sha256: Sha256Hex::digest(b"png"),
+                    size_bytes: 3,
+                    format: skald_spec::MediaFormat::Png,
+                    filename: None,
+                }),
+                sources: BTreeSet::new(),
+            },
+        )]);
+
+        let call = agent(prompt, &[]);
+        let idle = Arc::strong_count(&held);
+        let run = step(&executor, &call, inputs);
+        if pend {
+            let cancelled = tokio::time::timeout(Duration::from_millis(200), run).await;
+            assert!(cancelled.is_err(), "the pending provider never answers");
+        } else {
+            run.await.expect("the media step runs");
+        }
+
+        assert_eq!(
+            *provider.seen.lock().expect("unpoisoned"),
+            [idle + 1],
+            "the provider request sees the guard held (pend: {pend})"
+        );
+        assert_eq!(
+            Arc::strong_count(&held),
+            idle,
+            "the guard is released once the call ends (pend: {pend})"
+        );
+    }
 }

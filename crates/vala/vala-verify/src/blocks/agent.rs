@@ -9,6 +9,7 @@
 //! any number of distinct Agents, and no call can see another's media,
 //! tools, or workspace.
 
+use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -97,13 +98,20 @@ pub trait PromptCardResolver: Send + Sync {
 /// provider media kind.
 #[async_trait]
 pub trait EvidenceReader: Send + Sync {
-    /// Read `evidence` as inline provider-native media.
+    /// Read `evidence` as inline provider-native media, with a guard holding
+    /// the host resources the media's bytes take, such as their process
+    /// memory charge. The Agent call keeps the guard until the bound Prompt
+    /// that carries the media is dropped, on completion or cancellation.
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for missing, unauthorized,
-    /// mismatched, oversized, or non-native evidence and
+    /// mismatched, oversized, or non-native evidence,
+    /// [`BlockError::Busy`] when the host cannot hold the media now, and
     /// [`BlockError::Retryable`] for a transient storage failure.
-    async fn media(&self, evidence: &InputDeclaration) -> Result<MediaRef, BlockError>;
+    async fn media(
+        &self,
+        evidence: &InputDeclaration,
+    ) -> Result<(MediaRef, Box<dyn Any + Send + Sync>), BlockError>;
 
     /// The subset of `citations` whose slot is in `reachable` and whose
     /// locator names a location in that slot's pinned original evidence.
@@ -298,7 +306,9 @@ impl AgentExecutor {
         }
     }
 
-    /// Bind `inputs` to the placeholders of `prompt`, the call's own copy.
+    /// Bind `inputs` to the placeholders of `prompt`, the call's own copy,
+    /// returning it with its text variables and the guards of the media it
+    /// binds, which must outlive every use of the bound copy.
     ///
     /// Input keys must equal the Prompt's text and media placeholders. JSON
     /// strings render raw and other JSON as JSON text; evidence binds as
@@ -317,7 +327,7 @@ impl AgentExecutor {
         prompt: Prompt,
         inputs: &BTreeMap<String, CallInput>,
         slots: &BTreeSet<SlotName>,
-    ) -> Result<(Prompt, Vec<(String, String)>), BlockError> {
+    ) -> Result<Bound, BlockError> {
         let mut bound = prompt.into_native();
         let placeholders: BTreeSet<&str> = bound
             .variables
@@ -329,6 +339,7 @@ impl AgentExecutor {
             return Err(terminal("Agent inputs must match the Prompt placeholders"));
         }
         let mut vars = Vec::new();
+        let mut media_guards = Vec::new();
         for (name, input) in inputs {
             let is_media = bound.media_variables.contains(name);
             match (&input.value, is_media) {
@@ -338,7 +349,8 @@ impl AgentExecutor {
                         .evidence
                         .as_ref()
                         .ok_or_else(|| terminal("media inputs need an evidence reader"))?;
-                    let media = reader.media(evidence).await?;
+                    let (media, guard) = reader.media(evidence).await?;
+                    media_guards.push(guard);
                     bound
                         .bind_media_mut(name, &media)
                         .map_err(|error| BlockError::Terminal {
@@ -372,7 +384,11 @@ impl AgentExecutor {
                     reason: format!("the Verdict citation slots cannot be narrowed: {error}"),
                 })?;
         }
-        Ok((Prompt::from_native(bound), vars))
+        Ok(Bound {
+            prompt: Prompt::from_native(bound),
+            vars,
+            media_guards,
+        })
     }
 
     /// Run the Agent `call` of `block` and return its raw run plus
@@ -423,7 +439,11 @@ impl AgentExecutor {
             Role::Check(slots) => (*slots, None),
         };
         let started = phase_end("resolve", started);
-        let (prompt, vars) = self.bind(resolved.prompt, inputs, slots).await?;
+        let Bound {
+            prompt,
+            vars,
+            media_guards,
+        } = self.bind(resolved.prompt, inputs, slots).await?;
         let started = phase_end("bind", started);
         let declared = resolved
             .spec
@@ -497,6 +517,7 @@ impl AgentExecutor {
             structured: run.structured_output,
             text: run.output,
             prompt,
+            _media_guards: media_guards,
             provenance: CallProvenance::Agent {
                 agent: resolved.agent_ref,
                 prompt: resolved.prompt_ref,
@@ -619,8 +640,20 @@ struct Invoked {
     text: String,
     /// The bound Prompt that ran.
     prompt: Arc<Prompt>,
+    /// Guards of the media `prompt` carries, released with it.
+    _media_guards: Vec<Box<dyn Any + Send + Sync>>,
     /// Agent, Prompt, and effective route.
     provenance: CallProvenance,
+}
+
+/// One call's Prompt copy with its inputs bound.
+struct Bound {
+    /// The bound copy.
+    prompt: Prompt,
+    /// Text placeholder values.
+    vars: Vec<(String, String)>,
+    /// Guards of the bound media, held while the copy is in use.
+    media_guards: Vec<Box<dyn Any + Send + Sync>>,
 }
 
 /// The stable code of a server that cannot take the call now.

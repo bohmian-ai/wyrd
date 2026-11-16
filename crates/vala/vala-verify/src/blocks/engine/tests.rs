@@ -2480,7 +2480,7 @@ impl EvidenceReader for Kit {
     async fn media(
         &self,
         _evidence: &InputDeclaration,
-    ) -> Result<skald_spec::MediaRef, BlockError> {
+    ) -> Result<(skald_spec::MediaRef, Box<dyn std::any::Any + Send + Sync>), BlockError> {
         Err(BlockError::Terminal {
             reason: "no media".to_owned(),
         })

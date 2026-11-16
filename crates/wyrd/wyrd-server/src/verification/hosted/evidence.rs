@@ -754,12 +754,18 @@ impl EvidenceReader for TenantEvidence {
         Ok(())
     }
 
-    /// Read `evidence` as inline provider-native media.
+    /// Read `evidence` as inline provider-native media, returned with the
+    /// process memory charge for the read bytes and their encoding, which
+    /// the Agent call holds while its provider request carries the media.
     ///
     /// # Errors
-    /// Returns [`Self::read`]'s errors and [`BlockError::Terminal`] for a
-    /// format with no native media kind.
-    async fn media(&self, evidence: &InputDeclaration) -> Result<MediaRef, BlockError> {
+    /// Returns [`Self::read`]'s errors, [`BlockError::Terminal`] for a
+    /// format with no native media kind, and [`BlockError::Busy`] when
+    /// process memory cannot hold the encoding now.
+    async fn media(
+        &self,
+        evidence: &InputDeclaration,
+    ) -> Result<(MediaRef, Box<dyn std::any::Any + Send + Sync>), BlockError> {
         let (Loaded { bytes, mut charge }, format) = self.read(evidence).await?;
         let kind = format.native_kind().ok_or_else(|| BlockError::Terminal {
             reason: format!(
@@ -771,16 +777,14 @@ impl EvidenceReader for TenantEvidence {
         charge.try_grow(encoded).map_err(|_| BlockError::Busy {
             reason: "process memory cannot hold the encoded evidence media now".to_owned(),
         })?;
-        // ponytail: the charge ends here while the provider request still
-        // holds the encoded media; carry it in `MediaRef` if media-heavy
-        // Agents measurably overrun the ledger.
-        Ok(MediaRef {
+        let media = MediaRef {
             kind,
             source: MediaSource::Base64 {
                 mime_type: format.mime().to_owned(),
                 data: base64::engine::general_purpose::STANDARD.encode(bytes),
             },
-        })
+        };
+        Ok((media, Box::new(charge)))
     }
 
     /// Keep each citation whose slot is reachable and pinned and whose

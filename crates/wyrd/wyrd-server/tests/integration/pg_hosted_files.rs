@@ -157,18 +157,25 @@ async fn evidence_refuses_tampered_body() {
         .expect("test server shuts down");
 }
 
-/// Native media is base64 with the format's MIME type; non-native formats
-/// are refused.
+/// Native media is base64 with the format's MIME type and comes with a
+/// guard holding the process memory its bytes and encoding take until it
+/// drops; non-native formats are refused.
 ///
 /// # Panics
-/// Panics when media binding differs.
+/// Panics when media binding or its charge differs.
 #[tokio::test(flavor = "current_thread")]
 async fn evidence_binds_native_media_only() {
     let uploads = Uploads::start().await;
     let pdf = uploads.put(b"%PDF-1.5").await;
     let csv = uploads.put(b"a,b").await;
-    let evidence = uploads.reader();
-    let media = evidence
+    let memory = wyrd_runtime::resources::ByteLedger::new(u64::MAX);
+    let evidence = TenantEvidence::new(
+        uploads.server.state().clone(),
+        user(uploads.server.data_tenant_id(), []),
+        HostedLimits::default(),
+        memory.clone(),
+    );
+    let (media, charge) = evidence
         .media(&file(pdf, 8, MediaFormat::Pdf))
         .await
         .expect("pdf is native");
@@ -179,6 +186,13 @@ async fn evidence_binds_native_media_only() {
             data: "JVBERi0xLjU=".to_owned(),
         }
     );
+    assert_eq!(
+        memory.used(),
+        8 + 12,
+        "the returned guard holds the read bytes and their encoding"
+    );
+    drop(charge);
+    assert_eq!(memory.used(), 0, "dropping the guard returns the charge");
     assert!(
         evidence
             .media(&file(csv, 3, MediaFormat::Csv))

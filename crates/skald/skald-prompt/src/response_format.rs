@@ -1,7 +1,7 @@
 //! Response-format authoring helpers.
 
-use serde_json::Value;
-use skald_spec::ResponseType;
+use serde_json::{Map, Value};
+use skald_spec::{NamedResponseFormat, ResponseType};
 
 use crate::coerce::schema_object;
 use crate::error::PromptBuilderResult;
@@ -30,6 +30,10 @@ pub enum ResponseFormatKind {
         /// JSON Schema object.
         schema: Value,
     },
+    /// A Wyrd-named format such as `verdict`, which sets no native field
+    /// itself; the Prompt compiler resolves its schema once the request is
+    /// built.
+    Named(NamedResponseFormat),
 }
 
 impl Default for ResponseFormat {
@@ -64,18 +68,46 @@ impl ResponseFormat {
         })
     }
 
+    /// Builds the canonical Verdict format: `outcome`, `reason`, and
+    /// `citations`, plus a required object-valued `data` matching the JSON
+    /// Schema `data` when one is given. The native Verdict schema builder
+    /// validates `data` when the Prompt is built.
+    pub fn verdict(data: Option<Map<String, Value>>) -> Self {
+        Self {
+            kind: ResponseFormatKind::Named(match data {
+                None => NamedResponseFormat::Name("verdict".to_owned()),
+                Some(data) => NamedResponseFormat::Expanded {
+                    kind: "verdict".to_owned(),
+                    data: Some(data),
+                },
+            }),
+        }
+    }
+
+    /// Builds the standard code review report format, `code_review`: a fixed
+    /// schema of summary and findings that GitHub delivery renders. It takes
+    /// no custom `data`.
+    pub fn code_review() -> Self {
+        Self {
+            kind: ResponseFormatKind::Named(NamedResponseFormat::Name("code_review".to_owned())),
+        }
+    }
+
     /// Returns the response-format kind.
     pub const fn kind(&self) -> &ResponseFormatKind {
         &self.kind
     }
 
-    /// Converts this builder value to the native prompt response type.
+    /// Converts this builder value to the native prompt response type; a
+    /// named format's type is resolved when its Prompt is built.
     pub fn response_type(&self) -> ResponseType {
         match &self.kind {
-            ResponseFormatKind::Text | ResponseFormatKind::JsonObject => ResponseType::Text,
+            ResponseFormatKind::Text
+            | ResponseFormatKind::JsonObject
+            | ResponseFormatKind::Named(_) => ResponseType::Text,
             ResponseFormatKind::JsonSchema { name, schema } => ResponseType::JsonSchema {
                 name: name.clone(),
-                schema: schema.clone(),
+                schema: schema.clone().into(),
             },
         }
     }
@@ -109,7 +141,12 @@ impl ResponseFormat {
         Ok(Self::json_schema(name, value)?)
     }
 
-    /// Return a JSON-serializable dict for inspection.
+    /// Return a JSON-serializable dict for inspection; a named format is
+    /// its expanded `{"kind": ..., "data"?: ...}` mapping.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` when the value cannot be converted to Python.
     pub fn to_dict(
         &self,
         py: pyo3::Python<'_>,
@@ -120,6 +157,10 @@ impl ResponseFormat {
             ResponseFormatKind::JsonSchema { name, schema } => {
                 serde_json::json!({ "type": "json_schema", "name": name, "schema": schema })
             }
+            ResponseFormatKind::Named(named) => serde_json::json!(NamedResponseFormat::Expanded {
+                kind: named.name().to_owned(),
+                data: named.data().cloned(),
+            }),
         };
         Ok(wyrd_utils::py::json_to_pyobject(py, &value)?)
     }
@@ -132,6 +173,12 @@ impl ResponseFormat {
             ResponseFormatKind::JsonSchema { name, .. } => {
                 format!("ResponseFormat.json_schema(name={name:?})")
             }
+            ResponseFormatKind::Named(
+                named @ NamedResponseFormat::Expanded { data: Some(_), .. },
+            ) => {
+                format!("ResponseFormat.{}(data=...)", named.name())
+            }
+            ResponseFormatKind::Named(named) => format!("ResponseFormat.{}()", named.name()),
         }
     }
 
@@ -148,6 +195,9 @@ impl ResponseFormat {
                 wyrd_utils::json::pretty_json_string(
                     &serde_json::json!({ "type": "json_schema", "name": name, "schema": schema }),
                 )
+            }
+            ResponseFormatKind::Named(named) => {
+                wyrd_utils::json::pretty_json_string(&serde_json::json!(named))
             }
         }
     }

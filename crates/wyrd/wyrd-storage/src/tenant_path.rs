@@ -133,6 +133,45 @@ pub fn evidence(
     }
 }
 
+/// The tenant-qualified object `<tenant>/code-review/<relative_path>` of the
+/// code-review pipeline's snapshot and context cache.
+///
+/// The pipeline scopes its own keys by installation and repository; this
+/// places them under the owning tenant's prefix, outside any Card, so the
+/// path carries an empty `card_uid` like [`evidence`].
+///
+/// # Errors
+/// Returns [`TenantPathError::Empty`] for an empty `relative_path`,
+/// [`TenantPathError::ForbiddenSegment`] for an empty, `.` or `..` segment,
+/// and [`TenantPathError::ShapeMismatch`] for any character outside ASCII
+/// letters, digits, `.`, `_`, `-` and `/`.
+pub fn code_review(
+    data_tenant_id: DataTenantId,
+    relative_path: &str,
+) -> Result<ValidatedPath, TenantPathError> {
+    if relative_path.is_empty() {
+        return Err(TenantPathError::Empty);
+    }
+    for segment in relative_path.split('/') {
+        if matches!(segment, "" | "." | "..") {
+            return Err(TenantPathError::ForbiddenSegment(segment.to_owned()));
+        }
+        if !segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return Err(TenantPathError::ShapeMismatch(relative_path.to_owned()));
+        }
+    }
+    let relative_path = format!("code-review/{relative_path}");
+    Ok(ValidatedPath {
+        full: format!("{data_tenant_id}/{relative_path}"),
+        data_tenant_id,
+        card_uid: String::new(),
+        relative_path,
+    })
+}
+
 /// Validate a stored verification File object path.
 ///
 /// Accepts exactly `<tenant>/evidence/sha256/<digest>/<upload_id>` for
@@ -240,6 +279,27 @@ mod tests {
         assert_eq!(validated.data_tenant_id, tenant);
         assert_eq!(validated.card_uid, card_uid);
         assert_eq!(validated.relative_path, "models/model.bin");
+    }
+
+    /// A code-review cache path sits under its tenant's prefix outside any
+    /// Card; empty, traversal and out-of-charset segments are refused.
+    ///
+    /// # Panics
+    /// Panics when a refused key builds or a valid key builds elsewhere.
+    #[test]
+    fn code_review_paths_stay_under_the_tenant_prefix() {
+        let tenant = DataTenantId::new_v7();
+        let path = super::code_review(tenant, "installations/1/repositories/7/contexts/c-1")
+            .expect("valid key");
+        assert_eq!(
+            path.full,
+            format!("{tenant}/code-review/installations/1/repositories/7/contexts/c-1")
+        );
+        assert_eq!(path.data_tenant_id, tenant);
+        assert!(path.card_uid.is_empty());
+        for refused in ["", "a//b", "a/../b", "./a", "a/b c", "a\\b", "a/%2e"] {
+            assert!(super::code_review(tenant, refused).is_err(), "{refused:?}");
+        }
     }
 
     /// Only the exact session-qualified evidence shape of the caller's

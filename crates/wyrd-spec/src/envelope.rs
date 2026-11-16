@@ -19,6 +19,7 @@ use crate::card::model::ModelSpec;
 use crate::card::operator::OperatorSpec;
 use crate::card::policy::PolicySpec;
 use crate::card::prompt::PromptSpec;
+use crate::card::repository::RepositorySpec;
 use crate::card::service::ServiceSpec;
 use crate::card::source::SourceSpec;
 use crate::card::trigger::TriggerSpec;
@@ -252,6 +253,8 @@ pub enum Spec {
     Operator(OperatorSpec),
     /// Source card spec.
     Source(SourceSpec),
+    /// Repository card spec.
+    Repository(RepositorySpec),
 }
 
 #[cfg(feature = "server")]
@@ -272,6 +275,7 @@ impl utoipa::PartialSchema for Spec {
             .item(<TriggerSpec as utoipa::PartialSchema>::schema())
             .item(<OperatorSpec as utoipa::PartialSchema>::schema())
             .item(<SourceSpec as utoipa::PartialSchema>::schema())
+            .item(<RepositorySpec as utoipa::PartialSchema>::schema())
             .title(Some("Spec"))
             .description(Some("One typed Wyrd Card spec variant."))
             .into()
@@ -313,6 +317,7 @@ impl utoipa::ToSchema for Spec {
         add_schema!(TriggerSpec);
         add_schema!(OperatorSpec);
         add_schema!(SourceSpec);
+        add_schema!(RepositorySpec);
     }
 }
 
@@ -325,7 +330,7 @@ impl schemars::JsonSchema for Spec {
         "Spec".into()
     }
 
-    /// `anyOf` the fourteen typed Card spec schemas, each registered in
+    /// `anyOf` the fifteen typed Card spec schemas, each registered in
     /// `generator`'s definitions. Exactly one variant matches the Card's
     /// `kind`, but an object may also match others, so schema consumers such
     /// as MCP clients validating `cards.get` must accept any match; `kind`,
@@ -346,6 +351,7 @@ impl schemars::JsonSchema for Spec {
             generator.subschema_for::<TriggerSpec>(),
             generator.subschema_for::<OperatorSpec>(),
             generator.subschema_for::<SourceSpec>(),
+            generator.subschema_for::<RepositorySpec>(),
         ];
         schemars::json_schema!({
             "title": Self::schema_name(),
@@ -374,6 +380,7 @@ impl Spec {
             Self::Trigger(_) => CardKind::Trigger,
             Self::Operator(_) => CardKind::Operator,
             Self::Source(_) => CardKind::Source,
+            Self::Repository(_) => CardKind::Repository,
         }
     }
 
@@ -471,6 +478,31 @@ pub struct Status {
     /// Read-side projection only, like `verification`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<crate::card::prompt::PromptStatus>,
+    /// Server-derived Repository policy selection and access, present only
+    /// on a Repository Card. Read-side projection, like `verification`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<RepositoryStatus>,
+}
+
+/// Server-derived state of one Repository Card version.
+///
+/// Exactly one version of a Repository family is selected once a
+/// declaration of it has completed: future pull request reviews use the
+/// selected version's bindings. Selection is separate from the Card's
+/// lifecycle `phase`: an Active version that a later declaration replaced
+/// stays readable and Active but is no longer selected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryStatus {
+    /// Whether this exact version is the family's selected policy.
+    pub selected: bool,
+    /// The family's selected version; `None` before any declaration of the
+    /// family completed.
+    pub selected_version: Option<VersionBlock>,
+    /// `owner/name` as the provider last reported it, while the tenant's
+    /// connection can reach the repository; `None` when it cannot.
+    pub full_name: Option<String>,
 }
 
 /// Native Wyrd Card kind plus forward-compatible external catch-all.
@@ -507,15 +539,17 @@ pub enum CardKind {
     Operator,
     /// Source Card.
     Source,
+    /// Repository Card.
+    Repository,
     /// Unknown/external card kind.
     External,
 }
 
 impl CardKind {
     /// Total v1 Card kind count including `External`.
-    pub const NATIVE_COUNT: usize = 15;
+    pub const NATIVE_COUNT: usize = 16;
     /// Registrable v1 Card kind count (excludes `External`).
-    pub const REGISTRABLE_COUNT: usize = 14;
+    pub const REGISTRABLE_COUNT: usize = 15;
 
     /// Return every native kind including [`CardKind::External`].
     #[must_use]
@@ -535,6 +569,7 @@ impl CardKind {
             Self::Trigger,
             Self::Operator,
             Self::Source,
+            Self::Repository,
             Self::External,
         ]
     }
@@ -557,6 +592,7 @@ impl CardKind {
             Self::Trigger,
             Self::Operator,
             Self::Source,
+            Self::Repository,
         ]
     }
 
@@ -578,6 +614,7 @@ impl CardKind {
             Self::Trigger => "Trigger",
             Self::Operator => "Operator",
             Self::Source => "Source",
+            Self::Repository => "Repository",
             Self::External => "External",
         })
     }
@@ -607,6 +644,7 @@ impl CardKind {
             Self::Trigger => "Trigger",
             Self::Operator => "Operator",
             Self::Source => "Source",
+            Self::Repository => "Repository",
             Self::External => "External",
         }
     }
@@ -629,6 +667,7 @@ impl CardKind {
             | Self::Operator
             | Self::Trigger
             | Self::Verifier
+            | Self::Repository
             | Self::External => false,
         }
     }
@@ -663,6 +702,7 @@ fn native_from_str(value: &str) -> Option<CardKind> {
         "Trigger" => CardKind::Trigger,
         "Operator" => CardKind::Operator,
         "Source" => CardKind::Source,
+        "Repository" => CardKind::Repository,
         "External" => CardKind::External,
         _ => return None,
     })
@@ -704,6 +744,7 @@ impl Serialize for Spec {
             Self::Trigger(s) => s.serialize(serializer),
             Self::Operator(s) => s.serialize(serializer),
             Self::Source(s) => s.serialize(serializer),
+            Self::Repository(s) => s.serialize(serializer),
         }
     }
 }
@@ -795,6 +836,7 @@ fn spec_from_kind_value(kind: &CardKind, mut value: serde_json::Value) -> Result
         CardKind::Trigger => decode(value).map(Spec::Trigger),
         CardKind::Operator => decode(value).map(Spec::Operator),
         CardKind::Source => decode(value).map(Spec::Source),
+        CardKind::Repository => decode(value).map(Spec::Repository),
         CardKind::External => {
             Err("External is a forward-compatibility variant; use a named card kind".to_string())
         }

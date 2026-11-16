@@ -140,7 +140,8 @@ message ReleaseTailCaptureResponse {}
 // content, every other row as the sub_principal_id and act_principal_id
 // values Scribe validates and stamps.
 message IngestCaptureRequest {
-  reserved 6, 7, 8, 9; reserved "verifier", "principal_id", "sub_principal_id", "act_principal_id";
+  reserved 6, 7, 8, 9, 10;
+  reserved "verifier", "principal_id", "sub_principal_id", "act_principal_id", "state";
   string tenant_id = 1; string table = 2; string batch_id = 3; string request_id = 4;
   bytes arrow_ipc = 5;
 }

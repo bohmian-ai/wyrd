@@ -298,18 +298,19 @@ impl Cards {
             Declarable::Input(input) => self.submit(input).await,
             Declarable::Path(path) => self.declare_from_path(path).await,
             Declarable::Card(card) => {
-                let declaration = card.declaration()?;
+                let mut declaration = card.declaration()?;
                 let mut published = None;
-                for artifact in declaration.artifacts {
-                    published = Some(
-                        self.publish_artifact(
+                while let Some(artifact) = declaration.artifacts.first().cloned() {
+                    let receipt = self
+                        .publish_artifact(
                             artifact.source,
                             artifact.metadata,
                             artifact.spec,
                             artifact.extract,
                         )
-                        .await?,
-                    );
+                        .await?;
+                    declaration.bind_published(&receipt.root)?;
+                    published = Some(receipt);
                 }
                 match (declaration.input, published) {
                     (Some(input), _) => self.submit(&input).await,

@@ -6,6 +6,28 @@ tasks, task review, remediation, and final change verification. Execution
 discipline for one task is in
 [implementation execution](implementation-execution.md).
 
+## Design to observable proof
+
+The normal authoring flow is `$wyrd-design` → `$wyrd-spec` → `$wyrd-plan` →
+implementation and observable proof. Use the existing Markdown packet and
+approval process.
+
+| Skill | Predecessor | Responsibility and handoff |
+|---|---|---|
+| `wyrd-design` | User intent and repository evidence | Settle the solution, implementation flow, material decisions and observable success in finalized notes and useful supplements. |
+| `wyrd-spec` | Finalized design and supplements | Record the agreement as a concise behavioral contract for human approval. |
+| `wyrd-plan` | Approved spec and finalized design | Carry the agreed approach into cohesive tasks with real inputs, outputs, dependencies and proof. |
+
+Each stage preserves its predecessor's agreement and adds only the detail
+needed for its responsibility. Surface missing material decisions in the
+design conversation instead of silently supplying them. If the approved
+contract changes, revise the spec and obtain renewed approval before affected
+work proceeds. Ordinary private coding choices remain implementation-owned.
+
+Existing approved packets remain authoritative; do not manufacture retroactive
+design artifacts. Bounded direct instructions remain valid under
+[implementation execution](implementation-execution.md#change-contract).
+
 ## Authority
 
 Apply instructions in this order, for spec-driven changes and bounded direct
@@ -24,6 +46,32 @@ test, repository discovery, or implementation conflicts with a requirement,
 invariant, public behavior, material constraint, or required system boundary,
 stop and route the conflict through a specification revision and renewed human
 approval.
+
+## Scope discipline
+
+Every requirement must come from an explicit user decision, an applicable
+repository authority, or behavior strictly necessary to make the agreed
+outcome correct. Explain necessary inferences where they arise; no separate
+provenance ledger is required. A useful improvement or conceivable failure
+mode alone does not authorize an obligation. Keep optional proposals outside
+requirements until agreed.
+
+Planning may decompose approved obligations and identify their necessary work;
+it may not add guarantees, supported cases, interfaces, operational features or
+acceptance obligations. Newly discovered material needs return to design, then
+specification and human approval when the approved contract must change.
+Existing repository safeguards remain mandatory. Reference
+their relevant consequences without restating policy as new change requirements.
+
+Resolve decisions that materially change the agreed outcome, public or
+persisted contract, required ownership, or safety boundary. Ordinary reversible
+implementation decisions remain implementation-owned. Resolve repository
+contradictions only when they prevent specifying or delivering this change
+correctly; report unrelated documentation drift separately.
+
+Stop elaborating when the agreed outcome, affected owner, material constraints
+and credible verification are clear. Do not fill categories, templates or
+scenario lists with additional scope.
 
 ## Write for maintainer approval
 
@@ -47,16 +95,15 @@ system or its contributors; do not invent a user story for mechanical work.
 - Explain verification as an observation: what situation is exercised, what
   must happen, and what result would show a violation. A command or test name
   alone does not explain the proof.
-- Use one scenario per distinct behavior. Group timing variations or equivalent
-  cases in a small table with an expected result for each. Do not duplicate
-  scenarios or hide unrelated guarantees inside a catch-all scenario.
+- Describe the situations needed to establish the agreed behavior. Group
+  equivalent cases when useful; do not expand the supported cases while
+  elaborating acceptance or repeat the same promise as several scenarios.
 - Keep IDs in metadata and one requirement-to-proof mapping. Use descriptive
   names in prose; an acceptance criterion must explain success without making
   the reader chase IDs through several sections.
-- Put inspected symbols, reuse evidence, affected files and exact commands
-  after the behavioral explanation. Combine overlapping inventories and record
-  each command once, with a descriptive link from its scenario. Keep all
-  required execution detail in the same authoritative packet.
+- Put useful source references and verification commands after the behavioral
+  explanation. Record them once. Implementation discovers private mechanics
+  and records actual execution evidence; planning need not predict them.
 
 A compact proof table can connect the decision to its evidence:
 
@@ -87,9 +134,11 @@ interpretation. Ask it to explain, citing the relevant sections:
 4. What does each important proof exercise and assert? What would fail?
 5. What exactly is the maintainer being asked to approve or decide?
 
-The reader reports missing explanations, ambiguous interpretations and
-contradictions. It does not redesign the system, run verification or reject
-wording for subjective style preferences. The author repairs the documents
+The reader reports missing explanations, ambiguous interpretations,
+contradictions and obligations without a source in the agreement or applicable
+authority. Repairs clarify or remove unsupported scope; new material needs
+follow spec approval. The reader does not redesign the system, run verification
+or reject wording for subjective style preferences. The author repairs the documents
 before handoff and checks that the repair preserves their technical meaning.
 Meaning-changing discoveries follow the existing spec approval rules.
 
@@ -100,20 +149,25 @@ same author check; never claim independence for a self-review.
 
 ## Change artifact lifecycle
 
-An optional `$wyrd-design` conversation starts the packet at
+A `$wyrd-design` conversation normally starts the packet at
 `changes/active/<slug>/design/notes.md`, with supplemental files only as needed.
-It records the problem, desired outcome, implementation proposal, evidence,
-decisions, and open questions before a spec exists. Design status is
-`exploring` or `finalized`; the user decides when to finalize. Neither status
-grants spec approval or implementation readiness. Design may propose changes
+It records the problem, agreed solution, end-to-end implementation flow,
+evidence, material decisions and observable success before a spec exists.
+Design status is `exploring` or `finalized`. Finalize when the user agrees the
+proposal and no unresolved decision would materially change the solution.
+Stopping a conversation with such a decision open leaves it `exploring`;
+private coding choices need not be settled. Finalization makes the design ready
+for specification, not approved for implementation. Design may propose changes
 to repository standards, recording the exact conflict and the user's decision
 without silently changing authority. Required authority updates must be
 resolved before spec approval.
 
-`wyrd-spec` and `wyrd-plan` read this folder when present as reference material,
-revalidating its claims and distinguishing user constraints from proposed
-private mechanics. The approved spec remains the behavioral contract. No
-design folder is required for changes that start directly with specification.
+`wyrd-spec` consumes the finalized notes and relevant supplements to record the
+agreement without redesigning it. `wyrd-plan` reads both the approved spec and
+the design to decompose the selected approach into tasks. Distinguish explicit
+decisions from illustrative sketches and private suggestions. Revalidate claims
+only where they matter to the current handoff; missing material decisions
+return to design. The approved spec remains the behavioral contract.
 
 Use one tracked, repository-local change packet while work is active. Keep the
 packet with the implementation so ordinary branches, worktrees, pull requests,
@@ -134,7 +188,7 @@ Store the active packet under:
 
 ```text
 changes/active/<slug>/
-|-- design/                    optional pre-spec research and proposal
+|-- design/                    agreed solution, flow and supporting evidence
 |   `-- notes.md
 |-- spec.md
 `-- tasks/
@@ -189,12 +243,17 @@ than rewriting history to remove small text artifacts.
 
 ## Specification contract
 
-A specification fixes intent, constraints, invariants, externally observable
-behavior, and only those system boundaries that are themselves required. It
-leaves ordinary implementation mechanics open.
+A specification records the finalized design's intent, constraints, material
+decisions, externally observable behavior and required system boundaries.
+Preserve settled implementation constraints without promoting illustrative
+private suggestions into requirements. Link the design and relevant supplements
+and summarize the agreed flow; keep supporting research in the design. Missing
+material decisions return to design rather than being invented during conversion.
+Ordinary implementation mechanics remain open.
 
-Use stable local IDs such as `REQ-001`, `INV-001`, and `AC-001`. A proportionate
-specification covers:
+Use stable local obligation IDs such as `REQ-001`, `INV-001`, and `AC-001`
+for traceability; do not require separate families for the same promise. Keep
+spec ID, revision and status:
 
 ```yaml
 ---
@@ -204,24 +263,16 @@ status: draft
 ---
 ```
 
-1. status and revision;
-2. human intent and user value;
-3. scope and non-goals;
-4. definitions needed to remove ambiguity;
-5. required behavior;
-6. invariants and prohibited outcomes;
-7. externally observable success and failure behavior;
-8. security, tenancy, durability, performance, and compatibility constraints;
-9. required system boundaries and public interfaces when they are part of the
-   contract;
-10. acceptance obligations and credible evidence classes;
-11. open material decisions; and
-12. revision history.
+Default to the problem and agreed outcome, required behavior and exclusions,
+applicable constraints and material decisions, and acceptance observations.
+Describe each promise once. Add definitions, alternatives, detailed contracts
+or rationale only when they explain an actual material choice. Record material
+revisions briefly and identify unresolved material decisions in drafts.
 
-Present these obligations in reading order: an explanation of the proposed
-change and its rationale first, precise behavior and constraints next, then
-acceptance evidence and supporting references. Use the maintainer-approval
-guidance above rather than turning the list into mandatory boilerplate headings.
+Address failure and edge behavior, security, tenancy, durability, performance,
+compatibility, concurrency and persistent formats only where the change affects
+them. Touching an area does not authorize new guarantees for it. Use the
+maintainer-approval guidance above without mandatory boilerplate headings.
 
 Do not prescribe private function signatures, module boundaries, data
 structures, algorithms, internal APIs, persistence mechanics, or concurrency
@@ -230,14 +281,18 @@ architecture authority already fixes it.
 
 Use `draft`, `approved`, and `superseded` status. Only explicit human approval
 moves a draft to approved. A material edit increments the revision and returns
-the spec to draft. An approved spec has no unresolved material decision.
+the spec to draft. An approved spec has no unresolved material decision as
+defined in Scope discipline; it need not settle ordinary implementation choices.
 
 ## Task contract
 
-`wyrd-plan` derives implementation tasks from an approved spec revision.
+`wyrd-plan` derives implementation tasks from an approved spec revision and
+the finalized design, carrying forward the selected implementation approach.
 `wyrd-task-review` packages validated review findings into remediation tasks
-under that same spec. Use as many tasks as cohesive ownership and real
-dependencies require; task count is not a target.
+under that same spec. Default to one task; split only for real dependencies,
+distinct behavioral owners or independently deliverable outcomes. Include each
+outcome's necessary consumer and test updates rather than creating mechanical
+subtasks.
 
 Each task identifies:
 
@@ -258,29 +313,39 @@ remediates: []
 - task ID, kind (`implementation` or `remediation`), and status;
 - approved spec ID and revision;
 - mapped requirement, invariant, and acceptance IDs;
-- outcome, owners, scope, non-goals, and direct dependencies;
-- material implementation decisions and seams that belong below the spec;
-- for new or changed executable behavior, scenarios, or logic, an ordered
-  behavioral test-scenario list and the required Red-Green-Refactor execution
-  discipline;
-- for documentation, generated artifacts, configuration, static obligations,
-  or already-correct behavior that does not require TDD, the reason and a
-  credible static, verification-only, regression, or no-op proof instead;
-- exact focused commands for every specifically named test;
-- broader crate, module, family, integration, codegen, and journey verification;
-- completion evidence and material stop conditions; and
+- outcome, scope, existing owner and missing behavior;
+- the agreed approach and relevant design references;
+- inputs and their actual sources, outputs and their consumers;
+- acceptance observations mapped once to approved obligations;
+- credible verification at the required test tier, with the test owner and
+  existing runner; exact commands for existing tests named in the task;
+- applicable owner lanes, boundary and format/lint checks;
+- relevant exclusions and any real dependencies or material blockers; and
 - for remediation, the parent task and validated finding IDs.
 
-Start with the outcome, one before/after example where useful, the important
-invariants and implementation sequence. Explain scenarios and their expected
-observations before the source-backed implementation reference and exact
-command inventory. Map obligations once without repeating the whole spec.
+Each task implements an agreed part of the flow: input and source → agreed
+change → output and consumer → observable proof. Inputs come from existing
+repository behavior or an identified predecessor task's output. Explain which
+output a dependency supplies; do not add placeholder tasks for existing
+capabilities or fabricate inputs to hide a missing connection.
 
-Task planning fixes outcomes, required boundaries, and source-backed reuse
-decisions. Reversible private mechanics remain implementation-owned. It may not
-weaken or reinterpret the approved spec. A task is ready only when an implementer can
-execute it without making a new material product, contract, ownership,
-security, tenancy, migration, rollout, or acceptance decision.
+Use the smallest readable structure and enough of the agreed approach to
+execute without rediscovering the solution. No step count, empty sections or
+scripted Behavior/RED/GREEN/REFACTOR blocks are required. TDD remains an
+execution discipline. Describe the trigger and expected observation, leaving
+exact new test names, private mechanics and useful refactoring to implementation.
+Static or already-correct behavior needs appropriate proof, not manufactured tests.
+
+Proof exercises actual inputs and demonstrates the promised outputs. At
+connected boundaries it establishes that the downstream consumer uses the
+predecessor's output through the agreed path. Preserve the end-to-end
+acceptance journey; disconnected fixtures alone do not prove the delivered flow.
+
+A task is ready when it covers its approved obligations and an implementer can
+proceed without a new material decision as defined in Scope discipline. It may
+not weaken, reinterpret or enlarge the approved spec. Preserve required
+journeys and shipped language surfaces; full journey lanes and required broad
+aggregates run on the integrated candidate at change review.
 
 Task status moves through `proposed`, `ready`, `in_progress`, `review`, and
 `complete`; use `superseded` when an approved spec revision or replacement task
@@ -290,16 +355,15 @@ when that durability is needed.
 
 ## Reuse evidence and task conflicts
 
-Every implementation task maps each capability to an inspected existing owner
-and symbol, callers and tests, the precise missing behavior, the selected
-extension, and any justification for new machinery. Compare complete workflows:
-leaf-call reuse inside duplicate orchestration is insufficient. New graph
-stores, traversals, loaders, parsers, transports, validators, lifecycle owners,
-caches, and orchestration require evidence that extending the existing owner
-cannot appropriately satisfy the behavior. Private helper choices are not a
-symbol or file allowlist.
+Identify the existing owner and missing behavior in each task; keep routine
+references brief. When proposing new machinery or a changed ownership boundary,
+compare the existing owner's complete workflow and explain why extending it
+cannot appropriately satisfy the outcome. Leaf-call reuse inside duplicate
+orchestration is insufficient. Private helper choices are not a symbol or file
+allowlist, and routine changes need no capability-by-capability research table.
 
-Implementers revalidate this map before adding machinery. Reviews independently
+Implementers revalidate relevant reuse evidence before adding machinery; a
+routine task need not contain a separate reuse map. Reviews independently
 compare actual new machinery with existing owners even when a task prescribed
 it. Correct private task conflicts through `wyrd-plan` under the same approved
 spec; route material behavior or boundary changes through `wyrd-spec` and human
@@ -309,9 +373,12 @@ required.
 
 ## Test command precision
 
-Every named test in a task carries its exact focused command, as defined in
-[`TESTING.md`](../TESTING.md#named-tests). A package-wide `mise run` lane never
-replaces a named-test command.
+Every existing test named in a task carries its exact focused command, as
+defined in [`TESTING.md`](../TESTING.md#named-tests). For tests that do not exist,
+planning identifies the test owner, tier and existing runner without inventing
+names or selectors. Implementation records actual focused commands after
+adding tests, before RED. A package-wide lane never replaces executing a named
+test through its focused command.
 
 ## TDD execution
 

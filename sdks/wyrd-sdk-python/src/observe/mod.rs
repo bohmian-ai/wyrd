@@ -10,6 +10,7 @@ use std::fmt::Display;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyMapping, PyModule, PyString, PyTuple, PyType};
+use wyrd_benchmark::{Cohort, Observation};
 use wyrd_client::observe::{Observe, Run};
 use wyrd_client::verify::{Input, Inputs, Submission};
 use wyrd_spec::error::WyrdError;
@@ -147,7 +148,7 @@ pub(crate) fn json_value(
 ///
 /// # Errors
 /// As [`json_value`].
-fn input(py: Python<'_>, field: &str, value: &Bound<'_, PyAny>) -> WyrdPyResult<Input> {
+pub(crate) fn input(py: Python<'_>, field: &str, value: &Bound<'_, PyAny>) -> WyrdPyResult<Input> {
     if let Ok(file) = value.cast::<PyFile>() {
         return Ok(Input::File(file.get().inner.clone()));
     }
@@ -292,16 +293,85 @@ impl PyRun {
         false
     }
 
-    /// The emit surface for this view.
+    /// The verification and submission surface for this view.
     #[getter]
     fn observe(&self) -> PyObserveHandle {
         PyObserveHandle {
             run: Run::clone(&self.inner),
         }
     }
+
+    /// The caller-table write surface for this view.
+    #[getter]
+    fn bifrost(&self) -> PyRunBifrost {
+        PyRunBifrost {
+            run: Run::clone(&self.inner),
+        }
+    }
 }
 
-/// Python wrapper for the record, verify, and submit calls on one scoped run.
+/// Python wrapper for the caller-table write on one scoped run.
+///
+/// It owns its own view clone rather than borrowing the `Run`, because a Python
+/// caller keeps `run.bifrost` alive independently of the object it came from.
+#[pyclass(module = "wyrd._wyrd.observe", name = "RunBifrost", frozen)]
+pub struct PyRunBifrost {
+    /// The view every row correlates to.
+    run: Run,
+}
+
+#[pymethods]
+impl PyRunBifrost {
+    /// Buffer one row for the state's active table: the root Service's sole
+    /// declared table, else the one bound by `start_bifrost(table=...)` or
+    /// `WyrdState.use_table_by_name`. Performs no IO; `WyrdState.shutdown()`
+    /// drains it.
+    ///
+    /// # Errors
+    /// Raises `WYRD_VALA_412_NO_ACTIVE_TABLE` when no table is active,
+    /// `WYRD_SDK_400_INVALID_OBSERVATION` when it is outside
+    /// `bifrost.datasets`, and otherwise as `write_to`.
+    fn write(&self, py: Python<'_>, row: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
+        let json = json_text(py, "row", row)?;
+        crate::trace::block_on(py, self.run.bifrost().write_json(None, &json))
+            .map_err(WyrdPyError::from)
+    }
+
+    /// Buffer one row for a named registered caller-owned table, leaving the
+    /// active table unchanged.
+    ///
+    /// Blocking: the first call for a table describes it. Later calls reuse the
+    /// writer's cached schema and producer and perform no schema lookup.
+    /// Returning is buffered submission; `WyrdState.shutdown()` drains it.
+    ///
+    /// # Errors
+    /// Raises `WYRD_SPEC_400_VALIDATION` for a row of another shape,
+    /// `WYRD_SDK_400_INVALID_OBSERVATION` for a table outside
+    /// `bifrost.datasets`, `WYRD_SDK_400_BIFROST_NOT_STARTED`,
+    /// `WYRD_SDK_409_BIFROST_CLOSED`, `WYRD_CLIENT_429_QUEUE_FULL`, and the
+    /// server's error for an unknown, unauthorized, or unavailable table.
+    fn write_to(&self, py: Python<'_>, table: &str, row: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
+        let json = json_text(py, "row", row)?;
+        crate::trace::block_on(py, self.run.bifrost().write_json(Some(table), &json))
+            .map_err(WyrdPyError::from)
+    }
+}
+
+/// The benchmark boundary of one `verify` through this module: from the
+/// call's entry with its Python arguments until its Python result exists,
+/// with components `input` (argument extraction), `core` (the shared
+/// client's `verify`, its `client.verify` root nested inside), and `output`
+/// (the result's Python projection). A stateless no-op outside `bench`
+/// builds.
+const SDK_VERIFY: &str = "sdk.verify";
+
+/// The benchmark boundary of one `verify`'s `core`, nested in
+/// [`SDK_VERIFY`], with components `trace` (reading the caller's span),
+/// `run` (the shared client with the GIL released), and `attach` (waiting
+/// to hold the GIL again); see [`crate::trace::block_on_timed`].
+const SDK_VERIFY_NATIVE: &str = "sdk.verify.native";
+
+/// Python wrapper for the verify and submit calls on one scoped run.
 ///
 /// It owns its own view clone rather than borrowing the `Run`, because a Python
 /// caller keeps `run.observe` alive independently of the object it came from.
@@ -313,23 +383,6 @@ pub struct PyObserveHandle {
 
 #[pymethods]
 impl PyObserveHandle {
-    /// Emit one row into a registered caller-owned table.
-    ///
-    /// Blocking: the first call for a table describes it. Later calls reuse the
-    /// writer's cached schema and producer and perform no schema lookup.
-    ///
-    /// # Errors
-    /// Raises `WYRD_SPEC_400_VALIDATION` for a row of another shape,
-    /// `WYRD_SDK_400_INVALID_OBSERVATION` for a table outside
-    /// `bifrost.datasets`, `WYRD_SDK_400_BIFROST_NOT_STARTED`,
-    /// `WYRD_SDK_409_BIFROST_CLOSED`, `WYRD_CLIENT_429_QUEUE_FULL`, and the
-    /// server's error for an unknown, unauthorized, or unavailable table.
-    fn record(&self, py: Python<'_>, table: &str, row: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
-        let json = json_text(py, "row", row)?;
-        crate::trace::block_on(py, self.observe().record_json(table, &json))
-            .map_err(WyrdPyError::from)
-    }
-
     /// Execute the bound Verifier `verifier` on this view's subject now.
     ///
     /// Pass one positional value for a single-slot Verifier or one keyword
@@ -353,11 +406,31 @@ impl PyObserveHandle {
         group_id: Option<&str>,
         named: Option<&Bound<'_, PyDict>>,
     ) -> WyrdPyResult<PyVerificationResult> {
-        let inputs = inputs(py, value, named)?;
-        let observe = self.observe().grouped(group_id)?;
-        crate::trace::block_on(py, observe.verify(verifier, inputs))
+        let mut observation = Observation::start(SDK_VERIFY, || Cohort::NONE);
+        let started = observation.now();
+        let prepared = inputs(py, value, named)
+            .and_then(|inputs| Ok::<_, WyrdPyError>((inputs, self.observe().grouped(group_id)?)));
+        observation.since("input", started);
+        let (inputs, observe) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                observation.finish(wyrd_benchmark::ERROR);
+                return Err(error);
+            }
+        };
+        let started = observation.now();
+        let mut native = observation.child(SDK_VERIFY_NATIVE);
+        let result =
+            crate::trace::block_on_timed(py, &mut native, observe.verify(verifier, inputs));
+        native.settle(&result);
+        observation.since("core", started);
+        let started = observation.now();
+        let result = result
             .map(PyVerificationResult::plain)
-            .map_err(WyrdPyError::from)
+            .map_err(WyrdPyError::from);
+        observation.since("output", started);
+        observation.settle(&result);
+        result
     }
 
     /// [`PyObserveHandle::verify`], with every requirement's custom `data`
@@ -431,5 +504,6 @@ impl PyObserveHandle {
 pub fn register_run(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyRun>()?;
     module.add_class::<PyObserveHandle>()?;
+    module.add_class::<PyRunBifrost>()?;
     Ok(())
 }

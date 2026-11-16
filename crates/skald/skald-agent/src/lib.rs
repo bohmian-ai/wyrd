@@ -9,7 +9,8 @@
 //! Adjacent crates own adjacent surfaces: [`wyrd_spec::AgentCard`] is the
 //! durable on-disk envelope, [`skald_tool::AgentTool`] and [`AgentDelegateTool`]
 //! provide callable tools and delegation. Runs emit OpenTelemetry GenAI-named
-//! `invoke_agent`, `chat`, and `execute_tool` spans through `tracing`.
+//! `invoke_agent` and `execute_tool` spans through `tracing`; each model call
+//! runs inside the inference span [`skald_runtime::dispatch`] opens.
 
 #![deny(missing_docs)]
 

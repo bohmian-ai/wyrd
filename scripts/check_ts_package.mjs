@@ -89,12 +89,12 @@ async function walkFiles(root) {
 
 const rootAllowed = new Set([
   "README.md",
-  "dist/authoring.d.ts",
-  "dist/authoring.js",
   "dist/card-types.d.ts",
   "dist/card-types.js",
   "dist/cli.d.ts",
   "dist/cli.js",
+  "dist/definitions.d.ts",
+  "dist/definitions.js",
   "dist/error-codes.d.ts",
   "dist/error-codes.js",
   "dist/index.d.ts",
@@ -109,6 +109,12 @@ const rootAllowed = new Set([
   "package.json",
 ]);
 const addonAllowed = new Set(["package.json", binary]);
+
+// A bench build exports the benchmark recorder and holds its registry,
+// whose histogram setup message no other code carries.
+if ((await readFile(sourceBinary)).includes("constant duration histogram bounds are valid")) {
+  throw new Error(`${binary} holds the benchmark registry: rebuild it with mise run ts:build`);
+}
 
 assertPublishedPaths(platformManifest, "platform addon manifest");
 assertNoWorkspaceMetadata(platformManifest, "platform addon manifest");
@@ -148,13 +154,20 @@ try {
   const { stdout: importOutput } = await exec(
     process.execPath,
     ["--input-type=module", "-e", `
-      import { Bifrost, TableConfig, WyrdAgentsTraceProcessor } from "wyrd-ai";
+      import { Bifrost, TableConfig, WyrdAgentsTraceProcessor, verify } from "wyrd-ai";
       if (typeof Bifrost.connect !== "function") throw new Error("Bifrost facade missing");
       if (typeof TableConfig !== "function") throw new Error("TableConfig missing");
-      const { Service } = await import("wyrd-ai/authoring");
-      if (new Service("app", "1.0.0").cardRef().version !== "1.0.0") throw new Error("authoring facade missing");
+      if (new verify.Service("app", { version: "1.0.0" }).cardRef()?.version !== "1.0.0") throw new Error("verify definitions missing");
+      if (new verify.Service("app").cardRef() !== undefined) throw new Error("an unversioned Card has a reference");
+      await import("wyrd-ai/authoring").then(
+        () => { throw new Error("wyrd-ai/authoring still resolves"); },
+        (error) => { if (error?.code !== "ERR_PACKAGE_PATH_NOT_EXPORTED") throw error; },
+      );
       // The clean project installs no optional peer, so this proves the Agents SDK is optional.
       await new WyrdAgentsTraceProcessor().onTraceStart({ traceId: "trace_1", name: "workflow" });
+      const { createRequire } = await import("node:module");
+      const addon = createRequire(import.meta.url)("wyrd-ai-${targetPackage}");
+      if ("benchmarkSnapshot" in addon || "benchmarkInstall" in addon) throw new Error("the addon exports the benchmark recorder");
       const resolved = import.meta.resolve("wyrd-ai");
       if (resolved.includes(".ts")) throw new Error("published export resolves to TypeScript: " + resolved);
       console.log(resolved);
@@ -169,8 +182,9 @@ try {
     `import { Bifrost, TableConfig, WyrdAgentsTraceProcessor, WyrdClient, WyrdState } from "wyrd-ai";
 export const processor = new WyrdAgentsTraceProcessor();
 export type Root = [Bifrost, TableConfig, WyrdClient, WyrdState];
-import { Component, Service, Verifier } from "wyrd-ai/authoring";
-export const service: Service = new Service("app", "1.0.0").addComponent(new Component("judge", new Verifier("v", "1.0.0")));
+import { verify } from "wyrd-ai";
+const { Component, Service, Verifier } = verify;
+export const service: verify.Service = new Service("app", { version: "1.0.0" }).addComponent(new Component("judge", new Verifier("v")));
 `,
   );
   const tsc = createRequire(join(sdkDir, "package.json")).resolve("typescript/bin/tsc");

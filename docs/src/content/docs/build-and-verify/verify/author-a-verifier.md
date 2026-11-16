@@ -9,7 +9,7 @@ order: 0
 
 Build the Verifiers for a support desk: one assertion, one Python check, and one model judge. Each step adds a check, binds it, and shows the verdict your code gets back.
 
-You need a running server from [Set up Wyrd](/get-started/setup/). The files live in a `service/` directory next to your program.
+You need a running server from [Set up Wyrd](/get-started/setup/). The files live in a `service/` directory next to your program. To build Verifiers in Python, Rust, or TypeScript instead of YAML, see [Author in code](/build-and-verify/declare/author-in-code/).
 
 ## 1. Write an assertion
 

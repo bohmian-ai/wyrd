@@ -1,0 +1,32 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: code-review
+  version: 1.0.0
+spec:
+  description: An Agent reviews each pull request; it passes when the review is complete with no critical or high findings.
+  steps:
+    - id: pr  # the pull request's pinned source, changes and context
+      action: {kind: extract, extractor: pull_request}
+    - id: review
+      depends_on: [pr]
+      action:
+        kind: agent
+        agent: ./reviewer.yaml
+        inputs: {pr: steps.pr.output.pr, changes: steps.pr.output.changes, context: steps.pr.output.context}
+        workspace: {/inputs/pr.json: steps.pr.output}  # the whole extraction, readable with fs.read
+  requirements:
+    - id: acceptable-review
+      statement: The review is complete with no critical or high findings
+      check:
+        kind: code
+        entrypoint: judge
+        inputs: {report: steps.review.output}  # the code_review report
+        source:
+          inline: |
+            def judge(report):
+                if not report["coverage"]["complete"]:
+                    return {"outcome": "inconclusive", "reason": "The review did not cover the whole change.", "citations": []}
+                if any(f["severity"] in ("critical", "high") for f in report["findings"]):
+                    return {"outcome": "failed", "reason": "The review found critical or high issues.", "citations": []}
+                return {"outcome": "passed", "reason": "The review is complete with no critical or high issues.", "citations": []}

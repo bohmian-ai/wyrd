@@ -34,7 +34,7 @@ use crate::boot::data_root::BifrostDataRoot;
 use crate::components::auth::ServerAuth;
 use crate::components::gateway::Gateway;
 use crate::components::health::Health;
-use crate::config::{BifrostRuntimeConfig, BifrostTarget, DeploymentProfile, ForgeRuntimeConfig};
+use crate::config::{BifrostRuntimeConfig, DeploymentProfile, ForgeRuntimeConfig, ServerTarget};
 use crate::mcp::Mcp;
 #[cfg(feature = "test-support")]
 use crate::oracle::SilentForwardPeer;
@@ -65,7 +65,7 @@ pub(crate) fn registry_db_error(error: impl std::fmt::Display) -> WyrdError {
 /// External dependency graph consumed exactly once by production Bifrost composition.
 pub struct BifrostBuildInputs {
     /// Closed process target controlling the selected subsystem graph.
-    pub target: BifrostTarget,
+    pub target: ServerTarget,
     /// Deployment posture used for fail-closed peer transport validation.
     pub deployment_profile: DeploymentProfile,
     /// Shared production PostgreSQL handles.
@@ -2204,7 +2204,7 @@ pub struct ServerSettings {
     /// Deployment posture (Development / Production) locked at boot.
     pub deployment_profile: DeploymentProfile,
     /// Closed process target derived from `WYRD_TARGET`.
-    pub role: BifrostTarget,
+    pub role: ServerTarget,
     /// Request-shaping limits for the router middleware stack.
     pub limits: LimitsConfig,
 }
@@ -2293,6 +2293,9 @@ pub struct AppStateInner {
     pub verification: Verification,
     /// The `/mcp` surface's in-flight work.
     pub mcp: Mcp,
+    /// The deployment's GitHub App; `None` when not configured, which makes
+    /// only the GitHub integration unavailable.
+    pub github: Option<Arc<crate::components::github::GithubApp>>,
     /// Readiness and peer-plane status.
     pub health: Health,
     /// Shared cancellation token for cooperative shutdown.

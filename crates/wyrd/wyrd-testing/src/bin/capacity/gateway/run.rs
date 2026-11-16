@@ -17,21 +17,25 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use wyrd_testing::release_server::PEAK_SAMPLE_INTERVAL_MS;
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
+use wyrd_benchmark::Distribution;
 use wyrd_client::transport::trace::with_benchmark_labels;
-use wyrd_testing::capacity::{
-    Expected, NANOS_PER_MS, Population, Selection, Usage, Window, release_binary,
-};
+use wyrd_testing::capacity::{Expected, NANOS_PER_MS, Population, Usage, Window, release_binary};
 use wyrd_testing::experiment::{ExperimentError, Phase, Reading, Repetition, Step, Workload};
-use wyrd_testing::gateway_capture::{PacedUpstream, Pacing};
+use wyrd_testing::gateway_capture::{FIXTURE_ROOT, PacedUpstream, Pacing};
 use wyrd_testing::release_server::{LocalServer, Metrics};
 
+use crate::gateway::capacity::{MISS_AFTER, Schedule, open_loop};
 use crate::gateway::workload::{
-    CapturePolicy, Outcome, PREFIXES, Shape, Tenant, Timed, call, http,
+    ATTEMPT_ROOT, CALL_ROOT, Caller, CapturePolicy, HEAD_ROOT, Outcome, PREFIXES, Shape, Tenant,
+    Timed, call, http,
 };
 use crate::gateway::{
     CLIENTS, Case, LARGE_BYTES, PROCESS, Result, SMALL_BYTES, STREAM_CHUNKS, shutdown,
@@ -41,7 +45,7 @@ use crate::gateway::{
 /// once arrivals stop.
 pub const DRAIN_LIMIT: Duration = Duration::from_secs(60);
 
-/// How often a drain reads `/metrics` again.
+/// How often a drain reads the benchmark snapshot again.
 const POLL: Duration = Duration::from_millis(100);
 
 /// The server timing of a buffered call: arrival until its answer handoff.
@@ -57,6 +61,47 @@ pub const STREAM_END: &str = "gateway.stream.end";
 
 /// The outcome of every judged gateway timing.
 pub const SUCCEEDED: &str = "succeeded";
+
+/// The server's Gateway phase histogram.
+pub const PHASE_SECONDS: &str = "wyrd_gateway_phase_duration_seconds";
+
+/// The server's Gateway receipt-to-task-start histogram.
+pub const QUEUE_DELAY_SECONDS: &str = "wyrd_gateway_queue_delay_seconds";
+
+/// The server's benchmark-only Gateway controlled-wait histogram.
+pub const WAIT_SECONDS: &str = "wyrd_gateway_wait_seconds";
+
+/// Every controlled wait a governed call records once while benchmarking.
+pub const WAITS: [&str; 4] = ["dispatch", "provider_headers", "provider_body", "resume"];
+
+/// The driver roots a Gateway window diagnoses, each with whether it
+/// excludes waits and its components; the streamed head, last, only for a
+/// stream.
+pub const DRIVER_ROOTS: [(&str, bool, &[&str]); 4] = [
+    (CALL_ROOT, false, &["send", "body", "decode"]),
+    (ATTEMPT_ROOT, false, &[]),
+    (FIXTURE_ROOT, true, &["parse", "answer"]),
+    (HEAD_ROOT, false, &[]),
+];
+
+/// The server's outbox batch write histogram.
+pub const OUTBOX_WRITE_SECONDS: &str = "outbox_write_seconds";
+
+/// Every Gateway call phase in request order, each recorded once per call
+/// by a successful call without retries; `relay` only by a stream.
+pub const PHASES: [&str; 11] = [
+    "authenticate",
+    "parse",
+    "snapshot",
+    "authorize",
+    "route",
+    "admit",
+    "credential",
+    "translate",
+    "account",
+    "relay",
+    "capture",
+];
 
 /// The server timings each call records, its answer handoff first.
 #[must_use]
@@ -287,6 +332,11 @@ pub struct Observed {
     pub usage: Usage,
     /// The server timings of every call the window sent.
     pub population: Population,
+    /// The window's case and phase labels.
+    pub cohort: (&'static str, &'static str),
+    /// The driver's own observations of the window's calls and fixture
+    /// answers, once collected.
+    pub driver: Option<Population>,
     /// Integrity counters from the baseline to the post-drain scrape.
     pub integrity: Integrity,
     /// What the Scribe outbox wrote during the traffic window alone.
@@ -310,6 +360,7 @@ impl Observed {
             processes: vec![PROCESS.to_owned()],
             server_cpu_seconds: usage.server_cpu_seconds,
             peak_memory_bytes: usage.peak_memory_bytes,
+            opening_memory_bytes: usage.opening_memory_bytes,
             memory_interval_ms: PEAK_SAMPLE_INTERVAL_MS,
             driver_cpu_seconds: usage.driver_cpu_seconds,
             ..Repetition::default()
@@ -331,6 +382,9 @@ impl Observed {
         }
         let population = &self.population;
         population.validate(&mut repetition, "measured");
+        if let Some(driver) = &self.driver {
+            driver.validate(&mut repetition, "measured");
+        }
         let answer = boundaries(self.stream)[0];
         population.percentiles(
             &mut repetition,
@@ -405,8 +459,14 @@ impl Observed {
                 Reading::exact(self.durable.bytes)
             },
         );
+        self.diagnose(&mut repetition);
         repetition.set("drain_s", Reading::exact(self.drain.seconds));
         repetition.set("undrained", Reading::exact(self.drain.remaining));
+        if !samples.errors.is_empty() {
+            repetition
+                .observations
+                .push(format!("errors by outcome: {:?}", samples.errors));
+        }
         if samples.arrivals == 0 {
             repetition
                 .invalid
@@ -427,6 +487,68 @@ impl Observed {
     }
 }
 
+impl Observed {
+    /// Sets the repetition's diagnostic readings from the window's server
+    /// histograms: each Gateway phase, the queue delay, the answer handoff's
+    /// elapsed, provider, and residual distributions, and the Scribe
+    /// outbox's batch writes. Each keeps its own population; an absent
+    /// required one is invalid evidence, never zero. In a window without
+    /// errors every call succeeded once, so each phase a call records once
+    /// must have one observation per answered call, late ones included.
+    fn diagnose(&self, repetition: &mut Repetition) {
+        let population = &self.population;
+        let answered = self.samples.completion_us.len() as u64;
+        let reconcile = self.samples.error_count() == 0;
+        for phase in PHASES {
+            let observation = format!("phase.{phase}");
+            if phase == "relay" && !self.stream {
+                repetition.inapplicable(&observation, "a buffered call relays no stream");
+                continue;
+            }
+            let distribution = population.histogram(PHASE_SECONDS, &[("phase", phase)]);
+            if let Ok(recorded) = distribution.as_ref().map(Distribution::len)
+                && reconcile
+                && recorded != answered
+            {
+                repetition.invalid.push(format!(
+                    "diagnostic `{observation}` recorded {recorded} observations for {answered} answered calls"
+                ));
+            }
+            repetition.diagnose(&observation, distribution, true);
+        }
+        let queue = population.histogram(QUEUE_DELAY_SECONDS, &[]);
+        repetition.diagnose("queue_delay", queue, true);
+        let answer = boundaries(self.stream)[0];
+        let missing = || format!("no `{answer}` timing observation has outcome `{SUCCEEDED}`");
+        let elapsed = population.elapsed(answer, SUCCEEDED).ok_or_else(missing);
+        repetition.diagnose("server_elapsed", elapsed, true);
+        let provider = population.excluded(answer, SUCCEEDED).ok_or_else(missing);
+        repetition.diagnose("provider_excluded", provider, true);
+        let residual = population.residuals(answer, SUCCEEDED);
+        repetition.diagnose("residual", residual, true);
+        let writes = population.histogram(OUTBOX_WRITE_SECONDS, &[("outbox", "scribe")]);
+        repetition.diagnose("outbox_write.scribe", writes, true);
+        for wait in WAITS {
+            let observation = format!("wait.{wait}");
+            let distribution = population.histogram(WAIT_SECONDS, &[("wait", wait)]);
+            repetition.diagnose(&observation, distribution, true);
+        }
+        if let Some(driver) = &self.driver {
+            let roots = if self.stream {
+                &DRIVER_ROOTS[..]
+            } else {
+                &DRIVER_ROOTS[..DRIVER_ROOTS.len() - 1]
+            };
+            driver.diagnose_roots(
+                repetition,
+                self.cohort,
+                roots,
+                reconcile.then_some(answered),
+            );
+        }
+    }
+}
+
 /// The L1 workload: one server, one tenant holding a key per client, and
 /// the instant upstream.
 pub struct Overhead {
@@ -440,18 +562,23 @@ pub struct Overhead {
     policy: Option<CapturePolicy>,
     /// Where the server log is copied when it stops.
     log: PathBuf,
+    /// The open-loop rate every window offers instead of closed-loop
+    /// clients, requests/s, or `None` for the closed-loop default.
+    pace: Option<f64>,
 }
 
 impl Overhead {
-    /// An unprepared workload that will copy the server log to `log`.
+    /// An unprepared workload that will copy the server log to `log`,
+    /// offering `pace` requests/s open loop when one is given.
     #[must_use]
-    pub const fn new(log: PathBuf) -> Self {
+    pub const fn new(log: PathBuf, pace: Option<f64>) -> Self {
         Self {
             server: None,
             upstream: None,
             tenant: None,
             policy: None,
             log,
+            pace,
         }
     }
 
@@ -511,19 +638,26 @@ impl Overhead {
         let shape = case.shape();
         let labels = (case.id(), phase.label());
         if phase == Phase::Warmup {
-            drive(tenant, &shape, clients, Instant::now() + window, labels).await?;
+            let stop = Instant::now() + window;
+            drive(tenant, &shape, clients, self.pace, stop, labels).await?;
             settle(server).await?;
             return Ok(Repetition::default());
         }
         let before = server.timings().await?;
-        let (traffic, baseline) = Window::open(server, Selection::RESOURCES).await?;
+        let driver_before = wyrd_benchmark::snapshot();
+        let (traffic, baseline) = Window::open(server).await?;
         let stop = Instant::now() + window;
         let (samples, usage, stopped) = traffic
-            .measure(server, stop, drive(tenant, &shape, clients, stop, labels))
+            .measure(
+                server,
+                stop,
+                drive(tenant, &shape, clients, self.pace, stop, labels),
+            )
             .await?;
         let samples = samples?;
         let drain = settle(server).await?;
         let last = server.metrics().await?;
+        let settled = settled(server, &last);
         let expected: Vec<Expected<'_>> = boundaries(shape.stream)
             .iter()
             .map(|boundary| Expected {
@@ -535,8 +669,25 @@ impl Overhead {
             })
             .collect();
         let population = Population::collect(server, &before, &expected).await;
+        let answered = samples.completion_us.len() as u64;
+        let mut roots = vec![CALL_ROOT, ATTEMPT_ROOT];
+        roots.extend(shape.stream.then_some(HEAD_ROOT));
+        roots.extend((samples.error_count() == 0).then_some(FIXTURE_ROOT));
+        let owed: Vec<Expected<'_>> = roots
+            .into_iter()
+            .map(|boundary| Expected {
+                boundary,
+                outcome: wyrd_benchmark::SUCCESS,
+                case: labels.0,
+                phase: labels.1,
+                count: answered,
+            })
+            .collect();
+        let driver = Population::collect_driver(&driver_before, &owed).await;
         let observed = Observed {
             stream: shape.stream,
+            cohort: labels,
+            driver: Some(driver),
             samples,
             usage,
             population,
@@ -544,8 +695,36 @@ impl Overhead {
             durable: Durable::between(&baseline, &stopped),
             drain,
         };
-        Ok(observed.repetition())
+        let mut repetition = observed.repetition();
+        repetition.observations.push(settled);
+        Ok(repetition)
     }
+}
+
+/// What the server still holds once a window drained: its resident memory
+/// and the governed memory each Bifrost owner reports in `metrics`, MiB.
+fn settled(server: &LocalServer, metrics: &Metrics) -> String {
+    let mib = |bytes: f64| bytes / 1_048_576.0;
+    let resident = server.resident_memory().map_or_else(
+        || "unread".to_owned(),
+        |bytes| format!("{:.0}", mib(bytes as f64)),
+    );
+    let owners = [
+        "governed_used",
+        "scribe_used",
+        "oracle_used",
+        "forge_used",
+        "transport_used",
+    ]
+    .map(|kind| {
+        let label = format!("kind=\"{kind}\"");
+        format!(
+            "{kind} {:.0}",
+            mib(metrics.sum("bifrost_resource_memory_bytes", &[&label]))
+        )
+    })
+    .join(", ");
+    format!("post-drain MiB: resident {resident}, {owners}")
 }
 
 #[async_trait]
@@ -562,6 +741,10 @@ impl Workload for Overhead {
     /// The server's PID while it runs.
     fn processes(&self) -> Vec<u32> {
         self.server.iter().filter_map(LocalServer::pid).collect()
+    }
+
+    fn heap_profile_url(&self) -> Option<String> {
+        self.server.as_ref().map(LocalServer::heap_profile_url)
     }
 
     /// Runs `phase` of `step` for `window`.
@@ -599,6 +782,8 @@ impl Workload for Overhead {
 /// Runs `clients` closed-loop clients of `tenant`, each with its own
 /// connection and key, making `shape` calls labelled `(case, phase)`
 /// admitted until `stop`; a call validated at or after `stop` is late.
+/// With a `pace`, the same lanes instead carry arrivals offered open loop at
+/// that rate (see [`paced`]).
 ///
 /// # Errors
 ///
@@ -607,19 +792,22 @@ async fn drive(
     tenant: &Tenant,
     shape: &Shape,
     clients: usize,
+    pace: Option<f64>,
     stop: Instant,
     (case, phase): (&'static str, &'static str),
 ) -> Result<Samples> {
     let body = shape.body("overhead");
+    if let Some(rate) = pace {
+        return paced(tenant, shape, clients, rate, stop, (case, phase), body).await;
+    }
     let mut tasks = JoinSet::new();
     for key in tenant.keys.iter().take(clients) {
-        let (http, key, shape, body) = (http()?, key.clone(), shape.clone(), body.clone());
+        let (caller, shape, body) = (Caller::new(http()?, key)?, shape.clone(), body.clone());
         tasks.spawn(async move {
             let mut samples = Samples::default();
             while Instant::now() < stop {
                 let timed =
-                    with_benchmark_labels(case, phase, call(&http, &key, &shape, body.clone()))
-                        .await;
+                    with_benchmark_labels(case, phase, call(&caller, &shape, body.clone())).await;
                 samples.record(&timed, Some(stop));
             }
             samples
@@ -630,6 +818,77 @@ async fn drive(
         match joined {
             Ok(samples) => total.merge(samples),
             Err(_) => *total.errors.entry("panicked".to_owned()).or_default() += 1,
+        }
+    }
+    Ok(total)
+}
+
+/// Offers `shape` calls labelled `(case, phase)` at `rate` requests/s from
+/// now until `stop` through the existing open-loop scheduler, with at most
+/// `clients` open at once, each on a free lane of its own connection and
+/// key. An arrival the scheduler missed or capped counts as an error, so a
+/// window that could not hold its rate is never judged at it.
+///
+/// # Errors
+///
+/// Returns the HTTP client build failure.
+async fn paced(
+    tenant: &Tenant,
+    shape: &Shape,
+    clients: usize,
+    rate: f64,
+    stop: Instant,
+    (case, phase): (&'static str, &'static str),
+    body: Bytes,
+) -> Result<Samples> {
+    let lanes = tenant
+        .keys
+        .iter()
+        .take(clients)
+        .map(|key| Caller::new(http()?, key))
+        .collect::<Result<Vec<_>>>()?;
+    let lanes = Arc::new(Mutex::new(lanes));
+    let samples = Arc::new(Mutex::new(Samples::default()));
+    let calls = Mutex::new(JoinSet::new());
+    let start = Instant::now();
+    // The scheduler drops an arrival that wakes at or after its schedule's
+    // end, and timers fire on whole milliseconds, so an arrivals-free tail
+    // lets the window's last arrivals wake in time; only a real miss counts.
+    let schedule = Schedule::new(vec![
+        (rate, stop.saturating_duration_since(start)),
+        (0.0, MISS_AFTER),
+    ]);
+    let slots = Arc::new(Semaphore::new(clients));
+    let start = tokio::time::Instant::from_std(start);
+    let driven = open_loop(&schedule, start, slots, clients, &calls, |_| {
+        let (lanes, samples, shape, body) = (
+            Arc::clone(&lanes),
+            Arc::clone(&samples),
+            shape.clone(),
+            body.clone(),
+        );
+        async move {
+            // A slot is held for every open call, so a lane is always free.
+            let lane = lanes.lock().unwrap_or_else(PoisonError::into_inner).pop();
+            let Some(caller) = lane else {
+                return;
+            };
+            let timed = with_benchmark_labels(case, phase, call(&caller, &shape, body)).await;
+            samples
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .record(&timed, Some(stop));
+            lanes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(caller);
+        }
+    })
+    .await;
+    let mut total = std::mem::take(&mut *samples.lock().unwrap_or_else(PoisonError::into_inner));
+    for (reason, count) in [("missed", driven.missed), ("capped", driven.capped)] {
+        if count > 0 {
+            *total.errors.entry(reason.to_owned()).or_default() += count;
         }
     }
     Ok(total)
@@ -661,11 +920,96 @@ async fn upstreams() -> std::io::Result<[PacedUpstream; 2]> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use wyrd_telemetry::timing::{Distribution, IntervalSeries};
+    use wyrd_benchmark::{
+        BenchmarkSnapshot, Distribution, HistogramUnit, IntervalSeries, Method, MetricSnapshot,
+        MetricValue,
+    };
     use wyrd_testing::capacity::{Population, UNLABELLED, Usage};
     use wyrd_testing::experiment::Reading;
 
-    use super::{BUFFERED, Drain, Integrity, Observed, STREAM_END, STREAM_HEAD, Samples};
+    use super::{
+        BUFFERED, Drain, Integrity, OUTBOX_WRITE_SECONDS, Observed, PHASE_SECONDS, PHASES,
+        QUEUE_DELAY_SECONDS, STREAM_END, STREAM_HEAD, Samples, WAIT_SECONDS, WAITS,
+    };
+
+    /// A cumulative `_seconds` histogram series `name` with `labels` holding
+    /// `samples` nanoseconds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a sample is outside the duration range.
+    fn histogram(name: &str, labels: &[(&str, &str)], samples: &[u64]) -> MetricSnapshot {
+        MetricSnapshot {
+            name: name.to_owned(),
+            labels: labels
+                .iter()
+                .map(|(label, value)| ((*label).to_owned(), (*value).to_owned()))
+                .collect(),
+            rejected: 0,
+            value: MetricValue::Histogram {
+                unit: HistogramUnit::Nanoseconds,
+                count: samples.len() as u64,
+                buckets: Distribution::of_durations(samples)
+                    .expect("in-range samples")
+                    .buckets(),
+            },
+        }
+    }
+
+    /// The Gateway diagnostic histograms of `calls` calls, phase `i` taking
+    /// `(i + 1) × 10 µs + offset_ns` each, with `writes` Scribe batch writes.
+    fn diagnostics(
+        calls: usize,
+        offset_ns: u64,
+        writes: usize,
+        stream: bool,
+    ) -> Vec<MetricSnapshot> {
+        let mut metrics: Vec<MetricSnapshot> = PHASES
+            .iter()
+            .zip(1_u64..)
+            .filter(|(phase, _)| stream || **phase != "relay")
+            .map(|(phase, step)| {
+                histogram(
+                    PHASE_SECONDS,
+                    &[("operation", "chat"), ("phase", phase)],
+                    &vec![step * 10_000 + offset_ns; calls],
+                )
+            })
+            .collect();
+        metrics.push(histogram(
+            QUEUE_DELAY_SECONDS,
+            &[("operation", "chat")],
+            &vec![70_000 + offset_ns; calls],
+        ));
+        metrics.push(histogram(
+            OUTBOX_WRITE_SECONDS,
+            &[("outbox", "scribe")],
+            &vec![2_000_000 + offset_ns; writes],
+        ));
+        metrics.extend(WAITS.iter().zip(1_u64..).map(|(wait, step)| {
+            histogram(
+                WAIT_SECONDS,
+                &[("operation", "chat"), ("wait", wait)],
+                &vec![step * 1_000 + offset_ns; calls],
+            )
+        }));
+        metrics
+    }
+
+    /// A cumulative snapshot of one process holding `metrics`.
+    fn snapshot(metrics: Vec<MetricSnapshot>) -> BenchmarkSnapshot {
+        BenchmarkSnapshot {
+            process: "server".to_owned(),
+            pid: 1,
+            taken_ns: metrics.len() as u64,
+            method: Method::current(),
+            series: Vec::new(),
+            scans: Vec::new(),
+            metrics,
+            dropped: 0,
+            invalid_labels: 0,
+        }
+    }
 
     /// The successful server timings at `boundary` of `calls`, each
     /// `(elapsed_ns, excluded_ns)` of provider wait.
@@ -742,6 +1086,10 @@ mod tests {
             },
             population: Population {
                 series,
+                metrics: snapshot(diagnostics(calls, 0, 3, stream))
+                    .since(&snapshot(Vec::new()))
+                    .expect("one process")
+                    .metrics,
                 ..Population::default()
             },
             integrity: Integrity {
@@ -829,8 +1177,12 @@ mod tests {
         ] {
             assert_eq!(exact(&broken.reading(id)), Some(value), "{id}");
         }
-        assert_eq!(broken.observations.len(), 2, "{:?}", broken.observations);
-        assert!(broken.observations[1].starts_with("capture saturated"));
+        assert_eq!(broken.observations.len(), 3, "{:?}", broken.observations);
+        assert_eq!(
+            broken.observations[1],
+            r#"errors by outcome: {"timed_out": 2}"#
+        );
+        assert!(broken.observations[2].starts_with("capture saturated"));
 
         let mut reset = observed(false, 1_000, 2_000_000, 5, 400_000);
         reset.integrity.reset = true;
@@ -840,14 +1192,23 @@ mod tests {
         let mut unwritten = observed(false, 1_000, 2_000_000, 5, 400_000);
         unwritten.integrity.written = 0.0;
         assert_eq!(unwritten.repetition().invalid.len(), 1);
+        let empty = observed(false, 0, 0, 0, 0).repetition().invalid;
+        let (diagnostics, judged): (Vec<&String>, Vec<&String>) = empty
+            .iter()
+            .partition(|reason| reason.starts_with("diagnostic `"));
         assert_eq!(
-            observed(false, 0, 0, 0, 0).repetition().invalid,
+            judged,
             [
                 "no `gateway.buffered` timing observation has outcome `succeeded`",
                 "no `gateway.buffered` timing observation has outcome `succeeded`",
                 "no call was sent in the window",
                 "no capture was staged in the window",
             ]
+        );
+        assert_eq!(
+            diagnostics.len(),
+            3,
+            "the answer handoff's components have no cohort, while registered empty histograms count zero: {diagnostics:?}"
         );
         let mut missing = observed(false, 1_000, 2_000_000, 5, 400_000);
         missing.population.series.clear();
@@ -858,5 +1219,154 @@ mod tests {
         let missing = missing.repetition();
         assert!(!missing.reading("overhead_p99_ms").is_present());
         assert!(missing.invalid[0].contains("recorded for 1000 requests"));
+    }
+
+    /// Each Gateway diagnostic keeps its own measured-to-drained population:
+    /// warmup observations before the window stay out, each phase keeps its
+    /// own distribution and mean, the batch writes keep their batch count,
+    /// and a buffered call's relay is inapplicable. An absent, refused, or
+    /// unreconciled required observation is invalid evidence, never zero;
+    /// with errors in the window, phase counts are not reconciled.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a diagnostic reading or its invalidity is wrong.
+    #[test]
+    fn phase_diagnostics_preserve_window_populations_and_missing_evidence() {
+        let warm = snapshot(diagnostics(50, 900_000, 7, false));
+        let mut later = diagnostics(50, 900_000, 7, false);
+        for (total, measured) in later.iter_mut().zip(diagnostics(1_000, 0, 3, false)) {
+            let (
+                MetricValue::Histogram { count, buckets, .. },
+                MetricValue::Histogram {
+                    count: added,
+                    buckets: more,
+                    ..
+                },
+            ) = (&mut total.value, measured.value)
+            else {
+                unreachable!("every diagnostic is a histogram");
+            };
+            *count += added;
+            buckets.0.extend(more.0);
+            buckets.0.sort_unstable();
+        }
+        let mut window = observed(false, 1_000, 2_000_000, 0, 0);
+        window.population.metrics = snapshot(later).since(&warm).expect("one process").metrics;
+        let repetition = window.repetition();
+        assert!(repetition.invalid.is_empty(), "{:?}", repetition.invalid);
+        let reading = |id: &str| repetition.reading(&format!("diagnostic.{id}"));
+        for (phase, step) in PHASES.iter().zip(1_u64..).filter(|(p, _)| **p != "relay") {
+            assert_eq!(
+                exact(&reading(&format!("phase.{phase}.count"))),
+                Some(1_000.0),
+                "{phase} keeps only the window's calls"
+            );
+            let us = (step * 10_000) as f64 / 1e3;
+            for stat in ["p50_us", "p99_us", "mean_us"] {
+                let value = reading(&format!("phase.{phase}.{stat}"));
+                assert!(holds(&value, us), "{phase} {stat}: {value:?}");
+            }
+        }
+        let relay = reading("phase.relay.count");
+        assert!(
+            relay
+                .reason
+                .is_some_and(|reason| reason.starts_with("inapplicable"))
+        );
+        assert_eq!(exact(&reading("outbox_write.scribe.count")), Some(3.0));
+        assert!(holds(&reading("outbox_write.scribe.p50_us"), 2_000.0));
+        assert!(holds(&reading("queue_delay.p95_us"), 70.0));
+        assert_eq!(exact(&reading("server_elapsed.count")), Some(1_000.0));
+        assert!(holds(&reading("provider_excluded.p50_us"), 2_000.0));
+        assert!(holds(&reading("residual.p50_us"), 100.0));
+        for (wait, step) in WAITS.iter().zip(1_u64..) {
+            assert_eq!(
+                exact(&reading(&format!("wait.{wait}.count"))),
+                Some(1_000.0)
+            );
+            let us = step as f64;
+            assert!(
+                holds(&reading(&format!("wait.{wait}.p50_us")), us),
+                "{wait}"
+            );
+        }
+
+        let mut absent = window.clone();
+        absent.population.metrics.retain(|metric| {
+            metric
+                .labels
+                .get("phase")
+                .is_none_or(|phase| phase != "capture")
+        });
+        let absent = absent.repetition();
+        assert!(
+            !absent
+                .reading("diagnostic.phase.capture.count")
+                .is_present()
+        );
+        assert!(
+            absent
+                .invalid
+                .iter()
+                .any(|reason| reason.starts_with("diagnostic `phase.capture` is missing")),
+            "{:?}",
+            absent.invalid
+        );
+
+        let mut refused = window.clone();
+        for metric in &mut refused.population.metrics {
+            if metric
+                .labels
+                .get("phase")
+                .is_some_and(|phase| phase == "admit")
+            {
+                metric.rejected = 2;
+            }
+        }
+        let refused = refused.repetition();
+        assert!(
+            refused
+                .invalid
+                .iter()
+                .any(|reason| reason.contains("refused 2 unrepresentable")),
+            "{:?}",
+            refused.invalid
+        );
+
+        let mut short = observed(false, 1_000, 2_000_000, 0, 0);
+        short.population.metrics = snapshot(diagnostics(999, 0, 3, false))
+            .since(&snapshot(Vec::new()))
+            .expect("one process")
+            .metrics;
+        let unreconciled = short.clone().repetition();
+        assert_eq!(
+            unreconciled
+                .invalid
+                .iter()
+                .filter(
+                    |reason| reason.contains("recorded 999 observations for 1000 answered calls")
+                )
+                .count(),
+            PHASES.len() - 1,
+            "{:?}",
+            unreconciled.invalid
+        );
+        short.samples.errors.insert("timed_out".to_owned(), 1);
+        assert!(
+            short
+                .repetition()
+                .invalid
+                .iter()
+                .all(|reason| !reason.contains("answered calls")),
+            "a window with errors does not assume once-per-call phases"
+        );
+
+        let stream = observed(true, 1_000, 2_000_000, 0, 0).repetition();
+        assert!(stream.invalid.is_empty(), "{:?}", stream.invalid);
+        assert_eq!(
+            exact(&stream.reading("diagnostic.phase.relay.count")),
+            Some(1_000.0)
+        );
     }
 }

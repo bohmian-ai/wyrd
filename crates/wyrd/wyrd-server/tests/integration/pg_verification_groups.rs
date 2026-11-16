@@ -9,6 +9,7 @@
 //! test brings pending groups due by moving their due time to PostgreSQL's
 //! statement time instead of waiting out the binding's `after`.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,9 +40,12 @@ use wyrd_server::verification::groups::GroupPoller;
 use wyrd_server::verification::inputs::InputResolver;
 use wyrd_server::verification::results::{ResultPayload, ResultPayloadBuilder, ResultRun};
 use wyrd_server::verification::scheduler::{GroupHandoff, VerificationScheduler};
+use wyrd_spec::card::verifier::Check;
 use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, GroupId, SlotName};
 use wyrd_spec::registry::DeclarationReceipt;
-use wyrd_spec::verification::execution::{InputDeclaration, VerificationResult};
+use wyrd_spec::verification::execution::{
+    ExecutedOutcome, ExecutedRequirement, InputDeclaration, VerificationResult,
+};
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::service_accounts::system_principal_id;
 use wyrd_sql::queries::verifier_executions::{
@@ -62,17 +66,17 @@ const HELD: &str = "1h";
 const LEASE: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
 
 /// One bound server with the support Service registered and credentialed.
-struct Support {
+pub(crate) struct Support {
     /// The bound server, verification runtime off.
-    server: WyrdTestServer,
+    pub(crate) server: WyrdTestServer,
     /// Tenant admin token that registered the Service and reads executions.
     admin: String,
     /// The Service's access token, which also records its activity.
     service: String,
     /// The support Service, owner of every turn.
-    owner: CardUid,
+    pub(crate) owner: CardUid,
     /// The Agent each turn judges.
-    agent: CardUid,
+    pub(crate) agent: CardUid,
     /// The per-turn source Verifier.
     turn_check: CardUid,
 }
@@ -87,7 +91,7 @@ impl Support {
     /// # Panics
     /// Panics when the server, registration, credential exchange, or window
     /// update fails.
-    async fn start() -> Self {
+    pub(crate) async fn start() -> Self {
         let server = WyrdTestServer::builder()
             .start_bound()
             .await
@@ -138,7 +142,7 @@ impl Support {
     ///
     /// # Panics
     /// Panics when the enqueue is not accepted or never becomes readable.
-    async fn turn(&self, group: &str, answer: &str, key: Option<&str>) -> ExecutionId {
+    pub(crate) async fn turn(&self, group: &str, answer: &str, key: Option<&str>) -> ExecutionId {
         let body = json!({
             "verifier_card_uid": self.turn_check,
             "card_uid": self.agent,
@@ -219,7 +223,7 @@ impl Support {
 
     /// A scheduler over the server's Postgres and the real [`GroupPoller`],
     /// sharing `capacity` as the runtime's execution capacity.
-    fn scheduler(&self, capacity: &Arc<Semaphore>) -> VerificationScheduler {
+    pub(crate) fn scheduler(&self, capacity: &Arc<Semaphore>) -> VerificationScheduler {
         let state = self.server.state();
         VerificationScheduler::new(
             state.postgres.wyrd().clone(),
@@ -261,7 +265,7 @@ impl Support {
     ///
     /// # Panics
     /// Panics when the statement or commit fails.
-    async fn exec(&self, sql: &'static str) {
+    pub(crate) async fn exec(&self, sql: &'static str) {
         let mut conn = self.conn().await;
         sqlx::query(sql)
             .execute(&mut **conn.transaction())
@@ -307,7 +311,7 @@ impl Support {
     ///
     /// # Panics
     /// Panics when the update fails.
-    async fn make_due(&self) {
+    pub(crate) async fn make_due(&self) {
         let mut conn = self.conn().await;
         sqlx::query("UPDATE wyrd.verification_group_pending SET due_at = statement_timestamp()")
             .execute(&mut **conn.transaction())
@@ -352,7 +356,7 @@ impl Support {
     async fn claim(&self) -> ClaimedExecution {
         let mut conn = self.conn().await;
         let claimed = VerifierExecutionQueue::default()
-            .claim(&mut conn, LEASE, 1)
+            .claim(&mut conn, LEASE, LEASE, 1)
             .await
             .expect("claim runs")
             .pop()
@@ -556,6 +560,7 @@ fn result(source: &ClaimedExecution, payload: ResultPayload) -> ScribeWrite {
     ScribeWrite::Result {
         payload,
         attribution: source.attribution,
+        acked: std::sync::Mutex::new(None),
     }
 }
 
@@ -586,8 +591,36 @@ fn payload(
         chrono::DateTime::UNIX_EPOCH,
         chrono::DateTime::UNIX_EPOCH,
     )
-    .build(&outcome.outcome)
+    .build(&recorded(outcome))
     .expect("the result builds")
+}
+
+/// The recorded outcome of the compact `turn-check` result `result`: its
+/// judgments beside the fixture's one assertion check.
+///
+/// # Panics
+/// Panics when the fixture check does not decode.
+fn recorded(result: &VerificationResult) -> ExecutedOutcome {
+    let check: Check = serde_json::from_value(json!({
+        "kind": "assert", "path": "inputs.turn.answer", "operator": "not_equals", "expected": ""
+    }))
+    .expect("the fixture check decodes");
+    ExecutedOutcome {
+        verdict: result.outcome.verdict,
+        requirements: result
+            .outcome
+            .requirements
+            .iter()
+            .map(|requirement| ExecutedRequirement {
+                result: requirement.clone(),
+                check: check.clone(),
+                provenance: None,
+                tool_calls: Vec::new(),
+            })
+            .collect(),
+        steps: Vec::new(),
+        evidence: BTreeMap::new(),
+    }
 }
 
 /// Acknowledged evidence, not historical metadata, makes a group due: a
@@ -756,7 +789,7 @@ async fn incomplete_snapshots_retry_then_error() {
         chrono::DateTime::UNIX_EPOCH,
         chrono::DateTime::UNIX_EPOCH,
     )
-    .build(&judged.outcome)
+    .build(&recorded(&judged))
     .expect("the result builds");
     let state = support.server.state();
     state

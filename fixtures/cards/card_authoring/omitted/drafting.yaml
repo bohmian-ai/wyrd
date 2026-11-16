@@ -1,0 +1,13 @@
+# A Service, its Agent component, the component's Verifier, and that
+# Verifier's judge Agent, none of which names a version: the server selects
+# each one and binds every link to the registered reference.
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: drafting
+spec:
+  service_type: api
+  components:
+    - alias: writer
+      ref: ./draft-writer.yaml
+      verified_by: [{verifier: ./draft-checks.yaml}]

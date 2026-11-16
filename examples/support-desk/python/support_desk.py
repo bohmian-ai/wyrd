@@ -164,8 +164,7 @@ def serve(desk: Desk) -> list[Served]:
         asked = question(index)
         with run, tracer.start_as_current_span("support-desk.request"):
             reply = answer(desk.gateway, state, run, asked)
-            run.observe.record(
-                "bifrost.datasets.tickets",
+            run.bifrost.write(
                 {
                     "ticket_id": f"T-{index}",
                     "question": asked,

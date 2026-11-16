@@ -1,0 +1,71 @@
+# Proposed revision 16 contract; not runnable on today's engine.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: code-review-conditional-specialists
+  version: 0.1.0
+spec:
+  steps:
+    - id: extract-pr
+      action:
+        kind: extract
+        extractor: pull_request
+
+    - id: plan
+      action:
+        kind: agent
+        agent: ./agents/planner.yaml
+        workspace:
+          /inputs/pr: steps.extract-pr.publications.evidence
+
+    - id: general-review
+      action:
+        kind: agent
+        agent: ./agents/general-reviewer.yaml
+        workspace:
+          /inputs/pr: steps.extract-pr.publications.evidence
+
+    - id: security-review
+      when:
+        path: steps.plan.output.security_review
+        operator: equals
+        expected: true
+      action:
+        kind: agent
+        agent: ./agents/security-reviewer.yaml
+        workspace:
+          /inputs/pr: steps.extract-pr.publications.evidence
+
+    - id: concurrency-review
+      when:
+        path: steps.plan.output.concurrency_review
+        operator: equals
+        expected: true
+      action:
+        kind: agent
+        agent: ./agents/concurrency-reviewer.yaml
+        workspace:
+          /inputs/pr: steps.extract-pr.publications.evidence
+
+    - id: consolidate
+      action:
+        kind: agent
+        agent: ./agents/consolidator.yaml
+        workspace:
+          /inputs/pr: steps.extract-pr.publications.evidence
+          /inputs/reviews/general: steps.general-review.publications
+          /inputs/reviews/security: steps.security-review.publications
+          /inputs/reviews/concurrency: steps.concurrency-review.publications
+
+  requirements:
+    - id: reviewed
+      statement: >-
+        The review completed with sufficient evidence and no substantiated
+        defects introduced by the pull request that require changes.
+      check:
+        kind: agent
+        agent: ./agents/final-judge.yaml
+        workspace:
+          /inputs/pr: steps.extract-pr.publications.evidence
+          /inputs/report: steps.consolidate.publications.report
+  decide: all

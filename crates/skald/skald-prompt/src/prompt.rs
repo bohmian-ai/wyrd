@@ -1,9 +1,7 @@
 //! Prompt wrapper and rendered request wrapper.
 
 use skald_spec::ProviderRequest;
-use skald_spec::wire::anthropic_messages::{
-    AnthropicMessage, AnthropicSystem, AnthropicSystemBlock,
-};
+use skald_spec::wire::anthropic_messages::AnthropicMessage;
 use skald_spec::wire::google_generate::{GoogleContent, GoogleFunctionResponse, GooglePart};
 use skald_spec::wire::openai_chat::{OpenAiChatMessage, OpenAiMessageContent};
 use skald_spec::wire::openai_responses::{OpenAiResponseContentPart, OpenAiResponseItem};
@@ -55,6 +53,24 @@ impl PartialEq for PyProviderRequest {
 }
 
 impl Prompt {
+    /// This Prompt with the Wyrd-named response format `named`, such as
+    /// `verdict`: the authored form carries the name, and the Prompt compiler
+    /// resolves its schema into the native request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PromptBuilderError::Skald`] for an unknown name, an invalid
+    /// `data` schema, or a request that already sets its own response format.
+    pub(crate) fn with_named_response_format(
+        mut self,
+        named: skald_spec::NamedResponseFormat,
+    ) -> PromptBuilderResult<Self> {
+        let mut authored = self.inner.authored()?.into_owned();
+        authored.response_format = Some(skald_spec::ResponseFormat::Named(named));
+        self.inner = wyrd_spec::card::prompt::compile_prompt(&authored)?;
+        Ok(self)
+    }
+
     /// Borrow the wrapped native prompt.
     pub const fn native(&self) -> &skald_spec::Prompt {
         &self.inner
@@ -85,37 +101,24 @@ impl Prompt {
         Ok(self.inner.render(vars)?)
     }
 
-    /// Return a copy with a native system message applied.
+    /// Return a copy with native system text applied through
+    /// [`skald_spec::Prompt::system_replaced`]: `OpenAI` Chat inserts a
+    /// system message, and the other formats replace their system slot.
     ///
     /// # Errors
     ///
     /// Returns [`PromptBuilderError::UnsupportedRole`] when the request
-    /// format has no system slot, and the errors of [`Prompt::rederived`].
+    /// format has no system slot, and [`PromptBuilderError::Skald`] when
+    /// `text` holds a media placeholder.
     pub fn with_system(&self, text: impl Into<String>) -> PromptBuilderResult<Self> {
         let mut prompt = self.clone();
-        let text = text.into();
-        match &mut prompt.inner.request {
-            ProviderRequest::OpenAiChatCompletion(request) => {
-                request.messages.insert(0, openai_message("system", text));
+        prompt.inner = match prompt.inner.system_replaced(text.into()) {
+            Err(skald_spec::SkaldError::ProviderUnsupported { .. }) => {
+                return unsupported_role(&self.inner.request, "system");
             }
-            ProviderRequest::OpenAiResponses(request) => {
-                request.instructions = Some(text);
-            }
-            ProviderRequest::AnthropicMessage(request) => {
-                request.system = Some(AnthropicSystem::Blocks(vec![AnthropicSystemBlock::Text {
-                    text,
-                    cache_control: None,
-                }]));
-            }
-            ProviderRequest::GeminiGenerateContent(request) => {
-                request.system_instruction = Some(GoogleContent {
-                    role: "user".to_owned(),
-                    parts: vec![google_text_part(text)],
-                });
-            }
-            other => return unsupported_role(other, "system"),
-        }
-        prompt.rederived()
+            edited => edited?,
+        };
+        Ok(prompt)
     }
 
     /// Return a copy with a native user message appended.
@@ -133,21 +136,21 @@ impl Prompt {
     /// # Errors
     ///
     /// Returns [`PromptBuilderError::UnsupportedRole`] when the request
-    /// format has no tool-result message, and the errors of [`Prompt::rederived`].
+    /// format has no tool-result message, and the errors of [`Prompt::appended`].
     pub fn with_tool_result(
         &self,
         tool_use_id: impl Into<String>,
         content: impl Into<String>,
         is_error: bool,
     ) -> PromptBuilderResult<Self> {
-        let mut prompt = self.clone();
         let tool_use_id = tool_use_id.into();
         let content = content.into();
-        match &mut prompt.inner.request {
+        self.appended(|request| match request {
             ProviderRequest::OpenAiChatCompletion(request) => {
                 let mut message = openai_message("tool", content);
                 message.tool_call_id = Some(tool_use_id);
                 request.messages.push(message);
+                Ok(())
             }
             ProviderRequest::OpenAiResponses(request) => {
                 request
@@ -157,40 +160,101 @@ impl Prompt {
                         call_id: tool_use_id,
                         output: content.into(),
                     });
+                Ok(())
             }
             ProviderRequest::AnthropicMessage(request) => {
                 request.messages.push(AnthropicMessage {
                     role: "user".to_owned(),
                     content: vec![anthropic_tool_result_block(tool_use_id, content, is_error)],
                 });
+                Ok(())
             }
             ProviderRequest::GeminiGenerateContent(request) => {
                 request
                     .contents
                     .push(google_tool_result(tool_use_id, &content));
+                Ok(())
             }
-            other => return unsupported_role(other, "tool_result"),
-        }
-        prompt.rederived()
+            other => unsupported_role(other, "tool_result"),
+        })
     }
 
-    /// Rebuild after a request edit so the derived variables, media
-    /// placeholders, and response type describe the edited request; the
-    /// dispatch destination is kept.
+    /// Return a copy with one turn of native content parts appended for
+    /// `role`: `value` is one provider content part or an ordered list of
+    /// them, in the request format's own wire shape, such as an `OpenAI`
+    /// Chat `image_url` part. Like a text turn, `${name}` / `{{name}}` text
+    /// in a part becomes a required variable and `${media:name}`
+    /// placeholders are recognised for [`skald_spec::Prompt::bind_media`].
     ///
     /// # Errors
     ///
-    /// Returns [`PromptBuilderError::Skald`] when the edited request puts a
-    /// media placeholder in system content or cannot be scanned.
-    fn rederived(mut self) -> PromptBuilderResult<Self> {
-        let skald_spec::Prompt {
-            request,
-            model,
-            provider,
-            ..
-        } = self.inner;
-        self.inner = crate::builder::finalize_prompt(request, model, provider)?.into_native();
-        Ok(self)
+    /// Returns [`PromptBuilderError::Validation`] when `value` does not
+    /// decode as the format's content parts,
+    /// [`PromptBuilderError::UnsupportedRole`] when the format has no
+    /// conversation turns, and the errors of [`Prompt::appended`].
+    pub fn with_content(&self, role: &str, value: serde_json::Value) -> PromptBuilderResult<Self> {
+        self.appended(|request| match request {
+            ProviderRequest::OpenAiChatCompletion(request) => {
+                let parts = json_parts::<skald_spec::wire::openai_chat::OpenAiContentPart>(value)?;
+                request.messages.push(OpenAiChatMessage {
+                    role: role.to_owned(),
+                    content: Some(OpenAiMessageContent::Parts(parts)),
+                    ..Default::default()
+                });
+                Ok(())
+            }
+            ProviderRequest::OpenAiResponses(request) => {
+                let parts = json_parts::<OpenAiResponseContentPart>(value)?;
+                request.input.items_mut().push(OpenAiResponseItem::Message {
+                    role: role.to_owned(),
+                    content: parts,
+                });
+                Ok(())
+            }
+            ProviderRequest::AnthropicMessage(request) => {
+                let blocks = json_parts::<
+                    skald_spec::wire::anthropic_messages::AnthropicContentBlock,
+                >(value)?;
+                request.messages.push(AnthropicMessage {
+                    role: if role == "assistant" {
+                        "assistant".to_owned()
+                    } else {
+                        "user".to_owned()
+                    },
+                    content: blocks,
+                });
+                Ok(())
+            }
+            ProviderRequest::GeminiGenerateContent(request) => {
+                request.contents.push(GoogleContent {
+                    role: if role == "assistant" {
+                        "model".to_owned()
+                    } else {
+                        "user".to_owned()
+                    },
+                    parts: json_parts::<GooglePart>(value)?,
+                });
+                Ok(())
+            }
+            other => unsupported_role(other, role),
+        })
+    }
+
+    /// A copy with conversation turns appended by `append` through
+    /// [`skald_spec::Prompt::appended`], which declares only what the new
+    /// turns author and keeps the rest of the Prompt's state.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of `append`, and [`PromptBuilderError::Skald`] when
+    /// a new system turn holds a media placeholder.
+    fn appended(
+        &self,
+        append: impl FnOnce(&mut ProviderRequest) -> PromptBuilderResult<()>,
+    ) -> PromptBuilderResult<Self> {
+        let mut prompt = self.clone();
+        prompt.inner = prompt.inner.appended(append)?;
+        Ok(prompt)
     }
 
     /// Appends one plain-text turn for `role` in the request's native shape.
@@ -198,13 +262,13 @@ impl Prompt {
     /// # Errors
     ///
     /// Returns [`PromptBuilderError::UnsupportedRole`] when the request
-    /// format has no conversation turns, and the errors of [`Prompt::rederived`].
+    /// format has no conversation turns, and the errors of [`Prompt::appended`].
     fn with_role_text(&self, role: &str, text: impl Into<String>) -> PromptBuilderResult<Self> {
-        let mut prompt = self.clone();
         let text = text.into();
-        match &mut prompt.inner.request {
+        self.appended(|request| match request {
             ProviderRequest::OpenAiChatCompletion(request) => {
                 request.messages.push(openai_message(role, text));
+                Ok(())
             }
             ProviderRequest::OpenAiResponses(request) => {
                 request.input.items_mut().push(OpenAiResponseItem::Message {
@@ -215,6 +279,7 @@ impl Prompt {
                         OpenAiResponseContentPart::InputText { text }
                     }],
                 });
+                Ok(())
             }
             ProviderRequest::AnthropicMessage(request) => {
                 request.messages.push(AnthropicMessage {
@@ -225,13 +290,14 @@ impl Prompt {
                     },
                     content: vec![anthropic_text_block(text)],
                 });
+                Ok(())
             }
             ProviderRequest::GeminiGenerateContent(request) => {
                 request.contents.push(google_content(role, text));
+                Ok(())
             }
-            other => return unsupported_role(other, role),
-        }
-        prompt.rederived()
+            other => unsupported_role(other, role),
+        })
     }
 }
 
@@ -295,7 +361,7 @@ fn google_tool_result(name: String, content: &str) -> GoogleContent {
 /// # Errors
 ///
 /// Always returns [`PromptBuilderError::UnsupportedRole`].
-fn unsupported_role(request: &ProviderRequest, role: &str) -> PromptBuilderResult<Prompt> {
+fn unsupported_role<T>(request: &ProviderRequest, role: &str) -> PromptBuilderResult<T> {
     Err(PromptBuilderError::UnsupportedRole {
         provider: request.provider().to_string(),
         role: role.to_owned(),
@@ -322,6 +388,37 @@ pub(crate) fn wrong_variant(expected: &str, actual: &str) -> crate::error::Promp
     }
 }
 
+/// Decode authored native content as one part or an ordered list of parts.
+///
+/// Native content helpers accept either a single provider part object or an
+/// array of them; a single part becomes a one-element list.
+///
+/// # Errors
+/// Returns [`PromptBuilderError::Validation`] (the public
+/// `WYRD_PROMPT_400_INVALID`) when the value, or any element, is not a part
+/// of type `T`.
+fn json_parts<T>(value: serde_json::Value) -> PromptBuilderResult<Vec<T>>
+where
+    T: serde::de::DeserializeOwned,
+{
+    if value.is_array() {
+        serde_json::from_value(value).map_err(invalid_authored_json)
+    } else {
+        Ok(vec![
+            serde_json::from_value(value).map_err(invalid_authored_json)?,
+        ])
+    }
+}
+
+/// Refuse caller-authored Prompt JSON that does not decode.
+///
+/// The decode error names the refused field, so it surfaces as the public
+/// `WYRD_PROMPT_400_INVALID` rather than the boundary's internal JSON failure,
+/// which is reserved for Wyrd's own serialization.
+fn invalid_authored_json(error: serde_json::Error) -> PromptBuilderError {
+    PromptBuilderError::Validation(error.to_string())
+}
+
 #[cfg(feature = "python")]
 use crate::python;
 
@@ -341,7 +438,6 @@ use {
         prelude::*,
         types::{PyAny, PyDict, PyList, PyString, PyTuple},
     },
-    serde::de::DeserializeOwned,
     skald_spec::NamedResponseFormat,
     wyrd_utils::py::WyrdPyResult,
 };
@@ -1387,11 +1483,7 @@ fn response_format_from_py(value: Option<&Bound<'_, PyAny>>) -> WyrdPyResult<For
         for (key, item) in named.iter() {
             let key = key.extract::<String>()?;
             let item = if key == "data" && !item.is_none() {
-                let mut schema = crate::coerce::schema_from_py(&item)?;
-                if is_pydantic_model(value.py(), &item) {
-                    normalize_output_schema(&mut schema);
-                }
-                schema
+                output_schema_from_py(&item)?
             } else {
                 wyrd_utils::py::pyobject_to_json(&item)?
             };
@@ -1406,6 +1498,22 @@ fn response_format_from_py(value: Option<&Bound<'_, PyAny>>) -> WyrdPyResult<For
     Ok((Some(ResponseFormat::json_schema("response", schema)?), None))
 }
 
+/// The JSON Schema a Python output description stands for: a JSON Schema
+/// as is, or a Pydantic model class's schema normalized for structured
+/// output.
+///
+/// # Errors
+///
+/// Raises `WyrdError` for a value that is neither.
+#[cfg(feature = "python")]
+pub fn output_schema_from_py(value: &Bound<'_, PyAny>) -> WyrdPyResult<serde_json::Value> {
+    let mut schema = crate::coerce::schema_from_py(value)?;
+    if is_pydantic_model(value.py(), value) {
+        normalize_output_schema(&mut schema);
+    }
+    Ok(schema)
+}
+
 /// Applies a named `response_format` to a built `prompt`: the authored form
 /// carries the name, and Wyrd resolves its schema into the native request.
 ///
@@ -1418,17 +1526,7 @@ fn named_prompt(prompt: Prompt, named: Option<NamedResponseFormat>) -> WyrdPyRes
     let Some(named) = named else {
         return Ok(prompt);
     };
-    let mut authored = prompt
-        .inner
-        .authored()
-        .map_err(PromptBuilderError::from)?
-        .into_owned();
-    authored.response_format = Some(skald_spec::ResponseFormat::Named(named));
-    Ok(Prompt {
-        inner: wyrd_spec::card::prompt::compile_prompt(&authored)
-            .map_err(PromptBuilderError::from)?,
-        ..prompt
-    })
+    Ok(prompt.with_named_response_format(named)?)
 }
 
 /// `(response_format, retained_pydantic_class)` produced by `output_from_py`.
@@ -1651,6 +1749,15 @@ fn cache_prompt_key(value: Option<&Bound<'_, PyAny>>) -> WyrdPyResult<Option<Str
     Ok(Some(value.str()?.extract::<String>()?))
 }
 
+/// Append one Python `content` turn for `role`: a string is a plain text
+/// turn and anything else is the format's native content parts, both
+/// through the shared Prompt operations.
+///
+/// # Errors
+///
+/// Returns the conversion error for content that is not JSON-compatible and
+/// the errors of [`Prompt::with_user`], [`Prompt::with_assistant`], and
+/// [`Prompt::with_content`].
 #[cfg(feature = "python")]
 fn append_py_content(
     prompt: &Prompt,
@@ -1665,105 +1772,7 @@ fn append_py_content(
     }
 
     let value = wyrd_utils::py::pyobject_to_json(content)?;
-    append_native_json_content(prompt, role, value)
-}
-
-/// Appends one turn of native JSON content parts for `role`.
-///
-/// # Errors
-///
-/// Raises `WyrdError` when `value` does not decode as the format's content
-/// parts or the format has no conversation turns.
-#[cfg(feature = "python")]
-fn append_native_json_content(
-    prompt: &Prompt,
-    role: &str,
-    value: serde_json::Value,
-) -> WyrdPyResult<Prompt> {
-    let mut out = prompt.clone();
-    match &mut out.inner.request {
-        ProviderRequest::OpenAiChatCompletion(request) => {
-            let parts = json_parts::<skald_spec::wire::openai_chat::OpenAiContentPart>(value)?;
-            request.messages.push(OpenAiChatMessage {
-                role: role.to_owned(),
-                content: Some(OpenAiMessageContent::Parts(parts)),
-                ..Default::default()
-            });
-        }
-        ProviderRequest::OpenAiResponses(request) => {
-            let parts = json_parts::<OpenAiResponseContentPart>(value)?;
-            request.input.items_mut().push(OpenAiResponseItem::Message {
-                role: role.to_owned(),
-                content: parts,
-            });
-        }
-        ProviderRequest::AnthropicMessage(request) => {
-            let blocks =
-                json_parts::<skald_spec::wire::anthropic_messages::AnthropicContentBlock>(value)?;
-            request.messages.push(AnthropicMessage {
-                role: if role == "assistant" {
-                    "assistant".to_owned()
-                } else {
-                    "user".to_owned()
-                },
-                content: blocks,
-            });
-        }
-        ProviderRequest::GeminiGenerateContent(request) => {
-            request.contents.push(GoogleContent {
-                role: if role == "assistant" {
-                    "model".to_owned()
-                } else {
-                    "user".to_owned()
-                },
-                parts: json_parts::<GooglePart>(value)?,
-            });
-        }
-        other => {
-            return Err(PromptBuilderError::UnsupportedRole {
-                provider: other.provider().to_string(),
-                role: role.to_owned(),
-            }
-            .into());
-        }
-    }
-    out.inner
-        .normalize_media_placeholders_mut()
-        .map_err(PromptBuilderError::from)?;
-    Ok(out)
-}
-
-/// Decode authored native content as one part or an ordered list of parts.
-///
-/// Native content helpers accept either a single provider part object or an
-/// array of them; a single part becomes a one-element list.
-///
-/// # Errors
-/// Returns [`PromptBuilderError::Validation`] (the public
-/// `WYRD_PROMPT_400_INVALID`) when the value, or any element, is not a part
-/// of type `T`.
-#[cfg(feature = "python")]
-fn json_parts<T>(value: serde_json::Value) -> WyrdPyResult<Vec<T>>
-where
-    T: DeserializeOwned,
-{
-    if value.is_array() {
-        Ok(serde_json::from_value(value).map_err(invalid_authored_json)?)
-    } else {
-        Ok(vec![
-            serde_json::from_value(value).map_err(invalid_authored_json)?,
-        ])
-    }
-}
-
-/// Refuse caller-authored Prompt JSON that does not decode.
-///
-/// The decode error names the refused field, so it surfaces as the public
-/// `WYRD_PROMPT_400_INVALID` rather than the boundary's internal JSON failure,
-/// which is reserved for Wyrd's own serialization.
-#[cfg(feature = "python")]
-fn invalid_authored_json(error: serde_json::Error) -> PromptBuilderError {
-    PromptBuilderError::Validation(error.to_string())
+    Ok(prompt.with_content(role, value)?)
 }
 
 #[cfg(feature = "python")]
@@ -1775,6 +1784,301 @@ where
         py,
         &serde_json::to_value(value)?,
     )?)
+}
+
+/// Proves the content editors' state transitions on every editable request
+/// format: bound data stays data, newly authored placeholders become
+/// required, system replacement drops only its own declarations, and compiled
+/// media kinds and named formats survive an edit.
+#[cfg(test)]
+mod edit_tests {
+    use serde_json::{Value, json};
+    use skald_spec::{AuthoredPrompt, MediaRef, ProviderRequest, SkaldError};
+
+    use super::Prompt;
+    use crate::builder::{
+        AnthropicOptions, GeminiOptions, OpenAiChatOptions, OpenAiResponsesOptions, anthropic,
+        gemini, openai_chat, openai_responses,
+    };
+    use crate::error::PromptBuilderError;
+
+    /// One builder per editable request format, given optional system text
+    /// and user messages, paired with that format's rich text part.
+    type Build = fn(Option<&str>, &[&str]) -> Prompt;
+    /// A format's name, builder, and rich text part.
+    type Format = (&'static str, Build, fn(&str) -> Value);
+
+    /// Every editable format, built through its public builder.
+    fn formats() -> [Format; 4] {
+        /// Owned copies of `messages`.
+        fn texts(messages: &[&str]) -> Vec<String> {
+            messages.iter().map(|text| (*text).to_owned()).collect()
+        }
+        [
+            (
+                "openai_chat",
+                |system, messages| {
+                    openai_chat(
+                        "gpt-test",
+                        OpenAiChatOptions {
+                            system: system.map(str::to_owned),
+                            messages: texts(messages),
+                            ..OpenAiChatOptions::default()
+                        },
+                    )
+                    .expect("chat builds")
+                },
+                |text| json!({"type": "text", "text": text}),
+            ),
+            (
+                "openai_responses",
+                |system, messages| {
+                    openai_responses(
+                        "gpt-test",
+                        OpenAiResponsesOptions {
+                            instructions: system.map(str::to_owned),
+                            messages: texts(messages),
+                            ..OpenAiResponsesOptions::default()
+                        },
+                    )
+                    .expect("responses builds")
+                },
+                |text| json!({"type": "input_text", "text": text}),
+            ),
+            (
+                "anthropic",
+                |system, messages| {
+                    anthropic(
+                        "claude-test",
+                        AnthropicOptions {
+                            system: system.map(str::to_owned),
+                            messages: texts(messages),
+                            ..AnthropicOptions::default()
+                        },
+                    )
+                    .expect("anthropic builds")
+                },
+                |text| json!({"type": "text", "text": text}),
+            ),
+            (
+                "gemini",
+                |system, messages| {
+                    gemini(
+                        "gemini-test",
+                        GeminiOptions {
+                            system: system.map(str::to_owned),
+                            messages: texts(messages),
+                            ..GeminiOptions::default()
+                        },
+                    )
+                    .expect("gemini builds")
+                },
+                |text| json!({"text": text}),
+            ),
+        ]
+    }
+
+    /// `prompt` with `vars` bound by the native Prompt.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the bind fails.
+    fn bind(prompt: &Prompt, vars: &[(&str, &str)]) -> Prompt {
+        Prompt::from_native(prompt.native().bind(vars).expect("binds"))
+    }
+
+    /// The missing variable a refused render names.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `result` is not a missing-variable refusal.
+    fn missing(result: Result<ProviderRequest, crate::error::PromptBuilderError>) -> String {
+        match result {
+            Err(PromptBuilderError::Skald(SkaldError::MissingVariable(name))) => name,
+            other => panic!("expected a missing variable, got {other:?}"),
+        }
+    }
+
+    /// The JSON of `prompt` rendered with `vars`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the render fails.
+    fn rendered(prompt: &Prompt, vars: &[(&str, &str)]) -> String {
+        serde_json::to_string(&prompt.render_native(vars).expect("renders")).expect("json")
+    }
+
+    /// Proves every content editor keeps bound template-looking text and
+    /// media spellings as data, while placeholders it newly authors become
+    /// required, across repeated edits with binds before and after them.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an edit, refusal, or rendered value differs.
+    #[test]
+    fn edits_keep_bound_data_literal_and_require_new_authored_variables() {
+        let data = "literal {{other}} ${media:pic}";
+        for (format, build, text_part) in formats() {
+            let prompt = bind(&build(None, &["Hello {{value}}"]), &[("value", data)]);
+            assert!(prompt.native().variables.is_empty(), "{format}");
+            let edited = prompt
+                .with_user("plain")
+                .and_then(|prompt| prompt.with_assistant("said {{said}}"))
+                .and_then(|prompt| prompt.with_content("user", text_part("rich {{rich}}")))
+                .and_then(|prompt| prompt.with_content("assistant", json!([text_part("ok")])))
+                .and_then(|prompt| prompt.with_tool_result("call_1", "tool {{tool}}", false))
+                .and_then(|prompt| prompt.with_system("system {{sys}}"))
+                .expect("edits apply");
+            assert_eq!(
+                edited.native().variables,
+                ["said", "rich", "tool", "sys"],
+                "{format}"
+            );
+            assert!(edited.native().media_variables.is_empty(), "{format}");
+            assert_eq!(missing(edited.render_native(&[])), "said", "{format}");
+
+            let edited = bind(&edited, &[("said", "{{again}}"), ("rich", "${media:late}")])
+                .with_user("more")
+                .expect("edits after binding");
+            assert_eq!(edited.native().variables, ["tool", "sys"], "{format}");
+            let text = rendered(&edited, &[("tool", "T"), ("sys", "S")]);
+            for kept in [
+                "literal {{other}} ${media:pic}",
+                "said {{again}}",
+                "rich ${media:late}",
+            ] {
+                assert!(text.contains(kept), "{format} keeps {kept}: {text}");
+            }
+            assert!(
+                text.contains("tool T") && text.contains("system S"),
+                "{format}"
+            );
+        }
+    }
+
+    /// Proves rich content keeps the media placeholders it authors after a
+    /// binding: the new placeholder must be bound before render, and binds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the authored media is not required or does not bind.
+    #[test]
+    fn edits_require_newly_authored_media_after_binding() {
+        let image = MediaRef::image_base64("image/png", "iVBORw0KGgo=");
+        for (format, build, text_part) in formats() {
+            let prompt = bind(
+                &build(None, &["Hello {{value}}"]),
+                &[("value", "${media:pic}")],
+            )
+            .with_content("user", text_part("see ${media:shot}"))
+            .expect("rich content appends");
+            assert_eq!(prompt.native().media_variables, ["shot"], "{format}");
+            assert!(matches!(
+                prompt.render_native(&[]),
+                Err(PromptBuilderError::Skald(SkaldError::MissingMediaVariable { name })) if name == "shot"
+            ));
+            let bound = prompt.native().bind_media("shot", &image).expect("binds");
+            let text = serde_json::to_string(&bound.render(&[]).expect("renders")).expect("json");
+            assert!(
+                text.contains("iVBORw0KGgo=") && text.contains("${media:pic}"),
+                "{format}"
+            );
+        }
+    }
+
+    /// Proves system replacement drops requirements only the replaced text
+    /// declared, keeps those still authored elsewhere, and, for `OpenAI`
+    /// Chat, inserts another system message that keeps the earlier one.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a replaced or retained requirement differs.
+    #[test]
+    fn system_replacement_replaces_only_its_own_declarations() {
+        for (format, build, _) in formats() {
+            let data_only = bind(&build(Some("{{x}}"), &["{{a}}"]), &[("a", "{{x}}")]);
+            let authored_twice = build(Some("{{x}}"), &["{{x}}"]);
+            let data_only = data_only.with_system("plain").expect("system replaces");
+            let authored_twice = authored_twice
+                .with_system("plain")
+                .expect("system replaces");
+            assert_eq!(missing(authored_twice.render_native(&[])), "x", "{format}");
+            if format == "openai_chat" {
+                let ProviderRequest::OpenAiChatCompletion(request) = &data_only.native().request
+                else {
+                    panic!("chat request");
+                };
+                assert_eq!(request.messages.len(), 3, "chat inserts a system message");
+                assert_eq!(missing(data_only.render_native(&[])), "x");
+            } else {
+                assert!(data_only.native().variables.is_empty(), "{format}");
+                let text = rendered(&data_only, &[]);
+                assert!(text.contains("{{x}}") && text.contains("plain"), "{format}");
+            }
+        }
+    }
+
+    /// Proves an edit keeps the compiled state the request cannot carry: a
+    /// portable image binding's kind and a named format's resolution, with
+    /// its destination.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an edit drops a media kind, a named-format refusal, the
+    /// resolved schema, or the destination.
+    #[test]
+    fn edits_keep_compiled_media_kinds_and_named_formats() {
+        let authored: AuthoredPrompt = serde_json::from_value(json!({
+            "provider": "anthropic", "model": "claude-test",
+            "settings": {"max_output_tokens": 8},
+            "messages": [{"role": "user", "content": [{"type": "image", "source": "${media:photo}"}]}],
+        }))
+        .expect("authored decodes");
+        let edited = Prompt::from_native(authored.compile().expect("compiles"))
+            .with_content("user", json!({"type": "text", "text": "more"}))
+            .expect("edits");
+        let document = MediaRef::document_base64("application/pdf", "JVBERi0=");
+        assert!(matches!(
+            edited.native().bind_media("photo", &document),
+            Err(SkaldError::InvalidMediaType(_))
+        ));
+        let image = MediaRef::image_base64("image/png", "iVBORw0KGgo=");
+        let bound = edited
+            .native()
+            .bind_media("photo", &image)
+            .expect("image binds");
+        bound.render(&[]).expect("renders");
+
+        let named: AuthoredPrompt = serde_json::from_value(json!({
+            "provider": "google", "model": "gemini-test",
+            "messages": [{"role": "user", "content": "{{claim}}"}],
+            "response_format": "verdict",
+        }))
+        .expect("authored decodes");
+        let unresolved = Prompt::from_native(named.compile().expect("compiles"))
+            .with_user("more")
+            .expect("edits");
+        assert!(matches!(
+            unresolved.render_native(&[("claim", "c")]),
+            Err(PromptBuilderError::Skald(SkaldError::PromptInvalid { field, .. })) if field == "response_format"
+        ));
+        let schema = json!({"type": "object", "properties": {"outcome": {"type": "string"}}});
+        let resolved = named
+            .compile_with(|_| Ok(schema.as_object().expect("object").clone()))
+            .expect("compiles");
+        let response_type = resolved.response_type.clone();
+        let resolved = Prompt::from_native(resolved)
+            .with_user("more")
+            .expect("edits");
+        assert_eq!(resolved.native().response_type, response_type);
+        assert_eq!(
+            resolved.native().provider,
+            Some(skald_spec::ProviderName::Google)
+        );
+        resolved
+            .render_native(&[("claim", "c")])
+            .expect("resolved renders");
+    }
 }
 
 #[cfg(test)]

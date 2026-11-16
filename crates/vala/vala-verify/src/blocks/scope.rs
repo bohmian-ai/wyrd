@@ -1,14 +1,16 @@
 //! The execution scope Verifier references resolve against.
 //!
-//! The scope reads the original evidence declarations and the shared
-//! [`RunLedger`] of the stage walk, which holds each settled step's status
-//! and output and each settled step requirement's verdict. The driver
+//! The scope reads the original evidence declarations, the shared
+//! [`RunLedger`], which holds each settled step's status, output, and
+//! requirement verdicts, and the [`Frame`] of the invocation being bound:
+//! its fanout item, repeat iteration, and its own unsettled step. The driver
 //! resolves every binding a block declares here before handing the block to
 //! an executor, so executors only ever see values. A value that cannot be
 //! supplied resolves to [`Missing`], which keeps the cause of the gap so an
 //! intentional skip is never confused with a failure.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -16,10 +18,11 @@ use wyrd_spec::card::verifier::{PathSegment, Reference, ReferenceRoot, Requireme
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
-    InputDeclaration, RequirementOutcome, RequirementResult, StepResult, StepStatus,
+    ExecutedRequirement, InputDeclaration, Producer, ProducerInvocation, PublicationCollection,
+    RequirementOutcome, RequirementResult, Speculation, StepResult, StepStatus,
 };
 
-use super::{CallInput, CallValue};
+use super::{BoundJson, CallInput, CallValue};
 use crate::walk::RunLedger;
 
 /// Why a value is missing. Ordered so the stronger cause is the greater:
@@ -60,6 +63,16 @@ impl Missing {
         }
     }
 
+    /// The status of a step whose own control value is this gap: an
+    /// intentional skip upstream stays a skip, and anything else is the
+    /// step's evaluation error, never an implicit false.
+    pub(super) const fn control_status(&self) -> StepStatus {
+        match self.cause {
+            Cause::Skipped => StepStatus::Skipped,
+            Cause::Failed => StepStatus::Failed,
+        }
+    }
+
     /// Fold several gaps into one: the strongest cause wins, keeping the
     /// first reason recorded for that cause.
     pub(super) fn strongest(gaps: impl IntoIterator<Item = Self>) -> Option<Self> {
@@ -74,12 +87,15 @@ impl Missing {
 /// The final state of one step as later blocks read it.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Settled {
-    /// The action produced `output`, derived from the `sources` slots.
+    /// The action succeeded, deriving its output from the `sources` slots.
+    /// The output has one owner until the run ends: this state, which
+    /// `steps.<id>.output` bindings share and which becomes the step's
+    /// reported [`StepResult::output`] once no binding holds it.
     Succeeded {
-        /// The action output.
-        output: Value,
         /// Original slots the action read.
         sources: BTreeSet<SlotName>,
+        /// The action's output.
+        output: Arc<Value>,
     },
     /// The step failed or was skipped, so it has no output.
     NoOutput {
@@ -101,55 +117,145 @@ impl Settled {
     }
 }
 
-/// One settled Verifier block in the shared [`RunLedger`].
-///
-/// Results are boxed because they are an order of magnitude larger than the
-/// settled state, and the ledger holds every block.
-#[derive(Debug)]
-pub(super) enum Done {
-    /// A step: its reported result and the state later blocks read.
-    Step {
-        /// The reported step result.
-        result: Box<StepResult>,
-        /// The state `steps.<id>` references read.
-        state: Settled,
-    },
-    /// A judged requirement, as reported.
-    Requirement(Box<RequirementResult>),
+/// One settled step, or one settled invocation of a step, as later blocks
+/// read it.
+#[derive(Debug, Clone)]
+pub(super) struct StepDone {
+    /// The reported result.
+    pub result: StepResult,
+    /// The state `steps.<id>` references read.
+    pub state: Settled,
+    /// Every judged instance of the step's requirements, in item, iteration,
+    /// then declaration order.
+    pub requirements: Vec<ExecutedRequirement>,
+    /// Every invocation attempt, ordered by item, iteration, then attempt;
+    /// the collection manifest reports them.
+    pub invocations: Vec<ProducerInvocation>,
+    /// The successful invocation attempt whose named publications
+    /// `steps.<id>.publications.<name>` selects: a plain step's final attempt
+    /// or a repeat's final successful iteration; `None` for fanout.
+    pub member: Option<Producer>,
+    /// The speculative disposition; anything but `none` and `admitted`
+    /// withholds the contribution.
+    pub speculation: Speculation,
 }
 
-/// The scope document of one stage: the original evidence plus every block
-/// earlier stages settled. Read-only; the stage walk owns the ledger.
+/// One settled Verifier block in the shared [`RunLedger`].
+///
+/// Settlements are boxed because they are an order of magnitude larger than
+/// the enum, and the ledger holds every block.
+#[derive(Debug, Clone)]
+pub(super) enum Done {
+    /// A step with its requirement instances.
+    Step(Box<StepDone>),
+    /// A judged whole-Verifier requirement, as reported.
+    Requirement(Box<ExecutedRequirement>),
+    /// A step whose approval occurrences wait for a decision. Never entered
+    /// in the ledger: the step and its dependents stay unsettled.
+    Awaiting(Vec<wyrd_spec::verification::state::ApprovalOccurrence>),
+}
+
+/// The ledger the engine shares with the blocks it starts, which each take a
+/// snapshot of it.
+pub(super) type Ledger = RunLedger<Arc<Done>>;
+
+/// The invocation a binding resolves for: its fanout item, its repeat
+/// iteration, and its own step's unsettled invocation once the action
+/// settled, which that invocation's requirements and `until` read.
+#[derive(Debug, Clone, Default)]
+pub(super) struct Frame {
+    /// The zero-based item and, for an `items` fanout, its value.
+    pub item: Option<(u32, Option<CallInput>)>,
+    /// The repeat iteration.
+    pub iteration: Option<Iteration>,
+    /// The own step's current invocation, once its action settled.
+    pub own: Option<StepDone>,
+}
+
+impl Frame {
+    /// The invocation this frame binds: its item and iteration.
+    pub(super) fn instance(&self) -> (Option<u32>, Option<u32>) {
+        (
+            self.item.as_ref().map(|(at, _)| *at),
+            self.iteration.as_ref().map(|iteration| iteration.index),
+        )
+    }
+}
+
+/// One repeat iteration's values.
+#[derive(Debug, Clone)]
+pub(super) struct Iteration {
+    /// Zero-based iteration.
+    pub index: u32,
+    /// The previous iteration's output; `null` in the first.
+    pub previous: Value,
+    /// The just-completed output, which only `until` reads.
+    pub output: Option<CallInput>,
+}
+
+/// The scope document of one invocation: the original evidence, every block
+/// already settled, and the invocation's own frame. Read-only; the engine
+/// owns the ledger.
 pub(super) struct Scope<'a> {
-    /// The pinned original evidence by slot.
-    evidence: &'a BTreeMap<SlotName, InputDeclaration>,
-    /// Blocks settled by earlier stages.
-    ledger: &'a RunLedger<Done>,
+    /// The pinned original evidence by slot, shared with the bindings that
+    /// select from it.
+    evidence: &'a Arc<BTreeMap<SlotName, InputDeclaration>>,
+    /// Blocks already settled.
+    ledger: &'a Ledger,
+    /// The invocation being bound.
+    frame: Frame,
 }
 
 impl<'a> Scope<'a> {
     /// The scope over the original evidence and the blocks in `ledger`.
     pub(super) fn new(
-        evidence: &'a BTreeMap<SlotName, InputDeclaration>,
-        ledger: &'a RunLedger<Done>,
+        evidence: &'a Arc<BTreeMap<SlotName, InputDeclaration>>,
+        ledger: &'a Ledger,
     ) -> Self {
-        Self { evidence, ledger }
+        Self {
+            evidence,
+            ledger,
+            frame: Frame::default(),
+        }
+    }
+
+    /// The same scope bound for the invocation `frame`.
+    pub(super) fn framed(&self, frame: Frame) -> Self {
+        Self {
+            evidence: self.evidence,
+            ledger: self.ledger,
+            frame,
+        }
     }
 
     /// Returns a settled step's state.
     pub(super) fn step(&self, step: &TaskId) -> Option<&Settled> {
-        match self.ledger.get(step) {
-            Some(Done::Step { state, .. }) => Some(state),
+        self.settled(step).map(|done| &done.state)
+    }
+
+    /// Returns a settled step, or the frame's own invocation of it.
+    pub(super) fn settled(&self, step: &TaskId) -> Option<&StepDone> {
+        if let Some(own) = &self.frame.own
+            && &own.result.id == step
+        {
+            return Some(own);
+        }
+        match self.ledger.get(step).map(AsRef::as_ref) {
+            Some(Done::Step(done)) => Some(done),
             _ => None,
         }
     }
 
-    /// Returns a settled step requirement's verdict.
-    fn verdict(&self, requirement: &TaskId) -> Option<&RequirementResult> {
-        match self.ledger.get(requirement) {
-            Some(Done::Requirement(result)) => Some(result),
-            _ => None,
-        }
+    /// Returns the verdict of `step`'s requirement: the frame's own instance,
+    /// or the settled step's last instance, which is a repeat's final
+    /// iteration.
+    fn verdict(&self, step: &TaskId, requirement: &TaskId) -> Option<&RequirementResult> {
+        self.settled(step)?
+            .requirements
+            .iter()
+            .rev()
+            .map(|requirement| &requirement.result)
+            .find(|result| &result.id == requirement)
     }
 
     /// Resolve every named binding, returning the values or the strongest
@@ -198,9 +304,14 @@ impl<'a> Scope<'a> {
             ReferenceRoot::Input(slot) => {
                 let sources = BTreeSet::from([slot.clone()]);
                 match self.evidence.get(slot) {
-                    Some(InputDeclaration::Json { value }) => select(value, &reference.path)
-                        .map(|value| json_input(value, sources))
-                        .ok_or_else(unresolved),
+                    Some(InputDeclaration::Json { value }) => bind(value, &reference.path, || {
+                        BoundJson::evidence(self.evidence, slot, &reference.path)
+                    })
+                    .map(|value| CallInput {
+                        value: CallValue::Json(value),
+                        sources,
+                    })
+                    .ok_or_else(unresolved),
                     Some(declaration) if reference.path.is_empty() => Ok(CallInput {
                         value: CallValue::Evidence(declaration.clone()),
                         sources,
@@ -210,9 +321,16 @@ impl<'a> Scope<'a> {
                 }
             }
             ReferenceRoot::StepOutput(step) => match self.step(step) {
-                Some(Settled::Succeeded { output, sources }) => select(output, &reference.path)
-                    .map(|value| json_input(value, sources.clone()))
-                    .ok_or_else(unresolved),
+                Some(Settled::Succeeded { sources, output }) => {
+                    bind(output, &reference.path, || {
+                        BoundJson::output(output, &reference.path)
+                    })
+                    .map(|value| CallInput {
+                        value: CallValue::Json(value),
+                        sources: sources.clone(),
+                    })
+                    .ok_or_else(unresolved)
+                }
                 Some(Settled::NoOutput { gap, .. }) => Err(Missing {
                     cause: gap.cause,
                     reason: format!(
@@ -228,16 +346,54 @@ impl<'a> Scope<'a> {
                 Ok(json_input(wire(&settled.status()), BTreeSet::new()))
             }
             ReferenceRoot::StepVerdict {
+                step,
                 requirement: id,
                 field,
-                ..
             } => {
-                let verdict = self.verdict(id).ok_or_else(unresolved)?;
+                let verdict = self.verdict(step, id).ok_or_else(unresolved)?;
                 let value = match field {
                     VerdictField::Outcome => wire(&verdict.outcome),
                     VerdictField::Reason => Value::String(verdict.reason.clone()),
                 };
                 Ok(json_input(value, BTreeSet::new()))
+            }
+            ReferenceRoot::StepPublications { step, name } => {
+                let done = self.settled(step).ok_or_else(unresolved)?;
+                match (name, &done.state, &done.member) {
+                    (Some(name), Settled::Succeeded { sources, .. }, Some(producer)) => {
+                        Ok(CallInput {
+                            value: CallValue::Publication {
+                                producer: producer.clone(),
+                                name: name.clone(),
+                            },
+                            sources: sources.clone(),
+                        })
+                    }
+                    (Some(_), Settled::Succeeded { .. }, None) => Err(Missing::failed(format!(
+                        "step `{}` has one member per fanout item",
+                        step.as_str()
+                    ))),
+                    (Some(_), Settled::NoOutput { gap, .. }, _) => Err(Missing {
+                        cause: gap.cause,
+                        reason: format!(
+                            "step `{}` has no successful attempt to publish: {}",
+                            step.as_str(),
+                            gap.reason
+                        ),
+                    }),
+                    (None, settled, _) => Ok(CallInput {
+                        value: CallValue::Publications {
+                            step: step.clone(),
+                            collection: collection(done),
+                        },
+                        // Partial work of a failed step derives from no
+                        // recorded sources, so it can cite none.
+                        sources: match settled {
+                            Settled::Succeeded { sources, .. } => sources.clone(),
+                            Settled::NoOutput { .. } => BTreeSet::new(),
+                        },
+                    }),
+                }
             }
             ReferenceRoot::RequirementId => {
                 requirement.map_or_else(|| Err(unresolved()), |req| constant(req.id.as_str()))
@@ -245,16 +401,125 @@ impl<'a> Scope<'a> {
             ReferenceRoot::RequirementStatement => {
                 requirement.map_or_else(|| Err(unresolved()), |req| constant(&req.statement))
             }
+            ReferenceRoot::Item => match &self.frame.item {
+                Some((_, Some(item))) => match &item.value {
+                    CallValue::Json(value) => select(value, &reference.path)
+                        .map(|value| json_input(value, item.sources.clone()))
+                        .ok_or_else(unresolved),
+                    _ => Err(unresolved()),
+                },
+                _ => Err(unresolved()),
+            },
+            ReferenceRoot::ItemIndex => self
+                .frame
+                .item
+                .as_ref()
+                .map(|(index, _)| json_input(Value::from(*index), BTreeSet::new()))
+                .ok_or_else(unresolved),
+            ReferenceRoot::IterationIndex => self
+                .frame
+                .iteration
+                .as_ref()
+                .map(|iteration| json_input(Value::from(iteration.index), BTreeSet::new()))
+                .ok_or_else(unresolved),
+            ReferenceRoot::IterationPrevious => {
+                let iteration = self.frame.iteration.as_ref().ok_or_else(unresolved)?;
+                select(&iteration.previous, &reference.path)
+                    .map(|value| json_input(value, BTreeSet::new()))
+                    .ok_or_else(unresolved)
+            }
+            ReferenceRoot::IterationOutput => {
+                let output = self
+                    .frame
+                    .iteration
+                    .as_ref()
+                    .and_then(|iteration| iteration.output.as_ref())
+                    .ok_or_else(unresolved)?;
+                match &output.value {
+                    CallValue::Json(value) => select(value, &reference.path)
+                        .map(|value| json_input(value, output.sources.clone()))
+                        .ok_or_else(unresolved),
+                    _ => Err(unresolved()),
+                }
+            }
         }
     }
 }
 
-/// A JSON binding value.
+/// The reason a collection reports for an attempt that failed and was
+/// retried; the retried failure itself is not recorded.
+pub(super) const RETRIED: &str = "the attempt failed and was retried";
+
+/// One record per attempt of one invocation that made `attempts` attempts
+/// and ended as `status` for `reason`, each attempt before the last having
+/// failed and been retried.
+pub(super) fn attempt_records(
+    item_index: Option<u32>,
+    iteration_index: Option<u32>,
+    attempts: u32,
+    status: StepStatus,
+    reason: Option<&str>,
+) -> impl Iterator<Item = ProducerInvocation> + '_ {
+    (1..=attempts).map(move |attempt| {
+        let last = attempt == attempts;
+        ProducerInvocation {
+            item_index,
+            iteration_index,
+            attempt,
+            status: if last { status } else { StepStatus::Failed },
+            reason: if last {
+                reason.map(str::to_owned)
+            } else {
+                Some(RETRIED.to_owned())
+            },
+        }
+    })
+}
+
+/// The collection of the settled step `done`, with no entries: its status,
+/// disposition, and every invocation attempt. The host fills the entries of
+/// an admitted contribution only.
+fn collection(done: &StepDone) -> PublicationCollection {
+    PublicationCollection {
+        status: done.result.status,
+        reason: done.result.reason.clone(),
+        speculation: done.speculation,
+        invocations: done.invocations.clone(),
+        entries: Vec::new(),
+    }
+}
+
+/// A JSON binding value the binding owns.
 fn json_input(value: Value, sources: BTreeSet<SlotName>) -> CallInput {
     CallInput {
-        value: CallValue::Json(value),
+        value: CallValue::Json(value.into()),
         sources,
     }
+}
+
+/// Bind the selection `path` makes below `value`: `shared`, pointing at the
+/// selected value where it is held, unless a wildcard builds a new array.
+/// Returns `None` when the selection matches nothing.
+fn bind(
+    value: &Value,
+    path: &[PathSegment],
+    shared: impl FnOnce() -> Option<BoundJson>,
+) -> Option<BoundJson> {
+    if path.contains(&PathSegment::Wildcard) {
+        select(value, path).map(BoundJson::from)
+    } else {
+        shared()
+    }
+}
+
+/// The one value field and index selectors name below `value`, borrowed;
+/// `None` when a selector matches nothing or is a wildcard.
+pub(super) fn find<'v>(value: &'v Value, path: &[PathSegment]) -> Option<&'v Value> {
+    path.iter().try_fold(value, |value, segment| match segment {
+        PathSegment::Field(name) => value.get(name),
+        PathSegment::Index(index) => value.get(index),
+        PathSegment::Wildcard => None,
+    })
 }
 
 /// The serde wire form of a status or outcome enum, such as `"succeeded"`.

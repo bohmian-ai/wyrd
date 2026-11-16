@@ -13,7 +13,7 @@ use crate::cards::{CardSelector, Cards, Declarable};
 use crate::environment::Environment;
 use crate::error::WyrdClientError;
 use crate::observe::Run;
-use crate::observe::lifecycle::{BifrostLifecycle, StartedBifrost};
+use crate::observe::lifecycle::{BifrostLifecycle, StartClaim, StartedBifrost};
 use base64::Engine;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -23,7 +23,7 @@ use wyrd_cards::model::ModelCard;
 use wyrd_cards::prompt::PromptCard;
 use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::card::agent::AgentCard;
-use wyrd_spec::card::verifier::{VerificationBinding, VerifierSpec};
+use wyrd_spec::card::verifier::VerifierSpec;
 use wyrd_spec::envelope::{Card, CardKind, Relationships, Spec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
@@ -66,6 +66,9 @@ struct HydratedArtifact {
 struct TypedCards {
     /// Agent Card holders keyed by exact `CardRef`.
     agents: BTreeMap<String, AgentCard>,
+    /// The exact `CardRef` key of each Agent's pinned Prompt, keyed like
+    /// `agents`, so navigation formats no key.
+    agent_prompts: BTreeMap<String, String>,
     /// Prompt Card holders keyed by exact `CardRef`.
     prompts: BTreeMap<String, PromptCard>,
     /// Model Card holders keyed by exact `CardRef`.
@@ -81,6 +84,7 @@ impl fmt::Debug for TypedCards {
         formatter
             .debug_struct("TypedCards")
             .field("agents", &self.agents.keys().collect::<Vec<_>>())
+            .field("agent_prompts", &self.agent_prompts)
             .field("prompts", &self.prompts.keys().collect::<Vec<_>>())
             .field("models", &self.models.keys().collect::<Vec<_>>())
             .field("data", &self.data.keys().collect::<Vec<_>>())
@@ -108,12 +112,16 @@ impl TypedCards {
                 json!({ "card_ref_key": key }),
             )
         })?;
-        let prompt = self.prompts.get(&prompt_ref.to_string()).ok_or_else(|| {
-            state_bundle_error(
-                "Agent prompt target is missing or is not a Prompt Card",
-                json!({ "card_ref_key": key, "card_ref": prompt_ref }),
-            )
-        })?;
+        let prompt = self
+            .agent_prompts
+            .get(key)
+            .and_then(|prompt_key| self.prompts.get(prompt_key))
+            .ok_or_else(|| {
+                state_bundle_error(
+                    "Agent prompt target is missing or is not a Prompt Card",
+                    json!({ "card_ref_key": key, "card_ref": prompt_ref }),
+                )
+            })?;
         Ok(HydratedAgent {
             card,
             prompt_ref,
@@ -188,7 +196,8 @@ struct HydratedStateIndex {
     /// Exact root reference emitted by the hydration producer.
     root_ref: CardRef,
     /// Complete Card envelopes indexed by canonical exact-reference key.
-    cards_by_ref: BTreeMap<String, Card>,
+    /// Shared so adapter projections retain the same envelope.
+    cards_by_ref: BTreeMap<String, Arc<Card>>,
     /// Exact Card references indexed by their canonical key.
     refs_by_key: BTreeMap<String, CardRef>,
     /// Persisted aliases mapped to canonical exact-reference keys.
@@ -235,7 +244,7 @@ impl HydratedStateIndex {
         for item in loaded {
             let key = item.key;
             refs_by_key.insert(key.clone(), item.card_ref);
-            cards_by_ref.insert(key.clone(), item.card);
+            cards_by_ref.insert(key.clone(), Arc::new(item.card));
             #[cfg(feature = "internal")]
             {
                 let mut item_aliases = item.aliases;
@@ -295,7 +304,7 @@ impl HydratedStateIndex {
     /// Returns an invalid-state-bundle error when the key is absent from the
     /// validated Card map.
     fn card_by_key(&self, key: &str) -> Result<&Card, WyrdError> {
-        self.cards_by_ref.get(key).ok_or_else(|| {
+        self.cards_by_ref.get(key).map(Arc::as_ref).ok_or_else(|| {
             state_bundle_error(
                 "validated CardRef key points to a missing Card",
                 json!({ "card_ref_key": key }),
@@ -730,9 +739,9 @@ impl WyrdState {
 
     /// Connect this state's one Bifrost writer with an active write table.
     ///
-    /// `table` retains its existing Bifrost meaning as the handle's active
-    /// write binding; it does not choose a run's destination and does not
-    /// replace a fixed system table. The queue keeps its default configuration;
+    /// `table` is the handle's active write binding, the table
+    /// `run.bifrost().write(row)` writes, in place of a sole declared table;
+    /// it never replaces a fixed system table. The queue keeps its default configuration;
     /// [`WyrdState::start_bifrost_with_config`] is the configured form.
     ///
     /// # Arguments
@@ -773,9 +782,68 @@ impl WyrdState {
     ) -> Result<(), WyrdError> {
         let claim = self.bifrost.claim()?;
         let client = self.client()?;
-        claim
-            .complete(Bifrost::connect_with(client, BifrostOptions { table, queue }).await?)
-            .await
+        let chosen = table.is_some();
+        let bifrost = Bifrost::connect_with(client, BifrostOptions { table, queue }).await?;
+        self.complete_start(claim, bifrost, chosen).await
+    }
+
+    /// Activate the sole declared table unless the caller chose one, then
+    /// publish the started writer.
+    ///
+    /// A root Service that declares exactly one table makes it the active
+    /// table, so `run.bifrost().write(row)` needs no table name. With none,
+    /// or several, nothing is activated: the caller binds one with
+    /// [`WyrdState::start_bifrost_with`] or [`WyrdState::use_table_by_name`].
+    ///
+    /// # Errors
+    /// The server's describe error for the declared table, then as
+    /// [`StartClaim::complete`].
+    async fn complete_start(
+        &self,
+        claim: StartClaim<'_>,
+        bifrost: Bifrost,
+        chosen: bool,
+    ) -> Result<(), WyrdError> {
+        if !chosen && let Some(table) = self.sole_declared_table() {
+            bifrost.use_table_by_name(&table).await?;
+        }
+        claim.complete(bifrost).await
+    }
+
+    /// The fully-qualified name of the root Service's only declared table.
+    fn sole_declared_table(&self) -> Option<String> {
+        match &self.service().spec {
+            Spec::Service(service) => match service.tables.as_slice() {
+                [table] => Some(format!("bifrost.datasets.{}", table.name)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Bind the registered `<namespace>.<name>` table as the active table
+    /// that `run.bifrost().write(row)` writes, describing it first.
+    ///
+    /// This is [`Bifrost::use_table_by_name`] on the state's one writer: the
+    /// previous table's producer keeps draining, so switching strands no
+    /// buffered row. Every run of this state shares the active table; a
+    /// caller writing several tables concurrently names each one with
+    /// `run.bifrost().write_to(table, row)` instead.
+    ///
+    /// # Arguments
+    /// * `fqn` - The registered table's `<namespace>.<name>`.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup,
+    /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, and the server's describe
+    /// error for an unknown, unauthorized, or unavailable table.
+    ///
+    /// # Cancellation
+    /// Abandoning the future during the describe leaves the active table
+    /// unchanged.
+    pub async fn use_table_by_name(&self, fqn: &str) -> Result<(), WyrdError> {
+        let started = self.started_bifrost()?;
+        Ok(started.bifrost.use_table_by_name(fqn).await?)
     }
 
     /// The client this state's server calls go through.
@@ -924,28 +992,36 @@ impl WyrdState {
         name: &str,
     ) -> Result<BoundVerifier<'_>, WyrdError> {
         let subject_key = subject.to_string();
-        let mut bindings: Vec<&VerificationBinding> = Vec::new();
-        if let Spec::Service(service) = &self.service().spec {
-            if subject_key == self.index.root_key {
-                bindings.extend(&service.verified_by);
-            }
-            for component in &service.components {
-                if component.card_ref.as_card_ref() == Some(subject) {
-                    bindings.extend(&component.verified_by);
-                }
-            }
-        }
-        if let Spec::Agent(agent) = &self.index.card_by_key(&subject_key)?.spec {
-            bindings.extend(&agent.verified_by);
-        }
+        let service = match &self.service().spec {
+            Spec::Service(service) => Some(service),
+            _ => None,
+        };
+        let root = service
+            .filter(|_| subject_key == self.index.root_key)
+            .map(|service| service.verified_by.as_slice())
+            .unwrap_or_default();
+        let components = service
+            .map(|service| service.components.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .filter(|component| component.card_ref.as_card_ref() == Some(subject))
+            .flat_map(|component| &component.verified_by);
+        let agent = match &self.index.card_by_key(&subject_key)?.spec {
+            Spec::Agent(agent) => agent.verified_by.as_slice(),
+            _ => &[],
+        };
+        let bindings = root.iter().chain(components).chain(agent);
         for binding in bindings {
-            let Some(verifier_ref) = binding.verifier.as_card_ref() else {
+            // The graph keys each Card by its own reference, so a bound Card's
+            // name is its reference's: only a matching binding is looked up.
+            let Some(verifier_ref) = binding
+                .verifier
+                .as_card_ref()
+                .filter(|verifier_ref| verifier_ref.name.as_str() == name)
+            else {
                 continue;
             };
             let card = self.index.card_by_key(&verifier_ref.to_string())?;
-            if card.metadata.name.as_str() != name {
-                continue;
-            }
             let Spec::Verifier(spec) = &card.spec else {
                 return Err(state_bundle_error(
                     "a verified_by binding names a Card that is not a Verifier",
@@ -1036,7 +1112,9 @@ impl WyrdState {
         &self,
         bifrost: Bifrost,
     ) -> Result<(), WyrdError> {
-        self.bifrost.claim()?.complete(bifrost).await
+        let chosen = bifrost.table().is_some();
+        self.complete_start(self.bifrost.claim()?, bifrost, chosen)
+            .await
     }
 
     /// The started writer and its described fixed Drift table.
@@ -1331,8 +1409,11 @@ impl WyrdState {
     }
 
     /// Iterate over every loaded Card keyed by its canonical exact `CardRef`.
+    ///
+    /// Each Card is the state's shared envelope, so an adapter projection
+    /// can retain it without copying.
     #[cfg(feature = "internal")]
-    pub fn cards(&self) -> impl Iterator<Item = (&str, &Card)> {
+    pub fn cards(&self) -> impl Iterator<Item = (&str, &Arc<Card>)> {
         self.index
             .cards_by_ref
             .iter()
@@ -1344,7 +1425,7 @@ impl WyrdState {
     /// # Arguments
     /// * `kind` - The Card kind to keep.
     #[cfg(feature = "internal")]
-    pub fn cards_of_kind(&self, kind: CardKind) -> impl Iterator<Item = (&str, &Card)> {
+    pub fn cards_of_kind(&self, kind: CardKind) -> impl Iterator<Item = (&str, &Arc<Card>)> {
         self.index
             .cards_by_ref
             .iter()
@@ -1787,33 +1868,40 @@ fn state_bundle_error(message: impl Into<String>, details: Value) -> WyrdError {
 /// # Errors
 /// Returns `WYRD_SDK_400_INVALID_STATE_BUNDLE` when a validated envelope cannot
 /// be converted to its required native typed holder.
-fn hydrate_typed_cards(cards: &BTreeMap<String, Card>) -> Result<TypedCards, WyrdError> {
+fn hydrate_typed_cards(cards: &BTreeMap<String, Arc<Card>>) -> Result<TypedCards, WyrdError> {
     let mut typed = TypedCards::default();
     for (key, envelope) in cards {
         match envelope.kind {
             CardKind::Agent => {
-                let holder = AgentCard::from_envelope(envelope.clone())
+                let holder = AgentCard::from_envelope(Card::clone(envelope))
                     .map_err(|error| typed_hydration_error(envelope, &error))?;
                 typed.agents.insert(key.clone(), holder);
             }
             CardKind::Prompt => {
-                let holder = PromptCard::from_card(envelope.clone())
+                let holder = PromptCard::from_card(Card::clone(envelope))
                     .map_err(|error| typed_hydration_error(envelope, &error))?;
                 typed.prompts.insert(key.clone(), holder);
             }
             CardKind::Model => {
-                let holder = ModelCard::from_card(envelope.clone())
+                let holder = ModelCard::from_card(Card::clone(envelope))
                     .map_err(|error| typed_hydration_error(envelope, &error))?;
                 typed.models.insert(key.clone(), holder);
             }
             CardKind::Data => {
-                let holder = DataCard::from_card(envelope.clone())
+                let holder = DataCard::from_card(Card::clone(envelope))
                     .map_err(|error| typed_hydration_error(envelope, &error))?;
                 typed.data.insert(key.clone(), holder);
             }
             _ => {}
         }
     }
+    typed.agent_prompts = typed
+        .agents
+        .iter()
+        .filter_map(|(key, agent)| {
+            Some((key.clone(), agent.spec.prompt.as_card_ref()?.to_string()))
+        })
+        .collect();
     for key in typed.agents.keys() {
         typed.agent(key)?;
     }
@@ -2392,7 +2480,7 @@ pub(crate) mod tests {
     use wyrd_spec::card::field::FieldSpec;
     use wyrd_spec::card::model::{CustomMeta, ModelInterface, ModelSignature, ModelSpec, TaskType};
     use wyrd_spec::card::prompt::PromptSpec;
-    use wyrd_spec::card::service::{ServiceComponent, ServiceSpec};
+    use wyrd_spec::card::service::{ServiceComponent, ServiceSpec, ServiceTable};
     use wyrd_spec::card::trigger::{TriggerActivation, TriggerSpec};
     use wyrd_spec::card::verifier::{
         AgentCall, Check, Requirement, VerificationBinding, VerifierSpec,
@@ -2441,6 +2529,16 @@ pub(crate) mod tests {
         /// Panics if the temporary directory cannot be created or fixture
         /// values cannot be serialized and written.
         pub(crate) fn complete_service() -> Self {
+            Self::complete_service_with_tables(&[])
+        }
+
+        /// [`Self::complete_service`] whose root Service declares `tables`,
+        /// each with an empty object schema.
+        ///
+        /// # Panics
+        /// Panics if the temporary directory cannot be created or a Card,
+        /// the manifest, or a fixture file cannot be serialized and written.
+        pub(crate) fn complete_service_with_tables(tables: &[&str]) -> Self {
             let root_ref = test_ref(CardKind::Service, "service", 1);
             let model_ref = test_ref(CardKind::Model, "model", 2);
             let backup_ref = test_ref(CardKind::Model, "backup", 3);
@@ -2463,6 +2561,13 @@ pub(crate) mod tests {
                         credential_refs: Vec::new(),
                     },
                 ],
+                tables: tables
+                    .iter()
+                    .map(|name| ServiceTable {
+                        name: (*name).to_owned(),
+                        schema: serde_json::json!({ "type": "object" }),
+                    })
+                    .collect(),
                 ..ServiceSpec::default()
             };
             let mut bundle = Self {
@@ -2640,6 +2745,73 @@ pub(crate) mod tests {
             bundle
         }
 
+        /// Build [`Self::with_typed_cards`] with Verifiers bound at every
+        /// level: `judge` 1.0.0 on the `model` component, a second `model`
+        /// occurrence binding `judge` 2.0.0 then `solo`, `judge` 2.0.0 on the
+        /// `agent_triage` component, and `judge` 1.0.0 then `solo` on the
+        /// triage Agent itself. Returns the bundle and `judge` 1.0.0, `judge`
+        /// 2.0.0, and `solo`.
+        ///
+        /// # Panics
+        /// Panics if fixture construction or serialization fails.
+        pub(crate) fn with_bound_verifiers() -> (Self, [CardRef; 3]) {
+            let mut bundle = Self::with_typed_cards();
+            let judge = test_ref(CardKind::Verifier, "judge", 0x20);
+            let judge_next = CardRef {
+                version: VersionBlock::parse("2.0.0").expect("fixture version is valid"),
+                uid: test_ref(CardKind::Verifier, "judge", 0x21).uid,
+                ..judge.clone()
+            };
+            let solo = test_ref(CardKind::Verifier, "solo", 0x22);
+            for (alias, verifier) in [
+                ("judge", &judge),
+                ("judge_next", &judge_next),
+                ("solo", &solo),
+            ] {
+                bundle.add_card(
+                    alias,
+                    card(
+                        verifier,
+                        CardKind::Verifier,
+                        Spec::Verifier(assert_verifier()),
+                        Relationships::default(),
+                    ),
+                    &[],
+                );
+            }
+            let model_ref = test_ref(CardKind::Model, "model", 2);
+            let agent_ref = test_ref(CardKind::Agent, "triage", 6);
+            bundle.add_alias("model_again", &model_ref);
+            let bind = |refs: &[&CardRef]| -> Vec<VerificationBinding> {
+                refs.iter()
+                    .map(|verifier| verification_binding((*verifier).clone(), None))
+                    .collect()
+            };
+            bundle.rewrite_card(&test_ref(CardKind::Service, "service", 1), |card| {
+                let Spec::Service(spec) = &mut card.spec else {
+                    panic!("fixture root is a Service");
+                };
+                for component in &mut spec.components {
+                    match component.alias.as_str() {
+                        "model" => component.verified_by = bind(&[&judge]),
+                        "agent_triage" => component.verified_by = bind(&[&judge_next]),
+                        _ => {}
+                    }
+                }
+                let mut again = service_component("model_again", &model_ref);
+                again.verified_by = bind(&[&judge_next, &solo]);
+                spec.components.push(again);
+            });
+            bundle.rewrite_card(&agent_ref, |card| {
+                let Spec::Agent(spec) = &mut card.spec else {
+                    panic!("fixture triage Card is an Agent");
+                };
+                spec.verified_by = bind(&[&judge, &solo]);
+            });
+            bundle.write();
+            (bundle, [judge, judge_next, solo])
+        }
+
         /// Add a Verifier, bound to the root Service, whose agent check runs
         /// an inline Agent with a prompt in the supplied reference form.
         ///
@@ -2654,7 +2826,7 @@ pub(crate) mod tests {
                 agent: InlineableRef::Inline(Box::new(AgentSpec {
                     prompt: if sibling {
                         InlineableRef::Sibling {
-                            sibling: prompt_ref,
+                            sibling: (&prompt_ref).into(),
                         }
                     } else {
                         InlineableRef::Ref(prompt_ref)
@@ -3177,12 +3349,20 @@ pub(crate) mod tests {
     }
 
     /// Assert the stable error shape used when durable state contains a sibling.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `result` succeeds or its error lacks the invalid-bundle
+    /// code, the owner, or the sibling projection of `expected_ref`.
     fn assert_sibling_error(result: Result<WyrdState, WyrdError>, expected_ref: &CardRef) {
         let error = result.expect_err("sibling reference must be rejected");
         assert_eq!(error.code(), "WYRD_SDK_400_INVALID_STATE_BUNDLE");
         let details = problem_details(&error);
         assert!(!details["owner"].is_null(), "owner detail is required");
-        assert_eq!(details["card_ref"], serde_json::json!(expected_ref));
+        assert_eq!(
+            details["card_ref"],
+            serde_json::json!(wyrd_spec::reference::SiblingRef::from(expected_ref))
+        );
         assert_eq!(details["reference_form"], "sibling");
     }
 
@@ -3979,7 +4159,7 @@ pub(crate) mod tests {
         bundle.rewrite_card(&test_ref(CardKind::Service, "service", 1), |card| {
             if let Spec::Service(spec) = &mut card.spec {
                 spec.components[0].card_ref = Ref::Sibling {
-                    sibling: sibling.clone(),
+                    sibling: (&sibling).into(),
                 };
             }
         });

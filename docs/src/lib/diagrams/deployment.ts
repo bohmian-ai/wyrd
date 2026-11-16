@@ -8,7 +8,7 @@ export const wyrdDeployment: DiagramSpec = {
   views: [
     {
       size: [860, 410],
-      rest: 'Every pod is the same <code>wyrd-server</code> binary; <code>WYRD_TARGET</code> picks its role. One pod running <code>all</code> is a complete deployment. Choose a step, or press Play.',
+      rest: 'Every pod is the same <code>wyrd-server</code> binary; <code>WYRD_TARGET</code> picks its role. One pod running <code>combined</code> is a complete deployment. Choose a step, or press Play.',
       groups: [{ x: 346, y: 14, w: 250, h: 360, label: 'wyrd-server pods' }],
       nodes: [
         { id: 'apps', kind: 'client', x: 16, y: 40, w: 150, h: 52, title: 'Your apps', sub: 'SDK' },
@@ -16,10 +16,10 @@ export const wyrdDeployment: DiagramSpec = {
         { id: 'agents', kind: 'client', x: 16, y: 184, w: 150, h: 52, title: 'Coding agents', sub: 'MCP' },
         { id: 'people', kind: 'client', x: 16, y: 256, w: 150, h: 52, title: 'People', sub: 'browser' },
         { id: 'lb', kind: 'component', x: 196, y: 130, w: 120, h: 80, title: 'Load balancer', sub: 'yours · TLS' },
-        { id: 'api', kind: 'pod', x: 360, y: 40, w: 222, h: 58, title: 'server', sub: 'API · verification · LLM gateway' },
-        { id: 'scribe', kind: 'pod', x: 360, y: 120, w: 222, h: 58, title: 'scribe', sub: 'writes · persistent disk' },
-        { id: 'oracle', kind: 'pod', x: 360, y: 200, w: 222, h: 58, title: 'oracle', sub: 'SQL queries' },
-        { id: 'worker', kind: 'pod', x: 360, y: 280, w: 222, h: 58, title: 'forge-worker', sub: 'compaction · no API' },
+        { id: 'api', kind: 'pod', x: 360, y: 40, w: 222, h: 58, title: 'direct · worker', sub: 'API · verification · LLM gateway' },
+        { id: 'scribe', kind: 'pod', x: 360, y: 120, w: 222, h: 58, title: 'bifrost-ingest', sub: 'writes · persistent disk' },
+        { id: 'oracle', kind: 'pod', x: 360, y: 200, w: 222, h: 58, title: 'bifrost-query', sub: 'SQL queries' },
+        { id: 'worker', kind: 'pod', x: 360, y: 280, w: 222, h: 58, title: 'bifrost-maintenance', sub: 'compaction · no API' },
         { id: 'idp', kind: 'client', x: 640, y: 24, w: 204, h: 56, title: 'Identity provider', sub: 'OIDC sign-in' },
         { id: 'models', kind: 'client', x: 640, y: 100, w: 204, h: 56, title: 'Model providers', sub: 'your keys' },
         { id: 'pg', kind: 'store', x: 640, y: 196, w: 204, h: 72, title: 'Postgres', sub: 'declarations · coordination' },
@@ -47,7 +47,7 @@ export const wyrdDeployment: DiagramSpec = {
       nodes: ['apps', 'ci', 'agents', 'people', 'lb', 'api', 'scribe', 'oracle'],
       edges: ['a', 'c', 'g', 'p', 'la', 'ls', 'lo'],
       caption:
-        'Every client reaches one address. Your load balancer terminates TLS and routes HTTP to API pods, Bifrost writes over gRPC to <code>scribe</code> pods, and queries to <code>oracle</code> pods. It never decides who the caller is; the Wyrd token does.'
+        'Every client reaches one address. Your load balancer terminates TLS and routes verification to <code>direct</code> pods and queued work and webhooks to <code>worker</code> pods, Bifrost writes over gRPC to <code>bifrost-ingest</code> pods, and queries to <code>bifrost-query</code> pods. It never decides who the caller is; the Wyrd token does.'
     },
     {
       label: 'Identity',
@@ -68,7 +68,7 @@ export const wyrdDeployment: DiagramSpec = {
       nodes: ['api', 'scribe', 'oracle', 'worker', 'pg', 'obj'],
       edges: ['sp', 'so'],
       caption:
-        'Postgres holds declarations, permissions, and coordination. Object storage holds evidence and artifacts. <code>forge-worker</code> pods compact Bifrost tables in the background and take no client traffic.'
+        'Postgres holds declarations, permissions, and coordination. Object storage holds evidence and artifacts. <code>bifrost-maintenance</code> pods compact Bifrost tables in the background and take no client traffic.'
     }
   ]
 };

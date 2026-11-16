@@ -171,10 +171,11 @@ pub struct MemorySnapshot {
     pub oracle_limit_bytes: usize,
     /// Total charged bytes by category in enum order.
     pub categories: [usize; MEMORY_CATEGORY_COUNT],
-    /// Current cgroup resident usage when the kernel exposes it.
-    pub cgroup_current_bytes: Option<usize>,
-    /// Cgroup memory limit used for the external-pressure tripwire.
-    pub cgroup_limit_bytes: Option<usize>,
+    /// Process memory ledger bytes promised to every capability, Bifrost's
+    /// governed total included.
+    pub process_used_bytes: usize,
+    /// Process memory ledger budget shared with non-Bifrost capabilities.
+    pub process_limit_bytes: usize,
     /// Current ingress bytes charged (the value ingress admission counts).
     ///
     /// This equals `scribe_total_bytes`: ingress admission charges the whole
@@ -208,7 +209,7 @@ impl MemorySnapshot {
     }
 
     /// Effective pressure as a percentage of the most constrained active
-    /// governor. The cgroup signal is absent on bare-metal hosts.
+    /// governor, the process ledger other capabilities share included.
     #[must_use]
     pub fn effective_pressure_percent(self) -> usize {
         let managed = self
@@ -221,14 +222,12 @@ impl MemorySnapshot {
             .saturating_mul(100)
             .checked_div(self.bifrost_limit_bytes.max(1))
             .unwrap_or(100);
-        let cgroup = match (self.cgroup_current_bytes, self.cgroup_limit_bytes) {
-            (Some(current), Some(limit)) if limit > 0 => current
-                .saturating_mul(100)
-                .checked_div(limit)
-                .unwrap_or(100),
-            _ => 0,
-        };
-        managed.max(parent).max(cgroup)
+        let process = self
+            .process_used_bytes
+            .saturating_mul(100)
+            .checked_div(self.process_limit_bytes.max(1))
+            .unwrap_or(100);
+        managed.max(parent).max(process)
     }
 
     /// Ingress occupancy as a percent of the ingress ceiling.
@@ -309,40 +308,37 @@ impl MemorySnapshot {
 /// the only accepted values of the ceiling-labelled rejection metric; the label
 /// set is closed and carries no tenant or table identity.
 ///
-/// The ingress admission path constructs [`Self::CgroupBreaker`],
+/// The ingress admission path constructs [`Self::ProcessMemory`],
 /// [`Self::IngressSublimit`], and [`Self::BifrostParent`] (see
 /// the root-issued Scribe ingress capability); [`Self::ScribeChild`] is the
-/// child-limit form used by the non-ingress reservation paths, and
-/// [`Self::CgroupParent`] identifies the parent cgroup tripwire. All five are a
+/// child-limit form used by the non-ingress reservation paths. All four are a
 /// normative D84 interface, not implementor latitude.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScribeRejectionCeiling {
-    /// The Scribe-child cgroup breaker tripped at or above 90% container usage.
-    CgroupBreaker,
+    /// The process memory ledger, shared with non-Bifrost capabilities, had
+    /// no room; a Scribe pressure seal cannot relieve it.
+    ProcessMemory,
     /// A raw Scribe-child reservation exceeded the full child limit.
     ScribeChild,
     /// An ingress reservation exceeded the ingress sublimit (`limit - headroom`).
     IngressSublimit,
     /// A reservation exceeded the parent Bifrost ceiling.
     BifrostParent,
-    /// The parent cgroup tripwire tripped at 100% container usage.
-    CgroupParent,
 }
 impl ScribeRejectionCeiling {
     /// Return the stable `snake_case` label used by ceiling-rejection telemetry.
     ///
     /// The returned string is the value attached as the `reason` label on
     /// `bifrost_scribe_rejections_total` for a ceiling-labelled rejection; the
-    /// five values form the closed label set and must stay stable across
+    /// four values form the closed label set and must stay stable across
     /// changes.
     #[must_use]
     pub fn as_metric_label(self) -> &'static str {
         match self {
-            Self::CgroupBreaker => "cgroup_breaker",
+            Self::ProcessMemory => "process_memory",
             Self::ScribeChild => "scribe_child",
             Self::IngressSublimit => "ingress_sublimit",
             Self::BifrostParent => "bifrost_parent",
-            Self::CgroupParent => "cgroup_parent",
         }
     }
 }

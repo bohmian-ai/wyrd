@@ -10,7 +10,7 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 pub mod auth;
-pub mod authoring;
+mod authoring;
 pub mod bifrost;
 pub mod cards;
 pub mod client;
@@ -20,6 +20,8 @@ pub mod environment;
 pub mod error;
 pub mod gateway_admin;
 pub mod gateway_credential;
+/// Tenant GitHub connection: connect, read and disconnect the deployment's App.
+pub mod github;
 pub mod global_config;
 pub mod observe;
 pub mod operator_connections;
@@ -34,7 +36,9 @@ pub mod verify;
 pub use bifrost::{Bifrost, QueueConfig};
 pub use client::WyrdClient;
 pub use gateway_admin::Gateway;
+pub use github::GithubConnection;
 pub use global_config::GlobalConfig;
 pub use operator_connections::OperatorConnections;
 pub use platform::Platform;
 pub use principals::Principals;
+pub use verify::Evidence;

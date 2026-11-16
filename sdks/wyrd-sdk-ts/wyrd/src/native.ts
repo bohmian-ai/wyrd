@@ -231,7 +231,7 @@ export function jsonSnapshot<H = never>(
   return { value: check(value, "$", []), holes };
 }
 
-/** The native handle behind each `wyrd-ai/authoring` value. */
+/** The native handle behind each `verify` definition value. */
 const authored = new WeakMap<object, NativeAuthored>();
 
 /** Record `native` as the handle behind the authoring value `owner`. */
@@ -247,14 +247,14 @@ export function authoredNative(value: object): NativeAuthored | undefined {
 /**
  * The native handle behind the authoring value `owner`.
  *
- * @param owner - A `wyrd-ai/authoring` value.
+ * @param owner - A `verify` definition value.
  * @returns Its handle.
  * @throws `TypeError` when `owner` is not an authoring value.
  */
 export function authoredOf(owner: object): NativeAuthored {
   const native = authored.get(owner);
   if (native === undefined) {
-    throw new TypeError("not a wyrd-ai/authoring value");
+    throw new TypeError("not a verify definition value");
   }
   return native;
 }

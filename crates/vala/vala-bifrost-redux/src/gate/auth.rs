@@ -16,9 +16,8 @@
 
 use std::sync::Arc;
 
-use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
-use wyrd_auth_verify::{TokenAudience, TokenVerifier, VerifiedToken};
+use wyrd_auth_verify::{AccessTokenClaims, TokenAudience, TokenVerifier, VerifiedToken};
 use wyrd_runtime::{
     DelegationStep, Principal, delegated_attribution, needs_root_resolution, owning_root,
 };
@@ -162,22 +161,7 @@ pub fn extract_bearer(metadata: &MetadataMap) -> Result<SecretString, IngestErro
 }
 
 fn tenant_from_unverified_access_token(token: &str) -> Result<DataTenantId, IngestError> {
-    let payload = token
-        .split('.')
-        .nth(1)
-        .ok_or_else(|| IngestError::Unauthenticated("token does not name a tenant".to_owned()))?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .map_err(|_| IngestError::Unauthenticated("token does not name a tenant".to_owned()))?;
-    let claims: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|_| IngestError::Unauthenticated("token does not name a tenant".to_owned()))?;
-    let tenant = claims
-        .pointer("/principal/tenant_id")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| IngestError::Unauthenticated("token does not name a tenant".to_owned()))?;
-    let uuid = uuid::Uuid::parse_str(tenant)
-        .map_err(|_| IngestError::Unauthenticated("token does not name a tenant".to_owned()))?;
-    DataTenantId::new(uuid)
+    AccessTokenClaims::unverified_tenant(token)
         .map_err(|_| IngestError::Unauthenticated("token does not name a tenant".to_owned()))
 }
 

@@ -250,6 +250,36 @@ impl WyrdPostgres {
             .await
     }
 
+    /// Resolve the tenant associated with a GitHub App installation.
+    ///
+    /// A verified installation webhook names only `(host, installation_id)`.
+    /// The SECURITY DEFINER function `wyrd.github_installation_tenant`,
+    /// called on the tenant pool, answers this one question across tenant
+    /// RLS, or `None` when no tenant is associated with it. Routing grants no
+    /// permission: the caller then works on that tenant's [`crate::TenantConn`].
+    ///
+    /// # Errors
+    /// Returns [`SqlError::Query`] when Postgres rejects the lookup and
+    /// [`SqlError::InvalidDataTenantId`] when the stored tenant id violates the
+    /// Wyrd tenant-id contract.
+    pub async fn github_installation_tenant(
+        &self,
+        host: &str,
+        installation_id: i64,
+    ) -> Result<Option<DataTenantId>, SqlError> {
+        // Dynamic query is intentional: the definer function post-dates the
+        // SQLx offline bundle.
+        sqlx::query_scalar::<_, Option<Uuid>>("SELECT wyrd.github_installation_tenant($1, $2)")
+            .bind(host)
+            .bind(installation_id)
+            .fetch_one(&self.app)
+            .await
+            .map_err(SqlError::from)?
+            .map(DataTenantId::new)
+            .transpose()
+            .map_err(SqlError::InvalidDataTenantId)
+    }
+
     /// Read a tenant's route key and display name from the tenant directory.
     ///
     /// The directory is not tenant data, so the read runs on the audited

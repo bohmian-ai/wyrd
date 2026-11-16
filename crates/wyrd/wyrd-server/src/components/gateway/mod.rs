@@ -25,6 +25,7 @@ pub(crate) mod routes;
 mod service;
 mod snapshots;
 mod telemetry;
+mod usage;
 
 pub(crate) use api_keys::GatewayApiKeys;
 pub use batches::{BatchAnswer, GatewayBatches};
@@ -42,4 +43,5 @@ pub use routes::gateway_router;
 pub use service::GatewayAdministration;
 pub(crate) use service::invalid;
 pub use snapshots::GatewaySnapshots;
+pub use usage::GatewayUsage;
 pub use wyrd_gateway::{GatewayCredentialSnapshot, GatewayCredentialSource, GatewayTenantSnapshot};

@@ -39,7 +39,7 @@ use wyrd_sql::{OperatorPool, TenantConn, WyrdPostgres};
 use wyrd_vault::{VaultError, VaultKv2};
 use zeroize::Zeroizing;
 
-use crate::config::{BifrostTarget, OperatorKeySource, OperatorKeysConfig};
+use crate::config::{OperatorKeySource, OperatorKeysConfig, ServerTarget};
 
 /// Rows one tenant rewrap transaction moves at most.
 const REWRAP_BATCH: i64 = 100;
@@ -258,14 +258,14 @@ impl Default for OperatorKeys {
 impl OperatorKeys {
     /// Build the owner a server `role` uses.
     ///
-    /// Only API-bearing roles serve Operator connections, so only they build
-    /// the configured owner; a dedicated Forge worker keeps the unused default
+    /// Only API-bearing targets serve Operator connections, so only they build
+    /// the configured owner; the Forge maintenance target keeps the unused default
     /// and never reads Operator key settings it does not own or validate.
     ///
     /// # Errors
     /// Returns any [`OperatorKeys::new`] error for an API-bearing role.
     pub(crate) fn for_role(
-        role: BifrostTarget,
+        role: ServerTarget,
         config: &OperatorKeysConfig,
     ) -> Result<Self, KeyError> {
         if role.serves_api() {
@@ -996,11 +996,11 @@ mod tests {
             Err(KeyError::VersionOutOfRange)
         ));
         assert!(matches!(
-            OperatorKeys::for_role(BifrostTarget::Server, &oversized),
+            OperatorKeys::for_role(ServerTarget::Direct, &oversized),
             Err(KeyError::VersionOutOfRange)
         ));
-        let forge = OperatorKeys::for_role(BifrostTarget::ForgeWorker, &oversized)
-            .expect("a Forge worker keeps the default owner");
+        let forge = OperatorKeys::for_role(ServerTarget::BifrostMaintenance, &oversized)
+            .expect("the Forge maintenance target keeps the default owner");
         assert_eq!(forge.active_version(), 1);
     }
 

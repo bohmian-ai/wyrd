@@ -91,8 +91,8 @@ def test_records_land_under_the_view_that_wrote_them(
 ) -> None:
     run = observed_with_bifrost.run()
 
-    run.for_card("agent").observe.record(dataset, {"value": 41})
-    run.for_card("model").observe.record(dataset, {"value": 42})
+    run.for_card("agent").bifrost.write_to(dataset, {"value": 41})
+    run.for_card("model").bifrost.write_to(dataset, {"value": 42})
     observed_with_bifrost.flush()
     wyrd_server.flush_bifrost()
 
@@ -107,6 +107,29 @@ def test_records_land_under_the_view_that_wrote_them(
     ]
 
 
+def test_write_needs_an_active_table_and_switching_moves_it(
+    observed_with_bifrost: WyrdState, dataset: str, wyrd_server: WyrdTestServer, bifrost: Bifrost
+) -> None:
+    run = observed_with_bifrost.run("agent")
+
+    with pytest.raises(WyrdError) as refused:
+        run.bifrost.write({"value": 43})
+    assert refused.value.code == "WYRD_VALA_412_NO_ACTIVE_TABLE"
+    observed_with_bifrost.use_table_by_name(dataset)
+    run.bifrost.write({"value": 43})
+    observed_with_bifrost.flush()
+    wyrd_server.flush_bifrost()
+
+    rows = bifrost.sql(
+        f"SELECT value, subject_card_uid FROM {dataset} WHERE run_id = $1",
+        [run.run_id],
+        model=RecordRow,
+    )
+    assert rows == [
+        RecordRow(value=43, subject_card_uid=str(observed_with_bifrost.card_ref("agent").uid))
+    ]
+
+
 @pytest.mark.parametrize(
     ("table", "code"),
     [
@@ -114,11 +137,11 @@ def test_records_land_under_the_view_that_wrote_them(
         ("bifrost.datasets.never_registered", "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND"),
     ],
 )
-def test_record_into_a_managed_or_unregistered_table_is_refused(
+def test_write_into_a_managed_or_unregistered_table_is_refused(
     observed_with_bifrost: WyrdState, table: str, code: str
 ) -> None:
     with pytest.raises(WyrdError) as refused:
-        observed_with_bifrost.run("agent").observe.record(table, {"value": 1})
+        observed_with_bifrost.run("agent").bifrost.write_to(table, {"value": 1})
     assert refused.value.code == code
 
 

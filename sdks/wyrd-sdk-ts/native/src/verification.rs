@@ -1,5 +1,5 @@
-//! Thin napi projection of Verifier inputs, submissions, and execution
-//! handles.
+//! Thin napi projection of Verifier inputs, submissions, execution
+//! handles, approval decisions, and deferred evidence publication.
 //!
 //! Slot projection, file pinning, routing, retry keys, and polling stay in
 //! `wyrd_client::verify`; this module only converts Node values into the
@@ -11,9 +11,12 @@ use napi::Env;
 use napi::bindgen_prelude::{Buffer, PromiseRaw};
 use napi_derive::napi;
 use serde_json::{Value, json};
-use wyrd_client::verify::{ArtifactRef, Execution, File, Input, Inputs, Submission};
+use wyrd_client::verify::{
+    ApprovalDecision, ArtifactRef, Evidence, Execution, ExecutionPageQuery, File, Input, Inputs,
+    PublicationName, PublicationSelector, Submission, TaskId,
+};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::ExecutionId;
+use wyrd_spec::ids::{ApprovalId, ExecutionId};
 
 use crate::cards::parse_card_ref;
 use crate::client::NativeWyrdClient;
@@ -203,12 +206,31 @@ impl NativeExecution {
         })
     }
 
+    /// Reads what the completed execution ran: each requirement's authored
+    /// check and provenance, every step, and the pinned evidence.
+    ///
+    /// # Errors
+    /// Returns a napi error only when the details cannot be projected; read
+    /// failures, including `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND`, are
+    /// returned in [`NativeLifecycleResult`].
+    #[napi]
+    pub fn details<'env>(
+        &self,
+        env: &'env Env,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let execution = self.execution.clone();
+        crate::trace::spawn(env, async move {
+            NativeLifecycleResult::outcome(execution.details().await)
+        })
+    }
+
     /// Polls until a result, the execution's terminal error, or `timeout_ms`.
     ///
     /// # Errors
     /// Returns a napi error only when the result cannot be projected; the
-    /// terminal error and `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT` are returned
-    /// in [`NativeLifecycleResult`].
+    /// terminal error, `WYRD_SDK_409_VERIFICATION_CANCELLED`, and
+    /// `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT` are returned in
+    /// [`NativeLifecycleResult`].
     #[napi]
     pub fn wait<'env>(
         &self,
@@ -224,6 +246,171 @@ impl NativeExecution {
             )
         })
     }
+
+    /// Reads one stable page of the execution's invocation attempts.
+    ///
+    /// # Errors
+    /// Returns a napi error only when the page cannot be projected; a
+    /// malformed `page_json` and read failures are returned in
+    /// [`NativeLifecycleResult`].
+    #[napi]
+    pub fn invocations<'env>(
+        &self,
+        env: &'env Env,
+        page_json: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let execution = self.execution.clone();
+        crate::trace::spawn(env, async move {
+            NativeLifecycleResult::outcome(match parsed::<ExecutionPageQuery>("page", &page_json) {
+                Ok(page) => execution.invocations(&page).await,
+                Err(error) => Err(error),
+            })
+        })
+    }
+
+    /// Reads one stable page of the execution's accepted publications.
+    ///
+    /// # Errors
+    /// As [`Self::invocations`].
+    #[napi]
+    pub fn publications<'env>(
+        &self,
+        env: &'env Env,
+        page_json: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let execution = self.execution.clone();
+        crate::trace::spawn(env, async move {
+            NativeLifecycleResult::outcome(match parsed::<ExecutionPageQuery>("page", &page_json) {
+                Ok(page) => execution.publications(&page).await,
+                Err(error) => Err(error),
+            })
+        })
+    }
+
+    /// Reads publication `name` of `step_id`'s exact producer attempt.
+    ///
+    /// # Errors
+    /// Returns a napi error only when the publication cannot be projected; a
+    /// malformed step, name, or selector and read failures are returned in
+    /// [`NativeLifecycleResult`].
+    #[napi]
+    pub fn publication<'env>(
+        &self,
+        env: &'env Env,
+        step_id: String,
+        name: String,
+        selector_json: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let execution = self.execution.clone();
+        crate::trace::spawn(env, async move {
+            NativeLifecycleResult::outcome(match selected(step_id, name, &selector_json) {
+                Ok((step, name, selector)) => execution.publication(&step, &name, &selector).await,
+                Err(error) => Err(error),
+            })
+        })
+    }
+
+    /// Plans the download of a file publication, or of one listed file of a
+    /// directory publication.
+    ///
+    /// # Errors
+    /// As [`Self::publication`].
+    #[napi]
+    pub fn download<'env>(
+        &self,
+        env: &'env Env,
+        step_id: String,
+        name: String,
+        selector_json: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let execution = self.execution.clone();
+        crate::trace::spawn(env, async move {
+            NativeLifecycleResult::outcome(match selected(step_id, name, &selector_json) {
+                Ok((step, name, selector)) => execution.download(&step, &name, &selector).await,
+                Err(error) => Err(error),
+            })
+        })
+    }
+
+    /// Cancels the execution durably; a terminal execution keeps its status.
+    ///
+    /// # Errors
+    /// Returns a napi error only when the response cannot be projected;
+    /// refusals are returned in [`NativeLifecycleResult`].
+    #[napi]
+    pub fn cancel<'env>(
+        &self,
+        env: &'env Env,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let execution = self.execution.clone();
+        crate::trace::spawn(env, async move {
+            NativeLifecycleResult::outcome(execution.cancel().await)
+        })
+    }
+
+    /// Approves or rejects the pending approval occurrence `approval_id`
+    /// and resolves to its durable receipt; the same decision and reason
+    /// replay it.
+    ///
+    /// # Errors
+    /// Returns a napi error only when the receipt cannot be projected; an
+    /// invalid ID or decision and every server refusal are returned in
+    /// [`NativeLifecycleResult`].
+    #[napi]
+    pub fn decide<'env>(
+        &self,
+        env: &'env Env,
+        approval_id: String,
+        decision: String,
+        reason: Option<String>,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let execution = self.execution.clone();
+        let parsed = approval_id
+            .parse::<ApprovalId>()
+            .map_err(|error| WyrdError::Validation {
+                message: format!("approval ID is invalid: {error}"),
+                details: json!({ "field": "approval_id" }),
+            })
+            .and_then(|id| {
+                Ok((
+                    id,
+                    parsed::<ApprovalDecision>("decision", &json!(decision).to_string())?,
+                ))
+            });
+        crate::trace::spawn(env, async move {
+            NativeLifecycleResult::outcome(match parsed {
+                Ok((id, decision)) => execution.decide(id, decision, reason).await,
+                Err(error) => Err(error),
+            })
+        })
+    }
+}
+
+/// Parses the JSON `field` the TypeScript wrapper serialized.
+///
+/// # Errors
+/// Returns [`WyrdError::Validation`] naming `field` when it does not parse.
+fn parsed<T: serde::de::DeserializeOwned>(field: &str, json: &str) -> Result<T, WyrdError> {
+    serde_json::from_str(json).map_err(|error| WyrdError::Validation {
+        message: format!("{field} is invalid: {error}"),
+        details: json!({ "field": field }),
+    })
+}
+
+/// The step, name, and producer selector of one publication read.
+///
+/// # Errors
+/// Returns [`WyrdError::Validation`] for a malformed step, name, or selector.
+fn selected(
+    step_id: String,
+    name: String,
+    selector_json: &str,
+) -> Result<(TaskId, PublicationName, PublicationSelector), WyrdError> {
+    Ok((
+        TaskId::new(step_id)?,
+        PublicationName::new(name)?,
+        parsed("selector", selector_json)?,
+    ))
 }
 
 #[napi]
@@ -251,6 +438,88 @@ impl NativeWyrdClient {
             Ok(match connected {
                 Ok(execution) => NativeSubmission::queued(execution),
                 Err(error) => NativeSubmission::outcome(Err(error)),
+            })
+        })
+    }
+}
+
+/// Node-facing deferred evidence publisher over the shared
+/// [`Evidence`] handle; source resolution and upload stay in Rust.
+#[napi]
+pub struct NativeEvidence {
+    /// Shared handle owning transport and authentication.
+    evidence: Evidence,
+}
+
+/// Closed result of connecting one evidence publisher: the handle or a
+/// catalog error.
+#[napi(object, object_from_js = false)]
+pub struct NativeEvidenceConnection {
+    /// Connected handle when the connection succeeded.
+    pub handle: Option<NativeEvidence>,
+    /// Catalog failure otherwise.
+    pub error: Option<NativeWyrdError>,
+}
+
+#[napi]
+impl NativeWyrdClient {
+    /// Connects one evidence publisher that calls the server as this client,
+    /// as `Evidence::connect_with` does.
+    ///
+    /// # Errors
+    /// Never returns a napi error; a refused or unreachable exchange is
+    /// carried in the result.
+    #[napi]
+    pub fn evidence<'env>(
+        &self,
+        env: &'env Env,
+    ) -> napi::Result<PromiseRaw<'env, NativeEvidenceConnection>> {
+        let client = self.client.clone();
+        crate::trace::spawn(env, async move {
+            Ok(match Evidence::connect_with(&client).await {
+                Ok(evidence) => NativeEvidenceConnection {
+                    handle: Some(NativeEvidence { evidence }),
+                    error: None,
+                },
+                Err(error) => NativeEvidenceConnection {
+                    handle: None,
+                    error: Some(NativeWyrdError::from_wyrd(&error)),
+                },
+            })
+        })
+    }
+}
+
+#[napi]
+impl NativeEvidence {
+    /// Publishes `value` as the deferred input `name`; an omitted
+    /// `repository` or `commit` resolves as `wyrd_client::verify::source`
+    /// does, from `WYRD_REPOSITORY` / `WYRD_COMMIT`, then the working
+    /// directory's Git checkout.
+    ///
+    /// # Errors
+    /// Returns a napi error only when the receipt cannot be projected; a
+    /// malformed value, an unresolvable source, and a server refusal are
+    /// carried in the result.
+    #[napi]
+    pub fn publish<'env>(
+        &self,
+        env: &'env Env,
+        name: String,
+        value: NativeVerifierInput,
+        repository: Option<String>,
+        commit: Option<String>,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let evidence = self.evidence.clone();
+        let value = input(&name, value);
+        crate::trace::spawn(env, async move {
+            NativeLifecycleResult::outcome(match value {
+                Ok(value) => {
+                    evidence
+                        .publish(&name, value, repository.as_deref(), commit.as_deref())
+                        .await
+                }
+                Err(error) => Err(error),
             })
         })
     }

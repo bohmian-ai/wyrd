@@ -1,10 +1,12 @@
-//! Protected-edge load shedding that the public SQL query bypasses.
+//! Protected-edge load shedding that owner-admitted routes bypass.
 //!
 //! Every protected request is shed when the protected edge's concurrency limit
-//! is full, except `POST /v1/query`. A public query that finds Oracle's
-//! execution slots busy waits in Oracle's own bounded, tenant-fair queue under
-//! its query deadline; the generic edge must not refuse it earlier, and must not
-//! let long queued queries take the concurrency slots other routes rely on.
+//! is full, except `POST /v1/query` and `POST /v1/verification/{execute,enqueue}`.
+//! A public query that finds Oracle's execution slots busy waits in Oracle's
+//! own bounded, tenant-fair queue under its query deadline, and a verification
+//! waits in hosted admission over process memory under its arrival deadline;
+//! the generic edge must not refuse them earlier, and must not let long waits
+//! take the concurrency slots other routes rely on.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -16,7 +18,7 @@ use tower::limit::ConcurrencyLimit;
 use tower::load_shed::LoadShed;
 use tower::{BoxError, Layer, Service, ServiceExt as _};
 
-use super::edge_timeout::is_public_query;
+use super::edge_timeout::owns_admission;
 
 /// Tower layer applying [`EdgeCapacity`] with the protected edge's limit.
 #[derive(Clone, Copy, Debug)]
@@ -38,7 +40,7 @@ impl<S: Clone> Layer<S> for EdgeCapacityLayer {
     type Service = EdgeCapacity<S>;
 
     /// Wraps one copy of `inner` in load shedding and the concurrency limit and
-    /// keeps a second, unlimited copy for public queries.
+    /// keeps a second, unlimited copy for owner-admitted routes.
     fn layer(&self, inner: S) -> Self::Service {
         EdgeCapacity {
             limited: LoadShed::new(ConcurrencyLimit::new(inner.clone(), self.concurrency)),
@@ -47,8 +49,8 @@ impl<S: Clone> Layer<S> for EdgeCapacityLayer {
     }
 }
 
-/// Service that sheds protected requests at the concurrency limit, except the
-/// public SQL query, which it passes straight to the inner stack.
+/// Service that sheds protected requests at the concurrency limit, except
+/// owner-admitted routes, which it passes straight to the inner stack.
 #[derive(Clone, Debug)]
 pub struct EdgeCapacity<S> {
     /// Inner stack behind load shedding and the concurrency limit.
@@ -85,15 +87,15 @@ where
         self.direct.poll_ready(cx).map_err(Into::into)
     }
 
-    /// Sends a public query to the direct stack and every other request
-    /// through load shedding and the concurrency limit.
+    /// Sends an owner-admitted request to the direct stack and every other
+    /// request through load shedding and the concurrency limit.
     ///
     /// # Errors
     ///
     /// The returned future resolves to the inner stack's failure, boxed, or to
-    /// the load-shed overload when a non-query request finds the limit full.
+    /// the load-shed overload when another request finds the limit full.
     fn call(&mut self, request: Request<Body>) -> Self::Future {
-        if is_public_query(&request) {
+        if owns_admission(&request) {
             let response = self.direct.call(request);
             return Box::pin(async move { response.await.map_err(Into::into) });
         }
@@ -123,14 +125,14 @@ mod tests {
     }
 
     /// With the single concurrency slot held by a stalled request, another
-    /// route is shed immediately while public queries still reach the inner
-    /// stack.
+    /// route is shed immediately while public queries and verification
+    /// execute and enqueue still reach the inner stack and its own admission.
     ///
     /// # Panics
     ///
-    /// Panics when a query is shed or another route is not.
+    /// Panics when a bypassing route is shed or another route is not.
     #[tokio::test]
-    async fn public_queries_bypass_the_full_concurrency_limit() {
+    async fn owner_admitted_routes_bypass_the_full_concurrency_limit() {
         let release = std::sync::Arc::new(Notify::new());
         let inner = service_fn({
             let release = std::sync::Arc::clone(&release);
@@ -154,15 +156,26 @@ mod tests {
             .await
             .expect_err("another route is shed while the only slot is held");
         assert!(shed.is::<Overloaded>());
-        for _ in 0..3 {
+        for path in [
+            "/v1/query",
+            "/v1/query",
+            "/v1/verification/execute",
+            "/v1/verification/enqueue",
+        ] {
             tokio::time::timeout(
                 Duration::from_secs(5),
-                service.clone().oneshot(request(Method::POST, "/v1/query")),
+                service.clone().oneshot(request(Method::POST, path)),
             )
             .await
-            .expect("a query is not held behind the limit")
-            .expect("a query is not shed");
+            .unwrap_or_else(|_| panic!("{path} is not held behind the limit"))
+            .unwrap_or_else(|_| panic!("{path} is not shed"));
         }
+        let shed = service
+            .clone()
+            .oneshot(request(Method::POST, "/v1/verification/evidence"))
+            .await
+            .expect_err("evidence uploads keep the limit");
+        assert!(shed.is::<Overloaded>());
 
         release.notify_one();
         stalled

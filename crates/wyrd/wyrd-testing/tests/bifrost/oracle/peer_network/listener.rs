@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use sha2::{Digest as _, Sha256};
-use wyrd_server::config::BifrostTarget;
+use wyrd_server::config::ServerTarget;
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::peer_ca::BifrostPeerCa;
@@ -56,9 +56,9 @@ async fn peer_listener_is_isolated_mtls_and_role_complete() {
 /// Returns the first scenario failure, which names the claim that broke.
 async fn prove_peer_listener_isolation() -> Result<(), PeerJourneyError> {
     let mut cluster = PeerCluster::start(&[
-        BifrostTarget::Oracle,
-        BifrostTarget::Scribe,
-        BifrostTarget::ForgeWorker,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostIngest,
+        ServerTarget::BifrostMaintenance,
     ])
     .await?;
 
@@ -222,7 +222,7 @@ async fn incomplete_peer_material_refuses_to_start(
         let tls = authority.materialize(scratch.path(), label)?;
         std::fs::remove_file(tls.dir.join(missing))?;
         let started = WyrdTestServer::builder()
-            .with_bifrost_target_for_test(BifrostTarget::Oracle)
+            .with_bifrost_target_for_test(ServerTarget::BifrostQuery)
             .with_peer_tls(tls)
             .start_bound()
             .await;
@@ -386,7 +386,7 @@ async fn a_trusted_certificate_alone_authorizes_nothing(
         let channel = PeerDial::member(cluster.peer_ca(), cluster.peer_addr(index)?)
             .connect()
             .await?;
-        let serves_oracle = matches!(target, BifrostTarget::Oracle | BifrostTarget::All);
+        let serves_oracle = matches!(target, ServerTarget::BifrostQuery | ServerTarget::Combined);
         // The fence is read from a live membership cut, which is what a
         // leader stamps into a reservation.
         let fence = cluster
@@ -453,28 +453,17 @@ async fn every_target_mounts_exactly_its_services(
     for index in 0..cluster.len() {
         let target = cluster.target(index);
         let peer = cluster.peer_addr(index)?;
-        if !target_serves_peer_plane(target) {
-            // No Scribe and no Oracle means nothing to answer privately, so the
-            // pod must not open a private listener at all.
-            if PeerDial::member(cluster.peer_ca(), peer)
-                .connect()
-                .await
-                .is_ok()
-            {
-                return Err(
-                    format!("{target:?} opened a peer listener it owns no service on").into(),
-                );
-            }
-            continue;
-        }
+        // Every target opens the listener: the Forge maintenance target
+        // answers the Forge leader route on it and mounts neither Scribe nor
+        // Oracle lifecycle services.
         let channel = PeerDial::member(cluster.peer_ca(), peer).connect().await?;
         let expects_tail = matches!(
             target,
-            BifrostTarget::All | BifrostTarget::Server | BifrostTarget::Scribe
+            ServerTarget::Combined | ServerTarget::Direct | ServerTarget::BifrostIngest
         );
         let expects_lifecycle = matches!(
             target,
-            BifrostTarget::All | BifrostTarget::Server | BifrostTarget::Oracle
+            ServerTarget::Combined | ServerTarget::Direct | ServerTarget::BifrostQuery
         );
         for (name, mounted, status) in [
             (
@@ -525,13 +514,13 @@ async fn every_target_mounts_exactly_its_services(
 async fn a_frame_above_the_tonic_default_is_acknowledged_and_retained(
     cluster: &PeerCluster,
 ) -> Result<(), PeerJourneyError> {
-    let index_of = |target: BifrostTarget| {
+    let index_of = |target: ServerTarget| {
         (0..cluster.len())
             .find(|index| cluster.target(*index) == target)
             .ok_or_else(|| format!("the cluster runs no {target:?} pod"))
     };
-    let scribe = cluster.server(index_of(BifrostTarget::Scribe)?)?;
-    let oracle = cluster.server(index_of(BifrostTarget::Oracle)?)?;
+    let scribe = cluster.server(index_of(ServerTarget::BifrostIngest)?)?;
+    let oracle = cluster.server(index_of(ServerTarget::BifrostQuery)?)?;
     let operation = format!("journey.large_frame.{}", uuid::Uuid::now_v7().simple());
     let resource_bytes = 6 * 1024 * 1024;
     let event = wyrd_spec::vala::api::AuditEvent::new(
@@ -549,7 +538,7 @@ async fn a_frame_above_the_tonic_default_is_acknowledged_and_retained(
     );
     let batch = vala_bifrost_redux::tables::staged::StagedRow::project(&[
         vala_bifrost_redux::tables::audit::projection::stage_audit_event(
-            &event,
+            event.clone(),
             chrono::Utc::now(),
         )?,
     ])?;
@@ -667,7 +656,7 @@ async fn scribe_identity_is_coupled_to_its_volume() -> Result<(), PeerJourneyErr
     let tls = authority.materialize(scratch.path(), "scribe")?;
     let start = || {
         WyrdTestServer::builder()
-            .with_bifrost_target_for_test(BifrostTarget::Scribe)
+            .with_bifrost_target_for_test(ServerTarget::BifrostIngest)
             .with_durable_bifrost_data_root(volume.clone())
             .with_peer_tls(tls.clone())
             .start_bound()
@@ -723,10 +712,10 @@ async fn scribe_identity_is_coupled_to_its_volume() -> Result<(), PeerJourneyErr
 async fn oracle_topology_is_uniform_and_exactly_addressed(
     oracles: usize,
 ) -> Result<(), PeerJourneyError> {
-    let mut targets = vec![BifrostTarget::Oracle; oracles];
+    let mut targets = vec![ServerTarget::BifrostQuery; oracles];
     // One Scribe so the topology owns a catalog and a tail source, exactly as a
     // deployment that serves queries does.
-    targets.push(BifrostTarget::Scribe);
+    targets.push(ServerTarget::BifrostIngest);
     let cluster = PeerCluster::start(&targets).await?;
 
     let api_key = cluster
@@ -767,7 +756,7 @@ async fn oracle_topology_is_uniform_and_exactly_addressed(
     }
 
     for index in 0..cluster.len() {
-        if cluster.target(index) != BifrostTarget::Oracle {
+        if cluster.target(index) != ServerTarget::BifrostQuery {
             continue;
         }
         coordinate_public_query(cluster.server(index)?, &api_key, &table).await?;

@@ -6,12 +6,26 @@
 
 mod identity_e2e;
 mod identity_ui_e2e;
+/// Human approval steps decided over HTTP under one execution.
+mod pg_approvals;
 /// Rust-owned opaque browser sessions through `/auth/browser`.
 mod pg_browser_sessions;
 mod pg_card_declaration_route;
+/// The code-review pipeline over Wyrd object storage and Postgres cache custody.
+mod pg_code_review_cache;
+mod pg_deferred_evidence;
+/// The durable publication backend of queued Verifier work.
+#[cfg(feature = "test-support")]
+mod pg_durable_verifier_work;
 // Inspects recovered WAL state through `replay_wal_directory`, which exists only
 // under `vala-bifrost-redux/test-support`; this crate's `test-support` feature
 // forwards it.
+/// The GitHub installation token facility against the GitHub App mock.
+mod pg_github_connection;
+/// GitHub Check and review delivery of pull request executions.
+mod pg_github_delivery;
+mod pg_github_pull_request_extraction;
+mod pg_github_pull_requests;
 #[cfg(feature = "test-support")]
 mod pg_grpc_ingest_smoke;
 mod pg_grpc_smoke;

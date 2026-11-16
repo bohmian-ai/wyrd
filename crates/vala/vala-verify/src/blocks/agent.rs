@@ -9,8 +9,10 @@
 //! any number of distinct Agents, and no call can see another's media,
 //! tools, or workspace.
 
+use std::any::Any;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{Map, Value};
@@ -21,8 +23,7 @@ use skald_agent::{
 use skald_prompt::Prompt;
 use skald_providers::ProviderError;
 use skald_runtime::{ProviderRegistry, SkaldRuntimeError};
-use skald_spec::{MediaRef, ResponseType};
-use tokio::time::Instant;
+use skald_spec::{MediaRef, PreparedSchemas, ResponseType};
 use wyrd_spec::card::agent::{AgentSpec, BuiltinTool, ExecutionRoute};
 use wyrd_spec::card::verifier::{Action, AgentCall, Check, InputSlot};
 use wyrd_spec::error::WyrdError;
@@ -30,13 +31,43 @@ use wyrd_spec::ids::SlotName;
 use wyrd_spec::reference::{CardRef, InlineableRef};
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::VerificationVerdict;
-use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclaration, Verdict};
+use wyrd_spec::verification::execution::{
+    CallProvenance, Citation, InputDeclaration, Producer, Verdict,
+};
 
-use super::tools::{AgentToolset, ToolSession, finished};
+use super::tools::{AgentToolset, ToolSession};
 use super::{
     ActionExecutor, ActionOutput, BlockCall, BlockError, CallInput, CallValue, CheckExecutor,
     CheckOutput, EngineError, Position, verdict_from,
 };
+
+/// Histogram of one Agent call's phases, seconds, labelled `phase`:
+/// `resolve` (the Agent, its Prompt, and the route), `bind` (inputs and
+/// citation slots into the Prompt), `run` (the Agent loop, its tools and model
+/// calls), and, for a check, `verdict` (the answer against the Verdict format)
+/// and `cite` (citations against reachable evidence). It is benchmark-only
+/// timing: recorded only once [`wyrd_benchmark::install`] has run, so a build
+/// without the `bench` feature never records or times it.
+pub const AGENT_PHASE_DURATION_SECONDS: &str = "wyrd_verification_agent_phase_duration_seconds";
+
+/// One benchmark-only Agent phase's start: `None` unless the benchmark
+/// recorder is installed, so an ordinary build reads no clock.
+fn phase_start() -> Option<std::time::Instant> {
+    wyrd_benchmark::enabled().then(std::time::Instant::now)
+}
+
+/// Records the Agent `phase` begun at `started` into
+/// [`AGENT_PHASE_DURATION_SECONDS`] and returns the next phase's start.
+fn phase_end(
+    phase: &'static str,
+    started: Option<std::time::Instant>,
+) -> Option<std::time::Instant> {
+    let started = started?;
+    let now = std::time::Instant::now();
+    metrics::histogram!(AGENT_PHASE_DURATION_SECONDS, "phase" => phase)
+        .record(now.duration_since(started).as_secs_f64());
+    Some(now)
+}
 
 /// Resolves a registered Agent Card into its pure Agent spec.
 #[async_trait]
@@ -67,13 +98,20 @@ pub trait PromptCardResolver: Send + Sync {
 /// provider media kind.
 #[async_trait]
 pub trait EvidenceReader: Send + Sync {
-    /// Read `evidence` as inline provider-native media.
+    /// Read `evidence` as inline provider-native media, with a guard holding
+    /// the host resources the media's bytes take, such as their process
+    /// memory charge. The Agent call keeps the guard until the bound Prompt
+    /// that carries the media is dropped, on completion or cancellation.
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for missing, unauthorized,
-    /// mismatched, oversized, or non-native evidence and
+    /// mismatched, oversized, or non-native evidence,
+    /// [`BlockError::Busy`] when the host cannot hold the media now, and
     /// [`BlockError::Retryable`] for a transient storage failure.
-    async fn media(&self, evidence: &InputDeclaration) -> Result<MediaRef, BlockError>;
+    async fn media(
+        &self,
+        evidence: &InputDeclaration,
+    ) -> Result<(MediaRef, Box<dyn Any + Send + Sync>), BlockError>;
 
     /// The subset of `citations` whose slot is in `reachable` and whose
     /// locator names a location in that slot's pinned original evidence.
@@ -111,7 +149,10 @@ pub trait EvidenceReader: Send + Sync {
     /// `slots` before any block runs.
     ///
     /// `evidence` holds the caller's slots plus one undeclared slot per
-    /// fixed Artifact attachment file; every admitted slot is citable.
+    /// fixed Artifact attachment file; every admitted slot is citable. It is
+    /// the run's one evidence backing: a reader that keeps it for later
+    /// citations keeps an [`Arc::downgrade`] view, so the engine moves the
+    /// evidence uncopied into its outcome once every block has settled.
     ///
     /// [`VerificationEngine::run`](super::VerificationEngine::run) calls it
     /// once, after its own slot validation, for checks only the host can
@@ -125,7 +166,7 @@ pub trait EvidenceReader: Send + Sync {
     async fn admit(
         &self,
         _slots: &BTreeMap<SlotName, InputSlot>,
-        _evidence: &BTreeMap<SlotName, InputDeclaration>,
+        _evidence: &Arc<BTreeMap<SlotName, InputDeclaration>>,
     ) -> Result<(), EngineError> {
         Ok(())
     }
@@ -151,6 +192,9 @@ pub struct AgentExecutor {
     toolset: Option<Arc<dyn AgentToolset>>,
     /// Whole-route replacements keyed by step or requirement ID.
     routes: BTreeMap<TaskId, ExecutionRoute>,
+    /// Response and Verdict schema preparation, shared with the host's other
+    /// executions when it lends one.
+    schemas: Arc<PreparedSchemas>,
 }
 
 impl AgentExecutor {
@@ -170,7 +214,17 @@ impl AgentExecutor {
             gateway: None,
             toolset: None,
             routes: BTreeMap::new(),
+            schemas: Arc::default(),
         }
+    }
+
+    /// Reuse `schemas` to prepare each call's narrowed response schema and
+    /// declared Verdict format, so executions with unchanged schemas skip
+    /// meta-validation and compilation. Every answer is still validated.
+    #[must_use]
+    pub fn with_prepared_schemas(mut self, schemas: Arc<PreparedSchemas>) -> Self {
+        self.schemas = schemas;
+        self
     }
 
     /// Read native media placeholders' evidence through `reader`.
@@ -202,24 +256,26 @@ impl AgentExecutor {
         self
     }
 
-    /// Resolve the Agent and its Prompt, keeping each Card identity.
+    /// Resolve the Agent and its Prompt, keeping each Card identity; an
+    /// inline Agent is borrowed from the call, not copied.
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for a loader-only path reference and
     /// the resolvers' errors.
-    async fn resolve(&self, agent: &InlineableRef<AgentSpec>) -> Result<Resolved, BlockError> {
+    async fn resolve<'a>(
+        &self,
+        agent: &'a InlineableRef<AgentSpec>,
+    ) -> Result<Resolved<'a>, BlockError> {
         let spec = match agent {
-            InlineableRef::Ref(card) | InlineableRef::Sibling { sibling: card } => {
-                self.agents.resolve(card).await?
-            }
-            InlineableRef::Inline(spec) => (**spec).clone(),
+            InlineableRef::Ref(card) => Cow::Owned(self.agents.resolve(card).await?),
+            InlineableRef::Sibling { sibling } => return Err(unbound_sibling("Agent", sibling)),
+            InlineableRef::Inline(spec) => Cow::Borrowed(&**spec),
             InlineableRef::Path(path) => return Err(unresolved_path("Agent", path)),
         };
         let prompt = match &spec.prompt {
             InlineableRef::Inline(prompt) => Prompt::from_native((**prompt).clone()),
-            InlineableRef::Ref(card) | InlineableRef::Sibling { sibling: card } => {
-                self.prompts.resolve(card).await?
-            }
+            InlineableRef::Ref(card) => self.prompts.resolve(card).await?,
+            InlineableRef::Sibling { sibling } => return Err(unbound_sibling("Prompt", sibling)),
             InlineableRef::Path(path) => return Err(unresolved_path("Prompt", path)),
         };
         Ok(Resolved {
@@ -250,13 +306,16 @@ impl AgentExecutor {
         }
     }
 
-    /// Bind `inputs` to the Prompt placeholders on a per-call Prompt copy.
+    /// Bind `inputs` to the placeholders of `prompt`, the call's own copy,
+    /// returning it with its text variables and the guards of the media it
+    /// binds, which must outlive every use of the bound copy.
     ///
     /// Input keys must equal the Prompt's text and media placeholders. JSON
     /// strings render raw and other JSON as JSON text; evidence binds as
     /// provider-native media, which Skald checks against the placeholder kind.
     /// Non-empty `slots` narrow the copy's Verdict citation slots, so the
-    /// provider and the Agent's validation admit only the reachable ones.
+    /// provider and the Agent's validation admit only the reachable ones;
+    /// the prepared schemas reuse an earlier narrowing to the same slots.
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for a placeholder mismatch, evidence
@@ -265,24 +324,24 @@ impl AgentExecutor {
     /// provider rejects, plus the reader's errors.
     async fn bind(
         &self,
-        prompt: &Prompt,
+        prompt: Prompt,
         inputs: &BTreeMap<String, CallInput>,
         slots: &BTreeSet<SlotName>,
-    ) -> Result<(Prompt, Vec<(String, String)>), BlockError> {
-        let native = prompt.native();
-        let placeholders: BTreeSet<&str> = native
+    ) -> Result<Bound, BlockError> {
+        let mut bound = prompt.into_native();
+        let placeholders: BTreeSet<&str> = bound
             .variables
             .iter()
-            .chain(&native.media_variables)
+            .chain(&bound.media_variables)
             .map(String::as_str)
             .collect();
         if placeholders != inputs.keys().map(String::as_str).collect() {
             return Err(terminal("Agent inputs must match the Prompt placeholders"));
         }
-        let mut bound = native.clone();
         let mut vars = Vec::new();
+        let mut media_guards = Vec::new();
         for (name, input) in inputs {
-            let is_media = native.media_variables.contains(name);
+            let is_media = bound.media_variables.contains(name);
             match (&input.value, is_media) {
                 (CallValue::Json(value), false) => vars.push((name.clone(), render(value))),
                 (CallValue::Evidence(evidence), true) => {
@@ -290,7 +349,8 @@ impl AgentExecutor {
                         .evidence
                         .as_ref()
                         .ok_or_else(|| terminal("media inputs need an evidence reader"))?;
-                    let media = reader.media(evidence).await?;
+                    let (media, guard) = reader.media(evidence).await?;
+                    media_guards.push(guard);
                     bound
                         .bind_media_mut(name, &media)
                         .map_err(|error| BlockError::Terminal {
@@ -307,49 +367,84 @@ impl AgentExecutor {
                         reason: format!("text placeholder {name} cannot bind media"),
                     });
                 }
+                (CallValue::Publication { .. } | CallValue::Publications { .. }, _) => {
+                    return Err(terminal("publications mount only in a workspace"));
+                }
             }
         }
         if !slots.is_empty() {
+            // Slot names are identifiers, so the joined set names it exactly.
+            let names: Vec<&str> = slots.iter().map(SlotName::as_str).collect();
+            let edit = format!("verdict-slots:{}", names.join(","));
             bound
-                .edit_response_schema_mut(|schema| Verdict::restrict_slots(schema, slots))
+                .edit_response_schema_mut(&self.schemas, &edit, |schema| {
+                    Verdict::restrict_slots(schema, slots);
+                })
                 .map_err(|error| BlockError::Terminal {
                     reason: format!("the Verdict citation slots cannot be narrowed: {error}"),
                 })?;
         }
-        Ok((Prompt::from_native(bound), vars))
+        Ok(Bound {
+            prompt: Prompt::from_native(bound),
+            vars,
+            media_guards,
+        })
     }
 
-    /// Run one Agent call and return its raw run plus provenance.
+    /// Run the Agent `call` of `block` and return its raw run plus
+    /// provenance.
     ///
-    /// `slots` are the citation slots a check invocation can reach, empty for
-    /// a step; see [`Self::bind`].
+    /// The run uses `block`'s inputs, workspace, deadline, and tool-call
+    /// records. `role` carries a step's producing attempt or a check's
+    /// reachable citation slots; see [`Role`].
     ///
-    /// Steps and checks get exactly their declared built-ins from the toolset, which holds the
-    /// invocation's workspace until the run ends. The first tool refused
-    /// process capacity ends the invocation busy at once: the loop is raced
-    /// against the session's refusal and dropped with any sibling tool calls
-    /// still pending, so no further model call or tool result follows.
+    /// Steps and checks get exactly their declared built-ins from the
+    /// toolset, which holds the attempt's workspace until the run ends. Every
+    /// call is recorded in `calls` and spends its allowance; at most the
+    /// Agent's effective tool concurrency cap of operations other than
+    /// `code.run` run at once across direct and nested calls. A session stop
+    /// ends the invocation at once: the loop is raced against it and dropped
+    /// with any sibling tool calls still pending, so no further model call or
+    /// tool result follows.
     ///
     /// # Errors
     /// Returns resolution, binding, route, tool, and run failures as
-    /// [`BlockError`]s, and [`BlockError::Busy`] when the workspace or a tool
-    /// is refused process capacity.
+    /// [`BlockError`]s, [`BlockError::Busy`] when the workspace or a tool is
+    /// refused process capacity, and a terminal
+    /// `WYRD_VERIFICATION_422_TOOL_BUDGET_EXCEEDED` failure once a request
+    /// comes after the invocation's allowance is spent.
     ///
     /// # Panics
-    /// Never panics: the loop stops before completing only once a refusal
-    /// is raised, and a raised refusal returns busy first.
-    async fn invoke(
+    /// Never panics: the loop stops before completing only once the session
+    /// stops, and a stopped session returns its error first.
+    async fn invoke<B: Sync>(
         &self,
-        id: &TaskId,
+        block: &BlockCall<'_, B>,
         call: &AgentCall,
-        inputs: &BTreeMap<String, CallInput>,
-        workspace: &BTreeMap<String, CallInput>,
-        slots: &BTreeSet<SlotName>,
-        deadline: Instant,
+        role: &Role<'_>,
     ) -> Result<Invoked, BlockError> {
+        let started = phase_start();
+        let BlockCall {
+            id,
+            inputs,
+            workspace,
+            deadline,
+            tool_calls: calls,
+            ..
+        } = block;
         let resolved = self.resolve(&call.agent).await?;
         let route = self.route(id, &resolved.spec.execution_route)?;
-        let (prompt, vars) = self.bind(&resolved.prompt, inputs, slots).await?;
+        let (slots, producer) = match role {
+            Role::Step(producer) => (&BTreeSet::new(), Some(producer)),
+            Role::Check(slots) => (*slots, None),
+        };
+        let started = phase_end("resolve", started);
+        let Bound {
+            prompt,
+            vars,
+            media_guards,
+        } = self.bind(resolved.prompt, inputs, slots).await?;
+        let started = phase_end("bind", started);
         let declared = resolved
             .spec
             .tool_names
@@ -360,7 +455,6 @@ impl AgentExecutor {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let records = Arc::new(Mutex::new(Vec::new()));
         if declared.is_empty() && !call.workspace.is_empty() {
             return Err(terminal("a workspace needs a filesystem or code tool"));
         }
@@ -371,24 +465,32 @@ impl AgentExecutor {
                 .toolset
                 .as_ref()
                 .ok_or_else(|| terminal("this host provides no built-in tools"))?;
-            Some(toolset.open(id, workspace, deadline, &declared).await?)
+            let session = toolset
+                .open(id, workspace, *deadline, &declared, producer)
+                .await?;
+            session.register_with(calls);
+            Some(session)
         };
+        let run_config = run_config_from_agent_run_config_spec(&resolved.spec.run_config);
         let tools = match &session {
-            Some(session) => session.resolve(&declared, &records)?,
+            Some(session) => session.resolve(
+                &declared,
+                calls,
+                run_config.tool_concurrency_cap.unwrap_or(8),
+            )?,
             None => Vec::new(),
         };
-        let mut agent = Agent::new(prompt.clone())
-            .with_id(id.as_str())
+        let prompt = Arc::new(prompt);
+        let mut agent = Agent::from_resolved(id.as_str(), Arc::clone(&prompt))
+            .with_prepared_schemas(Arc::clone(&self.schemas))
             .with_tools(tools)
-            .with_run_config(run_config_from_agent_run_config_spec(
-                &resolved.spec.run_config,
-            ))
+            .with_run_config(run_config)
             .with_execution_route(route.clone());
         if let Some(caller) = &self.gateway {
             agent = agent.with_gateway_caller(Arc::clone(caller));
         }
         if let Some(session) = &session {
-            agent = agent.before_model(session.halt_on_refusal());
+            agent = agent.before_model(session.halt_before_model());
         }
         let borrowed: Vec<(&str, &str)> = vars
             .iter()
@@ -398,28 +500,29 @@ impl AgentExecutor {
         let run = match &session {
             Some(session) => tokio::select! {
                 run = run => Some(run),
-                () = session.refusal_raised() => None,
+                () = session.halt_raised() => None,
             },
             None => Some(run.await),
         };
-        let refused = session.as_ref().and_then(ToolSession::refused);
+        let halted = session.as_ref().and_then(ToolSession::halted);
         drop(session);
-        if let Some(reason) = refused {
-            return Err(BlockError::Busy { reason });
+        if let Some(error) = halted {
+            return Err(error);
         }
         let run = run
-            .expect("the loop only stops early for a raised refusal")
+            .expect("the loop only stops early for a stopped session")
             .map_err(block_error)?;
+        phase_end("run", started);
         Ok(Invoked {
             structured: run.structured_output,
             text: run.output,
             prompt,
+            _media_guards: media_guards,
             provenance: CallProvenance::Agent {
                 agent: resolved.agent_ref,
                 prompt: resolved.prompt_ref,
                 route,
             },
-            tool_calls: finished(&records),
         })
     }
 }
@@ -439,14 +542,7 @@ impl ActionExecutor for AgentExecutor {
             return Err(terminal("the Agent executor runs only Agent actions"));
         };
         let invoked = self
-            .invoke(
-                call.id,
-                agent,
-                &call.inputs,
-                &call.workspace,
-                &BTreeSet::new(),
-                call.deadline,
-            )
+            .invoke(&call, agent, &Role::Step(call.producer()))
             .await?;
         let output = invoked
             .structured
@@ -454,7 +550,6 @@ impl ActionExecutor for AgentExecutor {
         Ok(ActionOutput {
             output,
             provenance: Some(invoked.provenance),
-            tool_calls: invoked.tool_calls,
         })
     }
 }
@@ -483,16 +578,7 @@ impl CheckExecutor for AgentExecutor {
             .chain(call.workspace.values())
             .flat_map(|input| input.sources.iter().cloned())
             .collect();
-        let invoked = self
-            .invoke(
-                call.id,
-                agent,
-                &call.inputs,
-                &call.workspace,
-                &reachable,
-                call.deadline,
-            )
-            .await?;
+        let invoked = self.invoke(&call, agent, &Role::Check(&reachable)).await?;
         let answer = invoked
             .structured
             .ok_or_else(|| terminal("the check Agent returned no structured Verdict"))?;
@@ -501,11 +587,14 @@ impl CheckExecutor for AgentExecutor {
                 "the check Agent's Prompt declares no Verdict format",
             ));
         };
-        let mut verdict = verdict_from(schema, Value::Object(answer))?;
+        let started = phase_start();
+        let mut verdict = verdict_from(&self.schemas, schema, Value::Object(answer))?;
+        let started = phase_end("verdict", started);
         let citations = std::mem::take(&mut verdict.citations);
         if let Some(reader) = &self.evidence {
             verdict.citations = reader.cited(&reachable, citations).await?;
         }
+        phase_end("cite", started);
         if verdict.outcome == VerificationVerdict::Passed && verdict.citations.is_empty() {
             verdict.outcome = VerificationVerdict::Inconclusive;
             verdict.reason = format!(
@@ -523,15 +612,24 @@ impl CheckExecutor for AgentExecutor {
 }
 
 /// An Agent and Prompt resolved for one call.
-struct Resolved {
-    /// The Agent body.
-    spec: AgentSpec,
+struct Resolved<'a> {
+    /// The Agent body, borrowed when the call declares it inline.
+    spec: Cow<'a, AgentSpec>,
     /// The Agent Card, when referenced.
     agent_ref: Option<CardRef>,
     /// The runtime Prompt.
     prompt: Prompt,
     /// The Prompt Card, when referenced.
     prompt_ref: Option<CardRef>,
+}
+
+/// What one Agent call is invoked as.
+enum Role<'a> {
+    /// A step action: the attempt the toolset attributes publications to.
+    Step(Producer),
+    /// A check: the citation slots its Verdict may cite, narrowed by
+    /// [`AgentExecutor::bind`] when non-empty.
+    Check(&'a BTreeSet<SlotName>),
 }
 
 /// The result of one Agent run.
@@ -541,12 +639,25 @@ struct Invoked {
     /// The final text answer.
     text: String,
     /// The bound Prompt that ran.
-    prompt: Prompt,
+    prompt: Arc<Prompt>,
+    /// Guards of the media `prompt` carries, released with it.
+    _media_guards: Vec<Box<dyn Any + Send + Sync>>,
     /// Agent, Prompt, and effective route.
     provenance: CallProvenance,
-    /// Tool calls in call order.
-    tool_calls: Vec<wyrd_spec::verification::execution::ToolCallRecord>,
 }
+
+/// One call's Prompt copy with its inputs bound.
+struct Bound {
+    /// The bound copy.
+    prompt: Prompt,
+    /// Text placeholder values.
+    vars: Vec<(String, String)>,
+    /// Guards of the bound media, held while the copy is in use.
+    media_guards: Vec<Box<dyn Any + Send + Sync>>,
+}
+
+/// The stable code of a server that cannot take the call now.
+const SERVER_UNAVAILABLE: &str = "WYRD_SERVER_503_SERVICE_UNAVAILABLE";
 
 /// Classify an Agent run failure.
 ///
@@ -556,9 +667,23 @@ struct Invoked {
 /// an unregistered provider, may clear on retry. Structured output still
 /// invalid when the Agent's iteration budget ran out carries its stable code
 /// and schema locations only. It is terminal, like every non-provider
-/// failure except an Agent timeout.
+/// failure except an Agent timeout. A gateway answering
+/// [`SERVER_UNAVAILABLE`] is the serving process draining, shedding load, or
+/// still loading the tenant's gateway configuration, so the block is
+/// [`BlockError::Busy`] and its execution runs again later instead of being
+/// judged.
 #[must_use]
 pub fn block_error(error: AgentError) -> BlockError {
+    if let AgentError::Provider(SkaldRuntimeError::Provider {
+        source: ProviderError::RemoteProblem(problem),
+        ..
+    }) = &error
+        && problem.code == SERVER_UNAVAILABLE
+    {
+        return BlockError::Busy {
+            reason: format!("{}: {}", problem.code, problem.message),
+        };
+    }
     let reason = match &error {
         AgentError::Provider(SkaldRuntimeError::Provider {
             source: ProviderError::RemoteProblem(problem),
@@ -603,10 +728,69 @@ fn unresolved_path(kind: &str, path: &std::path::Path) -> BlockError {
     }
 }
 
+/// The terminal refusal for a declaration-only sibling reaching execution,
+/// which runs only registered specs whose siblings declaration replaced.
+fn unbound_sibling(kind: &str, sibling: &wyrd_spec::reference::SiblingRef) -> BlockError {
+    BlockError::Terminal {
+        reason: format!(
+            "WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY: {kind} sibling {sibling} must be registered before execution"
+        ),
+    }
+}
+
 /// Render a JSON value as Prompt text: strings raw, anything else as JSON.
 pub(crate) fn render(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use skald_providers::RemoteProblem;
+    use skald_spec::ProviderName;
+
+    use super::*;
+
+    /// An Agent failure carrying the gateway problem `code`.
+    fn gateway_problem(code: &str, status: u16) -> AgentError {
+        AgentError::Provider(SkaldRuntimeError::from_provider(
+            ProviderName::OpenAi,
+            ProviderError::RemoteProblem(Box::new(RemoteProblem {
+                code: code.to_owned(),
+                status,
+                message: "gateway configuration is loading; retry shortly".to_owned(),
+                field: None,
+                remediation: String::new(),
+            })),
+        ))
+    }
+
+    /// A gateway that cannot serve the call yet makes the block busy, so the
+    /// execution runs again instead of judging it; a capacity refusal keeps
+    /// the shared retry classification.
+    ///
+    /// # Panics
+    /// Panics when an unavailable gateway is not busy, a capacity refusal is
+    /// not retryable, or a permission refusal is not terminal.
+    #[test]
+    fn unavailable_gateway_is_busy_and_other_problems_are_classified() {
+        assert_eq!(
+            block_error(gateway_problem(SERVER_UNAVAILABLE, 503)),
+            BlockError::Busy {
+                reason: "WYRD_SERVER_503_SERVICE_UNAVAILABLE: \
+                         gateway configuration is loading; retry shortly"
+                    .to_owned()
+            }
+        );
+        assert!(matches!(
+            block_error(gateway_problem("WYRD_GATEWAY_429_LIMIT_EXCEEDED", 429)),
+            BlockError::Retryable { .. }
+        ));
+        assert!(matches!(
+            block_error(gateway_problem("WYRD_PERMISSION_403_DENIED_RBAC", 403)),
+            BlockError::Terminal { .. }
+        ));
     }
 }

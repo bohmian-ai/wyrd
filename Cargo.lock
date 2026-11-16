@@ -3,6 +3,15 @@
 version = 4
 
 [[package]]
+name = "addr2line"
+version = "0.27.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e567177890eb1617b1f774005b66b26b2377afd138a2ca37aae7d8f0c81429d4"
+dependencies = [
+ "gimli",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -202,7 +211,7 @@ dependencies = [
  "crc32fast",
  "digest 0.10.7",
  "log",
- "miniz_oxide",
+ "miniz_oxide 0.8.9",
  "num-bigint 0.4.8",
  "quad-rand",
  "rand 0.9.5",
@@ -233,7 +242,7 @@ version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4087686b4b0a3427190bae57a1d9a478dbb2d40c5dc1bd6e2b6d797913bdd348"
 dependencies = [
- "object",
+ "object 0.37.3",
 ]
 
 [[package]]
@@ -278,7 +287,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 [[package]]
 name = "arrow"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -298,7 +307,7 @@ dependencies = [
 [[package]]
 name = "arrow-arith"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -311,7 +320,7 @@ dependencies = [
 [[package]]
 name = "arrow-array"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "ahash",
  "arrow-buffer",
@@ -329,7 +338,7 @@ dependencies = [
 [[package]]
 name = "arrow-buffer"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "bytes",
  "half",
@@ -340,7 +349,7 @@ dependencies = [
 [[package]]
 name = "arrow-cast"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -361,7 +370,7 @@ dependencies = [
 [[package]]
 name = "arrow-cmp"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -371,7 +380,7 @@ dependencies = [
 [[package]]
 name = "arrow-csv"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -385,7 +394,7 @@ dependencies = [
 [[package]]
 name = "arrow-data"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "arrow-buffer",
  "arrow-schema",
@@ -397,7 +406,7 @@ dependencies = [
 [[package]]
 name = "arrow-flight"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -417,7 +426,7 @@ dependencies = [
 [[package]]
 name = "arrow-ipc"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -432,7 +441,7 @@ dependencies = [
 [[package]]
 name = "arrow-json"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -456,7 +465,7 @@ dependencies = [
 [[package]]
 name = "arrow-ord"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -469,7 +478,7 @@ dependencies = [
 [[package]]
 name = "arrow-row"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -481,7 +490,7 @@ dependencies = [
 [[package]]
 name = "arrow-schema"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "serde_core",
  "serde_json",
@@ -490,7 +499,7 @@ dependencies = [
 [[package]]
 name = "arrow-select"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "ahash",
  "arrow-array",
@@ -504,7 +513,7 @@ dependencies = [
 [[package]]
 name = "arrow-string"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -809,6 +818,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "backtrace"
+version = "0.3.77"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42f4220217f3288537b83684130f42fad43320b1c3b805f1910d683d52ded24f"
+dependencies = [
+ "addr2line",
+ "cfg-if",
+ "libc",
+ "miniz_oxide 0.9.1",
+ "object 0.40.0",
+ "rustc-demangle",
+ "windows-link",
+]
+
+[[package]]
 name = "base16ct"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -988,9 +1012,107 @@ dependencies = [
 ]
 
 [[package]]
+name = "bohmian-code-review"
+version = "0.1.0"
+source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=9046d1035538df8dfb661f826b102316ee6d0b4e#9046d1035538df8dfb661f826b102316ee6d0b4e"
+dependencies = [
+ "bohmian-code-review-core",
+ "bohmian-code-review-extract",
+ "bohmian-code-review-index",
+ "bohmian-code-review-resolve",
+ "bohmian-code-review-select",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "bohmian-code-review-core"
+version = "0.1.0"
+source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=9046d1035538df8dfb661f826b102316ee6d0b4e#9046d1035538df8dfb661f826b102316ee6d0b4e"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "bohmian-code-review-extract"
+version = "0.1.0"
+source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=9046d1035538df8dfb661f826b102316ee6d0b4e#9046d1035538df8dfb661f826b102316ee6d0b4e"
+dependencies = [
+ "bohmian-code-review-core",
+ "cc",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
+ "tree-sitter",
+ "tree-sitter-c",
+ "tree-sitter-c-sharp",
+ "tree-sitter-cpp",
+ "tree-sitter-go",
+ "tree-sitter-java",
+ "tree-sitter-javascript",
+ "tree-sitter-language",
+ "tree-sitter-luau",
+ "tree-sitter-php",
+ "tree-sitter-python",
+ "tree-sitter-r",
+ "tree-sitter-ruby",
+ "tree-sitter-rust",
+ "tree-sitter-swift",
+ "tree-sitter-typescript",
+]
+
+[[package]]
+name = "bohmian-code-review-index"
+version = "0.1.0"
+source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=9046d1035538df8dfb661f826b102316ee6d0b4e#9046d1035538df8dfb661f826b102316ee6d0b4e"
+dependencies = [
+ "bohmian-code-review-core",
+]
+
+[[package]]
+name = "bohmian-code-review-pipeline"
+version = "0.1.0"
+source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=9046d1035538df8dfb661f826b102316ee6d0b4e#9046d1035538df8dfb661f826b102316ee6d0b4e"
+dependencies = [
+ "bohmian-code-review",
+ "flate2",
+ "getrandom 0.4.3",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "sha1 0.10.7",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "bohmian-code-review-resolve"
+version = "0.1.0"
+source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=9046d1035538df8dfb661f826b102316ee6d0b4e#9046d1035538df8dfb661f826b102316ee6d0b4e"
+dependencies = [
+ "bohmian-code-review-core",
+ "bohmian-code-review-index",
+]
+
+[[package]]
+name = "bohmian-code-review-select"
+version = "0.1.0"
+source = "git+https://github.com/bohmian-ai/bohmian-code-review?rev=9046d1035538df8dfb661f826b102316ee6d0b4e#9046d1035538df8dfb661f826b102316ee6d0b4e"
+dependencies = [
+ "bohmian-code-review-core",
+ "bohmian-code-review-index",
+ "bohmian-code-review-resolve",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "bohmian-parquet-variant"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "arrow-schema",
  "chrono",
@@ -1003,7 +1125,7 @@ dependencies = [
 [[package]]
 name = "bohmian-parquet-variant-compute"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -1019,7 +1141,7 @@ dependencies = [
 [[package]]
 name = "bohmian-parquet-variant-json"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "arrow-schema",
  "base64 0.23.1",
@@ -3340,7 +3462,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
- "miniz_oxide",
+ "miniz_oxide 0.8.9",
  "zlib-rs",
 ]
 
@@ -3629,6 +3751,12 @@ dependencies = [
  "opaque-debug",
  "polyval",
 ]
+
+[[package]]
+name = "gimli"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1033caf0b349c518623b5396bfb2cf0bddf44f0306d543a250e5743297aafd10"
 
 [[package]]
 name = "glob"
@@ -3995,7 +4123,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=469cf4aff3aaee824f2ec3ce685c61411a08640e#469cf4aff3aaee824f2ec3ce685c61411a08640e"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=e849bc4fa46430e6278a4c201106cdd68dc5b244#e849bc4fa46430e6278a4c201106cdd68dc5b244"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -4054,7 +4182,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-sql"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=469cf4aff3aaee824f2ec3ce685c61411a08640e#469cf4aff3aaee824f2ec3ce685c61411a08640e"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=e849bc4fa46430e6278a4c201106cdd68dc5b244#e849bc4fa46430e6278a4c201106cdd68dc5b244"
 dependencies = [
  "async-trait",
  "iceberg",
@@ -4065,7 +4193,7 @@ dependencies = [
 [[package]]
 name = "iceberg-compaction-core"
 version = "0.1.0"
-source = "git+https://github.com/bohmian-ai/iceberg-compaction?rev=41662c25186808c5b6dd0f1e031dbb61d08ab0c0#41662c25186808c5b6dd0f1e031dbb61d08ab0c0"
+source = "git+https://github.com/bohmian-ai/iceberg-compaction?rev=21ceaf7172d7666e30e2f8527e70f22a7aea9741#21ceaf7172d7666e30e2f8527e70f22a7aea9741"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4093,7 +4221,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=469cf4aff3aaee824f2ec3ce685c61411a08640e#469cf4aff3aaee824f2ec3ce685c61411a08640e"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=e849bc4fa46430e6278a4c201106cdd68dc5b244#e849bc4fa46430e6278a4c201106cdd68dc5b244"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4980,6 +5108,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "miniz_oxide"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
+dependencies = [
+ "adler2",
+]
+
+[[package]]
 name = "mio"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5510,6 +5647,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "object"
+version = "0.40.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd229a0361b9d0d4396176e02d65897f487eebeab7caa6d443855ee152ca0b9c"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "object_store"
 version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5797,7 +5943,7 @@ dependencies = [
 [[package]]
 name = "parquet"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=ca5feff3b1c523640a03acaa437096b8934c3749#ca5feff3b1c523640a03acaa437096b8934c3749"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=394d4b0757488d70df9a78c0c271ab3c8fbc2928#394d4b0757488d70df9a78c0c271ab3c8fbc2928"
 dependencies = [
  "ahash",
  "arrow-array",
@@ -7135,6 +7281,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustc-demangle"
+version = "0.1.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b74b56ffa8bb2830709a538c2cbcae9aa062db0d2a42563bfb09bdaae44020eb"
+
+[[package]]
 name = "rustc-hash"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8137,6 +8289,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "streaming-iterator"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b2231b7c3057d5e4ad0156fb3dc807d900806020c5ffa3ee6ff2c8c76fb8520"
+
+[[package]]
 name = "stringprep"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8281,7 +8439,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -8785,6 +8943,166 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter"
+version = "0.25.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78f873475d258561b06f1c595d93308a7ed124d9977cb26b148c2084a4a3cc87"
+dependencies = [
+ "cc",
+ "regex",
+ "regex-syntax",
+ "serde_json",
+ "streaming-iterator",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-c"
+version = "0.24.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9b2eb57a55fed6b00812912e730b7a275cf4fe98bfd6a5d76263d4438371728"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-c-sharp"
+version = "0.23.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1aac67f1ad71de1d6d39708d34811081c26dfa495658de6c14c34200849357c"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-cpp"
+version = "0.23.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df2196ea9d47b4ab4a31b9297eaa5a5d19a0b121dceb9f118f6790ad0ab94743"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-go"
+version = "0.23.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b13d476345220dbe600147dd444165c5791bf85ef53e28acbedd46112ee18431"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-java"
+version = "0.23.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0aa6cbcdc8c679b214e616fd3300da67da0e492e066df01bcf5a5921a71e90d6"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-javascript"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68204f2abc0627a90bdf06e605f5c470aa26fdcb2081ea553a04bdad756693f5"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-language"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
+
+[[package]]
+name = "tree-sitter-luau"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "871abeb427d719788bb38094facd7ff082908ef2b93c1d3d6a5f6025330120f4"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-php"
+version = "0.24.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d8c17c3ab69052c5eeaa7ff5cd972dd1bc25d1b97ee779fec391ad3b5df5592"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-python"
+version = "0.23.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d065aaa27f3aaceaf60c1f0e0ac09e1cb9eb8ed28e7bcdaa52129cffc7f4b04"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-r"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "429133cbda9f8a46e03ef3aae6abb6c3d22875f8585cad472138101bfd517255"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-ruby"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be0484ea4ef6bb9c575b4fdabde7e31340a8d2dbc7d52b321ac83da703249f95"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-rust"
+version = "0.24.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "439e577dbe07423ec2582ac62c7531120dbfccfa6e5f92406f93dd271a120e45"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-swift"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe36052155b9dd69ca82b3b8f1b4ccfb2d867125ac1a4db1dd7331829242668c"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-typescript"
+version = "0.23.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c5f76ed8d947a75cc446d5fccd8b602ebf0cde64ccf2ffa434d873d7a575eff"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "triomphe"
 version = "0.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9170,6 +9488,7 @@ dependencies = [
  "workspace-hack",
  "wyrd-auth-verify",
  "wyrd-bench",
+ "wyrd-benchmark",
  "wyrd-dev-fixtures",
  "wyrd-queue",
  "wyrd-runtime",
@@ -9250,6 +9569,7 @@ dependencies = [
  "uuid",
  "vala-drift",
  "workspace-hack",
+ "wyrd-benchmark",
  "wyrd-skald-agent",
  "wyrd-skald-prompt",
  "wyrd-skald-providers",
@@ -9771,6 +10091,7 @@ dependencies = [
  "bit-set",
  "bit-vec 0.8.0",
  "bitflags 2.13.0",
+ "bohmian-code-review-pipeline",
  "brotli-decompressor 5.0.3",
  "byteorder",
  "bytes",
@@ -9807,6 +10128,7 @@ dependencies = [
  "hashbrown 0.15.5",
  "hashbrown 0.17.1",
  "hex",
+ "hmac 0.12.1",
  "httparse",
  "hyper",
  "hyper-rustls",
@@ -9828,6 +10150,7 @@ dependencies = [
  "memchr",
  "moka",
  "monty-types",
+ "nix",
  "num-bigint 0.4.8",
  "num-integer",
  "num-traits",
@@ -9895,8 +10218,6 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-core",
- "tracing-log",
- "tracing-subscriber",
  "twox-hash",
  "typenum",
  "url",
@@ -9939,6 +10260,7 @@ version = "0.4.1"
 dependencies = [
  "arrow",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "opentelemetry",
  "opentelemetry-http",
@@ -10088,6 +10410,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrd-benchmark"
+version = "0.4.1"
+dependencies = [
+ "backtrace",
+ "flate2",
+ "hdrhistogram",
+ "http",
+ "metrics",
+ "num-traits",
+ "prost",
+ "serde",
+ "tracing",
+ "tracing-subscriber",
+ "ulid",
+ "workspace-hack",
+ "wyrd-benchmark",
+]
+
+[[package]]
 name = "wyrd-cards"
 version = "0.4.1"
 dependencies = [
@@ -10206,11 +10547,13 @@ dependencies = [
  "vala-bifrost-redux",
  "wiremock",
  "workspace-hack",
+ "wyrd-benchmark",
  "wyrd-cards",
  "wyrd-loader",
  "wyrd-queue",
  "wyrd-runtime",
  "wyrd-semver",
+ "wyrd-skald-prompt",
  "wyrd-skald-spec",
  "wyrd-spec",
  "wyrd-testing",
@@ -10245,6 +10588,7 @@ version = "0.4.1"
 dependencies = [
  "aes-gcm",
  "argon2",
+ "hmac 0.12.1",
  "sha2 0.10.9",
  "thiserror 2.0.21",
  "workspace-hack",
@@ -10284,6 +10628,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bigdecimal",
+ "bytes",
  "chrono",
  "metrics",
  "rcgen",
@@ -10302,6 +10647,7 @@ dependencies = [
  "uuid",
  "wiremock",
  "workspace-hack",
+ "wyrd-benchmark",
  "wyrd-crypt",
  "wyrd-skald-providers",
  "wyrd-skald-spec",
@@ -10358,6 +10704,7 @@ name = "wyrd-mcp"
 version = "0.4.1"
 dependencies = [
  "arrow",
+ "base64 0.22.1",
  "chrono",
  "futures-util",
  "http",
@@ -10460,6 +10807,7 @@ dependencies = [
  "tracing",
  "url",
  "wyrd-auth-verify",
+ "wyrd-benchmark",
  "wyrd-cards",
  "wyrd-cli",
  "wyrd-client",
@@ -10489,6 +10837,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "wyrd-benchmark",
  "wyrd-cli",
  "wyrd-client",
  "wyrd-queue",
@@ -10543,6 +10892,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "blake3",
+ "bohmian-code-review-pipeline",
  "bytes",
  "chrono",
  "clap",
@@ -10565,6 +10915,7 @@ dependencies = [
  "monty-pool",
  "monty-proto",
  "monty-types",
+ "nix",
  "num-traits",
  "oauth2",
  "object_store",
@@ -10579,6 +10930,7 @@ dependencies = [
  "serde",
  "serde_jcs",
  "serde_json",
+ "sha1 0.10.7",
  "sha2 0.10.9",
  "shellexpand",
  "sqlx",
@@ -10595,6 +10947,8 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "unicase",
+ "unicode-normalization",
  "url",
  "utoipa",
  "utoipa-axum",
@@ -10609,6 +10963,7 @@ dependencies = [
  "wyrd-auth-issue",
  "wyrd-auth-oidc",
  "wyrd-auth-verify",
+ "wyrd-benchmark",
  "wyrd-client",
  "wyrd-crypt",
  "wyrd-dev-fixtures",
@@ -10617,6 +10972,7 @@ dependencies = [
  "wyrd-queue",
  "wyrd-runtime",
  "wyrd-semver",
+ "wyrd-server",
  "wyrd-skald-agent",
  "wyrd-skald-prompt",
  "wyrd-skald-providers",
@@ -10696,6 +11052,8 @@ version = "0.4.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "bytes",
+ "http",
  "httpdate",
  "insta",
  "jsonwebtoken",
@@ -10871,10 +11229,8 @@ dependencies = [
 name = "wyrd-telemetry"
 version = "0.4.1"
 dependencies = [
- "hdrhistogram",
  "http",
  "metrics",
- "num-traits",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-proto",
@@ -10913,6 +11269,7 @@ dependencies = [
  "http-body",
  "http-body-util",
  "iceberg",
+ "jsonwebtoken",
  "metrics",
  "metrics-exporter-prometheus",
  "num-traits",
@@ -10944,12 +11301,14 @@ dependencies = [
  "uuid",
  "vala-bifrost-redux",
  "vala-sql",
+ "vala-verify",
  "wiremock",
  "workspace-hack",
  "wyrd-auth",
  "wyrd-auth-issue",
  "wyrd-auth-oidc",
  "wyrd-auth-verify",
+ "wyrd-benchmark",
  "wyrd-client",
  "wyrd-crypt",
  "wyrd-dev-fixtures",
@@ -10999,6 +11358,7 @@ dependencies = [
  "tracing",
  "uuid",
  "workspace-hack",
+ "wyrd-benchmark",
  "wyrd-spec",
  "wyrd-telemetry",
  "wyrd-tls",

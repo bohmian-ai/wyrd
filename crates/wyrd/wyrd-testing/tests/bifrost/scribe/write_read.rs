@@ -5,6 +5,7 @@ use std::sync::Arc;
 use arrow::array::{Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use object_store::ObjectStoreExt as _;
 use url::Url;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_client::config::ClientConfig;
@@ -1888,4 +1889,284 @@ async fn assert_mixed_reads(client: &wyrd_client::WyrdClient, table: &str, stage
             "{stage}: `{filter}` returns each matching row once"
         );
     }
+}
+
+/// Every `(value, to_json(v), sub_principal_id)` row of `table`, in value order.
+///
+/// # Panics
+///
+/// Panics when the read fails or does not reach a successful terminal.
+async fn attributed_documents(
+    client: &wyrd_client::WyrdClient,
+    table: &str,
+) -> Vec<(i64, String, String)> {
+    let mut stream = wyrd_client::Bifrost::query_only(client)
+        .query(&BifrostQueryRequest {
+            params: Vec::new(),
+            sql: format!(
+                "SELECT value, to_json(v) AS v, CAST(sub_principal_id AS VARCHAR) AS principal \
+                 FROM {table} ORDER BY value"
+            ),
+            deadline_ms: Some(120_000),
+        })
+        .await
+        .expect("the public query starts");
+    let mut batches = Vec::new();
+    while let Some(batch) = stream
+        .next_batch()
+        .await
+        .expect("the public query reaches its successful terminal")
+    {
+        batches.push(batch);
+    }
+    let text = |name: &str| {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let column = arrow::compute::cast(
+                    batch.column_by_name(name).expect("the selected column"),
+                    &DataType::Utf8,
+                )
+                .expect("the column renders as text");
+                let column = column
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .expect("Utf8 text")
+                    .clone();
+                (0..column.len())
+                    .map(|row| column.value(row).to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
+    int_values(&batches, "value")
+        .into_iter()
+        .zip(text("v"))
+        .zip(text("principal"))
+        .map(|((value, document), principal)| (value, document, principal))
+        .collect()
+}
+
+/// The shredded Variant member names of each published object of `name`.
+///
+/// # Panics
+///
+/// Panics when an object cannot be listed, read, or parsed.
+async fn published_shredded_members(
+    server: &wyrd_testing::WyrdTestServer,
+    tenant: wyrd_spec::DataTenantId,
+    name: &str,
+) -> Vec<std::collections::BTreeSet<String>> {
+    let storage = server
+        .state()
+        .bifrost_storage()
+        .expect("the server owns Bifrost storage");
+    let mut objects = Vec::new();
+    for file in server
+        .published_hot_files_for_test(tenant, BifrostNamespace::Datasets.as_str(), name)
+        .await
+        .expect("published hot files are inspectable")
+    {
+        let bytes = storage
+            .objects()
+            .get(&object_store::path::Path::from(file.object_key.as_str()))
+            .await
+            .expect("the published object reads")
+            .bytes()
+            .await
+            .expect("the published object body");
+        let footer = parquet::file::metadata::ParquetMetaDataReader::new()
+            .parse_and_finish(&bytes)
+            .expect("the published object is Parquet");
+        objects.push(
+            footer
+                .file_metadata()
+                .schema_descr()
+                .columns()
+                .iter()
+                .filter_map(|column| match column.path().parts() {
+                    [root, typed, member, ..] if root == "v" && typed == "typed_value" => {
+                        Some(member.clone())
+                    }
+                    _ => None,
+                })
+                .collect(),
+        );
+    }
+    objects
+}
+
+/// Evolving Variant evidence stays exact through learned, cold, and mixed claims.
+///
+/// One writer publishes `{a, b}` documents, so the claim learns a layout that
+/// shreds `a`, then stages more of that distribution in the learned layout.
+/// The pod restarts on its retained root, losing the learned layout, and a
+/// second writer stages a changed distribution whose `c` member nests a list,
+/// staged cold. Publication merges the learned and the cold runs in one claim.
+/// Active, staged, restored, published, and restarted reads return every
+/// document once, in order, under its writer's principal; every published
+/// object shreds `a`; a selective read on `a` returns its one row; and another
+/// tenant's table of the same name reads none of the rows.
+///
+/// # Panics
+///
+/// Panics when a read, a published layout, an attribution, or the tenant
+/// boundary differs from what was written.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn learned_layout_evolution_preserves_published_evidence() {
+    let data_root = tempfile::tempdir().expect("durable Bifrost data root");
+    let builder = || {
+        wyrd_testing::WyrdTestServer::builder()
+            .with_durable_bifrost_data_root(data_root.path().to_path_buf())
+    };
+    let server = builder().start_bound().await.expect("the pod starts");
+    let tenant = server.data_tenant_id();
+    let name = unique_table("learned_evolution");
+    let request = |tenant| vala_bifrost_redux::catalog::CreateTableRequest {
+        table: vala_bifrost_redux::catalog::TableRef::new(BifrostNamespace::Datasets, &name),
+        user_fields: vec![
+            Field::new("value", DataType::Int64, false),
+            wyrd_types::variant::variant_field("v", true),
+        ],
+        tenant,
+        attribution: wyrd_spec::auth::Attribution::unresolved(),
+        physical_layout: None,
+    };
+    server
+        .create_bifrost_table_for_test(request(tenant))
+        .await
+        .expect("the catalog registers the Variant table");
+    let table = format!("{}.{name}", BifrostNamespace::Datasets.as_str());
+    let first_key = tenant_key(&server, tenant).await;
+    let second_key = tenant_key(&server, tenant).await;
+    let document = |generation: i64, value: i64| match generation {
+        0 => format!(r#"{{"a":{value},"b":"s{value}"}}"#),
+        1 => format!(r#"{{"a":{value},"b":"t{value}"}}"#),
+        _ => format!(r#"{{"a":{value},"c":{{"d":[{value},"x"]}}}}"#),
+    };
+    let mut written = Vec::new();
+    let mut append = async |client: &wyrd_client::WyrdClient, generation: i64| {
+        let rows = (generation * 300..(generation + 1) * 300)
+            .map(|value| (value, document(generation, value)))
+            .collect::<Vec<_>>();
+        let batch = super::recovery::variant_batch(
+            &rows
+                .iter()
+                .map(|(value, json)| (*value, json.as_str()))
+                .collect::<Vec<_>>(),
+        );
+        super::support::append_batch(client, &table, uuid::Uuid::now_v7(), &batch)
+            .await
+            .expect("the Variant append is acknowledged");
+        written.extend(rows);
+        written.clone()
+    };
+    let exact = async |client: &wyrd_client::WyrdClient, written: &[(i64, String)], stage: &str| {
+        let read = attributed_documents(client, &table).await;
+        assert_eq!(
+            read.iter()
+                .map(|(value, document, _)| (*value, document.clone()))
+                .collect::<Vec<_>>(),
+            written,
+            "{stage}: every document reads back once, in order, unchanged"
+        );
+        read.into_iter()
+            .map(|(_, _, principal)| principal)
+            .collect::<Vec<_>>()
+    };
+    let stage = async |server: &wyrd_testing::WyrdTestServer| {
+        let scribe = server.bifrost_scribe().expect("the pod owns a Scribe");
+        scribe
+            .flush_writable_for_test()
+            .await
+            .expect("every writable bucket freezes");
+        super::support::await_persistence_drained(&scribe).await;
+    };
+
+    let first = endpoint_client(&server, &first_key);
+    let learned = append(&first, 0).await;
+    exact(&first, &learned, "active").await;
+    server
+        .flush_bifrost()
+        .await
+        .expect("the first claim publishes");
+    let layouts = published_shredded_members(&server, tenant, &name).await;
+    assert!(
+        !layouts.is_empty() && layouts.iter().all(|members| members.contains("a")),
+        "the first claim learns a layout shredding `a`: {layouts:?}"
+    );
+    exact(&first, &learned, "published").await;
+    let matching = append(&first, 1).await;
+    stage(&server).await;
+    exact(&first, &matching, "staged in the learned layout").await;
+
+    let server = Box::pin(server.restart_bound(builder()))
+        .await
+        .expect("the pod restarts on its retained root");
+    let first = endpoint_client(&server, &first_key);
+    exact(&first, &matching, "restored").await;
+    let second = endpoint_client(&server, &second_key);
+    let changed = append(&second, 2).await;
+    exact(&second, &changed, "active beside staged").await;
+    stage(&server).await;
+    exact(&second, &changed, "staged cold").await;
+
+    server
+        .flush_bifrost()
+        .await
+        .expect("the mixed claim publishes");
+    assert_eq!(published_rows(&server, tenant, &name).await, 900);
+    let layouts = published_shredded_members(&server, tenant, &name).await;
+    assert!(
+        layouts.len() >= 2 && layouts.iter().all(|members| members.contains("a")),
+        "every published object shreds `a`: {layouts:?}"
+    );
+    let principals = exact(&first, &changed, "mixed claim published").await;
+    assert!(
+        principals[..600]
+            .iter()
+            .all(|principal| *principal == principals[0])
+            && principals[600..]
+                .iter()
+                .all(|principal| *principal == principals[600])
+            && principals[0] != principals[600],
+        "each row keeps its writer's principal"
+    );
+    for probe in [150, 450, 750] {
+        assert_eq!(
+            super::support::read_sql(
+                &first,
+                &format!("SELECT value FROM {table} WHERE CAST(v->>'a' AS BIGINT) = {probe}")
+            )
+            .await,
+            vec![probe],
+            "a selective read on the learned member returns its row"
+        );
+    }
+
+    let server = Box::pin(server.restart_bound(builder()))
+        .await
+        .expect("the pod restarts after publication");
+    let first = endpoint_client(&server, &first_key);
+    assert_eq!(
+        exact(&first, &changed, "republished").await,
+        principals,
+        "attribution survives the restart"
+    );
+    let other = server
+        .seed_tenant(&unique_table("learned_isolation"))
+        .await
+        .expect("a second tenant is seeded");
+    server
+        .create_bifrost_table_for_test(request(other))
+        .await
+        .expect("the second tenant registers the same table name");
+    assert!(
+        attributed_documents(&tenant_client(&server, other).await, &table)
+            .await
+            .is_empty(),
+        "another tenant reads none of the rows"
+    );
+    server.shutdown().await.expect("the server drains cleanly");
 }

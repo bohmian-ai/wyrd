@@ -2,7 +2,7 @@ import { Field, Int32, RecordBatch, Schema, Struct, makeBuilder, makeData, table
 import { expect, vi } from "vitest";
 import { ZodError, z } from "zod";
 
-import { Bifrost, TableConfig, type TableConfigOptions, WyrdClient, record } from "wyrd-ai";
+import { Bifrost, TableConfig, type TableConfigOptions, WyrdClient } from "wyrd-ai";
 
 import { rooted, serverTest } from "../support/server.js";
 
@@ -135,25 +135,6 @@ test("compaction type is recorded and a different one is refused", async () => {
   expect((await TableConfig.describe("bifrost.datasets.kind")).compactionType).toBe("small-files");
 });
 
-test("recorded telemetry row reads back", async ({ server, reader }) => {
-  const writer = await Bifrost.connect({ table: TableConfig.fromJsonSchema("bifrost.datasets.recorded", Value) });
-  expect(await writer.register()).toBe("created");
-
-  record(writer, "bifrost.datasets.recorded", Value, { value: 7 });
-  await writer.shutdown();
-  server.flushBifrost();
-
-  expect(writer.dropped).toBe(0);
-  const rows = await reader.sql("SELECT value FROM bifrost.datasets.recorded", [], z.object({ value: z.bigint() }));
-  expect(rows).toEqual([{ value: 7n }]);
-});
-
-test("recorded telemetry with an unmappable schema is refused", async ({ reader }) => {
-  expect(() => record(reader, "bifrost.datasets.recorded", { type: "object" }, { value: 7 })).toThrow(
-    expect.objectContaining({ code: "WYRD_VALA_400_SCHEMA_PARSE" }),
-  );
-});
-
 // Arrow declares a column type JSON Schema cannot: a 32-bit integer.
 test("arrow declared table keeps its column types", async ({ server, reader }) => {
   const schema = new Schema([new Field("small", new Int32(), false)]);
@@ -177,7 +158,6 @@ test("described table accepts writes without restating its schema", async ({ ser
   await writer.shutdown();
   server.flushBifrost();
 
-  expect(writer.dropped).toBe(0);
   expect((await reader.sql("SELECT value FROM bifrost.datasets.described")).numRows).toBe(1);
 });
 

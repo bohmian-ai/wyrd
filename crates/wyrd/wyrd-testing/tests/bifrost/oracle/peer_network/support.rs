@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use vala_bifrost_redux::oracle::peer::{
     ReservationBinding, ReservationOperationV1, ReservationTicketClaims, reservation_body_digest,
 };
-use wyrd_server::config::BifrostTarget;
+use wyrd_server::config::ServerTarget;
 use wyrd_spec::vala::api::NodeId;
 use wyrd_testing::bifrost::peer_ca::{BifrostPeerCa, BifrostPeerLeaf};
 use wyrd_tonic::prost::Message as _;
@@ -201,23 +201,21 @@ pub(crate) async fn probe_oracle_lifecycle(channel: Channel) -> Result<(), tonic
 
 /// Reports whether a target composes a public serving listener.
 ///
-/// A dedicated Forge worker composes neither HTTP nor public gRPC: it pulls
-/// work from Postgres and object storage and answers no caller.
+/// The Forge maintenance target composes neither HTTP nor public gRPC: it
+/// pulls work from Postgres and object storage and answers no public caller.
 #[must_use]
-pub(crate) fn target_serves_public_listener(target: BifrostTarget) -> bool {
-    target != BifrostTarget::ForgeWorker
+pub(crate) fn target_serves_public_listener(target: ServerTarget) -> bool {
+    target != ServerTarget::BifrostMaintenance
 }
 
-/// Reports whether a target composes a private peer plane at all.
+/// Reports whether a target joins Scribe and Oracle peer membership.
 ///
-/// A Forge worker owns neither a Scribe nor an Oracle, so it has nothing to
-/// answer on the peer plane and must not open a listener for it.
+/// The Forge maintenance target owns neither a Scribe nor an Oracle, so it
+/// publishes no membership address; its peer listener carries only the Forge
+/// leader route.
 #[must_use]
-pub(crate) fn target_serves_peer_plane(target: BifrostTarget) -> bool {
-    matches!(
-        target,
-        BifrostTarget::All | BifrostTarget::Server | BifrostTarget::Oracle | BifrostTarget::Scribe
-    )
+pub(crate) fn target_serves_peer_plane(target: ServerTarget) -> bool {
+    target != ServerTarget::BifrostMaintenance
 }
 
 /// The two fenced Oracle incarnations one reservation travels between.

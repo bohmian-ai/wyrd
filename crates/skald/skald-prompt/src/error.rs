@@ -79,45 +79,39 @@ impl PromptBuilderError {
     }
 }
 
-#[cfg(feature = "python")]
-impl From<PromptBuilderError> for wyrd_utils::py::WyrdPyError {
-    /// Maps each builder failure to its stable public Wyrd error for Python.
+impl From<PromptBuilderError> for wyrd_spec::error::WyrdError {
+    /// Maps each builder failure to its stable public Wyrd error, the one
+    /// every SDK boundary raises.
     fn from(error: PromptBuilderError) -> Self {
         use serde_json::json;
         let message = error.to_string();
         match error {
             PromptBuilderError::EmptyModel => wyrd_spec::error::WyrdError::from(
                 wyrd_spec::card::prompt::validate::PromptError::EmptyModel,
-            )
-            .into(),
+            ),
             PromptBuilderError::InvalidResponseSchema => wyrd_spec::error::WyrdError::from(
                 wyrd_spec::card::prompt::validate::PromptError::InvalidResponseSchema,
-            )
-            .into(),
+            ),
             PromptBuilderError::Io { path, message } => wyrd_spec::error::WyrdError::from(
                 wyrd_spec::card::prompt::validate::PromptError::LoaderIo { path, message },
-            )
-            .into(),
-            PromptBuilderError::Wyrd(error) => error.into(),
-            PromptBuilderError::Skald(error) => wyrd_spec::error::WyrdError::from(error).into(),
+            ),
+            PromptBuilderError::Wyrd(error) => error,
+            PromptBuilderError::Skald(error) => wyrd_spec::error::WyrdError::from(error),
             PromptBuilderError::InvalidProvider(provider) => {
                 wyrd_spec::error::WyrdError::PromptProviderMismatch {
                     message,
                     details: json!({ "provider": provider }),
                 }
-                .into()
             }
             PromptBuilderError::Validation(source) => wyrd_spec::error::WyrdError::PromptInvalid {
                 message,
                 details: json!({ "field": "prompt", "source": source }),
-            }
-            .into(),
+            },
             PromptBuilderError::UnsupportedRole { provider, role } => {
                 wyrd_spec::error::WyrdError::PromptProviderMismatch {
                     message,
                     details: json!({ "provider": provider, "role": role }),
                 }
-                .into()
             }
             PromptBuilderError::WrongProvider { expected, actual }
             | PromptBuilderError::WrongVariant { expected, actual } => {
@@ -125,8 +119,15 @@ impl From<PromptBuilderError> for wyrd_utils::py::WyrdPyError {
                     message,
                     details: json!({ "expected": expected, "actual": actual }),
                 }
-                .into()
             }
         }
+    }
+}
+
+#[cfg(feature = "python")]
+impl From<PromptBuilderError> for wyrd_utils::py::WyrdPyError {
+    /// Raises the builder failure's stable public Wyrd error in Python.
+    fn from(error: PromptBuilderError) -> Self {
+        wyrd_spec::error::WyrdError::from(error).into()
     }
 }

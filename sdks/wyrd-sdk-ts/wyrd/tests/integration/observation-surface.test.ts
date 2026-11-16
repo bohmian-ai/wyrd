@@ -1,5 +1,5 @@
 // TypeScript's own observation surface beyond the shared `observe_a_run`
-// story: generic records, local emit refusals, and a burst through the byte
+// story: caller-table writes, local emit refusals, and a burst through the byte
 // budget. Not mirrored.
 import { expect, vi } from "vitest";
 import { z } from "zod";
@@ -25,8 +25,8 @@ test("records land in their tables under the view that wrote them", async ({ ser
   await state.startBifrost();
   const run = state.run();
 
-  await run.forCard("agent").observe.record(ANSWERS, { value: 41 });
-  await run.forCard("model").observe.record(SCORES, { value: 42 });
+  await run.forCard("agent").bifrost.writeTo(ANSWERS, { value: 41 });
+  await run.forCard("model").bifrost.writeTo(SCORES, { value: 42 });
   await state.shutdown();
   server.flushBifrost();
 
@@ -34,6 +34,29 @@ test("records land in their tables under the view that wrote them", async ({ ser
     reader.sql(`SELECT value, subject_card_uid FROM ${table} WHERE run_id = $1`, [run.runId], RecordRow);
   expect(await read(ANSWERS)).toEqual([{ value: 41n, subject_card_uid: state.cardRef("agent").uid }]);
   expect(await read(SCORES)).toEqual([{ value: 42n, subject_card_uid: state.cardRef("model").uid }]);
+});
+
+test("write needs an active table, and switching it moves the destination", async ({ server, reader, state }) => {
+  for (const table of [ANSWERS, SCORES]) {
+    const registrar = await Bifrost.connect({ table: TableConfig.fromJsonSchema(table, VALUE_ROW) });
+    await registrar.register();
+    await registrar.shutdown();
+  }
+  await state.startBifrost();
+  const run = state.run("agent");
+
+  await expect(run.bifrost.write({ value: 1 })).rejects.toMatchObject({ code: "WYRD_VALA_412_NO_ACTIVE_TABLE" });
+  await state.useTableByName(ANSWERS);
+  await run.bifrost.write({ value: 43 });
+  await state.useTableByName(SCORES);
+  await run.bifrost.write({ value: 44 });
+  await state.shutdown();
+  server.flushBifrost();
+
+  const read = (table: string) =>
+    reader.sql(`SELECT value, subject_card_uid FROM ${table} WHERE run_id = $1`, [run.runId], RecordRow);
+  expect(await read(ANSWERS)).toEqual([{ value: 43n, subject_card_uid: state.cardRef("agent").uid }]);
+  expect(await read(SCORES)).toEqual([{ value: 44n, subject_card_uid: state.cardRef("agent").uid }]);
 });
 
 /** One emit a run refuses, and the catalog code it raises. */
@@ -46,13 +69,13 @@ test.for<Refusal>([
     "WYRD_SDK_400_BIFROST_NOT_STARTED",
   ],
   [
-    "record into a built-in table",
-    (state) => state.run("agent").observe.record("bifrost.drift.observations", { latency: 1 }),
+    "write into a built-in table",
+    (state) => state.run("agent").bifrost.writeTo("bifrost.drift.observations", { latency: 1 }),
     "WYRD_SDK_400_INVALID_OBSERVATION",
   ],
   [
-    "record into an unregistered table",
-    (state) => state.run("agent").observe.record("bifrost.datasets.never_registered", { value: 1 }),
+    "write into an unregistered table",
+    (state) => state.run("agent").bifrost.writeTo("bifrost.datasets.never_registered", { value: 1 }),
     "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
   ],
   ["view of an unknown alias", (state) => state.run().forCard("missing"), "WYRD_SDK_404_UNKNOWN_ALIAS"],

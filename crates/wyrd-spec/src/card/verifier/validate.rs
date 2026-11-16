@@ -11,11 +11,12 @@ use serde_json::{Value, json};
 use skald_spec::{Prompt, ResponseFormat, ResponseType};
 
 use super::extract::ExtractOutput;
+use super::pull_request::Extractor;
 use super::reference::{OrderBy, Reference, ReferenceRoot, SourceField};
 use super::schema_path::{admits, fits};
 use super::{
-    Action, AgentCall, Check, CheckEvidence, CodeCall, CodeSource, Condition, Decide, DriftCheck,
-    InputSlot, MAX_STEP_RETRIES, Requirement, Step, VerifierSpec, WorkspaceSource,
+    Action, AgentCall, Check, CheckEvidence, CodeCall, CodeSource, Condition, Decide, DependsOn,
+    DriftCheck, InputSlot, MAX_STEP_RETRIES, Requirement, Step, VerifierSpec, WorkspaceSource,
 };
 use crate::card::agent::{AgentSpec, BuiltinTool};
 use crate::card::drift::DriftSignal;
@@ -24,7 +25,7 @@ use crate::envelope::CardKind;
 use crate::error::WyrdError;
 use crate::ids::{FeatureName, SlotName};
 use crate::reference::InlineableRef;
-use crate::verification::execution::Verdict;
+use crate::verification::execution::{ApprovalReceipt, Verdict};
 use crate::verification::{ExecutionPlan, TaskId, plan_stages};
 
 /// An Agent and its Prompt, resolved by the caller for validation.
@@ -39,12 +40,23 @@ pub struct ResolvedAgent<'a> {
 /// Where a reference or Agent call appears.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Position<'a> {
-    /// A step action or `when` of the named step.
+    /// A step action of the named step, bound once per invocation.
     Step(&'a TaskId),
+    /// A step's `when` or `foreach.items`, resolved once before expansion.
+    Gate(&'a TaskId),
+    /// A step's `repeat.until`, resolved after each iteration settles.
+    Until(&'a TaskId),
     /// A requirement check on the named step.
     StepCheck(&'a TaskId),
     /// A whole-Verifier requirement check.
     VerifierCheck,
+}
+
+impl Position<'_> {
+    /// Whether the position binds step-side values rather than a check's.
+    const fn is_step(self) -> bool {
+        matches!(self, Self::Step(_) | Self::Gate(_) | Self::Until(_))
+    }
 }
 
 /// Builds the structured refusal for one violated rule.
@@ -98,7 +110,8 @@ impl VerifierSpec {
     }
 
     /// Plans step stages from `depends_on` plus every step reference in each
-    /// step's action and `when`.
+    /// step's action, `when`, `foreach.items`, and `repeat.until`, so every
+    /// possible edge, speculative conditions included, is checked for cycles.
     ///
     /// # Errors
     /// Returns [`WyrdError::Validation`] for an unknown step, self
@@ -121,8 +134,9 @@ impl VerifierSpec {
         self.steps
             .iter()
             .map(|step| {
-                let mut deps: BTreeSet<&TaskId> = step.depends_on.iter().collect();
-                deps.extend(step_references(step).filter_map(Reference::step));
+                let mut deps = step.prerequisites();
+                deps.extend(step.depends_on.steps());
+                deps.extend(step.guard_steps());
                 (&step.id, deps)
             })
             .collect()
@@ -164,10 +178,102 @@ impl VerifierSpec {
     }
 }
 
-/// Every reference in a step's action and `when`.
-fn step_references(step: &Step) -> impl Iterator<Item = &Reference> {
+impl Step {
+    /// The steps that must be complete before this step can start: every
+    /// list `depends_on` entry and every step its action, `foreach.items`,
+    /// `repeat.until` (other than itself), and non-speculative `when` read.
+    ///
+    /// `any_succeeded` candidates and a speculative step's guard steps are
+    /// not prerequisites; [`Self::guard_steps`] returns the latter.
+    #[must_use]
+    pub fn prerequisites(&self) -> BTreeSet<&TaskId> {
+        let mut deps: BTreeSet<&TaskId> = match &self.depends_on {
+            DependsOn::After(steps) => steps.iter().collect(),
+            DependsOn::AnySucceeded { .. } => BTreeSet::new(),
+        };
+        let when = self.when.iter().filter(|_| !self.speculative);
+        deps.extend(
+            action_references(self)
+                .chain(when.map(|when| &when.path))
+                .chain(
+                    self.foreach
+                        .as_ref()
+                        .and_then(|foreach| foreach.items.as_ref()),
+                )
+                .filter_map(Reference::step),
+        );
+        // `until` may read its own step's requirement verdicts.
+        deps.extend(
+            self.repeat
+                .iter()
+                .filter_map(|repeat| repeat.until.path.step())
+                .filter(|own| **own != self.id),
+        );
+        deps
+    }
+
+    /// The steps a speculative step's `when` reads, whose completion decides
+    /// its disposition; empty for an ordinary step.
+    #[must_use]
+    pub fn guard_steps(&self) -> BTreeSet<&TaskId> {
+        self.when
+            .iter()
+            .filter(|_| self.speculative)
+            .filter_map(|when| when.path.step())
+            .collect()
+    }
+}
+
+impl Step {
+    /// The input slots this step reads: through its action, `when`,
+    /// `foreach.items`, `repeat.until`, or any of its requirements' checks.
+    ///
+    /// The engine holds a step that reads a deferred slot whose evidence has
+    /// not arrived, so it and everything downstream of it wait while
+    /// independent steps run. Pure: no IO.
+    #[must_use]
+    pub fn input_slots(&self) -> BTreeSet<&SlotName> {
+        action_references(self)
+            .chain(self.when.iter().map(|when| &when.path))
+            .chain(
+                self.foreach
+                    .as_ref()
+                    .and_then(|foreach| foreach.items.as_ref()),
+            )
+            .chain(self.repeat.iter().map(|repeat| &repeat.until.path))
+            .filter_map(Reference::slot)
+            .chain(self.requirements.iter().flat_map(Requirement::input_slots))
+            .collect()
+    }
+}
+
+impl Requirement {
+    /// The input slots this requirement's check reads. Pure: no IO.
+    #[must_use]
+    pub fn input_slots(&self) -> BTreeSet<&SlotName> {
+        let references: Vec<&Reference> = match &self.check {
+            Check::Assert { path, each, .. } => path.iter().chain(each).collect(),
+            Check::Trace(trace) => vec![&trace.on],
+            Check::Agent(call) => call
+                .inputs
+                .values()
+                .chain(
+                    call.workspace
+                        .values()
+                        .filter_map(WorkspaceSource::reference),
+                )
+                .collect(),
+            Check::Code(check) => check.call.inputs.values().collect(),
+            Check::Drift(drift) => vec![&drift.on],
+        };
+        references.into_iter().filter_map(Reference::slot).collect()
+    }
+}
+
+/// Every reference a step's action binds.
+fn action_references(step: &Step) -> std::vec::IntoIter<&Reference> {
     let action: Vec<&Reference> = match &step.action {
-        Action::Extract { from } => vec![from],
+        Action::Extract { from, .. } => from.iter().collect(),
         Action::Agent(call) => call
             .inputs
             .values()
@@ -178,10 +284,9 @@ fn step_references(step: &Step) -> impl Iterator<Item = &Reference> {
             )
             .collect(),
         Action::Code(call) => call.inputs.values().collect(),
+        Action::Approval { .. } => Vec::new(),
     };
-    action
-        .into_iter()
-        .chain(step.when.as_ref().map(|when| &when.path))
+    action.into_iter()
 }
 
 /// One validation pass with its resolver and derived lookups.
@@ -214,6 +319,20 @@ where
             validate_order(spec, order)?;
         }
         self.validate_evidence_mode()?;
+        if let Some(limits) = &spec.limits {
+            let fields = [
+                ("concurrency", limits.concurrency),
+                ("max_agent_invocations", limits.max_agent_invocations),
+                ("timeout_seconds", limits.timeout_seconds),
+            ];
+            if let Some((field, _)) = fields.into_iter().find(|(_, value)| *value == Some(0)) {
+                return Err(invalid(
+                    "limits",
+                    &format!("limits.{field}"),
+                    "limits must be positive",
+                ));
+            }
+        }
         if let Decide::PassRate { threshold } = spec.decide
             && !(threshold.is_finite() && threshold > 0.0 && threshold <= 1.0)
         {
@@ -316,16 +435,41 @@ where
                 format!("at most {MAX_STEP_RETRIES} retries"),
             ));
         }
-        for dep in &step.depends_on {
+        let depends_path = format!("{path}.depends_on");
+        if let DependsOn::AnySucceeded { any_succeeded } = &step.depends_on {
+            if any_succeeded.is_empty() {
+                return Err(invalid(
+                    "depends_on",
+                    &depends_path,
+                    "any_succeeded names at least one step",
+                ));
+            }
+            if any_succeeded.iter().collect::<BTreeSet<_>>().len() != any_succeeded.len() {
+                return Err(invalid(
+                    "depends_on",
+                    &depends_path,
+                    "any_succeeded names each step once",
+                ));
+            }
+        }
+        for dep in step.depends_on.steps() {
             if !self.spec.steps.iter().any(|other| &other.id == dep) {
                 return Err(invalid(
                     "unknown_reference",
-                    &format!("{path}.depends_on"),
+                    &depends_path,
                     format!("unknown step {}", dep.as_str()),
                 ));
             }
         }
+        if step.speculative && step.when.is_none() {
+            return Err(invalid(
+                "speculative",
+                &format!("{path}.speculative"),
+                "a speculative step declares the when that admits it",
+            ));
+        }
         let position = Position::Step(&step.id);
+        let gate = Position::Gate(&step.id);
         if let Some(Condition {
             path: when,
             operator,
@@ -333,13 +477,96 @@ where
         }) = &step.when
         {
             let when_path = format!("{path}.when");
-            self.validate_reference(when, position, false, &when_path)?;
+            self.validate_reference(when, gate, false, false, &when_path)?;
             validate_operator(operator, &when_path)?;
+        }
+        if let Some(foreach) = &step.foreach {
+            let foreach_path = format!("{path}.foreach");
+            let refuse = |field: &str, message: &str| {
+                let at = if field.is_empty() {
+                    foreach_path.clone()
+                } else {
+                    format!("{foreach_path}.{field}")
+                };
+                Err(invalid("foreach", &at, message))
+            };
+            match (&foreach.count, &foreach.items, foreach.max_items) {
+                (Some(_), Some(_), _) | (None, None, _) => {
+                    return refuse("", "set exactly one of count or items");
+                }
+                (Some(0), None, _) => return refuse("count", "count must be positive"),
+                (Some(_), None, Some(_)) => {
+                    return refuse("max_items", "max_items bounds items only");
+                }
+                (None, Some(_), None | Some(0)) => {
+                    return refuse("max_items", "items requires a positive max_items");
+                }
+                _ => {}
+            }
+            if foreach.concurrency == Some(0) {
+                return refuse("concurrency", "concurrency must be positive");
+            }
+            if let Some(items) = &foreach.items {
+                self.validate_reference(
+                    items,
+                    gate,
+                    false,
+                    false,
+                    &format!("{foreach_path}.items"),
+                )?;
+            }
+        }
+        if let Some(repeat) = &step.repeat {
+            let repeat_path = format!("{path}.repeat");
+            if repeat.max_iterations == 0 {
+                return Err(invalid(
+                    "repeat",
+                    &format!("{repeat_path}.max_iterations"),
+                    "max_iterations must be positive",
+                ));
+            }
+            let until_path = format!("{repeat_path}.until");
+            self.validate_reference(
+                &repeat.until.path,
+                Position::Until(&step.id),
+                false,
+                false,
+                &until_path,
+            )?;
+            validate_operator(&repeat.until.operator, &until_path)?;
         }
         let action_path = format!("{path}.action");
         match &step.action {
-            Action::Extract { from } => {
-                self.validate_reference(from, position, false, &action_path)?;
+            Action::Approval { message } if message.trim().is_empty() => {
+                return Err(invalid(
+                    "approval_message",
+                    &format!("{action_path}.message"),
+                    "an approval states a non-empty message",
+                ));
+            }
+            Action::Extract {
+                from: None,
+                extractor: Some(_),
+            }
+            | Action::Approval { .. } => {}
+            Action::Extract {
+                from: None,
+                extractor: None,
+            }
+            | Action::Extract {
+                from: Some(_),
+                extractor: Some(_),
+            } => {
+                return Err(invalid(
+                    "extract_source",
+                    &action_path,
+                    "extract takes exactly one of `from` and `extractor`",
+                ));
+            }
+            Action::Extract {
+                from: Some(from), ..
+            } => {
+                self.validate_reference(from, position, false, false, &action_path)?;
                 let Some(InputSlot::Media { formats, .. }) = self.whole_slot(from) else {
                     return Err(invalid(
                         "extract_source",
@@ -394,11 +621,11 @@ where
                         ));
                     }
                 };
-                self.validate_reference(reference, position, wildcard, &path)?;
+                self.validate_reference(reference, position, wildcard, false, &path)?;
                 validate_operator(operator, &path)
             }
             Check::Trace(trace) => {
-                self.validate_reference(&trace.on, position, false, &path)?;
+                self.validate_reference(&trace.on, position, false, false, &path)?;
                 if !matches!(self.whole_slot(&trace.on), Some(InputSlot::Trace { .. })) {
                     return Err(invalid(
                         "trace_source",
@@ -472,7 +699,7 @@ where
             }
             CodeSource::Artifact { card, .. }
                 if card
-                    .as_card_ref()
+                    .target()
                     .is_some_and(|card| card.kind != CardKind::Artifact) =>
             {
                 return Err(invalid(
@@ -491,7 +718,7 @@ where
             ));
         }
         for reference in call.inputs.values() {
-            self.validate_reference(reference, position, false, path)?;
+            self.validate_reference(reference, position, false, false, path)?;
         }
         Ok(())
     }
@@ -515,7 +742,7 @@ where
     ) -> Result<(), WyrdError> {
         if call
             .agent
-            .as_card_ref()
+            .target()
             .is_some_and(|card| card.kind != CardKind::Agent)
         {
             return Err(invalid(
@@ -524,12 +751,15 @@ where
                 "agent must reference an Agent Card",
             ));
         }
-        for reference in call.inputs.values().chain(
-            call.workspace
-                .values()
-                .filter_map(WorkspaceSource::reference),
-        ) {
-            self.validate_reference(reference, position, false, path)?;
+        for reference in call.inputs.values() {
+            self.validate_reference(reference, position, false, false, path)?;
+        }
+        for reference in call
+            .workspace
+            .values()
+            .filter_map(WorkspaceSource::reference)
+        {
+            self.validate_reference(reference, position, false, true, path)?;
         }
         validate_workspace(&call.workspace, path)?;
         let Some(resolved) = (self.resolve)(&call.agent) else {
@@ -546,22 +776,39 @@ where
                     format!("{name} is not a built-in tool"),
                 ));
             };
+            if builtins.contains(&tool) {
+                return Err(invalid(
+                    "agent_tools",
+                    path,
+                    format!("{name} is selected more than once"),
+                ));
+            }
             builtins.push(tool);
         }
         let fs_tool = builtins.iter().any(|tool| tool.is_filesystem());
-        if fs_tool && call.workspace.is_empty() {
+        if fs_tool
+            && call.workspace.is_empty()
+            && !builtins.iter().any(|tool| tool.writes_scratch())
+        {
             return Err(invalid(
                 "agent_tools",
                 path,
-                "filesystem tools require a workspace",
+                "filesystem tools require a workspace or a scratch writer",
             ));
         }
-        let workspace_tool = fs_tool || builtins.contains(&BuiltinTool::CodeRun);
+        let workspace_tool = builtins.iter().any(|tool| tool.uses_workspace());
         if !call.workspace.is_empty() && !workspace_tool {
             return Err(invalid(
                 "agent_tools",
                 path,
-                "a workspace requires a filesystem or code.run tool",
+                "a workspace requires an fs.*, code.run, or publish tool",
+            ));
+        }
+        if builtins.contains(&BuiltinTool::Publish) && !matches!(position, Position::Step(_)) {
+            return Err(invalid(
+                "agent_tools",
+                path,
+                "publish is available only to step Agents; a check's Agent cannot publish",
             ));
         }
         if !matches!(position, Position::Step(_)) {
@@ -665,17 +912,19 @@ where
         Ok(())
     }
 
-    /// Validates one reference in its position.
+    /// Validates one reference in its position; `mount` admits publication
+    /// references, which only an Agent workspace source may name.
     ///
     /// # Errors
     /// Returns [`WyrdError::Validation`] with rule `wildcard_position`,
-    /// `unknown_reference`, `missing_field`, `requirement_position`,
-    /// `verdict_position`, or `step_position`.
+    /// `publication_position`, `unknown_reference`, `missing_field`,
+    /// `requirement_position`, `verdict_position`, or `step_position`.
     fn validate_reference(
         &self,
         reference: &Reference,
         position: Position<'a>,
         wildcard: bool,
+        mount: bool,
         path: &str,
     ) -> Result<(), WyrdError> {
         let refuse =
@@ -684,6 +933,12 @@ where
             return refuse(
                 "wildcard_position",
                 "[*] is allowed only in an assertion's each",
+            );
+        }
+        if matches!(reference.root, ReferenceRoot::StepPublications { .. }) && !mount {
+            return refuse(
+                "publication_position",
+                "publications mount only as an Agent workspace source",
             );
         }
         match &reference.root {
@@ -702,7 +957,7 @@ where
                 Ok(())
             }
             ReferenceRoot::RequirementId | ReferenceRoot::RequirementStatement => {
-                if matches!(position, Position::Step(_)) {
+                if position.is_step() {
                     return refuse(
                         "requirement_position",
                         "requirement.* is readable only in checks",
@@ -710,17 +965,84 @@ where
                 }
                 Ok(())
             }
+            ReferenceRoot::Item | ReferenceRoot::ItemIndex => {
+                let foreach = self
+                    .own_step(position)
+                    .and_then(|step| step.foreach.as_ref());
+                let readable = match (&reference.root, foreach) {
+                    (ReferenceRoot::Item, Some(foreach)) => foreach.items.is_some(),
+                    (_, foreach) => foreach.is_some(),
+                };
+                if !readable || matches!(position, Position::Gate(_)) {
+                    return refuse(
+                        "item_position",
+                        "item is readable only by an items fanout step, and item_index by a fanout step, inside its own invocations",
+                    );
+                }
+                Ok(())
+            }
+            ReferenceRoot::IterationOutput
+            | ReferenceRoot::IterationPrevious
+            | ReferenceRoot::IterationIndex => {
+                let repeated = self
+                    .own_step(position)
+                    .is_some_and(|step| step.repeat.is_some());
+                let output = matches!(reference.root, ReferenceRoot::IterationOutput);
+                let placed = match position {
+                    Position::Until(_) => true,
+                    Position::Step(_) | Position::StepCheck(_) => !output,
+                    Position::Gate(_) | Position::VerifierCheck => false,
+                };
+                if !repeated || !placed {
+                    return refuse(
+                        "iteration_position",
+                        "iteration.* is readable only inside a repeat step's own invocations, and iteration.output only by its until",
+                    );
+                }
+                Ok(())
+            }
             ReferenceRoot::StepOutput(step)
             | ReferenceRoot::StepStatus(step)
-            | ReferenceRoot::StepVerdict { step, .. } => {
+            | ReferenceRoot::StepVerdict { step, .. }
+            | ReferenceRoot::StepPublications { step, .. } => {
                 let Some(target) = self.spec.steps.iter().find(|s| &s.id == step) else {
                     return refuse("unknown_reference", "unknown step");
                 };
+                if matches!(
+                    reference.root,
+                    ReferenceRoot::StepPublications { name: Some(_), .. }
+                ) && !matches!(target.action, Action::Agent(_))
+                {
+                    return refuse(
+                        "unknown_reference",
+                        "only an Agent step publishes named content",
+                    );
+                }
+                let selects_member = matches!(
+                    reference.root,
+                    ReferenceRoot::StepPublications { name: Some(_), .. }
+                        | ReferenceRoot::StepVerdict { .. }
+                );
+                if selects_member && target.foreach.is_some() && Some(step) != self.own(position) {
+                    return refuse(
+                        "fanout_member",
+                        "a fanout step has one member per item; mount steps.<id>.publications and read its manifest",
+                    );
+                }
+                if let Position::Until(own) = position
+                    && step == own
+                    && !matches!(reference.root, ReferenceRoot::StepVerdict { .. })
+                {
+                    return refuse(
+                        "step_position",
+                        "until reads its own iteration through iteration.output and its own step only through requirement verdicts",
+                    );
+                }
                 if let ReferenceRoot::StepVerdict { requirement, .. } = &reference.root {
                     if self.owners.get(requirement) != Some(&step) {
                         return refuse("unknown_reference", "the step has no such requirement");
                     }
-                    if !matches!(position, Position::Step(_)) {
+                    if !position.is_step() {
                         return refuse(
                             "verdict_position",
                             "checks cannot read requirement verdicts",
@@ -750,6 +1072,23 @@ where
         }
     }
 
+    /// The step whose own invocations `position` belongs to, if any.
+    fn own(&self, position: Position<'a>) -> Option<&'a TaskId> {
+        match position {
+            Position::Step(own)
+            | Position::Gate(own)
+            | Position::Until(own)
+            | Position::StepCheck(own) => Some(own),
+            Position::VerifierCheck => None,
+        }
+    }
+
+    /// The declared step whose own invocations `position` belongs to.
+    fn own_step(&self, position: Position<'a>) -> Option<&'a Step> {
+        let own = self.own(position)?;
+        self.spec.steps.iter().find(|step| &step.id == own)
+    }
+
     /// Returns the slot a reference names when it selects the whole slot.
     fn whole_slot(&self, reference: &Reference) -> Option<&'a InputSlot> {
         match &reference.root {
@@ -758,18 +1097,44 @@ where
         }
     }
 
-    /// Returns the known output schema of a step, when it has one.
+    /// Returns the known output schema of a step, when it has one: its
+    /// action's output, or for a fanout step the array of its members'
+    /// outputs, with the member's definitions kept at the root its
+    /// references resolve against.
     fn output_schema(&self, step: &'a Step) -> Option<Value> {
+        let mut member = self.action_output_schema(step)?;
+        if step.foreach.is_none() {
+            return Some(member);
+        }
+        let definitions = member
+            .as_object_mut()
+            .and_then(|member| member.remove("$defs"));
+        let mut array = json!({ "type": "array", "items": member });
+        if let Some(definitions) = definitions {
+            array["$defs"] = definitions;
+        }
+        Some(array)
+    }
+
+    /// Returns the known output schema of one invocation of a step's action.
+    fn action_output_schema(&self, step: &'a Step) -> Option<Value> {
         match &step.action {
-            Action::Extract { from } => match self.whole_slot(from)? {
+            Action::Extract {
+                extractor: Some(Extractor::PullRequest),
+                ..
+            }
+            | Action::Code(_) => None,
+            Action::Approval { .. } => {
+                serde_json::to_value(schemars::schema_for!(ApprovalReceipt)).ok()
+            }
+            Action::Extract { from, .. } => match self.whole_slot(from.as_ref()?)? {
                 InputSlot::Media { formats, .. } => Some(ExtractOutput::schema_for(formats)),
                 _ => None,
             },
             Action::Agent(call) => match &(self.resolve)(&call.agent)?.prompt.response_type {
-                ResponseType::JsonSchema { schema, .. } => Some(schema.clone()),
+                ResponseType::JsonSchema { schema, .. } => Some(Value::clone(schema)),
                 ResponseType::Text => Some(json!({ "type": "string" })),
             },
-            Action::Code(_) => None,
         }
     }
 }
@@ -967,7 +1332,7 @@ fn validate_workspace(
         };
         if artifact
             .card
-            .as_card_ref()
+            .target()
             .is_some_and(|card| card.kind != CardKind::Artifact)
         {
             return Err(invalid(
@@ -1216,6 +1581,53 @@ mod tests {
             serde_json::to_value(parse(&explicit)).expect("serialize"),
             json!({"inputs": {"a": {"type": "json"}}})
         );
+    }
+
+    /// An approval step states a non-empty message and outputs its decision
+    /// receipt, so a requirement may read `status` but not an undeclared
+    /// field; it takes no expiration of its own.
+    ///
+    /// # Panics
+    /// Panics when a valid approval is refused or an invalid one accepted.
+    #[test]
+    fn approval_states_a_message_and_outputs_its_receipt() {
+        let body = |message: &str, path: &str| {
+            json!({
+                "steps": [{"id": "gate", "action": {"kind": "approval", "message": message}}],
+                "requirements": [{
+                    "id": "approved",
+                    "statement": "A person approved.",
+                    "check": {"kind": "assert", "path": path, "operator": "equals", "expected": "approved"},
+                }],
+            })
+        };
+        let valid = body("Approve the assessment.", "steps.gate.output.status");
+        let spec = parse(&valid);
+        spec.validate()
+            .expect("an approval reading its status validates");
+        assert_eq!(serde_json::to_value(&spec).expect("serialize"), valid);
+        assert_eq!(
+            rule(&body("  ", "steps.gate.output.status")),
+            "approval_message"
+        );
+        assert!(
+            parse(&body("Approve.", "steps.gate.output.verdict"))
+                .validate()
+                .is_err(),
+            "an undeclared receipt field is refused"
+        );
+        let mut fanout = body("Approve each region.", "steps.gate.output[1].status");
+        fanout["steps"][0]["foreach"] = json!({"count": 2});
+        parse(&fanout)
+            .validate()
+            .expect("a fanout step's output is the array of its members' receipts");
+        fanout["requirements"][0]["check"]["path"] = json!("steps.gate.output.status");
+        assert!(
+            parse(&fanout).validate().is_err(),
+            "a fanout output is an array"
+        );
+        let expiring = json!({"steps": [{"id": "gate", "action": {"kind": "approval", "message": "Approve.", "expires_after_seconds": 60}}]});
+        assert!(serde_json::from_value::<VerifierSpec>(expiring).is_err());
     }
 
     /// Pass-rate thresholds must be finite and in `(0, 1]`.
@@ -1485,6 +1897,11 @@ mod tests {
                 "extract_source",
             ),
             (
+                with("/steps/0/action/extractor", json!("pull_request")),
+                "extract_source",
+            ),
+            (with("/steps/0/action/from", Value::Null), "extract_source"),
+            (
                 with("/inputs/deck/formats", json!(["ppt"])),
                 "extract_format",
             ),
@@ -1538,6 +1955,44 @@ mod tests {
         let mut bad = self::drift();
         bad["requirements"][0]["check"]["on"] = json!("inputs.current.income");
         assert_eq!(rule(&bad), "drift_source");
+    }
+
+    /// A pull-request extraction step takes no media slot, and later steps
+    /// bind its output by field or whole. Its shape is server-owned, so
+    /// validation knows no output schema and leaves paths into it, as into
+    /// code output, to resolve at execution.
+    ///
+    /// # Panics
+    /// Panics when either Verifier is refused.
+    #[test]
+    fn pull_request_extraction_output_binds_without_a_client_schema() {
+        let body = json!({
+            "steps": [
+                {"id": "extract-pr", "action": {"kind": "extract", "extractor": "pull_request"}},
+                {"id": "review", "action": {"kind": "agent",
+                    "agent": agent(&["fs.read"], json!("{{pr}} {{changes}} {{context}}"), None),
+                    "inputs": {
+                        "pr": "steps.extract-pr.output.pr",
+                        "changes": "steps.extract-pr.output.changes.files",
+                        "context": "steps.extract-pr.output.context",
+                    },
+                    "workspace": {"/inputs/pr.json": "steps.extract-pr.output"}}}
+            ],
+            "requirements": [
+                {"id": "full", "statement": "The full PR is retained",
+                 "check": {"kind": "assert", "each": "steps.extract-pr.output.review.full_pr.files[*].path", "operator": "is_not_null"}}
+            ]
+        });
+        parse(&body)
+            .validate()
+            .expect("a pull-request extraction Verifier validates");
+        parse(&with(
+            body,
+            "/steps/1/action/inputs/changes",
+            json!("steps.extract-pr.output.diff"),
+        ))
+        .validate()
+        .expect("a path into the output is not checked before execution");
     }
 
     /// Agent calls follow their Prompt placeholders and position rules; a
@@ -1695,8 +2150,82 @@ mod tests {
         assert!(serde_json::from_value::<VerifierSpec>(unknown).is_err());
     }
 
+    /// Publication references mount only as Agent workspace sources, name a
+    /// declared step, and select a named member only from an Agent step;
+    /// collections of any step mount.
+    ///
+    /// # Panics
+    /// Panics when a publication reference rule is not enforced.
+    #[test]
+    fn verifier_spec_mounts_publications_only_in_workspaces() {
+        let mut consumer = review();
+        consumer["steps"]
+            .as_array_mut()
+            .expect("steps")
+            .push(json!({
+                "id": "consolidate",
+                "action": {"kind": "agent",
+                    "agent": agent(&["fs.read"], json!("Consolidate"), None),
+                    "workspace": {
+                        "/inputs/reviews": "steps.findings.publications",
+                        "/inputs/report": "steps.findings.publications.report",
+                        "/inputs/structure": "steps.structure.publications"
+                    }}
+            }));
+        parse(&consumer)
+            .validate()
+            .expect("publications mount as workspace sources");
+        let cases = [
+            (
+                with(
+                    review(),
+                    "/steps/2/action/inputs/text",
+                    json!("steps.findings.publications.report"),
+                ),
+                "publication_position",
+            ),
+            (
+                with(
+                    review(),
+                    "/requirements/0/check/path",
+                    json!("steps.findings.publications"),
+                ),
+                "publication_position",
+            ),
+            (
+                with(
+                    review(),
+                    "/steps/1/action/inputs/outline",
+                    json!("steps.structure.publications"),
+                ),
+                "publication_position",
+            ),
+        ];
+        let mount = |destination: &str, reference: &str| {
+            let mut body = consumer.clone();
+            body["steps"][3]["action"]["workspace"][destination] = json!(reference);
+            body
+        };
+        let cases = cases.into_iter().chain([
+            (
+                mount("/inputs/structure", "steps.structure.publications.evidence"),
+                "unknown_reference",
+            ),
+            (
+                mount("/inputs/report", "steps.missing.publications.report"),
+                "unknown_reference",
+            ),
+        ]);
+        for (body, expected) in cases {
+            assert_eq!(rule(&body), expected, "{body}");
+        }
+    }
+
     /// Every built-in tool validates on a step Agent, with a workspace only
-    /// when a filesystem or code tool reads it; unknown names stay refused.
+    /// when a workspace tool runs in it, and the scratch-only `fs.write`,
+    /// `code.run`, and `publish` also without one, as are reading tools
+    /// beside a scratch writer; only a step Agent may publish, and unknown or
+    /// repeated names stay refused.
     ///
     /// # Panics
     /// Panics when a built-in is refused or an unknown name is admitted.
@@ -1709,17 +2238,70 @@ mod tests {
                 "/steps/1/action/agent/tool_names",
                 json!([tool.as_str()]),
             );
-            if !tool.is_filesystem() && tool != BuiltinTool::CodeRun {
+            if !tool.uses_workspace() {
                 body = with(body, "/steps/1/action/workspace", json!({}));
             }
             parse(&body)
                 .validate()
                 .unwrap_or_else(|error| panic!("{}: {error:?}", tool.as_str()));
         }
-        for name in ["cards", "bifrost.*", "fs.read/x", "FS.READ", "http.fetch"] {
+        let scratch = with(
+            with(
+                review(),
+                "/steps/1/action/agent/tool_names",
+                json!(["fs.write", "code.run", "publish"]),
+            ),
+            "/steps/1/action/workspace",
+            json!({}),
+        );
+        parse(&scratch)
+            .validate()
+            .expect("scratch-only tools need no declared workspace");
+        let reads_scratch = with(
+            with(
+                review(),
+                "/steps/1/action/agent/tool_names",
+                json!(["fs.write", "fs.read", "fs.list"]),
+            ),
+            "/steps/1/action/workspace",
+            json!({}),
+        );
+        parse(&reads_scratch)
+            .validate()
+            .expect("reading tools read a scratch writer's files");
+        for tools in [json!(["fs.read"]), json!(["publish", "publish"])] {
+            let body = with(
+                with(review(), "/steps/1/action/agent/tool_names", tools.clone()),
+                "/steps/1/action/workspace",
+                json!({}),
+            );
+            assert_eq!(rule(&body), "agent_tools", "{tools}");
+        }
+        let writes = with(
+            review(),
+            "/requirements/2/check/agent/tool_names",
+            json!(["fs.write"]),
+        );
+        parse(&writes)
+            .validate()
+            .expect("a check Agent may write scratch");
+        for name in [
+            "cards",
+            "bifrost.*",
+            "fs.read/x",
+            "FS.READ",
+            "http.fetch",
+            "fs_write",
+        ] {
             let body = with(review(), "/steps/1/action/agent/tool_names", json!([name]));
             assert_eq!(rule(&body), "agent_tools", "{name}");
         }
+        let publishes = with(
+            review(),
+            "/requirements/2/check/agent/tool_names",
+            json!(["publish"]),
+        );
+        assert_eq!(rule(&publishes), "agent_tools", "a check cannot publish");
     }
 
     /// Check Agents in either position, inline or resolver-supplied, must
@@ -2243,5 +2825,235 @@ mod tests {
             });
             assert_eq!(outcome.is_ok(), valid, "{selector}: {outcome:?}");
         }
+    }
+
+    /// A code action reading `inputs`.
+    fn code(inputs: Value) -> Value {
+        json!({"kind": "code", "entrypoint": "run", "source": {"inline": "def run(**kw):\n    return kw"}, "inputs": inputs})
+    }
+
+    /// A Verifier whose `review` step reads the `sections` array of its JSON
+    /// input, with `step` merged into the `review` step.
+    ///
+    /// # Panics
+    /// Panics when `step` is not a JSON object.
+    fn controlled(step: Value) -> Value {
+        let mut review = json!({"id": "review", "action": code(json!({}))});
+        for (key, value) in step.as_object().expect("step fields") {
+            review[key] = value.clone();
+        }
+        json!({
+            "inputs": {"doc": {"type": "json", "schema": {"type": "object", "additionalProperties": false,
+                "properties": {"sections": {"type": "array"}, "flag": {"type": "boolean"}}}}},
+            "steps": [{"id": "split", "action": code(json!({"doc": "inputs.doc"}))}, review],
+            "requirements": [{"id": "done", "statement": "done",
+                "check": {"kind": "assert", "path": "steps.review.status", "operator": "equals", "expected": "succeeded"}}]
+        })
+    }
+
+    /// Returns the `rule` and `path` of a refusal.
+    ///
+    /// # Panics
+    /// Panics when validation succeeds or the refusal carries no rule/path.
+    fn refusal(body: &Value) -> (String, String) {
+        match parse(body).validate() {
+            Err(WyrdError::Validation { details, .. }) => (
+                details["rule"].as_str().expect("rule").to_owned(),
+                details["path"].as_str().expect("path").to_owned(),
+            ),
+            other => panic!("expected a validation refusal for {body}, got {other:?}"),
+        }
+    }
+
+    /// Fanout, repetition, speculation, `any_succeeded`, and limits accept
+    /// their documented shapes and refuse every other one at its own field,
+    /// including cycles through `any_succeeded` and speculative conditions.
+    ///
+    /// # Panics
+    /// Panics when a valid declaration is refused or an invalid one is
+    /// accepted or refused under another rule or path.
+    #[test]
+    fn step_controls_refuse_invalid_shapes() {
+        let until =
+            json!({"path": "iteration.output.done", "operator": "equals", "expected": true});
+        let flag =
+            json!({"path": "steps.split.output.flag", "operator": "equals", "expected": true});
+        let valid = [
+            controlled(json!({"foreach": {"count": 3}})),
+            controlled(
+                json!({"foreach": {"count": 3, "concurrency": 1}, "action": code(json!({"i": "item_index"}))}),
+            ),
+            controlled(
+                json!({"foreach": {"items": "inputs.doc.sections", "max_items": 10},
+                "action": code(json!({"item": "item.title", "i": "item_index"}))}),
+            ),
+            controlled(json!({"repeat": {"max_iterations": 3, "until": until},
+                "action": code(json!({"previous": "iteration.previous", "i": "iteration.index"}))})),
+            controlled(
+                json!({"foreach": {"count": 2}, "repeat": {"max_iterations": 2, "until": until}}),
+            ),
+            controlled(json!({"depends_on": {"any_succeeded": ["split"]}})),
+            controlled(json!({"when": flag, "speculative": true})),
+            with(
+                controlled(json!({})),
+                "/limits",
+                json!({"concurrency": 2, "max_agent_invocations": 5, "timeout_seconds": 60}),
+            ),
+        ];
+        for body in valid {
+            parse(&body)
+                .validate()
+                .unwrap_or_else(|error| panic!("{body}: {error}"));
+        }
+        let invalid = [
+            (json!({"foreach": {}}), "foreach", "steps[1].foreach"),
+            (
+                json!({"foreach": {"count": 0}}),
+                "foreach",
+                "steps[1].foreach.count",
+            ),
+            (
+                json!({"foreach": {"count": 2, "items": "inputs.doc.sections", "max_items": 3}}),
+                "foreach",
+                "steps[1].foreach",
+            ),
+            (
+                json!({"foreach": {"items": "inputs.doc.sections"}}),
+                "foreach",
+                "steps[1].foreach.max_items",
+            ),
+            (
+                json!({"foreach": {"items": "inputs.doc.sections", "max_items": 0}}),
+                "foreach",
+                "steps[1].foreach.max_items",
+            ),
+            (
+                json!({"foreach": {"count": 2, "max_items": 3}}),
+                "foreach",
+                "steps[1].foreach.max_items",
+            ),
+            (
+                json!({"foreach": {"count": 2, "concurrency": 0}}),
+                "foreach",
+                "steps[1].foreach.concurrency",
+            ),
+            (
+                json!({"foreach": {"items": "inputs.nope", "max_items": 3}}),
+                "unknown_reference",
+                "steps[1].foreach.items",
+            ),
+            (
+                json!({"foreach": {"items": "inputs.doc.missing", "max_items": 3}}),
+                "missing_field",
+                "steps[1].foreach.items",
+            ),
+            (
+                json!({"repeat": {"max_iterations": 0, "until": until}}),
+                "repeat",
+                "steps[1].repeat.max_iterations",
+            ),
+            (
+                json!({"repeat": {"max_iterations": 2, "until": {"path": "inputs.nope", "operator": "equals", "expected": true}}}),
+                "unknown_reference",
+                "steps[1].repeat.until",
+            ),
+            (
+                json!({"speculative": true}),
+                "speculative",
+                "steps[1].speculative",
+            ),
+            (
+                json!({"depends_on": {"any_succeeded": []}}),
+                "depends_on",
+                "steps[1].depends_on",
+            ),
+            (
+                json!({"depends_on": {"any_succeeded": ["split", "split"]}}),
+                "depends_on",
+                "steps[1].depends_on",
+            ),
+            (
+                json!({"depends_on": {"any_succeeded": ["nope"]}}),
+                "unknown_reference",
+                "steps[1].depends_on",
+            ),
+            (
+                json!({"action": code(json!({"item": "item"}))}),
+                "item_position",
+                "steps[1].action",
+            ),
+            (
+                json!({"foreach": {"count": 2}, "action": code(json!({"item": "item"}))}),
+                "item_position",
+                "steps[1].action",
+            ),
+            (
+                json!({"action": code(json!({"i": "item_index"}))}),
+                "item_position",
+                "steps[1].action",
+            ),
+            (
+                json!({"action": code(json!({"i": "iteration.index"}))}),
+                "iteration_position",
+                "steps[1].action",
+            ),
+            (
+                json!({"repeat": {"max_iterations": 2, "until": until}, "action": code(json!({"out": "iteration.output"}))}),
+                "iteration_position",
+                "steps[1].action",
+            ),
+        ];
+        for (step, rule, path) in invalid {
+            let body = controlled(step);
+            assert_eq!(refusal(&body), (rule.to_owned(), path.to_owned()), "{body}");
+        }
+        for field in ["concurrency", "max_agent_invocations", "timeout_seconds"] {
+            let limits = with(controlled(json!({})), "/limits", json!({ field: 0 }));
+            assert_eq!(
+                refusal(&limits),
+                ("limits".to_owned(), format!("limits.{field}")),
+                "{field}"
+            );
+        }
+        let any_cycle = with(
+            controlled(json!({"action": code(json!({"x": "steps.split.output"}))})),
+            "/steps/0/depends_on",
+            json!({"any_succeeded": ["review"]}),
+        );
+        assert_eq!(refusal(&any_cycle).0, "graph");
+        let guard_cycle = with(
+            controlled(json!({"action": code(json!({"x": "steps.split.output"}))})),
+            "/steps/0/when",
+            json!({"path": "steps.review.output.flag", "operator": "equals", "expected": true}),
+        );
+        assert_eq!(
+            refusal(&guard_cycle).0,
+            "graph",
+            "an ordinary guard closes the cycle"
+        );
+        let guard_cycle = with(guard_cycle, "/steps/0/speculative", json!(true));
+        assert_eq!(refusal(&guard_cycle).0, "graph");
+        let fanout_member = json!({
+            "steps": [
+                {"id": "review", "foreach": {"count": 2}, "action": {"kind": "agent", "agent": agent(&["publish"], json!("review"), None)}},
+                {"id": "consolidate", "action": {"kind": "agent", "agent": agent(&["fs.read"], json!("consolidate"), None),
+                    "workspace": {"/inputs/report": "steps.review.publications.report"}}}
+            ],
+            "requirements": [{"id": "done", "statement": "done",
+                "check": {"kind": "assert", "path": "steps.consolidate.status", "operator": "equals", "expected": "succeeded"}}]
+        });
+        assert_eq!(
+            refusal(&fanout_member),
+            ("fanout_member".to_owned(), "steps[1].action".to_owned())
+        );
+        let repeated_member = with(fanout_member, "/steps/0/foreach", Value::Null);
+        let repeated_member = with(
+            repeated_member,
+            "/steps/0/repeat",
+            json!({"max_iterations": 2, "until": {"path": "iteration.output", "operator": "equals", "expected": "done"}}),
+        );
+        parse(&repeated_member)
+            .validate()
+            .expect("a repeat's named member is its final iteration's");
     }
 }

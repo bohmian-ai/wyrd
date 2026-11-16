@@ -1,0 +1,131 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="2470" viewBox="0 0 1800 2470" role="img" aria-labelledby="title description">
+<title id="title">Three Verifier configurations for code review</title>
+<desc id="description">Revision 18 approved contract; implementation proposed. Three alternative review configurations share engine-owned in-memory state, existing Bifrost WAL persistence/recovery and File storage. PostgreSQL coordinates queued work. Takeover excludes stale writes; unavailable accepted state causes wait/retry. Text alternative: diagram-notes.md.</desc>
+<rect width="1800" height="2470" fill="#0b0c12"/>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8Z" fill="#7a8cff"/></marker></defs>
+<style>text{font-family:system-ui,sans-serif;fill:#e6e4da}.heading{font-size:30px;font-weight:700}.title{font-size:18px;font-weight:650}.body{font-size:14px;fill:#c1c4d2}.label{font-size:15px;fill:#a9b4ff}.flow{fill:none;stroke:#7a8cff;stroke-width:2;marker-end:url(#arrow)}</style>
+<text x="50" y="55" class="heading">Three ways to build a review Verifier.</text>
+<text x="50" y="90" class="body">REVISION 18 CONTRACT · Engine state / Bifrost WAL · PostgreSQL queue · Existing publication contracts</text>
+<text x="50" y="710" class="label">ALTERNATIVE CONFIGURATIONS — choose one Verifier pattern; these are not mandatory branches</text>
+<path d="M300.0 265 V302.5 H900.0 V340" class="flow"/>
+<path d="M900.0 265 V302.5 H900.0 V340" class="flow"/>
+<path d="M1500.0 265 V302.5 H900.0 V340" class="flow"/>
+<path d="M900.0 465 V502.5 H900.0 V540" class="flow"/>
+<path d="M900.0 670 V745.0 H300.0 V820" class="flow"/>
+<path d="M900.0 670 V745.0 H900.0 V820" class="flow"/>
+<path d="M900.0 670 V745.0 H1500.0 V820" class="flow"/>
+<path d="M300.0 960 V1020.0 H300.0 V1080" class="flow"/>
+<path d="M900.0 960 V1020.0 H900.0 V1080" class="flow"/>
+<path d="M1500.0 960 V1020.0 H1500.0 V1080" class="flow"/>
+<path d="M300.0 1220 V1300.0 H300.0 V1380" class="flow"/>
+<path d="M900.0 1220 V1300.0 H900.0 V1380" class="flow"/>
+<path d="M1500.0 1255 V1317.5 H1500.0 V1380" class="flow"/>
+<path d="M300.0 1510 V1572.5 H900.0 V1635" class="flow"/>
+<path d="M900.0 1510 V1572.5 H900.0 V1635" class="flow"/>
+<path d="M1500.0 1510 V1572.5 H900.0 V1635" class="flow"/>
+<path d="M900.0 1755 V1795.0 H900.0 V1835" class="flow"/>
+<rect x="50" y="145" width="500" height="120" rx="10" fill="#171923" stroke="#464b68"/>
+<text x="68" y="174" class="title">Tenant administrator</text>
+<text x="68" y="200" class="body">Verify App; allow repositories and enable PR verification</text>
+<text x="68" y="220" class="body">Choose publishing/execution principals; constrain limits</text>
+<rect x="650" y="145" width="500" height="120" rx="10" fill="#171923" stroke="#464b68"/>
+<text x="668" y="174" class="title">Team Verifier definitions</text>
+<text x="668" y="200" class="body">Publish independent exact versions through registry</text>
+<text x="668" y="220" class="body">Each application selects shared or local Verifiers</text>
+<rect x="1250" y="145" width="500" height="120" rx="10" fill="#171923" stroke="#464b68"/>
+<text x="1268" y="174" class="title">PR webhook or manual request</text>
+<text x="1268" y="200" class="body">Authenticate, authorize and persist accepted work</text>
+<text x="1268" y="220" class="body">No client review scheduler or Service Card required</text>
+<rect x="350" y="340" width="1100" height="125" rx="10" fill="#171923" stroke="#464b68"/>
+<text x="368" y="369" class="title">Trusted configuration and durable execution</text>
+<text x="368" y="395" class="body">Resolve target-tree root wyrd.toml; declare local Cards or resolve exact registered Verifiers</text>
+<text x="368" y="415" class="body">Pin repository binding, configuration, PR identity, authority, limits and retained evidence references</text>
+<text x="368" y="435" class="body">Each selected Verifier gets its own execution/check</text>
+<rect x="350" y="540" width="1100" height="130" rx="10" fill="#171923" stroke="#464b68"/>
+<text x="368" y="569" class="title">Extract pull_request using the public bohmian-code-review ReviewPipeline</text>
+<text x="368" y="595" class="body">Commit publications.evidence: pr.json, diff.patch, changes.json, changed/before and after, context.json</text>
+<text x="368" y="615" class="body">Reuse full library indexing/overlay/ranking/packing; extend its facade for complete pinned PR acquisition</text>
+<text x="368" y="635" class="body">Mount the same immutable directory at /inputs/pr for every reviewer; no injected Prompt inputs needed</text>
+<rect x="50" y="820" width="500" height="140" rx="10" fill="#171923" stroke="#464b68"/>
+<text x="68" y="849" class="title">1  Repeated sweeps</text>
+<text x="68" y="875" class="body">foreach: count 3</text>
+<text x="68" y="895" class="body">Same Agent, same PR mount, three private workspaces</text>
+<text x="68" y="915" class="body">Dispatch ready calls within existing server limits</text>
+<text x="68" y="935" class="body">Retain each invocation/attempt independently</text>
+<rect x="650" y="820" width="500" height="140" rx="10" fill="#171923" stroke="#464b68"/>
+<text x="668" y="849" class="title">2  Conditional specialists</text>
+<text x="668" y="875" class="body">General reviewer and planning Agent can run together</text>
+<text x="668" y="895" class="body">Planner returns security_review / concurrency_review</text>
+<text x="668" y="915" class="body">Each specialist has its own Agent Prompt and tools</text>
+<text x="668" y="935" class="body">Conditions select work; no assignment-array indirection</text>
+<rect x="1250" y="820" width="500" height="140" rx="10" fill="#171923" stroke="#464b68"/>
+<text x="1268" y="849" class="title">3  Speculative review</text>
+<text x="1268" y="875" class="body">Two independent bootstrap Agents run as capacity allows</text>
+<text x="1268" y="895" class="body">Each reads the same pinned evidence and publishes work</text>
+<text x="1268" y="915" class="body">Any bootstrap success makes the extra pass eligible</text>
+<text x="1268" y="935" class="body">Comparison waits for both settled collections</text>
+<rect x="50" y="1080" width="500" height="140" rx="10" fill="#171923" stroke="#464b68"/>
+<text x="68" y="1109" class="title">Collect three settled calls</text>
+<text x="68" y="1135" class="body">Preserve ordered successful output array</text>
+<text x="68" y="1155" class="body">Workspace collection also includes failed partial work</text>
+<text x="68" y="1175" class="body">Manifest identifies status, attempt and actual paths</text>
+<text x="68" y="1195" class="body">No failure becomes a clean empty review</text>
+<rect x="650" y="1080" width="500" height="140" rx="10" fill="#171923" stroke="#464b68"/>
+<text x="668" y="1109" class="title">Run selected security / concurrency Agents</text>
+<text x="668" y="1135" class="body">Existing when: true runs; false intentionally skips</text>
+<text x="668" y="1155" class="body">Decide before binding that branch workspace</text>
+<text x="668" y="1175" class="body">Missing/wrong-type decision is an error, not false</text>
+<text x="668" y="1195" class="body">Settled skipped collections remain mountable</text>
+<rect x="1250" y="1080" width="500" height="175" rx="10" fill="#171923" stroke="#464b68"/>
+<text x="1268" y="1109" class="title">Run extra pass while condition is pending</text>
+<text x="1268" y="1135" class="body">any_succeeded + ordinary when + speculative: true</text>
+<text x="1268" y="1155" class="body">Known false: no call; later false: cancel/exclude</text>
+<text x="1268" y="1175" class="body">True: admit; invalid/unavailable decision: block</text>
+<text x="1268" y="1195" class="body">Action completion alone never releases withheld content</text>
+<text x="1268" y="1215" class="body">Execution readers see discarded bytes; consumers cannot</text>
+<rect x="50" y="1380" width="500" height="130" rx="10" fill="#171923" stroke="#464b68"/>
+<text x="68" y="1409" class="title">Consolidate attached review work</text>
+<text x="68" y="1435" class="body">Wait for producers and decisions to settle</text>
+<text x="68" y="1455" class="body">Read manifests and admitted reports in workspace</text>
+<text x="68" y="1475" class="body">Distinguish success, intentional skip and failure</text>
+<text x="68" y="1495" class="body">Validate source claims; publish logical name report</text>
+<rect x="650" y="1380" width="500" height="130" rx="10" fill="#171923" stroke="#464b68"/>
+<text x="668" y="1409" class="title">Consolidate attached review work</text>
+<text x="668" y="1435" class="body">Wait for producers and decisions to settle</text>
+<text x="668" y="1455" class="body">Read manifests and admitted reports in workspace</text>
+<text x="668" y="1475" class="body">Distinguish success, intentional skip and failure</text>
+<text x="668" y="1495" class="body">Validate source claims; publish logical name report</text>
+<rect x="1250" y="1380" width="500" height="130" rx="10" fill="#171923" stroke="#464b68"/>
+<text x="1268" y="1409" class="title">Consolidate attached review work</text>
+<text x="1268" y="1435" class="body">Wait for producers and decisions to settle</text>
+<text x="1268" y="1455" class="body">Read manifests and admitted reports in workspace</text>
+<text x="1268" y="1475" class="body">Distinguish success, intentional skip and failure</text>
+<text x="1268" y="1495" class="body">Validate source claims; publish logical name report</text>
+<rect x="350" y="1635" width="1100" height="120" rx="10" fill="#171923" stroke="#464b68"/>
+<text x="368" y="1664" class="title">Existing final Agent requirement and decide</text>
+<text x="368" y="1690" class="body">Strictly mount successful consolidate.publications.report plus original PR evidence</text>
+<text x="368" y="1710" class="body">Substantiated defect fails; insufficient evidence is inconclusive; complete supported clean review can pass</text>
+<text x="368" y="1730" class="body">No platform finding schema, reviewer quorum or filename; named missing report remains missing evidence</text>
+<rect x="350" y="1835" width="1100" height="120" rx="10" fill="#171923" stroke="#464b68"/>
+<text x="368" y="1864" class="title">Committed result and exact-head GitHub Check Run</text>
+<text x="368" y="1890" class="body">Persist result/report manifests before terminal completion; delivery retries independently</text>
+<text x="368" y="1910" class="body">Reconcile ambiguous remote writes and never regress terminal state or rerun committed review</text>
+<text x="368" y="1930" class="body">Reports remain private and authorized; configuration/import failure never becomes an empty successful suite</text>
+<rect x="50" y="2055" width="825" height="155" rx="10" fill="#171923" stroke="#464b68"/>
+<text x="68" y="2084" class="title">Engine state / existing Bifrost shared writer</text>
+<text x="68" y="2110" class="body">Memory drives execution; Bifrost WAL persists complete logical checkpoints</text>
+<text x="68" y="2130" class="body">Keep exact File descriptors; preserve names, attempts, budgets and decisions</text>
+<text x="68" y="2150" class="body">Takeover excludes stale writers; rejected WAL progress never resurrects</text>
+<text x="68" y="2170" class="body">PostgreSQL owns queue claims and renewal, not duplicate execution state</text>
+<rect x="925" y="2055" width="825" height="155" rx="10" fill="#171923" stroke="#464b68"/>
+<text x="943" y="2084" class="title">Bifrost recovery / public APIs / UI</text>
+<text x="943" y="2110" class="body">Load exact accepted state; unavailable means wait/retry, never fresh state</text>
+<text x="943" y="2130" class="body">Keep selected result and execution_outputs; no terminal archive handoff</text>
+<text x="943" y="2150" class="body">Inspect active/failed/discarded work under normal evidence permissions</text>
+<text x="943" y="2170" class="body">Safe previews/downloads and stable pages through recovery/completion</text>
+<rect x="50" y="2280" width="1700" height="120" rx="10" fill="#171923" stroke="#464b68"/>
+<text x="68" y="2309" class="title">Server-owned maintenance and boundaries</text>
+<text x="68" y="2335" class="body">Default-branch pushes refresh library indexes; installation changes reconcile access and cancel revoked work</text>
+<text x="68" y="2355" class="body">Library snapshot refresh and context cleanup use the public pipeline</text>
+<text x="68" y="2375" class="body">No live finding-event successors, long-running streaming validator, automatic merge or extra orchestration service</text>
+</svg>

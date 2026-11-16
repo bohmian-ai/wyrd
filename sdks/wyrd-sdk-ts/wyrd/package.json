@@ -39,10 +39,6 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
-    "./authoring": {
-      "types": "./dist/authoring.d.ts",
-      "import": "./dist/authoring.js"
-    },
     "./otel": {
       "types": "./dist/otel.d.ts",
       "import": "./dist/otel.js"

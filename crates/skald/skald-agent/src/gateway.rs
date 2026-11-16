@@ -33,10 +33,13 @@ const RETRYABLE_GATEWAY_CODES: [&str; 3] = [
 ];
 
 /// One governed model call submitted to a [`WyrdGatewayCaller`].
+///
+/// The call borrows the Agent loop's request, so a caller serializes it
+/// once and never copies it.
 #[derive(Debug, Clone)]
-pub struct WyrdGatewayCall {
+pub struct WyrdGatewayCall<'a> {
     /// Native request exactly as the Agent loop produced it.
-    pub request: ProviderRequest,
+    pub request: &'a ProviderRequest,
     /// Gateway address: the route's deployment and the Prompt's model.
     pub model: ModelRef,
     /// Prompt provider, which bounds the adapters the requested deployment
@@ -62,7 +65,7 @@ pub trait WyrdGatewayCaller: Send + Sync {
     /// Returns the provider-layer failure of the call.
     async fn call(
         &self,
-        call: WyrdGatewayCall,
+        call: WyrdGatewayCall<'_>,
         cancellation: &CancellationToken,
     ) -> Result<ProviderResponse, ProviderError>;
 }
@@ -147,7 +150,7 @@ impl Provider for WyrdGatewayProvider {
     /// # Errors
     ///
     /// Returns the caller's failure.
-    async fn send(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+    async fn send(&self, request: &ProviderRequest) -> Result<ProviderResponse, ProviderError> {
         let call = WyrdGatewayCall {
             request,
             model: self.model.clone(),
@@ -162,7 +165,7 @@ impl Provider for WyrdGatewayProvider {
     /// # Errors
     ///
     /// Always returns [`ProviderError::BadRequest`].
-    async fn stream(&self, _request: ProviderRequest) -> Result<ProviderStream, ProviderError> {
+    async fn stream(&self, _request: &ProviderRequest) -> Result<ProviderStream, ProviderError> {
         Err(ProviderError::bad_request(
             "wyrd_gateway",
             "streaming is not supported on gateway routes",

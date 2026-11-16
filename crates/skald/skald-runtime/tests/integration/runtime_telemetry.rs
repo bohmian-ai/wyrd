@@ -14,7 +14,7 @@ async fn send_records_usage_accessible_from_native_response() {
     let runtime = runtime_with(&mock);
     let span = tracing::info_span!("test_runtime_send");
 
-    let response = async { runtime.send(request).await }
+    let response = async { runtime.send(&request).await }
         .instrument(span)
         .await
         .expect("runtime succeeds");

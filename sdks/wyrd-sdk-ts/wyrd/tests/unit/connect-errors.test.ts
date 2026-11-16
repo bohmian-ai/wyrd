@@ -4,7 +4,16 @@ import { join } from "node:path";
 
 import { beforeEach, expect, test, vi } from "vitest";
 
-import { Bifrost, Cards, Gateway, OperatorConnections, Principals, TableConfig, WyrdClient } from "wyrd-ai";
+import {
+  Bifrost,
+  Cards,
+  Gateway,
+  GithubConnection,
+  OperatorConnections,
+  Principals,
+  TableConfig,
+  WyrdClient,
+} from "wyrd-ai";
 
 /** A loopback port nothing listens on. */
 const UNREACHABLE = "http://127.0.0.1:1";
@@ -38,7 +47,7 @@ test.for<readonly [string, () => unknown]>([
 // refuses `connect` itself rather than the handle's first operation.
 test("every handle connect fails eagerly without a credential", async () => {
   const exchanging = WyrdClient.connect({ serverUrl: UNREACHABLE, credential: "wyrd_sk_t_v_s" });
-  for (const handle of [Bifrost, Cards, Gateway, OperatorConnections, Principals]) {
+  for (const handle of [Bifrost, Cards, Gateway, GithubConnection, OperatorConnections, Principals]) {
     await expect(handle.connect(), handle.name).rejects.toMatchObject({ code: "WYRD_CLIENT_401_NO_CREDENTIALS" });
     await expect(handle.connect({ client: exchanging }), handle.name).rejects.toMatchObject({
       code: "WYRD_CLIENT_503_TRANSPORT_DOWN",

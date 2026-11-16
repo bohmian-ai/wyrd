@@ -42,6 +42,7 @@ serde_jcs = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 serde_urlencoded = { workspace = true }
 serde_yaml = { workspace = true }
+skald-prompt = { workspace = true }
 skald-spec = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
@@ -55,6 +56,7 @@ tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 urlencoding = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
+wyrd-benchmark = { workspace = true }
 wyrd-cards = { workspace = true }
 wyrd-loader = { workspace = true }
 wyrd-queue = { workspace = true }

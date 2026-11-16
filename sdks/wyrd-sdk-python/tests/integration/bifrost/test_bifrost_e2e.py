@@ -20,7 +20,6 @@ from pydantic import BaseModel, ValidationError
 from wyrd import WyrdError
 from wyrd.bifrost import AsyncBifrost, Bifrost, QueryTerminal, TableConfig
 from wyrd.client import WyrdClient
-from wyrd.observe import record
 from wyrd.testing import WyrdTestServer
 
 from tests.integration.support import rooted
@@ -104,22 +103,6 @@ def test_insert_without_an_active_table_refuses(wyrd_server: WyrdTestServer) -> 
     with pytest.raises(WyrdError) as raised:
         Bifrost().insert(Item(id=1, value="nowhere"))
     assert raised.value.code == "WYRD_VALA_412_NO_ACTIVE_TABLE"
-
-
-def test_recorded_telemetry_row_reads_back(wyrd_server: WyrdTestServer, bifrost: Bifrost) -> None:
-    writer = Bifrost(TableConfig(Item, "bifrost.datasets.recorded"))
-    assert writer.register() == "created"
-    record(writer, "bifrost.datasets.recorded", Item, Item(id=1, value="recorded"))
-    writer.shutdown()
-    wyrd_server.flush_bifrost()
-    assert writer.dropped == 0
-    assert items(bifrost, "bifrost.datasets.recorded") == [Item(id=1, value="recorded")]
-
-
-def test_recorded_telemetry_with_an_unmappable_schema_is_refused(bifrost: Bifrost) -> None:
-    with pytest.raises(WyrdError) as raised:
-        record(bifrost, "bifrost.datasets.recorded", {"type": "object"}, {"id": 1})
-    assert raised.value.code == "WYRD_VALA_400_SCHEMA_PARSE"
 
 
 def test_register_insert_flush_and_read(wyrd_server: WyrdTestServer, bifrost: Bifrost) -> None:

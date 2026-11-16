@@ -4,9 +4,8 @@
 //! without it compiles an empty library and never activates `PyO3` or an
 //! owner crate's Python boundary.
 
-#[cfg(feature = "python")]
-/// `wyrd.authoring`: the Python projection of in-memory Card authoring.
-mod authoring;
+#[cfg(feature = "bench")]
+mod benchmark;
 #[cfg(feature = "python")]
 mod bifrost;
 #[cfg(feature = "python")]
@@ -15,6 +14,9 @@ mod cli;
 mod client;
 #[cfg(feature = "python")]
 mod gateway_admin;
+/// `PyO3` boundary for the tenant GitHub connection handle.
+#[cfg(feature = "python")]
+mod github;
 #[cfg(feature = "python")]
 mod observe;
 #[cfg(feature = "python")]
@@ -22,6 +24,8 @@ mod operators;
 #[cfg(feature = "python")]
 /// `wyrd.auth`: the Python projection of the tenant principal handle.
 mod principals;
+#[cfg(feature = "python")]
+mod prompt;
 #[cfg(feature = "python")]
 mod state;
 #[cfg(feature = "testing")]
@@ -93,14 +97,9 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
 
     let prompt = PyModule::new(py, "prompt")?;
-    skald_prompt::register_prompt(&prompt)?;
+    prompt::register(&prompt)?;
     m.add_submodule(&prompt)?;
     register_submodule(py, "wyrd._wyrd.prompt", &prompt)?;
-
-    let authoring = PyModule::new(py, "authoring")?;
-    authoring::register(&authoring)?;
-    m.add_submodule(&authoring)?;
-    register_submodule(py, "wyrd._wyrd.authoring", &authoring)?;
 
     let cli = PyModule::new(py, "cli")?;
     cli::register(&cli)?;
@@ -123,7 +122,6 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     register_submodule(py, "wyrd._wyrd.gateway_admin", &gateway_admin)?;
 
     let observe = PyModule::new(py, "observe")?;
-    bifrost::register_observe(&observe)?;
     observe::register_run(&observe)?;
     m.add_submodule(&observe)?;
     register_submodule(py, "wyrd._wyrd.observe", &observe)?;
@@ -138,10 +136,23 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_submodule(&operators)?;
     register_submodule(py, "wyrd._wyrd.operators", &operators)?;
 
+    let github = PyModule::new(py, "github")?;
+    github::register(&github)?;
+    m.add_submodule(&github)?;
+    register_submodule(py, "wyrd._wyrd.github", &github)?;
+
     let principals = PyModule::new(py, "auth")?;
     principals::register(&principals)?;
     m.add_submodule(&principals)?;
     register_submodule(py, "wyrd._wyrd.auth", &principals)?;
+
+    #[cfg(feature = "bench")]
+    {
+        let benchmark = PyModule::new(py, "_benchmark")?;
+        benchmark::register(&benchmark)?;
+        m.add_submodule(&benchmark)?;
+        register_submodule(py, "wyrd._wyrd._benchmark", &benchmark)?;
+    }
 
     #[cfg(feature = "testing")]
     {

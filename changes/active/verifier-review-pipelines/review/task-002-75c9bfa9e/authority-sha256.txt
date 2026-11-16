@@ -1,0 +1,4 @@
+5af4975a59d8aaba3702e5c2fde40d34b074760456a293cf61f30cd907a5e683  changes/active/verifier-review-pipelines/spec.md
+7c1773159a2d348d097a46fd5876f748bb32d1569447b102b664657117690bbe  changes/active/verifier-review-pipelines/tasks/TASK-002-agent-tooling.md
+a02ceaf9c6f40f07e5995925161c64dc38fb7563471e993d3212810533b773e9  changes/active/verifier-review-pipelines/output-publication.md
+08c4bf050e2f73cf5bb4eabcd91d412c3e73cf727b1a415165d504e9cb804d9f  changes/active/verifier-review-pipelines/execution-state-and-durability.md

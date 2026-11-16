@@ -16,18 +16,22 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
 use wyrd_spec::card::drift::DriftSignal;
+use wyrd_spec::card::repository::infer_card_name;
 use wyrd_spec::card::trigger::TriggerActivation;
 use wyrd_spec::card::verifier::{
-    InputSlot, OWNER_OCCURRENCE_KEY, OrderBy, VerificationBinding, VerificationStatus,
+    Action, CheckEvidence, InputSlot, OWNER_OCCURRENCE_KEY, OrderBy, VerificationBinding,
+    VerificationStatus, VerifierSpec,
 };
-use wyrd_spec::envelope::{Card, CardKind, Metadata, Relationships, Spec, Status};
+use wyrd_spec::envelope::{
+    Card, CardKind, Metadata, Relationships, RepositoryStatus, Spec, Status,
+};
 use wyrd_spec::error::{WyrdError, storage::WyrdStorageError};
 use wyrd_spec::graph::{
     GraphError, RootPick, TopoOrder, build, canonical_order, graph_ready_submissions, pick_root,
     relationships_from_spec, spec_binding_errors, topo_sort, validate_composition,
 };
 use wyrd_spec::ids::IdempotencyKey;
-use wyrd_spec::ids::{CardName, CardUid, SlotName};
+use wyrd_spec::ids::{CardName, CardUid, RepositoryId, SlotName};
 use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::{CardRef, CardRefIdentity, InlineableRef, scope_child_card_refs};
 use wyrd_spec::registry::{
@@ -48,19 +52,21 @@ use wyrd_sql::queries::cards::{
     CardArtifactManifestRow, CardDeclarationOperationRow, CardDeleteState,
     CardManifestCompletionRow, CardQuery, CardReconcileClaim, ListCursor, NewCardRow,
     NewDeclarationOperation, RECONCILE_KIND_BLOB, RECONCILE_KIND_CLEANUP,
-    RECONCILE_KIND_FINALIZATION, Resolution, SubmittedCardIdentity, activate_card,
-    commit_declaration_operation, declaration_request_hash, fail_card, find_card_by_ref,
-    get_card_by_uid as sql_get_card_by_uid,
+    RECONCILE_KIND_FINALIZATION, RepositorySelection, Resolution, SubmittedCardIdentity,
+    activate_card, commit_declaration_operation, declaration_request_hash, fail_card,
+    find_card_by_ref, get_card_by_uid as sql_get_card_by_uid,
     get_card_for_reconciliation as sql_get_card_for_reconciliation, get_latest_card_by_range,
-    inbound_relationships, insert_artifact_manifest_rows, insert_card_row,
+    hold_pending_member, inbound_relationships, insert_artifact_manifest_rows, insert_card_row,
     insert_declaration_operation, list_versions, lock_card_reconciliation_lease,
-    lock_pending_card_for_activation, lock_version_line, lookup_existing_operation,
-    lookup_expired_operation, manifest_completion_rows, manifest_rows_for_init,
-    mark_card_reconciliation_succeeded, mark_manifest_upload_initialized, mark_manifest_verified,
-    persist_outbound_relationships, query_cards, recheck_active_card_refs, record_blob_failure,
-    record_card_blob, record_card_reconciliation_failure, reschedule_card_reconciliation,
-    resolve_version, schedule_card_reconciliation, soft_delete_card_by_ref,
-    soft_delete_card_with_kind,
+    lock_card_repository_selections, lock_pending_card_for_activation, lock_version_line,
+    lookup_existing_operation, lookup_expired_operation, manifest_completion_rows,
+    manifest_rows_for_init, mark_card_reconciliation_succeeded, mark_manifest_upload_initialized,
+    mark_manifest_verified, persist_outbound_relationships, query_cards, recheck_active_card_refs,
+    record_blob_failure, record_card_blob, record_card_reconciliation_failure,
+    record_repository_selection, repository_family_identity, repository_family_name,
+    repository_status, reschedule_card_reconciliation, resolve_version,
+    schedule_card_reconciliation, selected_repository, settle_repository_selection,
+    soft_delete_card_by_ref, soft_delete_card_with_kind,
 };
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_sql::queries::storage::multipart_uploads;
@@ -79,8 +85,10 @@ use crate::components::cards::mapping::{
     existing_row_to_response, lifecycle_status, outcome_row_to_response,
 };
 use crate::components::cards::resolve::{
-    EffectiveSpecs, ResolvedRefs, bind_card_references, source_binding,
+    EffectiveSpecs, GroupSite, ResolvedRefs, ambiguous_source, bind_card_references,
+    sibling_identities, site_subjects, source_binding, validate_and_collect_refs,
 };
+use crate::components::github::service::GithubConnections;
 use crate::components::storage::inventory::{
     ObjectFact, ObjectInventory, ObjectOrigin, ObjectState,
 };
@@ -113,9 +121,19 @@ pub async fn get_card_by_uid(
     let inbound = inbound_relationships(&mut conn, card_uid).await?;
     let manifests = manifest_completion_rows(&mut conn, card_uid).await?;
     let verification = verification_status(&mut conn, card_uid).await?;
+    let repository = repository_status(&mut conn, card_uid).await?;
     conn.commit().await.map_err(registry_db_error)?;
     let files = card_files(&manifests)?;
-    hydrate_card(state, caller, row, inbound, &files, verification).await
+    hydrate_card(
+        state,
+        caller,
+        row,
+        inbound,
+        &files,
+        verification,
+        repository,
+    )
+    .await
 }
 
 /// Load a fully hydrated Card by its exact tenant-scoped reference, with
@@ -144,9 +162,19 @@ pub async fn get_card_objects_by_ref(
     let inbound = inbound_relationships(&mut conn, &row.card_uid).await?;
     let manifests = manifest_completion_rows(&mut conn, &row.card_uid).await?;
     let verification = verification_status(&mut conn, &row.card_uid).await?;
+    let repository = repository_status(&mut conn, &row.card_uid).await?;
     conn.commit().await.map_err(registry_db_error)?;
     let files = card_files(&manifests)?;
-    let response = hydrate_card(state, caller, row, inbound, &files, verification).await?;
+    let response = hydrate_card(
+        state,
+        caller,
+        row,
+        inbound,
+        &files,
+        verification,
+        repository,
+    )
+    .await?;
     Ok((response, files))
 }
 
@@ -202,9 +230,19 @@ pub async fn get_latest_card(
     let inbound = inbound_relationships(&mut conn, &row.card_uid).await?;
     let manifests = manifest_completion_rows(&mut conn, &row.card_uid).await?;
     let verification = verification_status(&mut conn, &row.card_uid).await?;
+    let repository = repository_status(&mut conn, &row.card_uid).await?;
     conn.commit().await.map_err(registry_db_error)?;
     let files = card_files(&manifests)?;
-    hydrate_card(state, caller, row, inbound, &files, verification).await
+    hydrate_card(
+        state,
+        caller,
+        row,
+        inbound,
+        &files,
+        verification,
+        repository,
+    )
+    .await
 }
 
 /// List versions in one card identity line, excluding deleted rows.
@@ -383,7 +421,8 @@ fn card_files(manifests: &[CardManifestCompletionRow]) -> Result<CardFiles, Wyrd
 /// registry row and completed files, then overlays server-derived state: inbound
 /// relationships and `status`, whose `verification.binding_ids` lists the
 /// owner's projected bindings and is omitted when the Card owns none, and
-/// whose `prompt` carries a Prompt Card's compiled variables.
+/// whose `prompt` carries a Prompt Card's compiled variables and whose
+/// `repository` is a Repository's selection view.
 ///
 /// # Errors
 /// Returns `WYRD_REGISTRY_404_CARD_NOT_FOUND` before the blob is active,
@@ -396,6 +435,7 @@ async fn hydrate_card(
     inbound: Vec<CardRef>,
     files: &CardFiles,
     verification: Option<VerificationStatus>,
+    repository: Option<RepositoryStatus>,
 ) -> Result<GetCardResponse, WyrdError> {
     let uri = row.card_blob_uri.as_deref().ok_or_else(|| {
         WyrdError::registry_card_not_found(
@@ -448,6 +488,7 @@ async fn hydrate_card(
         updated_at: Some(row.updated_at),
         verification,
         prompt,
+        repository,
     });
     Ok(GetCardResponse {
         card,
@@ -641,6 +682,9 @@ fn encode_list_cursor(cursor: &ListCursor) -> Result<String, WyrdError> {
 /// Deterministic request plan produced before the write transaction opens.
 struct DeclarationPlan {
     submissions: Vec<CardSubmission>,
+    /// The graph-ready projection of `submissions`, index for index; its
+    /// siblings name their targets' graph identities.
+    graph_submissions: Vec<CardSubmission>,
     request_hash: String,
     order: TopoOrder,
     root: RootPick,
@@ -670,26 +714,186 @@ pub async fn declare_card(
     state: &AppState,
     caller: &Caller,
     idempotency_key: &str,
-    request: DeclareCardRequest,
+    mut request: DeclareCardRequest,
 ) -> Result<DeclareCardResponse, WyrdError> {
     let request_hash = hash_request(&request)?;
     let (operation_id, seed) =
         if let Some(replayed) = replay(state, caller, idempotency_key, &request_hash).await? {
             replayed
         } else {
+            resolve_repositories(state, caller, &mut request).await?;
             validate_request(&request)?;
             let tables = declared_tables(&request.submissions)?;
-            let (order, root) = plan_declaration_graph(&request.submissions)?;
-            let external_refs = resolve_external(state, caller, &request.submissions).await?;
+            let (order, root, graph_submissions) = plan_declaration_graph(&request.submissions)?;
+            let external_refs = resolve_external(state, caller, &graph_submissions).await?;
             for table in tables {
                 register_table(state, caller.clone(), table).await?;
             }
-            let plan = plan_declaration(request, request_hash, external_refs, order, root);
+            let plan = DeclarationPlan {
+                submissions: request.submissions,
+                graph_submissions,
+                request_hash,
+                order,
+                root,
+                external_refs,
+            };
             DeclarationWriter { state, caller }
                 .write(idempotency_key, plan)
                 .await?
         };
     initialize_uploads(state, caller, operation_id, seed, idempotency_key).await
+}
+
+/// Verify every submitted Repository against the tenant's GitHub connection
+/// and settle its Card family name, before anything is planned or written.
+///
+/// The connection supplies the canonical host and the stable repository id,
+/// resolved from an explicit `repository_id` or the request's remote hint.
+/// A name inferred by the client (`infer_name`) is replaced by the family
+/// name already established for that repository id, or on first
+/// registration by the name inferred from the connection's `owner/name`, so
+/// a provider rename keeps the family. An explicit name must equal the
+/// established one, and no other repository may own the name.
+///
+/// # Errors
+/// Returns the refusals of [`GithubConnections::verify_repository`],
+/// `WYRD_REGISTRY_409_REPOSITORY_IDENTITY_CONFLICT` when the name and the
+/// repository identity disagree with an established family,
+/// `WYRD_REGISTRY_422_INVALID_CARD_SPEC` for an undecodable spec, and
+/// registry errors.
+async fn resolve_repositories(
+    state: &AppState,
+    caller: &Caller,
+    request: &mut DeclareCardRequest,
+) -> Result<(), WyrdError> {
+    let remote = request
+        .repository
+        .as_ref()
+        .and_then(|hint| hint.remote.as_ref());
+    let infer_name = request
+        .repository
+        .as_ref()
+        .is_some_and(|hint| hint.infer_name);
+    for submission in &mut request.submissions {
+        if submission.kind != CardKind::Repository {
+            continue;
+        }
+        let Spec::Repository(mut spec) =
+            Spec::from_kind_and_value(&submission.kind, submission.spec.clone())
+                .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?
+        else {
+            continue;
+        };
+        let (host, found) = GithubConnections::new(state)
+            .verify_repository(
+                caller.data_tenant_id,
+                spec.host.as_deref(),
+                spec.repository_id.as_ref(),
+                remote,
+            )
+            .await?;
+        let repository_id = RepositoryId::new(found.repository_id)
+            .map_err(|_| WyrdError::internal("connected repository id is not a positive id"))?;
+        let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
+        let established = repository_family_name(&mut conn, repository_id.as_str()).await?;
+        let name = match (&established, infer_name) {
+            (Some(established), true) => CardName::new(established.as_str())
+                .map_err(|_| WyrdError::internal("established Repository name is invalid"))?,
+            (None, true) => infer_card_name(&found.full_name)
+                .unwrap_or_else(|| submission.metadata.name.clone()),
+            (_, false) => submission.metadata.name.clone(),
+        };
+        admit_repository_family(&mut conn, &name, &repository_id).await?;
+        conn.commit().await.map_err(registry_db_error)?;
+        spec.host = Some(host);
+        spec.repository_id = Some(repository_id);
+        submission.metadata.name = name;
+        submission.spec =
+            serde_json::to_value(&spec).map_err(WyrdError::from_spec_serialization)?;
+    }
+    Ok(())
+}
+
+/// Refuse Repository family `name` for provider `repository_id` unless both
+/// directions of the stable family mapping agree: the repository has no
+/// other family, and the name belongs to no other repository.
+///
+/// Preflight calls this to fail early; [`DeclarationWriter::write`] calls it
+/// again under the tenant's GitHub slot lock, which serializes every
+/// Repository admission, so two first declarations cannot both observe no
+/// mapping.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_409_REPOSITORY_IDENTITY_CONFLICT` when the mapping
+/// disagrees, and registry errors.
+async fn admit_repository_family(
+    conn: &mut TenantConn<'_>,
+    name: &CardName,
+    repository_id: &RepositoryId,
+) -> Result<(), WyrdError> {
+    let established = repository_family_name(conn, repository_id.as_str()).await?;
+    let owner = repository_family_identity(conn, name).await?;
+    let conflict = |reason: &str| WyrdError::RegistryRepositoryIdentityConflict {
+        message: format!("Repository {name} and repository {repository_id} {reason}"),
+        details: serde_json::json!({
+            "name": name,
+            "repository_id": repository_id,
+            "established_name": established,
+        }),
+    };
+    if established
+        .as_deref()
+        .is_some_and(|established| established != name.as_str())
+    {
+        return Err(conflict(
+            "disagree: the repository already has another Card family",
+        ));
+    }
+    if owner.is_some_and(|owner| owner != repository_id.as_str()) {
+        return Err(conflict("disagree: the name belongs to another repository"));
+    }
+    Ok(())
+}
+
+/// Lock the tenant's GitHub connection slot and admit every submitted
+/// Repository's family identity under it, in the declaration transaction.
+///
+/// The lock is taken before any version line and held through commit, so
+/// concurrent declarations admit Repository identities one at a time and
+/// each rechecks the mapping the previous one committed. A declaration
+/// without a Repository takes no lock.
+///
+/// # Errors
+/// Returns the refusals of [`GithubConnections::lock_association`] when the
+/// tenant is no longer associated, the refusal of [`admit_repository_family`],
+/// `WYRD_REGISTRY_422_INVALID_CARD_SPEC` for an undecodable spec, and
+/// registry errors.
+async fn admit_repository_identities(
+    state: &AppState,
+    conn: &mut TenantConn<'_>,
+    submissions: &[CardSubmission],
+) -> Result<(), WyrdError> {
+    let mut locked = false;
+    for submission in submissions {
+        if submission.kind != CardKind::Repository {
+            continue;
+        }
+        let Spec::Repository(spec) =
+            Spec::from_kind_and_value(&submission.kind, submission.spec.clone())
+                .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?
+        else {
+            continue;
+        };
+        let repository_id = spec
+            .repository_id
+            .ok_or_else(|| WyrdError::internal("preflight left a Repository unidentified"))?;
+        if !locked {
+            GithubConnections::new(state).lock_association(conn).await?;
+            locked = true;
+        }
+        admit_repository_family(conn, &submission.metadata.name, &repository_id).await?;
+    }
+    Ok(())
 }
 
 /// The Bifrost dataset registrations every submitted Service declares.
@@ -962,9 +1166,82 @@ async fn initialize_uploads(
         {
             continue;
         }
-        response.outcomes[index] = complete_card(state, caller, card_uid, idempotency_key).await?;
+        response.outcomes[index] =
+            complete_card_inner(state, caller, card_uid, idempotency_key, None, true).await?;
     }
+    settle_selection(state, caller, operation_id).await?;
     Ok(response)
+}
+
+/// Report the Repository selection of declaration `operation_id` to its
+/// request.
+///
+/// The decision is made by the declaration's write commit when its exact
+/// graph is already Active, and otherwise by the Card lifecycle transaction
+/// that makes its last exact member Active (see
+/// [`settle_waiting_selections`]); those record a conflict without failing
+/// the Card transition. This request-side call, in its own transaction,
+/// answers that stored decision through the same settle, raising a conflict
+/// as the public refusal. One still pending, or without a Repository root,
+/// changes nothing. A
+/// settled operation answers its stored outcome again and never re-selects,
+/// so a delayed or replayed request cannot undo a newer selection.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_409_REPOSITORY_SELECTION_CONFLICT` when another
+/// declaration changed the family's selection first, and registry errors.
+async fn settle_selection(
+    state: &AppState,
+    caller: &Caller,
+    operation_id: DeclarationOperationId,
+) -> Result<(), WyrdError> {
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
+    let outcome = settle_repository_selection(&mut conn, operation_id).await?;
+    conn.commit().await.map_err(registry_db_error)?;
+    if let RepositorySelection::Conflict { current } = outcome {
+        return Err(selection_conflict(current.as_ref()));
+    }
+    Ok(())
+}
+
+/// The refusal a declaration answers once another declaration changed its
+/// Repository family's selection first; `current` is the selected version.
+fn selection_conflict(current: Option<&CardUid>) -> WyrdError {
+    WyrdError::RegistryRepositorySelectionConflict {
+        message: "another declaration changed this Repository's selected version first".to_owned(),
+        details: serde_json::json!({ "selected": current }),
+    }
+}
+
+/// Settle, in the caller's transaction, the pending Repository selections
+/// of the declarations `waiting`: those locked with
+/// [`lock_card_repository_selections`] by a Card's activation, after its Card
+/// row, or by an already-Active completion, or the declaration whose write
+/// commit this is.
+///
+/// Each settle locks its operation row and, once that declaration is ready
+/// and still pending, the Repository family line; both stay held until the
+/// caller commits or rolls back. Each declaration whose exact
+/// graph is now Active selects or records its conflict in that commit, so
+/// no completion can leave a ready declaration unsettled. A conflict ends
+/// only that declaration's attempt; it is recorded, not raised, so the Card
+/// transition and the other declarations still commit.
+///
+/// # Errors
+/// Returns registry errors; the caller's transaction then rolls back,
+/// including any Card transition in it, and the Card's recovery or the
+/// declaration's replay settles it again.
+async fn settle_waiting_selections(
+    conn: &mut TenantConn<'_>,
+    waiting: &[DeclarationOperationId],
+) -> Result<(), WyrdError> {
+    for operation_id in waiting {
+        let outcome = settle_repository_selection(conn, *operation_id).await?;
+        if matches!(outcome, RepositorySelection::Conflict { .. }) {
+            tracing::info!(operation_id = %operation_id.as_uuid(), "repository selection conflicted");
+        }
+    }
+    Ok(())
 }
 
 /// Initialize every pending manifest row for one card.
@@ -1118,35 +1395,39 @@ async fn resolve_external(
 
 /// Validate composition and build graph order before any registry I/O.
 ///
+/// Returns the order, the root, and the graph-ready submissions, whose
+/// siblings name their targets' graph identities for preflight and binding.
+/// A sibling no submission matched is refused here, before it can leave a
+/// disconnected graph. Binding validation runs again on the matched specs,
+/// because an omitted and an explicit sibling naming one submitted Verifier
+/// or Operator only converge once matched.
+///
 /// # Errors
-/// Returns a stable Wyrd error when graph construction, root selection, or
+/// Returns `WYRD_REGISTRY_*_UNRESOLVED_DEPENDENCY` for a sibling that names
+/// no submission, `WYRD_REGISTRY_*_UNRESOLVED_PATH_REF` for a loader-only
+/// path, and a stable Wyrd error when sibling matching, binding validation
+/// of the matched targets, graph construction, root selection, or
 /// Service-root composition validation fails.
 fn plan_declaration_graph(
     submissions: &[CardSubmission],
-) -> Result<(TopoOrder, RootPick), WyrdError> {
+) -> Result<(TopoOrder, RootPick, Vec<CardSubmission>), WyrdError> {
     let graph_submissions = graph_ready_submissions(submissions).map_err(graph_error)?;
+    let siblings = sibling_identities(graph_submissions.iter().map(|graph| &graph.submission));
+    for graph in &graph_submissions {
+        validate_and_collect_refs(&graph.spec, &siblings, &mut Vec::new())?;
+        if let Some(error) = spec_binding_errors(&graph.spec).into_iter().next() {
+            return Err(error);
+        }
+    }
     let (nodes, edges) = build(&graph_submissions).map_err(graph_error)?;
     let order = topo_sort(&nodes, &edges).map_err(graph_error)?;
     let root = pick_root(&order).map_err(graph_error)?;
     validate_composition(&graph_submissions, &root).map_err(graph_error)?;
-    Ok((order, root))
-}
-
-/// Assemble the validated graph with resolved external dependencies.
-fn plan_declaration(
-    request: DeclareCardRequest,
-    request_hash: String,
-    external_refs: ResolvedRefs,
-    order: TopoOrder,
-    root: RootPick,
-) -> DeclarationPlan {
-    DeclarationPlan {
-        submissions: request.submissions,
-        request_hash,
-        order,
-        root,
-        external_refs,
-    }
+    let graph_submissions = graph_submissions
+        .into_iter()
+        .map(|graph| graph.submission)
+        .collect();
+    Ok((order, root, graph_submissions))
 }
 
 /// Writes one planned declaration in a single tenant transaction.
@@ -1172,8 +1453,11 @@ impl DeclarationWriter<'_> {
     ///
     /// # Errors
     /// Returns `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` when a preflight-validated UID is
-    /// no longer Active, and the idempotency, validation, or registry failure
-    /// otherwise; nothing commits on any error.
+    /// no longer Active, the binding refusal of `spec_binding_errors` when
+    /// selected versions make two binding targets one exact Card, the
+    /// grouped-source refusal of [`BindingProjector::freeze`] when they make
+    /// two sites' subjects one Card, and the idempotency, validation, or
+    /// registry failure otherwise; nothing commits on any error.
     #[tracing::instrument(skip(self, plan), fields(operation = "card.declaration.write"))]
     async fn write(
         &self,
@@ -1189,6 +1473,7 @@ impl DeclarationWriter<'_> {
         // so a dependency rejection — including a replacement Card at the same
         // identity — rolls back the entire attempt, including its bookkeeping row.
         // The row locks remain held while cards and relationships are written below.
+        admit_repository_identities(self.state, &mut conn, &plan.submissions).await?;
         plan.external_refs = recheck_active_card_refs(&mut conn, &plan.external_refs).await?;
         let inserted = insert_declaration_operation(
             &mut conn,
@@ -1206,16 +1491,37 @@ impl DeclarationWriter<'_> {
                 .await;
         }
 
-        let mut sibling_uids = HashMap::new();
+        let mut registered = HashMap::new();
         let mut outcomes: Vec<CardDeclarationOutcome> = Vec::with_capacity(plan.order.nodes.len());
         let mut resolved_root = None;
         for node in &plan.order.nodes {
             let is_root = same_identity(&node.card_ref, &plan.root.root);
-            let authored = find_submission(&plan.submissions, &node.card_ref)?;
-            let mut submission = authored.clone();
-            let mut spec = Spec::from_kind_and_value(&submission.kind, submission.spec.clone())
-                .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
-            bind_card_references(&mut spec, &plan.external_refs, &sibling_uids)?;
+            let node_identity = graph_identity(&node.card_ref);
+            let index = plan
+                .graph_submissions
+                .iter()
+                .position(|graph| {
+                    graph.kind == node.card_ref.kind
+                        && graph.metadata.name == node.card_ref.name
+                        && graph.metadata.resolved_pin() == Some(&node.card_ref.version)
+                })
+                .ok_or_else(|| WyrdError::internal("graph node lost its submission"))?;
+            let mut submission = plan.submissions[index].clone();
+            let mut spec = Spec::from_kind_and_value(
+                &submission.kind,
+                plan.graph_submissions[index].spec.clone(),
+            )
+            .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
+            bind_card_references(&mut spec, &plan.external_refs, &registered)?;
+            // A selected version can make a sibling and an external target
+            // the same exact Card, so bindings are validated again by the
+            // identities they now persist.
+            if let Some(error) = spec_binding_errors(&spec).into_iter().next() {
+                return Err(error);
+            }
+            if let Spec::Verifier(verifier) = &mut spec {
+                verifier.queue_only = queue_only(&mut conn, verifier).await?;
+            }
             if let Spec::Agent(agent) = &mut spec
                 && let InlineableRef::Inline(prompt) = &agent.prompt
             {
@@ -1247,14 +1553,10 @@ impl DeclarationWriter<'_> {
                 &mut submission,
             )
             .await?;
-            sibling_uids.insert(
-                graph_identity(&outcome.card_ref),
-                outcome
-                    .card_ref
-                    .uid
-                    .clone()
-                    .ok_or_else(|| WyrdError::internal("registered outcome is missing uid"))?,
-            );
+            if outcome.card_ref.uid.is_none() {
+                return Err(WyrdError::internal("registered outcome is missing uid"));
+            }
+            registered.insert(node_identity, outcome.card_ref.clone());
             if is_root {
                 resolved_root = Some(outcome.card_ref.clone());
             }
@@ -1262,6 +1564,16 @@ impl DeclarationWriter<'_> {
         }
         let root = resolved_root
             .ok_or_else(|| WyrdError::internal("root registration outcome is missing"))?;
+        if root.kind == CardKind::Repository {
+            // The root's version line is still locked by its persist, so no
+            // settle can change the selection between this read and commit.
+            let target = root
+                .uid
+                .as_ref()
+                .ok_or_else(|| WyrdError::internal("registered root is missing uid"))?;
+            let expected = selected_repository(&mut conn, &root.name).await?;
+            record_repository_selection(&mut conn, operation_id, target, expected.as_ref()).await?;
+        }
         let response = DeclareCardResponse {
             root,
             outcomes,
@@ -1269,6 +1581,10 @@ impl DeclarationWriter<'_> {
         };
         let seed = replay_seed(&response, &plan.submissions);
         commit_declaration_operation(&mut conn, operation_id, &seed).await?;
+        // A declaration whose exact graph is already Active, such as a
+        // rollback to an existing version, selects in this commit; any other
+        // settles with the activation of its last member.
+        settle_waiting_selections(&mut conn, &[operation_id]).await?;
         conn.commit().await.map_err(registry_db_error)?;
         Ok((operation_id, seed))
     }
@@ -1283,6 +1599,15 @@ impl DeclarationWriter<'_> {
 /// that declares artifacts becomes due for reconciliation only once its
 /// client's presigned upload window has closed, so the reconciler recovers
 /// abandoned uploads without racing the client's own completion.
+///
+/// A reused Pending Card is held (see [`hold_pending_member`]) so its
+/// activation finds this declaration. A Repository's version line is also its
+/// family's selection line, which an activation takes after locking the Card
+/// row, so a reused exact Repository is held before that line, then resolved
+/// again under it. Any other Card is held after its own line, which no
+/// activation takes. Every Repository declaration writes under the tenant's
+/// GitHub slot lock, so no other writer can create the pinned Repository
+/// between the hold and the line.
 ///
 /// # Errors
 /// Returns a registry error when the submission cannot be canonicalized or
@@ -1302,6 +1627,14 @@ async fn persist_node(
         .canonical_hash()
         .map_err(WyrdError::from_spec_canonicalization)?;
     let artifact_hash = canonical_artifact_manifest_hash(&submission.artifacts)?;
+    let repository = card.kind == CardKind::Repository;
+    if repository
+        && let Some(VersionSpec::Pin(version)) = &card.metadata.version
+        && let Some(pinned) =
+            find_card_by_ref(conn, card.kind.clone(), &card.metadata.name, version).await?
+    {
+        hold_pending_member(conn, &pinned.card_uid).await?;
+    }
     lock_version_line(conn, card.kind.clone(), &card.metadata.name).await?;
     if let Some(existing) = resolve_existing(
         conn,
@@ -1312,6 +1645,9 @@ async fn persist_node(
     )
     .await?
     {
+        if !repository && existing.row.status == CardStatus::Pending {
+            hold_pending_member(conn, &existing.row.card_uid).await?;
+        }
         persist_outbound_relationships(conn, &existing.row.card_uid, &outbound_refs).await?;
         return Ok(existing_row_to_response(&existing.row, existing.outcome));
     }
@@ -1336,7 +1672,10 @@ async fn persist_node(
     .await?;
     persist_outbound_relationships(conn, &row.card_uid, &outbound_refs).await?;
     insert_artifact_manifest_rows(conn, &row.card_uid, &submission.artifacts).await?;
-    if matches!(card.kind, CardKind::Service | CardKind::Agent) {
+    if matches!(
+        card.kind,
+        CardKind::Service | CardKind::Agent | CardKind::Repository
+    ) {
         BindingProjector::new(conn)
             .project(&row.card_uid, &card.kind, &card.spec)
             .await?;
@@ -1398,10 +1737,11 @@ impl<'a, 'c> BindingProjector<'a, 'c> {
         Ok(())
     }
 
-    /// Freeze a bound Service or Agent spec's effective verification bindings.
+    /// Freeze a bound Service, Agent or Repository spec's effective
+    /// verification bindings.
     ///
-    /// Walks the three legal owner locations — Service level and standalone
-    /// Agent (keyed by [`OWNER_OCCURRENCE_KEY`]) and each Service component
+    /// Walks the legal owner locations — Service level, standalone Agent and
+    /// Repository (keyed by [`OWNER_OCCURRENCE_KEY`]) and each Service component
     /// occurrence (keyed by its alias) — of a spec whose refs resolution
     /// already pinned to exact UIDs. A referenced Trigger is read back by UID
     /// inside this transaction (a sibling Trigger was persisted earlier in it)
@@ -1412,7 +1752,8 @@ impl<'a, 'c> BindingProjector<'a, 'c> {
     /// `verified_by` instead.
     ///
     /// # Errors
-    /// Returns `WYRD_INTERNAL` when a bound ref lacks its pinned UID or a
+    /// Returns the grouped-source refusal of [`Self::group_sources`],
+    /// `WYRD_INTERNAL` when a bound ref lacks its pinned UID or a
     /// referenced Trigger UID names another kind, the canonicalization error
     /// for an inline body that cannot be hashed, and the registry error from
     /// reading a referenced Trigger.
@@ -1421,6 +1762,9 @@ impl<'a, 'c> BindingProjector<'a, 'c> {
         match spec {
             Spec::Agent(agent) => {
                 sites.push((OWNER_OCCURRENCE_KEY, owner.clone(), &agent.verified_by));
+            }
+            Spec::Repository(repository) => {
+                sites.push((OWNER_OCCURRENCE_KEY, owner.clone(), &repository.verified_by));
             }
             Spec::Service(service) => {
                 sites.push((OWNER_OCCURRENCE_KEY, owner.clone(), &service.verified_by));
@@ -1431,9 +1775,15 @@ impl<'a, 'c> BindingProjector<'a, 'c> {
             }
             _ => {}
         }
+        let binding_sites: Vec<_> = spec
+            .binding_sites()
+            .into_iter()
+            .filter(|site| !site.nested)
+            .collect();
+        let subjects = site_subjects(spec);
         let mut bindings = Vec::new();
-        for (occurrence, subject, site) in sites {
-            for binding in site {
+        for (site_index, (occurrence, subject, site)) in sites.into_iter().enumerate() {
+            for (binding_index, binding) in site.iter().enumerate() {
                 let Some(runs_on) = &binding.runs_on else {
                     continue;
                 };
@@ -1457,9 +1807,16 @@ impl<'a, 'c> BindingProjector<'a, 'c> {
                     TriggerActivation::Schedule { cron, tz } => {
                         BindingActivation::Schedule { cron, tz }
                     }
+                    TriggerActivation::PullRequest {} => BindingActivation::PullRequest,
                     TriggerActivation::GroupEnd { after } => {
+                        let group = GroupSite {
+                            sites: &binding_sites,
+                            subjects: &subjects,
+                            site: site_index,
+                        };
+                        let field = format!("{}[{binding_index}]", binding_sites[site_index].field);
                         let (sources, order_by) = self
-                            .group_sources(occurrence, &subject, site, &verifier_card_uid)
+                            .group_sources(occurrence, &subject, group, &field, &verifier_card_uid)
                             .await?;
                         BindingActivation::GroupEnd(GroupEndSettings {
                             after,
@@ -1498,21 +1855,29 @@ impl<'a, 'c> BindingProjector<'a, 'c> {
     /// source binding it reads, with the Verifier's declared `order_by`.
     ///
     /// The Verifier is read back by UID inside this transaction; each source
-    /// resolves within the same `site` through [`source_binding`], which
-    /// registration preflight already proved unique, so the pinned identity
-    /// is this site's occurrence and subject with the source's exact Verifier.
+    /// resolves within the binding's own site of `group` through
+    /// [`source_binding`], which registration preflight already proved
+    /// unique, so the pinned identity is this site's occurrence and subject
+    /// with the source's exact Verifier. `group` is built over the bound
+    /// spec, so [`GroupSite::ambiguous`] sees the selected exact subjects:
+    /// two aliases preflight saw as different Cards that version selection
+    /// made one are refused here, before the declaration commits.
     ///
     /// # Errors
-    /// Returns `WYRD_INTERNAL` when the Verifier UID names another kind, a
-    /// source no longer resolves to one binding, or a source ref is unpinned,
-    /// and the registry error from reading the Verifier.
+    /// Returns `WYRD_VALIDATION` with rule `source` at `field` when another
+    /// site binds the same subject Card and source Verifier, `WYRD_INTERNAL`
+    /// when the Verifier UID names another kind, a source no longer resolves
+    /// to one binding, or a source ref is unpinned, and the registry error
+    /// from reading the Verifier.
     async fn group_sources(
         &mut self,
         occurrence: &str,
         subject: &CardUid,
-        site: &[VerificationBinding],
+        group: GroupSite<'_, '_>,
+        field: &str,
         verifier: &CardUid,
     ) -> Result<(BTreeMap<SlotName, GroupSource>, Option<OrderBy>), WyrdError> {
+        let site = group.sites[group.site].bindings;
         let Spec::Verifier(verifier) = sql_get_card_by_uid(self.conn, verifier).await?.spec else {
             return Err(WyrdError::internal(
                 "bound Verifier UID is not a Verifier Card",
@@ -1529,6 +1894,9 @@ impl<'a, 'c> BindingProjector<'a, 'c> {
                 .verifier;
             let source = source_binding(site, &name)
                 .map_err(|_| WyrdError::internal("group source does not resolve to one binding"))?;
+            if group.ambiguous(source) {
+                return Err(ambiguous_source(field, &slot, &name));
+            }
             sources.insert(
                 slot,
                 GroupSource {
@@ -1552,6 +1920,66 @@ fn pinned_uid(card_ref: Option<&CardRef>) -> Result<CardUid, WyrdError> {
     card_ref
         .and_then(|card_ref| card_ref.uid.clone())
         .ok_or_else(|| WyrdError::internal("verification binding ref is not pinned to a UID"))
+}
+
+/// Whether `verifier` runs only as queued work, derived at registration.
+///
+/// Called once per declared Verifier after its references are pinned and
+/// before its spec is hashed, so the stored value replaces any the author
+/// sent and never depends on a later read. This is the one place that
+/// decides whether a Verifier may run directly. It is queue-only when a
+/// requirement judges a scheduled window, which only its binding schedule
+/// supplies; when a step extracts a pull request, whose source only a queued
+/// `pull_request` activation supplies; when it declares a deferred input,
+/// whose evidence only a parked queued execution can wait for; when a step
+/// asks for an approval, which only a parked queued execution can wait for;
+/// or when an inline or registered Agent it calls declares `publish`. A registered Agent
+/// is read by UID inside the declaration transaction, which already holds a
+/// sibling Agent persisted earlier in it. Later queued-only forms extend this
+/// one derivation.
+///
+/// # Errors
+/// Returns `WYRD_INTERNAL` when an Agent reference is unpinned or names
+/// another kind, and the registry error from reading a referenced Agent.
+async fn queue_only(conn: &mut TenantConn<'_>, verifier: &VerifierSpec) -> Result<bool, WyrdError> {
+    let extracts_pull_request = verifier.steps.iter().any(|step| {
+        matches!(
+            step.action,
+            Action::Extract {
+                extractor: Some(_),
+                ..
+            }
+        )
+    });
+    let judges_window = verifier
+        .all_requirements()
+        .any(|requirement| requirement.check.evidence() == CheckEvidence::Window);
+    let approves = verifier
+        .steps
+        .iter()
+        .any(|step| matches!(step.action, Action::Approval { .. }));
+    if judges_window
+        || extracts_pull_request
+        || approves
+        || verifier.inputs.values().any(InputSlot::is_deferred)
+    {
+        return Ok(true);
+    }
+    for (_, call) in verifier.agent_calls() {
+        let publishes = if let Some(agent) = call.agent.as_inline() {
+            agent.publishes()
+        } else {
+            let uid = pinned_uid(call.agent.as_card_ref())?;
+            let Spec::Agent(agent) = sql_get_card_by_uid(conn, &uid).await?.spec else {
+                return Err(WyrdError::internal("an Agent reference names another kind"));
+            };
+            agent.publishes()
+        };
+        if publishes {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Freeze an inline Trigger or Operator body as its canonical spec digest.
@@ -1903,6 +2331,19 @@ fn graph_error(error: GraphError) -> WyrdError {
                 "binding_owner_kinds": ["Service", "Agent"],
             }),
         },
+        GraphError::AmbiguousSibling {
+            sibling,
+            candidates,
+        } => WyrdError::RegistryUnresolvedDependency {
+            message: format!(
+                "sibling card dependency {sibling} matches {} submissions; give it a version",
+                candidates.len()
+            ),
+            details: serde_json::json!({
+                "card_ref": sibling.to_string(),
+                "candidates": candidates,
+            }),
+        },
         GraphError::InvalidSpec { message } => WyrdError::registry_invalid_card_spec(message),
     }
 }
@@ -1927,6 +2368,21 @@ struct CardCompletionState {
 /// therefore safe to retry without holding a database connection across
 /// backend calls. The route validates and forwards the caller's idempotency
 /// key so transport retries retain the declaration saga key.
+///
+/// The final transaction is the one [`complete_card_inner`] commits: it
+/// activates the Card and settles, in that same commit, every pending
+/// Repository selection whose exact graph the activation completes. This
+/// call then answers the stored selection of the operation `idempotency_key`
+/// names; it never decides a selection itself. Cancelling before that commit
+/// leaves the Card Pending with its recovery scheduled, and cancelling after
+/// it loses only the answer: a retry with the same key, or the Card
+/// reconciler, repeats the idempotent transition and the settled operation
+/// answers the same outcome.
+///
+/// # Errors
+/// Returns the completion errors of [`complete_card_inner`],
+/// `WYRD_REGISTRY_409_REPOSITORY_SELECTION_CONFLICT` when the operation's
+/// selection settled as a conflict, and registry errors.
 #[tracing::instrument(
     skip(state, caller, idempotency_key),
     fields(
@@ -1940,7 +2396,20 @@ pub async fn complete_card(
     card_uid: &CardUid,
     idempotency_key: &str,
 ) -> Result<CardDeclarationOutcome, WyrdError> {
-    complete_card_inner(state, caller, card_uid, idempotency_key, None, true).await
+    let outcome = complete_card_inner(state, caller, card_uid, idempotency_key, None, true).await?;
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
+    let operation =
+        lookup_existing_operation(&mut conn, caller.attribution(), idempotency_key).await?;
+    conn.commit().await.map_err(registry_db_error)?;
+    if let Some(operation) = operation {
+        settle_selection(
+            state,
+            caller,
+            DeclarationOperationId::new(operation.operation_id),
+        )
+        .await?;
+    }
+    Ok(outcome)
 }
 
 /// Execute completion for a reconciler claim without changing its durable lease.
@@ -2117,6 +2586,21 @@ pub(crate) fn reconciliation_caller(tenant_id: DataTenantId) -> Caller {
     }
 }
 
+/// Verify, store and activate one Card, settling the Repository selections
+/// its activation completes.
+///
+/// An already-Active Card still settles the pending selections waiting on it
+/// and, for a request or a reconciler claim, records its reconciliation
+/// success, in one transaction. Otherwise manifests are verified and the
+/// blob written before [`commit_card_activation`] commits the activation and
+/// those selections together. A storage failure with `schedule_failures`
+/// schedules the Card's recovery and leaves it Pending; nothing selects.
+/// `lease_owner` fences a reconciler claim.
+///
+/// # Errors
+/// Returns the Card status refusal, the manifest verification or blob
+/// storage error, and registry errors. On an error no activation or
+/// selection commits; only a storage failure's recovery schedule does.
 async fn complete_card_inner(
     state: &AppState,
     caller: &Caller,
@@ -2128,11 +2612,13 @@ async fn complete_card_inner(
     let completion_state = load_card_completion_state(state, caller, card_uid).await?;
     validate_card_completion_status(&completion_state.card, card_uid)?;
     if completion_state.card.status == CardStatus::Active {
+        let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
+        let waiting = lock_card_repository_selections(&mut conn, card_uid).await?;
         if schedule_failures || lease_owner.is_some() {
-            let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
             mark_card_reconciliation_succeeded(&mut conn, card_uid, lease_owner).await?;
-            conn.commit().await.map_err(registry_db_error)?;
         }
+        settle_waiting_selections(&mut conn, &waiting).await?;
+        conn.commit().await.map_err(registry_db_error)?;
         return load_card_declaration_outcome(
             state,
             caller,
@@ -2439,7 +2925,21 @@ async fn ensure_card_blob(
     }
 }
 
-/// Persist verified manifests, the blob URI, activation, and audit atomically.
+/// Persist verified manifests, the blob URI, activation, reconciliation
+/// success and the Repository selections the activation completes, in one
+/// transaction.
+///
+/// Locks are taken in one order: the Card row (through its lease when
+/// `lease_owner` is set), then the pending selections whose exact graph
+/// includes the Card (see [`lock_card_repository_selections`]), then each
+/// selection's Repository family line. So the
+/// activation of a declaration's last member, including one a concurrent
+/// declaration reused, observes every other member and settles it here; a
+/// failure anywhere rolls the whole transition back and leaves the Card
+/// Pending with its recovery scheduled.
+///
+/// # Errors
+/// Returns registry errors; nothing commits on any error.
 async fn commit_card_activation(
     state: &AppState,
     caller: &Caller,
@@ -2479,6 +2979,10 @@ async fn commit_card_activation(
         mark_card_reconciliation_succeeded(&mut conn, card_uid, lease_owner).await?;
     }
     if activated {
+        // Read after the Card lock: a declaration holding this Card while it
+        // wrote has committed by now and is found too.
+        let waiting = lock_card_repository_selections(&mut conn, card_uid).await?;
+        settle_waiting_selections(&mut conn, &waiting).await?;
         tracing::info!(%card_uid, "card activated");
     }
     conn.commit().await.map_err(registry_db_error)?;
@@ -3120,6 +3624,7 @@ mod tests {
             updated_at: None,
             verification: None,
             prompt: None,
+            repository: None,
         });
         card.relationships.inbound = vec!["different-live-edge".to_owned()];
         let second = immutable_card_blob_bytes(card).expect("blob serializes");
@@ -3169,5 +3674,114 @@ mod tests {
 
         assert_eq!(error.code(), "WYRD_REGISTRY_400_INVALID_CARD_SPEC");
         assert!(error.to_string().contains("artifact hash"));
+    }
+}
+
+/// Real-Postgres proof that a raced Repository selection settles once.
+#[cfg(test)]
+mod pg_tests {
+    use uuid::Uuid;
+    use wyrd_spec::envelope::Card;
+    use wyrd_spec::ids::CardUid;
+    use wyrd_spec::registry::DeclarationOperationId;
+    use wyrd_sql::queries::cards::{
+        NewCardRow, NewDeclarationOperation, insert_card_row, insert_declaration_operation,
+        record_repository_selection,
+    };
+    use wyrd_sql::row_types::cards::CardStatus;
+
+    use super::settle_selection;
+    use crate::components::auth::Caller;
+    use crate::state::AppState;
+    use crate::test_support::{test_caller, test_state};
+
+    /// Write `caller`'s declaration under `key` owning an Active Repository
+    /// `name@version` that targets itself with no expected prior selection,
+    /// and return its operation.
+    ///
+    /// # Panics
+    /// Panics when a write fails.
+    async fn declaration(
+        state: &AppState,
+        caller: &Caller,
+        key: &str,
+        name: &str,
+        version: &str,
+    ) -> DeclarationOperationId {
+        let card: Card = serde_json::from_value(serde_json::json!({
+            "apiVersion": "wyrd/v1",
+            "kind": "Repository",
+            "metadata": { "name": name, "version": version },
+            "spec": { "provider": "github", "host": "github.com", "repository_id": "42", "verified_by": [] },
+            "relationships": { "outbound": [], "inbound": [] }
+        }))
+        .expect("repository fixture deserializes");
+        let operation_id = DeclarationOperationId::new(Uuid::now_v7());
+        let mut conn = state
+            .registry_tenant_conn(caller.data_tenant_id)
+            .await
+            .expect("tenant connection opens");
+        insert_declaration_operation(
+            &mut conn,
+            NewDeclarationOperation {
+                operation_id,
+                attribution: caller.attribution(),
+                idempotency_key: key,
+                request_hash: key,
+            },
+        )
+        .await
+        .expect("operation inserts");
+        let card_uid = insert_card_row(
+            &mut conn,
+            NewCardRow {
+                card: &card,
+                card_uid: CardUid::from_uuid(Uuid::now_v7()).expect("UUIDv7"),
+                attribution: caller.attribution(),
+                operation_id,
+                status: CardStatus::Active,
+                spec_hash: key,
+                artifact_hash: None,
+                reconcile_delay: std::time::Duration::ZERO,
+            },
+        )
+        .await
+        .expect("card inserts")
+        .card_uid;
+        record_repository_selection(&mut conn, operation_id, &card_uid, None)
+            .await
+            .expect("selection target records");
+        conn.commit().await.expect("declaration commits");
+        operation_id
+    }
+
+    /// Two declarations of distinct versions written from the same prior
+    /// selection: the first to settle selects, and the other answers
+    /// `WYRD_REGISTRY_409_REPOSITORY_SELECTION_CONFLICT` on every retry.
+    ///
+    /// # Panics
+    /// Panics when a settle outcome differs.
+    #[test]
+    fn a_raced_repository_declaration_answers_a_selection_conflict() {
+        wyrd_runtime::runtime().block_on(async {
+            let state = test_state().await;
+            let caller = test_caller([]);
+            let name = format!("raced-{}", Uuid::now_v7().simple());
+            let first = declaration(&state, &caller, "raced-a", &name, "1.0.0").await;
+            let second = declaration(&state, &caller, "raced-b", &name, "1.1.0").await;
+
+            settle_selection(&state, &caller, first)
+                .await
+                .expect("the first distinct target selects");
+            for _ in 0..2 {
+                let error = settle_selection(&state, &caller, second)
+                    .await
+                    .expect_err("the raced target conflicts");
+                assert_eq!(
+                    error.code(),
+                    "WYRD_REGISTRY_409_REPOSITORY_SELECTION_CONFLICT"
+                );
+            }
+        });
     }
 }

@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use skald_spec::{MediaFormat, MediaSource};
 use vala_verify::blocks::{
     ActionExecutor, BlockCall, BlockError, CallInput, CallValue, EvidenceReader, Position,
+    ToolCallsOwner,
 };
 use wyrd_server::verification::hosted::HostedLimits;
 use wyrd_server::verification::hosted::evidence::TenantEvidence;
@@ -58,13 +59,14 @@ impl Uploads {
         Sha256Hex::digest(bytes)
     }
 
-    /// Evidence citing `slots`, read by a tenant caller with no grants.
-    fn reader(&self, slots: BTreeMap<SlotName, InputDeclaration>) -> TenantEvidence {
+    /// Evidence read by a tenant caller with no grants, citing what it
+    /// admits.
+    fn reader(&self) -> TenantEvidence {
         TenantEvidence::new(
             self.server.state().clone(),
             user(self.server.data_tenant_id(), []),
-            slots,
             HostedLimits::default(),
+            wyrd_runtime::resources::ByteLedger::new(u64::MAX),
         )
     }
 }
@@ -89,13 +91,13 @@ fn file(sha256: Sha256Hex, size_bytes: u64, format: MediaFormat) -> InputDeclara
 async fn evidence_reads_only_matching_files() {
     let uploads = Uploads::start().await;
     let sha256 = uploads.put(b"%PDF-1.5 body").await;
-    let evidence = uploads.reader(BTreeMap::new());
+    let evidence = uploads.reader();
     let (bytes, format) = evidence
         .read(&file(sha256, 13, MediaFormat::Pdf))
         .await
         .expect("the uploaded file reads");
     assert_eq!(
-        (bytes.as_slice(), format),
+        (bytes.bytes.as_slice(), format),
         (&b"%PDF-1.5 body"[..], MediaFormat::Pdf)
     );
 
@@ -143,7 +145,7 @@ async fn evidence_refuses_tampered_body() {
         .await
         .expect("tamper");
     let error = uploads
-        .reader(BTreeMap::new())
+        .reader()
         .read(&file(sha256, 5, MediaFormat::Text))
         .await
         .expect_err("digest mismatch");
@@ -155,18 +157,25 @@ async fn evidence_refuses_tampered_body() {
         .expect("test server shuts down");
 }
 
-/// Native media is base64 with the format's MIME type; non-native formats
-/// are refused.
+/// Native media is base64 with the format's MIME type and comes with a
+/// guard holding the process memory its bytes and encoding take until it
+/// drops; non-native formats are refused.
 ///
 /// # Panics
-/// Panics when media binding differs.
+/// Panics when media binding or its charge differs.
 #[tokio::test(flavor = "current_thread")]
 async fn evidence_binds_native_media_only() {
     let uploads = Uploads::start().await;
     let pdf = uploads.put(b"%PDF-1.5").await;
     let csv = uploads.put(b"a,b").await;
-    let evidence = uploads.reader(BTreeMap::new());
-    let media = evidence
+    let memory = wyrd_runtime::resources::ByteLedger::new(u64::MAX);
+    let evidence = TenantEvidence::new(
+        uploads.server.state().clone(),
+        user(uploads.server.data_tenant_id(), []),
+        HostedLimits::default(),
+        memory.clone(),
+    );
+    let (media, charge) = evidence
         .media(&file(pdf, 8, MediaFormat::Pdf))
         .await
         .expect("pdf is native");
@@ -177,6 +186,13 @@ async fn evidence_binds_native_media_only() {
             data: "JVBERi0xLjU=".to_owned(),
         }
     );
+    assert_eq!(
+        memory.used(),
+        8 + 12,
+        "the returned guard holds the read bytes and their encoding"
+    );
+    drop(charge);
+    assert_eq!(memory.used(), 0, "dropping the guard returns the charge");
     assert!(
         evidence
             .media(&file(csv, 3, MediaFormat::Csv))
@@ -199,7 +215,7 @@ async fn evidence_binds_native_media_only() {
 async fn extract_action_returns_locked_shape() {
     let uploads = Uploads::start().await;
     let sha256 = uploads.put(b"a,b\n1,2").await;
-    let evidence = uploads.reader(BTreeMap::new());
+    let evidence = uploads.reader();
     let id = TaskId::new("pull").expect("task id");
     let block: Action =
         serde_json::from_value(serde_json::json!({"kind": "extract", "from": "inputs.sheet"}))
@@ -217,6 +233,10 @@ async fn extract_action_returns_locked_shape() {
         )]),
         workspace: BTreeMap::new(),
         deadline: tokio::time::Instant::now(),
+        attempt: 1,
+        item_index: None,
+        iteration_index: None,
+        tool_calls: ToolCallsOwner::default().handle(),
     };
     let output = ActionExecutor::execute(
         &evidence,
@@ -235,9 +255,12 @@ async fn extract_action_returns_locked_shape() {
         })
     );
     assert!(
-        ActionExecutor::execute(&evidence, call(CallValue::Json(serde_json::json!(1))))
-            .await
-            .is_err()
+        ActionExecutor::execute(
+            &evidence,
+            call(CallValue::Json(serde_json::json!(1).into()))
+        )
+        .await
+        .is_err()
     );
     uploads
         .server
@@ -289,7 +312,12 @@ async fn citations_must_locate_reachable_evidence() {
             value: serde_json::json!({"rows": [{"days": 30}]}),
         },
     );
-    let evidence = uploads.reader(slots);
+    let evidence = uploads.reader();
+    let slots = std::sync::Arc::new(slots);
+    evidence
+        .admit(&BTreeMap::new(), &slots)
+        .await
+        .expect("the slots are admitted");
     let cite = |slot: &str, locator: Locator| Citation {
         slot: SlotName::new(slot).expect("slot"),
         locator,

@@ -6,7 +6,16 @@ import type {
   WyrdClient,
 } from "wyrd-ai";
 
-export { NativeWyrdTestServer, type NativeTestServerOptions, startTestServer } from "./native.cjs";
+export {
+  type NativeBrowserAnswer,
+  type NativeGithubAppMock,
+  type NativeGithubBrowser,
+  type NativeGithubRepository,
+  NativeWyrdTestServer,
+  type NativeTestServerOptions,
+  signInGithubBrowser,
+  startTestServer,
+} from "./native.cjs";
 
 /** One loader diagnostic reported by {@link cli.declareCheck}. */
 export interface CheckDiagnostic {
@@ -29,6 +38,8 @@ export interface CheckReport {
     readonly version: string | null;
   }[];
   readonly diagnostics: readonly CheckDiagnostic[];
+  /** Checks only the server can make, which this local check skipped. */
+  readonly deferred: readonly string[];
 }
 
 /** Card selector: a `uid` with `kind`, or `kind` and `name`; `version` narrows either. */

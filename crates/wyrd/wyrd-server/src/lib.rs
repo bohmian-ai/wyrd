@@ -27,17 +27,22 @@ pub mod verification;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+/// Counts each test thread's allocations; see [`test_support::CountingAllocator`].
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOCATOR: test_support::CountingAllocator = test_support::CountingAllocator;
+
 #[cfg(feature = "test-support")]
 pub use app::metrics::install_capture_runtime;
 pub use app::metrics::{TelemetryRuntimeError, WyrdTelemetryRuntime};
-#[cfg(feature = "test-support")]
-pub use app::run_forge_worker_process_for_test;
 pub use app::{BootExit, BoundServer, WyrdServer, run, serve};
 pub use boot::{
     BootedServer, ServerBootError, StartInputs, check_card_recovery_pool, spawn_storage_sweeper,
 };
 #[cfg(feature = "test-support")]
-pub use config::BifrostTarget;
+pub use components::cards::service::declare_card;
+#[cfg(feature = "test-support")]
+pub use config::ServerTarget;
 pub use config::{ServeMode, WyrdServerConfig};
 pub use http::build_router;
 pub use postgres::ServerPostgres;

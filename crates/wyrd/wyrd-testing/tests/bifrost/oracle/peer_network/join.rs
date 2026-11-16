@@ -1,6 +1,6 @@
 //! A second replica joins a running peer and serves remote work over mTLS.
 
-use wyrd_server::config::BifrostTarget;
+use wyrd_server::config::ServerTarget;
 use wyrd_spec::vala::api::BifrostQueryRequest;
 
 use super::support::PeerJourneyError;
@@ -58,9 +58,9 @@ async fn peer_join_and_remote_query() {
 /// Returns the first claim that broke.
 async fn prove_peer_join_and_remote_query() -> Result<(), PeerJourneyError> {
     let mut cluster = PeerCluster::start_with_joiner(&[
-        BifrostTarget::All,
-        BifrostTarget::Oracle,
-        BifrostTarget::Oracle,
+        ServerTarget::Combined,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostQuery,
     ])
     .await?;
     let members = [

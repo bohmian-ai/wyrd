@@ -43,6 +43,7 @@ from .support import (
     binding_status,
     client_of,
     declare,
+    details,
     group_binding,
     group_execution,
     hydrated,
@@ -153,11 +154,10 @@ def test_agent_answer_passes_its_verifier(
     resumed = verify.Execution.connect(result.execution_id, client_of(wyrd_server)).wait(
         WAIT_SECONDS
     )
-    assert (resumed.execution_id, resumed.verdict, resumed.requirements, resumed.evidence) == (
+    assert (resumed.execution_id, resumed.verdict, resumed.requirements) == (
         result.execution_id,
         result.verdict,
         result.requirements,
-        result.evidence,
     )
 
 
@@ -178,8 +178,9 @@ def test_judged_answer_passes_the_agent_check(assistant: WyrdState, receiver: Re
     [requirement] = result.requirements
     assert requirement["outcome"] == "passed"
     assert requirement["citations"] == [{"slot": "answer", "locator": {"json_pointer": ""}}]
-    assert requirement["provenance"]["kind"] == "agent"
-    assert requirement["provenance"]["agent"]["name"] == "judge-agent"
+    [described] = details(result.execution_id)["outcome"]["requirements"]
+    assert described["provenance"]["kind"] == "agent"
+    assert described["provenance"]["agent"]["name"] == "judge-agent"
     [judged] = receiver.to(CALLS)[asked:]
     assert "Claim: The answer agrees with the customer" in str(judged.body), judged.body
 
@@ -463,11 +464,11 @@ def test_another_tenant_cannot_verify_the_assistant(
         assert raised.value.code == "WYRD_AUTH_401_WORKLOAD_UID_REFUSED"
 
 
-def enqueue_over_http(
+def enqueue_response(
     server: WyrdTestServer, client: WyrdClient, idempotency_key: str, body: dict
-) -> str:
-    """Enqueue ``body`` over plain HTTP as ``client`` with ``idempotency_key``; return the execution."""
-    response = httpx.post(
+) -> httpx.Response:
+    """Enqueue ``body`` over plain HTTP as ``client`` with ``idempotency_key``."""
+    return httpx.post(
         f"{server.base_url}/v1/verification/enqueue",
         headers={
             "x-wyrd-access-token": f"Bearer {client.access_token()}",
@@ -476,6 +477,13 @@ def enqueue_over_http(
         json=body,
         timeout=60,
     )
+
+
+def enqueue_over_http(
+    server: WyrdTestServer, client: WyrdClient, idempotency_key: str, body: dict
+) -> str:
+    """Enqueue ``body`` over plain HTTP as ``client`` with ``idempotency_key``; return the execution."""
+    response = enqueue_response(server, client, idempotency_key, body)
     accepted = response.json()
     assert response.status_code == 202, accepted
     return accepted["execution_id"]
@@ -535,17 +543,17 @@ def test_grouped_support_resumes(wyrd_server: WyrdTestServer, cards: Cards, tmp_
     assert len(listed) == 6 and listed[5] == replayed, "six turns, the replay once"
     assert sources["answered"]["execution_ids"] == listed, "each turn's outcome aligns"
     outcome = judged["result"]["outcome"]
-    assert outcome["evidence"]["turns"] == {"kind": "json", "value": turns}
-    assert outcome["evidence"]["answered"] == {"kind": "json", "value": ["passed"] * 6}
+    evidence = details(judged["execution_id"])["outcome"]["evidence"]
+    assert evidence["turns"] == {"kind": "json", "value": turns}
+    assert evidence["answered"] == {"kind": "json", "value": ["passed"] * 6}
     assert outcome["verdict"] == "passed"
     assert binding_status(wyrd_server, binding_id)["last_execution_id"] == judged["execution_id"]
-    # A conflicting replay is refused by the queue after staging; it is sent
+    # A conflicting replay is refused once the queue decides it; it is sent
     # to its own group so the conversation above keeps its six turns.
     conflicting = {**body({"answer": ""}), "group_id": f"{group}-conflict"}
-    conflict = enqueue_over_http(wyrd_server, service, idempotency_key, conflicting)
-    with pytest.raises(WyrdError) as conflicted:
-        verify.Execution.connect(conflict, admin).wait(WAIT_SECONDS)
-    assert conflicted.value.code == "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT"
+    conflicted = enqueue_response(wyrd_server, service, idempotency_key, conflicting)
+    assert conflicted.status_code == 409, conflicted.text
+    assert conflicted.json()["code"] == "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT"
     with pytest.raises(WyrdError) as refused:
         declare(cards, "cards/verify_in_real_time/support-unsourced.yaml")
     assert refused.value.code == "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH"
@@ -704,9 +712,10 @@ def test_grouped_coding_uses_declared_sources(
     judged = group_execution(wyrd_server, binding_id, WAIT_SECONDS)
 
     outcome = judged["result"]["outcome"]
-    assert outcome["evidence"]["calls"] == {"kind": "json", "value": calls}
-    assert outcome["evidence"]["traces"] == {"kind": "json", "value": [trace_id, None, None]}
-    assert outcome["evidence"]["tests"] == {
+    evidence = details(judged["execution_id"])["outcome"]["evidence"]
+    assert evidence["calls"] == {"kind": "json", "value": calls}
+    assert evidence["traces"] == {"kind": "json", "value": [trace_id, None, None]}
+    assert evidence["tests"] == {
         "kind": "json",
         "value": ["passed", "failed", "passed"],
     }
@@ -844,7 +853,10 @@ def test_grouped_sampled_frames_use_visible_outcomes(
     judged = judged_after(None)
     assert judged["group_id"] == events["empty"]
     assert badged(judged) == ("inconclusive", "empty_selection")
-    assert judged["result"]["outcome"]["evidence"]["outcomes"] == {"kind": "json", "value": []}
+    assert details(judged["execution_id"])["outcome"]["evidence"]["outcomes"] == {
+        "kind": "json",
+        "value": [],
+    }
 
     paths = [frame(tmp_path, f"fail-{index:04}") for index in range(19)]
     paths.insert(7, frame(tmp_path, UNBADGED))
@@ -877,7 +889,10 @@ def test_grouped_sampled_frames_use_visible_outcomes(
     assert len(coverage["event"]["execution_ids"]) == 1
     expected = ["failed" if id == executions[7].id else "passed" for id in listed]
     outcome = judged["result"]["outcome"]
-    assert outcome["evidence"]["outcomes"] == {"kind": "json", "value": expected}
+    assert details(judged["execution_id"])["outcome"]["evidence"]["outcomes"] == {
+        "kind": "json",
+        "value": expected,
+    }
     assert outcome["verdict"] == "failed"
 
     paths = [frame(tmp_path, f"many-{index:04}") for index in range(21)]
@@ -890,7 +905,7 @@ def test_grouped_sampled_frames_use_visible_outcomes(
     assert sorted(judged["group"]["sources"]["outcomes"]["execution_ids"]) == sorted(
         execution.id for execution in executions
     ), "twenty-one frames are judged like any other group"
-    assert judged["result"]["outcome"]["evidence"]["outcomes"] == {
+    assert details(judged["execution_id"])["outcome"]["evidence"]["outcomes"] == {
         "kind": "json",
         "value": ["passed"] * 21,
     }
@@ -981,7 +996,7 @@ def test_grouped_conversations_coexist_with_drift(
         outcome = execution["result"]["outcome"]
         judged[execution["group_id"]] = (
             len(execution["group"]["sources"]["turns"]["execution_ids"]),
-            outcome["evidence"]["turns"],
+            details(execution_id, admin)["outcome"]["evidence"]["turns"],
             outcome["verdict"],
         )
     assert judged == {
@@ -1098,7 +1113,9 @@ def test_verification_staging_refuses_and_recovers(tmp_path: Path) -> None:
         support.shutdown()
         grouped = group_execution(server, binding_id, WAIT_SECONDS)
         assert grouped["group_id"] == group
-        assert grouped["result"]["outcome"]["evidence"]["turns"] == {
+        assert details(grouped["execution_id"], client_of(server))["outcome"]["evidence"][
+            "turns"
+        ] == {
             "kind": "json",
             "value": [pressured],
         }, "the refused grouped turn staged nothing"

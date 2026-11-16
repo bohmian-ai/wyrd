@@ -687,7 +687,7 @@ class _BifrostBase:
 
     Construction, the local binding and counters, and ``insert`` live here
     because they are identical on both facades: ``use_table``, ``table``,
-    ``dropped``, and ``producer_count`` never connect, and ``insert`` is a
+    and ``producer_count`` never connect, and ``insert`` is a
     bounded channel send once connected, so none has an ``await`` form to
     differ in.
     """
@@ -777,15 +777,6 @@ class _BifrostBase:
             correlation.get("subject_card_uid"),
             correlation.get("run_id"),
         )
-
-    @property
-    def dropped(self) -> int:
-        """Rows dropped by the fire-and-forget ``wyrd.observe.record`` path.
-
-        Zero before the first server operation. Local; never connects.
-        """
-
-        return int(self._native.dropped)
 
     @property
     def producer_count(self) -> int:
@@ -1165,7 +1156,7 @@ class AsyncBifrost(_BifrostBase):
     """The ``await`` surface over the same native client.
 
     Every blocking native call runs in a worker thread, so the event loop is
-    never blocked. ``use_table``, ``table``, ``dropped``, and
+    never blocked. ``use_table``, ``table``, and
     ``producer_count`` stay synchronous because they never connect;
     ``insert`` stays synchronous because it is a bounded channel send once
     connected, so connect first with ``await AsyncBifrost.connect()`` or an

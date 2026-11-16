@@ -3062,7 +3062,7 @@ mod tests {
             wyrd_spec::vala::api::AuditOutcome::Allowed,
         );
         let rows = crate::tables::staged::StagedRow::project(&[
-            crate::tables::audit::projection::stage_audit_event(&event, chrono::Utc::now())
+            crate::tables::audit::projection::stage_audit_event(event.clone(), chrono::Utc::now())
                 .expect("valid projection"),
         ])
         .expect("one row builds");
@@ -3133,7 +3133,7 @@ mod tests {
             wyrd_spec::vala::api::AuditOutcome::Allowed,
         );
         let projected = crate::tables::staged::StagedRow::project(&[
-            crate::tables::audit::projection::stage_audit_event(&event, chrono::Utc::now())
+            crate::tables::audit::projection::stage_audit_event(event, chrono::Utc::now())
                 .expect("valid projection"),
         ])
         .expect("one row builds");

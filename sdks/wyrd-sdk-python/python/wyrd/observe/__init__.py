@@ -1,16 +1,15 @@
-"""Scoped verification and observation, and fire-and-forget Vala telemetry.
+"""Scoped verification, observation, and caller-table writes.
 
-``Run`` and ``Observe`` are reached through ``WyrdState.run()``; they are not
-constructed directly. ``Observe.verify`` and ``Observe.submit`` take and return
-the ``wyrd.verify`` types. ``record`` below is the separate telemetry door that
-swallows queue-full instead of raising.
+``Run``, ``Observe`` and ``RunBifrost`` are reached through ``WyrdState.run()``;
+they are not constructed directly. ``Observe.verify`` and ``Observe.submit``
+take and return the ``wyrd.verify`` types; ``RunBifrost.write`` buffers
+caller-table rows.
 """
 
-from .._wyrd.observe import Observe, Run
-from ._telemetry import record
+from .._wyrd.observe import Observe, Run, RunBifrost
 
 __all__ = [
     "Observe",
     "Run",
-    "record",
+    "RunBifrost",
 ]

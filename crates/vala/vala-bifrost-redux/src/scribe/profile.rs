@@ -84,7 +84,7 @@ pub(crate) struct WriteProfile {
 
 impl WriteProfile {
     /// Records this acknowledged write through
-    /// [`wyrd_telemetry::record_timing_parts`] at [`WRITE_TIMING`] under the
+    /// [`wyrd_benchmark::record_timing_parts`] at [`WRITE_TIMING`] under the
     /// current span's benchmark classification: `elapsed`, then each step as
     /// a part.
     ///
@@ -99,7 +99,7 @@ impl WriteProfile {
         let time =
             |time: &Time| Duration::from_nanos(u64::try_from(time.value()).unwrap_or(u64::MAX));
         let group = &self.group;
-        wyrd_telemetry::record_timing_parts(
+        wyrd_benchmark::record_timing_parts(
             &tracing::Span::current(),
             WRITE_TIMING,
             "success",

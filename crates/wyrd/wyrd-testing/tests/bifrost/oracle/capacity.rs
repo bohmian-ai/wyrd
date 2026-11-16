@@ -1300,8 +1300,8 @@ async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
     // Both controls arm the same next query: it takes its share of the root
     // and then parks after its schema frame, so the occupancy the refusal below
     // meets is real queries' own reservations rather than a harness counter.
-    // The holds share what the root has free, because the footer cache keeps
-    // its whole budget charged to the root from composition onward.
+    // The holds share what the root has free after whatever the caches and
+    // earlier work still hold.
     let idle = resources.snapshot().map_err(|error| error.to_string())?;
     let held_floor = root_limit
         .saturating_sub(idle.governed_memory_used_bytes)

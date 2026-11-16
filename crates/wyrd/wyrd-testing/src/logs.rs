@@ -4,28 +4,56 @@
 //! thread's default. A test on a current-thread Tokio runtime observes every
 //! event its in-process server and spawned tasks emit, so it can assert a
 //! structured event was written — or that a secret never was — without
-//! replacing the process-global subscriber other tests share.
+//! replacing the process-global subscriber other tests share. A test whose
+//! events come from threads it does not own, such as an in-process server's
+//! shared runtime, installs it process-globally instead.
 
 use std::io::{Result as IoResult, Write};
 use std::sync::{Arc, Mutex};
 
-use tracing::subscriber::DefaultGuard;
+use tracing::subscriber::{DefaultGuard, SetGlobalDefaultError};
 
 /// Plain-text tracing output of the installing thread.
 ///
-/// Captures events at `DEBUG` and above without ANSI escapes. Dropping it
-/// restores the thread's previous default subscriber.
+/// Captures events at `DEBUG` and above without ANSI escapes. Dropping a
+/// thread-default capture restores the thread's previous default subscriber;
+/// a process-global capture stays installed for the life of the process.
 pub struct LogCapture {
     /// Bytes the subscriber wrote.
     sink: Arc<Mutex<Vec<u8>>>,
-    /// Keeps the capture installed as the thread default.
-    _guard: DefaultGuard,
+    /// Keeps a thread-default capture installed; `None` when process-global.
+    _guard: Option<DefaultGuard>,
 }
 
 impl LogCapture {
     /// Install the capture as this thread's default subscriber.
     #[must_use]
     pub fn install() -> Self {
+        let (sink, subscriber) = Self::subscriber();
+        Self {
+            sink,
+            _guard: Some(tracing::subscriber::set_default(subscriber)),
+        }
+    }
+
+    /// Install the capture as the process-global subscriber, so it observes
+    /// every thread without its own default, including an in-process
+    /// server's shared runtime. Install it before starting the server, whose
+    /// telemetry then keeps this subscriber.
+    ///
+    /// # Errors
+    /// Returns the refusal when the process already has a global subscriber.
+    pub fn install_global() -> Result<Self, SetGlobalDefaultError> {
+        let (sink, subscriber) = Self::subscriber();
+        tracing::subscriber::set_global_default(subscriber)?;
+        Ok(Self { sink, _guard: None })
+    }
+
+    /// A fresh sink and the plain-text subscriber writing into it.
+    fn subscriber() -> (
+        Arc<Mutex<Vec<u8>>>,
+        impl tracing::Subscriber + Send + Sync + 'static,
+    ) {
         let sink = Arc::new(Mutex::new(Vec::new()));
         let writer = Arc::clone(&sink);
         let subscriber = tracing_subscriber::fmt()
@@ -33,10 +61,7 @@ impl LogCapture {
             .with_max_level(tracing::Level::DEBUG)
             .with_writer(move || CaptureWriter(Arc::clone(&writer)))
             .finish();
-        Self {
-            sink,
-            _guard: tracing::subscriber::set_default(subscriber),
-        }
+        (sink, subscriber)
     }
 
     /// Everything captured so far, lossily decoded as UTF-8.

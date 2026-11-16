@@ -207,9 +207,7 @@ mod transport_behavior {
 
                 tokio::spawn(async move {
                     hits_inner.fetch_add(1, Ordering::SeqCst);
-                    let mut buf = vec![0u8; 8192];
-                    let n = stream.read(&mut buf).await.unwrap_or(0);
-                    let raw = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let raw = read_request(&mut stream).await;
                     captured_inner.lock().await.push(raw);
 
                     let MockResponse {
@@ -254,6 +252,32 @@ mod transport_behavior {
             captured,
             _handle: handle,
         }
+    }
+
+    /// Reads one whole request, its head and the `content-length` body
+    /// after it, however many reads that takes.
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
+        let mut raw = Vec::new();
+        let mut buf = vec![0u8; 8192];
+        loop {
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            raw.extend_from_slice(&buf[..n]);
+            let text = String::from_utf8_lossy(&raw);
+            let complete = text.find("\r\n\r\n").is_some_and(|head| {
+                let length = extract_header(&text[..head], "content-length")
+                    .and_then(|length| length.parse::<usize>().ok())
+                    .unwrap_or(0);
+                raw.len() >= head + 4 + length
+            });
+            if n == 0 || complete {
+                return String::from_utf8_lossy(&raw).into_owned();
+            }
+        }
+    }
+
+    /// The body of one captured request.
+    fn request_body(raw: &str) -> &str {
+        raw.split_once("\r\n\r\n").map_or("", |(_, body)| body)
     }
 
     fn make_transport(base_url: String) -> HttpTransport {
@@ -422,7 +446,224 @@ mod transport_behavior {
         None
     }
 
+    /// The completed observations of `boundary` ending in `outcome` over
+    /// `interval`, every cohort included.
+    fn roots(interval: &wyrd_benchmark::BenchmarkInterval, boundary: &str, outcome: &str) -> u64 {
+        interval
+            .series
+            .iter()
+            .filter(|series| series.boundary == boundary && series.outcome == outcome)
+            .map(|series| series.count)
+            .sum()
+    }
+
+    /// The unlabelled logical calls over `interval` that reached `component`;
+    /// zero when none did.
+    fn reached(interval: &wyrd_benchmark::BenchmarkInterval, component: &str) -> u64 {
+        interval
+            .histogram(
+                wyrd_benchmark::COMPONENT_SECONDS,
+                &[
+                    ("boundary", "client.http"),
+                    ("component", component),
+                    ("case", wyrd_benchmark::UNLABELLED),
+                    ("phase", wyrd_benchmark::UNLABELLED),
+                ],
+            )
+            .map_or(0, |distribution| distribution.len())
+    }
+
     // ── tests ─────────────────────────────────────────────────────────────────
+
+    /// A JSON body larger than one socket read is replayed byte for byte, with
+    /// the same request ID, after a `401` re-exchanges the credential; only the
+    /// bearer changes.
+    ///
+    /// # Panics
+    /// Panics when the replay's body, request ID, or method differs from the
+    /// refused attempt, or it does not carry the renewed bearer.
+    #[tokio::test]
+    async fn json_body_and_request_identity_survive_auth_refresh() {
+        wyrd_benchmark::install().expect("the only recorder");
+        let server = spawn_mock(vec![
+            MockResponse::ok(&token_response("tok-A")),
+            MockResponse::status(
+                401,
+                r#"{"code":"WYRD_AUTH_401_INVALID_TOKEN","detail":"unauthorized","details":{}}"#,
+            ),
+            MockResponse::ok(&token_response("tok-B")),
+            MockResponse::ok(r#"{"result":"ok"}"#),
+        ])
+        .await;
+        let transport = make_api_key_transport(server.base_url.clone());
+        let before = wyrd_benchmark::snapshot();
+        let body = serde_json::json!({"content": "x".repeat(64 * 1024), "escaped": "\"q\"\n"});
+        let expected = serde_json::to_string(&body).expect("body serializes");
+
+        let response: serde_json::Value = transport
+            .request_json(reqwest::Method::POST, "/v1/test", Some(&body))
+            .await
+            .expect("the replay succeeds");
+
+        assert_eq!(response["result"], "ok");
+        assert_eq!(server.hits.load(Ordering::SeqCst), 4);
+        let interval = wyrd_benchmark::snapshot()
+            .since(&before)
+            .expect("one process");
+        assert_eq!(
+            (
+                roots(&interval, "client.http", wyrd_benchmark::SUCCESS),
+                roots(&interval, "client.http.attempt", wyrd_benchmark::ERROR),
+                roots(&interval, "client.http.attempt", wyrd_benchmark::SUCCESS),
+            ),
+            (1, 1, 1),
+            "one logical call of a refused and a replayed attempt"
+        );
+        for component in ["serialize", "auth", "send", "body", "decode"] {
+            assert_eq!(
+                reached(&interval, component),
+                1,
+                "{component} accumulates once"
+            );
+        }
+        assert_eq!(
+            reached(&interval, "backoff"),
+            0,
+            "a 401 replay waits no backoff"
+        );
+        let captured = server.captured.lock().await;
+        let (refused, replay) = (&captured[1], &captured[3]);
+        assert_eq!(request_body(refused), expected);
+        assert_eq!(request_body(replay), expected);
+        assert!(refused.starts_with("POST /v1/test ") && replay.starts_with("POST /v1/test "));
+        let id = extract_header(refused, "wyrd-request-id").expect("request id");
+        assert_eq!(extract_header(replay, "wyrd-request-id"), Some(id));
+        assert_eq!(
+            extract_header(refused, "x-wyrd-access-token").as_deref(),
+            Some("Bearer tok-A")
+        );
+        assert_eq!(
+            extract_header(replay, "x-wyrd-access-token").as_deref(),
+            Some("Bearer tok-B")
+        );
+    }
+
+    /// A non-idempotent JSON request that the server may have applied, here
+    /// answered `503`, is reported, not replayed: shared body storage does
+    /// not make it replay-safe.
+    ///
+    /// # Panics
+    /// Panics when the request succeeds or the mock is hit more than once.
+    #[tokio::test]
+    async fn non_idempotent_json_is_not_replayed_after_ambiguous_failure() {
+        wyrd_benchmark::install().expect("the only recorder");
+        let server = spawn_mock(vec![
+            MockResponse::status(
+                503,
+                r#"{"code":"WYRD_SPEC_500_INTERNAL","detail":"overloaded","details":{}}"#,
+            ),
+            MockResponse::ok(r#"{"result":"ok"}"#),
+        ])
+        .await;
+        let transport = make_transport(server.base_url.clone());
+        let body = serde_json::json!({"op": "run"});
+        let before = wyrd_benchmark::snapshot();
+
+        transport
+            .request_json::<_, serde_json::Value>(reqwest::Method::POST, "/v1/test", Some(&body))
+            .await
+            .expect_err("the ambiguous failure is reported");
+
+        assert_eq!(server.hits.load(Ordering::SeqCst), 1);
+        let interval = wyrd_benchmark::snapshot()
+            .since(&before)
+            .expect("one process");
+        assert_eq!(
+            (
+                roots(&interval, "client.http", wyrd_benchmark::ERROR),
+                roots(&interval, "client.http.attempt", wyrd_benchmark::ERROR),
+                roots(&interval, "client.http.attempt", wyrd_benchmark::SUCCESS),
+            ),
+            (1, 1, 0),
+            "one failed call of one failed attempt"
+        );
+        assert_eq!(reached(&interval, "body"), 1, "the problem body was read");
+        assert_eq!(
+            reached(&interval, "decode"),
+            0,
+            "an unreached decode is absent"
+        );
+        let captured = server.captured.lock().await;
+        assert_eq!(request_body(&captured[0]), r#"{"op":"run"}"#);
+    }
+
+    /// A call whose answer does not decode is one failed logical call of a
+    /// successful attempt that reached decoding, and a call dropped while it
+    /// waits for headers records its logical call and attempt as cancelled.
+    /// Without the recorder the same calls record nothing.
+    ///
+    /// # Panics
+    /// Panics when a population, outcome, or reached component differs.
+    #[tokio::test]
+    async fn buffered_calls_keep_failed_decode_and_cancelled_populations() {
+        let server = spawn_mock(vec![MockResponse::ok("{}"), MockResponse::ok("not json")]).await;
+        let transport = make_transport(server.base_url.clone());
+        let decode = || {
+            transport.request_json::<serde_json::Value, serde_json::Value>(
+                reqwest::Method::GET,
+                "/v1/test",
+                None,
+            )
+        };
+        let ordinary = wyrd_benchmark::snapshot();
+        decode().await.expect("an ordinary call succeeds");
+        let interval = wyrd_benchmark::snapshot()
+            .since(&ordinary)
+            .expect("one process");
+        assert!(interval.series.is_empty() && interval.metrics.is_empty());
+
+        wyrd_benchmark::install().expect("the only recorder");
+        let before = wyrd_benchmark::snapshot();
+        decode().await.expect_err("prose is not JSON");
+        let silent = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = silent.local_addr().expect("address");
+        let unanswered = make_transport(format!("http://{address}"));
+        let mut pending = Box::pin(
+            unanswered.request_json::<serde_json::Value, serde_json::Value>(
+                reqwest::Method::GET,
+                "/v1/test",
+                None,
+            ),
+        );
+        let accepted = tokio::spawn(async move { silent.accept().await });
+        let _held = tokio::select! {
+            _ = &mut pending => panic!("an unanswered call never completes"),
+            accepted = accepted => accepted.expect("joins").expect("the call connects"),
+        };
+        drop(pending);
+
+        let interval = wyrd_benchmark::snapshot()
+            .since(&before)
+            .expect("one process");
+        assert_eq!(roots(&interval, "client.http", wyrd_benchmark::ERROR), 1);
+        assert_eq!(
+            roots(&interval, "client.http.attempt", wyrd_benchmark::SUCCESS),
+            1
+        );
+        assert_eq!(
+            reached(&interval, "decode"),
+            1,
+            "the failed decode was reached"
+        );
+        assert_eq!(
+            (
+                roots(&interval, "client.http", wyrd_benchmark::CANCELLED),
+                roots(&interval, "client.http.attempt", wyrd_benchmark::CANCELLED),
+            ),
+            (1, 1),
+            "a dropped call never disappears"
+        );
+    }
 
     #[tokio::test]
     async fn request_json_round_trips_json() {
@@ -620,6 +861,8 @@ mod transport_behavior {
         ])
         .await;
         let t = make_api_key_transport(server.base_url.clone());
+        wyrd_benchmark::install().expect("the only recorder");
+        let before = wyrd_benchmark::snapshot();
 
         let result: serde_json::Value = t
             .request_json(
@@ -631,6 +874,23 @@ mod transport_behavior {
             .expect("second attempt succeeds after re-exchange");
 
         assert_eq!(result["ok"], true);
+        let interval = wyrd_benchmark::snapshot()
+            .since(&before)
+            .expect("one process");
+        assert_eq!(
+            roots(&interval, "client.http", wyrd_benchmark::SUCCESS),
+            1,
+            "the re-exchanges are not logical calls of their own"
+        );
+        assert_eq!(
+            roots(&interval, "client.http.attempt", wyrd_benchmark::ERROR),
+            1
+        );
+        assert_eq!(
+            reached(&interval, "serialize"),
+            0,
+            "a GET serializes no body"
+        );
         assert_eq!(
             server.hits.load(Ordering::SeqCst),
             4,

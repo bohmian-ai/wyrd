@@ -28,7 +28,7 @@
 //! history, and reporting. Profiling through [`crate::profile`] is optional
 //! diagnostic evidence that never changes a verdict.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::future::Future;
 use std::io::Write as _;
@@ -44,7 +44,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::profile::{ProfileNote, Profiler};
+use crate::profile::{HeapProfiler, ProfileMode, ProfileNote, Profiler};
 use crate::release_server::{Host, HostLoad};
 
 /// The only record version this module writes and reads: a VALID or
@@ -248,6 +248,10 @@ pub struct Timing {
     pub minimum_seconds: u64,
 }
 
+/// The driver's declared CPU budget in cores: the [`Validity::driver_cores`]
+/// every run is judged against, and the worker count of the driver's runtime.
+pub const DRIVER_CORES: u16 = 8;
+
 /// The thresholds every run's validity checks use.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Validity {
@@ -275,7 +279,7 @@ impl Default for Validity {
         Self {
             host_busy_fraction: 0.10,
             host_sample_seconds: 10,
-            driver_cores: 8.0,
+            driver_cores: f64::from(DRIVER_CORES),
             driver_fraction: 0.80,
             lateness_p99_us: 5_000.0,
             p99_samples: 1_000,
@@ -411,7 +415,34 @@ pub struct Metric {
     pub derive: Option<Derive>,
 }
 
+/// The id prefix of a diagnostic reading: `diagnostic.<observation>.<stat>`,
+/// one [`DIAGNOSTIC_STATS`] reading of one declared observation, such as one
+/// Gateway phase. No criterion judges one; the report shows each per
+/// repetition under [`Record::render`]'s `diagnostics` detail.
+pub const DIAGNOSTIC: &str = "diagnostic.";
+
+/// The readings of one diagnostic observation, by stat id and unit.
+pub const DIAGNOSTIC_STATS: [(&str, &str); 5] = [
+    ("count", "observations"),
+    ("p50_us", "µs"),
+    ("p95_us", "µs"),
+    ("p99_us", "µs"),
+    ("mean_us", "µs"),
+];
+
 impl Metric {
+    /// The [`DIAGNOSTIC_STATS`] readings of diagnostic `observation` over
+    /// `boundary`, which names its interval, population, and whether it
+    /// overlaps another observation.
+    #[must_use]
+    pub fn diagnostic(observation: &str, boundary: &str) -> Vec<Self> {
+        DIAGNOSTIC_STATS
+            .map(|(stat, unit)| {
+                Self::raw(&format!("{DIAGNOSTIC}{observation}.{stat}"), unit, boundary)
+            })
+            .to_vec()
+    }
+
     /// A raw metric the workload reads.
     #[must_use]
     pub fn raw(id: &str, unit: &str, boundary: &str) -> Self {
@@ -1180,7 +1211,7 @@ impl Reading {
     /// divided by `per`, as the [`Self::bounded`] interval of its bucket,
     /// with the sample count and rank; missing without samples.
     #[must_use]
-    pub fn quantile(distribution: &wyrd_telemetry::timing::Distribution, q: f64, per: f64) -> Self {
+    pub fn quantile(distribution: &wyrd_benchmark::Distribution, q: f64, per: f64) -> Self {
         distribution.quantile(q).map_or_else(
             || Self::missing("no successful sample"),
             |bucket| Self {
@@ -1321,6 +1352,10 @@ pub struct Repetition {
     pub server_cpu_seconds: Option<f64>,
     /// Sampled peak server resident memory, bytes.
     pub peak_memory_bytes: Option<u64>,
+    /// Server resident memory as the window opened, bytes; peak less
+    /// opening is the memory the window added. Absent from older records.
+    #[serde(default)]
+    pub opening_memory_bytes: Option<u64>,
     /// The memory sampling interval, milliseconds.
     pub memory_interval_ms: u64,
     /// Driver CPU-seconds, or `None` when unreadable.
@@ -1348,10 +1383,47 @@ pub struct Repetition {
     pub timings: Vec<TimingEvidence>,
 }
 
-/// One server timing cohort's reconciliation: the observations a window
-/// owed at one boundary, outcome, case, and phase, and those it recorded.
+/// The process whose recorder produced timing evidence. Records written
+/// before the driver recorded its own observations hold only server
+/// evidence, so a missing role reads as [`Self::Server`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    /// The benchmark-owned `wyrd-server`.
+    #[default]
+    Server,
+    /// The capacity driver: its clients and its local provider fixture.
+    Driver,
+    /// A Python SDK client process the driver starts: its clients only.
+    Python,
+    /// A TypeScript SDK client process the driver starts: its clients only.
+    TypeScript,
+}
+
+impl Role {
+    /// Every role, in report order.
+    pub const ALL: [Self; 4] = [Self::Server, Self::Driver, Self::Python, Self::TypeScript];
+
+    /// The role's name in records and reports.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Server => "server",
+            Self::Driver => "driver",
+            Self::Python => "python",
+            Self::TypeScript => "typescript",
+        }
+    }
+}
+
+/// One timing cohort's reconciliation: the observations a window owed at
+/// one boundary, outcome, case, and phase in one process, and those it
+/// recorded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reconciled {
+    /// The process that recorded them.
+    #[serde(default)]
+    pub role: Role,
     /// The server timing boundary.
     pub boundary: String,
     /// The outcome the observations were owed with.
@@ -1366,22 +1438,82 @@ pub struct Reconciled {
     pub recorded: u64,
 }
 
-/// The full server timing evidence of one window: the cumulative snapshots
-/// it differences, whose buckets rebuild every judged distribution, and
-/// its reconciliation.
+/// The full timing evidence of one window in one process: the cumulative
+/// snapshots it differences, whose buckets rebuild every judged
+/// distribution, and its reconciliation. A process's snapshots are never
+/// differenced against another's.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TimingEvidence {
     /// The window's name within its repetition, such as `measured`.
     pub window: String,
+    /// The process whose snapshots these are.
+    #[serde(default)]
+    pub role: Role,
     /// The snapshot at the window's open.
-    pub before: wyrd_telemetry::timing::TimingSnapshot,
+    pub before: wyrd_benchmark::BenchmarkSnapshot,
     /// The snapshot once the window's cohort drained.
-    pub after: wyrd_telemetry::timing::TimingSnapshot,
+    pub after: wyrd_benchmark::BenchmarkSnapshot,
     /// The window's expected and recorded observations.
     pub reconciliation: Vec<Reconciled>,
 }
 
 impl Repetition {
+    /// Sets the [`DIAGNOSTIC_STATS`] readings of diagnostic `observation`
+    /// from its interval `distribution` of nanoseconds: its count, and in
+    /// microseconds its nearest-rank bucket bounds and the bounds of its
+    /// mean. A refused distribution
+    /// leaves every reading missing with its reason; [`Self::invalid`] then
+    /// records it when the observation is `required`, since its absence
+    /// means the server did not record what it declares.
+    pub fn diagnose(
+        &mut self,
+        observation: &str,
+        distribution: Result<wyrd_benchmark::Distribution, String>,
+        required: bool,
+    ) {
+        let id = |stat: &str| format!("{DIAGNOSTIC}{observation}.{stat}");
+        let distribution = match distribution {
+            Ok(distribution) => distribution,
+            Err(reason) => {
+                for (stat, _) in DIAGNOSTIC_STATS {
+                    self.set(&id(stat), Reading::missing(reason.clone()));
+                }
+                if required {
+                    self.invalid
+                        .push(format!("diagnostic `{observation}` is missing: {reason}"));
+                }
+                return;
+            }
+        };
+        let per = 1e3;
+        let samples = distribution.len();
+        self.set(&id("count"), Reading::count(samples));
+        for (stat, q) in [("p50_us", 0.5), ("p95_us", 0.95), ("p99_us", 0.99)] {
+            self.set(&id(stat), Reading::quantile(&distribution, q, per));
+        }
+        let (low, high) = distribution.total_bounds();
+        self.set(
+            &id("mean_us"),
+            if samples == 0 {
+                Reading::missing("no observation")
+            } else {
+                Reading::bounded(low as f64, high as f64, per * samples as f64)
+                    .with_samples(samples)
+            },
+        );
+    }
+
+    /// Sets every [`DIAGNOSTIC_STATS`] reading of `observation` missing as
+    /// inapplicable to this step, for `reason`.
+    pub fn inapplicable(&mut self, observation: &str, reason: &str) {
+        for (stat, _) in DIAGNOSTIC_STATS {
+            self.set(
+                &format!("{DIAGNOSTIC}{observation}.{stat}"),
+                Reading::missing(format!("inapplicable: {reason}")),
+            );
+        }
+    }
+
     /// Sets raw metric `id`.
     pub fn set(&mut self, id: &str, reading: Reading) {
         self.metrics.insert(id.to_owned(), reading);
@@ -1477,7 +1609,7 @@ pub enum Phase {
 impl Phase {
     /// The closed benchmark phase label a driver sends with every request
     /// it admits in this phase; a repetition beyond the declared labels is
-    /// [`wyrd_telemetry::timing::INVALID`], which the server counts.
+    /// [`wyrd_benchmark::INVALID`], which the server counts.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -1485,7 +1617,7 @@ impl Phase {
             Self::Repetition(0) => "repetition-1",
             Self::Repetition(1) => "repetition-2",
             Self::Repetition(2) => "repetition-3",
-            Self::Repetition(_) => wyrd_telemetry::timing::INVALID,
+            Self::Repetition(_) => wyrd_benchmark::INVALID,
         }
     }
 }
@@ -1533,6 +1665,29 @@ pub trait Workload: Send {
     /// PIDs of the declared server processes, for optional profiling.
     fn processes(&self) -> Vec<u32>;
 
+    /// Where the server under test serves its heap profile, for optional
+    /// profiling; `None`, the default, when it serves none.
+    fn heap_profile_url(&self) -> Option<String> {
+        None
+    }
+
+    /// The client processes beside the server and this driver, each with
+    /// its role, for optional profiling; none by default. A workload that
+    /// has any starts them in [`Self::prepare`] when profiled, so every
+    /// step's captures include them.
+    fn clients(&self) -> Vec<(Role, u32)> {
+        Vec::new()
+    }
+
+    /// Saves each of [`Self::clients`]'s own heap captures of `step` under
+    /// `directory`, returning the captures and a note for each
+    /// one missing or partial. The runner calls it after every measured step
+    /// of a profiled run; by default there is nothing to save.
+    async fn capture_clients(&mut self, step: &str, directory: &Path) -> ProfileNote {
+        let _ = (step, directory);
+        ProfileNote::default()
+    }
+
     /// Runs `phase` of `step` for `window` and returns what it measured.
     /// The runner calls it once per warmup and repetition and never retries
     /// a failed call.
@@ -1563,13 +1718,22 @@ pub trait Workload: Send {
     async fn finish(&mut self) -> Result<(), ExperimentError>;
 }
 
+/// What a `--profile` run collects and the CPU profiler it invokes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Profiling {
+    /// The collectors, for both process roles.
+    pub mode: ProfileMode,
+    /// The CPU profiler program, [`crate::profile::SAMPLY`] outside tests.
+    pub program: PathBuf,
+}
+
 /// Where a run keeps raw artifacts and whether it profiles.
 #[derive(Debug, Clone)]
 pub struct Options {
     /// Raw artifacts directory under `target/`.
     pub artifacts: PathBuf,
-    /// The profiler to run with `--profile`, or `None` without it.
-    pub profiler: Option<PathBuf>,
+    /// What `--profile` collects, or `None` without it.
+    pub profile: Option<Profiling>,
     /// Cancelled when the run is interrupted.
     pub interrupt: CancellationToken,
 }
@@ -1591,6 +1755,21 @@ pub struct Judgment {
     /// Whether the criterion was judged: false only in a smoke, which
     /// judges no criterion once its evidence is present.
     pub applicable: bool,
+}
+
+/// The `compare` control an experiment may declare: which step param the
+/// report's summary puts side by side, the metrics it compares, and a note
+/// per step group, keyed by the group's params as the summary labels them
+/// (such as `clients=64 rate=3000`).
+#[derive(Debug, Deserialize)]
+struct Comparison {
+    /// The step param whose values become the summary's columns.
+    by: String,
+    /// The metrics compared, one row each, in order.
+    metrics: Vec<String>,
+    /// What each group answers, for a literal reader.
+    #[serde(default)]
+    notes: BTreeMap<String, String>,
 }
 
 /// One metric's spread over the repetitions.
@@ -1808,14 +1987,35 @@ where
             }
             Err(reason) => stopped = Some(reason),
         }
-        let profiler = match (&options.profiler, stopped.is_none()) {
-            (Some(program), true) => Profiler::start(
-                program,
-                &workload.processes(),
-                &options.artifacts.join("profiles"),
-            ),
-            _ => Profiler::disabled(),
+        let profiles = options.artifacts.join("profiles");
+        let profiling = options.profile.as_ref().filter(|_| stopped.is_none());
+        let clients = workload.clients();
+        let targets: Vec<(Role, u32)> = workload
+            .processes()
+            .into_iter()
+            .map(|pid| (Role::Server, pid))
+            .chain(std::iter::once((Role::Driver, std::process::id())))
+            .chain(clients.iter().copied())
+            .collect();
+        profile = ProfileNote {
+            requested: profiling.is_some(),
+            mode: profiling.map(|profiling| profiling.mode),
+            roles: if profiling.is_some() {
+                [Role::Server, Role::Driver]
+                    .into_iter()
+                    .chain(clients.iter().map(|(role, _)| *role))
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            complete: profiling.is_some(),
+            ..ProfileNote::default()
         };
+        let cpu = profiling.filter(|profiling| profiling.mode.cpu());
+        let heap_mode = profiling.is_some_and(|profiling| profiling.mode.heap());
+        let heap_url = heap_mode.then(|| workload.heap_profile_url()).flatten();
+        let mut heap = HeapProfiler::start(heap_url, heap_mode, &profiles).await;
+        let mut saving = None;
         for step in &declaration.steps {
             if stopped.is_some()
                 || step.kind != StepKind::Measured
@@ -1823,6 +2023,12 @@ where
             {
                 continue;
             }
+            if let Some(previous) = saving.take() {
+                profile.absorb(saved(previous).await);
+            }
+            let profiler = cpu.map_or_else(Profiler::disabled, |cpu| {
+                Profiler::start(&cpu.program, &targets, &profiles.join(&step.id))
+            });
             let (repetitions, reasons) = measured.entry(step.id.clone()).or_default();
             let window = Duration::from_secs(declaration.step_timing(step).repetition_seconds);
             let warmup = Duration::from_secs(timing.warmup_seconds);
@@ -1869,8 +2075,12 @@ where
                     }
                 }
             }
+            heap.capture(&step.id).await;
+            if profiling.is_some() {
+                profile.absorb(workload.capture_clients(&step.id, &profiles).await);
+            }
+            saving = Some(tokio::task::spawn_blocking(move || profiler.finish()));
         }
-        let saving = tokio::task::spawn_blocking(move || profiler.finish());
         match tokio::time::timeout(FINISH_GRACE, workload.finish()).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => validity.push(Reason::new(
@@ -1895,11 +2105,16 @@ where
             "after",
         ));
         worked = Some(clock.elapsed());
-        profile = saving.await.unwrap_or_else(|_| ProfileNote {
-            requested: true,
-            notes: vec!["the profiler thread panicked".to_owned()],
-            ..ProfileNote::default()
-        });
+        if let Some(last) = saving {
+            profile.absorb(saved(last).await);
+        }
+        heap.finish(&mut profile);
+        if profile.requested && profile.captures.is_empty() && profile.notes.is_empty() {
+            profile.absorb(ProfileNote {
+                notes: vec!["no measured step was profiled".to_owned()],
+                ..ProfileNote::default()
+            });
+        }
     }
     let elapsed = worked.unwrap_or_else(|| clock.elapsed());
     if elapsed > Duration::from_secs(timing.budget_seconds) {
@@ -1984,6 +2199,15 @@ where
         },
         mode: declaration.mode,
     }
+}
+
+/// The note of a step's CPU captures once `saving` finished them; a
+/// panicked save is noted, never lost silently.
+async fn saved(saving: tokio::task::JoinHandle<ProfileNote>) -> ProfileNote {
+    saving.await.unwrap_or_else(|_| ProfileNote {
+        notes: vec!["the profiler thread panicked".to_owned()],
+        ..ProfileNote::default()
+    })
 }
 
 /// Awaits `work` until the budget `deadline` or an interrupt, whichever is
@@ -2579,8 +2803,9 @@ impl Record {
     }
 
     /// Whether the record enters history: a full run of the whole plan from
-    /// a clean source without `--profile`, VALID or INVALID. A `--steps`,
-    /// `--profile`, `--allow-dirty`, or `--smoke` run never does.
+    /// a clean source without `--profile` or Gateway's paced `--pace`
+    /// diagnostic, VALID or INVALID. A `--steps`, `--profile`, `--pace`,
+    /// dirty or `--smoke` run never does.
     #[must_use]
     pub fn historical(&self) -> bool {
         self.mode == Mode::Full
@@ -2590,7 +2815,7 @@ impl Record {
                 .command
                 .args
                 .iter()
-                .any(|argument| argument == "--profile")
+                .any(|argument| argument == "--profile" || argument == "--pace")
     }
 
     /// Reads a record file.
@@ -2677,6 +2902,7 @@ impl Record {
         {
             let _ = writeln!(out, "timing (schema {}): {method}\n", self.schema_version);
         }
+        self.render_comparison(&mut out);
         out.push_str(REPORT_HEADER);
         out.push('\n');
         out.push_str("|---|---|---|---|---|---|---|---|---|---|---|\n");
@@ -2750,7 +2976,11 @@ impl Record {
                 step.status,
                 step.repetitions.len()
             );
-            for (id, summary) in &step.summary {
+            for (id, summary) in step
+                .summary
+                .iter()
+                .filter(|(id, _)| !id.starts_with(DIAGNOSTIC))
+            {
                 let range = summary
                     .min
                     .zip(summary.max)
@@ -2782,6 +3012,7 @@ impl Record {
                     let _ = writeln!(out, "  - repetition {} observed: {observation}", index + 1);
                 }
             }
+            self.render_diagnostics(&mut out, step);
         }
         if !self.reasons.is_empty() {
             out.push_str("\n## Reasons\n\n");
@@ -2794,24 +3025,7 @@ impl Record {
                 let _ = writeln!(out, "- {} {}: {}", reason.code, place, reason.message);
             }
         }
-        let profile = &self.artifacts.profile;
-        if profile.requested {
-            let _ = writeln!(
-                out,
-                "\nprofile: {} ({} captures){}",
-                if profile.complete {
-                    "complete"
-                } else {
-                    "incomplete"
-                },
-                profile.captures.len(),
-                if profile.notes.is_empty() {
-                    String::new()
-                } else {
-                    format!("; {}", profile.notes.join("; "))
-                }
-            );
-        }
+        self.render_profile(&mut out);
         let _ = writeln!(
             out,
             "\nverdict: {} (exit {})",
@@ -2819,6 +3033,240 @@ impl Record {
             self.exit_code()
         );
         out
+    }
+
+    /// Writes the side-by-side summary the record's `compare` control
+    /// declares, ahead of the common table, so a reader compares like with
+    /// like without picking rows out of it. Measured steps are grouped by
+    /// the params that tell them apart, all but `by`; each group is one
+    /// table with one row per declared metric's median and one column per
+    /// `by` value, under the group's declared note. A record without the
+    /// control renders without the summary.
+    fn render_comparison(&self, out: &mut String) {
+        let Some(comparison) = self
+            .controls
+            .values
+            .get("compare")
+            .and_then(|value| serde_json::from_value::<Comparison>(value.clone()).ok())
+        else {
+            return;
+        };
+        let steps: Vec<&StepRecord> = self
+            .steps
+            .iter()
+            .filter(|step| !step.summary.is_empty())
+            .collect();
+        let keys: BTreeSet<&String> = steps
+            .iter()
+            .flat_map(|step| step.params.keys())
+            .filter(|key| **key != comparison.by)
+            .collect();
+        let varying: Vec<&String> = keys
+            .into_iter()
+            .filter(|key| {
+                let first = steps.first().and_then(|step| step.params.get(*key));
+                steps.iter().any(|step| step.params.get(*key) != first)
+            })
+            .collect();
+        let mut columns: Vec<&Value> = Vec::new();
+        let mut groups: Vec<(String, Vec<&StepRecord>)> = Vec::new();
+        for step in steps {
+            let Some(column) = step.params.get(&comparison.by) else {
+                continue;
+            };
+            if !columns.contains(&column) {
+                columns.push(column);
+            }
+            let label = varying
+                .iter()
+                .filter_map(|key| step.params.get(*key).map(|value| format!("{key}={value}")))
+                .collect::<Vec<_>>()
+                .join(" ");
+            match groups.iter_mut().find(|(known, _)| *known == label) {
+                Some((_, members)) => members.push(step),
+                None => groups.push((label, vec![step])),
+            }
+        }
+        if groups.is_empty() {
+            return;
+        }
+        let names: Vec<String> = columns
+            .iter()
+            .map(|column| {
+                column
+                    .as_str()
+                    .map_or_else(|| column.to_string(), str::to_owned)
+            })
+            .collect();
+        let _ = writeln!(
+            out,
+            "## By {}\n\nMedians of the repetitions. A histogram reading shows its bucket's upper bound; the table below has both bounds.\n",
+            comparison.by
+        );
+        for (label, members) in groups {
+            let _ = writeln!(out, "### {label}\n");
+            if let Some(note) = comparison.notes.get(&label) {
+                let _ = writeln!(out, "{note}\n");
+            }
+            let _ = writeln!(out, "| metric | {} |", names.join(" | "));
+            let _ = writeln!(out, "|---|{}", "---|".repeat(names.len()));
+            for metric in &comparison.metrics {
+                let cells: Vec<String> = columns
+                    .iter()
+                    .map(|column| {
+                        members
+                            .iter()
+                            .find(|step| step.params.get(&comparison.by) == Some(*column))
+                            .and_then(|step| step.summary.get(metric))
+                            .and_then(|summary| summary.median.value)
+                            .map_or_else(|| "—".to_owned(), number)
+                    })
+                    .collect();
+                let _ = writeln!(
+                    out,
+                    "| {metric} ({}) | {} |",
+                    self.unit(metric),
+                    cells.join(" | ")
+                );
+            }
+            out.push('\n');
+        }
+    }
+
+    /// Writes the profile evidence to `out`, when profiling was requested:
+    /// its mode and roles, whether it completed, its captures per role and
+    /// each capture's path, its notes, and the limits of its scope. A
+    /// record that predates profile modes and roles profiled the server
+    /// only, and says so.
+    fn render_profile(&self, out: &mut String) {
+        let profile = &self.artifacts.profile;
+        if !profile.requested {
+            return;
+        }
+        let scope = profile.mode.map_or_else(
+            || " of server (recorded before profile modes and roles)".to_owned(),
+            |mode| {
+                let roles: Vec<&str> = profile.roles.iter().map(|role| role.name()).collect();
+                format!(" {} of {}", mode.name(), roles.join(" and "))
+            },
+        );
+        let role = |capture: &str| {
+            let file = Path::new(capture)
+                .file_name()
+                .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+            Role::ALL
+                .into_iter()
+                .find(|role| {
+                    let name = role.name();
+                    file.starts_with(&format!("cpu-{name}-"))
+                        || file.starts_with(&format!("heap-{name}-"))
+                })
+                .unwrap_or(Role::Server)
+        };
+        let per_role: Vec<String> = Role::ALL
+            .into_iter()
+            .filter(|named| {
+                matches!(named, Role::Server | Role::Driver) || profile.roles.contains(named)
+            })
+            .map(|named| {
+                let count = profile
+                    .captures
+                    .iter()
+                    .filter(|capture| role(capture) == named)
+                    .count();
+                format!("{} {count}", named.name())
+            })
+            .collect();
+        let _ = writeln!(
+            out,
+            "\nprofile{scope}: {} ({} captures: {}){}",
+            if profile.complete {
+                "complete"
+            } else {
+                "incomplete"
+            },
+            profile.captures.len(),
+            per_role.join(", "),
+            if profile.notes.is_empty() {
+                String::new()
+            } else {
+                format!("; {}", profile.notes.join("; "))
+            }
+        );
+        out.push_str("- scope: a CPU capture spans one measured step from its warmup through its last repetition and settle; a heap capture holds the samples since sampling started, taken after each step; neither is aligned to a repetition window, and a profiled run is diagnostic, never a qualification\n");
+        for capture in &profile.captures {
+            let _ = writeln!(out, "- {} capture: {capture}", role(capture).name());
+        }
+    }
+
+    /// Writes `step`'s diagnostic readings to `out`: each declared or read
+    /// observation under the process role that recorded it (`driver.`
+    /// observations are the driver's, every other one the server's) with its
+    /// declared boundary, then its reading in every repetition, so no median
+    /// conceals a slow repetition and a repetition without one says why. A
+    /// step of a record that declares and read none, such as one that
+    /// predates them, says they are unavailable, and one with no driver
+    /// observation says the driver's are, rather than reading as zero.
+    fn render_diagnostics(&self, out: &mut String, step: &StepRecord) {
+        let mut observations: Vec<&str> = self
+            .criteria
+            .metrics
+            .iter()
+            .map(|metric| metric.id.as_str())
+            .chain(
+                step.repetitions
+                    .iter()
+                    .flat_map(|repetition| repetition.metrics.keys().map(String::as_str)),
+            )
+            .filter_map(|id| id.strip_prefix(DIAGNOSTIC)?.rsplit_once('.'))
+            .map(|(observation, _)| observation)
+            .collect();
+        observations.sort_unstable();
+        observations.dedup();
+        if observations.is_empty() {
+            out.push_str("  - diagnostics: — unavailable: this record declares and read none\n");
+            return;
+        }
+        out.push_str(
+            "  - diagnostics (wall time; nearest-rank bucket bounds; rows overlap and never add or subtract):\n",
+        );
+        let driver = format!("{}.", Role::Driver.name());
+        for observation in &observations {
+            let id = |stat: &str| format!("{DIAGNOSTIC}{observation}.{stat}");
+            let boundary = self
+                .criteria
+                .metrics
+                .iter()
+                .find(|metric| metric.id == id("count"))
+                .map_or("undeclared", |metric| metric.boundary.as_str());
+            let (role, name) = observation
+                .strip_prefix(&driver)
+                .map_or((Role::Server, *observation), |name| (Role::Driver, name));
+            let _ = writeln!(out, "    - {} {name}: {boundary}", role.name());
+            for (index, repetition) in step.repetitions.iter().enumerate() {
+                let count = repetition.reading(&id("count"));
+                let cells = if count.is_present() {
+                    std::iter::once(format!("n {}", count.cell("")))
+                        .chain(DIAGNOSTIC_STATS[1..].iter().map(|(stat, unit)| {
+                            let label = stat.strip_suffix("_us").unwrap_or(stat);
+                            format!("{label} {}", repetition.reading(&id(stat)).cell(unit))
+                        }))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                } else {
+                    count.cell("")
+                };
+                let _ = writeln!(out, "      - repetition {}: {cells}", index + 1);
+            }
+        }
+        if !observations
+            .iter()
+            .any(|observation| observation.starts_with(&driver))
+        {
+            out.push_str(
+                "    - driver: — unavailable: this record holds no driver observation for this step\n",
+            );
+        }
     }
 
     /// The first eight common cells of a step row.
@@ -2972,10 +3420,12 @@ mod tests {
 
     use super::{
         Arrivals, Criterion, Declaration, Derive, Direction, Engine, ExperimentError, HostRecord,
-        Invocation, Level, Metric, Mode, Op, Options, Outcome, Phase, REPORT_HEADER, Reading,
-        Record, Repetition, Source, Status, Step, Validity, Verdict, Workload, run,
+        Invocation, Level, Metric, Mode, Op, Options, Outcome, Phase, Profiling, REPORT_HEADER,
+        Reading, Record, Repetition, Role, Source, Status, Step, Validity, Verdict, Workload, run,
     };
-    use crate::capacity::{Histogram, Population, UNLABELLED};
+    use crate::capacity::{Population, UNLABELLED};
+    use crate::profile::{ProfileMode, ProfileNote};
+    use crate::release_server::Histogram;
     use crate::release_server::HostLoad;
 
     /// A quiet host sample.
@@ -3105,7 +3555,7 @@ mod tests {
         stall: Duration,
         /// Cancelled after this many calls, when set.
         interrupt: Option<(usize, CancellationToken)>,
-        /// Real time the first measurement blocks, so an external profiler
+        /// Real time each step's warmup blocks, so an external profiler
         /// started just before it is running when the paused clock races on.
         settle: Option<Duration>,
         /// Why preparation fails, when set.
@@ -3159,7 +3609,9 @@ mod tests {
             {
                 token.cancel();
             }
-            if let Some(settle) = self.settle.take() {
+            if phase == Phase::Warmup
+                && let Some(settle) = self.settle
+            {
                 std::thread::sleep(settle);
             }
             tokio::time::sleep(window + self.stall).await;
@@ -3181,7 +3633,7 @@ mod tests {
     fn options(directory: &Path) -> Options {
         Options {
             artifacts: directory.to_path_buf(),
-            profiler: None,
+            profile: None,
             interrupt: CancellationToken::new(),
         }
     }
@@ -3221,6 +3673,77 @@ mod tests {
             .iter()
             .map(|reason| reason.code.as_str())
             .collect()
+    }
+
+    /// A declared `compare` control puts each group of steps side by side,
+    /// one column per language and one row per metric, under the group's
+    /// note, ahead of the common table; a record without it has no summary.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the summary is missing, misplaced, or wrong.
+    #[tokio::test(start_paused = true)]
+    async fn report_compares_declared_steps_side_by_side() {
+        let directory = tempfile::tempdir().expect("artifacts");
+        let options = options(directory.path());
+        let mut declared = declaration();
+        declared.steps = vec![
+            Step::measured("op-1", json!({ "clients": 1, "language": "rust" })),
+            Step::measured("op-python-1", json!({ "clients": 1, "language": "python" })),
+            Step::measured("op-64", json!({ "clients": 64, "language": "rust" })),
+            Step::measured(
+                "op-python-64",
+                json!({ "clients": 64, "language": "python" }),
+            ),
+        ];
+        let plain = execute(
+            declared.clone(),
+            &mut Scripted::always(&good()),
+            [Some(quiet()), Some(quiet())],
+            &options,
+        )
+        .await;
+        assert!(!plain.render().contains("## By"));
+
+        declared.controls.insert(
+            "compare".to_owned(),
+            json!({
+                "by": "language",
+                "metrics": ["p99_ms", "rate"],
+                "notes": { "clients=64": "Overloaded: do not compare languages here." },
+            }),
+        );
+        let compared = execute(
+            declared,
+            &mut Scripted::always(&good()),
+            [Some(quiet()), Some(quiet())],
+            &options,
+        )
+        .await;
+        let report = compared.render();
+        let expected = "## By language
+
+Medians of the repetitions. A histogram reading shows its bucket's upper bound; the table below has both bounds.
+
+### clients=1
+
+| metric | rust | python |
+|---|---|---|
+| p99_ms (ms) | 0.3 | 0.3 |
+| rate (ops/s) | 100 | 100 |
+
+### clients=64
+
+Overloaded: do not compare languages here.
+
+| metric | rust | python |
+|---|---|---|
+| p99_ms (ms) | 0.3 | 0.3 |
+| rate (ops/s) | 100 | 100 |
+
+";
+        assert!(report.contains(expected), "{report}");
+        assert!(report.find(expected) < report.find(REPORT_HEADER));
     }
 
     /// V1: a complete declaration admits the workload and is recorded
@@ -4019,13 +4542,13 @@ mod tests {
                 .contains("provisioned vCPUs")
         );
 
-        wyrd_telemetry::timing::enable();
+        wyrd_benchmark::install().expect("the benchmark recorder installs");
         let verifier = 2_000_000;
         let window = |requests: &[(u64, Option<u64>)], expected: u64| {
-            let before = wyrd_telemetry::timing::snapshot();
+            let before = wyrd_benchmark::snapshot();
             let request = tracing::Span::none();
             for (elapsed, excluded) in requests {
-                wyrd_telemetry::record_timing(
+                wyrd_benchmark::record_timing(
                     &request,
                     "verification.direct",
                     "completed",
@@ -4033,7 +4556,7 @@ mod tests {
                     excluded.map(std::time::Duration::from_nanos),
                 );
             }
-            let interval = wyrd_telemetry::timing::snapshot()
+            let interval = wyrd_benchmark::snapshot()
                 .since(&before)
                 .expect("one process");
             let mut population = Population::from_interval(interval);
@@ -4103,15 +4626,15 @@ mod tests {
         );
         let mut zero = Repetition::default();
         Population::from_interval({
-            let before = wyrd_telemetry::timing::snapshot();
-            wyrd_telemetry::record_timing(
+            let before = wyrd_benchmark::snapshot();
+            wyrd_benchmark::record_timing(
                 &tracing::Span::none(),
                 "verification.direct",
                 "completed",
                 std::time::Duration::ZERO,
                 Some(std::time::Duration::ZERO),
             );
-            wyrd_telemetry::timing::snapshot()
+            wyrd_benchmark::snapshot()
                 .since(&before)
                 .expect("one process")
         })
@@ -4136,7 +4659,7 @@ mod tests {
             extra.invalid
         );
         let mut overflowed = samples(1_000);
-        overflowed[0].0 = wyrd_telemetry::timing::HIGHEST_NS * 2;
+        overflowed[0].0 = wyrd_benchmark::HIGHEST_NS * 2;
         let overflowed = window(&overflowed, 100);
         assert!(
             overflowed
@@ -4321,7 +4844,7 @@ mod tests {
     /// for missing values, store the dirty digest, and never carry a secret
     /// configuration value. Only a clean, unprofiled full run of the whole
     /// plan enters `benchmarks/history/`, VALID or INVALID; a dirty,
-    /// profiled, or `--steps` run stays under `target/benchmarks/`.
+    /// profiled, paced, or `--steps` run stays under `target/benchmarks/`.
     ///
     /// # Panics
     ///
@@ -4403,12 +4926,18 @@ mod tests {
         invalid.verdict = Verdict::Invalid;
         let mut profiled = clean.clone();
         profiled.command = Invocation::new(&["l1".to_owned(), "--profile".to_owned()], &[]);
+        let mut paced = clean.clone();
+        paced.command = Invocation::new(
+            &["l1".to_owned(), "--pace".to_owned(), "100".to_owned()],
+            &[],
+        );
         let mut selected = clean.clone();
         selected.controls.selection = Some(vec!["op-64".to_owned()]);
         for (record, base) in [
             (&clean, "benchmarks/history"),
             (&invalid, "benchmarks/history"),
             (&profiled, "target/benchmarks"),
+            (&paced, "target/benchmarks"),
             (&selected, "target/benchmarks"),
         ] {
             let path = record.publish(root.path()).expect("publish");
@@ -4667,11 +5196,11 @@ mod tests {
     #[test]
     fn histogram_cohorts_preserve_measurement_and_drain_windows() {
         use crate::capacity::{Population, UNLABELLED};
-        use wyrd_telemetry::timing;
+        use wyrd_benchmark as timing;
 
-        timing::enable();
+        timing::install().expect("the benchmark recorder installs");
         let record = |micros: u64| {
-            wyrd_telemetry::record_timing(
+            wyrd_benchmark::record_timing(
                 &tracing::Span::none(),
                 "bifrost.query",
                 "success",
@@ -4688,7 +5217,7 @@ mod tests {
         let closed = timing::snapshot();
         record(900_000);
         let drained = timing::snapshot();
-        let window = |after: &timing::TimingSnapshot| {
+        let window = |after: &timing::BenchmarkSnapshot| {
             Population::from_interval(after.since(&before).expect("one process"))
         };
         let (measured, mut cohort) = (window(&closed), window(&drained));
@@ -4732,12 +5261,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn kept_timing_evidence_rebuilds_judged_readings() {
         use crate::capacity::{Expected, Population, UNLABELLED};
-        use wyrd_telemetry::timing;
+        use wyrd_benchmark as timing;
 
-        timing::enable();
+        timing::install().expect("the benchmark recorder installs");
         let before = timing::snapshot();
         for (micros, outcome) in [(100, "success"), (300, "success"), (900, "error")] {
-            wyrd_telemetry::record_timing(
+            wyrd_benchmark::record_timing(
                 &tracing::Span::none(),
                 "bifrost.query",
                 outcome,
@@ -4747,7 +5276,7 @@ mod tests {
         }
         let after = timing::snapshot();
         let judged = [("p50_ms", 0.5), ("p95_ms", 0.95), ("p99_ms", 0.99)];
-        let reduce = |before: &timing::TimingSnapshot, after: timing::TimingSnapshot| {
+        let reduce = |before: &timing::BenchmarkSnapshot, after: timing::BenchmarkSnapshot| {
             let mut population = Population::between(before, after).expect("one process");
             population.expect(&[Expected {
                 boundary: "bifrost.query",
@@ -4874,6 +5403,276 @@ mod tests {
         }
     }
 
+    /// Every repetition's diagnostic readings survive publication: a
+    /// fresh and a re-read report agree once the raw artifacts are gone,
+    /// each observation shows its declared boundary and every repetition's
+    /// count, bucket bounds, and mean, a slow first repetition stays
+    /// visible beside the median, an inapplicable observation says why, a
+    /// repetition that read none says it was not read, and a record that
+    /// declares none says diagnostics are unavailable.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a diagnostic line is missing, collapsed, or differs
+    /// between the fresh and re-read report.
+    #[tokio::test(start_paused = true)]
+    async fn reports_keep_repetition_diagnostics_after_artifacts_are_removed() {
+        let root = tempfile::tempdir().expect("root");
+        let artifacts = root.path().join("target/run");
+        std::fs::create_dir_all(&artifacts).expect("artifacts");
+        std::fs::write(artifacts.join("timings.json"), "{}").expect("raw timings");
+        let mut declared = declaration();
+        declared.metrics.extend(Metric::diagnostic(
+            "phase.admit",
+            "server: the admission transaction, every call",
+        ));
+        declared.metrics.extend(Metric::diagnostic(
+            "phase.relay",
+            "server: stream relay; streams only",
+        ));
+        let diagnosed = |nanos: &[u64]| {
+            let mut repetition = good();
+            repetition.diagnose(
+                "phase.admit",
+                wyrd_benchmark::Distribution::of_durations(nanos),
+                true,
+            );
+            repetition.inapplicable("phase.relay", "a buffered call relays no stream");
+            repetition
+        };
+        let unread = good();
+        let mut workload = Scripted::always(&good());
+        workload.script = [
+            diagnosed(&[1]),
+            diagnosed(&[9_000_000; 4]),
+            diagnosed(&[20_000; 3]),
+            diagnosed(&[30_000, 50_000]),
+            diagnosed(&[1]),
+            diagnosed(&[40_000; 2]),
+            unread,
+            diagnosed(&[60_000]),
+        ]
+        .map(Ok)
+        .into_iter()
+        .collect();
+        let record = execute(
+            declared,
+            &mut workload,
+            [Some(quiet()), Some(quiet())],
+            &options(&artifacts),
+        )
+        .await;
+        let console = record.render();
+        let path = record.publish(root.path()).expect("publish");
+        std::fs::remove_dir_all(&artifacts).expect("raw artifacts removed");
+        let read = Record::read(&path).expect("read");
+        assert_eq!(
+            console,
+            read.render(),
+            "diagnostics regenerate from history alone"
+        );
+        let lines: Vec<&str> = console.lines().collect();
+        let admit: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|line| line.starts_with("      - repetition"))
+            .collect();
+        assert_eq!(
+            admit.len(),
+            12,
+            "both observations of both steps, every repetition: {admit:?}"
+        );
+        assert!(
+            admit[0].starts_with("      - repetition 1: n 4, p50 ("),
+            "{admit:?}"
+        );
+        assert!(admit[0].contains("mean ("), "{admit:?}");
+        assert!(admit[1].starts_with("      - repetition 2: n 3, p50 ("));
+        assert!(admit[2].starts_with("      - repetition 3: n 2, p50 ("));
+        assert!(admit[3].contains("— inapplicable: a buffered call relays no stream"));
+        assert!(
+            admit[7].contains("`diagnostic.phase.admit.count` was not read"),
+            "{admit:?}"
+        );
+        assert!(
+            console.contains("  - diagnostics (wall time; nearest-rank bucket bounds; rows overlap and never add or subtract):"),
+            "{console}"
+        );
+        assert!(
+            !console.contains("  - diagnostic.phase.admit.p50_us: median"),
+            "diagnostics are shown per repetition, not only as a median"
+        );
+
+        let mut workload = Scripted::always(&good());
+        let historical = execute(
+            declaration(),
+            &mut workload,
+            [Some(quiet()), Some(quiet())],
+            &options(&root.path().join("target/historical")),
+        )
+        .await;
+        assert_eq!(
+            historical
+                .render()
+                .matches("  - diagnostics: — unavailable: this record declares and read none")
+                .count(),
+            2
+        );
+
+        let mut declared = declaration();
+        for (observation, boundary) in [
+            (
+                "phase.admit",
+                "server: the admission transaction, every call",
+            ),
+            (
+                "driver.client.http",
+                "driver: one logical request, every call",
+            ),
+            (
+                "driver.client.http.attempt",
+                "driver: one attempt, retries included",
+            ),
+        ] {
+            declared
+                .metrics
+                .extend(Metric::diagnostic(observation, boundary));
+        }
+        let observed = |server: &[u64], logical: &[u64], attempts: &[u64]| {
+            let mut repetition = good();
+            for (observation, nanos) in [
+                ("phase.admit", server),
+                ("driver.client.http", logical),
+                ("driver.client.http.attempt", attempts),
+            ] {
+                repetition.diagnose(
+                    observation,
+                    wyrd_benchmark::Distribution::of_durations(nanos),
+                    true,
+                );
+            }
+            repetition
+        };
+        let mut workload = Scripted::always(&good());
+        workload.script = [
+            observed(&[1], &[1], &[1]),
+            observed(&[10_000; 2], &[100_000; 3], &[40_000; 4]),
+            observed(&[20_000; 2], &[200_000; 5], &[90_000; 5]),
+            observed(&[30_000; 2], &[300_000; 7], &[70_000; 9]),
+            observed(&[1], &[1], &[1]),
+            observed(&[10_000], &[100_000], &[100_000]),
+            observed(&[10_000], &[100_000], &[100_000]),
+            observed(&[10_000], &[100_000], &[100_000]),
+        ]
+        .map(Ok)
+        .into_iter()
+        .collect();
+        let artifacts = root.path().join("target/roles");
+        let mut record = execute(
+            declared,
+            &mut workload,
+            [Some(quiet()), Some(quiet())],
+            &options(&artifacts),
+        )
+        .await;
+        record.artifacts.profile = ProfileNote {
+            requested: true,
+            complete: false,
+            captures: vec![
+                "profiles/op-1/cpu-server-7.json.gz".to_owned(),
+                "profiles/op-1/cpu-driver-8.json.gz".to_owned(),
+                "profiles/heap-driver-op-1.pb.gz".to_owned(),
+                "profiles/verify-typescript-c1/cpu-python-9.json.gz".to_owned(),
+            ],
+            notes: vec!["the server heap profile was not served".to_owned()],
+            mode: Some(ProfileMode::Both),
+            roles: vec![Role::Server, Role::Driver, Role::Python],
+        };
+        let console = record.render();
+        let path = record.publish(root.path()).expect("publish");
+        std::fs::remove_dir_all(&artifacts).ok();
+        assert_eq!(
+            console,
+            Record::read(&path).expect("read").render(),
+            "roles and profile scope regenerate from history alone"
+        );
+        let block = |row: &str| -> Vec<String> {
+            let lines: Vec<&str> = console.lines().collect();
+            let start = lines
+                .iter()
+                .position(|line| line.starts_with(row))
+                .unwrap_or_else(|| panic!("{row} is reported: {console}"));
+            lines[start + 1..start + 4]
+                .iter()
+                .map(|line| line.trim().to_owned())
+                .collect()
+        };
+        let counts = |row: &str| -> Vec<String> {
+            block(row)
+                .iter()
+                .map(|line| line.split(',').next().unwrap_or_default().to_owned())
+                .collect()
+        };
+        assert_eq!(
+            counts("    - driver client.http: driver: one logical request"),
+            [
+                "- repetition 1: n 3",
+                "- repetition 2: n 5",
+                "- repetition 3: n 7"
+            ],
+            "every repetition's logical calls"
+        );
+        assert_eq!(
+            counts("    - driver client.http.attempt: driver: one attempt"),
+            [
+                "- repetition 1: n 4",
+                "- repetition 2: n 5",
+                "- repetition 3: n 9"
+            ],
+            "attempts are counted apart from logical calls"
+        );
+        assert_eq!(
+            counts("    - server phase.admit: server: the admission transaction"),
+            [
+                "- repetition 1: n 2",
+                "- repetition 2: n 2",
+                "- repetition 3: n 2"
+            ],
+            "the server's population is its own"
+        );
+        assert!(!console.contains("driver: — unavailable"), "{console}");
+        for line in [
+            "profile both of server and driver and python: incomplete (4 captures: server 1, driver 2, python 1); the server heap profile was not served",
+            "- python capture: profiles/verify-typescript-c1/cpu-python-9.json.gz",
+            "- driver capture: profiles/op-1/cpu-driver-8.json.gz",
+            "- server capture: profiles/op-1/cpu-server-7.json.gz",
+            "neither is aligned to a repetition window",
+        ] {
+            assert!(console.contains(line), "{line}: {console}");
+        }
+
+        let mut old = historical;
+        old.artifacts.profile = serde_json::from_value(json!({
+            "requested": true,
+            "complete": true,
+            "captures": ["profiles/profile-7.json.gz"],
+            "notes": [],
+        }))
+        .expect("an old profile note");
+        let report = old.render();
+        assert!(
+            report.contains("profile of server (recorded before profile modes and roles): complete (1 captures: server 1, driver 0)"),
+            "{report}"
+        );
+        assert_eq!(
+            report
+                .matches("    - driver: — unavailable: this record holds no driver observation for this step")
+                .count(),
+            0,
+            "a record with no diagnostics says so once, not per role"
+        );
+    }
+
     /// V8: a persisted multi-criterion record renders the exact common
     /// header, values with units, spread, reasons, and every verdict, and
     /// re-reading it after its raw artifacts are deleted renders the same
@@ -4991,6 +5790,24 @@ mod tests {
         );
     }
 
+    /// A repetition kept before the opening-memory reading existed still
+    /// reads, with no opening reading.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the older repetition is refused or invents a reading.
+    #[test]
+    fn repetitions_without_opening_memory_still_read() {
+        let mut older = serde_json::to_value(good()).expect("serializes");
+        older
+            .as_object_mut()
+            .expect("an object")
+            .remove("opening_memory_bytes");
+        let read: Repetition = serde_json::from_value(older).expect("an older repetition reads");
+        assert_eq!(read.opening_memory_bytes, None);
+        assert_eq!(read.peak_memory_bytes, good().peak_memory_bytes);
+    }
+
     /// V9: absent, failing, incomplete, and successful profilers leave the
     /// measured verdict and evidence identical, each records a diagnostic
     /// note or capture, and a profile never stands in for missing CPU.
@@ -5001,27 +5818,22 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn profiling_is_optional_diagnostic_evidence() {
         let root = tempfile::tempdir().expect("root");
-        let saving = root.path().join("saving-profiler");
-        std::fs::write(
-            &saving,
-            "#!/bin/sh\nout=''\nwhile [ $# -gt 0 ]; do [ \"$1\" = --output ] && out=\"$2\"; shift; done\n\
-             trap 'echo profile > \"$out\"; exit 0' INT\nwhile :; do sleep 0.02; done\n",
-        )
-        .expect("script");
+        let saving = saving_profiler(root.path());
         let silent = root.path().join("silent-profiler");
         std::fs::write(
             &silent,
             "#!/bin/sh\ntrap 'exit 0' INT\nwhile :; do sleep 0.02; done\n",
         )
         .expect("script");
-        for script in [&saving, &silent] {
-            let mut permissions = std::fs::metadata(script).expect("metadata").permissions();
-            std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-            std::fs::set_permissions(script, permissions).expect("chmod");
-        }
+        let mut permissions = std::fs::metadata(&silent).expect("metadata").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&silent, permissions).expect("chmod");
         let profiled = |program: Option<PathBuf>| Options {
             artifacts: root.path().join("target"),
-            profiler: program,
+            profile: program.map(|program| Profiling {
+                mode: ProfileMode::Cpu,
+                program,
+            }),
             interrupt: CancellationToken::new(),
         };
         let run_with = |options: Options, repetition: Repetition| async move {
@@ -5053,14 +5865,20 @@ mod tests {
             assert!(profile.requested);
             assert_eq!(profile.complete, complete, "{profile:?}");
             if complete {
-                assert_eq!(profile.captures.len(), 1);
-                assert!(record.render().contains("profile: complete (1 captures)"));
+                assert_eq!(profile.captures.len(), 2, "one per measured step");
+                assert!(record.render().contains(
+                    "profile cpu of server and driver: complete (2 captures: server 2, driver 0)"
+                ));
             } else {
                 assert!(
                     profile.notes.iter().any(|n| n.contains(note)),
                     "{note}: {profile:?}"
                 );
-                assert!(record.render().contains("profile: incomplete"));
+                assert!(
+                    record
+                        .render()
+                        .contains("profile cpu of server and driver: incomplete")
+                );
             }
         }
         let mut lost = good();
@@ -5096,8 +5914,9 @@ mod tests {
         let artifacts = root.path().join("target");
         let capture = artifacts
             .join("profiles")
-            .join(format!("profile-{}.json.gz", std::process::id()));
-        let run_with = |profiler: Option<PathBuf>, stall: Duration| {
+            .join("op-64")
+            .join(format!("cpu-server-{}.json.gz", std::process::id()));
+        let run_with = |program: Option<PathBuf>, stall: Duration| {
             let (artifacts, capture) = (artifacts.clone(), capture.clone());
             async move {
                 let mut workload = Scripted::always(&good());
@@ -5106,7 +5925,10 @@ mod tests {
                 workload.watch = Some(capture);
                 let options = Options {
                     artifacts,
-                    profiler,
+                    profile: program.map(|program| Profiling {
+                        mode: ProfileMode::Both,
+                        program,
+                    }),
                     interrupt: CancellationToken::new(),
                 };
                 let record = execute(
@@ -5140,5 +5962,158 @@ mod tests {
             );
             assert_eq!(overrun.verdict, Verdict::Invalid);
         }
+    }
+
+    /// Writes an executable stand-in profiler under `root` that saves a
+    /// capture to its `--output` when interrupted; returns its path.
+    ///
+    /// # Panics
+    /// Panics when the script cannot be written or made executable under
+    /// `root`.
+    fn saving_profiler(root: &Path) -> PathBuf {
+        let script = root.join("saving-profiler");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nout=''\nwhile [ $# -gt 0 ]; do [ \"$1\" = --output ] && out=\"$2\"; shift; done\n\
+             trap 'echo profile > \"$out\"; exit 0' INT\nwhile :; do sleep 0.02; done\n",
+        )
+        .expect("script");
+        let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&script, permissions).expect("chmod");
+        script
+    }
+
+    /// Runs the two-step declaration profiled in `mode`, or unprofiled,
+    /// writing artifacts under `artifacts`.
+    async fn profiled_run(artifacts: &Path, program: &Path, mode: Option<ProfileMode>) -> Record {
+        let mut workload = Scripted::always(&good());
+        workload.settle = Some(Duration::from_millis(500));
+        let options = Options {
+            artifacts: artifacts.to_path_buf(),
+            profile: mode.map(|mode| Profiling {
+                mode,
+                program: program.to_path_buf(),
+            }),
+            interrupt: CancellationToken::new(),
+        };
+        execute(
+            declaration(),
+            &mut workload,
+            [Some(quiet()), Some(quiet())],
+            &options,
+        )
+        .await
+    }
+
+    /// The files a run left under its `profiles/` directory, relative to it.
+    fn profile_files(artifacts: &Path) -> Vec<String> {
+        let profiles = artifacts.join("profiles");
+        let mut files = Vec::new();
+        let mut pending = vec![profiles.clone()];
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if let Ok(relative) = path.strip_prefix(&profiles) {
+                    files.push(relative.display().to_string());
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    /// Each mode starts only its collectors: no `--profile` starts neither,
+    /// `cpu` runs a CPU capture per measured step and no heap sampler,
+    /// `heap` starts no CPU profiler process and captures the driver's heap
+    /// after each step, and `both` does both; none changes the verdict.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a mode starts a collector it did not ask for or misses
+    /// one it did.
+    #[tokio::test(start_paused = true)]
+    async fn profile_modes_start_only_the_requested_collectors() {
+        let root = tempfile::tempdir().expect("root");
+        let program = saving_profiler(root.path());
+        let pid = std::process::id();
+        let cpu = [
+            format!("op-1/cpu-server-{pid}.json.gz"),
+            format!("op-1/samply-server-{pid}.log"),
+            format!("op-64/cpu-server-{pid}.json.gz"),
+            format!("op-64/samply-server-{pid}.log"),
+        ];
+        let heap = ["heap-driver-op-1.pb.gz", "heap-driver-op-64.pb.gz"].map(str::to_owned);
+        let unprofiled = profiled_run(&root.path().join("none"), &program, None).await;
+        assert!(!unprofiled.artifacts.profile.requested);
+        assert!(profile_files(&root.path().join("none")).is_empty());
+        for (mode, expected) in [
+            (ProfileMode::Cpu, cpu.to_vec()),
+            (ProfileMode::Heap, heap.to_vec()),
+            (ProfileMode::Both, [cpu.to_vec(), heap.to_vec()].concat()),
+        ] {
+            let artifacts = root.path().join(mode.name());
+            let record = profiled_run(&artifacts, &program, Some(mode)).await;
+            let files = profile_files(&artifacts);
+            let mut expected = expected.clone();
+            expected.sort();
+            assert_eq!(files, expected, "{mode:?}");
+            let note = &record.artifacts.profile;
+            assert!(note.complete, "{mode:?}: {note:?}");
+            assert_eq!(note.mode, Some(mode));
+            assert_eq!(record.verdict, unprofiled.verdict, "{mode:?}");
+        }
+    }
+
+    /// A profiled record keeps its mode, both process roles, each capture
+    /// under its measured step, and the declaration's executable identity;
+    /// a record that predates modes and roles reads back as the server-only
+    /// profile it was.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a manifest field is lost or an old record misreads.
+    #[tokio::test(start_paused = true)]
+    async fn profile_manifests_preserve_executable_and_window_identity() {
+        let root = tempfile::tempdir().expect("root");
+        let program = saving_profiler(root.path());
+        let record = profiled_run(root.path(), &program, Some(ProfileMode::Both)).await;
+        let read: Record =
+            serde_json::from_str(&serde_json::to_string(&record).expect("json")).expect("record");
+        let note = &read.artifacts.profile;
+        assert_eq!(note.mode, Some(ProfileMode::Both));
+        assert_eq!(note.roles, [Role::Server, Role::Driver]);
+        for step in ["op-1", "op-64"] {
+            assert!(
+                note.captures
+                    .iter()
+                    .any(|capture| capture.contains(&format!("/{step}/cpu-server-"))),
+                "{step}: {note:?}"
+            );
+            assert!(
+                note.captures
+                    .iter()
+                    .any(|capture| capture.ends_with(&format!("heap-driver-{step}.pb.gz"))),
+                "{step}: {note:?}"
+            );
+        }
+        assert_eq!(
+            read.build,
+            declaration().build,
+            "executable identity is kept"
+        );
+        let old: ProfileNote = serde_json::from_value(json!({
+            "requested": true,
+            "complete": true,
+            "captures": ["profiles/profile-1.json.gz"],
+            "notes": [],
+        }))
+        .expect("an old note");
+        assert_eq!((old.mode, old.roles.len()), (None, 0));
     }
 }

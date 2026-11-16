@@ -1,0 +1,27 @@
+# Two output-only Agents, each with its own private scratch: the scribe
+# writes and reads back, then the peeker sees none of the scribe's files.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: scratch-writes
+  version: 1.0.0
+spec:
+  description: Agents write private scratch without a declared input mount.
+  inputs:
+    question: {type: json, schema: {type: string}}
+  steps:
+    - id: write
+      action:
+        kind: agent
+        agent: ./scribe.yaml
+        inputs: {question: inputs.question}
+    - id: peek
+      depends_on: [write]
+      action:
+        kind: agent
+        agent: ./peeker.yaml
+        inputs: {question: inputs.question}
+  requirements:
+    - id: written
+      statement: The scribe finished
+      check: {kind: assert, path: steps.write.output.done, operator: equals, expected: true}

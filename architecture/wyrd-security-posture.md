@@ -35,6 +35,7 @@ controls required to operate those boundaries.
 | `wyrd-server` replica to replica | Mutual TLS from one dedicated cluster CA with the fixed `wyrd-peer` identity; the receiver checks every operation's context against its own state |
 | Application to Postgres | Tenant traffic runs under RLS through `TenantConn` or the named single-statement owners; the operator pool is excluded from handlers by construction. Operators supply the logins; boot refuses superuser and `BYPASSRLS` logins. Production uses a separate tenant login that does not own Wyrd's objects, so RLS confines it even if compromised. One ordinary login (local and small self-hosted) keeps RLS per pool, but a process compromise could set the operator flag and reach every tenant |
 | Application to object storage | Workload identity or short-lived credentials; tenant-qualified prefixes; encryption in transit and at rest |
+| GitHub to `wyrd-server` | Webhooks are accepted only with a valid `X-Hub-Signature-256` HMAC over the raw body under the deployment's webhook secret, and name a tenant only through the one SECURITY DEFINER installation-to-tenant lookup; setup and callback parameters are hints that never confer tenant rights until GitHub confirms the installation and the authorizing user's access |
 
 ## Principal and credential lifecycle
 
@@ -94,7 +95,7 @@ account atomically with its roles, optional `workload_restriction`, and first
 credential, returned once; failure creates nothing. A restriction is
 `{"mode":"unrestricted"}` (the default) or
 `{"mode":"family","kind":"Service","name":...}`. A family restriction
-limits Card-attributed emission and verification to that family's roots and
+limits Card-attributed emission to that family's roots and
 makes the account the family's unique scheduled runtime account; a second live
 account for the family conflicts with `WYRD_AUTH_409_WORKLOAD_BINDING_CONFLICT`.
 Creating or replacing a family restriction
@@ -154,7 +155,34 @@ without SYSTEM, accepts no run and nothing falls back to another identity or
 SYSTEM. The accepted authority is stored server-side with no credential,
 survives claim, retry, and restart, and is not refreshed by later grant
 changes; every protected downstream action still checks its own permission
-against it.
+against it. A tool call that an Agent's `code.run` Python makes through
+`call_tool` is such an action: it uses the same accepted authority and the
+same exact `tool:invoke` and capability checks and non-blocking audit as the
+model's direct call, and nothing in the program can select or widen the
+identity, tenant, delegation, or credentials it runs under. The bridge
+refuses `code.run`, `fs.write`, and `publish`, so a program cannot recurse
+or publish, and writes only its private `/work` through the interpreter's
+parent-mediated mount.
+
+Publishing deferred evidence adds no permission and no authority to the
+execution that consumes it. The publisher needs current `verifier:run` on
+each subscribing Verifier and its subject; a subscriber it may not run is
+skipped, and none refuses the publish before anything is retained. The
+repository must be one the tenant's connected installation reaches, resolved
+by the server from `owner/name`; the commit, branch, and any other Git
+metadata grant nothing. A parked execution resumes under its own accepted
+authority, never the publisher's, and losing repository access cancels it
+`repository_access_lost`.
+
+Deciding a pending approval needs only `verifier:approve` on the execution's
+exact Verifier, granted by that Verifier's UID or by every Verifier in the
+tenant; the caller's Card scope attributes and never authorizes it.
+`verifier:run` and `verifier:read` never cover it. The built-in `editor` and
+`admin` Roles hold it for every Verifier; `workload` and `viewer` do not. Each
+check is audited under `verification.approval.decide` with the execution as
+the resource. The decision adds no authority to the
+execution: it resumes under its own accepted authority, and the decider's
+identity is recorded only as the decision's actor.
 
 A tenant administrator is created once, during tenant provisioning, and is the
 tenant's headless root of trust: it holds credentials and roles, federates no
@@ -250,11 +278,37 @@ credential.
   the registered `bifrost.drift.observations` table UID; a missing SYSTEM
   principal or unreadable table identity fails closed before any row is
   returned.
+- Dedicated execution status/progress/publication reads authorize and audit current
+  `verifier:read` on the recorded exact Verifier, plus repository read where applicable.
+  Execution reads use accepted/recovered Bifrost state through fixed
+  tenant/execution-scoped statements under the same narrow SYSTEM read authority for
+  registered `bifrost.verification.execution_inputs`, `results`, `execution_outputs` and
+  `execution_events`. Retained identity and full metadata do not require a leftover
+  execution row or fetching a deleted Card. Historical accepted authority is provenance,
+  not a grant to the requesting caller. Ordinary public Bifrost SQL retains caller table
+  permissions; no caller SQL runs under internal authority.
+  Accepted publication mounts/download/local-content select the exact private
+  verified File association retained in run state from acceptance onward and
+  validate its tenant, producer, path, digest and length through existing storage
+  owners. Do not rediscover by global digest or accept a caller storage path.
+  Local publication bytes remain under verifier authorization, never the
+  cards:read blob route. Preserve external File completion/inventory acknowledgement,
+  original evidence retention and independent delivery/replay authority. There
+  is no active-Postgres descriptor custody or later reference transfer. Required
+  unavailable state is not absence and cannot authorize duplicate execution.
+  Checkpoint acceptance preserves current execution authority and rejects stale
+  writers, including during WAL recovery; historical authority remains provenance.
 - Revoking a credential, suspending or deleting a principal, suspending a
   tenant, or changing grants refuses the next issuance immediately. A tenant
   token already issued keeps its snapshot authority until its five-minute
   expiry; there is no revocation list or authorization epoch. The platform
-  plane instead revalidates current state on every request.
+  plane instead revalidates current state on every request. Revoking a
+  principal also cancels, in the same commit, every unfinished Verifier
+  execution it submitted or accepted, so queued work never outlives the
+  authority it was accepted under. A running claim observes that cancellation
+  through its lease-renewal listener, stops further engine work and settles
+  nothing after losing its claim; previously issued IO can still finish.
+  Revocation itself never waits for Bifrost.
 - Bearer access tokens remain replayable until expiry. TLS, short lifetime,
   token-family replay detection, least privilege, and audit are the required
   replay controls. Logs and traces never record bearer material.
@@ -464,6 +518,26 @@ credential.
   not exposed. Per-connection callback URLs would close the gap and are the
   upgrade path if it ever needs closing.
 
+### GitHub App association
+
+A tenant's GitHub connection is an association, not a principal or a
+credential. The deployment owns one GitHub.com App, using GitHub.com’s documented
+installation and OAuth flow, configured from environment
+or files with its private key, OAuth client secret and webhook secret held as
+`SecretString`; none is ever accepted from TOML, a tenant, a Card or a
+request. `wyrd.github_installations` holds at most one installation per
+tenant and one tenant per installation and host, under forced RLS; it stores
+no key or token. A tenant principal holding `identity_connections:write`
+begins a one-use transaction in `auth_login_state` (`flow = 'github'`), bound
+to that principal and, at setup, to an HttpOnly browser binding cookie. Only
+the matching principal and browser can consume it, once, before it expires,
+and only against the slot revision it captured, so a stale callback cannot
+restore a released or replaced connection. The callback redeems the OAuth
+code with PKCE for a transient user token that is used for the
+installation-access check and dropped. Disconnect fences the tenant's GitHub
+work before it releases the installation. Every operation authorizes and
+audits through the ordinary permission path.
+
 ## Wyrd signing keys and JWKS
 
 Wyrd-issued JWTs use asymmetric signing with an explicit algorithm allowlist.
@@ -554,6 +628,11 @@ change; there are no custom runtime permission strings and no
   dropped-and-recreated table; catalog and schema ride with the UID so the
   synchronous check needs no catalog lookup. Catalog and schema are the logical
   SQL names (catalog `bifrost`, schema `logs`), validated as identifier segments.
+
+- `Verifier(CardUid)` is valid only on `verifier` `run`, `read`, and
+  `approve`, and covers exactly that Verifier Card UID. `All` on the same
+  operation covers every Verifier; no Verifier scope covers `All`, and each
+  action is granted separately.
 
 A future domain that needs object scope adds its own typed variant rather than
 reusing another domain's identity spelling.
@@ -684,6 +763,15 @@ Multi-tenant Operator credentials never use process environment selectors.
 Secret values are redacted in diagnostics and are not persisted in Card specs
 or observations. Rotation changes the connection secret without changing the
 Card contract.
+
+GitHub repository access uses installation tokens the server mints on demand
+with an RS256 App JWT, narrowed to the one repository and the App's Contents
+read, Pull requests write and Checks write permissions. A token is minted
+only while the tenant's association is active, the repository is selected
+and GitHub still grants it; it is never persisted, returned, or derived from
+a user's personal token. Production uses `https://github.com` and
+`https://api.github.com` through the screened HTTP client. Development and tests
+may configure local protocol mocks.
 
 Before fetching any user- or tenant-supplied URL, the server must:
 

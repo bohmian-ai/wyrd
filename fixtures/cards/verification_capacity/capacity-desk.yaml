@@ -1,0 +1,14 @@
+# A desk whose agent answers are checked by sandboxed Python, so every
+# verification needs a worker session from shared process memory.
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: capacity-desk
+  version: 1.0.0
+spec:
+  service_type: agent
+  components:
+    - alias: agent
+      ref: ./capacity-agent.yaml
+      verified_by:
+        - verifier: ./adds-one.yaml

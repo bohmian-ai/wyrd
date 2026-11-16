@@ -20,8 +20,10 @@
 //! builds link none and keep their own.
 //!
 //! The serve loop mirrors `monty-runtime`'s `subprocess` shell over
-//! [`monty_proto::worker::Child`]. Each worker serves one checkout and exits,
-//! so no interpreter state crosses invocations.
+//! [`monty_proto::worker::Child`]. A worker serves one session at a time; a
+//! `Reset` between sessions drops the session's interpreter, globals, and
+//! budget, and [`apply_memory_limit`] re-arms the next session's ceiling, so
+//! no interpreter state crosses invocations.
 
 use std::fmt;
 use std::io::{self, Write};
@@ -47,7 +49,7 @@ static HARD_LIMIT: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 /// Native stack of the interpreter thread; Monty's recursion limit needs
 /// more than the platform default on some hosts.
-const WORKER_STACK_SIZE: usize = 16 * 1024 * 1024;
+pub(crate) const WORKER_STACK_SIZE: usize = 16 * 1024 * 1024;
 
 /// `sysexits.h` protocol error: the frame stream desynchronized.
 const EX_PROTOCOL: u8 = 76;

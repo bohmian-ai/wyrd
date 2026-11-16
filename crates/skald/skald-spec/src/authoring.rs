@@ -15,7 +15,7 @@ use serde_json::{Map, Value};
 use crate::error::{SkaldError, SkaldResult};
 use crate::media::{MediaKind, MediaRef, MediaSource};
 use crate::prompt::{
-    NamedFormat, Prompt, check_model, check_output_schema, media_placeholder_regex,
+    Compiled, NamedFormat, Prompt, check_model, check_output_schema, media_placeholder_regex,
 };
 use crate::request::{ProviderName, ProviderRequest};
 use crate::wire::anthropic_messages::{
@@ -410,11 +410,12 @@ impl AuthoredPrompt {
     /// Returns every [`compile`](Self::compile) refusal.
     pub(crate) fn compile_resolved(
         &self,
-        resolved: Option<Map<String, Value>>,
+        mut resolved: Option<Map<String, Value>>,
     ) -> SkaldResult<Prompt> {
         check_model(&self.model)?;
+        let named_resolved = resolved.is_some();
         let (named, schema) = match &self.response_format {
-            Some(ResponseFormat::Named(named)) => (Some(named), resolved.clone()),
+            Some(ResponseFormat::Named(named)) => (Some(named), resolved.take()),
             Some(ResponseFormat::Schema(schema)) => (None, Some(schema.clone())),
             None => (None, None),
         };
@@ -442,9 +443,14 @@ impl AuthoredPrompt {
         prompt.media_kinds = media_kinds;
         prompt.named_format = named.map(|named| NamedFormat {
             name: named.name().to_owned(),
-            schema: resolved,
+            resolved: named_resolved,
         });
-        prompt.authored = Some(Box::new(self.clone()));
+        prompt.authored = Some(std::sync::Arc::new(Compiled {
+            authored: self.clone(),
+            request: prompt.request.clone(),
+            model: prompt.model.clone(),
+            provider: prompt.provider.clone(),
+        }));
         Ok(prompt)
     }
 
@@ -793,7 +799,7 @@ fn named_output(
                 json_schema: OpenAiJsonSchema {
                     name: RESPONSE_SCHEMA_NAME.to_owned(),
                     description: None,
-                    schema: Some(schema),
+                    schema: Some(schema.into()),
                     strict: Some(false),
                 },
             });
@@ -813,7 +819,7 @@ fn named_output(
                     .format = Some(OpenAiTextResponseFormat::JsonSchema {
                     name: RESPONSE_SCHEMA_NAME.to_owned(),
                     description: None,
-                    schema: Some(schema),
+                    schema: Some(schema.into()),
                     strict: Some(false),
                 });
             }
@@ -824,7 +830,7 @@ fn named_output(
             }
             request.output_config = schema.map(|schema| AnthropicOutputConfig {
                 format: AnthropicOutputFormat::JsonSchema {
-                    schema: Value::Object(schema),
+                    schema: Value::Object(schema).into(),
                 },
             });
         }
@@ -846,7 +852,7 @@ fn named_output(
             if let Some(schema) = schema {
                 let config = request.settings.generation_config.get_or_insert_default();
                 config.response_mime_type = Some("application/json".to_owned());
-                config.response_json_schema = Some(Value::Object(schema));
+                config.response_json_schema = Some(Value::Object(schema).into());
             }
         }
         _ => {
@@ -927,7 +933,11 @@ fn openai_chat(
     }
     messages.extend(turns.into_iter().map(|turn| {
         let content = if turn.plain {
-            OpenAiMessageContent::Text(turn.parts.concat())
+            // A plain turn lowers to one part, which moves rather than copies.
+            OpenAiMessageContent::Text(match <[String; 1]>::try_from(turn.parts) {
+                Ok([text]) => text,
+                Err(parts) => parts.concat(),
+            })
         } else {
             OpenAiMessageContent::Parts(
                 turn.parts
@@ -949,7 +959,7 @@ fn openai_chat(
             json_schema: OpenAiJsonSchema {
                 name: RESPONSE_SCHEMA_NAME.to_owned(),
                 description: None,
-                schema: Some(schema),
+                schema: Some(schema.into()),
                 strict: Some(strict),
             },
         }),
@@ -1052,7 +1062,7 @@ fn anthropic(
         tool_choice: None,
         output_config: schema.map(|schema| AnthropicOutputConfig {
             format: AnthropicOutputFormat::JsonSchema {
-                schema: Value::Object(schema),
+                schema: Value::Object(schema).into(),
             },
         }),
         settings: AnthropicMessagesSettings {
@@ -1125,7 +1135,7 @@ fn google(
             2.0,
         )?,
         response_mime_type: schema.as_ref().map(|_| "application/json".to_owned()),
-        response_json_schema: schema.map(Value::Object),
+        response_json_schema: schema.map(|schema| Value::Object(schema).into()),
         ..Default::default()
     };
     Ok(GoogleGenerateContentRequest {
@@ -1361,7 +1371,7 @@ mod tests {
             openai.response_type,
             ResponseType::JsonSchema {
                 name: "response".to_owned(),
-                schema: schema.clone()
+                schema: schema.clone().into()
             }
         );
         assert!(matches!(
@@ -2251,6 +2261,14 @@ mod tests {
             portable
         );
 
+        let mut rerouted = prompt.clone();
+        rerouted.provider = None;
+        assert_eq!(
+            serde_json::to_value(&rerouted).expect("rerouted prompt json")["format"],
+            "messages",
+            "a Prompt whose provider changed serializes natively"
+        );
+
         let mut edited = prompt;
         edited.model = "claude-next".to_owned();
         let authored = serde_json::to_value(&edited).expect("edited prompt json");
@@ -2279,6 +2297,36 @@ mod tests {
         });
         let prompt = compile(native.clone()).expect("role-less native compiles");
         assert_eq!(serde_json::to_value(&prompt).expect("prompt json"), native);
+    }
+
+    /// A compiled Prompt lends its retained authored form while the request
+    /// is unchanged, and stops lending it once an edit changes the request.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the form is not borrowed, or a stale form survives an edit.
+    #[test]
+    fn authored_form_is_lent_only_while_the_request_is_unchanged() {
+        let authored: AuthoredPrompt = serde_json::from_value(json!({"provider": "openai", "model": "m", "messages": [{"role": "user", "content": "{{claim}}"}], "response_format": {"type": "object", "properties": {"slot": {"type": "string"}}}}))
+            .expect("authored decodes");
+        let mut prompt = authored.compile().expect("compiles");
+        assert!(matches!(
+            prompt.authored().expect("authored form"),
+            std::borrow::Cow::Borrowed(form) if *form == authored
+        ));
+
+        prompt
+            .edit_response_schema_mut(
+                &crate::prompt::PreparedSchemas::default(),
+                "order",
+                |schema| {
+                    schema["properties"]["slot"]["enum"] = json!(["order"]);
+                },
+            )
+            .expect("narrowed schema is valid");
+        let edited = prompt.authored().expect("native form");
+        assert!(matches!(edited, std::borrow::Cow::Owned(_)));
+        assert_ne!(*edited, authored);
     }
 
     /// Proves a host-named `response_format`: scalar and expanded forms

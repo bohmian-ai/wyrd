@@ -1,0 +1,19 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: signoff
+  version: 1.0.0
+spec:
+  description: CI is green and a person signed off on the pull request.
+  inputs:
+    ci: {type: json, deferred: true}
+  steps:
+    - id: signoff
+      action: {kind: approval, message: Ship this change?}
+  requirements:
+    - id: green
+      statement: CI is green
+      check: {kind: assert, path: inputs.ci.status, operator: equals, expected: green}
+    - id: approved
+      statement: A person approved the change
+      check: {kind: assert, path: steps.signoff.output.status, operator: equals, expected: approved}

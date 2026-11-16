@@ -4682,6 +4682,9 @@ otel = [
     { name = "opentelemetry-exporter-otlp-proto-http" },
     { name = "opentelemetry-sdk" },
 ]
+pydantic = [
+    { name = "pydantic" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -4732,8 +4735,9 @@ requires-dist = [
     { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'otel'", specifier = ">=1.27" },
     { name = "opentelemetry-sdk", marker = "extra == 'otel'", specifier = ">=1.27" },
     { name = "pyarrow", specifier = ">=18.0.0" },
+    { name = "pydantic", marker = "extra == 'pydantic'", specifier = ">=2.0.0,<3.0.0" },
 ]
-provides-extras = ["otel", "gateway", "agents"]
+provides-extras = ["otel", "gateway", "agents", "pydantic"]
 
 [package.metadata.requires-dev]
 dev = [

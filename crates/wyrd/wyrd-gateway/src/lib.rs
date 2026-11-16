@@ -17,6 +17,7 @@ mod engine;
 mod health;
 mod managed;
 mod pricing;
+mod request;
 mod routing;
 mod snapshot;
 mod vault;
@@ -29,13 +30,14 @@ pub use adapter::{
 pub use credential::{CredentialError, CredentialResolver, ProviderSecret};
 pub use engine::{
     AttemptRecord, AttemptResult, AttemptUsage, CallExecution, CallInput, EventStream,
-    ExecutionTiming, FailureClass, GatewayEngine, ProviderAttempt, ProviderDispatch,
+    ExecutionTiming, FailureClass, GatewayEngine, JsonAnswer, ProviderAttempt, ProviderDispatch,
     ProviderRefusal, ResponseBody, ResponseCapture, StreamAborted, StreamEnd, outcome_error_code,
     outcome_name,
 };
 pub use health::DeploymentHealth;
 pub use managed::ManagedSecretBinding;
 pub use pricing::{GatewayCost, PricedModel};
+pub use request::RequestJson;
 pub use routing::{CallPlan, PlannedCandidate};
 pub use skald_providers::{MediaAnswer, OpenAiMediaRoute, UploadContent, UploadFile};
 pub use snapshot::{

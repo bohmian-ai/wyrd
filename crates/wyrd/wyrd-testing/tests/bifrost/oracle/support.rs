@@ -969,3 +969,50 @@ pub(crate) async fn await_baseline(
     let after = cluster.ownership_snapshot(index)?;
     Err(format!("pod {index} did not return to {before:?}, holds {after:?}").into())
 }
+
+/// Runs one public query to its terminal and renders every cell as text.
+///
+/// Rendering through Arrow's display formatter lets one comparison cover
+/// strings, integers, and booleans without a per-column downcast.
+///
+/// # Errors
+///
+/// Returns the SDK error unchanged so a caller can read its catalog code, or a
+/// message when the stream ends without a terminal or a cell cannot render.
+pub(crate) async fn run_rows(
+    client: &WyrdClient,
+    sql: &str,
+) -> Result<(wyrd_spec::vala::api::QueryClass, Vec<Vec<String>>), JourneyError> {
+    let mut stream = wyrd_client::Bifrost::query_only(client)
+        .query(&BifrostQueryRequest {
+            sql: sql.to_owned(),
+            deadline_ms: Some(30_000),
+            params: Vec::new(),
+        })
+        .await?;
+    let mut rows = Vec::new();
+    while let Some(batch) = stream.next_batch().await? {
+        rows.extend(render_rows(&batch)?);
+    }
+    let terminal = stream
+        .terminal()
+        .ok_or("public query produced no terminal frame")?;
+    Ok((terminal.query_class, rows))
+}
+
+/// Renders every cell of one batch with Arrow's display formatter.
+///
+/// # Errors
+///
+/// Returns the formatter error for a column it cannot render.
+pub(crate) fn render_rows(batch: &RecordBatch) -> Result<Vec<Vec<String>>, JourneyError> {
+    (0..batch.num_rows())
+        .map(|row| {
+            batch
+                .columns()
+                .iter()
+                .map(|column| Ok(arrow::util::display::array_value_to_string(column, row)?))
+                .collect()
+        })
+        .collect()
+}

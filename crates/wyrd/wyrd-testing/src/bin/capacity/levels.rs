@@ -19,11 +19,12 @@ use tokio_util::sync::CancellationToken;
 use wyrd_testing::capacity::{
     binary_identity, release_binary, timer_resolution_ns, timing_declaration,
 };
+use wyrd_testing::experiment::Profiling;
 use wyrd_testing::experiment::{
     Declaration, Engine, HISTORY_DIRECTORY, HostRecord, Invocation, LOCAL_DIRECTORY, Level, Mode,
     Options, Record, SMOKE_DIRECTORY, Source, Validity, Verdict, Workload, run,
 };
-use wyrd_testing::profile::SAMPLY;
+use wyrd_testing::profile::{ProfileMode, SAMPLY};
 use wyrd_testing::release_server::{Host, HostLoad};
 
 use crate::flags;
@@ -59,8 +60,7 @@ impl Context<'_> {
     /// Returns a message naming the first unknown argument.
     pub fn known(&self, valued: &[&str], switches: &[&str]) -> Result<(), String> {
         let valued: Vec<&str> = VALUED.iter().chain(valued).copied().collect();
-        let switches: Vec<&str> = SWITCHES.iter().chain(switches).copied().collect();
-        flags::known(self.arguments, &valued, &switches)
+        known(self.arguments, &valued, switches)
     }
 
     /// Whether `--smoke` asks for the plan's reduced functional smoke, so
@@ -206,11 +206,67 @@ pub fn smoke(declaration: &mut Declaration) {
     declaration.timing = declaration.level.smoke_timing();
 }
 
+/// The profile mode `--profile` selects: `None` without it, [`ProfileMode::Both`]
+/// when bare, else the `cpu`, `heap`, or `both` that follows it.
+///
+/// # Errors
+///
+/// Returns a message when `--profile` is given twice or followed by
+/// anything but a mode or another flag.
+pub fn profile(arguments: &[String]) -> Result<Option<ProfileMode>, String> {
+    let mut found = None;
+    for (index, argument) in arguments.iter().enumerate() {
+        if argument != "--profile" {
+            continue;
+        }
+        if found.is_some() {
+            return Err("--profile is given twice".to_owned());
+        }
+        let mode = match arguments
+            .get(index + 1)
+            .filter(|next| !next.starts_with("--"))
+        {
+            None => ProfileMode::Both,
+            Some(value) => ProfileMode::parse(value)
+                .ok_or_else(|| format!("--profile takes cpu, heap, or both, got `{value}`"))?,
+        };
+        found = Some(mode);
+    }
+    Ok(found)
+}
+
+/// Refuses any argument that is neither a shared level flag, with
+/// `--profile`'s optional mode, nor one of `valued` and `switches`.
+///
+/// # Errors
+///
+/// Returns a message naming an invalid `--profile` or the first unknown
+/// argument.
+pub fn known(arguments: &[String], valued: &[&str], switches: &[&str]) -> Result<(), String> {
+    let mode = profile(arguments)?.and_then(|_| {
+        let index = arguments
+            .iter()
+            .position(|argument| argument == "--profile")?;
+        arguments
+            .get(index + 1)
+            .filter(|next| !next.starts_with("--"))
+            .map(|_| index + 1)
+    });
+    let rest: Vec<String> = arguments
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| Some(*index) != mode)
+        .map(|(_, argument)| argument.clone())
+        .collect();
+    let switches: Vec<&str> = SWITCHES.iter().chain(switches).copied().collect();
+    flags::known(&rest, valued, &switches)
+}
+
 /// Runs a plan: seals its declaration, samples the host, runs the workload
 /// under the shared lifecycle, publishes the record, prints the report, and
 /// returns the verdict's exit code. A record that cannot be published exits
 /// 2 and is kept under the run's artifacts directory instead.
-pub async fn execute(plan: Plan, root: &Path, profile: bool) -> u8 {
+pub async fn execute(plan: Plan, root: &Path, profile: Option<ProfileMode>) -> u8 {
     let Plan {
         declaration,
         mut workload,
@@ -234,7 +290,10 @@ pub async fn execute(plan: Plan, root: &Path, profile: bool) -> u8 {
     });
     let options = Options {
         artifacts: artifacts.clone(),
-        profiler: profile.then(|| PathBuf::from(SAMPLY)),
+        profile: profile.map(|mode| Profiling {
+            mode,
+            program: PathBuf::from(SAMPLY),
+        }),
         interrupt,
     };
     let record = run(

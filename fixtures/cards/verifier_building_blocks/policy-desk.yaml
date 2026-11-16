@@ -2,7 +2,9 @@
 # one Verifier that uses every action and Run check kind, one that extracts
 # each of the nine extractable formats, one whose Agent calls the
 # built-in Card, Bifrost, and code tools, one whose checks return custom
-# Verdict data, and one that judges a whole trace across workloads.
+# Verdict data, one that judges a whole trace across workloads, and one
+# that reduces twenty notes directly or through one Python program, and one
+# whose Python programs call tools inside array and repeated work.
 apiVersion: wyrd/v1
 kind: Service
 metadata:
@@ -15,3 +17,5 @@ spec:
     - verifier: ./tool-review.yaml
     - verifier: ./scored-review.yaml
     - verifier: ./whole-trace.yaml
+    - verifier: ./evidence-reduction.yaml
+    - verifier: ./nested-sweep.yaml

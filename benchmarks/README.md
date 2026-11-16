@@ -55,6 +55,18 @@ configuration declares server limits.
 
 ## Measurement
 
+- **One recorder.** A benchmark server installs `wyrd-benchmark` as its only
+  metrics recorder before it registers any metric: request timings,
+  counters, gauges and diagnostic histograms all land in the snapshots it
+  serves at `/benchmark/snapshot` on the loopback metrics port, and no
+  Prometheus recorder or exporter runs. A duration that has both a timing
+  and a production histogram is recorded only as the timing. The recorder,
+  every benchmark-only timing (such as an Agent check's
+  `wyrd_verification_agent_phase_duration_seconds{phase}`), and the heap
+  sampler exist only in a `wyrd-server` built with the `bench` feature, which
+  `bench:build` uses; a shipped build keeps only operational metrics, installs
+  Prometheus, and refuses `WYRD_METRICS_BENCHMARK_SNAPSHOT`. CPU and heap
+  profiles and the OS's CPU and memory readings remain separate sources.
 - **Latency is server-side.** Each judged request is timed inside the server
   from handler entry until its result is ready, its write is acknowledged, or
   its response is handed off, into bounded HDR histograms (3 significant
@@ -156,16 +168,112 @@ What each engine covers:
     `writes-parquet` record with the same host, build, fixture, and
     limits.
     Without such a record, L2 is INVALID before any work.
-- **Verification.**
-  - L1 `direct-verify` runs direct verify at 1 and 64 clients. Server
-    overhead p99 must be below 500 µs at 64. Each repetition also records
-    how many executions exceeded 0.5, 1, 5, and 10 ms of overhead, and the
-    p99 and maximum of each execution phase (`admit`, `load`, `prepare`,
-    `engine`, `stage`, and `outside`, the time outside every phase) from
-    the same server timing histograms, to locate a slow tail. Phase
-    readings are diagnostic: they never judge and never invalidate.
+- **Verification.** L1 `direct-verify` asks one question: how much time
+  does the server add to a direct `verify`, apart from the Verifier's own
+  work?
+  - **The workload.** Every call verifies the canonical Verifier: one
+    Assert check and two Agent checks. Each Agent check makes two model
+    exchanges with a local provider and one `code.run`.
+  - **The steps.** Each SDK runs three steps, nine in all:
+
+    | Step | Clients | Load |
+    |---|---|---|
+    | `direct-verify-c1` | 1 | closed loop: call, wait for the result, call again |
+    | `direct-verify-c64` | 64 | closed loop |
+    | `direct-verify-r3000` | 64 | paced: 3,000 verifications/s in all |
+
+    The Python and TypeScript steps carry the same names with `python-` or
+    `typescript-` after `direct-verify-`. Rust also has diagnostic
+    closed-loop steps `direct-verify-c4`, `-c16` and `-c32`, declared only
+    when `--steps` names them, to read throughput and CPU per verification
+    against `server_concurrency` as load rises.
+  - **The headline number: overhead.** Overhead is the server's elapsed
+    time for one execution, less the union of the Verifier's blocks (model
+    calls, tools, sandbox). It is what Wyrd itself adds. Its p99 must be
+    below 500 µs in `direct-verify-c64`. That is the only target.
+  - **How to read a row.** Overhead varies with the load the server
+    carries, and a closed loop fixes only the client count. Each step
+    records `server_concurrency`, the average number of executions in
+    progress (their summed time over the window). A client that spends
+    longer in its own SDK between calls keeps fewer executions on the
+    server, so compare closed-loop rows within one SDK only. To compare
+    SDKs, use the `-r3000` rows: they offer the same arrival rate from
+    every SDK. The report opens with a `By language` summary: one table
+    per workload, with the three SDKs side by side and a note on whether
+    that workload compares them.
+  - **The SDK drivers.** Every SDK calls its public `observe().verify`,
+    which runs the shared Rust `wyrd-client`.
+    - Rust clients are async tasks inside the benchmark controller, which
+      also hosts the local provider.
+    - Python clients are threads in one child Python process
+      (`sdks/wyrd-sdk-python/tests/benchmark_driver.py`).
+    - TypeScript clients are Promise loops in one child Node process
+      (`sdks/wyrd-sdk-ts/wyrd/tests/profile/verification-driver.mjs`).
+
+    The controller drives a child process over stdin with one line per
+    window (`{"run": {"clients", "seconds", "rate"}}`). The child times each
+    call with its own clock and answers with every call. Each child starts
+    and loads its applications before the first window.
+  - **Paced steps.** In a paced step, client `i`'s `k`-th call waits for
+    slot `i + k × clients`, due `slot / rate` seconds after the window
+    opened. The window opens only once the driver's setup is done, and
+    every slot due before it ends is sent, however late. Each call records
+    how late it started, measured immediately before `verify`. A slot never
+    sent is missed. A start-lateness p99 over 5 ms is late. Either makes the
+    repetition INVALID, so a client that cannot keep up never passes as a
+    lighter load. `arrivals_late` counts the calls that started more than
+    5 ms late, and `arrivals_late_first_ms` and `arrivals_late_last_ms` give
+    when the first and last of them were due. Late calls bunched at the
+    start point at the window's setup; spread across it, at a recurring
+    pause. `arrivals_wake_p99_us` is how late callers woke, before
+    preparing their calls. The Python driver also reports its
+    interpreter's garbage collections (`driver_gc_collections`,
+    `driver_gc_max_ms`), and `arrivals_late_in_gc` counts the late calls
+    whose wait overlapped one. Paced steps carry the correctness criteria, not the overhead
+    target.
+  - **Readings beside overhead.** None of these judge or invalidate.
+    - `client_p*_ms`: end-to-end latency from just before the public
+      `verify` until the decoded result returns. `client_ready_p*_ms` runs
+      until every outcome, citation and data value is materialized, and
+      `client_materialize_p*_ms` is the difference. Client latency has no
+      target, but a missing or inverted sample makes the repetition
+      INVALID.
+    - `phase_<phase>_p99_ms` and `_max_ms`: where the overhead goes. The
+      phases are `admit`, `load`, `prepare`, `engine` and `stage`.
+      `outside` is the time in no phase, split into `outside_before` (before
+      the first phase), `outside_between` (between phases) and
+      `outside_after` (after the last phase).
+    - `overhead_over_500us`, `_1ms`, `_5ms`, `_10ms`: how many executions
+      exceeded each bound.
+    - `diagnostic.server.{workspace,tool,sandbox,capacity,runnable,model}`:
+      where the engine's time goes, as per-execution unions of workspace
+      setup, tool calls, sandbox operations, waits for sandbox memory,
+      waits for a runnable Python turn, and model calls. They are nested
+      inside the engine and overlap across concurrent Agents, so never add
+      or subtract them. The capacity and runnable waits sit inside the
+      Verifier's blocks, so they are never counted as overhead.
+    - `diagnostic.<python|typescript|driver>.*`: the client's own
+      timings. These cover the shared client's `client.verify`,
+      `client.http` and `client.http.attempt`, and the binding's
+      `sdk.verify` (input conversion, shared core, output conversion, and
+      for TypeScript the dispatch until the native future first runs).
+      Python also splits that core as `sdk.verify.native`: `trace` (reading
+      the caller's span), `run` (the shared client with the GIL released)
+      and `attach` (waiting to hold the GIL again).
+      They need the `bench` native modules: run `mise run
+      bench:build:sdks`, then `py:setup` and `ts:build` again afterwards. A
+      driver without them reports no window and leaves attribution
+      unfinished.
+    - `client_cpu_seconds` and `client_peak_memory_bytes` belong to the
+      client process. For Rust, that process also holds the controller
+      and the provider.
+  - **Driver budget.** The driver may use at most 80% of its 8-core
+    budget. For a Python or TypeScript step that budget covers the
+    controller's CPU plus the child's, since both generate load.
   - L2 `competing` overlaps direct and background verification with their
-    evidence writes.
+    evidence writes. Submission, queue-wait and durable-ack means and the
+    component breakdown come from the same benchmark histograms. Means
+    retain bucket bounds rather than claiming exact precision.
 - **Gateway.**
   - L1 `overhead` runs buffered, streamed, and 64 KiB capture calls at
     1 and 64 clients. Added overhead p99 must be below 500 µs at 64.
@@ -186,9 +294,10 @@ Flags:
 
 | Flag | Applies to | Effect |
 |---|---|---|
-| `--profile` | every command | Adds optional samply captures under `target/benchmarks/` (see [Profiling](#profiling)). |
+| `--profile` | every command | Adds optional samply CPU captures and per-step server heap profiles under `target/benchmarks/` (see [Profiling](#profiling)). |
 | `--allow-dirty` | every command | Records a dirty source (see [Source](#source)). |
 | `--steps a,b` | engine commands | Runs a declared subset; the record lists every omitted step and never claims full coverage. |
+| `--pace <requests/s>` | `bench:l1:gateway` | Offers every window open loop at that rate, at most one open call per step client, with each missed or capped arrival counted as an error. It is a matched-load diagnostic: the record names the rate in its `workload` control, adds post-drain resident and governed memory by owner to each repetition's observations, and stays under `target/benchmarks/`. |
 
 `bench:l1` accepts only `--profile`, `--allow-dirty`, and `--smoke`, and
 passes them to every engine.
@@ -238,7 +347,7 @@ INVALID, appends to history:
 benchmarks/history/<engine>/<experiment>/YYYYMMDDTHHMMSSZ-<sha9>.json
 ```
 
-A `--steps`, `--profile`, or `--allow-dirty` run writes the same record under
+A `--steps`, `--profile`, `--pace` or dirty `--allow-dirty` run writes the same record under
 `target/benchmarks/<engine>/<experiment>/` and a smoke under
 `target/benchmarks/smoke/`; neither ever enters history.
 
@@ -248,8 +357,8 @@ a `-<n>` suffix. A record holds:
 - the command and non-secret configuration;
 - the host, build, and source;
 - the declared controls and criteria;
-- every repetition's metrics, units, sample counts, and server and driver
-  CPU;
+- every repetition's metrics, units, sample counts, server and driver CPU,
+  and the server's opening and peak resident memory;
 - every criterion's outcome, every reason, and the verdict.
 
 Raw evidence stays under `target/benchmarks/<engine>/<experiment>/<UTC
@@ -259,6 +368,26 @@ can be reproduced after `target/` is gone:
 ```bash
 target/profiling/release/capacity report benchmarks/history/bifrost/parquet/<record>.json
 ```
+
+A step's detail ends with its `diagnostics`: readings stored in each
+repetition as `diagnostic.<observation>.<stat>` (`count`, and `p50_us`,
+`p95_us`, `p99_us`, `mean_us`), judged by no criterion. Each observation is
+listed with its declared boundary and population, then one line per
+repetition with its count, nearest-rank bucket bounds, and mean bounds, so a
+slow repetition is never hidden behind a median. All are wall time, not CPU
+time; observations overlap (Gateway `queue_delay` includes `phase.admit`, and
+`server_elapsed` contains every request phase), so their values are never
+added, and percentiles are never subtracted. An inapplicable observation,
+such as Gateway `phase.relay` for a buffered call, says so; a missing
+required one makes the repetition INVALID; a record that predates
+diagnostics says they are unavailable. Gateway L1 records each phase of
+`wyrd_gateway_phase_duration_seconds`, `queue_delay`, the answer handoff's
+`server_elapsed`, `provider_excluded`, and `residual`, and the Scribe
+`outbox_write.scribe` batch writes, each over its own window population.
+
+When reporting a run, paste this report, fresh or regenerated with
+`capacity report <record>`, and append interpretation below it. Do not
+replace it with hand-built tables or extract results from raw snapshots.
 
 ## History
 
@@ -296,8 +425,92 @@ INVALID. `--allow-dirty` measures it anyway and records the SHA-256 of
 
 ## Profiling
 
-`--profile` runs `samply record` against each server process with the same
+`--profile [cpu|heap|both]` selects the captures; bare `--profile` is
+`both`. A CPU capture runs `samply record` against each server process with the same
 invocation on every platform, and saves the captures under the run's
 `target/benchmarks/` artifacts. A profile is diagnostic only. When samply is
 missing or a capture fails, the record carries a note instead, and the
 verdict is unchanged.
+
+A heap capture (`heap` or `both`) profiles the server. Once the fixtures are
+loaded, the run asks the `bench` server build to start sampling its heap:
+about one allocation per 512 KiB allocated, recorded with its call stack,
+through the same mimalloc allocator the server always uses. After each
+measured step, the run saves `profiles/heap-<step>.pb.gz`, a symbolized pprof
+profile with Go's four heap sample types: `alloc_space` and `alloc_objects`
+count everything the steps so far allocated, freed or not, and `inuse_space`
+and `inuse_objects` what they still hold. Memory allocated before sampling
+started is in neither.
+
+Resident memory can grow far past `inuse_space`: memory a step allocates and
+frees before it ends is gone from `inuse_space`, but the allocator may keep
+its pages. `alloc_space` shows which code allocated it.
+
+```bash
+pprof -top profiles/heap-<step>.pb.gz                      # what is held after <step>
+pprof -top -base profiles/heap-<earlier>.pb.gz profiles/heap-<step>.pb.gz  # what <step> still holds beyond <earlier>
+pprof -top -sample_index=alloc_space -base profiles/heap-<earlier>.pb.gz profiles/heap-<step>.pb.gz  # what <step> allocated
+```
+
+`pprof` is Google's profile viewer (`go install github.com/google/pprof@latest`);
+`-http=:8080` opens a flame graph. Each stack starts at the code that asked
+for memory, with the allocator and the standard library's `Vec` and `Box`
+plumbing trimmed. Inlined frames carry short names in the bench build's
+line-table debug info; `-lines` shows their files and lines.
+
+### Python and TypeScript clients
+
+A profiled Verification L1 run starts its Python and TypeScript drivers
+before the first step, so every step's captures include them under the
+`python` and `typescript` roles. Build their diagnostic native modules first
+with `mise run bench:build:sdks`: a `bench` Python extension and napi addon,
+which record the shared client's timings and the binding's `sdk.verify`
+boundary and sample their own native allocations. They are never published;
+run `mise run py:setup` and `mise run ts:build` again afterwards.
+
+CPU: the same samply capture as the server's
+(`profiles/<step>/cpu-<language>-<pid>.json.gz`). A CPU-profiled driver starts
+with its runtime's perf map, Python's `-X perf` and Node's
+`--perf-basic-prof`, from which samply names Python and JavaScript frames
+beside the native module's. Node then also writes a V8 log, kept as
+`v8-typescript.log` beside the server log, never in the package directory.
+A frame shows CPU only; waits come from the recorded phases.
+
+Heap, saved after each step as `profiles/heap-<language>-<step>.*`:
+
+| File | Python | TypeScript |
+|---|---|---|
+| Managed | `.tracemalloc`: every managed allocation still held, traced since the driver started | `.heapprofile`: V8's sampling heap profile since the driver started, collected objects included, so allocation volume; `.heapsnapshot`: what is still live |
+| Native | `.pb.gz`: the extension's sampled allocations, allocated and still live | `.pb.gz`: the addon's sampled allocations, allocated and still live |
+
+A driver whose native module is not a `bench` build saves no native file;
+the record notes it and marks the profile incomplete. `tracemalloc` records
+what the managed heap still holds and its peak, not the volume a window
+allocated and freed.
+
+```bash
+python -c 'import tracemalloc; [print(s) for s in tracemalloc.Snapshot.load("profiles/heap-python-<step>.tracemalloc").statistics("lineno")[:20]]'
+pprof -top -sample_index=alloc_space profiles/heap-python-<step>.pb.gz
+```
+
+Open a `.heapprofile` or `.heapsnapshot` in Chrome DevTools (Memory panel).
+
+Every repetition also records `opening_memory_bytes`, the server's resident
+memory as its window opened, beside `peak_memory_bytes`. Peak minus opening
+is the memory that window added, in profiled and unprofiled runs alike.
+
+Server CPU and memory are the server process's own. Its Python worker
+children are recorded apart, in every verification step, as
+`worker_cpu_seconds` and `worker_peak_memory_bytes`. Worker CPU is the growth,
+over the measured window, of the CPU of the children the server has reaped
+(the `bench` snapshot's `wyrd_process_reaped_children_cpu_seconds`, from
+`getrusage(RUSAGE_CHILDREN)`) plus the growth of its live children's CPU. A
+worker that starts or exits inside the window therefore counts only its CPU
+inside it. Worker memory is the sampled peak of the live children's summed
+resident memory; new children are found every 100 ms. Either reading is
+missing, never zero, when a counter was unavailable or no worker was
+sampled. Records written before these readings existed keep server CPU as
+the parent's alone. `worker_spawns`, `worker_resets` and `worker_reaps` count the
+workers started, reset for reuse and reaped inside the window, from the
+server's `wyrd_verification_python_worker_events_total` at the window's open
+and stop scrapes.

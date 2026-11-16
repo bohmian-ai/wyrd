@@ -1,14 +1,32 @@
 //! Shared submission graph ordering for the loader.
 
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::graph::GraphError;
+use wyrd_spec::graph::{GraphError, GraphSubmission, spec_binding_errors};
 use wyrd_spec::registry::CardSubmission;
 
 use super::error::Diagnostic;
 use super::parse::AuthoredCard;
 
-/// Order authored cards with the canonical graph implementation.
-pub fn order_cards(cards: &[AuthoredCard]) -> Result<Vec<usize>, Vec<Diagnostic>> {
+/// Order authored cards dependencies first through the canonical graph.
+///
+/// The loader and the registration service share graph construction and
+/// sorting, so a tree the loader orders is the tree registration accepts.
+/// Each card is projected to its submission, sibling targets are matched
+/// against the whole tree, and binding uniqueness is checked on those
+/// matched targets before the graph is built. Each returned index points
+/// into `cards` beside that card's submission, dependencies first and the
+/// single root last.
+///
+/// # Errors
+///
+/// Returns every [`Diagnostic`] found, each at the authored path it came
+/// from: an invalid envelope for an empty tree or a card that does not
+/// project to a submission, the binding diagnostics of the matched targets,
+/// and the graph diagnostic for an unresolved, ambiguous, or cyclic
+/// reference, a tree without exactly one root, or an invalid composition.
+pub fn order_cards(
+    cards: &[AuthoredCard],
+) -> Result<Vec<(usize, CardSubmission)>, Vec<Diagnostic>> {
     if cards.is_empty() {
         return Err(vec![Diagnostic::invalid_envelope(
             "<loader>".into(),
@@ -26,6 +44,10 @@ pub fn order_cards(cards: &[AuthoredCard]) -> Result<Vec<usize>, Vec<Diagnostic>
     // back to its local provenance IDs.
     let graph_submissions = wyrd_spec::graph::graph_ready_submissions(&submissions)
         .map_err(|error| vec![graph_diagnostic(&error, cards, &[])])?;
+    let binding_diagnostics = matched_binding_diagnostics(cards, &graph_submissions);
+    if !binding_diagnostics.is_empty() {
+        return Err(binding_diagnostics);
+    }
     let (nodes, edges) = wyrd_spec::graph::build(&graph_submissions)
         .map_err(|error| vec![graph_diagnostic(&error, cards, &[])])?;
     let card_refs = nodes
@@ -42,6 +64,7 @@ pub fn order_cards(cards: &[AuthoredCard]) -> Result<Vec<usize>, Vec<Diagnostic>
     let order = wyrd_spec::graph::root_last(order)
         .map_err(|error| vec![graph_diagnostic(&error, cards, &card_refs)])?;
 
+    let mut submissions = submissions.into_iter().map(Some).collect::<Vec<_>>();
     order
         .nodes
         .iter()
@@ -49,6 +72,7 @@ pub fn order_cards(cards: &[AuthoredCard]) -> Result<Vec<usize>, Vec<Diagnostic>
             card_refs
                 .iter()
                 .position(|card_ref| card_ref.same_identity(&node.card_ref))
+                .and_then(|index| Some((index, submissions[index].take()?)))
                 .ok_or_else(|| {
                     Diagnostic::invalid_envelope(
                         "<loader>".into(),
@@ -61,6 +85,33 @@ pub fn order_cards(cards: &[AuthoredCard]) -> Result<Vec<usize>, Vec<Diagnostic>
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|diagnostic| vec![diagnostic])
+}
+
+/// Binding refusals each card carries once its siblings name their matched
+/// targets.
+///
+/// Authored validation already ran [`spec_binding_errors`] on the authored
+/// spellings; an omitted and an explicit sibling naming one submitted
+/// Verifier or Operator only converge after matching, so the same owner runs
+/// again on the graph-ready specs.
+fn matched_binding_diagnostics(
+    cards: &[AuthoredCard],
+    graph_submissions: &[GraphSubmission],
+) -> Vec<Diagnostic> {
+    cards
+        .iter()
+        .zip(graph_submissions)
+        .flat_map(|(card, graph)| {
+            spec_binding_errors(&graph.spec).into_iter().map(|error| {
+                Diagnostic::from_wyrd_error(
+                    card.source_path.clone(),
+                    super::Severity::Error,
+                    None,
+                    &error,
+                )
+            })
+        })
+        .collect()
 }
 
 /// Project an authored envelope into the canonical client/server submission.
@@ -134,6 +185,13 @@ fn graph_diagnostic(
                 "binding_owner_kinds": ["Service", "Agent"],
             }),
         },
+        GraphError::AmbiguousSibling {
+            sibling,
+            candidates,
+        } => WyrdError::RegistryUnresolvedDependency {
+            message,
+            details: serde_json::json!({ "card_ref": sibling, "candidates": candidates }),
+        },
         GraphError::DuplicateIdentity { .. }
         | GraphError::Empty
         | GraphError::MultipleRoots { .. }
@@ -194,17 +252,20 @@ mod tests {
     }
 
     /// Build a Service fixture with an optional Service dependency.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `dependency` is not a valid Card name.
     fn service(name: &str, dependency: Option<&str>) -> AuthoredCard {
         let components = dependency
             .map(|dependency| {
                 vec![ServiceComponent {
                     alias: dependency.to_string(),
                     card_ref: Ref::Sibling {
-                        sibling: wyrd_spec::reference::CardRef {
+                        sibling: wyrd_spec::reference::SiblingRef {
                             kind: CardKind::Service,
                             name: CardName::new(dependency).unwrap(),
-                            version: VersionBlock::parse("1.0.0").unwrap(),
-                            uid: None,
+                            version: Some(VersionBlock::parse("1.0.0").unwrap()),
                         },
                     },
                     verified_by: Vec::new(),
@@ -227,12 +288,22 @@ mod tests {
         }
     }
 
+    /// The card indices of an order.
+    fn indices(order: &[(usize, CardSubmission)]) -> Vec<usize> {
+        order.iter().map(|(index, _)| *index).collect()
+    }
+
+    /// Ordering a Service and the Model it references places the Model
+    /// first.
+    ///
+    /// # Panics
+    /// Panics when the pair does not order or the Model is not first.
     #[test]
     fn order_reuses_shared_graph_and_places_dependencies_first() {
         let cards = vec![service("service", Some("model")), service("model", None)];
         let order = order_cards(&cards).unwrap();
 
-        assert_eq!(order, vec![1, 0]);
+        assert_eq!(indices(&order), vec![1, 0]);
     }
 
     #[test]
@@ -243,6 +314,12 @@ mod tests {
         assert_eq!(diagnostics[0].code, "WYRD_REGISTRY_400_DEPENDENCY_CYCLE");
     }
 
+    /// Two versions of one Card name are distinct graph nodes, the
+    /// referenced version ordered first.
+    ///
+    /// # Panics
+    /// Panics when the fixture version does not parse, the versions do not
+    /// order as one graph, or the referenced version is not first.
     #[test]
     fn order_keeps_same_named_versions_as_distinct_nodes() {
         let v1 = service("service", None);
@@ -251,10 +328,15 @@ mod tests {
 
         let order = order_cards(&[v2, v1]).expect("different versions form one graph");
 
-        assert_eq!(order, vec![1, 0]);
+        assert_eq!(indices(&order), vec![1, 0]);
     }
 
     /// Surface the stable peer-component diagnostic when a Verifier is a Service component.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the tree orders or its diagnostic carries another code or
+    /// path.
     #[test]
     fn order_rejects_verifier_service_component_with_stable_code() {
         let mut service = service("app", None);
@@ -264,7 +346,7 @@ mod tests {
         spec.components.push(ServiceComponent {
             alias: "quality".to_owned(),
             card_ref: Ref::Sibling {
-                sibling: card_ref(CardKind::Verifier, "quality"),
+                sibling: (&card_ref(CardKind::Verifier, "quality")).into(),
             },
             verified_by: Vec::new(),
             source: None,
@@ -316,5 +398,68 @@ mod tests {
 
         assert_eq!(diagnostics[0].code, "WYRD_SPEC_400_UNBOUND_VERIFIER_PEER");
         assert_eq!(diagnostics[0].path, PathBuf::from("quality.yaml"));
+    }
+
+    /// An omitted and an explicit sibling naming one submitted Verifier, or
+    /// one submitted Operator, are one binding target and are refused as a
+    /// duplicate once matched.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a mixed-spelling binding orders, or its diagnostic carries
+    /// another code or path.
+    #[test]
+    fn order_refuses_mixed_sibling_spellings_of_one_binding_target() {
+        let verifier = authored(
+            "quality",
+            &CardKind::Verifier,
+            serde_json::json!({
+                "inputs": { "answer": { "type": "json" } },
+                "requirements": [{
+                    "id": "answered",
+                    "statement": "The agent produced an answer.",
+                    "check": { "kind": "assert", "path": "inputs.answer", "operator": "is_not_null" }
+                }]
+            }),
+        );
+        let operator = authored(
+            "alert",
+            &CardKind::Operator,
+            serde_json::json!({ "kind": "http", "method": "post", "url": "https://hooks.example.com/alert" }),
+        );
+        let omitted = |kind: &str, name: &str| serde_json::json!({ "sibling": { "kind": kind, "name": name } });
+        let explicit = |kind: &str, name: &str| serde_json::json!({ "sibling": { "kind": kind, "name": name, "version": "1.0.0" } });
+        let cases = [
+            (
+                serde_json::json!([
+                    { "verifier": omitted("Verifier", "quality") },
+                    { "verifier": explicit("Verifier", "quality") },
+                ]),
+                "WYRD_SPEC_400_DUPLICATE_VERIFICATION_BINDING",
+            ),
+            (
+                serde_json::json!([{
+                    "verifier": omitted("Verifier", "quality"),
+                    "on_failure": [omitted("Operator", "alert"), explicit("Operator", "alert")],
+                }]),
+                "WYRD_SPEC_400_DUPLICATE_BINDING_OPERATOR",
+            ),
+        ];
+        for (verified_by, code) in cases {
+            let agent = authored(
+                "agent",
+                &CardKind::Agent,
+                serde_json::json!({
+                    "prompt": { "kind": "Prompt", "name": "prompt", "version": "1.0.0" },
+                    "execution_route": { "kind": "native" },
+                    "verified_by": verified_by,
+                }),
+            );
+            let diagnostics = order_cards(&[agent, verifier.clone(), operator.clone()])
+                .expect_err("mixed spellings name one target twice");
+
+            assert_eq!(diagnostics[0].code, code);
+            assert_eq!(diagnostics[0].path, PathBuf::from("agent.yaml"));
+        }
     }
 }

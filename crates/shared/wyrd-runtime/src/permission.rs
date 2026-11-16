@@ -182,6 +182,11 @@ pub enum Action {
     Lock,
     /// Run.
     Run,
+    /// Decide a pending approval of a Verifier execution.
+    ///
+    /// Distinct from [`Self::Run`]: whoever may run a Verifier does not
+    /// thereby decide its approvals.
+    Approve,
     /// Suspend a resource without destroying it, and resume it.
     Suspend,
     /// Restore administrative access a tenant can no longer reach itself.
@@ -298,6 +303,7 @@ impl Action {
             Self::Install => "install",
             Self::Lock => "lock",
             Self::Run => "run",
+            Self::Approve => "approve",
             Self::Suspend => "suspend",
             Self::Recover => "recover",
             Self::Wildcard => "wildcard",
@@ -329,9 +335,9 @@ impl Permission {
     /// Rejects a permission whose object scope cannot apply to its operation.
     ///
     /// Bifrost object scope is meaningful only for Bifrost query reads and
-    /// record writes, gateway object scope only for gateway invocation, and
-    /// Verifier object scope only for `verifier:run`, and tool object scope only
-    /// for `tool:invoke`. A wildcard or
+    /// record writes, gateway object scope only for gateway invocation,
+    /// Verifier object scope only for `verifier:run` and `verifier:read`, and
+    /// tool object scope only for `tool:invoke`. A wildcard or
     /// multi-resource grant on either axis keeps object-wide reach only with
     /// [`PermissionScope::All`], which is what stops a wildcard from inheriting
     /// one object's narrow authority.
@@ -344,7 +350,8 @@ impl Permission {
     /// with field `action` when a Bifrost scope is attached to an action other
     /// than [`Action::Read`] for query or [`Action::Write`] for record, a
     /// gateway or tool scope to any action other than [`Action::Invoke`], or a
-    /// Verifier scope to any action other than [`Action::Run`].
+    /// Verifier scope to any action other than [`Action::Run`],
+    /// [`Action::Read`], or [`Action::Approve`].
     pub fn validate(&self) -> Result<(), PermissionScopeError> {
         self.scope.validate()?;
         let (resource_accepts, required_action) = match &self.scope {
@@ -358,7 +365,14 @@ impl Permission {
                 },
             ),
             PermissionScope::Gateway(_) => (self.resource == Resource::Gateway, Action::Invoke),
-            PermissionScope::Verifier(_) => (self.resource == Resource::Verifier, Action::Run),
+            PermissionScope::Verifier(_) => (
+                self.resource == Resource::Verifier,
+                match self.action {
+                    Action::Read => Action::Read,
+                    Action::Approve => Action::Approve,
+                    _ => Action::Run,
+                },
+            ),
             PermissionScope::Tool(_) => (self.resource == Resource::Tool, Action::Invoke),
         };
         if !resource_accepts {
@@ -508,6 +522,62 @@ impl Permission {
         Self {
             resource: Resource::Verifier,
             action: Action::Run,
+            scope: PermissionScope::All,
+        }
+    }
+
+    /// Inspect executions of the one Verifier Card `verifier`: their status,
+    /// invocation progress, publications, and publication downloads.
+    ///
+    /// Only a grant of this exact UID or [`Self::verifier_read_any`] covers
+    /// it; `cards:read` does not, and it grants no Card, Artifact, or Bifrost
+    /// table access of its own.
+    #[must_use]
+    pub const fn verifier_read(verifier: CardUid) -> Self {
+        Self {
+            resource: Resource::Verifier,
+            action: Action::Read,
+            scope: PermissionScope::Verifier(verifier),
+        }
+    }
+
+    /// Inspect executions of every Verifier Card in the tenant.
+    ///
+    /// The unscoped grant every built-in Role carries; a narrower custom Role
+    /// grants [`Self::verifier_read`] for one UID.
+    #[must_use]
+    pub const fn verifier_read_any() -> Self {
+        Self {
+            resource: Resource::Verifier,
+            action: Action::Read,
+            scope: PermissionScope::All,
+        }
+    }
+
+    /// Decide pending approvals of executions of the one Verifier Card
+    /// `verifier`.
+    ///
+    /// Only a grant of this exact UID or [`Self::verifier_approve_any`]
+    /// covers it; neither `verifier:run` nor `verifier:read` does.
+    #[must_use]
+    pub const fn verifier_approve(verifier: CardUid) -> Self {
+        Self {
+            resource: Resource::Verifier,
+            action: Action::Approve,
+            scope: PermissionScope::Verifier(verifier),
+        }
+    }
+
+    /// Decide pending approvals of executions of every Verifier Card in the
+    /// tenant.
+    ///
+    /// The unscoped grant the built-in `editor` Role carries: approvals
+    /// belong to people, not to the workload being verified.
+    #[must_use]
+    pub const fn verifier_approve_any() -> Self {
+        Self {
+            resource: Resource::Verifier,
+            action: Action::Approve,
             scope: PermissionScope::All,
         }
     }
@@ -907,6 +977,7 @@ fn parse_action(value: &str) -> Result<Action, PermissionParseError> {
         "install" => Action::Install,
         "lock" => Action::Lock,
         "run" => Action::Run,
+        "approve" => Action::Approve,
         "wildcard" => Action::Wildcard,
         _ => return Err(PermissionParseError),
     })
@@ -1139,6 +1210,7 @@ mod tests {
             Action::Install,
             Action::Lock,
             Action::Run,
+            Action::Approve,
             Action::AnyOf(vec![Action::Read, Action::Write]),
             Action::Wildcard,
         ];
@@ -1367,8 +1439,14 @@ mod tests {
         }
     }
 
-    /// Proves `verifier:run` parses, covers only its exact Verifier UID or the
-    /// unscoped grant, and refuses a Verifier scope on any other operation.
+    /// Proves `verifier:run`, `verifier:read`, and `verifier:approve` parse,
+    /// cover only their exact
+    /// Verifier UID or their unscoped grant, never each other, and refuse a
+    /// Verifier scope on any other operation.
+    ///
+    /// # Panics
+    /// Panics when a grant fails to parse or covers the wrong operation or
+    /// Verifier.
     #[test]
     fn verifier_run_is_uid_scoped() {
         use wyrd_spec::ids::CardUid;
@@ -1386,14 +1464,65 @@ mod tests {
                 .covers(&Permission::verifier_run(bound.clone()))
         );
         assert!(
-            !Permission::verifier_run(other).covers(&Permission::verifier_run(bound.clone())),
+            !Permission::verifier_run(other.clone())
+                .covers(&Permission::verifier_run(bound.clone())),
             "an unrelated UID grant does not cover"
+        );
+        assert_eq!(
+            "verifier:read".parse::<Permission>().expect("parses"),
+            Permission::verifier_read_any()
+        );
+        assert!(Permission::verifier_read_any().covers(&Permission::verifier_read(bound.clone())));
+        assert!(
+            Permission::verifier_read(bound.clone())
+                .covers(&Permission::verifier_read(bound.clone()))
+        );
+        assert!(
+            !Permission::verifier_read(other).covers(&Permission::verifier_read(bound.clone()))
+        );
+        assert!(!Permission::verifier_run_any().covers(&Permission::verifier_read(bound.clone())));
+        assert!(!Permission::verifier_read_any().covers(&Permission::verifier_run(bound.clone())));
+        assert!(!Permission::card_read().covers(&Permission::verifier_read(bound.clone())));
+        assert_eq!(
+            "verifier:approve".parse::<Permission>().expect("parses"),
+            Permission::verifier_approve_any()
+        );
+        assert!(
+            Permission::verifier_approve_any().covers(&Permission::verifier_approve(bound.clone()))
+        );
+        assert!(
+            !Permission::verifier_approve(uid("01927b4c-0000-7000-8000-000000000003"))
+                .covers(&Permission::verifier_approve(bound.clone())),
+            "an unrelated UID approve grant does not cover"
+        );
+        for broader in [
+            Permission::verifier_run_any(),
+            Permission::verifier_read_any(),
+        ] {
+            assert!(
+                !broader.covers(&Permission::verifier_approve(bound.clone())),
+                "{broader} does not decide approvals"
+            );
+        }
+        assert_eq!(
+            serde_json::from_value::<Permission>(json!({
+                "resource": "verifier", "action": "approve", "scope": {"verifier": bound.as_str()}
+            }))
+            .expect("a scoped approve decodes"),
+            Permission::verifier_approve(bound.clone())
+        );
+        assert_eq!(
+            serde_json::from_value::<Permission>(json!({
+                "resource": "verifier", "action": "read", "scope": {"verifier": bound.as_str()}
+            }))
+            .expect("a scoped read decodes"),
+            Permission::verifier_read(bound.clone())
         );
         assert_eq!(
             serde_json::to_value(Permission::verifier_run(bound.clone())).expect("serializes"),
             json!({"resource": "verifier", "action": "run", "scope": {"verifier": bound.as_str()}})
         );
-        for (resource, action) in [("verifier", "read"), ("cards", "run")] {
+        for (resource, action) in [("verifier", "invoke"), ("cards", "run")] {
             assert!(
                 serde_json::from_value::<Permission>(json!({
                     "resource": resource,

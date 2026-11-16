@@ -16,17 +16,21 @@ use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_spec::error::WyrdError;
 use wyrd_testing::Bootstrap;
+use wyrd_testing::github::GithubAppMock;
 use wyrd_testing::human_login::HumanSso;
-use wyrd_testing::server::{WyrdTestServer, WyrdTestServerError};
+use wyrd_testing::server::{OccupiedForTest, WyrdTestServer, WyrdTestServerError};
 
 pub mod cli;
+/// Test-tier napi projection of the loopback GitHub App and its browser.
+pub mod github;
 
 /// In-process server handle used only by TypeScript integration tests.
 ///
-/// Journeys steer the server through exactly three test controls, each backed
-/// by the production code path: `flushBifrost`, `waitForBaseline`, and
-/// `makeBindingDue`. The remaining members start, address, or credential the
-/// server.
+/// Journeys steer the server through exactly six test controls, each backed
+/// by the production code path: `flushBifrost`, `waitForBaseline`,
+/// `makeBindingDue`, `holdPublications`, and, for contended process memory,
+/// `occupyHostedMemory` and `waitForHostedWaiters`. The remaining members
+/// start, address, or credential the server.
 #[napi]
 pub struct NativeWyrdTestServer {
     /// Owned Rust harness dropped only after explicit asynchronous shutdown.
@@ -43,6 +47,9 @@ pub struct NativeWyrdTestServer {
     api_key: String,
     /// Card the writer principal is scoped to, which its rows correlate to.
     card_ref: String,
+    /// The loopback GitHub App the server is configured against, when started
+    /// with `githubApp`.
+    github: Option<GithubAppMock>,
 }
 
 #[napi]
@@ -154,6 +161,43 @@ impl NativeWyrdTestServer {
             .map_err(|error| thrown(env, &error))
     }
 
+    /// Hold process memory so at most `leave` bytes stay free until the
+    /// returned hold is released, so a hosted verification whose session
+    /// does not fit waits and one whose request does not fit is refused.
+    ///
+    /// # Errors
+    ///
+    /// Throws a `WyrdError`-shaped error when the harness is closed or hosts
+    /// no Verifiers.
+    #[napi]
+    pub fn occupy_hosted_memory(&self, env: Env, leave: u32) -> Result<NativeHeldMemory> {
+        let _runtime = wyrd_runtime::runtime().enter();
+        self.control(|server| server.occupy_hosted_memory(u64::from(leave)))
+            .map(|held| NativeHeldMemory {
+                held: Mutex::new(Some(held)),
+            })
+            .map_err(|error| thrown(env, &error))
+    }
+
+    /// Return once exactly `count` hosted Python operations wait for process
+    /// memory, such as behind `occupyHostedMemory`, waiting at most
+    /// `timeoutMs`. A verify already called keeps running meanwhile: the
+    /// native call starts it before its promise is awaited.
+    ///
+    /// # Errors
+    ///
+    /// Throws a `WyrdError`-shaped error when the harness is closed, hosts no
+    /// Verifiers, or `timeoutMs` elapses first, with the last observed count.
+    #[napi]
+    pub fn wait_for_hosted_waiters(&self, env: Env, count: u32, timeout_ms: u32) -> Result<()> {
+        let timeout = Duration::from_millis(u64::from(timeout_ms));
+        self.control(|server| {
+            wyrd_runtime::runtime()
+                .block_on(server.wait_for_hosted_waiters(count as usize, timeout))
+        })
+        .map_err(|error| thrown(env, &error))
+    }
+
     /// Run one test control against the open harness, projecting every
     /// failure onto its catalogued [`WyrdError`].
     ///
@@ -162,10 +206,10 @@ impl NativeWyrdTestServer {
     /// Returns `WYRD_TESTING_500_HARNESS_START` when the harness lock is
     /// poisoned or the server is shut down, and the control's own catalogued
     /// error when `call` fails.
-    fn control(
+    fn control<T>(
         &self,
-        call: impl FnOnce(&WyrdTestServer) -> StdResult<(), WyrdTestServerError>,
-    ) -> StdResult<(), WyrdError> {
+        call: impl FnOnce(&WyrdTestServer) -> StdResult<T, WyrdTestServerError>,
+    ) -> StdResult<T, WyrdError> {
         let guard = self
             .server
             .lock()
@@ -174,6 +218,29 @@ impl NativeWyrdTestServer {
             .as_ref()
             .ok_or_else(|| harness("test server is shut down"))?;
         call(server).map_err(WyrdError::from)
+    }
+
+    /// The fixture tenant's slug, which a browser signs in to.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the harness is closed.
+    #[napi(getter)]
+    pub fn tenant_slug(&self) -> Result<String> {
+        self.with_server(|server| Ok(server.pg_fixture().tenant_slug().to_owned()))
+    }
+
+    /// The loopback GitHub App this server is configured against.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the server was started without `githubApp`.
+    #[napi(getter)]
+    pub fn github_app(&self) -> Result<github::NativeGithubAppMock> {
+        self.github
+            .clone()
+            .map(|mock| github::NativeGithubAppMock { mock })
+            .ok_or_else(|| reason("the test server was started without githubApp"))
     }
 
     /// Mint an API key for a principal holding exactly `permissions`.
@@ -439,6 +506,32 @@ impl NativeWyrdTestServer {
         })
     }
 
+    /// Admit one execution of a fresh Drift Verifier named `name` and hold it
+    /// running with the harness's four fixed publications.
+    ///
+    /// Attempt 1 of step `review` publishes JSON `verdict` `{"ok": true}` and
+    /// JSON `nothing` `null`; attempt 1 of step `draft` publishes file
+    /// `report` (`# Report` and a newline) and directory `tree` (`a.md` is
+    /// `alpha`, `nested/b.md` is `beta`). Only for a server started without
+    /// `verificationRuntime`, which would race for the execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the harness is closed, `name` is not a Card
+    /// name, or the submission or a publication is refused.
+    #[napi]
+    pub fn hold_publications(&self, name: String) -> Result<HeldPublications> {
+        self.with_server(|server| {
+            let (execution, verifier) = wyrd_runtime::runtime()
+                .block_on(server.hold_publications(&name))
+                .map_err(reason)?;
+            Ok(HeldPublications {
+                execution_id: execution.to_string(),
+                verifier: verifier.to_string(),
+            })
+        })
+    }
+
     /// Run `call` against the open harness while holding its lock.
     ///
     /// # Errors
@@ -583,6 +676,36 @@ impl NativeWyrdTestServer {
     }
 }
 
+/// The execution [`NativeWyrdTestServer::hold_publications`] holds and the
+/// Verifier it runs.
+#[napi(object)]
+pub struct HeldPublications {
+    /// The held execution's ID.
+    pub execution_id: String,
+    /// The held execution's Verifier Card UID.
+    pub verifier: String,
+}
+
+/// Process memory a journey holds on its test server; `release` returns it,
+/// and so does garbage collection of the handle.
+#[napi]
+pub struct NativeHeldMemory {
+    /// The held memory until released.
+    held: Mutex<Option<OccupiedForTest>>,
+}
+
+#[napi]
+impl NativeHeldMemory {
+    /// Return the memory; releasing twice does nothing.
+    #[napi]
+    pub fn release(&self) {
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+}
+
 /// Test-only capabilities a story's server starts with; every field is
 /// optional and defaults to off.
 #[napi(object)]
@@ -600,6 +723,12 @@ pub struct NativeTestServerOptions {
     /// Scribe outbox capacity in items, so a journey can fill verification
     /// staging with a few calls; omitted keeps the production capacity.
     pub scribe_outbox_capacity: Option<u32>,
+    /// `true` configures the deployment's GitHub App against a fresh loopback
+    /// GitHub mock, reachable as `githubApp`; omitted, no App is configured.
+    pub github_app: Option<bool>,
+    /// Direct verification deadline from arrival in milliseconds, so a
+    /// journey reaches it quickly; omitted keeps the production deadline.
+    pub verify_timeout_ms: Option<u32>,
 }
 
 /// Starts a real bound Wyrd test server and mints an admin access token.
@@ -619,6 +748,8 @@ pub fn start_test_server(
         verification_runtime: None,
         access_ttl_seconds: None,
         scribe_outbox_capacity: None,
+        github_app: None,
+        verify_timeout_ms: None,
     });
     let provider_root = options
         .provider_base_url
@@ -634,12 +765,16 @@ pub fn start_test_server(
         options.verification_runtime.unwrap_or(false),
         options.access_ttl_seconds,
         options.scribe_outbox_capacity,
+        options.github_app.unwrap_or(false),
+        options.verify_timeout_ms,
     )))
 }
 
 /// Starts the bound harness with the requested test-only capabilities.
 ///
-/// `scribe_outbox_capacity` replaces the Scribe outbox capacity when set.
+/// `scribe_outbox_capacity` replaces the Scribe outbox capacity and
+/// `verify_timeout_ms` the direct verification deadline when set;
+/// `github_app` configures the GitHub App against a fresh loopback mock.
 ///
 /// # Errors
 ///
@@ -649,8 +784,20 @@ async fn start_test_server_async(
     verification_runtime: bool,
     access_ttl_seconds: Option<u32>,
     scribe_outbox_capacity: Option<u32>,
+    github_app: bool,
+    verify_timeout_ms: Option<u32>,
 ) -> napi::Result<NativeWyrdTestServer> {
     let mut builder = WyrdTestServer::builder();
+    let github = github_app
+        .then(GithubAppMock::start)
+        .transpose()
+        .map_err(reason)?;
+    if let Some(mock) = &github {
+        builder = builder.with_github_app_for_test(mock);
+    }
+    if let Some(millis) = verify_timeout_ms {
+        builder = builder.with_verify_timeout_for_test(Duration::from_millis(u64::from(millis)));
+    }
     if let Some(capacity) = scribe_outbox_capacity {
         builder = builder.with_scribe_outbox_capacity_for_test(capacity as usize);
     }
@@ -722,6 +869,7 @@ async fn start_test_server_async(
         table_fqn: format!("bifrost.bifrost.{table_name}"),
         api_key: secrecy::ExposeSecret::expose_secret(&api_key).to_owned(),
         card_ref,
+        github,
     })
 }
 

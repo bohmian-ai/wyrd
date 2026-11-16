@@ -17,7 +17,7 @@ use vala_bifrost_redux::oracle::dispatcher::PEER_PROTOCOL_VERSION;
 use vala_bifrost_redux::oracle::peer::{
     PeerTicketClaims, ReservationBinding, assignment_authority_digest_for, reservation_body_digest,
 };
-use wyrd_server::config::BifrostTarget;
+use wyrd_server::config::ServerTarget;
 use wyrd_spec::vala::api::{
     ClusterRole, ExecuteFragmentRequest, FollowerScanAssignment, NodeId, OracleRoleFence,
     PeerContext, ReservationId, ScribeProviderCut, TenantTableBinding,
@@ -59,9 +59,9 @@ async fn prove_peer_context_refusals() -> Result<(), PeerJourneyError> {
     // one Scribe so the topology owns a catalog and a tail source exactly as a
     // deployment that serves queries does.
     let cluster = PeerCluster::start(&[
-        BifrostTarget::Oracle,
-        BifrostTarget::Oracle,
-        BifrostTarget::Scribe,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostIngest,
     ])
     .await?;
     let destination = cluster.advertise_addr(1).await?;
@@ -446,9 +446,9 @@ async fn prove_leaf_predicates_round_trip_and_execute() -> Result<(), PeerJourne
     use arrow::datatypes::{DataType, Field, Fields};
 
     let cluster = PeerCluster::start(&[
-        BifrostTarget::Oracle,
-        BifrostTarget::Oracle,
-        BifrostTarget::Scribe,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostIngest,
     ])
     .await?;
     let plane = ReservationPlane::observe(&cluster).await?;

@@ -86,14 +86,21 @@ pub enum BuiltinTool {
     /// Extract one workspace document into JSON under `/work`.
     #[serde(rename = "fs.extract")]
     FsExtract,
+    /// Create or replace one UTF-8 file in the invocation's private `/work`.
+    #[serde(rename = "fs.write")]
+    FsWrite,
     /// Run sandboxed Python over the workspace.
     #[serde(rename = "code.run")]
     CodeRun,
+    /// Retain a `/work` file, directory, or JSON value under a logical name
+    /// for the step's successors; only a step Agent may declare it.
+    #[serde(rename = "publish")]
+    Publish,
 }
 
 impl BuiltinTool {
     /// Every built-in, in catalog order.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 12] = [
         Self::CardsList,
         Self::CardsGet,
         Self::BifrostListTables,
@@ -103,7 +110,9 @@ impl BuiltinTool {
         Self::FsRead,
         Self::FsSearch,
         Self::FsExtract,
+        Self::FsWrite,
         Self::CodeRun,
+        Self::Publish,
     ];
 
     /// The wire name, identical to the serde spelling.
@@ -119,7 +128,9 @@ impl BuiltinTool {
             Self::FsRead => "fs.read",
             Self::FsSearch => "fs.search",
             Self::FsExtract => "fs.extract",
+            Self::FsWrite => "fs.write",
             Self::CodeRun => "code.run",
+            Self::Publish => "publish",
         }
     }
 
@@ -130,7 +141,8 @@ impl BuiltinTool {
         Self::ALL.into_iter().find(|tool| tool.as_str() == name)
     }
 
-    /// True for the `fs.*` tools, which read only a declared workspace.
+    /// True for the `fs.*` tools that read a declared workspace; `fs.write`
+    /// writes private scratch and needs none.
     #[must_use]
     pub const fn is_filesystem(self) -> bool {
         matches!(
@@ -138,17 +150,38 @@ impl BuiltinTool {
             Self::FsList | Self::FsRead | Self::FsSearch | Self::FsExtract
         )
     }
+
+    /// True for every tool that runs in the invocation's workspace: the
+    /// filesystem tools, `fs.write`, `code.run`, and `publish`. Without a
+    /// declared workspace they share a private scratch-only one.
+    #[must_use]
+    pub const fn uses_workspace(self) -> bool {
+        self.is_filesystem() || matches!(self, Self::FsWrite | Self::CodeRun | Self::Publish)
+    }
+
+    /// True for the tools that create files in private `/work` scratch,
+    /// `fs.write` and `code.run`. Selecting one gives the filesystem reading
+    /// tools something to read, so they need no declared input workspace.
+    pub const fn writes_scratch(self) -> bool {
+        matches!(self, Self::FsWrite | Self::CodeRun)
+    }
 }
 
 /// Agent authoring body inside a Wyrd Agent Card envelope.
+///
+/// `F` is the inline Prompt's form: [`Compiled`] to execute, or
+/// [`Authored`] for a descriptive read of retained evidence that never
+/// compiles. Both forms share one wire form.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(deny_unknown_fields)]
-pub struct AgentSpec {
+#[cfg_attr(feature = "server", schema(bound = ""))]
+#[serde(deny_unknown_fields, bound = "")]
+#[schemars(rename = "AgentSpec", bound = "F: PromptForm")]
+pub struct AgentSpec<F: PromptForm = Compiled> {
     /// Prompt reference preserved on disk and resolved by `skald-agent`.
     #[cfg_attr(feature = "server", schema(value_type = serde_json::Value))]
-    #[serde(deserialize_with = "inline_prompt")]
-    pub prompt: InlineableRef<skald_spec::Prompt>,
+    #[serde(deserialize_with = "inline_prompt::<_, F>")]
+    pub prompt: InlineableRef<F::Prompt>,
     /// Declared execution route; invocations may replace it whole.
     pub execution_route: ExecutionRoute,
     /// Runtime-local tool names resolved from a local Skald tool registry.
@@ -162,25 +195,97 @@ pub struct AgentSpec {
     pub verified_by: Vec<VerificationBinding>,
 }
 
-/// Decodes the Agent's Prompt reference, compiling an inline Prompt through
-/// [`compile_prompt`](crate::card::prompt::compile_prompt) so a named
-/// `response_format` resolves exactly as in a Prompt Card.
+impl<F: PromptForm> AgentSpec<F> {
+    /// Whether this Agent declares the built-in `publish` tool, whose
+    /// publications only queued execution keeps. Pure: no IO.
+    #[must_use]
+    pub fn publishes(&self) -> bool {
+        self.tool_names
+            .iter()
+            .any(|name| name == BuiltinTool::Publish.as_str())
+    }
+}
+
+/// The form an inline Agent Prompt takes once decoded from its authored
+/// wire form.
+pub trait PromptForm:
+    std::fmt::Debug + Clone + PartialEq + schemars::JsonSchema + Send + Sync + 'static
+{
+    /// The decoded Prompt.
+    type Prompt: std::fmt::Debug
+        + Clone
+        + PartialEq
+        + Serialize
+        + serde::de::DeserializeOwned
+        + schemars::JsonSchema
+        + Send
+        + Sync;
+
+    /// This form of `authored`.
+    ///
+    /// # Errors
+    /// Returns the compiler's refusal when the form compiles.
+    fn from_authored(
+        authored: skald_spec::AuthoredPrompt,
+    ) -> Result<Self::Prompt, skald_spec::SkaldError>;
+}
+
+/// The executable form: an inline Prompt compiles into the
+/// [`skald_spec::Prompt`] an execution runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct Compiled;
+
+impl PromptForm for Compiled {
+    type Prompt = skald_spec::Prompt;
+
+    /// Compiles `authored` through
+    /// [`compile_prompt`](crate::card::prompt::compile_prompt), so a named
+    /// `response_format` resolves exactly as in a Prompt Card.
+    fn from_authored(
+        authored: skald_spec::AuthoredPrompt,
+    ) -> Result<skald_spec::Prompt, skald_spec::SkaldError> {
+        crate::card::prompt::compile_prompt(&authored)
+    }
+}
+
+/// The descriptive form: an inline Prompt stays the
+/// [`skald_spec::AuthoredPrompt`] that was written, structurally decoded and
+/// never compiled, rendered, or executed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct Authored;
+
+impl PromptForm for Authored {
+    type Prompt = skald_spec::AuthoredPrompt;
+
+    /// Keeps `authored` as written.
+    fn from_authored(
+        authored: skald_spec::AuthoredPrompt,
+    ) -> Result<skald_spec::AuthoredPrompt, skald_spec::SkaldError> {
+        Ok(authored)
+    }
+}
+
+/// Decodes the Agent's Prompt reference, converting an inline Prompt
+/// through [`PromptForm::from_authored`].
 ///
 /// # Errors
 /// Returns the deserializer's error for an undecodable reference and the
-/// compiler's refusal for an inline Prompt.
-fn inline_prompt<'de, D: serde::Deserializer<'de>>(
+/// compiler's refusal for an inline Prompt that compiles.
+fn inline_prompt<'de, D: serde::Deserializer<'de>, F: PromptForm>(
     deserializer: D,
-) -> Result<InlineableRef<skald_spec::Prompt>, D::Error> {
-    match InlineableRef::<skald_spec::Prompt>::deserialize(deserializer)? {
-        InlineableRef::Inline(prompt) => {
-            let authored = prompt.authored().map_err(serde::de::Error::custom)?;
-            crate::card::prompt::compile_prompt(&authored)
-                .map(|prompt| InlineableRef::Inline(Box::new(prompt)))
-                .map_err(serde::de::Error::custom)
-        }
-        other => Ok(other),
-    }
+) -> Result<InlineableRef<F::Prompt>, D::Error> {
+    Ok(
+        match InlineableRef::<skald_spec::AuthoredPrompt>::deserialize(deserializer)? {
+            InlineableRef::Inline(prompt) => InlineableRef::Inline(Box::new(
+                F::from_authored(*prompt).map_err(serde::de::Error::custom)?,
+            )),
+            InlineableRef::Ref(card) => InlineableRef::Ref(card),
+            InlineableRef::Sibling { sibling } => InlineableRef::Sibling { sibling },
+            InlineableRef::Path(path) => InlineableRef::Path(path),
+        },
+    )
 }
 
 fn is_default_run_config(config: &AgentRunConfigSpec) -> bool {

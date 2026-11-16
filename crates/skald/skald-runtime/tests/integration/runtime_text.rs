@@ -15,7 +15,7 @@ async fn mock_openai_response_text_is_readable_through_adapter() {
         .respond_with(openai_response("openai text"));
     let runtime = runtime_with(&mock);
 
-    let response = runtime.send(request).await.expect("runtime succeeds");
+    let response = runtime.send(&request).await.expect("runtime succeeds");
 
     assert_eq!(response.adapter().text().as_deref(), Some("openai text"));
 }
@@ -28,7 +28,7 @@ async fn mock_anthropic_response_text_is_readable_through_adapter() {
         .respond_with(anthropic_response("anthropic text"));
     let runtime = runtime_with(&mock);
 
-    let response = runtime.send(request).await.expect("runtime succeeds");
+    let response = runtime.send(&request).await.expect("runtime succeeds");
 
     assert_eq!(response.adapter().text().as_deref(), Some("anthropic text"));
 }
@@ -41,7 +41,7 @@ async fn mock_google_response_text_is_readable_through_adapter() {
         .respond_with(google_response("google text"));
     let runtime = runtime_with(&mock);
 
-    let response = runtime.send(request).await.expect("runtime succeeds");
+    let response = runtime.send(&request).await.expect("runtime succeeds");
 
     assert_eq!(response.adapter().text().as_deref(), Some("google text"));
 }

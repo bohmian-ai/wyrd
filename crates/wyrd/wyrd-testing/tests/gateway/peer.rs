@@ -23,7 +23,7 @@ use vala_bifrost_redux::tables::{CallsTable, DomainTable};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_runtime::Permission;
-use wyrd_server::config::BifrostTarget;
+use wyrd_server::config::ServerTarget;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::GatewayAccess;
 use wyrd_spec::error::WyrdError;
@@ -201,7 +201,7 @@ async fn oracle_only_gateway_captures_through_the_peer_scribe() {
         .mount(&upstream)
         .await;
     let cluster = WyrdTestCluster::start_spec(
-        BifrostClusterSpec::for_targets(&[BifrostTarget::Oracle, BifrostTarget::Scribe])
+        BifrostClusterSpec::for_targets(&[ServerTarget::BifrostQuery, ServerTarget::BifrostIngest])
             .with_gateway_provider_root_for_test(Url::parse(&upstream.uri()).expect("mock url")),
     )
     .await

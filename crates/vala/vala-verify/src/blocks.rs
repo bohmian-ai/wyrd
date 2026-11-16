@@ -18,30 +18,41 @@ pub(crate) mod agent;
 mod tools;
 
 pub use agent::{
-    AgentCardResolver, AgentExecutor, EvidenceReader, PromptCardResolver, block_error,
+    AGENT_PHASE_DURATION_SECONDS, AgentCardResolver, AgentExecutor, EvidenceReader,
+    PromptCardResolver, block_error,
 };
-pub use tools::{AgentToolset, ToolSession, provider_tool_name};
+pub use tools::{
+    AgentToolset, CodeTool, Delivery, HostWork, ToolBridge, ToolCalls, ToolCallsOwner, ToolLimits,
+    ToolSession, hold_permit, provider_tool_name, tool_error,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Deref;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use skald_spec::{PreparedSchemas, SharedSchema};
 use thiserror::Error;
 use tokio::time::Instant;
 
-use wyrd_spec::card::verifier::{Action, Check};
+use wyrd_spec::card::verifier::{Action, Check, PathSegment};
 use wyrd_spec::ids::SlotName;
-use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
-    CallProvenance, InputDeclaration, RequirementDetail, ToolCallRecord, Verdict,
+    CallProvenance, InputDeclaration, InvocationSettlement, Producer, PublicationCollection,
+    RequirementDetail, Verdict,
 };
+use wyrd_spec::verification::state::{ApprovalOccurrence, ControlRecord};
+use wyrd_spec::verification::{PublicationName, TaskId};
 
 mod drift;
 mod engine;
 mod scope;
 
 pub use drift::DriftChecks;
-pub use engine::{BLOCK_DURATION_SECONDS, BlockClock, EngineError, VerificationEngine};
+pub use engine::{
+    BLOCK_DURATION_SECONDS, BlockClock, Decisions, EngineError, VerificationEngine, conform,
+};
 
 /// Where a block sits in the Verifier, which fixes what it may read and do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,9 +72,131 @@ pub enum Position<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum CallValue {
     /// JSON data: inline input, step output, status, or verdict field.
-    Json(Value),
+    Json(BoundJson),
     /// Pinned original evidence a media slot names; executors fetch bytes.
     Evidence(InputDeclaration),
+    /// `steps.<id>.publications.<name>`: what `producer`, the step's
+    /// successful attempt, published under `name`. The host mounts it, or
+    /// refuses the call before it runs when no such publication exists.
+    Publication {
+        /// The successful producer attempt.
+        producer: Producer,
+        /// The logical name.
+        name: PublicationName,
+    },
+    /// `steps.<id>.publications`: the settled step's collection, whose
+    /// `entries` the host fills from the execution's admitted publications.
+    Publications {
+        /// The producer step.
+        step: TaskId,
+        /// Its status and attempts, with no entries yet.
+        collection: PublicationCollection,
+    },
+}
+
+/// The JSON one binding reads, dereferencing to the selected value.
+///
+/// A selection naming one value of the run's pinned evidence or of a settled
+/// step's output points at that value where it is held, so binding copies
+/// nothing however large it is. A wildcard selection, which builds a new
+/// array, and a constant or derived value, such as a step status, are owned.
+#[derive(Debug, Clone)]
+pub struct BoundJson(Bound);
+
+/// Where a [`BoundJson`] value is held.
+#[derive(Debug, Clone)]
+enum Bound {
+    /// A value the binding owns.
+    Owned(Value),
+    /// The value at `path` in the JSON evidence `slot`.
+    Evidence {
+        /// The run's pinned evidence.
+        evidence: Arc<BTreeMap<SlotName, InputDeclaration>>,
+        /// The JSON slot selected.
+        slot: SlotName,
+        /// Field and index selectors below the slot's value.
+        path: Vec<PathSegment>,
+    },
+    /// The value at `path` in a settled step's output.
+    Output {
+        /// The step's output, shared with the ledger.
+        output: Arc<Value>,
+        /// Field and index selectors below the output.
+        path: Vec<PathSegment>,
+    },
+}
+
+impl BoundJson {
+    /// The value at `path` in the JSON evidence `slot`, or `None` when the
+    /// slot is not JSON or `path` selects nothing.
+    pub(crate) fn evidence(
+        evidence: &Arc<BTreeMap<SlotName, InputDeclaration>>,
+        slot: &SlotName,
+        path: &[PathSegment],
+    ) -> Option<Self> {
+        let Some(InputDeclaration::Json { value }) = evidence.get(slot) else {
+            return None;
+        };
+        scope::find(value, path)?;
+        Some(Self(Bound::Evidence {
+            evidence: Arc::clone(evidence),
+            slot: slot.clone(),
+            path: path.to_vec(),
+        }))
+    }
+
+    /// The value at `path` in a step's `output`, or `None` when `path`
+    /// selects nothing.
+    pub(crate) fn output(output: &Arc<Value>, path: &[PathSegment]) -> Option<Self> {
+        scope::find(output, path)?;
+        Some(Self(Bound::Output {
+            output: Arc::clone(output),
+            path: path.to_vec(),
+        }))
+    }
+}
+
+impl From<Value> for BoundJson {
+    /// A binding that owns `value`.
+    fn from(value: Value) -> Self {
+        Self(Bound::Owned(value))
+    }
+}
+
+impl Deref for BoundJson {
+    type Target = Value;
+
+    /// The selected value, found again by its selectors over data no one
+    /// mutates.
+    ///
+    /// # Panics
+    /// Panics when the selected value is gone, which cannot happen: a shared
+    /// binding is built only once its selectors resolve, over immutable
+    /// shared data.
+    fn deref(&self) -> &Value {
+        match &self.0 {
+            Bound::Owned(value) => value,
+            Bound::Evidence {
+                evidence,
+                slot,
+                path,
+            } => match evidence.get(slot) {
+                Some(InputDeclaration::Json { value }) => scope::find(value, path),
+                _ => None,
+            }
+            .expect("a bound evidence value stays selectable"),
+            Bound::Output { output, path } => {
+                scope::find(output, path).expect("a bound step output stays selectable")
+            }
+        }
+    }
+}
+
+impl PartialEq for BoundJson {
+    /// Bindings are equal when their selected values are.
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
 }
 
 /// A resolved binding plus the original input slots it derives from, so
@@ -94,6 +227,34 @@ pub struct BlockCall<'a, B> {
     pub workspace: BTreeMap<String, CallInput>,
     /// When the engine cancels this attempt.
     pub deadline: Instant,
+    /// The one-based attempt this call is, counting the block's recorded
+    /// attempts, so a host attributes what the attempt retains to it.
+    pub attempt: u32,
+    /// The zero-based fanout item this call serves, when its step fans out.
+    pub item_index: Option<u32>,
+    /// The zero-based repeat iteration this call serves, when its step
+    /// repeats.
+    pub iteration_index: Option<u32>,
+    /// A handle on the logical invocation's tool-call records, request
+    /// allowance, and host-work settlement, shared by every attempt of one
+    /// step; the engine keeps their [`ToolCallsOwner`], settles the work
+    /// before retrying or producing a result, and reads the records into the
+    /// result whatever the attempt returns.
+    pub tool_calls: ToolCalls,
+}
+
+impl<B> BlockCall<'_, B> {
+    /// The invocation attempt this call is: its block, item, iteration, and
+    /// attempt, the identity its retained work is attributed to.
+    #[must_use]
+    pub fn producer(&self) -> Producer {
+        Producer {
+            step_id: self.id.clone(),
+            item_index: self.item_index,
+            iteration_index: self.iteration_index,
+            attempt: self.attempt,
+        }
+    }
 }
 
 /// Data one step action produced.
@@ -103,8 +264,6 @@ pub struct ActionOutput {
     pub output: Value,
     /// What executed the action.
     pub provenance: Option<CallProvenance>,
-    /// Tools an Agent action called, in call order.
-    pub tool_calls: Vec<ToolCallRecord>,
 }
 
 /// The judgment one requirement check produced.
@@ -139,7 +298,8 @@ pub enum BlockError {
         reason: String,
     },
     /// The process refused the block a shared resource, such as a Python
-    /// worker or a workspace, at admission.
+    /// worker, a workspace, or a gateway call it cannot serve yet, at
+    /// admission.
     ///
     /// That is pressure on the host, not a failure of the block, so it spends
     /// no authored retry and is never judged: the engine stops the whole
@@ -148,6 +308,17 @@ pub enum BlockError {
     #[error("block refused process capacity: {reason}")]
     Busy {
         /// Bounded, secret-free cause.
+        reason: String,
+    },
+    /// An exact definition the block requires, such as its Agent or Prompt
+    /// Card, is unavailable.
+    ///
+    /// The block cannot run as declared, so it is never judged and spends
+    /// no authored retry: the engine stops the whole execution with
+    /// [`EngineError::DefinitionUnavailable`].
+    #[error("a required definition is unavailable: {reason}")]
+    Unavailable {
+        /// Bounded, secret-free cause naming the definition.
         reason: String,
     },
 }
@@ -182,6 +353,73 @@ pub trait CheckExecutor: Send + Sync {
     async fn execute(&self, call: BlockCall<'_, Check>) -> Result<CheckOutput, BlockError>;
 }
 
+/// The durable record of one queued execution's block invocations.
+///
+/// The engine records each action or check attempt before dispatching it and
+/// commits the block's settlement before its dependents run, so a reclaimed
+/// execution restores what settled and counts what never did. The host fences
+/// both writes with the execution's lease; direct verify runs without one.
+#[async_trait]
+pub trait Checkpoints: Send + Sync {
+    /// Record that the invocation attempt `producer` starts: a block, its
+    /// item and iteration, and its one-based attempt.
+    ///
+    /// # Errors
+    /// Returns a bounded reason when the record cannot commit, such as a lost
+    /// lease; the attempt is then not dispatched.
+    async fn begin(&self, producer: &Producer) -> Result<(), String>;
+
+    /// Forget the unsettled attempt `producer`, which was refused process
+    /// capacity or its definition after its host work settled, so it spends
+    /// no retry, while recording `tool_calls_spent`, the requests its
+    /// invocation had spent, so the deferred retry resumes from that count.
+    /// A host keeps the record of an attempt that already retained work as a
+    /// spent attempt.
+    ///
+    /// # Errors
+    /// Returns a bounded reason when the record cannot commit.
+    async fn forget(&self, producer: &Producer, tool_calls_spent: u32) -> Result<(), String>;
+
+    /// Record that the unsettled attempt `producer`'s invocation has spent
+    /// `tool_calls_spent` tool requests, called as each request spends one.
+    ///
+    /// Nothing waits for it to persist: a reclaimed invocation resumes from
+    /// the latest count the host persisted, so a request spent just before
+    /// an interruption may be spent again. A host that can no longer record
+    /// ignores it; its next commit reports the failure.
+    fn spent(&self, producer: &Producer, tool_calls_spent: u32);
+
+    /// Commit `settled` as the outcome of the attempt `producer`.
+    ///
+    /// # Errors
+    /// Returns a bounded reason when the settlement cannot commit; the block's
+    /// dependents then do not run.
+    async fn settle(
+        &self,
+        producer: &Producer,
+        settled: &InvocationSettlement,
+    ) -> Result<(), String>;
+
+    /// Record a scheduling decision recovery must reproduce rather than make
+    /// again, such as a step's frozen fanout items or a speculative step's
+    /// disposition, before anything depends on it.
+    ///
+    /// # Errors
+    /// Returns a bounded reason when the decision cannot commit; nothing that
+    /// depends on it then runs.
+    async fn control(&self, control: &ControlRecord) -> Result<(), String>;
+
+    /// Record that the engine reached the undecided approval `occurrence`
+    /// while other work may still run, so the host can offer it for a
+    /// decision at once rather than only when the execution parks.
+    /// Recording the same occurrence again changes nothing.
+    ///
+    /// # Errors
+    /// Returns a bounded reason when the occurrence cannot be recorded, such
+    /// as a lost lease; nothing downstream of it then runs.
+    async fn reached(&self, occurrence: &ApprovalOccurrence) -> Result<(), String>;
+}
+
 /// Decodes a check's raw `response` as the Verdict its declared `schema`
 /// describes.
 ///
@@ -189,16 +427,23 @@ pub trait CheckExecutor: Send + Sync {
 /// [`Verdict`], and keep its custom `data` within the fixed bounds. Agent
 /// and code checks share this rule; a refusal names the failing schema
 /// location or limit, never the response contents or a path into them,
-/// since returned dictionary keys are response contents.
+/// since returned dictionary keys are response contents. `schemas` reuses
+/// the schema's compiled validator when an equal schema was prepared before;
+/// the response is validated either way.
 ///
 /// # Errors
 /// Returns [`BlockError::Terminal`], which makes the requirement
 /// inconclusive, for an invalid schema, a response the schema refuses, a
 /// response that is not a Verdict, or data beyond its bounds.
-pub fn verdict_from(schema: &Value, response: Value) -> Result<Verdict, BlockError> {
+pub fn verdict_from(
+    schemas: &PreparedSchemas,
+    schema: &SharedSchema,
+    response: Value,
+) -> Result<Verdict, BlockError> {
     let terminal = |reason: String| BlockError::Terminal { reason };
-    let validator = jsonschema::validator_for(schema)
-        .map_err(|_| terminal("the declared Verdict format is not a valid schema".to_owned()))?;
+    let validator = schemas
+        .validator(schema)
+        .ok_or_else(|| terminal("the declared Verdict format is not a valid schema".to_owned()))?;
     if let Some(error) = validator.iter_errors(&response).next() {
         return Err(terminal(format!(
             "the check response violates its declared Verdict format at schema `{}`",
@@ -213,7 +458,7 @@ pub fn verdict_from(schema: &Value, response: Value) -> Result<Verdict, BlockErr
 
 #[cfg(test)]
 mod tests {
-    //! Executor seam calls and the tool-record handoff into step results.
+    //! Executor seam calls and Verdict decoding.
 
     use std::sync::Arc;
     use std::time::Duration;
@@ -236,9 +481,8 @@ mod tests {
         async fn execute(&self, call: BlockCall<'_, Action>) -> Result<ActionOutput, BlockError> {
             match call.inputs.get("from").map(|input| &input.value) {
                 Some(CallValue::Json(value)) => Ok(ActionOutput {
-                    output: value.clone(),
+                    output: Value::clone(value),
                     provenance: None,
-                    tool_calls: Vec::new(),
                 }),
                 _ => Err(BlockError::Terminal {
                     reason: "from is not JSON".to_owned(),
@@ -260,7 +504,7 @@ mod tests {
             serde_json::from_value(json!({"kind": "extract", "from": "inputs.deck"}))
                 .expect("action");
         let input = CallInput {
-            value: CallValue::Json(json!({"slides": []})),
+            value: CallValue::Json(json!({"slides": []}).into()),
             sources: BTreeSet::from([SlotName::new("deck").expect("slot")]),
         };
         let call = BlockCall {
@@ -270,45 +514,13 @@ mod tests {
             inputs: BTreeMap::from([("from".to_owned(), input)]),
             workspace: BTreeMap::new(),
             deadline: Instant::now() + Duration::from_secs(5),
+            attempt: 1,
+            item_index: None,
+            iteration_index: None,
+            tool_calls: ToolCallsOwner::default().handle(),
         };
         let output = executor.execute(call).await.expect("output");
         assert_eq!(output.output, json!({"slides": []}));
-    }
-
-    /// A tool record an action returns is the record a step result carries:
-    /// its digest and returned byte count survive the result wire round trip.
-    ///
-    /// # Panics
-    /// Panics when the step result does not round-trip the record unchanged.
-    #[test]
-    fn action_tool_calls_carry_into_step_results() {
-        use wyrd_spec::card::agent::BuiltinTool;
-        use wyrd_spec::verification::execution::{StepResult, StepStatus};
-        let record: ToolCallRecord = serde_json::from_value(json!({
-            "tool": "fs.read", "arguments": {"path": "/inputs/a.pdf"},
-            "output_sha256": "c".repeat(64), "returned_bytes": 512
-        }))
-        .expect("record");
-        let output = ActionOutput {
-            output: json!({"cap": 24}),
-            provenance: None,
-            tool_calls: vec![record.clone()],
-        };
-        let step = StepResult {
-            id: TaskId::new("findings").expect("id"),
-            status: StepStatus::Succeeded,
-            output: Some(output.output),
-            attempts: 1,
-            duration_ms: 5,
-            reason: None,
-            provenance: output.provenance,
-            tool_calls: output.tool_calls,
-        };
-        let wire = serde_json::to_value(&step).expect("serialize");
-        let parsed: StepResult = serde_json::from_value(wire).expect("deserialize");
-        assert_eq!(parsed.tool_calls, vec![record]);
-        assert_eq!(parsed.tool_calls[0].tool, BuiltinTool::FsRead);
-        assert_eq!(parsed.tool_calls[0].returned_bytes, 512);
     }
 
     /// A declared data schema keeps its own reference root once embedded in
@@ -362,20 +574,73 @@ mod tests {
         for (data, good, bad) in cases {
             let format: skald_spec::NamedResponseFormat =
                 serde_json::from_value(json!({"kind": "verdict", "data": data})).expect("format");
-            let schema = Value::Object(Verdict::response_format(&format).expect("resolves"));
-            let verdict = verdict_from(&schema, response(good.clone()))
-                .unwrap_or_else(|error| panic!("{good}: {error}"));
+            let schema = SharedSchema::new(Value::Object(
+                Verdict::response_format(&format).expect("resolves"),
+            ));
+            let verdict =
+                verdict_from(&PreparedSchemas::default(), &schema, response(good.clone()))
+                    .unwrap_or_else(|error| panic!("{good}: {error}"));
             assert_eq!(serde_json::to_value(verdict.data).expect("data"), good);
             for bad in bad {
                 assert!(
                     matches!(
-                        verdict_from(&schema, response(bad.clone())),
+                        verdict_from(&PreparedSchemas::default(), &schema, response(bad.clone())),
                         Err(BlockError::Terminal { .. })
                     ),
                     "{bad}"
                 );
             }
         }
+    }
+
+    /// A warm prepared Verdict format still refuses a response its schema
+    /// refuses, a non-Verdict, and custom data beyond the depth bound, and a
+    /// changed format is judged by its own schema rather than a stale one.
+    ///
+    /// # Panics
+    /// Panics when a warm format accepts what it refuses cold, or a changed
+    /// format reuses the previous validator.
+    #[test]
+    fn prepared_verdict_keeps_validation_and_data_bounds() {
+        let schemas = PreparedSchemas::default();
+        let format = |data: Value| {
+            let format: skald_spec::NamedResponseFormat =
+                serde_json::from_value(json!({"kind": "verdict", "data": data})).expect("format");
+            SharedSchema::new(Value::Object(
+                Verdict::response_format(&format).expect("resolves"),
+            ))
+        };
+        let integers = format(json!({"type": "object", "additionalProperties": true}));
+        let response = |data: Value| json!({"outcome": "passed", "reason": "judged", "citations": [], "data": data});
+        let mut deep = json!(1);
+        for _ in 0..=wyrd_spec::verification::execution::MAX_VERDICT_DATA_DEPTH {
+            deep = json!({"n": deep});
+        }
+        for _ in 0..2 {
+            let verdict =
+                verdict_from(&schemas, &integers, response(json!({"n": 1}))).expect("valid");
+            assert_eq!(
+                verdict.outcome,
+                wyrd_spec::verification::VerificationVerdict::Passed
+            );
+            for refused in [
+                json!({"outcome": "passed", "reason": "judged", "citations": [], "data": 1}),
+                json!({"outcome": "maybe", "reason": "judged", "citations": []}),
+                response(deep.clone()),
+            ] {
+                assert!(
+                    matches!(
+                        verdict_from(&schemas, &integers, refused.clone()),
+                        Err(BlockError::Terminal { .. })
+                    ),
+                    "{refused}"
+                );
+            }
+        }
+        let strings = format(json!({"type": "object", "additionalProperties": {"type": "string"}}));
+        assert!(verdict_from(&schemas, &strings, response(json!({"n": 1}))).is_err());
+        assert!(verdict_from(&schemas, &strings, response(json!({"n": "1"}))).is_ok());
+        assert!(verdict_from(&schemas, &integers, response(json!({"n": 1}))).is_ok());
     }
 
     /// A refusal names where the declared schema failed, never where the
@@ -391,11 +656,13 @@ mod tests {
             "data": {"type": "object", "additionalProperties": {"type": "integer"}}
         }))
         .expect("format");
-        let schema = Value::Object(Verdict::response_format(&format).expect("resolves"));
+        let schema = SharedSchema::new(Value::Object(
+            Verdict::response_format(&format).expect("resolves"),
+        ));
         let secret = "customer-secret@example.test";
         let response = json!({"outcome": "passed", "reason": "judged", "citations": [],
             "data": {"nested": 1, secret: "wrong"}});
-        match verdict_from(&schema, response) {
+        match verdict_from(&PreparedSchemas::default(), &schema, response) {
             Err(BlockError::Terminal { reason }) => {
                 assert!(!reason.contains("customer-secret"), "{reason}");
             }

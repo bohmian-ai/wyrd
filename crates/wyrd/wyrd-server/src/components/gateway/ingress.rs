@@ -12,7 +12,6 @@
 //! governed [`GatewayInvocation`], which never forwards caller headers to a
 //! provider.
 
-use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, RawQuery, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method};
 use axum::middleware::{self, Next};
@@ -23,7 +22,7 @@ use serde_json::Value;
 use skald_spec::ProviderName;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
-use wyrd_gateway::IngressDialect;
+use wyrd_gateway::{IngressDialect, RequestJson};
 use wyrd_spec::auth::DEPLOYMENT_ENVIRONMENT_HEADER;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::native::{
@@ -45,7 +44,9 @@ use super::invocation::{
     GatewayCallAttribution, GatewayCallContext, GatewayCallRequest, GatewayInvocation,
     invalid_request,
 };
-use super::routes::{self, PUBLIC_CALL_TIMEOUT, openai_error, relay, token_bound, typed_body};
+use super::routes::{
+    self, JsonBody, PUBLIC_CALL_TIMEOUT, openai_error, relay, token_bound, typed_body,
+};
 use super::telemetry::IngressClock;
 use crate::components::auth::Caller;
 use crate::components::auth::token_extract::{
@@ -467,14 +468,15 @@ pub(crate) async fn anthropic_messages(
     caller: Result<Caller, WyrdErrorResponse>,
     clock: Option<Extension<IngressClock>>,
     headers: HeaderMap,
-    request: Result<Json<Value>, JsonRejection>,
+    request: Result<JsonBody, WyrdErrorResponse>,
 ) -> Response {
     let answer = match caller {
         Err(WyrdErrorResponse(error)) => Err(error),
         Ok(caller) => {
             let call = typed_body::<GatewayAnthropicMessagesRequest>(request).and_then(|body| {
                 let model = body
-                    .get("model")
+                    .member("model")
+                    .as_deref()
                     .and_then(Value::as_str)
                     .ok_or_else(|| {
                         invalid_request(GatewayContractError::new("model", "is required"))
@@ -485,7 +487,7 @@ pub(crate) async fn anthropic_messages(
                     ingress: IngressDialect::AnthropicMessages,
                     fallback: requested_fallback(&headers, &model)?,
                     model,
-                    stream: body.get("stream") == Some(&Value::Bool(true)),
+                    stream: body.member("stream").as_deref() == Some(&Value::Bool(true)),
                     usage_bound: anthropic_usage_bound(&body),
                     body,
                     media: None,
@@ -558,7 +560,7 @@ pub(crate) async fn jev_systemone(
     caller: Result<Caller, WyrdErrorResponse>,
     clock: Option<Extension<IngressClock>>,
     headers: HeaderMap,
-    request: Result<Json<Value>, JsonRejection>,
+    request: Result<JsonBody, WyrdErrorResponse>,
 ) -> Response {
     let answer = match caller {
         Err(WyrdErrorResponse(error)) => Err(error),
@@ -588,11 +590,12 @@ pub(crate) async fn jev_systemone(
 /// error of [`requested_fallback`], [`requested_context`], and [`requested_prompt_provider`].
 fn jev_call(
     headers: &HeaderMap,
-    request: Result<Json<Value>, JsonRejection>,
+    request: Result<JsonBody, WyrdErrorResponse>,
 ) -> Result<GatewayCallRequest, WyrdError> {
     let body = typed_body::<GatewayJevRequest>(request)?;
     let model = body
-        .get("model")
+        .member("model")
+        .as_deref()
         .and_then(Value::as_str)
         .ok_or_else(|| invalid_request(GatewayContractError::new("model", "is required")))
         .and_then(native_model)?;
@@ -666,7 +669,7 @@ pub(crate) async fn gemini_generate_content(
     Path((deployment, target)): Path<(String, String)>,
     RawQuery(query): RawQuery,
     headers: HeaderMap,
-    request: Result<Json<Value>, JsonRejection>,
+    request: Result<JsonBody, WyrdErrorResponse>,
 ) -> Response {
     let answer = match caller {
         Err(WyrdErrorResponse(error)) => Err(error),
@@ -722,7 +725,7 @@ fn gemini_call(
     target: &str,
     query: Option<&str>,
     headers: &HeaderMap,
-    request: Result<Json<Value>, JsonRejection>,
+    request: Result<JsonBody, WyrdErrorResponse>,
 ) -> Result<GatewayCallRequest, WyrdError> {
     let (model, method) = target.rsplit_once(':').unwrap_or((target, ""));
     let stream = match method {
@@ -777,8 +780,8 @@ fn gemini_call(
 
 /// Token usage bound of an Anthropic Messages `body`, whose output is bounded
 /// by its required `max_tokens`, or `None` when it is unbounded.
-pub(super) fn anthropic_usage_bound(body: &Value) -> Option<Vec<GatewayUsageAmount>> {
-    let output = body.get("max_tokens").and_then(Value::as_u64)?;
+pub(super) fn anthropic_usage_bound(body: &RequestJson) -> Option<Vec<GatewayUsageAmount>> {
+    let output = body.member("max_tokens")?.as_u64()?;
     token_bound(body, Some(output))
 }
 
@@ -788,10 +791,11 @@ pub(super) fn anthropic_usage_bound(body: &Value) -> Option<Vec<GatewayUsageAmou
 /// Output is bounded by `maxOutputTokens` times `candidateCount` (default
 /// one) of its generation config, in either camel or snake case; a body
 /// without that maximum is unbounded.
-pub(super) fn google_usage_bound(body: &Value) -> Option<Vec<GatewayUsageAmount>> {
+pub(super) fn google_usage_bound(body: &RequestJson) -> Option<Vec<GatewayUsageAmount>> {
     let config = body
-        .get("generationConfig")
-        .or_else(|| body.get("generation_config"));
+        .member("generationConfig")
+        .or_else(|| body.member("generation_config"));
+    let config = config.as_deref();
     let field = |camel: &str, snake: &str| {
         config
             .and_then(|config| config.get(camel).or_else(|| config.get(snake)))

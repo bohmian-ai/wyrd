@@ -364,7 +364,8 @@ result = run.observe.verify(
     policy=verify.File("refund-policy.pdf"),  # your policy document, with "up to N dollars"
 )
 print(result.verdict)  # passed
-for step in result.steps:  # each step's status, for debugging
+details = verify.Execution.connect(result.execution_id).details()
+for step in details["outcome"]["steps"]:  # each step's status, for debugging
     print(step["id"], step["status"])
 ```
 

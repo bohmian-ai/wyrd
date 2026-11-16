@@ -17,11 +17,11 @@ pub struct Verifier {
 }
 
 impl Verifier {
-    /// An empty Verifier Card named `name` at `version`; nothing is
-    /// validated until its graph is.
-    pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
+    /// An empty Verifier Card named `name` at `version`, or with no version
+    /// for the server to select; nothing is validated until its graph is.
+    pub fn new<'v>(name: impl Into<String>, version: impl Into<Option<&'v str>>) -> Self {
         Self {
-            card: Card::new(CardKind::Verifier, name, version),
+            card: Card::new(CardKind::Verifier, name, version.into()),
         }
     }
 
@@ -62,7 +62,7 @@ fields!(Verifier [card.spec] {
 impl From<Verifier> for CardDefinition {
     /// The same Card, keeping what it references.
     fn from(verifier: Verifier) -> Self {
-        Self(verifier.card)
+        Self(std::sync::Arc::new(verifier.card))
     }
 }
 
@@ -336,18 +336,19 @@ impl Check {
         Self { body }
     }
 
-    /// Compare the one value at `path` with `expected` by `operator`, such
-    /// as `"equals"` or its object form.
+    /// Compare the one value at `path` with `expected` by `operator`: a
+    /// [`ComparisonOperator`](wyrd_spec::verification::ComparisonOperator),
+    /// or its YAML form such as `"equals"`.
     pub fn assert(
         path: impl Into<String>,
-        operator: impl Into<Value>,
+        operator: impl Into<FieldValue>,
         expected: impl Into<Value>,
     ) -> Self {
         Self::of(
             "assert",
             [
                 ("path", FieldValue::from(path.into())),
-                ("operator", FieldValue::from(operator.into())),
+                ("operator", operator.into()),
                 ("expected", FieldValue::from(expected.into())),
             ],
         )
@@ -357,14 +358,14 @@ impl Check {
     /// `operator`.
     pub fn each(
         each: impl Into<String>,
-        operator: impl Into<Value>,
+        operator: impl Into<FieldValue>,
         expected: impl Into<Value>,
     ) -> Self {
         Self::of(
             "assert",
             [
                 ("each", FieldValue::from(each.into())),
-                ("operator", FieldValue::from(operator.into())),
+                ("operator", operator.into()),
                 ("expected", FieldValue::from(expected.into())),
             ],
         )
@@ -375,7 +376,7 @@ impl Check {
     pub fn trace(
         on: impl Into<String>,
         span_selector: impl Into<String>,
-        operator: impl Into<Value>,
+        operator: impl Into<FieldValue>,
         expected: impl Into<Value>,
     ) -> Self {
         Self::of(
@@ -383,7 +384,7 @@ impl Check {
             [
                 ("on", FieldValue::from(on.into())),
                 ("span_selector", FieldValue::from(span_selector.into())),
-                ("operator", FieldValue::from(operator.into())),
+                ("operator", operator.into()),
                 ("expected", FieldValue::from(expected.into())),
             ],
         )

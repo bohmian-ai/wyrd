@@ -22,7 +22,7 @@ use std::time::Duration;
 use sha2::{Digest as _, Sha256};
 use vala_bifrost_redux::oracle::OraclePreparationPause;
 use vala_bifrost_redux::oracle::analytical::{AnalyticalExecutePause, AnalyticalPhysicalEvidence};
-use wyrd_server::config::BifrostTarget;
+use wyrd_server::config::ServerTarget;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::NodeId;
@@ -67,7 +67,7 @@ pub(crate) struct PeerCluster {
     /// The composed pods and their shared Postgres, storage, and peer CA.
     cluster: WyrdTestCluster,
     /// Target each pod was started as, in pod order.
-    targets: Vec<BifrostTarget>,
+    targets: Vec<ServerTarget>,
     /// Member leaf of the cluster authority every probe presents.
     member: BifrostPeerLeaf,
     /// Armed follower `ExecuteTask` pause per pod.
@@ -85,7 +85,7 @@ impl PeerCluster {
     ///
     /// Returns the cluster boot failure, or a readiness timeout naming the
     /// pod and its failing probes.
-    pub(crate) async fn start(targets: &[BifrostTarget]) -> Result<Self, JourneyError> {
+    pub(crate) async fn start(targets: &[ServerTarget]) -> Result<Self, JourneyError> {
         let pods: Vec<_> = targets.iter().map(|target| (*target, None)).collect();
         Self::launch(&pods, false).await
     }
@@ -100,7 +100,7 @@ impl PeerCluster {
     ///
     /// Returns the same errors as [`Self::start`].
     pub(crate) async fn start_with_slots(
-        pods: &[(BifrostTarget, Option<usize>)],
+        pods: &[(ServerTarget, Option<usize>)],
     ) -> Result<Self, JourneyError> {
         Self::launch(pods, false).await
     }
@@ -113,7 +113,7 @@ impl PeerCluster {
     /// # Errors
     ///
     /// Returns the same errors as [`Self::start`].
-    pub(crate) async fn start_with_joiner(targets: &[BifrostTarget]) -> Result<Self, JourneyError> {
+    pub(crate) async fn start_with_joiner(targets: &[ServerTarget]) -> Result<Self, JourneyError> {
         let pods: Vec<_> = targets.iter().map(|target| (*target, None)).collect();
         Self::launch(&pods, true).await
     }
@@ -125,10 +125,10 @@ impl PeerCluster {
     /// Returns the cluster boot failure, a member-leaf generation failure, or
     /// a readiness timeout.
     async fn launch(
-        pods: &[(BifrostTarget, Option<usize>)],
+        pods: &[(ServerTarget, Option<usize>)],
         delay_last: bool,
     ) -> Result<Self, JourneyError> {
-        let targets: Vec<BifrostTarget> = pods.iter().map(|(target, _)| *target).collect();
+        let targets: Vec<ServerTarget> = pods.iter().map(|(target, _)| *target).collect();
         let mut spec = BifrostClusterSpec::for_targets(&targets);
         for (node, (_, slots)) in spec.nodes.iter_mut().zip(pods) {
             if let Some(oracle) = node.oracle.as_mut() {
@@ -166,12 +166,12 @@ impl PeerCluster {
     /// # Panics
     ///
     /// Panics when `index` names no configured pod, which is a journey bug.
-    pub(crate) fn target(&self, index: usize) -> BifrostTarget {
+    pub(crate) fn target(&self, index: usize) -> ServerTarget {
         self.targets[index]
     }
 
     /// Returns every pod index started as `target`, in pod order.
-    pub(crate) fn indices_of(&self, target: BifrostTarget) -> Vec<usize> {
+    pub(crate) fn indices_of(&self, target: ServerTarget) -> Vec<usize> {
         (0..self.len())
             .filter(|index| self.targets[*index] == target)
             .collect()
@@ -236,7 +236,7 @@ impl PeerCluster {
     ///
     /// Returns a timeout naming every probe's reason and the peer-plane state.
     async fn await_ready(&self, index: usize) -> Result<(), JourneyError> {
-        if self.targets[index] == BifrostTarget::ForgeWorker {
+        if self.targets[index] == ServerTarget::BifrostMaintenance {
             return Ok(());
         }
         let deadline = tokio::time::Instant::now() + READY_DEADLINE;

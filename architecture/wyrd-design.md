@@ -21,8 +21,9 @@ drift, not permission for code and documentation to diverge.
 ## Table of contents
 
 - [Doctrine](#doctrine) — 21 design principles
+- [Recording and eventual consistency](#recording-and-eventual-consistency) — asynchronous recording and explicit durability boundaries
 - [Client model](#client-model) — language-agnostic protocol and first-class SDKs
-- [Kind catalog](#kind-catalog) — 12 registrable kinds + External discriminator
+- [Kind catalog](#kind-catalog) — 13 registrable kinds + External discriminator
 - [Per-kind specs](#per-kind-specs) — field shapes per kind
   - [Data](#data) · [Model](#model) · [Artifact](#artifact) · [Experiment](#experiment)
   - [Prompt](#prompt) · [Agent](#agent) · [Mcp](#mcp)
@@ -255,11 +256,16 @@ services.
     durable identity or an authored `Path`; `InlineableRef<T>` additionally
     permits an inline child body. `Path` is loader-only. During composite
     declaration, the loader may rewrite an authored path to the
-    declaration-only `Sibling { sibling: CardRef }` form so the server can
+    declaration-only `Sibling { sibling: SiblingRef }` form so the server can
     distinguish a target submitted in the same request from an external Card
-    referenced with `Ref(CardRef)`. The server validates both forms and
-    rewrites them to UID-bearing `Ref(CardRef)` before hashing, relationship
-    derivation, blob persistence, or any read response. `Sibling` is not a
+    referenced with `Ref(CardRef)`. A `SiblingRef` is `kind`, `name`, and an
+    optional `version`: with a version it names that submitted target, without
+    one the sole submission of that kind and name; several such submissions
+    make the link ambiguous and it is refused
+    (`WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY`). The server validates both
+    forms and rewrites them to the target's full registered `Ref(CardRef)`,
+    selected version and UID, before hashing, relationship derivation, blob
+    persistence, or any read response. `Sibling` is not a
     durable reference form, and there is no separate selector reference enum.
     The server, registry, and evaluator reject unresolved paths at their
     boundaries.
@@ -295,6 +301,30 @@ services.
     changes the containing Card spec. There is no separate publication or
     monitor-routing field, and clients never select a Verifier per
     observation.
+
+## Recording and eventual consistency
+
+Recording is asynchronous and eventually consistent by default. Execution does
+not wait for recorded results, evidence, or audit events to become durable or
+queryable. Verification and gateway calls stage their records on the process
+Scribe outbox and continue; background writers batch and persist those records
+in Bifrost. A successful execution response does not certify that its records
+are already retained or visible to readers.
+
+Background PostgreSQL writers and Scribe use batching and group commit.
+Recording must not introduce a database write or a wait for downstream
+acknowledgements into the execution path. Any operation that must wait for
+durability must explicitly document that boundary in its owning architecture
+contract. Existing boundaries include recoverable queued submission acceptance
+and the Bifrost append acknowledgement. Queued execution also retains its claim
+in background until terminal state and results are acknowledged; computation
+does not retain its engine resources while waiting.
+
+Eventual consistency does not excuse lost records. Recording paths retain their
+bounded buffering, retry, overload handling, and loss accounting contracts.
+Staging in process memory is not a durability acknowledgement; crash and
+shutdown guarantees remain explicit in the owning recording contract. Audit
+recording never blocks or fails the operation being audited.
 
 ## Client model
 
@@ -370,7 +400,7 @@ and ingest clients or implement their own HTTP or gRPC transports.
 
 ## Kind catalog
 
-Wyrd registers 12 native Card kinds. `CardKind::External` is a non-registrable
+Wyrd registers 13 native Card kinds. `CardKind::External` is a non-registrable
 discriminator used when reading foreign or unknown kind metadata. The foreign
 payload remains opaque and source-specific; it is not a Wyrd Card. There is no
 `ExternalSpec` and no External Card declaration path.
@@ -383,6 +413,7 @@ payload remains opaque and source-specific; it is not a Wyrd Card. There is no
 | Governance    | Audit |
 | Observability | Verifier |
 | Reaction      | Trigger, Operator |
+| Source control| Repository |
 
 `Tool` (a Skald runtime registry name), `SubAgent` (an Agent-to-Agent
 relationship), `Skill`, and `Bifrost` (server state) are not Card kinds.
@@ -503,14 +534,14 @@ spec:
   system?: string
   messages: [{ role: user | assistant, content: string | [ContentBlock] }]
   settings?: PortableSettings      # temperature, top_p, max_output_tokens, top_k, stop_sequences, seed, presence_penalty, frequency_penalty, reasoning_effort (chat_completion only)
-  response_format?: JsonSchema | verdict | { kind: verdict, data?: JsonSchema }
+  response_format?: JsonSchema | verdict | { kind: verdict, data?: JsonSchema } | code_review
 # Native form: one protocol body passed through unchanged.
 spec:
   provider: ProviderName
   model: string
   format: chat_completion | responses | messages | generate_content | system_one
   body: { ... }                    # that protocol's request body, extension options preserved
-  response_format?: verdict | { kind: verdict, data?: JsonSchema }
+  response_format?: verdict | { kind: verdict, data?: JsonSchema } | code_review
 ```
 
 `response_format: verdict` (or `{kind: verdict}`) compiles the closed
@@ -528,8 +559,18 @@ authored form, never the expanded provider settings. On a native body the
 named format is lowered into that protocol's structured-output settings; a
 body that also sets its own response settings, or a `system_one` body, is
 refused. Skald owns the
-compiler but no format names: Wyrd resolves `verdict` when it compiles a
-Prompt, and an unresolved named format cannot render.
+compiler but no format names: Wyrd resolves `verdict` and `code_review` when
+it compiles a Prompt, and an unresolved named format cannot render.
+
+`response_format: code_review` compiles the closed standard code review
+report: `format: code_review`, `version: 1`, a `summary`, `coverage`
+(`complete` and `limitations`) and `findings`, each with a report-unique
+`id`, `severity`, `confidence`, `title`, `explanation`, source `locations`
+and `evidence` anchors (path, commit, inclusive line range) and an optional
+`remediation` with an optional `suggested_edit`. It takes no `data`. The
+report is ordinary step output: normal code may return the same envelope,
+authored requirements judge it like any other output, and its severities
+never decide a verdict. It is optional; only GitHub delivery reads it.
 
 `provider` names the Prompt's protocol family and the native destination; a
 custom name is an OpenAI-compatible Chat provider. It never names a gateway
@@ -640,11 +681,14 @@ is a server-internal write holding no token, role, or grant; Scribe stamps
 each captured row with the verified pair the call ran under. Each `wyrd-server` process stages captures on its one
 Scribe outbox, which submits in-process when Scribe runs in the pod
 (`WYRD_TARGET`) and otherwise over the peer plane to a live, ready Scribe,
-retrying Scribe backpressure. A capturing call reserves its outbox slot during
+retrying Scribe backpressure. A standalone capturing call reserves its outbox slot during
 admission, before it is charged or dispatched; while the outbox is full,
 admission backs off and retries until the call's deadline, and then refuses the
 call with the retryable `WYRD_GATEWAY_429_CAPTURE_STAGING_FULL`. A reserved
-capture is never shed. Payload, storage, or deadline failures while the
+capture is never shed. A verification-originated call does not wait for a
+capture slot: its capture is staged unreserved and, when the outbox is full,
+shed and counted lost. Provider/model admission, quota accounting and per-call
+deadlines, including model response time, apply to both. Payload, storage, or deadline failures while the
 capture is projected drop it with a counted reason without changing the
 answered call. The same outbox submits Verifier results to the
 three result tables, attributed to the pair the result was produced under —
@@ -652,7 +696,10 @@ the caller's verified pair for a realtime invocation, and the run's subject
 with the tenant's `System` principal as actor for a queued run — which Scribe
 stamps as `sub_principal_id` and `act_principal_id`; each row names the verified Card as `card_uid` and the
 exact Verifier Card as `verifier_card_uid`; a result batch is never dropped for time and is retried under its
-own batch id until Scribe acknowledges it. Gate refuses every public write to
+own batch id until Scribe acknowledges it. A queued run commits `completed`
+only after Scribe acknowledges every row of its selected result; a result
+Scribe drops retries the run from its accepted state with
+`result_undelivered` within the attempt budget. Gate refuses every public write to
 `bifrost.gateway.calls` and the three result tables.
 Tenant principal kinds are `TenantAdmin`, `User`, and `Service`, plus the
 internal credentialless `System` actor. Agent is a Card kind, not a principal
@@ -666,7 +713,7 @@ account identity.
 A Service account carries one `workload_restriction`, a closed union:
 `{"mode":"unrestricted"}` (the default) or
 `{"mode":"family","kind":"Service","name":<card name>}`. A family
-restriction limits Card-attributed emission and verification to roots of that
+restriction limits Card-attributed emission to roots of that
 family, and makes the account that family's unique scheduled runtime account
 in the tenant; a second live account for the same family conflicts. Setting a
 family restriction, at creation or later, additionally requires
@@ -926,6 +973,24 @@ storage, URLs, logs, telemetry, captures or cookies. Store failure is unavailabl
 not anonymous success. Prior credential-bearing UI cookies require re-login;
 no plaintext-cookie compatibility path is retained.
 
+#### GitHub App association
+
+A tenant connects to GitHub.com through its documented App installation and
+OAuth flow, associating one installation of the deployment's GitHub App with the tenant; it creates no principal, Card or
+binding. The association is the tenant's single
+`wyrd.github_installations` slot, served at `/v1/integrations/github`
+(read, connect, disconnect) with the browser `setup` and `callback`
+redirects and the unauthenticated, signature-verified `webhook`. Association
+happens only at the callback, after GitHub confirms the installation belongs
+to this App, is not suspended and is reachable by the authorizing user; the
+view returns the configured host and App, state, installation id and the
+selected repositories that user could reach. Installation events suspend,
+resume, narrow or release the slot. Work that needs a repository asks the
+server for an installation token at the moment of use; repository access is
+the conjunction of the association, the selection and GitHub's current
+answer. Security controls are in
+[GitHub App association](wyrd-security-posture.md#github-app-association).
+
 #### Cross-service delegation
 
 The API key is exchanged at `/auth/token`, or once at
@@ -970,6 +1035,34 @@ Content-Type: application/json
 
 { "amount": 100 }
 ```
+
+#### Gateway quota enforcement
+
+Gateway request, token, concurrency and spending-budget checks use a per-server
+cache of tenant policy, refreshed shared usage and pending local reservations.
+Each server reserves atomically against its local view before provider dispatch.
+Quota admission and accounting do not await PostgreSQL; the existing Gateway
+background lifecycle batches usage writes and refreshes shared state. This
+guarantee excludes explicit authentication/token exchanges and administration.
+
+Enforcement across servers is approximate, including monetary budgets. A
+configured quota is not a strict cluster-wide ceiling: delayed visibility and
+loss of unflushed usage on abrupt process death can permit overshoot. Pending
+usage is memory-owned; no crash-safe local ledger is required. Background writes
+preserve tenant isolation and combine server contributions without losing local
+pending reservations or double-counting retried/committed updates. Local
+concurrency releases when execution ends, including stream completion.
+
+Missing usable policy/usage, unhealthy refresh or full pending-accounting state
+refuses quota-covered work before dispatch with retryable
+`503 WYRD_SERVER_503_SERVICE_UNAVAILABLE` until background recovery succeeds.
+Unknown policy is not assumed unrestricted. Cache misses do not substitute a
+synchronous quota-path database read. Buffers and background work remain bounded
+under the existing Gateway lifecycle, and normal shutdown drains accepted work;
+an expired shutdown deadline may lose unflushed usage.
+
+These approximate quota rules never relax permission checks, tenant isolation,
+credential handling, or the capture-slot reservation required before dispatch.
 
 #### Request correlator — `Wyrd-Request-Id`
 
@@ -1021,7 +1114,15 @@ Server spans export twice from one tracer provider:
   filter `WYRD_LOG`/`RUST_LOG`; neither filter nor the ratio can remove a
   tenant copy, because catalog spans and events at `info` or above always
   record. Logs are written whatever the sampling decision, so an error in
-  an unsampled request is still logged inside its request span.
+  an unsampled request is still logged inside its request span. At `info`
+  a direct verification opens only the request span,
+  `verification.execute`, the GenAI spans, `gateway.call`,
+  `gateway.execute`, and `gateway.attempt`; its in-process phases
+  (`verification.handle`, `verification.load`, `verification.engine`, the
+  hosted workspace's `verification.workspace.open`, per-file
+  `verification.workspace.stage`, and `verification.workspace.install`, and
+  the gateway's authorize, route, admit, translate, account, and capture
+  spans) are `debug` spans, whose timing the phase metrics already carry.
 - A server span whose parent or one of whose links is a sampled client span
   also writes, with its catalog descendants, to the requesting tenant's
   `bifrost.traces.spans` on the process Scribe outbox, with the same trace,
@@ -1035,11 +1136,16 @@ Server spans export twice from one tracer provider:
   caller's attempt, its catalog descendants, and its gateway calls' captured
   attempts read back from the enqueuing trace's timeline. The tenant copy carries only the
   behavior-span catalog — the request span, `verification.*`, the Agent
-  loop's `invoke_agent`, `chat`, and `execute_tool`, `dispatch`,
-  `agent.gateway.call`, `gateway.*` except `gateway.attempt`,
-  `bifrost.gate.*`, `bifrost.oracle.query`, and OTLP ingest — and only spans
+  loop's `invoke_agent` and `execute_tool`, one OpenTelemetry GenAI
+  inference span per model call named after its `gen_ai.operation.name`
+  (`chat`, `generate_content`, or `embeddings`), `gateway.*` except
+  `gateway.attempt`, `bifrost.gate.*`, `bifrost.oracle.query`, and OTLP
+  ingest — at `info` or above, and only spans
   whose ancestors up to the span that opened the copy are all catalog
-  spans. It keeps only safe
+  spans. A catalog span below `info`, recorded only at higher operator
+  verbosity, is not copied: its copied children name its nearest copied
+  ancestor as their parent, so the tenant copy is the same at every
+  operator verbosity. It keeps only safe
   attributes (`wyrd.*`, `gen_ai.*`, and HTTP, RPC, and error semantic
   conventions); the tenant id is never a span attribute. The copy is
   non-blocking and never fails the request, and it works with or without an
@@ -1081,6 +1187,25 @@ view's exact subject `card_uid`. Switching Cards never requires a distinct Run
 ID, and the request's root Card cannot say which card a correlated record
 belongs to — the subject Card must be carried on that row. Generic telemetry
 may omit a subject Card.
+
+Run-scoped caller-table writes use `run.bifrost.write(row)` for the state's
+shared active table, or `write_to(table, row)` (`writeTo` in TypeScript) for a
+named `bifrost.datasets.<name>` destination without changing that binding.
+Rust uses its normal method accessor. With no chosen startup table, a root
+Service's sole declared table becomes active; no or multiple declarations
+infer none. Describing the inferred table is a startup precondition: failure
+prevents that state's entire Bifrost writer from starting, including fixed-table
+observations, while ordinary verification and the server remain available.
+The existing failed-start retry and closed-state rules apply. Missing active
+selection returns `WYRD_VALA_412_NO_ACTIVE_TABLE`; scoped writes outside
+`bifrost.datasets` return `WYRD_SDK_400_INVALID_OBSERVATION`.
+The state projects Bifrost's existing table-switch operation. Every Run shares
+the binding; callers needing distinct concurrent destinations use named writes.
+Each admitted row retains its destination, exact subject Card UID and Run ID.
+Switching retains prior table producers in the same shutdown drain. Write
+return means buffered submission, not durable admission or complete row-schema
+validation; successful state shutdown is the existing drain barrier. Fixed
+system destinations, direct Bifrost operations and authorization are unchanged.
 
 Python `Run` values are synchronous context managers for optional ambient span
 correlation. Entering a scope best-effort attaches the selected Card UID and
@@ -1449,7 +1574,16 @@ spec:
   steps?: [Step]                             # id, action, when?, depends_on?, retries?, timeout_seconds?, requirements?
   requirements?: [Requirement]               # id, statement, check — whole-Verifier
   decide?: all | { pass_rate: { threshold } } # default all
+  queue_only: bool                           # server-derived at registration; never authored
 ```
+
+`queue_only` is derived when the Verifier registers and is stored with its
+spec: `true` when a requirement judges a scheduled window, a step extracts a
+pull request, a step or check Agent, inline or a referenced registered Agent,
+declares the `publish` tool, a step is an `approval`, or a slot declares
+`deferred: true`, else
+`false`. A value an author sends is replaced, never honored. Every queued-only
+form is derived here at registration; execution never re-infers it.
 
 | Slot | Evidence |
 |---|---|
@@ -1457,6 +1591,39 @@ spec:
 | `media` | One file pinned by SHA-256, with accepted `formats` and optional lower `max_bytes` |
 | `trace` | A trace ID resolved through tenant-scoped trace reads |
 | `samples` | Named `features` (or metric names) recorded for a scheduled window |
+
+A `json` or `media` slot may declare `deferred: true` (default `false`; other
+kinds refuse it): its value is not supplied when the execution starts but
+published later for one connected repository's commit with
+`POST /v1/verification/evidence/publish` (`repository` as `owner/name`,
+`tags.commit`, `input`, `value`). References alone make a step or check a
+consumer of the slot, so a consumer and its dependents wait while independent
+steps run; there is no wait action, Trigger, or `depends_on` for it. When no
+runnable work remains the execution reports `waiting` with the slot names,
+releases its workspace, Python, and model capacity, keeps its claim and lease
+until Scribe acknowledges the parked revision, and only then releases its
+queue row with the attempt refunded and
+the original deadline kept. Publication is matched by tenant, repository,
+commit, and input to every active binding of that repository and every
+nonterminal execution of that commit whose Verifier declares the input as
+deferred; each subscribed exact Verifier version accepts the evidence once,
+and the publish answers only after every acceptance is durable. No subscriber
+refuses `WYRD_VERIFICATION_409_EVIDENCE_UNMATCHED` and retains nothing;
+identical content replays its receipt (`status: replayed`) and different
+content for the same source refuses `WYRD_VERIFICATION_409_EVIDENCE_CONFLICT`.
+Each publication makes its waiting consumers due through the existing queue,
+replays included, and a parked claim rechecks accepted evidence at most a
+minute later, so a lost wake is repaired. Evidence accepted before an
+execution exists is read when it starts. Publishing never starts an execution
+or reopens a settled one; supersession, revoked repository access
+(`repository_access_lost`), and the deadline fence a parked execution, and
+evidence that never arrives ends it `timed_out`, never passed. Publishing needs
+`verifier:run` on a subscribing Verifier and its subject, the permission
+`submit` checks; a subscriber the caller may not run is skipped, none refuses
+the publish, and Git metadata grants nothing. The repository and commit come from the caller:
+SDKs and `wyrd evidence publish` take an explicit argument, else
+`WYRD_REPOSITORY` / `WYRD_COMMIT`, else the working directory's `.git`, and
+detect no CI system.
 
 Every declared slot uses the same omission rule: missing evidence makes checks
 that need it inconclusive, never a passing absence assertion or an intentional
@@ -1470,9 +1637,10 @@ aggregation are unchanged.
 
 | Action | Does |
 |---|---|
-| `extract` | Reads one `media` slot into the format-discriminated extraction JSON (PDF, PPTX, DOCX, XLSX, CSV, JSON, text/Markdown/HTML). Text and structure only; no OCR or rendering |
+| `extract` | Exactly one of `from` or `extractor`. `from` reads one `media` slot into the format-discriminated extraction JSON (PDF, PPTX, DOCX, XLSX, CSV, JSON, text/Markdown/HTML); text and structure only, no OCR or rendering. `extractor: pull_request` reads the accepted source of the pull request a queued `pull_request` execution was admitted for (see below) |
 | `agent` | Calls an inline, file-authored, or declared Agent with `inputs` matching its Prompt placeholders, optionally over a bounded `workspace` with built-in tools |
 | `code` | Runs sandboxed Python (`runtime: python`) from inline source or an exact Artifact, with a named `entrypoint` and bound `inputs`; returns JSON |
+| `approval` | Asks a person to approve or reject, showing `message`; outputs the decision receipt (see below) |
 
 | Check | Judges |
 |---|---|
@@ -1482,6 +1650,23 @@ aggregation are unchanged.
 | `code` | Sandboxed Python returning the same Verdict schema; an optional `response_format` on the check declares its `data` |
 | `drift` | The existing PSI, SPC, or Custom decision over one `samples` slot, with full statistical detail |
 
+An `approval` step (`action: {kind: approval, message}`) makes its Verifier
+queued-only. Each time the step is reached, including each fanout item and
+repeat iteration, the server records one pending occurrence with its own
+`approval_id`; inspection lists every occurrence with its status. There is no
+per-approval deadline: the occurrence parks the execution the way a deferred
+slot does, and the execution's original deadline, supersession, or
+cancellation expires it. `POST
+/v1/verification/executions/{execution_id}/approvals/{approval_id}` with
+`{decision: approved | rejected, reason?}` returns the receipt `{approval_id,
+status, actor_id, decided_at, reason}` only after the decision is durable. The
+first decision is final: the same actor, decision, and reason replay the
+receipt, and anything else refuses
+`WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING`. Deciding needs only
+`verifier:approve` on the exact Verifier. The same `ExecutionId`
+continues after the decision. A rejection is data: the step succeeds with the receipt (`status:
+rejected`) as `steps.<id>.output`, and a requirement over it fails the verdict.
+
 Actions read and compute; they never mutate external systems, declare Cards,
 or dispatch Operators. References use `inputs.<slot>`, `steps.<id>.output`,
 `steps.<id>.status`, `steps.<id>.requirements.<rid>.outcome|reason`, and
@@ -1490,8 +1675,29 @@ appears only in `each`. Step and requirement IDs are unique across the whole
 Verifier and key results, route overrides, and fitted drift state. References
 in actions and `when` create dependencies; declaration rejects cycles,
 unknown references, checks that read another requirement's verdict, and
-fields absent from a known output schema. Independent steps run concurrently;
+fields absent from a known output schema; code and `extractor: pull_request`
+outputs have no client-known schema and resolve at execution. Independent steps run concurrently;
 a step's requirements run before its dependents start.
+
+An Agent workspace source may also name `steps.<id>.publications.<name>` or
+`steps.<id>.publications`; no other position accepts them, and only an Agent
+step publishes named content. A named member mounts what the step's
+successful attempt published under that logical name at the destination: a
+file, a directory with its empty directories, or JSON as a UTF-8 JSON file.
+It never falls back to an earlier attempt; a step with no successful attempt
+leaves the consumer's binding missing, and a missing name refuses the
+consumer before it runs. A collection mounts once the step settles, whatever
+its status, as `manifest.json` (`status`, `reason`, `speculation`, every
+attempt's `invocations` record, and `entries` naming each admitted
+publication, its kind, its mounted `path`, and its producer item, iteration,
+and attempt) plus `content/<opaque invocation segment>/<name>`, so failed
+attempts' accepted partial work stays readable and distinct. Mounted content
+cites only its producer's original slots; a failed step's partial work and
+the manifest cite none. Publications are queued-only: queued verification
+retains Agent publications and engine extraction through its live run state and
+background revision path, and a direct request for a `queue_only` Verifier is
+refused `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` before any step runs. Standalone code
+actions receive no publication tool.
 
 Requirement outcomes are `passed`, `failed`, `inconclusive`, or
 `not_applicable`. An intentional skip (false `when`) makes dependent
@@ -1712,8 +1918,15 @@ execution; scheduled executions have no `run_id`.
 |---|---|
 | `POST /v1/verification/evidence` | Declare files by digest and length; receive an `upload_id` and shared upload plan for each one with no completed File record, under the tenant's `evidence/sha256/<digest>` namespace |
 | `POST /v1/verification/execute` | Exact Verifier and subject, optional Run and `group_id`, named input declarations, optional route overrides → `200 VerificationResult` |
-| `POST /v1/verification/enqueue` | The same Run evidence with `Idempotency-Key` → `202 { execution_id }` |
+| `POST /v1/verification/enqueue` | The same Run evidence with `Idempotency-Key` → `202 { execution_id }` after durable admission |
 | `GET /v1/verification/executions/{execution_id}` | Status, terminal error, result when visible, and a group execution's `group_id`, owner, and source selection once its input record is visible; a direct execution's completed status once its records are visible |
+| `GET /v1/verification/executions/{execution_id}/invocations` | One page of a queued execution's invocation attempts; a direct execution has no history and is not found in insertion order — producer, progress, reason, speculation — with its status and history projection counts |
+| `GET /v1/verification/executions/{execution_id}/publications` | One page of its publications' names, kinds, and producers, without content |
+| `GET /v1/verification/executions/{execution_id}/publications/{step_id}/{name}` | One publication of the exact producer attempt with its JSON value or manifest |
+| `POST /v1/verification/executions/{execution_id}/publications/{step_id}/{name}/download` | The shared download plan of a file publication's file or a directory publication's listed `path`. A cloud backend's plan is presigned; the local backend's points at `.../content` |
+| `GET /v1/verification/executions/{execution_id}/publications/{step_id}/{name}/content` | The local backend's bytes of that same file, selected and authorized as its download plan is |
+| `POST /v1/verification/executions/{execution_id}/cancel` | `{ execution_id, status }` after the cancellation fence commits; settled work keeps its status |
+| `GET /v1/verification/executions/{execution_id}/details` | `200 VerificationDetails` once the execution's complete records are visible; otherwise `404 WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND`, including unknown, not-yet-recorded, and no-longer-readable executions; the same `verifier:read` on the execution's Verifier, audited as its own read |
 | `GET /v1/verification/bindings/{binding_id}` | Readiness, cadence, `last_execution_id`, and a `group_end` binding's frozen settings and source bindings |
 
 File contents never pass through Postgres or a verification request body; an
@@ -1741,11 +1954,41 @@ bounds, the last ending `errored`. Per-file and aggregate limits
 (`WYRD_VERIFICATION_FILE_MAX_MIB`, `WYRD_VERIFICATION_FILES_MAX_MIB`) are
 enforced at planning. `ArtifactRef` selects a declared Artifact under its own
 authorization.
+Accepted publications additionally carry the exact descriptor of their stored
+object: its exact association is retained in the run state and its persisted
+revisions from acceptance onward. Hosted publication mounts and inspection/download/content
+use that association, not a new digest/size inventory lookup. Match descriptor tenant,
+digest and length to the selected manifest and preserve shared
+download/integrity/cleanup ownership. A server-produced publication file is put
+through the storage owner's validated server-side object path (tenant path,
+digest and length checks, exact `StoredObjectRef`) without an external
+upload-session round trip; the engine does not wait for its inventory record,
+which the storage owner persists in background. External client uploads keep the
+completion contract above. This does not change ordinary
+input-File discovery or authorize caller-supplied storage paths.
+
+
+Execution reads — status, invocation and publication pages, publication
+reads, download plans, and local publication content — check `verifier:read` against the execution's
+exact Verifier UID, and cancellation checks `verifier:run`; neither falls back
+to `cards:read`. A caller with no grant of the action at any scope is refused
+before the execution is looked up, and an absent or other-tenant execution is
+not found. Pages default to 50 and hold at most 200 entries; a cursor fixes
+its listing's insertion-sequence cut and is bound to the tenant, execution,
+and listing, so a page neither skips nor repeats entries while the execution
+progresses. Execution status reads its records through the tenant's SYSTEM
+read authority granted only `execution_inputs`, `results`, and
+`execution_outputs`; public Bifrost SQL keeps the caller's own table grants.
 
 Public invocation checks `verifier:run` against the selected Verifier's exact
 Card UID. `PermissionScope::Verifier(CardUid)` names one UID; `All` covers
 every Verifier in the tenant. Permission is checked before execution and the
 decision is audited. A binding does not replace the invocation permission.
+The engine loads the executing Verifier's exact Agent and Prompt Cards under
+the same audited `verifier:run`, never `cards:read`; a referenced definition
+that is deleted, mismatched, or otherwise unreadable when its work starts ends
+the execution errored with `capability_unavailable` instead of judging the
+work, and its accepted state stays readable.
 Planning and every follow-up operation on a File upload (part URL, local
 transfer, completion, abort) stage bytes and select no Verifier, so they
 require only operation-level `verifier:run` admission: any `verifier:run`
@@ -1768,13 +2011,19 @@ writer admits the execution, moving the expected schedule cursor or
 consuming the selected pending group generation in that transaction. The batched writer
 decides `Idempotency-Key` replay and conflict per tenant, subject, actor, and
 key: a matching retry returns the same execution ID; a conflicting one settles
-`errored` with `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT`, never runs, and leaves
-the original unchanged. `202` therefore confirms staging only. Staged work
-can be lost on abrupt process death before acknowledgment and then never
-becomes visible; observable losses are counted, and nothing is silently
-resubmitted. `VerificationExecution.wait` polls with capped backoff, tolerates
+`errored` with `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT`, never runs, leaves
+the original unchanged, and is refused to its caller with that code.
+`submit` answers only after the batched writer commits the queued row, so
+`202` confirms recoverable admission: a response lost after that commit is
+recovered by retrying under the same key, which returns the same execution.
+Work lost before the commit, on abrupt process death or an unacknowledged
+input, is never acknowledged; the caller receives
+`WYRD_SERVER_503_SERVICE_UNAVAILABLE` or no answer and retries under its key.
+Observable losses are counted, and nothing is silently resubmitted. Audit
+acknowledgement is unchanged. `VerificationExecution.wait` polls with capped backoff, tolerates
 not-found and delayed results within its deadline, and returns only a real
-result, the terminal error, or `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT`.
+result, the terminal error, `WYRD_SDK_409_VERIFICATION_CANCELLED` for a cancelled
+execution, or `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT`.
 
 Execution status includes the existing Operator `dispatches` projection:
 dispatch ID, exact Operator, delivery status, and optional error. Delivery
@@ -1786,8 +2035,9 @@ uses `last_execution_id` for its latest admitted execution, not an application
 Run or an unaccepted staged submission.
 
 MCP projects the HTTP contracts as `verification.evidence`,
-`verification.execute`, `verification.enqueue`, and
-`verification.get_execution`, with retained `verification.get_binding`.
+`verification.execute`, `verification.enqueue`,
+`verification.get_execution`, and `verification.get_execution_details`, with
+retained `verification.get_binding`.
 The old `verification.start_run` and `verification.get_run` have no aliases.
 Read tools remain discoverable; write scopes supplement domain authorization.
 
@@ -1800,35 +2050,153 @@ Postgres pool, Oracle admission and memory, the Bifrost memory budget, and
 verification-runtime capacity. Work refused by one of them returns to the
 queue without consuming an attempt. The claim transaction also returns the
 Verifier Card's status, its spec on a cache miss, and any fitted drift
-baselines. Parsed Verifiers are cached per process by tenant and Card UID in
-a fixed 64 MiB least-recently-used cache that is never shared across tenants.
+baselines. Resolved targets are cached per process by tenant, Verifier,
+subject, and mode (direct or queued) in one fixed 64 MiB least-recently-used
+cache that is never shared across tenants. Direct verify checks direct
+eligibility (`queue_only`) only on a direct miss and
+caches only an admitted target under direct; a direct hit runs with no further
+check, and a queued entry never answers a direct lookup. A Card or tenant
+invalidation removes both modes.
 A deleted Verifier terminates the execution `errored`.
 
-When execution completes, the runner builds the result once and stages it on
-the process Scribe outbox, then settles at once: settlement never waits for
-Scribe, so a completed execution can lack a retained result. Leases renew on
-the PostgreSQL clock once a third of the lease has passed; an expired lease is
-never revived, and a renewal that no longer finds the token cancels that work.
+One shared verification engine executes the declarative graph. Queued execution
+prepares a live in-memory `RunState` for recovery checkpoints; direct verify
+runs the same engine without that state or the checkpoint adapter.
+Preparation (input validation, authorization, exact target
+resolution including cold loads, and for queued work the batched claim, pinned
+input/source/policy, accepted authority, original deadline and exact accepted
+recovery) completes before the engine starts. Engine transitions (begin, forget,
+settle, control, publication acceptance and replay, terminal selection and
+failure) validate and mutate live memory and return at once; they never wait for
+SQL, lease confirmation, outbox reservation or staging, or Scribe acknowledgement.
+Model, tool, Python and validated file IO remain actual work under their limits.
+Bifrost is the durable recovery source; PostgreSQL coordinates admission, claims,
+lease renewal, cancellation and retry scheduling, not invocation results or
+publication acceptance.
 
-A `VerificationResult` carries `execution_id`, optional `run_id`, the exact
-`verifier` and `subject`, and an `outcome` of `verdict`, `requirements`
-(`id`, `step`, `statement`, `outcome`, `reason`, `actual`, `citations`,
-`detail`, `check` provenance), `steps` (`id`, `status`, `output`, `attempts`,
-`duration_ms`, `reason`, `provenance`, `tool_calls`), and pinned `evidence`.
+Only queued execution has recoverable state. Direct execution runs the same
+engine without the checkpoint adapter: it creates no run state, checkpoint,
+execution history or publication receipt, and stages exactly its
+`execution_inputs` (`origin=direct`) and compact result (`execution_outputs`
+then `results`) rows on two outbox slots reserved at admission. Those rows join
+their destination's shared frames, so many direct results deliver as one batch
+per table.
+
+Each state change of a queued run marks it dirty. One background flush per execution
+freezes at most one coalesced snapshot at a time as the next revision and writes
+it as a `bifrost.verification.execution_events` row through the process Scribe
+outbox. The batch id derives from execution and revision, so of competing writes
+of one revision the first fenced is accepted and the other refused; a refused or
+conflicting revision breaks the writer, the engine's next transition fails, and
+existing retry handling applies. Revisions wait in background for a
+reserved outbox slot and retry until accepted or the lease is lost. Complete versioned logical snapshots preserve pinned
+declarations/evidence, settlements, attempts, original deadline/budgets, control
+decisions, accepted publications/exact File descriptors and the selected final
+outcome. No separate writer, recovery store, engine serialization, conversation
+replay or archive handoff is introduced.
+
+Direct verify returns its result and releases its resources independently of
+persistence; the response does not certify that retained details exist. Its
+status and details reads resolve through its published `direct` input record and
+result, never through execution state. When queued computation ends, the engine and its workspace,
+Python, model and block permits are dropped. The runner keeps the claim: its
+claim-loop capacity permit, acquired before claiming, and its lease-renewal
+registration stay held while it waits in background for Scribe to acknowledge the
+revision holding the terminal decision and then the result rows, then completes
+the claim through the token-fenced batched completion group commit. There is no
+acknowledgement timeout and no pre-claim outbox reservation; full claim capacity
+pauses new claims while running work finishes, and the direct lane stays
+available. A cancelled, timed-out or errored decision is recorded the same way
+before the fenced terminate. A result whose acknowledgement is dropped follows
+the ordinary retry transition with `result_undelivered` within the attempt budget.
+Lease loss or cancellation ends the old owner's waits and settlement and releases
+its claim permit; previously submitted IO can still finish. A tenant without an
+active SYSTEM principal terminates `errored` without a state record. No separate
+finalizer or owed-delivery queue exists. Scheduled/group activation retains the
+same queue path.
+
+A crash loses live and unaccepted progress, including an unaccepted terminal
+decision. Direct work never resumes. Queued redelivery recovers the exact
+accepted revision (the fenced prefix) with the same execution ID, input, source,
+policy and original deadline, and may repeat later work, effects and spend; lost
+spend is not reconstructed. A recovered accepted terminal decision is delivered
+without recomputation. Recovery returns the exact accepted compatible state,
+authoritative absence, or explicit unavailability; unavailability defers
+preparation and is never treated as absence. A snapshot that does not decode
+as a supported `ExecutionState` format defers with `execution_state_incompatible`.
+A revision the old owner froze just before takeover may still be accepted ahead
+of the replacement's and is then inherited; this rare interval is accepted and no
+PostgreSQL ownership table closes it. An attempt's execution failure is recorded
+in the state with the execution's exact identity before the queue settles it, so
+retained reads of it need neither the queue row nor the source Cards. A
+cancellation or revocation settles only the queue row, which owns that status; a
+running holder learns of it through its lost token and records nothing more.
+
+Queue leases renew on the PostgreSQL clock; expiry never revives an old lease.
+The background lease-renewal owner sets each claim's local lost/cancelled token
+from renewal ticks and from its `LISTEN` on `wyrd_verification_cancelled`, fed by
+the cancellation trigger on `wyrd.verifier_executions`; the engine checks that
+token and its deadline. External calls or buffered writes may still return late.
+A queued execution's original deadline is its admission time (`created_at`) plus
+the runtime execution timeout, computed by PostgreSQL in the claim statement; a
+reclaim never replenishes it. The Verifier's `limits.timeout_seconds` also counts
+from admission. Current defaults remain a ten-minute queue lease and five-minute
+queued execution timeout.
+
+Direct verify remains queue-free and fresh requests have distinct identities.
+Disconnect stops new request work without creating background Agent execution or
+a new resume API. Settled failures in accepted state remain settled.
+
+Dedicated reads preserve existing wire/permission/cursor contracts using accepted
+execution identities and exact File references. They do not switch from a PostgreSQL
+payload owner to an archive. Group comparisons/dedup, binding summaries and
+independent Operator/provider delivery retain their behavior while old execution-row
+dependencies are removed. Existing storage/session and evidence retention owners
+remain; no new cleanup protocol, tombstones or whole-group serialization is added.
+
+A `VerificationResult` is the compact decision that direct execution, status,
+wait, and typed reads return. It carries `execution_id`, optional `run_id`,
+the exact `verifier` and `subject`, optional `deployment_environment`, and an
+`outcome` of only `verdict` and `requirements` (`id`, `step`, `statement`,
+`outcome`, `reason`, `actual`, `citations`, custom `data`, and `detail`).
+Check configuration, provenance, steps, and evidence are absent, not null.
+`VerificationDetails` is the explicit descriptive read of what one completed
+execution ran: the same identity and judgments, each requirement's exact
+authored `check`, `provenance`, and an Agent check's `tool_calls`, `steps`
+(`id`, `status`, `output`, `attempts`, `duration_ms`, `reason`, `provenance`,
+`tool_calls`), and pinned `evidence`. Checks decode as authored data: neither
+the server's readback nor client decoding compiles, renders, or executes a
+Prompt. SDKs expose it only as `Execution.details` and its typed sibling; no
+other read requests it.
 Provenance records code hash and runtime, extraction version, Agent and Prompt
 versions, effective routes, drift baselines and windows, and input digests.
 `bifrost.verification.results` is the canonical payload-free result summary,
 `bifrost.verification.execution_outputs` holds each result's `requirements`
 and `steps`, and `bifrost.verification.execution_inputs` holds each
 execution's one input record: declarations for direct and submitted work, a
-selector for group and schedule work, and queued activation context. A
-returned `VerificationResult` is assembled from the three by one reader:
-verdict from the summary, breakdown from outputs by result ID, evidence from
-inputs by execution ID (a group's resolved slot lists; an empty map for
-scheduled Drift). PostgreSQL stores no input values; a queued execution's
-selected `result_id` stays authoritative. A direct execution has no queue
-row: its status is read from records whose input origin is `direct`, and is
-`completed` once they are visible. Unknown IDs remain not found.
+selector for group and schedule work, and queued activation context. One
+reader assembles both projections from the three: verdict from the summary
+and requirements from outputs by result ID; details add the outputs' checks,
+provenance, and steps and the evidence from inputs by execution ID (a group's
+resolved slot lists; an empty map for scheduled Drift). The compact result
+drops those fields at the response, never in storage. PostgreSQL stores no input payload values. The recoverable
+Bifrost state identifies the exact selected result; never choose
+by result-row recency because abandoned deliveries may leave other rows. Existing
+canonical verification data retains typed invocation/publication metadata, exact
+private File associations, complete sanitized errors and replay identity. State
+loading reconstructs logical progress rather than replaying engine instructions.
+Unknown IDs are not found only after an authoritative read; unavailable required
+sources cause retryable failure. Existing result payload meanings stay unchanged.
+
+Dedicated execution reads retain exact Verifier/repository feature authorization using
+current caller grants and recorded immutable identities, without requiring source Card
+retrieval or leftover queue rows. The server reads accepted/recovered execution
+state and exact references; clients
+do not choose a backend. Ordinary registry/principal control-plane reads retain
+their owners. A publication file is stored by the storage owner's validated
+server-side put, which opens no upload session; its object-inventory fact is
+recorded in background, and accepted descriptor custody is in the run state from
+acceptance onward. External File uploads keep their upload-session contract.
 
 Every work record names who the work was for (`sub_principal_id`) and who
 performed it (`act_principal_id`). A direct caller A records A/A and a
@@ -1866,10 +2234,36 @@ refused before any model call. Only selected files are staged, unparsed;
 each is a citable attachment slot counted with the other inputs. `/work` is
 bounded scratch for that invocation only.
 
+`extract` with `extractor: pull_request` is the one way an Agent reviews
+pull request source. It reads only the queued execution's admitted pins and
+its tenant's GitHub connection; a Verifier holding it is registered
+`queue_only`, and an execution with no accepted pull request source is
+refused before any acquisition. The extractor chooses the review baseline
+from the pull request's execution history: the newest completed execution of
+the same pull request under the exact same Verifier whose source was
+extracted, recorded with its completion and independent of its verdict.
+Without one, or when the pipeline reports that head rewritten or
+unavailable, the review is full with `first_review`, `policy_changed`,
+`history_rewritten` or `history_unavailable`. It calls the code-review
+pipeline once for pinned evidence; Wyrd never clones, indexes or ranks the
+repository. The output is ordinary step output whose shape the server owns:
+`format`, the pinned `pr`, `review` (mode, `comparison_base`, `previous`
+execution, `fallback_reason`, and the whole pull request as `full_pr`), the
+active `changes` with exact before/after source or binary, unavailable or
+excluded identity, and the library's selected `context` with its omissions,
+budget and coverage, unchanged. Agents receive it only through declared
+`inputs` and `workspace` JSON mounts; it is not a source checkout or implicit
+input to other Agents. Dependents consume the live value without waiting for
+persistence; only extraction held in an accepted revision is reused on
+recovery, so the library's context lifetime never invalidates retained
+evidence. An empty active change is evidence, never a pass, and missing
+source, omissions and model input limits fail honestly through existing
+step, requirement and model limits.
+
 `AgentSpec.tool_names` selects server-owned built-ins: `cards.list`,
 `cards.get`, `bifrost.list_tables`,
 `bifrost.describe_table`, `bifrost.query`, `fs.list`, `fs.read`, `fs.search`,
-`fs.extract`, and `code.run`. `fs.read` returns a UTF-8 file's actual lines
+`fs.extract`, `fs.write`, `code.run`, and `publish`. `fs.read` returns a UTF-8 file's actual lines
 with `lines` locators and a resumable `next`, refusing directories and
 non-UTF-8 files. `fs.search` returns one bounded hit per matching line across
 visible inputs and scratch, in path order, skipping non-text files: a
@@ -1878,23 +2272,167 @@ file or directory scope, and a filename `glob` (the basename, or the path
 relative to the scope when it contains `/`); an invalid pattern or scope is
 refused and a cut result says `truncated`. `fs.extract` takes one input
 `path` and a new `/work` `output_path`, writes the shared extractor's JSON
-without overwriting, and returns `{output_path, sources, extractor_version}`. The Invoker resolves them before the first model call through
-the existing `ToolResolver`/`ToolRegistry`; an unknown name fails, and
-filesystem tools and a workspace require each other. There is no fetch tool.
+without overwriting, and returns `{output_path, sources, extractor_version}`.
+`fs.write` creates or replaces one UTF-8 file under `/work`, creating safe
+parents within the `/work` budget, and returns `{path, bytes}`; `/inputs`,
+traversal, and link or file parents are refused. `publish` is step-only: it
+snapshots one `/work` file or directory, or takes one JSON value (`null`
+included), under a logical name unique within the step attempt, and returns
+`{name, kind}` only after the execution state accepts it, keyed by the
+provider tool call so a replayed call returns its original receipt. The host
+supplies the producer step, item, iteration, and attempt; a final answer is
+never a publication. An Agent that selects `fs.write`, `code.run`, or
+`publish` gets private `/work` scratch without a declared input mount. The
+Invoker resolves them before the first model call through the existing
+`ToolResolver`/`ToolRegistry`; an unknown or repeated name fails, the
+reading `fs.*` tools need a workspace or a scratch writer (`fs.write`,
+`code.run`), and a workspace needs a tool that uses it. There is no fetch
+tool.
 Every call first needs `{"resource":"tool","action":"invoke"}` with scope
 `all` or `{ "tool": <exact name> }`, then the called capability's own
 permission (for `bifrost.query`, read on every table it touches). Neither
 grant implies the other, and neither is inferred from `verifier:run` or the
 Agent declaration. Calls run under the execution's accepted authority; each
-decision is audited non-blocking; tool names, arguments, output digests, and
-byte counts are recorded.
+decision is audited non-blocking.
 
-`code` and `code.run` run in one per-process pool of sandboxed Python worker
-processes with a separate unprivileged identity, empty credential
-environment, OS-enforced network denial, parent-serviced file access, no
-subprocesses or host packages, and a fresh interpreter session per operation.
-Pool, memory, file, archive, extraction, scratch, tool-result, and deadline
-limits are startup environment settings; slot limits only lower them.
+Inside an Agent's `code.run`, and nowhere else, Python may
+`await call_tool(name, arguments)`: `name` is a declared dotted built-in
+other than `code.run`, `fs.write`, and `publish`, `arguments` one JSON
+object. The server resolves,
+authorizes, executes, and records each nested call through the same path as
+a model's direct call, under the same accepted authority; Python cannot
+choose an identity, tenant, or credential. An unknown, undeclared, or
+excluded target is `WYRD_AGENT_404_TOOL_NOT_IN_AGENT` and invalid or
+oversized input is `WYRD_TOOL_422_INPUT`; neither dispatches or is recorded.
+A tool failure raises a catchable `RuntimeError` carrying the compact
+problem JSON; budget exhaustion, Busy, the deadline, and cancellation end
+the program and cannot be caught. Values cross as lossless JSON. Authored
+`code` actions and checks have no bridge.
+
+One logical Agent invocation, across its authored retries, has one request
+allowance (`WYRD_VERIFICATION_AGENT_TOOL_MAX_CALLS`, default 128) counting
+direct calls, `code.run`, and nested requests, refused ones included, with no
+refund; the request after the last fails with
+`WYRD_VERIFICATION_422_TOOL_BUDGET_EXCEEDED`. Each attempt records the
+invocation's spent count in the execution state as each request spends, and
+a later attempt, after a capacity refusal or an interruption, resumes from
+the latest persisted count; requests spent after it persisted may be spent
+again after an interruption. Arguments are bounded by
+`WYRD_VERIFICATION_TOOL_ARGUMENT_MAX_KIB` (default 64). The Agent's
+`tool_concurrency_cap` (default 8) bounds active non-code calls of both
+origins together; `code.run` holds no permit its children need. A suspended
+program holds no `/work` lock: each Python write and each extraction
+serializes on its own, extraction never overwrites, and both share one
+`/work` write and scratch budget. Every call is recorded once, flat, in start
+order, with tool, arguments, `recipient` (`model` for a direct call, which
+includes the outer `code.run`, `code` for a nested one; absent historically
+means `model`), output digest, and delivered byte count; a call that
+returned nothing has no digest, zero bytes, and a safe error. Records
+survive failed and inconclusive results and retries. Nested results reach
+the model only through the program's own output.
+
+`code` and `code.run` run in two per-process pools of reusable Python worker
+processes hosting the Monty interpreter, one for direct and one for queued
+work, with a fresh interpreter session per
+operation: no Python globals, mounts, callbacks, output, accepted authority,
+or allocator budget crosses operations or tenants. A worker returns to the
+pool only after a completed program or a Python error and a confirmed reset;
+a crash, cancellation, timeout, stopped tool session, or failed reset
+discards it. Isolation is portable and identical on every supported platform:
+the interpreter has no network, subprocess, host-package, or host-file
+access; its allocator enforces the memory limit, which is not an
+operating-system RSS limit; files are reachable only
+through parent-serviced mounts; tool calls only through the parent's
+mediated bridge, which is not network access from the worker; and the parent
+enforces deadlines and reaps workers. The worker holds no credentials or
+server state. Memory, file, archive, extraction, scratch, tool-result,
+tool-argument, tool-request, and deadline limits are startup environment
+settings; slot limits only lower them. They are per-operation ceilings, not
+reserved capacity.
+
+Hosted capacity follows the process resource plan, not fixed counts.
+`wyrd-runtime` owns the neutral mechanism: one process memory ledger and one
+disposable-scratch ledger for the data-root filesystem, which Bifrost,
+request buffering, and hosted verification all charge, so no byte is
+promised twice. The ledgers carry no policy;
+each capability decides what it charges and how it answers a refusal. The
+server composes them from the Bifrost plan
+([Admission and memory](bifrost-design.md#admission-and-memory)); Vala never
+imports server concepts, and `wyrd-spec` holds none of it. The process pool
+allows one runnable Python turn per effective CPU.
+
+A Python operation charges its code and globals to process memory before it
+waits, and is refused at once when even those do not fit. It then waits, FIFO
+within its tenant and round robin across tenants on this replica, for one
+atomic grant of its session's peak envelope: twice the allocator ceiling of
+`WYRD_VERIFICATION_MONTY_MEMORY_MIB` (the worker heap and the parent's copy
+of the largest frame a worker can send), plus the worker's measured resident
+baseline and interpreter stack. A tenant's head that does not fit never
+blocks another tenant's head that does, a refilling tenant cannot pass one
+already waiting, and a grant larger than the whole ledger is refused rather
+than queued. There is no worker, workspace, or waiter count. While an operation waits, idle workers are reaped to return
+their charges. A worker keeps its session's envelope charged after the
+session ends, reset or discarded, because its allocator keeps freed pages;
+the next session on that worker takes the charge over rather than adding to
+it, and the charge returns only once the worker's process is gone.
+`WYRD_VERIFICATION_MONTY_MIN_WORKERS` (default 1) is each pool's prewarming
+target:
+warm workers that fit are charged like any worker and reaped like any idle
+one. A program holds a runnable turn only while Python runs; suspended on a
+host call, a nested tool call, or the `/work` writer, it releases the turn,
+keeps its envelope, and competes for a turn again when it resumes. Workspace
+inputs charge scratch at their declared size and stream to disk with memory
+charged per chunk, and each `/work` write charges scratch before it lands;
+those charges are refused at once, never waited for.
+
+A capacity refusal is Busy: the process, not the code, lacked capacity, so it
+never becomes a verdict or reaches the program. A direct execution has one
+deadline, `WYRD_VERIFICATION_TIMEOUT_MS` (default 60 s) after the request
+arrives, lowered by the Verifier's `limits.timeout_seconds`, covering capacity waits, target lookup, staging, checkout,
+execution, and resumption; nothing restarts it. Busy before that deadline
+answers `WYRD_SERVER_503_SERVICE_UNAVAILABLE` with HTTP `Retry-After: 1` and
+a `reason` detail; a wait the deadline ends answers
+`WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT`. HTTP and MCP return the same
+problem document, and SDKs project it without replaying a direct call. A
+queued execution refused capacity returns to the queue without spending an
+attempt. Cancellation removes a waiter and stops mediated work; a cancelled
+operation's envelope stays charged until its killed worker is gone.
+`POST /v1/verification/execute` and `POST /v1/verification/enqueue`, like
+`POST /v1/query`, bypass the protected edge's in-flight limit
+(`WYRD_HTTP_CONCURRENCY_LIMIT`, default 1,024) and pass their bodies
+unbuffered, because hosted admission bounds them by bytes. Every other route
+keeps that limit, and a buffered body is charged to process memory before it
+is buffered, with the same 503 and `Retry-After: 1` on refusal.
+
+Operational metrics use bounded labels only, never tenant or request:
+`wyrd_verification_hosted_operations{state}` and
+`wyrd_verification_hosted_bytes{state}` (`waiting`, `active`),
+`wyrd_verification_hosted_refusals_total{reason}` (`memory`, `expired`),
+`wyrd_verification_hosted_wait_seconds{outcome}` for queued waits,
+`wyrd_verification_python_workers{state}` (`runnable`, `suspended`), and
+`wyrd_verification_python_worker_events_total{event}` (`spawn`, `reset`,
+`reap`). The hosted wait is the `verification.direct.capacity` benchmark
+part, nested inside the Verifier's blocks so it never enters the server
+overhead residual; benchmark collection records worker CPU, memory, and
+churn apart from parent-only server CPU (`benchmarks/README.md`).
+
+Direct `verify` and queued executions share one hosted capacity owner per
+process: one Python sandbox pool, one runnable-turn bound of the effective
+CPUs, and one model-call limit (`WYRD_VERIFICATION_MODEL_CALLS`), all
+charged to the one process memory and scratch ledger only while in use, with
+no fixed queued reservation. `WYRD_VERIFICATION_DIRECT_EXECUTIONS` and
+`WYRD_VERIFICATION_QUEUED_EXECUTIONS` cap each mode's concurrent executions
+and hold nothing idle. Direct admission refuses when
+capacity is full; queued work waits, and a resumed or retried queued
+execution is admitted again. A model call takes a permit before entering the
+ordinary gateway path, whose tenant and subject limits, budgets, and
+accounting still apply. Both modes run the one engine with the same
+authority, evidence, billing, cancellation, and platform behavior. Postgres,
+gateway, and provider capacity remain shared. A Verifier whose
+registration-derived `queue_only` is true is refused by `verify`
+before any step runs, never converted to a queued request. The queued
+execution deadline is the original ceiling of everything a queued execution
+waits for, including approval periods; waiting never resets it.
 
 #### Drift checks
 A `drift` check flattens the existing `DriftSpec` next to `on:
@@ -1935,6 +2473,21 @@ Fitted state is owned by `vala-drift`, keyed by tenant, exact Verifier, and
 requirement ID. Existing threshold, minimum-sample, baseline-readiness, and
 insufficient-data rules apply; per-feature statistics, thresholds, counts,
 flags, and window identity are in the requirement `detail`.
+
+#### Code-review source cache
+
+Code-review source preparation runs the independent `bohmian-code-review`
+pipeline over Wyrd custody. Its immutable snapshot and context objects live in
+the configured object store under `<tenant>/code-review/`, created only when
+absent; its snapshot pointers, snapshot records and context records live in
+`wyrd.code_review_snapshot_pointers`, `wyrd.code_review_snapshot_records` and
+`wyrd.code_review_contexts`, scoped by tenant RLS, installation and numeric
+repository id, with PostgreSQL-stamped lifetimes. No object bytes are stored in
+PostgreSQL. The cache is a reusable acceleration, never evidence: a review's
+accepted source, findings and verdict are retained by Bifrost, and cache
+collection or expiry never removes them. Context expiry is enumerated across
+tenants on the operator pool; each deletion runs on the owning tenant's
+connection.
 
 ### Bifrost
 
@@ -2005,7 +2558,7 @@ of bindings.
 ```yaml
 spec:
   description?: string
-  kind: schedule | group_end              # closed activation discriminator
+  kind: schedule | group_end | pull_request  # closed activation discriminator
   cron: string                            # schedule only
   tz?: string                             # schedule only — IANA tz name, default UTC
   after: duration                         # group_end only — elapsed since the newest acknowledged source evidence
@@ -2013,6 +2566,10 @@ spec:
 
 `group_end` binds only a Verifier with source inputs and judges each caller
 group once it ends (see Grouped verification under Verifier).
+
+`pull_request` carries no fields and is valid only on a Repository's
+`verified_by`; any other subject refuses it. It is the closed activation for a
+connected repository's pull requests, not an arbitrary provider event name.
 
 For `schedule`, each due occurrence creates one
 execution per active binding over that binding's subject window
@@ -2043,7 +2600,95 @@ flushes it before its dependencies close. A hard kill loses
 only unwritten requests, and every loss the process observes is counted and
 logged.
 
-External pushes are deliberately not an activation.
+For `pull_request`, the server admits from a signature-verified GitHub
+`pull_request` delivery for a connected, selected repository. Opened,
+reopened, ready-for-review, synchronize and base-changing edits are observed
+and can admit; converted-to-draft and closed are observed and deactivate;
+other edits, and every admitting event while the pull request is a draft, are
+not. A binding activates on pull requests through an inline or a referenced
+`pull_request` Trigger alike. The
+server mints a narrowed installation token for the installation that routed
+the delivery, takes a per-pull-request lock, then takes a PostgreSQL
+observation time and reads the pull request's current state from GitHub
+while holding it; the delivered payload never decides the source. A later
+delivery of the same pull request waits on that lock, so its read is always
+newer, including when the earlier decision writes nothing. The decision
+commits only while the tenant's connection slot, locked after the read, is
+still at the revision the token was minted under; access lost or replaced
+meanwhile leaves the delivery retryable and admits nothing. An observation
+older than the newest accepted one or the last deactivation is obsolete and
+owes no work. Otherwise the
+current base ref, head commit and head repository identify a generation, and
+the selected Repository version's `pull_request` bindings, its declaring
+principal and the Verifier and Trigger versions are frozen into one reserved
+execution per binding before any hand-off. A newer generation cancels every
+unfinished execution of the older one with `pull_request_superseded` and
+fences its running leases, and a newer source the selected policy binds no
+Verifier to does the same and deactivates the older generation, so it is
+never replayed as current; close, draft conversion and loss of repository
+access (repository removal, suspension, uninstall or disconnect) cancel with
+`pull_request_closed`, `pull_request_draft` and `repository_access_lost`. Settled history keeps its pins, and a policy
+re-declaration affects only later generations.
+
+The reserved executions then follow the same Scribe hand-off and outbox as
+`submit`, keyed by execution so a replay stages identical rows, and become
+due only when the outbox commits them. A delivery is answered 2xx only after
+every execution of its generation is due, or after durable obsolete or
+refusal settlement establishes that no work is owed; a refusal settles as an
+`errored` execution, and an unavailable authority store answers non-2xx. A
+redelivery of an accepted generation that is still current and not
+deactivated re-stages the stored pins, never a newer policy; a newer source
+is admitted under the selected policy instead, and a closed or draft pull
+request admits nothing. A pull request read GitHub refuses or rate-limits is
+unavailable, not absent. GitHub does not redeliver failed deliveries on its own, so the GitHub
+owner scans the App's delivery log and asks GitHub to redeliver each delivery
+without a 2xx attempt until a bounded number of redeliveries is logged;
+replicas scanning at once may each ask, and shutdown abandons a scan still
+waiting on GitHub. Reading a pull request's execution, or its progress and
+publications, needs `cards:read` in addition to `verifier:read` on its exact
+Verifier, decided from the queue row or, once that is gone, the accepted
+input record's origin.
+
+A `pull_request` execution's results reach GitHub in the background once the
+runner settles or parks it, and again for every current pull request
+execution when the server starts. Delivery reads only the accepted state, its
+selected result and the retained extraction; it never recomputes verification,
+never waits on or changes the verdict, and owns no SQL table or column. Each
+execution has one Check, named per binding, with `external_id` the execution
+and `head_sha` the reviewed commit: `passed` concludes `success`, `failed` and
+`errored` `failure`, `inconclusive` `action_required`, `cancelled` and
+`timed_out` themselves; waiting evidence or approval is `in_progress` with an
+explanation; waiting only creates the Check, never updates an existing one,
+so a completed Check never returns to it. Of the execution's
+accepted successful final step outputs (each fanout item, only a repeat's
+final output, never a failed attempt or discarded speculation), none holding a
+`code_review` envelope gives a summary-only Check, one renders, and more than
+one, or a malformed one, is shown as `report_ambiguous` or `report_invalid`.
+A rendered report, even one with no inline finding, adds one `COMMENT` review
+on the reviewed commit carrying the execution marker. Every anchor must lie in
+retained source: either side of a changed file or a selected context span. A
+finding whose anchors do and whose location lies in a head-side hunk is inline,
+with its suggested edit; other valid findings stay in the Check summary; a
+finding with an anchor the retained source does not hold is listed there with
+its reason, never moved. Without a retained extraction the report still
+renders in the summary and its anchors are refused as unavailable. There are no Check annotations, approvals,
+change requests, resolutions or source changes. GitHub REST has no idempotency
+key, so each write looks up the Check by name, head and `external_id` and the
+review by its marker before creating, also after an unanswered write; a rare
+duplicate after a lost answer is accepted. Writes honor `Retry-After` and the
+rate-limit reset in full and retry
+a bounded number of times, and each is preceded by a check of current
+repository access and pull request generation: a superseded or access-removed
+execution is `skipped` and never written again. One outcome per accepted state
+revision, and one more once the execution is cancelled, is retained in Bifrost
+(see
+[Storage format and Variant](./bifrost-design.md#storage-format-and-variant)); execution inspection over HTTP and
+MCP serves it as `github_delivery`, `pending` until recorded, separate from the
+verdict and under the execution's read authorization. Public cancellation
+starts the cancelled delivery at once; a principal revocation's is delivered by
+the next restart recovery.
+
+Other external pushes are deliberately not an activation.
 
 ### Operator
 A failure reaction. Performs exactly one action — a typed notification or a
@@ -2172,6 +2817,35 @@ channel: { kind: slack, connection: ops-slack, channel_id: C0123456789,
            text: "{{verifier_ref}} failed on {{subject_ref}}: {{summary}}" }
 ```
 
+### Repository
+A connected source repository and its complete review policy. Identity is the
+provider's stable repository ID on the deployment's configured host, verified
+against the tenant's GitHub connection; the owner/name is a hint, never
+authority.
+```yaml
+spec:
+  provider?: github                       # closed; github when omitted
+  host?: string                           # configured web host; set by the server, any other value refused
+  repository_id?: string                  # positive decimal provider ID; resolved from the hint when omitted
+  verified_by: [VerificationBinding]      # complete desired policy; runs_on, when present, is pull_request
+```
+
+`wyrd declare wyrd.toml` infers the Repository from the checkout's origin
+remote (or `--repository <url>`) and the `[repository]` table (see Workspace
+config). The server resolves the hint through the connection before
+registration, so a registered Repository always carries `host` and
+`repository_id`. A repository the connection does not currently cover is
+refused with `WYRD_GITHUB_403_REPOSITORY_INACCESSIBLE`. The first
+registration takes its Card name from the provider repository name; later
+declarations keep that family through a provider rename, and declaring the
+same `repository_id` under a second name is refused with
+`WYRD_REGISTRY_409_REPOSITORY_IDENTITY_CONFLICT`.
+
+`status.repository` projects the server-managed `full_name`, whether this
+version is `selected`, and the family's `selected_version`. Adding repository
+access never creates a Repository Card or bindings, and `verified_by: []`
+selects no automatic reviews without disconnecting access.
+
 ---
 
 ## Registry lifecycle
@@ -2222,6 +2896,22 @@ public error. Cycles surface as
 **Composite transaction.** Per-node inserts run in one Postgres
 transaction. Post-commit side effects (card blob write, presigned URL
 mint) are best-effort with reconcile — see below.
+
+### Repository selection
+
+A Repository family has at most one selected version. Selection is not Card
+`Active` state: an Active version may be unselected. A successful Repository
+declaration selects its exact root version only after the whole graph and
+every required artifact is ready, in the same commit that completes the
+declaration; the receipt follows that commit. The declaration attempt records
+its target and the selection it expected to replace, so a replay of the same
+target reuses it, a race between distinct targets conflicts, and a delayed
+completion never undoes a newer selection. A failed declaration, including an
+exact pin whose content changed (`WYRD_REGISTRY_409_SPEC_DRIFT`) or an
+unresolved registered reference (`WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY`),
+keeps the previous selection. Declaring an old exact version again is a new
+declaration and rolls the selection back to it. Unchanged content reuses the
+existing version and keeps it selected.
 
 ### Card blob state
 
@@ -2326,11 +3016,16 @@ is available only at `InlineableRef<T>` slots.
 
 ### In-memory authoring
 
-`wyrd-client::authoring` (`wyrd_ai::authoring` in Rust; the Python and
-TypeScript SDKs project it) builds the same Cards in code, in the Card YAML's
-own vocabulary. Each named Card type takes `new(name, version)`; each
+`wyrd-client::authoring` builds the same Cards in code, in the Card YAML's own
+vocabulary. Rust exposes it as `wyrd_ai::verify`, Python as `wyrd.verify`,
+and TypeScript as the `verify` namespace of `wyrd-ai`; there is no separate
+authoring module. Each named Card type takes its name and an optional
+version: `new(name, None)` in Rust, `Kind(name)` in Python, and
+`new Kind(name, { version })` in TypeScript, where `version` may be left out.
+An omitted version is never invented by the client: the server selects it at
+registration, exactly as for a YAML file that omits `metadata.version`. Each
 sub-value (`Component`, `Binding`, `InputSlot`, `Step`, `Requirement`,
-`Action`, `Check`) takes the fields that identify it. Constructor arguments
+`Table`, `Action`, `Check`) takes the fields that identify it. Constructor arguments
 are fixed: no later method edits them, so a different name, version, alias,
 reference, id, action, check, or check operand means constructing another
 value. Every `Action` constructor returns an `Action` and every `Check`
@@ -2341,21 +3036,30 @@ declares evidence, while `Action.bind_input` and `Check.bind_input` bind existin
 values to executable arguments (`addInput`/`bindInput` in TypeScript). Their
 canonical `inputs` maps and whole-map setters retain their names. Rust accepts
 bare JSON Schemas and Python accepts schema dictionaries or supported model
-classes without a mandatory JSON-slot wrapper. Explicit canonical slot forms
-and distinct non-JSON slot constructors remain available. Execution
-references stay strings such as `inputs.report.text`, operators stay strings
-or their parameterized objects, and nested objects stay canonical JSON. A
-setter consumes the value and replaces its whole field, together with
-everything that field referenced; an `add_*` method appends one entry in
+classes without a mandatory JSON-slot wrapper; a Python Verifier's `inputs`
+may also be one Pydantic model class whose fields are its named slots,
+and a Python Service `Table`'s `schema` may be a model class whose field
+order is the column order. Pydantic is the optional `wyrd-ai[pydantic]` extra.
+Explicit canonical slot forms and distinct non-JSON slot constructors remain
+available. Execution references stay strings such as `inputs.report.text`.
+Fields accept their canonical typed values as well as canonical JSON: the
+original Prompt (`openai_chat` in Rust, `Prompt.openai_chat` in Python,
+`Prompt.openaiChat` in TypeScript) at an Agent's `prompt`, and in Python
+`ComparisonOperator`, `ExecutionRoute`, and `AgentRunConfig`; the Prompt's
+`ResponseFormat.verdict(data=...)` extends the canonical Verdict with typed
+`data`. Authoring converts these to the canonical form and adds no validation
+of its own. A setter consumes the value and replaces its whole field, together
+with everything that field referenced; an `add_*` method appends one entry in
 place. A Service binds each Component's own Verifiers through
 `Component::verified_by`; Model verification belongs on its Component.
 
 Construction and editing do no domain validation, file reads, or network IO,
 so incomplete values and forward references are allowed. An attempted
 duplicate add is kept, not dropped, and refused when validated. A Card value
-at a reference position contributes a sibling definition, captured by value;
-an exact `CardRef` stays an external reference; a local Artifact is always
-referenced externally by exact name and version and published first.
+at a reference position contributes a sibling definition, captured by value,
+whose sibling reference carries the Card's version only when it has one; an
+exact `CardRef` stays an external reference. A local Artifact is referenced
+as a sibling, published first, and then bound to its registered reference.
 `CodeSource::file` records a path that each snapshot reads.
 
 `validate()` and `CardDefinition::declaration` snapshot the graph, read its
@@ -2368,9 +3072,12 @@ Every call validates afresh; nothing caches a result. The declaration emits
 one submission per distinct identity; definitions are compared as decoded, so
 an omitted default and its explicit value are one submission, and two that
 decode differently, or a local Artifact and a Card of its identity without
-that source, refuse with `WYRD_SPEC_400_DUPLICATE_SUBMISSION`. A local
-Artifact's own references are captured and validated as any Card's. No local
-path reaches a submission.
+that source, refuse with `WYRD_SPEC_400_DUPLICATE_SUBMISSION`. Two explicit
+versions of one kind and name are distinct submissions; a versionless sibling
+that names several submissions is refused with a
+`WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` diagnostic. A local Artifact's own
+references are captured and validated as any Card's. No local path reaches a
+submission.
 
 `Cards::declare` accepts a native `DeclarationInput`, a path, or an authored
 Card; `WyrdState::declare(_with)` accept a path or an authored Card and pull
@@ -2382,7 +3089,10 @@ local Artifact declared as the root is its own publication, and its receipt
 is the declaration's. There is no
 rollback: a graph refused after publication, or a dropped future, leaves each
 published Artifact registered for reuse by reference. Code-authored and
-file-authored forms of one graph register identical content and identities.
+file-authored forms of one graph register identical content and identities,
+with or without versions: the server binds each link to its target's
+registered reference before hashing the parent, so a changed child gives its
+versionless parents new versions through the existing version selection.
 
 ### Pre-declaration matrix (Rule 14)
 
@@ -2394,7 +3104,7 @@ file-authored forms of one graph register identical content and identities.
 | `Artifact`     | **Yes** (typically derived from heavy cards) | Pointer to durable bytes. |
 | `Prompt`       | Optional | Light. Inlineable as `InlineableRef<Prompt>` inside `Agent.prompt`; declaration materializes it as `<agent-name>-prompt`. |
 | `Agent`        | Optional | Light. Spec-only; `wyrd declare` declares it. Verifier `agent` actions and checks take `InlineableRef<AgentSpec>`. |
-| `Verifier`, `Trigger`, `Operator`, `Mcp`, `Audit`, `Service` | Optional | Light. Spec-only; `wyrd declare` declares each card as it's read. |
+| `Verifier`, `Trigger`, `Operator`, `Mcp`, `Audit`, `Service`, `Repository` | Optional | Light. Spec-only; `wyrd declare` declares each card as it's read. |
 
 A single YAML file may contain many `---`-separated card documents — `wyrd
 declare verification-suite.yaml` declares all of them in dependency order. The Agent
@@ -2456,7 +3166,7 @@ relationship tests all project from it:
 
 - `Service.components[].ref` (light and heavy targets)
 - `Service.components[].verified_by`, `Agent.verified_by`,
-  `Service.verified_by` — each binding's `verifier`, `runs_on`, and
+  `Service.verified_by`, `Repository.verified_by` — each binding's `verifier`, `runs_on`, and
   `on_failure[]`
 - `Agent.prompt`
 - Verifier refs: `agent` action and check `agent`, `code` Artifact `source`,
@@ -2473,7 +3183,8 @@ A path string is **client-side authoring sugar**, not a durable wire variant.
 It targets a full Card envelope on disk; the loader reads it without declaring.
 Apply submits it as an independent Card and rewrites the referring slot to an explicit
 declaration reference. When the target is part of the same composite
-submission, the declaration reference is `Sibling { sibling: CardRef }`;
+submission, the declaration reference is `Sibling { sibling: SiblingRef }`,
+carrying the target's version only when its file names one;
 an authored external `ref: CardRef` remains `Ref(CardRef)`. This preserves
 binding intent instead of inferring it from identity. The server validates
 both forms and rewrites them to UID-bearing `Ref(CardRef)` before hashing,
@@ -2485,11 +3196,12 @@ relationship derivation, or durable persistence. The server, registry, and
 - Absolute paths are allowed but discouraged (breaks portability across
   machines and CI).
 - The referenced file is a **full card envelope** — `kind` + `metadata`
-  (`name`, `version`) + `spec`, plus `apiVersion`, which authored
+  (`name`, optional `version`) + `spec`, plus `apiVersion`, which authored
   files may omit and which then defaults to `wyrd/v1`; the declaration wire
   always carries it explicitly. Declaration derives the
-  child's identity from that `metadata`, and the parent slot becomes a `ref:`
-  to it. This is what makes a `path:` target reusable and lineage-anchoring,
+  child's identity from that `metadata`; an omitted version is selected by the
+  server at registration, and the parent slot becomes a `ref:` to the
+  registered child. This is what makes a `path:` target reusable and lineage-anchoring,
   unlike `inline:`.
 - Path imports **are declared as independent cards**, in dependency order,
   ahead of the parent that references them. A heavy-card envelope reached by
@@ -2550,6 +3262,39 @@ domain = "customer"
 [kind.Model.annotations]
 "acme.com/owner" = "ml-platform"
 ```
+
+A checkout's `wyrd.toml` may also carry one `[repository]` table. Its
+presence makes `wyrd declare wyrd.toml` declare an inferred Repository root
+whose graph is only the listed Verifiers and their transitive references:
+
+```toml
+[repository.verified_by]
+verifier = ["./review/code-review.yaml",
+            { kind = "Verifier", name = "shared-check", version = "1.0.0" }]
+runs_on  = { kind = "pull_request" }
+
+# Overrides only; each is optional.
+[repository.metadata]
+name    = "web"          # Card name; inferred from the repository name
+version = "0.1.0"        # exact pin or scope; the server assigns one when absent
+
+[repository.spec]
+repository_id = "42"     # provider ID; still verified by the connection
+```
+
+- `verifier` entries are local Verifier paths (relative to `wyrd.toml`) or
+  exact registered references; each expands into one ordinary
+  `VerificationBinding` sharing `runs_on`. The list is complete desired
+  state, and `verifier = []` binds none.
+- `[repository.metadata]` accepts `name`, `version`, `bump`, `labels`, and
+  `annotations`; labels and annotations merge with `[defaults]` and
+  `[kind.Repository]` like any Card's.
+- `[repository.spec]` accepts `host` and `repository_id`. The origin remote
+  of the enclosing `.git/config`, or `--repository <url>` outside a checkout,
+  is a hint the server verifies; the loader never contacts the provider.
+- `wyrd declare --check wyrd.toml` validates locally and reports
+  `repository_identity`, `registered_references`, `authorization`, and
+  `version_assignment` as deferred server checks.
 
 - Defaultable fields: `labels`, `annotations`. `space` is not a field and
   is refused as an unknown key.
@@ -2621,7 +3366,8 @@ foreign-card content pinning are not supported workflows.
 | Verifier| `agent` actions and checks, `code` Artifact sources, drift `signal.baseline_ref` | `*.verified_by[].verifier` |
 | Audit   | `subject_refs`, `query` (roots), `lineage` (nodes), `investigator` (Agent variant) | — |
 | Service | `components[].ref`, `components[].verified_by`, `verified_by` | — |
-| Trigger | `schedule` activation | `*.verified_by[].runs_on` |
+| Trigger | `schedule`, `group_end`, or `pull_request` activation | `*.verified_by[].runs_on` |
+| Repository | `verified_by` | — |
 | Operator| `action` (typed `channel` shape \| tenant connection) | `*.verified_by[].on_failure` |
 
 `Service.components` accepts: Agent, Prompt, Model, Mcp. No

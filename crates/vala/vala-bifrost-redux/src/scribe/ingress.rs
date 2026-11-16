@@ -813,7 +813,10 @@ impl ScribeImpl {
             return Ok(Dispatched::AcceptedUnder(accepted));
         }
         let elapsed = append_started.elapsed();
-        metrics::histogram!("bifrost_scribe_ack_seconds").record(elapsed.as_secs_f64());
+        // A benchmark keeps this acknowledgement as the write timing alone.
+        if !wyrd_benchmark::enabled() {
+            metrics::histogram!("bifrost_scribe_ack_seconds").record(elapsed.as_secs_f64());
+        }
         profile.record_timing(elapsed, completion.sent.elapsed());
         Ok(Dispatched::Admitted(FrameAdmission {
             batch_id: frame.batch_id,
@@ -967,8 +970,9 @@ impl ScribeImpl {
     /// when the shared root refuses the resize, request a shard-count-invariant
     /// pressure seal toward the low-water mark
     /// ([`ScribeImpl::request_pressure_seal_toward_low_water`]), then retry
-    /// exactly once. An engaged cgroup tripwire is a container-level limit a
-    /// Scribe seal cannot relieve, so it returns `IngestBusy` without a retry.
+    /// exactly once. A process memory ledger with no room for the growth is held
+    /// by other capabilities a Scribe seal cannot relieve, so it returns
+    /// `IngestBusy` without a retry.
     /// A retry that still fails records the rejection labelled by the ceiling
     /// that tripped (D84, via [`super::record_scribe_ceiling_rejection`]) and
     /// returns `IngestBusy`, deferring to D71 client backoff. There is no
@@ -977,7 +981,7 @@ impl ScribeImpl {
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::IngestBusy`] when the cgroup tripwire is engaged or
+    /// Returns [`ScribeError::IngestBusy`] when the process ledger is exhausted or
     /// when the single post-seal retry still cannot fit under the shared cap,
     /// and an internal error when root accounting is poisoned.
     pub(super) fn resize_after_pressure_seal(
@@ -989,9 +993,12 @@ impl ScribeImpl {
         if lease.resize_ingress(bytes).is_ok() {
             return Ok(());
         }
-        if self.memory.cgroup_tripwire_engaged() {
+        if self
+            .memory
+            .process_memory_exhausted(bytes.saturating_sub(lease.bytes()))
+        {
             super::record_scribe_ceiling_rejection(
-                crate::scribe::memory::ScribeRejectionCeiling::CgroupBreaker,
+                crate::scribe::memory::ScribeRejectionCeiling::ProcessMemory,
             );
             return Err(ScribeError::IngestBusy {
                 table: table.to_owned(),
@@ -1551,17 +1558,18 @@ mod tests {
     }
 
     /// One acknowledged append records Scribe's write boundary and each of
-    /// its phases once, through the real benchmark timing collector.
+    /// its phases once, through the real benchmark timing collector, and no
+    /// acknowledgement histogram counts it again.
     ///
     /// # Panics
     ///
-    /// Panics when the write is refused or a boundary's observation count is
-    /// not exactly one.
+    /// Panics when the write is refused, a boundary's observation count is
+    /// not exactly one, or the acknowledgement histogram repeats it.
     #[tokio::test]
     async fn acknowledged_append_records_each_write_phase_once() {
-        use wyrd_telemetry::timing;
+        use wyrd_benchmark as timing;
 
-        timing::enable();
+        timing::install().expect("the benchmark recorder installs");
         let before = timing::snapshot();
         let scribe = ScribeImpl::new();
         let tenant = DataTenantId::new(uuid::Uuid::now_v7()).expect("random tenant is valid");
@@ -1598,6 +1606,12 @@ mod tests {
                 .sum();
             assert_eq!(count, 1, "{boundary}: {:?}", interval.series);
         }
+        assert!(
+            interval
+                .histogram("bifrost_scribe_ack_seconds", &[])
+                .is_err(),
+            "the acknowledgement histogram would count the timed write twice"
+        );
         scribe
             .shutdown(Instant::now() + Duration::from_secs(1))
             .await;

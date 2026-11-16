@@ -372,7 +372,7 @@ async fn grpc_lifecycle_controls_are_tenant_scoped_and_audited() {
 
 /// A denied table describe is refused, audited, and admits nothing.
 ///
-/// `WyrdState::start_bifrost` and `observe.record` reach a table only through
+/// `WyrdState::start_bifrost` and `run.bifrost.write` reach a table only through
 /// `Bifrost::writer_table`, so this is the describe every scoped observation
 /// depends on. A principal holding query but not `bifrost_table:read` receives
 /// the stable RBAC refusal, the server retains one denied decision naming the

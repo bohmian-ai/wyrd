@@ -20,7 +20,7 @@ use crate::card::verifier::{
     WorkspaceSource,
 };
 use crate::envelope::Spec;
-use crate::reference::{CardRef, InlineableRef, Ref};
+use crate::reference::{CardRef, InlineableRef, Ref, SiblingRef};
 use skald_spec::Prompt;
 
 /// A yielded reference slot with metadata about its kind and a mutable handle.
@@ -47,10 +47,10 @@ pub enum SlotValue<'a> {
 }
 
 impl SlotValue<'_> {
-    /// Return the resolved [`CardRef`] this slot carries.
+    /// Return the durable [`CardRef`] this slot carries.
     ///
-    /// Returns `None` for an unresolved `Path` and for an inline body, which
-    /// has no separate Card identity.
+    /// Returns `None` for a declaration-only sibling, an unresolved `Path`,
+    /// and an inline body, which has no separate Card identity.
     #[must_use]
     pub fn as_card_ref(&self) -> Option<&CardRef> {
         match self {
@@ -62,15 +62,59 @@ impl SlotValue<'_> {
         }
     }
 
-    /// Return the exact identity when this slot holds a loader-projected sibling.
+    /// Return the sibling identity when this slot holds a declaration-only sibling.
     #[must_use]
-    pub fn as_sibling(&self) -> Option<&CardRef> {
+    pub fn as_sibling(&self) -> Option<&SiblingRef> {
         match self {
             Self::Durable(reference) => reference.as_sibling(),
             Self::InlineablePrompt(reference) => reference.as_sibling(),
             Self::InlineableAgent(reference) => reference.as_sibling(),
             Self::InlineableTrigger(reference) => reference.as_sibling(),
             Self::InlineableOperator(reference) => reference.as_sibling(),
+        }
+    }
+
+    /// The kind, name, and version (when known) of the Card this slot names,
+    /// for a durable reference or a sibling.
+    #[must_use]
+    pub fn target(&self) -> Option<SiblingRef> {
+        match self {
+            Self::Durable(reference) => reference.target(),
+            Self::InlineablePrompt(reference) => reference.target(),
+            Self::InlineableAgent(reference) => reference.target(),
+            Self::InlineableTrigger(reference) => reference.target(),
+            Self::InlineableOperator(reference) => reference.target(),
+        }
+    }
+
+    /// Replace this slot's sibling with the exact registered reference it
+    /// resolved to. Slots that are not a sibling are left untouched.
+    pub fn bind_sibling(&mut self, card_ref: CardRef) {
+        match self {
+            Self::Durable(reference) => {
+                if matches!(reference, Ref::Sibling { .. }) {
+                    **reference = Ref::Ref(card_ref);
+                }
+            }
+            Self::InlineablePrompt(reference) => bind_inlineable_sibling(reference, card_ref),
+            Self::InlineableAgent(reference) => bind_inlineable_sibling(reference, card_ref),
+            Self::InlineableTrigger(reference) => bind_inlineable_sibling(reference, card_ref),
+            Self::InlineableOperator(reference) => bind_inlineable_sibling(reference, card_ref),
+        }
+    }
+
+    /// Replace this slot's sibling identity in place, keeping it a sibling.
+    /// Slots that are not a sibling are left untouched.
+    pub fn set_sibling(&mut self, sibling: SiblingRef) {
+        match self {
+            Self::Durable(Ref::Sibling { sibling: current })
+            | Self::InlineablePrompt(InlineableRef::Sibling { sibling: current })
+            | Self::InlineableAgent(InlineableRef::Sibling { sibling: current })
+            | Self::InlineableTrigger(InlineableRef::Sibling { sibling: current })
+            | Self::InlineableOperator(InlineableRef::Sibling { sibling: current }) => {
+                *current = sibling;
+            }
+            _ => {}
         }
     }
 
@@ -91,7 +135,7 @@ impl SlotValue<'_> {
     /// Each slot shape keeps its own sibling form, so the loader does not need
     /// to know which concrete reference type it is holding. Slots that are not
     /// currently a `Path` are left untouched.
-    pub fn resolve_path_to_sibling(&mut self, sibling: CardRef) {
+    pub fn resolve_path_to_sibling(&mut self, sibling: SiblingRef) {
         match self {
             Self::Durable(reference) => {
                 if matches!(reference, Ref::Path(_)) {
@@ -120,9 +164,16 @@ impl SlotValue<'_> {
 }
 
 /// Replace one inlineable slot's authored path with its sibling projection.
-fn set_inlineable_sibling<T>(reference: &mut InlineableRef<T>, sibling: CardRef) {
+fn set_inlineable_sibling<T>(reference: &mut InlineableRef<T>, sibling: SiblingRef) {
     if matches!(reference, InlineableRef::Path(_)) {
         *reference = InlineableRef::Sibling { sibling };
+    }
+}
+
+/// Replace one inlineable slot's sibling with its exact registered reference.
+fn bind_inlineable_sibling<T>(reference: &mut InlineableRef<T>, card_ref: CardRef) {
+    if matches!(reference, InlineableRef::Sibling { .. }) {
+        *reference = InlineableRef::Ref(card_ref);
     }
 }
 
@@ -150,6 +201,9 @@ impl ReferenceSlotVisitor {
             Spec::Agent(agent) => agent.visit(&mut f),
             Spec::Verifier(verifier) => verifier.visit(&mut f),
             Spec::Service(service) => service.visit(&mut f),
+            Spec::Repository(repository) => {
+                visit_verified_by(&mut repository.verified_by, "spec.verified_by", &mut f);
+            }
             Spec::Mcp(mcp) => mcp.visit(&mut f),
             Spec::Audit(audit) => audit.visit(&mut f),
             Spec::Artifact(artifact) => artifact.visit(&mut f),
@@ -292,7 +346,7 @@ impl Visit for VerifierSpec {
         for (i, step) in self.steps.iter_mut().enumerate() {
             let prefix = format!("spec.steps[{i}].action");
             match &mut step.action {
-                Action::Extract { .. } => {}
+                Action::Extract { .. } | Action::Approval { .. } => {}
                 Action::Agent(call) => visit_agent_call(call, &prefix, f),
                 Action::Code(call) => visit_code_call(call, &prefix, f),
             }
@@ -677,6 +731,8 @@ mod completeness_tests {
     fn agent_verifier() -> VerifierSpec {
         VerifierSpec {
             description: None,
+            limits: None,
+            queue_only: false,
             inputs: BTreeMap::new(),
             steps: Vec::new(),
             requirements: vec![Requirement {

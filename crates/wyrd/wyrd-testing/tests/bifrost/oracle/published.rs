@@ -17,7 +17,7 @@ use vala_bifrost_redux::forge::ForgeConfig;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_client::WyrdClient;
 use wyrd_runtime::Permission;
-use wyrd_server::config::BifrostTarget;
+use wyrd_server::config::ServerTarget;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdProblem;
 use wyrd_spec::vala::api::{BifrostQueryRequest, QueryClass};
@@ -873,10 +873,10 @@ async fn variant_sql_registry_covers_every_session() {
 /// topology has followers.
 async fn prove_variant_sql_sessions() -> Result<(), JourneyError> {
     let cluster = PeerCluster::start_with_slots(&[
-        (BifrostTarget::Oracle, Some(2)),
-        (BifrostTarget::Oracle, Some(2)),
-        (BifrostTarget::Oracle, Some(2)),
-        (BifrostTarget::Scribe, None),
+        (ServerTarget::BifrostQuery, Some(2)),
+        (ServerTarget::BifrostQuery, Some(2)),
+        (ServerTarget::BifrostQuery, Some(2)),
+        (ServerTarget::BifrostIngest, None),
     ])
     .await?;
     let suffix = uuid::Uuid::now_v7().simple();
@@ -1193,7 +1193,7 @@ async fn prove_worker_tenant_refusal(
         .await?;
     cluster.refresh_snapshots().await?;
     let baseline = cluster
-        .indices_of(BifrostTarget::Oracle)
+        .indices_of(ServerTarget::BifrostQuery)
         .into_iter()
         .map(|index| Ok((index, cluster.ownership_snapshot(index)?)))
         .collect::<Result<Vec<_>, JourneyError>>()?;
@@ -1243,53 +1243,6 @@ fn expect_path(case: &str, path: QueryClass, expected: QueryClass) -> Result<(),
     } else {
         Err(format!("{case}: expected {expected:?} execution, settled {path:?}").into())
     }
-}
-
-/// Runs one public query to its terminal and renders every cell as text.
-///
-/// Rendering through Arrow's display formatter lets one comparison cover
-/// strings, integers, and booleans without a per-column downcast.
-///
-/// # Errors
-///
-/// Returns the SDK error unchanged so a caller can read its catalog code, or a
-/// message when the stream ends without a terminal or a cell cannot render.
-async fn run_rows(
-    client: &WyrdClient,
-    sql: &str,
-) -> Result<(QueryClass, Vec<Vec<String>>), JourneyError> {
-    let mut stream = wyrd_client::Bifrost::query_only(client)
-        .query(&BifrostQueryRequest {
-            sql: sql.to_owned(),
-            deadline_ms: Some(30_000),
-            params: Vec::new(),
-        })
-        .await?;
-    let mut rows = Vec::new();
-    while let Some(batch) = stream.next_batch().await? {
-        rows.extend(render_rows(&batch)?);
-    }
-    let terminal = stream
-        .terminal()
-        .ok_or("public query produced no terminal frame")?;
-    Ok((terminal.query_class, rows))
-}
-
-/// Renders every cell of one batch with Arrow's display formatter.
-///
-/// # Errors
-///
-/// Returns the formatter error for a column it cannot render.
-fn render_rows(batch: &RecordBatch) -> Result<Vec<Vec<String>>, JourneyError> {
-    (0..batch.num_rows())
-        .map(|row| {
-            batch
-                .columns()
-                .iter()
-                .map(|column| Ok(arrow::util::display::array_value_to_string(column, row)?))
-                .collect()
-        })
-        .collect()
 }
 
 /// Rows each sealed file of the pushdown journey holds.

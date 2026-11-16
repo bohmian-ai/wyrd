@@ -10,7 +10,6 @@
 //! adapter cannot represent the request body is dropped later by
 //! [`CallPlan::retain_representable`].
 
-use serde_json::Value;
 use skald_spec::ProviderName;
 use wyrd_spec::gateway::{
     FallbackScope, GatewayCallId, GatewayFallbackOverride, GatewayOperation, ModelRef,
@@ -18,7 +17,8 @@ use wyrd_spec::gateway::{
 };
 use wyrd_spec::ids::ProviderDeploymentName;
 
-use crate::adapter::{IngressDialect, MediaRequest, UnsupportedRequest, adapter_name, prepare};
+use crate::adapter::{IngressDialect, MediaRequest, UnsupportedRequest, adapter_name, check};
+use crate::request::RequestJson;
 use crate::snapshot::GatewayTenantSnapshot;
 
 /// One address the call may use and the deployment it names.
@@ -181,13 +181,13 @@ impl CallPlan {
         &mut self,
         ingress: IngressDialect,
         stream: bool,
-        body: &Value,
+        body: &RequestJson,
         media: Option<&MediaRequest>,
     ) -> Result<(), UnsupportedRequest> {
         let operation = self.operation;
         let mut first = None;
         self.candidates.retain(|candidate| {
-            match prepare(
+            match check(
                 ingress,
                 operation,
                 stream,
@@ -213,7 +213,7 @@ impl CallPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use wyrd_spec::gateway::{GatewayCapturePolicy, GatewayFallbackPolicy};
 
     /// Builds an OpenAI-compatible deployment `name` with optional model and
@@ -541,7 +541,9 @@ mod tests {
         chat.retain_representable(
             IngressDialect::OpenAi,
             false,
-            &json!({"model": "chat/gpt-4o", "messages": [{"role": "user", "content": "hi"}]}),
+            &RequestJson::from(
+                json!({"model": "chat/gpt-4o", "messages": [{"role": "user", "content": "hi"}]}),
+            ),
             None,
         )
         .expect("ordinary chat is representable");

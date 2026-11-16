@@ -6,6 +6,7 @@
 //! Variants rather than a one-row Arrow batch, and [`StagedRow::project`]
 //! appends a run of rows sharing one schema straight into one dense batch.
 
+use std::borrow::Borrow;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -23,8 +24,8 @@ pub enum Cell {
     Text(Option<Box<str>>),
     /// A boolean value.
     Flag(bool),
-    /// A 64-bit integer value.
-    Int(i64),
+    /// A 64-bit integer value, or null.
+    Int(Option<i64>),
     /// A microsecond timestamp, or null; the column's declared type carries
     /// its time zone.
     Micros(Option<i64>),
@@ -43,7 +44,7 @@ impl Cell {
     fn is_null(&self) -> bool {
         matches!(
             self,
-            Self::Text(None) | Self::Micros(None) | Self::Variant(None)
+            Self::Text(None) | Self::Int(None) | Self::Micros(None) | Self::Variant(None)
         )
     }
 
@@ -138,21 +139,24 @@ impl StagedRow {
     }
 
     /// Build `rows`, which share the first row's schema, into one batch,
-    /// each column allocated once for its values.
+    /// each column allocated once for its values. Rows may be owned or
+    /// borrowed, so a caller holding them elsewhere projects without copying
+    /// any.
     ///
     /// # Errors
     ///
     /// Returns [`ArrowError::SchemaError`] when `rows` is empty or a row
     /// fills another schema, and the Arrow error when the batch cannot be
     /// assembled.
-    pub fn project(rows: &[Self]) -> Result<RecordBatch, ArrowError> {
+    pub fn project<R: Borrow<Self>>(rows: &[R]) -> Result<RecordBatch, ArrowError> {
         let schema = rows
             .first()
-            .map(|row| Arc::clone(&row.schema))
+            .map(|row| Arc::clone(&row.borrow().schema))
             .ok_or_else(|| ArrowError::SchemaError("no rows to project".to_owned()))?;
         if rows
             .iter()
-            .any(|row| !Arc::ptr_eq(&row.schema, &schema) && row.schema != schema)
+            .map(Borrow::borrow)
+            .any(|row: &Self| !Arc::ptr_eq(&row.schema, &schema) && row.schema != schema)
         {
             return Err(ArrowError::SchemaError(
                 "staged rows of different schemas".to_owned(),
@@ -176,9 +180,9 @@ impl StagedRow {
     ///
     /// Panics when `rows` is empty or a row has no cell at `index`; callers
     /// pass a non-empty run of one schema's rows.
-    fn column(rows: &[Self], index: usize, data_type: &DataType) -> ArrayRef {
-        let cells = rows.iter().map(|row| &row.cells[index]);
-        match &rows[0].cells[index] {
+    fn column<R: Borrow<Self>>(rows: &[R], index: usize, data_type: &DataType) -> ArrayRef {
+        let cells = rows.iter().map(|row| &row.borrow().cells[index]);
+        match &rows[0].borrow().cells[index] {
             Cell::Text(_) => {
                 let bytes = cells.clone().map(Cell::owned_bytes).sum();
                 let mut column = StringBuilder::with_capacity(rows.len(), bytes);
@@ -202,7 +206,7 @@ impl StagedRow {
                 let mut column = Int64Builder::with_capacity(rows.len());
                 for cell in cells {
                     if let Cell::Int(value) = cell {
-                        column.append_value(*value);
+                        column.append_option(*value);
                     }
                 }
                 Arc::new(column.finish())
@@ -281,21 +285,21 @@ mod tests {
                 Cell::Flag(true),
                 Cell::Micros(Some(7)),
                 Cell::Variant(Some(detail.clone())),
-                Cell::Int(-3),
+                Cell::Int(Some(-3)),
             ],
             vec![
                 Cell::text(None::<&str>),
                 Cell::Flag(false),
                 Cell::Micros(None),
                 Cell::Variant(None),
-                Cell::Int(0),
+                Cell::Int(Some(0)),
             ],
             vec![
                 Cell::text(Some("")),
                 Cell::Flag(true),
                 Cell::Micros(Some(9)),
                 Cell::Variant(None),
-                Cell::Int(i64::MAX),
+                Cell::Int(Some(i64::MAX)),
             ],
         ]
         .map(|cells| StagedRow::new(Arc::clone(&schema), cells).expect("row stages"));
@@ -340,7 +344,7 @@ mod tests {
                     Cell::Flag(true),
                     Cell::Micros(None),
                     Cell::Variant(None),
-                    Cell::Int(0)
+                    Cell::Int(Some(0))
                 ],
             )
             .is_err(),
@@ -354,11 +358,41 @@ mod tests {
                     Cell::Micros(None),
                     Cell::Micros(None),
                     Cell::Variant(None),
-                    Cell::Int(0)
+                    Cell::Int(Some(0))
                 ],
             )
             .is_err(),
             "a null in a required column is refused"
+        );
+        let counts = Arc::new(Schema::new(vec![Field::new(
+            "count",
+            DataType::Int64,
+            true,
+        )]));
+        let counted = [Some(4), None].map(|count| {
+            StagedRow::new(Arc::clone(&counts), vec![Cell::Int(count)]).expect("row stages")
+        });
+        let projected = StagedRow::project(&counted).expect("rows project");
+        assert_eq!(
+            projected
+                .column(0)
+                .as_primitive::<arrow::datatypes::Int64Type>()
+                .iter()
+                .collect::<Vec<_>>(),
+            [Some(4), None],
+            "a nullable integer keeps its null"
+        );
+        assert!(
+            StagedRow::new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "size",
+                    DataType::Int64,
+                    false
+                )])),
+                vec![Cell::Int(None)]
+            )
+            .is_err(),
+            "a null integer in a required column is refused"
         );
     }
 }

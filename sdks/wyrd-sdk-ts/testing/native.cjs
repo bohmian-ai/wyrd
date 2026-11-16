@@ -572,6 +572,9 @@ if (!nativeBinding) {
 }
 
 module.exports = nativeBinding
+module.exports.NativeGithubAppMock = nativeBinding.NativeGithubAppMock
+module.exports.NativeGithubBrowser = nativeBinding.NativeGithubBrowser
+module.exports.NativeHeldMemory = nativeBinding.NativeHeldMemory
 module.exports.NativeWyrdTestServer = nativeBinding.NativeWyrdTestServer
 module.exports.cliDeclare = nativeBinding.cliDeclare
 module.exports.cliDeclareCheck = nativeBinding.cliDeclareCheck
@@ -581,4 +584,5 @@ module.exports.cliMcpInstall = nativeBinding.cliMcpInstall
 module.exports.cliPull = nativeBinding.cliPull
 module.exports.cliPutProviderCredential = nativeBinding.cliPutProviderCredential
 module.exports.cliRevokeProviderCredential = nativeBinding.cliRevokeProviderCredential
+module.exports.signInGithubBrowser = nativeBinding.signInGithubBrowser
 module.exports.startTestServer = nativeBinding.startTestServer

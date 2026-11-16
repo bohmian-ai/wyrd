@@ -399,6 +399,8 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
         &scribe,
         &FetchLiveTailRequest {
             pruning: None,
+            requirements: None,
+            memory: crate::scribe::memtable::tests::unbounded_pool(),
             binding,
             target_stream: StreamIdentity::new(NodeId::new(Uuid::nil()), WriterEpoch::new(1)),
             start_partition: day,
@@ -465,7 +467,7 @@ async fn assert_producer_rows_share_the_wal_path(scribe: &ScribeImpl, tenant: Da
             wyrd_spec::vala::api::AuditOutcome::Allowed,
         );
         event.detail = detail;
-        crate::tables::audit::projection::stage_audit_event(&event, decided_at)
+        crate::tables::audit::projection::stage_audit_event(event, decided_at)
             .expect("the decision stages")
     };
     let rows = crate::tables::staged::StagedRow::project(&[
@@ -564,6 +566,8 @@ async fn assert_producer_rows_share_the_wal_path(scribe: &ScribeImpl, tenant: Da
         scribe,
         &FetchLiveTailRequest {
             pruning: None,
+            requirements: None,
+            memory: crate::scribe::memtable::tests::unbounded_pool(),
             binding: TenantTableBinding::resolve((tenant, table)).expect("binding"),
             target_stream: StreamIdentity::new(NodeId::new(Uuid::nil()), WriterEpoch::new(1)),
             start_partition: day,
@@ -677,6 +681,8 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
     let (start_partition, end_partition) = receipt_hours(since, chrono::Duration::zero());
     let request = FetchLiveTailRequest {
         pruning: None,
+        requirements: None,
+        memory: crate::scribe::memtable::tests::unbounded_pool(),
         binding,
         target_stream: stream,
         start_partition,
@@ -800,6 +806,8 @@ fn value_read(
 ) -> FetchLiveTailRequest {
     FetchLiveTailRequest {
         pruning: None,
+        requirements: None,
+        memory: crate::scribe::memtable::tests::unbounded_pool(),
         binding: TenantTableBinding::resolve((tenant, table.clone())).expect("tail binding"),
         target_stream: stream,
         start_partition,
@@ -1164,6 +1172,8 @@ async fn series_keys(
         scribe,
         &FetchLiveTailRequest {
             pruning: None,
+            requirements: None,
+            memory: crate::scribe::memtable::tests::unbounded_pool(),
             binding: TenantTableBinding::resolve((
                 tenant,
                 TableRef::new(BifrostNamespace::Metrics, table),
@@ -1317,6 +1327,8 @@ async fn series_contexts(
         scribe,
         &FetchLiveTailRequest {
             pruning: None,
+            requirements: None,
+            memory: crate::scribe::memtable::tests::unbounded_pool(),
             binding: TenantTableBinding::resolve((
                 tenant,
                 TableRef::new(BifrostNamespace::Metrics, table),

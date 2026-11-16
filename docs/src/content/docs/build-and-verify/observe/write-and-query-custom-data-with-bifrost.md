@@ -8,7 +8,7 @@ order: 2
 draft: true
 ---
 
-Bifrost is Wyrd's analytical warehouse, and you can use it directly: register a table from a type you already have, load rows into it, and query it, or any table you can read, with SQL. Use this for backfills, batch jobs, notebooks, and analysis. Inside a running service, prefer [`observe.record`](/build-and-verify/observe/record-a-run-and-observations/), which ties each row to the run and Card that produced it.
+Bifrost is Wyrd's analytical warehouse, and you can use it directly: register a table from a type you already have, load rows into it, and query it, or any table you can read, with SQL. Use this for backfills, batch jobs, notebooks, and analysis. Inside a running service, prefer [`run.bifrost.write`](/build-and-verify/observe/record-a-run-and-observations/), which ties each row to the run and Card that produced it.
 
 [Bifrost](/understand/bifrost/) explains the storage model and when written rows become queryable.
 

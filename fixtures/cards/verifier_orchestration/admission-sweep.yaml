@@ -1,0 +1,23 @@
+# Section reviewers fanned out over the submitted sections with no retry,
+# so the deployment's Agent ceiling, not a spent attempt, is what delays an
+# item the ceiling refuses.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: admission-sweep
+  version: 1.0.0
+spec:
+  description: Array work bounded by deployment capacity.
+  inputs:
+    sections: {type: json, schema: {type: array, items: {type: string}}}
+  steps:
+    - id: map
+      foreach: {items: inputs.sections, max_items: 4}
+      action:
+        kind: agent
+        agent: ./section-reviewer.yaml
+        inputs: {section: item, index: item_index}
+  requirements:
+    - id: mapped
+      statement: Every section was reviewed
+      check: {kind: assert, path: steps.map.status, operator: equals, expected: succeeded}

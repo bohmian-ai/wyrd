@@ -1,7 +1,8 @@
 //! In-memory Card authoring in the Card YAML's own vocabulary.
 //!
 //! Each named Card type, such as [`Service`] or [`Verifier`], is created with
-//! `new(name, version)`; each sub-value, such as [`Component`] or [`Step`],
+//! `new(name, version)`, where the version is optional and the server selects
+//! an omitted one at declaration; each sub-value, such as [`Component`] or [`Step`],
 //! with the fields that identify it. Every other method is named for the YAML
 //! field it edits and takes that field's YAML value: references stay strings
 //! such as `inputs.report.text`, operators stay `"equals"` or their object
@@ -12,8 +13,9 @@
 //!
 //! Construction and editing never validate, read files, or touch the
 //! network, so an incomplete or malformed definition, or one with a forward
-//! reference, can be assembled freely. A Card value or exact [`CardRef`] may
-//! stand at any reference position, as a YAML path does; passing a child
+//! reference, can be assembled freely. A Card value, which becomes a sibling
+//! reference, or an exact [`CardRef`] may stand at any reference position, as
+//! a YAML path does; passing a child
 //! captures its current value, so later edits to the child change nothing
 //! already passed. Replacing a field drops everything its old value
 //! referenced, while another field still referencing the same definition
@@ -26,7 +28,8 @@
 //! values meet the same rules and YAML field paths. Validation runs again for
 //! every snapshot; nothing caches it. Registration goes through
 //! [`crate::cards::Cards::declare`] or [`crate::state::WyrdState::declare`],
-//! which publish each local Artifact first and then declare the graph.
+//! which publish each local Artifact first, bind its registered reference
+//! into everything that names it, and then declare the graph.
 
 #![deny(missing_docs)]
 
@@ -35,16 +38,20 @@ mod verifier;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
 use wyrd_loader::{DeclarationInput, Diagnostic, LoadError, Severity};
 use wyrd_spec::card::artifact::ArtifactSpec;
 use wyrd_spec::envelope::{CardKind, Metadata, Spec};
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::graph::sibling_target;
+use wyrd_spec::refs::ReferenceSlotVisitor;
+use wyrd_spec::registry::CardSubmission;
 
 pub use kinds::{
-    Agent, Artifact, Audit, Binding, Component, Data, Experiment, Mcp, Model, Operator, Prompt,
-    Service, Trigger,
+    Agent, Artifact, Audit, Binding, Component, Data, Experiment, Mcp, Model, Operator, Service,
+    Table, Trigger,
 };
 pub use verifier::{Action, Check, InputSlot, Requirement, Step, Verifier};
 pub use wyrd_spec::verification::ExecutionPlan;
@@ -86,10 +93,10 @@ fn field_path(location: &[Segment]) -> String {
 /// What one authored value carries besides its JSON: the definitions it
 /// references, the map keys added to it twice, and the local code files its
 /// snapshot reads.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Captures {
     /// Referenced Card definitions, captured by value, local Artifacts
-    /// included.
+    /// included; each is an immutable snapshot that copies share.
     cards: Vec<CardDefinition>,
     /// Map keys an add method received twice; validation refuses them.
     duplicates: Vec<Location>,
@@ -121,11 +128,13 @@ impl Captures {
 /// A value for one authoring field: canonical JSON, plus the Cards, local
 /// Artifacts, and local code files it references.
 ///
-/// It converts from any JSON [`Value`] or string and from every authoring
-/// value that can stand at a reference position: a Card, which becomes a
-/// sibling reference declared in the same graph; a [`CardRef`], which stays an
-/// external reference; an [`ArtifactFile`]; and a [`CodeSource`].
-#[derive(Debug, Clone, PartialEq)]
+/// It converts from any JSON [`Value`] or string, from the canonical typed
+/// values a field takes, such as a [`skald_prompt::Prompt`] or an
+/// [`wyrd_spec::ExecutionRoute`], and from every authoring value that can
+/// stand at a reference position: a Card, which becomes a sibling reference
+/// declared in the same graph; a [`CardRef`], which stays an external
+/// reference; an [`ArtifactFile`]; and a [`CodeSource`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldValue {
     /// The canonical JSON this value contributes.
     value: Value,
@@ -208,18 +217,51 @@ impl From<wyrd_spec::reference::CardRef> for FieldValue {
     }
 }
 
+/// Generate `From<T> for FieldValue` for canonical typed field values, each
+/// written as the JSON its canonical type serializes to.
+macro_rules! canonical_values {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl From<$ty> for FieldValue {
+                /// The canonical JSON form of the value.
+                ///
+                /// # Panics
+                /// Never: the canonical type serializes to JSON with string
+                /// keys.
+                fn from(value: $ty) -> Self {
+                    Self::plain(
+                        serde_json::to_value(value)
+                            .expect("a canonical spec value serializes to JSON"),
+                    )
+                }
+            }
+        )*
+    };
+}
+
+canonical_values!(
+    skald_spec::Prompt,
+    wyrd_spec::ExecutionRoute,
+    wyrd_spec::AgentRunConfigSpec,
+    wyrd_spec::verification::ComparisonOperator,
+);
+
+impl From<skald_prompt::Prompt> for FieldValue {
+    /// The Prompt inline, as its native canonical request; the server
+    /// registers it with the Card that holds it.
+    fn from(prompt: skald_prompt::Prompt) -> Self {
+        Self::from(prompt.into_native())
+    }
+}
+
 impl From<CardDefinition> for FieldValue {
-    /// A sibling reference to `card`, which is declared in the same graph,
-    /// or, for an Artifact with a local source, its exact external
-    /// reference, published first.
+    /// A sibling reference to `card`, carrying its version only when one is
+    /// set. A Card without a local source is declared in the same graph; an
+    /// Artifact with one is published first and its registered reference
+    /// replaces the sibling.
     fn from(card: CardDefinition) -> Self {
-        let reference = card.0.card_ref().value();
         Self {
-            value: if card.0.source.is_some() {
-                reference
-            } else {
-                json!({ "sibling": reference })
-            },
+            value: json!({ "sibling": card.0.sibling() }),
             captures: Captures {
                 cards: vec![card],
                 ..Captures::default()
@@ -233,7 +275,7 @@ impl From<CardDefinition> for FieldValue {
 ///
 /// Captures are kept per field, so a setter replaces exactly its own field's
 /// references and leaves every other field's untouched.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Body {
     /// The object's fields, as authored.
     fields: Map<String, Value>,
@@ -369,13 +411,23 @@ impl Body {
     }
 
     /// The object as authored, with any flattened field written in place,
-    /// or the malformed value supplied in its place.
+    /// or the malformed value supplied in its place; a copy, since the body
+    /// stays editable.
     fn value(&self) -> Value {
-        if let Some(malformed) = &self.malformed {
-            return malformed.clone();
+        Self::written(self.malformed.clone(), self.fields.clone(), self.flatten)
+    }
+
+    /// The object `fields` with the `flatten` field written in place, or
+    /// `malformed` when one stands in place of the object.
+    fn written(
+        malformed: Option<Value>,
+        mut fields: Map<String, Value>,
+        flatten: Option<&'static str>,
+    ) -> Value {
+        if let Some(malformed) = malformed {
+            return malformed;
         }
-        let mut fields = self.fields.clone();
-        if let Some(flattened) = self.flatten
+        if let Some(flattened) = flatten
             && let Some(Value::Object(inner)) = fields.remove(flattened)
         {
             for (key, value) in inner {
@@ -385,20 +437,27 @@ impl Body {
         Value::Object(fields)
     }
 
-    /// Everything every field captures.
-    fn captures(&self) -> Captures {
-        let mut all = Captures::default();
-        for captures in self.captures.values() {
-            all.absorb(captures.clone());
-        }
-        all
+    /// Every captured definition, in field order, without copying any.
+    fn cards(&self) -> impl Iterator<Item = &CardDefinition> {
+        self.captures.values().flat_map(|captures| &captures.cards)
     }
 
-    /// This object as one field value.
+    /// Every repeated key, located from this object, in field order.
+    fn duplicates(&self) -> impl Iterator<Item = &Location> {
+        self.captures
+            .values()
+            .flat_map(|captures| &captures.duplicates)
+    }
+
+    /// This object as one field value, moving its JSON and captures.
     fn into_field(self) -> FieldValue {
+        let mut captures = Captures::default();
+        for field in self.captures.into_values() {
+            captures.absorb(field);
+        }
         FieldValue {
-            value: self.value(),
-            captures: self.captures(),
+            value: Self::written(self.malformed, self.fields, self.flatten),
+            captures,
         }
     }
 }
@@ -663,14 +722,14 @@ impl From<CodeSource> for FieldValue {
 
 /// One named Card under construction: identity, labels and annotations, and
 /// its spec.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Card {
     /// The kind, fixed by the authoring type.
     kind: CardKind,
     /// The name, as authored.
     name: String,
-    /// The exact version, as authored.
-    version: String,
+    /// The version, as authored; `None` lets the server select it.
+    version: Option<String>,
     /// `labels` and `annotations`.
     metadata: Body,
     /// The spec.
@@ -684,22 +743,22 @@ struct Card {
 }
 
 impl Card {
-    /// An empty `kind` Card named `name` at `version`.
-    fn new(kind: CardKind, name: impl Into<String>, version: impl Into<String>) -> Self {
+    /// An empty `kind` Card named `name` at `version`, if any.
+    fn new(kind: CardKind, name: impl Into<String>, version: Option<&str>) -> Self {
         Self::with_spec(kind, name, version, Body::default())
     }
 
-    /// A `kind` Card named `name` at `version` with `spec`.
+    /// A `kind` Card named `name` at `version`, if any, with `spec`.
     fn with_spec(
         kind: CardKind,
         name: impl Into<String>,
-        version: impl Into<String>,
+        version: Option<&str>,
         spec: Body,
     ) -> Self {
         Self {
             kind,
             name: name.into(),
-            version: version.into(),
+            version: version.map(str::to_owned),
             metadata: Body::default(),
             spec,
             source: None,
@@ -714,19 +773,38 @@ impl Card {
         self
     }
 
-    /// The exact reference this Card registers as.
-    fn card_ref(&self) -> CardRef {
-        CardRef::new(self.kind.clone(), &self.name, &self.version)
+    /// The exact reference this Card registers as, when its version is set.
+    fn card_ref(&self) -> Option<CardRef> {
+        self.version
+            .as_deref()
+            .map(|version| CardRef::new(self.kind.clone(), &self.name, version))
     }
 
-    /// The label naming this Card in diagnostics, in place of a file path.
+    /// The canonical sibling reference `{kind, name, version?}` naming this
+    /// Card within its declaration.
+    fn sibling(&self) -> Value {
+        let mut sibling = json!({ "kind": self.kind.wire_name(), "name": self.name });
+        if let Some(version) = &self.version {
+            sibling["version"] = Value::from(version.as_str());
+        }
+        sibling
+    }
+
+    /// The identity two definitions of one Card share: kind, name, and the
+    /// version as authored.
+    fn identity(&self) -> (&CardKind, &str, Option<&str>) {
+        (&self.kind, &self.name, self.version.as_deref())
+    }
+
+    /// The label naming this Card in diagnostics, in place of a file path:
+    /// `Kind/name`, followed by `@version` when one is set.
     fn label(&self) -> PathBuf {
-        PathBuf::from(format!(
-            "{}/{}@{}",
-            self.kind.wire_name(),
-            self.name,
-            self.version
-        ))
+        let mut label = format!("{}/{}", self.kind.wire_name(), self.name);
+        if let Some(version) = &self.version {
+            label.push('@');
+            label.push_str(version);
+        }
+        PathBuf::from(label)
     }
 
     /// The envelope YAML would hold, with every local code file read now.
@@ -736,10 +814,9 @@ impl Card {
     /// that cannot be read as UTF-8 text.
     fn envelope(&self) -> Result<Value, Vec<Diagnostic>> {
         let mut spec = self.spec.value();
-        let captures = self.spec.captures();
-        let mut diagnostics: Vec<Diagnostic> = captures
-            .duplicates
-            .iter()
+        let mut diagnostics: Vec<Diagnostic> = self
+            .spec
+            .duplicates()
             .map(|location| {
                 format!(
                     "Invalid spec for kind {}: {}",
@@ -749,9 +826,7 @@ impl Card {
             })
             .chain(
                 self.metadata
-                    .captures()
-                    .duplicates
-                    .iter()
+                    .duplicates()
                     .map(|location| format!("metadata.{}", field_path(location))),
             )
             .map(|path| {
@@ -761,7 +836,12 @@ impl Card {
                 )
             })
             .collect();
-        for (location, file) in &captures.files {
+        for (location, file) in self
+            .spec
+            .captures
+            .values()
+            .flat_map(|captures| &captures.files)
+        {
             match std::fs::read_to_string(file) {
                 Ok(text) => {
                     if let Some(slot) = value_at(&mut spec, location) {
@@ -777,31 +857,20 @@ impl Card {
         let mut metadata = self.metadata.value();
         if let Value::Object(fields) = &mut metadata {
             fields.insert("name".to_owned(), Value::from(self.name.as_str()));
-            fields.insert("version".to_owned(), Value::from(self.version.as_str()));
+            if let Some(version) = &self.version {
+                fields.insert("version".to_owned(), Value::from(version.as_str()));
+            }
         }
         Ok(json!({ "kind": self.kind.wire_name(), "metadata": metadata, "spec": spec }))
     }
 
-    /// Decode this Card's envelope as its YAML document would be decoded,
-    /// requiring an exact version.
+    /// Decode this Card's envelope as its YAML document would be decoded.
     ///
     /// # Errors
     /// Returns every diagnostic for this Card.
     fn decode(&self) -> Result<wyrd_loader::AuthoredCard, Vec<Diagnostic>> {
         let envelope = self.envelope()?;
-        let card = wyrd_loader::parse_card_value(&self.label(), envelope).map_err(|d| vec![d])?;
-        if card.metadata.resolved_pin().is_none() {
-            return Err(vec![Diagnostic::from_wyrd_error(
-                self.label(),
-                Severity::Error,
-                None,
-                &WyrdError::RegistryInvalidVersionBlock {
-                    message: "metadata.version: an authored Card needs an exact version".to_owned(),
-                    details: json!({ "path": "metadata.version", "version": self.version }),
-                },
-            )]);
-        }
-        Ok(card)
+        wyrd_loader::parse_card_value(&self.label(), envelope).map_err(|d| vec![d])
     }
 
     /// This Artifact's sole publication from `source`, after its descriptor
@@ -814,8 +883,8 @@ impl Card {
     /// # Panics
     /// Never: only an Artifact Card has a local source.
     fn local(&self, source: &Path) -> Result<LocalArtifact, Vec<Diagnostic>> {
-        let card = self.decode()?;
-        wyrd_loader::declaration_input_from_cards(std::slice::from_ref(&card))
+        let mut card = self.decode()?;
+        wyrd_loader::declaration_input_from_cards(std::slice::from_mut(&mut card))
             .map_err(|error| error.diagnostics)?;
         let Spec::Artifact(spec) = card.spec else {
             unreachable!("only an Artifact Card has a local source");
@@ -921,14 +990,16 @@ macro_rules! card_methods {
                 self
             }
 
-            /// The exact reference this Card registers as.
+            /// The exact reference this Card registers as, when its version
+            /// is set; without one, the server selects the version at
+            /// declaration.
             #[must_use]
-            pub fn card_ref(&self) -> $crate::authoring::CardRef {
+            pub fn card_ref(&self) -> Option<$crate::authoring::CardRef> {
                 self.card.card_ref()
             }
 
             /// The spec as authored so far, before validation; a
-            /// [`CodeSource::file`](crate::authoring::CodeSource::file) position is `null` until its graph is
+            /// [`CodeSource::file`](crate::verify::CodeSource::file) position is `null` until its graph is
             /// validated.
             #[must_use]
             pub fn spec(&self) -> serde_json::Value {
@@ -941,10 +1012,7 @@ macro_rules! card_methods {
             /// # Errors
             /// Returns [`CardDefinition::declaration`]'s refusals.
             pub fn validate(&self) -> Result<(), wyrd_spec::error::WyrdError> {
-                $crate::authoring::Graph::declaration(
-                    $crate::authoring::FieldValue::from(self.clone()).captures,
-                )
-                .map(drop)
+                $crate::authoring::Graph::declaration(&self.card).map(drop)
             }
         }
     };
@@ -956,22 +1024,25 @@ pub(crate) use card_methods;
 /// its kind erased.
 ///
 /// Only the named Card types build one, each converting with what it
-/// references.
-#[derive(Debug, Clone, PartialEq)]
+/// references. A definition is an immutable snapshot: copying it, or the
+/// Card that captures it, shares it and everything it captures instead of
+/// copying them.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CardDefinition(
-    /// The Card.
-    Card,
+    /// The Card, shared by every copy.
+    Arc<Card>,
 );
 
 impl CardDefinition {
-    /// The exact reference this Card registers as.
+    /// The exact reference this Card registers as, when its version is set;
+    /// without one, the server selects the version at declaration.
     #[must_use]
-    pub fn card_ref(&self) -> CardRef {
+    pub fn card_ref(&self) -> Option<CardRef> {
         self.0.card_ref()
     }
 
     /// The spec as authored so far, before validation; a
-    /// [`CodeSource::file`](crate::authoring::CodeSource::file) position is `null` until its graph is validated.
+    /// [`CodeSource::file`](crate::verify::CodeSource::file) position is `null` until its graph is validated.
     #[must_use]
     pub fn spec(&self) -> Value {
         self.0.spec.value()
@@ -984,19 +1055,23 @@ impl CardDefinition {
     /// Every code file is read now and every Card, local Artifacts
     /// included, is decoded and validated as its YAML file would be. Each
     /// referenced definition joins the graph once; definitions that decode
-    /// to the same Card are one submission. A local Artifact is referenced
-    /// by its exact identity, so the graph does not depend on publication,
-    /// and no local path enters a submission.
+    /// to the same Card are one submission. Siblings are matched among the
+    /// whole capture, local Artifacts included, so an omitted sibling naming
+    /// a local and another Artifact of one name is refused before anything
+    /// publishes. A local Artifact is referenced as a sibling until
+    /// [`Declaration::bind_published`] replaces every sibling that matched it
+    /// with the published reference, and no local path enters a submission.
     ///
     /// # Errors
     /// Returns [`WyrdError::SpecDuplicateSubmission`] when two different
     /// definitions share one identity, a local Artifact and a Card without
     /// that source included, and `WYRD_LOADER_400_INVALID_ENVELOPE` carrying every diagnostic for
     /// an invalid graph: a malformed or incomplete field by its YAML path, a
-    /// repeated key, an unreadable code file, a version that is not exact,
-    /// and each shared tree validation refusal.
+    /// repeated key, an unreadable code file, an invalid version, an
+    /// ambiguous versionless sibling, and each shared tree validation
+    /// refusal.
     pub fn declaration(&self) -> Result<Declaration, WyrdError> {
-        Graph::declaration(FieldValue::from(self.clone()).captures)
+        Graph::declaration(&self.0)
     }
 }
 
@@ -1010,6 +1085,113 @@ pub struct Declaration {
     /// `None` when the root is itself a local Artifact, whose publication,
     /// last in `artifacts`, is the whole declaration.
     pub input: Option<DeclarationInput>,
+    /// Every authored Card, local Artifacts included, as the submissions
+    /// sibling matching selects among; siblings keep the targets they
+    /// matched here while their local Artifacts are published. Only kind
+    /// and identity are kept, and none when nothing publishes first.
+    targets: Vec<CardSubmission>,
+}
+
+impl Declaration {
+    /// Record that the first of `artifacts`, a local Artifact, was just
+    /// published as `published`: remove it and replace every sibling whose
+    /// authored target it is with that exact registered reference, in the
+    /// Artifacts still to publish and in the graph.
+    ///
+    /// A sibling is bound by the target shared sibling matching selected
+    /// among every authored Card, so a sibling naming another Card of the
+    /// same kind and name, or another version, keeps its own target. With
+    /// no Artifact left to publish, nothing changes.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::internal`] when a validated submission no longer
+    /// decodes or serializes, or the published Artifact is not one of the
+    /// authored targets.
+    pub fn bind_published(
+        &mut self,
+        published: &wyrd_spec::reference::CardRef,
+    ) -> Result<(), WyrdError> {
+        if self.artifacts.is_empty() {
+            return Ok(());
+        }
+        let artifact = self.artifacts.remove(0);
+        let target = self
+            .targets
+            .iter()
+            .position(|target| {
+                target.kind == CardKind::Artifact
+                    && target.metadata.name == artifact.metadata.name
+                    && target.metadata.version == artifact.metadata.version
+            })
+            .ok_or_else(|| WyrdError::internal("a published local Artifact is not authored"))?;
+        let targets = &self.targets;
+        let name = artifact.metadata.name.as_str();
+        for artifact in &mut self.artifacts {
+            let mut spec = Spec::Artifact(std::mem::take(&mut artifact.spec));
+            bind_sibling(&mut spec, targets, target, published);
+            let Spec::Artifact(bound) = spec else {
+                unreachable!("binding keeps the spec's kind");
+            };
+            artifact.spec = bound;
+        }
+        let Some(input) = &mut self.input else {
+            return Ok(());
+        };
+        // Only a submission naming an Artifact sibling of this name can hold
+        // a sibling matched to it; every other one is left as validated.
+        for submission in input
+            .submissions
+            .iter_mut()
+            .filter(|submission| names_artifact_sibling(&submission.spec, name))
+        {
+            let mut spec = Spec::from_kind_and_value(&submission.kind, submission.spec.take())
+                .map_err(|error| {
+                    WyrdError::internal(format!("a validated submission does not decode: {error}"))
+                })?;
+            bind_sibling(&mut spec, targets, target, published);
+            submission.spec = serde_json::to_value(&spec).map_err(|error| {
+                WyrdError::internal(format!(
+                    "a validated submission does not serialize: {error}"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// Whether `value` holds, at any depth, a sibling reference
+/// `{sibling: {kind: Artifact, name}}` naming an Artifact called `name`.
+fn names_artifact_sibling(value: &Value, name: &str) -> bool {
+    match value {
+        Value::Object(fields) => {
+            fields.get("sibling").is_some_and(|sibling| {
+                sibling["kind"] == CardKind::Artifact.wire_name() && sibling["name"] == name
+            }) || fields
+                .values()
+                .any(|value| names_artifact_sibling(value, name))
+        }
+        Value::Array(items) => items.iter().any(|item| names_artifact_sibling(item, name)),
+        _ => false,
+    }
+}
+
+/// Bind every sibling in `spec` whose matched target among `targets` is
+/// `target` to `card_ref`.
+fn bind_sibling(
+    spec: &mut Spec,
+    targets: &[CardSubmission],
+    target: usize,
+    card_ref: &wyrd_spec::reference::CardRef,
+) {
+    ReferenceSlotVisitor::visit(spec, |mut slot| {
+        if slot
+            .value
+            .as_sibling()
+            .is_some_and(|sibling| sibling_target(sibling, targets) == Ok(Some(target)))
+        {
+            slot.value.bind_sibling(card_ref.clone());
+        }
+    });
 }
 
 /// One validated local Artifact to publish before its graph.
@@ -1025,64 +1207,106 @@ pub struct LocalArtifact {
     pub extract: bool,
 }
 
-/// The distinct Cards, local Artifacts included, reachable from one root.
+/// The distinct Cards, local Artifacts included, reachable from one root,
+/// borrowed from that root's captures rather than copied out of them.
 #[derive(Default)]
-struct Graph {
-    /// Cards without their captures, dependencies first.
-    cards: Vec<Card>,
+struct Graph<'a> {
+    /// Cards, dependencies first.
+    cards: Vec<&'a Card>,
 }
 
-impl Graph {
-    /// Snapshot, decode, and validate everything `captures` references.
+impl<'a> Graph<'a> {
+    /// Snapshot, decode, and validate the graph `root` roots.
     ///
     /// # Errors
     /// As [`CardDefinition::declaration`].
-    fn declaration(captures: Captures) -> Result<Declaration, WyrdError> {
+    fn declaration(root: &'a Card) -> Result<Declaration, WyrdError> {
         let mut graph = Self::default();
-        graph.absorb(captures)?;
+        graph.absorb(root)?;
+        let has_local = graph.cards.iter().any(|card| card.source.is_some());
         let mut diagnostics = Vec::new();
+        let mut every = Vec::new();
         let mut authored = Vec::new();
         let mut artifacts = Vec::new();
         for card in &graph.cards {
             let decoded = match &card.source {
-                Some(source) => card.local(source).map(|local| artifacts.push(local)),
-                None => card.decode().map(|card| authored.push(card)),
+                Some(source) => card.local(source).and_then(|local| {
+                    artifacts.push(local);
+                    card.decode()
+                }),
+                // Only a graph that publishes local Artifacts first declares
+                // a subset of the whole capture.
+                None if has_local => card.decode().inspect(|card| authored.push(card.clone())),
+                None => card.decode(),
             };
-            if let Err(errors) = decoded {
-                diagnostics.extend(errors);
+            match decoded {
+                Ok(card) => every.push(card),
+                Err(errors) => diagnostics.extend(errors),
             }
         }
         if !diagnostics.is_empty() {
             return Err(LoadError::multiple(diagnostics).into());
         }
+        // The whole capture, local Artifacts included, is matched and
+        // validated as its YAML tree would be before anything publishes.
+        let whole = wyrd_loader::declaration_input_from_cards(&mut every)?;
+        if !has_local {
+            return Ok(Declaration {
+                artifacts,
+                input: Some(whole),
+                targets: Vec::new(),
+            });
+        }
+        // Sibling matching reads only each target's kind and identity.
+        let targets = whole
+            .submissions
+            .into_iter()
+            .map(|target| CardSubmission {
+                spec: Value::Null,
+                artifacts: Vec::new(),
+                ..target
+            })
+            .collect();
         let input = if authored.is_empty() {
             None
         } else {
-            Some(wyrd_loader::declaration_input_from_cards(&authored)?)
+            Some(wyrd_loader::declaration_input_from_cards(&mut authored)?)
         };
-        Ok(Declaration { artifacts, input })
+        Ok(Declaration {
+            artifacts,
+            input,
+            targets,
+        })
     }
 
-    /// Add every Card `captures` references, local Artifacts included, each
-    /// after everything it references.
+    /// Add `card` after everything it captures, unless an equal definition
+    /// is already added; a copy shares its captures, so most repeats are
+    /// recognized by address.
     ///
     /// # Errors
     /// Returns [`WyrdError::SpecDuplicateSubmission`] for a different
     /// definition of an identity already added.
-    fn absorb(&mut self, captures: Captures) -> Result<(), WyrdError> {
-        for CardDefinition(card) in captures.cards {
-            self.absorb(card.spec.captures())?;
-            match self
-                .cards
-                .iter()
-                .find(|known| known.card_ref() == card.card_ref())
-            {
-                Some(known) if same_content(known, &card) => {}
-                Some(_) => return Err(conflict(&card.card_ref())),
-                None => self.cards.push(card),
-            }
+    fn absorb(&mut self, card: &'a Card) -> Result<(), WyrdError> {
+        if self.known(card).is_some_and(|known| known == card) {
+            return Ok(());
+        }
+        for definition in card.spec.cards() {
+            self.absorb(&definition.0)?;
+        }
+        match self.known(card) {
+            Some(known) if same_content(known, card) => {}
+            Some(_) => return Err(conflict(card)),
+            None => self.cards.push(card),
         }
         Ok(())
+    }
+
+    /// The added Card with `card`'s identity, if any.
+    fn known(&self, card: &Card) -> Option<&'a Card> {
+        self.cards
+            .iter()
+            .copied()
+            .find(|known| known.identity() == card.identity())
     }
 }
 
@@ -1096,20 +1320,18 @@ fn same_content(left: &Card, right: &Card) -> bool {
     if (&left.source, left.extract) != (&right.source, right.extract) {
         return false;
     }
+    if left == right {
+        return true;
+    }
     match (left.decode(), right.decode()) {
         (Ok(left), Ok(right)) => left.metadata == right.metadata && left.spec == right.spec,
         _ => left == right,
     }
 }
 
-/// The refusal of two different definitions of `card_ref`.
-fn conflict(card_ref: &CardRef) -> WyrdError {
-    let card_ref = format!(
-        "{}/{}@{}",
-        card_ref.kind.wire_name(),
-        card_ref.name,
-        card_ref.version
-    );
+/// The refusal of two different definitions of `card`'s identity.
+fn conflict(card: &Card) -> WyrdError {
+    let card_ref = card.label().display().to_string();
     WyrdError::SpecDuplicateSubmission {
         message: format!("{card_ref} is defined twice with different content"),
         details: json!({ "card_ref": card_ref }),

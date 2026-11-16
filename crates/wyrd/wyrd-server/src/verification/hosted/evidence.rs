@@ -12,36 +12,57 @@
 //! bounded by the expected length and the file
 //! limit and returns bytes only when their length and SHA-256 match, and
 //! evidence also only when its sniffed format matches, so a mismatched file
-//! can never feed a pass. Extraction, workspaces, citations, and native media all read through
-//! it; it is also the Agent executor's [`EvidenceReader`] and the `extract`
-//! action's [`ActionExecutor`].
+//! can never feed a pass. Every read charges the process memory ledger for
+//! its declared size before a byte is fetched, refusing busy when that does
+//! not fit, and returns the charge with the bytes as [`Loaded`]. Extraction,
+//! citations, Artifact code, and native media read through it. A workspace
+//! instead [stages](TenantEvidence::stage) each file: the object streams from
+//! storage straight into a file, hashed and counted as it passes, so only
+//! the chunk in flight is in process memory. The reader is also the Agent
+//! executor's [`EvidenceReader`] and the `extract` action's
+//! [`ActionExecutor`]. Bound to an execution's state, it also reads the
+//! publications that execution's steps accepted, which workspaces stage the
+//! same way through `steps.<id>.publications` references.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::io::{Read, Seek};
+use std::path::Path;
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use async_trait::async_trait;
 use base64::Engine as _;
+use futures_util::TryStreamExt as _;
+use sha2::Digest as _;
 use skald_spec::{MediaFormat, MediaRef, MediaSource};
+use tokio::io::AsyncWriteExt as _;
 use vala_verify::blocks::{
     ActionExecutor, ActionOutput, BlockCall, BlockError, CallValue, EngineError, EvidenceReader,
 };
 use wyrd_loader::{EXTRACT_VERSION, Extraction, lines, locates, units};
+use wyrd_runtime::resources::{ByteCharge, ByteLedger};
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::card::verifier::{Action, InputSlot};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardUid, SlotName};
 use wyrd_spec::reference::{CardRef, CardRefIdentity};
 use wyrd_spec::registry::StoredArtifactEntry;
-use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclaration, Locator};
+use wyrd_spec::storage::StoredObjectRef;
+use wyrd_spec::verification::TaskId;
+use wyrd_spec::verification::execution::{
+    CallProvenance, Citation, InputDeclaration, Locator, PublicationFile,
+};
+use wyrd_spec::verification::state::AcceptedPublication;
 use wyrd_storage::error::StorageError;
 use wyrd_storage::tenant_path::{self, ValidatedPath};
 
+use super::publications::published_object;
 use super::registry::refusal;
 use super::{HostedLimits, extract_refused};
 use crate::components::auth::Caller;
 use crate::components::cards::routes::{authorize_card_ref, get_card_objects_by_ref_for};
 use crate::components::storage::inventory::ObjectInventory;
 use crate::state::AppState;
+use crate::verification::state::{Charged, RunState};
 
 /// Reads one execution's pinned evidence from its tenant's storage.
 pub struct TenantEvidence {
@@ -51,9 +72,12 @@ pub struct TenantEvidence {
     /// The authority every Artifact read is authorized and audited under;
     /// its tenant is the evidence namespace.
     caller: Caller,
-    /// The execution's pinned input declarations, the only citable sources;
-    /// [`EvidenceReader::admit`] adds the engine's fixed attachment slots.
-    slots: Mutex<BTreeMap<SlotName, InputDeclaration>>,
+    /// The execution's pinned evidence, the only citable sources: the
+    /// caller's declarations and the engine's fixed attachment slots, as
+    /// [`EvidenceReader::admit`] receives them. The engine owns that one
+    /// backing; this reader keeps only a weak view, so the evidence returns
+    /// to the engine uncopied once the run settles. Empty before admission.
+    slots: Mutex<Weak<BTreeMap<SlotName, InputDeclaration>>>,
     /// Each File's recorded location by declared digest and size, resolved
     /// once for this execution.
     files: Mutex<HashMap<(Sha256Hex, u64), ValidatedPath>>,
@@ -61,29 +85,92 @@ pub struct TenantEvidence {
     artifacts: Mutex<BTreeMap<ArtifactKey, Arc<ArtifactInventory>>>,
     /// File limits in force.
     limits: HostedLimits,
+    /// The execution state whose accepted publications are readable; `None`
+    /// for a reader bound to no execution.
+    execution: Option<Arc<RunState>>,
+    /// The process memory ledger every read is charged to before it runs.
+    memory: ByteLedger,
+}
+
+/// Verified evidence bytes and the process memory charge covering them.
+///
+/// The charge is held for as long as the caller keeps the bytes; dropping
+/// it returns the memory, so a caller that moves the bytes elsewhere moves
+/// the charge with them.
+#[derive(Debug)]
+pub struct Loaded {
+    /// The verified bytes.
+    pub bytes: Vec<u8>,
+    /// The process memory charge for `bytes`.
+    pub charge: ByteCharge,
 }
 
 /// An exact Artifact reference: its identity and optional pinned UID.
 type ArtifactKey = (CardRefIdentity, Option<CardUid>);
 
 impl TenantEvidence {
-    /// A reader of `caller`'s tenant evidence whose citable sources are the
-    /// execution's pinned `slots`, under `limits`.
+    /// A reader of `caller`'s tenant evidence under `limits`, whose citable
+    /// sources are the evidence [`EvidenceReader::admit`] pins.
     #[must_use]
-    pub fn new(
-        state: AppState,
-        caller: Caller,
-        slots: BTreeMap<SlotName, InputDeclaration>,
-        limits: HostedLimits,
-    ) -> Self {
+    pub fn new(state: AppState, caller: Caller, limits: HostedLimits, memory: ByteLedger) -> Self {
         Self {
             state,
             caller,
-            slots: Mutex::new(slots),
+            slots: Mutex::default(),
             files: Mutex::default(),
             artifacts: Mutex::default(),
             limits,
+            execution: None,
+            memory,
         }
+    }
+
+    /// This reader, bound to read the publications `execution` accepted.
+    #[must_use]
+    pub fn with_execution(mut self, execution: Arc<RunState>) -> Self {
+        self.execution = Some(execution);
+        self
+    }
+
+    /// Every publication `step` accepted in the bound execution's state,
+    /// grouped by item, iteration, and attempt and in acceptance order within
+    /// an attempt, each with its completed File descriptors; none without a
+    /// bound execution. Read from the live state held in memory; the copy
+    /// holds its memory charge until it drops.
+    pub fn publications(&self, step: &TaskId) -> Charged<Vec<AcceptedPublication>> {
+        match &self.execution {
+            Some(state) => state.publications(step),
+            None => Charged::uncharged(Vec::new()),
+        }
+    }
+
+    /// One file a publication retains as a stored file to
+    /// [stage](Self::stage), located by the completed File descriptor
+    /// `object` its acceptance kept, never by an inventory lookup.
+    ///
+    /// # Errors
+    /// [`BlockError::Terminal`] for a descriptor that does not match the
+    /// manifest file.
+    pub(super) fn published(
+        &self,
+        file: &PublicationFile,
+        object: &StoredObjectRef,
+    ) -> Result<StoredFile, BlockError> {
+        let object = published_object(self.caller.data_tenant_id, file, object)
+            .map_err(|error| terminal(&error.to_string()))?;
+        Ok(StoredFile {
+            object,
+            size: file.size_bytes,
+            sha256: file.sha256,
+            format: None,
+        })
+    }
+
+    /// The tenant whose evidence this reads, whose turn its sandbox
+    /// operations wait in.
+    #[must_use]
+    pub const fn tenant(&self) -> wyrd_spec::DataTenantId {
+        self.caller.data_tenant_id
     }
 
     /// The located units of pinned slot `declaration`, or `None` when it
@@ -119,9 +206,9 @@ impl TenantEvidence {
             declaration => self
                 .read(declaration)
                 .await
-                .map(|(bytes, format)| (bytes, Some(format))),
+                .map(|(loaded, format)| (loaded, Some(format))),
         };
-        let (bytes, format) = match read {
+        let (Loaded { bytes, charge }, format) = match read {
             Ok(read) => read,
             Err(BlockError::Terminal { .. }) => return Ok(None),
             Err(error) => return Err(error),
@@ -131,6 +218,7 @@ impl TenantEvidence {
         }
         let limits = self.limits.extract();
         let found = tokio::task::spawn_blocking(move || {
+            let _charge = charge;
             let mut found = format
                 .filter(|format| format.is_extractable())
                 .and_then(|format| Extraction::new(&limits).run(&bytes, format).ok())
@@ -163,23 +251,21 @@ impl TenantEvidence {
     pub async fn read(
         &self,
         evidence: &InputDeclaration,
-    ) -> Result<(Vec<u8>, MediaFormat), BlockError> {
-        let (bytes, format) = match evidence {
-            InputDeclaration::File {
-                sha256,
-                size_bytes,
-                format,
-                ..
-            } => {
-                let path = self.file_object(sha256, *size_bytes).await?;
-                (self.stored(&path, *size_bytes, sha256).await?, *format)
+    ) -> Result<(Loaded, MediaFormat), BlockError> {
+        let (loaded, format) = match evidence {
+            InputDeclaration::File { format, .. } => {
+                let file = self.file(evidence).await?;
+                (
+                    self.stored(&file.object, file.size, &file.sha256).await?,
+                    *format,
+                )
             }
             InputDeclaration::Artifact { artifact, path } => {
-                let (bytes, format) = self.artifact(artifact, path.as_deref()).await?;
+                let (loaded, format) = self.artifact(artifact, path.as_deref()).await?;
                 let format = format.ok_or_else(|| {
                     terminal("the Artifact file has no supported media content type")
                 })?;
-                (bytes, format)
+                (loaded, format)
             }
             InputDeclaration::Json { .. } | InputDeclaration::Trace { .. } => {
                 return Err(terminal(
@@ -187,12 +273,133 @@ impl TenantEvidence {
                 ));
             }
         };
-        if !sniffs_as(&bytes, format) {
+        if !sniffs_as(std::io::Cursor::new(&loaded.bytes), format) {
             return Err(BlockError::Terminal {
                 reason: format!("the file content is not {format}"),
             });
         }
-        Ok((bytes, format))
+        Ok((loaded, format))
+    }
+
+    /// The stored metadata of file or Artifact `evidence`, read without its
+    /// bytes: a File's recorded location with its declared size, digest, and
+    /// format, or an Artifact file through [`Self::artifact_file`].
+    ///
+    /// # Errors
+    /// Returns [`BlockError::Terminal`] for JSON or trace evidence, and
+    /// [`Self::file_object`] and [`Self::artifact_file`] refusals.
+    pub(super) async fn file(&self, evidence: &InputDeclaration) -> Result<StoredFile, BlockError> {
+        match evidence {
+            InputDeclaration::File {
+                sha256,
+                size_bytes,
+                format,
+                ..
+            } => Ok(StoredFile {
+                object: self.file_object(sha256, *size_bytes).await?,
+                size: *size_bytes,
+                sha256: *sha256,
+                format: Some(*format),
+            }),
+            InputDeclaration::Artifact { artifact, path } => {
+                self.artifact_file(artifact, path.as_deref()).await
+            }
+            InputDeclaration::Json { .. } | InputDeclaration::Trace { .. } => Err(terminal(
+                "only file and Artifact evidence have readable bytes",
+            )),
+        }
+    }
+
+    /// Stream stored `file` from storage into a new file at `dest`, which
+    /// must not exist yet, and verify it there.
+    ///
+    /// One GET serves the body. Each chunk is charged to process memory
+    /// while it is hashed and written, so a file of any size holds only the
+    /// chunk in flight; the body may not run past `file.size`, and at its end
+    /// its length and SHA-256 must match. With `sniff`, the written file must
+    /// then also carry that format's signature. The caller owns `dest` and
+    /// its scratch charge, and removes it on any error.
+    ///
+    /// # Errors
+    /// Returns [`BlockError::Terminal`] for a file over the limit, an absent
+    /// object, or a length, digest, or format mismatch,
+    /// [`BlockError::Busy`] when process memory cannot hold a chunk now, and
+    /// [`BlockError::Retryable`] for another storage or local IO failure.
+    #[tracing::instrument(
+        level = "debug",
+        name = "verification.workspace.stage",
+        skip_all,
+        fields(bytes = file.size, chunks = tracing::field::Empty)
+    )]
+    pub(super) async fn stage(
+        &self,
+        file: &StoredFile,
+        sniff: Option<MediaFormat>,
+        dest: &Path,
+    ) -> Result<(), BlockError> {
+        if file.size > self.limits.file_max_bytes {
+            return Err(terminal("the file exceeds the input file limit"));
+        }
+        let mismatched = || terminal("the stored file length does not match its declaration");
+        let local = |error: std::io::Error| BlockError::Retryable {
+            reason: format!("the evidence file cannot be staged: {error}"),
+        };
+        let (mut body, stored) = self
+            .state
+            .storage
+            .get_object_stream(&file.object)
+            .await
+            .map_err(|error| self.failed(&error))?;
+        if stored != file.size {
+            return Err(mismatched());
+        }
+        let mut out = tokio::fs::File::create_new(dest).await.map_err(local)?;
+        let mut hasher = sha2::Sha256::new();
+        let (mut written, mut chunks) = (0_u64, 0_u64);
+        while let Some(chunk) = body.try_next().await.map_err(|error| self.failed(&error))? {
+            let len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+            written = written.saturating_add(len);
+            chunks += 1;
+            if written > file.size {
+                return Err(mismatched());
+            }
+            // ponytail: the backend sizes each chunk, so it is allocated
+            // before it is charged; bound the backend's read size if chunks
+            // measurably overrun the ledger.
+            let _chunk = self.memory.try_charge(len).map_err(|_| BlockError::Busy {
+                reason: "process memory cannot hold the evidence read now".to_owned(),
+            })?;
+            hasher.update(&chunk);
+            out.write_all(&chunk).await.map_err(local)?;
+        }
+        out.flush().await.map_err(local)?;
+        tracing::Span::current().record("chunks", chunks);
+        if written != file.size {
+            return Err(mismatched());
+        }
+        if Sha256Hex::from(<[u8; 32]>::from(hasher.finalize())) != file.sha256 {
+            return Err(terminal(
+                "the stored file digest does not match its declaration",
+            ));
+        }
+        let Some(format) = sniff else {
+            return Ok(());
+        };
+        let staged = dest.to_owned();
+        let sniffed = tokio::task::spawn_blocking(move || {
+            std::fs::File::open(staged).map(|staged| sniffs_as(staged, format))
+        })
+        .await
+        .map_err(|error| BlockError::Retryable {
+            reason: format!("the evidence format check stopped: {error}"),
+        })?
+        .map_err(local)?;
+        if !sniffed {
+            return Err(BlockError::Terminal {
+                reason: format!("the file content is not {format}"),
+            });
+        }
+        Ok(())
     }
 
     /// The recorded location of the completed File upload of `sha256` and
@@ -254,10 +461,10 @@ impl TenantEvidence {
         &self,
         card: &CardRef,
         path: Option<&str>,
-    ) -> Result<(Vec<u8>, Option<MediaFormat>), BlockError> {
+    ) -> Result<(Loaded, Option<MediaFormat>), BlockError> {
         let file = self.artifact_file(card, path).await?;
-        let bytes = self.stored(&file.object, file.size, &file.sha256).await?;
-        Ok((bytes, file.format))
+        let loaded = self.stored(&file.object, file.size, &file.sha256).await?;
+        Ok((loaded, file.format))
     }
 
     /// The stored metadata of one file of exact Artifact `card`, read
@@ -278,7 +485,7 @@ impl TenantEvidence {
         &self,
         card: &CardRef,
         path: Option<&str>,
-    ) -> Result<ArtifactFile, BlockError> {
+    ) -> Result<StoredFile, BlockError> {
         let inventory = self.inventory(card).await?;
         let entry = match path {
             Some(path) => inventory.files.get(path),
@@ -299,7 +506,7 @@ impl TenantEvidence {
             tenant,
         )
         .map_err(|_| terminal("the Artifact file path is not a valid tenant path"))?;
-        Ok(ArtifactFile {
+        Ok(StoredFile {
             object,
             size,
             sha256,
@@ -348,22 +555,26 @@ impl TenantEvidence {
     /// and hash to `sha256`.
     ///
     /// The size is checked against the file limit and the stored object's
-    /// length before the read, which is bounded by `size`; the body's
-    /// length and digest are checked after it.
+    /// length, and charged to process memory, before the read, which is
+    /// bounded by `size`; the body's length and digest are checked after it.
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for a file over the limit, an
-    /// absent object, or a length or digest mismatch, and
-    /// [`BlockError::Retryable`] for another storage failure.
+    /// absent object, or a length or digest mismatch,
+    /// [`BlockError::Busy`] when process memory cannot hold `size` bytes
+    /// now, and [`BlockError::Retryable`] for another storage failure.
     async fn stored(
         &self,
         path: &ValidatedPath,
         size: u64,
         sha256: &Sha256Hex,
-    ) -> Result<Vec<u8>, BlockError> {
+    ) -> Result<Loaded, BlockError> {
         if size > self.limits.file_max_bytes {
             return Err(terminal("the file exceeds the input file limit"));
         }
+        let charge = self.memory.try_charge(size).map_err(|_| BlockError::Busy {
+            reason: "process memory cannot hold the evidence read now".to_owned(),
+        })?;
         let storage = &self.state.storage;
         let stored = storage
             .object_len(path)
@@ -388,7 +599,7 @@ impl TenantEvidence {
                 "the stored file digest does not match its declaration",
             ));
         }
-        Ok(bytes)
+        Ok(Loaded { bytes, charge })
     }
 
     /// Classify a storage failure without exposing its key or backend text.
@@ -411,16 +622,18 @@ struct ArtifactInventory {
     files: BTreeMap<String, StoredArtifactEntry>,
 }
 
-/// One registered Artifact file's stored metadata, from its inventory.
-struct ArtifactFile {
+/// One evidence file's stored metadata: a completed File upload's recorded
+/// location and declaration, or a registered Artifact file's inventory row.
+pub(super) struct StoredFile {
     /// The file's tenant storage object.
     object: ValidatedPath,
-    /// Stored length in bytes.
-    size: u64,
-    /// Stored SHA-256.
+    /// Expected length in bytes.
+    pub(super) size: u64,
+    /// Expected SHA-256.
     sha256: Sha256Hex,
-    /// The media format its stored content type names, if supported.
-    format: Option<MediaFormat>,
+    /// The declared format, or the media format an Artifact file's stored
+    /// content type names, if supported.
+    pub(super) format: Option<MediaFormat>,
 }
 
 #[async_trait]
@@ -467,8 +680,9 @@ impl EvidenceReader for TenantEvidence {
     /// together. Each original input counts once, whatever later
     /// reads, workspaces, or retries do with it. Each uploaded file's
     /// recorded location is then resolved through [`Self::file_object`];
-    /// no bytes are read here. Admitted declarations the execution did not
-    /// pin, the engine's fixed attachments, become citable slots.
+    /// no bytes are read here. Every admitted declaration, the engine's fixed
+    /// attachments included, becomes a citable slot through a weak view of
+    /// the engine's evidence.
     ///
     /// # Errors
     /// Returns [`EngineError::InputTooLarge`] past a slot, individual, or
@@ -481,10 +695,10 @@ impl EvidenceReader for TenantEvidence {
     async fn admit(
         &self,
         slots: &BTreeMap<SlotName, InputSlot>,
-        evidence: &BTreeMap<SlotName, InputDeclaration>,
+        evidence: &Arc<BTreeMap<SlotName, InputDeclaration>>,
     ) -> Result<(), EngineError> {
         let mut total = 0_u64;
-        for (name, declaration) in evidence {
+        for (name, declaration) in evidence.iter() {
             let size = match declaration {
                 InputDeclaration::File { size_bytes, .. } => *size_bytes,
                 InputDeclaration::Artifact { artifact, path } => {
@@ -527,7 +741,7 @@ impl EvidenceReader for TenantEvidence {
                     ))
                 })?;
         }
-        for (name, declaration) in evidence {
+        for (name, declaration) in evidence.iter() {
             if let InputDeclaration::File {
                 sha256, size_bytes, ..
             } = declaration
@@ -537,34 +751,41 @@ impl EvidenceReader for TenantEvidence {
                     .map_err(|error| admission(name, error))?;
             }
         }
-        let mut pinned = lock(&self.slots);
-        for (name, declaration) in evidence {
-            pinned
-                .entry(name.clone())
-                .or_insert_with(|| declaration.clone());
-        }
+        *lock(&self.slots) = Arc::downgrade(evidence);
         Ok(())
     }
 
-    /// Read `evidence` as inline provider-native media.
+    /// Read `evidence` as inline provider-native media, returned with the
+    /// process memory charge for the read bytes and their encoding, which
+    /// the Agent call holds while its provider request carries the media.
     ///
     /// # Errors
-    /// Returns [`Self::read`]'s errors and [`BlockError::Terminal`] for a
-    /// format with no native media kind.
-    async fn media(&self, evidence: &InputDeclaration) -> Result<MediaRef, BlockError> {
-        let (bytes, format) = self.read(evidence).await?;
+    /// Returns [`Self::read`]'s errors, [`BlockError::Terminal`] for a
+    /// format with no native media kind, and [`BlockError::Busy`] when
+    /// process memory cannot hold the encoding now.
+    async fn media(
+        &self,
+        evidence: &InputDeclaration,
+    ) -> Result<(MediaRef, Box<dyn std::any::Any + Send + Sync>), BlockError> {
+        let (Loaded { bytes, mut charge }, format) = self.read(evidence).await?;
         let kind = format.native_kind().ok_or_else(|| BlockError::Terminal {
             reason: format!(
                 "{format} is not provider-native media; read it through a step workspace"
             ),
         })?;
-        Ok(MediaRef {
+        let encoded = u64::try_from(base64::encoded_len(bytes.len(), true).unwrap_or(usize::MAX))
+            .unwrap_or(u64::MAX);
+        charge.try_grow(encoded).map_err(|_| BlockError::Busy {
+            reason: "process memory cannot hold the encoded evidence media now".to_owned(),
+        })?;
+        let media = MediaRef {
             kind,
             source: MediaSource::Base64 {
                 mime_type: format.mime().to_owned(),
                 data: base64::engine::general_purpose::STANDARD.encode(bytes),
             },
-        })
+        };
+        Ok((media, Box::new(charge)))
     }
 
     /// Keep each citation whose slot is reachable and pinned and whose
@@ -581,19 +802,18 @@ impl EvidenceReader for TenantEvidence {
     ) -> Result<Vec<Citation>, BlockError> {
         let mut located: BTreeMap<SlotName, Option<Vec<(Locator, String)>>> = BTreeMap::new();
         let mut valid = Vec::new();
+        let Some(pinned) = lock(&self.slots).upgrade() else {
+            return Ok(valid);
+        };
         for citation in citations {
-            let Some(declaration) = self
-                .slots
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
+            let Some(declaration) = pinned
                 .get(&citation.slot)
                 .filter(|_| reachable.contains(&citation.slot))
-                .cloned()
             else {
                 continue;
             };
             if !located.contains_key(&citation.slot) {
-                let units = self.located(&declaration).await?;
+                let units = self.located(declaration).await?;
                 located.insert(citation.slot.clone(), units);
             }
             if let Some(Some(units)) = located.get(&citation.slot)
@@ -624,15 +844,16 @@ impl ActionExecutor for TenantEvidence {
         else {
             return Err(terminal("extract reads only media evidence"));
         };
-        let (bytes, format) = self.read(declaration).await?;
+        let (loaded, format) = self.read(declaration).await?;
         let limits = self.limits.extract();
-        let output =
-            tokio::task::spawn_blocking(move || Extraction::new(&limits).run(&bytes, format))
-                .await
-                .map_err(|error| BlockError::Retryable {
-                    reason: format!("extraction stopped: {error}"),
-                })?
-                .map_err(extract_refused)?;
+        let output = tokio::task::spawn_blocking(move || {
+            Extraction::new(&limits).run(&loaded.bytes, format)
+        })
+        .await
+        .map_err(|error| BlockError::Retryable {
+            reason: format!("extraction stopped: {error}"),
+        })?
+        .map_err(extract_refused)?;
         Ok(ActionOutput {
             output: serde_json::to_value(output).map_err(|error| BlockError::Terminal {
                 reason: format!("extraction output does not serialize: {error}"),
@@ -640,20 +861,25 @@ impl ActionExecutor for TenantEvidence {
             provenance: Some(CallProvenance::Extract {
                 version: EXTRACT_VERSION.to_owned(),
             }),
-            tool_calls: Vec::new(),
         })
     }
 }
 
-/// Whether `bytes` carry the signature of `format`.
+/// Whether the content of `source`, in memory or a staged file, carries the
+/// signature of `format`.
 ///
 /// Binary formats match their magic bytes; OOXML formats must also contain
-/// their main part; text formats must be UTF-8.
+/// their main part; text formats must be UTF-8 throughout, validated in
+/// bounded pieces. A read failure is a mismatch.
 #[must_use]
-pub fn sniffs_as(bytes: &[u8], format: MediaFormat) -> bool {
-    let ooxml = |part: &str| {
-        zip::ZipArchive::new(std::io::Cursor::new(bytes))
-            .is_ok_and(|archive| archive.index_for_name(part).is_some())
+pub fn sniffs_as(mut source: impl Read + Seek, format: MediaFormat) -> bool {
+    let mut head = Vec::with_capacity(12);
+    if source.by_ref().take(12).read_to_end(&mut head).is_err() {
+        return false;
+    }
+    let bytes = head.as_slice();
+    let ooxml = |source, part: &str| {
+        zip::ZipArchive::new(source).is_ok_and(|archive| archive.index_for_name(part).is_some())
     };
     match format {
         MediaFormat::Pdf => bytes.starts_with(b"%PDF-"),
@@ -664,9 +890,9 @@ pub fn sniffs_as(bytes: &[u8], format: MediaFormat) -> bool {
             bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP"
         }
         MediaFormat::Zip => bytes.starts_with(b"PK\x03\x04") || bytes.starts_with(b"PK\x05\x06"),
-        MediaFormat::Docx => ooxml("word/document.xml"),
-        MediaFormat::Xlsx => ooxml("xl/workbook.xml"),
-        MediaFormat::Pptx => ooxml("ppt/presentation.xml"),
+        MediaFormat::Docx => ooxml(source, "word/document.xml"),
+        MediaFormat::Xlsx => ooxml(source, "xl/workbook.xml"),
+        MediaFormat::Pptx => ooxml(source, "ppt/presentation.xml"),
         MediaFormat::Doc | MediaFormat::Xls | MediaFormat::Ppt => {
             bytes.starts_with(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1])
         }
@@ -675,7 +901,33 @@ pub fn sniffs_as(bytes: &[u8], format: MediaFormat) -> bool {
         | MediaFormat::Markdown
         | MediaFormat::Html
         | MediaFormat::Csv
-        | MediaFormat::Json => std::str::from_utf8(bytes).is_ok(),
+        | MediaFormat::Json => source.rewind().is_ok() && utf8(source),
+    }
+}
+
+/// Whether all of `source` is UTF-8, read 64 KiB at a time; a character
+/// split across two reads is carried into the next.
+fn utf8(mut source: impl Read) -> bool {
+    let mut buffer = vec![0_u8; 64 << 10];
+    let mut carried = 0;
+    loop {
+        let read = match source.read(&mut buffer[carried..]) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return false,
+        };
+        if read == 0 {
+            return carried == 0;
+        }
+        let filled = carried + read;
+        match std::str::from_utf8(&buffer[..filled]) {
+            Ok(_) => carried = 0,
+            Err(error) if error.error_len().is_none() => {
+                buffer.copy_within(error.valid_up_to()..filled, 0);
+                carried = filled - error.valid_up_to();
+            }
+            Err(_) => return false,
+        }
     }
 }
 
@@ -700,5 +952,33 @@ fn lock<T>(memo: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 fn terminal(reason: &str) -> BlockError {
     BlockError::Terminal {
         reason: reason.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+
+    /// Text sniffing validates UTF-8 in bounded pieces: a character split
+    /// across a piece boundary still sniffs as text, and an invalid byte
+    /// after the first piece, or a character cut off at the end, does not.
+    ///
+    /// # Panics
+    /// Panics when a split character is refused or invalid text is
+    /// accepted.
+    #[test]
+    fn text_sniffing_reads_utf8_in_pieces() {
+        let mut text = vec![b'a'; (64 << 10) - 1];
+        text.extend("é and more".as_bytes());
+        assert!(sniffs_as(Cursor::new(&text), MediaFormat::Text));
+        assert!(!sniffs_as(
+            Cursor::new(&text[..64 << 10]),
+            MediaFormat::Text
+        ));
+        text.push(0xFF);
+        assert!(!sniffs_as(Cursor::new(&text), MediaFormat::Text));
+        assert!(sniffs_as(Cursor::new(b"%PDF-1.7"), MediaFormat::Pdf));
     }
 }

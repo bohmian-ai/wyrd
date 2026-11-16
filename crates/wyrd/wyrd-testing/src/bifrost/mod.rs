@@ -34,7 +34,6 @@ pub use scribe_workload::{
     scribe_workload_digest,
 };
 pub use telemetry::{
-    BifrostQueryTelemetryReport, BifrostTelemetryCapture, BifrostTelemetryCheckpoint,
-    BifrostTelemetryReportError,
+    BifrostTelemetryCapture, BifrostTelemetryCheckpoint, BifrostTelemetryReportError,
 };
 pub use write::{BifrostWriter, RawIngest};

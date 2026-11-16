@@ -39,10 +39,18 @@ Tool names contain dots, which many model providers refuse, so each framework fo
 | `cards.list` | `cards:read` | List filters and optional cursor → `{items, next_cursor}` | List Card summaries |
 | `cards.get` | `cards:read` | `{card_ref}` or `{kind, card_uid}` → `{card, created_at, updated_at}` | Read one Card; pass exactly one form |
 | `verification.get_binding` | `cards:read` | `{binding_id}` → binding status | Read one binding |
-| `verification.get_execution` | `cards:read` | `{execution_id}` → execution status | Read one execution |
+| `verification.get_execution` | `verifier:read` on the execution's Verifier | `{execution_id}` → execution status with its compact result | Read one execution |
+| `verification.get_execution_details` | `verifier:read` on the execution's Verifier | `{execution_id}` → execution details: checks, provenance, steps, and pinned evidence | Read what one completed execution ran |
+| `verification.list_invocations` | `verifier:read` on the execution's Verifier | `{execution_id, limit?, cursor?}` → `{execution_id, status, items, next_cursor, history}` | Page invocation attempts and their progress |
+| `verification.list_publications` | `verifier:read` on the execution's Verifier | `{execution_id, limit?, cursor?}` → `{execution_id, items, next_cursor}` | Page publication names, kinds, and producers |
+| `verification.get_publication` | `verifier:read` on the execution's Verifier | `{execution_id, step_id, name, attempt, item_index?, iteration_index?}` → publication | Read one publication's JSON value or manifest |
+| `verification.download_publication` | `verifier:read` on the execution's Verifier | The `verification.get_publication` arguments plus `path` for a directory → `{plan, size_bytes, sha256}` | Plan one publication file's download |
 | `verification.evidence` | `verifier:run` | `{files: [{sha256, size_bytes}]}` → `{uploads: [{sha256, upload_id, plan}]}` | Plan uploads for files the tenant lacks; complete each with `POST /v1/cards/upload/{upload_id}/complete` |
+| `verification.publish_evidence` | `verifier:run` on each subscribed Verifier | `{repository: "owner/name", tags: {commit}, input, value}` → `{evidence_id, repository, tags, input, status, matched_subscriptions, recorded_at}` | Publish a deferred input for one commit; waiting executions resume; `status` is `accepted` or `replayed` |
 | `verification.execute` | `verifier:run` on exact Verifier | Verifier, subject, optional `run_id`, and named input declarations → `VerificationResult` | Verify now and store the result; no Operator dispatch |
 | `verification.enqueue` | `verifier:run` on exact Verifier | The `verification.execute` arguments plus optional `idempotency_key` → `{execution_id}` | Queue a verification; poll `verification.get_execution` |
+| `verification.cancel` | `verifier:run` on the execution's Verifier | `{execution_id}` → `{execution_id, status}` | Cancel unfinished queued work; settled work keeps its status |
+| `verification.decide_approval` | `verifier:approve` on the execution's Verifier and `cards:read` on its subject | `{execution_id, approval_id, decision, reason?}` → `{approval_id, status, actor_id, decided_at, reason}` | Approve or reject one pending approval; the same execution continues; the same decision and reason replays |
 
 `cards.list.filter` is a query string, such as `labels.env = "prod" and labels.deprecated not exists`, over `labels.<key>`, `annotations.<key>`, and `attributes.<key>`, with `=`, `in`, `not exists`, `and`, `or`, and `not`; at most 64 predicates. A caller passes `next_cursor` back unchanged with the same filters. Missing and foreign-tenant Cards look the same. `verification.execute` refuses a scheduled drift Verifier.
 
@@ -87,6 +95,18 @@ A token already minted from a revoked credential lapses within five minutes.
 | `operator_connections.create` | `operators:write` | `{request: CreateOperatorConnectionRequest}` → OperatorConnectionView | Create a Slack, PagerDuty, or HTTP connection |
 | `operator_connections.update` | `operators:write` | `{connection_id, request}` → OperatorConnectionView | Patch a connection; provider and name are fixed |
 | `operator_connections.disable` | `operators:write` | `{connection_id}` → OperatorConnectionView | Disable a connection |
+
+## GitHub connection
+
+The read is listed for every caller; the writes are listed only for a caller
+holding `identity_connections:write`. GitHub's setup and OAuth callback are
+browser redirects, not tools.
+
+| Tool | Permission | Input → output | Purpose |
+| --- | --- | --- | --- |
+| `github_connection.get` | `identity_connections:write` | `{}` → GithubConnectionView | Read the tenant's redacted connection |
+| `github_connection.connect` | `identity_connections:write` | `{}` → GithubConnectResponse | Begin a connection; a signed-in human opens the returned install URL |
+| `github_connection.disconnect` | `identity_connections:write` | `{}` → GithubConnectionView | Fence GitHub work and release the installation |
 
 ## Gateway administration
 

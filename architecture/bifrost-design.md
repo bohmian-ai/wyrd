@@ -414,11 +414,14 @@ typed columns:
     only writes a row again. Rows therefore repeat across replicas and
     restarts, and readers aggregate by `series_id`, never counting rows as
     series.
-- Three tables hold each verification fact once. A result read assembles the
-  public `VerificationResult` from them: the verdict from `results`,
-  `requirements` and `steps` from `execution_outputs` by `result_id`, and
-  `evidence` from `execution_inputs` by `execution_id`. Detail is never
-  copied between them, and no other table projects drift detail.
+- The existing three result tables hold each result payload fact once. One reader assembles both
+  public projections from them: the verdict from `results`, `requirements`
+  and `steps` from `execution_outputs` by `result_id`, and `evidence` from
+  `execution_inputs` by `execution_id`. The compact `VerificationResult`
+  keeps the verdict and each requirement's judgment; `VerificationDetails`
+  adds checks, provenance, steps, and evidence. Projection never changes
+  what is stored. Detail is never copied between them, and no other table
+  projects drift detail.
 - `bifrost.verification.results` is the payload-free summary of one result:
   result, execution, Run, Verifier, subject, binding, group, trigger, and
   window identity, execution status, the verdict, and timing. It carries no
@@ -452,6 +455,97 @@ typed columns:
   Its published input timestamp is `recorded_at`, the server-recorded input
   time, distinct from execution timing or sample/window time. It uses the
   same execution/binding/application-Run correlation names where applicable.
+- `bifrost.verification.execution_events` retains typed execution lifecycle, invocation
+  and publication facts, including bounded authored JSON in its existing sensitive value
+  semantics. It preserves server-assigned event identity, execution sequence/cut and
+  producer indices/attempt. Extend its versioned metadata for authoritative terminal
+  selection: exact result ID or null, full sanitized error and recorded
+  tenant/Verifier/subject/repository/actor identity; inspectable invocation/disposition
+  records; complete file/directory manifests with private verified File associations,
+  original-call receipt identity and source lineage; and accepted request
+  scope/key/digest for replay. It references existing inputs/results/outputs rather than
+  copying their payload or inventing another verdict. Oversized metadata/bytes use
+  existing immutable File references, never SQL payload custody or a new archive table
+  family.
+  - Verification execution checkpoints extend the existing canonical verification
+    data with complete versioned logical state of queued executions only; direct
+    executions write no checkpoint or history. The engine owns the live object;
+    PostgreSQL queue rows coordinate work, not a duplicate checkpoint/result
+    payload store, owed-delivery record or general event projection backlog. A
+    queued claim settles only after Scribe acknowledges the revision holding its
+    terminal decision and its result rows; the runner retains that terminal state
+    in memory until then. There is no execution-head table, separate finalizer or
+    second writer. Existing inputs/results/outputs retain their meanings.
+  - A pull request extraction's output, with its exact pinned source and
+    selected context, is retained as ordinary step output in the queued
+    execution's checkpoint revisions and result rows. Recovery reuses it from
+    the accepted revision without reacquiring from GitHub; the code-review
+    library's cache and context-record lifetime are acquisition aids, never
+    evidence custody. The baseline eligibility it earns
+    (`pr_source_extracted`) is a coordination column written with the lease-
+    fenced completion, not a copy of the evidence.
+  - A `pull_request` execution's GitHub delivery outcome is one
+    `github_delivery` event row per accepted state revision, at that revision's
+    sequence, holding the status (`delivered`, `skipped` or `failed`), safe
+    reason and refused finding anchors. It is a fenced Scribe write whose batch
+    id derives from event, execution and revision, so the first recorded
+    outcome is final and a replay records nothing. A cancelled execution's
+    outcome is a separate `github_delivery_cancelled` row at the same sequence,
+    with its own batch id, because cancellation settles only the queue row and
+    writes no revision. A revision without the outcome its status needs reads
+    as `pending`, and recovery redelivers it. No report, Check or review payload
+    is copied; the report stays in the accepted step output.
+  - The existing shared Scribe outbox provides bounded batching and stable retry
+    identities for revisions flushed in background; engine transitions never wait
+    for its acknowledgement.
+    Exact completed File descriptors stay with accepted publications from the
+    start; no terminal archive handoff or PostgreSQL descriptor transfer exists.
+  - Internal execution recovery reads obtain the accepted checkpoint position
+    and its exact compatible state, authoritative absence, or explicit
+    unavailability. Missing required source/record means wait/retry. Ordinary
+    analytical query success does not certify authoritative execution recovery;
+    its documented source-discovery semantics below remain unchanged. No public
+    freshness selector or execution-side source registry is added.
+  - Extend existing checkpoint acceptance/fence machinery for current-writer and
+    expected-revision acceptance. A replacement shuts out stale writes before
+    continuing. Expiry/cancellation/deadline protection remains required, and a
+    rejected WAL write must stay rejected during replay. Existing batch replay
+    deduplication alone does not implement this contract. These are required
+    owner extensions, not claims that the current implementation already does so.
+    Each revision's batch identity derives from its execution and revision, so
+    its Scribe batch fence accepts exactly one write of it; recovery reads the
+    fenced prefix. No PostgreSQL execution-head table exists. A revision the old
+    owner froze just before takeover may still be accepted first and is then
+    inherited; that rare interval is accepted.
+  - External File completion, exact path/digest/length validation, inventory
+    acknowledgement and existing storage/session retention remain unchanged.
+    Server-produced publication files keep validation and exact descriptors; their
+    inventory records persist in background without an engine wait. No inventory
+    rediscovery, remote-publication/Iceberg wait, extra writer or new collector.
+  - Execution APIs keep recorded identity, current feature permissions, exact
+    producer selection, page membership and complete errors without legacy
+    PostgreSQL payload rows. Operator/provider deliveries and registry/principal,
+    binding/schedule/group, webhook/generation and library metadata retain their
+    independent lifetimes; delivery retry does not reexecute verification.
+- `bifrost.verification.evidence` is the standalone custody of published
+  deferred evidence, independent of any execution: one row per subscribed
+  exact Verifier version that accepted one publication. It names the source
+  (`host`, `repository_id`, `commit`), the `input`, the subscriber's
+  `verifier_card_uid`, the content digest `sha256` (canonical JSON of the
+  declaration without a display filename), the source-and-content-derived
+  `evidence_id` every subscriber of one publication shares, the sensitive
+  `value` Variant holding the declaration itself (inline JSON, or a File by
+  digest whose bytes stay in verification File storage), and `recorded_at`,
+  its time column. No PostgreSQL table or payload mirror holds it; a parked
+  execution's revision records only which slots it waits for, and its
+  consumers read the accepted rows when they resume.
+- `bifrost.verification.approvals` is the custody of approval decisions: one
+  row per decided approval occurrence, naming `approval_id`, `execution_id`,
+  the execution's `verifier_card_uid`, the `decision`, the deciding
+  `actor_id`, the optional `reason`, and `decided_at`, its time column. The
+  first accepted decision is final. No PostgreSQL table or payload mirror
+  holds it; the queue only learns that the execution is due.
+
 - Every nullable built-in Struct — the `bifrost.metrics.points` bucket sets and
   `bifrost.gateway.calls` `resolved_model` — has nullable children, because a
   required Parquet leaf under a null parent reads back as another row's value
@@ -461,7 +555,8 @@ typed columns:
   refuses a batch with a partial Struct before ACK with
   `WYRD_VALA_400_SCHEMA_PARSE` naming the row and child.
 - The `bifrost.verification.execution_outputs` output, the
-  `bifrost.verification.execution_inputs` inputs and activation,
+  `bifrost.verification.execution_inputs` inputs and activation, the
+  `bifrost.verification.execution_events` value,
   `bifrost.gateway.calls` `request_payload` and `response_payload`, and
   `bifrost.system.audit_log` `detail` are Variant.
 
@@ -486,11 +581,20 @@ at any depth before rows leave the scan.
   stratum's sampled non-null values hold it with one compatible type. The seed
   is the claim, so a re-run claim writes the same objects. Each element of a
   Variant inside a List counts as one observation, and one layout covers every
-  element. The sample holds counters, never rows. The sample and the claim
-  merge read complete values — typed leaves plus residual reconstructed by the
-  recursive `unshred_variants` — so a key a staged run kept only in its
-  residual stays discoverable; runs of different layouts merge only after
-  their footers name the claim's logical schema and tenant.
+  element. The sample holds counters, never rows. The sample inspects the
+  complete logical value of only the selected observations — typed leaves
+  together with their residual, read in place exactly as reconstruction would
+  produce them — so a key a staged run kept only in its residual stays
+  discoverable. Selected observations may be reconstructed at most; sampling
+  never needs to. Runs of different layouts merge only after
+  their footers name the claim's logical schema and tenant; a run already in
+  the claim's physical layout passes through without a Variant round trip,
+  and only an incompatible run is reconstructed and reshredded. The sample,
+  the merge, and the writer decode in byte-shaped batches whose workspace —
+  decoded width from the footer's unencoded payload bytes plus fixed leaf
+  widths, tripled while a run converts — is reserved on the Scribe governed
+  root before it is decoded, so a claim that does not fit fails `IngestBusy`
+  instead of exceeding the root.
 - **Learned layouts.** A successful claim assembly installs its layout in a
   process-local advisory cache keyed by exact tenant, table, and table
   version, in completion order; entries are bounded in count and charged to
@@ -581,6 +685,14 @@ binding rather than restating them.
 
 ## Durability and visibility
 
+Bifrost implements Wyrd's
+[asynchronous, eventually consistent recording contract](wyrd-design.md#recording-and-eventual-consistency).
+Verification, gateway, and query-audit producers stage records without waiting
+for Scribe; background writers batch their delivery. The append acknowledgement
+below is the explicit durability boundary for an append, not a reason to make
+those producers wait. Later storage publication and maintenance also proceed
+asynchronously; an append does not wait for every downstream stage.
+
 Bifrost uses explicit authority transitions:
 
 ```text
@@ -596,6 +708,28 @@ accepted append
 An append acknowledgement means the WAL append and batch fence are durable and
 the exact rows and their recorded table version are authoritative in Scribe.
 It does not wait for local Parquet, object publication, Iceberg promotion, or compaction.
+
+Deferred evidence publication and approval decisions are the verification
+producers whose caller waits. A publication's positive receipt is returned
+only after Scribe acknowledges every subscriber's acceptance, within half the request timeout; without that
+acknowledgement the publish answers `WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE`
+and a republish of the same content replays. `bifrost.verification.evidence` is
+fenced-only: the committed batch fence is the acceptance, so an unfenced batch
+is absent and a fenced acceptance whose row no query can see yet is
+unavailable, never absent, both for publish deduplication and for a consumer's
+recovery read. An approval decision follows the same contract: its receipt is
+returned only after Scribe acknowledges the decision within half the request
+timeout, `bifrost.verification.approvals` is fenced-only, and without the
+acknowledgement the decide answers `WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE`
+so the caller decides again. A parked execution's revision is acknowledged
+before its queue row is released, so a crash before then repeats unpersisted work, never loses
+the park.
+
+Bifrost durability is the only evidence durability. The
+[code-review source cache](wyrd-design.md#code-review-source-cache) is Wyrd
+cache custody outside Bifrost: Scribe never ingests it, its objects and
+metadata are not table rows, and its collection or expiry never touches
+accepted Bifrost evidence.
 
 Every query pins one published cut: an Iceberg snapshot and committed Scribe
 hot objects not represented by that snapshot, with the table versions needed
@@ -680,9 +814,10 @@ Each shard rotates its WAL and memtable together when the WAL reaches
 `WYRD_MAX_FILE_SIZE_IN_MEMORY` (MiB), or the generation reaches
 `WYRD_MAX_FILE_RETENTION_TIME` (seconds). Each trigger reads its own counter;
 no byte is charged to two triggers. WAL disk is provisioned rather than
-tracked: there is no global disk ledger, and an out-of-space write surfaces as
+tracked: WAL and Scribe staging are durable, not disposable scratch, and
+charge no process scratch ledger, and an out-of-space write surfaces as
 retryable `507` pressure. Memory stays under the global admission governor
-because it competes with queries.
+because it competes with queries and hosted verification.
 
 Shard owners, reconciliation, staging, assembly, and persistence run on one
 dedicated Scribe Tokio runtime separated from request serving. One non-cloneable
@@ -698,7 +833,13 @@ complete lifecycle vector fits. Idle capacity is work-conserving. Under
 contention, equal tenant and table soft shares stop an over-share incumbent
 from reacquiring capacity while acknowledged ownership drains. Bounded,
 expiring identity-only demand determines which waiting table receives released
-capacity; it reserves no bytes or slots.
+capacity; it reserves no bytes or slots. Scribe's bytes are charged to the
+shared Bifrost root, whose growth is charged to the process memory ledger
+([Admission and memory](#admission-and-memory)). When capabilities outside
+Bifrost hold the process memory a write needs, Scribe refuses it with
+retryable pressure (`bifrost_scribe_rejections_total{reason="process_memory"}`)
+instead of sealing, because a pressure seal cannot relieve memory Scribe
+does not hold.
 
 Admission completes before WAL or mailbox mutation. It either accepts
 immediately or returns typed retryable pressure. Already acknowledged ownership
@@ -760,6 +901,14 @@ a fresh tenant transaction, retries identical absent fences, and poisons on
 unavailable/contradictory authority. RLS, group ownership and transaction
 counts do not change. Versioning adds no normal-ingest PostgreSQL call.
 No request is acknowledged before WAL sync and its durable fence commit.
+Each deferred evidence acceptance is its own batch whose id derives from its
+source, input, and subscriber, so the first fenced batch keeps the evidence,
+an identical retry replays it, and different content for the same id is the
+batch conflict the publish reports as `WYRD_VERIFICATION_409_EVIDENCE_CONFLICT`.
+Each approval decision is its own batch whose id derives from its approval id,
+so the first fenced decision is final, an identical retry by the same actor
+replays its receipt, and any other decision of the same occurrence is refused
+as `WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING`.
 
 An honest retry of a batch that is already fenced and visible can avoid the
 shard queue. The existing bounded committed-batch mirror returns its original
@@ -1041,10 +1190,10 @@ admission window rather than replay state. A compromised cluster member is out
 of scope. Claims and body digests are verified before lazy plan decode, task
 cache lookup, provider creation, or source IO. Every worker replaces its
 process runtime with the exact query-admitted `RuntimeEnv`, `MemoryPool`, spill
-share, cancellation token, and deadline.
+cap, cancellation token, and deadline.
 
 A follower never outlives its leader. The leader's stream owns every grant a
-follower holds for its graph: slot unit, memory, scratch share, query runtime
+follower holds for its graph: slot unit, memory, spill charges, query runtime
 and spill directory, task cache entries, and structured tasks. A follower
 takes no capacity before it accepts that stream. It admits the graph when it
 accepts the leader's stream, beneath its own local capacity root, or refuses
@@ -1059,11 +1208,12 @@ timer to reclaim it.
 Exchange buffers draw from the same finite query-owned memory pool as the
 operators; they are not precharged into a predicted child allocation. Before
 dispatch, Oracle enforces its configured selected-worker limit, admitted
-tasks/partitions, Wyrd-owned admission queue and slots, and scratch allocation
-with checked count/range arithmetic. Dependency-owned exchange queues retain
+tasks/partitions, and Wyrd-owned admission queue and slots with checked
+count/range arithmetic. Dependency-owned exchange queues retain
 their pinned byte backpressure without a Wyrd item-count guarantee. Oracle does
 not claim to predict every dependency allocation or transient encoded-message
-byte. Follower spill is charged to the same query-owned scratch allocation.
+byte. Follower spill is capped by the follower's own query runtime and
+charged to its node's process scratch ledger.
 Memory-pool, transport, or scratch exhaustion is typed and releases all memory,
 scratch, slot, task, cache, and transport owners exactly once when the graph
 ends, without waiting for nested children still being torn down: a late
@@ -1128,34 +1278,39 @@ Slots admit; the actual grant sizes only the execution memory ceiling. A slot
 unit represents the 32 MiB working set used to derive local capacity; it is not
 itself charged as resident query memory. Concurrency is governed by slot units,
 actual cooperative reservation by the shared memory root, and spill by the
-separately leased scratch share. Every query charges exactly one unit on each
+bytes actually written, capped per query and charged to the process scratch
+ledger. Every query charges exactly one unit on each
 node it runs on, whatever its class: an Interactive query on its leader, and an
 Analytical query on its leader and on every participant whose leader stream it
 has accepted. The class decides only which capacity rules apply, never the
 charge, and a participant's charge therefore carries no demand of its own. A query-local memory ceiling
-is derived once at admission:
+and a per-query spill cap are derived once at admission:
 
 ```text
 grant = clamp(bifrost_budget / 2, 256 MiB, bifrost_budget)
-spill_share = scratch_limit / 2
+spill_cap = scratch_limit / 2
 ```
 
-The grant is not divided by concurrent load: concurrent queries compete in the
-shared root, which refuses growth once they fill it. It is a non-reserved
-per-query ceiling held for the query lifetime and never recomputed under
-running operators. Every leader
+Neither is divided by concurrent load: concurrent queries compete in the
+shared root, which refuses growth once they fill it, and in the process
+scratch ledger. Both are non-reserved per-query ceilings held for the query
+lifetime and never recomputed under running operators; an idle or unspilled
+query holds neither memory nor disk. Every leader
 and follower query receives a private view over one process-wide Oracle memory
 root, never an independently sized pool: the view refuses growth past that
 query's own ceiling, and the root's single tracked spill-fair pool, bounded by
 the shared Bifrost memory cap that Scribe, Forge, and in-flight transport also
 charge, arbitrates what all live queries hold together. No role holds a fixed
-share or a precharge, with one exception: when an Oracle-serving node sets up
-`DataFusion`'s Parquet footer cache and its Parquet byte-range cache at
-composition, it charges each cache's whole budget, `metadata_cache_bytes` and
-`data_cache_bytes`, to the Oracle memory root and holds it for the storage
-owner's life, because neither cache reports a per-entry charge; a zero budget
-sets up no cache and charges nothing. Each budget defaults to a twentieth of
-managed memory within 32 MiB..512 MiB and may never exceed an eighth of it.
+share or a precharge. An Oracle-serving node's Parquet footer cache and
+Parquet byte-range cache have byte ceilings, `metadata_cache_bytes` and
+`data_cache_bytes`, not reservations: each cached entry is charged to the
+Oracle memory root at its retained size while anyone holds it, so an empty
+cache withholds nothing, and an evicted footer or range a scan still holds
+stays charged until its last reference drops. An entry the root cannot cover
+is not cached, so cache growth never displaces active work. A zero ceiling
+sets up no cache. Each ceiling defaults to a twentieth of managed memory
+within 32 MiB..512 MiB; an explicit one lies within 1 MiB..1 GiB, and
+neither may exceed an eighth of managed memory.
 
 The byte-range cache keeps the exact byte ranges Oracle scans read from
 warehouse objects, which are written once under unique names and never
@@ -1163,28 +1318,66 @@ rewritten, so a cached range never goes stale; staged scratch objects are read
 uncached. A scan answered from the cache still counts the bytes in
 `bytes_scanned`, and before its first cached range of an object it confirms the
 object exists, so a pinned object that vanished still fails the attempt as a
-stale object rather than being answered from memory. Apart from that standing
-charge an idle role holds nothing, and every charge returns when its owner
-ends. Aggregate governed reservations therefore cannot sum above
+stale object rather than being answered from memory. An idle role holds
+nothing, and every charge returns when its owner ends. Aggregate governed reservations therefore cannot sum above
 the Bifrost cap.
 
-The cap comes from the detected process or pod memory limit. `wyrd-server`
-keeps at least 1 GiB of that limit outside governed Bifrost memory
-(`WYRD_SERVER_MEMORY_MIN_BYTES` raises the minimum); the cap defaults to the
-limit less that minimum, and `WYRD_BIFROST_MEMORY_LIMIT_BYTES` may only lower
-it. The minimum is accounting headroom, not preallocated memory and not a
-ceiling on other server work. A plan that cannot leave both the minimum and a
-positive Bifrost cap fails boot, so an 8-GiB pod defaults to a 7-GiB cap.
-Every Wyrd pod has at least 4 GiB of memory; boot refuses a detected limit
-below that floor, so the smallest supported pod has a 3-GiB cap and a
-1.5-GiB query grant.
+The cap composes under the process plan. Process memory is the host's
+physical memory as `sysinfo` reports it, the same way on every platform, and
+`WYRD_BIFROST_PROCESS_MEMORY_LIMIT_BYTES` may only lower it. `wyrd-server`
+keeps at least 1 GiB of that limit outside the process memory ledger
+(`WYRD_SERVER_MEMORY_MIN_BYTES` raises the minimum): the baseline for
+server and dependency allocations no ledger tracks, accounting headroom
+rather than preallocated memory. The process memory ledger is the limit less
+that minimum, and hosted verification, buffered request bodies, and the
+Scribe outbox's admitted writes, from staging until written or lost, charge
+the same ledger while they use it
+([Agents, tools, and workspaces](wyrd-design.md#agents-tools-and-workspaces)).
+The Bifrost cap defaults to the whole ledger, and
+`WYRD_BIFROST_MEMORY_LIMIT_BYTES` may only lower it. Governed Bifrost growth
+is charged to the ledger as it happens, so memory one capability does not
+hold is usable by the others; growth past what they leave free is refused
+like growth past the cap. A plan that cannot leave both the minimum and a
+positive Bifrost cap fails boot, so an 8-GiB host defaults to a 7-GiB ledger
+and cap. Every Wyrd pod has at least 4 GiB of memory; boot refuses a memory
+budget, detected host memory lowered by any process ceiling, below that floor, so the smallest supported pod has a 3-GiB cap
+and a 1.5-GiB query grant.
+
+Each process resolves one immutable resource configuration at startup, before
+any consumer starts, from its own observed CPU, memory, and scratch, never a
+peer's. CPU `C` is `std::thread::available_parallelism`, and
+`WYRD_BIFROST_EFFECTIVE_CPU` may only lower it. Scratch is the data-root
+filesystem's available space less a 256 MiB free-space floor, and
+`WYRD_BIFROST_SCRATCH_LIMIT_BYTES` may only lower it; Oracle spill, Forge
+spill, and hosted verification workspaces all live on that filesystem and
+charge its one process scratch ledger. A ceiling above its observation
+leaves the observation. An unavailable observation, a zero ceiling,
+overflow, or a plan that cannot fit its baseline fails readiness; nothing
+guesses capacity. Processes sharing a host
+or filesystem must each be given non-overlapping memory and scratch ceilings:
+host memory and free space cannot assign disjoint budgets, and no process
+coordinates its plan with another. Scribe, Oracle, Forge, storage, transport,
+and hosted verification size themselves from that configuration or a
+capability derived from it; none probes the host. Omitted Scribe coordination, ingress, and persistence worker
+counts derive from `C` (`B = max(C - 2, 2)`: ingress `max(B / 3, 1)`,
+persistence `max(B - ingress, 1)`, coordination `max(C, 2)`); an explicit
+worker count keeps its value. The process Scribe outbox does not scale with
+`C`: it runs four slice writers and four ordered lanes per tenant, with eight
+concurrent frame deliveries per writer and 32 across the process. Queue capacities, database pools,
+WAL IO, and Scribe shard counts do not scale with `C` either. Startup logs the resolved
+configuration, its sources, explicit overrides, and queue limits, and
+`wyrd_process_resource_plan{resource}` publishes effective CPU, memory limit,
+managed memory, and scratch limit. Usage and pressure counters stay live;
+only the configuration is fixed. CPU has no ledger: the operating system
+shares it, Oracle slots and Scribe and Forge worker counts keep their own
+CPU-derived bounds, and only hosted Python turns are bounded by `C`.
 
 Only fallible cooperative reservation is hard-limited. Growth DataFusion does
 not let fail is still real memory, so it is charged to an explicit process
-headroom counter that makes later fallible growth refuse sooner. Dependency
-allocations outside cooperative reservation fall in the server minimum; the
-pool is the Bifrost safety boundary, not a guarantee against operating-system
-or cgroup OOM.
+headroom counter and to the process memory ledger, which makes later fallible
+growth refuse sooner. Dependency allocations outside cooperative reservation
+fall in the server minimum; the pool is the Bifrost safety boundary, not a
+guarantee against operating-system OOM.
 
 Query parallelism comes from CPU and scanned bytes, not memory. The node's
 effective CPU and the pinned input's locality cap it:
@@ -1232,17 +1425,23 @@ partition, and each row group is read exactly once.
 
 Operators and exchange consumers share that issued query ceiling without
 separate sublimits. Admission refuses before dispatch when checked graph counts
-or scratch demand exceed their finite configured limits. Allocation or
+exceed their finite configured limits. Allocation or
 transport refusal after admission is a typed query-resource failure and
 cancels the full query; it never borrows from another query's ceiling. A
-refusal names the requesting consumer and the pod's largest holders. Scratch
-space is separately reserved because spill consumes real disk.
+refusal names the requesting consumer and the pod's largest holders. Spill
+is charged separately because it consumes real disk.
 
 Every session that can spill, whether the leader, a leader-local live
 fragment, or a remote Oracle follower, spills only into its node's governed
-Oracle spill directory under its query's spill share; the leader and its live
-fragments share one runtime and therefore one share. A Scribe follower owns no
-Oracle spill directory and runs with spill disabled. Spill merges keep
+Oracle spill directory under its query's spill cap; the leader and its live
+fragments share one runtime and therefore one cap. Each byte is charged to
+the process scratch ledger before it is written, so Oracle, Forge, and hosted
+scratch together never exceed the scratch limit, and a write the ledger
+refuses fails the spill rather than the disk. A spill file's charge returns
+only after the file is deleted; a file that survives deletion stays charged
+for the process's life, and the next boot's prefix cleanup removes it. A
+Scribe follower owns no Oracle spill directory and runs with spill
+disabled. Spill merges keep
 `DataFusion`'s default fan-in: the per-query memory limit is the only memory
 bound, and a sort or merge that needs more non-spillable memory than that
 limit fails the query with the typed `QueryResourcesExhausted` error. Oracle
@@ -1363,8 +1562,9 @@ Python, TypeScript, and MCP.
 
 `bifrost.system.audit_log` is the authoritative retained audit history. Every
 audit event is staged in memory on the process Scribe outbox, whose one
-background writer cuts each tenant's writes into producer lanes keyed by
-request, Verifier execution, or a queued submission's idempotency key, lets a
+logical dispatcher cuts each tenant's writes into its fixed producer lanes keyed by
+request, Verifier execution, or a queued submission's idempotency key, hands
+independent lanes' slices to concurrent slice writers, lets a
 lane's slice linger until its oldest write is 50 ms old or it holds 4,096 writes
 or 32 MiB of accounted bytes, as a Kafka producer's `linger.ms` and `batch.size`
 do, takes at most 32 MiB of a lane's backlog per slice, so a large backlog is
@@ -1383,6 +1583,9 @@ platform audit principal, the one principal Scribe admits for the reserved
 system owner's audit history. A retryable failure resubmits the identical
 slice, so Scribe's durable batch-id fence absorbs a write whose
 acknowledgement was lost; later arrivals in that lane wait for the next slice.
+A delivery stays counted against the process ceiling from encoding through
+Scribe's acknowledgement, including blocking encoding whose waiter was
+cancelled; the count bounds concurrency, not bytes.
 Producer lanes are independent of Scribe shards, which keep their own routing,
 WAL, and fence. A row carries
 only decision content: there is no chain, sequence, or publication progress,
@@ -1406,11 +1609,14 @@ to: one row per authorized request rather than continuous high-rate ingest,
 date-range rather than recent-window queries, and retention measured in years
 rather than days.
 
-The four verification tables — `bifrost.drift.observations`,
+The seven verification tables — `bifrost.drift.observations`,
 `bifrost.verification.execution_inputs`, `bifrost.verification.execution_outputs`,
-and `bifrost.verification.results` — also partition by UTC day on each table's
+`bifrost.verification.execution_events`, `bifrost.verification.evidence`,
+`bifrost.verification.approvals`, and `bifrost.verification.results` — also partition by UTC day on each table's
 time column — `created_at` for observations, `recorded_at` for execution
-inputs, and `ended_at` for execution outputs and results —
+inputs and evidence, `occurred_at` for execution events, `decided_at` for
+approvals, and `ended_at` for
+execution outputs and results —
 never by Verifier, subject, binding, or tenant ID. A Drift schedule window does
 not determine partition size. `bifrost.storage.objects` partitions by UTC day
 on `recorded_at`.
@@ -1530,8 +1736,12 @@ Each rewrite attempt runs `DataFusion` over a fresh view of the shared Bifrost
 memory root, so its reservations are charged against the same cap Scribe,
 Oracle, and transport charge, and return when the attempt's context drops.
 Spillable operators spill beneath the data root's `forge-spill` directory,
-which boot clears of stale files. A refused fallible growth fails only that
-attempt: nothing partial is published, and the durable task retries through
+which boot clears of stale files, under `DataFusion`'s default per-attempt
+spill cap. Each written byte is charged to the process scratch ledger Oracle
+spill and hosted workspaces share, exactly as Oracle spill is
+([Admission and memory](#admission-and-memory)), and returns when the
+attempt's files are deleted. A refused fallible growth or spill write fails
+only that attempt: nothing partial is published, and the durable task retries through
 its ordinary bounded backoff once memory is free. One plan executes within one
 worker; Forge does not split a compaction plan across pods.
 
@@ -1689,6 +1899,14 @@ use age.
   instead provide finite byte backpressure when Wyrd cannot configure its item
   count; architecture must name that exception rather than claim ownership it
   does not have.
+- One process plan bounds memory and disposable scratch for every capability
+  in the process. The Bifrost root's growth, Oracle and Forge spill bytes, and
+  cached entries are charges on the process memory and scratch ledgers that
+  hosted verification, request buffering, and the Scribe outbox also charge, so no byte is
+  promised twice and no capability holds an idle share beyond the server
+  minimum. A charge returns only when its owner has settled the bytes: a cache
+  entry when its last reference drops, a spill file when it is deleted. Pressure
+  and accounting are portable and read no cgroup or other platform interface.
 - Global resource owners account tenant and table attribution without creating
   an independent root pool per tenant.
 - Cancellation is structured: stop admission, cancel descendants, reconcile
@@ -1883,9 +2101,11 @@ the namespace does not create another storage or authorization model.
 
 Permissions are scoped through `BifrostTable`, `BifrostRecord`, and
 `BifrostQuery`. Generic writes cannot target reserved or system-managed tables;
-`bifrost.gateway.calls`, the three verification tables
-(`bifrost.verification.results`, `bifrost.verification.execution_inputs`, and
-`bifrost.verification.execution_outputs`), the `bifrost.storage.objects`
+`bifrost.gateway.calls`, the six verification tables
+(`bifrost.verification.results`, `bifrost.verification.execution_inputs`,
+`bifrost.verification.execution_outputs`,
+`bifrost.verification.execution_events`,
+`bifrost.verification.evidence`, and `bifrost.verification.approvals`), the `bifrost.storage.objects`
 inventory, and the `bifrost.metrics.series` index, which Scribe derives from
 admitted points, accept no public write at all: Gate refuses every principal. Only
 the server-internal capture writer writes them, together with
@@ -1900,8 +2120,9 @@ caller's pair for `submit` inputs, and the execution's accepted subject with
 the tenant `System` principal as actor for a queued result. A `submit`
 creates its queued `wyrd.verifier_executions` row only after Scribe
 acknowledges its `execution_inputs` batch, through the existing batched
-request outbox; staged inputs not yet acknowledged are lost on abrupt process
-death, and the execution then never becomes visible. The row stores no input
+request outbox, and `submit` answers only after that row commits; staged
+inputs not yet acknowledged are lost on abrupt process death, and that
+submission is then never acknowledged. The row stores no input
 values: the runner resolves them, and the accepted routes, from that input
 record. A group or schedule execution follows the same order: the scheduler
 prepares it without writing the queue and stages its selector record on a

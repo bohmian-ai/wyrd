@@ -1,0 +1,24 @@
+# Takes a Python admission: one inline code step.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: python-check
+  version: 1.0.0
+spec:
+  description: Python measures the answer.
+  inputs:
+    question: {type: json, schema: {type: string}}
+  steps:
+    - id: measure
+      action:
+        kind: code
+        entrypoint: measure
+        inputs: {question: inputs.question}
+        source:
+          inline: |
+            def measure(question):
+                return {"length": len(question)}
+  requirements:
+    - id: measured
+      statement: Python measured the answer
+      check: {kind: assert, path: steps.measure.output.length, operator: greater_than, expected: 0}

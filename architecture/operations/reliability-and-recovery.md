@@ -246,6 +246,90 @@ direct-Iceberg relay is not a recovery mechanism.
   resumes cursors, and preserves one authoritative terminal outcome per
   attempt.
 
+## Verification execution state and recovery
+
+Direct and queued verification run one engine on a live in-memory `RunState`.
+Engine transitions never wait for SQL, lease confirmation, outbox capacity or
+Scribe acknowledgement. A background flush per execution coalesces dirty state
+into the next revision, written as a `bifrost.verification.execution_events` row
+whose batch id derives from execution and revision; the first fenced write of a
+revision wins. Queued revisions wait in background for reserved outbox capacity
+and retry until accepted or the lease is lost. Direct revisions are best effort
+and shed with counted loss when the outbox is full. PostgreSQL owns queue
+admission, claims, lease renewal and retry scheduling, not a second
+invocation/publication recovery payload. Direct verify is queue-free and never
+resumes; disconnect does not schedule background Agent work. Scheduled/group
+activation retains its existing queue path and retries preserve original windows
+and pinned inputs.
+
+A crash loses live and unaccepted progress, including an unaccepted terminal
+decision. Queued redelivery loads the exact accepted revision (the fenced prefix)
+with the same execution ID, input, source, policy and original deadline, and may
+repeat later work, effects and spend. Authoritative absence permits fresh
+execution; unavailable or incomplete state defers preparation, never older/empty
+fallback, and an unsupported `ExecutionState` format defers with
+`execution_state_incompatible`. Ordinary analytical query success is not proof
+of complete recovery. A revision the old owner froze just before takeover may be
+accepted first and is then inherited. A refused revision breaks its writer; the
+engine's next transition fails into ordinary retry, not a crash of healthy
+sibling capabilities.
+
+The original deadline is admission time plus the runtime execution timeout,
+computed by PostgreSQL at claim; reclaim and lease renewal never extend it.
+Cancellation reaches a running claim through the lease-renewal `LISTEN` on
+`wyrd_verification_cancelled` and renewal ticks, which set its local token.
+
+When queued computation ends, its workspace, Python, model and block permits are
+released. The runner keeps its claim permit and lease renewal until Scribe
+acknowledges the revision holding the terminal decision and then the result rows,
+then completes through token-fenced batched completion; there is no
+acknowledgement timeout. While Scribe is unavailable, full claim capacity pauses
+new claims and the direct lane stays available. A recovered accepted terminal
+decision is delivered without recomputation. A dropped result acknowledgement
+retries with `result_undelivered` within the attempt budget. Lease loss or
+cancellation ends the old owner's waits and releases its claim permit. Existing
+writer batching and backpressure remain bounded; no separate writer, owed-delivery
+queue, archive handoff, replica protocol or object-publication/Iceberg wait.
+The WAL guarantee requires retained Scribe storage; permanent loss of unpublished
+WAL remains outside automatic recovery. Recovery may wait for its owner/volume.
+
+Pull-request activation answers GitHub's webhook only after the generation's
+executions are committed due, or after obsolete or refusal settlement commits.
+A crash after reservation, an ambiguous Scribe ACK or a failed queue commit
+leaves the reserved rows not yet due and the delivery unanswered or non-2xx.
+GitHub never redelivers on its own, so every replica scans the App delivery
+log each minute and requests a redelivery for each delivery without a 2xx
+attempt until three redeliveries are logged; replicas scanning at once may
+each ask. While the source is unchanged and not deactivated, the redelivery
+re-stages the reserved rows with their stored pins and identical Scribe batch
+identity and makes them due without resampling policy, so no binding runs
+twice. A newer source is admitted under the selected policy instead, and a
+closed or draft pull request admits nothing. After the
+bound is exhausted, an operator redelivers from the App's delivery log, or the
+next pull-request event admits the current source. Disconnect, uninstall,
+suspension and repository removal cancel the affected unfinished executions with
+`repository_access_lost` in the access change's own transaction; a delivery
+whose GitHub read was outstanding meanwhile commits nothing and is answered
+non-2xx. A pull request read GitHub refuses or rate-limits is answered non-2xx
+as well, so recovery redelivers it. Shutdown abandons a delivery-log scan
+still waiting on GitHub rather than spending the shared drain budget; the log
+still shows what was not redelivered.
+
+Existing File completion, session recovery, integrity, inventory acknowledgement
+and evidence retention retain their owners. Accepted descriptors stay with run
+state from acceptance onward; there is no PostgreSQL-to-Bifrost root transfer or
+new execution cleanup/retention policy. Preserve replay/cursor/cancel behavior,
+group comparisons/dedup, binding summaries and independent registry, repository,
+library and Operator/provider delivery lifetimes when obsolete payload paths are
+removed. Old-format custody must not be erased or relabelled as fresh state;
+rollout drains or safely preserves existing work and refuses unsafe interpretation.
+
+Qualify crashes and delayed replies at checkpoint acceptance, writer takeover,
+WAL rejection replay, exact-state loading, publication acceptance, result delivery
+and queue completion. Include stale writes beside healthy batched work and
+independent delivery progress. These are required implementation proofs, not a
+claim that the current Bifrost reader/fence extensions already exist.
+
 ## Dependency and regional failure
 
 - Postgres unavailability stops mutations, policy decisions that require

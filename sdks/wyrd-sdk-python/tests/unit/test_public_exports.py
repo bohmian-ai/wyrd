@@ -7,7 +7,6 @@ import wyrd
 
 PUBLIC_MODULES = [
     "wyrd",
-    "wyrd.authoring",
     "wyrd.bifrost",
     "wyrd.cards",
     "wyrd.cli",
@@ -62,6 +61,13 @@ def test_state_declares_and_lists_no_artifact_files() -> None:
     assert not hasattr(wyrd, "HydratedArtifact")
 
 
-def test_authoring_exports_no_generic_card_constructor() -> None:
-    assert not hasattr(importlib.import_module("wyrd.authoring"), "CardDefinition")
-    assert not hasattr(importlib.import_module("wyrd._wyrd.authoring"), "CardDefinition")
+def test_verify_exports_definitions_and_the_original_prompt() -> None:
+    verify = importlib.import_module("wyrd.verify")
+
+    assert verify.Prompt is wyrd.prompt.Prompt
+    assert verify.ResponseFormat is wyrd.prompt.ResponseFormat
+    assert not hasattr(verify, "CardDefinition")
+    assert not hasattr(importlib.import_module("wyrd._wyrd.verify"), "CardDefinition")
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("wyrd.authoring")
+    assert not hasattr(importlib.import_module("wyrd._wyrd"), "authoring")

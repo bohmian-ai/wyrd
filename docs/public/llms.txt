@@ -24,11 +24,16 @@ Set up a local server, run one verification, then choose what to build, in this 
 
 ## Build and verify
 
-- [Services](/wyrd/build-and-verify/declare/define-a-service/): Declare a Service from YAML files, with each component at an exact version and a table for the rows it records, then read back what the server stored.
+- [Services](/wyrd/build-and-verify/declare/define-a-service/): Declare a Service from YAML files, with its components and a table for the rows it records, then read back the exact versions the server stored.
 - [Bindings](/wyrd/build-and-verify/declare/bind-a-verifier/): Attach a Verifier to a Service or one of its components with verified_by, and choose whether your code or a schedule runs it.
+- [Author in code](/wyrd/build-and-verify/declare/author-in-code/): Build a Service, its Agent and Prompt, and a Verifier in Python, Rust, or TypeScript, declare them without versions, verify two answers, and read back the rows each Run wrote.
+- [Repositories](/wyrd/build-and-verify/declare/declare-a-repository/): Declare a connected GitHub repository's review policy from wyrd.toml, check it offline, watch its pull requests run, and roll it back or empty it.
 - [Runs and observations](/wyrd/build-and-verify/observe/record-a-run-and-observations/): Wrap each request in a Run, call your model through the gateway, record what happened, verify it, and read the whole Run back.
 - [Write a Verifier](/wyrd/build-and-verify/verify/author-a-verifier/): Write a Verifier, bind it to your Service, call it from your code, and read its verdict, then add a Python check and a model judge.
 - [Recipes](/wyrd/build-and-verify/verify/verifier-recipes/): Copyable Verifiers for common checks, each with its YAML and the Python that calls it - assertions, traces, Python checks, model judges, multi-step, uploaded files, grouped sessions, and drift.
+- [Publish CI results to a pull request](/wyrd/build-and-verify/verify/publish-deferred-evidence/): Declare a Verifier input that arrives after review starts, watch the pull request's execution wait for it, and publish it from any CI system with wyrd evidence publish.
+- [Approve a pull request](/wyrd/build-and-verify/verify/approve-a-pull-request/): Add a step that waits for a person, find its pending approval on the pull request's execution, and approve or reject it so the same execution finishes.
+- [Review a pull request](/wyrd/build-and-verify/verify/review-a-pull-request/): Have an Agent review each pull request in the standard code_review report, judge the report with your own requirement, and read the Check and inline comments Wyrd posts on GitHub.
 
 ## Connect
 
@@ -43,6 +48,7 @@ Set up a local server, run one verification, then choose what to build, in this 
 - [Verification runtime](/wyrd/operate/configure-verification-runtime/): Choose which processes run Verifiers, size the worker pool, and diagnose startup refusals.
 - [Permissions](/wyrd/operate/grant-and-inspect-permissions/): See which roles a principal holds, grant or revoke a role, cut a principal off, and confirm the result in the audit log.
 - [Troubleshooting](/wyrd/operate/troubleshoot-a-deployment/): Find the cause of a Wyrd server that refuses to migrate or start, from the message it prints.
+- [Connect GitHub](/wyrd/operate/connect-github/): Register the deployment's GitHub App once, then connect a tenant to one GitHub installation and check which repositories it can reach.
 
 ## Understand
 
@@ -58,7 +64,7 @@ Set up a local server, run one verification, then choose what to build, in this 
 - [Verifier Card](/wyrd/reference/verifier-card/): Fields, input slots, steps, checks, operators, references, citations, and refusals of a Verifier spec.
 - [Extraction output](/wyrd/reference/extraction-output/): The JSON an extract step returns for each media format.
 - [Agent tools](/wyrd/reference/agent-tools-and-authorization/): Built-in tools a Verifier's Agent can call and the permissions each call needs.
-- [Runtime limits](/wyrd/reference/verification-runtime-limits/): Environment settings that bound Verifier files, extraction, workspaces, and Python code, with defaults and startup rules.
+- [Runtime limits](/wyrd/reference/verification-runtime-limits/): Server settings that bound Verifier files, extraction, workspaces, Python code, model calls, and direct and queued executions, with defaults and startup rules.
 - [MCP tools](/wyrd/reference/mcp-tools/): Wyrd MCP tool names, permissions, shapes, and query limits.
 - [Error codes](/wyrd/api/errors/): Every stable Wyrd error code with its HTTP status, title, and fix.
 - [HTTP API](/wyrd/api/openapi/): Where a Wyrd server serves its OpenAPI document and how to use it.

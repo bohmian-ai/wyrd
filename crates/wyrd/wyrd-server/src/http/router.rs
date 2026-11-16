@@ -24,6 +24,7 @@ use crate::components::auth::AuthenticatedPrincipal;
 use crate::components::auth::auth_router;
 use crate::components::cards::cards_router;
 use crate::components::gateway::{gateway_ingress_router, gateway_router};
+use crate::components::github::{github_router, github_webhook_router};
 use crate::components::health::health_router;
 use crate::components::operators::operator_connections_router;
 use crate::components::platform::{
@@ -84,6 +85,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(admin_router())
         .merge(identity_router())
         .merge(gateway_router())
+        .merge(github_router())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_tenant_authenticated,
@@ -96,7 +98,10 @@ pub fn build_router(state: AppState) -> Router {
         .flat_map(|group| group.get_openapi().paths.paths.keys())
         .map(|path| format!("/v1{path}"))
         .collect();
+    // GitHub's webhook authenticates by its delivery signature, verified by
+    // the handler before anything is read or routed.
     let v1_group = tenant_group
+        .merge(github_webhook_router())
         .merge(otlp_group)
         .merge(bifrost_group)
         .fallback(v1_not_found);
@@ -195,7 +200,7 @@ fn traced(router: Router, tenant_spans: Option<Arc<dyn wyrd_telemetry::TenantSpa
 /// continued trace stages its tenant span copies on this server's
 /// `tenant_spans` sink. A benchmark server attaches its declared benchmark
 /// headers to the span as it opens
-/// ([`wyrd_telemetry::timing::label_request`]); they select a timing
+/// ([`wyrd_benchmark::label_request`]); they select a timing
 /// series only and carry no authority.
 pub(crate) fn request_span(
     request: &Request,
@@ -204,9 +209,7 @@ pub(crate) fn request_span(
     let span = tracing::info_span!(
         "request",
         otel.kind = "server",
-        method = %request.method(),
         path = request.uri().path(),
-        version = ?request.version(),
         http.request.method = %request.method(),
         http.route = request
             .extensions()
@@ -219,7 +222,7 @@ pub(crate) fn request_span(
         wyrd_telemetry::inbound_context(request.headers()).as_ref(),
         tenant_spans,
     );
-    wyrd_telemetry::timing::label_request(&span, request.headers());
+    wyrd_benchmark::label_request(&span, request.headers());
     span
 }
 
@@ -330,6 +333,7 @@ where
                 .bifrost
                 .serves_api()
                 .then(|| state.bifrost.transport_admission()),
+            state.bifrost.transport_admission().process_memory().clone(),
         ));
     router
         // Wyrd's body limit above is the one request-size policy here; Axum's

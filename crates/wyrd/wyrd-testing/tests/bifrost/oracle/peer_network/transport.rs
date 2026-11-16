@@ -1,6 +1,6 @@
 //! One outbound peer transport, and the immutable destinations it may address.
 
-use wyrd_server::config::BifrostTarget;
+use wyrd_server::config::ServerTarget;
 
 use super::support::{PeerJourneyError, ReservationPlane, reserve, stamped};
 use crate::peer_cluster::{PeerCluster, PeerProbePlan, PeerProbeService, PeerProbeTransport};
@@ -33,9 +33,9 @@ async fn peer_transport_uses_immutable_fenced_destinations() {
 /// Returns the first scenario failure, which names the claim that broke.
 async fn prove_peer_transport_uses_immutable_fenced_destinations() -> Result<(), PeerJourneyError> {
     let mut cluster = PeerCluster::start(&[
-        BifrostTarget::Oracle,
-        BifrostTarget::Oracle,
-        BifrostTarget::Scribe,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostIngest,
     ])
     .await?;
 

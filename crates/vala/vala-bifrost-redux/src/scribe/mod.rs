@@ -197,22 +197,15 @@ pub struct ScribeLaneConfig {
     pub wal_io_threads: usize,
 }
 
-impl Default for ScribeLaneConfig {
-    fn default() -> Self {
-        Self::resolved()
-    }
-}
-
 impl ScribeLaneConfig {
-    /// Resolve the boot defaults from the host's available parallelism.
+    /// The lanes `resources`' plan resolves, with the default four WAL IO
+    /// workers.
     #[must_use]
-    pub fn resolved() -> Self {
-        let available = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
-        let cpu_budget = available.saturating_sub(2).max(2);
-        let ingress_cpu_threads = (cpu_budget / 3).max(1);
+    pub fn for_resources(resources: &crate::resources::ScribeResources) -> Self {
+        let workers = resources.scribe_workers();
         Self {
-            ingress_cpu_threads,
-            persistence_cpu_threads: cpu_budget.saturating_sub(ingress_cpu_threads).max(1),
+            ingress_cpu_threads: workers.ingress_cpu_threads,
+            persistence_cpu_threads: workers.persistence_cpu_threads,
             wal_io_threads: 4,
         }
     }
@@ -668,10 +661,12 @@ fn embedded_scribe_resources(config: AdmissionConfig) -> crate::resources::Scrib
                 roles: [crate::resources::BifrostRole::Scribe]
                     .into_iter()
                     .collect(),
+                process_memory_limit_bytes: None,
                 server_memory_min_bytes: None,
                 bifrost_memory_limit_bytes: None,
                 scratch_limit_bytes: Some(crate::resources::MIN_SCRATCH_FREE_BYTES),
                 effective_cpu: None,
+                scribe_workers: crate::resources::ScribeWorkerOverrides::default(),
                 oracle_query_slot_limit: None,
                 oracle_partition_scan_bytes: None,
                 scratch_root: None,
@@ -801,7 +796,7 @@ impl ScribeImpl {
             writer_epoch,
             ScribeEmbeddedConfig {
                 catalog: Some(catalog),
-                lane_config: ScribeLaneConfig::default(),
+                lane_config: ScribeLaneConfig::for_resources(&resources),
                 admission,
                 coordination_runtime: Handle::current(),
                 persistence: None,
@@ -864,7 +859,7 @@ impl ScribeImpl {
             sync_delay,
             ScribeEmbeddedConfig {
                 catalog: None,
-                lane_config: ScribeLaneConfig::resolved(),
+                lane_config: ScribeLaneConfig::for_resources(&resources),
                 admission,
                 coordination_runtime: Handle::current(),
                 persistence: None,
@@ -955,7 +950,7 @@ impl ScribeImpl {
             wal,
             node_id,
             writer_epoch,
-            ScribeLaneConfig::default(),
+            ScribeLaneConfig::for_resources(&embedded_scribe_resources(AdmissionConfig::default())),
             coordination_runtime,
         )
     }
@@ -1934,7 +1929,8 @@ impl Scribe for ScribeImpl {
                     | ScribeError::FingerprintMismatch { .. }
                     | ScribeError::TableNotFound { .. }
                     | ScribeError::CardScopeDenied
-                    | ScribeError::StreamMismatch { .. } => Some("invalid"),
+                    | ScribeError::StreamMismatch { .. }
+                    | ScribeError::BatchConflict => Some("invalid"),
                     ScribeError::IngressClosed
                     | ScribeError::IngestBusy { .. }
                     | ScribeError::Internal { .. } => None,
@@ -1958,8 +1954,8 @@ fn record_scribe_rejection(reason: &'static str) {
 /// [`record_scribe_rejection`] but attaches the closed
 /// [`ScribeRejectionCeiling::as_metric_label`] value as the `reason`, so a
 /// dashboard can tell a Scribe-child overflow apart from an ingress-sublimit,
-/// parent-ceiling, or cgroup-breaker rejection instead of reading one collapsed
-/// `reason="memory"`. The label set is closed to the five ceiling values and
+/// parent-ceiling, or process-memory rejection instead of reading one collapsed
+/// `reason="memory"`. The label set is closed to the four ceiling values and
 /// carries no tenant, table, or request identity.
 fn record_scribe_ceiling_rejection(ceiling: ScribeRejectionCeiling) {
     record_scribe_rejection(ceiling.as_metric_label());
@@ -2095,6 +2091,7 @@ mod constructor_rotation_tests {
             },
             ..defaults
         };
+        let resources = embedded_scribe_resources(admission);
         let scribe = ScribeImpl::new_for_embedded_with_runtime_config_and_admission_and_memory(
             operator,
             wal,
@@ -2102,11 +2099,11 @@ mod constructor_rotation_tests {
             1,
             ScribeEmbeddedConfig {
                 catalog: None,
-                lane_config: ScribeLaneConfig::default(),
+                lane_config: ScribeLaneConfig::for_resources(&resources),
                 admission,
                 coordination_runtime: Handle::current(),
                 persistence: None,
-                resources: embedded_scribe_resources(admission),
+                resources,
                 staging_file_publisher: None,
                 geometry_for_test: Some(
                     geometry::ScribeGeometry::for_uniform_shard_rotation(
@@ -2264,22 +2261,20 @@ mod telemetry_tests {
         let recorder = wyrd_bench::BenchmarkRecorder::default();
         metrics::with_local_recorder(&recorder, || {
             for ceiling in [
-                ScribeRejectionCeiling::CgroupBreaker,
+                ScribeRejectionCeiling::ProcessMemory,
                 ScribeRejectionCeiling::ScribeChild,
                 ScribeRejectionCeiling::IngressSublimit,
                 ScribeRejectionCeiling::BifrostParent,
-                ScribeRejectionCeiling::CgroupParent,
             ] {
                 super::record_scribe_ceiling_rejection(ceiling);
             }
         });
         let snapshot = recorder.snapshot();
         for reason in [
-            "cgroup_breaker",
+            "process_memory",
             "scribe_child",
             "ingress_sublimit",
             "bifrost_parent",
-            "cgroup_parent",
         ] {
             let key = format!("bifrost_scribe_rejections_total{{reason=\"{reason}\"}}");
             assert_eq!(

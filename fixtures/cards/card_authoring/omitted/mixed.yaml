@@ -1,0 +1,13 @@
+# A Service naming no version whose component Agent pins 1.0.0 and whose
+# Verifier and judge name none: the pin is kept and the server selects the
+# rest.
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: drafting-mixed
+spec:
+  service_type: api
+  components:
+    - alias: writer
+      ref: ./mixed-writer.yaml
+      verified_by: [{verifier: ./draft-checks.yaml}]

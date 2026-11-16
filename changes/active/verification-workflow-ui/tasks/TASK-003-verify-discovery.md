@@ -160,3 +160,4 @@ Focused selectors, recorded before each first run:
 - U `an executions list keeps status and verdict apart, names Verifiers the host read, and opens one exact execution`
 - P `the Verify dashboard reads one population and keeps its investigation in the URL`
 - P `an exact Verifier Card page shows its definition, versions and where it runs` (existing; now expects the Results in Verify link)
+- UI `Verify lists executions with and without a recorded result as one authorized population through every host`

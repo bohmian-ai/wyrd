@@ -22,6 +22,7 @@ import {
   loadCardHeader,
   loadCardInventory,
   loadExecution,
+  loadExecutionCharts,
   loadPromptMessages,
   loadPromptVariables,
   loadRelationshipList,
@@ -39,6 +40,7 @@ import {
   spanTree,
   type ChartInput,
   type Executor,
+  type QueryResult,
   type WireRequest
 } from 'wyrd-ai-ui/loaders';
 import { mcpExecutor } from 'wyrd-ai-ui/mcp';
@@ -1231,6 +1233,202 @@ judged('a judged execution shows its judgments, accepted inputs, completed detai
     await foreignMcp.close();
     await narrowMcp.close();
   }
+});
+
+judged('Verify lists executions with and without a recorded result as one authorized population through every host', async ({ server, assistant, state }) => {
+  const cards = await Cards.connect();
+  const client = WyrdClient.connect();
+  const token = await client.accessToken();
+  const bindingWith = async (owner: Exact, field: string) => {
+    for (const id of (await cards.get(owner)).status?.verification?.binding_ids ?? []) {
+      const response = await fetch(`${server.baseUrl}/v1/verification/bindings/${id}`, { headers: { 'x-wyrd-access-token': `Bearer ${token}` } });
+      if (((await response.json()) as Record<string, unknown>)[field]) return id;
+    }
+    throw new Error(`${owner.name} has no binding with ${field}`);
+  };
+  const submit = async (verifier: string, answer: string) => {
+    const submitted = await state.run('agent').observe.submit(verifier, { answer });
+    if (submitted.kind !== 'queued') throw new Error(`${verifier} queues an execution`);
+    await submitted.execution.wait({ timeoutMs: 60_000 });
+    return submitted.execution.id;
+  };
+  // Ordinary Run executions: one failed, one passed.
+  const refused = await submit('answer-check', 'no');
+  const agreed = await submit('answer-judged', 'yes');
+  // Drift: one scheduled window far from its fitted baseline.
+  const latency = (await cards.get({ kind: 'Verifier', name: 'latency-drift', version: '1.0.0' })).metadata.uid as string;
+  server.waitForBaseline(latency, 90_000);
+  await state.startBifrost();
+  for (let sample = 0; sample < 100; sample += 1) await state.run('model').observe.submit('latency-drift', { latency: 99 });
+  await state.shutdown();
+  server.flushBifrost();
+  const schedule = await bindingWith(exact(assistant.service), 'next_run_at');
+  server.makeBindingDue(schedule);
+  const drifted = (await scheduledResult(server, schedule, 90_000)).execution_id;
+  // A session: three direct turns of one conversation, then the group execution that judges them together.
+  const support = await cards.declareFromPath(fixture('cards/verify_in_real_time/support.yaml'));
+  const bundle = mkdtempSync(join(tmpdir(), 'wyrd-ui-verify-'));
+  await cards.pull(support.root, bundle);
+  const { key } = await runtimeAccount({ kind: 'Service', name: support.root.name });
+  const desk = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: key }) });
+  await desk.startBifrost();
+  for (const turn of [1, 2, 3]) await desk.run('agent').observe.verify('turn-check', { turn, answer: `answer ${turn}` }, { positional: true, group_id: 'ui-verify-conversation' });
+  await desk.shutdown();
+  const session = await groupExecution(server, await bindingWith(exact(declared(support)), 'group_end'), 90_000);
+  const turns = session.group?.sources.turns.execution_ids ?? [];
+  // Unfinished work: one execution still running, and one cancelled while no runner had settled it.
+  const running = server.holdPublications('ui-verify-running').executionId;
+  const stopped = server.holdPublications('ui-verify-stopped').executionId;
+  expect((await client.httpAuth(`${server.baseUrl}/v1/verification/executions/${stopped}/cancel`, { method: 'POST' })).status).toBe(200);
+  server.flushBifrost();
+
+  const range = { from: new Date(Date.now() - 3_600_000).toISOString(), to: new Date(Date.now() + 60_000).toISOString() };
+  const named = (read: QueryResult) => read.rows.map((row) => Object.fromEntries(read.columns.map((column, at) => [column.name, row[at]])));
+  const total = (read: QueryResult) => read.rows.reduce((sum, row) => sum + Number(row[row.length - 1]), 0);
+  /** One page of the list as named rows, or the reason it is empty. */
+  const page = async (input: Record<string, unknown>, executor: Executor) => {
+    const loaded = await loadRecordTable({ signal: 'executions', ...input } as never, { executor, range });
+    if (loaded.result.state === 'empty') return { rows: [], older: undefined, reason: loaded.result.reason };
+    if (loaded.result.state !== 'populated') throw new Error(JSON.stringify(loaded.result));
+    return { rows: named(loaded.result.data.rows), older: loaded.result.data.page?.older, reason: undefined };
+  };
+  /** Every row of the list, read three at a time. */
+  const all = async (input: Record<string, unknown>, executor: Executor) => {
+    const rows: Record<string, unknown>[] = [];
+    for (let read = await page({ ...input, limit: 3 }, executor); ; read = await page({ ...input, limit: 3, after: read.older }, executor)) {
+      rows.push(...read.rows);
+      if (!read.older) return rows;
+    }
+  };
+  const facets = async (where: readonly object[], executor: Executor) => {
+    const loaded = await loadFacetRail({ signal: 'executions', facets: ['status', 'verdict', 'verifier_card_uid'], where } as never, { executor, range });
+    if (loaded.result.state !== 'populated') throw new Error(JSON.stringify(loaded.result));
+    return loaded.result.data.facets.map((facet) => facet.values);
+  };
+
+  const mcp = await mcpOver(server.baseUrl, client);
+  try {
+    for (const [surface, direct] of [['node', nodeExecutor(client)], ['mcp', mcp.executor]] as const) {
+      const ops: string[] = [];
+      const executor: Executor = { run: (requests, signal) => (ops.push(...requests.map((request) => request.op)), direct.run(requests, signal)) };
+      // Every accepted execution is one row, whatever its origin, exactly once across pages.
+      const rows = await all({}, executor);
+      const ids = rows.map((row) => row.execution_id);
+      expect(new Set(ids).size, surface).toBe(ids.length);
+      expect(ids, surface).toEqual(expect.arrayContaining([refused, agreed, drifted, session.execution_id, ...turns, running, stopped]));
+      const row = (id: string) => rows.find((each) => each.execution_id === id) as Record<string, unknown>;
+      // Status and verdict are separate recorded facts, with the exact Verifier and the recorded correlations.
+      expect(row(refused), surface).toMatchObject({ status: 'completed', verdict: 'failed', verifier_card_uid: assistant.answerCheck.uid, group_id: null });
+      expect(row(agreed), surface).toMatchObject({ status: 'completed', verdict: 'passed' });
+      expect(row(drifted), surface).toMatchObject({ status: 'completed', verdict: 'failed', verifier_card_uid: latency, run_id: null });
+      expect(row(session.execution_id), surface).toMatchObject({ status: 'completed', verdict: 'passed', group_id: 'ui-verify-conversation' });
+      expect(turns.map((id) => [row(id).status, row(id).verdict, row(id).group_id]), surface).toEqual(turns.map(() => ['completed', 'passed', 'ui-verify-conversation']));
+      expect(row(refused).run_id, surface).toEqual(expect.any(String));
+      // Work with no retained terminal record has no verdict and claims no status: the list does not know running from a cancel no runner recorded.
+      expect([row(running).status, row(running).verdict], surface).toEqual(['not recorded', null]);
+      expect(['not recorded', 'cancelled'], surface).toContain(row(stopped).status);
+      expect(row(stopped).verdict, surface).toBeNull();
+      // A completed row agrees with the execution's own exact read.
+      for (const id of [refused, agreed, drifted, session.execution_id]) {
+        const [live] = await direct.run([{ op: 'verification.get_execution', execution_id: id }]);
+        expect(live.ok && [live.value.status, live.value.result?.outcome.verdict, live.value.result?.verifier.uid], surface).toEqual([row(id).status, row(id).verdict, row(id).verifier_card_uid]);
+      }
+
+      // Facets and both charts count the same population the pages hold.
+      const [statuses, verdicts, verifiers] = await facets([], executor);
+      const charts = await loadExecutionCharts({}, { executor, range });
+      if (charts.verdicts.result.state !== 'populated' || charts.verifiers.result.state !== 'populated') throw new Error(`${surface}: ${JSON.stringify(charts)}`);
+      expect([total(statuses), total(verdicts), total(verifiers), total(charts.verdicts.result.data), total(charts.verifiers.result.data)], surface).toEqual(Array(5).fill(rows.length));
+      const count = (read: QueryResult, value: unknown) => Number(read.rows.find((each) => each[0] === value)?.[1] ?? 0);
+      for (const status of ['completed', 'not recorded', 'cancelled']) expect(count(statuses, status), `${surface} ${status}`).toBe(rows.filter((each) => each.status === status).length);
+      for (const verdict of ['passed', 'failed', null]) expect(count(verdicts, verdict), `${surface} ${verdict}`).toBe(rows.filter((each) => each.verdict === verdict).length);
+      // No recorded verdict is its own neutral chart series, never a verdict.
+      expect(named(charts.verdicts.result.data).filter((each) => each.verdict === 'no verdict').reduce((sum, each) => sum + Number(each.executions), 0), surface).toBe(count(verdicts, null));
+
+      // Status and verdict combine across pages, and the facets under the same clauses count the same rows.
+      const failed = [{ column: 'status', value: 'completed' }, { column: 'verdict', value: 'failed' }];
+      const failures = await all({ where: failed }, executor);
+      expect(failures.map((each) => each.execution_id).sort(), surface).toEqual(rows.filter((each) => each.verdict === 'failed').map((each) => each.execution_id).sort());
+      expect((await facets(failed, executor)).map(total), surface).toEqual(Array(3).fill(failures.length));
+      // One exact Verifier, by its recorded UID; a session; no recorded verdict.
+      expect((await all({ where: [{ column: 'verifier_card_uid', value: assistant.answerCheck.uid }] }, executor)).map((each) => each.execution_id), surface).toEqual([refused]);
+      expect((await all({ where: [{ column: 'group_id', value: 'ui-verify-conversation' }] }, executor)).map((each) => each.execution_id).sort(), surface).toEqual([session.execution_id, ...turns].sort());
+      expect((await all({ where: [{ column: 'verdict', value: null }] }, executor)).map((each) => each.execution_id).sort(), surface).toEqual([running, stopped].sort());
+      // An incompatible combination is empty, and says so.
+      expect(await page({ where: [{ column: 'status', value: 'not recorded' }, { column: 'verdict', value: 'passed' }] }, executor), surface).toMatchObject({ rows: [], reason: 'No execution matches these filters in this window.' });
+      // An earlier range holds nothing.
+      expect((await loadRecordTable({ signal: 'executions' }, { executor, range: BEFORE })).result.state, surface).toBe('empty');
+      // Bounded shared queries only: no execution's status or details was read to build the list, counts or charts.
+      expect(new Set(ops), surface).toEqual(new Set(['bifrost.query']));
+    }
+  } finally {
+    await mcp.close();
+  }
+
+  // Another tenant sees no row, count or chart bucket; a principal without the query permission is refused, never shown an empty list.
+  const foreignKey = server.bootstrapServiceInTenant(server.seedTenant('ui-verify-foreign'), ['admin'], 'ui-verify-admin');
+  const outsider = { executor: nodeExecutor(WyrdClient.connect({ credential: foreignKey })), range };
+  expect((await loadRecordTable({ signal: 'executions' }, outsider)).result.state).toBe('empty');
+  expect((await loadFacetRail({ signal: 'executions', facets: ['status', 'verdict'] }, outsider)).result.state).toBe('empty');
+  const foreignCharts = await loadExecutionCharts({}, outsider);
+  expect([foreignCharts.verdicts.result.state, foreignCharts.verifiers.result.state]).toEqual(['empty', 'empty']);
+  // `verifier:read` alone opens exact executions but grants no discovery read: every panel is denied whole.
+  const narrow = { executor: nodeExecutor(WyrdClient.connect({ credential: server.scopedApiKey('ui_verify_narrow', ['verifier:read']) })), range };
+  const refusedCharts = await loadExecutionCharts({}, narrow);
+  for (const loaded of [await loadRecordTable({ signal: 'executions' }, narrow), await loadFacetRail({ signal: 'executions', facets: ['status'] }, narrow), refusedCharts.verdicts, refusedCharts.verifiers])
+    expect(loaded.result).toMatchObject({ state: 'denied', problem: { code: DENIED } });
+
+  // BFF and custom app: the same rows for this tenant's session, nothing for another tenant's.
+  env.WYRD_SERVER_URL = server.baseUrl;
+  const body = JSON.stringify({ component: 'RecordTable', input: { signal: 'executions', where: [{ column: 'verdict', value: 'failed' }] }, range });
+  const bff = async (tenant: string, credential: string) => {
+    const url = new URL(`http://ui.test/t/${tenant}/ui/load`);
+    const cookies = jar();
+    await browserSessions.signInWithApiKey(tenant, credential, url, cookies);
+    const browserSession = await browserSessions.read(tenant, url, cookies);
+    return (await loadPanel({ locals: { browserSession }, request: new Request(url, { method: 'POST', body, headers: { 'content-type': 'application/json' } }) } as never)).json();
+  };
+  const failedIds = [refused, drifted].sort();
+  const idsOf = (loaded: { result: { state: string; data?: { rows: QueryResult } } }) => (loaded.result.state === 'populated' && loaded.result.data ? named(loaded.result.data.rows).map((each) => each.execution_id).sort() : loaded.result.state);
+  expect(idsOf(await bff('test-tenant-1', server.apiKey))).toEqual(failedIds);
+  expect(idsOf(await bff('ui-verify-foreign', foreignKey))).toBe('empty');
+  const app = await loadExamplePanel({ request: new Request('http://app.test/view/load', { method: 'POST', body }) } as never);
+  const text = await app.text();
+  expect(text).not.toContain(server.apiKey);
+  expect(idsOf(JSON.parse(text))).toEqual(failedIds);
+
+  // The built HTML draws the list and its facets through host tools/call alone, each answered by the real MCP server.
+  const host = new Client({ name: 'wyrd-ui-artifact-host', version: '1.0.0' }, { versionNegotiation: { mode: 'auto' } });
+  await host.connect(new StreamableHTTPClientTransport(new URL('/mcp', server.baseUrl), { fetch: client.httpAuth }));
+  const doc = {
+    version: 'wyrd.view/v1',
+    catalogId: 'wyrd.ui/v1',
+    range,
+    panels: [
+      { id: 'list', component: 'RecordTable', input: { signal: 'executions', where: [{ column: 'verdict', value: null }] } },
+      { id: 'facets', component: 'FacetRail', input: { signal: 'executions', facets: ['status', 'verdict'] } }
+    ]
+  };
+  try {
+    const built = await appBridgeView(doc, async (name, args) => ((await host.callTool({ name, arguments: args })).structuredContent ?? {}) as object);
+    const list = () => built.document.querySelector('[data-panel="list"]') as Element;
+    await vi.waitFor(() => expect(list().querySelectorAll('tbody tr')).toHaveLength(2));
+    expect(list().textContent).toContain('not recorded');
+    expect(list().textContent).toContain('no verdict');
+    expect(list().textContent).not.toMatch(/passed|failed/);
+    await vi.waitFor(() => expect(built.document.querySelector('[data-panel="facets"]')?.textContent).toContain('completed'));
+    expect(new Set(built.calls.map((call) => call.name))).toEqual(new Set(['bifrost.query']));
+  } finally {
+    await host.close();
+  }
+  // A server that cannot be reached is a problem, never an empty list.
+  const down = await loadRecordTable({ signal: 'executions' }, { executor: nodeExecutor(WyrdClient.connect({ serverUrl: 'http://127.0.0.1:9', credential: server.apiKey })), range });
+  expect(down.result).toMatchObject({ state: 'error', problem: { code: expect.stringMatching(/^WYRD_/) } });
+  const dark = await appBridgeView(doc, async () => {
+    throw new Error('the host cannot reach its server');
+  });
+  await vi.waitFor(() => expect(dark.document.querySelector('[data-panel="list"]')?.textContent).toMatch(/WYRD_[A-Z0-9_]+/));
+  expect(dark.document.querySelector('[data-panel="list"]')?.textContent).not.toContain('No execution matches');
 });
 
 /** The `coding-verifier` statement every request of its `spans-reviewed` check carries. */

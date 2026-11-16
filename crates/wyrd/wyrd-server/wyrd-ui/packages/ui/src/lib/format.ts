@@ -208,7 +208,7 @@ export function diffLines(from: string, to: string): { from: DiffLine[]; to: Dif
     if (j >= endB || (i < endA && (!matched || common[i - head + 1][j - head] >= common[i - head][j - head + 1]))) sides.from.push({ kind: 'changed', text: a[i++] });
     else sides.to.push({ kind: 'changed', text: b[j++] });
   }
-  same.push(...a.slice(endA));
+  same = same.concat(a.slice(endA));
   flush();
   return sides;
 }

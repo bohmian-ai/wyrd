@@ -1,97 +1,91 @@
 ---
 title: Real-time verification
-description: Real-time verification for AI applications - get an evidence-backed verdict before your application sends a response or takes an action, and how Wyrd also runs the same checks queued or on a schedule.
+description: Real-time verification for AI applications - checking a system while it runs, in time to inform the current action, with deadlines, evidence and check time, uncertain results, and when a queued or recurring check fits better.
 pillar: wyrd
 section: Understand
 order: 2
 ---
 
-Real-time verification returns a judgment while the application can still act on it: before it sends a response or commits an action. Wyrd is a verification engine built for that request path, and it runs the same Verifiers asynchronously when no request is waiting.
+Real-time verification checks the relevant properties of a system while it executes, soon enough for the result to inform the action or response in progress; it is not hard real-time scheduling, where missing a fixed deadline counts as a system failure, and it implies no particular latency. It matters because the same check that prevents a bad action when it runs first can only explain that action when it runs afterward.
 
-[Foundations of verification](/understand/foundations-of-verification/) explains verification without Wyrd. This page shows how Wyrd places a verdict inside an application's decision.
+## The same check can arrive too late
 
-## A verdict before the response
+An application is about to share a quarterly report with an outside auditor. Two requirements apply: the recipient is authorized to receive the report, and the report contains no bank account number.
 
-A finance API receives a request to send a customer report to an outside party. Before it sends anything, it verifies the release:
+When the checks run before sharing, a violation means the report never leaves. The application can hold it, remove the account number, or ask a person. When the identical checks run an hour after sharing, on the same evidence, they find the same violation, but the report is already with the auditor. The result can still open an incident, contact the recipient, and change the next release. It cannot undo the share.
 
-<CodeFromFile file="examples/finance-release/api.py" lang="python" title="api.py" region="handler" />
+Nothing about the evidence or the check differed between the two runs. Only the time the result arrived, relative to the action, changed what it could do. The [Quickstart](/get-started/quickstart/) implements this example as a finance API that verifies each report before releasing it.
 
-The request moves through six stages:
+## What can be checked during execution
 
-1. **Request.** `POST /reports/send` arrives with the report, its purpose, the recipient, and the destination.
-2. **Requirements and evidence.** The `release-check` Verifier declares what must be true and which evidence it reads. The request body is the evidence; the policy is a file the Verifier version names.
-3. **Verification.** `run.observe.verify` sends the evidence to Wyrd, which runs every requirement's check.
-4. **Verdict.** Wyrd returns `passed`, `failed`, or `inconclusive`, with an outcome and reason for each requirement.
-5. **Decision.** The application releases only a `passed` report. Everything else is held for a person.
-6. **Response.** The caller learns whether the report was released or held.
+The sharing decision follows the same sequence as any request or agent step that is verified before it acts:
 
-Because the verdict arrives before step 6, the application can release, hold, or route the request to review while nothing has left. A check that runs after the report is sent can only explain what went wrong.
+1. **A proposed action.** The application has the report, the recipient, the purpose, and the destination.
+2. **Evidence.** It gathers what the requirements need: the report text, the result of the authorization lookup for this recipient, and the version of the sharing policy that applies.
+3. **Checks.** A pattern check scans the report for account numbers. A comparison reads the authorization result. A judgment compares the purpose with the policy.
+4. **A result** for each requirement, and an overall result.
+5. **The next action.** The application shares the report, holds it, or sends it for review.
 
-Verification during execution, sometimes called live verification, uses this same call: a workflow calls `verify` before its next step, as the finance API does before it sends.
+A check before the action can only use evidence that exists before the action: the proposed content and the preconditions. It can show that the report contains no account number and that the authorization record lists this recipient. It cannot show the effects of the share. An authorization check before sending does not prove that the report was delivered, that only the authorized person opened it, or that the recipient then handled it as the policy requires. Those are claims about a completed action, and they need evidence produced after it, such as a delivery receipt or the destination's access log.
 
-## The contract the application calls
+Agents make this split routine. Before an agent calls a tool, its proposed arguments can be checked against policy. After the call, its effects can be checked: whether the tool reported success, and whether the system's state now matches what the agent intended.
 
-`release-check` is a declared, versioned Verifier. This is its YAML form; the [Quickstart](/get-started/quickstart/) declares the same Verifier in Python, Rust, or TypeScript:
+## A useful result must arrive in time
 
-<CodeFromFile file="examples/finance-release/release-check.yaml" lang="yaml" title="release-check.yaml" />
+The application has a deadline: how long it can wait before it must share the report or answer the person who asked. A result that arrives after the deadline cannot inform that decision.
 
-The declaration fixes what the application can rely on:
+The time before a result has three parts:
 
-| Part | What it fixes |
-| --- | --- |
-| `inputs` | The named evidence slots the caller must fill, each with a type and optional schema |
-| `requirements` | Each `id` and `statement`, and the one `check` that decides it |
-| `decide` | How requirement outcomes combine. Omitted here, so the default `all` applies: any failed requirement fails the verdict, otherwise any inconclusive one makes it inconclusive |
-| Version | When `metadata.version` is omitted, the server assigns `0.1.0`, then the next patch version each time the content changes. Each result names the exact Verifier, policy file, and subject versions |
+- **Collecting and preparing evidence.** The report may already be in memory. The authorization result may need a lookup, and a PDF may need its text extracted before any check can read it.
+- **Coordination.** Whatever runs the checks has to receive the evidence, find which checks apply, confirm the caller may run them, and schedule the work.
+- **The checks themselves.** Scanning the text for an account number or comparing a field is local computation. Deciding whether a policy written in prose permits this purpose may need a language model, possibly several calls, each subject to the provider's load and the network.
 
-When the policy changes, declare the Verifier again with the new file: Wyrd registers a new Verifier version (in the Quickstart, `release-check@0.1.1`). Results judged by the old version still name the old file, so a past decision can be traced to the policy it applied. [How verification works](/understand/how-verification-works/) explains each part, and the [Verifier Card reference](/reference/verifier-card/) lists every field.
+The model-assisted judgment usually dominates, and its time varies from one call to the next. Waiting for it synchronously does not bound how long it takes. Only measurement on representative evidence shows whether a check fits the deadline, and the measurement holds only for the load, model, and provider measured.
 
-The contract is Wyrd's own public format. It makes requirements explicit and attributable; it does not make them complete, and a passing verdict is a judgment on the evidence supplied, not a proof.
+When a result cannot arrive in time, the application needs a fallback chosen on purpose: refuse the action, hold it for review, or act now and verify later where the risk allows. The checking system may also refuse work it cannot take on, or stop a check that runs past a timeout. Neither is a pass. Choosing the fallback is the application's decision, and making it before production is part of the design.
 
-## Where the time goes
+## Missing evidence and uncertain judgments
 
-Whether a verdict fits a request depends on the application's latency budget and on which checks the Verifier runs. Time in a `verify` call falls into three parts.
+Three outcomes in the sharing example are often confused:
 
-**Engine and coordination.** The server resolves the exact Verifier and subject, checks the caller's `verifier:run` permission, and admits the work.
-
-Resolved targets are cached in each server process, per tenant, Verifier, and subject. A first call, an evicted entry, or a change to the Verifier reads PostgreSQL to reload; while the process cannot hear change notifications, every call reads PostgreSQL.
-
-Admission can refuse work instead of queueing it: `WYRD_VERIFICATION_429_STAGING_FULL` when staging is full, `WYRD_SERVER_503_SERVICE_UNAVAILABLE` when no Python worker or workspace is free.
-
-**Evidence.** JSON evidence arrives in the request. A `File` is hashed by the SDK, which uploads only digests the server lacks, so a repeated file uploads once; each execution resolves its file and Artifact metadata once and reuses it. A step such as PDF extraction, or a `trace` check that reads spans from Bifrost, adds its own read time.
-
-**Checks.** An `assert` or `trace` check runs in the check engine without a model. A `code` check runs in a sandboxed Python worker. An `agent` check calls a model through the LLM gateway, possibly several times with tool calls between them, and usually dominates the total. In the finance example, the two assertions add little; the policy judge (`policy-judge.yaml` in the Quickstart) adds up to three model calls (`max_iterations: 3`), shared between tool use and answer corrections.
-
-Returning the verdict does not wait for the evidence to be published. The server stages the result and its pinned inputs on its in-process outbox and answers; Bifrost then stores them, and they become queryable shortly after. The verdict the application received stands even if an abrupt server stop loses the staged copy before it is written; then no record of that verdict is retained, and the loss is counted. [Runs and evidence](/understand/runs-observations-and-evidence/) and [Bifrost](/understand/bifrost/) explain retention.
-
-Real-time here means a verdict available for the current decision. It is not hard real-time scheduling and not a latency guarantee. The whole call is bounded by `WYRD_VERIFICATION_TIMEOUT_MS`, 60 seconds by default ([Runtime limits](/reference/verification-runtime-limits/)). A synchronous call is not proof a Verifier fits a budget: measure the Verifier you deploy, on your own evidence and model routes.
-
-## Queued and scheduled verification
-
-The same engine runs two more paths. They change when the verdict arrives, and so which decision it can inform.
-
-| Path | Called with | Verdict arrives | Use it when |
-| --- | --- | --- | --- |
-| Request | `verify` | In the call's response | The application must decide before it responds or acts |
-| Queued | `submit` | Later; any process holding the execution can wait for it | The decision can wait, a model judge is too slow for the request, or evidence such as trace spans lands after the call |
-| Scheduled | A binding with a Trigger in `runs_on` | When the server runs the schedule | A time window of recorded samples needs judging, as with drift. Only drift Verifiers are scheduled, and they refuse `verify` |
-
-`submit` returns once its inputs are staged, and the server then queues an execution. A queued execution has a status (`pending`, `running`, `retrying`, `completed`, `cancelled`, `timed_out`, `errored`) separate from its verdict. Only executions a binding's Trigger creates run Operators; `verify` and `submit` leave the response to the application. [verify and submit](/understand/how-verification-works/#verify-and-submit) compares the calls in detail.
-
-## Missing evidence, timeouts, and errors
-
-Each non-pass outcome has a defined meaning, and the application decides its response to each:
-
-| Situation | `verify` returns | Queued execution |
+| Situation | What it means | Possible response |
 | --- | --- | --- |
-| An input slot is omitted | The requirements that need it are `inconclusive` | The same |
-| A trace has no visible spans yet | The `trace` check is `inconclusive` at once | Tries 3 times, then `inconclusive` |
-| A model judge cannot decide, or passes without a valid citation | That requirement is `inconclusive` | The same |
-| The call exceeds the timeout | `WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT`, no verdict | Status `timed_out`, no verdict |
-| The input does not match the Verifier | `WYRD_VERIFICATION_400_INPUT_INVALID`; nothing ran | No verdict: `submit` is refused or the execution ends `errored` |
+| A violation | The evidence shows the requirement is not met | Hold the report |
+| Evidence that cannot decide | The check ran, but the evidence it needs is missing, or the judge could not decide | Hold the report, fetch the missing record, or ask a person |
+| A check that did not run | A timeout, a crash, or refused work leaves no judgment at all | The fallback chosen in advance, never a pass |
 
-`inconclusive` is never a pass and never a claim that the subject failed. An error or timeout is no verdict at all. The finance API releases only `passed` reports, so every other outcome holds the report. The [technical questions](/understand/technical-questions/) cover the remaining adoption questions.
+An authorization lookup that returns nothing belongs in the second or third row, not the first: it does not show that the recipient is unauthorized. A judge that cannot tell whether "external audit" covers this purpose belongs in the second. Systems name these outcomes differently. What matters is that the application can tell them apart, and that none of them silently becomes a pass.
+
+A model-assisted judgment also changes who sees the evidence. Sending the report and the policy to an externally hosted model exposes their content to that provider, and relies on the provider's model for that requirement. A deterministic check avoids both. Where a judgment is needed, deciding which evidence the judge may see is part of designing the requirement.
+
+## When a later check is appropriate
+
+Not every check belongs before the action. Each timing informs a different decision:
+
+| When the check runs | Decision it can inform | Fits |
+| --- | --- | --- |
+| Inline, before the action | Whether the action happens | Proposed content and preconditions that must be settled first |
+| Queued, after the response | Follow-up: correct, notify, or review | Slow judgments, and evidence such as traces that arrives after the action |
+| Recurring, on a schedule | Investigation, retraining, and the next release | Properties of many executions together, such as drift or a failure rate |
+
+A check can move later when its result could not change the current action anyway, when its evidence does not exist yet, or when it is too slow for the deadline and the risk of acting first is acceptable. Only a recurring check sees a property of many executions at once, such as a shift in the input distribution. Live verification and verification during execution are other names for the inline case.
+
+## What must be measured and retained
+
+Two measurements decide whether a real-time check is workable. The first is end-to-end time, measured from the application on representative evidence, with the expensive and variable judges running on their real models. The second is each check's accuracy, measured against labeled cases as for any other check.
+
+Results also need provenance: which version of the requirement, which evidence, and which versions of the system and the check. Without it, nobody can later tell which policy a past decision applied. When a requirement changes, the results of the old version stay attached to it.
+
+A returned result and a durable record are different things. A checking system can return the result first and write its record afterward, which is faster, or write the record first, so that every result the application acted on is kept. Which a given system does, and what it can lose when it fails, depends on the implementation, and is a property to confirm rather than assume.
+
+## These ideas in Wyrd
+
+Wyrd is one implementation of these ideas. [How verification works in Wyrd](/understand/how-verification-works/) maps requirements, evidence, checks, results, and provenance onto Wyrd, and follows one inline verification of the report release, including where its time goes and what it retains. The [Quickstart](/get-started/quickstart/) runs that example, and [Act on verdicts in production](/build-and-verify/verify/act-on-verdicts-in-production/) covers deadlines, provider exposure, and cost. Wyrd does not choose an application's requirements or fallbacks.
+
+## Sources
+
+Runtime verification, as checking an observed execution rather than every execution, and the distinction between online and offline monitoring come from [Leucker and Schallhart (2009)](/understand/foundations-of-verification/#sources). Monitors that judge a finite trace as satisfying, violating, or inconclusive are described by [Bauer, Leucker and Schallhart (2011)](/understand/foundations-of-verification/#sources). Delayed outcomes in drift detection are covered by [Gama et al. (2014)](/understand/foundations-of-verification/#sources). The decision deadline, the three parts of elapsed time, and the inline, queued, and recurring comparison are this page's practical synthesis, not established research terminology.
 
 ## Next
 
-Run the finance example in the [Quickstart](/get-started/quickstart/), or read [How verification works](/understand/how-verification-works/) for each part of a Verifier.
+[How verification works in Wyrd](/understand/how-verification-works/) applies these ideas to a running system. [Foundations of verification](/understand/foundations-of-verification/) covers the general discipline behind them.

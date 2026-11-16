@@ -50,9 +50,9 @@ Set up a local server, run one verification, then choose what to build, in this 
 
 ## Understand
 
-- [Foundations of verification](/wyrd/understand/foundations-of-verification/): What AI verification is, how it differs from validation, evaluation, testing, observability, and formal proof, and how to verify uncertain systems from observed evidence.
-- [Real-time verification](/wyrd/understand/real-time-verification/): Real-time verification for AI applications - get an evidence-backed verdict before your application sends a response or takes an action, and how Wyrd also runs the same checks queued or on a schedule.
-- [How verification works](/wyrd/understand/how-verification-works/): Inputs, steps, requirements, and decide; Agent workspaces; verify versus submit; executions, verdicts, results, and Operators.
+- [Foundations of verification](/wyrd/understand/foundations-of-verification/): What verification establishes, how testing, validation, formal proof, and runtime checking differ, how to check outputs with no single right answer, and what an ML score or an agent's claim cannot show.
+- [Real-time verification](/wyrd/understand/real-time-verification/): Real-time verification for AI applications - checking a system while it runs, in time to inform the current action, with deadlines, evidence and check time, uncertain results, and when a queued or recurring check fits better.
+- [How verification works in Wyrd](/wyrd/understand/how-verification-works/): How Wyrd implements verification - Verifiers, bindings, and evidence; one inline verification of a finance report release; verify, submit, and drift schedules; where the time goes; and what Wyrd retains.
 - [Runs and evidence](/wyrd/understand/runs-observations-and-evidence/): How Wyrd records what a declared service actually does, and ties each observation to the version that ran.
 - [Cards and versions](/wyrd/understand/cards-versions-and-relationships/): A Service declaration is a set of versioned Cards, each one a declared component of an AI system.
 - [Bifrost](/wyrd/understand/bifrost/): Wyrd's analytical warehouse, the two ways to write to it, and when a written row becomes queryable.

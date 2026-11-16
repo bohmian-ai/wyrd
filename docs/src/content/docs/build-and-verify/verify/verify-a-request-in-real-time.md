@@ -229,4 +229,4 @@ A Verifier with `samples` slots and `drift` checks judges a scheduled window, so
 | `WYRD_VERIFICATION_429_STAGING_FULL` | The server is staging more verification work than it holds | Nothing was staged. `submit` retries it for you; retry `verify` after `details.retry_after_seconds` |
 | `WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT` | The execution took longer than 60 seconds, usually a slow Agent step | Decide your fallback in code, or use `submit`. The SDK does not retry `verify` |
 
-A missing required input is not an error: the requirements that need it come back `inconclusive`. For when to check in real time versus in the background, see [How verification works](/understand/how-verification-works/).
+A missing required input is not an error: the requirements that need it come back `inconclusive`. For when to check in real time versus in the background, see [How verification works in Wyrd](/understand/how-verification-works/).

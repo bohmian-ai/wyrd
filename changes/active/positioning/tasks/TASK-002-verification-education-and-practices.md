@@ -368,13 +368,13 @@ the FAQ. The three practice guides complete REQ-011 coverage now.
 
 | Intent family | Canonical page |
 |---|---|
-| Real-time category | `understand/real-time-verification` |
+| Real-time category | `understand/real-time-verification` (concept), then `understand/how-verification-works` (Wyrd implementation) |
 | Broad education ("what is AI verification", "verification versus evaluation") | `understand/foundations-of-verification` |
 | Behavioral correctness ("verify AI agents against requirements") | `declare/write-verifiable-requirements`, then `get-started/quickstart` |
 | Workflow correctness ("verify an agent completed every step") | `observe/establish-sufficient-evidence` §5 now; TASK-003 skipped-step tutorial when published |
-| Application integration ("verify a proposed action before the application executes it") | `understand/real-time-verification`, `verify/act-on-verdicts-in-production` |
+| Application integration ("verify a proposed action before the application executes it") | `understand/how-verification-works` §One verification, end to end, `verify/act-on-verdicts-in-production` |
 | Policy judgment ("verify AI output against a policy document") | `get-started/quickstart`, `declare/write-verifiable-requirements` §3 |
-| Production continuity | `understand/real-time-verification` (queued and scheduled); TASK-003 continuous tutorial when published |
+| Production continuity | `understand/real-time-verification` (inline, queued, recurring concept); `understand/how-verification-works` §verify and submit (Wyrd paths); TASK-003 continuous tutorial when published |
 
 Handoffs: TASK-004 owns the agreed HTML titles (REQ-009) — the template renders
 `<title>{title} — Wyrd docs</title>`, so the frontmatter titles are
@@ -413,8 +413,35 @@ edition). Corrections were applied in `5b1a676dd`.
 | Verification versus validation definitions | NASA SEH §5.3, §5.4 (web edition, 2024) | Engineering guidance | Supported; citation corrected |
 | Verification bandwidth; correlated blind spots | Catalini, Hui and Wu 2026 v2 extended abstract | Preprint, economic argument | Reworded to the source |
 
+TASK-002-R1 teaching use. R1 added no external claim; it re-scoped the
+existing ones to the example each now supports. Source sections, types and
+access limits above are unchanged (Dennis et al. and Agha and Palmskog remain
+abstract-only).
+
+| Claim | Source | Limit kept in prose | Example it supports |
+|---|---|---|---|
+| RV judges an observed execution; online and offline | Leucker and Schallhart 2009 §2, §2.1 | Not all executions; "established field" only | Sort wrapper vs monthly job (Foundations); inline vs later (Real-time Sources) |
+| Three-valued finite-trace monitoring | Bauer et al. 2011 §1 | Inconclusive when the trace cannot settle it | Runtime monitors can check formal properties |
+| SMC on stochastic systems | Agha and Palmskog 2018 abstract | Statistical confidence, not certainty | Formal methods are not deterministic-only |
+| Agent decision-making verified formally | Dennis et al. 2016 abstract | Hybrid autonomous systems | Formal methods predate LLM agents |
+| Verification vs validation | NASA SEH §5.3–5.4 | Engineering guidance; ML "validation set" differs | Sort meets spec, fails users' alphabetical order |
+| Oracle problem; metamorphic relations | Barr et al. 2015; Segura et al. 2016 §2 | A passing relation shows consistency only | Two incident summaries; paragraph reordering |
+| Judge agreement and biases | Zheng et al. 2023 §3.3 | Preference agreement ≠ factual or policy correctness | Assessing a model judge |
+| Consistency plus tool verification | Han et al. 2025 | Reasoning benchmarks only | Same |
+| Calibration under shift | Ovadia et al. 2019 §5 | Methods and tasks studied | Judge confidence; drifted fraud model |
+| Leakage across fields | Kapoor and Narayanan 2023 | Compiled reports | 0.98 AUC fraud model |
+| Virtual vs real drift; delayed outcomes | Gama et al. 2014 §2 | Alarm ≠ wrong prediction | Merchant-mix shift; Real-time Sources |
+| Agent benchmarks | Liu et al. 2024 | Benchmark ≠ live run | Evaluation row |
+| Environment/requirements/specification; ML specs | Zave and Jackson 1997; Breck et al. 2017 | — | Build a verification practice |
+| Verification capacity, correlated errors | Catalini et al. 2026 v2 | Preprint, economic argument | Limits of agent assistance |
+| Learned model checked at runtime | Koohestani 2025 | Workshop proof of concept | Annotated further reading only; no body claim |
+
+"Hard real-time" is used as a plain definition without citation; the
+deadline, three-part elapsed time and inline/queued/recurring comparison are
+labeled on the page as practical synthesis.
+
 Removed: the Shin paragraph (philosophy; the reader did not need it). Wyrd
-mechanics on the real-time page cite repository authority:
+mechanics (on the Wyrd application page since R1) cite repository authority:
 `architecture/wyrd-design.md` (Run/Window table: `verify` within 60 s;
 "Neither Run entry point writes Postgres on the request path"; outbox and
 `429_STAGING_FULL`; statuses; Operators), `crates/wyrd/wyrd-server/src/verification/cache.rs`

@@ -7,7 +7,7 @@ topic: Verify
 order: 6
 ---
 
-Decide what your application does with every outcome of a verification before it reaches production. The examples use the finance API from [Real-time verification](/understand/real-time-verification/).
+Decide what your application does with every outcome of a verification before it reaches production. The examples use the finance API from [How verification works in Wyrd](/understand/how-verification-works/#one-verification-end-to-end).
 
 Each practice names the failure it prevents and where it stops helping.
 
@@ -44,7 +44,7 @@ A `verify` call is bounded by `WYRD_VERIFICATION_TIMEOUT_MS`, 60 seconds by defa
 - A model judge adds at least one model call. Keep it on the request path only when its measured time fits, as the finance policy judge must because the release cannot happen without it.
 - Move checks that can be decided after the response into a separate Verifier, and `submit` it after you respond. `submit` returns once the inputs are staged.
 
-Measure the Verifier you deploy: time the `verify` call in your application on representative evidence, and read each step's `duration_ms` in the execution's details. [Where the time goes](/understand/real-time-verification/#where-the-time-goes) explains what the total includes.
+Measure the Verifier you deploy: time the `verify` call in your application on representative evidence, and read each step's `duration_ms` in the execution's details. [Where the time goes](/understand/how-verification-works/#where-the-time-goes) explains what the total includes.
 
 **Limits:** a measurement holds for the evidence, model, provider, and load you measured. Remeasure after changing any of them.
 

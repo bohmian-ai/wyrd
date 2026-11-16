@@ -30,8 +30,9 @@ disconnected reference pages.
 
 The learning path starts with Foundations of verification, a cited,
 tool-independent explanation of requirements, evidence, and judgments, then
-Real-time verification, the bridge to Wyrd, and the practice guides in Build
-and verify. Educational pages cite primary sources beside their claims and
+Real-time verification, the equally tool-independent explanation of checking a
+system while it runs, then How verification works in Wyrd, which applies both
+to Wyrd, and the practice guides in Build and verify. Educational pages cite primary sources beside their claims and
 state each claim's limits; they promise no latency, accuracy, or enforcement
 Wyrd has not measured or does not perform.
 

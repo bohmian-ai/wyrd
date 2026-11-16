@@ -169,4 +169,4 @@ The judge's wording varies. `release-check@0.1.0` still mounts the original poli
 
 ## Next
 
-[Real-time verification](/understand/real-time-verification/) explains what happens inside the call, and [Write verifiable requirements](/build-and-verify/declare/write-verifiable-requirements/) turns your own goals into requirements like these three. [ASGI apps](/connect/integrate-asgi/) puts the same call inside a FastAPI or Starlette request. [What can I build?](/get-started/what-can-i-build/) matches your problem to a larger workflow. The [Verifier reference](/reference/verifier-card/) lists every field you can declare.
+[How verification works in Wyrd](/understand/how-verification-works/) explains what happens inside the call, and [Write verifiable requirements](/build-and-verify/declare/write-verifiable-requirements/) turns your own goals into requirements like these three. [ASGI apps](/connect/integrate-asgi/) puts the same call inside a FastAPI or Starlette request. [What can I build?](/get-started/what-can-i-build/) matches your problem to a larger workflow. The [Verifier reference](/reference/verifier-card/) lists every field you can declare.

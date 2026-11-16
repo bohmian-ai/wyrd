@@ -582,4 +582,4 @@ A drift Verifier refuses `verify`; only the schedule judges it.
 
 ## Next
 
-[How verification works](/understand/how-verification-works/) explains steps, verdicts, and where each check runs. [Write verifiable requirements](/build-and-verify/declare/write-verifiable-requirements/) shows how to test a model judge before relying on it.
+[How verification works in Wyrd](/understand/how-verification-works/) explains steps, verdicts, and where each check runs. [Write verifiable requirements](/build-and-verify/declare/write-verifiable-requirements/) shows how to test a model judge before relying on it.

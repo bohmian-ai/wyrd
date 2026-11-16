@@ -57,4 +57,4 @@ Every Card therefore shows what it depends on and what depends on it. A running 
 
 ## Next
 
-[How verification works](/understand/how-verification-works/).
+[How verification works in Wyrd](/understand/how-verification-works/).

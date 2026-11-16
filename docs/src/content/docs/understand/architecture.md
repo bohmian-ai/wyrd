@@ -32,4 +32,4 @@ The server calls model providers with keys you configure, for model-judged check
 
 ## Next
 
-[How verification works](/understand/how-verification-works/) follows one check through the server. [Bifrost](/understand/bifrost/) covers the data plane.
+[How verification works in Wyrd](/understand/how-verification-works/) follows one check through the server. [Bifrost](/understand/bifrost/) covers the data plane.

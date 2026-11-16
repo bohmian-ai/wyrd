@@ -59,4 +59,4 @@ Wyrd verifies your system; your code runs it. Your app owns its code, models, an
 
 ## Next
 
-[Set up Wyrd](/get-started/setup/) starts a local server. [Run your first verification](/get-started/quickstart/) then runs this example against it. [Foundations of verification](/understand/foundations-of-verification/) explains requirements, evidence, and judgments without Wyrd, and [Real-time verification](/understand/real-time-verification/) shows how Wyrd places a verdict before your application acts.
+[Set up Wyrd](/get-started/setup/) starts a local server. [Run your first verification](/get-started/quickstart/) then runs this example against it. [Foundations of verification](/understand/foundations-of-verification/) explains requirements, evidence, and judgments without Wyrd, [Real-time verification](/understand/real-time-verification/) explains checking a system while it runs, and [How verification works in Wyrd](/understand/how-verification-works/) shows how Wyrd places a verdict before your application acts.

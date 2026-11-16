@@ -10,13 +10,13 @@ These are direct answers to the questions engineers ask before adopting Wyrd. Ea
 
 ## Does Wyrd block a response that fails?
 
-No. Wyrd returns a verdict; your application decides what to do with it. In the [finance API](/understand/real-time-verification/#a-verdict-before-the-response), the handler releases a report only when `result.passed` is true and holds it otherwise. If the handler ignored the verdict, nothing would stop the release.
+No. Wyrd returns a verdict; your application decides what to do with it. In the [finance API](/understand/how-verification-works/#one-verification-end-to-end), the handler releases a report only when `result.passed` is true and holds it otherwise. If the handler ignored the verdict, nothing would stop the release.
 
 Enforcement lives in your code because the right response depends on the action: hold a report, rewrite a reply, ask a person, or log and continue. Executions a binding's Trigger creates can also notify through an [Operator](/understand/how-verification-works/#operators), which reports a failure but does not undo anything.
 
 ## When should I use verify, submit, or a schedule?
 
-Use `verify` when the application must decide before it responds or acts. Use `submit` when the decision can wait, the check is too slow for the request, or the evidence lands after the call. Use a schedule to judge a time window of recorded samples, as with drift. [Real-time verification](/understand/real-time-verification/#queued-and-scheduled-verification) compares the three. `verify` and `submit` run the same Verifier; schedules judge drift Verifiers, which refuse `verify`.
+Use `verify` when the application must decide before it responds or acts. Use `submit` when the decision can wait, the check is too slow for the request, or the evidence lands after the call. Use a schedule to judge a time window of recorded samples, as with drift. [verify and submit](/understand/how-verification-works/#verify-and-submit) compares the three. `verify` and `submit` run the same Verifier; schedules judge drift Verifiers, which refuse `verify`.
 
 ## What happens when evidence is missing?
 
@@ -32,7 +32,7 @@ Treat every outcome except `passed` as not passed. [Runtime limits](/reference/v
 
 ## How fast is a real-time check?
 
-It depends on the checks. Assertions and trace checks run without a model; a model judge adds at least one model call and usually dominates. Wyrd publishes no general latency figure, because the total depends on your Verifier, evidence, model, and provider. Measure the Verifier you deploy. [Where the time goes](/understand/real-time-verification/#where-the-time-goes) separates engine, evidence, and check time.
+It depends on the checks. Assertions and trace checks run without a model; a model judge adds at least one model call and usually dominates. Wyrd publishes no general latency figure, because the total depends on your Verifier, evidence, model, and provider. Measure the Verifier you deploy. [Where the time goes](/understand/how-verification-works/#where-the-time-goes) separates engine, evidence, and check time.
 
 ## What does a model provider see?
 
@@ -42,7 +42,7 @@ Assertion, trace, and code checks send nothing to a provider. Keep sensitive evi
 
 ## Can I trust a model judge?
 
-Not without testing it. A model judge can be biased, inconsistent, or wrong, and agreement with another model is not independent evidence. Wyrd requires a judge that passes to cite the evidence it used, and makes the requirement `inconclusive` when it does not; it does not measure a judge's accuracy for you. Run the judge on labeled cases before relying on it, as in [Choose checks and test judges](/build-and-verify/declare/write-verifiable-requirements/#3-choose-checks-and-test-judges). [Model judges](/understand/foundations-of-verification/#model-judges) summarizes what research shows.
+Not without testing it. A model judge can be biased, inconsistent, or wrong, and agreement with another model is not independent evidence. Wyrd requires a judge that passes to cite the evidence it used, and makes the requirement `inconclusive` when it does not; it does not measure a judge's accuracy for you. Run the judge on labeled cases before relying on it, as in [Choose checks and test judges](/build-and-verify/declare/write-verifiable-requirements/#3-choose-checks-and-test-judges). [Foundations of verification](/understand/foundations-of-verification/#when-there-is-no-single-expected-answer) summarizes what research shows about model judges.
 
 ## What happens to old results when a requirement changes?
 
@@ -50,7 +50,7 @@ They keep their versions. Every result names the exact Verifier and subject vers
 
 ## Where is the evidence kept?
 
-Each result's summary goes to `bifrost.verification.results`, its requirement outcomes and steps to `bifrost.verification.execution_outputs`, and the pinned inputs to `bifrost.verification.execution_inputs`, all queryable with SQL. The server stores them after it answers, so a row appears shortly after the call returns. [Runs and evidence](/understand/runs-observations-and-evidence/) explains what is retained.
+Each result's summary goes to `bifrost.verification.results`, its requirement outcomes and steps to `bifrost.verification.execution_outputs`, and the pinned inputs to `bifrost.verification.execution_inputs`, all queryable with SQL. The server stores them after it answers, so a row appears shortly after the call returns. An abrupt server stop before that write loses the record, though the verdict already returned stands; the loss is counted. [What Wyrd retains](/understand/how-verification-works/#what-wyrd-retains-and-how-requirements-change) explains the boundary.
 
 ## Which languages are supported?
 
@@ -62,4 +62,4 @@ Yes. [Set up Wyrd](/get-started/setup/) runs a local server against your Postgre
 
 ## Next
 
-Start with the [Quickstart](/get-started/quickstart/), or read [Foundations of verification](/understand/foundations-of-verification/) for the ideas behind it.
+Start with the [Quickstart](/get-started/quickstart/), or read [Foundations of verification](/understand/foundations-of-verification/) and [Real-time verification](/understand/real-time-verification/) for the ideas behind it.

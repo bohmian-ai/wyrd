@@ -3503,7 +3503,12 @@ impl Memory {
 }
 
 /// Bytes promised from a [`Memory`] until dropped.
-struct Promise(Arc<Memory>, u64);
+struct Promise(
+    /// The budget the bytes were promised from.
+    Arc<Memory>,
+    /// The promised bytes.
+    u64,
+);
 
 impl Drop for Promise {
     /// Returns the promised bytes.

@@ -928,7 +928,8 @@ impl RunState {
 
     /// The terminal decision the state holds, recording that the execution
     /// ended without an outcome, as `status` with `error`, first when it
-    /// holds none. A selected outcome or an earlier failure is kept.
+    /// holds none. A selected outcome or an earlier failure is kept. The
+    /// returned copy is charged as [`Self::decision`]'s is.
     ///
     /// # Errors
     /// As [`Self::select`].

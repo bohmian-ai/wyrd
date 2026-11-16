@@ -206,7 +206,11 @@ impl HostWork {
 /// mid-await releases it for the next, and every other waiter waits for
 /// the same end instead of finding the list empty.
 #[derive(Clone)]
-struct Owed(Arc<tokio::sync::Mutex<Option<Settlement>>>);
+struct Owed(
+    /// The settlement, `None` once it resolved; shared by every list and
+    /// waiter holding this entry.
+    Arc<tokio::sync::Mutex<Option<Settlement>>>,
+);
 
 impl Owed {
     /// Owes `settlement` until it resolves.

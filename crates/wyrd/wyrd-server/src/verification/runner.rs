@@ -1591,6 +1591,10 @@ impl VerifierRunner {
 /// it is built and then fitted to the write's own weight, so the decision
 /// is released only once its result's bytes are promised, and [`deliver`]
 /// hands that promise to the outbox.
+///
+/// # Panics
+/// Panics when `state` charges another ledger than `outbox`, as
+/// [`deliver`] does; a [`RunState`] always charges its own outbox's.
 async fn conclude(
     tenant: DataTenantId,
     frozen: Frozen<'_>,

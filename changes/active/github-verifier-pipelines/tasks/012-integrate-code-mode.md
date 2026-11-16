@@ -318,6 +318,15 @@ warm direct execution; replica-local budgets.
 
 ### Diagnoses
 
+- **Symptom:** every `wyrd-testing::forge scribe_promotion::*` test panicked
+  at `forge_harness.rs:1808`, "production server has Forge". **Evidence:**
+  `start_engine_fixture_server` (forge/support.rs:33) selected
+  `ServerTarget::Direct`, which composes no Forge role (config.rs:540,
+  boot/mod.rs:809). **Cause:** e8d845674 mapped the old API-server target to
+  `direct`; revision 13 gives `direct` no Forge. **Fix site:** the helper
+  selects `combined` (Codex diagnostician); all ten callers route through it
+  and pass.
+
 - **Symptom:** `pg_verification_runtime::queued_origins_require_their_own_input_ack`
   failed about half its runs, alone or in the seam lane, with
   `writer unavailable for table: bifrost.storage.objects` at Card registration.

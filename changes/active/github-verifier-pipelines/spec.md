@@ -284,9 +284,8 @@ serves every route and runs every Bifrost role; direct and queued work share
 one hosted capacity owner charged to the one process memory/scratch ledger
 only while in use, with no fixed queued reservation, and
 `WYRD_VERIFICATION_QUEUED_EXECUTIONS` bounds queued concurrency without
-holding idle capacity. Colocation does not guarantee direct noninterference.
-Operators isolate direct work by running `direct` and `worker` targets on
-separately provisioned pods: `direct` executes only synchronous `verify`;
+holding idle capacity. A deployment may also run `direct` and `worker`
+targets separately: `direct` executes only synchronous `verify`;
 `worker` admits queued submissions, webhooks, deferred inputs, approvals and
 queued-only controls and is the only non-`combined` target that claims queued
 executions. Both run Scribe and Oracle on the pod and neither Forge role.
@@ -298,8 +297,8 @@ every Scribe requires durable per-pod storage and stable identity. A target refu
 any side effect, identically over HTTP and MCP, and never forwards it.
 Readiness follows the target's capabilities. Original deadlines, Busy deferral,
 fenced takeover and graceful drain are unchanged. Direct c64 latency and
-throughput on a `direct` pod stay unchanged while `worker` pods saturate queued
-work; provider quota, Postgres and Bifrost remain shared. PR extraction,
+throughput stay unchanged while queued work saturates the same server; provider
+quota, Postgres and Bifrost remain shared. PR extraction,
 deferred inputs and approval are queued-only, including manual calls; refuse a
 direct request before any step. Under the TASK-010-R1 amendment, a Verifier
 whose step or check Agent, inline or a referenced registered Agent, declares
@@ -433,7 +432,7 @@ without production GitHub credentials.
 | AC-007 | Restart while an execution waits for evidence or a decision, then supply it | Accepted evidence or decision survives and the same execution finishes; unavailable state is not absence; no second accepted approval or replay of durably settled predecessors; unpersisted work can repeat under REQ-017. Proven with ordinary restart, retry and refusal tests, no test-only crash hooks | 009,010,011 |
 | AC-008 | No/one/multiple/malformed report; every severity, absent location, valid/invalid suggested edit | Exact report convention; honest verdict/conclusion; no invented source anchor or applied source change | 012,013 |
 | AC-009 | GitHub timeout after remote success, restart, rate limit, permanent refusal, new head/access removal during delivery | Lookup-before-create finds the landed write; restart delivers once; failure is visible; no rerun of verification or stale write | 005,014 |
-| AC-010 | Hold queued execution/workspace/Python/model admission saturated while calling direct-eligible Verifier | On a `direct` pod beside saturated `worker` pods, direct executes with unchanged c64 latency/throughput; in `combined`, queued holds no idle reservation and direct still executes; queued-only direct call refuses before work; each target refuses work it does not accept before any side effect | 015 |
+| AC-010 | Hold queued execution/workspace/Python/model admission saturated while calling direct-eligible Verifier | On one `combined` server, direct executes with unchanged c64 latency/throughput while queued work saturates, and queued holds no idle reservation; queued-only direct call refuses before work; each target refuses work it does not accept before any side effect | 015 |
 | AC-011 | Fresh reader follows CLI/SDK docs and uses execution, evidence and approval inspection; reads a pull_request extraction and the delivery outcome through execution inspection over HTTP and MCP | Complete journey without UI or hidden manual orchestration; schemas/errors match served operations | 016 |
 | AC-012 | Hold Scribe/outbox and background SQL replies while direct/queued graphs advance; fill terminal tracking, then restore persistence; crash/reclaim before/after acceptance and race cancellation/takeover | Engine progresses from memory, compute permits free, tracking bounded with room for running claims, new claims back off, direct remains admissible; restored persistence yields the same terminal evidence then batched fenced settlement; only unpersisted work may repeat | 011,015,017 |
 | AC-013 | Matched full immutable resource-scaling/candidate verification benchmarks with healthy evidence reconciliation | Existing latency/L2 targets met and RS throughput/CPU/memory baseline preserved; no invented tolerance or exit-zero-only performance claim | 018 |

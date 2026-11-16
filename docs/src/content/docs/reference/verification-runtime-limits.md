@@ -42,7 +42,7 @@ Environment variables on `wyrd-server`, read once at startup; a change takes a r
 
 `verify` calls and queued executions share one process's Python pool, CPU turns, model calls, memory, and scratch, charged only while in use; nothing is reserved for either. `DIRECT_EXECUTIONS` and `QUEUED_EXECUTIONS` cap how many of each run at once and hold nothing while idle. A queued execution resumed after it waited, was deferred, or was retried is admitted again. Both run the same engine with the same authority, evidence, billing, and cancellation rules, and every model call still passes the gateway's own tenant and subject limits and budgets.
 
-On a `combined` process, a busy queue can slow `verify` calls. To keep them apart, run `direct` and `worker` processes on separately provisioned pods (see [deployment targets](/understand/architecture/#one-binary-several-roles)). Postgres, the gateway, and model providers stay shared.
+A deployment may also run `direct` and `worker` processes separately (see [deployment targets](/understand/architecture/#one-binary-several-roles)). Postgres, the gateway, and model providers stay shared.
 
 The defaults give each process headroom to start from, not measured throughput or latency guarantees, and not every mix of workloads is guaranteed to fit a host.
 

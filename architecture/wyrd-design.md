@@ -2420,9 +2420,8 @@ CPUs, and one model-call limit (`WYRD_VERIFICATION_MODEL_CALLS`), all
 charged to the one process memory and scratch ledger only while in use, with
 no fixed queued reservation. `WYRD_VERIFICATION_DIRECT_EXECUTIONS` and
 `WYRD_VERIFICATION_QUEUED_EXECUTIONS` cap each mode's concurrent executions
-and hold nothing idle. Colocated in `combined`, direct work is not isolated
-from queued work; operators isolate it by running `direct` and `worker`
-targets on separately provisioned pods. Direct admission refuses when
+and hold nothing idle. Direct c64 latency and throughput stay unchanged
+while queued work saturates the same server. Direct admission refuses when
 capacity is full; queued work waits, and a resumed or retried queued
 execution is admitted again. A model call takes a permit before entering the
 ordinary gateway path, whose tenant and subject limits, budgets, and

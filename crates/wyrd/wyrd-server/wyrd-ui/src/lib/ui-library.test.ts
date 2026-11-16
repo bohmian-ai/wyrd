@@ -3037,10 +3037,10 @@ test('a retained text file previews as inert text within the bound, and says whe
 test('execution inspector shows a recorded actual value, a discarded output, a cut preview and the next page of outputs', async () => {
   const onaction = vi.fn();
   const big = 'x'.repeat(70_000);
-  const executor = fixtureRecording((request) => {
+  const executor = fixtureRecording((request): WireResult | undefined => {
     if (request.op === 'verification.list_publications')
-      return { ok: true, value: { items: [{ name: 'text', kind: 'json', producer: { step_id: 'read-photo', item_index: null, iteration_index: null, attempt: 1 }, speculation: 'discarded' }], next_cursor: 'outputs/1' } };
-    if (request.op === 'verification.get_publication') return { ok: true, value: { kind: 'json', name: 'text', value: big, producer: { step_id: 'read-photo', item_index: null, iteration_index: null, attempt: 1 } } };
+      return { ok: true, value: { items: [{ name: 'text', kind: 'json', producer: { step_id: 'read-photo', item_index: null, iteration_index: null, attempt: 1 }, speculation: 'discarded' }], next_cursor: 'outputs/1' } as never };
+    if (request.op === 'verification.get_publication') return { ok: true, value: { kind: 'json', name: 'text', value: big, producer: { step_id: 'read-photo', item_index: null, iteration_index: null, attempt: 1 } } as never };
     return undefined;
   }).executor;
   const load = (input: Parameters<typeof loadExecution>[0]) => loadExecution(input, { executor });

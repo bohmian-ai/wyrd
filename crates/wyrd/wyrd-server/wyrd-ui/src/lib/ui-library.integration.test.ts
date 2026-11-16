@@ -912,7 +912,8 @@ test('an unfinished execution shows recorded progress and retained outputs throu
     ).json();
   const own = await session('test-tenant-1', server.apiKey);
   const viewer = await session('test-tenant-1', server.bootstrapService(['viewer'], 'ui-execution-viewer'));
-  const foreign = await session('ui-execution-foreign', server.bootstrapServiceInTenant(server.seedTenant('ui-execution-foreign'), ['admin'], 'ui-execution-admin'));
+  const foreignKey = server.bootstrapServiceInTenant(server.seedTenant('ui-execution-foreign'), ['admin'], 'ui-execution-admin');
+  const foreign = await session('ui-execution-foreign', foreignKey);
   expect(await panel(own)).toMatchObject({
     result: { state: 'populated', data: { status: { status: 'running' }, definition: { state: 'populated', data: { ref: { uid: verifier } } }, publication: { state: 'populated', data: { kind: 'directory' } } } }
   });
@@ -955,6 +956,14 @@ test('an unfinished execution shows recorded progress and retained outputs throu
   } as never);
   expect(await missing.json()).toMatchObject({ result: { state: 'error', problem: { code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND' } } });
 
+  // Run as another tenant's key, the app finds no such execution.
+  vi.stubEnv('WYRD_API_KEY', foreignKey);
+  const other = await loadExamplePanel({
+    request: new Request('http://app.test/view/load', { method: 'POST', body: JSON.stringify({ component: 'VerificationExecution', input: tree, range: RANGE }) })
+  } as never);
+  vi.stubEnv('WYRD_API_KEY', server.apiKey);
+  expect(await other.json()).toMatchObject({ result: { state: 'error', problem: { code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND' } } });
+
   // The built HTML draws that execution through host tools/call alone, each answered by the real MCP server.
   const host = new Client({ name: 'wyrd-ui-artifact-host', version: '1.0.0' }, { versionNegotiation: { mode: 'auto' } });
   await host.connect(new StreamableHTTPClientTransport(new URL('/mcp', server.baseUrl), { fetch: client.httpAuth }));
@@ -980,6 +989,20 @@ test('an unfinished execution shows recorded progress and retained outputs throu
     expect(refusing.calls.map((call) => call.name)).toEqual(['verification.get_execution']);
   } finally {
     await host.close();
+  }
+
+  // Answered by the MCP server as another tenant, the artifact shows that refusal for the real execution and reads nothing further.
+  const outsider = new Client({ name: 'wyrd-ui-artifact-outsider', version: '1.0.0' }, { versionNegotiation: { mode: 'auto' } });
+  await outsider.connect(new StreamableHTTPClientTransport(new URL('/mcp', server.baseUrl), { fetch: WyrdClient.connect({ credential: foreignKey }).httpAuth }));
+  try {
+    const refused = await appBridgeView(
+      { version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels: [{ id: 'execution', component: 'VerificationExecution', input: tree }] },
+      async (name, args) => (await outsider.callTool({ name, arguments: args })) as object
+    );
+    await vi.waitFor(() => expect(refused.document.querySelector('[data-panel="execution"]')?.textContent).toContain('WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND'));
+    expect(refused.calls.map((call) => call.name)).toEqual(['verification.get_execution']);
+  } finally {
+    await outsider.close();
   }
 });
 
@@ -1103,18 +1126,25 @@ judged('a judged execution shows its judgments, accepted inputs, completed detai
   expect(pinned.members?.map((member) => member.execution_id)).toEqual(session.group?.sources.turns.execution_ids);
   expect(pinned.status.result?.outcome.verdict).toBe('passed');
 
-  // Another tenant reads none of them, by ID alone.
-  const foreign = nodeExecutor(WyrdClient.connect({ credential: server.bootstrapServiceInTenant(server.seedTenant('ui-judged-foreign'), ['admin'], 'ui-judged-admin') }));
-  for (const executionId of [refused, drifted, session.execution_id])
-    expect((await loadExecution({ executionId }, { executor: foreign })).result).toMatchObject({ state: 'error', problem: { code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND' } });
-
+  // Another tenant reads none of them, by ID alone, through either host.
+  const outsider = WyrdClient.connect({ credential: server.bootstrapServiceInTenant(server.seedTenant('ui-judged-foreign'), ['admin'], 'ui-judged-admin') });
   // A principal that may read executions only: the recorded state loads, and the Card and query reads are each denied apart.
-  const narrow = nodeExecutor(WyrdClient.connect({ credential: server.scopedApiKey('ui_judged_narrow', ['verifier:read']) }));
-  const partial = data(await loadExecution({ executionId: refused, node: 'input:answer' }, { executor: narrow }), 'narrow');
-  expect(partial.status.result?.outcome.verdict).toBe('failed');
-  expect(partial.invocations.state).toBe('populated');
-  expect([partial.definition, partial.inputs]).toMatchObject([
-    { state: 'denied', problem: { code: DENIED } },
-    { state: 'denied', problem: { code: DENIED } }
-  ]);
+  const limited = WyrdClient.connect({ credential: server.scopedApiKey('ui_judged_narrow', ['verifier:read']) });
+  const [foreignMcp, narrowMcp] = [await mcpOver(server.baseUrl, outsider), await mcpOver(server.baseUrl, limited)];
+  try {
+    for (const [surface, foreign, narrow] of [['node', nodeExecutor(outsider), nodeExecutor(limited)], ['mcp', foreignMcp.executor, narrowMcp.executor]] as const) {
+      for (const executionId of [refused, drifted, session.execution_id])
+        expect((await loadExecution({ executionId }, { executor: foreign })).result, surface).toMatchObject({ state: 'error', problem: { code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND' } });
+      const partial = data(await loadExecution({ executionId: refused, node: 'input:answer' }, { executor: narrow }), surface);
+      expect(partial.status.result?.outcome.verdict, surface).toBe('failed');
+      expect(partial.invocations.state, surface).toBe('populated');
+      expect([partial.definition, partial.inputs], surface).toMatchObject([
+        { state: 'denied', problem: { code: DENIED } },
+        { state: 'denied', problem: { code: DENIED } }
+      ]);
+    }
+  } finally {
+    await foreignMcp.close();
+    await narrowMcp.close();
+  }
 });

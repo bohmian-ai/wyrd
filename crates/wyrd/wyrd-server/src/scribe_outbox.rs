@@ -2610,8 +2610,10 @@ mod tests {
             batch: uuid::Uuid::now_v7(),
             checkpoint: Arc::new(crate::verification::state::Checkpoint::new(
                 1,
-                state,
+                state.clone(),
                 Arc::new(row),
+                usize::try_from(crate::verification::state::Checkpoint::live(&state))
+                    .unwrap_or(usize::MAX),
             )),
             attribution: background(),
             acked: Mutex::new(Some(sender)),

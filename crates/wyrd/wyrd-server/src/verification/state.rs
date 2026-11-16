@@ -519,9 +519,9 @@ impl Writer {
     /// revision's batch identity and wait for Scribe to accept it, returning
     /// whether it did.
     ///
-    /// Staging charges the revision's weight to the outbox and the process
-    /// memory ledger until it is written, taking over `frozen`, the charge
-    /// the copy was given before it was made; its lease's loss ends the
+    /// Staging charges the revision's weight, `frozen`'s bytes, to the
+    /// outbox and the process memory ledger until it is written, taking over
+    /// `frozen`, the charge the copy was given before it was made; its lease's loss ends the
     /// wait. The outbox writer prepares the row, so this does no encoding,
     /// and nothing here holds the state's lock.
     async fn write(
@@ -532,9 +532,19 @@ impl Writer {
         frozen: Option<ByteCharge>,
     ) -> bool {
         let (sender, acked) = oneshot::channel();
+        // the frozen copy's charge is its weight; an uncharged writer's
+        // outbox counts the copy's live size instead
+        let weight = frozen
+            .as_ref()
+            .map_or_else(|| Checkpoint::live(&state), ByteCharge::bytes);
         let write = ScribeWrite::ExecutionState {
             batch: revision_batch(self.row.execution_id, revision),
-            checkpoint: Arc::new(Checkpoint::new(revision, state, Arc::clone(&self.row))),
+            checkpoint: Arc::new(Checkpoint::new(
+                revision,
+                state,
+                Arc::clone(&self.row),
+                usize::try_from(weight).unwrap_or(usize::MAX),
+            )),
             attribution: self.row.attribution,
             acked: Mutex::new(Some(sender)),
         };
@@ -571,16 +581,16 @@ impl Checkpoint {
     /// for its in-memory structure and its prepared row's per-value overhead.
     const ENTRY_BYTES: usize = 512;
 
-    /// Times its encoded length the state is charged: the frozen state, the
-    /// JSON tree and Variant its preparation builds, and the prepared row
-    /// holding that Variant all hold its values at once.
-    const COPIES: usize = 4;
-
     /// `state` frozen as `revision` of the execution `row` identifies, not
-    /// prepared yet.
+    /// prepared yet, weighing `weight` bytes: the charge its frozen copy was
+    /// given. Its preparation's transient encoding is not precharged.
     #[must_use]
-    pub fn new(revision: i64, state: ExecutionState, row: Arc<StateRow>) -> Self {
-        let weight = Self::charge(&state);
+    pub const fn new(
+        revision: i64,
+        state: ExecutionState,
+        row: Arc<StateRow>,
+        weight: usize,
+    ) -> Self {
         Self {
             revision,
             state,
@@ -588,24 +598,6 @@ impl Checkpoint {
             weight,
             prepared: OnceLock::new(),
         }
-    }
-
-    /// The memory `state` is charged: [`Self::COPIES`] times its compact
-    /// JSON length, which every settlement, captured value, reason, outcome,
-    /// identity, failure, and publication descriptor adds to, plus
-    /// [`Self::ENTRY_BYTES`] per entry.
-    ///
-    /// The length is counted as the state streams into a sink that keeps no
-    /// byte, so the charge follows every retained value without building the
-    /// row its preparation does later on the outbox's encoding pool.
-    // ponytail: a counting pass over the state per revision; charge per-entry deltas if large states make it costly.
-    fn charge(state: &ExecutionState) -> usize {
-        // A state that does not encode is refused by its preparation; what
-        // was counted before the error still bounds its memory.
-        let counted = usize::try_from(super::encoded_len(state, false)).unwrap_or(usize::MAX);
-        counted
-            .saturating_mul(Self::COPIES)
-            .saturating_add(Self::ENTRY_BYTES.saturating_mul(Self::entries(state)))
     }
 
     /// The entries `state` holds that [`Self::ENTRY_BYTES`] is charged for.
@@ -616,7 +608,7 @@ impl Checkpoint {
 
     /// The memory a live `state` is charged: its compact JSON length plus
     /// [`Self::ENTRY_BYTES`] per entry, the size [`retained`] grows it by.
-    fn live(state: &ExecutionState) -> u64 {
+    pub(crate) fn live(state: &ExecutionState) -> u64 {
         let entries = u64::try_from(Self::entries(state)).unwrap_or(u64::MAX);
         super::encoded_len(state, false)
             .saturating_add((Self::ENTRY_BYTES as u64).saturating_mul(entries))
@@ -1913,13 +1905,15 @@ mod tests {
     /// Proves the live state is charged to process memory for as long as
     /// its writer holds it: a recovered state is charged on arrival, every
     /// later change grows the charge while an older revision is held, a
-    /// frozen revision is charged on top until Scribe accepts it, and the
-    /// acknowledgement returns only the frozen copy. Siblings cannot be
-    /// promised the live bytes, and dropping the writer returns them once.
+    /// frozen revision is charged on top until Scribe accepts it, exactly
+    /// its copy of the live state and no precharge for its later encoding,
+    /// and the acknowledgement returns only the frozen copy. Siblings cannot
+    /// be promised the live bytes, and dropping the writer returns them once.
     ///
     /// # Panics
-    /// Panics when the live state goes uncharged at any point, an
-    /// acknowledgement returns live bytes, or the final release differs.
+    /// Panics when the live state goes uncharged at any point, a held
+    /// revision is charged other than its copy, an acknowledgement returns
+    /// live bytes, or the final release differs.
     #[tokio::test]
     async fn live_state_stays_charged_through_acknowledged_revisions() {
         let limit = 1 << 30;
@@ -1937,14 +1931,20 @@ mod tests {
         state.begin(&first).await.expect("recorded");
         live += super::retained(&first);
         arrived(&scribe).await;
-        assert!(
-            memory.used() > live,
-            "the held revision is charged beside the live state"
+        let frozen = live;
+        assert_eq!(
+            memory.used(),
+            live + frozen,
+            "the held revision is charged its copy of the live state, nothing more"
         );
         let second = Producer::plain(&task("tone"), 1);
         state.begin(&second).await.expect("recorded");
         live += super::retained(&second);
-        assert!(memory.used() > live, "later growth is charged while held");
+        assert_eq!(
+            memory.used(),
+            live + frozen,
+            "later growth is charged while held"
+        );
 
         scribe
             .release

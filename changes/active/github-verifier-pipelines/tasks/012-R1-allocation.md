@@ -431,13 +431,39 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
      proves standalone bytes count as gateway work and nested bytes as
      verification work, never both, and both return on drop. RED: left 0,
      right 22. GREEN (80 passed, same command).
+   - Connected pressure journey:
+     `verification_runtime::isolated_capacity::connected_work_waits_out_pressure_with_its_own_attribution`.
+     - Setup: one combined server is held at critical pressure.
+     - Actions: a standalone chat completion over raw HTTP waits in
+       admission as Gateway work. A public SDK query waits as Bifrost work.
+       A queued Agent run waits in its Bifrost input read.
+     - Synchronization: the test waits on the new admission debug event,
+       "new work waits for process pressure to admit it", from
+       `WorkloadManager::admit`. It does not sleep.
+     - After recovery, all three complete. The nested model call is recorded
+       against the verified Service's UID, and the standalone call against
+       no subject. No workload keeps bytes afterwards.
+     - TDD VIOLATED: the journey was written after the implementation.
+     - Mutation check: replacing the gateway `admit` with `begin`, the
+       disconnected behaviour, fails "Gateway work never waited for pressure
+       1 times". GREEN in 4.3 s:
+       `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-testing --test server -P journey --run-ignored=all -E 'test(=verification_runtime::isolated_capacity::connected_work_waits_out_pressure_with_its_own_attribution)'"`.
    - Open:
      - Request bodies are charged by `WyrdBodyLimit` only while the HTTP
        handler runs, unattributed. Streaming calls keep the body past the
-       handler, and nested call bodies are uncharged.
+       handler, and nested call bodies are uncharged. Awaiting a decision on
+       handing the body charge to the call.
      - A relayed answer's charge returns when it becomes the HTTP body, not
        when the body is sent.
-     - The connected journey.
+     - The journey does not yet cover:
+       - media or code work;
+       - slow streams staying byte-bounded;
+       - cancellation and deadline expiry under pressure;
+       - local quotas refusing at their own boundaries;
+       - bounded drain of persistence and host settlement.
+     - The same file's
+       `direct_verification_runs_while_queued_capacity_is_held` fails: the
+       queued runner never logs its admission deferral. Under diagnosis.
      Status: FAIL.
 
 7. **Functional closure and performance — REQ-024; AC-018.** Run affected

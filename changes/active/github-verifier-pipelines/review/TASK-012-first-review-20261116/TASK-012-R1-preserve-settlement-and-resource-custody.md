@@ -112,3 +112,17 @@ mise exec -- cargo clippy --locked -p wyrd-server --bin wyrd-server -- -D warnin
 ```
 
 No full user-journey suite, gate, benchmark or unrelated package lane is required for this remediation. Those integrated suites belong to change review. Record focused commands/results and remaining environment limits with the finding closures. Route this task directly to wyrd-implement; the next task review retains accepted unchanged coverage and reviews the remediation diff, all seven closures and their affected paths.
+
+## Obligations
+
+| ID | Promise (contract source) | Planned proof |
+|---|---|---|
+| R1-1 | Cancellation (speculative discard, original execution expiry, queued-runner outer timeout) stops dispatch, and already-started host work settles before disposition, checkpoint or terminal progress is accepted. The original timeout result is returned, discarded output stays withheld, and spend and producer identity are preserved (FIND-012-1, OBL-3). | Held-host-work engine tests for discard and expiry, plus a runner timeout-to-terminal test. |
+| R1-2 | Live and recovered RunState payload bytes stay charged on the process ledger through held revisions, later growth and staged ACKs. A frozen copy is charged before it is cloned, a sibling cannot reuse live bytes, and the final release returns exactly once. Transition, coalescing, spend and fencing behavior is preserved (FIND-012-2, OBL-7, REQ-017). | State tests for held revision, growth, post-ACK, recovery and release; the existing coalescing and outbox selectors. |
+| R1-3 | JSON staging and extraction ask the ledger for exact encoded length before materializing. On refusal they return Busy and leave the destination unchanged; successful bytes are unchanged and no-overwrite holds (FIND-012-3, OBL-6/7). | Workspace tests under insufficient encoding memory for both producers. |
+| R1-4 | Replacement charges the full temporary file while the original stays charged, refusing Busy before mutation and preserving the old bytes. On success the final bytes are charged once; a failed temp cleanup keeps its custody (FIND-012-4, OBL-6/7). | `writes_charge_process_scratch`, corrected, plus a same-size refusal case. |
+| R1-5 | When cleanup cannot confirm deletion, the charge is retained for the process lifetime. This covers partial opens and abandoned cleanup. Successful deletion releases exactly once (FIND-012-5, OBL-6/7). | A workspace test with a portable deletion failure, plus the successful reuse case. |
+| R1-6 | Native-media charge custody transfers through the evidence/Agent binding seam and is held for the provider call's lifetime. Completion, refusal and cancellation release it exactly once, and wire types, formatting and citations are unchanged (FIND-012-6, OBL-7, REQ-027). | An Agent binding test with a held model call. |
+| R1-7 | Every listed changed declaration has substantive rustdoc with its real `# Errors`/`# Panics` contracts, and no behavior changes (FIND-012-7, AGENTS.md rustdoc gate). | Source review, fmt:check and scoped clippy. |
+| R1-G1 | `wyrd-cli pg_tests::init_keeps_the_gateway_managed_secret_key` passes; its 503 after a generated rerun is fixed at its cause (gate failure, AGENTS.md "a red gate is yours to fix"). | Exact selector through `with-test-postgres`. |
+| R1-G2 | `wyrd-server sandbox_worker::sandbox_contains_runaway_code` proves its contract regardless of host speed (gate failure, AGENTS.md). | Exact selector, with the diagnosed cause addressed. |

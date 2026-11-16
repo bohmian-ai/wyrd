@@ -101,6 +101,13 @@
   /** The check a requirement declares in the exact Verifier this execution ran, whole-Verifier or attached to a step. */
   const declaredCheck = (id: string) => [...(definition?.spec.requirements ?? []), ...(definition?.spec.steps ?? []).flatMap((step) => step.requirements ?? [])].find((each) => each.id === id)?.check;
 
+  /** The exact Agent Card a requirement's check declares as its judge, when it names one rather than declaring the Agent inline. */
+  function judge(id: string): CardTypes.CardRef | undefined {
+    const check = declaredCheck(id);
+    const agent = check?.kind === 'agent' ? check.agent : undefined;
+    return typeof agent === 'object' && 'kind' in agent && agent.kind === 'Agent' && 'version' in agent ? (agent as CardTypes.CardRef) : undefined;
+  }
+
   const act = (name: string) => actions[name];
   const off = (name: string) => !onaction || act(name)?.state === 'pending' || act(name)?.state === 'unavailable';
 </script>
@@ -387,6 +394,13 @@
             {/each}
           {/if}
         {:else if type === 'req'}
+          {@const agent = judge(id)}
+          {#if agent}
+            <p class="judge">
+              <span class="label">Judged by</span>
+              <button type="button" class="open" disabled={off('card.open')} title={fmtCardRef(agent)} onclick={() => onaction?.({ name: 'card.open', input: { card_ref: agent } })}>{agent.name}@{agent.version}</button>
+            </p>
+          {/if}
           {#each judgments as each, index (index)}
             <div class="judgment" data-outcome={each.outcome}>
               <dl>
@@ -470,6 +484,12 @@
 {/if}
 
 <style>
+  .judge {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin: 0;
+  }
   .execution {
     display: flex;
     flex-direction: column;

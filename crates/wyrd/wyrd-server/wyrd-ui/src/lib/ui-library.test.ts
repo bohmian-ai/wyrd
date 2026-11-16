@@ -2940,6 +2940,9 @@ test('execution inspector shows recorded state, judgments and outputs as separat
   expect(requirement()).toHaveTextContent('ticket kind: lines start: 4 end: 9');
   expect(requirement().querySelector('.judgment')).toHaveTextContent('Data { "label": "refund" }');
   expect(requirement().querySelector('[data-details]')).toBeNull();
+  // The check names an Agent Card as its judge, so the requirement links to that exact Card; an assert check has no judge to open.
+  await fireEvent.click(within(requirement()).getByRole('button', { name: `${AGENT.name}@${AGENT.version}` }));
+  expect(sent()).toEqual({ name: 'card.open', input: { card_ref: AGENT } });
   await fireEvent.click(within(shown.container).getByRole('button', { name: 'Load completed details' }));
   expect(sent()).toEqual({ name: 'execution.select', input: { node: 'req:policy-followed', details: true } });
   await shown.rerender({ ...(await load({ executionId: EXECUTIONS.settled, node: 'req:policy-followed', details: true })), onaction });

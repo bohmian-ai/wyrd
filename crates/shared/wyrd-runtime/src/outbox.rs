@@ -71,6 +71,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
+use crate::resources::ByteCharge;
 use tokio::sync::{Notify, mpsc};
 use tokio::task::{Id, JoinError, JoinSet};
 use tokio::time::{sleep_until, timeout_at};
@@ -298,10 +299,46 @@ impl<S: OutboxSink> Outbox<S> {
     /// spawned immediately.
     #[must_use]
     pub fn new(sink: S, concurrency: usize, limits: OutboxLimits) -> Arc<Self> {
+        Self::start(sink, concurrency, limits, None)
+    }
+
+    /// Creates the outbox like [`Self::new`], also charging every admitted
+    /// item's [`OutboxSink::weight`] to the process `memory` ledger from
+    /// admission until it is written or lost.
+    ///
+    /// The charge is infallible, so staging never blocks or fails on it;
+    /// other capabilities charging `memory` see the outbox's bytes as used,
+    /// and `limits` alone decide what the outbox sheds or refuses.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called outside a Tokio runtime, because the writer task is
+    /// spawned immediately.
+    #[must_use]
+    pub fn charging(
+        sink: S,
+        concurrency: usize,
+        limits: OutboxLimits,
+        memory: &crate::resources::ByteLedger,
+    ) -> Arc<Self> {
+        Self::start(sink, concurrency, limits, Some(memory))
+    }
+
+    /// Creates the outbox and starts its writer, charging `memory` when
+    /// given; see [`Self::new`] and [`Self::charging`].
+    fn start(
+        sink: S,
+        concurrency: usize,
+        limits: OutboxLimits,
+        memory: Option<&crate::resources::ByteLedger>,
+    ) -> Arc<Self> {
         // The channel is unbounded because `admission` already bounds it.
         let (queue, requests) = mpsc::unbounded_channel();
         let pending = Arc::new(AtomicUsize::new(0));
-        let admission = Arc::new(Admission::default());
+        let admission = Arc::new(Admission {
+            memory: memory.map(|ledger| Mutex::new(ledger.empty_charge())),
+            ..Admission::default()
+        });
         let idle = Arc::new(Notify::new());
         let abandon = CancellationToken::new();
         let writer = TaskTracker::new();
@@ -383,6 +420,7 @@ impl<S: OutboxSink> Outbox<S> {
             self.shed(tenant);
             return;
         }
+        admission.charge(bytes);
         self.enqueue(sender, tenant, item, Load::one(false, bytes));
     }
 
@@ -554,6 +592,7 @@ impl<S: OutboxSink> Outbox<S> {
         self.admission
             .reserved_bytes
             .fetch_add(bytes, Ordering::AcqRel);
+        self.admission.charge(bytes);
         self.enqueue(sender, tenant, item, Load::one(true, bytes));
     }
 
@@ -761,11 +800,31 @@ struct Admission {
     /// Length of the [`Outbox::reserve_until`] queue; zero lets releases
     /// skip [`Self::freed`].
     waiting: AtomicUsize,
+    /// The process memory charge holding every admitted byte, when the
+    /// outbox was started by [`Outbox::charging`].
+    memory: Option<Mutex<ByteCharge>>,
 }
 
 impl Admission {
-    /// Releases written or lost items from their shares.
+    /// Charges `bytes` just admitted to the process memory ledger, if any.
+    fn charge(&self, bytes: usize) {
+        if let Some(memory) = &self.memory {
+            memory
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .grow_infallible(bytes as u64);
+        }
+    }
+
+    /// Releases written or lost items from their shares and their bytes
+    /// from the process memory ledger.
     fn release(&self, load: Load) {
+        if let Some(memory) = &self.memory {
+            memory
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .shrink(load.bytes as u64);
+        }
         self.reserved.fetch_sub(load.reserved, Ordering::AcqRel);
         self.unreserved
             .fetch_sub(load.items - load.reserved, Ordering::AcqRel);
@@ -2416,6 +2475,46 @@ mod tests {
         );
         assert_eq!(outbox.pending(), 0);
         assert!(metrics.gauge("outbox_pending").abs() < f64::EPSILON);
+    }
+
+    /// A charging outbox holds every admitted item's bytes on the process
+    /// memory ledger until the item is written: staged and reserved items are
+    /// charged while their write hangs, a shed item is never charged, and
+    /// writing them returns the ledger to empty.
+    ///
+    /// # Panics
+    /// Panics when the ledger misses an admitted item's bytes, charges a shed
+    /// one, or keeps bytes after the items are written.
+    #[tokio::test(flavor = "current_thread")]
+    async fn admitted_items_charge_process_memory_until_written() {
+        let memory = crate::resources::ByteLedger::new(1_000);
+        let sink = MemorySink::default();
+        let (hang, state) = (Arc::clone(&sink.hang), Arc::clone(&sink.state));
+        let outbox = Outbox::charging(
+            sink,
+            4,
+            OutboxLimits {
+                items: 1_024,
+                bytes: 400,
+            },
+            &memory,
+        );
+        let tenant = DataTenantId::new_v7();
+        state.lock().expect("unpoisoned").hanging.insert(tenant);
+
+        outbox.stage(tenant, 60_u32);
+        outbox.stage(tenant, 60_u32);
+        assert_eq!(outbox.pending(), 1, "the second item is shed on bytes");
+        outbox
+            .reserve(1)
+            .expect("reserved bytes are free")
+            .stage(tenant, 50_u32);
+        assert_eq!(memory.used(), 110, "only admitted items are charged");
+
+        state.lock().expect("unpoisoned").hanging.clear();
+        hang.notify_one();
+        assert_eq!(outbox.settle(within(10)).await, 0);
+        assert_eq!(memory.used(), 0, "written items return their bytes");
     }
 
     /// Large items shed on bytes before the item limit is reached, small ones

@@ -941,7 +941,8 @@ pub async fn compose_bifrost(
     // The one process Scribe outbox: Gate, Oracle, peer security, every
     // request-path decision, gateway capture, and Verifier results stage on
     // it. It submits to the local Scribe, else to a peer Scribe, in frames
-    // that fit the configured Scribe request ceiling.
+    // that fit the configured Scribe request ceiling, and charges what it
+    // holds to the process memory ledger.
     let scribe_outbox = crate::scribe_outbox::ScribeSink::bounded_outbox(
         crate::scribe_outbox::ScribeRoute::select(
             scribe.as_ref().map(|parts| &parts.scribe),
@@ -955,6 +956,7 @@ pub async fn compose_bifrost(
             bytes: scribe_config.outbox_bytes,
         },
         Some(postgres.wyrd().clone()),
+        Some(bifrost_resources.process().memory()),
     );
     let scribe = if let Some(parts) = scribe {
         let fragment_security_audit = Arc::new(

@@ -1329,8 +1329,9 @@ keeps at least 1 GiB of that limit outside the process memory ledger
 (`WYRD_SERVER_MEMORY_MIN_BYTES` raises the minimum): the baseline for
 server and dependency allocations no ledger tracks, accounting headroom
 rather than preallocated memory. The process memory ledger is the limit less
-that minimum, and hosted verification and buffered request bodies charge the
-same ledger while they use it
+that minimum, and hosted verification, buffered request bodies, and the
+Scribe outbox's admitted writes, from staging until written or lost, charge
+the same ledger while they use it
 ([Agents, tools, and workspaces](wyrd-design.md#agents-tools-and-workspaces)).
 The Bifrost cap defaults to the whole ledger, and
 `WYRD_BIFROST_MEMORY_LIMIT_BYTES` may only lower it. Governed Bifrost growth
@@ -1901,7 +1902,7 @@ use age.
 - One process plan bounds memory and disposable scratch for every capability
   in the process. The Bifrost root's growth, Oracle and Forge spill bytes, and
   cached entries are charges on the process memory and scratch ledgers that
-  hosted verification and request buffering also charge, so no byte is
+  hosted verification, request buffering, and the Scribe outbox also charge, so no byte is
   promised twice and no capability holds an idle share beyond the server
   minimum. A charge returns only when its owner has settled the bytes: a cache
   entry when its last reference drops, a spill file when it is deleted. Pressure

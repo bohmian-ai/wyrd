@@ -55,8 +55,9 @@ use wyrd_spec::verification::{VerificationError, VerificationExecutionStatus};
 
 use super::inputs::InputResolver;
 use super::results::{ResultPayloadBuilder, ResultRun};
-use crate::scribe_outbox::{ScribeOutbox, ScribeWrite, revision_batch_id};
+use crate::scribe_outbox::{ScribeOutbox, ScribeSink, ScribeWrite, revision_batch_id};
 use crate::state::AppState;
+use wyrd_runtime::outbox::Reservation;
 
 /// The table every revision is a row of, and the logical table of every
 /// revision's batch fence.
@@ -344,13 +345,15 @@ impl Writer {
     /// Persist every change in background until an accepted revision holds
     /// the latest one or the writer breaks.
     ///
-    /// Each turn freezes the live state, every change so far, into the next
-    /// revision under the short lock, then writes it outside the lock, so
-    /// changes made while a revision is in flight coalesce into the one after
-    /// it and only one frozen copy exists at a time.
+    /// Each turn first reserves the revision's outbox slot, then freezes the
+    /// live state, every change so far, into the next revision under the
+    /// short lock and stages it at once, so a frozen copy never waits for
+    /// capacity uncharged. Changes made while a revision is in flight
+    /// coalesce into the one after it, and only one frozen copy exists at a
+    /// time.
     async fn flush(self: Arc<Self>) {
         loop {
-            let (revision, covers, state) = {
+            {
                 let mut held = self.lock();
                 if held.broken || held.covered >= held.changes {
                     held.writing = false;
@@ -358,31 +361,69 @@ impl Writer {
                     self.flushed.notify_waiters();
                     return;
                 }
-                (held.revision + 1, held.changes, held.state.clone())
+            }
+            let written = match self.reserve().await {
+                Some(slot) => {
+                    let (revision, covers, state) = {
+                        let held = self.lock();
+                        (held.revision + 1, held.changes, held.state.clone())
+                    };
+                    Some((revision, covers, self.write(slot, revision, state).await))
+                }
+                None => None,
             };
-            let accepted = self.write(revision, state).await;
             {
                 let mut held = self.lock();
-                if accepted {
-                    held.revision = revision;
-                    held.covered = covers;
-                } else {
-                    tracing::warn!(execution_id = %self.row.execution_id, revision, "an execution state revision was not accepted; its writer stops");
-                    held.broken = true;
+                match written {
+                    Some((revision, covers, true)) => {
+                        held.revision = revision;
+                        held.covered = covers;
+                    }
+                    Some((revision, _, false)) => {
+                        tracing::warn!(execution_id = %self.row.execution_id, revision, "an execution state revision was not accepted; its writer stops");
+                        held.broken = true;
+                    }
+                    None => {
+                        tracing::warn!(execution_id = %self.row.execution_id, "the execution's lease was lost before its next revision was staged; its writer stops");
+                        held.broken = true;
+                    }
                 }
             }
             self.flushed.notify_waiters();
         }
     }
 
-    /// Stage `state` as `revision` under the revision's batch identity and
-    /// wait for Scribe to accept it, returning whether it did.
+    /// Reserve one outbox slot for the next revision, waiting for capacity
+    /// while the outbox is full, so a revision is never shed; `None` once
+    /// the lease is lost. Nothing here holds the state's lock.
+    async fn reserve(&self) -> Option<Reservation<ScribeSink>> {
+        loop {
+            tokio::select! {
+                biased;
+                () = self.lost.cancelled() => return None,
+                reserved = self.outbox.reserve_until(1, std::time::Instant::now() + CAPACITY_WAIT) => {
+                    if let Ok(slot) = reserved {
+                        return Some(slot);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Stage `state` as `revision` on its reserved `slot` under the
+    /// revision's batch identity and wait for Scribe to accept it, returning
+    /// whether it did.
     ///
-    /// The revision takes a reserved outbox slot, waiting for capacity while
-    /// the outbox is full, so it is never shed; its lease's loss ends the
-    /// wait. The outbox writer prepares the row, so this does no encoding,
-    /// and nothing here holds the state's lock.
-    async fn write(&self, revision: i64, state: ExecutionState) -> bool {
+    /// Staging charges the revision's weight to the outbox and the process
+    /// memory ledger until it is written; its lease's loss ends the wait.
+    /// The outbox writer prepares the row, so this does no encoding, and
+    /// nothing here holds the state's lock.
+    async fn write(
+        &self,
+        slot: Reservation<ScribeSink>,
+        revision: i64,
+        state: ExecutionState,
+    ) -> bool {
         let (sender, acked) = oneshot::channel();
         let write = ScribeWrite::ExecutionState {
             batch: revision_batch(self.row.execution_id, revision),
@@ -390,22 +431,10 @@ impl Writer {
             attribution: self.row.attribution,
             acked: Mutex::new(Some(sender)),
         };
-        let lost = &self.lost;
-        let slot = loop {
-            tokio::select! {
-                biased;
-                () = lost.cancelled() => return false,
-                reserved = self.outbox.reserve_until(1, std::time::Instant::now() + CAPACITY_WAIT) => {
-                    if let Ok(slot) = reserved {
-                        break slot;
-                    }
-                }
-            }
-        };
         slot.stage(self.tenant, write);
         tokio::select! {
             biased;
-            () = lost.cancelled() => false,
+            () = self.lost.cancelled() => false,
             acked = acked => acked.is_ok(),
         }
     }

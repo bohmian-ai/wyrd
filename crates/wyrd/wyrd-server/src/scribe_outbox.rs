@@ -1215,13 +1215,14 @@ impl ScribeSink {
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub(crate) fn outbox(route: Option<ScribeRoute>, request_bytes: usize) -> Arc<ScribeOutbox> {
-        Self::bounded_outbox(route, request_bytes, Self::DEFAULT_LIMITS, None)
+        Self::bounded_outbox(route, request_bytes, Self::DEFAULT_LIMITS, None, None)
     }
 
     /// Starts an outbox like [`Self::outbox`] admitting at most `limits`
     /// writes and bytes (`scribe.outbox_capacity` and `scribe.outbox_bytes`),
-    /// and recording acknowledged grouped activity through `groups`, when
-    /// given.
+    /// recording acknowledged grouped activity through `groups`, and
+    /// charging every admitted write to the process `memory` ledger until it
+    /// is written or lost, each when given.
     ///
     /// # Panics
     /// Panics when called outside a Tokio runtime, because the writer task is
@@ -1232,12 +1233,13 @@ impl ScribeSink {
         request_bytes: usize,
         limits: OutboxLimits,
         groups: Option<WyrdPostgres>,
+        memory: Option<&wyrd_runtime::resources::ByteLedger>,
     ) -> Arc<ScribeOutbox> {
-        Outbox::new(
-            Self::new(route, request_bytes, groups),
-            SCRIBE_WRITERS,
-            limits,
-        )
+        let sink = Self::new(route, request_bytes, groups);
+        match memory {
+            Some(memory) => Outbox::charging(sink, SCRIBE_WRITERS, limits, memory),
+            None => Outbox::new(sink, SCRIBE_WRITERS, limits),
+        }
     }
 
     /// A sink submitting along `route` in frames sized for `request_bytes`,
@@ -1272,6 +1274,7 @@ impl ScribeSink {
             vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES,
             Self::DEFAULT_LIMITS,
             groups,
+            None,
         )
     }
 
@@ -2661,12 +2664,14 @@ mod tests {
     /// reason, and the terminal outcome repeating them, charge at least
     /// those bytes without any publication, so an outbox of exactly that
     /// charge refuses another reservation while the revision waits and
-    /// admits one once it is written.
+    /// admits one once it is written; the process memory ledger holds the
+    /// same charge while it waits and nothing once it is written.
     ///
     /// # Panics
     ///
     /// Panics when the revision is undercharged, a reservation is admitted
-    /// while it waits, or none is once it is written.
+    /// while it waits, none is once it is written, or the process ledger
+    /// differs from the revision's charge.
     #[tokio::test]
     async fn checkpoint_charge_tracks_variable_settlements() {
         let value = 64 * 1024;
@@ -2732,6 +2737,7 @@ mod tests {
         );
 
         let scribe = Arc::new(TableGate::new(ScribeTable::ExecutionEvents));
+        let memory = wyrd_runtime::resources::ByteLedger::new(u64::MAX);
         let outbox = ScribeSink::bounded_outbox(
             Some(ScribeRoute::Local(Arc::clone(&scribe) as _, None)),
             BIFROST_INGEST_REQUEST_LIMIT_BYTES,
@@ -2740,6 +2746,7 @@ mod tests {
                 bytes: weight,
             },
             None,
+            Some(&memory),
         );
         let tenant = DataTenantId::new_v7();
         outbox
@@ -2750,6 +2757,11 @@ mod tests {
             panic!("a waiting revision holds its whole charge");
         };
         assert_eq!(refused.unit, "bytes");
+        assert_eq!(
+            memory.used(),
+            weight as u64,
+            "a waiting revision holds its charge on the process ledger"
+        );
         scribe.release.add_permits(1);
         tokio::time::timeout(Duration::from_secs(10), acked)
             .await
@@ -2764,6 +2776,7 @@ mod tests {
         outbox
             .reserve(1)
             .expect("a written revision releases its charge");
+        assert_eq!(memory.used(), 0, "a written revision returns its bytes");
     }
 
     /// Proves cutting a mixed slice's frames into chunks copies no part: every
@@ -3814,7 +3827,13 @@ mod tests {
     /// Starts an outbox submitting along `route` under a `request_bytes`
     /// Scribe ceiling.
     fn route_outbox(route: ScribeRoute, request_bytes: usize) -> Arc<ScribeOutbox> {
-        ScribeSink::bounded_outbox(Some(route), request_bytes, ScribeSink::DEFAULT_LIMITS, None)
+        ScribeSink::bounded_outbox(
+            Some(route),
+            request_bytes,
+            ScribeSink::DEFAULT_LIMITS,
+            None,
+            None,
+        )
     }
 
     /// Each distinct acknowledged frame once, in first-acknowledged order,
@@ -4538,6 +4557,7 @@ mod tests {
             Some(ScribeRoute::Local(Arc::clone(&scribe) as _, None)),
             SMALL_REQUEST_BYTES,
             ScribeSink::DEFAULT_LIMITS,
+            None,
             None,
         );
         let tenants: Vec<DataTenantId> = (0..SCRIBE_WRITERS)

@@ -1,0 +1,273 @@
+/**
+ * Exact verification execution loader: the execution's recorded status, the
+ * declared graph of the Verifier it ran, its bounded invocation and
+ * publication pages, and whatever the selected node needs. Each part is read
+ * and refused on its own; nothing is recomputed, awaited or resubmitted.
+ */
+import type { CardTypes, VerificationExecutionState } from 'wyrd-ai';
+import { failed, wyrdProblem, type CardRef, type Executor, type Loaded, type Problem, type QueryResult, type WireRequest, type WireResult } from './contract.js';
+import type { ExecutionInput } from './schemas.js';
+import { definitionGraph, type DefinitionGraph } from './verifier.js';
+
+interface Context {
+  readonly executor: Executor;
+  readonly signal?: AbortSignal;
+}
+
+/** One part of an execution: read, refused, or not available for a stated reason. */
+export type Part<T> = Extract<Loaded<T>, { state: 'populated' | 'denied' | 'error' }> | { readonly state: 'empty'; readonly reason: string };
+
+/** The exact Verifier an execution ran, as registered. */
+export interface ExecutionDefinition {
+  readonly ref: CardRef;
+  readonly spec: CardTypes.VerifierSpec;
+  readonly graph: DefinitionGraph;
+}
+
+/** One pinned member of a session source slot, in the recorded order. */
+export interface SessionMember {
+  readonly execution_id: string;
+  /** The member's own recorded status; absent beyond the read bound. */
+  readonly status?: Part<VerificationExecutionState>;
+}
+
+/** One recorded drift result of the same binding. */
+export interface DriftPoint {
+  readonly execution_id: string;
+  readonly ended_at: string;
+  readonly window_start: string | null;
+  readonly window_end: string | null;
+  /** Recorded score per feature; null where the feature was inconclusive or absent. */
+  readonly scores: Readonly<Record<string, number | null>>;
+}
+
+/** The recorded window of a drift judgment and its binding's bounded history, oldest first. */
+export interface DriftContext {
+  readonly window_start: string | null;
+  readonly window_end: string | null;
+  readonly history: readonly DriftPoint[];
+}
+
+/** What `VerificationExecution` renders. */
+export interface ExecutionData {
+  readonly status: VerificationExecutionState;
+  readonly definition: Part<ExecutionDefinition>;
+  readonly invocations: Part<CardTypes.InvocationPage>;
+  readonly publications: Part<CardTypes.PublicationPage>;
+  /** Completed records, read only when asked for. */
+  readonly details?: Part<CardTypes.VerificationDetails>;
+  /** The selected publication's body or manifest. */
+  readonly publication?: Part<CardTypes.Publication>;
+  /** The pinned members of the selected session source slot. */
+  readonly members?: readonly SessionMember[];
+  /** The accepted input declarations, read when an input is selected. */
+  readonly inputs?: Part<unknown>;
+  /** The drift context of the selected drift requirement. */
+  readonly drift?: Part<DriftContext>;
+}
+
+/** Props of `VerificationExecution`. */
+export interface VerificationExecutionProps {
+  readonly input: ExecutionInput;
+  readonly result: Loaded<ExecutionData>;
+}
+
+/** The most invocations or publications one page reads; the server's own maximum. */
+export const EXECUTION_PAGE = 200;
+/** The most session members whose own status one load reads. */
+export const MEMBER_READS = 50;
+/** The most earlier results a drift history reads. */
+export const DRIFT_HISTORY = 30;
+
+const TERMINAL: readonly VerificationExecutionState['status'][] = ['completed', 'cancelled', 'timed_out', 'errored'];
+/** Whether the execution has reached a terminal lifecycle status. */
+export const settled = (status: VerificationExecutionState['status']) => TERMINAL.includes(status);
+
+const part = <T>(read: WireResult, value: (value: never) => T = (each) => each as T): Part<T> =>
+  read.ok ? { state: 'populated', data: value(read.value as never) } : failed(read.problem);
+
+const VERIFIER_UID = 'SELECT verifier_card_uid FROM bifrost.verification.execution_inputs WHERE execution_id = $1 LIMIT 1';
+const INPUTS = 'SELECT to_json(inputs) AS inputs FROM bifrost.verification.execution_inputs WHERE execution_id = $1 LIMIT 1';
+const DRIFT_ROW = 'SELECT binding_id, window_start, window_end, ended_at FROM bifrost.verification.results WHERE execution_id = $1 LIMIT 1';
+const DRIFT_ROWS =
+  'SELECT r.execution_id, r.ended_at, r.window_start, r.window_end, to_json(o.output) AS output ' +
+  'FROM bifrost.verification.results r JOIN bifrost.verification.execution_outputs o ON o.result_id = r.result_id ' +
+  `WHERE r.binding_id = $1 AND r.ended_at <= $2::timestamptz ORDER BY r.ended_at DESC LIMIT ${DRIFT_HISTORY}`;
+
+/** A Variant column arrives as JSON text or as the value itself. */
+function json(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
+const text = (value: unknown) => (value === null || value === undefined ? null : String(value));
+
+/** The Verifier an execution ran: the result's exact reference, else the retained UID through the existing UID Card read. */
+async function readDefinition(state: VerificationExecutionState, one: (request: WireRequest) => Promise<WireResult>): Promise<Part<ExecutionDefinition>> {
+  let read: WireResult;
+  if (state.result) read = await one({ op: 'cards.get_by_ref', card_ref: state.result.verifier });
+  else {
+    const metadata = await one({ op: 'bifrost.query', sql: VERIFIER_UID, params: [state.execution_id], max_rows: 1 });
+    if (!metadata.ok) return failed(metadata.problem);
+    const uid = (metadata.value as QueryResult).rows[0]?.[0];
+    if (typeof uid !== 'string')
+      return { state: 'empty', reason: 'The Verifier this execution runs is not yet visible in retained metadata. Refresh to read it again.' };
+    read = await one({ op: 'cards.get_by_uid', kind: 'Verifier', card_uid: uid });
+  }
+  if (!read.ok) return failed(read.problem);
+  const card = read.value as CardTypes.RegisteredCard;
+  if (card.kind !== 'Verifier') return { state: 'error', problem: wyrdProblem('validation', `${card.metadata.name}@${card.metadata.version} is a ${card.kind} Card, not a Verifier`) };
+  const spec = card.spec as CardTypes.VerifierSpec;
+  const ref = { kind: 'Verifier', name: card.metadata.name, version: card.metadata.version, uid: card.metadata.uid } as CardRef;
+  return { state: 'populated', data: { ref, spec, graph: definitionGraph(spec) } };
+}
+
+/** The recorded window of this execution's result and the earlier results of its binding. */
+async function readDrift(id: string, requirement: string, one: (request: WireRequest) => Promise<WireResult>): Promise<Part<DriftContext>> {
+  const own = await one({ op: 'bifrost.query', sql: DRIFT_ROW, params: [id], max_rows: 1 });
+  if (!own.ok) return failed(own.problem);
+  const row = (own.value as QueryResult).rows[0];
+  if (!row) return { state: 'empty', reason: 'The retained result of this execution is not yet visible. Refresh to read it again.' };
+  const [binding, window_start, window_end, ended] = [text(row[0]), text(row[1]), text(row[2]), text(row[3])];
+  if (binding === null || ended === null) return { state: 'populated', data: { window_start, window_end, history: [] } };
+  const rows = await one({ op: 'bifrost.query', sql: DRIFT_ROWS, params: [binding, ended], max_rows: DRIFT_HISTORY });
+  if (!rows.ok) return failed(rows.problem);
+  const history = (rows.value as QueryResult).rows.map((each): DriftPoint => {
+    const output = json(each[4]) as { requirements?: readonly CardTypes.RequirementResult[] } | null;
+    const features = output?.requirements?.find((judged) => judged.id === requirement)?.detail?.drift?.features ?? {};
+    return {
+      execution_id: String(each[0]),
+      ended_at: String(each[1]),
+      window_start: text(each[2]),
+      window_end: text(each[3]),
+      scores: Object.fromEntries(Object.entries(features).map(([name, feature]) => [name, feature.score]))
+    };
+  });
+  return { state: 'populated', data: { window_start, window_end, history: history.reverse() } };
+}
+
+/**
+ * Load one exact execution. A refused or missing status ends the load with
+ * that outcome and no further read. Otherwise the definition, the invocation
+ * page and the publication page are read independently, and the selection
+ * adds only what it names: completed details when asked for and the
+ * execution has a result, one publication, one source slot's members, the
+ * accepted inputs, or one drift requirement's recorded context.
+ */
+export async function loadExecution(input: ExecutionInput, context: Context): Promise<VerificationExecutionProps> {
+  const one = async (request: WireRequest) => (await context.executor.run([request], context.signal))[0] as WireResult;
+  const id = input.executionId;
+  const status = await one({ op: 'verification.get_execution', execution_id: id });
+  if (!status.ok) return { input, result: failed(status.problem) };
+  const state = status.value as VerificationExecutionState;
+  const [type, node] = (input.node ?? '').split(/:(.*)/s);
+  const slot = type === 'input' ? state.group?.sources[node] : undefined;
+  const drifted = type === 'req' && state.result?.outcome.requirements.some((each) => each.id === node && each.detail?.drift);
+
+  const [definition, invocations, publications, details, publication, members, inputs, drift] = await Promise.all([
+    readDefinition(state, one),
+    one({ op: 'verification.list_invocations', execution_id: id, limit: EXECUTION_PAGE, ...(input.invocations ? { cursor: input.invocations } : {}) }).then((read) => part<CardTypes.InvocationPage>(read)),
+    one({ op: 'verification.list_publications', execution_id: id, limit: EXECUTION_PAGE, ...(input.publications ? { cursor: input.publications } : {}) }).then((read) => part<CardTypes.PublicationPage>(read)),
+    !input.details
+      ? undefined
+      : !state.result
+        ? ({ state: 'empty', reason: 'Details are recorded when the execution completes with a visible result.' } as const)
+        : one({ op: 'verification.get_execution_details', execution_id: id }).then((read) => part<CardTypes.VerificationDetails>(read)),
+    type === 'step' && input.producer && input.output
+      ? one({ op: 'verification.get_publication', execution_id: id, step_id: node, name: input.output, ...input.producer }).then((read) => part<CardTypes.Publication>(read))
+      : undefined,
+    slot
+      ? context.executor
+          .run(slot.execution_ids.slice(0, MEMBER_READS).map((member) => ({ op: 'verification.get_execution', execution_id: member }) as const), context.signal)
+          .then((reads) => slot.execution_ids.map((member, index): SessionMember => ({ execution_id: member, ...(reads[index] ? { status: part<VerificationExecutionState>(reads[index]) } : {}) })))
+      : undefined,
+    type === 'input' && !slot
+      ? one({ op: 'bifrost.query', sql: INPUTS, params: [id], max_rows: 1 }).then(
+          (read): Part<unknown> =>
+            !read.ok
+              ? failed(read.problem)
+              : (read.value as QueryResult).rows[0]
+                ? { state: 'populated', data: (json((read.value as QueryResult).rows[0][0]) as Record<string, unknown> | null)?.[node] }
+                : { state: 'empty', reason: 'The accepted inputs of this execution are not yet visible. Refresh to read them again.' }
+        )
+      : undefined,
+    drifted ? readDrift(id, node, one) : undefined
+  ]);
+  return {
+    input,
+    result: {
+      state: 'populated',
+      data: { status: state, definition, invocations, publications, ...(details && { details }), ...(publication && { publication }), ...(members && { members }), ...(inputs && { inputs }), ...(drift && { drift }) }
+    }
+  };
+}
+
+/** A recorded state as its node shows it: a word, the tone its glyph and colour follow, and whether it recedes. */
+export interface NodeState {
+  readonly word: string;
+  readonly tone: 'neutral' | 'ok' | 'warn' | 'danger' | 'running';
+  readonly dim?: boolean;
+}
+
+type Invocation = CardTypes.ExecutionInvocation;
+/** The identity of one invocation without its attempt: its step, item and iteration. */
+const slotKey = (producer: CardTypes.Producer) => `${producer.item_index ?? ''}/${producer.iteration_index ?? ''}`;
+/** Whether two producers name the same step, item, iteration and attempt. */
+export const sameProducer = (a: CardTypes.Producer, b: Omit<CardTypes.Producer, 'step_id'> & { step_id?: string }) =>
+  (b.step_id === undefined || a.step_id === b.step_id) && a.attempt === b.attempt && (a.item_index ?? null) === (b.item_index ?? null) && (a.iteration_index ?? null) === (b.iteration_index ?? null);
+
+/** The last record of each invocation attempt of `step`, in first-seen order. */
+export function attemptsOf(items: readonly Invocation[], step: string): Invocation[] {
+  const last = new Map<string, Invocation>();
+  for (const item of items) if (item.producer.step_id === step) last.set(`${slotKey(item.producer)}/${item.producer.attempt}`, item);
+  return [...last.values()];
+}
+
+const OUTCOME_TONES = { passed: 'ok', failed: 'danger', inconclusive: 'warn', not_applicable: 'neutral' } as const;
+const STEP_TONES = { succeeded: 'ok', failed: 'danger', skipped: 'neutral' } as const;
+
+/** One word for several recorded values: the value they share, else how many of them are `bad`. */
+function together(values: readonly string[], bad: string): string {
+  if (new Set(values).size === 1) return values[0].replace('_', ' ');
+  return `${values.filter((value) => value === bad).length} of ${values.length} ${bad}`;
+}
+
+/**
+ * The recorded state of every step and requirement node, by node key. A step
+ * reads the last attempt of each of its items and iterations; a requirement
+ * reads the compact result, else its recorded requirement attempts. Nothing
+ * here positions or sizes a node.
+ */
+export function executionStates(graph: DefinitionGraph, status: VerificationExecutionState, items: readonly Invocation[]): Record<string, NodeState> {
+  const done = settled(status.status);
+  const idle: NodeState = { word: done ? 'not run' : 'pending', tone: 'neutral', dim: done };
+  const states: Record<string, NodeState> = {};
+  for (const step of graph.steps) {
+    const latest = new Map<string, Invocation>();
+    for (const item of attemptsOf(items, step.id)) if ((latest.get(slotKey(item.producer))?.producer.attempt ?? 0) <= item.producer.attempt) latest.set(slotKey(item.producer), item);
+    const last = [...latest.values()];
+    const speculation = last.find((item) => item.speculation !== 'none')?.speculation;
+    const dim = speculation === 'discarded' || speculation === 'blocked';
+    if (last.length === 0) states[step.key] = idle;
+    else if (last.some((item) => item.state === 'started')) states[step.key] = done ? { word: 'not finished', tone: 'neutral', dim: true } : { word: 'running', tone: 'running', dim };
+    else {
+      const recorded = last.map((item) => (item.state === 'action' ? item.status : item.state === 'requirement' ? item.outcome : 'started'));
+      const word = together(recorded, 'failed');
+      states[step.key] = { word, tone: recorded.includes('failed') ? 'danger' : (STEP_TONES[recorded[0] as keyof typeof STEP_TONES] ?? 'neutral'), dim };
+    }
+  }
+  for (const requirement of [...graph.steps.flatMap((step) => step.requirements), ...graph.requirements]) {
+    const judged = status.result?.outcome.requirements.filter((each) => each.id === requirement.id).map((each) => each.outcome);
+    const recorded = judged?.length ? judged : attemptsOf(items, requirement.id).flatMap((item) => (item.state === 'requirement' ? [item.outcome] : []));
+    if (recorded.length === 0) states[requirement.key] = { word: 'not judged', tone: 'neutral', dim: done };
+    else states[requirement.key] = { word: together(recorded, 'failed'), tone: recorded.includes('failed') ? 'danger' : OUTCOME_TONES[recorded[0]] };
+  }
+  return states;
+}
+
+/** A refused part's problem, for callers that only report it. */
+export const refusal = (part: Part<unknown> | undefined): Problem | undefined => (part?.state === 'denied' || part?.state === 'error' ? part.problem : undefined);

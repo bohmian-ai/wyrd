@@ -1,14 +1,16 @@
 <!--
   A Verifier's declared graph: inputs, steps with their attached requirements
   and whole-Verifier requirements, under stage headings, with labelled
-  dependency arrows. Read-only: nothing drags, connects or deletes, and no
-  execution state is drawn. Laid out once from topology; selection, focus and
-  zoom never move a node.
+  dependency arrows. Read-only: nothing drags, connects or deletes. Given an
+  execution's recorded states it marks each node with its state; without them
+  no execution state is drawn. Laid out once from topology; selection, focus,
+  zoom and recorded state never move or resize a node.
 -->
 <script lang="ts">
   import { Position, SvelteFlow, type Edge, type Node, type Viewport } from '@xyflow/svelte';
   import '@xyflow/svelte/dist/base.css';
   import { onMount, setContext } from 'svelte';
+  import type { NodeState } from '../execution.js';
   import type { DefinitionGraph } from '../verifier.js';
   import { HEAD, layoutDefinition, needsText } from '../verifier-layout.js';
   import Panel from './Panel.svelte';
@@ -20,9 +22,11 @@
     graph: DefinitionGraph;
     /** The selected node key (`input:`, `step:` or `req:` plus the id); empty for none. */
     selected?: string;
+    /** Recorded state by node key, for an execution; absent, the graph is a definition only. */
+    states?: Readonly<Record<string, NodeState>>;
   }
 
-  let { graph, selected = $bindable('') }: Props = $props();
+  let { graph, selected = $bindable(''), states }: Props = $props();
 
   // Laid out once: the arrays below are never replaced, so nothing re-flows after mount.
   // svelte-ignore state_referenced_locally
@@ -58,6 +62,9 @@
   setContext<GraphSelection>(SELECTION, {
     get selected() {
       return selected;
+    },
+    get states() {
+      return states;
     },
     select: (key) => (selected = key)
   });
@@ -109,7 +116,7 @@
   }
 </script>
 
-<Panel title="Graph" note="Declared dependencies. No execution state is shown.">
+<Panel title="Graph" note={states ? 'Declared dependencies, marked with recorded state.' : 'Declared dependencies. No execution state is shown.'}>
   {#snippet tools()}
     <span class="zoom" role="group" aria-label="Zoom">
       <span class="value" data-zoom>{Math.round(viewport.zoom * 100)}%</span>

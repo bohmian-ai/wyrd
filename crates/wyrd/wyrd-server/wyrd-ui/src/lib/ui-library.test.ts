@@ -60,6 +60,7 @@ import {
   RunsOn,
   VerifierDefinition,
   VerifierGraph,
+  VerificationExecution,
   fmtYaml,
   Chart,
   Drawer,
@@ -97,6 +98,8 @@ import {
   definitionGraph,
   loadRunsOn,
   loadVerifierDefinition,
+  executionStates,
+  loadExecution,
   loadChart,
   loadRecordDetail,
   loadRecordTable,
@@ -140,6 +143,10 @@ import {
   costs,
   denied,
   DRIFT_VERIFIER,
+  driftReport,
+  executionDetails,
+  executionStatus,
+  EXECUTIONS,
   facet,
   fixtureExecutor,
   LOG,
@@ -1290,6 +1297,7 @@ test('TASK-004: Canonical signal interactions', async () => {
     'VersionDiff',
     'VerifierDefinition',
     'RunsOn',
+    'VerificationExecution',
     'StatStrip',
     'FacetRail',
     'RecordTable',
@@ -2649,4 +2657,332 @@ test('verifier definition and bindings stay truthful across hosts and states', a
   await tick();
   expect(view.container).not.toHaveTextContent('A support ticket carries an answer.');
   expect(view.container.querySelector('[data-node="step:summarise"]')).toBeInTheDocument();
+});
+
+/** The text of each cell of each body row. */
+const cells = (table: Element) => [...table.querySelectorAll('tbody tr')].map((row) => [...row.querySelectorAll('td')].map((cell) => cell.textContent?.trim()));
+const reads = (calls: { request: WireRequest }[]) => calls.map(({ request }) => (request.op === 'bifrost.query' ? `query ${request.sql.split(' FROM ')[0]}` : request.op));
+const partOf = (loaded: Awaited<ReturnType<typeof loadExecution>>) => {
+  if (loaded.result.state !== 'populated') throw new Error(`execution is ${loaded.result.state}`);
+  return loaded.result.data;
+};
+
+test('execution loader reads each part once and keeps refusals apart', async () => {
+  // Running, no result: the Verifier comes from retained metadata and the existing UID Card read; details are never read.
+  const running = fixtureRecording();
+  const live = partOf(await loadExecution({ executionId: EXECUTIONS.running, details: true }, { executor: running.executor }));
+  expect(running.calls.map((call) => call.request)).toEqual([
+    { op: 'verification.get_execution', execution_id: 'exec_running' },
+    { op: 'bifrost.query', sql: 'SELECT verifier_card_uid FROM bifrost.verification.execution_inputs WHERE execution_id = $1 LIMIT 1', params: ['exec_running'], max_rows: 1 },
+    { op: 'verification.list_invocations', execution_id: 'exec_running', limit: 200 },
+    { op: 'verification.list_publications', execution_id: 'exec_running', limit: 200 },
+    { op: 'cards.get_by_uid', kind: 'Verifier', card_uid: 'card_verifier_ticket-policy_1.1.0' }
+  ]);
+  expect(live.definition).toMatchObject({ state: 'populated', data: { ref: { ...VERIFIER, uid: 'card_verifier_ticket-policy_1.1.0' }, graph: definitionGraph(specOf('ticket-policy@1.1.0')) } });
+  expect(live.details).toEqual({ state: 'empty', reason: 'Details are recorded when the execution completes with a visible result.' });
+  expect(live.status).toBe(executionStatus.exec_running);
+
+  // Settled: the result's exact reference reads the Card; no metadata query; details only when asked for.
+  const settled = fixtureRecording();
+  const compact = partOf(await loadExecution({ executionId: EXECUTIONS.settled }, { executor: settled.executor }));
+  expect(reads(settled.calls)).toEqual(['verification.get_execution', 'cards.get_by_ref', 'verification.list_invocations', 'verification.list_publications']);
+  expect(settled.calls[1].request).toEqual({ op: 'cards.get_by_ref', card_ref: VERIFIER });
+  expect(compact.details).toBeUndefined();
+  const asked = fixtureRecording();
+  expect(partOf(await loadExecution({ executionId: EXECUTIONS.settled, details: true }, { executor: asked.executor })).details).toEqual({ state: 'populated', data: executionDetails });
+  expect(reads(asked.calls)).toContain('verification.get_execution_details');
+
+  // Unknown, foreign and denied executions end the load with the server's problem and no dependent read; 404 is never "running".
+  for (const [problem, state] of [[{ code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND', title: 'Execution not found', status: 404 }, 'error'], [denied, 'denied']] as const) {
+    const refused = recording(() => ({ ok: false, problem }));
+    expect((await loadExecution({ executionId: 'exec_other', node: 'step:score', producer: { attempt: 1 }, output: 'units', details: true }, { executor: refused.executor })).result).toEqual({ state, problem });
+    expect(refused.calls).toHaveLength(1);
+  }
+
+  // A refused metadata query reads no Card; progress and outputs stay readable. Metadata not yet visible says so.
+  const noQuery = fixtureRecording((request) => (request.op === 'bifrost.query' ? { ok: false, problem: denied } : undefined));
+  const partial = partOf(await loadExecution({ executionId: EXECUTIONS.running }, { executor: noQuery.executor }));
+  expect(partial.definition).toEqual({ state: 'denied', problem: denied });
+  expect(reads(noQuery.calls)).not.toContain('cards.get_by_uid');
+  expect(partial.invocations.state).toBe('populated');
+  expect(partial.publications.state).toBe('populated');
+  const unseen = fixtureRecording((request) => (request.op === 'bifrost.query' ? { ok: true, value: { columns: [], rows: [], terminal: terminal(0) } } : undefined));
+  expect(partOf(await loadExecution({ executionId: EXECUTIONS.running }, { executor: unseen.executor })).definition).toEqual({ state: 'empty', reason: 'The Verifier this execution runs is not yet visible in retained metadata. Refresh to read it again.' });
+  expect(reads(unseen.calls)).not.toContain('cards.get_by_uid');
+  // A refused Card, progress or output read is its own part.
+  const noCard = partOf(await loadExecution({ executionId: EXECUTIONS.settled }, { executor: fixtureRecording((request) => (request.op === 'cards.get_by_ref' || request.op === 'verification.list_publications' ? { ok: false, problem: denied } : undefined)).executor }));
+  expect([noCard.definition.state, noCard.invocations.state, noCard.publications.state]).toEqual(['denied', 'populated', 'denied']);
+  const wrongKind = partOf(await loadExecution({ executionId: EXECUTIONS.settled }, { executor: fixtureRecording((request) => (request.op === 'cards.get_by_ref' ? { ok: true, value: agent } : undefined)).executor }));
+  expect(wrongKind.definition).toMatchObject({ state: 'error', problem: { code: 'WYRD_SPEC_400_VALIDATION' } });
+
+  // One publication is read by its exact producer; without a producer nothing is read. Cursors pass through opaque.
+  const output = fixtureRecording();
+  const shown = partOf(await loadExecution({ executionId: EXECUTIONS.settled, node: 'step:score', producer: { attempt: 2, item_index: null }, output: 'units', invocations: 'c/1=', publications: 'c/2=' }, { executor: output.executor }));
+  expect(output.calls.map((call) => call.request)).toEqual(
+    expect.arrayContaining([
+      { op: 'verification.get_publication', execution_id: 'exec_settled', step_id: 'score', name: 'units', attempt: 2, item_index: null },
+      { op: 'verification.list_invocations', execution_id: 'exec_settled', limit: 200, cursor: 'c/1=' },
+      { op: 'verification.list_publications', execution_id: 'exec_settled', limit: 200, cursor: 'c/2=' }
+    ])
+  );
+  expect(shown.publication).toMatchObject({ state: 'populated', data: { kind: 'json', value: { units: 3 }, producer: { step_id: 'score', attempt: 2 } } });
+  const unpicked = fixtureRecording();
+  await loadExecution({ executionId: EXECUTIONS.settled, node: 'step:score', output: 'units' }, { executor: unpicked.executor });
+  expect(reads(unpicked.calls)).not.toContain('verification.get_publication');
+
+  // A session source reads its pinned members in recorded order; a member that cannot be read keeps its row.
+  const session = fixtureRecording();
+  const members = partOf(await loadExecution({ executionId: EXECUTIONS.session, node: 'input:outcomes' }, { executor: session.executor })).members!;
+  expect(session.calls.filter((call) => call.request.op === 'verification.get_execution').map((call) => (call.request as { execution_id: string }).execution_id)).toEqual(['exec_session', 'exec_settled', 'exec_m2', 'exec_gone']);
+  expect(members.map((member) => [member.execution_id, member.status?.state])).toEqual([['exec_settled', 'populated'], ['exec_m2', 'populated'], ['exec_gone', 'error']]);
+  expect(reads(session.calls).filter((read) => read.startsWith('query'))).toEqual([]);
+  // An ordinary input reads the accepted value of that input alone.
+  const accepted = fixtureRecording();
+  expect(partOf(await loadExecution({ executionId: EXECUTIONS.settled, node: 'input:ticket' }, { executor: accepted.executor })).inputs).toEqual({ state: 'populated', data: { answer: 'Refund issued' } });
+  expect(accepted.calls.find((call) => call.request.op === 'bifrost.query')?.request).toMatchObject({ sql: 'SELECT to_json(inputs) AS inputs FROM bifrost.verification.execution_inputs WHERE execution_id = $1 LIMIT 1', params: ['exec_settled'], max_rows: 1 });
+
+  // Drift: the recorded window, then a bounded history of the same binding up to this result, oldest first; nothing is recomputed.
+  const drift = fixtureRecording();
+  const context = partOf(await loadExecution({ executionId: EXECUTIONS.drift, node: 'req:latency-stable' }, { executor: drift.executor })).drift;
+  const queries = drift.calls.map((call) => call.request).filter((request) => request.op === 'bifrost.query');
+  expect(queries).toEqual([
+    { op: 'bifrost.query', sql: 'SELECT binding_id, window_start, window_end, ended_at FROM bifrost.verification.results WHERE execution_id = $1 LIMIT 1', params: ['exec_drift'], max_rows: 1 },
+    {
+      op: 'bifrost.query',
+      sql:
+        'SELECT r.execution_id, r.ended_at, r.window_start, r.window_end, to_json(o.output) AS output FROM bifrost.verification.results r JOIN bifrost.verification.execution_outputs o ON o.result_id = r.result_id ' +
+        'WHERE r.binding_id = $1 AND r.ended_at <= $2::timestamptz ORDER BY r.ended_at DESC LIMIT 30',
+      params: ['bind_01', '2026-10-20T11:00:05Z'],
+      max_rows: 30
+    }
+  ]);
+  expect(context).toMatchObject({ state: 'populated', data: { window_start: '2026-10-20T10:00:00Z', window_end: '2026-10-20T11:00:00Z' } });
+  expect((context as { data: { history: { execution_id: string; scores: object }[] } }).data.history.map((point) => [point.execution_id, point.scores])).toEqual([
+    ['exec_drift_3', { latency_ms: 0.08, tokens: 0.04, cost: null }],
+    ['exec_drift_2', { latency_ms: 0.12, tokens: 0.04, cost: null }],
+    ['exec_drift_1', { latency_ms: 0.22, tokens: 0.04, cost: null }],
+    ['exec_drift', { latency_ms: 0.31, tokens: 0.04, cost: null }]
+  ]);
+  // A requirement without a drift judgment reads no history; a refused history query is its own part.
+  const plain = fixtureRecording();
+  await loadExecution({ executionId: EXECUTIONS.settled, node: 'req:has-answer' }, { executor: plain.executor });
+  expect(reads(plain.calls).filter((read) => read.startsWith('query'))).toEqual([]);
+  const noHistory = partOf(await loadExecution({ executionId: EXECUTIONS.drift, node: 'req:latency-stable' }, { executor: fixtureRecording((request) => (request.op === 'bifrost.query' ? { ok: false, problem: denied } : undefined)).executor }));
+  expect(noHistory.drift).toEqual({ state: 'denied', problem: denied });
+  expect(noHistory.status.result?.outcome.requirements[0].detail?.drift).toEqual(driftReport);
+
+  // The catalog input is strict: an unknown field or a zero attempt is refused before any read.
+  expect(validatePanel('VerificationExecution', { executionId: 'exec_1', node: 'step:a', producer: { attempt: 1, item_index: 0, iteration_index: null }, output: 'o', details: true })).toMatchObject({ component: 'VerificationExecution' });
+  expect(validatePanel('VerificationExecution', { executionId: 'exec_1', producer: { attempt: 0 } })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  expect(validatePanel('VerificationExecution', { executionId: 'exec_1', primary: true })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+});
+
+test('execution states mark the declared graph with recorded progress', () => {
+  const graph = definitionGraph(specOf('ticket-policy@1.1.0'));
+  const invocation = (step_id: string, record: object, attempt = 1, item_index: number | null = null, iteration_index: number | null = null) =>
+    ({ speculation: 'none', ...record, producer: { step_id, attempt, item_index, iteration_index } }) as never;
+  const ok = { state: 'action', status: 'succeeded' };
+  const bad = { state: 'action', status: 'failed' };
+
+  // Running: the last attempt of a retried step counts, a started step runs, the rest wait; nothing is judged.
+  const running = executionStates(graph, executionStatus.exec_running, [invocation('read-photo', ok), invocation('score', bad), invocation('score', ok, 2), invocation('classify', { state: 'started' })]);
+  expect(running).toEqual({
+    'step:read-photo': { word: 'succeeded', tone: 'ok', dim: false },
+    'step:score': { word: 'succeeded', tone: 'ok', dim: false },
+    'step:classify': { word: 'running', tone: 'running', dim: false },
+    'step:summarise': { word: 'pending', tone: 'neutral', dim: false },
+    'req:classified': { word: 'not judged', tone: 'neutral', dim: false },
+    'req:policy-followed': { word: 'not judged', tone: 'neutral', dim: false },
+    'req:has-answer': { word: 'not judged', tone: 'neutral', dim: false }
+  });
+  // Settled: the compact result judges requirements; a step that never ran says so, and a started step is not running.
+  const settled = executionStates(graph, executionStatus.exec_settled, [invocation('read-photo', { state: 'action', status: 'skipped' }), invocation('classify', { state: 'started' })]);
+  expect(settled).toMatchObject({
+    'step:read-photo': { word: 'skipped', tone: 'neutral' },
+    'step:score': { word: 'not run', dim: true },
+    'step:classify': { word: 'not finished', dim: true },
+    'req:classified': { word: 'passed', tone: 'ok' },
+    'req:policy-followed': { word: 'failed', tone: 'danger' }
+  });
+  // Before a result is visible a recorded requirement attempt is the judgment shown.
+  expect(executionStates(graph, executionStatus.exec_running, [invocation('policy-followed', { state: 'requirement', outcome: 'inconclusive' })])['req:policy-followed']).toEqual({ word: 'inconclusive', tone: 'warn' });
+  // Fan-out and repetition stay one node: mixed items count failures; a discarded speculative step recedes.
+  const fanned = executionStates(graph, executionStatus.exec_running, [
+    invocation('score', ok, 1, 0, 0),
+    invocation('score', bad, 1, 1, 0),
+    invocation('score', ok, 1, 1, 1),
+    invocation('score', bad, 1, 2, 0),
+    invocation('classify', { ...ok, speculation: 'discarded' })
+  ]);
+  expect(fanned['step:score']).toEqual({ word: '2 of 4 failed', tone: 'danger', dim: false });
+  expect(fanned['step:classify']).toEqual({ word: 'succeeded', tone: 'ok', dim: true });
+});
+
+test('execution inspector shows recorded state, judgments and outputs as separate facts', async () => {
+  const onaction = vi.fn();
+  const load = (input: Parameters<typeof loadExecution>[0], executor: Executor = fixtureExecutor) => loadExecution(input, { executor });
+  const settled = await load({ executionId: EXECUTIONS.settled });
+  const shown = render(VerificationExecution, { ...settled, onaction });
+  await waitFor(() => expect(shown.container.querySelector('[data-node="step:score"]')).toBeInTheDocument());
+  const node = (key: string) => shown.container.querySelector(`[data-node="${key}"]`) as HTMLElement;
+  const positions = () => [...shown.container.querySelectorAll<HTMLElement>('.svelte-flow__node')].map((each) => each.style.transform);
+  const viewport = () => (shown.container.querySelector('.svelte-flow__viewport') as HTMLElement).style.transform;
+  const sent = () => onaction.mock.lastCall?.[0];
+
+  // Lifecycle status and verdict are separate facts, each a word; the count is what the result records.
+  const head = within(shown.container).getByRole('region', { name: 'Execution' });
+  expect(head.querySelector('[data-execution-status]')).toHaveAttribute('data-execution-status', 'completed');
+  expect(head.querySelector('[data-verdict]')).toHaveAttribute('data-verdict', 'failed');
+  expect(head).toHaveTextContent('3 of 3 requirements');
+  expect(head).toHaveTextContent('ticket-policy@1.1.0');
+  expect(within(head).queryByRole('button', { name: /Cancel execution/ })).toBeNull();
+
+  // The same layout as the definition, each node marked with a word and glyph; runtime state moves nothing.
+  const plain = render(VerifierGraph, { graph: definitionGraph(specOf('ticket-policy@1.1.0')) });
+  await waitFor(() => expect(plain.container.querySelector('.svelte-flow__node')).toBeInTheDocument());
+  expect(positions()).toEqual([...plain.container.querySelectorAll<HTMLElement>('.svelte-flow__node')].map((each) => each.style.transform));
+  plain.unmount();
+  expect(node('step:score').querySelector('[data-status]')).toHaveTextContent('✓ succeeded');
+  expect(node('req:policy-followed').querySelector('[data-status]')).toHaveTextContent('✕ failed');
+  expect(shown.container).toHaveTextContent('Declared dependencies, marked with recorded state.');
+
+  // Selecting a node is a host action carrying the whole shareable selection, and shows at once.
+  await fireEvent.click(node('step:score'));
+  expect(sent()).toEqual({ name: 'execution.select', input: { node: 'step:score' } });
+  expect(validateIntent('VerificationExecution', sent())).toEqual(sent());
+  const step = () => within(shown.container).getByRole('region', { name: 'Step score' });
+  // Every recorded invocation attempt is listed; the latest is shown until one is chosen.
+  const attempts = () => within(step()).getAllByRole('radio');
+  expect(attempts().map((each) => [each.textContent, each.getAttribute('aria-checked')])).toEqual([['attempt 1 · failed', 'false'], ['attempt 2 · succeeded', 'true']]);
+  expect(step()).toHaveTextContent('units');
+  await fireEvent.click(attempts()[0]);
+  expect(sent()).toEqual({ name: 'execution.select', input: { node: 'step:score', producer: { item_index: null, iteration_index: null, attempt: 1 } } });
+  expect(step().querySelector('[data-producer]')).toHaveAttribute('data-producer', 'attempt 1');
+  expect(step()).toHaveTextContent('timed out');
+  expect(step()).toHaveTextContent('This invocation retained no output.');
+  expect(positions().length).toBeGreaterThan(0);
+
+  // Refresh with the selection in the input: the exact attempt and output survive, and neither layout nor viewport moves.
+  const before = [positions(), viewport()];
+  const picked = { executionId: EXECUTIONS.settled, node: 'step:score', producer: { attempt: 2, item_index: null, iteration_index: null }, output: 'units' };
+  await shown.rerender({ ...(await load(picked)), onaction });
+  expect(node('step:score')).toHaveAttribute('aria-pressed', 'true');
+  expect(attempts().map((each) => each.getAttribute('aria-checked'))).toEqual(['false', 'true']);
+  expect(step().querySelector('[data-preview="units"] pre')?.textContent).toBe('{\n  "units": 3\n}');
+  expect([positions(), viewport()]).toEqual(before);
+  // A newer status on refresh changes the marks only.
+  await shown.rerender({ ...(await load(picked, fixtureRecording((request) => (request.op === 'verification.list_invocations' ? { ok: true, value: { execution_id: 'exec_settled', history: { acknowledged: 0, pending: 2, failed: 0 }, status: 'completed', items: [], next_cursor: 'next/1' } as never } : undefined)).executor)), onaction });
+  expect(node('step:score').querySelector('[data-status]')).toHaveTextContent('not run');
+  expect([positions(), viewport()]).toEqual(before);
+  expect(shown.container.querySelector('[data-part="history"]')).toHaveTextContent('2 history events are not yet retained');
+  await fireEvent.click(within(shown.container).getByRole('button', { name: 'Next page of recorded progress' }));
+  expect(sent()).toEqual({ name: 'execution.page', input: { invocations: 'next/1' } });
+  expect(validateIntent('VerificationExecution', sent())).toEqual(sent());
+
+  // Previews are inert: markup in a JSON value is text, a directory is its manifest, and a file leaves only through the host.
+  await shown.rerender({ ...(await load({ executionId: EXECUTIONS.settled, node: 'step:read-photo', producer: { attempt: 1 }, output: 'text' })), onaction });
+  expect(shown.container.querySelector('[data-preview="text"] pre')?.textContent).toContain('<script>alert(1)</script>');
+  expect(shown.container.querySelector('[data-preview] script, [data-preview] iframe, [data-preview] a')).toBeNull();
+  await shown.rerender({ ...(await load({ executionId: EXECUTIONS.settled, node: 'step:summarise', producer: { attempt: 1 }, output: 'tree' })), onaction });
+  const files = within(shown.container).getByRole('region', { name: 'Files of tree' });
+  expect(cells(files)).toEqual([['a.md', '4 B', '9f86d081…00a08', 'Download'], ['nested/b.md', '2.0 KiB', '9f86d081…00a08', 'Download']]);
+  await fireEvent.click(within(files).getAllByRole('button', { name: 'Download' })[1]);
+  expect(sent()).toEqual({ name: 'publication.download', input: { step_id: 'summarise', name: 'tree', producer: { item_index: null, iteration_index: null, attempt: 1 }, path: 'nested/b.md' } });
+  expect(validateIntent('VerificationExecution', sent())).toEqual(sent());
+
+  // Every retained output is a peer with its producer; none is the step's or the execution's primary result.
+  await fireEvent.click(within(shown.container).getByRole('button', { name: /All retained outputs \(4\)/ }));
+  expect(sent()).toEqual({ name: 'execution.select', input: { node: 'outputs' } });
+  const all = within(shown.container).getByRole('region', { name: 'Retained outputs' });
+  expect(cells(all)).toEqual([['text', 'read-photo', 'attempt 1', 'json', '—'], ['units', 'score', 'attempt 2', 'json', '—'], ['report', 'summarise', 'attempt 1', 'file', '—'], ['tree', 'summarise', 'attempt 1', 'directory', '—']]);
+  expect(shown.container.textContent).not.toMatch(/primary|final output|report output/i);
+  await fireEvent.click(within(all).getByRole('button', { name: 'units' }));
+  expect(sent()).toEqual({ name: 'execution.select', input: { node: 'step:score', producer: { item_index: null, iteration_index: null, attempt: 2 }, output: 'units' } });
+
+  // A requirement shows the recorded judgment: outcome, reason, actual value, evidence locators and data; details only once loaded.
+  await shown.rerender({ ...(await load({ executionId: EXECUTIONS.settled, node: 'req:policy-followed' })), onaction });
+  const requirement = () => within(shown.container).getByRole('region', { name: 'Requirement policy-followed' });
+  expect(requirement().querySelector('[data-outcome]')).toHaveAttribute('data-outcome', 'failed');
+  expect(requirement()).toHaveTextContent('policy-followed did not hold');
+  expect(requirement()).toHaveTextContent('ticket kind: lines start: 4 end: 9');
+  expect(requirement().querySelector('[data-details]')).toBeNull();
+  await fireEvent.click(within(shown.container).getByRole('button', { name: 'Load completed details' }));
+  expect(sent()).toEqual({ name: 'execution.select', input: { node: 'req:policy-followed', details: true } });
+  await shown.rerender({ ...(await load({ executionId: EXECUTIONS.settled, node: 'req:policy-followed', details: true })), onaction });
+  expect(requirement().querySelector('[data-details]')).toHaveTextContent('operator: is_non_empty');
+  // Refused details leave the compact judgment in place.
+  await shown.rerender({ ...(await load({ executionId: EXECUTIONS.settled, node: 'req:policy-followed', details: true }, fixtureRecording((request) => (request.op === 'verification.get_execution_details' ? { ok: false, problem: denied } : undefined)).executor)), onaction });
+  expect(shown.container.querySelector('[data-part="Completed details"]')).toHaveTextContent(denied.code);
+  expect(requirement()).toHaveTextContent('policy-followed did not hold');
+  shown.unmount();
+
+  // Running: nothing is judged, the in-flight step says running, and Cancel is one host action that cannot be sent twice.
+  const actions = reactive<Record<string, { state: 'pending' }>>({});
+  const running = render(VerificationExecution, { ...(await load({ executionId: EXECUTIONS.running, node: 'req:has-answer', details: true })), onaction, actions });
+  await waitFor(() => expect(running.container.querySelector('[data-node="step:classify"]')).toBeInTheDocument());
+  expect(running.container.querySelector('[data-execution-status]')).toHaveAttribute('data-execution-status', 'running');
+  expect(running.container.querySelector('[data-verdict]')).toHaveTextContent('no verdict recorded');
+  expect(running.container).toHaveTextContent('0 of 3 requirements');
+  expect(running.container.querySelector('[data-node="step:classify"] [data-status]')).toHaveTextContent('● running');
+  expect(within(running.container).getByRole('region', { name: 'Requirement has-answer' })).toHaveTextContent('Not judged yet.');
+  expect(running.container.querySelector('[data-part="Completed details"]')).toHaveTextContent('Details are recorded when the execution completes with a visible result.');
+  const cancel = within(running.container).getByRole('button', { name: /Cancel execution/ });
+  await fireEvent.click(cancel);
+  expect(sent()).toEqual({ name: 'execution.cancel', input: { execution_id: 'exec_running' } });
+  expect(validateIntent('VerificationExecution', sent())).toEqual(sent());
+  expect(catalog.components.VerificationExecution.emits.find((action) => action.name === 'execution.cancel')?.completion).toBe('host-action');
+  actions['execution.cancel'] = { state: 'pending' };
+  await tick();
+  expect(cancel).toBeDisabled();
+  const sends = onaction.mock.calls.length;
+  await fireEvent.click(cancel);
+  expect(onaction.mock.calls).toHaveLength(sends);
+  running.unmount();
+
+  // A refused definition explains itself and keeps the status, verdict and outputs that are readable.
+  const noGraph = render(VerificationExecution, { ...(await load({ executionId: EXECUTIONS.settled, node: 'outputs' }, fixtureRecording((request) => (request.op === 'cards.get_by_ref' ? { ok: false, problem: denied } : undefined)).executor)), onaction });
+  expect(noGraph.container.querySelector('[data-node]')).toBeNull();
+  expect(noGraph.container.querySelector('[data-part="Verifier definition"]')).toHaveTextContent(denied.code);
+  expect(noGraph.container.querySelector('[data-verdict]')).toHaveAttribute('data-verdict', 'failed');
+  expect(within(noGraph.container).getByRole('region', { name: 'Retained outputs' }).querySelectorAll('tbody tr')).toHaveLength(4);
+  noGraph.unmount();
+
+  // Session: the pinned members of one source in recorded order, each opened as its own execution; an unreadable member keeps its row.
+  const session = render(VerificationExecution, { ...(await load({ executionId: EXECUTIONS.session, node: 'input:outcomes' })), onaction });
+  const members = within(session.container).getByRole('list', { name: 'Members of outcomes' });
+  expect([...members.querySelectorAll('li')].map((row) => row.textContent?.replace(/\s+/g, ' ').trim())).toEqual([
+    expect.stringMatching(/^exec_settled .*completed .*failed$/i),
+    expect.stringMatching(/^exec_m2 .*completed .*passed$/i),
+    'exec_gone Execution not found (WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND)'
+  ]);
+  expect(session.container).toHaveTextContent('session-42');
+  await fireEvent.click(within(members).getByRole('button', { name: 'exec_m2' }));
+  expect(sent()).toEqual({ name: 'execution.open', input: { execution_id: 'exec_m2' } });
+  expect(validateIntent('VerificationExecution', sent())).toEqual(sent());
+  session.unmount();
+
+  // Drift: method, recorded window, every feature with its recorded score and threshold, drifted first; an absent score stays absent.
+  const drift = render(VerificationExecution, { ...(await load({ executionId: EXECUTIONS.drift, node: 'req:latency-stable' })), onaction });
+  const table = within(drift.container).getByRole('region', { name: 'Drift features' });
+  expect([...table.querySelectorAll('tbody tr')].map((row) => [row.getAttribute('data-feature'), ...[...row.querySelectorAll('td')].slice(1, 4).map((cell) => cell.textContent?.trim())])).toEqual([
+    ['latency_ms', expect.stringContaining('drift'), '0.31', '0.25'],
+    ['cost', expect.stringContaining('inconclusive'), '—', '—'],
+    ['tokens', expect.stringContaining('no drift'), '0.04', '0.25']
+  ]);
+  const spark = table.querySelector('[data-feature="latency_ms"] svg') as SVGElement;
+  expect(spark).toHaveAttribute('aria-label', 'latency_ms: 4 recorded scores, this window marked');
+  expect(spark.querySelectorAll('.threshold, .current')).toHaveLength(2);
+  expect(table.querySelector('[data-feature="cost"] svg')).toBeNull();
+  expect(drift.container.querySelector('[data-drift]')).toHaveTextContent('Psi');
+  expect(drift.container.querySelector('[data-drift]')).toHaveTextContent('2026-10-20T10:00:00Z → 2026-10-20T11:00:00Z');
+  drift.unmount();
+
+  // Whole-read states: a refused or unknown execution shows the server's problem and nothing else; loading names the execution.
+  for (const state of ['denied', 'error'] as const) {
+    const refused = render(VerificationExecution, await load({ executionId: EXECUTIONS.settled }, stateExecutors[state]));
+    expect(refused.container).toHaveTextContent((refused.container.querySelector('code') as HTMLElement).textContent as string);
+    expect(refused.container.querySelector('[data-execution-status], [data-node]')).toBeNull();
+    refused.unmount();
+  }
+  expect(render(VerificationExecution, { input: { executionId: 'exec_x' }, result: { state: 'loading' } }).container).toHaveTextContent('Loading execution exec_x');
 });

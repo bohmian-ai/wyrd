@@ -16,6 +16,7 @@ export { default as UsedBy } from './components/UsedBy.svelte';
 export { default as VersionDiff } from './components/VersionDiff.svelte';
 export { default as VerifierDefinition } from './components/VerifierDefinition.svelte';
 export { default as RunsOn } from './components/RunsOn.svelte';
+export { default as VerificationExecution } from './components/VerificationExecution.svelte';
 export { default as VerifierGraph } from './components/VerifierGraph.svelte';
 export { default as Panel } from './components/Panel.svelte';
 export { default as StatStrip } from './components/StatStrip.svelte';
@@ -53,6 +54,14 @@ export type {
   DefinitionRequirement,
   DefinitionStep,
   RunsOnProps,
+  DriftContext,
+  DriftPoint,
+  ExecutionData,
+  ExecutionDefinition,
+  NodeState,
+  Part,
+  SessionMember,
+  VerificationExecutionProps,
   VerifierBinding,
   VerifierDefinitionData,
   VerifierDefinitionProps,

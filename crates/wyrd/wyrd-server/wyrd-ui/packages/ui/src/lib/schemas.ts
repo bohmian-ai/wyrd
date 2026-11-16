@@ -138,6 +138,33 @@ export const PromptInputSchema = z.object({ cardRef: promptRef }).strict();
 /** The input of a Verifier component: one exact Verifier Card. */
 export const VerifierInputSchema = z.object({ cardRef: CardRefSchema.extend({ kind: z.literal('Verifier') }) }).strict();
 
+/** One invocation attempt of a step: its fan-out item and repeat iteration, each null when the step has none, and the one-based attempt. */
+export const ProducerSchema = z
+  .object({ item_index: z.number().int().min(0).nullish(), iteration_index: z.number().int().min(0).nullish(), attempt: z.number().int().min(1) })
+  .strict();
+
+/** What an execution view shows beyond the execution itself; every field is shareable selection state. */
+const executionSelection = {
+  /** The selected graph node: `input:`, `step:` or `req:` plus its id, or `outputs` for every retained output. */
+  node: z.string().min(1).max(300).optional(),
+  /** The selected invocation attempt of the selected step. */
+  producer: ProducerSchema.optional(),
+  /** The publication of that attempt to read, by its name. */
+  output: z.string().min(1).max(300).optional(),
+  /** Read the completed records (steps, checks, provenance) as well. */
+  details: z.boolean().optional()
+};
+
+/** The input of `VerificationExecution`: one exact execution, its selection, and the page cursors to continue from. */
+export const ExecutionInputSchema = z
+  .object({
+    executionId: z.string().min(1).max(200),
+    ...executionSelection,
+    invocations: z.string().min(1).max(4096).optional(),
+    publications: z.string().min(1).max(4096).optional()
+  })
+  .strict();
+
 /** The input of `VersionDiff`: one exact Prompt and another registered version; absent, the version before it. */
 export const VersionDiffInputSchema = z
   .object({ cardRef: promptRef, otherVersion: exactVersion.optional() })
@@ -388,7 +415,7 @@ const spanRef = z.object({ trace_id: traceId, span_id: spanId.optional() }).stri
 const executedQuery = z.object({ sql: z.string().min(1), params: z.array(queryParam) }).strict();
 
 /** How an action's completion becomes observable. */
-type Completion = 'host-navigation' | 'view-range';
+type Completion = 'host-navigation' | 'view-range' | 'host-action';
 
 /** One action a component emits, with its input schema and completion. */
 interface ActionSpec {
@@ -533,6 +560,41 @@ export const components = {
     states: ['populated', 'empty', 'denied', 'error', 'loading'],
     emits: { 'card.open': openCard }
   },
+  VerificationExecution: {
+    description:
+      "One exact verification execution: its lifecycle status and verdict, the graph of the Verifier it ran coloured by recorded state, " +
+      'and an inspector for the selected step, requirement, input, session member or retained output. Every part is read and refused on its own.',
+    input: ExecutionInputSchema,
+    states: ['populated', 'denied', 'error', 'loading'],
+    emits: {
+      'execution.select': {
+        description: 'Show this node, invocation attempt, output and details; absent fields clear that part of the selection.',
+        input: z.object(executionSelection).strict(),
+        completion: 'host-navigation'
+      },
+      'execution.page': {
+        description: "Read the page after the one shown, following the server's opaque cursor.",
+        input: z.union([z.object({ invocations: z.string().min(1) }).strict(), z.object({ publications: z.string().min(1) }).strict()]),
+        completion: 'host-navigation'
+      },
+      'execution.open': {
+        description: 'Open another exact execution, such as a session member.',
+        input: z.object({ execution_id: z.string().min(1) }).strict(),
+        completion: 'host-navigation'
+      },
+      'execution.cancel': {
+        description: 'Cancel this execution through the existing cancel operation; the host reports the outcome and reads the status again.',
+        input: z.object({ execution_id: z.string().min(1) }).strict(),
+        completion: 'host-action'
+      },
+      'publication.download': {
+        description: 'Download one retained file of a publication through the host.',
+        input: z.object({ step_id: z.string().min(1), name: z.string().min(1), producer: ProducerSchema, path: z.string().min(1).optional() }).strict(),
+        completion: 'host-navigation'
+      },
+      'card.open': openCard
+    }
+  },
   StatStrip: {
     description:
       'One to five recorded numbers with a sparkline each, from built-in reads of bifrost.traces.spans, ' +
@@ -615,6 +677,8 @@ export type CardInventoryInput = z.infer<typeof CardInventoryInputSchema>;
 export type CardDetailInput = z.infer<typeof CardDetailInputSchema>;
 /** A validated `CardFacts` input. */
 export type CardFactsInput = z.infer<typeof CardFactsInputSchema>;
+/** A validated `VerificationExecution` input. */
+export type ExecutionInput = z.infer<typeof ExecutionInputSchema>;
 /** A validated `VersionDiff` input. */
 export type VersionDiffInput = z.infer<typeof VersionDiffInputSchema>;
 /** A view or panel range. */

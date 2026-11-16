@@ -2,6 +2,7 @@
  * Representative component data shared by the dev gallery and the component
  * tests. Shapes follow the real wire types; values are synthetic.
  */
+import type { CardTypes, VerificationExecutionState } from 'wyrd-ai';
 import type { CardRef, Executor, QueryResult, RegisteredCard } from 'wyrd-ai-ui';
 import type { ChartInput } from 'wyrd-ai-ui/loaders';
 
@@ -358,6 +359,101 @@ function emptied(value: unknown): unknown {
   return value;
 }
 
+/** Execution ids the fixtures answer: running, settled, a session judgment, and a drift judgment. */
+export const EXECUTIONS = { running: 'exec_running', settled: 'exec_settled', session: 'exec_session', drift: 'exec_drift' } as const;
+const produced = (step_id: string, attempt = 1, item_index: number | null = null, iteration_index: number | null = null) => ({ step_id, attempt, item_index, iteration_index });
+const judged = (id: string, outcome: CardTypes.RequirementOutcome, statement: string, extra: object = {}) => ({ id, outcome, statement, reason: outcome === 'passed' ? null : `${id} did not hold`, ...extra });
+/** The drift judgment `exec_drift` recorded: one drifted feature, one stable, one without a score. */
+export const driftReport = {
+  method: 'Psi',
+  verdict: 'Drift',
+  features: {
+    latency_ms: { feature: 'latency_ms', score: 0.31, threshold: 0.25, verdict: 'Drift' },
+    tokens: { feature: 'tokens', score: 0.04, threshold: 0.25, verdict: 'NoDrift' },
+    cost: { feature: 'cost', score: null, threshold: null, verdict: 'Inconclusive' }
+  }
+} as unknown as CardTypes.DriftReport;
+const resultOf = (execution_id: string, verifier: CardRef, verdict: string, requirements: object[]) => ({ execution_id, verifier, subject: SERVICE, run_id: 'run_01', outcome: { verdict, requirements } });
+const settledRequirements = [
+  judged('classified', 'passed', 'The ticket has exactly one label', { step: 'classify', actual: 'refund' }),
+  judged('policy-followed', 'failed', 'The reply follows the refund policy for its label', { citations: [{ slot: 'ticket', locator: { kind: 'lines', start: 4, end: 9 } }], data: { label: 'refund' } }),
+  judged('has-answer', 'passed', 'The ticket carries an answer')
+];
+/** Recorded status by execution id; three session members follow the four named executions. */
+export const executionStatus = {
+  exec_running: { execution_id: 'exec_running', status: 'running', dispatches: [] },
+  exec_settled: { execution_id: 'exec_settled', status: 'completed', dispatches: [], result: resultOf('exec_settled', VERIFIER, 'failed', settledRequirements) },
+  exec_session: {
+    execution_id: 'exec_session',
+    status: 'completed',
+    dispatches: [],
+    group_id: 'session-42',
+    group: { sources: { outcomes: { reference: 'verifiers.ticket-policy.requirements.policy-followed.outcome', execution_ids: ['exec_settled', 'exec_m2', 'exec_gone'] }, tickets: { reference: 'verifiers.ticket-policy.inputs.ticket', execution_ids: ['exec_settled', 'exec_m2', 'exec_gone'] } } },
+    result: resultOf('exec_session', SESSION_VERIFIER, 'failed', [judged('all-passed', 'failed', 'No reply in the session failed', { actual: ['failed', 'passed'] })])
+  },
+  exec_drift: { execution_id: 'exec_drift', status: 'completed', dispatches: [], result: resultOf('exec_drift', DRIFT_VERIFIER, 'failed', [judged('latency-stable', 'failed', 'Latency stays within its fitted baseline', { detail: { drift: driftReport } })]) },
+  exec_m2: { execution_id: 'exec_m2', status: 'completed', dispatches: [], result: resultOf('exec_m2', VERIFIER, 'passed', []) }
+} as unknown as Record<string, VerificationExecutionState>;
+const action = (producer: ReturnType<typeof produced>, status: string, speculation = 'none', reason: string | null = null) => ({ state: 'action', producer, status, speculation, reason });
+/** Recorded invocations by execution id: retries, a started step, and requirement judgments. */
+export const invocations = {
+  exec_running: [action(produced('read-photo'), 'succeeded'), action(produced('score'), 'failed', 'none', 'timed out'), action(produced('score', 2), 'succeeded'), { state: 'started', producer: produced('classify'), speculation: 'none' }],
+  exec_settled: [
+    action(produced('read-photo'), 'succeeded'),
+    action(produced('score'), 'failed', 'none', 'timed out'),
+    action(produced('score', 2), 'succeeded'),
+    action(produced('classify'), 'succeeded'),
+    action(produced('summarise'), 'succeeded'),
+    { state: 'requirement', producer: produced('policy-followed'), outcome: 'failed', speculation: 'none', reason: 'policy-followed did not hold' }
+  ]
+} as unknown as Record<string, CardTypes.ExecutionInvocation[]>;
+/** Retained outputs by execution id: JSON, a file and a directory, each tied to its producing attempt. */
+export const publications = {
+  exec_running: [{ name: 'text', kind: 'json', producer: produced('read-photo'), speculation: 'none' }],
+  exec_settled: [
+    { name: 'text', kind: 'json', producer: produced('read-photo'), speculation: 'none' },
+    { name: 'units', kind: 'json', producer: produced('score', 2), speculation: 'none' },
+    { name: 'report', kind: 'file', producer: produced('summarise'), speculation: 'none' },
+    { name: 'tree', kind: 'directory', producer: produced('summarise'), speculation: 'none' }
+  ]
+} as unknown as Record<string, CardTypes.PublicationSummary[]>;
+const SHA = '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08';
+const bodies: Record<string, object> = {
+  text: { kind: 'json', value: { text: '<script>alert(1)</script> refund requested' } },
+  units: { kind: 'json', value: { units: 3 } },
+  report: { kind: 'file', manifest: { directories: [], files: [{ path: 'report', sha256: SHA, size_bytes: 9 }] } },
+  tree: { kind: 'directory', manifest: { directories: ['nested'], files: [{ path: 'a.md', sha256: SHA, size_bytes: 4 }, { path: 'nested/b.md', sha256: SHA, size_bytes: 2048 }] } }
+};
+/** The completed records of `exec_settled`. */
+export const executionDetails = {
+  ...resultOf('exec_settled', VERIFIER, 'failed', settledRequirements.map((each) => ({ ...each, check: { kind: 'assert', operator: 'is_non_empty' }, provenance: null, tool_calls: [] }))),
+  outcome: {
+    verdict: 'failed',
+    requirements: settledRequirements.map((each) => ({ ...each, check: { kind: 'assert', operator: 'is_non_empty' } })),
+    steps: [{ id: 'score', status: 'succeeded', attempts: 2, duration_ms: 1840 }, { id: 'classify', status: 'succeeded', attempts: 1, duration_ms: 920, provenance: { agent: AGENT } }]
+  }
+} as unknown as CardTypes.VerificationDetails;
+const executionMissing = { code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND', title: 'Execution not found', status: 404 };
+/** Retained metadata rows the execution loader reads, by the SQL's distinguishing text. */
+function executionAnswer(sql: string, params: readonly unknown[]): QueryResult | undefined {
+  const id = String(params[0]);
+  if (sql.startsWith('SELECT verifier_card_uid')) return result([col('verifier_card_uid')], executionStatus[id] ? [[verifiers['ticket-policy@1.1.0'].metadata.uid]] : []);
+  if (sql.startsWith('SELECT to_json(inputs)')) return result([col('inputs')], [[JSON.stringify({ ticket: { answer: 'Refund issued' }, photo: null })]]);
+  if (sql.startsWith('SELECT binding_id')) return result([col('binding_id'), col('window_start', NS), col('window_end', NS), col('ended_at', NS)], [['bind_01', '2026-10-20T10:00:00Z', '2026-10-20T11:00:00Z', '2026-10-20T11:00:05Z']]);
+  if (sql.startsWith('SELECT r.execution_id'))
+    return result(
+      [col('execution_id'), col('ended_at', NS), col('window_start', NS), col('window_end', NS), col('output')],
+      [0.31, 0.22, 0.12, 0.08].map((score, back) => [
+        back === 0 ? 'exec_drift' : `exec_drift_${back}`,
+        `2026-10-20T${11 - back}:00:05Z`,
+        `2026-10-20T${10 - back}:00:00Z`,
+        `2026-10-20T${11 - back}:00:00Z`,
+        JSON.stringify({ requirements: [{ id: 'latency-stable', detail: { drift: { features: { latency_ms: { score }, tokens: { score: 0.04 }, cost: { score: null } } } } }] })
+      ])
+    );
+  return undefined;
+}
+
 /** Fixture executors by the state each makes every panel reach: rows kept or emptied, refused, failed, or never answered. */
 export const stateExecutors: Record<'populated' | 'empty' | 'denied' | 'error' | 'loading', Executor> = {
   populated: { run: (requests) => fixtureExecutor.run(requests) },
@@ -416,7 +512,25 @@ export const fixtureExecutor: Executor = {
             return { ok: true, value: { items: request.cursor ? inventory.slice(3) : inventory.slice(0, 3), next_cursor: request.cursor ? null : 'page-2' } };
           case 'cards.list_artifacts':
             return { ok: true, value: artifacts };
+          case 'cards.get_by_uid': {
+            const found = Object.values(verifiers).find((each) => each.metadata.uid === request.card_uid);
+            return found ? { ok: true, value: found } : { ok: false, problem: notFound };
+          }
+          case 'verification.get_execution':
+            return executionStatus[request.execution_id] ? { ok: true, value: executionStatus[request.execution_id] } : { ok: false, problem: executionMissing };
+          case 'verification.list_invocations':
+            return { ok: true, value: { execution_id: request.execution_id, history: { acknowledged: (invocations[request.execution_id] ?? []).length, pending: 0, failed: 0 }, status: executionStatus[request.execution_id]?.status, items: invocations[request.execution_id] ?? [], next_cursor: null } };
+          case 'verification.list_publications':
+            return { ok: true, value: { execution_id: request.execution_id, items: publications[request.execution_id] ?? [], next_cursor: null } };
+          case 'verification.get_execution_details':
+            return request.execution_id === 'exec_settled' ? { ok: true, value: executionDetails } : { ok: false, problem: executionMissing };
+          case 'verification.get_publication':
+            return bodies[request.name]
+              ? { ok: true, value: { ...bodies[request.name], name: request.name, producer: { step_id: request.step_id, attempt: request.attempt, item_index: request.item_index ?? null, iteration_index: request.iteration_index ?? null } } }
+              : { ok: false, problem: { code: 'WYRD_VERIFICATION_404_PUBLICATION_NOT_FOUND', title: 'Publication not found', status: 404 } };
           case 'bifrost.query': {
+            const recorded = executionAnswer(request.sql, request.params ?? []);
+            if (recorded) return { ok: true, value: recorded };
             // Honour bound $1/$2 like the server, so a brushed range visibly narrows the plot.
             const observed = observeAnswer(request.sql);
             if (observed) return { ok: true, value: observed };

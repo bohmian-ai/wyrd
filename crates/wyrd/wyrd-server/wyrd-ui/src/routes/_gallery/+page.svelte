@@ -29,6 +29,7 @@
     day,
     denied,
     DRIFT_VERIFIER,
+    EXECUTIONS,
     fixtureExecutor,
     liveExecutor,
     LOG,
@@ -152,6 +153,21 @@
         { label: 'drift check over samples', input: { cardRef: DRIFT_VERIFIER } },
         ...STATES.filter((state) => state !== 'empty').map((state) => ({ label: state, input: { cardRef: VERIFIER }, state })),
         { label: 'narrow: the graph pans', input: { cardRef: VERIFIER }, narrow: true }
+      ]
+    },
+    {
+      component: 'VerificationExecution',
+      regions: [],
+      note: 'Reference: the approved verification mock, exact execution page. Status and verdict are separate; each node carries its recorded state as a glyph and word; the inspector follows the selection.',
+      cases: [
+        { label: 'running: a retried step, one in flight, nothing judged', input: { executionId: EXECUTIONS.running, node: 'step:score' } },
+        { label: 'settled: a failed requirement with evidence', input: { executionId: EXECUTIONS.settled, node: 'req:policy-followed', details: true } },
+        { label: 'a directory output of one invocation', input: { executionId: EXECUTIONS.settled, node: 'step:summarise', producer: { attempt: 1 }, output: 'tree' } },
+        { label: 'all retained outputs', input: { executionId: EXECUTIONS.settled, node: 'outputs' } },
+        { label: 'session: ordered members of one source', input: { executionId: EXECUTIONS.session, node: 'input:outcomes' } },
+        { label: 'drift: every feature, drifted first', input: { executionId: EXECUTIONS.drift, node: 'req:latency-stable' } },
+        ...STATES.filter((state) => state !== 'empty' ).map((state) => ({ label: state, input: { executionId: EXECUTIONS.settled }, state })),
+        { label: 'narrow', input: { executionId: EXECUTIONS.settled, node: 'step:score' }, narrow: true }
       ]
     },
     {

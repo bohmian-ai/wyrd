@@ -1,14 +1,18 @@
 <!--
   One node of a Verifier graph inside Svelte Flow: a stage heading, an input
   slot, a step with its attached requirements, or a whole-Verifier
-  requirement. Declared facts only; selection comes from the owning graph.
+  requirement. Declared facts, plus the recorded state the owning graph
+  supplies for an execution; selection comes from the owning graph.
 -->
 <script lang="ts" module>
+  import type { NodeState } from '../execution.js';
   import type { DefinitionInput, DefinitionRequirement, DefinitionStep } from '../verifier.js';
 
   /** What the owning graph shares with its nodes and edges. */
   export interface GraphSelection {
     readonly selected: string;
+    /** Recorded state by node key, when the graph shows an execution. */
+    readonly states?: Readonly<Record<string, NodeState>>;
     select(key: string): void;
   }
   /** The context key of a graph's `GraphSelection`. */
@@ -28,19 +32,24 @@
 
   let { data }: { data: GraphNodeData } = $props();
   const graph = getContext<GraphSelection>(SELECTION);
+  const GLYPHS = { neutral: '○', ok: '✓', warn: '!', danger: '✕', running: '●' } as const;
 </script>
+
+{#snippet recorded(state: NodeState | undefined)}
+  {#if state}<span class="state" data-status={state.word} data-tone={state.tone}><span aria-hidden="true">{GLYPHS[state.tone]}</span> {state.word}</span>{/if}
+{/snippet}
 
 {#if data.type === 'stage'}
   <div class="stage" data-stage={data.text}>{data.text}</div>
 {:else}
   {@const node = data.node}
   {@const on = graph.selected === node.key}
-  <div class="gn" class:sel={on}>
+  <div class="gn" class:sel={on} class:dim={graph.states?.[node.key]?.dim}>
     {#if data.type !== 'input'}<Handle type="target" position={Position.Left} isConnectable={false} />{/if}
     <button type="button" class="main" data-node={node.key} aria-pressed={on} title={'statement' in node ? node.statement : node.detail} onclick={() => graph.select(node.key)}>
       <span class="row">
         {#if data.type === 'req'}<span class="glyph" aria-hidden="true">◇</span>{/if}
-        <span class="id">{node.id}</span><span class="kind">{node.kind}</span>
+        <span class="id">{node.id}</span>{@render recorded(graph.states?.[node.key])}<span class="kind">{node.kind}</span>
       </span>
       {#if data.type === 'step'}
         <span class="sub mono needs" title={data.needs}>{data.needs}</span>
@@ -55,7 +64,7 @@
     {#if data.type === 'step'}
       {#each data.node.requirements as each (each.key)}
         <button type="button" class="attached" class:sel={graph.selected === each.key} data-node={each.key} aria-pressed={graph.selected === each.key} title={each.statement} onclick={() => graph.select(each.key)}>
-          <span class="glyph" aria-hidden="true">◇</span><span class="id small">{each.id}</span><span class="kind">{each.kind}</span>
+          <span class="glyph" aria-hidden="true">◇</span><span class="id small">{each.id}</span>{@render recorded(graph.states?.[each.key])}<span class="kind">{each.kind}</span>
         </button>
       {/each}
     {/if}
@@ -125,6 +134,35 @@
   }
   .id.small {
     font-size: 12px;
+  }
+  .gn.dim {
+    border-style: dashed;
+  }
+  .gn.dim .main {
+    color: var(--muted);
+  }
+  .state {
+    --tone: var(--muted);
+    flex: none;
+    margin-left: auto;
+    color: var(--tone);
+    font: 11px var(--font-mono);
+    white-space: nowrap;
+  }
+  .state[data-tone='ok'] {
+    --tone: var(--ok);
+  }
+  .state[data-tone='warn'] {
+    --tone: var(--warn);
+  }
+  .state[data-tone='danger'] {
+    --tone: var(--danger);
+  }
+  .state[data-tone='running'] {
+    --tone: var(--declare);
+  }
+  .state + .kind {
+    margin-left: 0;
   }
   .kind {
     margin-left: auto;

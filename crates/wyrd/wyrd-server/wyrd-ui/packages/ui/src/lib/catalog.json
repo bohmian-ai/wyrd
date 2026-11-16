@@ -1673,6 +1673,360 @@
         }
       ]
     },
+    "VerificationExecution": {
+      "description": "One exact verification execution: its lifecycle status and verdict, the graph of the Verifier it ran coloured by recorded state, and an inspector for the selected step, requirement, input, session member or retained output. Every part is read and refused on its own.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "executionId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "node": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 300
+          },
+          "producer": {
+            "type": "object",
+            "properties": {
+              "item_index": {
+                "anyOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "iteration_index": {
+                "anyOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "attempt": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": [
+              "attempt"
+            ],
+            "additionalProperties": false
+          },
+          "output": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 300
+          },
+          "details": {
+            "type": "boolean"
+          },
+          "invocations": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "publications": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          }
+        },
+        "required": [
+          "executionId"
+        ],
+        "additionalProperties": false
+      },
+      "states": [
+        "populated",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": [
+        {
+          "name": "execution.select",
+          "description": "Show this node, invocation attempt, output and details; absent fields clear that part of the selection.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "node": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 300
+              },
+              "producer": {
+                "type": "object",
+                "properties": {
+                  "item_index": {
+                    "anyOf": [
+                      {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "iteration_index": {
+                    "anyOf": [
+                      {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "attempt": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 9007199254740991
+                  }
+                },
+                "required": [
+                  "attempt"
+                ],
+                "additionalProperties": false
+              },
+              "output": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 300
+              },
+              "details": {
+                "type": "boolean"
+              }
+            },
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "execution.page",
+          "description": "Read the page after the one shown, following the server's opaque cursor.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "invocations": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "invocations"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "publications": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "publications"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "execution.open",
+          "description": "Open another exact execution, such as a session member.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "execution_id": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "execution_id"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "execution.cancel",
+          "description": "Cancel this execution through the existing cancel operation; the host reports the outcome and reads the status again.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "execution_id": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "execution_id"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-action"
+        },
+        {
+          "name": "publication.download",
+          "description": "Download one retained file of a publication through the host.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "step_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "producer": {
+                "type": "object",
+                "properties": {
+                  "item_index": {
+                    "anyOf": [
+                      {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "iteration_index": {
+                    "anyOf": [
+                      {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "attempt": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 9007199254740991
+                  }
+                },
+                "required": [
+                  "attempt"
+                ],
+                "additionalProperties": false
+              },
+              "path": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "step_id",
+              "name",
+              "producer"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "card.open",
+          "description": "Open this exact Card version.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "card_ref": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "Data",
+                      "Model",
+                      "Artifact",
+                      "Experiment",
+                      "Prompt",
+                      "Agent",
+                      "Mcp",
+                      "Service",
+                      "Audit",
+                      "Verifier",
+                      "Trigger",
+                      "Operator",
+                      "Repository"
+                    ]
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "version": {
+                    "type": "string",
+                    "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+                  },
+                  "uid": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "name",
+                  "version"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "card_ref"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        }
+      ]
+    },
     "StatStrip": {
       "description": "One to five recorded numbers with a sparkline each, from built-in reads of bifrost.traces.spans, bifrost.logs.records and bifrost.gateway.calls, optionally scoped to one workload_card_uid or subject_card_uid.",
       "input": {

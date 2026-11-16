@@ -360,36 +360,80 @@
         "States: populated, empty, denied, error, loading. An owner opens through card.open; without a host handler the row is not a control."
       ]
     },
-    "VerifierGraph": {
+    "VerificationExecution": {
       "status": "built",
-      "catalog": false,
+      "catalog": true,
       "altitude": "quiet",
       "consumers": [
-        "packages/ui/src/lib/components/VerifierDefinition.svelte"
+        "src/routes/t/[tenantKey]/verify/executions/[executionId]/+page.svelte",
+        "view documents (WyrdView)"
       ],
       "tokens": [
-        "--bg",
         "--border",
         "--border-soft",
+        "--danger",
         "--declare",
         "--declare-soft",
         "--font-mono",
         "--font-sans",
         "--muted",
         "--r",
+        "--surface",
+        "--surface-hover",
+        "--text",
+        "--warn"
+      ],
+      "props": {
+        "input": "ExecutionInput (schemas.ts)",
+        "result": "loader result (ExecutionData, execution.ts)",
+        "actions?": "per-action state",
+        "onaction?": "(intent) => void"
+      },
+      "rules": [
+        "One exact execution: lifecycle status and verdict as separate pills, the graph of the Verifier it ran marked with recorded state, and an inspector for the selected input, step, requirement, session slot or retained output.",
+        "Status, definition, recorded progress, retained outputs, completed details and the selected output are separate parts: a refused or not-yet-visible part says so in place and never hides a readable one.",
+        "Recorded values only: no outcome, threshold, score or state is recomputed, and a missing judgment reads as not judged, never as passed or running.",
+        "A step lists every recorded invocation by item, iteration and one-based attempt; an output belongs to the invocation that produced it and is never a step's primary result.",
+        "Previews are inert: JSON and text are escaped and bounded, a directory is its manifest, and file bytes leave only through the host's publication.download.",
+        "Completed details load only when asked for; Cancel is offered until the execution settles and runs as the host's execution.cancel.",
+        "States: populated, denied, error, loading. Selection, paging, opening a member or the Verifier Card, and cancelling are host actions."
+      ]
+    },
+    "VerifierGraph": {
+      "status": "built",
+      "catalog": false,
+      "altitude": "quiet",
+      "consumers": [
+        "packages/ui/src/lib/components/VerifierDefinition.svelte",
+        "packages/ui/src/lib/components/VerificationExecution.svelte"
+      ],
+      "tokens": [
+        "--bg",
+        "--border",
+        "--border-soft",
+        "--danger",
+        "--declare",
+        "--declare-soft",
+        "--font-mono",
+        "--font-sans",
+        "--muted",
+        "--ok",
+        "--r",
         "--selected-border",
         "--surface",
         "--surface-hover",
-        "--text"
+        "--text",
+        "--warn"
       ],
       "props": {
         "graph": "DefinitionGraph (verifier.ts)",
-        "selected?": "string, bindable: the selected node key"
+        "selected?": "string, bindable: the selected node key",
+        "states?": "Record<node key, NodeState> (execution.ts): recorded state of an execution"
       },
       "rules": [
         "A read-only Svelte Flow drawing of declared inputs, steps, attached and whole-Verifier requirements under stage headings, with labelled dependency arrows.",
-        "Nothing drags, connects or deletes; no execution colour or state is drawn.",
-        "Laid out once from topology: selection, focus and zoom never move a node.",
+        "Nothing drags, connects or deletes. Without states no execution colour or state is drawn; with them each node shows its recorded state as a glyph and word, and a discarded or unrun node recedes behind a dashed rule.",
+        "Laid out once from topology: selection, focus, zoom and recorded state never move or resize a node.",
         "Selection and focus use --declare; arrow keys move between nodes."
       ]
     },

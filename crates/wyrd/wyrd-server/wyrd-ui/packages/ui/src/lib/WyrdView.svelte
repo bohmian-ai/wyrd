@@ -31,6 +31,7 @@
   import UsedBy from './components/UsedBy.svelte';
   import VerifierDefinition from './components/VerifierDefinition.svelte';
   import RunsOn from './components/RunsOn.svelte';
+  import VerificationExecution from './components/VerificationExecution.svelte';
   import VersionDiff from './components/VersionDiff.svelte';
   import Chart from './components/Chart.svelte';
   import EmptyState from './components/EmptyState.svelte';
@@ -87,6 +88,7 @@
     VersionDiff,
     VerifierDefinition,
     RunsOn,
+    VerificationExecution,
     StatStrip, FacetRail, RecordTable, TraceWaterfall, RecordDetail };
   /** How often a live panel re-reads. */
   const LIVE_MS = 5_000;

@@ -12,8 +12,8 @@ import { join, resolve } from 'node:path';
 import { chromium, type Browser, type Page } from 'playwright';
 import { test as base, expect, vi } from 'vitest';
 import { AGREES, assistantTest, judgeReply } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/assistant';
-import { declared, fixture, runtimeAccount, serverTest } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/server';
-import { Cards, Principals, WyrdClient } from 'wyrd-ai';
+import { declared, fixture, groupExecution, runtimeAccount, scheduledResult, serverTest } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/server';
+import { Cards, Principals, WyrdClient, WyrdState } from 'wyrd-ai';
 import { loadExecution } from 'wyrd-ai-ui/loaders';
 import { nodeExecutor } from 'wyrd-ai-ui/node';
 import { exportOtlp, nanos, seedSignals } from '$lib/ui-signals.integration';
@@ -1394,6 +1394,93 @@ judged('a completed execution page shows the recorded judgment, loads details on
     expect(executions).toMatchObject({ ok: true, value: { rows: [[executionId]] } });
     // Nor did it ask a provider anything: the judging provider received no request while the page was inspected.
     expect(judgeRequests).toBe(judgedBefore);
+  } finally {
+    await browser.close();
+    bff.stop();
+  }
+});
+
+judged('session, drift and cited judgments open as pages: members in recorded order, selection kept on return, declared baseline, and refused context said in place', async ({ server, assistant, state }) => {
+  const cards = await Cards.connect();
+  const token = await WyrdClient.connect().accessToken();
+  /** The one binding of `owner` whose status carries `field`: a schedule or a session end. */
+  const bindingWith = async (owner: { kind: string; name: string; version: string }, field: string) => {
+    for (const id of (await cards.get(owner as never)).status?.verification?.binding_ids ?? []) {
+      const response = await fetch(`${server.baseUrl}/v1/verification/bindings/${id}`, { headers: { 'x-wyrd-access-token': `Bearer ${token}` } });
+      if (((await response.json()) as Record<string, unknown>)[field]) return id;
+    }
+    throw new Error(`${owner.name} has no binding with ${field}`);
+  };
+  // A judged answer that cites its input.
+  const submitted = await state.run('agent').observe.submit('answer-judged', { answer: 'yes' });
+  if (submitted.kind !== 'queued') throw new Error('answer-judged queues an execution');
+  await submitted.execution.wait({ timeoutMs: 60_000 });
+  // A scheduled drift window far from its fitted baseline.
+  const latency = (await cards.get({ kind: 'Verifier', name: 'latency-drift', version: '1.0.0' })).metadata.uid as string;
+  server.waitForBaseline(latency, 90_000);
+  await state.startBifrost();
+  for (let sample = 0; sample < 100; sample += 1) await state.run('model').observe.submit('latency-drift', { latency: 99 });
+  await state.shutdown();
+  server.flushBifrost();
+  const schedule = await bindingWith(assistant.service, 'next_run_at');
+  server.makeBindingDue(schedule);
+  const drifted = (await scheduledResult(server, schedule, 90_000)).execution_id;
+  // A session of three turns, judged together when it ends.
+  const support = await cards.declareFromPath(fixture('cards/verify_in_real_time/support.yaml'));
+  const bundle = mkdtempSync(join(tmpdir(), 'wyrd-ui-page-session-'));
+  await cards.pull(support.root, bundle);
+  const desk = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: (await runtimeAccount({ kind: 'Service', name: support.root.name })).key }) });
+  await desk.startBifrost();
+  for (const turn of [1, 2, 3]) await desk.run('agent').observe.verify('turn-check', { turn, answer: `answer ${turn}` }, { positional: true, group_id: 'ui-page-conversation' });
+  await desk.shutdown();
+  const session = await groupExecution(server, await bindingWith(declared(support), 'group_end'), 90_000);
+  server.flushBifrost();
+  const members = session.group?.sources.turns.execution_ids ?? [];
+  expect(members).toHaveLength(3);
+
+  const tenant = 'test-tenant-1';
+  buildUi();
+  const bff = await startBff(server.baseUrl);
+  const browser = await chromium.launch();
+  try {
+    const page = await signIn(browser, bff.url, tenant, server.apiKey);
+    const at = (id: string, search = '') => `${bff.url}/t/${tenant}/verify/executions/${id}${search}`;
+    const path = () => new URL(page.url()).pathname + new URL(page.url()).search;
+
+    // Session: the source lists its pinned members in recorded order.
+    await page.goto(at(session.execution_id, '?node=input%3Aturns'));
+    const listed = page.getByRole('list', { name: 'Members of turns' }).getByRole('button');
+    await expect.poll(() => listed.allTextContents()).toEqual(members);
+    expect(await page.locator('[data-verdict]').getAttribute('data-verdict')).toBe('passed');
+    // Opening a member is its own exact page; Back returns to the session with the same source selected and the same members.
+    await listed.nth(1).click();
+    await expect.poll(path).toBe(new URL(at(members[1])).pathname);
+    await expect.poll(() => page.locator('main').textContent()).toContain(members[1]);
+    await page.goBack();
+    await expect.poll(path).toBe(new URL(at(session.execution_id)).pathname + '?node=input%3Aturns');
+    await expect.poll(() => listed.allTextContents()).toEqual(members);
+    expect(await page.locator('[data-node="input:turns"]').getAttribute('aria-pressed')).toBe('true');
+
+    // Drift: the recorded verdict, window and features, with the baseline the exact Verifier declares.
+    await page.goto(at(drifted));
+    const drift = page.locator('[data-drift]');
+    await expect.poll(() => drift.count()).toBe(1);
+    expect(await drift.textContent()).toContain('Window');
+    expect(await drift.locator('[data-declared]').textContent()).toContain('Declared baseline and condition');
+    expect(await page.getByRole('region', { name: 'Drift features' }).locator('tbody tr').first().textContent()).toContain('latency');
+    expect(await page.locator('[data-verdict]').getAttribute('data-verdict')).toBe('failed');
+
+    // A cited judgment names the slot and position it cites.
+    await page.goto(at(submitted.execution.id, '?node=req%3Aagrees'));
+    const agrees = page.getByRole('region', { name: 'Requirement agrees', exact: true });
+    await expect.poll(() => agrees.locator('[data-outcome]').getAttribute('data-outcome')).toBe('passed');
+    expect(await agrees.locator('li .mono').allTextContents()).toEqual(['answer']);
+
+    // A principal that may read executions but not query evidence sees the drift judgment, and its window and history as refused.
+    const narrow = await signIn(browser, bff.url, tenant, server.scopedApiKey('ui_page_narrow', ['verifier:read']));
+    await narrow.goto(at(drifted));
+    await expect.poll(() => narrow.locator('[data-drift] [data-part="Window and history"]').textContent()).toContain('WYRD_PERMISSION_403_DENIED_RBAC');
+    expect(await narrow.getByRole('region', { name: 'Drift features' }).locator('tbody tr').count()).toBeGreaterThan(0);
   } finally {
     await browser.close();
     bff.stop();

@@ -2552,7 +2552,7 @@ async fn terminal_selection_and_inspection_use_run_state() {
     let current = leased.reclaim().await;
     assert_eq!(
         current.snapshot().terminal.map(Decision::Selected),
-        Some(selected.clone())
+        Some((*selected).clone())
     );
     assert_eq!(
         current

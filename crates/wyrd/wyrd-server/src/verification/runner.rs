@@ -46,6 +46,8 @@ use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_verify::blocks::{Checkpoints, Decisions, DriftChecks, EngineError, HostWork};
 use wyrd_runtime::AcceptedAuthority;
+use wyrd_runtime::outbox::OutboxSink;
+use wyrd_runtime::resources::ByteCharge;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, PrincipalId};
 use wyrd_spec::card::agent::ExecutionRoute;
@@ -83,14 +85,14 @@ use super::hosted::blocks::{Execution, HostedBlocks};
 use super::inputs::{InputResolver, InputRow};
 use super::leases::{HeldLease, LeaseRenewal};
 use super::results::{ResultPayloadBuilder, ResultRun};
-use super::state::{Decision, RunState, StateError, StateRow};
+use super::state::{Charged, Decision, RunState, StateError, StateRow};
 use super::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
 use crate::components::auth::Caller;
 use crate::components::gateway::GatewayCallContext;
 use crate::components::github::delivery::GithubDeliveries;
 use crate::components::github::extraction::PullRequestSource;
 use crate::query::scheduled::ScheduledQueryCaller;
-use crate::scribe_outbox::{ScribeOutbox, ScribeWrite};
+use crate::scribe_outbox::{ScribeOutbox, ScribeSink, ScribeWrite};
 use crate::state::AppState;
 
 /// Stable error code when the exact Verifier Card cannot be loaded or is not
@@ -226,8 +228,9 @@ pub struct Custody {
 
 /// The terminal decision one claim offers its execution's state.
 enum Offer {
-    /// The decision the recovered state already accepted.
-    Accepted(Decision),
+    /// The decision the recovered state already accepted, as a copy
+    /// charged for as long as it is kept.
+    Accepted(Charged<Decision>),
     /// A completed outcome, computed from its instant.
     Selected(ExecutedOutcome, DateTime<Utc>),
     /// A failure without an outcome.
@@ -663,10 +666,6 @@ impl VerifierRunner {
             tracing::warn!(%execution_id, "the execution's identity cannot be read; the failure is not recorded in the execution state");
             return Transition::Terminate(status, error);
         };
-        let offer = match Decision::of(&accepted) {
-            Some(decision) => Offer::Accepted(decision),
-            None => Offer::Failed(status, error),
-        };
         let state = RunState::at(
             Arc::clone(&self.outbox),
             tenant,
@@ -676,6 +675,10 @@ impl VerifierRunner {
             accepted,
             revision,
         );
+        let offer = match state.decision() {
+            Some(decision) => Offer::Accepted(decision),
+            None => Offer::Failed(status, error),
+        };
         conclude(tenant, frozen, system, &state, offer, lease, &self.outbox).await
     }
 
@@ -1581,6 +1584,13 @@ impl VerifierRunner {
 /// result write and settles only once Scribe accepts it, through
 /// [`deliver`]. A decision whose persistence fails maps through
 /// [`state_failure`], and a lost lease settles nothing.
+///
+/// The decision is a copy of the live state's, charged to process memory
+/// before it was made and kept charged through the persistence wait. The
+/// result write is charged the decision's size from the same ledger before
+/// it is built and then fitted to the write's own weight, so the decision
+/// is released only once its result's bytes are promised, and [`deliver`]
+/// hands that promise to the outbox.
 async fn conclude(
     tenant: DataTenantId,
     frozen: Frozen<'_>,
@@ -1604,14 +1614,38 @@ async fn conclude(
     if let Err(transition) = persisted(state, lease, execution_id).await {
         return transition;
     }
+    let (decided, charge) = decided.into_parts();
     match decided {
         Decision::Failed(failure) => {
             Transition::Terminate(terminal_status(failure.status), failure.error)
         }
-        Decision::Selected(selected) => match result(frozen, &selected, system) {
-            Ok((transition, write)) => deliver(tenant, transition, write, lease, outbox).await,
-            Err(transition) => transition,
-        },
+        Decision::Selected(selected) => {
+            let mut promise = charge
+                .as_ref()
+                .map(|charge| charge.ledger().charge_infallible(charge.bytes()));
+            let built = result(frozen, &selected, system);
+            drop((selected, charge));
+            match built {
+                Ok((transition, write)) => {
+                    if let Some(promise) = &mut promise {
+                        fit(promise, <ScribeSink as OutboxSink>::weight(&write) as u64);
+                    }
+                    deliver(tenant, transition, write, promise, lease, outbox).await
+                }
+                Err(transition) => transition,
+            }
+        }
+    }
+}
+
+/// Grow or shrink `charge` to exactly `bytes`; growth is infallible because
+/// what it pays for already exists.
+fn fit(charge: &mut ByteCharge, bytes: u64) {
+    let held = charge.bytes();
+    if bytes > held {
+        charge.grow_infallible(bytes - held);
+    } else {
+        charge.shrink(held - bytes);
     }
 }
 
@@ -1649,10 +1683,19 @@ async fn persisted(
 /// and the next claim delivers the same selected result again. A lost
 /// `lease` ends the wait; each caller races its own abandoning shutdown
 /// around this one.
+///
+/// `held` is the process memory already charged for `write`, from the
+/// outbox's ledger; it stays charged through the reservation wait and the
+/// outbox takes it over as the staged write's charge.
+///
+/// # Panics
+/// Panics when `held` was charged to another ledger than the outbox's, as
+/// [`wyrd_runtime::outbox::Reservation::stage_charged`] does.
 async fn deliver(
     tenant: DataTenantId,
     transition: Transition,
     mut write: ScribeWrite,
+    held: Option<ByteCharge>,
     lease: &HeldLease,
     outbox: &Arc<ScribeOutbox>,
 ) -> Transition {
@@ -1674,7 +1717,10 @@ async fn deliver(
             }
         }
     };
-    slot.stage(tenant, write);
+    match held {
+        Some(held) => slot.stage_charged(tenant, write, held),
+        None => slot.stage(tenant, write),
+    }
     tokio::select! {
         biased;
         () = lost.cancelled() => Transition::LeaseLost,

@@ -321,9 +321,35 @@ impl Held {
     /// A charge for one copy of the live state, taken from the live
     /// charge's ledger before the copy is made; `None` when uncharged.
     fn charge_copy(&self) -> Option<ByteCharge> {
+        self.charge(self.live.as_ref().map_or(0, ByteCharge::bytes))
+    }
+
+    /// A charge of `bytes` from the live charge's ledger, taken infallibly
+    /// because the copy it pays for is mandatory; `None` when uncharged.
+    fn charge(&self, bytes: u64) -> Option<ByteCharge> {
         self.live
             .as_ref()
-            .map(|live| live.ledger().charge_infallible(live.bytes()))
+            .map(|live| live.ledger().charge_infallible(bytes))
+    }
+
+    /// A copy of the terminal decision the state holds, charged its
+    /// retained size before the copy is made, as [`Decision::of`] reads it;
+    /// `None` when nothing is decided.
+    ///
+    /// The copy is independent of the live state, so its charge is its own:
+    /// it outlives every revision's acknowledgement for as long as the
+    /// caller keeps the decision, and dropping it returns only that share.
+    fn decision(&self) -> Option<Charged<Decision>> {
+        let bytes = match (&self.state.terminal, &self.state.failure) {
+            (Some(selected), _) => retained(selected),
+            (None, Some(failure)) => retained(failure),
+            (None, None) => return None,
+        };
+        let charge = self.charge(bytes);
+        Some(Charged {
+            value: Decision::of(&self.state)?,
+            charge,
+        })
     }
 }
 
@@ -360,6 +386,7 @@ impl<T> Charged<T> {
 }
 
 impl<T> std::ops::Deref for Charged<T> {
+    /// The copy's type.
     type Target = T;
 
     /// The copy.
@@ -815,10 +842,11 @@ impl RunState {
         self.writer.lock().state.clone()
     }
 
-    /// The terminal decision the live state holds, if any.
+    /// A copy of the terminal decision the live state holds, if any,
+    /// charged before it is made and for as long as the caller keeps it.
     #[must_use]
-    pub fn decision(&self) -> Option<Decision> {
-        Decision::of(&self.writer.lock().state)
+    pub fn decision(&self) -> Option<Charged<Decision>> {
+        self.writer.lock().decision()
     }
 
     /// The approval occurrences the live state records.
@@ -877,7 +905,8 @@ impl RunState {
     /// new result identity first when it holds none. A recorded failure is
     /// never superseded: once either is decided, every later entry returns
     /// the same decision. The decision is live; [`Self::persisted`] awaits
-    /// its acceptance.
+    /// its acceptance. The returned copy is charged as
+    /// [`Self::decision`]'s is.
     ///
     /// # Errors
     /// Returns [`StateError::Stale`] when a new decision cannot be recorded
@@ -886,7 +915,7 @@ impl RunState {
         &self,
         outcome: &ExecutedOutcome,
         started_at: DateTime<Utc>,
-    ) -> Result<Decision, StateError> {
+    ) -> Result<Charged<Decision>, StateError> {
         self.decide(|| {
             Decision::Selected(TerminalSelection {
                 result_id: VerificationResultId::new_v7(),
@@ -907,7 +936,7 @@ impl RunState {
         &self,
         status: VerificationExecutionStatus,
         error: &VerificationError,
-    ) -> Result<Decision, StateError> {
+    ) -> Result<Charged<Decision>, StateError> {
         self.decide(|| {
             Decision::Failed(TerminalFailure {
                 status,
@@ -917,35 +946,44 @@ impl RunState {
         })
     }
 
-    /// The decision the state holds, else `decision()` recorded as it. The
-    /// check and the change share one memory lock, so two deciders never
-    /// both decide.
+    /// A charged copy of the decision the state holds, else of
+    /// `decision()` recorded as it. The check and the change share one
+    /// memory lock, so two deciders never both decide.
+    ///
+    /// A new decision moves into the live state, which retains its size,
+    /// and the returned copy is then charged before it is made, exactly as
+    /// a later [`Self::decision`] read is.
     ///
     /// # Errors
     /// As [`Self::select`].
-    fn decide(&self, decision: impl FnOnce() -> Decision) -> Result<Decision, StateError> {
+    ///
+    /// # Panics
+    /// Panics if the state holds no decision right after one was recorded
+    /// under the same lock, which cannot happen.
+    fn decide(&self, decision: impl FnOnce() -> Decision) -> Result<Charged<Decision>, StateError> {
         let mut held = self.writer.lock();
-        if let Some(decided) = Decision::of(&held.state) {
+        if let Some(decided) = held.decision() {
             return Ok(decided);
         }
         if !self.writer.current(&held) {
             return Err(StateError::Stale);
         }
-        let decided = decision();
         // ponytail: counted under the lock; a terminal record is one bounded
         // value, so the pass is short.
-        match &decided {
+        match decision() {
             Decision::Selected(selected) => {
-                held.retain(retained(selected));
-                held.state.terminal = Some(selected.clone());
+                held.retain(retained(&selected));
+                held.state.terminal = Some(selected);
             }
             Decision::Failed(failure) => {
-                held.retain(retained(failure));
-                held.state.failure = Some(failure.clone());
+                held.retain(retained(&failure));
+                held.state.failure = Some(failure);
             }
         }
         self.writer.changed(&mut held);
-        Ok(decided)
+        Ok(held
+            .decision()
+            .expect("the decision was just recorded in the live state"))
     }
 
     /// Record that the execution parks waiting for the deferred inputs
@@ -1646,7 +1684,7 @@ mod tests {
                 &error("engine"),
             )
             .expect("the failure is recorded");
-        assert!(matches!(failed, Decision::Failed(_)));
+        assert!(matches!(*failed, Decision::Failed(_)));
         let outcome = ExecutedOutcome {
             verdict: VerificationVerdict::Passed,
             requirements: Vec::new(),
@@ -1952,5 +1990,75 @@ mod tests {
         );
         drop(read);
         assert_eq!(memory.used(), live, "the copy's charge returns with it");
+    }
+
+    /// Proves a terminal decision returned to its consumer, newly selected
+    /// or recovered, is charged its own retained size beside the live
+    /// state's: the charge survives the revision's acknowledgement, a
+    /// sibling cannot be promised those bytes, and dropping the decision
+    /// returns exactly its share once. A recovered selection keeps the
+    /// first selection's identity.
+    ///
+    /// # Panics
+    /// Panics when a decision copy is uncharged, outlives its charge, keeps
+    /// it once dropped, or changes the selected identity.
+    #[tokio::test]
+    async fn terminal_decisions_hold_their_copy_charge() {
+        let limit = 1 << 30;
+        let memory = wyrd_runtime::resources::ByteLedger::new(limit);
+        let (state, scribe) = charged_at(&memory, ExecutionState::fresh(), 0);
+        scribe
+            .release
+            .add_permits(tokio::sync::Semaphore::MAX_PERMITS);
+        let base = memory.used();
+        let outcome = ExecutedOutcome {
+            verdict: VerificationVerdict::Passed,
+            requirements: Vec::new(),
+            steps: Vec::new(),
+            evidence: BTreeMap::from([(
+                wyrd_spec::ids::SlotName::new("doc").expect("slot"),
+                wyrd_spec::verification::execution::InputDeclaration::Json {
+                    value: serde_json::json!("x".repeat(64 * 1024)),
+                },
+            )]),
+        };
+
+        let selected = state
+            .select(&outcome, chrono::Utc::now())
+            .expect("selected");
+        let Decision::Selected(terminal) = &*selected else {
+            panic!("the outcome is selected");
+        };
+        let copy = super::retained(terminal);
+        assert!(copy > 64 * 1024);
+        settled(&state).await.expect("the selection is accepted");
+        charged(&memory, base + 2 * copy).await;
+        assert!(
+            memory.try_charge(limit - (base + 2 * copy) + 1).is_err(),
+            "a sibling cannot be promised the decision's bytes"
+        );
+        let again = state.decision().expect("decided");
+        assert_eq!(again, selected, "a later read is the same decision");
+        assert_eq!(memory.used(), base + 3 * copy, "each copy is charged");
+        drop(again);
+        drop(selected);
+        assert_eq!(memory.used(), base + copy, "each copy returns its share");
+
+        let recovered = state.snapshot();
+        let first = recovered.terminal.clone().expect("selected");
+        drop(state);
+        charged(&memory, 0).await;
+        let (state, _scribe) = charged_at(&memory, recovered, 1);
+        let live = memory.used();
+        let decided = state.decision().expect("the recovered decision");
+        assert_eq!(*decided, Decision::Selected(first.clone()));
+        assert_eq!(memory.used(), live + copy, "a recovered read is charged");
+        let reselected = state
+            .select(&outcome, chrono::Utc::now())
+            .expect("the decision reads");
+        assert_eq!(*reselected, Decision::Selected(first), "identity is kept");
+        assert_eq!(memory.used(), live + 2 * copy);
+        drop((decided, reselected));
+        assert_eq!(memory.used(), live, "the recovered copies return once");
     }
 }

@@ -20,8 +20,11 @@ use tokio::sync::futures::Notified;
 
 mod workload;
 
-pub use workload::{Operation, OperationId, WorkContext, Workload, WorkloadManager};
 use workload::OperationShared;
+pub use workload::{
+    CommitObservation, Operation, OperationId, Pressure, PressureState, WorkContext, Workload,
+    WorkloadManager,
+};
 
 /// A charge that does not fit the ledger's remaining bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -300,14 +303,29 @@ pub struct ProcessResources {
 }
 
 impl ProcessResources {
-    /// The plan over already-resolved budgets.
+    /// The plan over already-resolved budgets, with no headroom outside the
+    /// managed memory budget.
     #[must_use]
     pub fn new(effective_cpu: NonZeroUsize, memory_bytes: u64, scratch_bytes: u64) -> Self {
+        Self::with_ceiling(effective_cpu, memory_bytes, memory_bytes, scratch_bytes)
+    }
+
+    /// The plan for a process ceiling of `ceiling_bytes` (`P`, covering the
+    /// parent and its managed workers) of which `memory_bytes` (`M = P - H`)
+    /// is the managed budget; headroom `H` is excluded, never charged.
+    #[must_use]
+    pub fn with_ceiling(
+        effective_cpu: NonZeroUsize,
+        ceiling_bytes: u64,
+        memory_bytes: u64,
+        scratch_bytes: u64,
+    ) -> Self {
+        let memory = ByteLedger::new(memory_bytes);
         Self {
             effective_cpu,
-            memory: ByteLedger::new(memory_bytes),
+            workloads: WorkloadManager::new(memory.clone(), ceiling_bytes),
+            memory,
             scratch: ByteLedger::new(scratch_bytes),
-            workloads: WorkloadManager::default(),
         }
     }
 
@@ -403,7 +421,11 @@ mod tests {
         assert_eq!(retained.operation(), Some(verification.context().operation));
 
         let shared = Arc::new(retained);
-        let readers = [Arc::clone(&shared), Arc::clone(&shared), Arc::clone(&shared)];
+        let readers = [
+            Arc::clone(&shared),
+            Arc::clone(&shared),
+            Arc::clone(&shared),
+        ];
         assert_eq!(ledger.used(), 100, "readers are not copies");
         assert_eq!(workloads.workload_bytes(Workload::Verification), 100);
 

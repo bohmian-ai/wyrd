@@ -326,11 +326,21 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
      Regressions: under the same wrapper, `--lib` 942 passed and
      `--test integration` 75 passed.
    - `mise run test:bifrost:journey:oracle`: 65 passed.
+   - Release before IO (REQ-022): `CpuLanes::off_lane(io)` returns the lane
+     a `run_blocking` job holds for the IO, then queues for a lane again as
+     the same work. An unwinding job takes no new lane. Scribe staging runs
+     directory preparation, the encoder's 8 MiB `sync_data`
+     (`SyncingFile::write`), and the final run fsync, preflight and
+     directory fsync (`MemberStager::encode_runs`) through it. Only
+     encoding keeps the lane.
+     Test: `resources::lanes::tests::blocking_io_runs_off_the_lane_and_requeues`.
+     RED (stub ran the IO on the lane): competing work timed out. GREEN.
+     The Scribe call sites have no runtime proof of their own; this rests on
+     the cited source plus the regressions: `wyrd-runtime --lib` 93 passed,
+     redux `--lib` 942 passed, `--test integration` 75 passed.
    - Open:
-     - Persistence `StageMember` fsyncs its local runs inside the laned job,
-       so the lane is held across local IO, the same as DataFusion spill
-       writes inside a laned poll. REQ-022 says to release before IO.
-       Splitting encode from write in the stager needs a decision.
+     - DataFusion spill writes inside a laned poll still hold the lane
+       across local IO.
      - Scribe lanes are unattributed (`tenant: None`), because persistence
        jobs mix tenants.
      - No proof yet that held Bifrost jobs release lanes to competing

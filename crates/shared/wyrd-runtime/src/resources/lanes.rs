@@ -14,7 +14,7 @@
 //! service floor, so idle time earns no credit. Nothing is preempted: a long
 //! phase delays others until it returns its lane.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
@@ -31,6 +31,9 @@ use super::workload::{WorkContext, Workload};
 thread_local! {
     /// The work running on this thread's held lane, and its lanes, if any.
     static RUNNING: RefCell<Option<Inherited>> = const { RefCell::new(None) };
+    /// The lease of the blocking job running on this thread, which
+    /// [`CpuLanes::off_lane`] returns and replaces around blocking IO.
+    static HELD: Cell<Option<RunId>> = const { Cell::new(None) };
 }
 
 impl WorkContext {
@@ -239,9 +242,33 @@ impl CpuLanes {
         if RUNNING.with_borrow(Option::is_some) {
             return job();
         }
-        let _lease = self.acquire_blocking(context);
+        HELD.set(Some(self.wait_blocking(context)));
+        let _held = Held(self.clone());
         let _running = Scope::enter(self, context);
         job()
+    }
+
+    /// Runs blocking IO `io` off the lane the calling blocking job holds,
+    /// queueing for a lane again once it returns.
+    ///
+    /// A blocking job that writes or syncs files calls this around the IO,
+    /// so competing CPU work runs on the lane meanwhile. Outside a
+    /// [`Self::run_blocking`] job, `io` runs as is.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if a held blocking lease is found outside its job's
+    /// scope, which [`Self::run_blocking`] never allows.
+    pub fn off_lane<T>(io: impl FnOnce() -> T) -> T {
+        let Some(id) = HELD.take() else {
+            return io();
+        };
+        let running = RUNNING
+            .take()
+            .expect("a held blocking lease runs inside its scope");
+        running.lanes.release(id);
+        let _requeue = Requeue(Some(running));
+        io()
     }
 
     /// Wraps `future` so each poll runs on a lane for `context`, returning the
@@ -273,8 +300,17 @@ impl CpuLanes {
     }
 
     /// Blocks the calling thread until a lane is free for `context`.
+    #[cfg(test)]
     fn acquire_blocking(&self, context: WorkContext) -> LaneLease {
-        let id = match self.try_acquire(context, Wake::Thread(std::thread::current())) {
+        LaneLease {
+            lanes: self.clone(),
+            id: self.wait_blocking(context),
+        }
+    }
+
+    /// Parks the calling thread until a lane is granted to `context`.
+    fn wait_blocking(&self, context: WorkContext) -> RunId {
+        match self.try_acquire(context, Wake::Thread(std::thread::current())) {
             Ok(id) => id,
             Err(waiter) => loop {
                 let mut state = waiter.state();
@@ -285,10 +321,6 @@ impl CpuLanes {
                 drop(state);
                 std::thread::park();
             },
-        };
-        LaneLease {
-            lanes: self.clone(),
-            id,
         }
     }
 
@@ -509,6 +541,34 @@ impl LaneState {
                 WaitState::Granted(_) | WaitState::Done => {}
             }
         }
+    }
+}
+
+/// Returns the blocking job's current lease when the job ends.
+struct Held(CpuLanes);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        if let Some(id) = HELD.take() {
+            self.0.release(id);
+        }
+    }
+}
+
+/// Queues the blocking job for a lane again when its off-lane IO ends.
+///
+/// An unwinding job takes no new lane: its [`Held`] then has none to return.
+struct Requeue(Option<Inherited>);
+
+impl Drop for Requeue {
+    fn drop(&mut self) {
+        let Some(running) = self.0.take() else {
+            return;
+        };
+        if !std::thread::panicking() {
+            HELD.set(Some(running.lanes.wait_blocking(running.context)));
+        }
+        RUNNING.set(Some(running));
     }
 }
 
@@ -933,6 +993,45 @@ mod tests {
             .expect("the released lane runs the nested job");
         assert_eq!(value, Some(verification));
         worker.join().expect("the worker finishes");
+        assert_eq!(lanes.free(), 1);
+    }
+
+    #[test]
+    fn blocking_io_runs_off_the_lane_and_requeues() {
+        let lanes = CpuLanes::new(1);
+        let bifrost = context(Workload::Bifrost, None);
+        let gateway = context(Workload::Gateway, None);
+        let (io_started, started) = mpsc::channel();
+        let (competitor_ran, ran) = mpsc::channel();
+        let writer = {
+            let lanes = lanes.clone();
+            std::thread::spawn(move || {
+                lanes.run_blocking(bifrost, || {
+                    CpuLanes::off_lane(|| {
+                        io_started.send(()).expect("the test is listening");
+                        ran.recv_timeout(Duration::from_secs(5))
+                            .expect("competing work runs while the job does IO");
+                    });
+                    WorkContext::current()
+                })
+            })
+        };
+        started
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the job reaches its IO");
+        let competitor = {
+            let lanes = lanes.clone();
+            std::thread::spawn(move || lanes.run_blocking(gateway, || competitor_ran.send(())))
+        };
+        competitor
+            .join()
+            .expect("the competitor finishes")
+            .expect("the writer is listening");
+        assert_eq!(
+            writer.join().expect("the writer finishes"),
+            Some(bifrost),
+            "the job resumes as its own work on a lane"
+        );
         assert_eq!(lanes.free(), 1);
     }
 }

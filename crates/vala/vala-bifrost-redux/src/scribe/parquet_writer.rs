@@ -533,7 +533,8 @@ const ARTIFACT_SYNC_INTERVAL_BYTES: u64 = 8 * 1024 * 1024;
 /// writeback, stalling every write on the shard for hundreds of
 /// milliseconds. Syncing in bounded steps keeps the dirty backlog small, so
 /// a WAL sync waits behind at most one interval. Encoding runs on the
-/// staging rayon pool, so these blocking syncs never hold an async worker.
+/// staging rayon pool, so these blocking syncs never hold an async worker,
+/// and each sync runs off the shared CPU lane the encoder holds.
 struct SyncingFile {
     /// The scratch artifact being written.
     file: std::fs::File,
@@ -562,7 +563,9 @@ impl Write for SyncingFile {
             .unsynced
             .saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
         if self.unsynced >= ARTIFACT_SYNC_INTERVAL_BYTES {
-            self.file.sync_data()?;
+            // The sync waits on the disk, so the encoder's CPU lane is
+            // returned for it.
+            wyrd_runtime::resources::CpuLanes::off_lane(|| self.file.sync_data())?;
             self.unsynced = 0;
         }
         Ok(written)

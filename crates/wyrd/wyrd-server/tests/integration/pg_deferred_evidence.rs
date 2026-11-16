@@ -684,7 +684,27 @@ async fn a_finished_execution_releases_compute_before_its_terminal_is_acknowledg
             })
     })
     .await;
-    let measured = "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: ci-gate\n  version: 1.0.0\nspec:\n  description: Python ran.\n  steps:\n    - id: measure\n      action:\n        kind: code\n        entrypoint: measure\n        source:\n          inline: |\n            def measure():\n                return {\"measured\": True}\n  requirements:\n    - id: measured\n      statement: Python ran\n      check: {kind: assert, path: steps.measure.output.measured, operator: equals, expected: true}\n";
+    let measured = r#"apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: ci-gate
+  version: 1.0.0
+spec:
+  description: Python ran.
+  steps:
+    - id: measure
+      action:
+        kind: code
+        entrypoint: measure
+        source:
+          inline: |
+            def measure():
+                return {"measured": True}
+  requirements:
+    - id: measured
+      statement: Python ran
+      check: {kind: assert, path: steps.measure.output.measured, operator: equals, expected: true}
+"#;
     deployment
         .declare_files(
             &[("ci-gate.yaml", measured.to_owned())],

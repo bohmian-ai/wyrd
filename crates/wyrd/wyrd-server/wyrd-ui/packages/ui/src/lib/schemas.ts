@@ -665,14 +665,14 @@ export const components = {
   },
   RecordTable: {
     description:
-      'Typed rows of one signal (traces as root spans with span and error counts, spans, logs or metric points) ' +
+      'Typed rows of one signal (traces as root spans with span and error counts, spans, logs, metric points, or Verifier executions with their retained status and recorded verdict) ' +
       'or of authored SQL, newest first or sorted by a column, paged by keyset cursor, with optional grouping and live mode that pauses while inspected.',
     input: RecordTableInputSchema,
     states: ['populated', 'empty', 'denied', 'error', 'loading', 'live'],
     emits: {
       'record.open': {
-        description: 'Open one trace or span, or one log record by its exact identity.',
-        input: z.union([spanRef, z.object({ log: LogKeySchema }).strict()]),
+        description: 'Open one trace or span, one log record by its exact identity, or one exact Verifier execution.',
+        input: z.union([spanRef, z.object({ log: LogKeySchema }).strict(), z.object({ execution_id: z.string().min(1).max(200) }).strict()]),
         completion: 'host-navigation'
       },
       'record.open_in_query': {

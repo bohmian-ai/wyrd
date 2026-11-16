@@ -2337,7 +2337,7 @@
       ]
     },
     "RecordTable": {
-      "description": "Typed rows of one signal (traces as root spans with span and error counts, spans, logs or metric points) or of authored SQL, newest first or sorted by a column, paged by keyset cursor, with optional grouping and live mode that pauses while inspected.",
+      "description": "Typed rows of one signal (traces as root spans with span and error counts, spans, logs, metric points, or Verifier executions with their retained status and recorded verdict) or of authored SQL, newest first or sorted by a column, paged by keyset cursor, with optional grouping and live mode that pauses while inspected.",
       "input": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "anyOf": [
@@ -2570,7 +2570,7 @@
       "emits": [
         {
           "name": "record.open",
-          "description": "Open one trace or span, or one log record by its exact identity.",
+          "description": "Open one trace or span, one log record by its exact identity, or one exact Verifier execution.",
           "input": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "anyOf": [
@@ -2620,6 +2620,20 @@
                 },
                 "required": [
                   "log"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "execution_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  }
+                },
+                "required": [
+                  "execution_id"
                 ],
                 "additionalProperties": false
               }

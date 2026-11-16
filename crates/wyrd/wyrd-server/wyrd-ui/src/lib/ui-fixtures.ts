@@ -313,6 +313,30 @@ export const logRow = result(
 );
 export const LOG = { time_unix_nano: '2026-10-20T11:58:02.410000000+00:00', observed_time_unix_nano: '2026-10-20T11:58:02.411000000+00:00', wyrd_request_id: 'req_01' };
 
+/** Verifier Card UIDs the execution rows name, and the names a host read for them. */
+export const VERIFIER_UIDS = { policy: '01a1e602-c0e3-7880-ad65-f29c521418cb', drift: '01a1e602-cb7f-7c63-bc0c-f6b307a7147e' } as const;
+export const verifierLabels = { [VERIFIER_UIDS.policy]: 'ticket-policy 1.1.0', [VERIFIER_UIDS.drift]: 'latency-drift 1.0.0' };
+/** Executions, as the Verify list reads them: shown columns, then execution_id. Completed with each verdict, a recorded cancel, and no terminal record. */
+export const executions = result(
+  [col('recorded_at', 'Timestamp(µs, "+00:00")'), col('verifier_card_uid'), col('subject_name'), col('run_id'), col('group_id'), col('service_name'), col('status'), col('verdict'), col('execution_id')],
+  [
+    ['2026-10-20T11:58:02.412000Z', VERIFIER_UIDS.policy, 'support-agent', '01a1e602-c9a9-7d0b-a028-5acc7427195f', null, 'support-api', 'completed', 'failed', 'exec_failed'],
+    ['2026-10-20T11:57:41.000000Z', VERIFIER_UIDS.policy, 'support-agent', '01a1e602-c7e4-7396-97d9-a8f9dfc2cde9', 'conversation-7', 'support-api', 'completed', 'passed', 'exec_passed'],
+    ['2026-10-20T11:40:00.000000Z', VERIFIER_UIDS.drift, 'latency-model', null, null, null, 'completed', 'inconclusive', 'exec_inconclusive'],
+    ['2026-10-20T11:31:10.000000Z', VERIFIER_UIDS.drift, 'latency-model', null, null, null, 'cancelled', null, 'exec_cancelled'],
+    ['2026-10-20T11:30:00.000000Z', VERIFIER_UIDS.policy, 'support-agent', null, null, 'support-api', 'not recorded', null, 'exec_open']
+  ]
+);
+/** Executions per bucket by verdict and by Verifier, as the two Verify charts read them. */
+export const executionsByVerdict = result(
+  [col('at', NS), col('verdict'), col('executions', 'Int64')],
+  [['2026-10-20T10:00:00Z', 'passed', 4], ['2026-10-20T10:00:00Z', 'failed', 1], ['2026-10-20T11:00:00Z', 'passed', 6], ['2026-10-20T11:00:00Z', 'inconclusive', 1], ['2026-10-20T11:00:00Z', 'no verdict', 2]]
+);
+export const executionsByVerifier = result(
+  [col('at', NS), col('verifier'), col('executions', 'Int64')],
+  [['2026-10-20T10:00:00Z', VERIFIER_UIDS.policy, 5], ['2026-10-20T11:00:00Z', VERIFIER_UIDS.policy, 6], ['2026-10-20T11:00:00Z', VERIFIER_UIDS.drift, 3]]
+);
+
 /** Facet counts: largest first, with a null value. */
 export const facet = result([col('value'), col('n', 'Int64')], [['agent-api', 42], ['search', 7], [null, 3]]);
 /** Facet counts by the column a facet query groups; span names read past the ten shown. */

@@ -150,6 +150,10 @@ import {
   executionStatus,
   EXECUTIONS,
   facet,
+  executions,
+  executionsByVerdict,
+  VERIFIER_UIDS,
+  verifierLabels,
   fixtureExecutor,
   LOG,
   logRow,
@@ -3173,4 +3177,56 @@ test('JSON and YAML blocks are coloured by syntax role without changing their te
   // A version or a timestamp is not a number.
   expect(of(yaml, 'number')).toEqual(['0.25']);
 
+});
+
+test('an executions list keeps status and verdict apart, names Verifiers the host read, and opens one exact execution', async () => {
+  const onaction = vi.fn();
+  const list = render(RecordTable, { input: { signal: 'executions' }, result: { state: 'populated', data: { rows: executions } }, labels: verifierLabels, onaction });
+  expect(list.getAllByRole('columnheader').map((heading) => heading.textContent?.trim())).toEqual(['Time ↓', 'Verifier', 'Card name', 'Run', 'Session', 'Service', 'Status', 'Verdict']);
+  const cells = (row: number) => [...list.getAllByRole('row')[row].querySelectorAll('td')].map((cell) => cell.textContent?.trim());
+  // Status and verdict are separate facts: a completed failure, then a recorded cancel and an execution with no terminal record, neither with a verdict.
+  expect(cells(1).slice(6)).toEqual(['completed', '✕failed']);
+  expect(cells(4).slice(6)).toEqual(['!cancelled', 'no verdict']);
+  expect(cells(5).slice(6)).toEqual(['not recorded', 'no verdict']);
+  expect(list.getByText('not recorded').closest('[title]')).toHaveAttribute('title', 'No terminal state is retained. Open the execution for its current status.');
+  // The Verifier reads as the name the host supplied and keeps its exact UID; an id without one is shortened, never dropped.
+  expect(list.getAllByText('ticket-policy 1.1.0')[0]).toHaveAttribute('title', VERIFIER_UIDS.policy);
+  expect(list.getByText('01a1…195f')).toHaveAttribute('title', '01a1e602-c9a9-7d0b-a028-5acc7427195f');
+  expect(list.getAllByRole('row')[1].querySelector('time')).toHaveAttribute('datetime', '2026-10-20T11:58:02.412000Z');
+  expect(list.getByText(/^Showing 5 executions/)).toBeInTheDocument();
+  // A row opens its exact execution, by click or Enter.
+  await fireEvent.click(list.getAllByRole('row')[5]);
+  await fireEvent.keyDown(list.getAllByRole('row')[1], { key: 'Enter' });
+  expect(onaction.mock.calls.map(([intent]) => intent)).toEqual([
+    { name: 'record.open', input: { execution_id: 'exec_open' } },
+    { name: 'record.open', input: { execution_id: 'exec_failed' } }
+  ]);
+  for (const [intent] of onaction.mock.calls) expect(validateIntent('RecordTable', intent)).toEqual(intent);
+  list.unmount();
+
+  // Facets: no recorded verdict is counted apart and filters by IS NULL; a Verifier value reads as its name and filters by its UID.
+  const filter = vi.fn();
+  const facets = [
+    { column: 'verdict', values: { ...facet, rows: [['passed', 10], [null, 2]] } },
+    { column: 'verifier_card_uid', values: { ...facet, rows: [[VERIFIER_UIDS.policy, 9], [VERIFIER_UIDS.drift, 3]] } }
+  ];
+  const rail = render(FacetRail, { input: { signal: 'executions', facets: ['verdict', 'verifier_card_uid'] }, result: { state: 'populated', data: { facets } }, labels: verifierLabels, onaction: filter });
+  await fireEvent.click(rail.getByRole('button', { name: /no verdict\s*2/ }));
+  await fireEvent.click(rail.getByRole('button', { name: /latency-drift 1\.0\.0\s*3/ }));
+  expect(filter.mock.calls.map(([intent]) => intent.input)).toEqual([
+    { signal: 'executions', column: 'verdict', value: null },
+    { signal: 'executions', column: 'verifier_card_uid', value: VERIFIER_UIDS.drift }
+  ]);
+  rail.unmount();
+
+  // Both charts draw the read series; no verdict is a series of its own in the neutral colour the host names.
+  const chart = render(Chart, {
+    input: { type: 'timeseries', title: 'Executions by verdict', sql: '-', x: 'at', y: ['executions'], series: 'verdict', range: RANGE },
+    result: { state: 'populated', data: executionsByVerdict },
+    compact: true,
+    bars: true,
+    colors: { passed: 'var(--ok)', failed: 'var(--danger)', inconclusive: 'var(--warn)', 'no verdict': 'var(--muted)' }
+  });
+  expect(chart.container.textContent).toContain('no verdict');
+  chart.unmount();
 });

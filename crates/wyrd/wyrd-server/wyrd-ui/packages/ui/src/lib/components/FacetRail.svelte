@@ -5,17 +5,19 @@
   shows its first values and expands to every value read; when the read found
   more than it returns, the count of hidden values says so with "+". A
   severity text value reads in the colour of the highest severity number
-  recorded with it.
+  recorded with it. An execution with no recorded verdict is counted as "no
+  verdict", and a host that passes `labels` names a value it read, such as a
+  Verifier Card UID; the filter still carries the value itself.
 -->
 <script lang="ts">
   import type { ActionProps } from '../contract.js';
-  import { FACET_VALUES, STATUS_NAMES, columnLabel, severityLevel, type FacetRailProps } from '../loaders.js';
+  import { FACET_VALUES, NO_VERDICT, STATUS_NAMES, columnLabel, severityLevel, type FacetRailProps } from '../loaders.js';
   import { fmtCount } from '../format.js';
   import { numeric } from '../plot.js';
   import ActionNote from './ActionNote.svelte';
   import EmptyState from './EmptyState.svelte';
 
-  let { input, result, actions = {}, onaction }: FacetRailProps & ActionProps = $props();
+  let { input, result, actions = {}, onaction, labels = {} }: FacetRailProps & ActionProps & { labels?: Readonly<Record<string, string>> } = $props();
 
   const filterState = $derived(actions['facet.filter']);
   const blocked = $derived(!onaction || filterState?.state === 'pending' || filterState?.state === 'unavailable');
@@ -54,7 +56,8 @@
                     class:unset={value === null}
                     class:error={(column === 'status_code' && value !== null && numeric(value) === 2) || (column === 'severity_text' && severityLevel(number) === 'error')}
                     class:warn={column === 'severity_text' && severityLevel(number) === 'warn'}
-                    >{value === null ? 'not set' : column === 'status_code' ? (STATUS_NAMES[Number(value)] ?? String(value)) : String(value)}</span
+                     title={labels[String(value)] ? String(value) : undefined}
+                    >{value === null ? (column === 'verdict' ? NO_VERDICT : 'not set') : column === 'status_code' ? (STATUS_NAMES[Number(value)] ?? String(value)) : (labels[String(value)] ?? String(value))}</span
                   >
                   <span class="count">{fmtCount(numeric(n))}</span>
                 </button>

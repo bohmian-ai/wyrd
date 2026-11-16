@@ -27,11 +27,17 @@
   Span rows show their shortened trace and parent span ids before Duration,
   and trace rows their counts before Status; a log record's severity reads in
   its level's colour, decided by the recorded severity number.
+
+  An executions list reads Status and Verdict as separate pills; an execution
+  with no recorded verdict says so and never borrows one. Its ids are
+  shortened with the exact value as their title, and a host that passes
+  `labels` names a value it read, such as a Verifier Card UID, without
+  changing what a row holds or filters by. A row opens its exact execution.
 -->
 <script lang="ts">
   import type { Snippet } from 'svelte';
   import type { ActionProps, QueryResult } from '../contract.js';
-  import { KEY_COLUMNS, LIST_LIMIT, STATUS_NAMES, cellText, columnLabel, listSort, severityLevel, shortId, shownColumns, signalColumns, sortColumns, type ListSort, type RecordTableProps } from '../loaders.js';
+  import { KEY_COLUMNS, LIST_LIMIT, NO_VERDICT, STATUS_NAMES, cellText, columnLabel, isInstant, listSort, severityLevel, shortId, shownColumns, signalColumns, sortColumns, type ListSort, type RecordTableProps } from '../loaders.js';
   import { fmtCount } from '../format.js';
   import { columnIndex, numeric } from '../plot.js';
   import ActionButton from './ActionButton.svelte';
@@ -49,9 +55,10 @@
     paused = false,
     oncolumns,
     controls,
-    tools: hostTools
+    tools: hostTools,
+    labels = {}
   }: RecordTableProps &
-    ActionProps & { paused?: boolean; oncolumns?: (columns: readonly string[]) => void; controls?: HTMLElement; tools?: Snippet } = $props();
+    ActionProps & { paused?: boolean; oncolumns?: (columns: readonly string[]) => void; controls?: HTMLElement; tools?: Snippet; labels?: Readonly<Record<string, string>> } = $props();
 
   /** Keep `node` inside `target` while it is mounted. */
   const placeIn = (target: HTMLElement) => (node: HTMLElement) => {
@@ -60,7 +67,12 @@
   };
 
   const TONES: Record<number, Tone> = { 0: 'neutral', 1: 'ok', 2: 'danger' };
-  const NOUNS = { traces: ['trace', 'traces'], spans: ['span', 'spans'], logs: ['record', 'records'], metrics: ['point', 'points'] } as const;
+  const NOUNS = { traces: ['trace', 'traces'], spans: ['span', 'spans'], logs: ['record', 'records'], metrics: ['point', 'points'], executions: ['execution', 'executions'] } as const;
+  /** The tone of each retained execution status and recorded verdict; a status with no terminal record carries none. */
+  const EXECUTION_TONES: Readonly<Record<string, Tone>> = { completed: 'neutral', cancelled: 'warn', timed_out: 'danger', errored: 'danger', passed: 'ok', failed: 'danger', inconclusive: 'warn' };
+  const UNSETTLED = 'No terminal state is retained. Open the execution for its current status.';
+  /** Execution columns that hold a UUID: shown shortened, or as the name the host read for it. */
+  const isId = (column: string) => signal === 'executions' && (column.endsWith('_id') || column.endsWith('_uid'));
   const signal = $derived('signal' in input ? input.signal : undefined);
   const nouns = $derived(signal ? NOUNS[signal] : (['row', 'rows'] as const));
   const noun = $derived(nouns[1]);
@@ -156,7 +168,7 @@
     if (!rows) return;
     const column = sortKey(heading);
     const value = rows.rows.map((row) => row[columnIndex(rows, column)]).find((each) => each !== null);
-    const next = { column, desc: order?.column === column ? !order.desc : column.endsWith('_unix_nano') || typeof value === 'number' };
+    const next = { column, desc: order?.column === column ? !order.desc : isInstant(column) || typeof value === 'number' };
     if (signal) onaction?.({ name: 'record.sort', input: next });
     else local = next;
   }
@@ -198,7 +210,9 @@
     if (!openable || openState?.state === 'pending' || openState?.state === 'unavailable') return;
     const at = (name: string) => row[columnIndex(data, name)];
     const target =
-      signal === 'logs'
+      signal === 'executions'
+        ? { execution_id: at('execution_id') }
+        : signal === 'logs'
         ? { log: { time_unix_nano: at('time_unix_nano'), observed_time_unix_nano: at('observed_time_unix_nano'), wyrd_request_id: at('wyrd_request_id') } }
         : { trace_id: at('trace_id'), span_id: at('span_id') };
     opened = input.live === true;
@@ -301,7 +315,9 @@
                   {#each visible as column (column)}
                     {@const value = row[columnIndex(rows, column)]}
                     {#if column === extrasBefore}{@render extras(rows, row, traceCounts)}{/if}<td class:name={signal && column === 'name'}>
-                      {#if !signal || value === null}
+                      {#if signal === 'executions' && column === 'verdict' && value === null}
+                        <span class="null">{NO_VERDICT}</span>
+                      {:else if !signal || value === null}
                         <span class:null={value === null} title={typeof value === 'string' && value.length > 40 ? value : undefined}>{text(column, value)}</span>
                       {:else if column === 'duration_nano'}
                         <DurationBar ms={Math.round(numeric(value) / 1e6)} max={longest} />
@@ -311,7 +327,11 @@
                         <span class="level-{severityLevel(row[columnIndex(rows, 'severity_number')])}">{text(column, value)}</span>
                       {:else if column === 'service_name'}
                         <span class="chip" title={String(value)}>{String(value)}</span>
-                      {:else if column.endsWith('_unix_nano')}
+                      {:else if signal === 'executions' && (column === 'status' || column === 'verdict')}
+                        <span title={value === 'not recorded' ? UNSETTLED : undefined}><StatusPill tone={EXECUTION_TONES[String(value)] ?? 'neutral'} label={String(value).replace('_', ' ')} /></span>
+                      {:else if isId(column)}
+                        <span class:id={!labels[String(value)]} title={String(value)}>{labels[String(value)] ?? shortId(String(value))}</span>
+                      {:else if isInstant(column)}
                         <time datetime={String(value)} title={String(value)}>{text(column, value)}</time>
                       {:else}
                         <span title={typeof value === 'string' && value.length > 40 ? value : undefined}>{text(column, value)}</span>

@@ -429,7 +429,11 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
        - `oracle::spill::tests::spill_writes_return_the_query_lane`,
          written after the implementation. Mutation check: a plain write
          fails it.
-   Status: PENDING the final lane runs.
+   Final lane runs, with the spill and polled-lane changes included:
+   redux lib under managed Postgres, 943 passed
+   (`mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p vala-bifrost-redux --lib"`),
+   and `mise run test:bifrost:journey:oracle`, 67 + 1 passed.
+   Status: PASS.
 
 6. **Connected public journey and bounded drain — REQ-019–024; AC-018.** Extend
    existing Rust-client/WyrdTestServer/Postgres journey owners with verification

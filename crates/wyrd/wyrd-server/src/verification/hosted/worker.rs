@@ -322,6 +322,8 @@ mod tests {
     /// The committed bytes the telemetry test reports, and how often they
     /// were read.
     static COMMITTED: AtomicU64 = AtomicU64::new(1);
+    /// How many times [`committed`] was read, so a test can tell a sample
+    /// taken from one merely re-sent.
     static READS: AtomicUsize = AtomicUsize::new(0);
 
     /// The test's committed-bytes reader.
@@ -334,12 +336,17 @@ mod tests {
     /// for a worker stdout delayed behind a large interpreter frame, and
     /// which closes after its third frame.
     struct DelayedSink {
+        /// Where each accepted frame is copied for the test to read.
         frames: mpsc::Sender<Vec<u8>>,
+        /// Released by the test to let the first write return.
         release: mpsc::Receiver<()>,
+        /// Writes attempted so far, the refused one included.
         written: usize,
     }
 
     impl Write for DelayedSink {
+        /// Copies the frame to the test, holding the first write until the
+        /// test releases it, and refuses the third as a closed pipe.
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.written += 1;
             if self.written > 2 {
@@ -352,6 +359,7 @@ mod tests {
             Ok(buf.len())
         }
 
+        /// Nothing is buffered, so flushing always succeeds.
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }

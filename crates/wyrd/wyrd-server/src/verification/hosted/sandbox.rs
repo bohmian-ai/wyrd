@@ -736,6 +736,8 @@ impl Sandbox {
 struct Waiting<'a>(&'a AtomicUsize);
 
 impl Drop for Waiting<'_> {
+    /// Stops counting this operation as waiting, on every exit path,
+    /// cancellation included, so the count never strands a departed waiter.
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
     }

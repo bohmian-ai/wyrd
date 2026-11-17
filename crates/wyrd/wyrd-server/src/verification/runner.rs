@@ -1590,16 +1590,10 @@ impl VerifierRunner {
 /// [`deliver`]. A decision whose persistence fails maps through
 /// [`state_failure`], and a lost lease settles nothing.
 ///
-/// The decision is a copy of the live state's, charged to process memory
-/// before it was made and kept charged through the persistence wait. Once
-/// the result write is built from it, the charge grows by the write's weight
-/// while both live, then shrinks to that weight when the decision drops, and
-/// [`deliver`] hands it to the outbox; the write is never charged ahead of
-/// its build.
-///
-/// # Panics
-/// Panics when `state` charges another ledger than `outbox`, as
-/// [`deliver`] does; a [`RunState`] always charges its own outbox's.
+/// The decision is an uncharged copy of the live state's terminal record,
+/// a small object graph covered by aggregate pressure. The selected
+/// decision drops once its result write is built, and that write is charged
+/// only when [`deliver`] stages it, where the outbox takes its custody.
 async fn conclude(
     tenant: DataTenantId,
     frozen: Frozen<'_>,

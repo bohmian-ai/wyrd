@@ -1276,18 +1276,13 @@ judged('Verify lists executions with and without a recorded result as one author
   await desk.shutdown();
   const session = await groupExecution(server, await bindingWith(exact(declared(support)), 'group_end'), 90_000);
   const turns = session.group?.sources.turns.execution_ids ?? [];
-  // Unfinished work: one execution a runner claimed and holds while its hosted step waits for memory, and one cancelled while held.
+  // A hosted Verifier, whose step can be held waiting for memory, and one execution cancelled while held.
   const capacity = await cards.declareFromPath(fixture('cards/verification_capacity/capacity-desk.yaml'));
   const capacityBundle = mkdtempSync(join(tmpdir(), 'wyrd-ui-verify-capacity-'));
   await cards.pull(capacity.root, capacityBundle);
   const capacityRoot = declared(capacity);
   const counter = WyrdState.fromPath(capacityBundle, { client: WyrdClient.connect({ credential: (await runtimeAccount({ kind: 'Service', name: capacityRoot.name })).key, workloadUid: capacityRoot.uid }) });
   await counter.startBifrost();
-  const memory = server.occupyHostedMemory(64 << 20);
-  const claimed = await counter.run('agent').observe.submit('adds-one', { answer: 2 });
-  if (claimed.kind !== 'queued') throw new Error('adds-one queues an execution');
-  server.waitForHostedWaiters(1, 60_000);
-  const running = claimed.execution.id;
   const stopped = server.holdPublications('ui-verify-stopped').executionId;
   expect((await client.httpAuth(`${server.baseUrl}/v1/verification/executions/${stopped}/cancel`, { method: 'POST' })).status).toBe(200);
   server.flushBifrost();
@@ -1316,6 +1311,22 @@ judged('Verify lists executions with and without a recorded result as one author
     return loaded.result.data.facets.map((facet) => facet.values);
   };
 
+  // Unfinished work: a runner claims one execution and holds it while its hosted step waits for memory. The list finds it by its
+  // recorded status, with no verdict, as its own exact read says.
+  const memory = server.occupyHostedMemory(64 << 20);
+  const claimed = await counter.run('agent').observe.submit('adds-one', { answer: 2 });
+  if (claimed.kind !== 'queued') throw new Error('adds-one queues an execution');
+  server.waitForHostedWaiters(1, 60_000);
+  const running = claimed.execution.id;
+  server.flushBifrost();
+  const held = await nodeExecutor(client).run([{ op: 'verification.get_execution', execution_id: running }]);
+  expect((await page({ where: [{ column: 'status', value: 'running' }] }, nodeExecutor(client))).rows.map((each) => [each.execution_id, each.status, each.verdict])).toEqual([[running, held[0].ok && held[0].value.status, null]]);
+  // Given memory it finishes, and the list follows its newest recorded status.
+  memory.release();
+  await claimed.execution.wait({ timeoutMs: 60_000 });
+  await counter.shutdown();
+  server.flushBifrost();
+
   const mcp = await mcpOver(server.baseUrl, client);
   try {
     for (const [surface, direct] of [['node', nodeExecutor(client)], ['mcp', mcp.executor]] as const) {
@@ -1334,18 +1345,16 @@ judged('Verify lists executions with and without a recorded result as one author
       expect(row(session.execution_id), surface).toMatchObject({ status: 'completed', verdict: 'passed', group_id: 'ui-verify-conversation' });
       expect(turns.map((id) => [row(id).status, row(id).verdict, row(id).group_id]), surface).toEqual(turns.map(() => ['completed', 'passed', 'ui-verify-conversation']));
       expect(row(refused).run_id, surface).toEqual(expect.any(String));
-      // Unfinished work states its recorded lifecycle and no verdict: one claimed and still running, one cancelled while held.
-      expect([row(running).status, row(running).verdict], surface).toEqual(['running', null]);
+      // The execution that was running is now completed with its verdict; the one cancelled while held has its recorded status and no verdict.
+      expect([row(running).status, row(running).verdict], surface).toEqual(['completed', 'passed']);
       expect([row(stopped).status, row(stopped).verdict], surface).toEqual(['cancelled', null]);
       // Every queued row agrees with the execution's own exact read.
-      for (const id of [refused, agreed, drifted, session.execution_id]) {
+      for (const id of [refused, agreed, drifted, session.execution_id, running]) {
         const [live] = await direct.run([{ op: 'verification.get_execution', execution_id: id }]);
         expect(live.ok && [live.value.status, live.value.result?.outcome.verdict, live.value.result?.verifier.uid], surface).toEqual([row(id).status, row(id).verdict, row(id).verifier_card_uid]);
       }
-      for (const id of [running, stopped]) {
-        const [live] = await direct.run([{ op: 'verification.get_execution', execution_id: id }]);
-        expect(live.ok && live.value.status, surface).toBe(row(id).status);
-      }
+      const [cancelled] = await direct.run([{ op: 'verification.get_execution', execution_id: stopped }]);
+      expect(cancelled.ok && cancelled.value.status, surface).toBe('cancelled');
 
       // Facets and both charts count the same population the pages hold.
       const [statuses, verdicts, verifiers] = await facets([], executor);
@@ -1366,7 +1375,7 @@ judged('Verify lists executions with and without a recorded result as one author
       // One exact Verifier, by its recorded UID; a session; no recorded verdict.
       expect((await all({ where: [{ column: 'verifier_card_uid', value: assistant.answerCheck.uid }] }, executor)).map((each) => each.execution_id), surface).toEqual([refused]);
       expect((await all({ where: [{ column: 'group_id', value: 'ui-verify-conversation' }] }, executor)).map((each) => each.execution_id).sort(), surface).toEqual([session.execution_id, ...turns].sort());
-      expect((await all({ where: [{ column: 'verdict', value: null }] }, executor)).map((each) => each.execution_id).sort(), surface).toEqual([running, stopped].sort());
+      expect((await all({ where: [{ column: 'verdict', value: null }] }, executor)).map((each) => each.execution_id).sort(), surface).toEqual([stopped]);
       // An incompatible combination is empty, and says so.
       expect(await page({ where: [{ column: 'status', value: 'running' }, { column: 'verdict', value: 'passed' }] }, executor), surface).toMatchObject({ rows: [], reason: 'No execution matches these filters in this window.' });
       // An earlier range holds nothing.
@@ -1456,8 +1465,7 @@ judged('Verify lists executions with and without a recorded result as one author
   try {
     const built = await appBridgeView(doc, async (name, args) => ((await host.callTool({ name, arguments: args })).structuredContent ?? {}) as object);
     const list = () => built.document.querySelector('[data-panel="list"]') as Element;
-    await vi.waitFor(() => expect(list().querySelectorAll('tbody tr')).toHaveLength(2));
-    expect(list().textContent).toContain('running');
+    await vi.waitFor(() => expect(list().querySelectorAll('tbody tr')).toHaveLength(1));
     expect(list().textContent).toContain('cancelled');
     expect(list().textContent).toContain('no verdict');
     expect(list().textContent).not.toMatch(/passed|failed/);
@@ -1467,12 +1475,6 @@ judged('Verify lists executions with and without a recorded result as one author
   } finally {
     await host.close();
   }
-  // Given memory, the held execution finishes, and the list follows its newest recorded status.
-  memory.release();
-  await claimed.execution.wait({ timeoutMs: 60_000 });
-  await counter.shutdown();
-  server.flushBifrost();
-  expect((await all({}, nodeExecutor(client))).find((each) => each.execution_id === running)).toMatchObject({ status: 'completed', verdict: 'passed' });
   // A server that cannot be reached is a problem, never an empty list.
   const DOWN = 'http://127.0.0.1:9';
   const unreachable = { result: { state: 'error', problem: { code: expect.stringMatching(/^WYRD_/) } } };

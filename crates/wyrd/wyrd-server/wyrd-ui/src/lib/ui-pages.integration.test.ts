@@ -1520,7 +1520,6 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
   // One failed and one passed Run execution, one still running, and 53 direct turns: three of one conversation, fifty of none.
   const refused = await submit('answer-check', 'no');
   await submit('answer-judged', 'yes');
-  const running = server.holdPublications('ui-verify-browser').executionId;
   const support = await cards.declareFromPath(fixture('cards/verify_in_real_time/support.yaml'));
   const bundle = mkdtempSync(join(tmpdir(), 'wyrd-ui-verify-page-'));
   await cards.pull(support.root, bundle);
@@ -1530,12 +1529,19 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
   for (let turn = 1; turn <= 53; turn += 1)
     await desk.run('agent').observe.verify('turn-check', { turn, answer: `answer ${turn}` }, { positional: true, ...(turn <= 3 ? { group_id: 'ui-verify-conversation' } : {}) });
   await desk.shutdown();
-  // The ended conversation is judged once as its own group execution: 57 accepted executions in all.
+  // A hosted Verifier, whose step can be held waiting for memory.
+  const capacity = await cards.declareFromPath(fixture('cards/verification_capacity/capacity-desk.yaml'));
+  const capacityBundle = mkdtempSync(join(tmpdir(), 'wyrd-ui-verify-capacity-'));
+  await cards.pull(capacity.root, capacityBundle);
+  const capacityRoot = declared(capacity);
+  const counter = WyrdState.fromPath(capacityBundle, { client: WyrdClient.connect({ credential: (await runtimeAccount({ kind: 'Service', name: capacityRoot.name })).key, workloadUid: capacityRoot.uid }) });
+  await counter.startBifrost();
+  // The ended conversation is judged once as its own group execution: 56 accepted executions so far.
   await vi.waitFor(
     async () => {
       server.flushBifrost();
       const [read] = await nodeExecutor(WyrdClient.connect()).run([{ op: 'bifrost.query', sql: 'SELECT count(DISTINCT execution_id) FROM bifrost.verification.execution_inputs', params: [], max_rows: 1 }]);
-      expect(read.ok && Number(read.value.rows[0][0])).toBe(57);
+      expect(read.ok && Number(read.value.rows[0][0])).toBe(56);
     },
     { timeout: 90_000, interval: 1_000 }
   );
@@ -1544,6 +1550,7 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
   buildUi();
   const bff = await startBff(server.baseUrl);
   const browser = await chromium.launch();
+  let memory: { release(): void } | undefined;
   try {
     const page = await signIn(browser, bff.url, tenant, server.apiKey);
     const list = `${bff.url}/t/${tenant}/verify`;
@@ -1551,6 +1558,14 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
     const rows = page.locator('[aria-label="executions rows"] tbody tr:not(.group)');
     const rail = page.getByRole('navigation', { name: 'Filter executions' });
     const where = page.getByLabel('WHERE: read-only projection of the active filters');
+
+    // The 57th execution: a runner claims it and holds it while its hosted step waits for memory.
+    memory = server.occupyHostedMemory(64 << 20);
+    const claimed = await counter.run('agent').observe.submit('adds-one', { answer: 2 });
+    if (claimed.kind !== 'queued') throw new Error('adds-one queues an execution');
+    server.waitForHostedWaiters(1, 60_000);
+    const running = claimed.execution.id;
+    server.flushBifrost();
 
     // Verify is a destination of the tenant shell; it opens on the newest page of every accepted execution.
     await page.getByRole('navigation', { name: 'Destinations' }).getByRole('link', { name: 'Verify' }).click();
@@ -1562,6 +1577,19 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
     expect(await rail.getByRole('button', { name: /answer-check 1\.0\.0/ }).count()).toBe(1);
     expect(await rail.getByRole('button', { name: /running/ }).textContent()).toContain('1');
     await captureExecution(page, 'verify-dashboard');
+
+    // The unfinished execution is found by its recorded status, and its own page agrees.
+    await rail.getByRole('button', { name: /running/ }).click();
+    await expect.poll(() => rows.count()).toBe(1);
+    expect(await rows.first().textContent()).toContain('no verdict');
+    await rows.first().click();
+    await page.waitForURL(`${list}/executions/${running}`);
+    await expect.poll(() => page.locator('[data-execution-status]').getAttribute('data-execution-status')).toBe('running');
+    await page.goBack();
+    await expect.poll(() => rows.count()).toBe(1);
+    await page.getByRole('link', { name: 'Clear' }).click();
+    await page.waitForURL(list);
+    await expect.poll(() => rows.count()).toBe(50);
 
     // Paging keeps the population: the second page holds the rest, and the address holds the cursor.
     await page.getByRole('button', { name: /Older/ }).click();
@@ -1601,17 +1629,6 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
     await page.waitForURL(list);
     await expect.poll(() => rows.count()).toBe(50);
 
-    // The unfinished execution is found by its recorded status, and its own page agrees.
-    await rail.getByRole('button', { name: /running/ }).click();
-    await expect.poll(() => rows.count()).toBe(1);
-    expect(await rows.first().textContent()).toContain('no verdict');
-    await rows.first().click();
-    await page.waitForURL(`${list}/executions/${running}`);
-    await expect.poll(() => page.locator('[data-execution-status]').getAttribute('data-execution-status')).toBe('running');
-    await page.goBack();
-    await expect.poll(() => rows.count()).toBe(1);
-    await page.getByRole('link', { name: 'Clear' }).click();
-    await page.waitForURL(list);
 
     // Grouping arranges the same rows under their session; it adds no row and no judgment.
     await page.getByRole('combobox', { name: 'Group by' }).selectOption('group_id');
@@ -1675,6 +1692,8 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
   } finally {
     await browser.close();
     bff.stop();
+    memory?.release();
+    await counter.shutdown();
   }
 });
 

@@ -15,7 +15,7 @@ import { expect, vi } from 'vitest';
 import { TraceWaterfall } from 'wyrd-ai-ui';
 import { z } from 'zod';
 import { Bifrost, Cards, GithubConnection, Principals, TableConfig, WyrdClient, WyrdState } from 'wyrd-ai';
-import { signInGithubBrowser } from '@wyrd/testing';
+import { type NativeWyrdTestServer, signInGithubBrowser } from '@wyrd/testing';
 import {
   CardRefSchema,
   loadArtifactTable,
@@ -1533,11 +1533,16 @@ judged('Verify lists executions with and without a recorded result as one author
 
 /** A fresh deployment with the GitHub App mock, for a tenant that connects a repository. */
 const reviewed = serverTest({ githubApp: true, perTest: true });
+/** The same deployment, which also runs Verifiers. */
+const deferred = serverTest({ githubApp: true, perTest: true, verificationRuntime: true });
 
-reviewed('Verify lists pull request executions by their recorded repository and number', async ({ server }) => {
-  // The tenant connects installation 101 and declares the review policy of its repository `acme/api` (provider id 1).
+/** An admin of the tenant after it connected installation 101 with `acme/api` (provider id 1) and `acme/web` (2). */
+async function connectGithub(server: NativeWyrdTestServer): Promise<WyrdClient> {
   const github = server.githubApp;
-  github.addInstallation(101, [{ id: 1, fullName: 'acme/api' }]);
+  github.addInstallation(101, [
+    { id: 1, fullName: 'acme/api' },
+    { id: 2, fullName: 'acme/web' }
+  ]);
   github.addUser('octo', [101]);
   github.signIn('octo');
   github.installTarget(101);
@@ -1545,6 +1550,39 @@ reviewed('Verify lists pull request executions by their recorded repository and 
   const admin = WyrdClient.connect({ credential: key });
   const connection = await (await GithubConnection.connect({ client: admin })).begin();
   expect(signInGithubBrowser(server.baseUrl, server.tenantSlug, key).open(connection.authorization_url).status).toBe(200);
+  return admin;
+}
+
+deferred('Verify lists an execution waiting for deferred evidence by its recorded status', async ({ server }) => {
+  // The repository's `ci-gate` Verifier needs a `ci` input that CI publishes later, so its pull request execution parks.
+  const github = server.githubApp;
+  const admin = await connectGithub(server);
+  await (await Cards.connect({ client: admin })).declareFromPath(fixture('cards/deferred_evidence/repository.yaml'));
+  github.setPullRequest(2, 7, 'b1'.repeat(20), 'a1'.repeat(20));
+  expect(github.deliverPullRequest(server.baseUrl, 101, 2, 7, 'opened')).toBe(202);
+
+  const context = { executor: nodeExecutor(admin), range: { from: new Date(Date.now() - 3_600_000).toISOString(), to: new Date(Date.now() + 60_000).toISOString() } };
+  let rows: readonly (readonly unknown[])[] = [];
+  await vi.waitFor(
+    async () => {
+      server.flushBifrost();
+      const loaded = await loadRecordTable({ signal: 'executions', columns: ['execution_id', 'status', 'verdict', 'pull_request'], where: [{ column: 'status', value: 'waiting' }] }, context);
+      rows = loaded.result.state === 'populated' ? loaded.result.data.rows.rows : [];
+      expect(rows).toHaveLength(1);
+    },
+    { timeout: 30_000, interval: 500 }
+  );
+  const [[id, status, verdict, pullRequest]] = rows;
+  expect([status, verdict, pullRequest]).toEqual(['waiting', null, '7']);
+  // The list's status is the one the execution's own exact read reports, with the input it waits for.
+  const [live] = await context.executor.run([{ op: 'verification.get_execution', execution_id: id as string }]);
+  expect(live.ok && [live.value.status, live.value.waiting]).toEqual(['waiting', ['ci']]);
+});
+
+reviewed('Verify lists pull request executions by their recorded repository and number', async ({ server }) => {
+  // The tenant connects installation 101 and declares the review policy of its repository `acme/api` (provider id 1).
+  const github = server.githubApp;
+  const admin = await connectGithub(server);
   const checkout = mkdtempSync(join(tmpdir(), 'wyrd-ui-verify-checkout-'));
   cpSync(fixture('cards/repository_declaration'), checkout, { recursive: true });
   mkdirSync(join(checkout, '.git'));

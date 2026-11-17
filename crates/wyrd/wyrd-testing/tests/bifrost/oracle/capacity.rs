@@ -1210,18 +1210,26 @@ const REFUSAL_QUERY_DEADLINE_MS: i64 = 30_000;
 
 /// Governed bytes the holds deliberately leave free in the root.
 ///
-/// One partition working set: exactly what the plan calls the minimum a query
-/// needs to produce a batch. Holding the whole root instead would refuse the
-/// last holder itself before it could reach its schema frame, and there would
-/// be no occupied root for the refusal below to meet.
-const REFUSAL_HOLDER_HEADROOM_BYTES: usize = 64 * 1024 * 1024;
+/// Four partition working sets. At least the minimum a query needs to produce
+/// a batch, so the last holder still reaches its schema frame; holding the
+/// whole root instead would refuse that holder itself. More than the 5% of
+/// the root at which process pressure pauses new Bifrost work, so the refused
+/// query is admitted and refused at its allocation rather than paused until
+/// its deadline.
+const REFUSAL_HOLDER_HEADROOM_BYTES: usize = 256 * 1024 * 1024;
 
 /// Bytes of filler each row of the refused query's sort key carries.
 ///
 /// Three rows of this width exceed the headroom above, and a sort must reserve
 /// a whole batch before it can spill any of it, so the refusal is a property of
 /// the arithmetic rather than of how `DataFusion` chose to schedule the work.
-const REFUSAL_SORT_KEY_BYTES: usize = 15_000_000;
+/// The refused query reads only [`REFUSAL_WIDE_ROWS_AFTER`]'s rows, so its key
+/// column stays inside Arrow's 2 GiB string offsets.
+const REFUSAL_SORT_KEY_BYTES: usize = 100_000_000;
+
+/// The refused query reads rows above this id: four published rows and every
+/// live row, so it still has a live source.
+const REFUSAL_WIDE_ROWS_AFTER: i64 = REFUSAL_ROWS - 4;
 
 /// Stable error code a query refused for capacity must carry.
 const QUERY_ADMISSION_REJECTED_CODE: &str = "WYRD_VALA_429_QUERY_ADMISSION_REJECTED";
@@ -1344,7 +1352,7 @@ async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
         &wyrd_client::Bifrost::query_only(&refused),
         &format!(
             "SELECT REPEAT('x', {REFUSAL_SORT_KEY_BYTES}) || CAST(id AS VARCHAR) AS wide_key \
-             FROM bifrost.bifrost.{table} ORDER BY wide_key"
+             FROM bifrost.bifrost.{table} WHERE id > {REFUSAL_WIDE_ROWS_AFTER} ORDER BY wide_key"
         ),
     )
     .await

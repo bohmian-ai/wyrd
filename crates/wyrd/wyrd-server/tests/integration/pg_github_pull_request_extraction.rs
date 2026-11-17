@@ -79,7 +79,7 @@ pub(super) fn sha(ch: char) -> String {
 }
 
 /// Git blob id of `bytes`.
-fn blob(bytes: &[u8]) -> String {
+pub(super) fn blob(bytes: &[u8]) -> String {
     let mut hasher = Sha1::new();
     hasher.update(format!("blob {}\0", bytes.len()).as_bytes());
     hasher.update(bytes);
@@ -90,7 +90,7 @@ fn blob(bytes: &[u8]) -> String {
 ///
 /// # Panics
 /// Panics if building or compressing the archive fails.
-fn tarball(files: &[(&str, &[u8])]) -> Vec<u8> {
+pub(super) fn tarball(files: &[(&str, &[u8])]) -> Vec<u8> {
     let mut builder = tar::Builder::new(Vec::new());
     for (path, bytes) in files {
         let mut header = tar::Header::new_gnu();

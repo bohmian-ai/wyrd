@@ -2,7 +2,10 @@
 # Prepare and run the canonical wyrd-example-py application for `dev:full`.
 #
 #   example-app.sh prepare   pinned checkout + this checkout's production wheel
-#   example-app.sh setup     gateway deployment to MockServer, Cards, capture policy, the Cards board's fixtures
+#   example-app.sh setup     gateway deployment to MockServer, Cards, capture policy, the Cards board's fixtures,
+#                            the reusable code-review Verifier
+#   example-app.sh register  wait for the GitHub connection to cover the demo repository, then
+#                            declare its Repository bound to that Verifier (scripts/dev/review_repository.py)
 #   example-app.sh serve     the API on 127.0.0.1:${WYRD_EXAMPLE_PORT:-8000}
 #   example-app.sh batch ARGS   one bounded workload batch (scripts/batch.py)
 #   example-app.sh test ARGS    the app's pytest suite with the testing-enabled wheel,
@@ -17,7 +20,7 @@ set -Eeuo pipefail
 
 readonly root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly repo=https://github.com/bohmian-ai/wyrd-example-py
-readonly base=ee83b2559fb66a89b673786d3bcbe7e65cd26c17
+readonly base=9a33805cb2f80de9a1aaaa3ff6db3ad12f8c3857
 readonly app="$root/target/dev/wyrd-example-py"
 readonly port=${WYRD_EXAMPLE_PORT:-8000}
 
@@ -83,6 +86,8 @@ setup() {
  "deployments": [{"name": "openai", "adapter": "openai", "auth": {"bearer": {"credential": "openai-key"}}}]}
 JSON
   uv run --no-sync python -m scripts.deploy
+  # The pull request reviewer `register` binds once GitHub is connected.
+  uv run --no-sync wyrd declare review/code-review.yaml >/dev/null
   # The Cards board's representative registry: a Model with a file, two
   # versions of one Prompt, the Agent using the newer one, and a Service
   # bound to multi-step Verifiers.
@@ -114,6 +119,9 @@ case ${1:-} in
     cd "$app"
     exec uv run --no-sync python -m pytest "$@" ;;
   setup) setup ;;
+  register)
+    cd "$app"
+    exec uv run --no-sync python "$root/scripts/dev/review_repository.py" ;;
   serve)
     cd "$app"
     # Export metrics every 5 s instead of every 60 s so a short batch sees them.
@@ -123,5 +131,5 @@ case ${1:-} in
     shift
     cd "$app"
     exec uv run --no-sync python -m scripts.batch --base-url "http://127.0.0.1:$port" "$@" ;;
-  *) echo "usage: $0 prepare|setup|serve|batch [--requests N --concurrency N]|test [PYTEST ARGS]" >&2; exit 2 ;;
+  *) echo "usage: $0 prepare|setup|register|serve|batch [--requests N --concurrency N]|test [PYTEST ARGS]" >&2; exit 2 ;;
 esac

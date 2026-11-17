@@ -1,5 +1,111 @@
 [
   {
+    "id": "code-review-scripted-failure",
+    "priority": 60,
+    "httpRequest": {
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "body": {
+        "type": "JSON",
+        "json": {
+          "model": "gpt-4o",
+          "messages": [
+            {
+              "role": "user",
+              "content": "${json-unit.regex}(?s)Pull request:\\n[^\\n]*\"title\":\"\\[wyrd-demo-fail\\].*"
+            }
+          ]
+        },
+        "matchType": "ONLY_MATCHING_FIELDS"
+      }
+    },
+    "httpResponse": {
+      "statusCode": 200,
+      "headers": {
+        "content-type": [
+          "application/json"
+        ]
+      },
+      "body": {
+        "type": "JSON",
+        "json": {
+          "id": "chatcmpl-mockserver",
+          "object": "chat.completion",
+          "created": 1,
+          "model": "gpt-4o",
+          "choices": [
+            {
+              "index": 0,
+              "finish_reason": "stop",
+              "message": {
+                "role": "assistant",
+                "content": "{\"format\": \"code_review\", \"version\": 1, \"summary\": \"Scripted development review from MockServer: the [wyrd-demo-fail] title requested one high-severity finding. No model read this change.\", \"coverage\": {\"complete\": true, \"limitations\": []}, \"findings\": [{\"id\": \"scripted-high-finding\", \"severity\": \"high\", \"confidence\": \"high\", \"title\": \"Scripted high-severity finding (development data)\", \"explanation\": \"MockServer returns this finding for every pull request whose title starts with [wyrd-demo-fail], so the review fails. It describes no real problem in the change.\", \"locations\": [], \"evidence\": [], \"remediation\": null}]}"
+              }
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 3,
+            "total_tokens": 8
+          }
+        }
+      }
+    }
+  },
+  {
+    "id": "code-review-scripted-pass",
+    "priority": 50,
+    "httpRequest": {
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "body": {
+        "type": "JSON",
+        "json": {
+          "model": "gpt-4o",
+          "messages": [
+            {
+              "role": "user",
+              "content": "${json-unit.regex}(?s)Pull request:.*"
+            }
+          ]
+        },
+        "matchType": "ONLY_MATCHING_FIELDS"
+      }
+    },
+    "httpResponse": {
+      "statusCode": 200,
+      "headers": {
+        "content-type": [
+          "application/json"
+        ]
+      },
+      "body": {
+        "type": "JSON",
+        "json": {
+          "id": "chatcmpl-mockserver",
+          "object": "chat.completion",
+          "created": 1,
+          "model": "gpt-4o",
+          "choices": [
+            {
+              "index": 0,
+              "finish_reason": "stop",
+              "message": {
+                "role": "assistant",
+                "content": "{\"format\": \"code_review\", \"version\": 1, \"summary\": \"Scripted development review from MockServer: no findings. No model read this change.\", \"coverage\": {\"complete\": true, \"limitations\": []}, \"findings\": []}"
+              }
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 3,
+            "total_tokens": 8
+          }
+        }
+      }
+    }
+  },
+  {
     "id": "policy-judge",
     "priority": 30,
     "httpRequest": {

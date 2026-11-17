@@ -1330,9 +1330,11 @@ scripts/dev/example-app.sh prepare
 set -m
 pids=()
 app=
+review=
 stop() {
   trap "" INT TERM
   trap - EXIT
+  if [[ -n $review ]]; then kill -TERM -- "-$review" 2>/dev/null || true; fi
   if [[ -n $app ]]; then kill -TERM -- "-$app" 2>/dev/null && wait "$app" || true; fi
   for pid in "${pids[@]}"; do kill -TERM -- "-$pid" 2>/dev/null || true; done
   wait
@@ -1365,6 +1367,9 @@ until curl -sf http://127.0.0.1:1080/mockserver/ready >/dev/null; do
 done
 # A failed setup or batch leaves the server, UI and MockServer running for diagnosis.
 if scripts/dev/example-app.sh setup; then
+  # Registers the demo repository for pull request review once GitHub covers it, then exits; never awaited below.
+  scripts/dev/example-app.sh register &
+  review=$!
   scripts/dev/example-app.sh serve &
   app=$!
   until curl -sf -o /dev/null http://127.0.0.1:${WYRD_EXAMPLE_PORT:-8000}/docs; do
@@ -1381,11 +1386,17 @@ else
   example="not started: setup FAILED (see above)"
   batch="not sent: setup FAILED; the server, UI and MockServer are still running for diagnosis"
 fi
+if [[ -n $review ]]; then
+  reviews="registers bohmian-ai/wyrd-example-py once GitHub is connected (see CONTRIBUTING.md); its review lines report progress"
+else
+  reviews="not started: setup FAILED"
+fi
 printf '\nwyrd-server  http://127.0.0.1:8080 (fresh database; tenant dev key replaced %s)\n' "$credentials"
 printf 'UI           %s/t/dev/login (sign in as development / development)\n' "$ui"
 printf 'example app  %s\n' "$example"
 printf 'MockServer   http://127.0.0.1:1080/mockserver/dashboard\n'
-printf 'batch        %s\n\n' "$batch"
+printf 'batch        %s\n' "$batch"
+printf 'review       %s\n\n' "$reviews"
 wait -n "${pids[@]}" ${app:+"$app"}
 """
 

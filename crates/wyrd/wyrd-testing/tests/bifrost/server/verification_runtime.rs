@@ -3882,6 +3882,54 @@ async fn running_cancellation_and_revocation_record_cancelled_status()
     Ok(())
 }
 
+/// A submission admitted after its submitter was revoked is cancelled by
+/// the admission's principal fence and records `cancelled` (REQ-015,
+/// AC-010).
+///
+/// The submission's input write is held at Scribe, so the route has
+/// accepted its authority but nothing is queued yet. An administrator then
+/// revokes the submitter through the public principal route, and the held
+/// write is released: the admission that queues the execution cancels it in
+/// the same transaction, and its one status row is `cancelled`.
+///
+/// # Errors
+/// Returns server, route, query, or fixture errors, or a description of the
+/// first expectation that differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn admission_after_revocation_records_cancelled_status() -> Result<(), ServerJourneyError> {
+    let journey = StatusJourney::start("admission-fence").await?;
+    let held = journey
+        .server
+        .stall_next_bifrost_write_into(EXECUTION_INPUTS)?;
+    let fenced = {
+        let submitted = journey.enqueue();
+        tokio::pin!(submitted);
+        tokio::select! {
+            biased;
+            answered = &mut submitted => {
+                return Err(format!("a held submission is answered before admission: {answered:?}").into());
+            }
+            () = held.wait_entered() => {}
+        }
+        if !journey.seed.executions().await?.is_empty() {
+            return Err(
+                "the submission was queued before its held input write was released".into(),
+            );
+        }
+        journey.revoke_submitter().await?;
+        held.release();
+        submitted.await?
+    };
+    journey.await_newest(fenced, "cancelled").await?;
+    journey.assert_history(fenced, &["cancelled"]).await?;
+    if journey.seed.execution(fenced).await?.status != "cancelled" {
+        return Err("the admission did not fence the revoked submitter".into());
+    }
+    journey.server.shutdown().await?;
+    Ok(())
+}
+
 /// A delegated execution's trace input reads keep the accepted delegation
 /// history (REQ-008/010, AC-017, FIND-TASK-001-6).
 ///

@@ -292,6 +292,43 @@ impl Harness {
             .collect()
     }
 
+    /// The status words the runtime recorded for `execution` once the outbox
+    /// settles, ordered by occurrence, each submitted batch counted once.
+    ///
+    /// # Panics
+    /// Panics when a submitted execution-events batch does not decode.
+    async fn statuses(&self, execution: ExecutionId) -> Vec<String> {
+        let mut batches = std::collections::HashSet::new();
+        let mut statuses = Vec::new();
+        for sent in sent_to(&self.fault, EVENTS).await {
+            if !batches.insert(sent.batch_id) {
+                continue;
+            }
+            let reader =
+                arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(&sent.bytes), None)
+                    .expect("a sent batch is an Arrow IPC stream");
+            for batch in reader {
+                let batch = batch.expect("the stream decodes");
+                let text = |column: &str, row: usize| {
+                    arrow::util::display::array_value_to_string(
+                        batch.column_by_name(column).expect("the column is present"),
+                        row,
+                    )
+                    .expect("the value renders")
+                };
+                for row in 0..batch.num_rows() {
+                    if text("event", row) == "status"
+                        && text("execution_id", row) == execution.to_string()
+                    {
+                        statuses.push((text("occurred_at", row), text("status", row)));
+                    }
+                }
+            }
+        }
+        statuses.sort();
+        statuses.into_iter().map(|(_, status)| status).collect()
+    }
+
     /// Every retained audit operation for the tenant since the floor, in
     /// decision order.
     ///
@@ -1584,6 +1621,13 @@ async fn retryable_engine_failures_exhaust_to_errored() {
     assert_eq!(row.attempts, 3);
     assert_eq!(row.error_code.as_deref(), Some("engine_unavailable"));
     assert!(harness.writes().await.is_empty());
+    assert_eq!(
+        harness.statuses(run).await,
+        [
+            "running", "retrying", "running", "retrying", "running", "errored"
+        ],
+        "each claim and settlement records its status, and exhaustion records errored"
+    );
     runtime.stop().await;
 }
 
@@ -2593,9 +2637,13 @@ async fn held_persistence_bounds_queued_custody_by_claim_permits() {
 /// compute while their claims are held, so they complete together; every
 /// run then commits through the batched statement on its first attempt.
 ///
+/// Each run records `completed` once: the failed batch rolled back and
+/// staged nothing.
+///
 /// # Panics
-/// Panics when the fault cannot be installed, no batch failed, or any run
-/// commits through the single-run statement or retries its attempt.
+/// Panics when the fault cannot be installed, no batch failed, any run
+/// commits through the single-run statement or retries its attempt, or a
+/// run's status history differs.
 #[tokio::test]
 async fn failed_group_commits_retry_as_groups() {
     let harness = Harness::start().await;
@@ -2652,6 +2700,13 @@ async fn failed_group_commits_retry_as_groups() {
         paths, expected,
         "every run commits once through the batched statement"
     );
+    for run in &runs {
+        assert_eq!(
+            harness.statuses(*run).await,
+            ["running", "completed"],
+            "{run} records completed once, for its committed batch only"
+        );
+    }
 }
 
 /// Stage `harness`'s submitted execution's selected result while its

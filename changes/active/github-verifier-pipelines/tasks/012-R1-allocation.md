@@ -1003,6 +1003,17 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
        (`20261112T030209Z-2ce7caec7`) measured a different check, so its
        sub-ms latencies cannot be compared. Target missed: Rust c64
        `overhead_p99_ms` is 1.10 ms against < 0.5.
+     - Verification model steps are comparable. Only `--steps` declares
+       them, so they ran with
+       `mise run bench:l1:verification -- --steps direct-verify-model-c1,direct-verify-model-c64`
+       (VALID, `target/benchmarks/verification/direct-verify/20261117T203136Z-6ca58163d.json`).
+       Against the latest record `20261112T030343Z-2ce7caec7`, with the
+       same params:
+       - model-c1: rate 3174 → 2624/s (-17%), client p99 0.607 → 0.732
+         ms, CPU per verification +13%.
+       - model-c64: rate 37.7k → 34.3k/s (-9%), overhead p99 0.48 → 0.61
+         ms, CPU per verification unchanged.
+       - Peak memory fell on both steps.
      - Gateway against `20261031T131441Z-92b62f9c0`: 57 metrics better and
        5 worse.
        - Better: 64 KiB payload c64 rate 4981 → 9540/s, with CPU per
